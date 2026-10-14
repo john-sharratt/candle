@@ -38,11 +38,11 @@ use crossbeam::channel::{self, Receiver, Sender};
 
 use super::identity::{RecordIdentity, Stamped};
 use super::manifest::RecordLoc;
-use super::record::{BranchCheckpointPayload, RecordType, SnapshotPayload};
+use super::record::{BranchCheckpointPayload, RecordType, SectionGeneration, SnapshotPayload};
 use super::resume::{self, TurnChunkGrid};
 use super::{PersistenceError, PersistenceLock, Result};
 use crate::persistence::streams::StreamId;
-use crate::substrate::{ResidenceIndex, Substrate};
+use crate::substrate::{ResidenceIndex, Substrate, TurnMark};
 
 /// Max pending write EVENTS before an enqueue blocks. Sized to absorb a full
 /// segment-compaction's worth of seal decls (the writer stalls on the persistence
@@ -173,6 +173,29 @@ pub(crate) enum WriteJob {
         payload: Vec<u8>,
         identity: RecordIdentity,
     },
+    /// A timeline tombstone. The enqueuer has already marked the timeline in
+    /// RAM; the writer appends the record and drops the persistence-side
+    /// snapshot and file index. The append runs here so a caller that holds
+    /// the engine mutex does not wait on the persistence lock.
+    TimelineTombstone {
+        timeline_id: u64,
+        reason: Option<String>,
+    },
+    /// A turn tombstone. Same split as [`Self::TimelineTombstone`]: the
+    /// substrate mark is synchronous, the append is the writer's. Retention
+    /// retires up to a few hundred turns while its caller holds the engine
+    /// mutex, so the append cannot take the persistence lock on that caller.
+    TurnTombstone {
+        mark: TurnMark,
+        reason: Option<String>,
+    },
+    /// A section tombstone, including the generation the persistence minter
+    /// stops stamping. Applied in RAM by the enqueuer first.
+    SectionTombstone {
+        stream_id: u64,
+        generation: Option<SectionGeneration>,
+        reason: Option<String>,
+    },
     /// Drain everything queued, fsync, ack, and stop the thread.
     Shutdown(Sender<()>),
 }
@@ -187,6 +210,11 @@ impl WriteJob {
             WriteJob::ProjectionEvents { payload, .. } => payload.len() as u64,
             WriteJob::ConvMeta { payload, .. } => payload.len() as u64,
             WriteJob::ConvState { payload, .. } => payload.len() as u64,
+            WriteJob::TimelineTombstone { reason, .. }
+            | WriteJob::TurnTombstone { reason, .. }
+            | WriteJob::SectionTombstone { reason, .. } => {
+                reason.as_ref().map_or(0, |r| r.len()) as u64
+            }
             WriteJob::Snapshot { payload, .. } => payload.encoded_len() as u64,
             WriteJob::BranchCheckpoint { payload, .. } => payload.parts().byte_len() as u64,
             WriteJob::KvCold { grid, .. } => grid.bytes() as u64,
@@ -592,6 +620,44 @@ fn process_one(
                     target: "candle_conversation::persistence::writer",
                     timeline,
                     "conversation state append failed: {e}"
+                );
+            }
+        }
+        WriteJob::TimelineTombstone {
+            timeline_id,
+            reason,
+        } => {
+            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = p.write_tombstone(timeline_id, reason.as_deref()) {
+                tracing::error!(
+                    target: "candle_conversation::persistence::writer",
+                    timeline_id,
+                    "timeline tombstone append failed: {e}"
+                );
+            }
+        }
+        WriteJob::TurnTombstone { mark, reason } => {
+            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = p.write_turn_tombstone(mark, reason.as_deref()) {
+                tracing::error!(
+                    target: "candle_conversation::persistence::writer",
+                    timeline = mark.timeline.raw(),
+                    turn = mark.turn_index,
+                    "turn tombstone append failed: {e}"
+                );
+            }
+        }
+        WriteJob::SectionTombstone {
+            stream_id,
+            generation,
+            reason,
+        } => {
+            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = p.write_section_tombstone(stream_id, generation, reason.as_deref()) {
+                tracing::error!(
+                    target: "candle_conversation::persistence::writer",
+                    stream_id,
+                    "section tombstone append failed: {e}"
                 );
             }
         }

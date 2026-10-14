@@ -3645,9 +3645,13 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.write_tombstone(timeline.raw(), None)
-            .map_err(|e| candle::Error::Msg(format!("write_tombstone: {e}")))?;
+        // The append runs on the writer. The caller — retention, a character
+        // retiring yesterday's conversation — holds the engine mutex, so this
+        // returns without waiting on the persistence lock.
+        self.writer.enqueue(WriteJob::TimelineTombstone {
+            timeline_id: timeline.raw(),
+            reason: None,
+        });
         Ok(())
     }
 
@@ -3670,9 +3674,11 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.write_section_tombstone(stream_id.0, generation, reason)
-            .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
+        self.writer.enqueue(WriteJob::SectionTombstone {
+            stream_id: stream_id.0,
+            generation,
+            reason: reason.map(str::to_string),
+        });
         Ok(())
     }
 
@@ -3691,9 +3697,11 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.write_section_tombstone(stream_id.0, generation, Some(reason))
-            .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
+        self.writer.enqueue(WriteJob::SectionTombstone {
+            stream_id: stream_id.0,
+            generation,
+            reason: Some(reason.to_string()),
+        });
         Ok(())
     }
 
@@ -3749,9 +3757,13 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.write_turn_tombstone(mark, Some("retention"))
-            .map_err(|e| candle::Error::Msg(format!("write_turn_tombstone: {e}")))?;
+        // Retention calls this in a loop of up to a few hundred turns while
+        // holding the engine mutex, so the append is the writer's and this
+        // returns without taking the persistence lock.
+        self.writer.enqueue(WriteJob::TurnTombstone {
+            mark,
+            reason: Some("retention".to_string()),
+        });
         Ok(())
     }
 
@@ -3883,10 +3895,12 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
         for (stream, generation) in streams {
-            p.write_section_tombstone(stream.0, generation, Some("owner released"))
-                .map_err(|e| candle::Error::Msg(format!("write_section_tombstone: {e}")))?;
+            self.writer.enqueue(WriteJob::SectionTombstone {
+                stream_id: stream.0,
+                generation,
+                reason: Some("owner released".to_string()),
+            });
         }
         Ok(())
     }
@@ -4850,9 +4864,10 @@ impl Conversation {
                 //    substrate lock is released, so decode's in-RAM projection
                 //    proceeds during the read + re-append + fsync. The scheduler's
                 //    seal writes and cold loads DO share this persistence lock, so
-                //    the lock is taken per batch: the resident re-emit and then the
-                //    chunks, `RELOCATION_BATCH_BYTES` at a time, then the small
-                //    record types — each its own hold. A seal write or cold load
+                //    the lock is taken per batch: the resident re-emit, the chunks,
+                //    and the tail (tokens, snapshots, branch checkpoints,
+                //    singletons, characters, file events, blobs), each
+                //    `RELOCATION_BATCH_BYTES` at a time. A seal write or cold load
                 //    that arrives mid-op waits for one batch. Held across a whole
                 //    phase it waited for all of it: a 3.6 GB segment's chunks
                 //    stalled an elevate — and the decode behind it — for 37 s, and
@@ -4877,8 +4892,18 @@ impl Conversation {
                         break;
                     }
                 }
-                let result =
-                    self.maintenance_hold(&mut held, |p| p.complete_maintenance(&plan, run))?;
+                loop {
+                    let before = held;
+                    let more = self.maintenance_hold(&mut held, |p| {
+                        p.relocate_tail_batch(&plan, &mut run, RELOCATION_BATCH_BYTES)
+                    })?;
+                    batches += 1;
+                    longest = longest.max(held - before);
+                    if !more {
+                        break;
+                    }
+                }
+                let result = run.into_result();
                 note_persistence_maint_us(held.as_micros() as u64);
                 let exec_ms = t_exec.elapsed().as_millis() as u64;
                 // 3. Repoint the index at the relocated records under a brief write lock.

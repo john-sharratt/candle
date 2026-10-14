@@ -401,6 +401,40 @@ pub struct MaintenanceRun {
     chunk_cursor: usize,
     /// `(stream, chunk_index, old_loc, new_loc)` of every chunk moved so far.
     chunk_updates: Vec<(StreamKey, u64, ChunkLoc, ChunkLoc)>,
+    /// Which tail stage [`SubstratePersistence::relocate_tail_batch`] is in.
+    /// Tokens, snapshots, branch checkpoints, singletons, characters, file
+    /// events, blobs, then done.
+    tail_stage: u8,
+    /// How far into the current tail stage the cursor has walked.
+    tail_cursor: usize,
+    token_updates: Vec<(StreamKey, RecordLoc, RecordLoc)>,
+    snapshot_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
+    branch_checkpoint_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
+}
+
+/// Tail stages of [`SubstratePersistence::relocate_tail_batch`], in order.
+const TAIL_TOKENS: u8 = 0;
+const TAIL_SNAPSHOTS: u8 = 1;
+const TAIL_BRANCHES: u8 = 2;
+const TAIL_SINGLETONS: u8 = 3;
+const TAIL_NPCS: u8 = 4;
+const TAIL_VFS: u8 = 5;
+const TAIL_BLOBS: u8 = 6;
+const TAIL_DONE: u8 = 7;
+/// Skipped records examined under one hold before the lock is released, so a
+/// stage of nothing-but-superseded entries cannot sit on the lock.
+const TAIL_EXAMINE_CAP: usize = 4096;
+
+impl MaintenanceRun {
+    /// The index updates the batches accumulated, once every stage has run.
+    pub fn into_result(self) -> MaintenanceResult {
+        MaintenanceResult {
+            chunk_updates: self.chunk_updates,
+            token_updates: self.token_updates,
+            snapshot_updates: self.snapshot_updates,
+            branch_checkpoint_updates: self.branch_checkpoint_updates,
+        }
+    }
 }
 
 /// The relocated records' new locations, produced by
@@ -1083,6 +1117,11 @@ impl SubstratePersistence {
             resident_cursor: 0,
             chunk_cursor: 0,
             chunk_updates: Vec::with_capacity(plan.chunk_relocs.len()),
+            tail_stage: TAIL_TOKENS,
+            tail_cursor: 0,
+            token_updates: Vec::new(),
+            snapshot_updates: Vec::new(),
+            branch_checkpoint_updates: Vec::new(),
         })
     }
 
@@ -1245,19 +1284,19 @@ impl SubstratePersistence {
     }
 
     /// The last step of [`Self::execute_maintenance`]: the small record types,
-    /// each behind its own supersession check, then the commit every relocated
-    /// copy is durable under before [`Self::finish_maintenance`] unlinks a
-    /// source. One hold of the lock. The watch stays up until that unlink.
+    /// each behind its own supersession check. [`Self::relocate_tail_batch`]
+    /// does the I/O one budget at a time; this runs that to the end under the
+    /// caller's hold and hands back the index updates. The watch stays up
+    /// until [`Self::finish_maintenance`] unlinks a source.
     ///
     /// # Panics
     ///
-    /// When [`Self::relocate_batch`] has not run the op to the end: the commit
-    /// below is what licenses unlinking the sources, and a resident record or
-    /// chunk not yet carried would be unlinked with them.
+    /// When [`Self::relocate_batch`] has not run the op to the end: a resident
+    /// record or chunk not yet carried would be unlinked with the sources.
     pub fn complete_maintenance(
         &mut self,
         plan: &MaintenancePlan,
-        run: MaintenanceRun,
+        mut run: MaintenanceRun,
     ) -> Result<MaintenanceResult> {
         assert!(
             run.resident_cursor == plan.resident.len()
@@ -1269,177 +1308,323 @@ impl SubstratePersistence {
             run.chunk_cursor,
             plan.chunk_relocs.len(),
         );
-        let chunk_updates = run.chunk_updates;
+        while self.relocate_tail_batch(plan, &mut run, u64::MAX)? {}
+        Ok(run.into_result())
+    }
 
-        // Tokens — same coalesced verbatim path, behind the watch the chunks
-        // take: a stream whose tokens were rewritten since the plan, or a
-        // section retired since, has no planned copy worth carrying, and
-        // carrying it would put it after the newer record or the tombstone.
-        let live_tokens: Vec<(StreamKey, RecordLoc)> = plan
-            .token_relocs
-            .iter()
-            .filter(|(key, _)| {
-                self.relocation_watch
-                    .as_ref()
-                    .is_none_or(|w| w.keeps_tokens(key.stream_id.0, key.writer))
-            })
-            .copied()
-            .collect();
-        let token_updates = self.relocate_stream_records(&live_tokens)?;
+    /// Advance the tail — tokens, snapshots, branch checkpoints, singletons,
+    /// characters, file events, blobs — by up to `budget_bytes`, and commit
+    /// what moved. Answers whether any of the tail remains.
+    ///
+    /// This is the unit the caller takes the persistence lock for, the same
+    /// bound as [`Self::relocate_batch`]. A seal, a cold load, and any engine
+    /// caller waiting on this lock wait for one batch.
+    pub fn relocate_tail_batch(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget_bytes: u64,
+    ) -> Result<bool> {
+        assert!(
+            run.resident_cursor == plan.resident.len()
+                && run.chunk_cursor == plan.chunk_relocs.len(),
+            "a maintenance tail batch ran with relocation still to do: \
+             {}/{} resident records, {}/{} chunks",
+            run.resident_cursor,
+            plan.resident.len(),
+            run.chunk_cursor,
+            plan.chunk_relocs.len(),
+        );
+        let mut moved = 0u64;
+        let mut examined = 0usize;
+        while run.tail_stage < TAIL_DONE
+            && examined < TAIL_EXAMINE_CAP
+            && (moved == 0 || moved < budget_bytes)
+        {
+            let room = budget_bytes.saturating_sub(moved).max(1);
+            let (n, bytes, stage_done) = self.relocate_tail_stage(plan, run, room)?;
+            examined += n;
+            moved += bytes;
+            if stage_done {
+                run.tail_stage += 1;
+                run.tail_cursor = 0;
+            }
+            // An empty stage falls through to the next one in this hold. A
+            // stage that stopped mid-way (budget, or a run of skips) releases
+            // the lock so a seal or a cold load gets in.
+            if n == 0 && !stage_done {
+                break;
+            }
+            if !stage_done && moved >= budget_bytes {
+                break;
+            }
+        }
+        if moved > 0 {
+            self.commit()?;
+        }
+        Ok(run.tail_stage < TAIL_DONE)
+    }
 
-        // Snapshots — the same verbatim path, behind a supersession check.
-        // Snapshot records are keyed `(Snapshot, stream_id)`, the greatest
-        // stamp holding, and the seal thread's writer can append a
-        // NEWER tail for a planned stream between plan and execute (the plan
-        // holds no lock across that window). Relocating the planned — now
-        // stale — copy would append it physically AFTER the newer record, so
-        // the next reload's walk would install the stale copy as the tail
-        // (rolled-back recurrent state), and the accounting would credit the
-        // newer LIVE record's bytes as dead. So a planned snapshot whose
-        // location is no longer the stream's live tail (per `snapshot_locs`,
-        // the persistence-side twin of the substrate index — current under
-        // this thread's persistence lock, and also emptied by a timeline
-        // tombstone) is skipped entirely: it is dead in its source segment,
-        // produces no update for `apply_to_substrate`, and the segment drop
-        // reclaims it.
-        let live_snapshots: Vec<(StreamId, RecordLoc)> = plan
-            .snapshot_relocs
-            .iter()
-            .filter(|(sid, old)| self.snapshot_locs.get(&sid.0) == Some(old))
-            .copied()
-            .collect();
-        let snapshot_updates = self.relocate_stream_records(&live_snapshots)?;
+    fn relocate_tail_stage(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget: u64,
+    ) -> Result<(usize, u64, bool)> {
+        match run.tail_stage {
+            TAIL_TOKENS => {
+                let (n, bytes, done, batch) = Self::take_budgeted(
+                    &plan.token_relocs,
+                    &mut run.tail_cursor,
+                    budget,
+                    |(_, old)| old.record_size,
+                    |(key, _)| {
+                        self.relocation_watch
+                            .as_ref()
+                            .is_none_or(|w| w.keeps_tokens(key.stream_id.0, key.writer))
+                    },
+                );
+                self.extend_stream_updates(&batch, &mut run.token_updates)?;
+                Ok((n, bytes, done))
+            }
+            TAIL_SNAPSHOTS => {
+                let (n, bytes, done, batch) = Self::take_budgeted(
+                    &plan.snapshot_relocs,
+                    &mut run.tail_cursor,
+                    budget,
+                    |(_, old)| old.record_size,
+                    |(sid, old)| self.snapshot_locs.get(&sid.0) == Some(old),
+                );
+                self.extend_stream_updates(&batch, &mut run.snapshot_updates)?;
+                Ok((n, bytes, done))
+            }
+            TAIL_BRANCHES => {
+                let (n, bytes, done, batch) = Self::take_budgeted(
+                    &plan.branch_checkpoint_relocs,
+                    &mut run.tail_cursor,
+                    budget,
+                    |(_, old)| old.record_size,
+                    |(sid, old)| self.snapshot_locs.get(&sid.0) == Some(old),
+                );
+                self.extend_stream_updates(&batch, &mut run.branch_checkpoint_updates)?;
+                Ok((n, bytes, done))
+            }
+            TAIL_SINGLETONS => self.take_singletons(plan, run, budget),
+            TAIL_NPCS => self.take_npcs(plan, run, budget),
+            TAIL_VFS => self.take_vfs(plan, run, budget),
+            TAIL_BLOBS => self.take_blobs(plan, run, budget),
+            _ => Ok((0, 0, true)),
+        }
+    }
 
-        // Branch checkpoints relocate by the same rule and under their own
-        // record type — writing them back as `Snapshot` would re-type a cache
-        // as durable state, and compaction's cap would then never see them.
-        let live_branch: Vec<(StreamId, RecordLoc)> = plan
-            .branch_checkpoint_relocs
-            .iter()
-            .filter(|(sid, old)| self.snapshot_locs.get(&sid.0) == Some(old))
-            .copied()
-            .collect();
-        let branch_updates = self.relocate_stream_records(&live_branch)?;
+    /// Walk `items` from `cursor`, keeping those `keep` still calls live, until
+    /// `budget` bytes are kept or [`TAIL_EXAMINE_CAP`] entries have been
+    /// looked at. The first kept record is taken even when it is larger than
+    /// the budget. A run of superseded entries releases the lock at the cap
+    /// instead of scanning the rest of the stage. Returns
+    /// `(examined, bytes, stage_done, kept)`.
+    fn take_budgeted<T: Copy>(
+        items: &[T],
+        cursor: &mut usize,
+        budget: u64,
+        size_of: impl Fn(&T) -> u64,
+        keep: impl Fn(&T) -> bool,
+    ) -> (usize, u64, bool, Vec<T>) {
+        let start = *cursor;
+        let mut bytes = 0u64;
+        let mut taken = Vec::new();
+        while *cursor < items.len() && *cursor - start < TAIL_EXAMINE_CAP {
+            let item = items[*cursor];
+            if !keep(&item) {
+                *cursor += 1;
+                continue;
+            }
+            let size = size_of(&item);
+            if !taken.is_empty() && bytes + size > budget {
+                break;
+            }
+            *cursor += 1;
+            bytes += size;
+            taken.push(item);
+            if bytes >= budget {
+                break;
+            }
+        }
+        let done = *cursor >= items.len();
+        (*cursor - start, bytes, done, taken)
+    }
 
-        // Singletons — few (≤3); the encoding append repoints them via
-        // `manifest.ingest`.
-        for &(rt, old) in &plan.singleton_relocs {
+    fn extend_stream_updates<K: Copy>(
+        &mut self,
+        batch: &[(K, RecordLoc)],
+        into: &mut Vec<(K, RecordLoc, RecordLoc)>,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        into.extend(self.relocate_stream_records(batch)?);
+        Ok(())
+    }
+
+    /// `ModelKey`, `Template`, and `Tokenizer` — re-read and re-appended so
+    /// `manifest.ingest` repoints them. A singleton rewritten since the plan
+    /// is skipped: its newer copy is not on a target segment, and appending
+    /// the planned one would install the stale bytes as the manifest's copy.
+    fn take_singletons(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget: u64,
+    ) -> Result<(usize, u64, bool)> {
+        let (n, bytes, done, batch) = Self::take_budgeted(
+            &plan.singleton_relocs,
+            &mut run.tail_cursor,
+            budget,
+            |(_, old)| old.record_size,
+            |(rt, old)| self.singleton_loc(*rt) == Some(*old),
+        );
+        for &(rt, old) in &batch {
             let rec = self
                 .segments
                 .read_record_at(old.segment, old.offset, old.record_size)?;
             self.append_carried(rt, 0, 0, 0, 0, 0, &rec.payload, rec.header.identity())?;
         }
+        Ok((n, bytes, done))
+    }
 
-        // Characters — carried verbatim off the target, grouped by source for
-        // coalesced reads. `append_raw_record` repoints `npc_locs` at the new
-        // home, so no update rides back through `apply_to_substrate`: the
-        // substrate holds no opinion about a character.
-        //
-        // **Behind the same supersession check snapshots use.** `plan.npc_relocs`
-        // was read at PLAN time; an edit between plan and execute rewrites the
-        // record, and relocating the stale copy would append it *after* the newer
-        // one, so the next reload's walk would install the superseded character as
-        // the winner — an edit silently rolled back. `npc_locs` naming a different
-        // location than the plan recorded is exactly that case, and the entry is
-        // dropped: the newer copy is not on a target segment and needs no carry.
-        let mut npcs_by_seg: BTreeMap<SegmentId, Vec<(u64, RecordLoc)>> = BTreeMap::new();
-        for &(npc_id, loc) in plan
-            .npc_relocs
-            .iter()
-            .filter(|(sid, old)| self.npc_locs.get(&sid.0) == Some(old))
-        {
-            npcs_by_seg
-                .entry(loc.segment)
-                .or_default()
-                .push((npc_id.0, loc));
+    fn singleton_loc(&self, rt: RecordType) -> Option<RecordLoc> {
+        match rt {
+            RecordType::ModelKey => self.manifest.model_key,
+            RecordType::Template => self.manifest.template,
+            RecordType::Tokenizer => self.manifest.tokenizer,
+            _ => None,
         }
-        for (source, recs) in npcs_by_seg {
-            let items: Vec<RawReloc> = recs
-                .iter()
-                .map(|&(_, loc)| RawReloc {
-                    offset: loc.offset,
-                    record_size: loc.record_size,
-                })
-                .collect();
-            self.relocate_raw_from_segment(source, &items)?;
-        }
+    }
 
-        // A conversation's file events and tombstones — carried verbatim, and
-        // behind the same check characters take: the plan was read without the
-        // persistence lock, so a tombstone written since may have killed a
-        // planned event, or a conversation been tombstoned since. The index
-        // names only what is still live where the plan found it; relocating
-        // anything else would put a dead record after the tombstone that
-        // killed it.
-        let still_live = |r: &VfsReloc| {
-            self.vfs_index.timeline(r.timeline).is_some_and(|tl| {
-                let at = if r.rt == RecordType::VfsEvent {
-                    tl.events()
-                } else {
-                    tl.tombstones()
-                };
-                at.get(&r.id) == Some(&r.loc)
-            })
-        };
-        let mut vfs_by_seg: BTreeMap<SegmentId, Vec<VfsReloc>> = BTreeMap::new();
-        for r in plan.vfs_relocs.iter().filter(|r| still_live(r)) {
-            vfs_by_seg.entry(r.loc.segment).or_default().push(*r);
+    /// Characters, grouped by source. `append_raw_record` repoints `npc_locs`,
+    /// so nothing rides back through [`MaintenanceResult`]. A character edited
+    /// since the plan is skipped: relocating the stale copy would append it
+    /// after the newer one, and the next reload would install the edit's
+    /// predecessor.
+    fn take_npcs(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget: u64,
+    ) -> Result<(usize, u64, bool)> {
+        let (n, bytes, done, batch) = Self::take_budgeted(
+            &plan.npc_relocs,
+            &mut run.tail_cursor,
+            budget,
+            |(_, old)| old.record_size,
+            |(sid, old)| self.npc_locs.get(&sid.0) == Some(old),
+        );
+        if !batch.is_empty() {
+            let _ = self.relocate_stream_records(&batch)?;
         }
-        for (source, recs) in vfs_by_seg {
-            let items: Vec<RawReloc> = recs
-                .iter()
-                .map(|r| RawReloc {
-                    offset: r.loc.offset,
-                    record_size: r.loc.record_size,
-                })
-                .collect();
-            let new = self.relocate_raw_from_segment(source, &items)?;
-            for (r, at) in recs.into_iter().zip(new) {
-                let moved = at.loc(r.loc.payload_len);
-                if r.rt == RecordType::VfsEvent {
-                    self.vfs_index.repoint_event(r.timeline, r.id, r.loc, moved);
-                } else {
-                    self.vfs_index
-                        .repoint_tombstone(r.timeline, r.id, r.loc, moved);
-                }
+        Ok((n, bytes, done))
+    }
+
+    /// File events and tombstones still named by the index at the planned
+    /// location. A tombstone written since the plan, or a conversation
+    /// tombstoned since, drops the entry: relocating it would put a dead
+    /// record after the record that killed it.
+    fn take_vfs(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget: u64,
+    ) -> Result<(usize, u64, bool)> {
+        let (n, bytes, done, batch) = Self::take_budgeted(
+            &plan.vfs_relocs,
+            &mut run.tail_cursor,
+            budget,
+            |r| r.loc.record_size,
+            |r| self.vfs_still_planned(r),
+        );
+        let moved = self.relocate_raw_batch(
+            &batch,
+            |r| r.loc.segment,
+            |r| RawReloc {
+                offset: r.loc.offset,
+                record_size: r.loc.record_size,
+            },
+        )?;
+        for (r, at) in moved {
+            let new = at.loc(r.loc.payload_len);
+            if r.rt == RecordType::VfsEvent {
+                self.vfs_index.repoint_event(r.timeline, r.id, r.loc, new);
+            } else {
+                self.vfs_index
+                    .repoint_tombstone(r.timeline, r.id, r.loc, new);
             }
         }
+        Ok((n, bytes, done))
+    }
 
-        // Blobs — carried verbatim, each still where the plan found it.
-        let mut blobs_by_seg: BTreeMap<SegmentId, Vec<(BlobKey, RecordLoc)>> = BTreeMap::new();
-        for &(key, loc) in plan
-            .blob_relocs
-            .iter()
-            .filter(|(key, loc)| self.blob_index.get(*key) == Some(*loc))
-        {
-            blobs_by_seg
-                .entry(loc.segment)
-                .or_default()
-                .push((key, loc));
-        }
-        for (source, recs) in blobs_by_seg {
-            let items: Vec<RawReloc> = recs
-                .iter()
-                .map(|(_, loc)| RawReloc {
-                    offset: loc.offset,
-                    record_size: loc.record_size,
-                })
-                .collect();
-            let new = self.relocate_raw_from_segment(source, &items)?;
-            for ((key, loc), at) in recs.into_iter().zip(new) {
-                self.blob_index.repoint(key, loc, at.loc(loc.payload_len));
-            }
-        }
-
-        // Durability barrier: relocated copies are fsynced before any source is
-        // unlinked (in `finish_maintenance`).
-        self.commit()?;
-        Ok(MaintenanceResult {
-            chunk_updates,
-            token_updates,
-            snapshot_updates,
-            branch_checkpoint_updates: branch_updates,
+    fn vfs_still_planned(&self, r: &VfsReloc) -> bool {
+        self.vfs_index.timeline(r.timeline).is_some_and(|tl| {
+            let at = if r.rt == RecordType::VfsEvent {
+                tl.events()
+            } else {
+                tl.tombstones()
+            };
+            at.get(&r.id) == Some(&r.loc)
         })
+    }
+
+    /// Blobs still at the location the plan recorded.
+    fn take_blobs(
+        &mut self,
+        plan: &MaintenancePlan,
+        run: &mut MaintenanceRun,
+        budget: u64,
+    ) -> Result<(usize, u64, bool)> {
+        let (n, bytes, done, batch) = Self::take_budgeted(
+            &plan.blob_relocs,
+            &mut run.tail_cursor,
+            budget,
+            |(_, old)| old.record_size,
+            |(key, old)| self.blob_index.get(*key) == Some(*old),
+        );
+        let moved = self.relocate_raw_batch(
+            &batch,
+            |(_, old)| old.segment,
+            |(_, old)| RawReloc {
+                offset: old.offset,
+                record_size: old.record_size,
+            },
+        )?;
+        for ((key, old), at) in moved {
+            self.blob_index.repoint(key, old, at.loc(old.payload_len));
+        }
+        Ok((n, bytes, done))
+    }
+
+    /// Relocate `batch` verbatim, grouped by source segment, and return each
+    /// item with where its copy landed.
+    fn relocate_raw_batch<T: Copy>(
+        &mut self,
+        batch: &[T],
+        segment_of: impl Fn(&T) -> SegmentId,
+        raw_of: impl Fn(&T) -> RawReloc,
+    ) -> Result<Vec<(T, Appended)>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut by_seg: BTreeMap<SegmentId, Vec<T>> = BTreeMap::new();
+        for item in batch {
+            by_seg.entry(segment_of(item)).or_default().push(*item);
+        }
+        let mut out = Vec::with_capacity(batch.len());
+        for (source, recs) in by_seg {
+            let items: Vec<RawReloc> = recs.iter().map(|r| raw_of(r)).collect();
+            let new = self.relocate_raw_from_segment(source, &items)?;
+            for (item, at) in recs.into_iter().zip(new) {
+                out.push((item, at));
+            }
+        }
+        Ok(out)
     }
 
     /// Relocate a set of already-encoded records from `source` into the active

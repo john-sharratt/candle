@@ -39,6 +39,9 @@ fn a_tombstone_is_swept_by_a_complete_compaction() {
     let conv = open(&dir);
     let timeline = conv.mint_timeline(LayerId::new(1), GroupId::new(1));
     conv.tombstone_timeline(timeline).unwrap();
+    // The append is the writer's. Drain it before reading the log: this shuts
+    // the writer down, and the compaction below writes the log itself.
+    conv.flush_writer();
     conv.commit_persistence_if_pending().unwrap();
     assert_eq!(
         conv.tombstone_counts(),
@@ -58,4 +61,25 @@ fn a_tombstone_is_swept_by_a_complete_compaction() {
             deleted: 0
         }
     );
+}
+
+/// A turn tombstone reaches the log when the writer drains — a conversation's
+/// drop does that — and a reopen restores the turn as dropped. The caller does
+/// not wait for the append.
+#[test]
+fn a_turn_tombstone_survives_the_writer_draining() {
+    let dir = TempDir::new().unwrap();
+    let timeline = {
+        let conv = open(&dir);
+        let timeline = conv.mint_timeline(LayerId::new(1), GroupId::new(1));
+        conv.tombstone_turn(timeline, 3).unwrap();
+        assert!(conv.is_turn_tombstoned(timeline, 3));
+        timeline
+    };
+    let conv = open(&dir);
+    assert!(
+        conv.is_turn_tombstoned(timeline, 3),
+        "the drained writer left the turn tombstone in the log"
+    );
+    assert!(!conv.read().is_tombstoned(timeline));
 }
