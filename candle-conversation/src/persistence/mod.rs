@@ -513,16 +513,6 @@ pub struct SubstratePersistence {
     /// surfaced in the daemon status for the GUI's compaction indicator.
     /// `None` until the first op runs.
     last_maintenance: Option<(String, u64)>,
-    /// The active-segment id captured at the last maintenance **resident-set
-    /// re-emission** (the drop-safety net). Because segment ids are strictly
-    /// append-ordered (a fresh id is always above every existing one), every
-    /// metadata record that existed at that re-emission is duplicated into
-    /// segments `>= resident_reemit_floor`. So a later maintenance op that
-    /// targets only segments `< floor` cannot lose a unique metadata record and
-    /// can SKIP re-emitting the whole resident set — which is what stops the
-    /// re-emit→looks-dead→compact→re-emit churn. `None` forces a re-emit (no
-    /// durable snapshot yet, or reset by a full `compact`).
-    resident_reemit_floor: Option<SegmentId>,
     /// The writes made since the running maintenance op was planned that its
     /// relocation must step around — see [`RelocationWatch`]. `Some` from the
     /// plan until the op's sources are unlinked (or the op fails), so it also
@@ -540,8 +530,8 @@ pub struct SubstratePersistence {
     metadata_locs: StampedLocs<MetadataKey>,
     /// On-disk location of the CURRENT copy of each resident record keyed by
     /// its payload rather than its header — `Label`, `ConvState`,
-    /// `TreeMetadata`, `TurnCoupling`, `DebugId`, `Tombstone`, `Distilled` —
-    /// keyed by [`ResidentKey`], the greatest stamp.
+    /// `TreeMetadata`, `TurnCoupling`, `DebugId`, `Tombstone`, `Distilled`,
+    /// `SectionTombstone` — keyed by [`ResidentKey`], the greatest stamp.
     ///
     /// The twin of `metadata_locs` for the types it cannot key. Maintenance
     /// re-emits all of them on every op, and with no location to count they
@@ -1252,7 +1242,6 @@ impl SubstratePersistence {
             last_index,
             recovered_records,
             last_maintenance: None,
-            resident_reemit_floor: None,
             relocation_watch: None,
             metadata_locs,
             resident_locs,
@@ -3266,10 +3255,6 @@ impl SubstratePersistence {
         //    segment in the same pass (a just-compacted store is all-live).
         substrate.clear_walker_state();
         self.accounting.reset();
-        // Compaction rewrote every live record (metadata included) into the fresh
-        // single segment, so the previous drop-safety floor is meaningless. Clear
-        // it — the next maintenance op re-establishes a floor with a fresh re-emit.
-        self.resident_reemit_floor = None;
         // Metadata and snapshot locations point at the OLD segments; rebuild
         // them from the freshly-compacted segment in the same recovery pass
         // (mirrors the load walk in `from_dir_with_sink`).

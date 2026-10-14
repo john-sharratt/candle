@@ -47,13 +47,18 @@
 //! per-segment live set is [`SubstratePersistence::segment_liveness`], with the
 //! same distill/tombstone filter [`super::compaction::collect_live_records`]
 //! uses. **Resident** records (`StreamDecl`, `Commit`, `ProjectionEvents`,
-//! `WideQSig`, `Label`, `ConvState`, `TreeMetadata`, `DebugId`, `Distilled`,
-//! `Tombstone`) carry no location — the substrate holds their decoded state — so
-//! before any drop the whole resident set is re-emitted into the active
-//! ([`SubstratePersistence::re_emit_resident_set`]). That guarantees a dropped
-//! segment never takes the only on-disk copy of live metadata with it, and the
-//! re-emitted **tombstone markers** keep tombstoned timelines dead even while
-//! their (excluded) records still physically linger in undropped segments.
+//! `WideQSig`, `TurnIndexPage`, `CustomObject`, `Label`, `ConvState`,
+//! `TreeMetadata`, `TurnCoupling`, `DebugId`, `Distilled`, `Tombstone`,
+//! `SectionTombstone`) are rebuilt from the substrate's decoded state rather
+//! than read back, and the persistence side tracks where each one's current
+//! copy is (`metadata_locs` / `resident_locs`). Before a drop, every resident
+//! record whose current copy is in a target segment is re-emitted into the
+//! active ([`SubstratePersistence::relocate_batch`]), in batches bounded by
+//! bytes and by record count. That guarantees a dropped segment never takes
+//! the only on-disk copy of live metadata with it, and the re-emitted
+//! **tombstone markers** keep tombstoned timelines and ended section
+//! generations dead even while their (excluded) records still physically
+//! linger in undropped segments.
 //!
 //! Crash safety follows the write→fsync→unlink order: the relocated copies are
 //! committed to the active before any source is unlinked, and until the unlink
@@ -295,18 +300,6 @@ pub(super) struct Resident {
     pub(super) id: RecordIdentity,
 }
 
-/// Where a resident record's current on-disk copy is, as far as the
-/// persistence-side location maps know.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResidentLoc {
-    /// The map holds its current copy here.
-    At(RecordLoc),
-    /// Its type is tracked, but the map holds no entry for it.
-    Unlocated,
-    /// Its type has no location map at all.
-    Untracked,
-}
-
 /// One already-encoded record to relocate verbatim from a source segment: its
 /// on-disk `(offset, record_size)`. The copy's bookkeeping reads the header
 /// out of the copied bytes ([`SubstratePersistence::append_raw_record`]), so it
@@ -323,18 +316,12 @@ struct RawReloc {
 /// locked). See [`SubstratePersistence::plan_maintenance`].
 pub struct MaintenancePlan {
     op: MaintenanceOp,
-    /// The full resident set to re-emit (the drop-safety net, §6 module doc),
-    /// each with the identity of the record holding its value when the plan was
-    /// made — which the copy keeps. A write made since the plan is carried
-    /// after it under its own ([`RelocationWatch`]).
+    /// The resident records whose current copy the op is about to drop
+    /// ([`SubstratePersistence::resident_to_carry`]), each with the identity of
+    /// the record holding its value when the plan was made — which the copy
+    /// keeps. A write made since the plan is carried after it under its own
+    /// ([`RelocationWatch`]).
     resident: Vec<Resident>,
-    /// The active segment when the plan was made, recorded as the drop-safety
-    /// floor once the resident set is re-emitted (`None` when the plan re-emits
-    /// nothing). Taken at the plan rather than at the first append: a record
-    /// written between the two that supersedes a planned copy — the planned
-    /// copy is then skipped — sits in a segment no older than this, so every
-    /// live metadata record still has a copy at or above the floor.
-    reemit_floor: Option<SegmentId>,
     /// `(stream, chunk_index, source_loc)` chunks to relocate off the targets.
     chunk_relocs: Vec<(StreamKey, u64, ChunkLoc)>,
     /// `(stream, source_loc)` `Tokens` records to relocate.
@@ -391,6 +378,12 @@ impl MaintenancePlan {
 /// segment took 37 s), so this bounds what a seal write or cold load waits
 /// behind maintenance to roughly 150 ms.
 pub const RELOCATION_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Resident records one batch re-emits under a single hold, whatever their
+/// size. Most resident records are a few hundred bytes — a section tombstone
+/// is under one sector — so a byte budget alone let one batch take every
+/// record of a large set, and each still costs an append's bookkeeping.
+pub const RELOCATION_BATCH_RECORDS: usize = 1024;
 
 /// A maintenance op in progress, carried between the batches of
 /// [`SubstratePersistence::relocate_batch`].
@@ -931,10 +924,9 @@ impl SubstratePersistence {
         // Re-emit only the resident records whose current copy the op is about
         // to drop (see `resident_to_carry`).
         let t_resident = Instant::now();
-        let (resident, untracked_carried) = self.resident_to_carry(substrate, &op.targets());
+        let resident = self.resident_to_carry(substrate, &op.targets());
         let resident_ms = t_resident.elapsed().as_millis() as u64;
         let t_relocs = Instant::now();
-        let reemit_floor = untracked_carried.then(|| self.segments.active_id());
         let (
             chunk_relocs,
             token_relocs,
@@ -972,6 +964,7 @@ impl SubstratePersistence {
         let target_age = target_age.unwrap_or(0);
         tracing::info!(
             target: "candle_conversation::persistence::census",
+            dir = %self.dir().display(),
             op = op.label(),
             target_bytes,
             target_live,
@@ -998,7 +991,6 @@ impl SubstratePersistence {
         Ok(Some(MaintenancePlan {
             op,
             resident,
-            reemit_floor,
             chunk_relocs,
             token_relocs,
             snapshot_relocs,
@@ -1010,49 +1002,37 @@ impl SubstratePersistence {
         }))
     }
 
-    /// The resident records an op targeting `targets` must re-emit, and whether
-    /// that includes every untracked one — the condition for advancing
-    /// [`resident_reemit_floor`](SubstratePersistence::resident_reemit_floor).
+    /// The resident records an op targeting `targets` must re-emit.
     ///
-    /// **Only what the op is about to drop.** A resident record whose current
-    /// copy is location-tracked (`metadata_locs` / `resident_locs`) is
-    /// re-emitted exactly when that copy sits in a target segment: anywhere else,
-    /// the drop cannot touch it. Re-emitting the whole set instead wrote every
-    /// live turn's index page, signature and events forward on every op — 2.2 GB
-    /// across ~12,900 records on the live daemon. That re-emission spilled over
-    /// the active segment, left the previous op's copies dead in the segments
-    /// just sealed, and made them the next op's targets: one compaction every
-    /// 15–60 s on segments barely a minute old, each rewriting the set again and
-    /// carrying the same chunks forward each time.
+    /// **Only what the op is about to drop.** Every resident type's current
+    /// copy is location-tracked (`metadata_locs` / `resident_locs`), and a
+    /// record is re-emitted exactly when that copy sits in a target segment:
+    /// anywhere else, the drop cannot touch it. Re-emitting the whole set
+    /// instead wrote every live turn's index page, signature and events forward
+    /// on every op — 2.2 GB across ~12,900 records on the live daemon. That
+    /// re-emission spilled over the active segment, left the previous op's
+    /// copies dead in the segments just sealed, and made them the next op's
+    /// targets: one compaction every 15–60 s on segments barely a minute old,
+    /// each rewriting the set again and carrying the same chunks forward each
+    /// time. Section tombstones were the last type carried that way, and grew
+    /// with every section a character retired: 12,000 of them re-emitted on
+    /// each op held the persistence lock for 18 s.
     ///
-    /// A tracked type with no location entry is re-emitted unconditionally —
-    /// the map has no copy to vouch for, so the op makes one.
-    ///
-    /// Untracked types (`SectionTombstone`) keep the append-ordered floor rule:
-    /// all of them are re-emitted unless every target is strictly older than the
-    /// floor, which the last complete re-emission duplicated every then-existing
-    /// one above.
-    fn resident_to_carry(
-        &self,
-        substrate: &Substrate,
-        targets: &[SegmentId],
-    ) -> (Vec<Resident>, bool) {
-        let untracked_due = match self.resident_reemit_floor {
-            None => true,
-            Some(floor) => targets.iter().any(|t| *t >= floor),
-        };
+    /// A record with no location entry is re-emitted unconditionally — the map
+    /// has no copy to vouch for, so the op makes one.
+    fn resident_to_carry(&self, substrate: &Substrate, targets: &[SegmentId]) -> Vec<Resident> {
         let mut set = self.resident_set(substrate);
-        set.retain(|r| match self.current_resident_loc(r) {
-            ResidentLoc::At(loc) => targets.contains(&loc.segment),
-            ResidentLoc::Unlocated => true,
-            ResidentLoc::Untracked => untracked_due,
+        set.retain(|r| {
+            self.current_resident_loc(r)
+                .is_none_or(|loc| targets.contains(&loc.segment))
         });
-        (set, untracked_due)
+        set
     }
 
     /// Where the current on-disk copy of `r` is, as the location maps record
-    /// it — keyed as an append keys it, by the record's identity.
-    fn current_resident_loc(&self, r: &Resident) -> ResidentLoc {
+    /// it — keyed as an append keys it, by the record's identity. `None` when
+    /// the map holds no entry for it.
+    fn current_resident_loc(&self, r: &Resident) -> Option<RecordLoc> {
         let loc = if is_tracked_metadata(r.rt) {
             self.metadata_locs
                 .get(&metadata_key_parts(r.rt, r.stream_id, r.id.origin))
@@ -1060,9 +1040,9 @@ impl SubstratePersistence {
             resident_key(r.rt, r.stream_id, &r.payload, &r.id)
                 .and_then(|k| self.resident_locs.get(&k))
         } else {
-            return ResidentLoc::Untracked;
+            None
         };
-        loc.map_or(ResidentLoc::Unlocated, |l| ResidentLoc::At(*l))
+        loc.copied()
     }
 
     /// **Phase 2** — the slow I/O: append the resident set, then relocate each
@@ -1149,18 +1129,14 @@ impl SubstratePersistence {
     }
 
     /// Re-emit the next run of the plan's resident set — up to `budget_bytes`
-    /// of appended records, at least one planned record — and commit it.
+    /// of appended records and [`RELOCATION_BATCH_RECORDS`] planned records,
+    /// at least one — and commit it.
     ///
     /// Re-emitted from in-RAM state (not read from disk), so the normal
     /// encoding append. A record written since the plan is followed by its
     /// newer writes, appended again, the way the watch says (see [`Reemit`]):
     /// the lock is released between batches, and a planned copy left as the
     /// last word would roll its record back on the next load.
-    ///
-    /// The batch that finishes the set records the plan's floor as the new
-    /// drop-safety floor, so subsequent older-only ops can leave the untracked
-    /// records alone (see `resident_to_carry`). Not before: an op abandoned
-    /// part-way has not duplicated every record above it.
     ///
     /// **The watch is set aside while the op appends its own copies.** It is
     /// there to see other writers; fed the re-emission, it would read a
@@ -1176,9 +1152,6 @@ impl SubstratePersistence {
         let appended = self.reemit_resident_run(plan, run, budget_bytes, watch.as_ref());
         self.relocation_watch = watch;
         appended?;
-        if run.resident_cursor == plan.resident.len() {
-            self.resident_reemit_floor = plan.reemit_floor;
-        }
         self.commit()
     }
 
@@ -1191,7 +1164,11 @@ impl SubstratePersistence {
         watch: Option<&RelocationWatch>,
     ) -> Result<()> {
         let mut bytes = 0u64;
-        while run.resident_cursor < plan.resident.len() && (bytes == 0 || bytes < budget_bytes) {
+        let end = plan
+            .resident
+            .len()
+            .min(run.resident_cursor + RELOCATION_BATCH_RECORDS);
+        while run.resident_cursor < end && (bytes == 0 || bytes < budget_bytes) {
             let r = &plan.resident[run.resident_cursor];
             run.resident_cursor += 1;
             let verdict = watch.map_or(Reemit::Carry, |w| {
@@ -1618,7 +1595,7 @@ impl SubstratePersistence {
         }
         let mut out = Vec::with_capacity(batch.len());
         for (source, recs) in by_seg {
-            let items: Vec<RawReloc> = recs.iter().map(|r| raw_of(r)).collect();
+            let items: Vec<RawReloc> = recs.iter().map(&raw_of).collect();
             let new = self.relocate_raw_from_segment(source, &items)?;
             for (item, at) in recs.into_iter().zip(new) {
                 out.push((item, at));
@@ -1715,11 +1692,11 @@ impl SubstratePersistence {
             self.segments.drop_sealed(t)?;
         }
         // Drop metadata-location entries that pointed into the now-unlinked
-        // segments. Live metadata for non-tombstoned streams was already
-        // re-pointed forward by the resident re-emission (or never lived here, per
-        // the reemit-floor invariant); any residue is a tombstoned stream's
-        // metadata, which is genuinely gone with its segment. Leaving stale
-        // entries would mis-attribute live bytes to a segment that no longer exists.
+        // segments. Live metadata whose current copy lived here was re-pointed
+        // forward by the resident re-emission; any residue is a tombstoned
+        // stream's metadata, which is genuinely gone with its segment. Leaving
+        // stale entries would mis-attribute live bytes to a segment that no
+        // longer exists.
         self.metadata_locs
             .retain(|_, loc| !targets.contains(&loc.segment));
         // The same for the payload-keyed resident records: their live copies
@@ -1779,8 +1756,7 @@ impl SubstratePersistence {
         if self.is_read_only() {
             return Err(PersistenceError::ReadOnly);
         }
-        let (resident, untracked_carried) = self.resident_to_carry(substrate, &op.targets());
-        let reemit_floor = untracked_carried.then(|| self.segments.active_id());
+        let resident = self.resident_to_carry(substrate, &op.targets());
         let (
             chunk_relocs,
             token_relocs,
@@ -1791,7 +1767,6 @@ impl SubstratePersistence {
         let plan = MaintenancePlan {
             op: *op,
             resident,
-            reemit_floor,
             chunk_relocs,
             token_relocs,
             snapshot_relocs,
@@ -2131,6 +2106,18 @@ impl SubstratePersistence {
             .into_iter()
             .map(|(tl, _, id)| (tl, id.origin, id.oseq))
             .collect();
+        // A section tombstone is live while the substrate holds the generation
+        // it ended — keyed as `resident_key` keys it, `(section, oseq,
+        // writer)`, and `(section, 0, 0)` for one written before generations.
+        let ended_sections: HashSet<(u64, u64, u64)> = substrate
+            .ended_section_generations()
+            .map(|(sid, g)| (sid.0, g.oseq, g.writer))
+            .chain(
+                substrate
+                    .ended_unstamped_sections()
+                    .map(|sid| (sid.0, 0, 0)),
+            )
+            .collect();
         for (key, loc) in self.resident_locs.iter() {
             let tl = key.id;
             let gone = tombstoned.contains(&tl);
@@ -2141,6 +2128,9 @@ impl SubstratePersistence {
                 RecordType::TreeMetadata | RecordType::TurnCoupling | RecordType::DebugId => !gone,
                 RecordType::Tombstone => key.sub == 0 || !gone,
                 RecordType::Distilled => distilled.contains_key(&tl),
+                RecordType::SectionTombstone => {
+                    ended_sections.contains(&(key.id, key.sub, key.origin))
+                }
                 _ => false,
             };
             if carried_record {
@@ -3400,10 +3390,9 @@ mod tests {
     /// in the segments just sealed, and those segments compacted a minute later
     /// to do it again.
     ///
-    /// A tracked record goes exactly when its current copy is in a target; a
-    /// tracked record the map has no copy of always goes; an untracked one
-    /// (`SectionTombstone`) follows the floor, and only a re-emission that takes
-    /// all of them may advance it.
+    /// A record goes exactly when its current copy is in a target, and a
+    /// record the map has no copy of always goes — a section tombstone by the
+    /// same rule as every other resident type.
     #[test]
     fn an_op_re_emits_only_the_resident_records_it_drops() {
         use crate::persistence::streams::TurnDecl;
@@ -3446,63 +3435,75 @@ mod tests {
         sp.metadata_locs
             .offer((RecordType::WideQSig, sid.0, 0), Some(at(7)), none);
         // `ProjectionEvents` is left without an entry.
-        sp.resident_reemit_floor = Some(SegmentId(10));
 
         let carry = |sp: &SubstratePersistence, targets: &[u64]| {
             let targets: Vec<SegmentId> = targets.iter().map(|&t| SegmentId(t)).collect();
-            let (set, untracked) = sp.resident_to_carry(&substrate, &targets);
-            let mut kinds: Vec<(RecordType, u64)> =
-                set.iter().map(|r| (r.rt, r.stream_id)).collect();
+            let mut kinds: Vec<(RecordType, u64)> = sp
+                .resident_to_carry(&substrate, &targets)
+                .iter()
+                .map(|r| (r.rt, r.stream_id))
+                .collect();
             kinds.sort_by_key(|&(rt, id)| (rt as u8, id));
-            (kinds, untracked)
+            kinds
         };
         let sorted = |mut v: Vec<(RecordType, u64)>| {
             v.sort_by_key(|&(rt, id)| (rt as u8, id));
             v
         };
 
+        // The section tombstone has no copy on record yet: every op makes one.
+        assert_eq!(
+            carry(&sp, &[9]),
+            sorted(vec![
+                (RecordType::ProjectionEvents, sid.0),
+                (RecordType::SectionTombstone, section.0),
+            ])
+        );
+
+        // Its copy recorded in segment 12, keyed as an append keys it.
+        let tombstone = sp
+            .resident_set(&substrate)
+            .into_iter()
+            .find(|r| r.rt == RecordType::SectionTombstone)
+            .expect("the ended section is in the resident set");
+        let key = resident_key(
+            tombstone.rt,
+            tombstone.stream_id,
+            &tombstone.payload,
+            &tombstone.id,
+        )
+        .expect("a section tombstone has a resident key");
+        sp.resident_locs.offer(key, Some(at(12)), tombstone.id);
+
         // The decl's segment: the decl, plus the unlocated events.
         assert_eq!(
             carry(&sp, &[5]),
-            (
-                sorted(vec![
-                    (RecordType::StreamDecl, sid.0),
-                    (RecordType::ProjectionEvents, sid.0),
-                ]),
-                false
-            )
+            sorted(vec![
+                (RecordType::StreamDecl, sid.0),
+                (RecordType::ProjectionEvents, sid.0),
+            ])
         );
         // The signature's segment: the signature, plus the unlocated events.
         assert_eq!(
             carry(&sp, &[7]),
-            (
-                sorted(vec![
-                    (RecordType::WideQSig, sid.0),
-                    (RecordType::ProjectionEvents, sid.0),
-                ]),
-                false
-            )
+            sorted(vec![
+                (RecordType::WideQSig, sid.0),
+                (RecordType::ProjectionEvents, sid.0),
+            ])
         );
-        // A segment holding none of them, below the floor: only the unlocated.
+        // A segment holding none of them: only the unlocated.
         assert_eq!(
             carry(&sp, &[9]),
-            (vec![(RecordType::ProjectionEvents, sid.0)], false)
+            vec![(RecordType::ProjectionEvents, sid.0)]
         );
-        // At or above the floor the untracked section tombstone goes too, and
-        // the op may advance the floor.
+        // The tombstone's segment: the tombstone too.
         assert_eq!(
             carry(&sp, &[12]),
-            (
-                sorted(vec![
-                    (RecordType::ProjectionEvents, sid.0),
-                    (RecordType::SectionTombstone, section.0),
-                ]),
-                true
-            )
+            sorted(vec![
+                (RecordType::ProjectionEvents, sid.0),
+                (RecordType::SectionTombstone, section.0),
+            ])
         );
-        // No floor yet: the same.
-        sp.resident_reemit_floor = None;
-        assert!(carry(&sp, &[3]).1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3832,11 +3833,6 @@ mod tests {
                 plan.resident.len() >= 3,
                 "the decl, the label and the debug id are planned"
             );
-            assert_eq!(
-                plan.reemit_floor,
-                Some(sp.segments.active_id()),
-                "the floor is the active segment at the plan"
-            );
             sp.watch_relocation();
             let mut run = sp.begin_maintenance(&plan).unwrap();
             sp.write_debug_id(606, "second", sp.mint()).unwrap();
@@ -3846,10 +3842,6 @@ mod tests {
 
             let mut resident_batches = 0;
             while run.resident_cursor < plan.resident.len() {
-                assert_eq!(
-                    sp.resident_reemit_floor, None,
-                    "the floor waits for the whole set"
-                );
                 assert!(sp.relocate_batch(&plan, &mut run, 1).unwrap());
                 resident_batches += 1;
             }
@@ -3857,7 +3849,6 @@ mod tests {
                 resident_batches >= 2,
                 "the set spans several holds at a one-byte budget, not one"
             );
-            assert_eq!(sp.resident_reemit_floor, plan.reemit_floor);
             while sp.relocate_batch(&plan, &mut run, 1).unwrap() {}
             let result = sp.complete_maintenance(&plan, run).unwrap();
             result.apply_to_substrate(&mut substrate);
@@ -4175,6 +4166,137 @@ mod tests {
                 "the tombstone survived the drop that removed the timeline's records"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A store whose sealed segment 1 holds `n` section tombstones and nothing
+    /// else, and whose sealed segment 2 holds a live stream with a superseded
+    /// chunk — dead weight an op has reason to compact. The tombstones end
+    /// sections `0x5000..0x5000 + n`, written before generations.
+    fn store_with_section_tombstones(tag: &str, n: u64) -> PathBuf {
+        let dir = tmp_dir(tag);
+        let decl = turn_decl(707, 0);
+        let sid = decl.stream_id();
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        for i in 0..n {
+            sp.write_section_tombstone(0x5000 + i, None, None).unwrap();
+        }
+        sp.commit().unwrap();
+        sp.seal_active().unwrap();
+        sp.declare_stream(&decl).unwrap();
+        sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(1))
+            .unwrap();
+        sp.write_chunk(sid, 0, 32, 4, None, &chunk_payload(2))
+            .unwrap();
+        sp.commit().unwrap();
+        sp.seal_active().unwrap();
+        dir
+    }
+
+    /// **A section tombstone is carried only by the op that drops its copy,
+    /// and counts as live where it lies.** It was the one resident type with
+    /// no location: every op on a segment newer than the last full re-emission
+    /// re-emitted all of them, and the segment holding them read as dead
+    /// weight. On the live daemon that was 12,000 tombstones per op, holding
+    /// the persistence lock for 18 s.
+    #[test]
+    fn a_section_tombstone_is_carried_only_off_its_own_segment() {
+        let dir = store_with_section_tombstones("section_carry", 3);
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(substrate.ended_unstamped_sections().count(), 3);
+
+            let tombstones =
+                |sp: &SubstratePersistence, substrate: &Substrate, targets: &[SegmentId]| {
+                    sp.resident_to_carry(substrate, targets)
+                        .iter()
+                        .filter(|r| r.rt == RecordType::SectionTombstone)
+                        .count()
+                };
+            assert_eq!(
+                tombstones(&sp, &substrate, &[SegmentId(2)]),
+                0,
+                "not on segment 2"
+            );
+            assert_eq!(
+                tombstones(&sp, &substrate, &[SegmentId(1)]),
+                3,
+                "all three on segment 1"
+            );
+
+            let liveness = sp.segment_liveness(&substrate);
+            assert!(
+                liveness.get(&SegmentId(1)).copied().unwrap_or(0) > 0,
+                "a segment of nothing but live section tombstones is live"
+            );
+
+            sp.apply_maintenance_op(&mut substrate, &MaintenanceOp::Compact(SegmentId(1)))
+                .unwrap();
+            assert!(
+                !sealed_log(&dir, 1).exists(),
+                "segment 1 was compacted away"
+            );
+            assert_eq!(
+                tombstones(&sp, &substrate, &[SegmentId(1)]),
+                0,
+                "the copies now live in the active segment"
+            );
+        }
+        {
+            let mut substrate = Substrate::new();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let mut ended: Vec<u64> = substrate.ended_unstamped_sections().map(|s| s.0).collect();
+            ended.sort_unstable();
+            assert_eq!(
+                ended,
+                vec![0x5000, 0x5001, 0x5002],
+                "every section stays ended across the compaction and a reload"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A batch re-emits at most [`RELOCATION_BATCH_RECORDS`] resident
+    /// records, however small they are.** The byte budget alone let one batch
+    /// take an entire set of sector-sized records under a single hold.
+    #[test]
+    fn a_resident_batch_is_bounded_by_record_count() {
+        let n = 2 * RELOCATION_BATCH_RECORDS as u64 + 5;
+        let dir = store_with_section_tombstones("section_batches", n);
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let plan = MaintenancePlan {
+            op: MaintenanceOp::Compact(SegmentId(1)),
+            resident: sp.resident_to_carry(&substrate, &[SegmentId(1)]),
+            chunk_relocs: Vec::new(),
+            token_relocs: Vec::new(),
+            snapshot_relocs: Vec::new(),
+            branch_checkpoint_relocs: Vec::new(),
+            singleton_relocs: Vec::new(),
+            npc_relocs: Vec::new(),
+            vfs_relocs: Vec::new(),
+            blob_relocs: Vec::new(),
+        };
+        assert_eq!(plan.resident.len() as u64, n);
+        let mut run = sp.begin_maintenance(&plan).unwrap();
+        let mut cursors = Vec::new();
+        while run.resident_cursor < plan.resident.len() {
+            sp.relocate_batch(&plan, &mut run, u64::MAX).unwrap();
+            cursors.push(run.resident_cursor);
+        }
+        assert_eq!(
+            cursors,
+            vec![
+                RELOCATION_BATCH_RECORDS,
+                2 * RELOCATION_BATCH_RECORDS,
+                2 * RELOCATION_BATCH_RECORDS + 5
+            ],
+            "three holds for 2 × the cap + 5, at an unlimited byte budget"
+        );
+        drop(sp);
         std::fs::remove_dir_all(&dir).ok();
     }
 

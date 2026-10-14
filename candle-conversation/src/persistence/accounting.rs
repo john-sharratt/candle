@@ -31,7 +31,7 @@
 //! retires that stream's records here directly — see [`RecordAccounting::record`].
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::identity::RecordIdentity;
 use super::record::{RecordHeader, RecordType, SectionTombstonePayload};
@@ -81,8 +81,28 @@ fn stream_owned(rt: RecordType) -> bool {
 pub struct RecordAccounting {
     /// The current live record per key.
     live_sizes: HashMap<Key, Live>,
+    /// The live keys of each stream's own records ([`stream_owned`]), by
+    /// `(stream_id, writer)`: what a section tombstone retires, found without
+    /// walking every live key in the store. Maintenance re-emits a section
+    /// tombstone whenever the segment holding it is compacted, and a walk of
+    /// the whole map per tombstone was ~1.5 ms each — 12,000 of them held the
+    /// persistence lock for 18 s.
+    owned: HashMap<(u64, u64), HashSet<Key>>,
     /// Total padded bytes of superseded (dead) records.
     dead_bytes: u64,
+}
+
+/// Whether a stream-owned record with identity `id` belongs to the section
+/// generation whose declaration had `oseq` — the declaration itself by its own
+/// `oseq`, every other record of the generation by its `epoch`
+/// (`Substrate::admits`). `None` is a tombstone written before generations,
+/// which ends whatever unstamped stream stands under the key.
+fn of_generation(rt: RecordType, id: &RecordIdentity, generation: Option<u64>) -> bool {
+    match generation {
+        None => true,
+        Some(oseq) if rt == RecordType::StreamDecl => id.oseq == oseq,
+        Some(oseq) => id.epoch == oseq,
+    }
 }
 
 impl RecordAccounting {
@@ -94,21 +114,23 @@ impl RecordAccounting {
     /// key was already live, its previous on-disk size becomes dead
     /// weight.
     ///
-    /// A `SectionTombstone` also retires every live record of the stream its
-    /// generation was written by: the tombstone ends that generation of the
-    /// section (`Substrate::end_section`), and a fresh prefill of the same
-    /// content writes a new one under the same keys — which, with the old keys
-    /// retired here, count as new rather than as superseding the dead bytes a
-    /// second time. That retirement walks the live map, which is fine for a
-    /// record written once per section rebuild or repair. `payload` is read
-    /// for nothing else.
+    /// A `SectionTombstone` also retires every live record of the generation
+    /// it ends: the tombstone ends that generation of the section
+    /// (`Substrate::end_section`), and a fresh prefill of the same content
+    /// writes a new one under the same keys — which, with the old keys retired
+    /// here, count as new rather than as superseding the dead bytes a second
+    /// time. A copy of the tombstone carried forward later retires nothing of a
+    /// generation declared since. `payload` is read for nothing else.
     pub fn record(&mut self, header: &RecordHeader, payload: &[u8], padded_size: u64) {
         if header.record_type == RecordType::SectionTombstone {
-            let writer = SectionTombstonePayload::decode(payload)
+            let generation = SectionTombstonePayload::decode(payload)
                 .ok()
-                .and_then(|p| p.generation)
-                .map_or(0, |g| g.writer);
-            self.retire_stream(header.stream_id, writer);
+                .and_then(|p| p.generation);
+            self.retire_stream(
+                header.stream_id,
+                generation.map_or(0, |g| g.writer),
+                generation.map(|g| g.oseq),
+            );
         }
         // A snapshot retraction kills the stream's tail when it outranks it,
         // and is itself never carried forward, so it is dead the moment it
@@ -221,6 +243,9 @@ impl RecordAccounting {
             }
             Entry::Vacant(slot) => {
                 slot.insert(incoming);
+                if stream_owned(key.0) {
+                    self.owned.entry((key.1, key.3)).or_default().insert(key);
+                }
             }
         }
     }
@@ -235,19 +260,31 @@ impl RecordAccounting {
         }
     }
 
-    /// Count every live record `writer`'s stream `stream_id` owns as dead — its
-    /// chunks and its per-stream records. Keyed only on the stream-owned
-    /// types, since `Snapshot`, `Npc` and `ConvState` reuse the header's
-    /// `stream_id` for ids of their own.
-    fn retire_stream(&mut self, stream_id: u64, writer: u64) {
+    /// Count every live record of `writer`'s stream `stream_id` that belongs to
+    /// `generation` ([`of_generation`]) as dead — its chunks and its per-stream
+    /// records. Keyed only on the stream-owned types, since `Snapshot`, `Npc`
+    /// and `ConvState` reuse the header's `stream_id` for ids of their own.
+    /// Touches that stream's keys and no others.
+    fn retire_stream(&mut self, stream_id: u64, writer: u64, generation: Option<u64>) {
+        let Some(keys) = self.owned.get_mut(&(stream_id, writer)) else {
+            return;
+        };
+        let live_sizes = &mut self.live_sizes;
         let mut retired = 0u64;
-        self.live_sizes.retain(|&(rt, sid, _, w), live| {
-            let owned = sid == stream_id && w == writer && stream_owned(rt);
-            if owned {
-                retired += live.size;
+        keys.retain(|key| {
+            let Some(live) = live_sizes.get(key) else {
+                return false;
+            };
+            if !of_generation(key.0, &live.id, generation) {
+                return true;
             }
-            !owned
+            retired += live.size;
+            live_sizes.remove(key);
+            false
         });
+        if keys.is_empty() {
+            self.owned.remove(&(stream_id, writer));
+        }
         self.dead_bytes += retired;
     }
 
@@ -260,6 +297,7 @@ impl RecordAccounting {
     /// right before the new file is re-walked into fresh accounting.
     pub fn reset(&mut self) {
         self.live_sizes.clear();
+        self.owned.clear();
         self.dead_bytes = 0;
     }
 }
@@ -355,10 +393,13 @@ mod tests {
     /// supersedes the other, whatever their stamps.
     #[test]
     fn two_writers_records_of_one_stream_id_are_both_live() {
+        // Each writer's records belong to the generation its declaration
+        // (`oseq` 1) started, which they carry in their epoch.
         let by = |origin: u64, hlc: u64| RecordHeader {
             hlc,
             origin,
             oseq: hlc,
+            epoch: 1,
             ..header(RecordType::Chunk, 5, 0)
         };
         let mut acc = RecordAccounting::new();
@@ -490,6 +531,71 @@ mod tests {
             4096 + 8192 + 8192 + 4096,
             "the new generation is live and supersedes nothing"
         );
+    }
+
+    /// **A section tombstone retires the generation it names, and no other.**
+    /// Maintenance carries a tombstone forward whenever the segment holding it
+    /// is compacted, long after the section may have been declared again; the
+    /// carried copy must leave the new generation's records live.
+    #[test]
+    fn a_section_tombstone_retires_only_its_generation() {
+        let of = |rt: RecordType, chunk: u64, oseq: u64, epoch: u64| RecordHeader {
+            origin: 3,
+            oseq,
+            epoch,
+            hlc: oseq,
+            ..header(rt, 40, chunk)
+        };
+        let ends = |oseq: u64| {
+            SectionTombstonePayload {
+                generation: Some(SectionGeneration { writer: 3, oseq }),
+                reason: None,
+            }
+            .encode()
+        };
+        let mut acc = RecordAccounting::new();
+        // Generation 10: its declaration, and a chunk carrying epoch 10.
+        record(&mut acc, &of(RecordType::StreamDecl, 0, 10, 0), 4096);
+        record(&mut acc, &of(RecordType::Chunk, 0, 11, 10), 8192);
+        acc.record(&header(RecordType::SectionTombstone, 40, 0), &ends(10), 64);
+        assert_eq!(acc.dead_bytes(), 4096 + 8192, "generation 10 is retired");
+
+        // Generation 20, declared again under the same keys.
+        record(&mut acc, &of(RecordType::StreamDecl, 0, 20, 0), 4096);
+        record(&mut acc, &of(RecordType::Chunk, 0, 21, 20), 8192);
+        assert_eq!(acc.dead_bytes(), 4096 + 8192, "and starts live");
+
+        // Generation 10's tombstone carried forward retires nothing of 20;
+        // only the copy it supersedes is dead.
+        acc.record(&header(RecordType::SectionTombstone, 40, 0), &ends(10), 64);
+        assert_eq!(acc.dead_bytes(), 4096 + 8192 + 64);
+
+        // Generation 20's own tombstone retires it.
+        acc.record(&header(RecordType::SectionTombstone, 40, 0), &ends(20), 64);
+        assert_eq!(acc.dead_bytes(), 2 * (4096 + 8192) + 2 * 64);
+    }
+
+    /// **Retiring a stream leaves every other stream's records alone, however
+    /// many there are** — each stream's keys are indexed, so a tombstone finds
+    /// its own without visiting the rest.
+    #[test]
+    fn retiring_a_stream_leaves_the_others_live() {
+        let mut acc = RecordAccounting::new();
+        for stream in 0..1000u64 {
+            record(&mut acc, &header(RecordType::Chunk, stream, 0), 4096);
+            record(&mut acc, &header(RecordType::Chunk, stream, 1), 4096);
+        }
+        record(&mut acc, &header(RecordType::SectionTombstone, 500, 0), 64);
+        assert_eq!(acc.dead_bytes(), 2 * 4096);
+        assert_eq!(acc.owned.len(), 999, "stream 500's index entry is gone");
+        assert_eq!(
+            acc.live_sizes.len(),
+            1998 + 1,
+            "999 streams' chunks and the tombstone"
+        );
+        // A second copy retires nothing more.
+        record(&mut acc, &header(RecordType::SectionTombstone, 500, 0), 64);
+        assert_eq!(acc.dead_bytes(), 2 * 4096 + 64);
     }
 
     #[test]

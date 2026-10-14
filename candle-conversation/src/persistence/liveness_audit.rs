@@ -55,6 +55,9 @@ pub struct ResidentKey {
 /// Resident types whose key is in the payload rather than the header — the
 /// ones `SubstratePersistence::resident_locs` tracks. Every other resident type
 /// keys by its header and is tracked in `metadata_locs`.
+///
+/// A `SectionTombstone` names its section in the header but its generation in
+/// the payload, and each ended generation is its own marker.
 pub fn keyed_by_payload(rt: RecordType) -> bool {
     matches!(
         rt,
@@ -65,6 +68,7 @@ pub fn keyed_by_payload(rt: RecordType) -> bool {
             | RecordType::DebugId
             | RecordType::Tombstone
             | RecordType::Distilled
+            | RecordType::SectionTombstone
     )
 }
 
