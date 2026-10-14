@@ -19,6 +19,7 @@ use cluster::launch::{LaunchSpec, OneShot};
 use cluster::upgrade::artifacts::RunProbe;
 use cluster::upgrade::handoff::hand_off;
 use cluster::upgrade::runtime::{Setup, Upgrader};
+use cluster::upgrade::switch::PROOF;
 use include_dir::Dir;
 use sysinfo::System;
 use tokio::runtime::{Builder as RuntimeBuilder, Handle};
@@ -42,7 +43,7 @@ use crate::server::serve;
 use crate::starting::StartLine;
 use crate::stopping::{Ending, Stopping};
 use crate::telemetry::Telemetry;
-use crate::tenant::{Stop, Tenant, TenantContext, TenantUi};
+use crate::tenant::{Reports, Stop, Tenant, TenantContext, TenantUi};
 use crate::ui::{build_id, COMMON};
 
 /// One forward in this many records its GPU spans in a profiling build (see
@@ -205,6 +206,28 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     }
 }
 
+/// Print [`PROOF`] once, after every tenant reports ready. `start` returns
+/// while a model is still loading, and the boot server is already gone, so
+/// this is the moment the process is actually serving.
+fn announce_when_ready(reports: Vec<Arc<dyn Reports>>) {
+    tokio::spawn(async move {
+        loop {
+            let mut ready = !reports.is_empty();
+            for report in &reports {
+                if report.status().await.state != "ready" {
+                    ready = false;
+                    break;
+                }
+            }
+            if ready {
+                eprintln!("{PROOF}");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+}
+
 async fn serve_tenants(
     cfg: HostConfig,
     tenants: Vec<Box<dyn Tenant>>,
@@ -289,17 +312,9 @@ async fn serve_tenants(
         let (listen, uis, signin) = (listen.clone(), uis.clone(), local_signin.clone());
         let app = boot_router(Arc::clone(&boot), common.clone());
         tokio::spawn(async move {
-            serve(
-                &listen,
-                &uis,
-                app,
-                signin,
-                None,
-                async {
-                    let _ = boot_ended.await;
-                },
-                false,
-            )
+            serve(&listen, &uis, app, signin, None, async {
+                let _ = boot_ended.await;
+            })
             .await
         })
     };
@@ -372,6 +387,7 @@ async fn serve_tenants(
         watch_readiness(watched);
     }
 
+    let proving: Vec<Arc<dyn Reports>> = reports.iter().map(|(_, r)| Arc::clone(r)).collect();
     let shared = Arc::new(Shared {
         started_at_ms,
         build,
@@ -397,8 +413,10 @@ async fn serve_tenants(
     }
 
     accept_ctrl_c();
-    // The tenants are started and the boot server has released the ports.
-    // This is the server that is actually serving.
+    // The boot server has released the ports. The real server is about to
+    // accept, and a tenant's `start` returns while its model is still loading.
+    // The line `keep` waits for is printed once every tenant reports ready.
+    announce_when_ready(proving);
     let served = serve(
         &listen,
         &uis,
@@ -406,7 +424,6 @@ async fn serve_tenants(
         local_signin,
         cluster.clone(),
         leave(Arc::clone(&stopping), cluster.clone()),
-        true,
     )
     .await;
     if let Some(c) = &cluster {

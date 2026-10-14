@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use axum::middleware;
 use axum::Router;
-use cluster::upgrade::switch::PROOF;
 use serde_json::{json, Value};
 use web::auth::Gateways;
 use web::tls::{self_signed, Entrance};
@@ -135,9 +134,7 @@ pub fn builder(
 }
 
 /// Serve `router` for `uis` until `shutdown` resolves, then return once every
-/// request in flight is answered. `proof` prints the serving line on stderr
-/// once the entrances are bound. The boot server passes `false`: it is up
-/// while the model loads, and that is not serving.
+/// request in flight is answered.
 pub async fn serve(
     listen: &Listen,
     uis: &[(&str, TenantUi)],
@@ -145,7 +142,6 @@ pub async fn serve(
     local_signin: LocalSignin,
     cluster: Option<Arc<Cluster>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
-    proof: bool,
 ) -> anyhow::Result<()> {
     if !listen.bind.is_loopback() {
         tracing::warn!(
@@ -169,9 +165,6 @@ pub async fn serve(
         }
         None => None,
     };
-    if proof {
-        eprintln!("{PROOF}");
-    }
     bound.serve_until(entrance, shutdown).await
 }
 
