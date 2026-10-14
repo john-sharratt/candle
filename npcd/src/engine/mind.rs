@@ -55,7 +55,7 @@ use std::time::Duration;
 use tokio::sync::Mutex as ConversationLock;
 
 use candle_conversation::projection::{
-    Builder, GroupId, LayerId, SelectedTurn, SelectionState, TimelineId,
+    Builder, Conversation, GroupId, LayerId, SelectedTurn, SelectionState, TimelineId,
 };
 use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, StencilTree, ThinkMode, ThinkSteerEnvelope,
@@ -202,6 +202,11 @@ struct Live {
 /// Every character's conversation, and the engine they run on.
 pub struct Minds {
     engine: Arc<Mutex<ConversationEngine>>,
+    /// The substrate, taken when the minds were built. Status and the host's
+    /// substrate reads use this and do not take `engine`: that mutex is held
+    /// across scheduler waits, and a `/v1/status` poll blocked on it is the
+    /// console sitting on "Reconnecting".
+    substrate: Conversation,
     /// The model's own dialect and sampling, captured at load.
     ///
     /// From `ModelBuilder::conversation_config` rather than assembled here: the
@@ -502,13 +507,14 @@ impl Minds {
         // mission that genuinely needs thinking raises the *selector*
         // (`identity::Deliberation`); this is the backstop underneath, and a
         // backstop that is off is not a backstop.
-        {
+        let substrate = {
             let e = engine.lock().unwrap();
             let max = base_config.max_response_tokens;
             base_config
                 .sampling
                 .apply_think_mode(ThinkMode::Off, e.tokenizer(), max);
-        }
+            e.conversation()
+        };
         // The cast decodes on the checkpoint's own published sampling. An earlier
         // "character dialogue" tuning widened the think-off row and layered on
         // DRY, presence and a cross-turn penalty to fight repetition from the
@@ -580,6 +586,7 @@ impl Minds {
         }
         Self {
             engine,
+            substrate,
             base_config,
             acts,
             grammar_ok: ok,
@@ -1045,6 +1052,11 @@ impl Minds {
     /// everything else.
     pub fn engine(&self) -> Arc<Mutex<ConversationEngine>> {
         Arc::clone(&self.engine)
+    }
+
+    /// The substrate, without taking the engine mutex.
+    pub fn substrate(&self) -> Conversation {
+        self.substrate.clone()
     }
 
     /// Retire every conversation this character has, so the next one it opens

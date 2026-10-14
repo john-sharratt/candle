@@ -481,6 +481,11 @@ struct InferenceState {
     /// `scheduler_tx` senders) and the substrate persistence handle —
     /// locked for the per-turn group-commit and for shutdown checkpointing.
     engine: Mutex<ConversationEngine>,
+    /// The substrate, cloned out of the engine when it was built. `/v1/status`
+    /// reads maintenance from this handle and does not take `engine`: that
+    /// mutex is held across scheduler waits, and a page poll blocked on it is
+    /// the console sitting on "Reconnecting".
+    substrate: Conversation,
     /// Per-conversation state, keyed by the client-supplied conv_id string.
     ///
     /// The outer map lock is a std mutex held only to look an entry up; the
@@ -2289,6 +2294,9 @@ impl InferenceState {
         // mint their sequence; the per-file pool holds the lock only for the quick
         // create/tombstone ops and releases it across each decode), so the loop
         // below is uniform across injection types and refresh stays non-blocking.
+        // The substrate handle comes out first. Status reads it without this
+        // mutex, which later callers hold across a scheduler wait.
+        let substrate = engine.conversation();
         let engine = Mutex::new(engine);
 
         // Structure-derived ingestion. The load plan is derived from the declared
@@ -2536,6 +2544,7 @@ impl InferenceState {
         let state = Arc::new(Self {
             decoder,
             engine,
+            substrate,
             conversations: Mutex::new(HashMap::new()),
             tool_modes: Mutex::new(HashMap::new()),
             base_conv: Mutex::new(base_conv),
@@ -5283,8 +5292,7 @@ impl ZendSession {
     /// loaded.
     pub fn substrate_maintenance(&self) -> Option<MaintenanceStatus> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let conversation = state.engine.lock().unwrap().conversation();
-        Some(conversation.maintenance_status())
+        Some(state.substrate.maintenance_status())
     }
 
     /// How this boot loaded its prompt sections — restored from the redo log or

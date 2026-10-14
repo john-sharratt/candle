@@ -46,6 +46,14 @@ pub const GROUP: &str = "group:";
 /// The longest a request waits for the records ahead of it to be applied.
 pub const APPLY_WAIT: Duration = Duration::from_secs(10);
 
+/// An admission replaces the previous socket. The close that ended that socket
+/// described it, and it does not describe the one now admitted.
+fn note_admitted(view: &mut ClusterView, session: u64) {
+    view.state = "admitted";
+    view.session = Some(session);
+    view.last_close = None;
+}
+
 /// Who this member is to an app's gateways.
 #[derive(Debug, Clone)]
 pub struct Identity {
@@ -402,8 +410,7 @@ impl AppMember {
         }
         {
             let mut d = lock(&self.dialling);
-            d[c].view.state = "admitted";
-            d[c].view.session = Some(admit.session);
+            note_admitted(&mut d[c].view, admit.session);
             d[c].retry_at = None;
         }
         lock(&self.links).ready(c);
@@ -731,5 +738,31 @@ impl AppMember {
             r.shutdown();
         }
         self.close_all(reason);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A socket that died and was admitted again is admitted. The close that
+    /// killed the previous one stays out of the status body, and the attempt
+    /// count is the history of dials, not a count of the socket now up.
+    #[test]
+    fn admission_clears_the_close_that_ended_the_previous_socket() {
+        let mut view = ClusterView {
+            url: "https://192.168.0.5:9443".into(),
+            state: "retrying",
+            attempts: 16,
+            session: None,
+            retry_in_s: Some(4),
+            last_close: Some("no frame from the gateway for 45 s".into()),
+        };
+        note_admitted(&mut view, 50);
+        assert_eq!(view.state, "admitted");
+        assert_eq!(view.session, Some(50));
+        assert_eq!(view.last_close, None);
+        assert_eq!(view.attempts, 16);
+        assert_eq!(view.retry_in_s, Some(4));
     }
 }

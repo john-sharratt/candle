@@ -21,6 +21,14 @@
 //! the `cluster` crate's [`AppMember`]; one socket's connection — TLS, the
 //! certificate's name, the WebSocket — is `cluster-dial`'s; this module is its
 //! process.
+//!
+//! The sockets run on their own runtime. The HTTP runtime also serves turns,
+//! and a worker blocked on the engine mutex — held across a scheduler wait
+//! while compaction has the persistence lock — stops being polled. A reader
+//! that is not polled for 45 s closes with "no frame from the gateway", both
+//! apps together, because they share that runtime. Gateway frames are what
+//! keep the socket admitted; they are read here, off that runtime. A request
+//! the gateway opens is handed back to the HTTP runtime to be served.
 
 pub mod capacity;
 pub mod disk;
@@ -57,7 +65,7 @@ use cluster::replicate::{CatchupView, Phase, Replication, ReplicationView};
 use cluster::upgrade::runtime::Upgrader;
 use cluster::version::this_build;
 use cluster_dial::{tls_connector, Dial, Target};
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, Runtime};
 use tokio::time::interval;
 use tokio_rustls::TlsConnector;
 use zend_vfs::sandbox::programs::policy;
@@ -146,7 +154,12 @@ pub struct Cluster {
     targets: Vec<Arc<Target>>,
     tls: TlsConnector,
     build: BuildId,
+    /// Serves gateway requests. Not the runtime the sockets live on.
     runtime: Handle,
+    /// Reader, writer and session for every app socket. Kept alive for the
+    /// process; dropped with a short timeout so a test that drops the cluster
+    /// does not wait out a dial loop.
+    sockets: Option<Runtime>,
     telemetry: Arc<Telemetry>,
     /// This host's whole router, which serves the requests gateways send.
     router: OnceLock<Router>,
@@ -173,6 +186,15 @@ pub struct AppLink {
     repos: OnceLock<Vec<RepoAd>>,
 }
 
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        self.close_all("stopped");
+        if let Some(sockets) = self.sockets.take() {
+            sockets.shutdown_timeout(Duration::from_secs(1));
+        }
+    }
+}
+
 impl Cluster {
     /// The membership of the tenants named `apps`, on `runtime`, upgrading
     /// through `upgrader`.
@@ -189,6 +211,14 @@ impl Cluster {
             Some(cfg) => Some(start_agent(&settings, cfg, &targets, &tls, &runtime)?),
             None => None,
         };
+        // Four workers. A session task can sit in one while the readers and
+        // writers are still polled on the others.
+        let sockets = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name("cluster-socket")
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("could not start the cluster socket runtime: {e}"))?;
         Ok(Arc::new(Cluster {
             targets,
             agent,
@@ -196,6 +226,7 @@ impl Cluster {
             tls,
             build: settings.build.clone(),
             runtime,
+            sockets: Some(sockets),
             telemetry,
             router: OnceLock::new(),
             links: apps
@@ -216,6 +247,12 @@ impl Cluster {
                 .collect(),
             settings,
         }))
+    }
+
+    fn sockets(&self) -> &Runtime {
+        self.sockets
+            .as_ref()
+            .expect("the socket runtime is taken only when the cluster is dropped")
     }
 
     pub fn link(&self, app: &str) -> Option<&Arc<AppLink>> {
@@ -314,15 +351,24 @@ impl Cluster {
             let cluster = self.clone();
             let member = member.clone();
             let replicator = member.replicator().cloned();
-            self.runtime.spawn(async move {
+            let http = self.runtime.clone();
+            self.sockets().spawn(async move {
                 let stopped = member
                     .clone()
                     .run(c, dial, move |conn| {
-                        if let Some(router) = cluster.router() {
-                            serve::serve(router, conn, c, replicator.clone());
-                        } else {
-                            conn.reset();
-                        }
+                        let http = http.clone();
+                        let cluster = cluster.clone();
+                        let replicator = replicator.clone();
+                        // Served on the HTTP runtime. The socket runtime only
+                        // reads and writes frames; a handler that blocks must
+                        // not stop it doing that.
+                        http.spawn(async move {
+                            if let Some(router) = cluster.router() {
+                                serve::serve(router, conn, c, replicator);
+                            } else {
+                                conn.reset();
+                            }
+                        });
                     })
                     .await;
                 tracing::warn!(

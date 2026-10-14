@@ -65,10 +65,7 @@ fn status_of(authored: &Authored) -> TenantStatus {
             .map(loading_view),
     );
     let minds = runtime.and_then(|rt| rt.minds.read().unwrap().clone());
-    status.maintenance = minds.map(|minds| {
-        let conv = minds.engine().lock().unwrap().conversation();
-        Maintenance::of(conv.maintenance_status())
-    });
+    status.maintenance = minds.map(|minds| Maintenance::of(minds.substrate().maintenance_status()));
     status
 }
 
@@ -81,7 +78,7 @@ fn storage(authored: &Authored, dir: &SubstrateDir) -> Value {
         .as_ref()
         .and_then(|rt| rt.minds.read().unwrap().clone());
     if let Some(minds) = minds {
-        let conv = minds.engine().lock().unwrap().conversation();
+        let conv = minds.substrate();
         storage.dead_ratio = conv.dead_ratio();
         storage.live_chunks = Some(conv.read().live_chunk_count() as u64);
     }
@@ -186,8 +183,7 @@ impl Reports for NpcdReports {
             .runtime
             .as_ref()
             .and_then(|rt| rt.minds.read().unwrap().clone())?;
-        let conv = minds.engine().lock().unwrap().conversation();
-        Some(conv)
+        Some(minds.substrate())
     }
 
     fn self_check(&self, _: CheckProgress) -> BoxFuture<'_, Result<Value, String>> {
