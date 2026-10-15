@@ -4867,6 +4867,7 @@ impl Sequence {
                 out.push(RecoveredMessage {
                     role: Role::User,
                     text: user_text,
+                    turn: idx.0,
                     no_think,
                     thinking: None,
                     tool_tokens,
@@ -4877,6 +4878,7 @@ impl Sequence {
                 out.push(RecoveredMessage {
                     role: Role::Assistant,
                     text: assistant_text,
+                    turn: idx.0,
                     no_think: false,
                     thinking,
                     tool_tokens: Vec::new(),

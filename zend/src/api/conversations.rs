@@ -145,6 +145,7 @@ pub async fn get(
                 tool_tokens: Vec::new(),
                 spans: Vec::new(),
                 files,
+                error: None,
             });
         }
     };
@@ -155,9 +156,14 @@ pub async fn get(
     // Upload markers are interleaved at their recorded turn boundaries.
     let mut messages: Vec<HistoryMessage> = Vec::new();
     emit_uploads(&mut messages, 0); // uploads before the first turn
+    let turn_errors = session.conversation_turn_errors(&id);
     let mut turn_no: u32 = 0;
     for entry in history {
         turn_no += 1;
+        let first_bubble = messages.len();
+        let error = (entry.role == TurnRole::Assistant)
+            .then(|| turn_errors.get(&entry.turn).cloned())
+            .flatten();
         // The reasoning length belongs to the first assistant bubble the turn
         // splits into — the one its thinking block renders in.
         let mut thinking = entry.thinking;
@@ -185,8 +191,10 @@ pub async fn get(
                 tool_tokens,
                 spans: Vec::new(),
                 files: Vec::new(),
+                error: None,
             });
         }
+        attach_turn_error(&mut messages[first_bubble..], error);
         emit_uploads(&mut messages, turn_no);
     }
     // Any uploads recorded past the last turn (uploaded after the final turn)
@@ -201,6 +209,7 @@ pub async fn get(
             tool_tokens: Vec::new(),
             spans: Vec::new(),
             files: Vec::new(),
+            error: None,
         });
     }
 
@@ -252,6 +261,14 @@ fn cut_reply(history: &mut Vec<RecoveredMessage>, history_before: usize) -> usiz
         .count();
     history.truncate(cut);
     assistant
+}
+
+/// Put a failed turn's `error` on the last assistant bubble the turn split
+/// into — where its reply stopped. `bubbles` are the turn's own.
+fn attach_turn_error(bubbles: &mut [HistoryMessage], error: Option<String>) {
+    if let Some(last) = bubbles.iter_mut().rev().find(|m| m.role == "assistant") {
+        last.error = error;
+    }
 }
 
 fn chat_role(role: TurnRole) -> Role {
@@ -337,6 +354,11 @@ pub struct HistoryMessage {
     /// (empty) on ordinary user/assistant bubbles.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<UploadOut>,
+    /// Why the turn stopped, on the last assistant bubble of a turn that
+    /// failed — kept as the turn sealed, so a reload shows the failure the
+    /// live stream did instead of a reply that just ends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// One uploaded file as the history/pane wire shape — the metadata the GUI
@@ -378,10 +400,43 @@ mod tests {
         RecoveredMessage {
             role,
             text: text.to_string(),
+            turn: 0,
             no_think: false,
             thinking: None,
             tool_tokens: Vec::new(),
         }
+    }
+
+    fn bubble(role: &'static str, content: &str) -> HistoryMessage {
+        HistoryMessage {
+            role,
+            content: content.to_string(),
+            no_think: false,
+            thinking: None,
+            tool_tokens: Vec::new(),
+            spans: Vec::new(),
+            files: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// **A failed turn's error goes on its last assistant bubble** — where its
+    /// reply stopped — and nowhere else; a turn with none leaves its bubbles
+    /// alone.
+    #[test]
+    fn a_turn_error_lands_on_the_last_assistant_bubble() {
+        let mut turn = vec![
+            bubble("assistant", "<tool_call>{}</tool_call>"),
+            bubble("user", "<tool_response>…</tool_response>"),
+            bubble("assistant", "<think>\ncut off mid-thought"),
+        ];
+        attach_turn_error(&mut turn, Some("short by 117440512 B".to_string()));
+        let errors: Vec<Option<&str>> = turn.iter().map(|m| m.error.as_deref()).collect();
+        assert_eq!(errors, [None, None, Some("short by 117440512 B")]);
+
+        let mut ok = vec![bubble("assistant", "an answer")];
+        attach_turn_error(&mut ok, None);
+        assert_eq!(ok[0].error, None);
     }
 
     /// The reply's sealed rounds go, and the count says how many of them were

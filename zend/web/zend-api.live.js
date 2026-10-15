@@ -79,7 +79,8 @@
         title: body.title,
         // `thinking` ({tokens, exact}) is the turn's reasoning length; the UI
         // keeps one per think block, in order.
-        history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, thinking: m.thinking ? [m.thinking] : [], tool_tokens: m.tool_tokens || [], spans: m.spans || [], files: m.files || [] })),
+        // `error`: why a failed turn stopped, on its last assistant bubble.
+        history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, thinking: m.thinking ? [m.thinking] : [], tool_tokens: m.tool_tokens || [], spans: m.spans || [], files: m.files || [], error: m.error || null })),
         uploads: body.uploads || [],
         // The composer dials this conversation last ran at, as levels. Absent
         // for one that has never taken a turn — the composer keeps its own.
@@ -467,6 +468,12 @@
     }
     if (event === 'prefill') {
       try { if (handlers.onPrefill) handlers.onPrefill(JSON.parse(data)); } catch (_) {}
+      return;
+    }
+    // The turn failed. Not the stream: the daemon keeps what the turn wrote
+    // and why it stopped, and the stream still ends with `[DONE]`.
+    if (event === 'turn_error') {
+      try { if (handlers.onTurnError) handlers.onTurnError(JSON.parse(data).message || ''); } catch (_) {}
       return;
     }
     if (data === '[DONE]') { handlers.onDone(); return; }

@@ -371,6 +371,11 @@ fn stream_sse(
                 tokens.turn_end(usage, finish);
                 Vec::new()
             }
+
+            Ok(StreamItem::Error(message)) => {
+                let data = serde_json::json!({ "message": message }).to_string();
+                vec![Ok(Event::default().event("turn_error").data(data))]
+            }
         })
         .flat_map(futures::stream::iter);
 
@@ -420,6 +425,12 @@ async fn collect_completion(
             Ok(StreamItem::Tool(_)) => {}   // tool lifecycle; display-only, not in the body
             Ok(StreamItem::Prefill { .. }) => {} // prefill progress; display-only
             Ok(StreamItem::Think { .. }) => {} // reasoning progress; display-only
+            // The only channel a body-reading client has: said after whatever
+            // the turn wrote before it stopped.
+            Ok(StreamItem::Error(message)) => {
+                full.push_str("\n\n⚠ ");
+                full.push_str(&message);
+            }
             Ok(StreamItem::TurnEnd {
                 usage: turn,
                 finish: ended,

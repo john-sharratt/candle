@@ -531,6 +531,7 @@ mod tests {
         RecoveredMessage {
             role,
             text: text.to_string(),
+            turn: 0,
             no_think: false,
             thinking: None,
             tool_tokens: Vec::new(),

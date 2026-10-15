@@ -199,6 +199,12 @@ pub enum StreamItem {
         usage: Usage,
         finish: FinishReason,
     },
+    /// The turn failed: what the engine reported, worded for the user. Its own
+    /// item rather than text, because text lands wherever the reply has got to
+    /// — inside an open `<think>` block, where the GUI folds it away — and an
+    /// error is not part of the reply. Display-only; the collected completion
+    /// body appends it, for a client that reads only the body.
+    Error(String),
 }
 
 /// A dialogue conversation's recovered history, as `GET /v1/conversations/{id}`
@@ -214,8 +220,8 @@ fn dialogue_history(state: &InferenceState, conv_id: &str) -> Vec<RecoveredMessa
 ///
 /// Drains `ts` to the end whether or not the request is still there: the turn
 /// runs to completion either way, and a client that comes back mid-turn follows
-/// it from `live`. An error item is recorded as the text the request showed for
-/// it, so a follower sees the same failure.
+/// it from `live`. An error item is recorded as the turn error the request
+/// showed for it, so a follower sees the same failure.
 async fn relay_live(
     ts: &mut Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>>,
     tx: &mpsc::Sender<anyhow::Result<StreamItem>>,
@@ -226,7 +232,7 @@ async fn relay_live(
     while let Some(item) = ts.next().await {
         live.push(match &item {
             Ok(i) => i.clone(),
-            Err(e) => StreamItem::Token(format!("\n\n⚠ {e}")),
+            Err(e) => StreamItem::Error(e.to_string()),
         });
         if listening && tx.send(item).await.is_err() {
             listening = false;
@@ -274,6 +280,27 @@ struct ConvState {
 /// its scale. [`ZendSession::conversation_dials`] maps them back to levels for
 /// the client.
 const DIAL_EFFORT_KEY: &str = "dial_effort";
+
+/// The conversation metadata key a failed turn's error is kept under — one per
+/// turn, by the turn's substrate index, so every failure stays beside its own
+/// turn ([`ZendSession::conversation_turn_errors`]).
+fn turn_error_key(turn: u32) -> String {
+    format!("{TURN_ERROR_PREFIX}{turn}")
+}
+
+/// The prefix of [`turn_error_key`].
+const TURN_ERROR_PREFIX: &str = "turn_error.";
+
+/// Every failed turn's error in a conversation's metadata, by turn index. A key
+/// whose suffix is not a turn index is not one of these.
+fn turn_errors(meta: &BTreeMap<String, String>) -> BTreeMap<u32, String> {
+    meta.iter()
+        .filter_map(|(k, v)| {
+            let turn = k.strip_prefix(TURN_ERROR_PREFIX)?.parse().ok()?;
+            Some((turn, v.clone()))
+        })
+        .collect()
+}
 const DIAL_LENGTH_KEY: &str = "dial_response_length";
 const DIAL_THINK_KEY: &str = "dial_think";
 const DIAL_TOOLS_KEY: &str = "dial_tools";
@@ -3955,16 +3982,16 @@ fn run_inference_stream(
                             // assistant said it, tell the user plainly and stop:
                             // no retry here would do anything but repeat it.
                             let shown = if msg.contains("no repair from here can be trusted") {
-                                "\n\n⚠ This conversation's memory has become corrupted and can't \
+                                "This conversation's memory has become corrupted and can't \
                                  be recovered. Please start a new conversation."
                                     .to_string()
                             } else {
-                                format!("\n\n⚠ {msg}")
+                                msg.clone()
                             };
-                            // Send as text so the client shows the message rather
-                            // than dropping the connection.
-                            let _ = tx.send(Ok(StreamItem::Token(shown))).await;
-                            turn_error = Some(anyhow::anyhow!("{msg}"));
+                            // Its own item, so the client shows it beside the
+                            // reply rather than dropping the connection.
+                            let _ = tx.send(Ok(StreamItem::Error(shown.clone()))).await;
+                            turn_error = Some(anyhow::anyhow!("{shown}"));
                             // Do not return — drain the iterator so the channel
                             // closes cleanly before we decide what to do with the
                             // conversation state.
@@ -4016,9 +4043,12 @@ fn run_inference_stream(
                             iteration,
                             "turn ended without Done or Error — evicting conversation",
                         );
-                        let _ = tx.send(Ok(StreamItem::Token(
-                            "\n\n⚠ Generation ended unexpectedly. Your next message will start fresh.".to_string()
-                        ))).await;
+                        let _ = tx
+                            .send(Ok(StreamItem::Error(
+                                "Generation ended unexpectedly. Your next message will start fresh."
+                                    .to_string(),
+                            )))
+                            .await;
                     }
                     // Evict the conversation so the next request forks fresh
                     // rather than hitting the in-flight guard.  Dropping `handle`
@@ -4070,7 +4100,10 @@ fn run_inference_stream(
                     "the turn after the repeat guard closed the loop made tool calls — not run",
                 );
             }
-            let is_final = round.is_empty() || force_hires.is_some() || closing;
+            // A turn that failed ends the reply too: what it wrote is cut off
+            // wherever the error landed, and a call in it was never finished.
+            let is_final =
+                round.is_empty() || force_hires.is_some() || closing || turn_error.is_some();
             // A call the turn stopped writing has no `</tool_call>` in the
             // stream, and the GUI reads everything after an unclosed opener —
             // the rounds that follow included — as that call's JSON. Close it
@@ -4104,6 +4137,20 @@ fn run_inference_stream(
 
             if let Err(e) = cs.conv.finish_turn(handle, &resp) {
                 tracing::warn!(conv_id = %conv_id, "finish_turn error: {e}");
+            }
+            // A failed turn is kept — what it wrote is what the user watched
+            // arrive — and so is why it stopped, under the turn it belongs to,
+            // for the history to show beside it after a reload.
+            if let (Some(e), Some(turn)) =
+                (&turn_error, resp.seal.as_ref().and_then(|s| s.turn_index))
+            {
+                if let Err(err) = state.engine.lock().unwrap().set_conversation_metadata(
+                    timeline,
+                    &turn_error_key(turn),
+                    &e.to_string(),
+                ) {
+                    tracing::warn!(conv_id = %conv_id, "recording the turn's error failed: {err}");
+                }
             }
 
             // One projection event per decode: the scored reprojection now
@@ -6027,9 +6074,11 @@ impl ZendSession {
         if let Some(timeline) = passthrough::timeline_of(conv_id) {
             // A passthrough conversation's turns are the client's exchanges.
             let engine = state.engine.lock().unwrap();
-            let bubble = |role, text| RecoveredMessage {
+            // One exchange per turn, in turn order.
+            let bubble = |role, text, turn: usize| RecoveredMessage {
                 role,
                 text,
+                turn: turn as u32,
                 no_think: false,
                 thinking: None,
                 tool_tokens: Vec::new(),
@@ -6037,10 +6086,11 @@ impl ZendSession {
             return Some(
                 passthrough::held_history(&engine, timeline)
                     .into_iter()
-                    .flat_map(|e| {
+                    .enumerate()
+                    .flat_map(|(turn, e)| {
                         [
-                            bubble(TurnRole::User, e.user.text()),
-                            bubble(TurnRole::Assistant, e.assistant),
+                            bubble(TurnRole::User, e.user.text(), turn),
+                            bubble(TurnRole::Assistant, e.assistant, turn),
                         ]
                     })
                     .collect(),
@@ -6058,6 +6108,22 @@ impl ZendSession {
     /// its dials from when the conversation is opened. `None` when the model
     /// isn't loaded, or when no turn has recorded dials — a conversation that
     /// has never run keeps the client's own defaults.
+    /// Why each of the conversation's failed turns stopped, by the turn's
+    /// substrate index — recorded as the turn sealed (`turn_error_key`).
+    pub fn conversation_turn_errors(&self, conv_id: &str) -> BTreeMap<u32, String> {
+        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+            return BTreeMap::new();
+        };
+        let timeline = conversation_timeline(conv_id);
+        let meta = state
+            .engine
+            .lock()
+            .unwrap()
+            .conversation_metadata(timeline)
+            .unwrap_or_default();
+        turn_errors(&meta)
+    }
+
     pub fn conversation_dials(&self, conv_id: &str) -> Option<ConversationDials> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = conversation_timeline(conv_id);

@@ -12,6 +12,10 @@ pub(crate) const TOOL_RESPONSE_OPEN: &str = "<tool_response>";
 pub struct RecoveredMessage {
     pub role: Role,
     pub text: String,
+    /// The substrate index of the turn this bubble came from — both halves of
+    /// one turn share it. What a caller keeps per turn (a failed turn's error)
+    /// is matched to its bubbles by this.
+    pub turn: u32,
     /// The turn's recorded thinking-suppressed flag, set on the USER bubble so
     /// the GUI can re-render the `/no_think` soft-switch on prior turns exactly
     /// as the assembler does for the model (see `turn_no_think`); `false` on the

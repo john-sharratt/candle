@@ -972,8 +972,15 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     rem = rem.replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (m, json) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'tool', complete: true, json }); return mk; });
     let openIdx = rem.lastIndexOf('<think>');
     if (openIdx !== -1) {
-      if (streaming) { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: false, body: rem.slice(openIdx + 7), tokens: think && think.live != null ? think.live : null }); rem = rem.slice(0, openIdx) + mk; }
-      else rem = rem.slice(0, openIdx);
+      const mk = ' SEG:' + segs.length + ' ';
+      // Streaming: the reasoning still arriving. Finished: a reply that stopped
+      // inside its reasoning — a turn that failed mid-thought — so the block is
+      // drawn as the finished reasoning it is, exactly as an unterminated tool
+      // call below becomes a finished card. Dropping it left a turn that only
+      // reasoned as an empty bubble, with its failure the only thing to see.
+      if (streaming) segs.push({ kind: 'think', complete: false, body: rem.slice(openIdx + 7), tokens: think && think.live != null ? think.live : null });
+      else segs.push({ kind: 'think', complete: true, body: rem.slice(openIdx + 7), length: lengths[thinkNo++] || null });
+      rem = rem.slice(0, openIdx) + mk;
     }
     openIdx = rem.lastIndexOf('<tool_call>');
     if (openIdx !== -1) {
@@ -1503,6 +1510,14 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
         m.prefill = (p && p.total > 0 && p.done < p.total) ? { done: p.done, total: p.total } : null;
       }),
       onLog: () => addLog(API.nextLogLine()),
+      // The TURN failed, and the stream carries on to its end. The daemon keeps
+      // what the turn wrote and why it stopped, so the hydrate after `onDone`
+      // brings both back: this is not `failed`, and offers no retry — the
+      // question is already stored.
+      onTurnError: (msg) => {
+        patchStream(convId, (m) => { m.error = msg; m.status = ''; m.prefill = null; });
+        addLog(API.mkLog('ERROR', 'zend::session', 'conv_id=' + convId + ' turn failed: ' + msg));
+      },
       // The stream failed rather than finished. Record it on the message so the
       // bubble renders the reason, and log it — a silent failure here was the
       // whole reason a wedged turn looked like an empty answer.
@@ -2314,8 +2329,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     //
     // `_blockEnd` is recorded per projection while the turn streams, against the
     // block count at that moment. The count can then SHRINK: `onDone` re-renders
-    // with `streaming` false, which drops an unterminated `<think>` outright and
-    // folds an unterminated `<tool_call>` into one finished card. Every frozen
+    // with `streaming` false, which folds an unterminated `<think>` into one
+    // finished block and an unterminated `<tool_call>` into one finished card. Every frozen
     // bound is then past the end, `projOf` finds its first candidate for every
     // block, and one bar is stretched over the whole bubble.
     //
