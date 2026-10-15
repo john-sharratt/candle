@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use zend_vfs::{FetchSpec, Oid, RefName, RemoteName, Rev};
 
@@ -47,6 +48,9 @@ pub struct Importer {
     lease: Arc<dyn Lease>,
     /// Rewrites seen once, waiting for a second look.
     suspect: Mutex<HashMap<RefName, Option<Oid>>>,
+    /// How often the lease holder fetches; every tick when zero.
+    fetch_every: Duration,
+    last_fetch: Mutex<Option<Instant>>,
 }
 
 impl Importer {
@@ -54,22 +58,49 @@ impl Importer {
         Self {
             lease,
             suspect: Mutex::new(HashMap::new()),
+            fetch_every: Duration::ZERO,
+            last_fetch: Mutex::new(None),
         }
     }
 
-    /// One round: publish this member's pushes, import if holding the lease,
-    /// sync.
+    /// This importer fetching at most every `every` — each fetch is a job on
+    /// an agent and a request to origin — while its ticks still publish and
+    /// sync every time.
+    pub fn fetching_every(mut self, every: Duration) -> Self {
+        self.fetch_every = every;
+        self
+    }
+
+    /// One round: publish this member's pushes, import if holding the lease
+    /// and a fetch is due, sync.
     pub fn tick(&self, store: &Store, records: &dyn Records) -> anyhow::Result<Imported> {
+        self.round(store, records, false)
+    }
+
+    /// [`Self::tick`], fetching now if holding the lease, due or not: a
+    /// member's first load of a repository.
+    pub fn pull(&self, store: &Store, records: &dyn Records) -> anyhow::Result<Imported> {
+        self.round(store, records, true)
+    }
+
+    fn round(&self, store: &Store, records: &dyn Records, now: bool) -> anyhow::Result<Imported> {
         let mut out = Imported::default();
         let repo = store.repo();
+        let due = now || {
+            let last = *self.last_fetch.lock().unwrap();
+            last.is_none_or(|at| at.elapsed() >= self.fetch_every)
+        };
 
         let log = log_branches(records, store.name())?;
         let pushed = ahead_of(store, &log, &store.record()?)?;
         out.pushed = publish(records, store.name(), repo, &pushed, false)?;
 
-        let fetched = match self.lease.hold(&import_lease(store.name())) {
+        let fetched = match due && self.lease.hold(&import_lease(store.name())) {
             false => None,
-            true => match repo.fetch(&RemoteName::parse(IMPORT)?, &FetchSpec::AllBranches) {
+            true => match {
+                *self.last_fetch.lock().unwrap() = Some(Instant::now());
+                repo.fetch(&RemoteName::parse(IMPORT)?, &FetchSpec::AllBranches)
+            } {
                 Ok(_) => Some(true),
                 // An agent or origin out of reach: what is held is still
                 // published and synced, and the next tick tries again.
@@ -112,7 +143,7 @@ impl Importer {
 
             out.moved = publish(records, store.name(), repo, &moved, false)?;
             out.forced = publish(records, store.name(), repo, &rewritten, true)?;
-        } else if fetched.is_none() {
+        } else if fetched.is_none() && due {
             self.suspect.lock().unwrap().clear();
         }
 

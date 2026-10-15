@@ -1493,13 +1493,20 @@ impl InferenceState {
                 .collect();
             let git_cluster = cluster.as_ref().and_then(|join| {
                 let member = join.link().member()?;
-                Some(crate::substrate_git::Cluster {
+                Some(::substrate_git::member::Cluster {
                     replicator: member.replicator().cloned()?,
                     agents: Agents::new(Arc::clone(member), join.in_process_agent()),
                     runtime: host_runtime.clone()?,
                 })
             });
-            crate::substrate_git::start(&root, &names, engine.conversation().shared(), git_cluster)?;
+            crate::substrate_git::load(
+                &root,
+                &names,
+                engine.conversation().shared(),
+                git_cluster,
+                &progress,
+                &status_tx,
+            )?;
         }
 
         let formatted_prompt = builder.format_system_prompt();

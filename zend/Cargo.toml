@@ -36,7 +36,7 @@ host         = { path = "../host" }
 cluster      = { path = "../cluster" }
 # With `--cluster`, commands and pushes go to agents (`docs/replicated_substrate.md` §11.5).
 agent        = { path = "../agent" }
-substrate-git = { path = "../substrate-git", features = ["substrate"] }
+substrate-git = { path = "../substrate-git", features = ["member"] }
 # A conversation's files kept as file events (`docs/zend_vfs_events.md`).
 store-events = { path = "../store-events" }
 # The gateway's own types, where zend reads them: who a caller is

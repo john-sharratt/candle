@@ -19,6 +19,8 @@
 
 pub mod adopt;
 pub mod import;
+#[cfg(feature = "member")]
+pub mod member;
 pub mod publish;
 pub mod records;
 pub mod store;

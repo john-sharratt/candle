@@ -13,6 +13,9 @@ default = []
 # `Records` for candle-conversation's `SharedSubstrate`. Off by default so the
 # crate's own tests build without the model stack.
 substrate = ["dep:candle-conversation"]
+# A daemon's repositories loaded and followed through the cluster's agents
+# (`member`): zend's and npcd's.
+member = ["substrate", "dep:agent", "dep:cluster", "dep:tokio"]
 
 [dependencies]
 anyhow     = { workspace = true }
@@ -21,6 +24,9 @@ serde_json = { workspace = true }
 tracing    = { workspace = true }
 zend-vfs   = { path = "../zend-vfs" }
 candle-conversation = { path = "../candle-conversation", optional = true }
+agent      = { path = "../agent", optional = true }
+cluster    = { path = "../cluster", optional = true }
+tokio      = { version = "1", features = ["rt"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

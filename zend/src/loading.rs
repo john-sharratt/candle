@@ -52,6 +52,10 @@ pub enum LoadStep {
     /// (§7.2, §7.6), and taking a generation for what it wrote cut off.
     /// Skipped standalone and when no cluster was reached.
     CatchUp,
+    /// Every repository the workspace names brought up to the log: its packs
+    /// taken into its store, pulled through an agent first when no member has
+    /// (`docs/substrate_git.md` §5). Skipped without `substrate_git`.
+    Repositories,
     Sections,
     CalibratingSections,
     /// Every stored conversation asked whether it is intact (`--self-check`).
@@ -88,6 +92,7 @@ impl LoadStep {
         LoadStep::Compacting,
         LoadStep::Connecting,
         LoadStep::CatchUp,
+        LoadStep::Repositories,
         LoadStep::Sections,
         LoadStep::CalibratingSections,
         LoadStep::SelfCheck,
@@ -106,6 +111,7 @@ impl LoadStep {
             LoadStep::Compacting => "compacting",
             LoadStep::Connecting => "connecting",
             LoadStep::CatchUp => "catchup",
+            LoadStep::Repositories => "repositories",
             LoadStep::Sections => "sections",
             LoadStep::CalibratingSections => "calibrating_sections",
             LoadStep::SelfCheck => "self_check",
@@ -125,6 +131,7 @@ impl LoadStep {
             LoadStep::Compacting => "Compacting substrate",
             LoadStep::Connecting => "Connecting to the cluster",
             LoadStep::CatchUp => "Catching up",
+            LoadStep::Repositories => "Loading repositories",
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
             LoadStep::SelfCheck => "Checking conversations",
@@ -155,6 +162,7 @@ impl LoadStep {
             LoadStep::Compacting => "",
             LoadStep::Connecting => "clusters",
             LoadStep::CatchUp => "records",
+            LoadStep::Repositories => "packs",
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
             LoadStep::SelfCheck => "conversations",
@@ -490,7 +498,8 @@ mod tests {
                 LoadStep::Substrate,
                 LoadStep::Compacting,
                 LoadStep::Connecting,
-                LoadStep::CatchUp
+                LoadStep::CatchUp,
+                LoadStep::Repositories
             ]
         );
     }
@@ -619,6 +628,7 @@ mod tests {
                 "compacting",
                 "connecting",
                 "catchup",
+                "repositories",
                 "sections",
                 "calibrating_sections",
                 "self_check",

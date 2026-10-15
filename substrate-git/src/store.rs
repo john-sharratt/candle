@@ -53,6 +53,12 @@ pub struct Synced {
     pub taken: usize,
     /// Packs the log names whose blob has not arrived.
     pub waiting: usize,
+    /// Packs the log names that the store holds, and how many it names.
+    pub held: usize,
+    pub listed: usize,
+    /// Branches the log names that the store does not yet hold where the log
+    /// does: their packs have not all arrived.
+    pub behind: usize,
     /// Record refs set or deleted, with where they point now.
     pub moved: Vec<(RefName, Option<Oid>)>,
 }
@@ -176,6 +182,8 @@ impl Store {
             }
         }
 
+        synced.held = held.len();
+        synced.listed = synced.held + synced.waiting;
         let current = self.record()?;
         let mut txn = RefTransaction::new();
         for (name, entry) in log.refs()? {
@@ -183,6 +191,7 @@ impl Store {
                 continue;
             };
             if !entry.needs.iter().all(|sha| held.contains(sha)) {
+                synced.behind += 1;
                 continue;
             }
             let name = RefName::parse(&name)?;
@@ -191,6 +200,7 @@ impl Store {
                 Some(oid) => {
                     let oid = Oid::parse(oid)?;
                     if !self.repo.has_object(&oid)? {
+                        synced.behind += 1;
                         continue;
                     }
                     Some(oid)
