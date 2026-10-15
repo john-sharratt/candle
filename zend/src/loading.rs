@@ -54,7 +54,7 @@ pub enum LoadStep {
     CatchUp,
     /// Every repository the workspace names brought up to the log: its packs
     /// taken into its store, pulled through an agent first when no member has
-    /// (`docs/substrate_git.md` §5). Skipped without `substrate_git`.
+    /// (`docs/substrate_git.md` §5). Skipped when the workspace names none.
     Repositories,
     Sections,
     CalibratingSections,

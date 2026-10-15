@@ -29,8 +29,11 @@ pub const META_PATH: &str = "mind.path";
 pub fn rel(mind: &Path, path: &Path) -> Option<String> {
     // A path already relative is a mind path: what every document read from
     // the mind's files is (`docs/substrate_git.md` §8.1).
+    // An absolute path against an empty root is no mind path at all: an empty
+    // prefix strips from anything, and the whole drive would become the key.
     let r = match path.is_relative() {
         true => path,
+        false if mind.as_os_str().is_empty() => return None,
         false => path.strip_prefix(mind).ok()?,
     };
     Some(r.to_string_lossy().replace('\\', "/"))
@@ -144,6 +147,11 @@ mod tests {
             Some("layers/stories/the-ledger.md")
         );
         assert_eq!(rel(&mind, Path::new("C:/elsewhere/x.md")), None);
+        assert_eq!(rel(Path::new(""), &std::env::temp_dir().join("x.md")), None);
+        assert_eq!(
+            rel(Path::new(""), Path::new("layers/x.md")).as_deref(),
+            Some("layers/x.md")
+        );
         assert_eq!(
             address_of("layers/stories/the-ledger.md").as_deref(),
             Some("stories/the-ledger")

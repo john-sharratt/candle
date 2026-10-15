@@ -3866,12 +3866,14 @@ fn mind_moved(rt: &Arc<Runtime>, repos: &Repos, source: &MindSource) {
         .as_ref()
         .is_none_or(|o| o.read(projection::SCHEMA_FILE) != files.read(projection::SCHEMA_FILE));
     tracing::info!(commit = ?files.commit(), "mind: moved to a newer commit");
-    rt.mind_handle.replace(Arc::clone(&files));
+    // Not replaced: the grammar is the old schema's until the restart, and
+    // readers moved onto a commit it does not describe would read past it.
     if schema_changed {
         tracing::warn!("mind: its schema changed — restarting onto it");
         rt.ask_relaunch();
         return;
     }
+    rt.mind_handle.replace(Arc::clone(&files));
     rt.ops.moved();
     if let Some(old) = old {
         rt.reconcile_mind(&old, &files);

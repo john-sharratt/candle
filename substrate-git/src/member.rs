@@ -31,7 +31,7 @@ use tokio::runtime::Handle;
 use zend_vfs::{Oid, RefName, RemoteUrl};
 
 use crate::import::Importer;
-use crate::records::{Alone, Lease, Log};
+use crate::records::{import_lease, Alone, Lease, Log};
 use crate::store::Store;
 
 /// How often the follow thread ticks: publishes and syncs, all local.
@@ -93,7 +93,8 @@ pub struct Loading {
     pub listed: usize,
     /// Whether the store holds every branch where the log does.
     pub whole: bool,
-    /// Why a pull failed, while it does.
+    /// Why the repository is not whole yet, when there is more to say than
+    /// its packs: a pull failing, or another member's pull awaited.
     pub error: Option<String>,
 }
 
@@ -113,11 +114,11 @@ pub struct Repos {
 }
 
 impl Repos {
-    /// Open a store under `root` for every source, fetching through `cluster`'s
-    /// agents when given, else from each checkout's `origin`. A checkout's
-    /// branches are adopted only without a cluster: with one, the agents'
-    /// view of origin is the only source, so a stale local clone never leaks
-    /// in.
+    /// Open a store under `root` for every repository in `names`, every fetch
+    /// made as `agent:<name>` through `access`'s agents — the cluster's, or
+    /// with no cluster the one in this process. Nothing is adopted from a
+    /// local checkout: the agents' view of origin is the only source, so a
+    /// stale clone never leaks in.
     pub fn open(
         root: &Path,
         names: &[String],
@@ -153,8 +154,9 @@ impl Repos {
 
     /// Block until every repository is whole in its store, reporting each
     /// round to `report`. A repository the log names no branch of is pulled
-    /// now by whichever member holds its lease. Returns early, incomplete,
-    /// when `cancelled` says so.
+    /// now by whichever member holds its lease, and is whole when that pull
+    /// finds origin empty; every other member waits for it, saying so in the
+    /// report. Returns early, incomplete, when `cancelled` says so.
     pub fn load(
         &self,
         cancelled: &dyn Fn() -> bool,
@@ -184,8 +186,22 @@ impl Repos {
                     Ok(t) => {
                         loading.held = t.synced.held;
                         loading.listed = t.synced.listed;
-                        loading.error = t.fetch_error;
-                        loading.whole = whole(store, &self.inner.shared)?;
+                        // A pull that found origin with no branch: an empty
+                        // repository, whole as it is.
+                        let empty = t.fetched
+                            && store.imported()?.is_empty()
+                            && branches(&self.inner.shared, store.name())?.is_empty();
+                        loading.whole = empty || whole(store, &self.inner.shared)?;
+                        loading.error = match t.fetch_error {
+                            Some(e) => Some(e),
+                            // Not this member's to pull: it waits, as long as
+                            // it takes, for the member holding the lease.
+                            None if !t.fetched && !named => Some(format!(
+                                "waiting for the member holding `{}` to pull it",
+                                import_lease(store.name())
+                            )),
+                            None => None,
+                        };
                     }
                     Err(e) => loading.error = Some(format!("{e:#}")),
                 }

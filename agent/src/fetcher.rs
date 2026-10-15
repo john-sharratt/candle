@@ -12,7 +12,10 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use tokio::runtime::Handle;
-use zend_vfs::{Fetch, FetchSpec, GitError, RefUpdate, RemoteName, Repo};
+use zend_vfs::{
+    Fetch, FetchSpec, GitError, Oid, RefName, RefOp, RefTransaction, RefUpdate, RemoteName, Repo,
+    ORIGIN,
+};
 
 use crate::client::Agents;
 use crate::wire::FetchJob;
@@ -54,14 +57,28 @@ impl Fetch for AgentFetch {
         remote: &RemoteName,
         spec: &FetchSpec,
     ) -> Result<Vec<RefUpdate>, GitError> {
-        let mut have: Vec<String> = repo
+        // Everything this repository already holds of origin's history: the
+        // fetching remote's tracking refs, the record's — a store's
+        // `refs/remotes/origin/*`, which the log's packs filled — and the
+        // slices a run cut short already took.
+        let mut slices: Vec<(RefName, Oid)> = repo.refs_in(SLICES)?;
+        let mut have: Vec<String> = Vec::new();
+        let held = repo
             .tracking_tips(remote)?
             .into_iter()
-            .map(|o| o.to_string())
-            .collect();
+            .chain(repo.tracking_tips(&RemoteName::parse(ORIGIN)?)?)
+            .chain(slices.iter().map(|(_, o)| o.clone()));
+        for oid in held {
+            let oid = oid.to_string();
+            if !have.contains(&oid) {
+                have.push(oid);
+            }
+        }
         // A long history comes in slices: each one's objects are taken and its
         // commits named as held, and only the last answer moves the tracking
-        // refs, so they never stand anywhere origin's branches do not.
+        // refs, so they never stand anywhere origin's branches do not. Each
+        // slice's commits are kept under `SLICES` too, so a run that fails part
+        // way resumes where it stopped; the last answer drops them.
         loop {
             let job = FetchJob {
                 repo: self.repo.clone(),
@@ -82,14 +99,52 @@ impl Fetch for AgentFetch {
                 .map_err(|_| failed(remote, "the fetch's job was dropped".into()))?
                 .map_err(|e| failed(remote, e.to_string()))?;
             if !fetched.partial {
-                return repo.take_fetch(remote, spec, &fetched);
+                let taken = repo.take_fetch(remote, spec, &fetched)?;
+                drop_slices(repo, &slices);
+                return Ok(taken);
             }
             let Some(bundle) = &fetched.bundle else {
                 return Err(failed(remote, "a partial answer carried no objects".into()));
             };
             repo.take_bundle(bundle)?;
-            have.extend(fetched.tips.values().map(|o| o.to_string()));
+            let mut txn = RefTransaction::new();
+            for tip in fetched.tips.values() {
+                let named = tip.to_string();
+                if have.contains(&named) {
+                    continue;
+                }
+                have.push(named);
+                let slice = RefName::parse(&format!("{SLICES}{tip}"))?;
+                if !slices.iter().any(|(n, _)| *n == slice) {
+                    txn = txn.push(RefOp::Create {
+                        name: slice.clone(),
+                        new: tip.clone(),
+                    });
+                    slices.push((slice, tip.clone()));
+                }
+            }
+            repo.update_refs(&txn)?;
         }
+    }
+}
+
+/// Where a sliced fetch keeps the commits its slices took, one ref per commit,
+/// named by it, until its last answer lands.
+const SLICES: &str = "refs/substrate-slices/";
+
+/// Drop a fetch's slice refs once its tracking refs reach past them. Left
+/// behind they only name commits already held, so failing here fails no
+/// fetch.
+fn drop_slices(repo: &Repo, slices: &[(RefName, Oid)]) {
+    let mut txn = RefTransaction::new();
+    for (name, old) in slices {
+        txn = txn.push(RefOp::Delete {
+            name: name.clone(),
+            old: old.clone(),
+        });
+    }
+    if let Err(e) = repo.update_refs(&txn) {
+        tracing::warn!("dropping a fetch's slice refs: {e}");
     }
 }
 

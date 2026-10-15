@@ -200,7 +200,7 @@ async fn keep_in_mind(rt: &Runtime, folder: String, npc: u64) -> Option<Keep> {
         .await
         .payload(npc)
         .map(|p| p.owner_id.clone())?;
-    let author = Author::open(&rt.mind_handle, Some(&rt.ops), &owner);
+    let author = Author::open(&rt.mind_handle, &rt.data, Some(&rt.ops), &owner);
     Some(Keep {
         drafts: author.keeps_drafts(),
         shelf: Box::new(author),

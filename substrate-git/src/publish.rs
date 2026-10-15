@@ -66,24 +66,51 @@ pub fn publish(
     }
 
     let tips: Vec<Oid> = moving.iter().filter_map(|(_, oid)| oid.clone()).collect();
-    let known: Vec<Oid> = held
-        .values()
-        .filter_map(|e| e.oid.as_deref())
-        .map(Oid::parse)
-        .collect::<Result<_, _>>()?;
-    let mut needs = Vec::new();
-    for pack in source
-        .pack_objects(&tips, &known, MAX_PACK)
-        .with_context(|| format!("packing {repo}"))?
-    {
-        let entry = PackEntry {
-            checksum: pack_checksum(&pack).context("a pack with no trailer")?,
-            objects: object_count(&pack),
+    let mut known = Vec::new();
+    let mut needs: Vec<String> = Vec::new();
+    for entry in held.values() {
+        let Some(oid) = entry.oid.as_deref() else {
+            continue;
         };
-        needs.push(log.put_pack(pack, &entry)?);
-        published.packs += 1;
+        known.push(Oid::parse(oid)?);
     }
+    // Each pack is written and let go before the next is read: a first
+    // publish of a whole history is never in memory at once.
+    published.packs = source
+        .pack_objects(&tips, &known, MAX_PACK, |pack| {
+            let entry = PackEntry {
+                checksum: pack_checksum(&pack).context("a pack with no trailer")?,
+                objects: object_count(&pack),
+            };
+            needs.push(log.put_pack(pack, &entry)?);
+            Ok::<(), anyhow::Error>(())
+        })
+        .with_context(|| format!("packing {repo}"))?;
+
+    // Packing took a while, and the log is last writer wins: a ref another
+    // member moved meanwhile is replaced only by a descendant of where it
+    // stands now, else left for the next tick to publish again.
+    let now = log.refs()?;
     for (name, oid) in moving {
+        let before = held.get(name.as_str()).and_then(|e| e.oid.as_deref());
+        let current = now.get(name.as_str()).and_then(|e| e.oid.as_deref());
+        if current != before && !forced {
+            match (current, &oid) {
+                (Some(current), Some(new)) => {
+                    let current = Oid::parse(current)?;
+                    if !descends(source, &current, new)? {
+                        published.refused.push((name, current));
+                        continue;
+                    }
+                }
+                (Some(current), None) => {
+                    published.refused.push((name, Oid::parse(current)?));
+                    continue;
+                }
+                // Deleted meanwhile: deleting is a forced move, and wins.
+                (None, _) => continue,
+            }
+        }
         log.put_ref(
             &name,
             &RefEntry {

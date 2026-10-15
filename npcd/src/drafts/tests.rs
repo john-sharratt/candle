@@ -83,7 +83,12 @@ fn under_git() -> Mind {
 
 impl Mind {
     fn author(&self, account: &str) -> Author {
-        Author::open(&crate::mind::Mind::new(Some(self.root.clone())), Some(&self.stores), account)
+        Author::open(
+            &crate::mind::Mind::new(Some(self.root.clone())),
+            &self.root,
+            Some(&self.stores),
+            account,
+        )
     }
 
     fn worlds(&self) -> Registry {
@@ -97,7 +102,12 @@ impl Mind {
 fn a_plain_folder_is_written_as_it_stands() {
     let dir = TempDir::new().unwrap();
     let stores = MindStores::new(Some(dir.path()));
-    let author = Author::open(&crate::mind::Mind::new(Some(dir.path().to_path_buf())), Some(&stores), "ab");
+    let author = Author::open(
+        &crate::mind::Mind::new(Some(dir.path().to_path_buf())),
+        dir.path(),
+        Some(&stores),
+        "ab",
+    );
     assert!(!author.keeps_drafts());
     save(&author, "world", WORLDS, "ardh", &json!({"name": "Ardh"})).unwrap();
     assert_eq!(
@@ -106,6 +116,23 @@ fn a_plain_folder_is_written_as_it_stands() {
     );
     assert!(author.drafted().is_empty());
     assert!(author.owner().is_none());
+}
+
+/// **A mind with no folder is written in the authored folder**, never the
+/// process's working directory — and a mind still on its way from the
+/// substrate refuses the write outright.
+#[test]
+fn a_mind_with_no_folder_writes_in_the_authored_folder() {
+    let dir = TempDir::new().unwrap();
+    let author = Author::open(&crate::mind::Mind::new(None), dir.path(), None, "ab");
+    save(&author, "world", WORLDS, "ardh", &json!({"name": "Ardh"})).unwrap();
+    assert!(dir.path().join("worlds/ardh.yaml").is_file());
+
+    let pending = crate::mind::Mind::pending(dir.path());
+    let author = Author::open(&pending, dir.path(), None, "ab");
+    let refused = author.commit(&[("worlds/hess.yaml".into(), Some("name: Hess\n".into()))]);
+    assert!(refused.is_err());
+    assert!(!dir.path().join("worlds/hess.yaml").exists());
 }
 
 /// **A save over a mind under git is the author's draft**: rendered against

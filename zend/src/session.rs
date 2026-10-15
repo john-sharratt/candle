@@ -628,6 +628,10 @@ struct InferenceState {
     /// VFS stores).  Cloned per-conversation if scoping is later
     /// needed; for now it's workspace-wide.
     tool_host: ToolHost,
+    /// This load's repositories and their follower (`docs/substrate_git.md`
+    /// §7); `None` when the workspace names none. Stopped by
+    /// `ZendSession::shutdown` before the drain.
+    repositories: Option<crate::substrate_git::Repositories>,
     /// Constrained-decoding stencil for the whole tool catalog, keyed by the
     /// `<tool_call>` trigger token.  Passed on every user turn so a tool call
     /// the model emits is forced to the catalog's exact JSON shape.  Compiled
@@ -1482,27 +1486,34 @@ impl InferenceState {
 
         // Repositories read from the substrate (`docs/substrate_git.md` §7):
         // every store brought up to the log before anything reads a branch,
-        // then kept there — and with origin — on a thread of its own.
-        {
+        // then kept there — and with origin — on a thread of its own, which
+        // `ZendSession::shutdown` stops. A workspace naming no repository
+        // has nothing to load, and needs no agent.
+        let repositories = {
             let names: Vec<String> = workspace
                 .repos()
                 .iter()
                 .map(|r| r.name.clone())
                 .filter(|name| name != crate::workspace::UPLOADS_REPO)
                 .collect();
-            let runtime = host_runtime.clone().ok_or_else(|| {
-                anyhow::anyhow!("no async runtime for the agents' jobs to run on")
-            })?;
-            let access = crate::substrate_git::access(cluster.as_ref(), agent.as_ref(), runtime)?;
-            crate::substrate_git::load(
-                &root,
-                &names,
-                engine.conversation().shared(),
-                access,
-                &progress,
-                &status_tx,
-            )?;
-        }
+            if names.is_empty() {
+                None
+            } else {
+                let runtime = host_runtime.clone().ok_or_else(|| {
+                    anyhow::anyhow!("no async runtime for the agents' jobs to run on")
+                })?;
+                let access =
+                    crate::substrate_git::access(cluster.as_ref(), agent.as_ref(), runtime)?;
+                Some(crate::substrate_git::load(
+                    &root,
+                    &names,
+                    engine.conversation().shared(),
+                    access,
+                    &progress,
+                    &status_tx,
+                )?)
+            }
+        };
 
         let formatted_prompt = builder.format_system_prompt();
         let decoder = engine.token_decoder();
@@ -2622,6 +2633,7 @@ impl InferenceState {
             think_closer_phrase,
             tokenizer,
             tool_host: ToolHost::deployed(&workspace, secrets, cluster.as_ref(), agent.as_ref())?,
+            repositories,
             workspace,
             base_branches,
             tool_stencil,
@@ -6711,12 +6723,16 @@ impl ZendSession {
                             // A record branch that moves in the log — imported
                             // from origin through an agent, or another
                             // member's push — wakes the worker
-                            // (`docs/substrate_git.md` §5).
-                            let on_change: Arc<dyn Fn() + Send + Sync> = {
-                                let wake = Arc::clone(&wake);
-                                Arc::new(move || wake.notify_one())
-                            };
-                            crate::substrate_git::on_change(on_change);
+                            // (`docs/substrate_git.md` §5). Registering wakes it
+                            // once too: the follower has run since the load, and
+                            // a move in between is reported to no one.
+                            if let Some(repositories) = state.repositories.as_ref() {
+                                let on_change: Arc<dyn Fn() + Send + Sync> = {
+                                    let wake = Arc::clone(&wake);
+                                    Arc::new(move || wake.notify_one())
+                                };
+                                repositories.on_change(on_change);
+                            }
                         }
                         // The engine is up — only NOW mark ready and unblock
                         // submit-flow waiters. Skipped on the shutdown-during-ingest
@@ -6783,6 +6799,20 @@ impl ZendSession {
             let _ = tokio::task::spawn_blocking(move || {
                 if h.join().is_err() {
                     tracing::warn!("shutdown: loader thread panicked");
+                }
+            })
+            .await;
+        }
+        //    Then the repositories' follower, so no record branch that moves
+        //    wakes a worker being stopped, and no import writes past the drain;
+        //    the round in flight finishes first. A load that never
+        //    published its state dropped its repositories, which stops theirs.
+        let followed: Option<Arc<InferenceState>> =
+            { self.inference.read().unwrap().as_ref().map(Arc::clone) };
+        if let Some(state) = followed {
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(repositories) = state.repositories.as_ref() {
+                    repositories.stop();
                 }
             })
             .await;

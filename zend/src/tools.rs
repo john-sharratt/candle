@@ -777,10 +777,11 @@ impl ToolHost {
         Ok(Self::on(workspace, secrets, Arc::new(sandboxes)))
     }
 
-    /// The host this daemon runs with: commands and pushes on agents when it
-    /// is a member of `cluster` (§11.5) — reaching the agent in its own
-    /// process while cut off, with `--agent` — and on its own checkouts
-    /// otherwise.
+    /// The host this daemon runs with: commands and pushes on agents — the
+    /// cluster's when it is a member of `cluster` (§11.5), reaching the agent
+    /// in its own process while cut off, else the one in its own process. A
+    /// workspace naming no repository needs no agent: its commands run in
+    /// [`ToolHost::new`]'s sandboxes.
     pub fn deployed(
         workspace: &Workspace,
         secrets: Arc<Secrets>,
@@ -790,12 +791,19 @@ impl ToolHost {
         // Every command and push on an agent — the cluster's, or the one in
         // this process alone (`docs/substrate_git.md` §9): a repository is
         // a store with no working tree, which nothing runs in.
-        let agents = crate::substrate_git::agents(cluster, agent).ok_or_else(|| {
-            anyhow::anyhow!(
-                "commands and pushes run on an agent, and there is none: give the process an \
-                 `agent:` file"
-            )
-        })?;
+        let Some(agents) = crate::substrate_git::agents(cluster, agent) else {
+            let repos = workspace
+                .repos()
+                .iter()
+                .any(|r| r.name != crate::workspace::UPLOADS_REPO);
+            if repos {
+                anyhow::bail!(
+                    "commands and pushes run on an agent, and there is none: give the process \
+                     an `agent:` file"
+                );
+            }
+            return Ok(Self::new(workspace, secrets)?);
+        };
         let executor =
             AgentExecutor::new(agents, Handle::current(), workspace.root().join(JOBS_DIR));
         Ok(Self::on(workspace, secrets, Arc::new(executor)))

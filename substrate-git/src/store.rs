@@ -160,7 +160,8 @@ impl Store {
     }
 
     /// Bring the store up to `records`: take every pack it lacks whose blob has
-    /// arrived, then move every record branch whose packs are all here.
+    /// arrived, then, once every pack the log lists is here, move every record
+    /// branch whose own `needs` are too.
     pub fn sync(&self, records: &dyn Records) -> anyhow::Result<Synced> {
         let log = Log::new(records, &self.name)?;
         let mut synced = Synced::default();
@@ -190,7 +191,12 @@ impl Store {
             let Some(branch) = name.strip_prefix("refs/heads/") else {
                 continue;
             };
-            if !entry.needs.iter().all(|sha| held.contains(sha)) {
+            // Every pack the log lists, not only the ref's own `needs`: a ref
+            // published before `needs` named every pack it reaches through
+            // (`crate::publish`) lists only its newest, and its parents may
+            // be in any other. A tracking ref never names a commit whose
+            // history the store cannot read whole.
+            if synced.waiting > 0 || !entry.needs.iter().all(|sha| held.contains(sha)) {
                 synced.behind += 1;
                 continue;
             }

@@ -1,18 +1,20 @@
 //! zend's repositories read from the substrate (`docs/substrate_git.md` §7).
 //!
-//! With `substrate_git: true`, each repository `workspace.yaml` names is read
-//! from the object store derived from the log, `<workspace>/substrate/git/<name>`,
-//! instead of a folder under the workspace. The repository keeps its name, so
-//! every tool, path and ingest key is unchanged; only the folder behind it
-//! moves. A member then needs no checkouts: its stores fill from the log.
+//! Each repository `workspace.yaml` names is read from the object store
+//! derived from the log, `<workspace>/substrate/git/<name>`; there is no folder
+//! for it under the workspace. The repository keeps its name, so every tool,
+//! path and ingest key is unchanged. A member needs no checkouts: its stores
+//! fill from the log, and origin is reached only through an agent — the
+//! cluster's, or the one in this process (`docs/substrate_git.md` §9).
 //!
 //! Every repository is loaded whole during the [`LoadStep::Repositories`] step
 //! — pulled through an agent first when no member has — and then followed
-//! ([`substrate_git::member::Repos`]). A record branch that moves wakes the
-//! ingest worker.
+//! ([`substrate_git::member::Repos`]) until [`Repositories::stop`]. A record
+//! branch that moves wakes the ingest worker.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use ::substrate_git::member::{Access, Loading, Repos};
 use agent::client::Agents;
@@ -28,9 +30,6 @@ use crate::loading::{LoadProgress, LoadStep};
 
 /// The stores' folder inside the substrate.
 pub const GIT_DIR: &str = "git";
-
-/// This daemon's repositories, once loaded.
-static REPOS: OnceLock<Repos> = OnceLock::new();
 
 /// Where `root`'s stores are.
 pub fn stores_root(root: &Path) -> PathBuf {
@@ -84,6 +83,45 @@ pub fn access(
     })
 }
 
+/// A load's repositories, followed on a thread of their own until
+/// [`Repositories::stop`] — or until dropped, unwaited.
+pub struct Repositories {
+    repos: Repos,
+    /// What the follower asks each round: once set, it ends.
+    stop: Arc<AtomicBool>,
+    /// Disconnected once the follower has ended: its one sender lives in the
+    /// closure the follower owns, dropped as the thread returns or unwinds.
+    exited: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl Repositories {
+    /// Wake `f` whenever a record branch moves — and once now, for a branch
+    /// that moved between the load and this call, which no later round of
+    /// the follower reports again.
+    pub fn on_change(&self, f: Arc<dyn Fn() + Send + Sync>) {
+        let wake = Arc::clone(&f);
+        self.repos.on_change(Arc::new(move |_: &str| wake()));
+        f();
+    }
+
+    /// Stop following and wait for the follower to end: at most the round in
+    /// flight. Blocking.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let exited = self.exited.lock().unwrap().take();
+        if let Some(exited) = exited {
+            // Nothing is ever sent: this returns once the sender is dropped.
+            let _ = exited.recv();
+        }
+    }
+}
+
+impl Drop for Repositories {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Load every repository of `names` whole, through `access`, then follow them
 /// on a thread.
 pub fn load(
@@ -93,7 +131,7 @@ pub fn load(
     access: Access,
     progress: &LoadProgress,
     status: &watch::Sender<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Repositories> {
     let repos = Repos::open(&stores_root(root), names, shared, access)?;
     progress.set_step(LoadStep::Repositories);
     repos.load(&crate::ingest_cancel::cancelled, &|state: &[Loading]| {
@@ -103,9 +141,23 @@ pub fn load(
         status.send(detail(state)).ok();
     })?;
     status.send(String::new()).ok();
-    repos.follow(Arc::new(crate::ingest_cancel::cancelled))?;
-    let _ = REPOS.set(repos);
-    Ok(())
+    let stop = Arc::new(AtomicBool::new(false));
+    let (exited_tx, exited) = mpsc::channel::<()>();
+    let stopped: Arc<dyn Fn() -> bool + Send + Sync> = {
+        let stop = Arc::clone(&stop);
+        let exited_tx = Mutex::new(exited_tx);
+        Arc::new(move || {
+            // Held, never sent on: dropped with the follower's closure.
+            let _ = &exited_tx;
+            stop.load(Ordering::Relaxed)
+        })
+    };
+    repos.follow(stopped)?;
+    Ok(Repositories {
+        repos,
+        stop,
+        exited: Mutex::new(Some(exited)),
+    })
 }
 
 /// What the loading page says while repositories load: each one still
@@ -121,11 +173,4 @@ fn detail(state: &[Loading]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-/// Wake `f` whenever a record branch moves.
-pub fn on_change(f: Arc<dyn Fn() + Send + Sync>) {
-    if let Some(repos) = REPOS.get() {
-        repos.on_change(Arc::new(move |_| f()));
-    }
 }

@@ -4,6 +4,7 @@
 //! object store it derives from its log ([`Repo::take_pack`]).
 
 use std::fs;
+use std::path::Path;
 
 use crate::error::GitError;
 use crate::runner::utf8;
@@ -18,18 +19,25 @@ const PACKING_DIR: &str = "zend-packing";
 const PACK_HEADER: usize = 12;
 
 impl Repo {
-    /// Packs of every object reachable from `tips` and not from `known`, each
-    /// at most `max_bytes` (git's `--max-pack-size`, so a pack holding one
-    /// object larger than that is larger). Empty when `known` already reaches
-    /// everything. A `known` commit this repository lacks is passed over.
-    pub fn pack_objects(
+    /// Pack every object reachable from `tips` and not from `known`, handing
+    /// each pack to `each` in turn; how many it was handed. Each is at most
+    /// `max_bytes` (git's `--max-pack-size`, so a pack holding one object
+    /// larger than that is larger), and only one is read into memory at a
+    /// time, so a whole history is never in memory at once. None when
+    /// `known` already reaches everything. A `known` commit this repository
+    /// lacks is passed over.
+    ///
+    /// The write lock is held until the last pack is handed over: the packs
+    /// wait in a folder of this repository's own.
+    pub fn pack_objects<E: From<GitError>>(
         &self,
         tips: &[Oid],
         known: &[Oid],
         max_bytes: u64,
-    ) -> Result<Vec<Vec<u8>>, GitError> {
+        mut each: impl FnMut(Vec<u8>) -> Result<(), E>,
+    ) -> Result<usize, E> {
         if tips.is_empty() {
-            return Ok(Vec::new());
+            return Ok(0);
         }
         let mut revs = String::new();
         for tip in tips {
@@ -52,19 +60,12 @@ impl Repo {
             .arg(base.as_os_str())
             .stdin(revs.into_bytes())
             .run_ok();
-        let packs = made.and_then(|out| {
-            let mut packs = Vec::new();
-            for name in utf8("pack-objects", out)?.lines() {
-                let path = dir.join(format!("pack-{}.pack", name.trim()));
-                let bytes = fs::read(&path).map_err(GitError::Io)?;
-                if object_count(&bytes) > 0 {
-                    packs.push(bytes);
-                }
-            }
-            Ok(packs)
-        });
+        let handed = made
+            .and_then(|out| utf8("pack-objects", out))
+            .map_err(E::from)
+            .and_then(|names| hand_over(&dir, &names, &mut each));
         let _ = fs::remove_dir_all(&dir);
-        packs
+        handed
     }
 
     /// Take `pack` into this repository's object store, indexed. A pack
@@ -103,6 +104,25 @@ impl Repo {
     }
 }
 
+/// Read each pack `pack-objects` named in `names` out of `dir` and hand it to
+/// `each`, one in memory at a time; how many were handed.
+fn hand_over<E: From<GitError>>(
+    dir: &Path,
+    names: &str,
+    each: &mut impl FnMut(Vec<u8>) -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut handed = 0;
+    for name in names.lines() {
+        let path = dir.join(format!("pack-{}.pack", name.trim()));
+        let bytes = fs::read(&path).map_err(GitError::Io)?;
+        if object_count(&bytes) > 0 {
+            each(bytes)?;
+            handed += 1;
+        }
+    }
+    Ok(handed)
+}
+
 /// How many objects a pack says it holds; zero for bytes too short to be one.
 pub fn object_count(pack: &[u8]) -> u32 {
     if pack.len() < PACK_HEADER || &pack[..4] != b"PACK" {
@@ -126,6 +146,19 @@ mod tests {
     use super::*;
     use crate::testing::TestRepo;
 
+    /// Every pack `pack_objects` hands over, collected.
+    fn packs(repo: &Repo, tips: &[Oid], known: &[Oid]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let handed = repo
+            .pack_objects(tips, known, 64 << 20, |pack| {
+                out.push(pack);
+                Ok::<_, GitError>(())
+            })
+            .unwrap();
+        assert_eq!(handed, out.len());
+        out
+    }
+
     /// **A pack carries what one repository has and another lacks**, and the
     /// other reads every object of it once taken.
     #[test]
@@ -137,11 +170,9 @@ mod tests {
         let second = a.commit_all("two");
         let repo = Repo::open(&a.path).unwrap();
 
-        let all = repo.pack_objects(&[second.clone()], &[], 64 << 20).unwrap();
+        let all = packs(&repo, &[second.clone()], &[]);
         assert_eq!(all.len(), 1);
-        let only_new = repo
-            .pack_objects(&[second.clone()], &[first.clone()], 64 << 20)
-            .unwrap();
+        let only_new = packs(&repo, &[second.clone()], &[first.clone()]);
         assert_eq!(only_new.len(), 1);
         assert!(object_count(&only_new[0]) < object_count(&all[0]));
 
@@ -160,9 +191,6 @@ mod tests {
         a.write("f", b"one\n");
         let head = a.commit_all("one");
         let repo = Repo::open(&a.path).unwrap();
-        assert!(repo
-            .pack_objects(&[head.clone()], &[head], 64 << 20)
-            .unwrap()
-            .is_empty());
+        assert!(packs(&repo, &[head.clone()], &[head]).is_empty());
     }
 }

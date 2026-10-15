@@ -152,6 +152,36 @@ fn only_a_descendant_replaces_a_ref_unless_forced() {
     assert_eq!(forced.refs, vec![(main_ref(), Some(parent))]);
 }
 
+/// **A ref needs only the packs written with it**, and a member still reads its
+/// whole history: sync moves no ref while any pack the log lists is missing.
+#[test]
+fn a_ref_needs_its_own_packs_and_syncs_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    checkout(&src, 2);
+    let log = Mem::default();
+    let source = Repo::open(&src).unwrap();
+    adopt(&log, "r", &source).unwrap();
+
+    std::fs::write(src.join("f"), "more\n").unwrap();
+    git(&src, &["commit", "-qam", "more"]);
+    let head = Oid::parse(&git(&src, &["rev-parse", "HEAD"])).unwrap();
+    let moved = publish(&log, "r", &source, &[(main_ref(), Some(head.clone()))], false).unwrap();
+    assert_eq!(moved.packs, 1);
+
+    let packs: BTreeSet<String> = Log::new(&log, "r").unwrap().packs().unwrap().into_keys().collect();
+    let held = Log::new(&log, "r").unwrap().refs().unwrap();
+    let needs: BTreeSet<String> = held["refs/heads/main"].needs.iter().cloned().collect();
+    assert_eq!(packs.len(), 2);
+    assert_eq!(needs.len(), 1);
+    assert!(needs.is_subset(&packs));
+
+    let store = Store::open(&tmp.path().join("m"), "r").unwrap();
+    store.sync(&log).unwrap();
+    assert_eq!(branch(&store), Some(head));
+}
+
 /// **Deleting the store loses nothing**: reopened and synced, it holds the
 /// same branch.
 #[test]

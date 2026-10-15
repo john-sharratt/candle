@@ -82,23 +82,44 @@ impl Ledger {
     /// and wrong, so every ambiguity resolves towards doing the work again.
     pub fn open(data: &Path) -> Self {
         let path = ledger_path(data);
+        // Ledgers before mind paths keyed each document by the absolute path a
+        // walk of `<mind>/layers` found it at. Rewritten once to the mind path
+        // from `layers/` on, keeping the hash — or every document re-ingests.
+        let (mut migrated, mut dropped) = (0usize, 0usize);
         let hashes: HashMap<PathBuf, String> = std::fs::read_to_string(&path)
             .ok()
             .and_then(|t| serde_json::from_str::<HashMap<PathBuf, String>>(&t).ok())
             .unwrap_or_default()
             .into_iter()
-
+            .filter_map(|(key, h)| match mind_key(&key) {
+                Some(k) if k == key => Some((k, h)),
+                Some(k) => {
+                    migrated += 1;
+                    Some((k, h))
+                }
+                None => {
+                    dropped += 1;
+                    None
+                }
+            })
             .collect();
-        if !hashes.is_empty() {
-            tracing::info!(
-                "ingest ledger: {} document(s) already in the substrate",
-                hashes.len()
-            );
-        }
-        Self {
+        let ledger = Self {
             hashes: Mutex::new(hashes),
             path: Some(path),
+        };
+        if migrated + dropped > 0 {
+            ledger.flush();
+            tracing::info!(
+                "ingest ledger: {migrated} key(s) migrated to mind paths, {dropped} outside `layers/` dropped"
+            );
         }
+        let hashes = ledger.hashes.lock().unwrap().len();
+        if hashes > 0 {
+            tracing::info!(
+                "ingest ledger: {hashes} document(s) already in the substrate"
+            );
+        }
+        ledger
     }
 
     /// Write the ledger out.
@@ -240,6 +261,25 @@ fn hash(content: &str) -> String {
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
+/// A ledger key as a mind path: itself when it already is one, else its suffix
+/// from the first `layers` component, joined with '/'. `None` for a key with no
+/// `layers` in it — nothing a mind path could be recovered from.
+fn mind_key(key: &Path) -> Option<PathBuf> {
+    let text = key.to_string_lossy();
+    let parts: Vec<&str> = text.split(|c| c == '/' || c == '\\').collect();
+    let valid = !key.has_root()
+        && !key.is_absolute()
+        && !text.contains('\\')
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && *p != "." && *p != ".." && !p.contains(':'));
+    if valid {
+        return Some(key.to_path_buf());
+    }
+    let from = parts.iter().position(|p| *p == "layers")?;
+    Some(PathBuf::from(parts[from..].join("/")))
+}
+
 /// Files in the mind that carry ingestible content.
 ///
 /// Authored content is YAML and Markdown. Everything else in a mind directory —
@@ -367,10 +407,7 @@ mod tests {
     #[test]
     fn a_saved_ledger_is_read_back_and_skips_what_it_holds() {
         let data = tmp();
-        let mind = data.join("mind");
-        std::fs::create_dir_all(&mind).unwrap();
-        let doc = mind.join("world.md");
-        std::fs::write(&doc, "# Alpha").unwrap();
+        let doc = PathBuf::from("layers/world.md");
 
         let first = Ledger::open(&data);
         assert_eq!(first.reconcile(&doc, Some("# Alpha")), Reconcile::Added);
@@ -391,6 +428,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    /// **A ledger keyed by absolute paths opens keyed by mind paths**, hashes
+    /// kept — or the first boot after mind paths re-ingests the whole mind.
+    #[test]
+    fn an_absolute_keyed_ledger_opens_as_mind_paths() {
+        let data = tmp();
+        let old = PathBuf::from("D:/prog/mind\\layers\\world\\x.md");
+        let stray = PathBuf::from("D:/prog/mind\\missions.yaml");
+        let h = hash("# X");
+        let file = ledger_path(&data);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let old_map: HashMap<PathBuf, String> =
+            [(old, h.clone()), (stray, h.clone())].into_iter().collect();
+        std::fs::write(&file, serde_json::to_string(&old_map).unwrap()).unwrap();
+
+        let l = Ledger::open(&data);
+        let new = Path::new("layers/world/x.md");
+        assert_eq!(
+            l.hashes.lock().unwrap().clone(),
+            [(new.to_path_buf(), h)].into_iter().collect::<HashMap<_, _>>()
+        );
+        assert_eq!(l.reconcile(new, Some("# X")), Reconcile::Unchanged);
+        // Flushed once, so the next open reads mind paths straight off disk.
+        assert_eq!(Ledger::open(&data).inspect(new, Some("# X")), Reconcile::Unchanged);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     /// **After a wipe, every document is owed again** — on disk as well as in
     /// memory. `--wipe-conversations` retires every turn the ledger vouches for,
     /// and a ledger that still vouched for them after a restart would skip the
@@ -398,7 +461,7 @@ mod tests {
     #[test]
     fn a_forgotten_ledger_owes_every_document_again() {
         let data = tmp();
-        let doc = data.join("world.md");
+        let doc = PathBuf::from("layers/world.md");
 
         let first = Ledger::open(&data);
         first.reconcile(&doc, Some("# Alpha"));

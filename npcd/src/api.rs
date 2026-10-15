@@ -16,7 +16,7 @@
 //! `registry::id::check` first.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, RwLock as SyncRwLock};
 
 use axum::{
@@ -109,6 +109,10 @@ pub struct Authored {
     pub personality_portraits: SyncRwLock<BTreeMap<String, String>>,
     /// The mind directory, for the file editor.
     pub mind: Mind,
+    /// The folder the worlds and personalities are kept in, and an author's
+    /// writes go to when the mind has no folder of its own: the data
+    /// directory of a daemon with none.
+    authored_dir: PathBuf,
     /// The engine.
     ///
     /// Always present, and always *there before the model is*. The daemon binds
@@ -151,6 +155,13 @@ impl Authored {
         images: Images,
         personality_portraits: BTreeMap<String, String>,
     ) -> Self {
+        // Both registries are read from their folders of one place, which is
+        // where an author's writes go when the mind has no folder.
+        let authored_dir = worlds
+            .dir()
+            .parent()
+            .map(FsPath::to_path_buf)
+            .unwrap_or_default();
         Self {
             worlds: RwLock::new(worlds),
             personalities: RwLock::new(personalities),
@@ -161,6 +172,7 @@ impl Authored {
             images,
             personality_portraits: SyncRwLock::new(personality_portraits),
             mind,
+            authored_dir,
             runtime: None,
             lifegen: Jobs::new(),
         }
@@ -170,7 +182,7 @@ impl Authored {
     /// where its writes go — its drafts, over a mind under git (§10.3).
     pub fn author(&self, account: &str) -> Author {
         let stores = self.runtime.as_ref().map(|rt| &rt.ops);
-        Author::open(&self.mind, stores, account)
+        Author::open(&self.mind, &self.authored_dir, stores, account)
     }
 
     /// What follows a write through `author`: over a mind that keeps no

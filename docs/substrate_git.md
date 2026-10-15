@@ -1,7 +1,7 @@
 # Git in the substrate: repositories replicate as packs
 
 **Status:** stages 1–3 are built (§11): the records, the derived store, the importer and
-adoption (`substrate-git/`), zend behind `substrate_git: true`, and npcd's mind read from
+adoption (`substrate-git/`), zend reading every repository from its store, and npcd's mind read from
 the substrate with `--mind-repo`. Stage 4 is not, and nothing has run end to end yet.
 **Scope:** where a member's git objects and refs come from. Today every zend member reads
 each workspace repository from its own checkout, and every npcd member reads its mind
@@ -10,7 +10,7 @@ packs and refs become replicated records, and a member reads every repository fr
 its log holds. Agents remain the only machines that talk to `origin` (fetch, push) and the
 only ones with working trees for commands. zend and npcd use the same mechanism.
 
-§1 is the code as it stands. §2 lists the decisions. §3–§9 are the design. §10 lists what
+§1 is the code as it stood before this design. §2 lists the decisions. §3–§9 are the design. §10 lists what
 it removes and what it adds, §11 the build order, §12 the tests, §13 what is open.
 
 ---
@@ -34,8 +34,8 @@ it removes and what it adds, §11 the build order, §12 the tests, §13 what is 
   and push them to `origin` under a lease (`zend-vfs/src/write/commit.rs`,
   `zend-vfs/src/remote/push.rs`). The objects exist only on that member until the push
   lands and the other members fetch.
-- Every member fetches for itself. One `origin_watch` task per repository probes `origin`
-  every couple of seconds and fetches on a change (`zend/src/origin_watch/mod.rs`).
+- Every member fetched for itself. One `origin_watch` task per repository probed `origin`
+  every couple of seconds and fetched on a change (`zend/src/origin_watch/`, removed by §7).
 - Routing has to care. `HELLO.repos` lists a member's repositories, and `Sticky`/`Best`
   consider only members holding every repository a conversation names
   (`docs/replicated_substrate.md` §10.1). D10 there exists because "machines with
@@ -101,9 +101,9 @@ content; battle-mind's are under 0.1 GB.
 | G3 | **One member imports from `origin`**, holding the lease `git/<repo>`, fetching through an agent. Everyone else learns new commits by replication (§5). | One fetch per change for the whole group, instead of one per member. |
 | G4 | **Every member publishes its own pushes**, packs first, then the branch (§6). | A commit that lands on `origin` reaches every member through the log, not through each member's next fetch. |
 | G5 | **A member's object store is derived from its log**: a repository with an empty working tree at `<substrate>/git/<repo>`, filled only from the log's packs, whose record branches are the log's (§4). Stage 4 replaces it with an in-process object database (§11). | `Repo` sends writes and some reads to the `git` program, which needs a repository on disk (§1.1). Unlike today's checkouts and mirror, it has no other source, so it cannot diverge from the log. |
-| G6 | **Repositories are names, not folders.** With `substrate_git: true`, a member reads each repository `workspace.yaml` names from its store and needs no checkout (§7). | Members stop needing per-machine clones. |
+| G6 | **Repositories are names, not folders.** A member reads each repository `workspace.yaml` names from its store and needs no checkout (§7). | Members stop needing per-machine clones. |
 | G7 | **npcd's mind is a repository like zend's.** npcd reads it through the same store, at a commit. A branch move replaces the file watcher's trigger, and the mirror is retired (§8). | One mechanism for both daemons. The schema, the corpus and an operation's base all come from one commit in the log. |
-| G8 | **Standalone daemons use the same read path.** Without `--cluster`, the importer fetches from the checkout's own `origin` (§9). | One code path. |
+| G8 | **Standalone daemons use the same read path.** Without `--cluster`, the importer fetches through the agent in this process instead of the cluster's (§9). | One code path. |
 | G9 | **Packs are never collected in this design**, as `Blob` records are not. LFS content is not imported (§13). | git history is append-only by intent. Reachability collection and LFS are separable work. |
 
 ---
@@ -210,25 +210,27 @@ member's next tick publishes it, packs first. Since the push was compare-and-swa
 
 ## 7. zend
 
-Built behind `substrate_git: true` (`--substrate-git`), in `zend/src/substrate_git.rs`.
+Built, with no setting and no checkout mode, in `zend/src/substrate_git.rs`.
 
-- **Manifest.** Unchanged: `workspace.yaml` names repositories. With the setting, the
-  manifest is read without requiring the folders (`Workspace::manifest`), and each
+- **Manifest.** Unchanged: `workspace.yaml` names repositories. The manifest is read
+  without requiring the folders (`Workspace::manifest`), and each
   repository's folder is its store (`Workspace::with_dir`). The name is unchanged, so every
   tool argument, workspace-relative path and ingest key is too.
 - **Everything that opens `repo.dir`** — `GitSource` for the lower layer, branch ingest,
   conversation branches, pushes through `AgentPush` — opens the store with no other
   change.
 - **Starting.** After the cluster join and catch-up, before anything reads a branch, each
-  repository is brought up to the log once: a checkout at `<workspace>/<name>` the log
-  has not seen is adopted (§9), and the importer ticks. Then a `substrate-git` thread
-  ticks every 2 s.
+  repository is brought up to the log once, pulled through an agent (§9) when the log
+  names no branch of it. Then a `substrate-git` thread ticks every 2 s until shutdown
+  stops and joins it, before the drain. A workspace naming no repository skips the step
+  and needs no agent.
 - **Conversation bases.** A store has no local branch, so a conversation's base is the
   record's `main` (else `master`) before `HEAD` (`zend/src/conv_branches.rs`).
-- **`origin_watch`** is not started; the importer wakes the ingest worker instead.
+- **The ingest worker** is woken by a record branch that moves, and once when it starts
+  listening; `origin_watch` is removed.
 - **Commands** (`run_command`) already run on agents with the conversation's overlay.
 - **Not yet:** `HELLO.repos` still advertises each repository, now with the URL
-  `agent:<name>` on every member, so routing is unchanged among members with the setting.
+  `agent:<name>` on every member, so routing is unchanged among members.
 
 ---
 
@@ -299,7 +301,8 @@ one; no daemon reads a checkout, a folder or `origin` of its own.
 - **With no cluster**, the agent in this process alone: the host opens the `agent:`
   file's checkouts and runs their jobs, joined to nothing (`host::cluster::standalone_agent`,
   `Agents::in_process`). Tenants get it as `TenantContext::agent`.
-- **No agent at all** is a startup error naming the missing `agent:` file.
+- **No agent at all** is a startup error naming the missing `agent:` file, unless the
+  workspace names no repository.
 
 So zend has no checkout mode: every repository `workspace.yaml` names is read from its
 store, and `origin_watch` is gone. npcd has no `--mind <folder>`: the mind is
@@ -340,7 +343,7 @@ fixtures only; nothing in a daemon builds one.
 | Stage | Contents | State |
 |---|---|---|
 | 1 | Pack and branch records; the derived store; the importer and its lease; adoption | Built: `substrate-git/` |
-| 2 | zend reads from the derived store behind `substrate_git: true`; repositories loaded whole while zend loads; `origin_watch` replaced | Built: `zend/src/substrate_git.rs` |
+| 2 | zend reads every repository from the derived store; repositories loaded whole while zend loads; `origin_watch` removed | Built: `zend/src/substrate_git.rs` |
 | 3 | npcd reads the mind at a commit through `MindFiles`; the mirror retired; the watcher's trigger a branch move | Built: `npcd/src/mind/files.rs`, `npcd/src/mind_store.rs` |
 | 4 | An in-process object database: the remaining `git` program writes and reads ported to libgit2 over packs read from the log, and the derived store deleted | Not started; optional |
 

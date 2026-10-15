@@ -24,7 +24,7 @@ pub mod records;
 pub mod routes;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::mind::Mind;
@@ -36,6 +36,9 @@ use crate::sim::shelf::{Published, Shelf};
 use self::disk::Disk;
 use self::overlay::{Drafted, Overlay};
 
+/// Why a write is refused while the mind has not arrived.
+const PENDING: &str = "the mind has not arrived from the substrate yet — nothing can be written until it has";
+
 /// One account's view of the mind, and where its writes go.
 pub enum Author {
     /// A mind under git: the published mind under the account's drafts, its
@@ -44,21 +47,34 @@ pub enum Author {
     /// A mind folder that is not a git repository: read and written as it
     /// stands.
     Disk(Disk),
+    /// A mind read from the substrate that has not arrived yet: nothing to
+    /// read, and every write refused rather than landed somewhere else.
+    Pending,
 }
 
 impl Author {
     /// Account `account`'s view of `mind`, over `stores` when the daemon has
-    /// them.
-    pub fn open(mind: &Mind, stores: Option<&Arc<MindStores>>, account: &str) -> Author {
-        let published = mind
-            .published()
-            .unwrap_or_else(|| Published::folder(PathBuf::new()));
+    /// them. A mind with no folder of its own is written in `authored` — the
+    /// folder the worlds and personalities are kept in — as it stands.
+    pub fn open(
+        mind: &Mind,
+        authored: &Path,
+        stores: Option<&Arc<MindStores>>,
+        account: &str,
+    ) -> Author {
+        let files = mind.files();
+        if files.is_none() && mind.repo_dir().is_some() {
+            return Author::Pending;
+        }
+        let published = files
+            .map(Published::of)
+            .unwrap_or_else(|| Published::folder(authored));
         let Some(stores) = stores.filter(|s| s.under_git()) else {
             let root = published
                 .files()
                 .folder_root()
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
+                .unwrap_or(authored)
+                .to_path_buf();
             return Author::Disk(Disk::new(root));
         };
         let store = StoreShelf {
@@ -92,7 +108,7 @@ impl Author {
     pub fn drafted(&self) -> Drafted {
         match self {
             Author::Drafts { view, .. } => view.drafts().clone(),
-            Author::Disk(_) => Drafted::new(),
+            Author::Disk(_) | Author::Pending => Drafted::new(),
         }
     }
 
@@ -113,7 +129,7 @@ impl Author {
     pub fn owner(&self) -> Option<&Owner> {
         match self {
             Author::Drafts { store, .. } => Some(&store.owner),
-            Author::Disk(_) => None,
+            Author::Disk(_) | Author::Pending => None,
         }
     }
 
@@ -125,6 +141,7 @@ impl Author {
                 !view.drafts().contains_key(key) && view.published().not_a_document(key)
             }
             Author::Disk(disk) => disk.folder.not_a_document(key),
+            Author::Pending => false,
         }
     }
 }
@@ -134,6 +151,7 @@ impl Shelf for Author {
         match self {
             Author::Drafts { view, .. } => view.read(key),
             Author::Disk(disk) => disk.read(key),
+            Author::Pending => None,
         }
     }
 
@@ -141,6 +159,7 @@ impl Shelf for Author {
         match self {
             Author::Drafts { view, .. } => view.list(dir),
             Author::Disk(disk) => disk.list(dir),
+            Author::Pending => BTreeSet::new(),
         }
     }
 
@@ -148,6 +167,7 @@ impl Shelf for Author {
         match self {
             Author::Drafts { view, .. } => view.size(key),
             Author::Disk(disk) => disk.size(key),
+            Author::Pending => None,
         }
     }
 
@@ -159,6 +179,7 @@ impl Shelf for Author {
                 Ok(())
             }
             Author::Disk(disk) => disk.commit(changes),
+            Author::Pending => Err(PENDING.to_string()),
         }
     }
 }
