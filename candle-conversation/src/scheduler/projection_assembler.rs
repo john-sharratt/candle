@@ -1039,6 +1039,31 @@ pub(super) fn apply_segments_build(
     // new Arc, forcing a conservative recompute). Resumed from the kept prefix's
     // end, where it stood when that piece was placed.
     let mut islands: Vec<PlannedIsland> = Vec::new();
+    // The convention assert below names only the slot; this names the first
+    // piece (or the kept-prefix restore) after which the two counts parted.
+    let mut drift_seen = false;
+    let mut check_drift = |ctx: &ApplyContext<'_>, walker: &SegmentWalker, at: &dyn Fn() -> String| {
+        if drift_seen {
+            return;
+        }
+        let Some(off) = ctx.session.sequence_offset(parent_id.0) else {
+            return;
+        };
+        if off as u32 != walker.logical_pos {
+            drift_seen = true;
+            tracing::warn!(
+                target: "candle_conversation::scheduler::reproject",
+                slot = parent_id.0,
+                slot_offset = off,
+                logical_pos = walker.logical_pos,
+                blocks = ?ctx.session.sequence_block_count(parent_id.0),
+                kept = keep,
+                at = %at(),
+                "apply_segments: slot offset and walker position parted"
+            );
+        }
+    };
+    check_drift(ctx, &walker, &|| "kept prefix".to_string());
     for i in keep..pieces.len() {
         let pos_before = walker.logical_pos;
         match &pieces[i] {
@@ -1226,6 +1251,7 @@ pub(super) fn apply_segments_build(
                 prefix_h.write_u32(walker.logical_pos - pos_before);
             }
         }
+        check_drift(ctx, &walker, &|| format!("piece {i} {}", piece_label(&pieces[i])));
         // What the slot holds after this piece, for the next rebuild to keep.
         // The deferred user message is prefilled after the walk and never
         // part of a kept prefix.
