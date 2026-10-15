@@ -148,7 +148,12 @@ mod tests {
 
         let workspace = Workspace::new(d.path(), vec![RepoSpec::named("k")]).unwrap();
         let ctx = ToolContext::with_workspace(workspace);
-        let shown = zend_tools::run("file_list", "test", &serde_json::json!({"repo": "k"}), &ctx);
+        let shown = zend_tools::run(
+            "file_list",
+            "test",
+            &serde_json::json!({"repo": "k", "page": 0}),
+            &ctx,
+        );
         let listed_by_tool: Vec<String> = shown["entries"]
             .as_array()
             .expect("entries array")

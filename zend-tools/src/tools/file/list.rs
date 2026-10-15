@@ -22,9 +22,14 @@ pub struct ListRequest {
     /// Defaults to "" — the repository's root. Must name a real directory (or
     /// the root); a file path does not resolve.
     pub path: Option<String>,
-    /// Zero-based page of results to return. Defaults to 0. When the response's
+    /// Zero-based page of results to return — 0 to start. When the response's
     /// `paging.next_page` is set, pass it here to read the following page.
-    pub page: Option<u32>,
+    ///
+    /// Required, as on every paged tool. Optional, a call for the next page
+    /// that left it out was the first call again, word for word: measured, a
+    /// listing turn asked for "page 2" of four directories that way, got page
+    /// 0 back each time, and never saw the rest.
+    pub page: u32,
 }
 
 #[derive(Serialize)]
@@ -74,8 +79,9 @@ impl Tool for FileList {
          entry (`dir: true`), never expanded — so list it in turn to go \
          further. `path` must name a real directory; a file path does not \
          resolve. Ignored paths (per .gitignore and friends) never appear. \
-         Results are paged: the response's `paging` reports the total and, \
-         when more remain, a `next_page` to pass back as `page`. Returns names \
+         Results are paged and `page` is required — pass 0 to start; the \
+         response's `paging` reports the total and, when more remain, a \
+         `next_page` to pass back as `page`. Returns names \
          and byte sizes, not file contents or line counts; a file entry carries \
          `modified: true` when this session has changed it. Use file_read to \
          get a file's contents — read page 0 and its header reports the \
@@ -100,7 +106,7 @@ impl Tool for FileList {
             .repo(&repo)?
             .list_dir(path)?
             .ok_or_else(|| FileError::NotFound(path.to_string()))?;
-        let paging = Paging::of(all.len(), req.page.unwrap_or(0), LIST_PAGE_ENTRIES);
+        let paging = Paging::of(all.len(), req.page, LIST_PAGE_ENTRIES);
         let entries = all
             .into_iter()
             .skip(paging.skipped())

@@ -106,12 +106,13 @@ pub fn folder_anchor(repo: &str, inner: &str) -> String {
 }
 
 /// The `file_list` arguments for `unit`: the repository alone for its root,
-/// the repository and path otherwise — in the order the tool's schema
-/// declares them.
+/// the repository and path otherwise, and its first page — in the order the
+/// tool's schema declares them. `page` is required, and a prefilled call is
+/// what the model learns to write, so it is written here too.
 fn list_args(unit: &DirUnit) -> Vec<(&'static str, &str)> {
     match split(&unit.dir) {
-        (repo, "") => vec![("repo", repo)],
-        (repo, inner) => vec![("repo", repo), ("path", inner)],
+        (repo, "") => vec![("repo", repo), ("page", "0")],
+        (repo, inner) => vec![("repo", repo), ("path", inner), ("page", "0")],
     }
 }
 
@@ -135,9 +136,14 @@ pub fn render_list_call(env: &ToolCallEnvelope, unit: &DirUnit) -> String {
 /// `file_list` against `ctx`, so the bytes are the tool's own. The listing is
 /// literal: a file name is the workspace's text, not markup.
 pub fn render_list_response(ctx: &ToolContext, unit: &DirUnit) -> TurnText {
+    // The page is the one number among them; the rest are names, whatever
+    // they look like.
     let args: Map<String, Value> = list_args(unit)
         .into_iter()
-        .map(|(k, v)| (k.to_string(), json!(v)))
+        .map(|(k, v)| match (k, v.parse::<u32>()) {
+            ("page", Ok(page)) => (k.to_string(), json!(page)),
+            _ => (k.to_string(), json!(v)),
+        })
         .collect();
     let value = zend_tools::run("file_list", "repo_map_prefill", &Value::Object(args), ctx);
     let body = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
@@ -329,7 +335,7 @@ mod tests {
         assert_eq!(root.dir, "a/");
         assert_eq!(
             render_list_call(&env(), root),
-            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"a\"}}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"a\", \"page\": 0}}\n</tool_call>",
         );
         let listing = render_list_response(&ctx_for(&d), root).text();
         assert!(
@@ -377,7 +383,7 @@ mod tests {
         assert_eq!(
             call,
             "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"a\", \
-             \"path\": \"src\"}}\n</tool_call>",
+             \"path\": \"src\", \"page\": 0}}\n</tool_call>",
         );
     }
 
@@ -404,7 +410,7 @@ mod tests {
         let env = ToolCallEnvelope::for_dialect(&Dialect::qwen35());
         assert_eq!(
             render_list_call(&env, &units[0]),
-            env.render("file_list", &[("repo", "a")]),
+            env.render("file_list", &[("repo", "a"), ("page", "0")]),
             "the listing call must be the dialect envelope's own rendering",
         );
         // And it is the CHECKPOINT's envelope, not a hardcoded family: ask the
@@ -412,7 +418,7 @@ mod tests {
         let lines = ToolCallEnvelope::for_dialect(&Dialect::llama3());
         assert_eq!(
             render_list_call(&lines, &units[0]),
-            lines.render("file_list", &[("repo", "a")]),
+            lines.render("file_list", &[("repo", "a"), ("page", "0")]),
         );
     }
 

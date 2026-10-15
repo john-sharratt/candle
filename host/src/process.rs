@@ -22,8 +22,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-use crate::log_file::{is_resuming, RotatingFileLog};
 use crate::logs::{BusWriter, LogBus};
+use web::log_file::{is_resuming, RotatingFileLog};
 
 /// Print a full backtrace on every panic — no `RUST_BACKTRACE` needed — with
 /// the last CUDA kernel launched on the crashing thread and the relief trace.

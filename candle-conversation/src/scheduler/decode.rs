@@ -5,6 +5,7 @@ use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{locate_rows, SpecChooser};
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
+use crate::batched_sampler::DEGENERATE_TOKEN_RUN;
 use crate::recorded_reply::{departure, replayed_step};
 use crate::stats::streams_committed;
 use candle_nn::kv_cache::is_tier_refusal;
@@ -516,8 +517,8 @@ impl Scheduler {
                 .sample_batch(&stacked, &mut state_refs, &config_refs)
         };
         for (id, state) in state_ids.into_iter().zip(states) {
-            if state.degenerate_run == crate::batched_sampler::DEGENERATE_TOKEN_RUN {
-                describe_recurrent_state(self.model.as_ref(), id);
+            if state.degenerate_run == DEGENERATE_TOKEN_RUN {
+                self.fail_degenerate(id);
             }
             self.sampling_states.insert(id, state);
         }
@@ -1146,8 +1147,8 @@ impl Scheduler {
             // these vocabularies and ordinary prose contains it, so triggering
             // on a single one reports healthy turns as faults — measured, 16
             // such reports in a clean ingest. A RUN of them is the signal.
-            if state.degenerate_run == crate::batched_sampler::DEGENERATE_TOKEN_RUN {
-                describe_recurrent_state(self.model.as_ref(), id);
+            if state.degenerate_run == DEGENERATE_TOKEN_RUN {
+                self.fail_degenerate(id);
             }
             self.sampling_states.insert(id, state);
         }
@@ -1444,12 +1445,15 @@ impl Scheduler {
                                     .as_mut()
                                     .is_some_and(|replay| replay.refuse(at))
                                 {
+                                    // `DecodeState::fail`, spelled out: the
+                                    // stencil driver still borrows `state`.
                                     let _ = state.event_tx.send(TurnEvent::Error(
                                         ConversationError::Channel(format!(
                                             "the replay left its recording at reply id {at}: \
                                              the stencil refused the recorded token twice"
                                         )),
                                     ));
+                                    state.faulted = true;
                                     state.finished = true;
                                 }
                             }
@@ -2172,8 +2176,7 @@ impl Scheduler {
                         "reprojection prepare failed; aborting decode for this view"
                     );
                     if let Some(state) = self.active_decodes.get_mut(&view_id) {
-                        let _ = state.event_tx.send(TurnEvent::Error(e));
-                        state.finished = true;
+                        state.fail(e);
                     }
                 }
             }
@@ -2307,16 +2310,26 @@ impl Scheduler {
         }
     }
 
-    /// Send an error to all active decodes and mark them finished.
+    /// A sequence whose forward has produced unusable logits for a run of
+    /// [`DEGENERATE_TOKEN_RUN`] tokens: say whether its carried recurrent state is to blame, then fail
+    /// the turn so what it decoded over those logits is never sealed.
+    fn fail_degenerate(&mut self, id: SequenceId) {
+        describe_recurrent_state(self.model.as_ref(), id);
+        if let Some(state) = self.active_decodes.get_mut(&id) {
+            state.fail(ConversationError::Channel(format!(
+                "degenerate decode: the forward produced unusable logits for {} tokens \
+                 running; the turn is discarded",
+                DEGENERATE_TOKEN_RUN
+            )));
+        }
+    }
+
+    /// Fail every listed decode: each caller gets the error, and what each turn
+    /// decoded is discarded rather than sealed ([`DecodeState::fail`]).
     pub(super) fn fail_all_decodes(&mut self, seq_ids: &[SequenceId], msg: &str) {
         for &id in seq_ids {
             if let Some(state) = self.active_decodes.get_mut(&id) {
-                let _ = state
-                    .event_tx
-                    .send(TurnEvent::Error(ConversationError::Channel(
-                        msg.to_string(),
-                    )));
-                state.finished = true;
+                state.fail(ConversationError::Channel(msg.to_string()));
             }
         }
     }

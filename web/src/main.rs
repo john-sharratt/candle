@@ -10,11 +10,18 @@
 //! The second is what makes the console iterable on a laptop with nothing else
 //! running, over real sockets rather than a stubbed `fetch`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use cluster::handshake::GroupKey;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
+use web::log_file::RotatingFileLog;
 use web::{Builder, Config};
+
+/// The gateway's log file, written beside its config.
+const LOG_NAME: &str = "web.log";
 
 #[derive(Parser, Debug)]
 #[command(name = "web", about = "Static host + API gateway, by domain")]
@@ -55,11 +62,34 @@ async fn main() -> anyhow::Result<()> {
         1 => "web=debug",
         _ => "web=trace",
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()),
-        )
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into());
+    let stdout = tracing_subscriber::fmt::layer()
         .with_target(false)
+        .with_filter(filter());
+    // `web.log` beside the config, for a process that serves: `keep` runs the
+    // gateway with its stdout detached, and a gateway that logs only there
+    // keeps no record of a failed request at all. A `--check` or a key write
+    // opens no file — opening truncates it, and the gateway serving beside
+    // the check would lose its log. An unopenable file degrades to stdout.
+    let serving = !cli.check && cli.new_group_key.is_none();
+    let log_dir = cli
+        .config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let to_file = serving
+        .then(|| RotatingFileLog::new(log_dir, LOG_NAME))
+        .flatten()
+        .map(|w| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(w)
+                .with_filter(filter())
+        });
+    tracing_subscriber::registry()
+        .with(stdout)
+        .with(to_file)
         .init();
 
     if let Some(path) = &cli.new_group_key {

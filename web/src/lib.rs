@@ -47,6 +47,7 @@ pub mod config;
 pub mod content;
 pub mod errors;
 pub mod health;
+pub mod log_file;
 pub mod markdown;
 pub mod mock;
 pub mod proxy;

@@ -90,7 +90,7 @@ fn file_list_within_a_directory() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": "alpha"}),
+        json!({"repo": REPO, "path": "alpha", "page": 0}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();
@@ -416,7 +416,7 @@ fn file_edit_already_applied_does_not_copy_the_file_up() {
 
     let listed = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO}),
+        json!({"repo": REPO, "page": 0}),
         &ctx,
     ));
     let entry = listed["entries"]
@@ -496,7 +496,7 @@ fn file_list() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": "a"}),
+        json!({"repo": REPO, "path": "a", "page": 0}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();
@@ -513,7 +513,7 @@ fn file_list_root_is_empty_until_something_is_written() {
     for path in ["", "/"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path }),
+            json!({ "repo": REPO, "path": path, "page": 0 }),
             &ctx,
         ));
         assert_eq!(
@@ -531,8 +531,11 @@ fn file_list_root_is_empty_until_something_is_written() {
 fn file_list_of_an_unwritten_directory_is_not_found() {
     let ctx = ctx();
     for path in ["src", "candle-examples/"] {
-        let resp =
-            harness::invoke_with_ctx("file_list", json!({ "repo": REPO, "path": path }), &ctx);
+        let resp = harness::invoke_with_ctx(
+            "file_list",
+            json!({ "repo": REPO, "path": path, "page": 0 }),
+            &ctx,
+        );
         harness::expect_error(&resp, "not_found");
     }
 }
@@ -557,7 +560,7 @@ fn file_list_root_path_lists_one_level() {
     for path in ["/", ""] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path }),
+            json!({ "repo": REPO, "path": path, "page": 0 }),
             &ctx,
         ));
         let entries = resp["entries"].as_array().unwrap();
@@ -593,7 +596,7 @@ fn leading_slash_and_dot_segments_normalise_to_the_same_entry() {
     for path in ["src", "src/", "/src", "./src", "src/../src"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path }),
+            json!({ "repo": REPO, "path": path, "page": 0 }),
             &ctx,
         ));
         let entries = resp["entries"].as_array().unwrap();

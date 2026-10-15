@@ -4316,9 +4316,10 @@ fn run_inference_stream(
                 tracing::warn!(
                     conv_id = %conv_id,
                     iteration,
-                    "the same tool call returned the same result {} rounds running — the \
-                     next turn answers without tools",
+                    "{} rounds running made only calls already made {} times with the same \
+                     result — the next turn answers without tools",
                     repeat_guard::STOP_AFTER,
+                    repeat_guard::NOTICE_FROM - 1,
                 );
                 closing = true;
             }

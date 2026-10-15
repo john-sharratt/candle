@@ -5,7 +5,9 @@ use super::admission::{
 use super::admit;
 use super::admit_ground::AdmitPass;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
-use super::first_sample::{contiguous_runs, FirstSample, FirstSampled, PrefillEnd};
+use super::first_sample::{
+    contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
+};
 use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
 use super::priority_pause::rank;
 use super::section_pack;
@@ -3561,12 +3563,28 @@ impl Scheduler {
                     )))
                 })),
                 Err(e) => {
+                    // The dispatch fails every turn it carried, so say which
+                    // row was at fault: a non-finite row is its own prefill's
+                    // forward gone bad, and the others failed only beside it.
                     let msg = e.to_string();
-                    out.extend(
-                        (0..n).map(|_| {
-                            Err(ConversationError::Model(candle::Error::Msg(msg.clone())))
-                        }),
-                    );
+                    for (k, row) in rows[start..end].iter().enumerate() {
+                        let seq = self.active_prefills[prepared[start + k].0].work.sequence_id;
+                        let clean = row_is_nan_free(row);
+                        tracing::warn!(
+                            seq = seq.0,
+                            row_nan_free = ?clean,
+                            "first-token sample failed for a block of {n} turn(s): {msg}"
+                        );
+                        let why = match clean {
+                            Some(false) => format!("{msg} (this turn's prefill row holds NaN)"),
+                            Some(true) => format!(
+                                "{msg} (this turn's own row holds no NaN: it was sampled beside \
+                                 one that did)"
+                            ),
+                            None => msg.clone(),
+                        };
+                        out.push(Err(ConversationError::Model(candle::Error::Msg(why))));
+                    }
                 }
             }
         }
@@ -3872,6 +3890,7 @@ impl Scheduler {
                     no_think: work.no_think,
                     prefill_assistant_text: work.prefill_assistant_text,
                     finished: true,
+                    faulted: false,
                     finish,
                     decode_start: Instant::now(),
                     decode_busy_us: 0,
@@ -4010,6 +4029,7 @@ impl Scheduler {
             no_think: work.no_think,
             prefill_assistant_text: work.prefill_assistant_text,
             finished: false,
+            faulted: false,
             finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,

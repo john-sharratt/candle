@@ -132,3 +132,7 @@ zend/examples/provenance_queries.json
 # Six of these had accumulated untracked and a `git add -A` would have taken
 # them all — a live daemon's stderr is a debugging artifact, not a source file.
 /npcd*.log
+
+# The gateway's own log, written beside its config (`web::log_file`), and its
+# rotations.
+/web/web.log*

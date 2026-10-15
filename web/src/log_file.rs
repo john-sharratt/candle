@@ -1,21 +1,24 @@
-//! Size-rotated file log sink for the process.
+//! Size-rotated file log sink for a process.
 //!
-//! A third tracing sink (alongside stdout and the WebSocket bus) writes the
-//! full configured log stream to `<dir>/<name>` — `substrate/zend.log` for
-//! zend. The active file is truncated on every ORDINARY start — and any
-//! archives from the prior run are removed — so each run begins from a clean
-//! set. When the active file would exceed [`MAX_BYTES`] it rotates:
-//! `<name>.{N-1}` → `.{N}` (oldest dropped), `<name>` → `.1`, then reopens an
-//! empty active file. On-disk log size is therefore bounded at roughly
-//! `MAX_BYTES * (MAX_ARCHIVES + 1)`.
+//! A tracing sink beside stdout that writes the full configured log stream to
+//! `<dir>/<name>` — `web/web.log` for the gateway, `substrate/zend.log` for
+//! zend. It is what survives a process whose stdout nobody reads: `keep`
+//! starts the gateway and `motherd` with theirs detached. When the active file
+//! would exceed [`MAX_BYTES`] it rotates: `<name>.{N-1}` → `.{N}` (oldest
+//! dropped), `<name>` → `.1`, then reopens an empty active file. On-disk log
+//! size is therefore bounded at roughly `MAX_BYTES * (MAX_ARCHIVES + 1)`.
 //!
-//! The one exception is a **self-heal restart** (`self_heal.rs`): the whole
-//! reason that relaunch happens is a fault worth diagnosing, and truncating
-//! the log on the very next start would destroy the only record of it before
-//! anyone could read it — which is exactly what made an earlier out-of-memory
-//! stall invisible until the daemon was restarted by hand. [`RESTART_MARKER_NAME`]
-//! is dropped next to the log right before that relaunch; its presence here
-//! means "append, keep the archives" instead of the ordinary fresh start.
+//! An ordinary start rotates the previous run's file out the same way, so the
+//! new run begins on an empty active file and the run before it is `.1`. The
+//! run that just ended is the one most worth reading — it is the one that
+//! failed, or was replaced by a deploy whose trial then failed and was rolled
+//! back — and truncating on start destroyed exactly that record: two starts
+//! in a row (a failed trial, then the stable relaunch) left no trace of either
+//! the trial's fault or what the replaced process had been doing.
+//!
+//! A **self-heal restart** (`host::self_heal`) appends instead, so the fault
+//! and the recovery read as one run. [`RESTART_MARKER_NAME`] is dropped next to
+//! the log right before that relaunch; its presence here means "append".
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -28,7 +31,7 @@ use tracing_subscriber::fmt::MakeWriter;
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Number of rotated archives kept (`<name>.1` … `<name>.N`).
 const MAX_ARCHIVES: usize = 4;
-/// Dropped next to the log by `self_heal` right before it relaunches the
+/// Dropped next to the log by `host::self_heal` right before it relaunches the
 /// process. Its presence on the NEXT start means "this run continues one that
 /// just crashed" — see the module doc.
 pub const RESTART_MARKER_NAME: &str = ".self_heal_restart";
@@ -114,14 +117,14 @@ pub struct RotatingFileLog(Arc<Mutex<Inner>>);
 impl RotatingFileLog {
     /// Open the active log at `<dir>/<name>`, creating `dir` if missing.
     /// Returns `None` (with a stderr note) if the directory or file can't be
-    /// opened — boot then proceeds with the stdout + bus sinks only rather
+    /// opened — the process then proceeds with its other sinks only rather
     /// than aborting.
     ///
-    /// Ordinarily this truncates the active file and clears previous archives
-    /// so each run starts from an empty set. When [`RESTART_MARKER_NAME`] is
-    /// present next to the log (consumed here, so this happens at most once
-    /// per relaunch), it instead appends to the existing active file and
-    /// leaves the archives alone — see the module doc.
+    /// Ordinarily the previous run's non-empty active file is rotated out to
+    /// `.1` and this run starts on an empty one. When [`RESTART_MARKER_NAME`]
+    /// is present next to the log (consumed here, so this happens at most once
+    /// per relaunch), it instead appends to the existing active file — see the
+    /// module doc.
     pub fn new(dir: &Path, name: &str) -> Option<Self> {
         if let Err(e) = fs::create_dir_all(dir) {
             eprintln!("could not create log dir {}: {e}", dir.display());
@@ -131,36 +134,33 @@ impl RotatingFileLog {
         let resuming = is_resuming(dir);
         if resuming {
             let _ = fs::remove_file(dir.join(RESTART_MARKER_NAME));
-        } else {
-            for n in 1..=MAX_ARCHIVES {
-                let _ = fs::remove_file(archive_path(&base, n));
-            }
         }
-        let open = if resuming {
-            open_appending
-        } else {
-            open_truncated
-        };
-        let file = match open(&base) {
+        let file = match open_appending(&base) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("could not open log file {}: {e}", base.display());
                 return None;
             }
         };
-        // Resuming: `written` must reflect what's already on disk, or
-        // rotation waits for another full `MAX_BYTES` on top of it instead of
-        // triggering where it should.
-        let written = if resuming {
-            fs::metadata(&base).map(|m| m.len()).unwrap_or(0)
-        } else {
-            0
-        };
-        Some(Self(Arc::new(Mutex::new(Inner {
+        // `written` reflects what is already on disk: a resumed run rotates
+        // where it should rather than a full `MAX_BYTES` later, and an
+        // ordinary start sees the previous run's bytes and rotates them out.
+        let written = fs::metadata(&base).map(|m| m.len()).unwrap_or(0);
+        let mut inner = Inner {
             file: Some(file),
             written,
             base,
-        }))))
+        };
+        if !resuming && inner.written > 0 {
+            if let Err(e) = inner.rotate() {
+                eprintln!(
+                    "could not rotate the previous log {}: {e}",
+                    inner.base.display()
+                );
+                return None;
+            }
+        }
+        Some(Self(Arc::new(Mutex::new(inner))))
     }
 }
 
@@ -203,20 +203,53 @@ mod tests {
         s
     }
 
+    /// An ordinary start keeps the previous run: its file becomes `.1`, the
+    /// older archives shift up, and the new run writes to an empty file.
     #[test]
-    fn truncates_active_and_clears_archives_on_new() {
+    fn a_start_rotates_the_previous_run_out_instead_of_truncating_it() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let base = dir.join(NAME);
-        // Seed a stale active file and a stale archive from a "prior run".
-        fs::write(&base, b"stale active\n").unwrap();
-        fs::write(archive_path(&base, 1), b"stale archive\n").unwrap();
+        fs::write(&base, b"the run before\n").unwrap();
+        fs::write(archive_path(&base, 1), b"two runs before\n").unwrap();
 
-        let log = RotatingFileLog::new(dir, NAME).unwrap();
-        // Active file is empty (truncated), prior archive is gone.
+        let mut log = RotatingFileLog::new(dir, NAME).unwrap();
+        assert_eq!(read(&base), "");
+        assert_eq!(read(&archive_path(&base, 1)), "the run before\n");
+        assert_eq!(read(&archive_path(&base, 2)), "two runs before\n");
+        log.write_all(b"this run\n").unwrap();
+        assert_eq!(read(&base), "this run\n");
+    }
+
+    /// A start over an empty file has nothing to keep and archives nothing.
+    #[test]
+    fn a_start_over_an_empty_log_archives_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(NAME);
+        fs::write(&base, b"").unwrap();
+
+        let log = RotatingFileLog::new(tmp.path(), NAME).unwrap();
         assert_eq!(read(&base), "");
         assert!(!archive_path(&base, 1).exists());
         drop(log);
+    }
+
+    /// Starts past the archive limit drop the oldest run, so the set stays
+    /// bounded however often the process restarts.
+    #[test]
+    fn repeated_starts_keep_at_most_the_archive_limit() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(NAME);
+        for run in 0..MAX_ARCHIVES + 3 {
+            let mut log = RotatingFileLog::new(tmp.path(), NAME).unwrap();
+            log.write_all(format!("run {run}\n").as_bytes()).unwrap();
+        }
+        let last = MAX_ARCHIVES + 2;
+        assert_eq!(read(&base), format!("run {last}\n"));
+        for n in 1..=MAX_ARCHIVES {
+            assert_eq!(read(&archive_path(&base, n)), format!("run {}\n", last - n));
+        }
+        assert!(!archive_path(&base, MAX_ARCHIVES + 1).exists());
     }
 
     /// The name is the caller's: each binary writes its own file.
@@ -251,12 +284,16 @@ mod tests {
         log.write_all(b"after the restart\n").unwrap();
         assert_eq!(read(&base), "before the restart\nafter the restart\n");
         // The marker is consumed: a second `new()` on the same directory goes
-        // back to the ordinary truncating start.
+        // back to the ordinary start, which rotates the resumed run out.
         assert!(!dir.join(RESTART_MARKER_NAME).exists());
         drop(log);
         let log2 = RotatingFileLog::new(dir, NAME).unwrap();
         assert_eq!(read(&base), "");
-        assert!(!archive_path(&base, 1).exists());
+        assert_eq!(
+            read(&archive_path(&base, 1)),
+            "before the restart\nafter the restart\n"
+        );
+        assert_eq!(read(&archive_path(&base, 2)), "an older archive\n");
         drop(log2);
     }
 

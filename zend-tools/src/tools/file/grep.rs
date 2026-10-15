@@ -42,9 +42,10 @@ pub struct GrepRequest {
     /// Match without regard to case. Defaults to false (case-sensitive), which
     /// is what searching for a Rust identifier wants.
     pub ignore_case: Option<bool>,
-    /// Zero-based page of results. Defaults to 0. When the response's
+    /// Zero-based page of results — 0 to start. When the response's
     /// `paging.next_page` is set, pass it here for the following page.
-    pub page: Option<u32>,
+    /// Required, as on every paged tool (see `file_list`'s `page`).
+    pub page: u32,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -107,7 +108,8 @@ impl Tool for FileGrep {
          regex (`^pub fn `, `Error::\\w+`, `foo|bar`), an optional path prefix to \
          narrow the search, and optional ignore_case. Returns the matches grouped by \
          repo — path, line number and the matching line — paged, with files_searched so an empty result is \
-         unambiguous. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it \
+         unambiguous. `page` is required — pass 0 to start, and the response's \
+         `paging.next_page` for the next. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it \
          before guessing at directory names with file_list. Use file_search to find \
          a file by its NAME; use file_read with the line number this returns to see \
          the surrounding code.";
@@ -165,7 +167,7 @@ impl Tool for FileGrep {
             }));
         }
 
-        let paging = Paging::of(hits.len(), req.page.unwrap_or(0), GREP_PAGE_HITS);
+        let paging = Paging::of(hits.len(), req.page, GREP_PAGE_HITS);
         let page = hits.into_iter().skip(paging.skipped()).take(GREP_PAGE_HITS);
 
         Ok(GrepResponse {

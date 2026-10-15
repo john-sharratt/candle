@@ -46,7 +46,7 @@ fn a_name_is_found_anywhere_in_the_tree() {
     let dir = workspace();
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": REPO, "query": "web_search"}),
+        json!({"repo": REPO, "page": 0, "query":"web_search"}),
         &ctx(&dir),
     ));
     assert_eq!(r["repos"][0]["repo"], REPO);
@@ -61,7 +61,7 @@ fn the_query_is_case_insensitive() {
     let dir = workspace();
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": REPO, "query": "WEB_Search.RS"}),
+        json!({"repo": REPO, "page": 0, "query":"WEB_Search.RS"}),
         &ctx(&dir),
     ));
     assert_eq!(r["repos"][0]["files"][0], "src/tools/web_search.rs");
@@ -75,7 +75,7 @@ fn the_shallowest_match_sorts_first() {
     let dir = workspace();
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": REPO, "query": "mod.rs"}),
+        json!({"repo": REPO, "page": 0, "query":"mod.rs"}),
         &ctx(&dir),
     ));
     assert_eq!(r["repos"][0]["files"][0], "src/tools/mod.rs");
@@ -87,7 +87,7 @@ fn a_glob_matches_by_extension() {
     let dir = workspace();
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": REPO, "query": "*.toml"}),
+        json!({"repo": REPO, "page": 0, "query":"*.toml"}),
         &ctx(&dir),
     ));
     assert_eq!(r["repos"][0]["files"][0], "Cargo.toml");
@@ -99,7 +99,7 @@ fn a_prefix_narrows_the_search() {
     let dir = workspace();
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": REPO, "query": "mod.rs", "prefix": "vendor/"}),
+        json!({"repo": REPO, "page": 0, "query":"mod.rs", "prefix": "vendor/"}),
         &ctx(&dir),
     ));
     assert_eq!(r["paging"]["total"], 1);
@@ -113,7 +113,7 @@ fn an_unmatched_query_is_empty_not_an_error() {
     let dir = workspace();
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": REPO, "query": "nothing_like_this_exists"}),
+        json!({"repo": REPO, "page": 0, "query":"nothing_like_this_exists"}),
         &ctx(&dir),
     ));
     assert_eq!(r["paging"]["total"], 0);
@@ -132,7 +132,7 @@ fn a_session_file_is_searchable() {
     ));
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": REPO, "query": "scratch"}),
+        json!({"repo": REPO, "page": 0, "query":"scratch"}),
         &c,
     ));
     assert_eq!(r["repos"][0]["files"][0], "notes/scratch.md");
@@ -145,7 +145,7 @@ fn a_literal_is_found_with_its_line_number() {
     let dir = workspace();
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "TODO"}),
+        json!({"repo": REPO, "page": 0, "pattern":"TODO"}),
         &ctx(&dir),
     ));
     assert_eq!(r["repos"][0]["repo"], REPO);
@@ -165,7 +165,7 @@ fn the_line_number_feeds_a_file_read_page() {
     let c = ctx(&dir);
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "API_KEY"}),
+        json!({"repo": REPO, "page": 0, "pattern":"API_KEY"}),
         &c,
     ));
     let path = r["repos"][0]["matches"][0]["path"]
@@ -189,7 +189,7 @@ fn a_regex_alternation_matches_either_branch() {
     let dir = workspace();
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "^fn main|^pub fn run"}),
+        json!({"repo": REPO, "page": 0, "pattern":"^fn main|^pub fn run"}),
         &ctx(&dir),
     ));
     assert_eq!(r["paging"]["total"], 2);
@@ -202,14 +202,14 @@ fn case_sensitivity_is_the_default_and_can_be_turned_off() {
 
     let sensitive = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "api_key"}),
+        json!({"repo": REPO, "page": 0, "pattern":"api_key"}),
         &c,
     ));
     assert_eq!(sensitive["paging"]["total"], 0);
 
     let insensitive = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "api_key", "ignore_case": true}),
+        json!({"repo": REPO, "page": 0, "pattern":"api_key", "ignore_case": true}),
         &c,
     ));
     assert_eq!(insensitive["paging"]["total"], 1);
@@ -224,7 +224,7 @@ fn an_empty_result_reports_how_much_was_searched() {
 
     let searched = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "definitely_not_present"}),
+        json!({"repo": REPO, "page": 0, "pattern":"definitely_not_present"}),
         &c,
     ));
     assert_eq!(searched["paging"]["total"], 0);
@@ -232,7 +232,7 @@ fn an_empty_result_reports_how_much_was_searched() {
 
     let nothing_to_search = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "fn", "prefix": "no/such/dir/"}),
+        json!({"repo": REPO, "page": 0, "pattern":"fn", "prefix": "no/such/dir/"}),
         &c,
     ));
     assert_eq!(nothing_to_search["files_searched"], 0);
@@ -243,7 +243,7 @@ fn a_bad_pattern_is_rejected_with_its_reason() {
     let dir = workspace();
     let resp = harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "unclosed(["}),
+        json!({"repo": REPO, "page": 0, "pattern":"unclosed(["}),
         &ctx(&dir),
     );
     let detail = harness::expect_error(&resp, "invalid_arguments");
@@ -266,7 +266,7 @@ fn a_session_edit_shadows_the_workspace_copy() {
     ));
     let r = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "unique_marker"}),
+        json!({"repo": REPO, "page": 0, "pattern":"unique_marker"}),
         &c,
     ));
     assert_eq!(r["repos"][0]["matches"][0]["path"], "src/main.rs");
@@ -276,7 +276,7 @@ fn a_session_edit_shadows_the_workspace_copy() {
     // is what the path now resolves to.
     let gone = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "lookup"}),
+        json!({"repo": REPO, "page": 0, "pattern":"lookup"}),
         &c,
     ));
     assert_eq!(gone["paging"]["total"], 0);

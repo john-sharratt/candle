@@ -125,7 +125,7 @@ fn file_grep_never_matches_inside_a_secrets_directory() {
     for pattern in ["tvly", "TESTKEY", "GOCSPX", "client_secret", "api_key", "."] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_grep",
-            json!({ "repo": REPO, "pattern": pattern }),
+            json!({ "repo": REPO, "pattern": pattern, "page": 0 }),
             &c,
         ));
         let body = text(&resp);
@@ -149,7 +149,7 @@ fn file_search_never_lists_a_protected_path() {
     for query in ["tools.yaml", "auth.yaml", "secrets", "*.yaml"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_search",
-            json!({ "repo": REPO, "query": query }),
+            json!({ "repo": REPO, "query": query, "page": 0 }),
             &c,
         ));
         assert!(
@@ -166,7 +166,7 @@ fn file_list_never_lists_a_protected_path() {
     for path in ["", "secrets", "web", "web/secrets"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path }),
+            json!({ "repo": REPO, "path": path, "page": 0 }),
             &c,
         ));
         assert!(
@@ -212,14 +212,14 @@ fn ordinary_files_still_read_and_search() {
 
     let found = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": REPO, "query": "main.rs"}),
+        json!({"repo": REPO, "query": "main.rs", "page": 0}),
         &c,
     ));
     assert_eq!(found["repos"][0]["files"][0], "src/main.rs");
 
     let hit = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "println"}),
+        json!({"repo": REPO, "pattern": "println", "page": 0}),
         &c,
     ));
     assert_eq!(hit["repos"][0]["matches"][0]["path"], "src/main.rs");

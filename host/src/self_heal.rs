@@ -15,10 +15,10 @@
 //! On poison this module relaunches an identical process — from the
 //! [`LaunchSpec`] captured at startup — before exiting: self-healing rather than
 //! self-terminating. The substrate redo log is crash-safe, so the abrupt exit
-//! loses nothing durable; `log_file::RESTART_MARKER_NAME` (dropped here,
-//! consumed by `log_file::RotatingFileLog::new`) makes the relaunch append to
-//! the existing log instead of truncating it, so the evidence for why this
-//! happened survives.
+//! loses nothing durable; `web::log_file::RESTART_MARKER_NAME` (dropped here,
+//! consumed by `web::log_file::RotatingFileLog::new`) makes the relaunch append to
+//! the existing log instead of rotating it out, so the fault and the recovery
+//! read as one run.
 //!
 //! **Relaunching is capped, not unconditional.** A transient fault (the OOM
 //! streak above) is exactly what one relaunch fixes — but nothing tells that
@@ -44,8 +44,8 @@ use candle_conversation::relief_trace;
 use cluster::launch::LaunchSpec;
 
 #[cfg(test)]
-use crate::log_file::is_resuming;
-use crate::log_file::RESTART_MARKER_NAME;
+use web::log_file::is_resuming;
+use web::log_file::RESTART_MARKER_NAME;
 
 /// Exit code a relaunch replaces — distinct from clean shutdown (0) and
 /// Ctrl-C (130). Kept for anything external still watching for it (a log
@@ -154,8 +154,8 @@ fn write_attempts(state_dir: &Path, attempts: u32) {
 }
 
 /// Drop the restart marker next to the log so the relaunched process appends
-/// instead of truncating. Best-effort: a failure here means the relaunch's
-/// log starts fresh (loses the "why", not the daemon), so it is logged and
+/// instead of rotating. Best-effort: a failure here means the relaunch's log
+/// starts a new file (the fault is still in `.1`), so it is logged and
 /// swallowed rather than aborting the relaunch over it.
 fn mark_resume(state_dir: &Path) {
     if let Err(e) = std::fs::create_dir_all(state_dir)
@@ -163,7 +163,7 @@ fn mark_resume(state_dir: &Path) {
     {
         tracing::error!(
             "could not write the self-heal restart marker — the relaunched process's \
-             log will start fresh instead of continuing this one: {e}"
+             log will start a new file instead of continuing this one: {e}"
         );
     }
 }

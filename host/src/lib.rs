@@ -21,7 +21,7 @@
 //! | [`model`] | the one model every tenant runs |
 //! | [`build_info`] | `--build-info`, and what every binary does first |
 //! | [`logs`], [`telemetry`], [`loading`] | what the process says about itself |
-//! | [`process`], [`ctrl_c`], [`self_heal`], [`log_file`] | process-wide concerns |
+//! | [`process`], [`ctrl_c`], [`self_heal`] | process-wide concerns (the log file is `web::log_file`, which the gateway writes too) |
 
 pub mod access;
 pub mod boot;
@@ -34,7 +34,6 @@ pub mod download;
 pub mod endpoints;
 pub mod guard;
 pub mod loading;
-pub mod log_file;
 pub mod logs;
 pub mod model;
 pub mod process;

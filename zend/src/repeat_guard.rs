@@ -7,12 +7,29 @@
 //! saying "the file doesn't exist yet, so I'll create it with the write tool".
 //! Each identical result was more of the pattern it was copying.
 //!
-//! The guard breaks the pattern where it forms. A call identical to one made
-//! earlier in the same turn, whose result is also identical, carried no
-//! information, so its result is replaced with a `repeated_call` notice telling
-//! the model to act on what it already has. Polling a session (`ssh_session_poll`,
-//! `tcp_session_recv`) repeats a call legitimately, and its result changes —
-//! so it passes.
+//! The guard breaks the pattern where it forms. A call made for the
+//! [`NOTICE_FROM`]th time in the same turn, with the same arguments and the same
+//! result each time, carries no information, so its result is replaced with a
+//! `repeated_call` notice telling the model to act on what it already has.
+//! Polling a session (`ssh_session_poll`, `tcp_session_recv`) repeats a call
+//! legitimately, and its result changes — so it passes.
+//!
+//! **A few repeats are allowed.** The notice used to answer the second
+//! occurrence, and a model that re-reads to check its own work — or simply
+//! re-lists a folder it has lost track of — was told it could change nothing.
+//! Three occurrences pass; the fourth is the loop.
+//!
+//! **A change starts the count again.** A call that mutates — writes a file,
+//! changes a repository, runs a program or code ([`mutates`]) — is never a
+//! repeat, and it clears every count: after it, reading the same file again
+//! may well read something new. Clearing everything rather than only what the
+//! change touched keeps the rule exact without knowing what each command
+//! touches, and costs at most three more reads of something unchanged.
+//!
+//! **A paged result says how to get the next page.** The commonest repeat is a
+//! model that wants the next page and sends the same call again without
+//! `page`; a notice that only said "act on that result" sent it back to the
+//! page it already had.
 //!
 //! **Earlier in the turn, not just the round before.** A cycle repeats just as
 //! surely as a stutter does, and comparing only against the previous round
@@ -36,12 +53,36 @@
 
 use candle_conversation::SamplingConfig;
 use serde_json::{json, Value};
+use zend_tools::{registry, Capability};
 
 use crate::tools::{ToolCall, ToolResult};
 
-/// Consecutive rounds made entirely of repeats after which the loop closes —
-/// with the first call, three identical rounds in all.
+/// The occurrence of an identical call, with an identical result, that is
+/// answered with a notice instead: the first three run as themselves.
+pub const NOTICE_FROM: usize = 4;
+
+/// Consecutive rounds made entirely of repeats after which the loop closes.
 pub const STOP_AFTER: usize = 2;
+
+/// The file tools that change the session's files. They write the session
+/// overlay rather than the disk, so they declare no capability, and nothing
+/// else about them says they change anything.
+const OVERLAY_WRITERS: [&str; 3] = ["write", "file_edit", "file_delete"];
+
+/// Whether `call` changes anything: writes the session's files or the disk (a
+/// repository, a database), or runs a program or code, which can change
+/// anything. Such a call is never a repeat, and it clears the guard's counts.
+pub fn mutates(call: &ToolCall) -> bool {
+    registry::find(&call.name).is_some_and(|tool| {
+        OVERLAY_WRITERS.contains(&tool.name)
+            || tool.requires.iter().any(|c| {
+                matches!(
+                    c,
+                    Capability::DiskWrite | Capability::Exec | Capability::Sandbox
+                )
+            })
+    })
+}
 
 /// Answer tokens past the think block after which the closing answer ends at
 /// the next sentence.
@@ -87,10 +128,19 @@ pub enum Verdict {
     Close,
 }
 
-/// Every call this turn's tool loop has run, with the result it got.
+/// One call the turn has made, with the result it got, and how many times.
+#[derive(Debug)]
+struct Seen {
+    call: ToolCall,
+    response: Value,
+    count: usize,
+}
+
+/// Every call this turn's tool loop has run since its last mutation, with the
+/// result it got and how often.
 #[derive(Debug, Default)]
 pub struct RepeatGuard {
-    seen: Vec<(ToolCall, Value)>,
+    seen: Vec<Seen>,
     streak: usize,
 }
 
@@ -100,23 +150,40 @@ impl RepeatGuard {
     }
 
     /// Screen the round just run: each result whose call and response both
-    /// match one made earlier in the turn becomes a `repeated_call` notice.
+    /// match one made [`NOTICE_FROM`]` − 1` times already since the last
+    /// mutation becomes a `repeated_call` notice. A mutating call is never one,
+    /// and any in the round clears the counts after it is screened.
     ///
     /// A round is compared with the rounds before it, never with itself, so
-    /// two identical calls batched into one round both run.
+    /// identical calls batched into one round all run — and all count.
     pub fn screen(&mut self, results: &mut [ToolResult]) -> Verdict {
+        let mutating: Vec<bool> = results.iter().map(|r| mutates(&r.call)).collect();
         let repeated: Vec<bool> = results
             .iter()
-            .map(|result| {
-                self.seen
-                    .iter()
-                    .any(|(call, response)| *call == result.call && *response == result.response)
+            .zip(&mutating)
+            .map(|(result, &mutating)| {
+                !mutating
+                    && self
+                        .find(result)
+                        .is_some_and(|seen| seen.count + 1 >= NOTICE_FROM)
             })
             .collect();
-        for (result, repeated) in results.iter().zip(&repeated) {
-            if !repeated {
-                self.seen
-                    .push((result.call.clone(), result.response.clone()));
+        if mutating.iter().any(|&m| m) {
+            self.seen.clear();
+        } else {
+            for result in results.iter() {
+                match self
+                    .seen
+                    .iter_mut()
+                    .find(|s| s.call == result.call && s.response == result.response)
+                {
+                    Some(seen) => seen.count += 1,
+                    None => self.seen.push(Seen {
+                        call: result.call.clone(),
+                        response: result.response.clone(),
+                        count: 1,
+                    }),
+                }
             }
         }
         let all_repeats = !results.is_empty() && repeated.iter().all(|&r| r);
@@ -126,7 +193,7 @@ impl RepeatGuard {
             if closing {
                 result.response = closing_notice(&result.call);
             } else if repeated {
-                result.response = notice(&result.call);
+                result.response = notice(&result.call, &result.response);
             }
         }
         if closing {
@@ -135,6 +202,18 @@ impl RepeatGuard {
             Verdict::Continue
         }
     }
+
+    /// The earlier occurrences of `result`'s call with `result`'s response.
+    fn find(&self, result: &ToolResult) -> Option<&Seen> {
+        self.seen
+            .iter()
+            .find(|s| s.call == result.call && s.response == result.response)
+    }
+}
+
+/// The page a paged result names as the next one, if more remain.
+fn next_page(response: &Value) -> Option<u64> {
+    response.get("paging")?.get("next_page")?.as_u64()
 }
 
 /// The result every call gets in the round that closes the loop.
@@ -151,18 +230,29 @@ fn closing_notice(call: &ToolCall) -> Value {
     })
 }
 
-/// The result a repeated call gets in place of the same answer again.
-fn notice(call: &ToolCall) -> Value {
-    json!({
-        "error": "repeated_call",
-        "detail": format!(
-            "This {} call is exactly one made earlier in this turn, and its result would \
-             be exactly the one shown there. Repeating it cannot change anything. Act on \
-             that result instead: take the next step your reasoning names — if a file you \
-             need does not exist, create it with `write` — or answer the user.",
-            call.name
+/// The result a repeated call gets in place of the same answer again —
+/// `response`. When that answer is one page of several, the notice names the
+/// next, which is what a model repeating a paged call almost always wanted.
+fn notice(call: &ToolCall, response: &Value) -> Value {
+    let detail = match next_page(response) {
+        Some(next) => format!(
+            "This {name} call is exactly one already made {times} times in this turn, and \
+             its result would be exactly the one shown there: the same page. More pages \
+             remain — to read the next one, call {name} again with the same arguments \
+             and `page: {next}`.",
+            name = call.name,
+            times = NOTICE_FROM - 1,
         ),
-    })
+        None => format!(
+            "This {} call is exactly one already made {} times in this turn, and its result \
+             would be exactly the one shown there. Repeating it cannot change anything. Act \
+             on that result instead: take the next step your reasoning names — if a file \
+             you need does not exist, create it with `write` — or answer the user.",
+            call.name,
+            NOTICE_FROM - 1,
+        ),
+    };
+    json!({ "error": "repeated_call", "detail": detail })
 }
 
 #[cfg(test)]
@@ -226,17 +316,24 @@ mod tests {
         )
     }
 
-    /// **The same call with the same answer is a repeat; the loop closes after
-    /// [`STOP_AFTER`] in a row**, and the closing round says no call will run.
+    /// Run `round` through the guard `times` times, each run passing as itself.
+    fn passes(guard: &mut RepeatGuard, round: impl Fn() -> Vec<ToolResult>, times: usize) {
+        for n in 1..=times {
+            let mut r = round();
+            let expected: Vec<Value> = r.iter().map(|x| x.response.clone()).collect();
+            assert_eq!(guard.screen(&mut r), Verdict::Continue, "occurrence {n}");
+            let got: Vec<Value> = r.iter().map(|x| x.response.clone()).collect();
+            assert_eq!(got, expected, "occurrence {n} runs as itself");
+        }
+    }
+
+    /// **The first three occurrences run as themselves; the fourth is a notice,
+    /// and the loop closes after [`STOP_AFTER`] such rounds in a row**, the
+    /// closing round saying no call will run.
     #[test]
-    fn an_identical_round_is_answered_with_a_notice_and_closes_the_loop() {
+    fn the_fourth_identical_call_is_a_notice_and_the_loop_then_closes() {
         let mut guard = RepeatGuard::new();
-        let mut first = vec![missing()];
-        assert_eq!(guard.screen(&mut first), Verdict::Continue);
-        assert_eq!(
-            first[0].response["error"], "not_found",
-            "a first call is itself"
-        );
+        passes(&mut guard, || vec![missing()], NOTICE_FROM - 1);
         for round in 1..=STOP_AFTER {
             let mut again = vec![missing()];
             let verdict = guard.screen(&mut again);
@@ -248,7 +345,86 @@ mod tests {
             } else {
                 assert_eq!(verdict, Verdict::Continue, "round {round}");
                 assert!(detail.contains("create it with `write`"), "{detail}");
+                assert!(detail.contains("already made 3 times"), "{detail}");
             }
+        }
+    }
+
+    /// **A mutation starts every count again**, and is never a repeat itself:
+    /// a file read three times, then written, can be read three times more.
+    #[test]
+    fn a_mutation_clears_every_count() {
+        let mut guard = RepeatGuard::new();
+        let write = || {
+            result(
+                "write",
+                json!({"repo": "candle", "path": "scratch/T.ts", "content": "x"}),
+                json!({"path": "scratch/T.ts", "created": true}),
+            )
+        };
+        passes(&mut guard, || vec![missing()], NOTICE_FROM - 1);
+        // Written the same way more times than any read may be: never a repeat.
+        passes(&mut guard, || vec![write()], NOTICE_FROM + 1);
+        passes(&mut guard, || vec![missing()], NOTICE_FROM - 1);
+        let mut fourth = vec![missing()];
+        guard.screen(&mut fourth);
+        assert_eq!(fourth[0].response["error"], "repeated_call");
+    }
+
+    /// **A repeat of a paged call names the next page** — the step a model
+    /// re-sending a listing without `page` was after.
+    #[test]
+    fn a_repeated_paged_call_is_told_the_next_page() {
+        let mut guard = RepeatGuard::new();
+        let listing = || {
+            vec![result(
+                "file_list",
+                json!({"repo": "candle", "path": "zend/src"}),
+                json!({"entries": [], "paging": {"page": 0, "pages": 2, "next_page": 1}}),
+            )]
+        };
+        passes(&mut guard, listing, NOTICE_FROM - 1);
+        let mut again = listing();
+        guard.screen(&mut again);
+        let detail = again[0].response["detail"].as_str().unwrap();
+        assert!(detail.contains("`page: 1`"), "{detail}");
+        assert!(!detail.contains("create it with `write`"), "{detail}");
+    }
+
+    /// Writing, changing a repository and running code or a program mutate;
+    /// reading does not.
+    #[test]
+    fn what_mutates() {
+        let call = |name: &str| ToolCall {
+            name: name.to_string(),
+            arguments: json!({}),
+        };
+        for name in [
+            "write",
+            "file_edit",
+            "file_delete",
+            "git_commit",
+            "run_command",
+            "code_run",
+        ] {
+            assert!(mutates(&call(name)), "{name}");
+        }
+        for name in [
+            "file_read",
+            "file_list",
+            "file_grep",
+            "git_log",
+            "git_show",
+            "web_fetch",
+        ] {
+            assert!(!mutates(&call(name)), "{name}");
+        }
+        // A writer renamed in the registry would silently stop clearing counts.
+        for name in OVERLAY_WRITERS {
+            assert!(
+                registry::find(name).is_some(),
+                "{name} is a registered tool"
+            );
         }
     }
 
@@ -272,9 +448,9 @@ mod tests {
 
     /// **A cycle is a repeat.** Two calls taking turns differ from the round
     /// before every time, which is how a turn alternated `git_log` and
-    /// `git_show` seven times over with the guard never firing. Each call is
-    /// the same as one two rounds back, so from the third round on each is a
-    /// notice, and the loop closes like any other run of repeats.
+    /// `git_show` seven times over with the guard never firing. Counted over
+    /// the whole turn, each reaches its fourth occurrence, is a notice, and the
+    /// loop closes like any other run of repeats.
     #[test]
     fn two_calls_taking_turns_are_caught_and_close_the_loop() {
         let mut guard = RepeatGuard::new();
@@ -292,21 +468,23 @@ mod tests {
                 json!({"subject": "s", "changes": []}),
             )
         };
-        let mut first = vec![log()];
-        assert_eq!(guard.screen(&mut first), Verdict::Continue);
-        let mut second = vec![show()];
-        assert_eq!(guard.screen(&mut second), Verdict::Continue);
-        assert_eq!(second[0].response["subject"], "s", "a new call is itself");
+        for _ in 1..NOTICE_FROM {
+            passes(&mut guard, || vec![log()], 1);
+            passes(&mut guard, || vec![show()], 1);
+        }
 
-        let mut third = vec![log()];
-        assert_eq!(guard.screen(&mut third), Verdict::Continue);
-        assert_eq!(third[0].response["error"], "repeated_call", "{:?}", third);
-        let detail = third[0].response["detail"].as_str().unwrap();
-        assert!(detail.contains("earlier in this turn"), "{detail}");
+        let mut log_again = vec![log()];
+        assert_eq!(guard.screen(&mut log_again), Verdict::Continue);
+        assert_eq!(
+            log_again[0].response["error"], "repeated_call",
+            "{log_again:?}"
+        );
+        let detail = log_again[0].response["detail"].as_str().unwrap();
+        assert!(detail.contains("in this turn"), "{detail}");
 
-        let mut fourth = vec![show()];
-        assert_eq!(guard.screen(&mut fourth), Verdict::Close);
-        let detail = fourth[0].response["detail"].as_str().unwrap();
+        let mut show_again = vec![show()];
+        assert_eq!(guard.screen(&mut show_again), Verdict::Close);
+        let detail = show_again[0].response["detail"].as_str().unwrap();
         assert!(detail.contains("no further tool call will run"), "{detail}");
     }
 
@@ -326,16 +504,18 @@ mod tests {
     #[test]
     fn progress_resets_the_streak() {
         let mut guard = RepeatGuard::new();
-        let write = result(
-            "write",
-            json!({"path": "scratch/T.ts", "content": "x"}),
-            json!({"path": "scratch/T.ts", "created": true}),
-        );
-        guard.screen(&mut [missing()]);
-        let mut mixed = vec![missing(), write];
+        let listing = |path: &str| {
+            result(
+                "file_list",
+                json!({"repo": "candle", "path": path}),
+                json!({"entries": []}),
+            )
+        };
+        passes(&mut guard, || vec![missing()], NOTICE_FROM - 1);
+        let mut mixed = vec![missing(), listing("docs")];
         assert_eq!(guard.screen(&mut mixed), Verdict::Continue);
         assert_eq!(mixed[0].response["error"], "repeated_call");
-        assert_eq!(mixed[1].response["created"], true);
+        assert_eq!(mixed[1].response["entries"], json!([]));
         assert_eq!(guard.streak, 0);
     }
 }

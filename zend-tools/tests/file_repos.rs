@@ -137,7 +137,7 @@ fn file_list_lists_inside_one_repository() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": "b"}),
+        json!({"repo": "b", "page": 0}),
         &c,
     ));
     assert_eq!(resp["repo"], "b");
@@ -157,13 +157,31 @@ fn every_file_tool_refuses_a_call_without_a_repo() {
     let dir = two_repo_workspace();
     let c = ctx(&dir);
     for (tool, args) in [
-        ("file_list", json!({})),
-        ("file_search", json!({"query": "shared.txt"})),
-        ("file_grep", json!({"pattern": "marker"})),
+        ("file_list", json!({"page": 0})),
+        ("file_search", json!({"query": "shared.txt", "page": 0})),
+        ("file_grep", json!({"pattern": "marker", "page": 0})),
         ("file_read", json!({"path": "shared.txt", "page": 0})),
     ] {
         let resp = harness::invoke_with_ctx(tool, args, &c);
         harness::expect_error(&resp, "invalid_arguments");
+    }
+}
+
+/// **The page is always stated too.** Every paged file tool requires `page`:
+/// left optional, a call meant for the next page that left it out was the
+/// first call again, word for word, and returned the page already held.
+#[test]
+fn every_paged_file_tool_refuses_a_call_without_a_page() {
+    let dir = two_repo_workspace();
+    let c = ctx(&dir);
+    for (tool, args) in [
+        ("file_list", json!({"repo": "a"})),
+        ("file_search", json!({"repo": "a", "query": "shared.txt"})),
+        ("file_grep", json!({"repo": "a", "pattern": "marker"})),
+    ] {
+        let resp = harness::invoke_with_ctx(tool, args, &c);
+        let detail = harness::expect_error(&resp, "invalid_arguments");
+        assert!(detail.contains("page"), "{tool}: {detail}");
     }
 }
 
@@ -179,7 +197,7 @@ fn only_the_search_tools_take_all_repos() {
             "file_read",
             json!({"repo": "*", "path": "shared.txt", "page": 0}),
         ),
-        ("file_list", json!({"repo": "*"})),
+        ("file_list", json!({"repo": "*", "page": 0})),
     ] {
         let resp = harness::invoke_with_ctx(tool, args, &c);
         let detail = harness::expect_error(&resp, "unknown_repo");
@@ -197,7 +215,7 @@ fn file_search_of_all_repos_groups_the_hits_by_repo() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"query": "shared.txt", "repo": "*"}),
+        json!({"query": "shared.txt", "repo": "*", "page": 0}),
         &c,
     ));
     let got: Vec<(&str, Vec<&str>)> = groups(&resp, "files")
@@ -213,7 +231,7 @@ fn file_search_with_a_repo_finds_only_that_repos_hits() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": "b", "query": "shared.txt"}),
+        json!({"repo": "b", "query": "shared.txt", "page": 0}),
         &c,
     ));
     let got = groups(&resp, "files");
@@ -228,7 +246,7 @@ fn file_grep_of_all_repos_groups_the_hits_by_repo() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"pattern": "pub fn marker_", "repo": "*"}),
+        json!({"pattern": "pub fn marker_", "repo": "*", "page": 0}),
         &c,
     ));
     let got: Vec<(&str, Vec<(&str, u64)>)> = groups(&resp, "matches")
@@ -303,7 +321,7 @@ fn file_grep_with_a_repo_finds_only_that_repos_hits() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": "b", "pattern": "pub fn marker_"}),
+        json!({"repo": "b", "pattern": "pub fn marker_", "page": 0}),
         &c,
     ));
     let got = groups(&resp, "matches");

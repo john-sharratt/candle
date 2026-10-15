@@ -7,7 +7,7 @@
 //! finished prefill, inside the wave. The sample is taken instead while the
 //! wave still holds its logits, and what survives to promotion is the token.
 
-use candle::Tensor;
+use candle::{DType, Tensor};
 
 use crate::batched_sampler::SequenceSamplingState;
 use crate::config::SamplingConfig;
@@ -54,6 +54,22 @@ pub(super) fn contiguous_runs(rows: &[Tensor]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Whether a logits row is free of NaN — `Some(false)` when any entry is
+/// NaN, `None` when the row could not be read back.
+///
+/// Read only on a failed sample's path, where one row of a block has made the
+/// whole dispatch fail and the question is which. NaN, not "non-finite": a row
+/// may carry `-inf` entries legitimately (vocabulary padding), and a forward
+/// gone bad shows as NaN throughout.
+pub(super) fn row_is_nan_free(row: &Tensor) -> Option<bool> {
+    let values = row
+        .flatten_all()
+        .and_then(|r| r.to_dtype(DType::F32))
+        .and_then(|r| r.to_vec1::<f32>())
+        .ok()?;
+    Some(!values.iter().any(|v| v.is_nan()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +97,17 @@ mod tests {
         );
         assert!(contiguous_runs(&[]).is_empty());
         assert_eq!(contiguous_runs(&rows[2..3]), vec![(0, 1)]);
+        Ok(())
+    }
+
+    /// A NaN anywhere marks the row; `-inf` padding does not.
+    #[test]
+    fn a_row_is_nan_free_unless_it_holds_nan() -> Result<()> {
+        let dev = Device::Cpu;
+        let ok = Tensor::new(&[[1f32, -2., f32::NEG_INFINITY]], &dev)?;
+        let bad = Tensor::new(&[[1f32, f32::NAN, 3.]], &dev)?;
+        assert_eq!(row_is_nan_free(&ok), Some(true));
+        assert_eq!(row_is_nan_free(&bad), Some(false));
         Ok(())
     }
 }

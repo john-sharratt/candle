@@ -28,9 +28,10 @@ pub struct SearchRequest {
     /// each repository searched (e.g. `candle-nn/src/`). Omit to search whole
     /// repositories.
     pub prefix: Option<String>,
-    /// Zero-based page of results. Defaults to 0. When the response's
+    /// Zero-based page of results — 0 to start. When the response's
     /// `paging.next_page` is set, pass it here for the following page.
-    pub page: Option<u32>,
+    /// Required, as on every paged tool (see `file_list`'s `page`).
+    pub page: u32,
 }
 
 /// One repository's matching files.
@@ -69,7 +70,8 @@ impl Tool for FileSearch {
          \"where is\", \"find the file\", \"which file is\", \"locate\", \"is there a \
          file called\", \"what files are named\", \"show me all the .rs files\". \
          Returns the matching paths grouped by repo, shortest path first within \
-         each, paged. THIS IS THE \
+         each, paged: `page` is required — pass 0 to start, and the response's \
+         `paging.next_page` for the next. THIS IS THE \
          TOOL FOR FINDING A FILE — do not guess directory names and call file_list \
          repeatedly; one file_search over the whole workspace replaces that entirely. Use file_grep to \
          search file CONTENTS for a string or symbol; use file_list to enumerate a \
@@ -103,7 +105,7 @@ impl Tool for FileSearch {
             all.extend(paths.into_iter().map(|path| (repo.clone(), path)));
         }
 
-        let paging = Paging::of(all.len(), req.page.unwrap_or(0), SEARCH_PAGE_ENTRIES);
+        let paging = Paging::of(all.len(), req.page, SEARCH_PAGE_ENTRIES);
         let page = all
             .into_iter()
             .skip(paging.skipped())

@@ -232,6 +232,7 @@ pub mod repvgg;
 pub mod resnet;
 pub mod rwkv_v5;
 pub mod rwkv_v6;
+pub mod sealed_injection;
 pub mod segformer;
 pub mod segment_anything;
 pub mod selection_strata;

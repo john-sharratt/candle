@@ -28,6 +28,9 @@ use std::sync::Mutex;
 /// host half draws from.
 struct PendingAllowList {
     allow: Vec<u32>,
+    /// Allowed tokens the row had banned, counted by the masking that already
+    /// visits them — for a failure's report.
+    banned_n: usize,
     processor: LogitsProcessor,
     pending: PendingSample,
 }
@@ -71,6 +74,7 @@ fn allow_result_words(row: &AllowRow) -> usize {
 fn finish_allow_row(row: AllowRow, result: AllowResult) -> candle::Result<u32> {
     let AllowRow {
         allow,
+        banned,
         mut processor,
         ..
     } = row;
@@ -78,8 +82,15 @@ fn finish_allow_row(row: AllowRow, result: AllowResult) -> candle::Result<u32> {
         AllowResult::Index(i) => i,
         AllowResult::Probs(p) => {
             let n = p.len();
-            processor.sample_finish(PendingSample::Probs(Tensor::from_vec(p, n, &Device::Cpu)?))?
-                as usize
+            let probs = Tensor::from_vec(p, n, &Device::Cpu)?;
+            // A handle, not a copy: read only if the sample fails.
+            let kept = probs.clone();
+            processor
+                .sample_finish(PendingSample::Probs(probs))
+                .map_err(|e| {
+                    let banned_n = banned.iter().filter(|&&b| b).count();
+                    allow_sample_failure(e, &allow, banned_n, non_finite_count(&kept))
+                })? as usize
         }
     };
     allow.get(local).copied().ok_or_else(|| {
@@ -88,6 +99,36 @@ fn finish_allow_row(row: AllowRow, result: AllowResult) -> candle::Result<u32> {
             allow.len()
         ))
     })
+}
+
+/// A stencil-constrained row that could not be sampled, with what decides why:
+/// how many tokens the grammar allowed at the step, how many of those the row
+/// had banned, and how many of the probabilities were not finite. A softmax
+/// is NaN two ways — the model's logits went non-finite, or every allowed
+/// token was banned to −inf — and the sampler's own error ("a weight is
+/// negative, too large or not a valid number") reads the same for both.
+///
+/// Built only on the failure path: a row that samples pays for none of it.
+fn allow_sample_failure(
+    e: candle::Error,
+    allow: &[u32],
+    banned_n: usize,
+    non_finite: usize,
+) -> candle::Error {
+    let shown: Vec<u32> = allow.iter().take(8).copied().collect();
+    candle::Error::Msg(format!(
+        "{e} — allow-list row: {} allowed, {banned_n} of them banned, {non_finite} \
+         probabilities not finite; first allowed {shown:?}",
+        allow.len()
+    ))
+}
+
+/// Entries of a probability vector that are not finite; `0` if it cannot be
+/// read. For [`allow_sample_failure`] only.
+fn non_finite_count(probs: &Tensor) -> usize {
+    probs
+        .to_vec1::<f32>()
+        .map_or(0, |v| v.iter().filter(|x| !x.is_finite()).count())
 }
 
 /// What [`SequenceSamplingState::mark`] saves: every field an advance changes
@@ -1531,12 +1572,13 @@ impl BatchedSampler {
         let allow: Vec<u32> = config.stencil.iter().map(|&t| t as u32).collect();
         let idx = Tensor::from_vec(allow.clone(), allow.len(), logits2d.device())?;
         let gathered = logits2d.i(row)?.index_select(&idx, 0)?;
-        let gathered = apply_banned_local(&gathered, &allow, config)?;
+        let (gathered, banned_n) = apply_banned_local(&gathered, &allow, config)?;
         let seed = config.seed.wrapping_add(state.rng_offset);
         let processor = LogitsProcessor::from_sampling(seed, config_to_sampling(config));
         let pending = processor.sample_issue(&gathered)?;
         Ok(PendingAllowList {
             allow,
+            banned_n,
             processor,
             pending,
         })
@@ -1547,10 +1589,20 @@ impl BatchedSampler {
     fn finish_allow_list(&self, row: PendingAllowList) -> candle::Result<u32> {
         let PendingAllowList {
             allow,
+            banned_n,
             mut processor,
             pending,
         } = row;
-        let local = processor.sample_finish(pending)? as usize;
+        // A handle, read only on a failure: the sample's own readback is the
+        // only one a row that succeeds pays.
+        let probs = match &pending {
+            PendingSample::Probs(p) => Some(p.clone()),
+            PendingSample::Token(_) => None,
+        };
+        let local = processor.sample_finish(pending).map_err(|e| {
+            let non_finite = probs.as_ref().map_or(0, non_finite_count);
+            allow_sample_failure(e, &allow, banned_n, non_finite)
+        })? as usize;
         Ok(allow[local])
     }
 
@@ -1748,7 +1800,29 @@ impl BatchedSampler {
         };
         let seed = config.seed.wrapping_add(state.rng_offset);
         let mut processor = LogitsProcessor::from_sampling(seed, sampling);
-        let mut sampled = processor.sample(&seq_logits)?;
+        let mut sampled = processor.sample(&seq_logits).map_err(|e| {
+            // Read only on a failure: which of the two ways a softmax goes
+            // NaN this row took — non-finite logits, or everything at −inf.
+            let (nan, inf, neg_inf) = seq_logits
+                .to_dtype(DType::F32)
+                .and_then(|l| l.to_vec1::<f32>())
+                .map(|v| {
+                    v.iter().fold((0, 0, 0), |(n, p, m), x| {
+                        (
+                            n + usize::from(x.is_nan()),
+                            p + usize::from(*x == f32::INFINITY),
+                            m + usize::from(*x == f32::NEG_INFINITY),
+                        )
+                    })
+                })
+                .unwrap_or((0, 0, 0));
+            candle::Error::Msg(format!(
+                "{e} — full row of {}: {nan} NaN, {inf} +inf, {neg_inf} −inf logits; \
+                 {} banned",
+                self.live_vocab,
+                config.banned_tokens.len()
+            ))
+        })?;
         // A verify row's draft, accepted on the typical-acceptance rule over
         // the same top-k/nucleus distribution the kernel measures it on.
         if let (Some(draft), Some(typical)) = (row.draft, typical) {
@@ -2571,29 +2645,33 @@ fn apply_suppression(logits: &Tensor, config: &SamplingConfig) -> candle::Result
 
 /// Apply banned tokens within a gathered allow-list logit vector: any banned
 /// token that also appears in `allow` is set to `-inf` at its local position.
-/// A no-op when no banned token intersects the allow-list.
+/// A no-op when no banned token intersects the allow-list. Also returns how
+/// many allowed tokens it banned, counted in the pass that masks them.
 fn apply_banned_local(
     gathered: &Tensor,
     allow: &[u32],
     config: &SamplingConfig,
-) -> candle::Result<Tensor> {
+) -> candle::Result<(Tensor, usize)> {
     if config.banned_tokens.is_empty() {
-        return Ok(gathered.clone());
+        return Ok((gathered.clone(), 0));
     }
     let banned: std::collections::HashSet<u32> =
         config.banned_tokens.iter().map(|&b| b as u32).collect();
     if !allow.iter().any(|t| banned.contains(t)) {
-        return Ok(gathered.clone());
+        return Ok((gathered.clone(), 0));
     }
     let dtype = gathered.dtype();
     let dims = gathered.dims().to_vec();
     let mut v: Vec<f32> = gathered.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let mut banned_n = 0;
     for (local, t) in allow.iter().enumerate() {
         if banned.contains(t) {
             v[local] = f32::NEG_INFINITY;
+            banned_n += 1;
         }
     }
-    Tensor::from_vec(v, dims, gathered.device())?.to_dtype(dtype)
+    let masked = Tensor::from_vec(v, dims, gathered.device())?.to_dtype(dtype)?;
+    Ok((masked, banned_n))
 }
 
 /// Map a [`SamplingConfig`] to candle's `Sampling` strategy.

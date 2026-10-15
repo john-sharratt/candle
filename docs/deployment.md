@@ -163,7 +163,10 @@ slots, and its own checkouts, cloned over SSH — `D:\agent\candle`,
 apart from the working trees zend reads in `D:\prog`.
 
 Its log is `motherd.log` beside zend's substrate, `D:\prog\substrate\motherd.log`; `/up`'s
-redirected output is in `target\services\` as for the other services.
+redirected output is in `target\services\` as for the other services. Each start rotates
+the previous run's log to `motherd.log.1` (up to `.4`), so a deploy whose trial fails and
+is rolled back leaves the trial's fault in `.1` and the run it replaced in `.2`. The
+gateway writes `web.log` beside its config, `D:\prog\candle\web\web.log`, the same way.
 
 **Rolling back to the standalone zend**: stop motherd (Ctrl-C), then start zend with
 the line the launch table records for it. The gateway needs no change — with no member
@@ -275,8 +278,7 @@ sticky on its own and is left to admission control. On either, the watchdog:
 1. logs the root fault (plus the recent-kernel-launch breadcrumb);
 2. drops a marker next to the process's log (`<binary>.log` beside the highest-ranked
    tenant's substrate — `substrate/zend.log` for zend) so the relaunch **appends** instead
-   of the ordinary fresh-boot truncate — the whole point is to keep the evidence readable
-   across the restart, in one file;
+   of the ordinary start's rotation — the fault and the recovery read as one file;
 3. spawns an identical process — same executable, same argv (captured from its own launch,
    not reconstructed from parsed flags), same working directory;
 4. exits with code 75 (distinct from clean shutdown 0 and Ctrl-C 130).

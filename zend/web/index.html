@@ -76,6 +76,9 @@
   .zmd .zcursor { display: inline-block; width: 2px; height: .85em; background: #9a9490; vertical-align: text-bottom; margin-left: 1px; animation: zblink .85s step-end infinite; }
   .zmd .tool-call-card { margin: .5rem 0; background: #26231f; border: 1px solid #38342f; border-left: 3px solid #8c5f28; border-radius: 8px; overflow: hidden; font-family: "Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace; font-size: .82rem; }
   .zmd .tool-call-card.pending { border-left-color: #5a5652; }
+  /* The pending card is the collapsed card it becomes, line for line: no rule
+     under its header, or completing every call moved the page by a pixel. */
+  .zmd .tool-call-card.pending > .tool-call-header { border-bottom: none; }
   .zmd .tool-call-header { display: flex; align-items: center; gap: .5rem; padding: .4rem .75rem; background: #1e1b19; border-bottom: 1px solid #2e2b27; }
   .zmd .tool-call-icon { color: #8c5f28; font-size: .8rem; }
   .zmd .tool-call-name { font-weight: 600; color: #c98a3e; letter-spacing: .02em; }
@@ -613,7 +616,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // over and past the block it described — until the next full `render()`.
     // `render()` hides it for exactly this reason; the streaming patch did not.
     hideProjPopover();
+    const before = zmd.offsetHeight;
     zmd.innerHTML = nodeHtml(m, open);
+    holdStreamHeight(zmd, m, before);
     restoreToolOpen(zmd, conv.id, idx);
     // The bars are measured against the DOM's current layout, which keeps
     // shifting turn by turn while this message is still streaming — showing
@@ -627,6 +632,24 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // Follow the bottom only while the user hasn't scrolled away; keep
     // lastScrollTop in sync so this programmatic move isn't read as a scroll-up.
     if (stick) { chatEl.scrollTop = chatEl.scrollHeight; lastScrollTop = chatEl.scrollTop; }
+  }
+  // **A streaming reply never shrinks.** Its phases swap blocks of different
+  // heights — a file being written is drawn in a box up to 18rem tall that
+  // folds to a one-line card when the call completes, and a tool round's
+  // "Reading tool output" bar comes and goes — and every shrink pulled the
+  // page up under the reader before the follow-to-bottom pulled it back. So
+  // while it streams, the bubble holds the tallest height it has reached as
+  // its minimum, and what comes next fills the space rather than the page
+  // jumping to make it. The hold ends with the stream: one settle at the end,
+  // not one per phase.
+  function holdStreamHeight(zmd, m, before) {
+    if (!m.streaming) {
+      m.heightFloor = 0;
+      zmd.style.minHeight = '';
+      return;
+    }
+    m.heightFloor = Math.max(m.heightFloor || 0, before);
+    zmd.style.minHeight = m.heightFloor ? m.heightFloor + 'px' : '';
   }
   function activeConv() { return S.conversations.find((c) => c.id === S.activeId) || null; }
 
@@ -1307,10 +1330,18 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   }
   function doArchiveConv(id) {
     // The sync never clears the flag (archiving is one-way), so a refused
-    // archive has to put the row back itself.
-    Promise.resolve(API.archiveConversation(id)).catch(() => {
+    // archive has to put the row back itself — and say so: a row that quietly
+    // reappears reads as a button that did nothing, which is all a daemon that
+    // was still loading (503) or had faulted ever showed.
+    Promise.resolve(API.archiveConversation(id)).catch((err) => {
       S.conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: false }) : c);
-      render();
+      const why = err && err.message ? err.message : String(err);
+      setState({ confirm: {
+        title: 'Archive failed',
+        body: 'The daemon did not archive this conversation, so it is still here: ' + why + '. Try again once it is serving.',
+        confirmLabel: 'OK',
+        onConfirm: () => setState({ confirm: null }),
+      } });
     });
     let conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: true }) : c);
     let activeId = S.activeId;
@@ -2184,7 +2215,10 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
           turnCopyBtn(m, 'right:0;')));
       } else {
         const open = !!S.thinkOpen[conv.id + ':' + idx];
-        const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtmlMemo(m, open, toolOut[idx], toolTok[idx]) });
+        // A streaming reply keeps the height it has reached (`holdStreamHeight`)
+        // across a full render as well as across its own live patches.
+        const floor = m.streaming && m.heightFloor ? ' min-height:' + m.heightFloor + 'px;' : '';
+        const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;' + floor, html: nodeHtmlMemo(m, open, toolOut[idx], toolTok[idx]) });
         // Draw the projection bars by measuring the inline anchors — deferred to
         // the next frame because `zmd` isn't in the document yet (the scroller is
         // attached by the caller after buildChat returns), and getBoundingClientRect

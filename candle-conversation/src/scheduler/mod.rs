@@ -38,6 +38,7 @@ pub mod exported_state;
 mod first_sample;
 mod graph_window;
 mod guest_room;
+mod injected_piece;
 mod interleave;
 #[cfg(feature = "kv-zero-check")]
 pub(crate) mod kv_zero_check;
@@ -142,6 +143,7 @@ use candle_transformers::models::batched_inference::{
 use candle_transformers::models::delta_net::ExportedLayerState;
 use candle_transformers::models::draft_depth::DraftDepth;
 use candle_transformers::models::piece_key::PieceKey;
+use candle_transformers::models::sealed_injection::reconcile_sealed_prefix;
 
 use self::exported_state::{ExportedState, SharedState};
 use self::norm_warm::NormWarm;
@@ -1525,6 +1527,19 @@ struct DecodeState {
     pending_page_cut_after: Option<u32>,
     /// Whether this sequence has finished (EOS or max_tokens).
     finished: bool,
+    /// The turn ended on a fault ([`DecodeState::fail`]): its caller has the
+    /// error, and what it decoded is discarded rather than sealed.
+    ///
+    /// A fault is a forward or a sampler that could not go on — non-finite
+    /// logits, a refused tier past its retries, a failed reprojection — and
+    /// what the view holds past that point is not the reply it was meant to
+    /// be. Sealed, it became the conversation's history: K/V computed from
+    /// non-finite activations, and a recurrent state that had advanced over
+    /// them, moved onto the parent. Every later turn of that conversation
+    /// attended over it and failed the same way, and so did every other
+    /// conversation that recalled it — measured: both npcs failing every turn
+    /// for the rest of the process after one row went non-finite.
+    faulted: bool,
     /// Why it finished, once it has. [`FinishReason::Length`] only when the
     /// response budget ran out, set where the budget is checked; every other
     /// ending — end-of-sequence, a completed stencil, an abort — is a `Stop`.
@@ -1658,6 +1673,19 @@ struct DecodeState {
 }
 
 impl DecodeState {
+    /// End the turn on a fault: the caller gets `error`, and `cleanup_finished`
+    /// discards what the turn decoded instead of sealing it ([`Self::faulted`]).
+    /// Once is enough — a later fault on the same turn adds nothing the caller
+    /// can act on.
+    fn fail(&mut self, error: ConversationError) {
+        if self.faulted {
+            return;
+        }
+        let _ = self.event_tx.send(TurnEvent::Error(error));
+        self.faulted = true;
+        self.finished = true;
+    }
+
     /// Append one token to the turn's generated run, recording the reasoning
     /// boundary as it goes past.
     ///
@@ -5933,6 +5961,7 @@ impl Scheduler {
             free_tool_calls_from_penalties: false,
             prefill_assistant_text: String::new(),
             finished: false,
+            faulted: false,
             finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,
@@ -6853,6 +6882,37 @@ impl Scheduler {
         self.lose_group_case(view_id);
     }
 
+    /// Drop a turn that ended on a fault ([`DecodeState::fail`]) without
+    /// sealing it. Its caller already has the error.
+    ///
+    /// An ordinary turn's view is finalized onto its parent and its recurrent
+    /// state moved there; a faulted one's is released, so the parent stays
+    /// exactly where it stood before the turn began and a retry starts clean.
+    /// A summarise pass answers its job with the fault and frees its slot.
+    fn discard_faulted_turn(&mut self, seq_id: SequenceId, seal_action: &SealAction) {
+        tracing::warn!(
+            seq = seq_id.0,
+            "a turn ended on a fault; discarding what it decoded instead of sealing it"
+        );
+        if let SealAction::CompressionPass { job_id } = *seal_action {
+            if let Some(job) = self.compression_jobs.remove(&job_id) {
+                // Lifted to hot only for this pass, as in
+                // `complete_compression_pass`.
+                if !job.children.is_empty() {
+                    job.conversation.write().demote_turns_to_warm(&job.children);
+                }
+                let _ = job.response_tx.send(Err(ProbeError::Soft(
+                    "SubmitSummaryProbe: the summary decode ended on a fault".to_string(),
+                )));
+            }
+            self.free_summary_slot(seq_id);
+            return;
+        }
+        // A non-view decode owns its slot outright and leaves through the
+        // slot's own release; a view goes here, group cases included.
+        self.discard_turn_view(seq_id);
+    }
+
     /// [`Self::discard_turn_view`] for every view borrowing from `parent_id`.
     fn discard_turn_views_of(&mut self, parent_id: SequenceId) {
         // The parent is going away, so its groups end here — before their
@@ -7605,6 +7665,12 @@ impl Scheduler {
                 // The slot's ground is back, so an admission that did not fit
                 // before may fit now.
                 self.settled_since_admit = true;
+                // A turn that ended on a fault has told its caller so; what it
+                // decoded is dropped with its view and never sealed.
+                if state.faulted {
+                    self.discard_faulted_turn(seq_id, &state.seal_action);
+                    continue;
+                }
                 // The summarise decode completes through the job registry, not
                 // the substrate seal path: its body becomes the node's assistant
                 // half and is sealed with the derived scope. No view to finalize,
@@ -8413,6 +8479,9 @@ impl Scheduler {
                     (0..n_layers).map(|_| Vec::new()).collect();
                 let mut per_layer_token_count: Vec<usize> = vec![0; n_layers];
                 let chunk_size = self.chunk_size;
+                // Prefix sections whose stored layers disagree, retired below
+                // once the read guard is gone — retiring takes the write lock.
+                let mut skewed: Vec<(SectionId, StreamId)> = Vec::new();
                 {
                     let view = conversation.read();
                     for &prefix_id in prefix_section_ids {
@@ -8432,8 +8501,34 @@ impl Scheduler {
                             );
                             continue;
                         }
+                        // Each section is cut to its own layers' common prefix
+                        // BEFORE it is joined: a skewed section misaligns every
+                        // section joined after it, and the cut the inject makes
+                        // of the joined whole would take all of them with it.
+                        let reconciled = reconcile_sealed_prefix(&sealed);
+                        let source = reconciled.as_deref().unwrap_or(&sealed);
+                        // Retired once, and only when the cut lost tokens —
+                        // trimming an empty chunk one layer carried moves no
+                        // position. Later borrows of the same copy, until the
+                        // rebuild replaces it, say nothing more.
+                        let stored_tokens = sealed.iter().map(|s| s.token_count).max().unwrap_or(0);
+                        let lost = source[0].token_count < stored_tokens;
+                        let retire = lost.then(|| view.section_stream(prefix_id));
+                        if let Some(stream) =
+                            retire.flatten().filter(|s| !view.is_section_tombstoned(*s))
+                        {
+                            tracing::warn!(
+                                section = prefix_id.raw(),
+                                stored_tokens,
+                                injected_tokens = source[0].token_count,
+                                "prepare_section_ingest: prefix section's layers describe \
+                                 different token windows; borrowing their common prefix and \
+                                 ending its generation so the next request prefills it fresh"
+                            );
+                            skewed.push((prefix_id, stream));
+                        }
                         for layer_idx in 0..n_layers {
-                            let layer_seq = &sealed[layer_idx];
+                            let layer_seq = &source[layer_idx];
                             per_layer_chunks[layer_idx].extend(layer_seq.chunks.iter().cloned());
                             per_layer_token_count[layer_idx] += layer_seq.token_count;
                         }
@@ -8444,7 +8539,18 @@ impl Scheduler {
                             sequence_id,
                             prefix_id,
                             view.section_stream(prefix_id),
-                            sealed[0].token_count,
+                            source[0].token_count,
+                        );
+                    }
+                }
+                for (section, stream) in skewed {
+                    if let Err(e) = conversation.retire_section_generation(
+                        stream,
+                        "layers sealed with different token windows",
+                    ) {
+                        tracing::warn!(
+                            "prepare_section_ingest: prefix section {} could not be retired: {e}",
+                            section.raw()
                         );
                     }
                 }
@@ -8461,9 +8567,21 @@ impl Scheduler {
                                 location: candle_nn::kv_cache::ArenaLocation::Gpu,
                             })
                             .collect();
-                    self.session
+                    let injected = self
+                        .session
                         .inject_sealed_at_tail(sequence_id.0, &per_layer_sealed)
                         .map_err(ConversationError::Model)?;
+                    // Every section was reconciled before it was joined, so
+                    // the whole can only disagree if the join itself did.
+                    if injected.was_cut() {
+                        return Err(ConversationError::Other(format!(
+                            "prepare_section_ingest: the joined prefix of {} section(s) was \
+                             cut by {} chunk(s) although each section's layers agreed — the \
+                             join misaligned them",
+                            prefix_section_ids.len(),
+                            injected.cut_chunks
+                        )));
+                    }
                 }
             }
         }
@@ -10045,8 +10163,19 @@ impl Scheduler {
                 let sealed = conversation.read().turn_sealed_of(target.timeline, idx);
                 if let Some(sealed) = sealed {
                     match self.session.inject_sealed_at_tail(scratch, &sealed) {
-                        Ok(_) => {
+                        Ok(placed) => {
                             injected += 1;
+                            if placed.was_cut() {
+                                tracing::warn!(
+                                    timeline = target.timeline.raw(),
+                                    index = idx.0,
+                                    cut_chunks = placed.cut_chunks,
+                                    injected_tokens = placed.tokens,
+                                    stored_tokens = sealed.first().map_or(0, |s| s.token_count),
+                                    "memory catch-up: the turn's layers describe different \
+                                     token windows; the replay slot received their common prefix"
+                                );
+                            }
                             // The rows for the K/V just injected. Borrowing the
                             // turn's keys does not bring its index across —
                             // resident copy first, then the turn's stored page,
@@ -10061,7 +10190,7 @@ impl Scheduler {
                             // the slot finishes past this turn's whole width, so the
                             // next turn's rows land where its K/V does: the same rule
                             // `apply_projection` follows.
-                            let width = sealed.first().map_or(0, |s| s.token_count);
+                            let width = placed.tokens;
                             let model: &(dyn ManagedBatchedModel + Send) = &*self.model;
                             let carries = model.carries_positional_state();
                             // A skip that fails leaves every later turn's rows short
@@ -11540,9 +11669,19 @@ impl Scheduler {
         let tail_token_count: usize = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
         let t_inject = Instant::now();
         if tail_token_count > 0 {
-            self.session
+            let placed = self
+                .session
                 .inject_sealed_at_tail(parent_id.0, &tail_per_layer)
                 .map_err(ConversationError::Model)?;
+            // Captured from this slot a moment ago: a cut here would drop
+            // decoded tokens the turn's text still holds.
+            if placed.was_cut() {
+                return Err(ConversationError::Other(format!(
+                    "reproject: the captured decode tail's layers describe different token \
+                     windows — {} chunk(s) cut, {} of {tail_token_count} token(s) placed",
+                    placed.cut_chunks, placed.tokens
+                )));
+            }
             // The rows that describe those tokens, back at the position the
             // tokens landed. The rebuilt prefix ended flush with its last
             // injected piece and forwarded nothing, so these rows sit on an
@@ -14565,6 +14704,7 @@ mod tests {
             free_tool_calls_from_penalties: false,
             prefill_assistant_text: String::new(),
             finished: false,
+            faulted: false,
             finish: FinishReason::Stop,
             decode_start: Instant::now(),
             decode_busy_us: 0,
@@ -15349,6 +15489,7 @@ mod tests {
         );
     }
 
+    mod faulted_turn;
     mod refused_decode_tier;
     mod speculation_in_a_grammar;
 

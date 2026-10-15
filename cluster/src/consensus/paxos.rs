@@ -338,6 +338,7 @@ impl<S: VoteStore> Paxos<S> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_promise(
         &mut self,
         key: &[u8],

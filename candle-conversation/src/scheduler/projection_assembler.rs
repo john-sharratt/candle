@@ -37,6 +37,7 @@ use candle_nn::kv_cache::{SealedSequence, WriterTail};
 use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, PendingGlue, WINDOW_DIVERGENCE_MARKER,
 };
+use candle_transformers::models::sealed_injection::SealedInjection;
 
 use crate::conversation::slice_per_layer_sealed;
 use crate::error::ConversationError;
@@ -47,6 +48,7 @@ use crate::projection::{
     ContentResolver, Conversation, GroupId, MaterializedPiece, ProjectionSegment, ProjectionTarget,
     Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
 };
+use crate::scheduler::injected_piece::InjectedPiece;
 use crate::scheduler::piece_identity::{
     chained_identities, fit_kept_prefix, kept_prefix, piece_label, PieceReads,
 };
@@ -1111,9 +1113,28 @@ pub(super) fn apply_segments_build(
                     // sees this island. Mirrors the sealed-inject bookkeeping,
                     // the index page included: the wave not seeing the island is
                     // exactly why nothing would otherwise index it.
-                    inject_arc_sealed(ctx.session, parent_id, &cached.kv)?;
-                    push_captured_page(ctx, &cached, "cached glue island");
-                    walker.logical_pos += tokens.len() as u32;
+                    let what = InjectedPiece::CachedGlue {
+                        tokens: tokens.len(),
+                    };
+                    let injected = inject_arc_sealed(ctx.session, parent_id, &cached.kv, &what)?;
+                    let placed = injected.map_or(0, |inj| inj.tokens);
+                    if let Some(inj) = injected.filter(SealedInjection::was_cut) {
+                        // Captured by this process's own forward, so a skew here
+                        // is a live fault, not a stored one: drop the capture and
+                        // let the next rebuild forward the island again.
+                        report_cut(
+                            &what,
+                            parent_id,
+                            &cached.kv,
+                            &inj,
+                            "dropping the capture so the next rebuild forwards it",
+                        );
+                        state.glue_islands.remove(&key);
+                    }
+                    if let Some(inj) = &injected {
+                        push_captured_page(ctx, &cached, inj, &what);
+                    }
+                    walker.logical_pos += placed as u32;
                     walker.last_was_sealed = true;
                     walker.reused_glue_tokens += tokens.len();
                     log_injected_tokens(ctx, tokens);
@@ -1507,7 +1528,53 @@ fn inject_sealed_section(
             return Ok(());
         }
     };
-    inject_arc_sealed(ctx.session, parent_id, &sealed)?;
+    let what = InjectedPiece::Section(sid);
+    let Some(injected) = inject_arc_sealed(ctx.session, parent_id, &sealed, &what)? else {
+        walker.skipped_sections += 1;
+        return Ok(());
+    };
+    // **A skewed section is rebuilt, not re-cut on every projection.** Its
+    // stored layers disagree, so every slot that borrows it gets the common
+    // prefix and the stored record never improves. Ending its generation makes
+    // the next request for the section prefill it fresh; this copy keeps serving
+    // until then. Once ended, later borrows of the same copy say nothing more.
+    if injected.was_cut() {
+        if let Some(stream) = stream {
+            let retired = ctx.conversation.read().is_section_tombstoned(stream);
+            if !retired {
+                report_cut(
+                    &what,
+                    parent_id,
+                    &sealed,
+                    &injected,
+                    "ending its generation so the next request prefills it fresh",
+                );
+                if let Err(e) = ctx
+                    .conversation
+                    .retire_section_generation(stream, "layers sealed with different token windows")
+                {
+                    tracing::warn!(
+                        "apply_projection: section {} could not be retired: {e}",
+                        sid.raw()
+                    );
+                }
+            }
+        } else {
+            report_cut(
+                &what,
+                parent_id,
+                &sealed,
+                &injected,
+                "it has no persisted stream to retire",
+            );
+        }
+    }
+    // **A cut section's page is not pushed.** The page describes every token the
+    // section stored, and the slot now holds fewer: pushed, it claims blocks the
+    // slot does not hold and places every later page past where its K/V sits —
+    // a select then reaches blocks nothing wrote. The cut span goes in as a gap
+    // of the tokens actually placed, unindexed and aligned.
+    let page = page.filter(|_| !injected.was_cut());
     // **Only the anomaly earns a debug line.** The case worth seeing is a section
     // that reaches here with no positional blob: `section_positional` is filled by
     // `ingest_section` and by nothing else, so a RECOVERED section — one the
@@ -1557,7 +1624,7 @@ fn inject_sealed_section(
         // position, and that position is measured from here. The span itself
         // stays unindexed, which is the truth about it: nothing indexed it, and
         // a query landing there finds no candidates.
-        let tokens = sealed.first().map_or(0, |s| s.token_count);
+        let tokens = injected.tokens;
         if let Err(e) = ctx.model.push_positional_gap(parent_id.0, tokens) {
             tracing::warn!(
                 "apply_projection: section {} has no index page and the slot could not be \
@@ -1565,7 +1632,8 @@ fn inject_sealed_section(
                  placed short of where their K/V is",
                 sid.raw()
             );
-        } else {
+        } else if !injected.was_cut() {
+            // A cut section's missing page was reported with the cut.
             tracing::warn!(
                 "apply_projection: section {} has no index page — its {tokens} token(s) are \
                  unindexed",
@@ -1575,25 +1643,15 @@ fn inject_sealed_section(
     }
 
     let toks = ctx.conversation.read().section_tokens_of(sid);
-    let start_block = ctx
-        .session
-        .sequence_block_count(parent_id.0)
-        .ok_or_else(|| {
-            ConversationError::Channel(format!(
-                "apply_projection: slot {} not in session",
-                parent_id
-            ))
-        })?
-        .saturating_sub(sealed[0].chunks.len());
-    let end_block = start_block + sealed[0].chunks.len();
+    let (start_block, end_block) = injected.range;
     ctx.conversation
         .write()
         .set_section_block_range(sid, start_block as u64, end_block as u64);
 
-    log_injected_tokens(ctx, &toks);
+    log_injected_tokens(ctx, &toks[..injected.tokens.min(toks.len())]);
     walker.sealed_sections += 1;
-    walker.sealed_tokens += sealed[0].token_count;
-    walker.record_sealed(sealed[0].token_count);
+    walker.sealed_tokens += injected.tokens;
+    walker.record_sealed(injected.tokens);
     Ok(())
 }
 
@@ -1806,7 +1864,24 @@ fn inject_sealed_turn(
         );
         return Ok(());
     }
-    inject_arc_sealed(ctx.session, parent_id, &sealed)?;
+    let what = InjectedPiece::Turn(timeline, index);
+    let Some(injected) = inject_arc_sealed(ctx.session, parent_id, &sealed, &what)? else {
+        walker.skipped_turns += 1;
+        return Ok(());
+    };
+    if injected.was_cut() {
+        report_cut(
+            &what,
+            parent_id,
+            &sealed,
+            &injected,
+            "a conversation's turn is its history and is not rebuilt; its index pages \
+             are left out and the span goes in unindexed",
+        );
+    }
+    // A cut turn's pages describe tokens the slot does not hold — see the same
+    // rule in `inject_sealed_section`.
+    let page = page.filter(|_| !injected.was_cut());
     // The rows that go with those chunks. Borrowing the K/V is what makes a
     // reprojection cheap; the index cannot be borrowed the same way, because
     // its keys come from hidden states this slot never computed.
@@ -1869,8 +1944,7 @@ fn inject_sealed_turn(
                 );
                 if carries {
                     // Nothing was pushed, so the whole injected width is the gap.
-                    let tokens = sealed.first().map_or(0, |s| s.token_count);
-                    let _ = model.push_positional_gap(parent_id.0, tokens);
+                    let _ = model.push_positional_gap(parent_id.0, injected.tokens);
                 }
             }
         }
@@ -1878,16 +1952,19 @@ fn inject_sealed_turn(
         // Same reasoning as the section path: the turn's K/V is injected either
         // way, so the slot has to be advanced past it or the next page is placed
         // short of where its K/V actually sits.
-        let tokens = sealed.first().map_or(0, |s| s.token_count);
+        let tokens = injected.tokens;
         let declared = ctx.model.push_positional_gap(parent_id.0, tokens);
-        tracing::warn!(
-            stream_id = format!("{:#018x}", turn_stream_id(timeline.raw(), index.0).0),
-            advanced = declared.is_ok(),
-            "apply_projection: turn {}/{} has no index page, resident or stored — its \
-             {tokens} token(s) are unindexed",
-            timeline,
-            index.0
-        );
+        // A cut turn's pages were left out above and reported with the cut.
+        if !injected.was_cut() || declared.is_err() {
+            tracing::warn!(
+                stream_id = format!("{:#018x}", turn_stream_id(timeline.raw(), index.0).0),
+                advanced = declared.is_ok(),
+                "apply_projection: turn {}/{} has no index page, resident or stored — its \
+                 {tokens} token(s) are unindexed",
+                timeline,
+                index.0
+            );
+        }
     }
 
     let toks: Vec<u32> = ctx
@@ -1895,25 +1972,15 @@ fn inject_sealed_turn(
         .read()
         .assistant_token_ids_of(timeline, index)
         .to_vec();
-    let start_block = ctx
-        .session
-        .sequence_block_count(parent_id.0)
-        .ok_or_else(|| {
-            ConversationError::Channel(format!(
-                "apply_projection: slot {} not in session",
-                parent_id
-            ))
-        })?
-        .saturating_sub(sealed[0].chunks.len());
-    let end_block = start_block + sealed[0].chunks.len();
+    let (start_block, end_block) = injected.range;
     ctx.conversation
         .write()
         .set_block_range(timeline, index, start_block as u64, end_block as u64);
 
     log_injected_tokens(ctx, &toks);
     walker.sealed_turns += 1;
-    walker.sealed_tokens += sealed[0].token_count;
-    walker.record_sealed(sealed[0].token_count);
+    walker.sealed_tokens += injected.tokens;
+    walker.record_sealed(injected.tokens);
     Ok(())
 }
 
@@ -1956,7 +2023,20 @@ fn inject_sealed_turn_half(
             return Ok(());
         }
     };
-    inject_arc_sealed(ctx.session, parent_id, &sealed)?;
+    let what = InjectedPiece::TurnHalf(timeline, index);
+    let Some(injected) = inject_arc_sealed(ctx.session, parent_id, &sealed, &what)? else {
+        walker.skipped_turns += 1;
+        return Ok(());
+    };
+    if injected.was_cut() {
+        report_cut(
+            &what,
+            parent_id,
+            &sealed,
+            &injected,
+            "a conversation's turn is its history and is not rebuilt",
+        );
+    }
     // **No page for a HALF, deliberately.** The stored page covers a whole
     // turn, and this borrows only its user half — handing the whole turn's rows
     // over would claim blocks for positions this slot does not hold, which is a
@@ -1965,7 +2045,7 @@ fn inject_sealed_turn_half(
     // a piece with no page: without that, every page pushed after the half is
     // placed its width short of where its K/V sits.
     if ctx.model.carries_positional_state() {
-        let tokens = sealed[0].token_count;
+        let tokens = injected.tokens;
         let advanced = ctx.model.push_positional_gap(parent_id.0, tokens);
         tracing::warn!(
             advanced = advanced.is_ok(),
@@ -1978,8 +2058,8 @@ fn inject_sealed_turn_half(
     }
 
     walker.sealed_turns += 1;
-    walker.sealed_tokens += sealed[0].token_count;
-    walker.record_sealed(sealed[0].token_count);
+    walker.sealed_tokens += injected.tokens;
+    walker.record_sealed(injected.tokens);
     Ok(())
 }
 
@@ -1996,25 +2076,51 @@ fn inject_sealed_turn_half(
 /// `SealedSequence` on this path) ever reads a `SealedSequence`'s own
 /// `chunk_size` or `location` — both fields are copied through, never
 /// branched on — so the override was dead work from the moment it ran.
+///
+/// `None` when the piece's layer count does not match the session's and nothing
+/// was injected. A piece whose layers disagree on their chunk windows is cut to
+/// the common prefix by the session and reported in the returned
+/// [`SealedInjection`]; the caller knows which stored record the piece is, and
+/// so whether it can be repaired and how loudly to say so ([`report_cut`]).
 fn inject_arc_sealed(
     session: &mut BatchedInferenceSession,
     parent_id: SequenceId,
     sealed: &Arc<Vec<SealedSequence>>,
-) -> Result<(), ConversationError> {
+    what: &InjectedPiece,
+) -> Result<Option<SealedInjection>, ConversationError> {
     let _g = profile::span("inject:arc_sealed");
     let n_layers = session.num_layers();
     if sealed.len() != n_layers {
         tracing::warn!(
-            "apply_projection: unit has {} layers, expected {}; skipping",
+            "apply_projection: {what} has {} layers, expected {}; skipping",
             sealed.len(),
             n_layers,
         );
-        return Ok(());
+        return Ok(None);
     }
     session
         .inject_sealed_at_tail(parent_id.0, sealed)
-        .map_err(ConversationError::Model)?;
-    Ok(())
+        .map(Some)
+        .map_err(ConversationError::Model)
+}
+
+/// Name a piece the session cut to its layers' common prefix: which piece,
+/// what it stored, what the slot received, and what is being done about it.
+fn report_cut(
+    what: &InjectedPiece,
+    parent_id: SequenceId,
+    sealed: &[SealedSequence],
+    injected: &SealedInjection,
+    repair: &str,
+) {
+    tracing::warn!(
+        slot = parent_id.0,
+        cut_chunks = injected.cut_chunks,
+        injected_tokens = injected.tokens,
+        stored_tokens = sealed.first().map_or(0, |s| s.token_count),
+        "apply_projection: {what}'s layers describe different token windows; the slot \
+         received their common prefix — {repair}"
+    );
 }
 
 /// A span this slot forwarded once and can re-inject instead of recomputing.
@@ -2033,8 +2139,18 @@ pub(super) struct CapturedSpan {
 }
 
 /// Hand a re-injected span's index rows back to the model.
-fn push_captured_page(ctx: &mut ApplyContext<'_>, span: &CapturedSpan, what: &str) {
-    match &span.page {
+///
+/// `injected` is what the slot actually received. With no page, or with a cut
+/// (whose page describes tokens the slot does not hold), the slot is advanced
+/// over the tokens placed instead, as the section and turn paths do: a page
+/// pushed after this one is placed at a position measured from here.
+fn push_captured_page(
+    ctx: &mut ApplyContext<'_>,
+    span: &CapturedSpan,
+    injected: &SealedInjection,
+    what: &InjectedPiece,
+) {
+    match span.page.as_ref().filter(|_| !injected.was_cut()) {
         Some(page) => {
             if let Err(e) =
                 ctx.model
@@ -2044,10 +2160,18 @@ fn push_captured_page(ctx: &mut ApplyContext<'_>, span: &CapturedSpan, what: &st
             }
         }
         None => {
-            if ctx.model.carries_positional_state() {
+            if !ctx.model.carries_positional_state() {
+                return;
+            }
+            let advanced = ctx
+                .model
+                .push_positional_gap(ctx.parent_id.0, injected.tokens);
+            if span.page.is_none() || advanced.is_err() {
                 tracing::warn!(
-                    "apply_projection: {what} has no index page — this slot will select \
-                     against a prefix it never indexed"
+                    advanced = advanced.is_ok(),
+                    "apply_projection: {what} has no index page — its {} token(s) are \
+                     unindexed",
+                    injected.tokens
                 );
             }
         }
@@ -2066,10 +2190,24 @@ fn handle_new_user_message(
         // Mid-decode reproject path: the user's K/V was already
         // captured on an earlier apply.  Re-inject the cached bytes;
         // do not re-run the forward pass.
-        inject_arc_sealed(ctx.session, ctx.parent_id, &cached.kv)?;
+        let what = InjectedPiece::CachedUserMessage {
+            tokens: tokens.len(),
+        };
+        let injected = inject_arc_sealed(ctx.session, ctx.parent_id, &cached.kv, &what)?;
+        if let Some(inj) = injected.filter(SealedInjection::was_cut) {
+            report_cut(
+                &what,
+                ctx.parent_id,
+                &cached.kv,
+                &inj,
+                "captured by this process's own forward, so this is a live fault",
+            );
+        }
         // And the rows that go with them — `apply_segments_build` reset the
         // index before this walk, so nothing else puts them back.
-        push_captured_page(ctx, &cached, "cached user message");
+        if let Some(inj) = &injected {
+            push_captured_page(ctx, &cached, inj, &what);
+        }
         log_injected_tokens(ctx, tokens);
     } else {
         let captured = drive_prefill_and_capture(ctx, tokens, walker.last_was_sealed)?;

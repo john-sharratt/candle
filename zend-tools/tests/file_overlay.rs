@@ -167,7 +167,7 @@ fn list_enumerates_the_workspace_one_level_from_the_root() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": "/"}),
+        json!({"repo": REPO, "path": "/", "page": 0}),
         &ctx,
     ));
     assert_eq!(paths(&resp), vec!["README.md", "docs", "src"]);
@@ -190,7 +190,7 @@ fn list_narrows_the_workspace_by_directory() {
     for path in ["src", "src/", "/src"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path }),
+            json!({ "repo": REPO, "path": path, "page": 0 }),
             &ctx,
         ));
         assert_eq!(
@@ -211,7 +211,7 @@ fn list_omits_gitignored_and_hidden_paths() {
     let ctx = ctx_for(&dir);
     let listed = paths(&harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": ""}),
+        json!({"repo": REPO, "path": "", "page": 0}),
         &ctx,
     )));
     assert!(
@@ -242,7 +242,7 @@ fn list_marks_session_written_entries_as_modified() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": "src"}),
+        json!({"repo": REPO, "path": "src", "page": 0}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();
@@ -308,7 +308,7 @@ fn edit_of_a_workspace_file_is_ambiguous_when_the_text_occurs_twice() {
     // A rejected edit must not leave a copy-up behind that shadows the original.
     let listed = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": ""}),
+        json!({"repo": REPO, "path": "", "page": 0}),
         &ctx,
     ));
     let entries = listed["entries"].as_array().unwrap();
@@ -363,7 +363,7 @@ fn delete_hides_a_workspace_file_without_erasing_it() {
     );
     let listed = paths(&harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": "docs"}),
+        json!({"repo": REPO, "path": "docs", "page": 0}),
         &ctx,
     )));
     assert!(!listed.contains(&"docs/guide.md".to_string()), "{listed:?}");
@@ -472,7 +472,7 @@ fn list_caps_a_large_directory_to_one_page() {
 
     let first = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": "src"}),
+        json!({"repo": REPO, "path": "src", "page": 0}),
         &ctx,
     ));
     assert_eq!(first["entries"].as_array().unwrap().len(), 50);
@@ -529,7 +529,7 @@ fn list_within_one_page_reports_no_next_page() {
     let ctx = ctx_for(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": ""}),
+        json!({"repo": REPO, "path": "", "page": 0}),
         &ctx,
     ));
     assert_eq!(resp["paging"]["pages"], 1);
@@ -553,7 +553,7 @@ fn list_entries_omit_the_modified_flag_when_unchanged() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": "src"}),
+        json!({"repo": REPO, "path": "src", "page": 0}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();

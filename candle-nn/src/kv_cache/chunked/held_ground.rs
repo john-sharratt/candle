@@ -41,10 +41,14 @@ const REFUSAL_REPORT_SITES: usize = 8;
 /// pinned scratch it mirrors), a few MiB of launch tables and resident headers
 /// per stream handle, and the sampler's argument pack — the CUDA pool held
 /// ~1 GiB of such buffers and their churn outside the reservation before they
-/// moved here. A request the ground cannot hold is served from the pool and
-/// reported, so the figure is a budget to measure against
+/// moved here. The launchers' grow-only kernel scratch lives here too, and on
+/// its own outgrew the rest: the INT8 prefill split partials took 337 MiB in one
+/// block (Flash-Next, an 8192-token prefill wave), which at 384 MiB left the
+/// slot-state slabs, sampler packs and launch tables refused into the pool. A
+/// request the ground cannot hold is served from the pool and reported, so the
+/// figure is a budget to measure against
 /// ([`super::region_pool::held_ground_stats`]'s `peak`), not a wall.
-pub const HELD_GROUND_BYTES: usize = 384 * 1024 * 1024;
+pub const HELD_GROUND_BYTES: usize = 512 * 1024 * 1024;
 
 /// Every range the ground hands out starts on this boundary.
 pub(crate) const HELD_ALIGN: usize = 256;
