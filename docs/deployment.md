@@ -218,7 +218,10 @@ after any exit. The scheduled task **`\keep`** runs that supervisor — boot tri
 as `johna`, restart count 999, no time limit, normal priority (cf-ddns's below-normal
 priority class would be inherited by `motherd`). So a reboot brings `keep` back, and
 `keep` brings back `web` and `motherd`, with nobody logged on. Registering the task
-needs an elevated session. Log: `C:\Users\johna\AppData\Local\keep\keep.log`. Its
+needs an elevated session. Log: `C:\Users\johna\AppData\Local\keep\keep.log`.
+The supervisor redirects keep's output with `cmd /c "… >> log 2>&1"`, never through a
+PowerShell pipe: `web` and `motherd` inherit keep's handles, and a pipe they hold open
+kept the loop waiting after keep exited, so keep was never restarted. Its
 processes run in the task's logon session, so their start time and path read empty from
 an interactive session; match them by name. A rollout does not swap `keep`.
 
