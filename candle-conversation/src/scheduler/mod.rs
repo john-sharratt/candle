@@ -3580,6 +3580,9 @@ pub(crate) struct Scheduler {
     /// Consecutive failures of the decode-less wave step and the wait owed
     /// before the next — see `wave_retry`.
     wave_retry: wave_retry::WaveRetry,
+    /// Consecutive decode steps whose tier the partition refused, and the wait
+    /// owed before the next — see `decode::refused_step`.
+    decode_retry: wave_retry::WaveRetry,
     /// The last wave step carried rows other than decode and verify — a prefill
     /// creep, a section chunk or glue — so the profile can tell an 8-session
     /// decode step from one that also paid for ingest.
@@ -3881,6 +3884,7 @@ impl Scheduler {
             wave_prefill_members: Vec::new(),
             wave_cohort_advanced: false,
             wave_retry: wave_retry::WaveRetry::default(),
+            decode_retry: wave_retry::WaveRetry::default(),
             wave_cobatched: false,
             wave_step_ratio: 1,
             wave_section_advanced: false,
@@ -15345,6 +15349,7 @@ mod tests {
         );
     }
 
+    mod refused_decode_tier;
     mod speculation_in_a_grammar;
 
     // —— admission (`admit_ground::AdmitPass`) ———————————————————————————————

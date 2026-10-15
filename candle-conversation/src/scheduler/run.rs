@@ -700,33 +700,38 @@ impl Scheduler {
                 continue;
             }
 
-            // 3b. **A decode-less wave that just failed is not rebuilt at once.**
-            // Nothing it stands on has changed yet, so the same wave would fail
-            // the same way. Wait out the backoff — a request ends it early and is
-            // handled — then try again (`wave_retry`). With decodes running the
-            // decode-less path is not taken, so there is nothing to wait for.
-            if let Some(wait) = self.wave_retry.take_wait() {
-                if self.decode_width() == 0 {
-                    let t_wait = Instant::now();
-                    match self.rx.recv_timeout(wait) {
-                        Ok(req) => {
-                            self.wave_stats
-                                .add_idle(t_wait.elapsed().as_millis() as u64);
-                            let t_req = Instant::now();
-                            let keep_going = self.handle_request(req);
-                            self.wave_stats
-                                .add_requests(t_req.elapsed().as_micros() as u64);
-                            if !keep_going {
-                                break;
-                            }
-                            continue;
+            // 3b. **A wave that just failed is not rebuilt at once.** Nothing it
+            // stands on has changed yet, so the same wave would fail the same
+            // way. Wait out the backoff — a request ends it early and is handled
+            // — then try again: a decode-less wave's (`wave_retry`), which is
+            // only taken with no decodes running, and a decode step whose tier
+            // was refused (`decode_retry`), which leaves its turns where they
+            // stood for the next step.
+            let decode_less = self
+                .wave_retry
+                .take_wait()
+                .filter(|_| self.decode_width() == 0);
+            let owed = decode_less.max(self.decode_retry.take_wait());
+            if let Some(wait) = owed {
+                let t_wait = Instant::now();
+                match self.rx.recv_timeout(wait) {
+                    Ok(req) => {
+                        self.wave_stats
+                            .add_idle(t_wait.elapsed().as_millis() as u64);
+                        let t_req = Instant::now();
+                        let keep_going = self.handle_request(req);
+                        self.wave_stats
+                            .add_requests(t_req.elapsed().as_micros() as u64);
+                        if !keep_going {
+                            break;
                         }
-                        Err(flume::RecvTimeoutError::Timeout) => {
-                            self.wave_stats
-                                .add_idle(t_wait.elapsed().as_millis() as u64);
-                        }
-                        Err(flume::RecvTimeoutError::Disconnected) => break,
+                        continue;
                     }
+                    Err(flume::RecvTimeoutError::Timeout) => {
+                        self.wave_stats
+                            .add_idle(t_wait.elapsed().as_millis() as u64);
+                    }
+                    Err(flume::RecvTimeoutError::Disconnected) => break,
                 }
             }
 

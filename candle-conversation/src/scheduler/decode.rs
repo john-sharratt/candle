@@ -3,9 +3,11 @@ use super::named_tool::steer_to_named_tool;
 use super::priority_pause::rank;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{locate_rows, SpecChooser};
+use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use crate::recorded_reply::{departure, replayed_step};
 use crate::stats::streams_committed;
+use candle_nn::kv_cache::is_tier_refusal;
 use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
 use candle_transformers::models::held_tensor::hold_rows;
 use candle_transformers::models::speculative_choice::AcceptWalk;
@@ -782,6 +784,10 @@ impl Scheduler {
             budget,
         ) {
             Ok(d) => d,
+            Err(e) if is_tier_refusal(&e) => {
+                self.refused_step(&seq_ids, "decode draft", &e);
+                return;
+            }
             Err(e) => {
                 self.fail_all_decodes(&seq_ids, &format!("decode draft failed: {e}"));
                 return;
@@ -877,11 +883,18 @@ impl Scheduler {
             Ok(l) => l,
             Err(e) => {
                 self.model.abort_verify(&spec_seqs);
-                self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
+                if is_tier_refusal(&e) {
+                    self.refused_step(&seq_ids, "decode forward", &e);
+                } else {
+                    self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
+                }
                 return;
             }
         };
         forward_span.end();
+        if let Some(refusals) = self.decode_retry.succeeded() {
+            tracing::info!(refusals, "decode step ran after its tier was refused");
+        }
         let fwd_elapsed = t_fwd.elapsed();
         // The step's two halves by the wave's shape, so a pure decode step is
         // never averaged with one that also carried an ingest chunk.
@@ -2258,6 +2271,37 @@ impl Scheduler {
                     target: "candle_conversation::scheduler::reproject",
                     view_id = view_id.0, err = %e,
                     "reprojection complete failed; decode for this view ends"
+                );
+            }
+        }
+    }
+
+    /// A decode step whose transient tier the partition refused — the draft
+    /// walk's or the verify forward's. **The turns keep their place.** A refusal
+    /// is placement, not computation: nothing was committed, and the next step
+    /// re-forwards the same last token (`DecodeState::mark_forwarded`'s benign
+    /// direction). Ending the turn instead threw away a reply mid-thought
+    /// over ground that relief, a compaction or the weight side's between-wave
+    /// concession hands back a step or two later — the weight side refuses to
+    /// move only while a wave or an expert invocation is in flight. The step
+    /// waits out the backoff ([`WaveRetry`]) and runs again; a run of refusals
+    /// long enough to give up fails the turns with the error.
+    fn refused_step(&mut self, seq_ids: &[SequenceId], what: &str, err: &candle::Error) {
+        match self.decode_retry.failed() {
+            Next::Retry { wait, attempt } => {
+                if WaveRetry::logs(attempt) {
+                    tracing::warn!(
+                        attempt,
+                        wait_us = wait.as_micros() as u64,
+                        "{what} refused its tier; the turns wait for ground: {err}"
+                    );
+                }
+            }
+            Next::GiveUp { attempts } => {
+                tracing::error!(attempts, "{what} refused its tier on every attempt: {err}");
+                self.fail_all_decodes(
+                    seq_ids,
+                    &format!("{what} could not place its tier in {attempts} attempts: {err}"),
                 );
             }
         }
