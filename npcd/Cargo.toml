@@ -61,6 +61,7 @@ cluster    = { path = "../cluster" }
 zend-vfs     = { path = "../zend-vfs" }
 store-events = { path = "../store-events" }
 agent        = { path = "../agent" }
+substrate-git = { path = "../substrate-git", features = ["member"] }
 # Hashing a provider's subject id into a file name that is valid whatever shape
 # the provider chose. Not a security boundary — the subject inside the file is
 # authoritative — but it has to be total over every possible input.

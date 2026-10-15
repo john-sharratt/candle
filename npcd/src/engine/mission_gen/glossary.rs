@@ -14,9 +14,9 @@
 //! saying what it is. The terms a draft and what it answers to name are given
 //! with that opening, most named first.
 
-use std::path::Path;
 
 use super::answer::unlink;
+use crate::mind::files::MindFiles;
 use super::material::cut;
 
 /// Where the world's terms are, under the mind root.
@@ -41,19 +41,13 @@ pub struct Term {
 
 /// The world's terms in the mind at `root`, in alphabetical order — none
 /// when it has no world layer.
-pub fn terms(root: &Path) -> Vec<Term> {
-    let Ok(entries) = std::fs::read_dir(root.join(WORLD)) else {
-        return Vec::new();
-    };
-    let mut out: Vec<Term> = entries
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            if !p.is_file() || p.extension()? != "md" {
-                return None;
-            }
-            let stem = p.file_stem()?.to_str()?.to_string();
-            let gist = gist(&std::fs::read_to_string(&p).ok()?)?;
+pub fn terms(root: &MindFiles) -> Vec<Term> {
+    let mut out: Vec<Term> = root
+        .list(WORLD)
+        .into_iter()
+        .filter_map(|name| {
+            let stem = name.strip_suffix(".md")?.to_string();
+            let gist = gist(&root.read(&format!("{WORLD}/{name}"))?)?;
             Some(Term {
                 word: stem.replace('_', " "),
                 path: format!("{WORLD}/{stem}.md"),
@@ -159,7 +153,7 @@ mod tests {
         std::fs::write(world.join("alien_wildlife.md"), "Beasts of the waste.").unwrap();
         std::fs::write(world.join("avatar").join("biological.md"), "Not a term.").unwrap();
         assert_eq!(
-            terms(dir.path()),
+            terms(&MindFiles::folder(dir.path())),
             [
                 term("alien wildlife", "Beasts of the waste."),
                 term(
@@ -168,7 +162,7 @@ mod tests {
                 ),
             ]
         );
-        assert!(terms(&dir.path().join("nothing")).is_empty());
+        assert!(terms(&MindFiles::folder(dir.path().join("nothing"))).is_empty());
     }
 
     /// **The terms a draft names come first**, singular or plural, as whole

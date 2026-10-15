@@ -74,6 +74,29 @@ impl MapSet {
         MapSet::assemble(areas, parts)
     }
 
+    /// Load a map from its files' texts rather than a folder: `areas` the map
+    /// files and `parts` the part catalogue's, each `(name, yaml)`. What a map
+    /// kept somewhere other than a folder — a commit of a repository — loads
+    /// from. A name that is not a map file is passed over, as in a folder.
+    pub fn load_texts(areas: &[(String, String)], parts: &[(String, String)]) -> Result<MapSet> {
+        fn parse<T: serde::de::DeserializeOwned>(files: &[(String, String)]) -> Result<Vec<T>> {
+            let mut out = Vec::new();
+            for (name, text) in files {
+                if !is_map_file(Path::new(name)) {
+                    continue;
+                }
+                out.push(serde_yaml::from_str(text).with_context(|| format!("parsing {name}"))?);
+            }
+            Ok(out)
+        }
+        let areas: Vec<Area> = parse(areas)?;
+        if areas.is_empty() {
+            bail!("no map files");
+        }
+        let parts: Vec<Part> = parse(parts)?;
+        MapSet::assemble(areas, parts)
+    }
+
     /// Build a set from areas already in memory. The tests use this; so does
     /// anything generating a world rather than reading one.
     pub fn from_areas(areas: impl IntoIterator<Item = Area>) -> Result<MapSet> {

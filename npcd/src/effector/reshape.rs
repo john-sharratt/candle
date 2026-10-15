@@ -164,24 +164,23 @@ async fn reshape_world(
 /// over a mind under git — and a map outside it in its own folder. `None` for
 /// a world with no folder, or a map in the mind with nobody to keep it for.
 async fn keep_for(rt: &Runtime, hosted: &Hosted, npc: u64) -> Option<Keep> {
+    // A map read from the mind's files is kept in the mind, as the owner's
+    // write (`docs/substrate_git.md` §8.1).
+    if let Some(rel) = hosted.map_in_mind() {
+        return keep_in_mind(rt, rel.to_string(), npc).await;
+    }
     let dir = hosted.map_dir()?;
     let in_mind = rt
         .ops
         .mind_dir()
-        .and_then(|mind| Some((mind, dir.strip_prefix(mind).ok()?)));
-    let Some((mind, rel)) = in_mind else {
+        .and_then(|mind| Some(dir.strip_prefix(mind).ok()?.to_path_buf()));
+    let Some(rel) = in_mind else {
         return Some(Keep {
             shelf: Box::new(Disk::new(dir)),
             folder: String::new(),
             drafts: false,
         });
     };
-    let owner = rt
-        .npcs()?
-        .read()
-        .await
-        .payload(npc)
-        .map(|p| p.owner_id.clone())?;
     let folder: Vec<String> = rel
         .components()
         .filter_map(|c| match c {
@@ -189,11 +188,23 @@ async fn keep_for(rt: &Runtime, hosted: &Hosted, npc: u64) -> Option<Keep> {
             _ => None,
         })
         .collect();
-    let author = Author::open(mind, Some(&rt.ops), &owner);
+    keep_in_mind(rt, folder.join("/"), npc).await
+}
+
+/// A map in the mind's folder `folder`, kept as the write of character `npc`'s
+/// owner: their draft over a mind under git.
+async fn keep_in_mind(rt: &Runtime, folder: String, npc: u64) -> Option<Keep> {
+    let owner = rt
+        .npcs()?
+        .read()
+        .await
+        .payload(npc)
+        .map(|p| p.owner_id.clone())?;
+    let author = Author::open(&rt.mind_handle, Some(&rt.ops), &owner);
     Some(Keep {
         drafts: author.keeps_drafts(),
         shelf: Box::new(author),
-        folder: folder.join("/"),
+        folder,
     })
 }
 

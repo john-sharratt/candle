@@ -292,9 +292,7 @@ mod tests {
     #[test]
     fn the_published_mind_takes_no_write() {
         let root = tempfile::tempdir().unwrap();
-        let published = Published {
-            root: root.path().to_path_buf(),
-        };
+        let published = Published::folder(root.path().to_path_buf());
         assert!(matches!(
             write(&published, &p("a.md"), "x", true),
             Err(DocError::Unkept(_))

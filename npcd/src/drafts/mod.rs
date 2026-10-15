@@ -24,9 +24,10 @@ pub mod records;
 pub mod routes;
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::mind::Mind;
 use crate::opstore::owner::Owner;
 use crate::opstore::shelf::StoreShelf;
 use crate::opstore::MindStores;
@@ -46,10 +47,18 @@ pub enum Author {
 }
 
 impl Author {
-    /// Account `account`'s view of the mind folder at `root`, over `stores`
-    /// when the daemon has them.
-    pub fn open(root: &Path, stores: Option<&Arc<MindStores>>, account: &str) -> Author {
+    /// Account `account`'s view of `mind`, over `stores` when the daemon has
+    /// them.
+    pub fn open(mind: &Mind, stores: Option<&Arc<MindStores>>, account: &str) -> Author {
+        let published = mind
+            .published()
+            .unwrap_or_else(|| Published::folder(PathBuf::new()));
         let Some(stores) = stores.filter(|s| s.under_git()) else {
+            let root = published
+                .files()
+                .folder_root()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
             return Author::Disk(Disk::new(root));
         };
         let store = StoreShelf {
@@ -68,12 +77,7 @@ impl Author {
             })
             .unwrap_or_default();
         Author::Drafts {
-            view: Overlay::new(
-                Published {
-                    root: root.to_path_buf(),
-                },
-                drafts,
-            ),
+            view: Overlay::new(published, drafts),
             store,
         }
     }

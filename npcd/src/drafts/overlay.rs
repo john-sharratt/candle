@@ -116,9 +116,7 @@ mod tests {
 
     fn overlay(dir: &tempfile::TempDir, drafts: &[(&str, Option<&str>)]) -> Overlay {
         Overlay::new(
-            Published {
-                root: dir.path().to_path_buf(),
-            },
+            Published::folder(dir.path().to_path_buf()),
             drafts
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.map(str::to_string)))

@@ -480,7 +480,7 @@ pub fn report_block(hosted: &Hosted, body: &str) -> Option<String> {
         }
     }
     let vocabulary = hosted.read(leakage::vocabulary);
-    let lore = hosted.sim(|s| s.bench.mind_root().map(leakage::lore));
+    let lore = hosted.sim(|s| s.bench.files()).map(|f| leakage::lore(&f));
     let refusal = hosted.sim(|s| gate_refusal(s, body, &*shelf, &vocabulary, &lore))?;
     // A document that does not stand is to be written again — said in the
     // mission's own steps, so the compass sends the Maker back to its desk
@@ -1436,7 +1436,8 @@ fn time_travel(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcom
         ));
     };
     let eras = hosted
-        .sim(|s| s.bench.mind_root().map(chronology::eras))
+        .sim(|s| s.bench.files())
+        .map(|f| chronology::eras(&f))
         .unwrap_or_default();
     if let (Some(first), Some(now)) = (eras.first(), eras.last()) {
         if year < first.opens {
@@ -2167,7 +2168,7 @@ mod tests {
         .unwrap();
 
         let h = vault();
-        h.set_bench_root(&root);
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&root))));
         on_operation(&h, &root);
         (h, root)
     }
@@ -2436,7 +2437,7 @@ mod tests {
         });
         // Each Maker step set on the table as the engine's loop sets it.
         let put_up = || {
-            let corpus = Corpus::read(&root, "creators-vault");
+            let corpus = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(&root)), "creators-vault");
             h.with_sim(|s| {
                 let ops = s.missions.operations();
                 let offer = ops.offer(id).unwrap();
@@ -3235,7 +3236,7 @@ mod tests {
             "# the fourth era\n\nQuiet, and then not.\n",
         )
         .unwrap();
-        h.set_bench_root(&root);
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&root))));
 
         h.sim(|s| {
             let names: Vec<&str> = s.record.iter().map(|i| i.name.as_str()).collect();
@@ -3392,7 +3393,7 @@ mod tests {
         // The record already names the courier and the eastern flats (the vault
         // seed); the world/ layers are made on the first commit into them.
         let h = vault();
-        h.set_bench_root(&root);
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&root))));
         on_operation(&h, &root);
         (h, root)
     }
@@ -3603,7 +3604,7 @@ mod tests {
         // mind and the place is filed, at its path, again.
         publish(&h, &root, key);
         let mut fresh = crate::sim::record::Record::new();
-        fresh.index_canon(&root);
+        fresh.index_canon(&crate::mind::files::MindFiles::folder(&root));
         assert_eq!(
             fresh.path_of("the eastern flats").as_deref(),
             Some("layers/world/locations/the-eastern-flats.md")
@@ -3651,7 +3652,7 @@ mod tests {
         // history is NOT its entry path: `Item.path` names the entry, which is
         // still unwritten here, and the history is found name-derived instead.
         let mut fresh = crate::sim::record::Record::new();
-        fresh.index_canon(&root);
+        fresh.index_canon(&crate::mind::files::MindFiles::folder(&root));
         assert!(
             fresh.path_of("the eastern flats").is_none(),
             "the geography history was adopted as the entry path"
@@ -3688,7 +3689,7 @@ mod tests {
         )
         .unwrap();
         // Re-index off the disk so the record adopts both documents.
-        h.set_bench_root(&root);
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&root))));
         h.sim(|s| {
             assert_eq!(
                 s.record.path_of("the eastern flats").as_deref(),

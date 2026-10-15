@@ -9,9 +9,9 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::mind::path::MindPath;
-use crate::sim::bench::refuse_link;
+use crate::mind::files::MindFiles;
 
 /// What a body's documents stand on. Shared, so an act may hold one across
 /// its awaits.
@@ -35,32 +35,33 @@ pub trait Shelf: Send + Sync {
     }
 }
 
-/// The published mind, read from its folder; it takes no commit.
+/// The published mind — its files at the commit the log names, or a plain
+/// folder ([`MindFiles`]); it takes no commit.
+#[derive(Clone)]
 pub struct Published {
-    pub root: PathBuf,
+    files: Arc<MindFiles>,
 }
 
 impl Published {
-    /// Where `key` is in the folder, refusing a path that leaves it or a link.
-    pub fn file(&self, key: &str) -> Option<PathBuf> {
-        let full = MindPath::parse(key).ok()?.resolve(&self.root).ok()?;
-        refuse_link(&full, key).ok()?;
-        Some(full)
+    /// The published mind as `files` hold it.
+    pub fn of(files: Arc<MindFiles>) -> Self {
+        Self { files }
+    }
+
+    /// The published mind as the folder `root` holds it.
+    pub fn folder(root: impl Into<PathBuf>) -> Self {
+        Self::of(Arc::new(MindFiles::folder(root)))
+    }
+
+    /// The files beneath.
+    pub fn files(&self) -> &Arc<MindFiles> {
+        &self.files
     }
 
     /// Whether something that is not a document stands at `key`: a folder, or
     /// a link, which is never followed.
     pub fn not_a_document(&self, key: &str) -> bool {
-        let Some(full) = MindPath::parse(key)
-            .ok()
-            .and_then(|p| p.resolve(&self.root).ok())
-        else {
-            return false;
-        };
-        match full.symlink_metadata() {
-            Ok(meta) => !meta.is_file() || refuse_link(&full, key).is_err(),
-            Err(_) => false,
-        }
+        self.files.not_a_document(key)
     }
 }
 
@@ -70,37 +71,17 @@ pub const NO_OPERATION: &str = "There is nowhere for this to go: work reaches wh
 
 impl Shelf for Published {
     fn read(&self, key: &str) -> Option<String> {
-        std::fs::read_to_string(self.file(key)?).ok()
+        self.files.read(key)
     }
 
     fn size(&self, key: &str) -> Option<u64> {
-        let meta = self.file(key)?.metadata().ok()?;
-        meta.is_file().then_some(meta.len())
+        self.files.size(key)
     }
 
     /// A folder that is a link lists as nothing: a junction would otherwise
     /// report documents from somewhere the character never named.
     fn list(&self, dir: &str) -> BTreeSet<String> {
-        let Some(full) = MindPath::parse(dir)
-            .ok()
-            .and_then(|p| p.resolve(&self.root).ok())
-            .filter(|full| refuse_link(full, dir).is_ok())
-        else {
-            return BTreeSet::new();
-        };
-        let Ok(entries) = std::fs::read_dir(full) else {
-            return BTreeSet::new();
-        };
-        entries
-            .flatten()
-            .map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                match e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    true => format!("{name}/"),
-                    false => name,
-                }
-            })
-            .collect()
+        self.files.list(dir)
     }
 
     fn commit(&self, _changes: &[(String, Option<String>)]) -> Result<(), String> {
@@ -118,9 +99,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("layers/eras")).unwrap();
         std::fs::write(dir.path().join("layers/eras/third.md"), "the third era\n").unwrap();
-        let shelf = Published {
-            root: dir.path().to_path_buf(),
-        };
+        let shelf = Published::folder(dir.path().to_path_buf());
         assert_eq!(
             shelf.read("layers/eras/third.md").as_deref(),
             Some("the third era\n")

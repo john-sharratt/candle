@@ -103,6 +103,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::mind::files::MindFiles;
+
 /// How much of the calendar one document covers.
 ///
 /// Ordered coarse-to-fine, and the derived `Ord` follows that order — which is
@@ -293,16 +295,17 @@ pub fn parse_name(file: &Path) -> Result<Named, NotAnEpisode> {
 /// is still a life, and the author needs to be told which document fell out
 /// rather than left to infer it from a character that does not remember
 /// something.
-pub fn episodes(dir: &Path, who: &str) -> (Vec<Episode>, Vec<NotAnEpisode>) {
+pub fn episodes(mind: &MindFiles, dir: &str, who: &str) -> (Vec<Episode>, Vec<NotAnEpisode>) {
     let mut found = Vec::new();
     let mut rejected = Vec::new();
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (found, rejected);
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() || !crate::engine::watcher::is_ingestible(&path) {
+    for name in mind.list(dir) {
+        // Mind-relative, as every path the substrate keys a document by is.
+        let path = PathBuf::from(match dir.is_empty() {
+            true => name.clone(),
+            false => format!("{dir}/{name}"),
+        });
+        if name.ends_with('/') || !crate::engine::watcher::is_ingestible(&path) {
             continue;
         }
         match parse_name(&path) {
@@ -331,13 +334,12 @@ pub fn episodes(dir: &Path, who: &str) -> (Vec<Episode>, Vec<NotAnEpisode>) {
 /// `layers/life/<personality>/`. Absent is ordinary — most characters have no
 /// authored life yet, and that is a character with no beliefs rather than an
 /// error.
-pub fn lives(mind: &Path, characters: &[String]) -> Vec<(String, PathBuf)> {
-    let root = mind.join("layers").join("life");
-    let mut out: Vec<(String, PathBuf)> = characters
+pub fn lives(mind: &MindFiles, characters: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = characters
         .iter()
         .filter_map(|who| {
-            let dir = root.join(who);
-            dir.is_dir().then(|| (who.clone(), dir))
+            let dir = format!("layers/life/{who}");
+            mind.is_dir(&dir).then(|| (who.clone(), dir))
         })
         .collect();
     out.sort();
@@ -494,7 +496,7 @@ mod tests {
         ] {
             std::fs::write(dir.join(name), "# x").unwrap();
         }
-        let (eps, rejected) = episodes(&dir, "cindy-tan");
+        let (eps, rejected) = episodes(&MindFiles::folder(&dir), "", "cindy-tan");
         assert!(rejected.is_empty());
         let titles: Vec<&str> = eps.iter().map(|e| e.title.as_str()).collect();
         assert_eq!(titles, vec!["Earliest", "Middle", "Later"]);
@@ -507,7 +509,7 @@ mod tests {
         let dir = tmp("sameday");
         std::fs::write(dir.join("1998-09-14 Second.md"), "x").unwrap();
         std::fs::write(dir.join("1998-09-14 First.md"), "x").unwrap();
-        let (eps, _) = episodes(&dir, "who");
+        let (eps, _) = episodes(&MindFiles::folder(&dir), "", "who");
         assert_eq!(
             eps.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
             vec!["First", "Second"]
@@ -524,7 +526,7 @@ mod tests {
         let dir = tmp("hole");
         std::fs::write(dir.join("1998-09-14 Good.md"), "x").unwrap();
         std::fs::write(dir.join("about_courage.md"), "x").unwrap();
-        let (eps, rejected) = episodes(&dir, "who");
+        let (eps, rejected) = episodes(&MindFiles::folder(&dir), "", "who");
         assert_eq!(eps.len(), 1);
         assert_eq!(rejected.len(), 1);
         assert!(rejected[0].message().contains("about_courage"));
@@ -536,7 +538,7 @@ mod tests {
     fn a_character_with_no_life_directory_is_ordinary() {
         let mind = tmp("nolife");
         std::fs::create_dir_all(mind.join("layers/life/zen")).unwrap();
-        let found = lives(&mind, &["zen".into(), "keeper".into()]);
+        let found = lives(&MindFiles::folder(&mind), &["zen".into(), "keeper".into()]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "zen");
         let _ = std::fs::remove_dir_all(&mind);
@@ -579,7 +581,7 @@ mod tests {
         ] {
             std::fs::write(dir.join(name), "x").unwrap();
         }
-        let (eps, rejected) = episodes(&dir, "cindy-tan");
+        let (eps, rejected) = episodes(&MindFiles::folder(&dir), "", "cindy-tan");
         assert!(rejected.is_empty(), "{rejected:?}");
         assert_eq!(
             eps.iter().map(|e| e.date.as_str()).collect::<Vec<_>>(),
@@ -604,7 +606,7 @@ mod tests {
         let dir = tmp("coarse");
         std::fs::write(dir.join("1998 Nanyang.md"), "x").unwrap();
         std::fs::write(dir.join("1998-09 First Term.md"), "x").unwrap();
-        let (eps, _) = episodes(&dir, "who");
+        let (eps, _) = episodes(&MindFiles::folder(&dir), "", "who");
         assert_eq!(
             eps.iter().map(|e| e.precision).collect::<Vec<_>>(),
             vec![Precision::Year, Precision::Month]

@@ -59,7 +59,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::engine::loading::LoadProgress;
-use crate::engine::watcher::{is_ingestible, walk, Ledger, Reconcile};
+use crate::engine::watcher::{is_ingestible, Ledger, Reconcile};
+use crate::mind::files::MindFiles;
 
 /// How many documents are in flight at once.
 ///
@@ -177,11 +178,13 @@ pub struct LayerReport {
 /// and a second declaration to keep in step with it would be one more thing to
 /// get wrong.
 pub fn sources(
-    mind: &Path,
+    mind: &MindFiles,
     schema_layers: &[(String, Option<String>)],
     characters: &[String],
 ) -> Vec<LayerSource> {
-    let root = mind.join("layers");
+    // Mind paths: every source's folder and every document's path is relative
+    // to the mind, as the ledger and the substrate key them.
+    let root = Path::new("layers");
     let mut out: Vec<LayerSource> = Vec::new();
 
     for (name, unit) in schema_layers {
@@ -192,10 +195,10 @@ pub fn sources(
             continue;
         }
         let dir = root.join(name);
-        if !dir.is_dir() {
+        if !mind.is_dir(&format!("layers/{name}")) {
             continue;
         }
-        let owners = per_character_owners(&dir, characters);
+        let owners = per_character_owners(mind, &format!("layers/{name}"), characters);
         if owners.is_empty() {
             out.push(LayerSource {
                 name: name.clone(),
@@ -230,20 +233,14 @@ pub fn sources(
 /// subdirectory names a personality — one stray topic folder among them means
 /// the layer is organised by subject, not by character, and splitting it would
 /// scatter shared content into per-character silos.
-fn per_character_owners(dir: &Path, characters: &[String]) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
+fn per_character_owners(mind: &MindFiles, dir: &str, characters: &[String]) -> Vec<String> {
     let mut subdirs: Vec<String> = Vec::new();
     let mut has_loose_file = false;
-    for e in entries.flatten() {
-        let path = e.path();
-        if path.is_dir() {
-            if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
-                subdirs.push(n.to_string());
-            }
-        } else if is_ingestible(&path) {
-            has_loose_file = true;
+    for name in mind.list(dir) {
+        match name.strip_suffix('/') {
+            Some(sub) => subdirs.push(sub.to_string()),
+            None if is_ingestible(Path::new(&name)) => has_loose_file = true,
+            None => {}
         }
     }
     // A layer with content directly in it is shared, whatever its subdirectories
@@ -310,17 +307,24 @@ pub struct Pending {
 }
 
 pub fn pending(
+    mind: &MindFiles,
     source: &LayerSource,
     ledger: &Ledger,
 ) -> std::io::Result<(Vec<Pending>, LayerReport)> {
-    let files = walk(&source.dir)?;
+    let dir = source.dir.to_string_lossy().replace('\\', "/");
+    let files: Vec<PathBuf> = mind
+        .walk(&dir)
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|p| is_ingestible(p))
+        .collect();
     let mut out = Vec::new();
     let mut report = LayerReport {
         layer: source.name.clone(),
         ..Default::default()
     };
     for file in files {
-        let Ok(content) = std::fs::read_to_string(&file) else {
+        let Some(content) = mind.read(&file.to_string_lossy()) else {
             // Unreadable — a permission, a half-written file, a stray binary
             // with a .md name. Counted and skipped.
             report.failed += 1;
@@ -525,7 +529,7 @@ mod tests {
             std::fs::write(mind.join("layers").join(l).join("x.md"), "x").unwrap();
         }
         let found = sources(
-            &mind,
+            &MindFiles::folder(&mind),
             &layers(&[
                 ("beliefs", Some("beliefs")),
                 ("relationships", Some("people")),
@@ -550,7 +554,7 @@ mod tests {
         for who in ["zen", "keeper", "cindy-tan"] {
             std::fs::create_dir_all(mind.join("layers/memory").join(who)).unwrap();
         }
-        let found = sources(&mind, &layers(&[("memory", Some("memories"))]), &cast());
+        let found = sources(&MindFiles::folder(&mind), &layers(&[("memory", Some("memories"))]), &cast());
 
         assert_eq!(
             found.len(),
@@ -572,7 +576,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("zen")).unwrap();
         std::fs::write(dir.join("alliances.md"), "# Alliances").unwrap();
 
-        let found = sources(&mind, &layers(&[("world", Some("documents"))]), &cast());
+        let found = sources(&MindFiles::folder(&mind), &layers(&[("world", Some("documents"))]), &cast());
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[0].owner, None,
@@ -587,7 +591,7 @@ mod tests {
         for topic in ["ammo", "armor"] {
             std::fs::create_dir_all(mind.join("layers/world").join(topic)).unwrap();
         }
-        let found = sources(&mind, &layers(&[("world", Some("documents"))]), &cast());
+        let found = sources(&MindFiles::folder(&mind), &layers(&[("world", Some("documents"))]), &cast());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].owner, None);
         let _ = std::fs::remove_dir_all(&mind);
@@ -602,7 +606,7 @@ mod tests {
             std::fs::write(mind.join("layers").join(l).join("x.md"), "x").unwrap();
         }
         let found = sources(
-            &mind,
+            &MindFiles::folder(&mind),
             &layers(&[
                 ("memory", Some("memories")),
                 ("world", Some("documents")),
@@ -632,7 +636,7 @@ mod tests {
             std::fs::write(mind.join("layers").join(l).join("x.md"), "x").unwrap();
         }
         let found = sources(
-            &mind,
+            &MindFiles::folder(&mind),
             &layers(&[("dreams", Some("dreams")), ("world", Some("documents"))]),
             &cast(),
         );
@@ -648,7 +652,7 @@ mod tests {
         std::fs::create_dir_all(mind.join("layers/interaction")).unwrap();
 
         let found = sources(
-            &mind,
+            &MindFiles::folder(&mind),
             &layers(&[
                 ("world", Some("documents")),
                 ("interaction", None),
@@ -734,7 +738,8 @@ mod tests {
         std::fs::write(dir.join("a.md"), "# Alpha").unwrap();
         std::fs::write(dir.join("b.md"), "# Beta").unwrap();
 
-        let src = source("world", dir.clone());
+        let src = source("world", PathBuf::from("layers/world"));
+        let files = MindFiles::folder(&mind);
         let ledger = Ledger::new();
 
         // What the runtime does when a turn seals. `pending` only plans; the ledger entry is
@@ -745,7 +750,7 @@ mod tests {
             }
         };
 
-        let (first, r1) = pending(&src, &ledger).unwrap();
+        let (first, r1) = pending(&files, &src, &ledger).unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(r1.written, 2);
 
@@ -753,7 +758,7 @@ mod tests {
         // asking what a layer owed recorded every document as already ingested — and a
         // document whose turn then failed was skipped on every later boot, unrecoverable
         // without editing the file.
-        let (replan, _) = pending(&src, &ledger).unwrap();
+        let (replan, _) = pending(&files, &src, &ledger).unwrap();
         assert_eq!(
             replan.len(),
             2,
@@ -762,7 +767,7 @@ mod tests {
 
         seal(&first);
 
-        let (second, r2) = pending(&src, &ledger).unwrap();
+        let (second, r2) = pending(&files, &src, &ledger).unwrap();
         assert!(
             second.is_empty(),
             "a second boot rewrote unchanged documents"
@@ -770,14 +775,14 @@ mod tests {
         assert_eq!(r2.unchanged, 2);
 
         std::fs::write(dir.join("a.md"), "# Alpha, revised").unwrap();
-        let (third, r3) = pending(&src, &ledger).unwrap();
+        let (third, r3) = pending(&files, &src, &ledger).unwrap();
         assert_eq!(third.len(), 1);
         assert_eq!(third[0].addr, "world/a");
         assert_eq!(r3.written, 1);
 
         seal(&third);
         assert!(
-            pending(&src, &ledger).unwrap().0.is_empty(),
+            pending(&files, &src, &ledger).unwrap().0.is_empty(),
             "the revised document was still owed after its turn sealed"
         );
         let _ = std::fs::remove_dir_all(&mind);
@@ -793,7 +798,7 @@ mod tests {
         let body = "# Hess\n\nHe burned the east granary.\n\n  - indented\n";
         std::fs::write(dir.join("hess.md"), body).unwrap();
 
-        let (out, _) = pending(&source("world", dir), &Ledger::new()).unwrap();
+        let (out, _) = pending(&MindFiles::folder(&mind), &source("world", PathBuf::from("layers/world")), &Ledger::new()).unwrap();
         assert_eq!(out[0].body, body);
         let _ = std::fs::remove_dir_all(&mind);
     }
@@ -806,7 +811,7 @@ mod tests {
         std::fs::write(dir.join("good.md"), "fine").unwrap();
         std::fs::write(dir.join("bad.md"), [0xff, 0xfe, 0x00, 0x9c]).unwrap();
 
-        let (out, report) = pending(&source("world", dir), &Ledger::new()).unwrap();
+        let (out, report) = pending(&MindFiles::folder(&mind), &source("world", PathBuf::from("layers/world")), &Ledger::new()).unwrap();
         assert_eq!(out.len(), 1, "the good document did not survive");
         assert_eq!(report.written, 1);
         assert_eq!(report.failed, 1);

@@ -6,11 +6,12 @@
 //! the page, including whatever a Maker committed a minute ago.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::fingerprint::Fingerprint;
 use super::glossary::{self, Term};
 use crate::engine::life;
+use crate::mind::files::{MindFiles, MindRef};
 
 /// How many years apart two written events must be for the years between them
 /// to count as a stretch the next event belongs in.
@@ -99,7 +100,8 @@ pub struct Story {
 /// Everything the generator reads.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Corpus {
-    pub root: PathBuf,
+    /// The mind as it stood when this corpus was read.
+    pub mind: MindRef,
     /// The world's own `setting`, from `worlds/<id>.yaml` — what kind of place
     /// this is, which a story or a life written in it must not step outside.
     pub setting: Option<String>,
@@ -128,14 +130,13 @@ impl Corpus {
     /// **The cast is whoever has a life or a memory folder.** A personality with
     /// neither is not somebody in this world's history — a Maker, which writes
     /// the world and is not in it, is the case that matters.
-    pub fn read(root: &Path, world: &str) -> Corpus {
-        let layers = root.join("layers");
-        let setting = std::fs::read_to_string(root.join("worlds").join(format!("{world}.yaml")))
-            .ok()
+    pub fn read(root: &Arc<MindFiles>, world: &str) -> Corpus {
+        let setting = root
+            .read(&format!("worlds/{world}.yaml"))
             .and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok())
             .and_then(|y| y.get("setting")?.as_str().map(|s| s.trim().to_string()))
             .filter(|s| !s.is_empty());
-        let mut eras: Vec<Era> = docs(&layers.join("eras"))
+        let mut eras: Vec<Era> = docs(root, "layers/eras")
             .into_iter()
             .map(|(name, text)| Era {
                 path: format!("layers/eras/{name}"),
@@ -146,7 +147,7 @@ impl Corpus {
             .collect();
         eras.sort_by_key(|e| (e.year.unwrap_or(u32::MAX), e.path.clone()));
 
-        let stories = docs(&layers.join("stories"))
+        let stories = docs(root, "layers/stories")
             .into_iter()
             .map(|(name, text)| Story {
                 path: format!("layers/stories/{name}"),
@@ -156,13 +157,13 @@ impl Corpus {
             .collect();
 
         let mut lives = Vec::new();
-        for (who, yaml) in personalities(&root.join("personalities")) {
-            let life_dir = layers.join("life").join(&who);
-            let memory_dir = layers.join("memory").join(&who);
-            if !life_dir.is_dir() && !memory_dir.is_dir() {
+        for (who, yaml) in personalities(root) {
+            let life_dir = format!("layers/life/{who}");
+            let memory_dir = format!("layers/memory/{who}");
+            if !root.is_dir(&life_dir) && !root.is_dir(&memory_dir) {
                 continue;
             }
-            let (episodes, _) = life::episodes(&life_dir, &who);
+            let (episodes, _) = life::episodes(root, &life_dir, &who);
             let events = episodes
                 .into_iter()
                 .filter_map(|e| {
@@ -181,14 +182,14 @@ impl Corpus {
                     n => n.to_string(),
                 },
                 anchor: field("anchor").trim().to_string(),
-                story: std::fs::read_to_string(memory_dir.join("life-story.md")).ok(),
+                story: root.read(&format!("{memory_dir}/life-story.md")),
                 events,
                 who,
             });
         }
         lives.sort_by(|a, b| a.who.cmp(&b.who));
         Corpus {
-            root: root.to_path_buf(),
+            mind: MindRef(Some(Arc::clone(root))),
             setting,
             eras,
             lives,
@@ -210,18 +211,18 @@ impl Corpus {
         if let Some(s) = self.stories.iter().find(|s| s.path == path) {
             return Some(s.text.clone());
         }
-        std::fs::read_to_string(self.root.join(path)).ok()
+        self.on_disk(path)
     }
 
-    /// A document's file exactly as it stands on disk, by mind path — `None`
-    /// when there is none.
+    /// A document exactly as the published mind holds it, by mind path —
+    /// `None` when there is none.
     pub fn on_disk(&self, path: &str) -> Option<String> {
-        std::fs::read_to_string(self.root.join(path)).ok()
+        self.mind.0.as_ref()?.read(path)
     }
 
     /// Whether a document exists, by mind path.
     pub fn exists(&self, path: &str) -> bool {
-        self.held.contains_key(path) || self.root.join(path).is_file()
+        self.held.contains_key(path) || self.mind.0.as_ref().is_some_and(|m| m.is_file(path))
     }
 
     /// The world's present: the year its latest era opens. Nothing in a life
@@ -258,18 +259,16 @@ impl Corpus {
 }
 
 /// Every `.md` directly in `dir`, by file name, sorted, skipping the `_` notes.
-fn docs(dir: &Path) -> Vec<(String, String)> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<(String, String)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_str()?.to_string();
-            if !name.ends_with(".md") || name.starts_with('_') || !e.path().is_file() {
+fn docs(mind: &MindFiles, dir: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = mind
+        .list(dir)
+        .into_iter()
+        .filter_map(|name| {
+            if !name.ends_with(".md") || name.starts_with('_') {
                 return None;
             }
-            Some((name, std::fs::read_to_string(e.path()).ok()?))
+            let text = mind.read(&format!("{dir}/{name}"))?;
+            Some((name, text))
         })
         .collect();
     out.sort();
@@ -277,16 +276,13 @@ fn docs(dir: &Path) -> Vec<(String, String)> {
 }
 
 /// Every personality file, by id.
-fn personalities(dir: &Path) -> Vec<(String, serde_yaml::Value)> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<(String, serde_yaml::Value)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_str()?.to_string();
+fn personalities(mind: &MindFiles) -> Vec<(String, serde_yaml::Value)> {
+    let mut out: Vec<(String, serde_yaml::Value)> = mind
+        .list("personalities")
+        .into_iter()
+        .filter_map(|name| {
             let id = name.strip_suffix(".yaml")?.to_string();
-            let yaml = serde_yaml::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+            let yaml = serde_yaml::from_str(&mind.read(&format!("personalities/{name}"))?).ok()?;
             Some((id, yaml))
         })
         .collect();
@@ -387,7 +383,7 @@ pub(crate) mod tests {
 
     /// The fixture mind, read as its one world.
     pub fn corpus(dir: &tempfile::TempDir) -> Corpus {
-        Corpus::read(dir.path(), "test")
+        Corpus::read(&Arc::new(MindFiles::folder(dir.path())), "test")
     }
 
     #[test]

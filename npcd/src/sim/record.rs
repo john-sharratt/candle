@@ -34,10 +34,10 @@
 //! is the same on two runs and a test can assert the exact set.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::mind::files::MindFiles;
 
 /// A thing's name as the disk spells its document: lowercased, every run of
 /// characters that is not a letter or a digit collapsed to a single dash, and no
@@ -75,9 +75,9 @@ pub(crate) fn slug_of(name: &str) -> String {
 /// Read a line at a time and stopped at the first one that answers, so
 /// indexing a directory does not pull every document into memory to learn its
 /// title — the heading is on the first line of every one of them.
-fn heading_of(file: &Path) -> Option<String> {
-    let f = std::fs::File::open(file).ok()?;
-    for line in BufReader::new(f).lines().map_while(Result::ok).take(20) {
+fn heading_of(files: &MindFiles, rel: &str) -> Option<String> {
+    let text = files.read(rel)?;
+    for line in text.lines().take(20) {
         if let Some(h) = line.strip_prefix("# ") {
             let h = h.trim();
             if !h.is_empty() {
@@ -418,7 +418,7 @@ impl Record {
     /// Called whenever the world learns where the mind is, and idempotent: a
     /// document already indexed keeps the state and custody it has, because
     /// re-indexing must not release work somebody is holding.
-    pub fn index_canon(&mut self, root: &Path) {
+    pub fn index_canon(&mut self, mind: &MindFiles) {
         // `owns_path` is the whole of the geography fix: a directory that owns
         // `Item.path` names the ENTRY a place (or era, or story) is edited as;
         // geography names *histories*, found from the name by [`history_path`]
@@ -436,19 +436,15 @@ impl Record {
             // `history_path`, deliberately not the item's `path`.
             ("layers/world/geography", Kind::Place, false),
         ] {
-            let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
-                continue;
-            };
-            // Sorted, because a directory's order is the filesystem's and the
-            // record has to be the same on two machines for a test to assert it.
-            let mut files: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "md"))
+            // Sorted, because the record has to be the same on two machines for
+            // a test to assert it.
+            let files: Vec<String> = mind
+                .list(dir)
+                .into_iter()
+                .filter(|name| name.ends_with(".md"))
                 .collect();
-            files.sort();
             for file in files {
-                let Some(stem) = file.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+                let Some(stem) = file.strip_suffix(".md").map(str::to_string) else {
                     continue;
                 };
                 let path = format!("{dir}/{stem}.md");
@@ -463,7 +459,7 @@ impl Record {
                 {
                     continue;
                 }
-                let name = heading_of(&file).unwrap_or_else(|| stem.replace(['-', '_'], " "));
+                let name = heading_of(mind, &path).unwrap_or_else(|| stem.replace(['-', '_'], " "));
                 // A thing the world already names *becomes* this document
                 // rather than gaining a twin beside it. Two items called the
                 // same thing — one real and one not — is exactly the trap this
@@ -710,6 +706,7 @@ impl Record {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use super::*;
 
     fn record() -> Record {
@@ -752,7 +749,7 @@ mod tests {
     fn both_layers_are_indexed_and_carry_their_paths() {
         let root = canon("both");
         let mut r = Record::new();
-        r.index_canon(&root);
+        r.index_canon(&crate::mind::files::MindFiles::folder(&root));
 
         assert_eq!(
             r.path_of("A Night At The Gate").as_deref(),
@@ -787,7 +784,7 @@ mod tests {
         .unwrap();
 
         let mut r = Record::new();
-        r.index_canon(&root);
+        r.index_canon(&crate::mind::files::MindFiles::folder(&root));
 
         // One item, not a twin, and its entry path is the LOCATIONS document.
         let named: Vec<&Item> = r.iter().filter(|i| i.name == "the eastern flats").collect();
@@ -819,7 +816,7 @@ mod tests {
         .unwrap();
 
         let mut r = Record::new();
-        r.index_canon(&root);
+        r.index_canon(&crate::mind::files::MindFiles::folder(&root));
 
         assert_eq!(r.by_name("the eastern flats").unwrap().kind, Kind::Place);
         assert!(
@@ -851,7 +848,7 @@ mod tests {
     fn a_document_is_named_by_its_heading_and_falls_back_to_its_filename() {
         let root = canon("naming");
         let mut r = Record::new();
-        r.index_canon(&root);
+        r.index_canon(&crate::mind::files::MindFiles::folder(&root));
         assert!(
             r.by_name("the third era").is_some(),
             "the heading was not read"
@@ -870,7 +867,7 @@ mod tests {
         let root = canon("adopt");
         let mut r = record();
         assert!(r.path_of("the third era").is_none());
-        r.index_canon(&root);
+        r.index_canon(&crate::mind::files::MindFiles::folder(&root));
 
         let named: Vec<&Item> = r.iter().filter(|i| i.name == "the third era").collect();
         assert_eq!(named.len(), 1, "indexing made a twin");
@@ -890,11 +887,11 @@ mod tests {
     fn indexing_twice_changes_nothing_and_keeps_custody() {
         let root = canon("idempotent");
         let mut r = Record::new();
-        r.index_canon(&root);
+        r.index_canon(&crate::mind::files::MindFiles::folder(&root));
         r.take("the third era", "m1").unwrap();
         let before = r.len();
 
-        r.index_canon(&root);
+        r.index_canon(&crate::mind::files::MindFiles::folder(&root));
         assert_eq!(r.len(), before, "a second pass added items");
         assert_eq!(
             r.by_name("the third era").unwrap().holder.as_deref(),
@@ -907,7 +904,7 @@ mod tests {
     fn only_documents_are_indexed() {
         let root = canon("filter");
         let mut r = Record::new();
-        r.index_canon(&root);
+        r.index_canon(&crate::mind::files::MindFiles::folder(&root));
         assert!(
             r.iter().all(|i| i.name != ".gitkeep"),
             "a keep-file became an era"
@@ -924,7 +921,7 @@ mod tests {
     fn a_mind_with_no_such_layers_indexes_nothing_and_does_not_fail() {
         let mut r = record();
         let before = r.len();
-        r.index_canon(Path::new("/no/such/mind/anywhere"));
+        r.index_canon(&crate::mind::files::MindFiles::folder("/no/such/mind/anywhere"));
         assert_eq!(r.len(), before);
     }
 
@@ -951,7 +948,7 @@ mod tests {
     fn settling_a_path_twice_keeps_the_first_one() {
         let root = canon("settle-twice");
         let mut r = record();
-        r.index_canon(&root);
+        r.index_canon(&crate::mind::files::MindFiles::folder(&root));
         let first = r.settle_path("the third era");
         assert_eq!(first.as_deref(), Some("layers/eras/the-third-era.md"));
         assert_eq!(r.settle_path("the third era"), first);

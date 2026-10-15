@@ -20,11 +20,12 @@
 //! separated from its libraries parses perfectly and projects nothing.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::mind::files::MindFiles;
 use crate::mind::{catalog, parts, Address, Mind};
-use crate::sim::shelf::Published;
 
 /// The schema compiled into the binary — `npcd/projection.yaml`, the checked-in
 /// default. Embedded rather than read from the source tree so a released binary
@@ -50,11 +51,15 @@ pub struct Source {
     /// reached.
     #[allow(dead_code)]
     pub yaml: String,
-    /// The directory holding the schema — the root for every folder-backed
+    /// The mind's files beside the schema — the root for every folder-backed
     /// collection. `None` for the bundled schema, which has no folders: a
-    /// binary with no mind directory has nothing to read them from, and
-    /// defaulting to the data directory would let an unrelated `worlds/` folder
-    /// be mistaken for a collection.
+    /// binary with no mind has nothing to read them from, and defaulting to
+    /// the data directory would let an unrelated `worlds/` folder be mistaken
+    /// for a collection.
+    pub files: Option<Arc<MindFiles>>,
+    /// The folder holding the schema, for a `--mind` folder — where `--data`
+    /// defaults to. `None` for the bundled schema, and for a mind read from
+    /// the substrate, which has no folder (`docs/substrate_git.md` §8).
     pub dir: Option<PathBuf>,
     /// For logging. The path, or the word `bundled`.
     pub label: String,
@@ -70,9 +75,7 @@ pub struct Source {
 /// Used by `/v1/schema/layers`, and by the substrate view, which needs to know
 /// what the layers *are* before it can report that every one of them is empty.
 pub fn layers(mind: &Mind) -> Option<Vec<Value>> {
-    let published = Published {
-        root: mind.root()?.to_path_buf(),
-    };
+    let published = mind.published()?;
     let addr = Address::parse("settings/projection").ok()??;
     let (list_key, id_key) = addr.parts()?;
     let doc = catalog::read(&published, &addr).ok()?;
@@ -142,11 +145,7 @@ impl Source {
     /// bundled default.
     pub fn resolve(mind: Option<&Path>) -> Result<Self, SchemaError> {
         let Some(dir) = mind else {
-            return Ok(Self {
-                yaml: BUNDLED.to_string(),
-                dir: None,
-                label: "bundled".to_string(),
-            });
+            return Ok(Self::bundled());
         };
 
         if !dir.is_dir() {
@@ -176,20 +175,50 @@ impl Source {
         let dir = plain(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
         Ok(Self {
             yaml,
+            files: Some(Arc::new(MindFiles::folder(&dir))),
             dir: Some(dir),
             label: path.display().to_string(),
         })
     }
 
-    /// The directory a folder-backed collection named `name` reads from, if
-    /// this schema has a home on disk and that folder exists.
+    /// The bundled default: no mind.
+    pub fn bundled() -> Self {
+        Self {
+            yaml: BUNDLED.to_string(),
+            files: None,
+            dir: None,
+            label: "bundled".to_string(),
+        }
+    }
+
+    /// The schema of the mind `files` hold — read from the substrate, at the
+    /// commit `label` names (`docs/substrate_git.md` §8.1).
+    pub fn from_files(files: Arc<MindFiles>, label: String) -> Result<Self, SchemaError> {
+        let at = PathBuf::from(&label);
+        let Some(yaml) = files.read(SCHEMA_FILE) else {
+            return Err(SchemaError::NoSchema(at));
+        };
+        serde_yaml::from_str::<serde_yaml::Value>(&yaml)
+            .map_err(|e| SchemaError::Malformed(at.join(SCHEMA_FILE), e.to_string()))?;
+        Ok(Self {
+            yaml,
+            files: Some(files),
+            dir: None,
+            label,
+        })
+    }
+
+    /// The mind folder a folder-backed collection named `name` reads from, if
+    /// this schema has a mind and that folder exists in it.
     ///
     /// `None` covers both "bundled schema, no folders anywhere" and "this mind
     /// declares no such collection folder", because the caller does the same
     /// thing in either case: the collection stays empty.
-    pub fn collection_dir(&self, name: &str) -> Option<PathBuf> {
-        let d = self.dir.as_ref()?.join(name);
-        d.is_dir().then_some(d)
+    pub fn collection_dir(&self, name: &str) -> Option<String> {
+        self.files
+            .as_ref()?
+            .is_dir(name)
+            .then(|| name.to_string())
     }
 }
 

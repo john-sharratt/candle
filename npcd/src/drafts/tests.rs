@@ -84,7 +84,7 @@ fn under_git() -> Mind {
 
 impl Mind {
     fn author(&self, account: &str) -> Author {
-        Author::open(&self.root, Some(&self.stores), account)
+        Author::open(&crate::mind::Mind::new(Some(self.root.clone())), Some(&self.stores), account)
     }
 
     fn worlds(&self) -> Registry {
@@ -98,7 +98,7 @@ impl Mind {
 fn a_plain_folder_is_written_as_it_stands() {
     let dir = TempDir::new().unwrap();
     let stores = MindStores::new(Some(dir.path()));
-    let author = Author::open(dir.path(), Some(&stores), "ab");
+    let author = Author::open(&crate::mind::Mind::new(Some(dir.path().to_path_buf())), Some(&stores), "ab");
     assert!(!author.keeps_drafts());
     save(&author, "world", WORLDS, "ardh", &json!({"name": "Ardh"})).unwrap();
     assert_eq!(

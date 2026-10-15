@@ -295,7 +295,7 @@ mod tests {
             "layers/stories/the-quiet-shift.md",
             "# The Quiet Shift\n\nThe year is 2938. Nobody named came.\n",
         );
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         (dir, c)
     }
 

@@ -71,7 +71,7 @@ pub fn load(
         status.send(detail(state)).ok();
     })?;
     status.send(String::new()).ok();
-    repos.follow(crate::ingest_cancel::cancelled)?;
+    repos.follow(Arc::new(crate::ingest_cancel::cancelled))?;
     let _ = REPOS.set(repos);
     Ok(())
 }

@@ -41,7 +41,7 @@ pub mod identity;
 pub mod images;
 pub mod lifegen;
 pub mod mind;
-pub mod mind_repo;
+pub mod mind_store;
 pub mod model;
 pub mod namegen;
 pub mod ndjson;

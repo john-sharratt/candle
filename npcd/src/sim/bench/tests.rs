@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use super::*;
 use crate::sim::shelf::{Published, NO_OPERATION};
@@ -10,16 +11,12 @@ struct Folder(PathBuf);
 
 impl Shelf for Folder {
     fn read(&self, key: &str) -> Option<String> {
-        Published {
-            root: self.0.clone(),
-        }
+        Published::folder(self.0.clone())
         .read(key)
     }
 
     fn list(&self, dir: &str) -> BTreeSet<String> {
-        Published {
-            root: self.0.clone(),
-        }
+        Published::folder(self.0.clone())
         .list(dir)
     }
 
@@ -51,7 +48,7 @@ fn rooted(name: &str) -> (Benches, PathBuf, Folder) {
     .unwrap();
     std::fs::write(root.join("layers/eras/fourth.md"), "the fourth era\n").unwrap();
     let mut b = Benches::new();
-    b.set_root(&root);
+    b.set_mind(crate::mind::Mind::new(Some(root.clone())));
     let s = Folder(root.clone());
     (b, root, s)
 }
@@ -98,7 +95,10 @@ fn uncommitted_work_survives_a_save_and_restore() {
 
     let (mut fresh, fresh_root, fs) = rooted("restore-fresh");
     fresh.restore(saved);
-    assert_eq!(fresh.mind_root(), Some(fresh_root.as_path()));
+    assert_eq!(
+        fresh.files().and_then(|f| f.folder_root().map(|p| p.to_path_buf())),
+        Some(fresh_root.clone())
+    );
     assert_eq!(
         fresh.read("m1", "layers/eras/third.md", &fs).unwrap(),
         "rewritten\n"
@@ -127,7 +127,7 @@ fn a_world_with_no_root_has_no_documents_and_says_so() {
 #[test]
 fn the_published_mind_takes_no_commit() {
     let (mut b, root, _) = rooted("published");
-    let published = Published { root: root.clone() };
+    let published = Published::folder(root.clone());
     b.write("m1", "x", "layers/eras/third.md", "an edit\n", &published)
         .unwrap();
     assert_eq!(b.commit("m1", &published), Err(NO_OPERATION.to_string()));

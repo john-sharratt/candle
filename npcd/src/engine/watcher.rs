@@ -43,6 +43,8 @@ use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use sha2::{Digest, Sha256};
 
+use crate::mind::files::MindFiles;
+
 /// Quiet time after the first relevant event before a reload fires. Subsequent
 /// events inside the window extend it — an editor's burst lands well inside.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(400);
@@ -104,6 +106,26 @@ pub enum Reconcile {
 }
 
 /// The ledger's file, inside the substrate directory it describes.
+/// A ledger key as a mind path: forward slashes, from the mind's root. A key an
+/// earlier build wrote as an absolute path under a mind folder is cut to the
+/// part from its `layers/` down, where every ingested document lives — so a
+/// ledger written over a folder still knows its documents once the mind is
+/// read from the substrate (`docs/substrate_git.md` §8.1), and nothing is
+/// retired for having moved.
+pub fn mind_relative(path: &Path) -> PathBuf {
+    if path.is_relative() {
+        return PathBuf::from(path.to_string_lossy().replace('\\', "/"));
+    }
+    let parts: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    match parts.iter().rposition(|p| p == "layers") {
+        Some(at) => PathBuf::from(parts[at..].join("/")),
+        None => path.to_path_buf(),
+    }
+}
+
 pub fn ledger_path(data: &Path) -> PathBuf {
     data.join(SUBSTRATE_DIR).join("ingest-ledger.json")
 }
@@ -128,10 +150,13 @@ impl Ledger {
     /// and wrong, so every ambiguity resolves towards doing the work again.
     pub fn open(data: &Path) -> Self {
         let path = ledger_path(data);
-        let hashes = std::fs::read_to_string(&path)
+        let hashes: HashMap<PathBuf, String> = std::fs::read_to_string(&path)
             .ok()
             .and_then(|t| serde_json::from_str::<HashMap<PathBuf, String>>(&t).ok())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(p, h)| (mind_relative(&p), h))
+            .collect();
         if !hashes.is_empty() {
             tracing::info!(
                 "ingest ledger: {} document(s) already in the substrate",
@@ -187,13 +212,13 @@ impl Ledger {
     /// Every document the ledger records as ingested whose file is gone —
     /// deleted, or moved out of the record (a rejected draft goes to
     /// `rejected/`).
-    pub fn missing(&self) -> Vec<PathBuf> {
+    pub fn missing(&self, mind: &MindFiles) -> Vec<PathBuf> {
         let mut gone: Vec<PathBuf> = self
             .hashes
             .lock()
             .unwrap()
             .keys()
-            .filter(|p| !p.is_file())
+            .filter(|p| !mind.is_file(&p.to_string_lossy().replace('\\', "/")))
             .cloned()
             .collect();
         gone.sort();
@@ -597,16 +622,29 @@ mod tests {
     #[test]
     fn a_recorded_document_whose_file_is_gone_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let here = dir.path().join("here.md");
-        let gone = dir.path().join("gone.md");
-        std::fs::write(&here, "x").unwrap();
+        let here = PathBuf::from("here.md");
+        let gone = PathBuf::from("gone.md");
+        std::fs::write(dir.path().join(&here), "x").unwrap();
+        let mind = MindFiles::folder(dir.path());
         let l = Ledger::new();
         l.reconcile(&here, Some("x"));
         l.reconcile(&gone, Some("y"));
-        assert_eq!(l.missing(), vec![gone.clone()]);
+        assert_eq!(l.missing(&mind), vec![gone.clone()]);
         l.forget(&gone);
-        assert!(l.missing().is_empty());
+        assert!(l.missing(&mind).is_empty());
         assert_eq!(l.inspect(&gone, Some("y")), Reconcile::Added);
+    }
+
+    /// **A key written as an absolute path under a mind folder becomes a mind
+    /// path**, from its `layers/` down; a relative key keeps its form.
+    #[test]
+    fn an_absolute_ledger_key_becomes_a_mind_path() {
+        let abs = Path::new("D:/prog/npcd-data/mind/battle-mind/layers/eras/first.md");
+        assert_eq!(mind_relative(abs), PathBuf::from("layers/eras/first.md"));
+        assert_eq!(
+            mind_relative(Path::new("layers\\world\\a.md")),
+            PathBuf::from("layers/world/a.md")
+        );
     }
 
     /// An editor creating and deleting a temp file inside one debounce window

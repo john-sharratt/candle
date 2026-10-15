@@ -19,10 +19,11 @@
 //! passes.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use npc_map::world::World;
+
+use crate::mind::files::MindFiles;
 
 /// The bench's words for the act of writing — not the world's, unless its
 /// lore says them.
@@ -92,41 +93,38 @@ pub fn vocabulary(world: &World) -> Vec<String> {
 /// The world's own words: its eras and world documents, lower case, read once
 /// per mind. The lives and stories are not lore — they are what is being
 /// checked, and the pieces already written carry the very leakage this finds.
-pub fn lore(root: &Path) -> Arc<String> {
-    static READ: OnceLock<Mutex<HashMap<PathBuf, Arc<String>>>> = OnceLock::new();
+pub fn lore(root: &MindFiles) -> Arc<String> {
+    // Per commit: a mind whose branch moved has new lore. A folder is read
+    // once, as it always was.
+    let key = root
+        .commit()
+        .map(|c| c.to_string())
+        .or_else(|| root.folder_root().map(|p| p.display().to_string()))
+        .unwrap_or_default();
+    static READ: OnceLock<Mutex<HashMap<String, Arc<String>>>> = OnceLock::new();
     let cache = READ.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(known) = cache.lock().expect("lore lock").get(root) {
+    if let Some(known) = cache.lock().expect("lore lock").get(&key) {
         return Arc::clone(known);
     }
     let mut text = String::new();
     for dir in ["layers/eras", "layers/world"] {
-        gather(&root.join(dir), &mut text);
+        for path in root.walk(dir) {
+            if path.ends_with(".md") {
+                if let Some(t) = root.read(&path) {
+                    text.push_str(&t);
+                    text.push('\n');
+                }
+            }
+        }
     }
     let text = Arc::new(text.to_lowercase());
     cache
         .lock()
         .expect("lore lock")
-        .insert(root.to_path_buf(), Arc::clone(&text));
+        .insert(key, Arc::clone(&text));
     text
 }
 
-/// Every markdown document under `dir`, appended to `into`.
-fn gather(dir: &Path, into: &mut String) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            gather(&path, into);
-        } else if path.extension().is_some_and(|e| e == "md") {
-            if let Ok(t) = std::fs::read_to_string(&path) {
-                into.push_str(&t);
-                into.push('\n');
-            }
-        }
-    }
-}
 
 /// The writers' terms `text` holds that the lore never uses, in the order of
 /// `vocabulary`. The lore is asked about the word itself, article or none: a
@@ -172,6 +170,7 @@ fn has_term(text: &str, term: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use super::*;
 
     fn words(ws: &[&str]) -> Vec<String> {
@@ -268,7 +267,7 @@ mod tests {
                 .unwrap();
         }
         let vocabulary = vocabulary(&world);
-        let lore = lore(root);
+        let lore = lore(&MindFiles::folder(root));
         let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap_or_default();
 
         for bad in [

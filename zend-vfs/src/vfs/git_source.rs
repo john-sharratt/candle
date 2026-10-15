@@ -47,12 +47,33 @@ impl fmt::Debug for GitSource {
     }
 }
 
+/// The record's `main`, else `master`, as `origin`'s tracking ref: what a
+/// repository with nothing checked out reads. `None` when it has neither.
+fn record_default(repo: &Repo) -> Result<Option<Rev>, GitError> {
+    let Some(origin) = repo.origin()? else {
+        return Ok(None);
+    };
+    for name in ["main", "master"] {
+        let tracking = origin.tracking(&crate::BranchName::parse(name)?);
+        if repo.ref_target(&tracking)?.is_some() {
+            return Ok(Some(Rev::Ref(tracking)));
+        }
+    }
+    Ok(None)
+}
+
 impl GitSource {
     /// The repository whose top level is `dir`.
     pub fn open(dir: &Path) -> Result<Arc<Self>, GitError> {
         let repo = Repo::open(dir)?;
         let default = match repo.head()?.branch() {
-            Some(branch) => Rev::Branch(branch.clone()),
+            Some(branch) if repo.ref_target(&branch.to_ref())?.is_some() => {
+                Rev::Branch(branch.clone())
+            }
+            // A branch with no commit checked out — a store derived from a
+            // substrate, which checks nothing out (`docs/substrate_git.md`
+            // §4): what it reads is the record's `main`, else `master`.
+            Some(branch) => record_default(&repo)?.unwrap_or_else(|| Rev::Branch(branch.clone())),
             None => Rev::Head,
         };
         let blobs = repo.blobs();

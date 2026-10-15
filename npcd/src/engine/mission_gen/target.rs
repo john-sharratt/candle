@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn the_thinnest_life_is_chosen_and_one_in_hand_is_skipped() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let t = next(Kind::LifeEvent, &c, &nothing_blocked, 0).unwrap();
         assert_eq!(t.key, "life:kaelor");
         let t = next(Kind::LifeEvent, &c, &|k, _| k == "life:kaelor", 0).unwrap();
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn era_boundaries_come_first_then_each_event_against_its_era() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let keys: Vec<String> = pairs(&c).into_iter().map(|(_, t)| t.key).collect();
         assert_eq!(
             keys,
@@ -220,7 +220,7 @@ mod tests {
     fn a_pair_fingerprint_moves_when_either_document_changes() {
         let dir = mind();
         let before = pair(
-            &Corpus::read(dir.path(), "test"),
+            &Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test"),
             "layers/eras/the-fall.md",
             "layers/eras/the-retreat.md",
         );
@@ -230,7 +230,7 @@ mod tests {
         )
         .unwrap();
         let after = pair(
-            &Corpus::read(dir.path(), "test"),
+            &Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test"),
             "layers/eras/the-fall.md",
             "layers/eras/the-retreat.md",
         );
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn the_least_told_era_is_chosen() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let ranks: Vec<usize> = eras(&c).into_iter().map(|(r, _)| r).collect();
         assert_eq!(ranks, [0, 0, 0]);
         std::fs::write(
@@ -251,7 +251,7 @@ mod tests {
             "# A Fall\n\nIn The Fall, a clerk finished the schedule.\n",
         )
         .unwrap();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let t = next(Kind::Gap, &c, &nothing_blocked, 0).unwrap();
         assert_ne!(t.key, "era:layers/eras/the-fall.md", "the told era waits");
     }

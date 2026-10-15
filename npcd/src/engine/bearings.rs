@@ -20,7 +20,6 @@
 //! selection both read only those.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::{GroupId, TimelineId};
@@ -28,6 +27,7 @@ use candle_conversation::ConversationEngine;
 use serde::Deserialize;
 
 use crate::engine::chronology;
+use crate::mind::files::MindFiles;
 
 /// The file a mind declares its bearings in.
 pub const FILE: &str = "bearings.yaml";
@@ -100,11 +100,11 @@ pub const ELSEWHERE: &str = "elsewhere";
 
 impl Bearings {
     /// Read `<mind>/bearings.yaml`. `Ok(None)` when the mind has none.
-    pub fn read(mind: &Path) -> anyhow::Result<Option<Self>> {
-        match std::fs::read_to_string(mind.join(FILE)) {
-            Ok(text) => Self::parse(&text).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+    pub fn read(mind: &MindFiles) -> anyhow::Result<Option<Self>> {
+        match mind.read(FILE) {
+            Some(text) => Self::parse(&text).map(Some),
+            None if mind.is_file(FILE) => anyhow::bail!("{FILE} is not UTF-8"),
+            None => Ok(None),
         }
     }
 

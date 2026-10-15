@@ -150,8 +150,17 @@ pub fn ingest(reg: &Registry, dir: &Path, images: &Images) -> BTreeMap<String, S
             }
             continue;
         };
+        // Beside the personality's file: in the mind when the registry reads
+        // the mind, in its folder otherwise.
         let path = dir.join(rel);
-        let bytes = match std::fs::read(&path) {
+        let read = match reg.mind() {
+            Some((mind, folder)) => mind
+                .files()
+                .and_then(|files| files.bytes(&format!("{folder}/{rel}")))
+                .ok_or_else(|| "not in the mind".to_string()),
+            None => std::fs::read(&path).map_err(|e| e.to_string()),
+        };
+        let bytes = match read {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(

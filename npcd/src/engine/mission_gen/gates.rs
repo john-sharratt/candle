@@ -759,9 +759,7 @@ mod tests {
     }
 
     fn on(dir: &tempfile::TempDir) -> Published {
-        Published {
-            root: dir.path().to_path_buf(),
-        }
+        Published::folder(dir.path().to_path_buf())
     }
 
     /// A shelf holding its documents in memory, taking every commit.

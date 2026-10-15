@@ -54,8 +54,15 @@ impl<'a> Merge<'a> {
         pusher: Arc<dyn Push>,
         fetcher: Arc<dyn Fetch>,
     ) -> Result<Merge<'a>, String> {
-        let Some(Rev::Branch(branch)) = store.rev() else {
-            return Err(NOT_UNDER_GIT.to_string());
+        // A store over a mind read from the substrate reads the record's
+        // branch through `origin`'s tracking ref (`docs/substrate_git.md` §4).
+        let branch = match store.rev() {
+            Some(Rev::Branch(branch)) => branch,
+            Some(Rev::Ref(name)) => match name.as_str().strip_prefix("refs/remotes/origin/") {
+                Some(b) => BranchName::parse(b).map_err(|e| e.to_string())?,
+                None => return Err(NOT_UNDER_GIT.to_string()),
+            },
+            _ => return Err(NOT_UNDER_GIT.to_string()),
         };
         let repo = Repo::open(dir)
             .map_err(|e| format!("the mind repository cannot be opened: {e}"))?

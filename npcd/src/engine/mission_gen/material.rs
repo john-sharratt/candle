@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn a_life_shows_who_what_is_written_the_eras_and_where_the_event_goes() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let t = next(Kind::LifeEvent, &c, &|k, _| k == "life:kaelor", 0).unwrap();
         let m = render(Kind::LifeEvent, &t, &c, &proposal()).unwrap();
         assert!(m.starts_with("## Whose life\n\nKeeper (`keeper`)\n\nYou keep the towers."));
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn a_pair_shows_both_documents_and_a_gap_shows_the_era_and_the_stories() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let t = next(Kind::Contradiction, &c, &|_, _| false, 0).unwrap();
         let m = render(Kind::Contradiction, &t, &c, &proposal()).unwrap();
         assert!(m.starts_with("## Document A (`layers/eras/the-fall.md`)"));
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn a_proposal_shows_only_the_sections_its_generator_lists() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let t = next(Kind::LifeEvent, &c, &|k, _| k == "life:kaelor", 0).unwrap();
         let only = ["where-it-belongs".to_string(), "how-dated".to_string()];
         let m = render(Kind::LifeEvent, &t, &c, &only).unwrap();
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn a_draft_shows_the_document_and_what_it_answers_to() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let m = draft(&c, "layers/life/keeper/2786 The Charge.md", None, &every()).unwrap();
         assert!(m.starts_with(
             "## The draft (`layers/life/keeper/2786 The Charge.md`)\n\nWe were given the plan."
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn a_story_draft_is_read_in_the_era_it_tells() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let story = "layers/stories/the-charge.md";
         let m = draft(&c, story, Some("layers/eras/the-retreat.md"), &every()).unwrap();
         let era = m
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn a_draft_shows_only_the_sections_its_step_lists() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let path = "layers/life/keeper/2786 The Charge.md";
         let m = draft(&c, path, None, &["whose-life".to_string()]).unwrap();
         assert!(m.starts_with(
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn a_stretch_names_the_eras_inside_it() {
         let dir = mind();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         assert_eq!(
             belongs(c.life("keeper").unwrap(), &c),
             "Between 2488 and 2785: the longest stretch of this life with nothing written in it. \
@@ -642,7 +642,7 @@ mod tests {
             "x",
         )
         .unwrap();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         assert_eq!(
             belongs(c.life("kaelor").unwrap(), &c),
             "In 2487 to 2781: away from the one event written (2785). A life is filled from its \
@@ -653,7 +653,7 @@ mod tests {
             dir.path().join("layers/life/kaelor/2600 Midway.md"),
         )
         .unwrap();
-        let c = Corpus::read(dir.path(), "test");
+        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         assert!(
             belongs(c.life("kaelor").unwrap(), &c).starts_with("In 2487 to 2596 or 2604 to 2787:")
         );

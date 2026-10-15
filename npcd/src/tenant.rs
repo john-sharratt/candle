@@ -51,7 +51,7 @@ use crate::engine::watcher::{spawn as watch_mind, ReloadReport};
 use crate::identity::log_identity;
 use crate::images::Images;
 use crate::mind::Mind;
-use crate::mind_repo::MindRepo;
+use crate::mind_store::{self, MindSource};
 use crate::npcs::{Casting, Npcs};
 use crate::personality_portrait;
 use crate::projection;
@@ -227,9 +227,9 @@ impl NpcdArgs {
             .map(absolute)
             .transpose()
             .context("--data")?;
-        // A mind repository is read through its mirror under `--data`; until
-        // the mirror holds the record, the daemon starts with no mind and
-        // fetches it once joined (§10.3).
+        // A mind repository is read from the substrate (`docs/substrate_git.md`
+        // §8): its schema once the substrate is open, at start; until then the
+        // bundled one stands in.
         let repo = match &self.mind_repo {
             Some(name) => {
                 if self.mind.is_some() {
@@ -238,19 +238,24 @@ impl NpcdArgs {
                          repository the agents hold — give one"
                     );
                 }
-                let data = explicit.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("--mind-repo keeps its mirror under --data: name one")
-                })?;
-                Some(MindRepo::new(data, name, &self.mind_branch)?)
+                if explicit.is_none() {
+                    anyhow::bail!("--mind-repo keeps its store under --data: name one");
+                }
+                let bad = name.is_empty() || name.contains(['/', '\\', ':']) || name.starts_with('.');
+                if bad {
+                    anyhow::bail!("--mind-repo `{name}` is not a repository's name");
+                }
+                Some(MindSource {
+                    name: name.clone(),
+                    branch: self.mind_branch.clone(),
+                })
             }
             None => None,
         };
-        let mind = match &repo {
-            Some(r) if r.ready() => Some(r.dir.clone()),
-            Some(_) => None,
-            None => self.mind.clone(),
+        let schema = match &repo {
+            Some(_) => projection::Source::bundled(),
+            None => projection::Source::resolve(self.mind.as_deref())?,
         };
-        let schema = projection::Source::resolve(mind.as_deref())?;
         // **The compiled-in default is a path on the machine that built
         // this.** Used when it is really there; the working directory stands in
         // when it is not, and the choice is logged at start.
@@ -284,7 +289,7 @@ pub struct NpcdTenant {
     /// directory stands in.
     fell_back: bool,
     /// The mind repository the agents hold, with `--mind-repo`.
-    repo: Option<MindRepo>,
+    repo: Option<MindSource>,
 }
 
 impl Tenant for NpcdTenant {
@@ -340,13 +345,11 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
             schema.label,
             dir.display()
         ),
-        // A repository the agents hold that is not mirrored yet: the schema
-        // falls back to the bundled one until the fetch after joining.
-        (None, Some(r)) => tracing::warn!(
-            "the mind repository `{}` is not mirrored at {} yet: starting with no mind; once \
-             joined it is fetched through an agent and the process restarts onto it",
+        // A repository the agents hold: read from the substrate once it opens.
+        (None, Some(r)) => tracing::info!(
+            "the mind is the repository `{}` on `{}`, read from the substrate",
             r.name,
-            r.dir.display()
+            r.branch
         ),
         // A warning, not a note: a daemon with no mind starts, serves the
         // console and looks healthy, while every character in it has no world,
@@ -367,19 +370,6 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         );
     }
     tracing::info!("data: {} (substrate and accounts)", data.display());
-
-    // Authored content, read once — from the MIND when one is named, from the
-    // data directory otherwise. Worlds and personalities are written by a
-    // person; the data directory holds what the ENGINE wrote.
-    let authored_dir = schema.dir.clone().unwrap_or_else(|| data.clone());
-    let worlds = Registry::load("world", authored_dir.join(WORLDS))?;
-    let personalities = Registry::load("personality", authored_dir.join(PERSONALITIES))?;
-    tracing::info!(
-        "authored content: {} worlds, {} personalities from {}",
-        worlds.len(),
-        personalities.len(),
-        authored_dir.display()
-    );
 
     // The cast, rebuilt from the substrate's redo log. The one read of that
     // log — every request after this is answered from memory. Shown on the
@@ -417,6 +407,64 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         );
     }
 
+    // The mind. A repository the agents hold is read from the substrate, now
+    // that it is open: the files of the commit the log names for its branch
+    // (`docs/substrate_git.md` §8). One the log does not hold yet is pending:
+    // the load pulls it through an agent once joined, and the process
+    // restarts onto it. A `--mind` folder is read as it stands.
+    let (schema, mind) = match &repo {
+        Some(source) => {
+            let store = source.store_dir(&data);
+            match mind_store::from_log(&data, source, &npcs.substrate())? {
+                Some(files) => {
+                    let label = format!(
+                        "{}@{} ({})",
+                        source.name,
+                        files.commit().map(|c| c.to_string()).unwrap_or_default(),
+                        source.branch
+                    );
+                    let schema = projection::Source::from_files(Arc::clone(&files), label)?;
+                    (schema, Mind::of(files, store))
+                }
+                None => {
+                    tracing::warn!(
+                        "mind: the substrate holds no `{}` on `{}` yet — starting with no mind; \
+                         once joined it is pulled through an agent and the process restarts \
+                         onto it",
+                        source.name,
+                        source.branch
+                    );
+                    (schema, Mind::pending(store))
+                }
+            }
+        }
+        None => {
+            let mind = Mind::new(schema.dir.clone());
+            (schema, mind)
+        }
+    };
+    tracing::info!("projection schema: {}", schema.label);
+
+    // Authored content — from the MIND when there is one, from the data
+    // directory otherwise. Worlds and personalities are written by a person;
+    // the data directory holds what the ENGINE wrote.
+    let authored_dir = schema.dir.clone().unwrap_or_else(|| data.clone());
+    let (worlds, personalities) = match mind.is_present() || repo.is_some() {
+        true => (
+            Registry::load_mind("world", &mind, WORLDS)?,
+            Registry::load_mind("personality", &mind, PERSONALITIES)?,
+        ),
+        false => (
+            Registry::load("world", authored_dir.join(WORLDS))?,
+            Registry::load("personality", authored_dir.join(PERSONALITIES))?,
+        ),
+    };
+    tracing::info!(
+        "authored content: {} worlds, {} personalities",
+        worlds.len(),
+        personalities.len(),
+    );
+
     // The response and mood libraries, beside the schema. Read once: they are
     // ingested untagged and shared by every world.
     let libraries = Libraries::load(&schema);
@@ -437,12 +485,13 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         .collect();
 
     // The editor and the engine read the same schema through the same `Mind`.
+    // Only a `--mind` folder is watched: a mind read from the substrate moves
+    // when its branch does, not when a file does.
     let mind_dir = schema.dir.clone();
-    let mind = Mind::new(mind_dir.clone());
     let mind_for_engine = mind.clone();
-    match mind.root() {
-        Some(root) => tracing::info!("mind: editable at {}", root.display()),
-        None => tracing::info!("mind: none — the file editor will report it has nothing to edit"),
+    match mind.files() {
+        Some(files) => tracing::info!("mind: {files:?}"),
+        None => tracing::info!("mind: none yet — the file editor will report it has nothing to edit"),
     }
 
     // Portraits, as blobs in the substrate; a character naming an image kept
@@ -481,6 +530,9 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // handed to the state, then given the resolvers that read that state back.
     // That order breaks the cycle between them.
     let runtime = Runtime::new(mind_for_engine, &data);
+    if repo.is_some() {
+        runtime.ops.read_from_substrate();
+    }
     // The engine adopts the substrate the cast was just loaded from: one
     // `substrate/` takes one writable handle. See `Npcs::substrate`.
     runtime.set_substrate(authored.npcs.read().await.substrate());
@@ -985,22 +1037,24 @@ mod tests {
     /// a folder and a repository, never both, and a mirror not yet holding the
     /// record starts on no mind; `mind_repo:` reads the same from
     /// `motherd.yaml`.
+    /// **A mind repository is read from the substrate**: its store under
+    /// `--data`, its schema not read at resolve — the substrate is not open
+    /// yet — and nothing on disk made (`docs/substrate_git.md` §8).
     #[test]
-    fn a_mind_repository_is_mirrored_under_data() {
+    fn a_mind_repository_is_read_from_the_substrate() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().to_str().unwrap();
         let t = parse(&["--mind-repo", "mind", "--data", data])
             .resolve()
             .unwrap();
         let repo = t.repo.clone().unwrap();
-        assert_eq!(repo.dir, dir.path().join("mind").join("mind"));
+        assert_eq!(repo.store_dir(dir.path()), dir.path().join("git").join("mind"));
         assert_eq!(repo.branch.as_str(), "main");
-        assert_eq!(t.schema.dir, None, "not mirrored yet: no mind");
+        assert_eq!(t.schema.dir, None, "a mind in the substrate has no folder");
+        assert!(t.schema.files.is_none(), "read once the substrate opens");
         assert_eq!(t.data, dir.path());
 
-        std::fs::create_dir_all(&repo.dir).unwrap();
-        std::fs::write(repo.dir.join(projection::SCHEMA_FILE), projection::BUNDLED).unwrap();
-        let ready = parse(&[
+        let branch = parse(&[
             "--mind-repo",
             "mind",
             "--data",
@@ -1010,8 +1064,7 @@ mod tests {
         ])
         .resolve()
         .unwrap();
-        assert_eq!(ready.schema.dir.as_deref(), Some(repo.dir.as_path()));
-        assert_eq!(ready.repo.unwrap().branch.as_str(), "record");
+        assert_eq!(branch.repo.unwrap().branch.as_str(), "record");
 
         let both = parse(&["--mind-repo", "mind", "--data", data, "--mind", "../mind"]).resolve();
         assert!(both.is_err());
@@ -1020,7 +1073,7 @@ mod tests {
             .err()
             .unwrap()
             .to_string()
-            .contains("--mind-repo keeps its mirror under --data"));
+            .contains("--mind-repo keeps its store under --data"));
         let yaml: NpcdArgs =
             serde_yaml::from_str(&format!("mind_repo: mind\ndata: '{data}'\n")).unwrap();
         assert_eq!(yaml, parse(&["--mind-repo", "mind", "--data", data]));
@@ -1038,8 +1091,8 @@ mod tests {
             .unwrap();
         assert_eq!(t.data, here.join("unmade-npcd-data"));
         assert_eq!(
-            t.repo.unwrap().dir,
-            here.join("unmade-npcd-data").join("mind").join("mind")
+            t.repo.unwrap().store_dir(&t.data),
+            here.join("unmade-npcd-data").join("git").join("mind")
         );
         let plain = parse(&["--data", "unmade-npcd-data"]).resolve().unwrap();
         assert_eq!(plain.data, here.join("unmade-npcd-data"));

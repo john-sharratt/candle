@@ -92,10 +92,10 @@ fn fields(raw: &str) -> String {
 #[ignore = "loads the checkpoint on the GPU and reads the live mind at D:/prog/mind"]
 fn the_reading_replayed_on_the_real_model() {
     let root = Path::new(MIND);
-    let config = Config::load(root)
+    let config = Config::load(&crate::mind::files::MindFiles::folder(root))
         .expect("missions.yaml parses")
         .expect("the mind has a missions.yaml");
-    let corpus = Corpus::read(root, WORLD);
+    let corpus = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(root)), WORLD);
 
     let workspace = tempfile::tempdir().expect("a workspace for the substrate");
     let device = Device::new_cuda(0).expect("a CUDA device");

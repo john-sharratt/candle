@@ -79,9 +79,7 @@ mod tests {
     }
 
     fn on(dir: &tempfile::TempDir) -> Published {
-        Published {
-            root: dir.path().to_path_buf(),
-        }
+        Published::folder(dir.path().to_path_buf())
     }
 
     fn mind() -> (tempfile::TempDir, Work) {

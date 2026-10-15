@@ -37,6 +37,8 @@ use npc_map::{MapEdit, MapSet};
 
 use crate::engine::rooms::Rooms;
 use crate::engine::watch::Watch;
+use crate::mind::files::MindFiles;
+use crate::mind::Mind;
 use crate::opstore::owner::Owner;
 use crate::opstore::shelf::StoreShelf;
 use crate::opstore::MindStores;
@@ -55,6 +57,10 @@ pub struct Hosted {
     /// generated world or a test), whose reshapes are ephemeral by
     /// construction: there is no authored file to keep them in.
     map_dir: Option<PathBuf>,
+    /// The mind folder this world's map was loaded from, for a map read from
+    /// the mind's files — `map/<id>` — rather than a folder
+    /// (`docs/substrate_git.md` §8.1). A reshape is kept there as a draft.
+    map_in_mind: Option<String>,
     /// Serialises the keeping half of [`Hosted::reshape`] — deliberately a
     /// second lock, separate from `state`, because that write is deliberately
     /// off the world lock for latency. Without it, two reshapes landing on the
@@ -141,9 +147,46 @@ impl Hosted {
                 watch: Watch::new(),
             }),
             map_dir: Some(dir.to_path_buf()),
+            map_in_mind: None,
             writeback: Mutex::new(()),
             ops: OnceLock::new(),
         })
+    }
+
+    /// Load a world from the mind folder `rel` — `map/<id>` — of `mind`'s
+    /// files: its map files there, and its part catalogue in `parts/`.
+    pub fn load_mind(id: impl Into<String>, mind: &MindFiles, rel: &str) -> Result<Hosted> {
+        let id = id.into();
+        let texts = |dir: &str| -> Vec<(String, String)> {
+            mind.list(dir)
+                .into_iter()
+                .filter(|name| !name.ends_with('/'))
+                .filter_map(|name| Some((name.clone(), mind.read(&format!("{dir}/{name}"))?)))
+                .collect()
+        };
+        let map = MapSet::load_texts(&texts(rel), &texts(&format!("{rel}/parts")))
+            .with_context(|| format!("world `{id}` from the mind's {rel}/"))?;
+        let sim = seed::for_world(&id, Some(&map));
+        Ok(Hosted {
+            id,
+            state: Mutex::new(State {
+                world: World::new(map),
+                attention: Attention::new(),
+                sim,
+                rooms: Rooms::new(),
+                watch: Watch::new(),
+            }),
+            map_dir: None,
+            map_in_mind: Some(rel.to_string()),
+            writeback: Mutex::new(()),
+            ops: OnceLock::new(),
+        })
+    }
+
+    /// The mind folder this world's map was loaded from, for a map read from
+    /// the mind's files.
+    pub fn map_in_mind(&self) -> Option<&str> {
+        self.map_in_mind.as_deref()
     }
 
     /// Host a world already in memory. What a generated world arrives as, and
@@ -163,6 +206,7 @@ impl Hosted {
             // An in-memory world has no authored directory, so its reshapes are
             // ephemeral: nothing to write them back to.
             map_dir: None,
+            map_in_mind: None,
             writeback: Mutex::new(()),
             ops: OnceLock::new(),
         }
@@ -185,21 +229,22 @@ impl Hosted {
     /// mission is a step of, or the published mind — which is also all a
     /// daemon with no mind folder has.
     pub fn shelf_of(&self, body: &str) -> Box<dyn Shelf> {
-        let (op, root) = self.sim(|s| {
+        let (op, files) = self.sim(|s| {
             let op = s
                 .missions
                 .active(body)
                 .and_then(|m| m.operation())
                 .map(|(op, _)| op);
-            (op, s.bench.mind_root().map(Path::to_path_buf))
+            (op, s.bench.files())
         });
         match (op, self.ops.get()) {
             (Some(op), Some(stores)) if stores.repo_name().is_some() => Box::new(StoreShelf {
                 stores: Arc::clone(stores),
                 owner: Owner::operation(&self.id, op),
             }),
-            _ => Box::new(Published {
-                root: root.unwrap_or_default(),
+            _ => Box::new(match files {
+                Some(files) => Published::of(files),
+                None => Published::folder(PathBuf::new()),
             }),
         }
     }
@@ -284,9 +329,10 @@ impl Hosted {
     /// nothing changed.
     pub fn reshape(&self, edit: &MapEdit, keep: Option<Keep>) -> Result<Reshaped, String> {
         let relocated = self.with(|w| w.reshape(edit))?;
-        let durability = match (&self.map_dir, keep) {
-            (None, _) | (_, None) => Durability::Ephemeral,
-            (Some(_), Some(keep)) => {
+        let kept_somewhere = self.map_dir.is_some() || self.map_in_mind.is_some();
+        let durability = match (kept_somewhere, keep) {
+            (false, _) | (_, None) => Durability::Ephemeral,
+            (true, Some(keep)) => {
                 // Held for the snapshot and the write together, so no other
                 // reshape's write-back can interleave with this one's.
                 let _writeback = self.writeback.lock().expect("writeback lock");
@@ -313,8 +359,8 @@ impl Hosted {
     }
 
     /// Point this world's benches at the documents they work on.
-    pub fn set_bench_root(&self, root: impl Into<std::path::PathBuf>) {
-        self.with_sim(|s| s.set_bench_root(root));
+    pub fn set_bench_root(&self, mind: Mind) {
+        self.with_sim(|s| s.set_bench_root(mind));
     }
 
     /// Where a body is standing, as the `area/node` string the sim keys on.
@@ -439,7 +485,7 @@ pub struct Worlds {
     /// about this daemon — where its authored content is — and a per-call
     /// argument would be a chance for two worlds to disagree about it. `None`
     /// in a daemon started without a mind, and then every bench act refuses.
-    bench_root: Mutex<Option<PathBuf>>,
+    bench_root: Mutex<Option<Mind>>,
     /// The operations' stores over that mind, for every world hosted here.
     ops: Mutex<Option<Arc<MindStores>>>,
 }
@@ -463,8 +509,8 @@ impl Worlds {
     /// Applies to the worlds already hosted as well as the ones still to come,
     /// so the order of startup — mind resolved before or after the first world
     /// is loaded — cannot leave a world without its documents.
-    pub fn set_bench_root(&self, root: impl Into<PathBuf>) {
-        let root = root.into();
+    pub fn set_bench_root(&self, mind: Mind) {
+        let root = mind;
         for hosted in self.worlds.lock().expect("worlds lock").values() {
             hosted.set_bench_root(root.clone());
         }

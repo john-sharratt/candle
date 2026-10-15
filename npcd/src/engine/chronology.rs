@@ -2,7 +2,7 @@
 //! machine checks a year against, and what decides which eras reach a
 //! character standing in one.
 
-use std::path::Path;
+use crate::mind::files::MindFiles;
 
 use crate::engine::mission_gen::corpus::{era_year, heading};
 
@@ -16,16 +16,13 @@ pub struct Era {
 }
 
 /// Every dated era under `<mind>/layers/eras`, earliest first.
-pub fn eras(mind: &Path) -> Vec<Era> {
-    let Ok(entries) = std::fs::read_dir(mind.join("layers").join("eras")) else {
-        return Vec::new();
-    };
-    let mut out: Vec<Era> = entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
+pub fn eras(mind: &MindFiles) -> Vec<Era> {
+    let mut out: Vec<Era> = mind
+        .list("layers/eras")
+        .into_iter()
+        .filter_map(|name| {
             let stem = name.strip_suffix(".md")?.to_string();
-            let text = std::fs::read_to_string(e.path()).ok()?;
+            let text = mind.read(&format!("layers/eras/{name}"))?;
             Some(Era {
                 address: format!("eras/{stem}"),
                 title: heading(&text).unwrap_or_else(|| stem.clone()),
@@ -124,7 +121,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            eras(dir.path()),
+            eras(&MindFiles::folder(dir.path())),
             [
                 Era {
                     address: "eras/the-awakening".into(),

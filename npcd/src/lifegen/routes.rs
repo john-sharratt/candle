@@ -121,7 +121,7 @@ pub(super) async fn resolve(
     headers: &HeaderMap,
     who: &str,
 ) -> Result<Arc<Author>, Refusal> {
-    if s.mind.root().is_none() {
+    if !s.mind.is_present() {
         return Err(refuse(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_mind",

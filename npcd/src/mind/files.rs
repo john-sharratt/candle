@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use zend_vfs::{ObjectKind, Oid, Repo, Rev};
+use zend_vfs::{FileMode, ObjectKind, Oid, Repo, Rev};
 
 use crate::mind::path::MindPath;
 use crate::sim::bench::refuse_link;
@@ -29,6 +29,8 @@ use crate::sim::shelf::{Shelf, NO_OPERATION};
 #[derive(Debug, Clone)]
 enum Node {
     File { oid: Oid, size: u64 },
+    /// A symbolic link: never followed, never read as a document.
+    Link,
     Dir,
 }
 
@@ -76,6 +78,7 @@ impl MindFiles {
             let path = sized.entry.path.to_string();
             let node = match sized.entry.kind {
                 ObjectKind::Tree => Node::Dir,
+                ObjectKind::Blob if sized.entry.mode == FileMode::Symlink => Node::Link,
                 ObjectKind::Blob => Node::File {
                     oid: sized.entry.oid,
                     size: sized.size.unwrap_or(0),
@@ -122,7 +125,7 @@ impl MindFiles {
             Backing::Folder(root) => std::fs::read(folder_file(root, rel)?).ok(),
             Backing::Commit { nodes, blobs, .. } => match nodes.get(&key(rel)?)? {
                 Node::File { oid, .. } => blobs.read_blob(oid).ok().flatten(),
-                Node::Dir => None,
+                Node::Dir | Node::Link => None,
             },
         }
     }
@@ -130,6 +133,26 @@ impl MindFiles {
     /// Whether a document stands at `rel`.
     pub fn is_file(&self, rel: &str) -> bool {
         self.size(rel).is_some()
+    }
+
+    /// Whether something that is not a document stands at `rel`: a folder, or
+    /// a link, which is never followed.
+    pub fn not_a_document(&self, rel: &str) -> bool {
+        match &self.backing {
+            Backing::Folder(root) => {
+                let Some(full) = MindPath::parse(rel).ok().and_then(|p| p.resolve(root).ok())
+                else {
+                    return false;
+                };
+                match full.symlink_metadata() {
+                    Ok(meta) => !meta.is_file() || refuse_link(&full, rel).is_err(),
+                    Err(_) => false,
+                }
+            }
+            Backing::Commit { nodes, .. } => key(rel)
+                .and_then(|k| nodes.get(&k))
+                .is_some_and(|n| matches!(n, Node::Dir | Node::Link)),
+        }
     }
 
     /// Whether a folder stands at `rel`; the root always does.
@@ -158,7 +181,7 @@ impl MindFiles {
             }
             Backing::Commit { nodes, .. } => match nodes.get(&key(rel)?)? {
                 Node::File { size, .. } => Some(*size),
-                Node::Dir => None,
+                Node::Dir | Node::Link => None,
             },
         }
     }
@@ -201,6 +224,7 @@ impl MindFiles {
                         let rest = &p[prefix.len()..];
                         (!rest.contains('/')).then(|| match node {
                             Node::Dir => format!("{rest}/"),
+                            Node::Link => rest.to_string(),
                             Node::File { .. } => rest.to_string(),
                         })
                     })
@@ -243,6 +267,78 @@ impl MindFiles {
                     .map(|(p, _)| p.clone())
                     .collect()
             }
+        }
+    }
+}
+
+/// How two snapshots of the mind differ, document by document.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Changes {
+    pub added: Vec<String>,
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl MindFiles {
+    /// The documents `newer` adds, changes and removes against `self`. Two
+    /// commits compare by blob id, without reading a document; anything else
+    /// by its bytes.
+    pub fn diff(&self, newer: &MindFiles) -> Changes {
+        let mut out = Changes::default();
+        let before: BTreeSet<String> = self.walk("").into_iter().collect();
+        let after: BTreeSet<String> = newer.walk("").into_iter().collect();
+        for path in after.difference(&before) {
+            out.added.push(path.clone());
+        }
+        for path in before.difference(&after) {
+            out.removed.push(path.clone());
+        }
+        for path in before.intersection(&after) {
+            let same = match (self.blob(path), newer.blob(path)) {
+                (Some(a), Some(b)) => a == b,
+                _ => self.bytes(path) == newer.bytes(path),
+            };
+            if !same {
+                out.changed.push(path.clone());
+            }
+        }
+        out
+    }
+
+    /// The blob id of the document at `rel`, for a commit.
+    fn blob(&self, rel: &str) -> Option<Oid> {
+        match &self.backing {
+            Backing::Commit { nodes, .. } => match nodes.get(&key(rel)?)? {
+                Node::File { oid, .. } => Some(oid.clone()),
+                _ => None,
+            },
+            Backing::Folder(_) => None,
+        }
+    }
+}
+
+/// A snapshot held by something that compares itself: two are equal when they
+/// are the same snapshot. Empty when there is no mind.
+#[derive(Clone, Default)]
+pub struct MindRef(pub Option<std::sync::Arc<MindFiles>>);
+
+impl PartialEq for MindRef {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for MindRef {}
+
+impl std::fmt::Debug for MindRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(files) => files.fmt(f),
+            None => f.write_str("no mind"),
         }
     }
 }

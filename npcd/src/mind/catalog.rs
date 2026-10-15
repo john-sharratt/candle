@@ -721,7 +721,7 @@ mod tests {
         let root = tmp("drafts");
         seed(&root);
         let view = Overlay::new(
-            Published { root: root.clone() },
+            Published::folder(root.clone()),
             [
                 (
                     "layers/world/ammo/tracer.md".to_string(),

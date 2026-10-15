@@ -35,7 +35,7 @@
 //! documents and not others.
 
 use std::collections::HashMap;
-use std::path::Path;
+use crate::mind::files::MindFiles;
 
 use candle_conversation::models::DialectType;
 use candle_conversation::projection::{Builder, CorruptTurnPolicy, GroupId, LayerId};
@@ -64,9 +64,8 @@ pub struct Projection {
 /// and the console from the same process, and a YAML typo should degrade the
 /// engine rather than take the daemon down with it. The caller falls back to the
 /// synthetic schema and says so.
-pub fn build(mind: Option<&Path>, world_name: &str) -> Option<Projection> {
-    let path = mind?.join("projection.yaml");
-    let yaml = std::fs::read_to_string(&path).ok()?;
+pub fn build(mind: Option<&MindFiles>, world_name: &str) -> Option<Projection> {
+    let yaml = mind?.read("projection.yaml")?;
     // ChatML, so the schema's `kind: template` items resolve to the right
     // structural-token strings at parse time. The model is a ChatML family
     // member; a mismatch here produces a schema whose glue markers are wrong in
@@ -82,7 +81,7 @@ pub fn build(mind: Option<&Path>, world_name: &str) -> Option<Projection> {
             tracing::error!(
                 "projection schema {} failed to parse: {e:#} — falling back to a schema \
                  that cannot gather",
-                path.display()
+                "projection.yaml"
             );
             return None;
         }
@@ -101,7 +100,7 @@ pub fn build(mind: Option<&Path>, world_name: &str) -> Option<Projection> {
         tracing::warn!(
             "projection {}: {} authored section(s) do not end in exactly one blank line, so the \
              model reads them run into what follows or with a gap after: {}",
-            path.display(),
+            "projection.yaml",
             faults.len(),
             faults.join(", ")
         );
@@ -109,7 +108,7 @@ pub fn build(mind: Option<&Path>, world_name: &str) -> Option<Projection> {
     tracing::info!(
         "projection: {} layer(s) from {}, {} bytes of prelude",
         builder.schema().layers.len(),
-        path.display(),
+        "projection.yaml",
         prelude.len()
     );
     Some(Projection {
@@ -135,9 +134,8 @@ pub fn build(mind: Option<&Path>, world_name: &str) -> Option<Projection> {
 ///
 /// A malformed value is a warning and a `None`, on the same reasoning as
 /// [`build`]: a typo should cost retention, not the daemon.
-pub fn turn_retention(mind: Option<&Path>) -> Option<u64> {
-    let path = mind?.join("projection.yaml");
-    let yaml = std::fs::read_to_string(&path).ok()?;
+pub fn turn_retention(mind: Option<&MindFiles>) -> Option<u64> {
+    let yaml = mind?.read("projection.yaml")?;
     let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).ok()?;
     let block = doc.get("turn_retention")?;
     match block.get("keep_turns").and_then(|v| v.as_u64()) {
@@ -146,7 +144,7 @@ pub fn turn_retention(mind: Option<&Path>) -> Option<u64> {
             tracing::warn!(
                 "turn_retention.keep_turns is 0 in {} — a conversation that keeps no turns \
                  would retire what it just said, so retention is off",
-                path.display()
+                "projection.yaml"
             );
             None
         }
@@ -154,7 +152,7 @@ pub fn turn_retention(mind: Option<&Path>) -> Option<u64> {
             tracing::warn!(
                 "turn_retention in {} has no numeric `keep_turns` — retention is off and the \
                  log will grow without bound",
-                path.display()
+                "projection.yaml"
             );
             None
         }
@@ -232,9 +230,8 @@ const QUESTION_TWO_SLOTS: [&str; 2] = [DOMAIN_SLOT, AXES_SLOT];
 /// reason as [`turn_retention`]: these are user turns the engine sends, not
 /// system-prompt composition, and nothing in the schema's own vocabulary would
 /// ever read them.
-pub fn reflection(mind: Option<&Path>) -> Option<ReflectionTurns> {
-    let path = mind?.join("projection.yaml");
-    let yaml = std::fs::read_to_string(&path).ok()?;
+pub fn reflection(mind: Option<&MindFiles>) -> Option<ReflectionTurns> {
+    let yaml = mind?.read("projection.yaml")?;
     let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).ok()?;
     let block = doc.get("reflection")?;
 
@@ -245,7 +242,7 @@ pub fn reflection(mind: Option<&Path>) -> Option<ReflectionTurns> {
             tracing::error!(
                 "reflection.{key} is missing or empty in {} — reflection is unavailable until it \
                  is authored",
-                path.display()
+                "projection.yaml"
             );
             return None;
         }
@@ -261,7 +258,7 @@ pub fn reflection(mind: Option<&Path>) -> Option<ReflectionTurns> {
             tracing::error!(
                 "reflection.question_two in {} carries no `{slot}` — the engine fills it, and \
                  without it the value is computed and discarded",
-                path.display()
+                "projection.yaml"
             );
             return None;
         }
@@ -286,7 +283,7 @@ pub fn reflection(mind: Option<&Path>) -> Option<ReflectionTurns> {
     tracing::info!(
         "reflection: two authored turns, a retry and {} repair question(s) from {}",
         repair.len(),
-        path.display()
+        "projection.yaml"
     );
     Some(ReflectionTurns {
         question_one,
@@ -486,6 +483,7 @@ fn boundary_faults(builder: &Builder) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use super::*;
 
     #[test]
@@ -498,7 +496,7 @@ mod tests {
     #[test]
     fn the_bundled_minds_corrupt_turn_policies_are_its_own() {
         let mind = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let projection = build(Some(mind), "world").expect("the bundled mind parses");
+        let projection = build(Some(&MindFiles::folder(mind)), "world").expect("the bundled mind parses");
         let policies = corrupt_turn_policies(&projection.builder);
         let by_name: HashMap<&str, CorruptTurnPolicy> = projection
             .builder
@@ -552,7 +550,7 @@ mod tests {
     fn a_missing_schema_is_an_absence_not_a_panic() {
         let dir = std::env::temp_dir().join("npcd-schema-none");
         let _ = std::fs::create_dir_all(&dir);
-        assert!(build(Some(&dir), "world").is_none());
+        assert!(build(Some(&MindFiles::folder(&dir)), "world").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -569,7 +567,7 @@ mod tests {
             "layers: [ this is not\n  valid: yaml",
         )
         .unwrap();
-        assert!(build(Some(&dir), "world").is_none());
+        assert!(build(Some(&MindFiles::folder(&dir)), "world").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -621,7 +619,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            reflection(Some(&dir)).is_none(),
+            reflection(Some(&MindFiles::folder(&dir))).is_none(),
             "{AXES_SLOT} is absent, so the diversity steer would be computed and discarded"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -639,7 +637,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let t = reflection(Some(&dir)).expect("a complete block is read");
+        let t = reflection(Some(&MindFiles::folder(&dir))).expect("a complete block is read");
         assert_eq!(t.question_one, "what comes to you?");
         assert!(t.question_two.contains(DOMAIN_SLOT));
         assert_eq!(t.retry, "again");
@@ -657,7 +655,7 @@ mod tests {
             return; // no bundled schema in this checkout
         }
         // Whatever the fixture says, the reader must answer rather than panic.
-        let _ = reflection(Some(mind));
+        let _ = reflection(Some(&MindFiles::folder(mind)));
     }
 
     /// The real schema parses and finds a live layer to write into. Reads the
@@ -669,7 +667,7 @@ mod tests {
         if !mind.join("projection.yaml").is_file() {
             return; // no bundled schema in this checkout
         }
-        let p = build(Some(mind), "battle-cities").expect("the bundled schema parses");
+        let p = build(Some(&MindFiles::folder(mind)), "battle-cities").expect("the bundled schema parses");
         assert!(
             !p.builder.schema().layers.is_empty(),
             "a schema with no layers cannot gather, which is the whole point"
@@ -690,7 +688,7 @@ mod tests {
         if !mind.join("projection.yaml").is_file() {
             return; // no bundled schema in this checkout
         }
-        let p = build(Some(mind), "battle-cities").expect("the bundled schema parses");
+        let p = build(Some(&MindFiles::folder(mind)), "battle-cities").expect("the bundled schema parses");
         let b = &p.builder;
         assert_eq!(
             document_target(b, "world"),

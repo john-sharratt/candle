@@ -190,7 +190,7 @@ pub async fn review(
         return no_engine("opening an operation");
     };
     let path = body.path.trim().trim_start_matches('/').to_string();
-    if !rt.mind.as_ref().is_some_and(|m| m.join(&path).is_file()) {
+    if !rt.mind_files().is_some_and(|m| m.is_file(&path)) {
         return err(
             StatusCode::NOT_FOUND,
             "no_document",
@@ -414,7 +414,7 @@ pub async fn document(
     let Some(op) = hosted.sim(|sim| sim.missions.operations().get(oid).cloned()) else {
         return err(StatusCode::NOT_FOUND, "no_operation", "no such operation");
     };
-    let Some(root) = rt.mind.as_ref() else {
+    let Some(root) = rt.mind_files() else {
         return err(
             StatusCode::NOT_FOUND,
             "no_document",
@@ -424,7 +424,7 @@ pub async fn document(
     let stored = hosted
         .op_shelf(oid)
         .and_then(|shelf| shelf.read(&op.document));
-    let published = Published { root: root.clone() }.read(&op.document);
+    let published = Published::of(root).read(&op.document);
     match stored {
         Some(text) => Json(json!({
             "path": op.document,

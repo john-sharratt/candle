@@ -31,11 +31,11 @@
 //! guess — which is the habit that caused the problem above. It reports
 //! `chars`, which is a thing it can actually count.
 
-use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::mind::files::MindFiles;
 use crate::projection::Source;
 
 /// A section's file, as far as the console cares.
@@ -97,36 +97,31 @@ impl Library {
     /// the library down — the same call the registry makes, and for the same
     /// reason: one malformed mood out of a hundred and sixteen must not cost
     /// the other hundred and fifteen.
-    pub fn load(name: &'static str, dir: &Path) -> Self {
-        let folder = dir
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or(name)
-            .to_string()
-            + "/";
+    pub fn load(name: &'static str, mind: &MindFiles, dir: &str) -> Self {
+        let folder = format!("{dir}/");
 
         let mut sections = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut paths: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "yaml"))
-                .collect();
+        {
             // Sorted, so the console's listing does not reshuffle between loads.
-            paths.sort();
+            let paths: Vec<String> = mind
+                .list(dir)
+                .into_iter()
+                .filter(|n| n.ends_with(".yaml"))
+                .collect();
 
-            for path in paths {
-                let Ok(text) = std::fs::read_to_string(&path) else {
+            for file in paths {
+                let rel = match dir.is_empty() {
+                    true => file.clone(),
+                    false => format!("{dir}/{file}"),
+                };
+                let path = std::path::PathBuf::from(&rel);
+                let Some(text) = mind.read(&rel) else {
                     tracing::warn!(path = %path.display(), "{name}: unreadable, skipping");
                     continue;
                 };
                 match serde_yaml::from_str::<SectionFile>(&text) {
                     Ok(f) => {
-                        let stem = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default()
-                            .to_string();
+                        let stem = file.trim_end_matches(".yaml").to_string();
                         let template = f.template.unwrap_or_default();
                         sections.push(Section {
                             // The file name is the id when the document does not
@@ -147,7 +142,7 @@ impl Library {
             }
         }
 
-        tracing::info!("{name}: {} sections from {}", sections.len(), dir.display());
+        tracing::info!("{name}: {} sections from {}", sections.len(), dir);
         Self {
             name,
             folder,
@@ -195,12 +190,12 @@ impl Libraries {
     /// from". Joining the mind path here instead would be a second answer to
     /// that question, free to disagree the day the layout changes.
     pub fn load(schema: &Source) -> Self {
-        let open = |name: &'static str, folder: &str| match schema.collection_dir(folder) {
-            Some(dir) => Library::load(name, &dir),
+        let open = |name: &'static str, folder: &str| match (&schema.files, schema.collection_dir(folder)) {
+            (Some(files), Some(dir)) => Library::load(name, files, &dir),
             // No mind, or a mind without that folder. An empty library, which
             // the console renders as a collection with no sections — the truth,
             // and visibly different from one it failed to load.
-            None => Library {
+            _ => Library {
                 name,
                 folder: format!("{folder}/"),
                 sections: Vec::new(),
@@ -424,6 +419,7 @@ pub fn excludes_of(body: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use super::*;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
@@ -458,7 +454,7 @@ mod tests {
             "id: calm\ncategory: mood\ntemplate: Steady.\n",
         );
 
-        let lib = Library::load("mood", &dir);
+        let lib = Library::load("mood", &MindFiles::folder(&dir), "");
         assert_eq!(lib.len(), 2);
         assert_eq!(lib.with_examples(), 1);
 
@@ -476,7 +472,7 @@ mod tests {
     fn a_file_without_an_id_is_named_by_its_file() {
         let dir = tmp("stem");
         write(&dir, "bait_then_trap.yaml", "template: Lure them in.\n");
-        let lib = Library::load("response", &dir);
+        let lib = Library::load("response", &MindFiles::folder(&dir), "");
         assert_eq!(lib.sections[0].id, "bait_then_trap");
         assert_eq!(lib.sections[0].category, "response");
     }
@@ -487,7 +483,7 @@ mod tests {
         let dir = tmp("broken");
         write(&dir, "good.yaml", "id: good\ntemplate: Fine.\n");
         write(&dir, "broken.yaml", "id: [unclosed\n");
-        let lib = Library::load("mood", &dir);
+        let lib = Library::load("mood", &MindFiles::folder(&dir), "");
         assert_eq!(lib.len(), 1);
         assert_eq!(lib.sections[0].id, "good");
     }
@@ -504,7 +500,7 @@ mod tests {
                 &format!("id: {n}\ntemplate: x\n"),
             );
         }
-        let ids: Vec<_> = Library::load("response", &dir)
+        let ids: Vec<_> = Library::load("response", &MindFiles::folder(&dir), "")
             .sections
             .iter()
             .map(|s| s.id.clone())
@@ -547,8 +543,8 @@ mod tests {
             "id: flank\ncategory: combat\ntemplate: c\n",
         );
         let libs = Libraries {
-            responses: Library::load("response", &dir),
-            moods: Library::load("mood", Path::new("nowhere")),
+            responses: Library::load("response", &MindFiles::folder(&dir), ""),
+            moods: Library::load("mood", &MindFiles::folder("nowhere"), ""),
         };
 
         // No exclusions: everything.
@@ -601,8 +597,8 @@ mod tests {
         let dir = tmp("wire");
         write(&dir, "a.yaml", "id: a\ncategory: affect\ntemplate: abc\n");
         let libs = Libraries {
-            responses: Library::load("response", &dir),
-            moods: Library::load("mood", &dir),
+            responses: Library::load("response", &MindFiles::folder(&dir), ""),
+            moods: Library::load("mood", &MindFiles::folder(&dir), ""),
         };
         let w = libs.world_wire(&[]);
         let s = &w["collections"][0]["sections"][0];

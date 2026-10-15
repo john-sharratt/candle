@@ -51,7 +51,11 @@ pub mod path;
 pub mod scope;
 pub mod section;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+
+use crate::sim::shelf::Published;
+use files::MindFiles;
 
 pub use address::Address;
 pub use path::MindPath;
@@ -63,20 +67,90 @@ pub use scope::Scope;
 /// substrate and has no authored content at all. Every method here reports that
 /// as a plain absence rather than an error, so the console can say "no mind
 /// directory" once instead of the API failing five different ways.
-#[derive(Debug, Clone)]
+///
+/// It holds the mind's files as they stand ([`MindFiles`]): at the commit the
+/// log names for the mind's branch, or in a plain folder. Every clone shares
+/// one holder, so when the branch moves, [`Mind::replace`] moves every reader
+/// to the new commit at once; a snapshot taken before keeps reading the old.
+#[derive(Debug, Clone, Default)]
 pub struct Mind {
-    root: Option<PathBuf>,
+    /// `None` for a daemon with no mind. Within, `None` while a mind read from
+    /// the substrate has not arrived yet.
+    current: Option<Arc<RwLock<Option<Arc<MindFiles>>>>>,
+    /// The repository behind the files: the plain folder, or the mind's
+    /// object store — where operations' stores and publishes work. Never read
+    /// as the mind's files: a store checks nothing out.
+    repo: Option<PathBuf>,
 }
 
+/// Two handles are the same mind when they share one holder.
+impl PartialEq for Mind {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.current, &other.current) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Mind {}
+
 impl Mind {
-    /// Wrap the resolved mind directory. `None` when `--mind` was not given.
+    /// The mind in the folder `root`, read as it stands. `None` when `--mind`
+    /// was not given.
     pub fn new(root: Option<PathBuf>) -> Self {
-        Mind { root }
+        match root {
+            Some(root) => Self::of(Arc::new(MindFiles::folder(&root)), root),
+            None => Self::default(),
+        }
     }
 
-    /// The root, or `None` when there is no mind.
-    pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
+    /// The mind as `files` hold it, from the repository at `repo`.
+    pub fn of(files: Arc<MindFiles>, repo: impl Into<PathBuf>) -> Self {
+        Mind {
+            current: Some(Arc::new(RwLock::new(Some(files)))),
+            repo: Some(repo.into()),
+        }
+    }
+
+    /// A mind read from the repository at `repo` that has not arrived yet:
+    /// no files until [`Self::replace`] gives it some.
+    pub fn pending(repo: impl Into<PathBuf>) -> Self {
+        Mind {
+            current: Some(Arc::new(RwLock::new(None))),
+            repo: Some(repo.into()),
+        }
+    }
+
+    /// The folder of the repository behind the files: what operations' stores
+    /// read through and publishes land in. `None` with no mind.
+    pub fn repo_dir(&self) -> Option<&std::path::Path> {
+        self.repo.as_deref()
+    }
+
+    /// The mind's files as they stand now, or `None` when there is no mind —
+    /// or it has not arrived.
+    pub fn files(&self) -> Option<Arc<MindFiles>> {
+        self.current.as_ref()?.read().unwrap().clone()
+    }
+
+    /// The published mind as it stands now, as a shelf.
+    pub fn published(&self) -> Option<Published> {
+        self.files().map(Published::of)
+    }
+
+    /// Whether this daemon has a mind it can read now.
+    pub fn is_present(&self) -> bool {
+        self.files().is_some()
+    }
+
+    /// Move every reader to `files`: the mind's branch moved, or the mind
+    /// arrived. A daemon with no mind keeps none.
+    pub fn replace(&self, files: Arc<MindFiles>) {
+        if let Some(current) = &self.current {
+            *current.write().unwrap() = Some(files);
+        }
     }
 }
 
@@ -86,12 +160,13 @@ mod tests {
 
     #[test]
     fn a_daemon_without_a_mind_says_so_rather_than_failing() {
-        assert!(Mind::new(None).root().is_none());
+        assert!(Mind::new(None).files().is_none());
     }
 
     #[test]
     fn a_daemon_with_a_mind_reports_its_root() {
         let dir = std::env::temp_dir();
-        assert_eq!(Mind::new(Some(dir.clone())).root(), Some(dir.as_path()));
+        let files = Mind::new(Some(dir.clone())).files().unwrap();
+        assert_eq!(files.folder_root(), Some(dir.as_path()));
     }
 }

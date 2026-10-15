@@ -149,7 +149,7 @@ pub(super) mod tests {
     fn the_world_s_state_is_one_record_per_entity() {
         let mut s = seed::for_world("w", None);
         s.table_open = false;
-        s.set_bench_root("/somewhere/on/this/machine");
+        s.set_bench_root(crate::mind::Mind::new(Some("/somewhere/on/this/machine".into())));
         seed::issue_handset(&mut s, "m1", "Maker-01");
         let records = sim_records(&s);
         let meta = records.get("sim/meta").expect("a meta record");

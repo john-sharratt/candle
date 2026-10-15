@@ -139,14 +139,15 @@ mod tests {
 
         let replica = vault();
         replica.with(|w| w.enter("a", "A", at("band-one")).unwrap());
-        replica.with_sim(|s| s.bench.set_root("/the/replica/s/own"));
+        let own = crate::mind::Mind::new(Some("/the/replica/s/own".into()));
+        replica.with_sim(|s| s.bench.set_mind(own.clone()));
         apply(&replica, &records);
         assert_eq!(replica.place_of("a"), "vault-casting/green-room");
         assert!(!replica.sim(|s| s.table_open));
         assert!(replica.sim(|s| s.has_phone("a")));
         assert_eq!(
-            replica.sim(|s| s.bench.mind_root().map(|p| p.to_path_buf())),
-            Some("/the/replica/s/own".into())
+            replica.sim(|s| s.bench.mind().cloned()),
+            Some(own)
         );
         assert_eq!(
             replica.sim(sim_records),

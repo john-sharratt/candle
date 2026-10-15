@@ -16,7 +16,7 @@
 //! `registry::id::check` first.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock as SyncRwLock};
 
 use axum::{
@@ -109,9 +109,6 @@ pub struct Authored {
     pub personality_portraits: SyncRwLock<BTreeMap<String, String>>,
     /// The mind directory, for the file editor.
     pub mind: Mind,
-    /// The folder the worlds and personalities are kept in, and an author's
-    /// writes go to: the mind, or the data directory of a daemon with none.
-    authored_dir: PathBuf,
     /// The engine.
     ///
     /// Always present, and always *there before the model is*. The daemon binds
@@ -154,13 +151,6 @@ impl Authored {
         images: Images,
         personality_portraits: BTreeMap<String, String>,
     ) -> Self {
-        // Both registries are read from their folders of one place, which is
-        // where an author's writes go.
-        let authored_dir = worlds
-            .dir()
-            .parent()
-            .map(FsPath::to_path_buf)
-            .unwrap_or_default();
         Self {
             worlds: RwLock::new(worlds),
             personalities: RwLock::new(personalities),
@@ -171,7 +161,6 @@ impl Authored {
             images,
             personality_portraits: SyncRwLock::new(personality_portraits),
             mind,
-            authored_dir,
             runtime: None,
             lifegen: Jobs::new(),
         }
@@ -181,7 +170,7 @@ impl Authored {
     /// where its writes go — its drafts, over a mind under git (§10.3).
     pub fn author(&self, account: &str) -> Author {
         let stores = self.runtime.as_ref().map(|rt| &rt.ops);
-        Author::open(&self.authored_dir, stores, account)
+        Author::open(&self.mind, stores, account)
     }
 
     /// What follows a write through `author`: over a mind that keeps no
@@ -1880,7 +1869,7 @@ async fn mind_request(
     headers: &HeaderMap,
     q: &HashMap<String, String>,
 ) -> Result<(Option<Address>, Scope), Box<Response>> {
-    if s.mind.root().is_none() {
+    if !s.mind.is_present() {
         return Err(Box::new(err(
             StatusCode::NOT_FOUND,
             "no_mind",
@@ -1913,9 +1902,7 @@ async fn mind_request(
 fn mind_view(s: &Authored, headers: &HeaderMap) -> Box<dyn Shelf> {
     match caller::admin(s, headers) {
         Some(author) => Box::new(author),
-        None => Box::new(Published {
-            root: s.mind.root().map(FsPath::to_path_buf).unwrap_or_default(),
-        }),
+        None => Box::new(s.mind.published().unwrap_or_else(|| Published::folder(PathBuf::new()))),
     }
 }
 
@@ -2130,11 +2117,8 @@ pub fn schema_layers(s: &Authored) -> Result<Vec<Value>, String> {
     let Some((list_key, id_key)) = addr.parts() else {
         return Err("the projection schema declares no parts".into());
     };
-    let text = match s.mind.root() {
-        Some(root) => {
-            let published = Published {
-                root: root.to_path_buf(),
-            };
+    let text = match s.mind.published() {
+        Some(published) => {
             mind_catalog::read(&published, &addr)
                 .map_err(|e| format!("{e:?}"))?
                 .text

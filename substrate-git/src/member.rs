@@ -258,7 +258,7 @@ impl Repos {
 
     /// Keep every repository with the log and with origin on a thread of its
     /// own, until `stopped` says so.
-    pub fn follow(&self, stopped: fn() -> bool) -> anyhow::Result<()> {
+    pub fn follow(&self, stopped: Arc<dyn Fn() -> bool + Send + Sync>) -> anyhow::Result<()> {
         let inner = Arc::clone(&self.inner);
         thread::Builder::new()
             .name("substrate-git".into())
@@ -284,7 +284,7 @@ fn whole(store: &Store, shared: &SharedSubstrate) -> anyhow::Result<bool> {
     Ok(!log.is_empty() && store.record()? == log)
 }
 
-fn follow(inner: Arc<Inner>, stopped: fn() -> bool) {
+fn follow(inner: Arc<Inner>, stopped: Arc<dyn Fn() -> bool + Send + Sync>) {
     let mut last_error: HashMap<String, String> = HashMap::new();
     loop {
         thread::sleep(TICK);

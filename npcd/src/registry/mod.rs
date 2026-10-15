@@ -38,6 +38,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::mind::files::MindFiles;
+use crate::mind::Mind;
+
 /// Largest document this will write.
 ///
 /// Twenty times the biggest real personality in the mind, which is enough that
@@ -117,6 +120,10 @@ pub struct Record {
 #[derive(Debug)]
 pub struct Registry {
     dir: PathBuf,
+    /// Read from the mind instead of `dir`: the mind and the folder in it
+    /// (`docs/substrate_git.md` §8.1). Every load and reload reads the mind as
+    /// it stands then.
+    mind: Option<(Mind, String)>,
     /// Ordered so listings are stable — a GUI list that reshuffles between
     /// loads looks broken even when it is not.
     items: BTreeMap<String, Record>,
@@ -139,13 +146,45 @@ impl Registry {
         let dir = dir.as_ref().to_path_buf();
         let items = Self::read(kind, &dir)?;
         tracing::info!("{kind}: {} loaded from {}", items.len(), dir.display());
-        Ok(Self { dir, items, kind })
+        Ok(Self {
+            dir,
+            mind: None,
+            items,
+            kind,
+        })
+    }
+
+    /// Read every `*.yaml` in the folder `rel` of `mind` into memory: the mind
+    /// as it stands now, and again at each [`Self::reload`].
+    pub fn load_mind(kind: &'static str, mind: &Mind, rel: &str) -> Result<Self> {
+        let items = match mind.files() {
+            Some(files) => Self::read_files(kind, &files, rel),
+            None => BTreeMap::new(),
+        };
+        tracing::info!("{kind}: {} loaded from the mind's {rel}/", items.len());
+        Ok(Self {
+            dir: PathBuf::from(rel),
+            mind: Some((mind.clone(), rel.to_string())),
+            items,
+            kind,
+        })
+    }
+
+    /// The mind this registry reads, and its folder in it, when it reads one.
+    pub fn mind(&self) -> Option<(&Mind, &str)> {
+        self.mind.as_ref().map(|(m, rel)| (m, rel.as_str()))
     }
 
     /// Read the directory again, as it stands now. The ids that were here and
     /// are gone come back, so whatever runs from one can be stopped.
     pub fn reload(&mut self) -> Result<Vec<String>> {
-        let items = Self::read(self.kind, &self.dir)?;
+        let items = match &self.mind {
+            Some((mind, rel)) => match mind.files() {
+                Some(files) => Self::read_files(self.kind, &files, rel),
+                None => BTreeMap::new(),
+            },
+            None => Self::read(self.kind, &self.dir)?,
+        };
         let gone = self
             .items
             .keys()
@@ -154,6 +193,23 @@ impl Registry {
             .collect();
         self.items = items;
         Ok(gone)
+    }
+
+    fn read_files(kind: &'static str, files: &MindFiles, rel: &str) -> BTreeMap<String, Record> {
+        let mut items = BTreeMap::new();
+        for name in files.list(rel) {
+            if !name.ends_with(".yaml") {
+                continue;
+            }
+            let Some(text) = files.read(&format!("{rel}/{name}")) else {
+                tracing::warn!(file = %name, "{kind}: unreadable, skipping");
+                continue;
+            };
+            if let Some(record) = authored::record_of(kind, &name, &text) {
+                items.insert(record.id.clone(), record);
+            }
+        }
+        items
     }
 
     fn read(kind: &'static str, dir: &Path) -> Result<BTreeMap<String, Record>> {

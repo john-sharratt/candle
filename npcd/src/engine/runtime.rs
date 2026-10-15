@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use futures::executor::block_on;
@@ -110,12 +110,14 @@ use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::{self, Ledger, Reconcile};
 use crate::engine::witnessed;
 use crate::engine::work;
+use crate::mind::files::MindFiles;
 use crate::mind::Mind;
-use crate::mind_repo::MindRepo;
+use crate::mind_store::{self, MindSource};
+use crate::projection;
+use substrate_git::member::{Cluster, Repos, Source as RepoSource};
 use crate::model;
 use crate::npcs::{Casting, Npcs};
 use crate::opstore::MindStores;
-use crate::projection::SCHEMA_FILE;
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
@@ -138,7 +140,6 @@ use npc_map::schema::NodeKind;
 use npc_map::world::Where;
 use npc_map::{describe, perceive, route};
 use tokio::sync::watch;
-use zend_vfs::Fetch;
 
 /// Tokens one prefill forward carries when the model can take them — the
 /// scheduler's per-forward *target*.
@@ -342,10 +343,12 @@ pub struct Runtime {
     /// directory*, so a daemon that does not name this ends up with its redo log
     /// wherever it happened to be launched from.
     pub data: PathBuf,
-    /// The mind directory, when there is one — what the file watcher watches.
-    pub mind: Option<PathBuf>,
     /// The same mind, as the handle the schema is read through.
     pub mind_handle: Mind,
+    /// The mind repository, loaded and followed, with `--mind-repo`.
+    mind_repos: OnceLock<Repos>,
+    /// Asked for a relaunch: the mind's schema moved.
+    relaunch: OnceLock<Arc<Stopping>>,
     /// Content hashes for every ingested layer file.
     ///
     /// Shared between the startup ingest and the watcher, deliberately: they are
@@ -796,6 +799,42 @@ pub struct MessageSent {
 }
 
 impl Runtime {
+    /// The mind's files as they stand now, or `None` with no mind.
+    pub fn mind_files(&self) -> Option<Arc<MindFiles>> {
+        self.mind_handle.files()
+    }
+
+    /// Restart the process, when the load has said how: the mind's schema
+    /// moved, and the grammar is built from it once.
+    fn ask_relaunch(&self) {
+        match self.relaunch.get() {
+            Some(stopping) => {
+                stopping.ask(Ending::Relaunch);
+            }
+            None => tracing::warn!("mind: a restart is needed to take the new schema"),
+        }
+    }
+
+    /// What the mind's move from `old` to `new` changed, reported as the folder
+    /// watcher reports an edit: the documents added, changed and removed. They
+    /// are read into the substrate at the next start, as a watched folder's
+    /// edits are (`engine::watcher`).
+    fn reconcile_mind(&self, old: &MindFiles, new: &MindFiles) {
+        let changes = old.diff(new);
+        let ingestible = |paths: &[String]| {
+            paths
+                .iter()
+                .filter(|p| crate::engine::watcher::is_ingestible(Path::new(p)))
+                .count()
+        };
+        tracing::info!(
+            "mind reloaded: +{} ~{} -{}",
+            ingestible(&changes.added),
+            ingestible(&changes.changed),
+            ingestible(&changes.removed)
+        );
+    }
+
     pub fn new(mind_handle: Mind, data: &Path) -> Arc<Self> {
         // **The benches are pointed at the mind this daemon was given**, before
         // any world is hosted. Derived from the handle rather than set on a
@@ -804,17 +843,19 @@ impl Runtime {
         // them able to edit documents was a difference nothing in the fiction
         // justifies and nothing in the signature announces.
         let hosted = Worlds::new();
-        if let Some(root) = mind_handle.root() {
-            hosted.set_bench_root(root);
+        if mind_handle.is_present() {
+            hosted.set_bench_root(mind_handle.clone());
         }
-        let ops = MindStores::new(mind_handle.root());
+        let ops = MindStores::new(mind_handle.repo_dir());
         hosted.set_op_stores(Arc::clone(&ops));
         let rt = Arc::new(Self {
             scheduler: Arc::new(Scheduler::default()),
             progress: Arc::new(LoadProgress::new()),
             data: data.to_path_buf(),
-            mind: mind_handle.root().map(Path::to_path_buf),
+
             mind_handle,
+            mind_repos: OnceLock::new(),
+            relaunch: OnceLock::new(),
             // Read from disk: a document already in the substrate must not be
             // prefilled again, and at four seconds each that is the difference
             // between a twelve-second boot and half an hour of one.
@@ -873,6 +914,15 @@ impl Runtime {
         authored: &Path,
         worlds: impl IntoIterator<Item = &'a str>,
     ) -> Vec<(String, anyhow::Result<Arc<Hosted>>)> {
+        // The mind's maps when it has a mind: its files, at the commit the log
+        // names. The data directory's folder only for a daemon with none.
+        if let Some(files) = self.mind_files() {
+            return worlds
+                .into_iter()
+                .filter(|id| files.is_dir(&format!("{MAPS}/{id}")))
+                .map(|id| (id.to_string(), self.host_from_mind(id, &files)))
+                .collect();
+        }
         let maps = authored.join(MAPS);
         worlds
             .into_iter()
@@ -888,10 +938,28 @@ impl Runtime {
     /// the runtime — and the daemon would never drop, which reads as a clean
     /// shutdown that never finishes.
     pub fn host(self: &Arc<Self>, id: &str, dir: &Path) -> anyhow::Result<Arc<Hosted>> {
+        let world = self.hosted.load(id, dir)?;
+        self.start_hosted(id, world)
+    }
+
+    /// Load one world from the mind's files — its map at `map/<id>` — and
+    /// start it moving (`docs/substrate_git.md` §8.1).
+    pub fn host_from_mind(
+        self: &Arc<Self>,
+        id: &str,
+        mind: &MindFiles,
+    ) -> anyhow::Result<Arc<Hosted>> {
+        let world = Arc::new(Hosted::load_mind(id, mind, &format!("{MAPS}/{id}"))?);
+        let world = self.hosted.keep(world);
+        self.start_hosted(id, world)
+    }
+
+    /// A world just loaded: its saved state restored, and its metronome
+    /// started.
+    fn start_hosted(self: &Arc<Self>, id: &str, world: Arc<Hosted>) -> anyhow::Result<Arc<Hosted>> {
         let Some(spawner) = self.spawner.clone() else {
             anyhow::bail!("no async runtime to beat `{id}`'s metronome on");
         };
-        let world = self.hosted.load(id, dir)?;
         self.restore(&world);
         let back = Arc::downgrade(self);
         let name = id.to_string();
@@ -2636,7 +2704,7 @@ impl Runtime {
         let job = hosted.sim(|s| {
             let m = s.missions.active(&body)?;
             let w = m.work.as_ref()?;
-            let root = s.bench.mind_root()?.to_path_buf();
+            let root = s.bench.files()?;
             let written = written_up_to_floor(s, &body, m, &DocStep::Write(w.writes.clone()));
             Some((
                 m.prompt.clone(),
@@ -3709,68 +3777,105 @@ pub struct LoadPlan {
     /// before the layers load — `--wipe-conversations`. See
     /// [`wipe_conversations`].
     pub wipe_conversations: bool,
-    /// The mind repository the agents hold, with `--mind-repo`: its fetches
-    /// and pushes go through them once joined, and a mirror not yet ready is
-    /// brought up and the process restarted onto it (§10.3).
-    pub mind_repo: Option<MindRepo>,
+    /// The mind repository the agents hold, with `--mind-repo`, read from the
+    /// substrate (`docs/substrate_git.md` §8): its fetches and pushes go
+    /// through the agents once joined, and a mind the log did not hold at
+    /// start is pulled and the process restarted onto it.
+    pub mind_repo: Option<MindSource>,
     /// The process's stop, asked for that restart.
     pub stopping: Arc<Stopping>,
 }
 
-/// How long a mind fetch that found no agent, or no branch, waits before the
-/// next try.
-const MIND_RETRY: Duration = Duration::from_secs(30);
-
-/// Bring the mirror of `repo` up to the record through `fetcher`, trying
-/// again every [`MIND_RETRY`] while no agent holding it answers or its origin
-/// has no such branch yet. A record that holds no schema is not a mind, and
-/// fails the load.
-fn bring_up_mind(
+/// Load the mind repository whole — pulled through an agent first when no
+/// member has — then follow it: each move of its branch takes the mind to the
+/// new commit (`docs/substrate_git.md` §8.2). Whether the mind arrived now,
+/// having been pending at start, which the process restarts onto: the schema,
+/// the libraries and the grammar built from them are read once.
+fn load_mind(
     rt: &Arc<Runtime>,
-    repo: &MindRepo,
-    fetcher: Arc<dyn Fetch>,
-) -> anyhow::Result<()> {
+    source: &MindSource,
+    shared: &SharedSubstrate,
+    cluster: Option<Cluster>,
+) -> anyhow::Result<bool> {
     let p = &rt.progress;
-    loop {
-        if rt.stopping() {
-            anyhow::bail!("the process stopped while fetching the mind");
+    let repos = Repos::open(
+        &mind_store::stores_root(&rt.data),
+        &[RepoSource {
+            name: source.name.clone(),
+            checkout: None,
+        }],
+        shared.clone(),
+        cluster,
+    )?;
+    let stopping = || rt.stopping();
+    repos.load(&stopping, &|state| {
+        if let Some(l) = state.first() {
+            p.set_detail(match &l.error {
+                Some(e) => format!("the mind repository `{}`: {e}", l.repo),
+                None if l.listed == 0 => format!(
+                    "the mind repository `{}`: waiting for a member to pull it through an agent",
+                    l.repo
+                ),
+                None => format!(
+                    "the mind repository `{}`: {} of {} packs",
+                    l.repo, l.held, l.listed
+                ),
+            });
         }
-        p.set_detail(format!(
-            "fetching the mind repository `{}` through an agent",
-            repo.name
-        ));
-        match repo.bring_up(Arc::clone(&fetcher)) {
-            Ok(Some(tip)) if repo.ready() => {
-                tracing::warn!(
-                    %tip,
-                    "mind: `{}` mirrored at {} — restarting onto it",
-                    repo.name,
-                    repo.dir.display()
-                );
-                return Ok(());
-            }
-            Ok(Some(tip)) => anyhow::bail!(
-                "the mind repository `{}` holds no {SCHEMA_FILE} at {tip} on `{}`: it is not a \
-                 mind",
-                repo.name,
-                repo.branch
-            ),
-            Ok(None) => tracing::warn!(
-                "mind: `{}`'s origin has no branch `{}` yet — trying again in {} s",
-                repo.name,
-                repo.branch,
-                MIND_RETRY.as_secs()
-            ),
-            Err(e) => tracing::warn!(
-                "mind: `{}` could not be fetched through an agent: {e} — trying again in {} s",
-                repo.name,
-                MIND_RETRY.as_secs()
-            ),
+    })?;
+    if rt.stopping() {
+        anyhow::bail!("the process stopped while loading the mind");
+    }
+    let pending = !rt.mind_handle.is_present();
+    let follower = Arc::downgrade(rt);
+    let followed = repos.clone();
+    let source_moved = source.clone();
+    repos.on_change(Arc::new(move |_| {
+        if let Some(rt) = follower.upgrade() {
+            mind_moved(&rt, &followed, &source_moved);
         }
-        let until = Instant::now() + MIND_RETRY;
-        while Instant::now() < until && !rt.stopping() {
-            std::thread::sleep(Duration::from_millis(250));
+    }));
+    let stopped = Arc::downgrade(rt);
+    repos.follow(Arc::new(move || {
+        stopped.upgrade().is_none_or(|rt| rt.stopping())
+    }))?;
+    let _ = rt.mind_repos.set(repos);
+    Ok(pending)
+}
+
+/// The mind's branch moved in the log: every reader moves to the new commit,
+/// and what was read from the old is read again — the worlds and
+/// personalities, and the documents ingested from it. A move that changes the
+/// schema restarts the process onto it, since the grammar is built once.
+fn mind_moved(rt: &Arc<Runtime>, repos: &Repos, source: &MindSource) {
+    let Some(store) = repos.store(&source.name) else {
+        return;
+    };
+    let files = match mind_store::at_record(store.repo(), source) {
+        Ok(Some(files)) => files,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("mind: reading the new commit: {e:#}");
+            return;
         }
+    };
+    let old = rt.mind_handle.files();
+    if old.as_ref().and_then(|o| o.commit().cloned()) == files.commit().cloned() {
+        return;
+    }
+    let schema_changed = old
+        .as_ref()
+        .is_none_or(|o| o.read(projection::SCHEMA_FILE) != files.read(projection::SCHEMA_FILE));
+    tracing::info!(commit = ?files.commit(), "mind: moved to a newer commit");
+    rt.mind_handle.replace(Arc::clone(&files));
+    if schema_changed {
+        tracing::warn!("mind: its schema changed — restarting onto it");
+        rt.ask_relaunch();
+        return;
+    }
+    rt.ops.moved();
+    if let Some(old) = old {
+        rt.reconcile_mind(&old, &files);
     }
 }
 
@@ -3801,6 +3906,7 @@ pub fn start(rt: Arc<Runtime>, plan: LoadPlan) {
 
 fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow::Result<()> {
     let p = &rt.progress;
+    let _ = rt.relaunch.set(Arc::clone(&plan.stopping));
     let spec = model::spec();
 
     // ── the model ──────────────────────────────────────────────────────────
@@ -3875,8 +3981,9 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     //
     // Parsed before the engine is built, because the engine takes each layer's
     // corrupt-turn policy from it and applies them in its startup reload.
-    let mut projection = schema::build(rt.mind.as_deref(), "battle-cities");
-    if projection.is_none() && rt.mind.is_some() {
+    let mind_files = rt.mind_files();
+    let mut projection = schema::build(mind_files.as_deref(), "battle-cities");
+    if projection.is_none() && mind_files.is_some() {
         tracing::warn!(
             "no usable projection schema — documents will be written but will produce \
              no provenance signatures, so nothing will gather them"
@@ -3914,7 +4021,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         .guests(guests)
         .prefill_pass_tokens(PREFILL_PASS_TOKENS)
         .corrupt_turn_policies(corrupt_turn)
-        .substrate(shared);
+        .substrate(shared.clone());
     // The checkpoint's own dialect and sampling. Captured before the builder is
     // consumed, and handed to every conversation — a second opinion about either
     // would run the model outside the settings it was tuned under.
@@ -3988,12 +4095,12 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     let engine: SharedEngine = Arc::new(Mutex::new(engine));
     // Retention is read from the mind's own schema, so a deployment that wants
     // whole transcripts omits the block and nothing changes for it.
-    let keep_turns = crate::engine::schema::turn_retention(rt.mind.as_deref());
+    let keep_turns = crate::engine::schema::turn_retention(mind_files.as_deref());
     // The reflection's two user turns, from the same schema. Read here rather
     // than per request: they are authored content and a reflection sends them
     // verbatim, so re-reading the file mid-run would let two reflections in the
     // same minute be asked different questions.
-    let reflection = crate::engine::schema::reflection(rt.mind.as_deref());
+    let reflection = crate::engine::schema::reflection(mind_files.as_deref());
     *rt.minds.write().unwrap() = Some(Arc::new(
         Minds::new(Arc::clone(&engine), conv_config.clone())
             .keeping_turns(keep_turns)
@@ -4052,16 +4159,24 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             rt.join_cluster(Arc::clone(member));
             // The mind repository's fetches and pushes go through an agent
             // holding it — this process's own while it is cut off (§10.3,
-            // §11.5). A mirror not yet holding the record is brought up now,
-            // and the process restarts onto it.
-            if let (Some(repo), Some(handle)) = (&plan.mind_repo, &rt_handle) {
+            // §11.5). Its packs and branches are records in the substrate,
+            // loaded whole now — pulled through an agent first when no member
+            // has — and followed from then on (`docs/substrate_git.md` §8).
+            if let (Some(source), Some(handle)) = (&plan.mind_repo, &rt_handle) {
                 let agents = Agents::new(Arc::clone(member), join.in_process_agent());
-                let fetcher = AgentFetch::shared(agents.clone(), handle.clone(), &repo.name);
+                let fetcher = AgentFetch::shared(agents.clone(), handle.clone(), &source.name);
                 rt.ops
-                    .set_pusher(AgentPush::shared(agents, handle.clone(), &repo.name));
+                    .set_pusher(AgentPush::shared(agents.clone(), handle.clone(), &source.name));
                 rt.ops.set_fetcher(Arc::clone(&fetcher));
-                if !repo.ready() {
-                    bring_up_mind(rt, repo, fetcher)?;
+                let cluster = member.replicator().cloned().map(|replicator| Cluster {
+                    replicator,
+                    agents,
+                    runtime: handle.clone(),
+                });
+                let arrived = load_mind(rt, source, &shared, cluster)?;
+                if arrived {
+                    // The schema, the libraries and the grammar built from
+                    // them are read once, at start: onto the mind that arrived.
                     plan.stopping.ask(Ending::Relaunch);
                     return Ok(());
                 }
@@ -4179,8 +4294,10 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     // on the engine's own channels and need no timer or I/O driver, and a
     // current-thread executor here cannot collide with the ambient runtime
     // this thread has entered.
-    match &rt.mind {
-        Some(dir) => {
+    match &mind_files {
+        Some(files) => {
+            // Every document path is a mind path, relative to the mind's root.
+            let dir: &Path = Path::new("");
             // ── what has left the record leaves memory ────────────────────
             //
             // Before anything is ingested: a document gone from disk is
@@ -4188,7 +4305,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             // folder holds only published work — an operation's drafts are in
             // its store until its publish step lands them (§10.3) — so
             // everything on disk is memory's to take.
-            let out_of_record: Vec<PathBuf> = rt.ledger.missing();
+            let out_of_record: Vec<PathBuf> = rt.ledger.missing(files);
             if !out_of_record.is_empty() {
                 let e = engine.lock().unwrap();
                 let retired: usize = out_of_record
@@ -4206,10 +4323,10 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                     out_of_record.len()
                 );
             }
-            let mind_root: &Path = dir;
+            let mind_root: &MindFiles = files;
 
             let units = crate::projection::ingest_units(&rt.mind_handle);
-            let sources = ingest::sources(dir, &units, &plan.characters);
+            let sources = ingest::sources(files, &units, &plan.characters);
             if sources.is_empty() {
                 tracing::info!("mind: no layer declares content to ingest");
             }
@@ -4234,7 +4351,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                     }
                     shared_groups.push((source.name.clone(), group));
                 }
-                let (turns, mut report) = ingest::pending(source, &rt.ledger)?;
+                let (turns, mut report) = ingest::pending(files, source, &rt.ledger)?;
                 let total = turns.len();
                 ingest::announce(p, source, 0, total);
 
@@ -4285,8 +4402,8 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             // `<tool_call>` blocks are executed as it lands — so a belief is
             // formed at the point in the life where it formed, by the same
             // mechanism a belief would be formed at run time.
-            for (who, dir) in life::lives(dir, &plan.characters) {
-                let (episodes, rejected) = life::episodes(&dir, &who);
+            for (who, dir) in life::lives(files, &plan.characters) {
+                let (episodes, rejected) = life::episodes(files, &dir, &who);
                 for r in &rejected {
                     // A life with a hole in it is still a life, but the author
                     // has to be told which document fell out.
@@ -4331,7 +4448,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             // After the lives, which are written against the whole of the
             // world: from here on a shared group offers a conversation only what
             // the bearing it stands at draws on. See `bearings`.
-            match bearings::Bearings::read(dir) {
+            match bearings::Bearings::read(files) {
                 Ok(Some(b)) if !shared_groups.is_empty() => {
                     let e = engine.lock().unwrap();
                     let shelves: Vec<bearings::Shelf> = shared_groups
@@ -4961,7 +5078,7 @@ pub struct Lived {
 #[allow(clippy::too_many_arguments)]
 async fn run_life(
     engine: &SharedEngine,
-    mind: &Path,
+    mind: &MindFiles,
     base_config: &SequenceConfig,
     proj: Option<&schema::Projection>,
     who: &str,
@@ -4974,7 +5091,7 @@ async fn run_life(
     cfg.context_window_turns = 0;
 
     for (i, ep) in episodes.iter().enumerate() {
-        let Ok(raw) = std::fs::read_to_string(&ep.path) else {
+        let Some(raw) = mind.read(&ep.path.to_string_lossy().replace('\\', "/")) else {
             tracing::warn!("life {who}: {} unreadable", ep.path.display());
             continue;
         };
@@ -4982,7 +5099,7 @@ async fn run_life(
         // question; the answer is recorded at the seal below, so an episode that errors on the
         // way there is re-lived next boot instead of being silently lost with every belief,
         // relationship and intention it would have formed.
-        let rel = mind_record::rel(mind, &ep.path);
+        let rel = mind_record::rel(Path::new(""), &ep.path);
         match ledger.inspect(&ep.path, Some(&raw)) {
             Reconcile::Added => {}
             // The episode as it was, and every belief, relationship and
@@ -7478,9 +7595,9 @@ mod tests {
         let hosted = first
             .host(WORLD, Path::new(ROOMS))
             .expect("the vault loads");
-        let published = Published { root: mind.clone() };
+        let published = Published::folder(mind.clone());
         hosted.with_sim(|s| {
-            s.set_bench_root(&mind);
+            s.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&mind))));
             s.bench
                 .write(
                     "m1",
@@ -7499,7 +7616,7 @@ mod tests {
             .host(WORLD, Path::new(ROOMS))
             .expect("the vault loads");
         let back = revived.with_sim(|s| {
-            s.set_bench_root(&mind);
+            s.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&mind))));
             s.bench.read("m1", DOC, &published)
         });
         assert_eq!(back.as_deref(), Ok("# The Count\n\nYou count the fleet.\n"));

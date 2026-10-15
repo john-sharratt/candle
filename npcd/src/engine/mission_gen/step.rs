@@ -183,7 +183,7 @@ mod tests {
 
     fn keeper() -> (tempfile::TempDir, Corpus, Operations, u64) {
         let dir = mind();
-        let corpus = Corpus::read(dir.path(), "test");
+        let corpus = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let mut ops = Operations::default();
         ops.set_workflows(workflows());
         let doc = "layers/life/keeper/2488 The Empty Table.md";
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn a_review_of_a_document_with_no_brief_says_it_owes_no_event() {
         let dir = mind();
-        let corpus = Corpus::read(dir.path(), "test");
+        let corpus = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
         let mut ops = Operations::default();
         ops.set_workflows(workflows());
         let id = ops

@@ -708,13 +708,14 @@ impl Sim {
     /// A world told nothing has no documents, and every bench act refuses
     /// rather than inventing somewhere to write — the same rule the tower and
     /// the field run on.
-    pub fn set_bench_root(&mut self, root: impl Into<std::path::PathBuf>) {
-        let root = root.into();
+    pub fn set_bench_root(&mut self, mind: crate::mind::Mind) {
         // The record learns what is actually there at the same moment, so there
         // is no window in which a bench can reach a document the stations have
         // never heard of.
-        self.record.index_canon(&root);
-        self.bench.set_root(root);
+        if let Some(files) = mind.files() {
+            self.record.index_canon(&files);
+        }
+        self.bench.set_mind(mind);
     }
 
     /// Take `other` in as this world's state, keeping what is this machine's
@@ -725,8 +726,8 @@ impl Sim {
     /// The record is taken as `other` holds it, not re-indexed from this
     /// machine's documents: what the world has been told is what it knows.
     pub fn take_in(&mut self, mut other: Sim) {
-        if let Some(root) = self.bench.mind_root() {
-            other.bench.set_root(root.to_path_buf());
+        if let Some(mind) = self.bench.mind() {
+            other.bench.set_mind(mind.clone());
         }
         other.missions.adopt_workflows(&mut self.missions);
         *self = other;

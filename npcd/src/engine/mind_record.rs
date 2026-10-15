@@ -27,7 +27,12 @@ pub const META_PATH: &str = "mind.path";
 
 /// `path` as a mind path — relative to `mind`, forward slashes.
 pub fn rel(mind: &Path, path: &Path) -> Option<String> {
-    let r = path.strip_prefix(mind).ok()?;
+    // A path already relative is a mind path: what every document read from
+    // the mind's files is (`docs/substrate_git.md` §8.1).
+    let r = match path.is_relative() {
+        true => path,
+        false => path.strip_prefix(mind).ok()?,
+    };
     Some(r.to_string_lossy().replace('\\', "/"))
 }
 

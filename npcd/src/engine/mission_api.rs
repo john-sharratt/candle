@@ -393,7 +393,7 @@ pub async fn generate(
         return no_engine("generating a mission");
     };
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let Some(mind) = rt.mind.clone() else {
+    let Some(mind) = rt.mind_files() else {
         return err(
             StatusCode::CONFLICT,
             "no_mind",

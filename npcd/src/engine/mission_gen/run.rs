@@ -7,7 +7,6 @@
 //! do. The loop runs one at a time per world while the table is open and its
 //! pool is below the configured level.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -106,8 +105,7 @@ pub async fn generate(
     only: Option<&str>,
 ) -> anyhow::Result<Generation> {
     let mind = rt
-        .mind
-        .clone()
+        .mind_files()
         .ok_or_else(|| anyhow::anyhow!("this daemon has no mind to generate from"))?;
     let minds = rt
         .minds
@@ -491,8 +489,7 @@ pub async fn table_step(
         anyhow::bail!("the table has no call `{call}`");
     }
     let mind = rt
-        .mind
-        .clone()
+        .mind_files()
         .ok_or_else(|| anyhow::anyhow!("this daemon has no mind to read from"))?;
     let minds = rt
         .minds
@@ -654,7 +651,7 @@ pub fn spawn(rt: Arc<Runtime>) {
             if rt.stopping() {
                 return;
             }
-            let Some(mind) = rt.mind.clone() else {
+            let Some(mind) = rt.mind_files() else {
                 return;
             };
             let config = match Config::load(&mind) {
@@ -693,10 +690,10 @@ pub fn spawn(rt: Arc<Runtime>) {
                 // read it, and a read of nothing is a step no Maker can finish.
                 // A step reads through its operation's store (§10.3), so its
                 // own document counts there while it is a draft.
-                let struck = hosted.sim(|s| s.bench.mind_root().map(Path::to_path_buf));
+                let struck = hosted.sim(|s| s.bench.files());
                 let struck = struck.map(|root| {
                     let holds = |op: Option<u64>, p: &str| {
-                        root.join(p).is_file()
+                        root.is_file(p)
                             || op
                                 .and_then(|id| hosted.op_shelf(id))
                                 .is_some_and(|shelf| shelf.read(p).is_some())
@@ -795,7 +792,7 @@ mod tests {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"),
         )
         .unwrap();
-        h.set_bench_root(&mind);
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&mind))));
         let stores = MindStores::new(Some(&mind));
         stores.set_quiet(Box::new(|_| true));
         h.set_op_stores(Arc::clone(&stores));

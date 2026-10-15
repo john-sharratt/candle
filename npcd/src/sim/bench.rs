@@ -36,12 +36,15 @@
 //! `.md` and `.yaml` documents the mind is actually made of.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::mind::files::MindFiles;
 use crate::mind::path::MindPath;
+use crate::mind::Mind;
 use crate::registry::yaml_edit;
 use crate::sim::missing::no_document;
 use crate::sim::shelf::Shelf;
@@ -158,8 +161,10 @@ impl Working {
 /// rather than pretending.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Benches {
-    /// Where documents live. `None` in a world that has none.
-    root: Option<PathBuf>,
+    /// The mind whose documents these are. `None` in a world that has none.
+    /// Never saved: a restored world keeps the mind this daemon was given.
+    #[serde(skip)]
+    mind: Option<Mind>,
     /// body → what it has open.
     open: BTreeMap<String, Working>,
     /// body → what it set aside.
@@ -174,8 +179,8 @@ impl Benches {
     }
 
     /// Point the benches at the documents they work on.
-    pub fn set_root(&mut self, root: impl Into<PathBuf>) {
-        self.root = Some(root.into());
+    pub fn set_mind(&mut self, mind: Mind) {
+        self.mind = Some(mind);
     }
 
     /// Take back the working sets `saved` held — what every body had open, set
@@ -193,17 +198,23 @@ impl Benches {
 
     /// Whether this world has documents at all.
     pub fn has_root(&self) -> bool {
-        self.root.is_some()
+        self.mind.is_some()
     }
 
-    /// The folder this world's documents live in, if it has any.
-    pub fn mind_root(&self) -> Option<&Path> {
-        self.root.as_deref()
+    /// The mind this world's documents are, if it has any.
+    pub fn mind(&self) -> Option<&Mind> {
+        self.mind.as_ref()
     }
 
-    fn root(&self) -> Result<&Path, String> {
-        self.root
-            .as_deref()
+    /// This world's documents as they stand now, if it has any.
+    pub fn files(&self) -> Option<Arc<MindFiles>> {
+        self.mind.as_ref()?.files()
+    }
+
+    fn root(&self) -> Result<(), String> {
+        self.mind
+            .as_ref()
+            .map(|_| ())
             .ok_or_else(|| "There are no documents in this world to work on.".to_string())
     }
 

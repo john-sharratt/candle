@@ -73,6 +73,9 @@ pub struct MindStores {
     /// How many times the mind folder has been moved to a newer record, for
     /// whatever reads the folder to read it again.
     moved: watch::Sender<u64>,
+    /// Set when the mind is read from the substrate (`docs/substrate_git.md`
+    /// §8).
+    substrate: OnceLock<()>,
 }
 
 impl MindStores {
@@ -97,12 +100,19 @@ impl MindStores {
             pusher: OnceLock::new(),
             fetcher: OnceLock::new(),
             moved: watch::channel(0).0,
+            substrate: OnceLock::new(),
         })
     }
 
     /// Bring the mind folder up to the record ([`follow`]), telling whatever
     /// watches [`Self::moves`] when it moved. `None` for a daemon with no mind.
     pub fn follow(&self) -> Option<Result<Option<Followed>, GitError>> {
+        // A mind read from the substrate checks nothing out: its record moves
+        // when the log's branch does, and [`Self::moved`] says so
+        // (`docs/substrate_git.md` §8.2).
+        if self.substrate.get().is_some() {
+            return Some(Ok(None));
+        }
         let followed = follow(self.mind_dir()?, self.fetcher());
         if let Ok(Some(Followed::Moved { .. })) = &followed {
             self.moved.send_modify(|n| *n += 1);
@@ -113,6 +123,17 @@ impl MindStores {
     /// Each time the mind folder moves to a newer record.
     pub fn moves(&self) -> watch::Receiver<u64> {
         self.moved.subscribe()
+    }
+
+    /// The mind moved to a newer record: tell whatever watches [`Self::moves`].
+    pub fn moved(&self) {
+        self.moved.send_modify(|n| *n += 1);
+    }
+
+    /// The mind is read from the substrate: its record moves with the log, and
+    /// [`Self::follow`] checks nothing out.
+    pub fn read_from_substrate(&self) {
+        let _ = self.substrate.set(());
     }
 
     /// Make every publish's push through `pusher`.
@@ -189,7 +210,7 @@ impl MindStores {
         files
             .fresh()
             .repo(name)
-            .is_ok_and(|store| matches!(store.rev(), Some(Rev::Branch(_))))
+            .is_ok_and(|store| matches!(store.rev(), Some(Rev::Branch(_) | Rev::Ref(_))))
     }
 
     /// `owner`'s stores, as its events hold them — or as this member holds

@@ -13,18 +13,30 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::mind::path::MindPath;
+use crate::sim::bench::refuse_link;
 use crate::sim::shelf::{Published, Shelf};
 
 /// The mind folder at `root`, read and written as it stands.
 pub struct Disk {
+    root: PathBuf,
     pub folder: Published,
 }
 
 impl Disk {
     pub fn new(root: impl Into<PathBuf>) -> Disk {
+        let root = root.into();
         Disk {
-            folder: Published { root: root.into() },
+            folder: Published::folder(root.clone()),
+            root,
         }
+    }
+
+    /// Where `key` is in the folder, refusing a path that leaves it or a link.
+    fn file(&self, key: &str) -> Option<PathBuf> {
+        let full = MindPath::parse(key).ok()?.resolve(&self.root).ok()?;
+        refuse_link(&full, key).ok()?;
+        Some(full)
     }
 }
 
@@ -49,7 +61,6 @@ impl Shelf for Disk {
         let mut planned = Vec::with_capacity(changes.len());
         for (key, now) in changes {
             let full = self
-                .folder
                 .file(key)
                 .ok_or_else(|| format!("{key} is not a document in the mind"))?;
             if full.is_dir() {

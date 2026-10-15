@@ -12,10 +12,9 @@
 //! engine does not implement is refused when the file is read, not discovered
 //! when an operation reaches it.
 
-use std::io::ErrorKind;
-use std::path::Path;
 
 use super::copied::BRIEF_COPIED;
+use crate::mind::files::MindFiles;
 use super::gates::CHECKS;
 use super::target::Kind;
 use crate::engine::workflow::{parse_missions, By, Workflow, PUBLISHED};
@@ -204,12 +203,11 @@ impl Config {
 
     /// Read `<mind>/missions.yaml`. `Ok(None)` when the mind has none — a mind
     /// with no generator gives out the routine bank alone, as it always has.
-    pub fn load(mind: &Path) -> Result<Option<Config>, String> {
-        let path = mind.join(FILE);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Config::parse(&text).map(Some),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("{}: {e}", path.display())),
+    pub fn load(mind: &MindFiles) -> Result<Option<Config>, String> {
+        match mind.read(FILE) {
+            Some(text) => Config::parse(&text).map(Some),
+            None if mind.is_file(FILE) => Err(format!("{FILE} is not UTF-8")),
+            None => Ok(None),
         }
     }
 
@@ -405,8 +403,8 @@ mod tests {
     #[test]
     fn a_mind_with_no_file_has_no_generator() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(Config::load(dir.path()), Ok(None));
+        assert_eq!(Config::load(&MindFiles::folder(dir.path())), Ok(None));
         std::fs::write(dir.path().join(FILE), TEMPLATE).unwrap();
-        assert!(Config::load(dir.path()).unwrap().is_some());
+        assert!(Config::load(&MindFiles::folder(dir.path())).unwrap().is_some());
     }
 }
