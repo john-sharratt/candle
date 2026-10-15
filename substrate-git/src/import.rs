@@ -95,12 +95,9 @@ impl Importer {
         let pushed = ahead_of(store, &log, &store.record()?)?;
         out.pushed = publish(records, store.name(), repo, &pushed, false)?;
 
-        let fetched = match due && self.lease.hold(&import_lease(store.name())) {
-            false => None,
-            true => match {
-                *self.last_fetch.lock().unwrap() = Some(Instant::now());
-                repo.fetch(&RemoteName::parse(IMPORT)?, &FetchSpec::AllBranches)
-            } {
+        let fetched = if due && self.lease.hold(&import_lease(store.name())) {
+            *self.last_fetch.lock().unwrap() = Some(Instant::now());
+            match repo.fetch(&RemoteName::parse(IMPORT)?, &FetchSpec::AllBranches) {
                 Ok(_) => Some(true),
                 // An agent or origin out of reach: what is held is still
                 // published and synced, and the next tick tries again.
@@ -108,7 +105,9 @@ impl Importer {
                     out.fetch_error = Some(e.to_string());
                     Some(false)
                 }
-            },
+            }
+        } else {
+            None
         };
         if fetched == Some(true) {
             out.fetched = true;

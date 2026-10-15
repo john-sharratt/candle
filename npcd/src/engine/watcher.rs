@@ -267,7 +267,7 @@ fn hash(content: &str) -> String {
 /// `layers` in it — nothing a mind path could be recovered from.
 fn mind_key(key: &Path) -> Option<PathBuf> {
     let text = key.to_string_lossy();
-    let parts: Vec<&str> = text.split(|c| c == '/' || c == '\\').collect();
+    let parts: Vec<&str> = text.split(['/', '\\']).collect();
     let valid = !key.has_root()
         && !key.is_absolute()
         && !text.contains('\\')

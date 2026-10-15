@@ -44,7 +44,9 @@ enum Backing {
     Commit {
         commit: Oid,
         nodes: BTreeMap<String, Node>,
-        blobs: BlobReader,
+        /// Boxed: a reader is large beside a folder's path, and a snapshot is
+        /// made once per commit.
+        blobs: Box<BlobReader>,
     },
 }
 
@@ -97,7 +99,7 @@ impl MindFiles {
             backing: Backing::Commit {
                 commit,
                 nodes,
-                blobs,
+                blobs: Box::new(blobs),
             },
         })
     }

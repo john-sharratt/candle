@@ -101,11 +101,12 @@ impl Repo {
         // every head of it.
         let mut cut_from: Vec<Oid> = tips.values().cloned().collect();
         if let Some(budget) = max_commits {
-            let heads;
-            (tips, heads, partial) = self.slice(tips, &held, budget.max(1))?;
+            let sliced = self.slice(tips, &held, budget.max(1))?;
+            tips = sliced.tips;
+            partial = sliced.cut;
             // A whole answer keeps every branch at its commit: cut from those.
             if partial {
-                cut_from = heads;
+                cut_from = sliced.heads;
             }
             if tips.is_empty() {
                 return Ok(FetchBundle {
@@ -169,7 +170,7 @@ impl Repo {
         tips: BTreeMap<BranchName, Oid>,
         held: &[String],
         mut budget: usize,
-    ) -> Result<(BTreeMap<BranchName, Oid>, Vec<Oid>, bool), GitError> {
+    ) -> Result<Sliced, GitError> {
         let mut out = BTreeMap::new();
         let mut heads: Vec<Oid> = Vec::new();
         let mut cut = false;
@@ -208,8 +209,22 @@ impl Repo {
             out.insert(branch, Oid::parse(&taken[budget - 1][0])?);
             budget = 0;
         }
-        Ok((out, heads, cut))
+        Ok(Sliced {
+            tips: out,
+            heads,
+            cut,
+        })
     }
+}
+
+/// What [`Repo::slice`] cut a fetch's branches to.
+struct Sliced {
+    /// How far each branch the slice reaches is carried.
+    tips: BTreeMap<BranchName, Oid>,
+    /// Every commit the slice's bundle is cut from.
+    heads: Vec<Oid>,
+    /// Whether anything was left for a later answer.
+    cut: bool,
 }
 
 /// The heads of a slice — `rev-list --parents` lines, each a commit and then

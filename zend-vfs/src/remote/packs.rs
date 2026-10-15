@@ -147,6 +147,8 @@ pub fn pack_checksum(pack: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::slice::from_ref;
+
     use super::*;
     use crate::testing::TestRepo;
 
@@ -174,9 +176,9 @@ mod tests {
         let second = a.commit_all("two");
         let repo = Repo::open(&a.path).unwrap();
 
-        let all = packs(&repo, &[second.clone()], &[]);
+        let all = packs(&repo, from_ref(&second), &[]);
         assert_eq!(all.len(), 1);
-        let only_new = packs(&repo, &[second.clone()], &[first.clone()]);
+        let only_new = packs(&repo, from_ref(&second), from_ref(&first));
         assert_eq!(only_new.len(), 1);
         assert!(object_count(&only_new[0]) < object_count(&all[0]));
 
@@ -195,6 +197,6 @@ mod tests {
         a.write("f", b"one\n");
         let head = a.commit_all("one");
         let repo = Repo::open(&a.path).unwrap();
-        assert!(packs(&repo, &[head.clone()], &[head]).is_empty());
+        assert!(packs(&repo, from_ref(&head), from_ref(&head)).is_empty());
     }
 }
