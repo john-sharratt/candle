@@ -64,7 +64,7 @@ impl Author {
         account: &str,
     ) -> Author {
         let files = mind.files();
-        if files.is_none() && mind.repo_dir().is_some() {
+        if files.is_none() && mind.repo().is_some() {
             return Author::Pending;
         }
         let published = files

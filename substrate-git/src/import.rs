@@ -41,6 +41,29 @@ pub struct Imported {
     pub forced: Published,
     /// What the sync after them did.
     pub synced: Synced,
+    /// How long each part of the round took.
+    pub took: Took,
+}
+
+/// A round's time, by part: what a slow load is spent on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Took {
+    /// Publishing this member's pushes.
+    pub publish: Duration,
+    /// Fetching `origin` and publishing what moved; zero when this member did
+    /// not fetch.
+    pub fetch: Duration,
+    /// Syncing the store up to the log.
+    pub sync: Duration,
+}
+
+impl Took {
+    /// Both rounds' time, part by part.
+    pub fn add(&mut self, other: &Took) {
+        self.publish += other.publish;
+        self.fetch += other.fetch;
+        self.sync += other.sync;
+    }
 }
 
 /// The importer of one repository.
@@ -91,10 +114,13 @@ impl Importer {
             last.is_none_or(|at| at.elapsed() >= self.fetch_every)
         };
 
+        let started = Instant::now();
         let log = log_branches(records, store.name())?;
         let pushed = ahead_of(store, &log, &store.record()?)?;
         out.pushed = publish(records, store.name(), repo, &pushed, false)?;
+        out.took.publish = started.elapsed();
 
+        let started = Instant::now();
         let fetched = if due && self.lease.hold(&import_lease(store.name())) {
             *self.last_fetch.lock().unwrap() = Some(Instant::now());
             match repo.fetch(&RemoteName::parse(IMPORT)?, &FetchSpec::AllBranches) {
@@ -145,8 +171,13 @@ impl Importer {
         } else if fetched.is_none() && due {
             self.suspect.lock().unwrap().clear();
         }
+        if fetched.is_some() {
+            out.took.fetch = started.elapsed();
+        }
 
+        let started = Instant::now();
         out.synced = store.sync(records)?;
+        out.took.sync = started.elapsed();
         Ok(out)
     }
 }

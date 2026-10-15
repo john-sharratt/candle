@@ -43,7 +43,9 @@ pub fn install_panic_hook() {
 
 /// The filter every sink shares, at `verbose` (0 info, 1 debug, 2+ trace).
 ///
-/// Every tenant's crate and the engine's at the chosen level. `candle_nn` sits
+/// Every tenant's crate, the engine's and the repositories' — the substrate's
+/// git stores, the object database, the agents that fetch for them — at the
+/// chosen level. `candle_nn` sits
 /// **one step below**, because its debug tier is not diagnostics: the KV
 /// cache's pools narrate every arena sweep and region claim, thousands of lines
 /// a second under load, which buries the events worth reading. Anything in
@@ -66,6 +68,9 @@ pub fn filter_directives(tenants: &[&str], verbose: u8) -> Vec<String> {
         "candle_conversation",
         "candle_transformers",
         "candle_core",
+        "substrate_git",
+        "zend_vfs",
+        "agent",
     ] {
         d.push(format!("{krate}={level}"));
     }
@@ -187,6 +192,9 @@ mod tests {
                 "candle_conversation=info",
                 "candle_transformers=info",
                 "candle_core=info",
+                "substrate_git=info",
+                "zend_vfs=info",
+                "agent=info",
                 "candle_nn=warn",
             ]
         );

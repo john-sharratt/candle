@@ -134,8 +134,13 @@ fn read_target(step: &Step) -> Option<(&str, &str)> {
 /// than this reading whatever an unchecked name joins to.
 fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, String)> {
     let (repo, path) = read_target(step)?;
-    let dir = &workspace.repo(repo)?.dir;
-    let rel = normalise(path, dir);
+    // A repository read from the substrate has no folder: an absolute path
+    // into it names where it would sit under the workspace.
+    let dir = match workspace.repo(repo)?.folder() {
+        Some(dir) => dir.to_path_buf(),
+        None => workspace.root().join(repo),
+    };
+    let rel = normalise(path, &dir);
     Some((format!("{repo}/{rel}"), repo.to_string(), rel))
 }
 
@@ -487,7 +492,7 @@ mod tests {
         std::fs::write(dir.path().join("candle/a.rs"), b"a\n").unwrap();
         std::fs::write(dir.path().join("candle/b.rs"), b"b\n").unwrap();
         let ws = Workspace::new(dir.path(), vec![RepoSpec::named("candle")]).unwrap();
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         files
             .repo("candle")
             .unwrap()

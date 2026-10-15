@@ -517,7 +517,7 @@ impl Scheduler {
                 .sample_batch(&stacked, &mut state_refs, &config_refs)
         };
         for (id, state) in state_ids.into_iter().zip(states) {
-            if state.degenerate_run == DEGENERATE_TOKEN_RUN {
+            if state.degenerate {
                 self.fail_degenerate(id);
             }
             self.sampling_states.insert(id, state);
@@ -1147,7 +1147,13 @@ impl Scheduler {
             // these vocabularies and ordinary prose contains it, so triggering
             // on a single one reports healthy turns as faults — measured, 16
             // such reports in a clean ingest. A RUN of them is the signal.
-            if state.degenerate_run == DEGENERATE_TOKEN_RUN {
+            //
+            // Read from the sticky flag, never the run's length: a speculative
+            // step commits several tokens, and one that commits the run's last
+            // `!` and the guard's forced EOS together has reset the run by
+            // now. Checking the length let exactly such a turn seal as an
+            // answer of eight `!`.
+            if state.degenerate {
                 self.fail_degenerate(id);
             }
             self.sampling_states.insert(id, state);
@@ -2175,6 +2181,9 @@ impl Scheduler {
                         view_id = view_id.0, err = %e,
                         "reprojection prepare failed; aborting decode for this view"
                     );
+                    // A failure before prepare took the turn's state leaves it
+                    // here to fail; one after has told the turn already
+                    // (`reproject_abandon.rs`).
                     if let Some(state) = self.active_decodes.get_mut(&view_id) {
                         state.fail(e);
                     }
@@ -2314,6 +2323,10 @@ impl Scheduler {
     /// [`DEGENERATE_TOKEN_RUN`] tokens: say whether its carried recurrent state is to blame, then fail
     /// the turn so what it decoded over those logits is never sealed.
     fn fail_degenerate(&mut self, id: SequenceId) {
+        // Once per turn: the flag stays set on every step after the bar.
+        if self.active_decodes.get(&id).is_none_or(|s| s.faulted) {
+            return;
+        }
         describe_recurrent_state(self.model.as_ref(), id);
         if let Some(state) = self.active_decodes.get_mut(&id) {
             state.fail(ConversationError::Channel(format!(

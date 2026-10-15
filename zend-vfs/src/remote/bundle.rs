@@ -8,8 +8,11 @@
 use std::fs;
 
 use crate::error::GitError;
+use crate::library::refs;
+use crate::odb::bundle as odb_bundle;
+use crate::odb::pack::RawId;
 use crate::remote::push::{PushAction, PushSpec};
-use crate::types::RemoteName;
+use crate::types::{Oid, RemoteName};
 use crate::Repo;
 
 /// The refs a bundle is cut from, which exist only while it is made: a bundle
@@ -41,6 +44,20 @@ impl Repo {
         self.require_remote(remote)?;
         let _write = self.write_lock();
         let refs: Vec<String> = (0..tips.len()).map(|i| format!("{PUSH_REFS}{i}")).collect();
+        // In process, what libgit2 holds: the tips beyond every tracking ref of
+        // `remote`, as `--not --remotes=<remote>` cuts them.
+        if let Some(lib) = self.library() {
+            let named = tips
+                .iter()
+                .zip(&refs)
+                .map(|(tip, name)| Ok((RawId::from_oid(&Oid::parse(tip)?)?, name.clone())))
+                .collect::<Result<Vec<_>, GitError>>()?;
+            let hidden = refs::refs_under(&lib, &format!("refs/remotes/{remote}/"))?
+                .iter()
+                .map(|(_, oid)| RawId::from_oid(oid))
+                .collect::<Result<Vec<_>, GitError>>()?;
+            return odb_bundle::cut(&lib, &named, &hidden);
+        }
         let create: String = refs
             .iter()
             .zip(&tips)
@@ -81,9 +98,15 @@ impl Repo {
         self.take_bundle_locked(bundle)
     }
 
-    /// [`Self::take_bundle`], the write lock held by the caller.
+    /// [`Self::take_bundle`], the write lock held by the caller. A repository
+    /// read from the substrate takes the bundle's pack into its database, and
+    /// so into the log (`docs/substrate_git.md` §4.2); a checkout, through
+    /// `git bundle unbundle`.
     pub(crate) fn take_bundle_locked(&self, bundle: &[u8]) -> Result<(), GitError> {
-        let path = self.git_dir().join("zend-push.bundle");
+        if let Some(db) = self.objects() {
+            return db.take_bundle(bundle);
+        }
+        let path = self.git_dir()?.join("zend-push.bundle");
         fs::write(&path, bundle).map_err(GitError::Io)?;
         let taken = self
             .git("bundle")

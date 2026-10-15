@@ -376,8 +376,9 @@ mod tests {
             &mut TreeCache::default(),
         );
         assert!(failed.is_empty());
-        let a_main = git(repo.repo.dir(), &["rev-parse", "main:a.rs"]);
-        let a_topic = git(repo.repo.dir(), &["rev-parse", "topic:a.rs"]);
+        let dir = repo.repo.dir().unwrap();
+        let a_main = git(dir, &["rev-parse", "main:a.rs"]);
+        let a_topic = git(dir, &["rev-parse", "topic:a.rs"]);
         let got = paths(&corpus.ingest);
         assert_eq!(
             got.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
@@ -529,7 +530,7 @@ mod tests {
         assert_eq!(cache.trees.len(), 2);
         let only_main = RepoBranches {
             name: repo.name.clone(),
-            repo: Repo::open(repo.repo.dir()).unwrap(),
+            repo: Repo::open(repo.repo.dir().unwrap()).unwrap(),
             tips: repo.tips[..1].to_vec(),
         };
         cache.retain_tips(std::slice::from_ref(&only_main));

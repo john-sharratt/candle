@@ -14,7 +14,6 @@
 //! branch once recorded is the conversation's own and is never replaced here.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
 
 use candle_conversation::persistence::manifest::ConvState;
 use candle_conversation::projection::TimelineId;
@@ -33,7 +32,7 @@ const PREFERRED: [&str; 2] = ["main", "master"];
 pub fn base_branches(workspace: &Workspace) -> BaseBranches {
     let mut bases = BaseBranches::new();
     for repo in workspace.repos() {
-        match base_branch(&repo.dir) {
+        match repo.open().and_then(|r| base_branch(&r)) {
             Ok(Some(branch)) => {
                 tracing::info!(repo = %repo.name, %branch, "conversations start on");
                 bases.insert(repo.name.clone(), branch);
@@ -49,11 +48,10 @@ pub fn base_branches(workspace: &Workspace) -> BaseBranches {
     bases
 }
 
-/// `dir`'s base branch: `main`, else `master`, else the checked-out branch.
+/// `repo`'s base branch: `main`, else `master`, else the checked-out branch.
 /// `None` when there is none of those — a detached `HEAD` in a repository
 /// with neither preferred branch.
-fn base_branch(dir: &Path) -> Result<Option<String>, GitError> {
-    let repo = Repo::open(dir)?;
+fn base_branch(repo: &Repo) -> Result<Option<String>, GitError> {
     let branches = repo.branches()?;
     for preferred in PREFERRED {
         if branches.iter().any(|b| b.name.as_str() == preferred) {
@@ -114,6 +112,7 @@ pub fn seed_live(engine: &ConversationEngine, bases: &BaseBranches, hidden: Time
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::process::Command;
 
     use zend_vfs::RepoSpec;
@@ -159,7 +158,7 @@ mod tests {
     }
 
     fn base(dir: &Path) -> Option<String> {
-        base_branch(dir).unwrap()
+        base_branch(&Repo::open(dir).unwrap()).unwrap()
     }
 
     /// **`main` wins, then `master`, then what is checked out** — and what

@@ -96,7 +96,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("uploads")).unwrap();
         let ws = Workspace::new(dir.path(), vec![RepoSpec::named("uploads")]).unwrap();
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         let png = vec![0x89, 0x50, 0x4e, 0x47, 0xff, 0x00, 0x0d];
         let stored =
             crate::uploads::store(&files.repo("uploads").unwrap(), "logo.png", png.clone())

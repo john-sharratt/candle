@@ -712,25 +712,22 @@ build is certified (§3.8):
      it had been supervising and starts the staged file with the same arguments in
      the same working directory. The plan at `<data>/upgrade/watch.json` is the lease
      list the next process reads. `self_heal` relaunches the executable it is running
-     from, which is the stable file once `keep` has kept a trial.
+     from, which is the stable file: `keep` starts every trial from the stable path.
 4. **`keep` is the failsafe, and it is already running.** It is its own process. It
    does not certify, roll out, carry bytes, or choose a canary share. For `web` and
    `motherd` the last known-good executable is `keep/stable/<name>.exe`, started with
    the arguments in `keep`'s config:
    - **A process that is gone** is started again from that stable file.
-   - **A trial** is the staged path. `keep` reads its stderr for the line
-     `INFO serving`, which the process prints only after it is serving, not while it
-     is booting. The wait is at most 10 minutes.
-   - **No line in that time, or the process dying,** kills the trial and starts the
-     stable file again.
-   - **The line** makes the trial file the stable file. `keep` renames the trial
-     file onto the stable path when the platform allows it, and otherwise copies
-     the bytes and deletes the trial file once it is no longer locked. Which of
-     the two worked is recorded under `keep/state/`. The trial process is then
-     stopped and the stable file is started with the same arguments. That start
-     is not another trial. The process that stays up was started from the stable
-     path; a rename leaves a process on the path it was started from, and that
-     path is not the one the firewall allows.
+   - **A trial** runs from the stable path: the stable file is set aside, the
+     staged file copied onto its path and started there — the path the firewall
+     allows, and the one a self-relaunch starts. `keep` reads its stderr, written
+     to a file under `keep/state/`, for the line `INFO serving`, which the process
+     prints only after it is serving, not while it is booting. The wait is at most
+     10 minutes.
+   - **No line in that time, or the process dying,** kills the trial, puts the
+     set-aside file back and starts it.
+   - **The line** makes the trial the service: the set-aside file is deleted and
+     the trial process goes on running. A promotion does not restart it.
    - **Success for the member** is the new process. Once it is ready it writes
      `<data>/upgrade/ok`, prunes kept builds beyond *N*, and hands the leases back.
 

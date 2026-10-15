@@ -10,6 +10,9 @@
 //! The two keys are written in the order that keeps the config coherent if
 //! the second write fails: git treats a branch as having an upstream only
 //! when `merge` is set, so `remote` is written first and removed last.
+//!
+//! A repository read from the substrate keeps its upstreams in memory, beside
+//! its refs (`docs/substrate_git.md` §4.3).
 
 use crate::error::GitError;
 use crate::types::{BranchName, RemoteName};
@@ -36,6 +39,14 @@ impl Repo {
     ) -> Result<(), GitError> {
         let _write = self.write_lock();
         self.require_branch(branch)?;
+        if let Some(db) = self.objects() {
+            db.settings().set_upstream(
+                branch.as_str(),
+                remote.as_str(),
+                remote_branch.to_ref().as_str(),
+            );
+            return Ok(());
+        }
         self.git("config")
             .arg("--end-of-options")
             .arg(format!("branch.{branch}.remote"))
@@ -54,6 +65,10 @@ impl Repo {
     pub fn unset_upstream(&self, branch: &BranchName) -> Result<(), GitError> {
         let _write = self.write_lock();
         self.require_branch(branch)?;
+        if let Some(db) = self.objects() {
+            db.settings().unset_upstream(branch.as_str());
+            return Ok(());
+        }
         // Exit 5: the key was not set.
         for key in ["merge", "remote"] {
             self.git("config")

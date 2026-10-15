@@ -54,6 +54,8 @@ pub mod section;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use zend_vfs::ObjectDb;
+
 use crate::sim::shelf::Published;
 use files::MindFiles;
 
@@ -77,10 +79,20 @@ pub struct Mind {
     /// `None` for a daemon with no mind. Within, `None` while a mind read from
     /// the substrate has not arrived yet.
     current: Option<Arc<RwLock<Option<Arc<MindFiles>>>>>,
-    /// The repository behind the files: the plain folder, or the mind's
-    /// object store — where operations' stores and publishes work. Never read
-    /// as the mind's files: a store checks nothing out.
-    repo: Option<PathBuf>,
+    /// The repository behind the files — where operations' stores and
+    /// publishes work.
+    repo: Option<MindRepo>,
+}
+
+/// The repository behind a mind's files.
+#[derive(Debug, Clone)]
+pub enum MindRepo {
+    /// A plain folder, read as it stands.
+    Folder(PathBuf),
+    /// Read from the substrate (`docs/substrate_git.md` §8): the object
+    /// database every reader of the mind shares with what keeps it with the
+    /// log.
+    Substrate(ObjectDb),
 }
 
 /// Two handles are the same mind when they share one holder.
@@ -101,32 +113,32 @@ impl Mind {
     /// was not given.
     pub fn new(root: Option<PathBuf>) -> Self {
         match root {
-            Some(root) => Self::of(Arc::new(MindFiles::folder(&root)), root),
+            Some(root) => Self::of(Arc::new(MindFiles::folder(&root)), MindRepo::Folder(root)),
             None => Self::default(),
         }
     }
 
-    /// The mind as `files` hold it, from the repository at `repo`.
-    pub fn of(files: Arc<MindFiles>, repo: impl Into<PathBuf>) -> Self {
+    /// The mind as `files` hold it, from `repo`.
+    pub fn of(files: Arc<MindFiles>, repo: MindRepo) -> Self {
         Mind {
             current: Some(Arc::new(RwLock::new(Some(files)))),
-            repo: Some(repo.into()),
+            repo: Some(repo),
         }
     }
 
-    /// A mind read from the repository at `repo` that has not arrived yet:
-    /// no files until [`Self::replace`] gives it some.
-    pub fn pending(repo: impl Into<PathBuf>) -> Self {
+    /// A mind read from the substrate's `db` that has not arrived yet: no
+    /// files until [`Self::replace`] gives it some.
+    pub fn pending(db: ObjectDb) -> Self {
         Mind {
             current: Some(Arc::new(RwLock::new(None))),
-            repo: Some(repo.into()),
+            repo: Some(MindRepo::Substrate(db)),
         }
     }
 
-    /// The folder of the repository behind the files: what operations' stores
-    /// read through and publishes land in. `None` with no mind.
-    pub fn repo_dir(&self) -> Option<&std::path::Path> {
-        self.repo.as_deref()
+    /// The repository behind the files: what operations' stores read through
+    /// and publishes land in. `None` with no mind.
+    pub fn repo(&self) -> Option<&MindRepo> {
+        self.repo.as_ref()
     }
 
     /// The mind's files as they stand now, or `None` when there is no mind —

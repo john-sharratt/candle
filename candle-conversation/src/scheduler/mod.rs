@@ -54,6 +54,7 @@ pub(crate) mod profile;
 pub(crate) mod projection_assembler;
 mod projection_identity;
 pub mod relief_trace;
+mod reproject_abandon;
 mod run;
 mod sample;
 mod seal_scan;
@@ -73,6 +74,7 @@ mod wave_timing;
 use detached::Detached;
 use graph_window::graph_window;
 use phase_split::cobatched_shares;
+use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 
 use self::phase_ring::ProjectedKind;
@@ -11522,32 +11524,71 @@ impl Scheduler {
         // Sealing the live tail alone drops the user's own message — measured at
         // 14 tokens, after which the model decoded a question it could not
         // attend to and answered a different one it invented.
+        //
+        // **From here the turn's state is held by this reprojection alone**, so
+        // every exit goes through `or_abandon!`: the turn is told why and
+        // discarded, never dropped unannounced (`reproject_abandon.rs`). Until
+        // the free below, the view's slot is still held.
         let turn_tokens = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
-        let tail_index_page = self
-            .model
-            .seal_positional_tail_span(view_id.0, turn_tokens)
-            .map_err(ConversationError::Model)?;
+        let tail_index_page = or_abandon!(
+            self,
+            view_id,
+            parent_id,
+            decode_state,
+            true,
+            self.model
+                .seal_positional_tail_span(view_id.0, turn_tokens)
+                .map_err(ConversationError::Model)
+        );
         // Ordering: move before the free, or there is nothing left to read.
         // The move already removes the view's entry, so the release below is
         // just the general per-sequence cleanup.
-        self.model
-            .move_recurrent(view_id.0, parent_id.0)
-            .map_err(ConversationError::Model)?;
-        self.session
-            .free_sequence(view_id.0)
-            .map_err(ConversationError::Model)?;
-        self.model
-            .release_sequence(view_id.0)
-            .map_err(ConversationError::Model)?;
+        or_abandon!(
+            self,
+            view_id,
+            parent_id,
+            decode_state,
+            true,
+            self.model
+                .move_recurrent(view_id.0, parent_id.0)
+                .map_err(ConversationError::Model)
+        );
+        or_abandon!(
+            self,
+            view_id,
+            parent_id,
+            decode_state,
+            true,
+            self.session
+                .free_sequence(view_id.0)
+                .map_err(ConversationError::Model)
+        );
+        or_abandon!(
+            self,
+            view_id,
+            parent_id,
+            decode_state,
+            false,
+            self.model
+                .release_sequence(view_id.0)
+                .map_err(ConversationError::Model)
+        );
 
         // Cut the parent back to the pieces its last assembly placed — the
         // active turn it also holds past them was captured above from the
         // view and goes back on after the rebuild. The assembler then keeps
         // whatever prefix of those pieces the new projection shares and
         // re-injects only from the first that differs.
-        self.session
-            .truncate_sequence_to_blocks(parent_id.0, view_state.turn_start_parent_blocks)
-            .map_err(ConversationError::Model)?;
+        or_abandon!(
+            self,
+            view_id,
+            parent_id,
+            decode_state,
+            false,
+            self.session
+                .truncate_sequence_to_blocks(parent_id.0, view_state.turn_start_parent_blocks)
+                .map_err(ConversationError::Model)
+        );
         // Reset the slot_tokens diagnostic log so it stays in sync with
         // the post-rebuild slot contents.  apply_projection re-populates
         // it with the new prefix's tokens; the active turn tokens get
@@ -11584,7 +11625,14 @@ impl Scheduler {
         let t_build = Instant::now();
         // Build the gap-fill descriptor + inject the sealed prefix, but DON'T
         // fire the forward — the caller batches it across conversations.
-        let plan = self.apply_projection_build(parent_id, &projected_segments)?;
+        let plan = or_abandon!(
+            self,
+            view_id,
+            parent_id,
+            decode_state,
+            false,
+            self.apply_projection_build(parent_id, &projected_segments)
+        );
         let build_ms = t_build.elapsed().as_millis() as u64;
         Ok(Some(ReprojectInFlight {
             view_id,
@@ -11673,16 +11721,49 @@ impl Scheduler {
         // seal — it is not tied to reprojections; the event is just a marker.)
         decode_state.last_projection_end = repro_gen;
 
+        // The turn's state is this reprojection's until it is re-bound below,
+        // so every exit goes through `or_abandon!` (`reproject_abandon.rs`).
+        // The old view's slot was freed in prepare.
         let t_finish = Instant::now();
         let applied_identity = plan.complete.then_some(identity);
-        self.apply_projection_finish(parent_id, plan)?;
+        or_abandon!(
+            self,
+            view_id,
+            parent_id,
+            decode_state,
+            false,
+            self.apply_projection_finish(parent_id, plan)
+        );
         // The rebuilt prefix ends here, so the turn's anchor moves here — and
         // the index closes with it. The rebuild re-supplies the turn's user half
         // by *prefilling* it (`deferred_user`), which leaves rows in the live
         // tail; without this cut the tail pages pushed below land on a
         // non-empty tail and are refused outright, and the slot then holds the
         // turn's K/V with nothing indexing it.
-        let new_prefix_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
+        //
+        // The anchor is the blocks holding content, not the block count: an
+        // empty writer chunk at the tail is where the turn's captured tail
+        // lands below (`inject_sealed_at_tail` trims it first), so a count that
+        // included it would start the turn one chunk into its own tail — the
+        // turn's seal missing that chunk, and the next rebuild's cut back to the
+        // anchor keeping it.
+        let new_prefix_block_count = or_abandon!(
+            self,
+            view_id,
+            parent_id,
+            decode_state,
+            false,
+            self.session
+                .sequence_content_block_count(parent_id.0)
+                .map_err(ConversationError::Model)
+                .and_then(|n| {
+                    n.ok_or_else(|| {
+                        ConversationError::Channel(format!(
+                            "reproject: parent slot {parent_id} not in session"
+                        ))
+                    })
+                })
+        );
         self.begin_unit(parent_id, "reprojected turn");
         // apply_ms = this slot's segment build + finish, NOT the shared gap-fill
         // wave (reported separately as glue_ms), so it no longer absorbs the
@@ -11700,18 +11781,25 @@ impl Scheduler {
         let tail_token_count: usize = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
         let t_inject = Instant::now();
         if tail_token_count > 0 {
-            let placed = self
-                .session
-                .inject_sealed_at_tail(parent_id.0, &tail_per_layer)
-                .map_err(ConversationError::Model)?;
+            let placed = or_abandon!(
+                self,
+                view_id,
+                parent_id,
+                decode_state,
+                false,
+                self.session
+                    .inject_sealed_at_tail(parent_id.0, &tail_per_layer)
+                    .map_err(ConversationError::Model)
+            );
             // Captured from this slot a moment ago: a cut here would drop
             // decoded tokens the turn's text still holds.
             if placed.was_cut() {
-                return Err(ConversationError::Other(format!(
+                let cut: Result<(), ConversationError> = Err(ConversationError::Other(format!(
                     "reproject: the captured decode tail's layers describe different token \
                      windows — {} chunk(s) cut, {} of {tail_token_count} token(s) placed",
                     placed.cut_chunks, placed.tokens
                 )));
+                or_abandon!(self, view_id, parent_id, decode_state, false, cut);
             }
             // The rows that describe those tokens, back at the position the
             // tokens landed. The rebuilt prefix ended flush with its last
@@ -11797,7 +11885,14 @@ impl Scheduler {
             vec![BlockRange::new(0, parent_block_count)]
         };
         let t_view = Instant::now();
-        let (new_view_id, new_borrowed) = self.create_view(parent_id, &effective_ranges)?;
+        let (new_view_id, new_borrowed) = or_abandon!(
+            self,
+            view_id,
+            parent_id,
+            decode_state,
+            false,
+            self.create_view(parent_id, &effective_ranges)
+        );
         let view_ms = t_view.elapsed().as_millis() as u64;
         // Diagnostic log: the new view's slot index may have been
         // recycled from the freed old view's slot; drop any stale
@@ -15522,6 +15617,7 @@ mod tests {
 
     mod faulted_turn;
     mod refused_decode_tier;
+    mod reproject_abandoned;
     mod speculation_in_a_grammar;
 
     // —— admission (`admit_ground::AdmitPass`) ———————————————————————————————

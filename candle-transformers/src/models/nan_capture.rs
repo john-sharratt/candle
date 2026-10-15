@@ -280,6 +280,20 @@ pub fn checkpoint(
     extras: &[(&str, &LiveTensor<'_>)],
     dev: &CudaDevice,
 ) -> Result<()> {
+    match armed_finding(name, out) {
+        Some(f) => capture(name, &f, out, extras, &[], dev),
+        None => Ok(()),
+    }
+}
+
+/// The first half of [`checkpoint`]: what the synchronous check found at an
+/// armed site, or `None` — having done nothing beyond the asynchronous assert —
+/// when the site is unarmed or the value is finite.
+///
+/// For a checkpoint that has its own questions to ask between finding the bad
+/// value and dumping it: those questions need the same pass's operands, which
+/// is why they cannot wait for the dump's replay.
+pub fn armed_finding(name: &'static str, out: &LiveTensor<'_>) -> Option<Finding> {
     arm_from_drain();
     // **Free until a drain has already named this site.**
     //
@@ -299,19 +313,35 @@ pub fn checkpoint(
     // is worth perturbing the program for.
     out.assert(name);
     if !armed_for(name) {
-        return Ok(());
+        return None;
     }
     let mut found: Option<Finding> = None;
     check_now(out, name, |f| found = Some(f.clone()));
-    let Some(f) = found else {
-        return Ok(());
-    };
+    found
+}
 
+/// The second half of [`checkpoint`]: dump `out`, the `extras` and whatever
+/// the caller learned (`notes`), then stop the process.
+///
+/// `notes` land in the manifest beside the bytes, so a diagnosis made in the
+/// failing pass travels with the dump rather than living in a log line nothing
+/// correlates with it.
+pub fn capture(
+    name: &'static str,
+    f: &Finding,
+    out: &LiveTensor<'_>,
+    extras: &[(&str, &LiveTensor<'_>)],
+    notes: &[(String, String)],
+    dev: &CudaDevice,
+) -> Result<()> {
     let mut d = Dump::create(DUMP_DIR)?;
     d.note("checkpoint", name);
     d.note("out_dtype", format!("{:?}", out.dtype()));
     d.note("out_shape", format!("{:?}", out.dims()));
-    note_stats(&mut d, &f);
+    note_stats(&mut d, f);
+    for (k, v) in notes {
+        d.note(k, v);
+    }
     note_integrity(&mut d);
     dump_tensor(&mut d, "out", out, dev)?;
     for (n, t) in extras {

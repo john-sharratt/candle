@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use crate::error::GitError;
+use crate::library::diffs;
 use crate::read::diff::{parse_raw, DiffEntry, DiffStatus};
 use crate::types::{RepoPath, Rev};
 use crate::Repo;
@@ -296,6 +297,9 @@ impl Repo {
         context: u32,
         paths: &[&RepoPath],
     ) -> Result<Vec<FilePatch>, GitError> {
+        if let Some(lib) = self.library() {
+            return diffs::patches(&lib, from, to, context, paths);
+        }
         let mut inv = self
             .git("diff-tree")
             .arg("-r")
@@ -359,6 +363,9 @@ impl Repo {
     /// The patch from `from` to `to` as bytes `git apply` accepts — full
     /// object ids and binary content included — for [`Repo::apply_patch`].
     pub fn patch_bytes(&self, from: &Rev, to: &Rev) -> Result<Vec<u8>, GitError> {
+        if let Some(lib) = self.library() {
+            return diffs::patch_bytes(&lib, from, to);
+        }
         self.git("diff-tree")
             .args([
                 "-r",

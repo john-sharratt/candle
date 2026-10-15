@@ -37,7 +37,7 @@ fn two_repo_workspace() -> TempDir {
 
 fn ctx(dir: &TempDir) -> ToolContext {
     let ws = Workspace::new(dir.path(), vec![RepoSpec::named("a"), RepoSpec::named("b")]).unwrap();
-    ToolContext::with_workspace(ws)
+    ToolContext::with_workspace(ws).unwrap()
 }
 
 /// A grouped search result — `{"repos": [{"repo", <items>: [...]}]}` — as its

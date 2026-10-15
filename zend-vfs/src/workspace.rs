@@ -27,14 +27,25 @@
 //!   the command sandboxes log their jobs. Names are unique,
 //!   so no two repositories share a folder and none nests inside another.
 //! * [`Workspace::load`] also requires each folder to exist.
+//!
+//! # Repositories read from the substrate
+//!
+//! A repository can instead be read from the substrate
+//! ([`Workspace::in_substrate`], `docs/substrate_git.md` §7): it keeps its
+//! name, so every tool and path is unchanged, but it has no folder. Its object
+//! database is opened once the daemon's substrate is, and [`Workspace::attach`]
+//! hands it to every clone of the workspace at once.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
 use thiserror::Error;
 
 use super::sandbox::JOBS_DIR;
 use super::vfs::VfsStore;
+use crate::{Fetch, GitError, ObjectDb, Repo as GitRepo};
 
 /// The manifest's file name, in the workspace folder.
 pub const MANIFEST_FILE: &str = "workspace.yaml";
@@ -54,6 +65,12 @@ pub enum WorkspaceError {
     DuplicateName(String),
     #[error("repository {name:?}: {dir} is not a directory")]
     NotADirectory { name: String, dir: PathBuf },
+    #[error("the workspace lists no repository {0:?}")]
+    Unknown(String),
+    #[error("repository {0:?} is not read from the substrate")]
+    NotInSubstrate(String),
+    #[error("repository {0:?} has already been attached to its object database")]
+    AlreadyAttached(String),
 }
 
 /// One repository as the manifest names it.
@@ -84,8 +101,92 @@ pub struct Repo {
     /// What tools call it — the `repo` argument, and the first segment of every
     /// workspace-relative path inside it.
     pub name: String,
-    /// Its folder on disk: the workspace root joined with the name.
-    pub dir: PathBuf,
+    /// Where it is.
+    pub place: RepoPlace,
+}
+
+/// Where a workspace repository is.
+#[derive(Clone)]
+pub enum RepoPlace {
+    /// A folder on disk: the workspace root joined with the name.
+    Folder(PathBuf),
+    /// Read from the substrate: its object database, once
+    /// [`Workspace::attach`] has given it one. Shared by every clone of the
+    /// workspace.
+    Substrate(Arc<OnceLock<Attached>>),
+}
+
+/// A repository read from the substrate, as [`Workspace::attach`] gives it:
+/// its object database, and what makes its fetches.
+#[derive(Clone)]
+pub struct Attached {
+    pub db: ObjectDb,
+    pub fetcher: Arc<dyn Fetch>,
+}
+
+impl fmt::Debug for RepoPlace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Folder(dir) => f.debug_tuple("Folder").field(dir).finish(),
+            Self::Substrate(slot) => f
+                .debug_tuple("Substrate")
+                .field(&slot.get().map(|a| a.db.name()))
+                .finish(),
+        }
+    }
+}
+
+/// Two folders are the same place when their paths are; two repositories read
+/// from the substrate when they share one slot.
+impl PartialEq for RepoPlace {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Folder(a), Self::Folder(b)) => a == b,
+            (Self::Substrate(a), Self::Substrate(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RepoPlace {}
+
+impl Repo {
+    /// Its folder; `None` for a repository read from the substrate.
+    pub fn folder(&self) -> Option<&Path> {
+        match &self.place {
+            RepoPlace::Folder(dir) => Some(dir),
+            RepoPlace::Substrate(_) => None,
+        }
+    }
+
+    /// Whether it is a git repository: a folder with a `.git` in it — read
+    /// from the folder, never from a failure to open it — or a repository
+    /// read from the substrate.
+    pub fn is_git(&self) -> bool {
+        match &self.place {
+            RepoPlace::Folder(dir) => dir.join(".git").exists(),
+            RepoPlace::Substrate(_) => true,
+        }
+    }
+
+    /// It, as a git repository: the folder's, or one over its object
+    /// database, fetching through what [`Workspace::attach`] gave it. Refused
+    /// for a repository read from the substrate that has not been attached.
+    pub fn open(&self) -> Result<GitRepo, GitError> {
+        match &self.place {
+            RepoPlace::Folder(dir) => GitRepo::open(dir),
+            RepoPlace::Substrate(slot) => {
+                let attached = slot.get().ok_or_else(|| {
+                    GitError::invalid(format!(
+                        "repository {} has not loaded from the substrate yet",
+                        self.name
+                    ))
+                })?;
+                Ok(GitRepo::in_substrate(&attached.db)?
+                    .fetching_through(Arc::clone(&attached.fetcher)))
+            }
+        }
+    }
 }
 
 /// A validated workspace: its root folder and the repositories in scope, in
@@ -103,10 +204,10 @@ impl Workspace {
         let root = root.into();
         let workspace = Self::new(root.clone(), Self::manifest(&root)?)?;
         for repo in &workspace.repos {
-            if !repo.dir.is_dir() {
+            if let Some(dir) = repo.folder().filter(|d| !d.is_dir()) {
                 return Err(WorkspaceError::NotADirectory {
                     name: repo.name.clone(),
-                    dir: repo.dir.clone(),
+                    dir: dir.to_path_buf(),
                 });
             }
         }
@@ -138,16 +239,36 @@ impl Workspace {
         Ok(manifest.repos)
     }
 
-    /// This workspace with repository `name` read from `dir` instead of its
-    /// folder under the root: a member's object store derived from its log
-    /// (`docs/substrate_git.md` §7). The repository keeps its name, so every
-    /// workspace-relative path is unchanged.
-    pub fn with_dir(mut self, name: &str, dir: impl Into<PathBuf>) -> Result<Self, WorkspaceError> {
+    /// This workspace with repository `name` read from the substrate instead
+    /// of its folder under the root (`docs/substrate_git.md` §7): no folder,
+    /// and nothing to read until [`Self::attach`] gives it its object
+    /// database. The repository keeps its name, so every workspace-relative
+    /// path is unchanged.
+    pub fn in_substrate(mut self, name: &str) -> Result<Self, WorkspaceError> {
         let Some(repo) = self.repos.iter_mut().find(|r| r.name == name) else {
-            return Err(WorkspaceError::BadName(name.to_string()));
+            return Err(WorkspaceError::Unknown(name.to_string()));
         };
-        repo.dir = dir.into();
+        repo.place = RepoPlace::Substrate(Arc::new(OnceLock::new()));
         Ok(self)
+    }
+
+    /// Give repository `name`, read from the substrate, its object database
+    /// and what makes its fetches — in this workspace and every clone of it.
+    /// Once: a repository's database is the one it keeps.
+    pub fn attach(
+        &self,
+        name: &str,
+        db: ObjectDb,
+        fetcher: Arc<dyn Fetch>,
+    ) -> Result<(), WorkspaceError> {
+        let repo = self
+            .repo(name)
+            .ok_or_else(|| WorkspaceError::Unknown(name.to_string()))?;
+        let RepoPlace::Substrate(slot) = &repo.place else {
+            return Err(WorkspaceError::NotInSubstrate(name.to_string()));
+        };
+        slot.set(Attached { db, fetcher })
+            .map_err(|_| WorkspaceError::AlreadyAttached(name.to_string()))
     }
 
     /// Validate `specs` against `root` without touching the disk.
@@ -165,7 +286,7 @@ impl Workspace {
                 return Err(WorkspaceError::DuplicateName(spec.name));
             }
             repos.push(Repo {
-                dir: root.join(&spec.name),
+                place: RepoPlace::Folder(root.join(&spec.name)),
                 name: spec.name,
             });
         }
@@ -185,7 +306,7 @@ impl Workspace {
         }
         self.repos.push(Repo {
             name: name.to_string(),
-            dir: self.root.join(name),
+            place: RepoPlace::Folder(self.root.join(name)),
         });
         Ok(self)
     }
@@ -243,6 +364,8 @@ fn is_plain_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch_here;
+    use crate::odb::memory_store::MemoryStore;
 
     /// **A repository's folder is its name**, and the order is the manifest's.
     #[test]
@@ -254,10 +377,13 @@ mod tests {
         .unwrap();
         assert_eq!(ws.names(), vec!["candle", "mind"]);
         assert_eq!(
-            ws.repo("candle").unwrap().dir,
-            Path::new("/w").join("candle")
+            ws.repo("candle").unwrap().folder(),
+            Some(Path::new("/w").join("candle").as_path())
         );
-        assert_eq!(ws.repo("mind").unwrap().dir, Path::new("/w").join("mind"));
+        assert_eq!(
+            ws.repo("mind").unwrap().folder(),
+            Some(Path::new("/w").join("mind").as_path())
+        );
         assert!(ws.repo("other").is_none());
     }
 
@@ -280,8 +406,8 @@ mod tests {
             .unwrap();
         assert_eq!(ws.names(), vec!["candle", "uploads"]);
         assert_eq!(
-            ws.repo("uploads").unwrap().dir,
-            Path::new("/w").join("uploads")
+            ws.repo("uploads").unwrap().folder(),
+            Some(Path::new("/w").join("uploads").as_path())
         );
         assert_eq!(
             ws.clone().with_repo("uploads"),
@@ -290,6 +416,44 @@ mod tests {
         assert_eq!(
             ws.with_repo("a/b"),
             Err(WorkspaceError::BadName("a/b".to_string()))
+        );
+    }
+
+    /// **A repository read from the substrate has no folder, and opens once
+    /// attached** — in every clone of the workspace, since they share it —
+    /// and only once.
+    #[test]
+    fn a_repository_in_the_substrate_opens_in_every_clone_once_attached() {
+        let ws = Workspace::new("/w", vec![RepoSpec::named("candle")])
+            .unwrap()
+            .in_substrate("candle")
+            .unwrap();
+        let clone = ws.clone();
+        let repo = clone.repo("candle").unwrap();
+        assert_eq!(repo.folder(), None);
+        assert!(repo.is_git());
+        assert!(
+            repo.open().is_err(),
+            "nothing to read before it is attached"
+        );
+
+        let db = ObjectDb::open("candle", Arc::new(MemoryStore::default()), 1 << 20).unwrap();
+        ws.attach("candle", db.clone(), fetch_here()).unwrap();
+        let opened = clone.repo("candle").unwrap().open().unwrap();
+        assert_eq!(opened.objects().map(ObjectDb::name), Some("candle"));
+        assert_eq!(
+            ws.attach("candle", db.clone(), fetch_here()),
+            Err(WorkspaceError::AlreadyAttached("candle".into()))
+        );
+        assert_eq!(
+            ws.attach("other", db, fetch_here()),
+            Err(WorkspaceError::Unknown("other".into()))
+        );
+        assert_eq!(
+            Workspace::new("/w", vec![RepoSpec::named("a")])
+                .unwrap()
+                .in_substrate("b"),
+            Err(WorkspaceError::Unknown("b".into()))
         );
     }
 

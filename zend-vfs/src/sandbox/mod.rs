@@ -202,10 +202,10 @@ impl Sandbox {
         // 3, 4. The branch, and the conversation's changes over it.
         let session = self.put_on(session, job.branch, &base, changes).await?;
         // 5. Check what reads the checkout.
-        self.policy
-            .check_on_checkout(self.repo.dir(), job.command)?;
+        let dir = self.repo.dir().map_err(CheckoutError::from)?;
+        self.policy.check_on_checkout(dir, job.command)?;
         // 6. Run.
-        let executed = process::execute(self.repo.dir(), job.command, output)
+        let executed = process::execute(dir, job.command, output)
             .await
             .map_err(|source| SandboxError::Start {
                 program: job.command.program.clone(),
@@ -280,13 +280,12 @@ impl Sandbox {
     /// `branch` at the commit the branch holds — the base its changes are
     /// made on, which the checkout is put on. Returns that commit.
     fn check_store(&self, files: &VfsStore, branch: &BranchName) -> Result<Oid, SandboxError> {
-        let same = files
-            .root()
-            .is_some_and(|root| same_folder(root, self.repo.dir()));
+        let dir = self.repo.dir().map_err(CheckoutError::from)?;
+        let same = files.root().is_some_and(|root| same_folder(root, dir));
         if !same {
             return Err(SandboxError::WrongStore {
                 store: files.root().map(Path::to_path_buf),
-                repo: self.repo.dir().to_path_buf(),
+                repo: dir.to_path_buf(),
             });
         }
         let reads = files.rev();

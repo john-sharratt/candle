@@ -1,7 +1,10 @@
-//! Adding, removing and re-pointing remotes.
+//! Adding, removing and re-pointing remotes: a checkout's in its config, a
+//! repository read from the substrate's in memory (`docs/substrate_git.md`
+//! §4.3).
 
 use crate::error::GitError;
 use crate::types::{RemoteName, RemoteUrl};
+use crate::write::ref_txn::{RefOp, RefTransaction};
 use crate::Repo;
 
 /// Which of a remote's URLs to set.
@@ -23,6 +26,10 @@ impl Repo {
                 remote: name.clone(),
             });
         }
+        if let Some(db) = self.objects() {
+            db.settings().set_remote(name.as_str(), url.as_str());
+            return Ok(());
+        }
         // `remote` subcommands take no `--end-of-options` before 2.30. Neither
         // value can be read as a flag: a `RemoteName` and a `RemoteUrl` both
         // refuse a leading `-`.
@@ -38,6 +45,19 @@ impl Repo {
     pub fn remove_remote(&self, name: &RemoteName) -> Result<(), GitError> {
         let _write = self.write_lock();
         self.require_remote(name)?;
+        if let Some(db) = self.objects() {
+            let tracking = self.refs_under(&format!("refs/remotes/{name}/"))?;
+            let txn = tracking
+                .into_iter()
+                .fold(RefTransaction::new(), |txn, (name, old)| {
+                    txn.push(RefOp::Delete { name, old })
+                });
+            if !txn.ops().is_empty() {
+                self.update_refs_locked(&txn)?;
+            }
+            db.settings().remove_remote(name.as_str());
+            return Ok(());
+        }
         self.git("remote")
             .arg("remove")
             .arg(name.as_str())
@@ -54,6 +74,19 @@ impl Repo {
     ) -> Result<(), GitError> {
         let _write = self.write_lock();
         self.require_remote(name)?;
+        if let Some(db) = self.objects() {
+            return match kind {
+                UrlKind::Fetch => {
+                    db.settings().set_remote(name.as_str(), url.as_str());
+                    Ok(())
+                }
+                // Its pushes go where its pusher sends them, an agent.
+                UrlKind::Push => Err(GitError::invalid(
+                    "a repository read from the substrate has one URL per remote; its pushes \
+                     are made through an agent",
+                )),
+            };
+        }
         // `set-url` refuses a push URL that is not configured yet, so a
         // first push URL is written as config.
         let key = match kind {

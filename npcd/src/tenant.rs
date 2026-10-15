@@ -48,7 +48,7 @@ use crate::engine::identity::Authored as Identities;
 use crate::engine::runtime::{start as start_engine, LoadPlan, Runtime};
 use crate::identity::log_identity;
 use crate::images::Images;
-use crate::mind::Mind;
+use crate::mind::{Mind, MindRepo};
 use crate::mind_store::{self, MindSource};
 use crate::npcs::{Casting, Npcs};
 use crate::personality_portrait;
@@ -373,8 +373,8 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // restarts onto it. A `--mind` folder is read as it stands.
     let (schema, mind) = match &repo {
         Some(source) => {
-            let store = source.store_dir(&data);
-            match mind_store::from_log(&data, source, &npcs.substrate())? {
+            let (db, files) = mind_store::from_log(source, &npcs.substrate())?;
+            match files {
                 Some(files) => {
                     let label = format!(
                         "{}@{} ({})",
@@ -383,7 +383,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
                         source.branch
                     );
                     let schema = projection::Source::from_files(Arc::clone(&files), label)?;
-                    (schema, Mind::of(files, store))
+                    (schema, Mind::of(files, MindRepo::Substrate(db)))
                 }
                 None => {
                     tracing::warn!(
@@ -393,7 +393,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
                         source.name,
                         source.branch
                     );
-                    (schema, Mind::pending(store))
+                    (schema, Mind::pending(db))
                 }
             }
         }
@@ -489,7 +489,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // The runtime is built first — it needs only the mind directory — then
     // handed to the state, then given the resolvers that read that state back.
     // That order breaks the cycle between them.
-    let runtime = Runtime::new(mind_for_engine, &data);
+    let runtime = Runtime::new(mind_for_engine, &data)?;
 
     // The engine adopts the substrate the cast was just loaded from: one
     // `substrate/` takes one writable handle. See `Npcs::substrate`.
@@ -942,13 +942,10 @@ mod tests {
         }
     }
 
-    /// **A mind repository is mirrored under `--data`**, one or the other of
-    /// a folder and a repository, never both, and a mirror not yet holding the
-    /// record starts on no mind; `mind_repo:` reads the same from
-    /// `motherd.yaml`.
-    /// **A mind repository is read from the substrate**: its store under
-    /// `--data`, its schema not read at resolve — the substrate is not open
-    /// yet — and nothing on disk made (`docs/substrate_git.md` §8).
+    /// **A mind repository is read from the substrate**: no folder, its
+    /// schema not read at resolve — the substrate is not open yet — and
+    /// nothing on disk made (`docs/substrate_git.md` §8); `mind_repo:` reads
+    /// the same from `motherd.yaml`.
     #[test]
     fn a_mind_repository_is_read_from_the_substrate() {
         let dir = tempfile::tempdir().unwrap();
@@ -957,10 +954,7 @@ mod tests {
             .resolve()
             .unwrap();
         let repo = t.repo.clone().unwrap();
-        assert_eq!(
-            repo.store_dir(dir.path()),
-            dir.path().join("git").join("mind")
-        );
+        assert_eq!(repo.name.as_str(), "mind");
         assert_eq!(repo.branch.as_str(), "main");
         assert_eq!(t.schema.dir, None, "a mind in the substrate has no folder");
         assert!(t.schema.files.is_none(), "read once the substrate opens");
@@ -994,8 +988,7 @@ mod tests {
     }
 
     /// **A relative `--data` is made absolute at resolve**, as `motherd.yaml`'s
-    /// `data: ../npcd-data` is: a mirror is a repository opened by its path,
-    /// which must be absolute, and the substrate's volume is measured from its
+    /// `data: ../npcd-data` is: the substrate's volume is measured from its
     /// path. Resolving touches nothing on disk.
     #[test]
     fn a_relative_data_directory_resolves_absolute() {
@@ -1004,10 +997,6 @@ mod tests {
             .resolve()
             .unwrap();
         assert_eq!(t.data, here.join("unmade-npcd-data"));
-        assert_eq!(
-            t.repo.unwrap().store_dir(&t.data),
-            here.join("unmade-npcd-data").join("git").join("mind")
-        );
         let plain = parse(&["--data", "unmade-npcd-data"]).resolve().unwrap();
         assert_eq!(plain.data, here.join("unmade-npcd-data"));
         assert!(!here.join("unmade-npcd-data").exists());

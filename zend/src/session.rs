@@ -1507,7 +1507,7 @@ impl InferenceState {
                 })?;
                 let access = substrate_git::access(cluster.as_ref(), agent.as_ref(), runtime)?;
                 Some(substrate_git::load(
-                    &root,
+                    &workspace,
                     &names,
                     engine.conversation().shared(),
                     access,

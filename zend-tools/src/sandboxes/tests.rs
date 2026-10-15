@@ -81,7 +81,7 @@ fn policy() -> CommandPolicy {
 fn store(ws: &Workspace) -> Arc<VfsStore> {
     let main = BranchName::parse("main").unwrap();
     Arc::new(VfsStore::on_branch(
-        GitSource::open(&ws.repo("app").unwrap().dir).unwrap(),
+        GitSource::open(ws.repo("app").unwrap().folder().unwrap()).unwrap(),
         Rev::Branch(main),
     ))
 }
@@ -150,7 +150,12 @@ fn a_job_runs_records_what_it_wrote_and_pages_its_output() {
     let written = files.read("out.txt").unwrap().unwrap();
     assert_eq!(written.trim_end(), "made");
     assert!(
-        !ws.repo("app").unwrap().dir.join("out.txt").exists(),
+        !ws.repo("app")
+            .unwrap()
+            .folder()
+            .unwrap()
+            .join("out.txt")
+            .exists(),
         "the folder is put back"
     );
 

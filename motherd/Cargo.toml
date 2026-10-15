@@ -28,3 +28,6 @@ web      = { path = "../web" }
 default = []
 # Zero-cost scoped timing of the hot path; `/v1/profile` reports it.
 profile = ["host/profile", "zend/profile"]
+# The `tensor-assert` harness (CLAUDE.md): every wave drained for non-finite
+# sites, and the first one armed to capture its operands on the next pass.
+tensor-assert = ["zend/tensor-assert"]

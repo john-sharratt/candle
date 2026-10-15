@@ -46,7 +46,7 @@ pub fn repo_root(root: &Path) -> PathBuf {
 pub fn workspace_ctx(root: &Path) -> ToolContext {
     let ws =
         Workspace::new(root, vec![RepoSpec::named(REPO)]).expect("valid single-repo workspace");
-    ToolContext::with_workspace(ws)
+    ToolContext::with_workspace(ws).unwrap()
 }
 
 /// Invoke a tool by name with a fresh [`granted`] context.

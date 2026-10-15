@@ -1,0 +1,4 @@
+# What `npm install` and a Playwright run leave behind on the machine that ran them.
+node_modules/
+package-lock.json
+test-results/

@@ -1130,8 +1130,10 @@ fn escaped_token_bails_and_terminates() {
 #[test]
 fn an_empty_string_argument_drives() {
     let (tree, vocab) = build_tree();
+    // Required properties first, as the catalog compiles them: `page`, then
+    // the optional `path`.
     let target = "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"candle\", \
-                  \"path\": \"\"}}\n</tool_call><|im_end|>";
+                  \"page\": 0, \"path\": \"\"}}\n</tool_call><|im_end|>";
     let out = drive(Arc::clone(&tree), target, &vocab)
         .unwrap_or_else(|e| panic!("an empty path must drive, got {e:?}"));
     let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();

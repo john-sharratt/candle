@@ -2,8 +2,9 @@
 //!
 //! | Key | Value |
 //! |---|---|
-//! | `git/pack/<repo>/<sha256>` | [`PackEntry`]: the `Blob` of that SHA-256 is a pack of `<repo>` |
+//! | `git/pack/<repo>/<sha256>` | [`PackEntry`]: the `Blob` of that SHA-256 is a pack of `<repo>`, its index another `Blob` |
 //! | `git/ref/<repo>/<ref>` | [`RefEntry`]: where `<ref>` points, and the packs it needs |
+//! | `git/slice/<repo>/<oid>` | A commit an unfinished sliced fetch has taken |
 //!
 //! Both are keyed objects, last writer wins by version stamp. A ref is only
 //! ever written by a member that has checked it descends from the one it
@@ -22,8 +23,12 @@ pub trait Records: Send + Sync {
     fn put_blob(&self, bytes: Vec<u8>) -> anyhow::Result<[u8; 32]>;
     /// The blob named `sha256`, or `None` while it has not arrived.
     fn blob(&self, sha256: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>>;
+    /// Whether the blob named `sha256` has arrived, without reading it.
+    fn has_blob(&self, sha256: &[u8; 32]) -> bool;
     /// Write the keyed object `key`.
     fn put_object(&self, key: &str, value: serde_json::Value) -> anyhow::Result<()>;
+    /// Retire the keyed object `key`.
+    fn delete_object(&self, key: &str) -> anyhow::Result<()>;
     /// Every live keyed object whose key starts with `prefix`.
     fn objects_under(&self, prefix: &str) -> Vec<(String, serde_json::Value)>;
 }
@@ -51,6 +56,9 @@ pub struct PackEntry {
     pub checksum: String,
     /// How many objects it holds.
     pub objects: u32,
+    /// The SHA-256 of the blob holding its `.idx` (`docs/substrate_git.md`
+    /// §3).
+    pub index: String,
 }
 
 /// `git/ref/<repo>/<ref>`: where a ref points.
@@ -113,12 +121,55 @@ impl<'a> Log<'a> {
             .collect()
     }
 
-    /// Write a pack: its blob, then the entry naming it. Its SHA-256 in hex.
-    pub fn put_pack(&self, bytes: Vec<u8>, entry: &PackEntry) -> anyhow::Result<String> {
-        let sha = hex(&self.records.put_blob(bytes)?);
+    /// Write a pack: its blob and its index's, then the entry naming both. Its
+    /// SHA-256 in hex.
+    pub fn put_pack(
+        &self,
+        pack: Vec<u8>,
+        index: Vec<u8>,
+        checksum: &str,
+        objects: u32,
+    ) -> anyhow::Result<String> {
+        let sha = hex(&self.records.put_blob(pack)?);
+        let index = hex(&self.records.put_blob(index)?);
+        let entry = PackEntry {
+            checksum: checksum.to_string(),
+            objects,
+            index,
+        };
         self.records
-            .put_object(&pack_key(self.repo, &sha), serde_json::to_value(entry)?)?;
+            .put_object(&pack_key(self.repo, &sha), serde_json::to_value(&entry)?)?;
         Ok(sha)
+    }
+
+    /// Whether the pack `sha` and its index have both arrived.
+    pub fn arrived(&self, sha: &str, entry: &PackEntry) -> anyhow::Result<bool> {
+        Ok(self.records.has_blob(&unhex(sha)?) && self.records.has_blob(&unhex(&entry.index)?))
+    }
+
+    /// The blob of the index `entry` names, or `None` while it has not
+    /// arrived.
+    pub fn index_bytes(&self, entry: &PackEntry) -> anyhow::Result<Option<Vec<u8>>> {
+        self.records.blob(&unhex(&entry.index)?)
+    }
+
+    /// The commits an unfinished sliced fetch has taken.
+    pub fn slices(&self) -> Vec<String> {
+        let prefix = slices_prefix(self.repo);
+        self.records
+            .objects_under(&prefix)
+            .into_iter()
+            .map(|(key, _)| key[prefix.len()..].to_string())
+            .collect()
+    }
+
+    /// Keep commit `oid` as taken by a sliced fetch, or forget it.
+    pub fn set_slice(&self, oid: &str, kept: bool) -> anyhow::Result<()> {
+        let key = format!("{}{oid}", slices_prefix(self.repo));
+        match kept {
+            true => self.records.put_object(&key, serde_json::Value::Bool(true)),
+            false => self.records.delete_object(&key),
+        }
     }
 
     /// Write where `name` points.
@@ -145,6 +196,10 @@ fn packs_prefix(repo: &str) -> String {
 
 fn refs_prefix(repo: &str) -> String {
     format!("git/ref/{repo}/")
+}
+
+fn slices_prefix(repo: &str) -> String {
+    format!("git/slice/{repo}/")
 }
 
 fn pack_key(repo: &str, sha: &str) -> String {
@@ -174,7 +229,7 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn unhex(text: &str) -> anyhow::Result<[u8; 32]> {
+pub(crate) fn unhex(text: &str) -> anyhow::Result<[u8; 32]> {
     let mut out = [0u8; 32];
     if text.len() != 64 {
         bail!("`{text}` is not a SHA-256");

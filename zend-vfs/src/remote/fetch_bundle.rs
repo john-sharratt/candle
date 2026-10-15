@@ -59,7 +59,7 @@ impl Repo {
         spec: &FetchSpec,
         have: &[Oid],
     ) -> Result<FetchBundle, GitError> {
-        self.bundle_for_fetch_sliced(remote, spec, have, None)
+        self.bundle_for_fetch_sliced(remote, spec, have, None, None)
     }
 
     /// [`Self::bundle_for_fetch`], reaching at most `max_commits` commits the
@@ -67,13 +67,45 @@ impl Repo {
     /// fetch of a long history in slices an answer can carry
     /// (`docs/substrate_git.md` §5.1). A sliced answer is
     /// [`partial`](FetchBundle::partial).
+    ///
+    /// With `max_bytes`, a bundle larger than that is cut again, half the
+    /// commits each time, until it fits — or holds one commit, which is
+    /// answered as it is: the asker keeps an answer larger than a pack of its
+    /// log as several packs (`docs/substrate_git.md` §4.2), and the bound only
+    /// keeps that rare.
     pub fn bundle_for_fetch_sliced(
         &self,
         remote: &RemoteName,
         spec: &FetchSpec,
         have: &[Oid],
         max_commits: Option<usize>,
+        max_bytes: Option<usize>,
     ) -> Result<FetchBundle, GitError> {
+        // A byte bound needs a commit count to halve: every answer is sliced.
+        let mut budget = match (max_commits, max_bytes) {
+            (None, Some(_)) => Some(usize::MAX),
+            (budget, _) => budget,
+        };
+        loop {
+            let (answer, commits) = self.cut_for_fetch(remote, spec, have, budget)?;
+            let over =
+                matches!((&answer.bundle, max_bytes), (Some(b), Some(limit)) if b.len() > limit);
+            if !over || commits <= 1 {
+                return Ok(answer);
+            }
+            budget = Some(commits / 2);
+        }
+    }
+
+    /// One answer for [`Self::bundle_for_fetch_sliced`], reaching at most
+    /// `budget` commits, and how many commits it reaches.
+    fn cut_for_fetch(
+        &self,
+        remote: &RemoteName,
+        spec: &FetchSpec,
+        have: &[Oid],
+        max_commits: Option<usize>,
+    ) -> Result<(FetchBundle, usize), GitError> {
         let prefix = format!("refs/remotes/{remote}/");
         let mut tips: BTreeMap<BranchName, Oid> = self
             .snapshot(&spec.scope(remote))?
@@ -84,12 +116,15 @@ impl Repo {
             })
             .collect();
         if tips.is_empty() {
-            return Ok(FetchBundle {
-                tips,
-                bundle: None,
-                partial: false,
-                heads: Vec::new(),
-            });
+            return Ok((
+                FetchBundle {
+                    tips,
+                    bundle: None,
+                    partial: false,
+                    heads: Vec::new(),
+                },
+                0,
+            ));
         }
         let held: Vec<String> = have
             .iter()
@@ -97,6 +132,8 @@ impl Repo {
             .map(|oid| format!("^{oid}"))
             .collect();
         let mut partial = false;
+        // An unsliced answer's commit count is never asked for.
+        let mut commits = 0;
         // What the bundle is cut from: each branch's commit, or for a slice
         // every head of it.
         let mut cut_from: Vec<Oid> = tips.values().cloned().collect();
@@ -104,17 +141,21 @@ impl Repo {
             let sliced = self.slice(tips, &held, budget.max(1))?;
             tips = sliced.tips;
             partial = sliced.cut;
+            commits = sliced.commits;
             // A whole answer keeps every branch at its commit: cut from those.
             if partial {
                 cut_from = sliced.heads;
             }
             if tips.is_empty() {
-                return Ok(FetchBundle {
-                    tips,
-                    bundle: None,
-                    partial,
-                    heads: Vec::new(),
-                });
+                return Ok((
+                    FetchBundle {
+                        tips,
+                        bundle: None,
+                        partial,
+                        heads: Vec::new(),
+                    },
+                    commits,
+                ));
             }
         }
         let _write = self.write_lock();
@@ -152,12 +193,15 @@ impl Repo {
                 ))
             }
         };
-        Ok(FetchBundle {
-            tips,
-            bundle,
-            heads: if partial { cut_from } else { Vec::new() },
-            partial,
-        })
+        Ok((
+            FetchBundle {
+                tips,
+                bundle,
+                heads: if partial { cut_from } else { Vec::new() },
+                partial,
+            },
+            commits,
+        ))
     }
 
     /// `tips` cut to at most `budget` commits beyond `held` (each `^<oid>`),
@@ -174,6 +218,7 @@ impl Repo {
         let mut out = BTreeMap::new();
         let mut heads: Vec<Oid> = Vec::new();
         let mut cut = false;
+        let mut commits = 0;
         for (branch, tip) in tips {
             if budget == 0 {
                 cut = true;
@@ -197,6 +242,7 @@ impl Repo {
                 .collect();
             if lines.len() <= budget {
                 budget -= lines.len();
+                commits += lines.len();
                 if !lines.is_empty() {
                     heads.push(tip.clone());
                 }
@@ -207,12 +253,14 @@ impl Repo {
             let taken = &lines[..budget];
             heads.extend(slice_heads(taken)?);
             out.insert(branch, Oid::parse(&taken[budget - 1][0])?);
+            commits += budget;
             budget = 0;
         }
         Ok(Sliced {
             tips: out,
             heads,
             cut,
+            commits,
         })
     }
 }
@@ -225,6 +273,8 @@ struct Sliced {
     heads: Vec<Oid>,
     /// Whether anything was left for a later answer.
     cut: bool,
+    /// How many commits the asker lacks the slice reaches.
+    commits: usize,
 }
 
 /// The heads of a slice — `rev-list --parents` lines, each a commit and then
@@ -490,7 +540,7 @@ mod tests {
             .fetch_here(&origin(), &FetchSpec::AllBranches)
             .unwrap();
 
-        let slices = carry_in_slices(&agent, &member, 3, &tip);
+        let slices = carry_in_slices(&agent, &member, commits(3), &tip);
         assert_eq!(slices, 2, "7 commits in slices of 3");
         assert_eq!(member.oid("refs/remotes/origin/main"), tip);
     }
@@ -520,23 +570,116 @@ mod tests {
             .unwrap();
 
         // 10 commits: 3 + 3 + 3 in slices, the last whole answer the 10th.
-        let slices = carry_in_slices(&agent, &member, 3, &tip);
+        let slices = carry_in_slices(&agent, &member, commits(3), &tip);
         assert_eq!(slices, 3, "a slice carried fewer commits than its budget");
         assert_eq!(member.oid("refs/remotes/origin/main"), tip);
     }
 
-    /// Carry everything the agent's origin holds to the member in slices of
-    /// `budget` commits, as `AgentFetch` does: each partial answer's objects
-    /// taken and its heads named as held, the last answer taken whole. How
-    /// many partial answers there were.
-    fn carry_in_slices(agent: &TestRepo, member: &TestRepo, budget: usize, tip: &Oid) -> usize {
+    /// **A byte bound halves a slice until its bundle fits**: commits of
+    /// incompressible content, a commit budget that would carry them all, and
+    /// a byte limit two commits' worth — every answer fits it, and the member
+    /// ends whole.
+    #[test]
+    fn a_byte_bound_halves_a_slice_until_it_fits() {
+        let (_bare, upstream, agent, member, _first) = three();
+        for i in 0..8u32 {
+            upstream.write("noise.bin", &noise(i, 16 * 1024));
+            upstream.commit_all(&format!("n{i}"));
+        }
+        upstream.git(&["push", "-q", "origin", "main"]);
+        let tip = upstream.oid("HEAD");
+        agent
+            .repo()
+            .fetch_here(&origin(), &FetchSpec::AllBranches)
+            .unwrap();
+
+        let budget = Budget {
+            commits: Some(100),
+            bytes: Some(40 * 1024),
+        };
+        let slices = carry_in_slices(&agent, &member, budget, &tip);
+        assert!(slices >= 3, "8 × 16 KiB in 40 KiB answers: {slices} slices");
+        assert_eq!(member.oid("refs/remotes/origin/main"), tip);
+    }
+
+    /// **A commit larger than the byte bound is answered alone**, as it is:
+    /// a bound no slice can meet still moves the fetch on, one commit at a
+    /// time, and the asker splits what it cannot keep as one pack.
+    #[test]
+    fn a_commit_over_the_byte_bound_is_answered_alone() {
+        let (_bare, upstream, agent, _member, _first) = three();
+        upstream.write("noise.bin", &noise(0, 64 * 1024));
+        upstream.commit_all("big");
+        upstream.git(&["push", "-q", "origin", "main"]);
+        agent
+            .repo()
+            .fetch_here(&origin(), &FetchSpec::AllBranches)
+            .unwrap();
+        let tip = agent.oid("refs/remotes/origin/main");
+        let parent = agent.oid("refs/remotes/origin/main~1");
+        let answer = agent
+            .repo()
+            .bundle_for_fetch_sliced(
+                &origin(),
+                &FetchSpec::AllBranches,
+                &[parent],
+                None,
+                Some(16 * 1024),
+            )
+            .unwrap();
+        assert!(answer.bundle.as_ref().unwrap().len() > 16 * 1024);
+        assert_eq!(answer.tips[&main()], tip, "the one commit, whole");
+    }
+
+    /// `len` bytes no compressor shrinks, different for each `seed`.
+    fn noise(seed: u32, len: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_u32 ^ seed.wrapping_mul(0x85eb_ca6b);
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// How [`carry_in_slices`] bounds each answer.
+    #[derive(Clone, Copy)]
+    struct Budget {
+        commits: Option<usize>,
+        bytes: Option<usize>,
+    }
+
+    /// Answers of at most `n` commits, of any size.
+    fn commits(n: usize) -> Budget {
+        Budget {
+            commits: Some(n),
+            bytes: None,
+        }
+    }
+
+    /// Carry everything the agent's origin holds to the member in answers
+    /// bounded by `budget`, as `AgentFetch` does: each partial answer's
+    /// objects taken and its heads named as held, the last answer taken whole.
+    /// How many partial answers there were.
+    fn carry_in_slices(agent: &TestRepo, member: &TestRepo, budget: Budget, tip: &Oid) -> usize {
         let mut have: Vec<Oid> = Vec::new();
         let mut slices = 0;
         let last = loop {
             let fetched = agent
                 .repo()
-                .bundle_for_fetch_sliced(&origin(), &FetchSpec::AllBranches, &have, Some(budget))
+                .bundle_for_fetch_sliced(
+                    &origin(),
+                    &FetchSpec::AllBranches,
+                    &have,
+                    budget.commits,
+                    budget.bytes,
+                )
                 .unwrap();
+            if let (Some(bundle), Some(limit)) = (&fetched.bundle, budget.bytes) {
+                assert!(bundle.len() <= limit, "{} > {limit}", bundle.len());
+            }
             if !fetched.partial {
                 assert!(fetched.heads.is_empty());
                 break fetched;

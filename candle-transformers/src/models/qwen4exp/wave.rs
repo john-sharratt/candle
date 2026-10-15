@@ -43,6 +43,8 @@ use candle_nn::kv_cache::{
 
 use super::kv_row::kv_factors_for;
 
+#[cfg(feature = "tensor-assert")]
+use super::attn_capture::attention_checkpoint;
 use super::batched_attention::Qwen4ExpAttentionLayer;
 use super::capture_rows::CaptureRows;
 use super::coverage::coverage_disagreements;
@@ -3724,6 +3726,15 @@ impl Qwen4ExpBatched {
         }
         #[cfg(feature = "tensor-assert")]
         use candle::tensor_assert::site;
+        // Where an armed attention capture fences, reads back and dumps.
+        #[cfg(feature = "tensor-assert")]
+        let Device::Cuda(capture_dev) = dev
+        else {
+            candle::bail!("qwen4exp wave runs on CUDA");
+        };
+        // A decode row per sequence — built once per wave, not per layer.
+        #[cfg(feature = "tensor-assert")]
+        let decode_rows = vec![1usize; n_decode];
 
         // The rows the routed experts' residency scores as decode: the decode
         // rows, the verify segments and each prompt's last row
@@ -4083,6 +4094,27 @@ impl Qwen4ExpBatched {
                             mix_wave.as_ref(),
                         )?;
                         g_attn.end();
+                        #[cfg(feature = "tensor-assert")]
+                        attention_checkpoint(
+                            site("q4e.mix.y.L", li),
+                            &out,
+                            x_g.as_cat_tensor(),
+                            &decode_rows,
+                            dec_c,
+                            |c| {
+                                forward_attn_batched(
+                                    &alayer,
+                                    c,
+                                    &x_g,
+                                    dec_off,
+                                    &dec_params,
+                                    kv,
+                                    dec_sel.as_ref(),
+                                    mix_wave.as_ref(),
+                                )
+                            },
+                            capture_dev,
+                        )?;
                         combine_rows(
                             &mut res,
                             &out.reshape((n_decode, n_embd))?,
@@ -4091,8 +4123,6 @@ impl Qwen4ExpBatched {
                             n_decode,
                             dev,
                         )?;
-                        #[cfg(feature = "tensor-assert")]
-                        probe(site("q4e.mix.y.L", li), &out);
                     }
                     if pre_rows > 0 {
                         let x_g = TensorCat::from_cat_tensor(
@@ -4115,6 +4145,27 @@ impl Qwen4ExpBatched {
                             mix_wave.as_ref(),
                         )?;
                         g_attn.end();
+                        #[cfg(feature = "tensor-assert")]
+                        attention_checkpoint(
+                            site("q4e.mix.y.L", li),
+                            &out,
+                            x_g.as_cat_tensor(),
+                            pre_q,
+                            pre_c,
+                            |c| {
+                                forward_attn_batched(
+                                    &alayer,
+                                    c,
+                                    &x_g,
+                                    pre_off,
+                                    &pre_params,
+                                    kv,
+                                    pre_sel.as_ref(),
+                                    mix_wave.as_ref(),
+                                )
+                            },
+                            capture_dev,
+                        )?;
                         combine_rows(
                             &mut res,
                             &out.reshape((pre_rows, n_embd))?,
@@ -4123,8 +4174,6 @@ impl Qwen4ExpBatched {
                             pre_rows,
                             dev,
                         )?;
-                        #[cfg(feature = "tensor-assert")]
-                        probe(site("q4e.mix.y.L", li), &out);
                     }
                     None
                 }

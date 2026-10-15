@@ -216,6 +216,27 @@ test.describe('1.3b a failed send', () => {
 test.describe('1.3c a reply runs on while another conversation answers', () => {
   const END = 'writes the assistant turn once';
 
+  // A turn the engine discards — a fault it will not seal — is not stored at
+  // all, not even its question. The reload after it used to replace the
+  // conversation with that empty history, which draws as the home page: the
+  // question and the error both gone.
+  test('a first turn the engine discards keeps its question and error, not the home page', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__ZEND_MOCK_DAEMON_TURNS__ = true;
+      window.__ZEND_MOCK_DISCARDED_TURN__ = 'the reprojection failed: glue convention violated';
+    });
+    await boot(page);
+    const ta = page.locator('#zend-prompt');
+    await ta.fill('Give me a tour of the codebase');
+    await ta.press('Enter');
+    await expect(page.locator('.zerr')).toContainText('glue convention violated', { timeout: 5000 });
+    // Past the reload that follows the turn's end.
+    await page.waitForTimeout(1000);
+    await expect(page.getByRole('heading', { name: /Good (Morning|Afternoon|Evening)\./ })).toHaveCount(0);
+    await expect(page.locator('.z-chatscroll').getByText('Give me a tour of the codebase')).toBeVisible();
+    await expect(page.locator('.zerr')).toContainText('glue convention violated');
+  });
+
   test('going back to the first conversation follows its reply to the end', async ({ page }) => {
     await page.addInitScript(() => { window.__ZEND_MOCK_DAEMON_TURNS__ = true; });
     await boot(page);
@@ -551,6 +572,28 @@ test.describe('1.11 opening a conversation', () => {
     await expect(page.locator('[data-msg]').last().locator('.tool-call-card')).toBeVisible();
     await expect(page.locator('[data-msg]').last().locator('.zmd')).toContainText('redo log', { timeout: 10000 });
   });
+
+  // The progress has to be on screen, not merely in the page somewhere above
+  // the fold — after a read, and after a write whose tall writing box folds
+  // away as the progress appears. A phone, a foldable open (wider than the
+  // narrow layout's breakpoint, so laid out as a desktop) and a desktop.
+  const screens = [['a phone', 390, 844], ['an open foldable', 884, 1104], ['a desktop', 1280, 900]];
+  const rounds = [['read', 'read the redo file for me'], ['write', 'write up the redo log for me']];
+  for (const [name, width, height] of screens) {
+    for (const [round, prompt] of rounds) {
+      test(`on ${name}, a ${round} round’s prefill progress is on screen`, async ({ page }) => {
+        await page.setViewportSize({ width, height });
+        await boot(page, { conv: '2' });
+        await expect(page.locator('.zmd').first()).toBeVisible();
+        const ta = page.locator('#zend-prompt');
+        await ta.fill(prompt);
+        await ta.press('Enter');
+        const bar = page.locator('.tool-prefill');
+        await expect(bar).toBeVisible({ timeout: 10000 });
+        await expect(bar).toBeInViewport();
+      });
+    }
+  }
 
   test('an expanded tool card shows its output’s length in tokens', async ({ page }) => {
     await boot(page, { conv: '2' });

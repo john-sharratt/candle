@@ -222,7 +222,7 @@ mod tests {
             .filter(|e| e.path().is_dir())
             .map(|e| RepoSpec::named(&e.file_name().to_string_lossy()))
             .collect();
-        ToolContext::with_workspace(Workspace::new(d.path(), repos).unwrap())
+        ToolContext::with_workspace(Workspace::new(d.path(), repos).unwrap()).unwrap()
     }
 
     /// The envelope the chain tests render through. ChatML, so the assertions

@@ -2,6 +2,7 @@
 //! from git's raw `-z` diff format.
 
 use crate::error::GitError;
+use crate::library::diffs;
 use crate::runner::utf8;
 use crate::types::{FileMode, Oid, RepoPath, Rev};
 use crate::Repo;
@@ -110,6 +111,9 @@ impl Repo {
         to: &Rev,
         paths: &[&RepoPath],
     ) -> Result<Vec<DiffEntry>, GitError> {
+        if let Some(lib) = self.library() {
+            return diffs::diff(&lib, from, to, paths);
+        }
         let mut inv = self
             .git("diff-tree")
             .args(["-r", "-z", "--raw", "--no-abbrev", "-M", "--end-of-options"])

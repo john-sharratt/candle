@@ -173,7 +173,7 @@ pub(super) fn capture(
         .cloned()
         .collect();
 
-    let root = repo.dir().to_path_buf();
+    let root = repo.dir()?.to_path_buf();
     let mut regular: Vec<(String, FileMode)> = Vec::new();
     let mut entries: Vec<(FileMode, Oid, String)> = Vec::new();
     let mut deleted = Vec::new();
@@ -277,7 +277,7 @@ pub(super) fn restore(
     } else {
         BTreeSet::new()
     };
-    let root = repo.dir().to_path_buf();
+    let root = repo.dir()?.to_path_buf();
     let mut cleared = Vec::new();
     // What held no file first: a file standing where a captured folder's
     // files go, or a folder where a captured file goes, is out of the way.
@@ -612,11 +612,12 @@ fn hash_paths<'a>(
     repo: &Repo,
     paths: impl Iterator<Item = &'a str>,
 ) -> Result<Vec<Oid>, CheckoutError> {
+    let root = repo.dir()?;
     if let Some(lib) = repo.library() {
         return paths
             .map(|path| {
                 let bytes =
-                    std::fs::read(repo.dir().join(path)).map_err(|e| CheckoutError::io(path, e))?;
+                    std::fs::read(root.join(path)).map_err(|e| CheckoutError::io(path, e))?;
                 Ok(objects::hash_raw(&lib, &bytes)?)
             })
             .collect();
@@ -643,7 +644,7 @@ fn tree_of(repo: &Repo, entries: &[(FileMode, Oid, String)]) -> Result<Oid, Chec
     if let Some(lib) = repo.library() {
         return Ok(objects::tree_from_entries(&lib, entries)?);
     }
-    let index = PrivateIndex::new(repo.git_dir());
+    let index = PrivateIndex::new(repo.git_dir()?);
     let info: Vec<u8> = entries
         .iter()
         .flat_map(|(mode, oid, path)| format!("{} {oid}\t{path}\0", mode.as_str()).into_bytes())

@@ -839,6 +839,22 @@ fn block_count_of(
         })
 }
 
+/// How many blocks of `parent_id` hold content — the count a record of where
+/// the slot stood after a piece keeps
+/// (`BatchedInferenceSession::sequence_content_block_count`): a glue gap
+/// leaves an empty writer chunk behind it, which the next piece fills.
+fn content_block_count_of(
+    ctx: &ApplyContext<'_>,
+    parent_id: SequenceId,
+) -> Result<usize, ConversationError> {
+    ctx.session
+        .sequence_content_block_count(parent_id.0)
+        .map_err(ConversationError::Model)?
+        .ok_or_else(|| {
+            ConversationError::Channel(format!("apply_segments: slot {} not in session", parent_id))
+        })
+}
+
 /// Build phase: snapshot the writer tail, truncate, then walk the segments —
 /// injecting the sealed prefix and collecting all glue as the new region with
 /// each column's TRUE logical position. Reserves the glue writer chunk but does
@@ -1261,7 +1277,7 @@ pub(super) fn apply_segments_build(
         if !matches!(pieces[i], AssembledPiece::DeferredUser(_)) {
             state.placed_pieces.push(PlacedPiece {
                 identity: identities[i],
-                blocks_after: block_count_of(ctx, parent_id)?,
+                blocks_after: content_block_count_of(ctx, parent_id)?,
                 pos_after: walker.logical_pos,
                 prefix_h: prefix_h.clone(),
             });

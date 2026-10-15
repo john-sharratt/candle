@@ -143,6 +143,8 @@ impl ToolError for GitToolError {
                 GitError::Malformed { .. } => "git_output_unreadable",
                 GitError::Timeout { .. } => "timeout",
                 GitError::Io(_) => "io_error",
+                GitError::Packs(_) => "objects_unreadable",
+                GitError::NoFolder { .. } => "no_folder",
                 GitError::Unclassified { .. } => "git_failed",
             },
         }
@@ -248,7 +250,7 @@ pub fn open(ctx: &ToolContext, name: &str) -> Result<ConvRepo, GitToolError> {
             known: workspace.names().join(", "),
         })?;
     Ok(ConvRepo {
-        repo: GitRepo::open(&repo.dir)?.pushing_through(ctx.pusher(name)),
+        repo: repo.open()?.pushing_through(ctx.pusher(name)),
         store: ctx.files.repo(name).ok(),
     })
 }

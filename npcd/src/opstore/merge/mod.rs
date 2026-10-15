@@ -23,10 +23,10 @@ pub mod publish;
 pub mod status;
 pub mod sync;
 
-use std::path::Path;
 use std::sync::Arc;
 
 use zend_vfs::work::held;
+use zend_vfs::workspace::Repo as WorkspaceRepo;
 use zend_vfs::{
     merge_into, BranchName, Fetch, GitError, Merged, Oid, Push, Repo, Rev, Snapshot, VfsStore,
 };
@@ -42,12 +42,12 @@ pub struct Merge<'a> {
 }
 
 impl<'a> Merge<'a> {
-    /// The store over the repository at `dir`, its pushes made by `pusher`
+    /// The store over the mind repository `mind`, its pushes made by `pusher`
     /// and its fetches of the record by `fetcher`. Refused when the store is
     /// not read through a branch: a mind folder that is not a git repository
     /// has no record to land anything on.
     pub fn open(
-        dir: &Path,
+        mind: &WorkspaceRepo,
         store: &'a VfsStore,
         pusher: Arc<dyn Push>,
         fetcher: Arc<dyn Fetch>,
@@ -62,7 +62,8 @@ impl<'a> Merge<'a> {
             },
             _ => return Err(NOT_UNDER_GIT.to_string()),
         };
-        let repo = Repo::open(dir)
+        let repo = mind
+            .open()
             .map_err(|e| format!("the mind repository cannot be opened: {e}"))?
             .pushing_through(pusher)
             .fetching_through(fetcher);

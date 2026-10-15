@@ -47,7 +47,16 @@ pub(crate) fn parse_ls_remote(out: &str) -> Result<RemoteRefs, GitError> {
 }
 
 impl Repo {
+    /// What `remote`'s refs point at now, read where this repository's
+    /// fetches are made: here, or by an agent for a repository whose remote
+    /// lives with one (`docs/substrate_git.md` §9).
     pub fn ls_remote(&self, remote: &RemoteName) -> Result<RemoteRefs, GitError> {
+        self.require_remote(remote)?;
+        self.fetcher.list(self, remote)
+    }
+
+    /// [`Self::ls_remote`] over this checkout's own network and credentials.
+    pub fn ls_remote_here(&self, remote: &RemoteName) -> Result<RemoteRefs, GitError> {
         self.require_remote(remote)?;
         let out = self
             .git("ls-remote")

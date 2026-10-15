@@ -215,8 +215,12 @@ impl CudaDevice {
         // the guards on the allocation paths cannot see it. An upload aimed at
         // the wrong slot writes a contiguous, slot-sized block of plausible
         // bytes over whatever was there.
-        self.guard_copy_dst::<T, _>("CudaDevice::memcpy_htod", dst, src.len());
+        //
+        // Inside the eager section: reading the destination's address goes
+        // through the compute stream, which a thread recording a wave may not
+        // touch — the driver refuses it and the refusal invalidates the capture.
         let _eager = self.pause_capture()?;
+        self.guard_copy_dst::<T, _>("CudaDevice::memcpy_htod", dst, src.len());
         self.stream.memcpy_htod(src, dst).w()
     }
 
@@ -251,9 +255,10 @@ impl CudaDevice {
         dst: &mut Dst,
     ) -> Result<()> {
         // Same reasoning as `memcpy_htod`: a bulk write to a caller-computed
-        // destination, invisible to every allocation-path guard.
-        self.guard_copy_dst::<T, _>("CudaDevice::memcpy_dtod", dst, src.len());
+        // destination, invisible to every allocation-path guard. Guarded inside
+        // the eager section for the reason `memcpy_htod` gives.
         let _eager = self.pause_capture()?;
+        self.guard_copy_dst::<T, _>("CudaDevice::memcpy_dtod", dst, src.len());
         self.stream.memcpy_dtod(src, dst).w()
     }
 

@@ -475,12 +475,13 @@ impl VfsStore {
 
     /// The folder of the repository beneath this store — the one it reads,
     /// or, over a branch, the one the branch belongs to. `None` for a store
-    /// with nothing beneath it.
+    /// with nothing beneath it, or over a repository read from the substrate,
+    /// which has no folder.
     pub fn root(&self) -> Option<&Path> {
         match &self.lower {
             Lower::None => None,
             Lower::Folder(root) => Some(root),
-            Lower::Branch { source, .. } => Some(source.dir()),
+            Lower::Branch { source, .. } => source.folder(),
         }
     }
 

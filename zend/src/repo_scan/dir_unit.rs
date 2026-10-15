@@ -147,7 +147,7 @@ mod tests {
         let u = folder_units("k", &tree, &read, &mut |_: &TreeFile| None).remove(0);
 
         let workspace = Workspace::new(d.path(), vec![RepoSpec::named("k")]).unwrap();
-        let ctx = ToolContext::with_workspace(workspace);
+        let ctx = ToolContext::with_workspace(workspace).unwrap();
         let shown = zend_tools::run(
             "file_list",
             "test",

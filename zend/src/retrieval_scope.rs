@@ -462,7 +462,7 @@ mod tests {
     fn the_scope_is_what_the_base_holds() {
         let (root, ws) = workspace();
         let rs = scoped(root.path());
-        let scope = scope_of(&rs, &RepoFiles::overlay(ws));
+        let scope = scope_of(&rs, &RepoFiles::overlay(ws).unwrap());
         assert_eq!(*scope.files, set(&[1, 2, 30]));
         assert_eq!(*scope.folders, set(&[10, 11]));
     }
@@ -473,7 +473,7 @@ mod tests {
     fn what_the_conversation_changed_leaves_the_scope() {
         let (root, ws) = workspace();
         let rs = scoped(root.path());
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         files
             .repo("r")
             .unwrap()
@@ -490,7 +490,7 @@ mod tests {
     fn conversations_that_changed_nothing_share_a_scope() {
         let (root, ws) = workspace();
         let rs = scoped(root.path());
-        let one = RepoFiles::overlay(ws);
+        let one = RepoFiles::overlay(ws).unwrap();
         let two = one.fresh();
         let (a, b) = (scope_of(&rs, &one), scope_of(&rs, &two));
         assert!(Arc::ptr_eq(&a.files, &b.files) && Arc::ptr_eq(&a.folders, &b.folders));
@@ -517,7 +517,7 @@ mod tests {
     fn a_folder_unit_is_the_one_its_base_lists() {
         let (root, ws) = workspace();
         let rs = scoped(root.path());
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         assert_eq!(folder_in(&rs, &files, "r", ""), Some(10));
         assert_eq!(folder_in(&rs, &files, "r", "src"), Some(11));
         assert_eq!(folder_in(&rs, &files, "r", "nope"), None);
@@ -531,7 +531,7 @@ mod tests {
     fn a_change_under_a_folder_takes_it_and_its_ancestors_out() {
         let (root, ws) = workspace();
         let rs = scoped(root.path());
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         files
             .repo("r")
             .unwrap()
@@ -556,7 +556,10 @@ mod tests {
         let (root, ws) = workspace();
         let rs = RetrievalScope::new(Some(GroupId::from_raw(2).unwrap()), None);
         *rs.index.write().unwrap() = Arc::new(index(root.path(), &IngestScope::new("", None), 1));
-        assert_eq!(folder_in(&rs, &RepoFiles::overlay(ws), "r", ""), None);
+        assert_eq!(
+            folder_in(&rs, &RepoFiles::overlay(ws).unwrap(), "r", ""),
+            None
+        );
     }
 
     /// **Working a scope out takes no base**: a conversation that has not
@@ -566,7 +569,7 @@ mod tests {
     fn working_a_scope_out_takes_no_base() {
         let (root, ws) = workspace();
         let rs = scoped(root.path());
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         scope_of(&rs, &files);
         let dir = root.path().join("r");
         std::fs::write(dir.join("a.rs"), "fn later() {}\n").unwrap();
@@ -581,7 +584,7 @@ mod tests {
         let (root, ws) = workspace();
         let rs = RetrievalScope::new(Some(GroupId::from_raw(2).unwrap()), None);
         *rs.index.write().unwrap() = Arc::new(index(root.path(), &IngestScope::new("", None), 1));
-        let scope = scope_of(&rs, &RepoFiles::overlay(ws));
+        let scope = scope_of(&rs, &RepoFiles::overlay(ws).unwrap());
         assert!(scope.folders.is_empty());
         assert_eq!(*scope.files, set(&[1, 2, 30]));
     }
@@ -639,7 +642,7 @@ mod tests {
     fn a_rebuild_lets_go_of_the_old_generation() {
         let (root, ws) = workspace();
         let rs = scoped(root.path());
-        scope_of(&rs, &RepoFiles::overlay(ws));
+        scope_of(&rs, &RepoFiles::overlay(ws).unwrap());
         let tree = oid(root.path(), "main^{tree}");
         let shared_key = (1, vec![("r".to_string(), tree.clone())]);
         let tree_key = ("r".to_string(), tree, 1);

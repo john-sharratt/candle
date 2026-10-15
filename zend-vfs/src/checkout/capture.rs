@@ -52,7 +52,7 @@ pub fn capture(
     branch: &BranchName,
     ledger: &mut Ledger,
 ) -> Result<Vec<(String, TimedDelta)>, CheckoutError> {
-    let root = repo.dir().to_path_buf();
+    let root = repo.dir()?.to_path_buf();
     let base_oid = Oid::parse(ledger.base())?;
     let (head, mut status) = repo.status_with_head()?;
     if reclaim(repo, branch, &base_oid, &head)? {

@@ -1,12 +1,16 @@
 //! Applying a patch to a commit's tree, in the object store.
 //!
-//! `git apply --cached` needs an index to apply into. It gets a private one
+//! Where libgit2 holds the repository — a checkout, or one read from the
+//! substrate — the patch is parsed and applied to the tree in this process
+//! ([`patches`](crate::library::patches)). Otherwise `git apply --cached`
+//! needs an index to apply into, and gets a private one
 //! — a temporary file named by `GIT_INDEX_FILE`, loaded from the base tree
 //! and deleted afterwards — so the user's index is never read or written.
 //! The file lives in the repository's own git folder, never a shared temp
 //! folder where another user could create its path, or its lock, first.
 
 use crate::error::GitError;
+use crate::library::patches;
 use crate::runner::utf8;
 use crate::types::{FileMode, Oid, Rev};
 use crate::write::scratch::PrivateIndex;
@@ -26,7 +30,20 @@ impl Repo {
     /// commit is made and no ref moves.
     pub fn apply_patch(&self, base: &Oid, patch: &[u8]) -> Result<ApplyOutcome, GitError> {
         let _write = self.write_lock();
-        let index = PrivateIndex::new(self.git_dir());
+        let applied = match self.library() {
+            Some(lib) => patches::apply(&lib, base, patch)?,
+            None => self.apply_in_index(base, patch)?,
+        };
+        if let ApplyOutcome::Applied { tree } = &applied {
+            self.refuse_unsafe_changes(base, tree)?;
+        }
+        Ok(applied)
+    }
+
+    /// [`Self::apply_patch`] for a repository libgit2 cannot hold: `git apply
+    /// --cached` into a private index.
+    fn apply_in_index(&self, base: &Oid, patch: &[u8]) -> Result<ApplyOutcome, GitError> {
+        let index = PrivateIndex::new(self.git_dir()?);
         self.git("read-tree")
             .arg("--end-of-options")
             .arg(base.as_str())
@@ -49,7 +66,6 @@ impl Repo {
             .env("GIT_INDEX_FILE", &index.0)
             .run_ok()?;
         let tree = Oid::parse(utf8("write-tree", tree)?.trim())?;
-        self.refuse_unsafe_changes(base, &tree)?;
         Ok(ApplyOutcome::Applied { tree })
     }
 

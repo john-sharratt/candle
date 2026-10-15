@@ -110,7 +110,7 @@ use crate::engine::watcher::{is_ingestible, Ledger, Reconcile};
 use crate::engine::witnessed;
 use crate::engine::work;
 use crate::mind::files::MindFiles;
-use crate::mind::Mind;
+use crate::mind::{Mind, MindRepo};
 use crate::mind_store::{self, MindSource};
 use crate::model;
 use crate::npcs::{Casting, Npcs};
@@ -831,7 +831,9 @@ impl Runtime {
         );
     }
 
-    pub fn new(mind_handle: Mind, data: &Path) -> Arc<Self> {
+    /// The runtime over `mind_handle`, its state kept under `data`. Refused
+    /// when the mind's repository cannot be read for its operations' stores.
+    pub fn new(mind_handle: Mind, data: &Path) -> anyhow::Result<Arc<Self>> {
         // **The benches are pointed at the mind this daemon was given**, before
         // any world is hosted. Derived from the handle rather than set on a
         // hosting call: a world reached through `host` and one reached through
@@ -842,7 +844,7 @@ impl Runtime {
         if mind_handle.is_present() {
             hosted.set_bench_root(mind_handle.clone());
         }
-        let ops = MindStores::new(mind_handle.repo_dir());
+        let ops = MindStores::for_mind(mind_handle.repo(), data)?;
         hosted.set_op_stores(Arc::clone(&ops));
         let rt = Arc::new(Self {
             scheduler: Arc::new(Scheduler::default()),
@@ -892,7 +894,7 @@ impl Runtime {
                 .upgrade()
                 .is_some_and(|rt| rt.standing.role(world) == Role::Disconnected)
         }));
-        rt
+        Ok(rt)
     }
 
     /// Host every authored world that has rooms to stand in.
@@ -3797,12 +3799,16 @@ fn load_mind(
     access: Access,
 ) -> anyhow::Result<bool> {
     let p = &rt.progress;
-    let repos = Repos::open(
-        &mind_store::stores_root(&rt.data),
-        std::slice::from_ref(&source.name),
-        shared.clone(),
-        access,
-    )?;
+    // The database the mind was read from at start: what the follower keeps
+    // with the log is what every reader of the mind reads.
+    let Some(MindRepo::Substrate(db)) = rt.mind_handle.repo() else {
+        anyhow::bail!(
+            "the mind repository `{}` is read from the substrate, and the mind holds no database \
+             of it",
+            source.name
+        );
+    };
+    let repos = Repos::over(vec![db.clone()], shared.clone(), access)?;
     let stopping = || rt.stopping();
     repos.load(&stopping, &|state| {
         if let Some(l) = state.first() {
@@ -5993,7 +5999,7 @@ mod tests {
     fn rt() -> Arc<Runtime> {
         // A temp path: the tests exercise scheduling, not persistence, and an
         // in-repo one would leave a ledger file behind.
-        Runtime::new(Mind::new(None), &std::env::temp_dir())
+        Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap()
     }
 
     // ── the effector device, enacted ────────────────────────────────────────
@@ -6240,7 +6246,7 @@ mod tests {
     #[test]
     fn the_runtime_knows_where_the_daemon_writes() {
         let data = std::env::temp_dir().join("npcd-data-probe");
-        let rt = Runtime::new(Mind::new(None), &data);
+        let rt = Runtime::new(Mind::new(None), &data).unwrap();
         assert_eq!(
             rt.data, data,
             "the runtime cannot tell the engine where to write"
@@ -6277,7 +6283,7 @@ mod tests {
     /// per pass instead of once per character is exactly how that happens.
     #[test]
     fn the_world_clock_is_resolved_per_character() {
-        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
+        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
         // Before a clock is installed there is no time to report, and zero is
         // the only honest answer. The driver does not run in this window.
         assert_eq!(rt.world_ms(3), 0);

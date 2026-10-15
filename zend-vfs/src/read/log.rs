@@ -1,6 +1,9 @@
-//! Commit history, from `log -z` with NUL-delimited fields.
+//! Commit history: from libgit2 where it holds the repository
+//! ([`log`](crate::library::log)), and otherwise from `log -z` with
+//! NUL-delimited fields.
 
 use crate::error::GitError;
+use crate::library::log as history_log;
 use crate::runner::Invocation;
 use crate::types::{GitTime, Oid, RepoPath, Rev, Signature};
 use crate::Repo;
@@ -95,6 +98,9 @@ impl Repo {
 
     /// Up to `limit` commits in `range`, newest first.
     pub fn log(&self, range: &LogRange, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
+        if let Some(lib) = self.library() {
+            return history_log::log(&lib, range, limit);
+        }
         let mut inv = self
             .log_invocation(limit)
             .arg("--end-of-options")
@@ -117,6 +123,9 @@ impl Repo {
         path: &RepoPath,
         limit: usize,
     ) -> Result<Vec<CommitInfo>, GitError> {
+        if let Some(lib) = self.library() {
+            return history_log::file_history(&lib, rev, path, limit);
+        }
         let out = self
             .log_invocation(limit)
             .arg("--follow")
@@ -232,6 +241,50 @@ mod tests {
             .map(|c| c.oid)
             .collect();
         assert_eq!(oids, vec![third, first]);
+    }
+
+    /// **The history libgit2 walks is the history `git log` prints**, path
+    /// limits and merges included: a merge the same as one parent at the
+    /// paths is passed over, and that parent's line alone followed.
+    #[test]
+    fn a_path_limited_history_across_merges_is_gits() {
+        let t = TestRepo::init();
+        t.write("a.txt", b"0\n");
+        t.write("b.txt", b"0\n");
+        t.commit_all("base");
+        t.git(&["checkout", "-q", "-b", "side"]);
+        t.write("b.txt", b"side\n");
+        t.commit_all("side touches b");
+        t.write("a.txt", b"side a\n");
+        t.commit_all("side touches a");
+        t.git(&["checkout", "-q", "main"]);
+        t.write("b.txt", b"main\n");
+        t.commit_all("main touches b");
+        t.git(&["merge", "-q", "--no-edit", "-X", "ours", "side"]);
+        t.write("a.txt", b"after\n");
+        t.commit_all("after the merge");
+        let held = t.repo();
+        let git = t.repo().without_library();
+        for paths in [vec![], vec!["a.txt"], vec!["b.txt"], vec!["a.txt", "b.txt"]] {
+            let range = LogRange {
+                paths: paths.iter().map(|p| RepoPath::parse(p).unwrap()).collect(),
+                ..LogRange::of(Rev::Head)
+            };
+            let ids = |repo: &Repo| -> Vec<Oid> {
+                repo.log(&range, 50)
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.oid)
+                    .collect()
+            };
+            assert_eq!(ids(&held), ids(&git), "paths {paths:?}");
+        }
+        let full = held.log(&LogRange::of(Rev::Head), 1).unwrap();
+        assert_eq!(
+            full,
+            git.log(&LogRange::of(Rev::Head), 1).unwrap(),
+            "every field"
+        );
     }
 
     /// A file's history follows it back through a rename; a plain path

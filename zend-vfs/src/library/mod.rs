@@ -18,9 +18,17 @@
 //! libgit2 reads the files as git leaves them, so a ref moved or a remote added
 //! by a `git` process a moment ago is what the next read here sees.
 
+pub(crate) mod blame;
 pub(crate) mod config;
+pub(crate) mod diffs;
+pub(crate) mod grep;
 pub(crate) mod history;
+pub(crate) mod log;
+pub(crate) mod merge_file;
+pub(crate) mod merges;
 pub(crate) mod objects;
+pub(crate) mod patch_text;
+pub(crate) mod patches;
 pub(crate) mod ref_txn;
 pub(crate) mod refs;
 pub(crate) mod trees;
@@ -32,7 +40,7 @@ use crate::error::GitError;
 use crate::remote::fetcher::fetch_here;
 use crate::remote::pusher::here;
 use crate::types::{ObjectFormat, Oid};
-use crate::Repo;
+use crate::{Place, Repo};
 
 /// Open the working tree at `dir` in this process, or `None` when it is not one
 /// libgit2 can hold: not a repository, not a top level, a bare repository, or an
@@ -49,8 +57,10 @@ pub(crate) fn open_in_process(dir: &Path) -> Option<Repo> {
     }
     let git_dir: PathBuf = library.path().components().collect();
     Some(Repo {
-        dir: dir.to_path_buf(),
-        git_dir,
+        place: Place::Folder {
+            dir: dir.to_path_buf(),
+            git_dir,
+        },
         format: ObjectFormat::Sha1,
         write: Mutex::new(()),
         library: Some(Mutex::new(library)),
@@ -125,7 +135,7 @@ mod tests {
         let t = TestRepo::init();
         let repo = Repo::open(&t.path).unwrap();
         assert!(repo.library().is_some());
-        assert!(repo.git_dir().ends_with(".git"), "{:?}", repo.git_dir());
+        assert!(repo.git_dir().unwrap().ends_with(".git"));
     }
 
     #[test]

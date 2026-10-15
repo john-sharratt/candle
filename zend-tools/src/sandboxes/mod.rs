@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use zend_vfs::{
-    here, CommandPolicy, DiskWriteGrant, JobId, JobInfo, JobRequest, Push, Repo, RunOutcome,
-    Sandbox, SandboxServer, Workspace, JOBS_DIR,
+    here, CommandPolicy, DiskWriteGrant, JobId, JobInfo, JobRequest, Push, RunOutcome, Sandbox,
+    SandboxServer, Workspace, JOBS_DIR,
 };
 
 use crate::executor::Executor;
@@ -56,15 +56,18 @@ impl Sandboxes {
     /// [`JOBS_DIR`] — made if it does not exist — each checkout first
     /// recovered from any job a crash cut short. A folder with no `.git` is
     /// not a repository and gets none; one with a `.git` that cannot be
-    /// opened — unreadable, corrupt — is an error, not a quiet absence.
+    /// opened — unreadable, corrupt — is an error, not a quiet absence. A
+    /// repository read from the substrate has no folder to run anything in,
+    /// and gets none: its commands run on an agent.
     pub fn for_workspace(workspace: &Workspace, policy: &CommandPolicy) -> io::Result<Self> {
         let jobs_dir = workspace.root().join(JOBS_DIR);
         let mut servers = BTreeMap::new();
         for repo in workspace.repos() {
-            if !repo.dir.join(".git").exists() {
+            if repo.folder().is_none() || !repo.is_git() {
                 continue;
             }
-            let git = Repo::open(&repo.dir)
+            let git = repo
+                .open()
                 .map_err(|e| io::Error::other(format!("repository {}: {e}", repo.name)))?;
             let sandbox = Sandbox::new(git, policy.clone());
             // A job a crash cut short left its checkout set aside — the

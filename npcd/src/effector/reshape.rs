@@ -247,7 +247,7 @@ mod tests {
     /// files — the disk-writeback path is pinned in `world::mapstore`'s own tests
     /// against a temp directory.
     fn daemon() -> (Arc<Runtime>, Arc<Tokens>) {
-        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
+        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
         let map = MapSet::load_dir(ROOMS).expect("the vault loads");
         rt.hosted.keep(Arc::new(Hosted::of(WORLD, World::new(map))));
         let tokens = Arc::new(Tokens::load(tmp()).expect("a fresh token store"));

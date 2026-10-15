@@ -51,7 +51,7 @@ const WORLD: &str = "creators-vault";
 /// awaits never yields, so no spawned task runs and the tests keep driving
 /// every moment and tick by hand, deterministically.
 fn daemon() -> Arc<Runtime> {
-    let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
+    let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
     rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
     rt.hold_world(WORLD, true);
     rt
@@ -831,7 +831,7 @@ fn daemon_with_a_mind() -> (Arc<Runtime>, PathBuf, TempDir) {
     )
     .unwrap();
 
-    let rt = Runtime::new(Mind::new(Some(mind.clone())), dir.path());
+    let rt = Runtime::new(Mind::new(Some(mind.clone())), dir.path()).unwrap();
     let mut substrate = Substrate::new();
     let persistence =
         SubstratePersistence::open_in_with_substrate(&dir.path().join("substrate"), &mut substrate)

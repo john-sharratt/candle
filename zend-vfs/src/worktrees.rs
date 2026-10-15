@@ -87,6 +87,10 @@ pub(crate) fn parse_worktrees(out: &[u8]) -> Result<Vec<Worktree>, GitError> {
 impl Repo {
     /// Every worktree of this repository, the main one first.
     pub fn worktrees(&self) -> Result<Vec<Worktree>, GitError> {
+        // A repository read from the substrate checks nothing out anywhere.
+        if self.objects().is_some() {
+            return Ok(Vec::new());
+        }
         let out = self
             .git("worktree")
             .args(["list", "--porcelain"])

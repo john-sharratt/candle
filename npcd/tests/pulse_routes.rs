@@ -95,7 +95,7 @@ impl Rig {
         let nid = npc_id_of_wire(&wire).unwrap();
         assert_eq!(npc_id_wire(nid), wire);
 
-        let rt = Runtime::new(Mind::new(None), &base);
+        let rt = Runtime::new(Mind::new(None), &base).unwrap();
         if awake {
             rt.scheduler.wake(nid, 0, 0);
         }

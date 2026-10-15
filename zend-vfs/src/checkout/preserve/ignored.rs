@@ -48,7 +48,7 @@ impl Ignored {
     /// files is anyone's to remove.
     pub(crate) fn kept_in(repo: &Repo) -> Result<Self, CheckoutError> {
         let mut entries = Vec::new();
-        for place in Place::left_in(repo.git_dir())? {
+        for place in Place::left_in(repo.git_dir()?)? {
             entries.extend(place.load_ignored()?.entries);
         }
         entries.sort();

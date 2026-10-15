@@ -4,13 +4,14 @@
 //! arguments from its config. That child is detached: stdout and stderr are
 //! not inherited, and this process does not read or write them. A switch is
 //! one request to `127.0.0.1:8092` whose body is the path of a new executable.
-//! That file is the trial. Its stderr is the only hooked stream, and it must
-//! contain the line `INFO serving` within ten minutes, which those processes
-//! print only once they are serving. The file is then renamed onto the stable
-//! path, or copied there when a running executable cannot be renamed, and
-//! that child is stopped and started again from the stable path, detached.
-//! The process that stays up was started from the stable file. No line, or
-//! the process dying, stops the trial and starts the stable file again.
+//! That file is the trial. The stable file is set aside, the trial's bytes are
+//! installed on the stable path, and it is started from there — the path the
+//! firewall allows — its stderr written to a file under keep's state, which
+//! must contain the line `INFO serving` within ten minutes. Those processes
+//! print it only once they are serving. The trial is then the service: the
+//! set-aside file is let go and the process goes on running — a promotion
+//! never restarts it. No line, or the process dying, stops the trial, puts the
+//! set-aside file back and starts it.
 //!
 //! It does not certify, roll out, or choose a canary. It joins the gateway as
 //! the app `keep` so the cluster page lists it.
@@ -24,7 +25,7 @@ use std::thread;
 use std::time::Duration;
 
 use cluster::upgrade::switch::SWITCH_ADDR;
-use place::{pending_copy, record, same_file, How};
+use place::{previous_of, restore, same_file};
 use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use trial::{spawn_detached, switch_to, Ended, Running};
@@ -61,7 +62,8 @@ struct Service {
     stable: PathBuf,
     args: Vec<std::ffi::OsString>,
     cwd: PathBuf,
-    place: PathBuf,
+    /// Where a trial's stderr is written, and read for the proof line.
+    trial_log: PathBuf,
 }
 
 struct Slot {
@@ -151,7 +153,7 @@ fn prepare(state: &Path, cfg: ServiceCfg) -> anyhow::Result<Service> {
         std::env::current_dir()?.join(cfg.cwd)
     };
     Ok(Service {
-        place: state.join(format!("{}.place", cfg.name)),
+        trial_log: state.join(format!("{}.trial.log", cfg.name)),
         name: cfg.name,
         file,
         stable,
@@ -174,102 +176,92 @@ fn bind_switch() -> io::Result<TcpListener> {
 }
 
 fn supervise(svc: Service, rx: Receiver<Req>) {
-    let mut leftover = startup_leftover(&svc);
+    roll_back_interrupted_trial(&svc);
     let mut live = ensure(&svc);
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(req) => {
-                let (next, held) = apply(&svc, live, req);
-                live = next;
-                if let Some(path) = held {
-                    leftover = Some(path);
-                }
-            }
+            Ok(req) => live = apply(&svc, live, req),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                live = restart_if_gone(&svc, live, &mut leftover);
+                live = restart_if_gone(&svc, live);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
-/// A copy promotion leaves the trial file until the process exits. A keep
-/// that starts again deletes it once the running image is the stable file.
-fn startup_leftover(svc: &Service) -> Option<PathBuf> {
-    let path = pending_copy(&svc.place)?;
-    if let Some(found) = find(&svc.file) {
-        if same_file(&found.exe, &path) {
-            return Some(path);
-        }
+/// A set-aside stable file exists only while a trial is unproven, so one
+/// found at startup is a trial this keep's predecessor was stopped in the
+/// middle of. It never proved itself: whatever runs from it is stopped and
+/// the set-aside file put back.
+fn roll_back_interrupted_trial(svc: &Service) {
+    if !previous_of(&svc.stable).exists() {
+        return;
     }
-    let _ = fs::remove_file(&path);
-    None
+    eprintln!(
+        "keep: {}: a trial was interrupted before it proved itself; rolling it back",
+        svc.name
+    );
+    if let Some(found) = find(&svc.file) {
+        stop(&mut Live::Adopted(found.pid));
+    }
+    if let Err(e) = restore(&svc.stable) {
+        eprintln!(
+            "keep: {}: the previous stable file was not put back: {e}",
+            svc.name
+        );
+    }
 }
 
-fn apply(svc: &Service, live: Option<Live>, req: Req) -> (Option<Live>, Option<PathBuf>) {
+fn apply(svc: &Service, live: Option<Live>, req: Req) -> Option<Live> {
     if let Some(mut live) = live {
         stop(&mut live);
     }
-    let result = switch_to(&req.path, &svc.stable, &svc.args, &svc.cwd, TRIAL);
-    let (answer, held) = match &result {
+    let result = switch_to(
+        &req.path,
+        &svc.stable,
+        &svc.trial_log,
+        &svc.args,
+        &svc.cwd,
+        TRIAL,
+    );
+    let answer = match &result {
         Ok(Running {
-            ended: Ended::Proven(how),
+            ended: Ended::Proven,
             ..
-        }) => {
-            if let Err(e) = record(&svc.place, *how, &req.path) {
-                eprintln!("keep: {}: the promotion was not recorded: {e}", svc.name);
-            }
-            let held = (*how == How::Copy).then(|| req.path.clone());
-            (
-                Answer {
-                    status: 200,
-                    reason: "OK",
-                    body: format!("proven {how}\n"),
-                },
-                held,
-            )
-        }
+        }) => Answer {
+            status: 200,
+            reason: "OK",
+            body: "proven\n".to_string(),
+        },
         Ok(Running {
             ended: Ended::RolledBack(why),
             ..
-        }) => (
-            Answer {
-                status: 409,
-                reason: "Conflict",
-                body: format!("rolled back\n{why}\n"),
-            },
-            None,
-        ),
-        Err(e) => (
-            Answer {
-                status: 409,
-                reason: "Conflict",
-                body: format!("rolled back\n{e}\n"),
-            },
-            None,
-        ),
+        }) => Answer {
+            status: 409,
+            reason: "Conflict",
+            body: format!("rolled back\n{why}\n"),
+        },
+        Err(e) => Answer {
+            status: 409,
+            reason: "Conflict",
+            body: format!("rolled back\n{e}\n"),
+        },
     };
     eprintln!("keep: {} {}", svc.name, answer.body.trim());
     let _ = req.reply.send(answer);
-    let live = match result {
+    match result {
         Ok(running) => Some(Live::Child(running.child)),
         Err(_) => ensure(svc),
-    };
-    (live, held)
+    }
 }
 
-fn restart_if_gone(
-    svc: &Service,
-    live: Option<Live>,
-    leftover: &mut Option<PathBuf>,
-) -> Option<Live> {
+fn restart_if_gone(svc: &Service, live: Option<Live>) -> Option<Live> {
     match live {
         Some(Live::Adopted(pid)) if alive(pid) => Some(Live::Adopted(pid)),
         Some(Live::Child(mut child)) => match child.try_wait() {
             Ok(None) | Err(_) => Some(Live::Child(child)),
             Ok(Some(_)) => {
                 let _ = child.wait();
-                clear_leftover(leftover);
                 eprintln!(
                     "keep: {} is down: starting {}",
                     svc.name,
@@ -280,7 +272,6 @@ fn restart_if_gone(
         },
         gone => {
             if gone.is_some() {
-                clear_leftover(leftover);
                 eprintln!(
                     "keep: {} is down: starting {}",
                     svc.name,
@@ -289,12 +280,6 @@ fn restart_if_gone(
             }
             ensure(svc)
         }
-    }
-}
-
-fn clear_leftover(leftover: &mut Option<PathBuf>) {
-    if let Some(path) = leftover.take() {
-        let _ = fs::remove_file(path);
     }
 }
 
@@ -333,9 +318,9 @@ fn stop(live: &mut Live) {
     thread::sleep(Duration::from_secs(1));
 }
 
+/// A running instance of the service, found by its file name.
 struct Found {
     pid: u32,
-    exe: PathBuf,
 }
 
 fn find(exe_name: &str) -> Option<Found> {
@@ -354,7 +339,6 @@ fn find(exe_name: &str) -> Option<Found> {
         if name.eq_ignore_ascii_case(exe_name) {
             return Some(Found {
                 pid: proc.pid().as_u32(),
-                exe,
             });
         }
     }

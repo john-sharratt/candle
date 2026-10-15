@@ -3,26 +3,19 @@
 //! With `--mind-repo <name>`, the mind is a repository the cluster's agents
 //! hold. Its packs and branches are records in this member's substrate, and
 //! its files are read at the commit the log names for `--mind-branch`, from
-//! an object store derived from the log at `<data>/git/<name>` — no checkout,
-//! no mirror. The first member to need it pulls it through an agent while it
-//! loads ([`substrate_git::member::Repos`]); the rest catch it up.
+//! its object database — no checkout, no mirror, no folder. The database is
+//! opened once and shared: what reads the mind, what the operations' stores
+//! read through, and what keeps it with the log are one database. The first
+//! member to need it pulls it through an agent while it loads
+//! ([`substrate_git::member::Repos`]); the rest catch it up.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use candle_conversation::persistence::SharedSubstrate;
 use substrate_git::Store;
-use zend_vfs::{BranchName, Oid, RefName, RemoteName, Repo, ORIGIN};
+use zend_vfs::{BranchName, ObjectDb, Oid, RefName, RemoteName, Repo, ORIGIN};
 
 use crate::mind::files::MindFiles;
-
-/// The stores' folder under `--data`.
-pub const GIT_DIR: &str = "git";
-
-/// Where `data`'s stores are.
-pub fn stores_root(data: &Path) -> PathBuf {
-    data.join(GIT_DIR)
-}
 
 /// Which repository and branch the mind is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,11 +25,6 @@ pub struct MindSource {
 }
 
 impl MindSource {
-    /// The mind's store under `data`.
-    pub fn store_dir(&self, data: &Path) -> PathBuf {
-        stores_root(data).join(&self.name)
-    }
-
     /// Where the store holds the branch as the record: `origin`'s tracking
     /// ref. Refuses a branch name git would not take.
     fn record_ref(&self) -> anyhow::Result<RefName> {
@@ -44,17 +32,17 @@ impl MindSource {
     }
 }
 
-/// The mind as this member's log holds it now: the store brought up to the
-/// log, and the files of the branch's commit — `None` while the log names no
-/// such branch, or its packs have not all arrived.
+/// The mind as this member's log holds it now: its object database brought up
+/// to the log, and the files of the branch's commit — `None` while the log
+/// names no such branch, or its packs have not all arrived.
 pub fn from_log(
-    data: &Path,
     source: &MindSource,
     shared: &SharedSubstrate,
-) -> anyhow::Result<Option<Arc<MindFiles>>> {
-    let store = Store::open(&stores_root(data), &source.name)?;
+) -> anyhow::Result<(ObjectDb, Option<Arc<MindFiles>>)> {
+    let store = Store::open(Arc::new(shared.clone()), &source.name)?;
     store.sync(shared)?;
-    at_record(store.repo(), source)
+    let files = at_record(store.repo(), source)?;
+    Ok((store.objects().clone(), files))
 }
 
 /// The files at the branch's commit as the store `repo` holds it as the
@@ -75,6 +63,7 @@ mod tests {
     use super::*;
     use candle_conversation::persistence::SubstratePersistence;
     use candle_conversation::substrate::Substrate;
+    use std::path::Path;
     use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) {
@@ -92,7 +81,8 @@ mod tests {
     }
 
     /// **A mind adopted into the log reads from the log alone**: another
-    /// member's data folder, with no checkout, finds its files at the commit.
+    /// member, with no checkout, finds its files at the commit — and its
+    /// database names the repository it holds.
     #[test]
     fn a_mind_in_the_log_reads_with_no_checkout() {
         let tmp = tempfile::tempdir().unwrap();
@@ -116,15 +106,20 @@ mod tests {
             name: "battle-mind".into(),
             branch: "main".into(),
         };
-        let data = tmp.path().join("member");
-        let files = from_log(&data, &source, &shared).unwrap().unwrap();
+        let (db, files) = from_log(&source, &shared).unwrap();
+        let files = files.unwrap();
+        assert_eq!(db.name(), "battle-mind");
         assert_eq!(
             files.read("projection.yaml").as_deref(),
             Some("layers: []\n")
         );
         assert!(files.is_file("layers/eras/first.md"));
         assert!(files.folder_root().is_none());
-        // The store checks nothing out: its folder holds no file of the mind.
-        assert!(!source.store_dir(&data).join("projection.yaml").exists());
+
+        let other = MindSource {
+            name: "battle-mind".into(),
+            branch: "elsewhere".into(),
+        };
+        assert!(from_log(&other, &shared).unwrap().1.is_none());
     }
 }

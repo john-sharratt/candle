@@ -1,6 +1,9 @@
-//! Who last changed each line of a file, from `blame --line-porcelain`.
+//! Who last changed each line of a file: from libgit2 where it holds the
+//! repository ([`blame`](crate::library::blame)), otherwise from `blame
+//! --line-porcelain`.
 
 use crate::error::GitError;
+use crate::library::blame as library_blame;
 use crate::types::{GitTime, Oid, RepoPath, Rev, Signature};
 use crate::Repo;
 
@@ -177,6 +180,9 @@ impl Repo {
         if !found.iter().any(|e| e.mode.is_blob()) {
             return Ok(None);
         }
+        if let Some(lib) = self.library() {
+            return library_blame::blame(&lib, rev, path, lines).map(Some);
+        }
         // No text-conversion filters: they are programs named in the
         // repository's config, and blame runs them by default.
         let mut inv = self
@@ -311,6 +317,35 @@ summary import\nfilename \"say \\\"hi\\\".txt\"\n\tx\n"
             .unwrap();
         assert!(b.iter().all(|l| l.commit == created));
         assert_eq!(b[0].orig_path.as_str(), "old.rs");
+    }
+
+    /// **The blame in this process is git's**, every field of every line,
+    /// whole and over a range, across edits and a rename.
+    #[test]
+    fn the_blame_in_process_is_gits() {
+        let t = TestRepo::init();
+        let mut lines: Vec<String> = (0..12).map(|i| format!("line {i}\n")).collect();
+        t.write("old.rs", lines.concat().as_bytes());
+        t.commit_all("create");
+        lines[3] = "changed three\n".into();
+        t.write("old.rs", lines.concat().as_bytes());
+        t.commit_all("edit three");
+        t.git(&["mv", "old.rs", "new.rs"]);
+        t.commit_all("rename");
+        lines[8] = "changed eight\n".into();
+        lines.insert(5, "inserted\n".into());
+        t.write("new.rs", lines.concat().as_bytes());
+        t.commit_all("edit eight, insert five");
+        let path = RepoPath::parse("new.rs").unwrap();
+        let held = t.repo();
+        let git = t.repo().without_library();
+        for range in [None, Some(LineRange { start: 3, end: 9 })] {
+            assert_eq!(
+                held.blame(&Rev::Head, &path, range).unwrap(),
+                git.blame(&Rev::Head, &path, range).unwrap(),
+                "{range:?}"
+            );
+        }
     }
 
     /// **A text-conversion filter named in the repository's config never

@@ -172,7 +172,7 @@ async fn model_independent_api_contract() {
     assert_eq!(r.status(), 200);
     let v: serde_json::Value = r.json().await.unwrap();
     assert_eq!(v["state"], "loading", "status: {v}");
-    assert_eq!(v["loading"]["current"], "model", "status: {v}");
+    assert_eq!(v["loading"]["current"], "pack", "status: {v}");
     assert_eq!(v["tenants"]["zend"]["state"], "loading", "status: {v}");
     assert!(
         v["tenants"]["zend"].get("ingest_backlog").is_some(),

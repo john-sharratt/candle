@@ -111,6 +111,55 @@ fn injecting_onto_a_partly_padded_slot_keeps_every_layer_aligned() -> Result<()>
     Ok(())
 }
 
+/// **Where the slot stood after a glue gap is its content's blocks, not its
+/// blocks.** The reservation pushes an empty writer chunk behind the gap, and
+/// the next inject trims it and lands its first chunk at that index. Cutting
+/// back to a count taken before the inject — with the writer chunk in it —
+/// keeps that first chunk: the live failure, a kept prefix whose slot offset
+/// ran one 32-token chunk past its logical position. Cutting to the content
+/// count lands exactly where the gap ended.
+#[test]
+fn a_cut_back_to_after_a_glue_gap_keeps_nothing_placed_after_it() -> Result<()> {
+    let mut s = session()?;
+    let sealed = donor_record(&mut s)?;
+    let slot = s.create_sequence()?;
+    fill(&mut s, slot, 0, CHUNK + 8)?;
+    s.reserve_glue_gap(slot, 10)?;
+    let after_gap = s.sequence_offset(slot).unwrap();
+    let blocks = s.sequence_block_count(slot).unwrap();
+    let content = s.sequence_content_block_count(slot)?.unwrap();
+    assert_eq!(
+        blocks,
+        content + 1,
+        "the reservation leaves its empty writer chunk at the tail"
+    );
+
+    s.inject_sealed_at_tail(slot, &sealed)?;
+
+    s.truncate_sequence_to_blocks(slot, content)?;
+    assert_eq!(
+        s.sequence_offset(slot),
+        Some(after_gap),
+        "cut to the content count, the slot ends where the gap did"
+    );
+    // The count with the writer chunk in it, after the inject: one chunk of
+    // the injected record kept past the gap.
+    let mut again = session()?;
+    let sealed = donor_record(&mut again)?;
+    let slot = again.create_sequence()?;
+    fill(&mut again, slot, 0, CHUNK + 8)?;
+    again.reserve_glue_gap(slot, 10)?;
+    let blocks = again.sequence_block_count(slot).unwrap();
+    again.inject_sealed_at_tail(slot, &sealed)?;
+    again.truncate_sequence_to_blocks(slot, blocks)?;
+    assert_eq!(
+        again.sequence_offset(slot),
+        Some(after_gap + CHUNK),
+        "the block count ends inside the inject: the measured failure"
+    );
+    Ok(())
+}
+
 /// Trimming is lossless: it takes the empty chunks and nothing else, and the
 /// slot's token count is untouched.
 #[test]

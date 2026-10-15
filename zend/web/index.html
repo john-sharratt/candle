@@ -1270,7 +1270,29 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // message and its streaming reply: adopted, it wiped both from the view and
   // left the stream writing into the previous turn until the next hydrate.
   // `send` and `startStream` retire every snapshot in flight (`retireHydrates`).
-  function hydrateConv(id, first) {
+  // The exchange a turn that failed left on screen: the question and the
+  // bubble after it, error and all — what `hydrateConv` keeps when the stored
+  // conversation does not hold it.
+  function failedExchange(id) {
+    const conv = S.conversations.find((c) => c.id === id);
+    if (!conv) return null;
+    const h = conv.history;
+    let q = h.length - 1;
+    while (q >= 0 && h[q].role !== 'user') q--;
+    if (q < 0) return null;
+    return h.slice(q).map((m) => Object.assign({}, m, { streaming: false }));
+  }
+  // `stored`, with `failed` on the end when the stored conversation does not
+  // already end with its question: a turn the engine discarded was never
+  // stored, and its question and error are the only record of it.
+  function withFailedExchange(stored, failed) {
+    if (!failed || !failed.length) return stored;
+    let last = stored.length - 1;
+    while (last >= 0 && stored[last].role !== 'user') last--;
+    if (last >= 0 && stored[last].content === failed[0].content) return stored;
+    return stored.concat(failed);
+  }
+  function hydrateConv(id, first, failed) {
     if (first) { S.hydrating[id] = true; delete S.loadError[id]; }
     const gen = (S.hydrateGen[id] || 0) + 1;
     S.hydrateGen[id] = gen;
@@ -1278,7 +1300,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       delete S.hydrating[id];
       const cur = S.conversations.find((c) => c.id === id);
       if (S.hydrateGen[id] !== gen || (cur && cur.streaming)) { render(); return; }
-      const patch = { history: full.history || [] };
+      const patch = { history: withFailedExchange(full.history || [], failed) };
       if (full.title != null) patch.title = full.title;
       if (full.turn_count != null) patch.turn_count = full.turn_count;
       // Recovered upload events hydrate the files pane (and the inline
@@ -1489,6 +1511,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // Set with `failed` when the daemon had the turn: it is still running, or
     // finished and stored, so the page reconnects instead of stopping.
     let reattach = false;
+    // The turn itself failed (`onTurnError`), and the stream carried on to its
+    // end. A turn the engine discards — a fault it will not seal — is not in
+    // the stored conversation at all, so the reload after it must keep the
+    // question and the error rather than draw the conversation without them.
+    let turnFailed = false;
     // Every handler below answers for THIS stream only. A cancelled stream
     // still reports its end, and the adapter reports a finished one twice
     // (`[DONE]`, then the closed reader): each would otherwise clear the next
@@ -1546,6 +1573,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       // brings both back: this is not `failed`, and offers no retry — the
       // question is already stored.
       onTurnError: (msg) => {
+        turnFailed = true;
         patchStream(convId, (m) => { m.error = msg; m.status = ''; m.prefill = null; });
         addLog(API.mkLog('ERROR', 'zend::session', 'conv_id=' + convId + ' turn failed: ' + msg));
       },
@@ -1583,7 +1611,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
         // structure (real turns + full projection timeline). The daemon commits
         // every turn's events before sending Done, so the fetch sees them.
         S.loaded[convId] = true;
-        hydrateConv(convId);
+        hydrateConv(convId, false, turnFailed ? failedExchange(convId) : null);
         addLog(API.mkLog('INFO', 'zend::http', 'POST /v1/chat/completions conv_id=' + convId + ' 200 stream=done'));
       },
     });

@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use agent::checkouts::Checkouts;
 use agent::client::Agents;
@@ -11,8 +12,8 @@ use agent::config::AgentConfig;
 use agent::jobs::Jobs;
 use candle_conversation::persistence::{SharedSubstrate, SubstratePersistence};
 use candle_conversation::substrate::Substrate;
-use substrate_git::member::{branches, Access, Repos};
-use zend_vfs::{CommandPolicy, Priority};
+use substrate_git::member::{branches, Access, Loading, Repos};
+use zend_vfs::{CommandPolicy, Priority, RepoPath, Rev};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -84,7 +85,7 @@ async fn a_repository_loads_whole_through_an_agent_in_process() {
     std::fs::write(&cfg_file, yaml).unwrap();
     let cfg = AgentConfig::load(&cfg_file).unwrap();
     let checkouts = Checkouts::open(&cfg, &CommandPolicy::allowing(Vec::<String>::new())).unwrap();
-    let jobs: std::sync::Arc<Jobs> = Jobs::new(checkouts, 1, Priority::Below);
+    let jobs: Arc<Jobs> = Jobs::new(checkouts, 1, Priority::Below);
 
     let sub = tmp.path().join("substrate");
     std::fs::create_dir(&sub).unwrap();
@@ -97,10 +98,10 @@ async fn a_repository_loads_whole_through_an_agent_in_process() {
             runtime: runtime.clone(),
             replicator: None,
         };
-        let root = tmp.path().join("git-a");
         let shared2 = shared.clone();
+        let names = names.clone();
         tokio::task::spawn_blocking(move || {
-            let repos = Repos::open(&root, &names, shared2, access).unwrap();
+            let repos = Repos::open(&names, shared2, access).unwrap();
             repos.load(&|| false, &|_| {}).unwrap();
             repos.store("r").unwrap().record().unwrap()
         })
@@ -109,7 +110,46 @@ async fn a_repository_loads_whole_through_an_agent_in_process() {
     };
     assert_eq!(loaded.values().next().unwrap().as_str(), head);
 
+    // Reopened — a restart, or another member on the same log — the
+    // repository is whole from the log: its branch, and a file of it read
+    // through the database with no folder anywhere.
     let shared = shared(&sub);
     let log = branches(&shared, "r").unwrap();
     assert_eq!(log.values().next().unwrap().as_str(), head);
+    let access = Access {
+        agents: Agents::in_process(jobs),
+        runtime,
+        replicator: None,
+    };
+    let (reread, reports) = tokio::task::spawn_blocking(move || {
+        let repos = Repos::open(&names, shared, access).unwrap();
+        let reports: Mutex<Vec<Vec<Loading>>> = Mutex::new(Vec::new());
+        repos
+            .load(&|| false, &|state| {
+                reports.lock().unwrap().push(state.to_vec())
+            })
+            .unwrap();
+        let store = repos.store("r").unwrap();
+        let tip = store.record().unwrap().values().next().unwrap().clone();
+        let read = store
+            .repo()
+            .blobs()
+            .read_at(&Rev::Oid(tip), &RepoPath::parse("f").unwrap())
+            .unwrap();
+        (read, reports.into_inner().unwrap())
+    })
+    .await
+    .unwrap();
+    assert_eq!(reread.as_deref(), Some(&b"2\n"[..]));
+
+    // The loading page has numbers before any round runs: the packs the log
+    // names, all held from the first load, read before the first tick.
+    let first = &reports.first().expect("a report before the first round")[0];
+    assert!(first.listed > 0, "the log names the packs: {first:?}");
+    assert_eq!(first.held, first.listed, "all held already: {first:?}");
+    assert!(!first.busy && !first.whole, "{first:?}");
+    // A round running says so, and the last report is the repository whole.
+    assert!(reports.iter().any(|r| r[0].busy), "{reports:?}");
+    let last = &reports.last().unwrap()[0];
+    assert!(last.whole && !last.busy, "{last:?}");
 }

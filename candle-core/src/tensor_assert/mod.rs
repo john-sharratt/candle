@@ -64,7 +64,8 @@ pub mod names;
 pub mod scratch;
 pub mod slots;
 
-use crate::cuda_backend::DeviceId;
+use crate::backend::BackendDevice;
+use crate::cuda_backend::{CudaDevice, DeviceId};
 use crate::quantized::{GgmlDType, LiveQTensor, QStorage};
 use crate::{DType, Device, LiveTensor, Result, Storage};
 use candle_kernels::simple::tensor_assert::{run_tensor_assert, AssertDType, MAX_DIMS};
@@ -198,7 +199,7 @@ pub unsafe fn assert_device_ptr(
     ptr: u64,
     dtype: AssertDType,
     elem_count: usize,
-    device: &crate::cuda_backend::CudaDevice,
+    device: &CudaDevice,
 ) {
     if let Err(e) = try_assert_device_ptr(name, ptr, dtype, elem_count, device) {
         tracing::warn!(
@@ -214,7 +215,7 @@ fn try_assert_device_ptr(
     ptr: u64,
     dtype: AssertDType,
     elem_count: usize,
-    device: &crate::cuda_backend::CudaDevice,
+    device: &CudaDevice,
 ) -> Result<()> {
     let Some(slot_idx) = names::slot_for(name) else {
         return Ok(());
@@ -267,7 +268,7 @@ pub unsafe fn assert_device_quant(
     ptr: u64,
     qtype: i32,
     elem_count: usize,
-    device: &crate::cuda_backend::CudaDevice,
+    device: &CudaDevice,
 ) {
     if let Err(e) = try_assert_device_quant(name, ptr, qtype, elem_count, device) {
         tracing::warn!(
@@ -283,7 +284,7 @@ fn try_assert_device_quant(
     ptr: u64,
     qtype: i32,
     elem_count: usize,
-    device: &crate::cuda_backend::CudaDevice,
+    device: &CudaDevice,
 ) -> Result<()> {
     let Some(slot_idx) = names::slot_for(name) else {
         return Ok(());
@@ -430,10 +431,7 @@ fn try_check_now(t: &LiveTensor<'_>, name: &str, on_bad: impl FnOnce(&Finding)) 
     // table is copied because it is 128 KiB and one transfer is cheaper than
     // teaching the drain to address a single entry.
     try_assert_tensor(t, name)?;
-    let stream = dev.cuda_stream();
-    stream
-        .synchronize()
-        .map_err(|e| crate::Error::Msg(format!("tensor_assert: check fence: {e}")))?;
+    fence(dev, "check")?;
     let raw = slots::with_slots(dev, |sl| sl.read(dev))?;
     let Some(slot) = raw.get(slot_idx) else {
         return Ok(false);
@@ -471,7 +469,7 @@ pub unsafe fn check_now_quant(
     ptr: u64,
     qtype: i32,
     elem_count: usize,
-    device: &crate::cuda_backend::CudaDevice,
+    device: &CudaDevice,
     on_bad: impl FnOnce(&Finding),
 ) -> bool {
     match try_check_now_quant(name, ptr, qtype, elem_count, device, on_bad) {
@@ -492,17 +490,14 @@ fn try_check_now_quant(
     ptr: u64,
     qtype: i32,
     elem_count: usize,
-    device: &crate::cuda_backend::CudaDevice,
+    device: &CudaDevice,
     on_bad: impl FnOnce(&Finding),
 ) -> Result<bool> {
     let Some(slot_idx) = names::slot_for(name) else {
         return Ok(false);
     };
     unsafe { assert_device_quant(name, ptr, qtype, elem_count, device) };
-    let stream = device.cuda_stream();
-    stream
-        .synchronize()
-        .map_err(|e| crate::Error::Msg(format!("tensor_assert: quant check fence: {e}")))?;
+    fence(device, "quant check")?;
     let raw = slots::with_slots(device, |sl| sl.read(device))?;
     let Some(slot) = raw.get(slot_idx).filter(|s| s.is_bad()) else {
         return Ok(false);
@@ -517,6 +512,21 @@ fn try_check_now_quant(
         elems: slot.elems,
     });
     Ok(true)
+}
+
+/// Wait for everything issued on `dev` so far, including launches a wave
+/// capture is still recording.
+///
+/// Through the device's own `synchronize`, which launches the recording
+/// segment and fences the compute stream. Fencing [`CudaDevice::cuda_stream`]
+/// directly is wrong inside a wave capture: that is the capture stream, which
+/// executes nothing until its segment is launched and refuses a synchronise
+/// while it records — so the check that a drain armed would report "skipped" on
+/// exactly the pass it exists to capture.
+///
+pub(crate) fn fence(dev: &CudaDevice, what: &str) -> Result<()> {
+    BackendDevice::synchronize(dev)
+        .map_err(|e| crate::Error::Msg(format!("tensor_assert: {what} fence: {e}")))
 }
 
 /// Whether `name`'s one-shot latch is still unfired, claiming it if so.

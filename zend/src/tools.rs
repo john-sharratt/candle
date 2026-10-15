@@ -47,7 +47,7 @@ use zend_tools::sandboxes::Sandboxes;
 use zend_tools::state::Secrets;
 use zend_tools::{alias_pins, registry, replay, Replay, ToolContext};
 use zend_vfs::sandbox::programs;
-use zend_vfs::{RepoFiles, Workspace, JOBS_DIR};
+use zend_vfs::{GitError, RepoFiles, Workspace, JOBS_DIR};
 
 use crate::access;
 use crate::agent_exec::AgentExecutor;
@@ -772,11 +772,11 @@ impl ToolHost {
     /// reads fall through to when the session layer has no entry, whose every
     /// context carries `secrets` — read once by the daemon at launch
     /// ([`crate::secrets::load`]) — and whose commands run in a sandbox per git
-    /// repository, starting the programs [`programs`] lists. Fails
-    /// only when the workspace's jobs folder cannot be made.
+    /// repository, starting the programs [`programs`] lists. Fails when the
+    /// workspace's jobs folder cannot be made, or a repository opened.
     pub fn new(workspace: &Workspace, secrets: Arc<Secrets>) -> io::Result<Self> {
         let sandboxes = Sandboxes::for_workspace(workspace, &programs::policy())?;
-        Ok(Self::on(workspace, secrets, Arc::new(sandboxes)))
+        Self::on(workspace, secrets, Arc::new(sandboxes)).map_err(io::Error::other)
     }
 
     /// The host this daemon runs with: commands and pushes on agents — the
@@ -810,18 +810,23 @@ impl ToolHost {
         };
         let executor =
             AgentExecutor::new(agents, Handle::current(), workspace.root().join(JOBS_DIR));
-        Ok(Self::on(workspace, secrets, Arc::new(executor)))
+        Ok(Self::on(workspace, secrets, Arc::new(executor))?)
     }
 
     /// A host whose commands run, and whose pushes are made, by `executor` —
-    /// agents, for a daemon given `--cluster` (§11.5).
-    pub fn on(workspace: &Workspace, secrets: Arc<Secrets>, executor: Arc<dyn Executor>) -> Self {
-        let base = ToolContext::with_workspace(workspace.clone())
+    /// agents, for a daemon given `--cluster` (§11.5). Refused when a
+    /// repository of `workspace` cannot be opened.
+    pub fn on(
+        workspace: &Workspace,
+        secrets: Arc<Secrets>,
+        executor: Arc<dyn Executor>,
+    ) -> Result<Self, GitError> {
+        let base = ToolContext::with_workspace(workspace.clone())?
             .with_secrets(secrets)
             .with_executor(executor);
         let contexts =
             ToolMode::ALL.map(|mode| Arc::new(base.clone().granting(access::grants(mode))));
-        Self { contexts }
+        Ok(Self { contexts })
     }
 
     /// A new conversation's own file stores: an overlay over each repository

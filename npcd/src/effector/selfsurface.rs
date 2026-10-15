@@ -238,7 +238,7 @@ mod tests {
     /// A runtime with a token store and, optionally, a seeded cast installed. No
     /// world hosted: `/self` reads touch only the shared cast.
     fn daemon(seed: Option<Vec<NpcPayload>>) -> (Arc<Runtime>, Arc<Tokens>) {
-        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
+        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
         let tokens = Arc::new(Tokens::load(tmp()).expect("a fresh token store"));
         rt.set_tokens(tokens.clone());
         if let Some(payloads) = seed {
