@@ -419,13 +419,14 @@ const TAIL_DONE: u8 = 7;
 const TAIL_EXAMINE_CAP: usize = 4096;
 
 impl MaintenanceRun {
-    /// The index updates the batches accumulated, once every stage has run.
-    pub fn into_result(self) -> MaintenanceResult {
+    /// The index updates the batches accumulated, once every stage has run —
+    /// taken out of the run, which an op held across passes still owns.
+    pub fn take_result(&mut self) -> MaintenanceResult {
         MaintenanceResult {
-            chunk_updates: self.chunk_updates,
-            token_updates: self.token_updates,
-            snapshot_updates: self.snapshot_updates,
-            branch_checkpoint_updates: self.branch_checkpoint_updates,
+            chunk_updates: std::mem::take(&mut self.chunk_updates),
+            token_updates: std::mem::take(&mut self.token_updates),
+            snapshot_updates: std::mem::take(&mut self.snapshot_updates),
+            branch_checkpoint_updates: std::mem::take(&mut self.branch_checkpoint_updates),
         }
     }
 }
@@ -1286,7 +1287,7 @@ impl SubstratePersistence {
             plan.chunk_relocs.len(),
         );
         while self.relocate_tail_batch(plan, &mut run, u64::MAX)? {}
-        Ok(run.into_result())
+        Ok(run.take_result())
     }
 
     /// Advance the tail — tokens, snapshots, branch checkpoints, singletons,

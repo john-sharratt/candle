@@ -269,7 +269,8 @@ pub use project::{
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub(crate) use resolver::SubstrateRef;
 pub use resolver::{
-    CollectionWarm, Conversation, GalleryPreload, Observe, SectionLoads, TargetedRead, WarmProbe,
+    CollectionWarm, Conversation, GalleryPreload, MaintenanceOp, Observe, SectionLoads,
+    TargetedRead, WarmProbe,
 };
 pub use schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,

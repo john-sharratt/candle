@@ -130,6 +130,13 @@ impl<'a> PassFlush<'a> {
         }
     }
 
+    /// Whether a request has arrived that no pass has taken up — what a phase
+    /// after the hot→warm one checks to step aside for it, so the next pass
+    /// serves it at once rather than after the phase is through.
+    pub fn waiting(&self) -> bool {
+        self.incoming.is_some_and(|rx| !rx.is_empty())
+    }
+
     /// At the end of the pass's hot→warm phase: answer what is outstanding, or
     /// keep a mid-pass drain for the next pass ([`FlushRequest::answer_or_carry`]).
     pub fn finish(&mut self) {
@@ -210,6 +217,21 @@ mod tests {
         assert!(ack_rx.try_recv().is_ok());
         pass.finish();
         assert!(pass.carried().is_none());
+    }
+
+    /// A request sent after the hot→warm phase is through is waiting, for the
+    /// phases after it to step aside for; one already taken up is not.
+    #[test]
+    fn a_request_no_pass_has_taken_up_is_waiting() {
+        let (req_tx, req_rx) = channel::bounded(1);
+        let mut pass = PassFlush::new(None, Some(&req_rx));
+        assert!(!pass.waiting());
+        let (ack_tx, _ack_rx) = channel::bounded(1);
+        req_tx.try_send(FlushRequest::at_least(ack_tx, 50)).unwrap();
+        assert!(pass.waiting());
+        pass.at_group(0);
+        assert!(!pass.waiting(), "taken up by the pass");
+        assert!(!PassFlush::new(None, None).waiting());
     }
 
     /// A drain that arrives mid-pass goes on to the next pass unanswered.

@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
+mod maintenance_op;
+pub use maintenance_op::MaintenanceOp;
+use maintenance_op::Pass;
+
 use super::belief_files::{assemble_file_scans, scan_file_scans};
 use super::ids::{
     process_timeline_allocator, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId,
@@ -34,7 +38,6 @@ use crate::persistence::content_hash::{
 };
 use crate::persistence::identity::Minter;
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
-use crate::persistence::maintenance::RELOCATION_BATCH_BYTES;
 use crate::persistence::manifest::{self, ConvState, RecordLoc};
 use crate::persistence::record::{
     BranchCheckpointPayload, DistillMode, DistillPayload, RecordType, SectionGeneration,
@@ -56,7 +59,6 @@ use crate::provenance::{
     decode_wide_sigs_for_scoring, score_slots_fused, score_slots_grouped, score_slots_weighted,
     FusionMode, GalleryArena, WideQSig,
 };
-use crate::scheduler::note_persistence_maint_us;
 use crate::scheduler::profile;
 use crate::substrate::{
     ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, Substrate, SubstrateRead,
@@ -331,17 +333,6 @@ impl SubstrateRef {
 /// - **Reset** — does *not* clear the shared store (other conversations
 ///   would lose their history).  Sequence-level reset only drops local
 ///   KV state via the scheduler.
-/// Which maintenance op a pass may pick.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pass {
-    /// The background pass: only past the age and dead-ratio gates.
-    Gated,
-    /// The manual trigger: the gates waived.
-    Forced,
-    /// A full volume's pass: dropping a dead segment, nothing that relocates.
-    DropOnly,
-}
-
 #[derive(Clone)]
 pub struct Conversation {
     pub(super) inner: Arc<RwLock<Substrate>>,
@@ -4755,17 +4746,36 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))
     }
 
-    /// Run one **background maintenance** op on the segmented redo log — drop a
-    /// fully-dead segment, compact a mostly-dead one, or combine two small
-    /// adjacent ones (`docs/archived/segmented_substrate_log.md` §6). At most one op per
-    /// call; the persistence thread polls this every pass. The common no-op
-    /// path is a cheap per-segment liveness scan. Holds the persistence lock
-    /// and the substrate write lock for the op's duration — cold-loads and
-    /// persists queue behind it.
+    /// Advance the persistence thread's **background maintenance** on the
+    /// segmented redo log — drop a fully-dead segment, compact a mostly-dead
+    /// one, or combine two small adjacent ones
+    /// (`docs/archived/segmented_substrate_log.md` §6). Continues the op in
+    /// `op` when there is one; otherwise, when `start`, plans one past the age
+    /// and dead-ratio gates (a cheap per-segment liveness scan on the common
+    /// no-op path). Steps aside between batches when `yield_now` says a flush
+    /// is waiting, leaving the op in `op` for the next pass
+    /// ([`MaintenanceOp`]).
     ///
-    /// Returns `true` when an op actually ran.
-    pub fn compact_persistence_if_needed(&self) -> candle::Result<bool> {
-        self.run_maintenance_pass(Pass::Gated)
+    /// Returns `true` when an op completed.
+    pub fn step_background_maintenance(
+        &self,
+        op: &mut Option<MaintenanceOp>,
+        start: bool,
+        yield_now: &dyn Fn() -> bool,
+    ) -> candle::Result<bool> {
+        if op.is_none() && start {
+            *op = self.begin_maintenance_op(Pass::Gated)?;
+        }
+        let Some(running) = op.as_mut() else {
+            return Ok(false);
+        };
+        match self.advance_maintenance(running, yield_now) {
+            Ok(false) => Ok(false),
+            done => {
+                *op = None;
+                done
+            }
+        }
     }
 
     /// Run one maintenance op that drops a fully-dead segment, and nothing
@@ -4815,150 +4825,16 @@ impl Conversation {
         out.map_err(|e| candle::Error::Msg(format!("substrate maintenance exec: {e}")))
     }
 
-    /// One maintenance pass under phased locking so the slow relocation I/O never
-    /// holds the substrate write lock (which would stall every decode `read()`),
-    /// mirroring the persistence thread's hot→warm / warm→cold discipline. A
-    /// forced pass waives the age/ratio gates (`pick_maintenance_op`); a
-    /// drop-only pass relocates nothing (`pick_drop`).
+    /// One maintenance op run to the end under phased locking, so the slow
+    /// relocation I/O never holds the substrate write lock (which would stall
+    /// every decode `read()`) — see [`MaintenanceOp`]. A forced pass waives the
+    /// age/ratio gates (`pick_maintenance_op`); a drop-only pass relocates
+    /// nothing (`pick_drop`). Returns whether an op ran.
     fn run_maintenance_pass(&self, pass: Pass) -> candle::Result<bool> {
-        // 1. Plan under a brief read + persistence lock (snapshot only). The
-        //    relocation watch starts in the same hold, so every write after the
-        //    plan is known to the relocation below.
-        //
-        //    One op at a time: an op releases this lock between its batches, so
-        //    a second pass — the forced `POST /v1/substrate/zend/maintenance` beside the
-        //    background thread's — can arrive mid-op. It plans nothing and
-        //    leaves the status alone: the op in flight owns `running`.
-        let t_plan = Instant::now();
-        let (plan, dir) = {
-            let mut p = self.persistence.lock_behind_waiters().unwrap();
-            if p.relocation_in_flight() {
-                tracing::debug!(
-                    target: "candle_conversation::persistence::maintenance",
-                    "a maintenance op is already relocating — this pass plans none"
-                );
-                return Ok(false);
-            }
-            let substrate = self.read();
-            let plan = match pass {
-                Pass::Gated => p.plan_maintenance(&substrate, false),
-                Pass::Forced => p.plan_maintenance(&substrate, true),
-                Pass::DropOnly => p.plan_drop(&substrate),
-            }
-            .map_err(|e| candle::Error::Msg(format!("substrate maintenance plan: {e}")))?;
-            if plan.is_some() {
-                p.watch_relocation();
-            }
-            (plan, p.dir().to_path_buf())
+        let Some(mut op) = self.begin_maintenance_op(pass)? else {
+            return Ok(false);
         };
-        let plan_ms = t_plan.elapsed().as_millis() as u64;
-        let outcome = if let Some(plan) = plan {
-            // Signal "in progress" so the GUI shows a live spinner across the I/O.
-            self.maintenance.lock().unwrap().2 = true;
-            // Run the I/O in a closure so its result is captured rather than
-            // early-returned: `running` MUST be cleared below on both success and
-            // failure — an `?` straight out of here would leave the spinner (and
-            // `/v1/status.running`) stuck true until the next successful pass.
-            (|| -> candle::Result<bool> {
-                // 2. Relocation I/O under the persistence lock ONLY — the
-                //    substrate lock is released, so decode's in-RAM projection
-                //    proceeds during the read + re-append + fsync. The scheduler's
-                //    seal writes and cold loads DO share this persistence lock, so
-                //    the lock is taken per batch: the resident re-emit, the chunks,
-                //    and the tail (tokens, snapshots, branch checkpoints,
-                //    singletons, characters, file events, blobs), each
-                //    `RELOCATION_BATCH_BYTES` at a time. A seal write or cold load
-                //    that arrives mid-op waits for one batch. Held across a whole
-                //    phase it waited for all of it: a 3.6 GB segment's chunks
-                //    stalled an elevate — and the decode behind it — for 37 s, and
-                //    a ~35,700-record re-emit held every finishing turn's token
-                //    write for 44–52 s.
-                //
-                //    Only the time the lock is actually held is charged to the
-                //    scheduler's Sync bucket.
-                let t_exec = Instant::now();
-                let mut held = Duration::ZERO;
-                let mut batches = 0u32;
-                let mut longest = Duration::ZERO;
-                let mut run = self.maintenance_hold(&mut held, |p| p.begin_maintenance(&plan))?;
-                loop {
-                    let before = held;
-                    let more = self.maintenance_hold(&mut held, |p| {
-                        p.relocate_batch(&plan, &mut run, RELOCATION_BATCH_BYTES)
-                    })?;
-                    batches += 1;
-                    longest = longest.max(held - before);
-                    if !more {
-                        break;
-                    }
-                }
-                loop {
-                    let before = held;
-                    let more = self.maintenance_hold(&mut held, |p| {
-                        p.relocate_tail_batch(&plan, &mut run, RELOCATION_BATCH_BYTES)
-                    })?;
-                    batches += 1;
-                    longest = longest.max(held - before);
-                    if !more {
-                        break;
-                    }
-                }
-                let result = run.into_result();
-                note_persistence_maint_us(held.as_micros() as u64);
-                let exec_ms = t_exec.elapsed().as_millis() as u64;
-                // 3. Repoint the index at the relocated records under a brief write lock.
-                let t_apply = Instant::now();
-                {
-                    let mut substrate = self.write();
-                    result.apply_to_substrate(&mut substrate);
-                }
-                let apply_ms = t_apply.elapsed().as_millis() as u64;
-                // 4. Unlink the drained source segments under the persistence lock.
-                let t_finish = Instant::now();
-                {
-                    let mut p = self.persistence.lock_behind_waiters().unwrap();
-                    p.finish_maintenance(&plan).map_err(|e| {
-                        candle::Error::Msg(format!("substrate maintenance drop: {e}"))
-                    })?;
-                }
-                let finish_ms = t_finish.elapsed().as_millis() as u64;
-                // **Every phase's hold, not only the relocation's.** The plan holds
-                // the persistence lock and a substrate read lock together; the apply
-                // holds the substrate write lock; the finish holds the persistence
-                // lock across the unlinks. Any of them stalls a seal behind it, and
-                // `longest_hold_ms` covers only the relocation batches.
-                // At `info`, once per op beside the plan's own line: an op that
-                // stalls the tenants behind it is named by its slow phase here,
-                // and a process hosting several substrates says whose it was.
-                tracing::info!(
-                    target: "candle_conversation::persistence::maintenance",
-                    dir = %dir.display(),
-                    plan_ms,
-                    exec_ms,
-                    held_ms = held.as_millis() as u64,
-                    batches,
-                    longest_hold_ms = longest.as_millis() as u64,
-                    apply_ms,
-                    finish_ms,
-                    "segment-maintenance: plan under both locks, relocation one batch \
-                     at a time, apply under the substrate write lock, finish under the \
-                     persistence lock"
-                );
-                Ok(true)
-            })()
-        } else {
-            Ok(false)
-        };
-        // Always refresh the status cache — this also clears `running`, even if
-        // the op above errored. The persistence lock here is held only for two
-        // O(1) reads (never across I/O); the status endpoint reads the separate
-        // `maintenance` lock, so it never blocks on a compaction.
-        let view = {
-            let p = self.persistence.lock().unwrap();
-            (p.segment_count(), p.last_maintenance(), false)
-        };
-        *self.maintenance.lock().unwrap() = view;
-        outcome
+        self.advance_maintenance(&mut op, &|| false)
     }
 
     /// The segmented redo log's maintenance state for the daemon status / GUI

@@ -52,7 +52,7 @@ use super::held_groups::{drain_in_held_groups, HeldDrain};
 use super::resume::TurnChunkGrid;
 use super::streams::StreamId;
 use super::transfer::seal_to_chunk_images;
-use crate::projection::Conversation;
+use crate::projection::{Conversation, MaintenanceOp};
 use crate::scheduler::phase_ring::{
     migrate_sample, mix_due, push_idle_migrate, push_migrate, push_mix,
 };
@@ -382,6 +382,8 @@ fn run_loop(
         .unwrap_or_else(Instant::now);
     // A full drain the last pass took up mid-pass, owed to this one.
     let mut carried: Option<FlushRequest> = None;
+    // A maintenance op an earlier pass stepped aside from for a flush.
+    let mut maintenance_op: Option<MaintenanceOp> = None;
     loop {
         // Wait for trigger, shutdown, or the periodic tick — whichever
         // fires first. The `default` arm fires after `DEFAULT_TICK` if
@@ -416,6 +418,13 @@ fn run_loop(
         if run_maintenance {
             last_maintenance = Instant::now();
         }
+        // An op left in flight is let go for the same reason: its sources stay
+        // until a later op reclaims them, and nothing it planned is lost.
+        if shutting_down {
+            if let Some(op) = maintenance_op.take() {
+                conversation.abandon_maintenance(op);
+            }
+        }
         // Answered by the pass as soon as what it asks for is warm; a request sent
         // while the pass runs is taken up at its next group.
         let mut flush = PassFlush::new(flush_ack, Some(&flush_rx));
@@ -426,7 +435,10 @@ fn run_loop(
             &copy_stream,
             compression_policy.as_ref(),
             &mut pinned_scratch,
-            run_maintenance,
+            PassMaintenance {
+                op: &mut maintenance_op,
+                may_start: run_maintenance,
+            },
             &backlog,
             &mut flush,
         );
@@ -524,7 +536,12 @@ fn run_loop(
                     &copy_stream,
                     compression_policy.as_ref(),
                     &mut pinned_scratch,
-                    false, // no maintenance during the shutdown drain
+                    // No maintenance during the shutdown drain; the op in
+                    // flight was let go above.
+                    PassMaintenance {
+                        op: &mut None,
+                        may_start: false,
+                    },
                     // Still stamped: the drain is what finally empties the
                     // backlog, and leaving the gauge holding its pre-shutdown
                     // reading would publish a deficit that never clears.
@@ -927,6 +944,13 @@ fn migrate_group_hot_to_warm(
     wave_deferred
 }
 
+/// A pass's segment maintenance: the op an earlier pass left in flight, and
+/// whether this pass may start one (`MAINTENANCE_INTERVAL`).
+struct PassMaintenance<'a> {
+    op: &'a mut Option<MaintenanceOp>,
+    may_start: bool,
+}
+
 fn run_pass(
     conversation: &Conversation,
     backings: &[ChunkedKvBacking],
@@ -934,7 +958,7 @@ fn run_pass(
     copy_stream: &Arc<CudaStream>,
     compression_policy: Option<&CompressionPolicy>,
     pinned_scratch: &mut Option<PinnedBuf>,
-    run_maintenance: bool,
+    maintenance: PassMaintenance<'_>,
     backlog: &BacklogGauge,
     flush: &mut PassFlush<'_>,
 ) {
@@ -1553,14 +1577,20 @@ fn run_pass(
     // ── Phase 4: segment maintenance ───────────────────────────────────
     //
     // Reclaim dead weight incrementally — one segment drop / compact / combine
-    // per invocation (`persistence/maintenance.rs`). Rate-limited to
+    // at a time (`persistence/maintenance.rs`). A new op starts at most every
     // `MAINTENANCE_INTERVAL` (the candidate scan is O(live records), so it's
-    // decoupled from the trigger rate). The relocation I/O runs under the
-    // persistence lock only (phased locking), never the substrate write lock,
-    // so it can't stall decode. The specific op is logged at TRACE by
-    // `finish_maintenance`.
-    match if run_maintenance && !read_only {
-        conversation.compact_persistence_if_needed()
+    // decoupled from the trigger rate); one already in flight continues. The
+    // relocation I/O runs under the persistence lock only (phased locking),
+    // never the substrate write lock, so it can't stall decode.
+    //
+    // **A flush waiting steps the op aside.** The flush is this thread's own
+    // work, so it would otherwise wait out every batch of the op — a 2.1 s
+    // compaction was a 2.4 s relief wait inside a prefill. The op stops between
+    // batches, the next pass serves the flush in its hot→warm phase, and the
+    // op carries on after it ([`MaintenanceOp`]).
+    let PassMaintenance { op, may_start } = maintenance;
+    match if !read_only && (op.is_some() || may_start) {
+        conversation.step_background_maintenance(op, may_start, &|| flush.waiting())
     } else {
         Ok(false)
     } {
