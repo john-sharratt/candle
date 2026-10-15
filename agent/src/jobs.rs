@@ -267,10 +267,11 @@ impl Jobs {
         let jobs = Arc::clone(self);
         let repo = fetch.repo.clone();
         let held = have.clone();
+        let max_commits = fetch.max_commits.map(|n| n as usize);
         let found = spawn_blocking(move || {
             let c = jobs.checkout(&repo)?;
             c.repo()
-                .bundle_for_fetch(&origin(), &spec, &held)
+                .bundle_for_fetch_sliced(&origin(), &spec, &held, max_commits)
                 .map_err(|e| JobError::Bad(format!("bundling `{repo}`: {e}")))
         })
         .await
@@ -676,6 +677,7 @@ mod tests {
             repo: "mind".into(),
             branch: Some("main".into()),
             have: Vec::new(),
+            max_commits: None,
         };
         assert_eq!(fetch_command(&one), ["git", "fetch", "origin", "main"]);
         let all = FetchJob {
@@ -696,6 +698,7 @@ mod tests {
         let at = |o: &Oid, bundle: Option<Vec<u8>>| FetchBundle {
             tips: [(main.clone(), o.clone())].into(),
             bundle,
+            partial: false,
         };
         assert!(brought_nothing(&at(&a, None), std::slice::from_ref(&a)));
         assert!(!brought_nothing(&at(&b, None), std::slice::from_ref(&a)));

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::error::GitError;
 use crate::remote::fetch::{FetchSpec, RefUpdate};
+use crate::runner::utf8;
 use crate::types::{BranchName, Oid, RemoteName, Rev};
 use crate::write::ref_txn::{RefOp, RefTransaction};
 use crate::Repo;
@@ -28,6 +29,10 @@ pub struct FetchBundle {
     /// The objects of those commits the asker lacks, as a git bundle; `None`
     /// when it lacks none.
     pub bundle: Option<Vec<u8>>,
+    /// A slice of what the asker lacks, not all of it: `tips` name how far it
+    /// reaches, and a branch it does not reach is left out. The asker takes
+    /// the objects and asks again, naming those commits as held.
+    pub partial: bool,
 }
 
 impl Repo {
@@ -49,8 +54,23 @@ impl Repo {
         spec: &FetchSpec,
         have: &[Oid],
     ) -> Result<FetchBundle, GitError> {
+        self.bundle_for_fetch_sliced(remote, spec, have, None)
+    }
+
+    /// [`Self::bundle_for_fetch`], reaching at most `max_commits` commits the
+    /// asker lacks, oldest first, when that is fewer than all of them: a first
+    /// fetch of a long history in slices an answer can carry
+    /// (`docs/substrate_git.md` §5.1). A sliced answer is
+    /// [`partial`](FetchBundle::partial).
+    pub fn bundle_for_fetch_sliced(
+        &self,
+        remote: &RemoteName,
+        spec: &FetchSpec,
+        have: &[Oid],
+        max_commits: Option<usize>,
+    ) -> Result<FetchBundle, GitError> {
         let prefix = format!("refs/remotes/{remote}/");
-        let tips: BTreeMap<BranchName, Oid> = self
+        let mut tips: BTreeMap<BranchName, Oid> = self
             .snapshot(&spec.scope(remote))?
             .into_iter()
             .filter_map(|(name, oid)| {
@@ -59,13 +79,28 @@ impl Repo {
             })
             .collect();
         if tips.is_empty() {
-            return Ok(FetchBundle { tips, bundle: None });
+            return Ok(FetchBundle {
+                tips,
+                bundle: None,
+                partial: false,
+            });
         }
         let held: Vec<String> = have
             .iter()
             .filter(|oid| self.resolve(&Rev::Oid((*oid).clone())).is_ok())
             .map(|oid| format!("^{oid}"))
             .collect();
+        let mut partial = false;
+        if let Some(budget) = max_commits {
+            (tips, partial) = self.slice(tips, &held, budget.max(1))?;
+            if tips.is_empty() {
+                return Ok(FetchBundle {
+                    tips,
+                    bundle: None,
+                    partial,
+                });
+            }
+        }
         let _write = self.write_lock();
         let refs: Vec<String> = (0..tips.len())
             .map(|i| format!("{FETCH_REFS}{i}"))
@@ -101,7 +136,58 @@ impl Repo {
                 ))
             }
         };
-        Ok(FetchBundle { tips, bundle })
+        Ok(FetchBundle {
+            tips,
+            bundle,
+            partial,
+        })
+    }
+
+    /// `tips` cut to at most `budget` commits beyond `held` (each `^<oid>`),
+    /// oldest first: a branch reaching further is cut to the commit at the
+    /// budget's end, and one the budget does not reach at all is left out.
+    /// Whether anything was cut.
+    fn slice(
+        &self,
+        tips: BTreeMap<BranchName, Oid>,
+        held: &[String],
+        mut budget: usize,
+    ) -> Result<(BTreeMap<BranchName, Oid>, bool), GitError> {
+        let mut out = BTreeMap::new();
+        let mut cut = false;
+        let mut reached: Vec<String> = Vec::new();
+        for (branch, tip) in tips {
+            if budget == 0 {
+                cut = true;
+                continue;
+            }
+            // Parents before children: every ancestor of a commit in this list
+            // the asker lacks comes before it, so a prefix is a whole slice.
+            let listed = self
+                .git("rev-list")
+                .args(["--reverse", "--topo-order"])
+                .arg(tip.to_string())
+                .args(held)
+                .args(&reached)
+                .read_only()
+                .run_ok()?;
+            let commits: Vec<String> = utf8("rev-list", listed)?
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let at = if commits.len() <= budget {
+                budget -= commits.len();
+                tip
+            } else {
+                cut = true;
+                let at = Oid::parse(&commits[budget - 1])?;
+                budget = 0;
+                at
+            };
+            reached.push(format!("^{at}"));
+            out.insert(branch, at);
+        }
+        Ok((out, cut))
     }
 
     /// Take `fetched` — what `remote` held for `spec` — into this repository:
@@ -330,5 +416,46 @@ mod tests {
             fresh.oid("refs/remotes/origin/main"),
             agent.oid("refs/remotes/origin/main")
         );
+    }
+
+    /// **A long history comes in slices**: each answer reaches at most the
+    /// commits asked, oldest first; the member takes each slice's objects and
+    /// names them as held, and the last answer, whole, moves its tracking ref
+    /// to origin's own commit.
+    #[test]
+    fn a_long_history_is_carried_in_slices() {
+        let (_bare, upstream, agent, member, _first) = three();
+        for i in 0..6 {
+            upstream.write("projection.yaml", format!("layers: [{i}]\n").as_bytes());
+            upstream.commit_all(&format!("c{i}"));
+        }
+        upstream.git(&["push", "-q", "origin", "main"]);
+        let tip = upstream.oid("HEAD");
+        agent
+            .repo()
+            .fetch_here(&origin(), &FetchSpec::AllBranches)
+            .unwrap();
+
+        let mut have: Vec<Oid> = Vec::new();
+        let mut slices = 0;
+        let last = loop {
+            let fetched = agent
+                .repo()
+                .bundle_for_fetch_sliced(&origin(), &FetchSpec::AllBranches, &have, Some(3))
+                .unwrap();
+            if !fetched.partial {
+                break fetched;
+            }
+            slices += 1;
+            assert_ne!(fetched.tips[&main()], tip);
+            member.repo().take_bundle(fetched.bundle.as_ref().unwrap()).unwrap();
+            have.extend(fetched.tips.values().cloned());
+        };
+        assert_eq!(slices, 2, "7 commits in slices of 3");
+        member
+            .repo()
+            .take_fetch(&origin(), &FetchSpec::AllBranches, &last)
+            .unwrap();
+        assert_eq!(member.oid("refs/remotes/origin/main"), tip);
     }
 }

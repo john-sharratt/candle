@@ -55,6 +55,11 @@ pub struct FetchJob {
     pub branch: Option<String>,
     /// Commits the member holds: what the bundle leaves out.
     pub have: Vec<String>,
+    /// At most this many commits the member lacks in one answer, oldest first;
+    /// a longer history comes back [`partial`](Fetched::partial), in slices an
+    /// answer can carry (`docs/substrate_git.md` §5.1). Unbounded when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_commits: Option<u32>,
 }
 
 /// What origin holds for a fetch, and the objects the member lacks.
@@ -64,6 +69,10 @@ pub struct Fetched {
     pub tips: BTreeMap<String, String>,
     /// A git bundle in base64; `None` when the member lacks nothing.
     pub bundle: Option<String>,
+    /// A slice of the history, not all of it: take it and ask again
+    /// ([`zend_vfs::FetchBundle::partial`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 impl Fetched {
@@ -75,6 +84,7 @@ impl Fetched {
                 .map(|(b, o)| (b.as_str().to_string(), o.to_string()))
                 .collect(),
             bundle: f.bundle.as_deref().map(encode_bundle),
+            partial: f.partial,
         }
     }
 
@@ -90,6 +100,7 @@ impl Fetched {
         Ok(FetchBundle {
             tips,
             bundle: self.bundle.as_deref().map(decode_bundle).transpose()?,
+            partial: self.partial,
         })
     }
 }
@@ -411,6 +422,7 @@ mod tests {
             repo: "mind".into(),
             branch: Some("main".into()),
             have: vec![A.into()],
+            max_commits: None,
         });
         assert_eq!(
             serde_json::to_value(&fetch).unwrap(),
@@ -419,6 +431,7 @@ mod tests {
         let answer = Fetched {
             tips: BTreeMap::from([("main".to_string(), B.to_string())]),
             bundle: Some(encode_bundle(b"PACK")),
+            partial: false,
         };
         assert_eq!(
             serde_json::to_value(&answer).unwrap(),
@@ -434,6 +447,7 @@ mod tests {
         let bad = Fetched {
             tips: BTreeMap::from([("main".to_string(), "zz".to_string())]),
             bundle: None,
+            partial: false,
         };
         assert!(bad.bundle().is_err());
     }

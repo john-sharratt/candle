@@ -54,28 +54,45 @@ impl Fetch for AgentFetch {
         remote: &RemoteName,
         spec: &FetchSpec,
     ) -> Result<Vec<RefUpdate>, GitError> {
-        let have = repo
+        let mut have: Vec<String> = repo
             .tracking_tips(remote)?
             .into_iter()
             .map(|o| o.to_string())
             .collect();
-        let job = FetchJob {
-            repo: self.repo.clone(),
-            branch: match spec {
-                FetchSpec::Branch(b) => Some(b.as_str().to_string()),
-                FetchSpec::AllBranches => None,
-            },
-            have,
-        };
-        let agents = self.agents.clone();
-        let (tx, rx) = mpsc::channel();
-        self.runtime.spawn(async move {
-            let _ = tx.send(agents.fetch(job).await);
-        });
-        let fetched = rx
-            .recv()
-            .map_err(|_| failed(remote, "the fetch's job was dropped".into()))?
-            .map_err(|e| failed(remote, e.to_string()))?;
-        repo.take_fetch(remote, spec, &fetched)
+        // A long history comes in slices: each one's objects are taken and its
+        // commits named as held, and only the last answer moves the tracking
+        // refs, so they never stand anywhere origin's branches do not.
+        loop {
+            let job = FetchJob {
+                repo: self.repo.clone(),
+                branch: match spec {
+                    FetchSpec::Branch(b) => Some(b.as_str().to_string()),
+                    FetchSpec::AllBranches => None,
+                },
+                have: have.clone(),
+                max_commits: Some(SLICE),
+            };
+            let agents = self.agents.clone();
+            let (tx, rx) = mpsc::channel();
+            self.runtime.spawn(async move {
+                let _ = tx.send(agents.fetch(job).await);
+            });
+            let fetched = rx
+                .recv()
+                .map_err(|_| failed(remote, "the fetch's job was dropped".into()))?
+                .map_err(|e| failed(remote, e.to_string()))?;
+            if !fetched.partial {
+                return repo.take_fetch(remote, spec, &fetched);
+            }
+            let Some(bundle) = &fetched.bundle else {
+                return Err(failed(remote, "a partial answer carried no objects".into()));
+            };
+            repo.take_bundle(bundle)?;
+            have.extend(fetched.tips.values().map(|o| o.to_string()));
+        }
     }
 }
+
+/// The most commits one answer carries. A first fetch of candle's history —
+/// 6,500 commits, 1.3 GB packed — comes in about 26 answers of this.
+const SLICE: u32 = 256;
