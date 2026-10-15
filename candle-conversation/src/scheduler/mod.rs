@@ -3422,6 +3422,14 @@ pub(crate) struct Scheduler {
     /// are read summed — see [`PersistenceTriggers`].
     persist_triggers: PersistenceTriggers,
 
+    /// Every substrate attached to this engine core, slot or no slot: the
+    /// holders a compaction sweep and a relief pass must visit. A substrate
+    /// with no live slot still holds resident KV in its residences — on a
+    /// shared engine, the tenant that is between conversations — and a pass
+    /// that walked only [`Self::slot_conversations`] relocated the chunks they
+    /// name without rewriting them: the sweep's `unwitnessed` count.
+    attached_substrates: Vec<Conversation>,
+
     /// Trigger handle for the async summariser thread.  Fired after
     /// every turn-seal (`docs/archived/infinite_conversations.md` §4 step ③)
     /// so the freshly-pending Normal turn is absorbed into the immutable
@@ -3882,6 +3890,7 @@ impl Scheduler {
             slot_projection_state: HashMap::new(),
             cold_load_stager: ColdLoadStager::with_preallocation(PINNED_PREALLOC_BYTES),
             persist_triggers: PersistenceTriggers::new(FIRST_ATTACHMENT, persist_trigger),
+            attached_substrates: Vec::new(),
             summariser_trigger,
             pending_section_quantize: Vec::new(),
             elevate_pinned_scratch: preallocate_pinned_scratch(
@@ -5244,6 +5253,7 @@ impl Scheduler {
                 status,
             } => {
                 self.persist_triggers.attach(id, trigger);
+                self.register_substrate(&conversation);
                 self.detached.reattached(&conversation);
                 self.reconstruct_substrate(&conversation, &status);
                 true
@@ -6994,6 +7004,8 @@ impl Scheduler {
         self.turn_positional
             .retain(|k, _| !timelines.contains(&k.timeline));
         self.persist_triggers.detach(id);
+        self.attached_substrates
+            .retain(|c| !c.same_substrate(conversation));
         tracing::info!(
             attachment = id,
             freed_slots = freed_count,
@@ -7002,7 +7014,26 @@ impl Scheduler {
         );
     }
 
-    /// One handle per substrate the live slots are bound to.
+    /// Record `conversation`'s substrate as attached to this core, once.
+    pub fn register_substrate(&mut self, conversation: &Conversation) {
+        if !self
+            .attached_substrates
+            .iter()
+            .any(|c| c.same_substrate(conversation))
+        {
+            self.attached_substrates.push(conversation.clone());
+        }
+    }
+
+    /// One handle per substrate that holds resident KV: every attached one, and
+    /// any other a live slot is bound to.
+    ///
+    /// **Attached, not only slotted.** A substrate with no live slot still holds
+    /// resident KV in its residences, and a compaction sweep that skips it moves the
+    /// chunks they name without rewriting them — on a shared engine, every pass run
+    /// while one tenant was between conversations (`unwitnessed` in the sweep's
+    /// report). Visiting it costs one walk of its residences per pass, the cost it
+    /// already pays on any pass where it has a slot open.
     ///
     /// Every slot of a workspace registers its own handle on the same substrate, so
     /// a walk over [`Self::slot_conversations`] visits that substrate once per slot.
@@ -7010,7 +7041,7 @@ impl Scheduler {
     /// left to do on a second visit, and pays a full walk of every residence to learn
     /// it.
     pub(super) fn distinct_substrates(&self) -> Vec<Conversation> {
-        let mut out: Vec<Conversation> = Vec::new();
+        let mut out: Vec<Conversation> = self.attached_substrates.clone();
         for conv in self.slot_conversations.values() {
             if !out.iter().any(|seen| seen.same_substrate(conv)) {
                 out.push(conv.clone());
@@ -16647,6 +16678,31 @@ mod tests {
         }
         assert_eq!(scheduler.distinct_substrates().len(), 1);
         assert_eq!(scheduler.persist_triggers.len(), 1);
+    }
+
+    /// **An attached substrate with no live slot is still walked.** Its residences
+    /// hold resident KV, and a compaction sweep that skipped it relocated the chunks
+    /// they name without rewriting them — on a shared engine, every pass run while
+    /// one tenant was between conversations. Detaching it stops the walk; visiting
+    /// it twice — attached and slotted — still walks it once.
+    #[test]
+    fn an_attached_substrate_with_no_slot_is_walked() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let zend = crate::projection::Conversation::new();
+        let npcd = crate::projection::Conversation::new();
+        scheduler.register_substrate(&zend);
+        scheduler.register_substrate(&npcd);
+        scheduler.register_substrate(&npcd);
+        create_scratch_slot(&mut scheduler, &zend);
+
+        let distinct = scheduler.distinct_substrates();
+        assert_eq!(distinct.len(), 2, "npcd has no slot and is walked anyway");
+        assert!(distinct.iter().any(|c| c.same_substrate(&npcd)));
+
+        scheduler.detach_substrate(1, &npcd);
+        let distinct = scheduler.distinct_substrates();
+        assert_eq!(distinct.len(), 1);
+        assert!(distinct[0].same_substrate(&zend));
     }
 
     /// **A requester that gave up costs no slot.**

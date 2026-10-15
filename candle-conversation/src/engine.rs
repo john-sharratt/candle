@@ -534,6 +534,7 @@ impl ConversationEngine {
                 // §16.12 — reload any persisted turns into the substrate
                 // before serving requests, reporting progress to the daemon.
                 let t_recon = std::time::Instant::now();
+                scheduler.register_substrate(&scheduler_conversation);
                 scheduler.reconstruct_substrate(&scheduler_conversation, &reload_status_for_thread);
                 tracing::info!(
                     reconstruct_ms = t_recon.elapsed().as_millis() as u64,

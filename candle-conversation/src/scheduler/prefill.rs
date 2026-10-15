@@ -541,11 +541,23 @@ impl Scheduler {
         // The closure receives the pass's OWN `Sweep`, already carrying whatever the
         // backings rewrote. Sharing it is what makes an allocation held by both a
         // block table and a residence come back as one replacement.
+        // The substrates no live slot is bound to — on a shared engine, the tenant
+        // between conversations — timed apart, so the cost of walking them reads
+        // beside the pass it is part of.
+        let idle: Vec<bool> = substrates
+            .iter()
+            .map(|s| !self.slot_conversations.values().any(|c| c.same_substrate(s)))
+            .collect();
+        let mut idle_us = 0u128;
         let outcome = {
             let _g = super::profile::span("compact:kv");
             self.session.compact_kv(BUDGET, &mut |sweep| {
-                for s in &substrates {
+                for (s, idle) in substrates.iter().zip(&idle) {
+                    let t = std::time::Instant::now();
                     swept += s.rewrite_for_compaction(sweep)?;
+                    if *idle {
+                        idle_us += t.elapsed().as_micros();
+                    }
                 }
                 for state in projections.values_mut() {
                     swept += state.rewrite_for_compaction(sweep)?;
@@ -679,6 +691,10 @@ impl Scheduler {
                     // budget like the quiesce. Named because it scales with slots ×
                     // chunks × layers, not with what the pass moved.
                     invalidate_us = report.timings.invalidate.as_micros(),
+                    // Rewriting every holder, and of that the substrates no live
+                    // slot is bound to.
+                    sweep_us = report.timings.sweep.as_micros(),
+                    idle_substrates_us = idle_us,
                     // **The figure that says whether the pass was complete.** A relocated
                     // slot no holder the sweep reached names: its claim is wasted, its
                     // source is not reclaimed, and because nothing names it the census
