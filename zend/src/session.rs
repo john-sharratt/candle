@@ -11,6 +11,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 use agent::client::Agents;
+use agent::jobs::Jobs;
 use cluster::member::{ClusterView, Link};
 use futures::executor::block_on;
 use futures::future::select_all;
@@ -20,6 +21,7 @@ use host::cluster::view::{
     admitted, catchup_detail, catchup_progress, connecting_detail, model_id,
 };
 use host::cluster::Join;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as ConvLock;
 use tokio::sync::{watch, Notify, OwnedMutexGuard};
@@ -90,6 +92,7 @@ use crate::repo_scan::{utility_config, DIR_KEY};
 use crate::resume;
 use crate::retrieval_scope::RetrievalScope;
 use crate::self_check::{self, Report as SelfCheckReport};
+use crate::substrate_git::{self, Repositories};
 use crate::think_budget;
 use crate::think_progress::{ThinkProgress, ThinkUpdate};
 use crate::tool_round;
@@ -631,7 +634,7 @@ struct InferenceState {
     /// This load's repositories and their follower (`docs/substrate_git.md`
     /// §7); `None` when the workspace names none. Stopped by
     /// `ZendSession::shutdown` before the drain.
-    repositories: Option<crate::substrate_git::Repositories>,
+    repositories: Option<Repositories>,
     /// Constrained-decoding stencil for the whole tool catalog, keyed by the
     /// `<tool_call>` trigger token.  Passed on every user turn so a tool call
     /// the model emits is forced to the catalog's exact JSON shape.  Compiled
@@ -1018,8 +1021,8 @@ impl InferenceState {
         wiped_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
         max_depth: Option<usize>,
-        host_runtime: Option<tokio::runtime::Handle>,
-        agent: Option<Arc<agent::jobs::Jobs>>,
+        host_runtime: Option<Handle>,
+        agent: Option<Arc<Jobs>>,
         compact_substrate: bool,
         self_check: SelfCheck,
         read_only_substrate: bool,
@@ -1494,7 +1497,7 @@ impl InferenceState {
                 .repos()
                 .iter()
                 .map(|r| r.name.clone())
-                .filter(|name| name != crate::workspace::UPLOADS_REPO)
+                .filter(|name| name != UPLOADS_REPO)
                 .collect();
             if names.is_empty() {
                 None
@@ -1502,9 +1505,8 @@ impl InferenceState {
                 let runtime = host_runtime.clone().ok_or_else(|| {
                     anyhow::anyhow!("no async runtime for the agents' jobs to run on")
                 })?;
-                let access =
-                    crate::substrate_git::access(cluster.as_ref(), agent.as_ref(), runtime)?;
-                Some(crate::substrate_git::load(
+                let access = substrate_git::access(cluster.as_ref(), agent.as_ref(), runtime)?;
+                Some(substrate_git::load(
                     &root,
                     &names,
                     engine.conversation().shared(),
@@ -5330,7 +5332,7 @@ impl ZendSession {
     /// cluster's, or with no cluster the one in this process. `None` with
     /// neither.
     pub fn agents(&self) -> Option<Agents> {
-        crate::substrate_git::agents(self.config.cluster.as_ref(), self.config.agent.as_ref())
+        substrate_git::agents(self.config.cluster.as_ref(), self.config.agent.as_ref())
     }
 
     /// Snapshot for `GET /v1/status`. `loading=None` once every startup
@@ -6531,13 +6533,13 @@ impl ZendSession {
         // panic for lack of a runtime context — which killed the loader thread
         // before `mark_ready()`, wedging the loading screen. We re-enter this
         // handle after the download phase so the worker can spawn.
-        let rt_handle = tokio::runtime::Handle::try_current().ok();
+        let rt_handle = Handle::try_current().ok();
         // Held by the spawned thread, which stores the ingest worker on the
         // session and hands it to the resumed turns.
         let session_for_loader: Arc<Self> = Arc::clone(self);
-        // The host's runtime, where the cluster's sockets live: what an agent's
+        // The same runtime, where the cluster's sockets live: what an agent's
         // fetch for a repository read from the substrate is made on.
-        let host_runtime = tokio::runtime::Handle::try_current().ok();
+        let host_runtime = rt_handle.clone();
         // OS thread, not `tokio::spawn` — `start_loading` may be
         // called from contexts without an ambient Tokio runtime
         // (integration tests, alternative binaries).  The bits that

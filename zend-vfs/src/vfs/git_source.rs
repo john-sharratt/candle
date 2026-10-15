@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use super::base::Base;
 use super::tree::Tree;
-use crate::{BlobReader, GitError, Oid, RemoteName, Repo, Rev, ORIGIN};
+use crate::{BlobReader, BranchName, GitError, Oid, RemoteName, Repo, Rev, ORIGIN};
 
 /// How many parsed trees a source keeps: a branch's tree and the one before
 /// it, for a handful of branches read at once.
@@ -54,7 +54,7 @@ fn record_default(repo: &Repo) -> Result<Option<Rev>, GitError> {
         return Ok(None);
     };
     for name in ["main", "master"] {
-        let tracking = origin.tracking(&crate::BranchName::parse(name)?);
+        let tracking = origin.tracking(&BranchName::parse(name)?);
         if repo.ref_target(&tracking)?.is_some() {
             return Ok(Some(Rev::Ref(tracking)));
         }

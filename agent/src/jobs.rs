@@ -707,6 +707,7 @@ mod tests {
             tips: [(main.clone(), o.clone())].into(),
             bundle,
             partial: false,
+            heads: Vec::new(),
         };
         assert!(brought_nothing(&at(&a, None), std::slice::from_ref(&a)));
         assert!(!brought_nothing(&at(&b, None), std::slice::from_ref(&a)));

@@ -39,7 +39,7 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
-
+use agent::jobs::Jobs;
 use host::cluster::Join;
 use tokio::runtime::Handle;
 use zend_tools::executor::Executor;
@@ -51,8 +51,10 @@ use zend_vfs::{RepoFiles, Workspace, JOBS_DIR};
 
 use crate::access;
 use crate::agent_exec::AgentExecutor;
+use crate::substrate_git::agents as agents_for;
 use crate::tool_guidance;
 use crate::types::ToolMode;
+use crate::workspace::UPLOADS_REPO;
 
 /// The names of the tools projected in `mode` — see
 /// [`crate::tool_def::names_for`].
@@ -786,16 +788,18 @@ impl ToolHost {
         workspace: &Workspace,
         secrets: Arc<Secrets>,
         cluster: Option<&Join>,
-        agent: Option<&Arc<agent::jobs::Jobs>>,
+        agent: Option<&Arc<Jobs>>,
     ) -> anyhow::Result<Self> {
         // Every command and push on an agent — the cluster's, or the one in
         // this process alone (`docs/substrate_git.md` §9): a repository is
         // a store with no working tree, which nothing runs in.
-        let Some(agents) = crate::substrate_git::agents(cluster, agent) else {
-            let repos = workspace
-                .repos()
-                .iter()
-                .any(|r| r.name != crate::workspace::UPLOADS_REPO);
+        let Some(agents) = agents_for(cluster, agent) else {
+            if cluster.is_some() {
+                anyhow::bail!(
+                    "commands and pushes run on the cluster's agents, and its member never started"
+                );
+            }
+            let repos = workspace.repos().iter().any(|r| r.name != UPLOADS_REPO);
             if repos {
                 anyhow::bail!(
                     "commands and pushes run on an agent, and there is none: give the process \

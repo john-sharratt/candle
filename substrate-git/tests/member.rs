@@ -9,19 +9,30 @@ use agent::checkouts::Checkouts;
 use agent::client::Agents;
 use agent::config::AgentConfig;
 use agent::jobs::Jobs;
-use zend_vfs::{CommandPolicy, Priority};
 use candle_conversation::persistence::{SharedSubstrate, SubstratePersistence};
 use candle_conversation::substrate::Substrate;
 use substrate_git::member::{branches, Access, Repos};
+use zend_vfs::{CommandPolicy, Priority};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(dir)
-        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
         .args(args)
         .output()
         .expect("git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
@@ -40,7 +51,17 @@ async fn a_repository_loads_whole_through_an_agent_in_process() {
     let origin = tmp.path().join("origin.git");
     let work = tmp.path().join("work");
     std::fs::create_dir(&work).unwrap();
-    git(tmp.path(), &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+    git(
+        tmp.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            origin.to_str().unwrap(),
+        ],
+    );
     git(&work, &["init", "-q", "-b", "main"]);
     for i in 0..3 {
         std::fs::write(work.join("f"), format!("{i}\n")).unwrap();

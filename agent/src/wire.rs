@@ -73,6 +73,11 @@ pub struct Fetched {
     /// ([`zend_vfs::FetchBundle::partial`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
+    /// For a partial answer, every commit its bundle is cut from: what the
+    /// member names as held when it asks again
+    /// ([`zend_vfs::FetchBundle::heads`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heads: Vec<String>,
 }
 
 impl Fetched {
@@ -85,6 +90,7 @@ impl Fetched {
                 .collect(),
             bundle: f.bundle.as_deref().map(encode_bundle),
             partial: f.partial,
+            heads: f.heads.iter().map(|o| o.to_string()).collect(),
         }
     }
 
@@ -101,6 +107,11 @@ impl Fetched {
             tips,
             bundle: self.bundle.as_deref().map(decode_bundle).transpose()?,
             partial: self.partial,
+            heads: self
+                .heads
+                .iter()
+                .map(|o| oid(o))
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -432,11 +443,28 @@ mod tests {
             tips: BTreeMap::from([("main".to_string(), B.to_string())]),
             bundle: Some(encode_bundle(b"PACK")),
             partial: false,
+            heads: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&answer).unwrap(),
             json!({ "tips": { "main": B }, "bundle": "UEFDSw==" })
         );
+        // A slice names every head its bundle is cut from.
+        let slice = Fetched {
+            partial: true,
+            heads: vec![A.to_string(), B.to_string()],
+            ..answer.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&slice).unwrap(),
+            json!({ "tips": { "main": B }, "bundle": "UEFDSw==", "partial": true, "heads": [A, B] })
+        );
+        let taken_slice = slice.bundle().unwrap();
+        assert_eq!(
+            taken_slice.heads,
+            vec![Oid::parse(A).unwrap(), Oid::parse(B).unwrap()]
+        );
+        assert_eq!(Fetched::of(&taken_slice), slice);
         let taken = answer.bundle().unwrap();
         assert_eq!(
             taken.tips,
@@ -448,6 +476,7 @@ mod tests {
             tips: BTreeMap::from([("main".to_string(), "zz".to_string())]),
             bundle: None,
             partial: false,
+            heads: Vec::new(),
         };
         assert!(bad.bundle().is_err());
     }

@@ -366,7 +366,10 @@ impl Agents {
         AgentRow {
             node: node_in(jobs.checkouts().jobs_dir())
                 .map_or_else(|_| String::new(), |n| format!("{n:016x}")),
-            host: self.member.as_ref().map_or_else(String::new, |m| m.host().to_string()),
+            host: self
+                .member
+                .as_ref()
+                .map_or_else(String::new, |m| m.host().to_string()),
             build: this_build(),
             state: state_name(cap.state).to_string(),
             os: cap.os,

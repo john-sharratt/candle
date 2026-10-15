@@ -145,10 +145,7 @@ mod tests {
         assert_eq!(replica.place_of("a"), "vault-casting/green-room");
         assert!(!replica.sim(|s| s.table_open));
         assert!(replica.sim(|s| s.has_phone("a")));
-        assert_eq!(
-            replica.sim(|s| s.bench.mind().cloned()),
-            Some(own)
-        );
+        assert_eq!(replica.sim(|s| s.bench.mind().cloned()), Some(own));
         assert_eq!(
             replica.sim(sim_records),
             source.sim(sim_records),

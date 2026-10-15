@@ -12,12 +12,11 @@
 //! engine does not implement is refused when the file is read, not discovered
 //! when an operation reaches it.
 
-
 use super::copied::BRIEF_COPIED;
-use crate::mind::files::MindFiles;
 use super::gates::CHECKS;
 use super::target::Kind;
 use crate::engine::workflow::{parse_missions, By, Workflow, PUBLISHED};
+use crate::mind::files::MindFiles;
 
 /// The file a mind configures its table in.
 pub const FILE: &str = "missions.yaml";
@@ -405,6 +404,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(Config::load(&MindFiles::folder(dir.path())), Ok(None));
         std::fs::write(dir.path().join(FILE), TEMPLATE).unwrap();
-        assert!(Config::load(&MindFiles::folder(dir.path())).unwrap().is_some());
+        assert!(Config::load(&MindFiles::folder(dir.path()))
+            .unwrap()
+            .is_some());
     }
 }

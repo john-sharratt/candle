@@ -7,10 +7,11 @@
 //! The log's branches are the store's **record**: `origin`'s tracking refs,
 //! `refs/remotes/origin/<branch>`, which is where zend reads a repository's
 //! branches when it has an origin (`zend_vfs::Repo::record_branches`). A sync
-//! only moves a tracking ref forward, or where the log says `forced`, so a
-//! member's own push — which moves its tracking ref as it lands — is never
-//! rewound before it is published ([`crate::Importer`]). Local branches are
-//! the member's own and never touched.
+//! never moves a tracking ref back to an ancestor of what it holds unless the
+//! log says `forced`, so a member's own push — which moves its tracking ref as
+//! it lands — is never rewound before it is published ([`crate::Importer`]).
+//! A tip on another line is taken: the log reached it through a forced write
+//! this store missed. Local branches are the member's own and never touched.
 //!
 //! Deleting the store loses nothing a member has published: the next sync
 //! rebuilds it from the log.
@@ -53,6 +54,9 @@ pub struct Synced {
     pub taken: usize,
     /// Packs the log names whose blob has not arrived.
     pub waiting: usize,
+    /// Packs whose blob arrived but could not be read or taken, by SHA-256,
+    /// with why. Every branch waits while one is, as for a pack not arrived.
+    pub failed: Vec<(String, String)>,
     /// Packs the log names that the store holds, and how many it names.
     pub held: usize,
     pub listed: usize,
@@ -161,7 +165,8 @@ impl Store {
 
     /// Bring the store up to `records`: take every pack it lacks whose blob has
     /// arrived, then, once every pack the log lists is here, move every record
-    /// branch whose own `needs` are too.
+    /// branch whose own `needs` are too — never back to an ancestor unless
+    /// forced.
     pub fn sync(&self, records: &dyn Records) -> anyhow::Result<Synced> {
         let log = Log::new(records, &self.name)?;
         let mut synced = Synced::default();
@@ -171,20 +176,28 @@ impl Store {
                 held.insert(sha);
                 continue;
             }
-            match log.pack_bytes(&sha)? {
+            // One pack that cannot be read or taken is reported and passed
+            // over, never the sync's failure: every other pack is still
+            // taken, and the next sync tries it again.
+            let taken = log.pack_bytes(&sha).and_then(|bytes| match bytes {
                 Some(bytes) => {
-                    self.repo
-                        .take_pack(&bytes)
-                        .with_context(|| format!("pack {sha} of {}", self.name))?;
+                    self.repo.take_pack(&bytes)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            });
+            match taken {
+                Ok(true) => {
                     synced.taken += 1;
                     held.insert(sha);
                 }
-                None => synced.waiting += 1,
+                Ok(false) => synced.waiting += 1,
+                Err(e) => synced.failed.push((sha, format!("{e:#}"))),
             }
         }
 
         synced.held = held.len();
-        synced.listed = synced.held + synced.waiting;
+        synced.listed = synced.held + synced.waiting + synced.failed.len();
         let current = self.record()?;
         let mut txn = RefTransaction::new();
         for (name, entry) in log.refs()? {
@@ -196,7 +209,7 @@ impl Store {
             // (`crate::publish`) lists only its newest, and its parents may
             // be in any other. A tracking ref never names a commit whose
             // history the store cannot read whole.
-            if synced.waiting > 0 || !entry.needs.iter().all(|sha| held.contains(sha)) {
+            if synced.listed > synced.held || !entry.needs.iter().all(|sha| held.contains(sha)) {
                 synced.behind += 1;
                 continue;
             }
@@ -216,10 +229,16 @@ impl Store {
             let op = match (current.get(&name), &new) {
                 (Some(old), Some(new)) if old == new => continue,
                 (Some(old), Some(new)) => {
-                    let forward = self
+                    // Never back to an ancestor of what the record holds,
+                    // unless forced: that is the log behind this member's own
+                    // push, or a stale write. A tip on another line is taken —
+                    // the log moved there through a forced write this store
+                    // missed, and `forced` belongs to that one entry, not to
+                    // the commits written on top of it since.
+                    let backward = self
                         .repo
-                        .is_ancestor(&Rev::Oid(old.clone()), &Rev::Oid(new.clone()))?;
-                    if !forward && !entry.forced {
+                        .is_ancestor(&Rev::Oid(new.clone()), &Rev::Oid(old.clone()))?;
+                    if backward && !entry.forced {
                         continue;
                     }
                     RefOp::Update {

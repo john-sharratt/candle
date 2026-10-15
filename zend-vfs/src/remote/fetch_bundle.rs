@@ -6,7 +6,7 @@
 //! as its own remote-tracking refs ([`Repo::take_fetch`]), with the same refs
 //! and the same report a fetch from origin itself gives.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::error::GitError;
 use crate::remote::fetch::{FetchSpec, RefUpdate};
@@ -31,8 +31,13 @@ pub struct FetchBundle {
     pub bundle: Option<Vec<u8>>,
     /// A slice of what the asker lacks, not all of it: `tips` name how far it
     /// reaches, and a branch it does not reach is left out. The asker takes
-    /// the objects and asks again, naming those commits as held.
+    /// the objects and asks again, naming [`heads`](Self::heads) as held.
     pub partial: bool,
+    /// For a partial answer, every commit the bundle is cut from: each commit
+    /// of the slice no other commit of it descends from. A history with merges
+    /// has several, and a slice cut from one alone would carry only that one's
+    /// ancestors. Empty for a whole answer.
+    pub heads: Vec<Oid>,
 }
 
 impl Repo {
@@ -83,6 +88,7 @@ impl Repo {
                 tips,
                 bundle: None,
                 partial: false,
+                heads: Vec::new(),
             });
         }
         let held: Vec<String> = have
@@ -91,23 +97,32 @@ impl Repo {
             .map(|oid| format!("^{oid}"))
             .collect();
         let mut partial = false;
+        // What the bundle is cut from: each branch's commit, or for a slice
+        // every head of it.
+        let mut cut_from: Vec<Oid> = tips.values().cloned().collect();
         if let Some(budget) = max_commits {
-            (tips, partial) = self.slice(tips, &held, budget.max(1))?;
+            let heads;
+            (tips, heads, partial) = self.slice(tips, &held, budget.max(1))?;
+            // A whole answer keeps every branch at its commit: cut from those.
+            if partial {
+                cut_from = heads;
+            }
             if tips.is_empty() {
                 return Ok(FetchBundle {
                     tips,
                     bundle: None,
                     partial,
+                    heads: Vec::new(),
                 });
             }
         }
         let _write = self.write_lock();
-        let refs: Vec<String> = (0..tips.len())
+        let refs: Vec<String> = (0..cut_from.len())
             .map(|i| format!("{FETCH_REFS}{i}"))
             .collect();
         let create: String = refs
             .iter()
-            .zip(tips.values())
+            .zip(&cut_from)
             .map(|(r, oid)| format!("update {r} {oid}\n"))
             .collect();
         self.git("update-ref")
@@ -139,6 +154,7 @@ impl Repo {
         Ok(FetchBundle {
             tips,
             bundle,
+            heads: if partial { cut_from } else { Vec::new() },
             partial,
         })
     }
@@ -146,50 +162,73 @@ impl Repo {
     /// `tips` cut to at most `budget` commits beyond `held` (each `^<oid>`),
     /// oldest first: a branch reaching further is cut to the commit at the
     /// budget's end, and one the budget does not reach at all is left out.
-    /// Whether anything was cut.
+    /// With the slice's heads — every commit the bundle is cut from — and
+    /// whether anything was cut.
     fn slice(
         &self,
         tips: BTreeMap<BranchName, Oid>,
         held: &[String],
         mut budget: usize,
-    ) -> Result<(BTreeMap<BranchName, Oid>, bool), GitError> {
+    ) -> Result<(BTreeMap<BranchName, Oid>, Vec<Oid>, bool), GitError> {
         let mut out = BTreeMap::new();
+        let mut heads: Vec<Oid> = Vec::new();
         let mut cut = false;
-        let mut reached: Vec<String> = Vec::new();
         for (branch, tip) in tips {
             if budget == 0 {
                 cut = true;
                 continue;
             }
+            let reached: Vec<String> = heads.iter().map(|h| format!("^{h}")).collect();
             // Parents before children: every ancestor of a commit in this list
             // the asker lacks comes before it, so a prefix is a whole slice.
+            // Each line is a commit and then its parents.
             let listed = self
                 .git("rev-list")
-                .args(["--reverse", "--topo-order"])
+                .args(["--reverse", "--topo-order", "--parents"])
                 .arg(tip.to_string())
                 .args(held)
                 .args(&reached)
                 .read_only()
                 .run_ok()?;
-            let commits: Vec<String> = utf8("rev-list", listed)?
+            let lines: Vec<Vec<String>> = utf8("rev-list", listed)?
                 .lines()
-                .map(str::to_string)
+                .map(|l| l.split(' ').map(str::to_string).collect())
                 .collect();
-            let at = if commits.len() <= budget {
-                budget -= commits.len();
-                tip
-            } else {
-                cut = true;
-                let at = Oid::parse(&commits[budget - 1])?;
-                budget = 0;
-                at
-            };
-            reached.push(format!("^{at}"));
-            out.insert(branch, at);
+            if lines.len() <= budget {
+                budget -= lines.len();
+                if !lines.is_empty() {
+                    heads.push(tip.clone());
+                }
+                out.insert(branch, tip);
+                continue;
+            }
+            cut = true;
+            let taken = &lines[..budget];
+            heads.extend(slice_heads(taken)?);
+            out.insert(branch, Oid::parse(&taken[budget - 1][0])?);
+            budget = 0;
         }
-        Ok((out, cut))
+        Ok((out, heads, cut))
     }
+}
 
+/// The heads of a slice — `rev-list --parents` lines, each a commit and then
+/// its parents: every commit no other commit of the slice names as a parent.
+/// Cut from all of them, a bundle carries the whole slice.
+fn slice_heads(lines: &[Vec<String>]) -> Result<Vec<Oid>, GitError> {
+    let parents: HashSet<&str> = lines
+        .iter()
+        .flat_map(|l| l.iter().skip(1).map(String::as_str))
+        .collect();
+    lines
+        .iter()
+        .map(|l| l[0].as_str())
+        .filter(|c| !parents.contains(c))
+        .map(Oid::parse)
+        .collect()
+}
+
+impl Repo {
     /// Take `fetched` — what `remote` held for `spec` — into this repository:
     /// its objects, then each branch's tracking ref set to its commit, and for
     /// every branch the tracking refs of branches the remote no longer has
@@ -436,26 +475,70 @@ mod tests {
             .fetch_here(&origin(), &FetchSpec::AllBranches)
             .unwrap();
 
+        let slices = carry_in_slices(&agent, &member, 3, &tip);
+        assert_eq!(slices, 2, "7 commits in slices of 3");
+        assert_eq!(member.oid("refs/remotes/origin/main"), tip);
+    }
+
+    /// **A slice of a history with merges carries all of itself**: cut from
+    /// every head of the slice, not one commit, a slice holding two lines of
+    /// work brings both, so each answer carries its whole budget.
+    #[test]
+    fn a_slice_across_a_merge_carries_its_whole_budget() {
+        let (_bare, upstream, agent, member, first) = three();
+        upstream.git(&["checkout", "-q", "-b", "side", first.as_str()]);
+        for i in 0..4 {
+            upstream.write("side.txt", format!("{i}\n").as_bytes());
+            upstream.commit_all(&format!("s{i}"));
+        }
+        upstream.git(&["checkout", "-q", "main"]);
+        for i in 0..4 {
+            upstream.write("main.txt", format!("{i}\n").as_bytes());
+            upstream.commit_all(&format!("m{i}"));
+        }
+        upstream.git(&["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+        upstream.git(&["push", "-q", "origin", "main"]);
+        let tip = upstream.oid("HEAD");
+        agent
+            .repo()
+            .fetch_here(&origin(), &FetchSpec::AllBranches)
+            .unwrap();
+
+        // 10 commits: 3 + 3 + 3 in slices, the last whole answer the 10th.
+        let slices = carry_in_slices(&agent, &member, 3, &tip);
+        assert_eq!(slices, 3, "a slice carried fewer commits than its budget");
+        assert_eq!(member.oid("refs/remotes/origin/main"), tip);
+    }
+
+    /// Carry everything the agent's origin holds to the member in slices of
+    /// `budget` commits, as `AgentFetch` does: each partial answer's objects
+    /// taken and its heads named as held, the last answer taken whole. How
+    /// many partial answers there were.
+    fn carry_in_slices(agent: &TestRepo, member: &TestRepo, budget: usize, tip: &Oid) -> usize {
         let mut have: Vec<Oid> = Vec::new();
         let mut slices = 0;
         let last = loop {
             let fetched = agent
                 .repo()
-                .bundle_for_fetch_sliced(&origin(), &FetchSpec::AllBranches, &have, Some(3))
+                .bundle_for_fetch_sliced(&origin(), &FetchSpec::AllBranches, &have, Some(budget))
                 .unwrap();
             if !fetched.partial {
+                assert!(fetched.heads.is_empty());
                 break fetched;
             }
             slices += 1;
-            assert_ne!(fetched.tips[&main()], tip);
-            member.repo().take_bundle(fetched.bundle.as_ref().unwrap()).unwrap();
-            have.extend(fetched.tips.values().cloned());
+            assert_ne!(&fetched.tips[&main()], tip);
+            assert!(!fetched.heads.is_empty());
+            member
+                .repo()
+                .take_bundle(fetched.bundle.as_ref().unwrap())
+                .unwrap();
+            have.extend(fetched.heads.iter().cloned());
         };
-        assert_eq!(slices, 2, "7 commits in slices of 3");
         member
             .repo()
             .take_fetch(&origin(), &FetchSpec::AllBranches, &last)
             .unwrap();
-        assert_eq!(member.oid("refs/remotes/origin/main"), tip);
+        slices
     }
 }

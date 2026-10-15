@@ -554,7 +554,11 @@ mod tests {
         for who in ["zen", "keeper", "cindy-tan"] {
             std::fs::create_dir_all(mind.join("layers/memory").join(who)).unwrap();
         }
-        let found = sources(&MindFiles::folder(&mind), &layers(&[("memory", Some("memories"))]), &cast());
+        let found = sources(
+            &MindFiles::folder(&mind),
+            &layers(&[("memory", Some("memories"))]),
+            &cast(),
+        );
 
         assert_eq!(
             found.len(),
@@ -576,7 +580,11 @@ mod tests {
         std::fs::create_dir_all(dir.join("zen")).unwrap();
         std::fs::write(dir.join("alliances.md"), "# Alliances").unwrap();
 
-        let found = sources(&MindFiles::folder(&mind), &layers(&[("world", Some("documents"))]), &cast());
+        let found = sources(
+            &MindFiles::folder(&mind),
+            &layers(&[("world", Some("documents"))]),
+            &cast(),
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[0].owner, None,
@@ -591,7 +599,11 @@ mod tests {
         for topic in ["ammo", "armor"] {
             std::fs::create_dir_all(mind.join("layers/world").join(topic)).unwrap();
         }
-        let found = sources(&MindFiles::folder(&mind), &layers(&[("world", Some("documents"))]), &cast());
+        let found = sources(
+            &MindFiles::folder(&mind),
+            &layers(&[("world", Some("documents"))]),
+            &cast(),
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].owner, None);
         let _ = std::fs::remove_dir_all(&mind);
@@ -798,7 +810,12 @@ mod tests {
         let body = "# Hess\n\nHe burned the east granary.\n\n  - indented\n";
         std::fs::write(dir.join("hess.md"), body).unwrap();
 
-        let (out, _) = pending(&MindFiles::folder(&mind), &source("world", PathBuf::from("layers/world")), &Ledger::new()).unwrap();
+        let (out, _) = pending(
+            &MindFiles::folder(&mind),
+            &source("world", PathBuf::from("layers/world")),
+            &Ledger::new(),
+        )
+        .unwrap();
         assert_eq!(out[0].body, body);
         let _ = std::fs::remove_dir_all(&mind);
     }
@@ -811,7 +828,12 @@ mod tests {
         std::fs::write(dir.join("good.md"), "fine").unwrap();
         std::fs::write(dir.join("bad.md"), [0xff, 0xfe, 0x00, 0x9c]).unwrap();
 
-        let (out, report) = pending(&MindFiles::folder(&mind), &source("world", PathBuf::from("layers/world")), &Ledger::new()).unwrap();
+        let (out, report) = pending(
+            &MindFiles::folder(&mind),
+            &source("world", PathBuf::from("layers/world")),
+            &Ledger::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1, "the good document did not survive");
         assert_eq!(report.written, 1);
         assert_eq!(report.failed, 1);

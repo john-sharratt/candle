@@ -106,23 +106,23 @@ use crate::engine::reflect;
 use crate::engine::schema;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
-use crate::engine::watcher::{Ledger, Reconcile};
+use crate::engine::watcher::{is_ingestible, Ledger, Reconcile};
 use crate::engine::witnessed;
 use crate::engine::work;
 use crate::mind::files::MindFiles;
 use crate::mind::Mind;
 use crate::mind_store::{self, MindSource};
-use crate::projection;
-use substrate_git::member::{Access, Repos};
 use crate::model;
 use crate::npcs::{Casting, Npcs};
 use crate::opstore::MindStores;
+use crate::projection;
 use crate::sim::Sim;
 use crate::world::binding::Bindings;
 use crate::world::{Hosted, Worlds};
 use crate::world_state::place_of;
 use agent::client::Agents;
 use agent::fetcher::AgentFetch;
+use agent::jobs::Jobs;
 use agent::pusher::AgentPush;
 use candle_conversation::EngineSource;
 use cluster::member::{ClusterView, Link};
@@ -138,6 +138,7 @@ use host::MODEL;
 use npc_map::schema::NodeKind;
 use npc_map::world::Where;
 use npc_map::{describe, perceive, route};
+use substrate_git::member::{Access, Repos};
 use tokio::sync::watch;
 
 /// Tokens one prefill forward carries when the model can take them — the
@@ -820,12 +821,8 @@ impl Runtime {
     /// edits are (`engine::watcher`).
     fn reconcile_mind(&self, old: &MindFiles, new: &MindFiles) {
         let changes = old.diff(new);
-        let ingestible = |paths: &[String]| {
-            paths
-                .iter()
-                .filter(|p| crate::engine::watcher::is_ingestible(Path::new(p)))
-                .count()
-        };
+        let ingestible =
+            |paths: &[String]| paths.iter().filter(|p| is_ingestible(Path::new(p))).count();
         tracing::info!(
             "mind reloaded: +{} ~{} -{}",
             ingestible(&changes.added),
@@ -3783,7 +3780,7 @@ pub struct LoadPlan {
     pub mind_repo: Option<MindSource>,
     /// The agent in this process, with no cluster: what the mind is read and
     /// written through (`docs/substrate_git.md` §9).
-    pub agent: Option<Arc<agent::jobs::Jobs>>,
+    pub agent: Option<Arc<Jobs>>,
     /// The process's stop, asked for that restart.
     pub stopping: Arc<Stopping>,
 }
@@ -4171,15 +4168,27 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         let handle = rt_handle
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no async runtime for the agents' jobs to run on"))?;
-        let joined = plan
-            .cluster
-            .as_ref()
-            .and_then(|join| Some((join, join.link().member()?)));
-        let (agents, replicator) = match joined {
-            Some((join, member)) => (
-                Agents::new(Arc::clone(member), join.in_process_agent()),
-                member.replicator().cloned(),
-            ),
+        // A member of a cluster never acts as a daemon alone: one whose member
+        // never started, or has no replication to hold the import lease
+        // through, fails here rather than importing beside the others.
+        let (agents, replicator) = match &plan.cluster {
+            Some(join) => {
+                let member = join.link().member().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the mind is kept through the cluster, whose member never started"
+                    )
+                })?;
+                let replicator = member.replicator().cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the mind's import lease is held through the cluster's replication, and \
+                         this member has none"
+                    )
+                })?;
+                (
+                    Agents::new(Arc::clone(member), join.in_process_agent()),
+                    Some(replicator),
+                )
+            }
             None => {
                 let jobs = plan.agent.clone().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -4191,10 +4200,16 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                 (Agents::in_process(jobs), None)
             }
         };
-        rt.ops
-            .set_pusher(AgentPush::shared(agents.clone(), handle.clone(), &source.name));
-        rt.ops
-            .set_fetcher(AgentFetch::shared(agents.clone(), handle.clone(), &source.name));
+        rt.ops.set_pusher(AgentPush::shared(
+            agents.clone(),
+            handle.clone(),
+            &source.name,
+        ));
+        rt.ops.set_fetcher(AgentFetch::shared(
+            agents.clone(),
+            handle.clone(),
+            &source.name,
+        ));
         let access = Access {
             agents,
             runtime: handle,
@@ -7618,7 +7633,9 @@ mod tests {
             .expect("the vault loads");
         let published = Published::folder(mind.clone());
         hosted.with_sim(|s| {
-            s.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&mind))));
+            s.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(
+                &mind,
+            ))));
             s.bench
                 .write(
                     "m1",
@@ -7637,7 +7654,9 @@ mod tests {
             .host(WORLD, Path::new(ROOMS))
             .expect("the vault loads");
         let back = revived.with_sim(|s| {
-            s.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&mind))));
+            s.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(
+                &mind,
+            ))));
             s.bench.read("m1", DOC, &published)
         });
         assert_eq!(back.as_deref(), Ok("# The Count\n\nYou count the fleet.\n"));

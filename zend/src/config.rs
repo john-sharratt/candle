@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent::jobs::Jobs;
 use candle_conversation::models::{Model, StrataTokens};
 use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::EngineSource;
@@ -66,8 +67,7 @@ pub struct DaemonConfig {
     /// The agent in this process — the cluster's, or with no cluster the one
     /// alone — the repositories are read and written through when no cluster
     /// agent is reached (`docs/substrate_git.md` §9).
-
-    pub agent: Option<std::sync::Arc<agent::jobs::Jobs>>,
+    pub agent: Option<Arc<Jobs>>,
     /// Force a whole-store redo-log compaction once during load, after the
     /// substrate reload and before serving. Normally reclaim is incremental and
     /// background (the persistence-thread maintenance pass); this flag forces

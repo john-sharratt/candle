@@ -14,10 +14,9 @@
 //! saying what it is. The terms a draft and what it answers to name are given
 //! with that opening, most named first.
 
-
 use super::answer::unlink;
-use crate::mind::files::MindFiles;
 use super::material::cut;
+use crate::mind::files::MindFiles;
 
 /// Where the world's terms are, under the mind root.
 const WORLD: &str = "layers/world";

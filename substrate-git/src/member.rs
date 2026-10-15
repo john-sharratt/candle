@@ -32,7 +32,7 @@ use zend_vfs::{Oid, RefName, RemoteUrl};
 
 use crate::import::Importer;
 use crate::records::{import_lease, Alone, Lease, Log};
-use crate::store::Store;
+use crate::store::{Store, Synced};
 
 /// How often the follow thread ticks: publishes and syncs, all local.
 pub const TICK: Duration = Duration::from_secs(2);
@@ -192,7 +192,7 @@ impl Repos {
                             && store.imported()?.is_empty()
                             && branches(&self.inner.shared, store.name())?.is_empty();
                         loading.whole = empty || whole(store, &self.inner.shared)?;
-                        loading.error = match t.fetch_error {
+                        loading.error = match failed_packs(&t.synced).or(t.fetch_error) {
                             Some(e) => Some(e),
                             // Not this member's to pull: it waits, as long as
                             // it takes, for the member holding the lease.
@@ -207,10 +207,9 @@ impl Repos {
                 }
             }
             report(&state);
-            if state.iter().all(|l| l.whole) || cancelled() {
+            if state.iter().all(|l| l.whole) || wait_or_stop(LOAD_ROUND, cancelled) {
                 return Ok(());
             }
-            thread::sleep(LOAD_ROUND);
         }
     }
 
@@ -251,6 +250,34 @@ pub fn branches(shared: &SharedSubstrate, repo: &str) -> anyhow::Result<BTreeMap
         .collect()
 }
 
+/// How often a wait looks whether it was asked to stop.
+const STOP_POLL: Duration = Duration::from_millis(100);
+
+/// Wait `period`, ending early when `stopped` says so; whether it did.
+fn wait_or_stop(period: Duration, stopped: &dyn Fn() -> bool) -> bool {
+    let until = Instant::now() + period;
+    loop {
+        if stopped() {
+            return true;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        thread::sleep(left.min(STOP_POLL));
+    }
+}
+
+/// Why a sync's packs could not all be taken — every branch waits on them —
+/// or `None` when none failed.
+fn failed_packs(synced: &Synced) -> Option<String> {
+    let (sha, why) = synced.failed.first()?;
+    Some(format!(
+        "{} pack(s) cannot be taken, and no branch moves until they are; pack {sha}: {why}",
+        synced.failed.len()
+    ))
+}
+
 /// Whether `store` holds every branch the log names, where the log has it.
 fn whole(store: &Store, shared: &SharedSubstrate) -> anyhow::Result<bool> {
     let log = branches(shared, store.name())?;
@@ -259,21 +286,36 @@ fn whole(store: &Store, shared: &SharedSubstrate) -> anyhow::Result<bool> {
 
 fn follow(inner: Arc<Inner>, stopped: Arc<dyn Fn() -> bool + Send + Sync>) {
     let mut last_error: HashMap<String, String> = HashMap::new();
+    // The record as last reported, per repository. A move is any change to it,
+    // whatever made it: a sync taking another member's branch, or this
+    // member's own push landing — which moves the record before the sync
+    // sees the log agree. Empty at first, so the first round reports what
+    // moved between the load and the follower starting.
+    let mut reported: HashMap<String, BTreeMap<RefName, Oid>> = HashMap::new();
     loop {
-        thread::sleep(TICK);
-        if stopped() {
+        if wait_or_stop(TICK, &*stopped) {
             return;
         }
         for (store, importer) in &inner.repos {
+            // Between repositories too: a stop waits for one repository's
+            // round at most, never every repository's.
+            if stopped() {
+                return;
+            }
             let name = store.name().to_string();
             let error = match importer.tick(store, &inner.shared) {
                 Ok(t) => {
-                    if !t.synced.moved.is_empty() {
-                        if let Some(f) = inner.on_change.lock().unwrap().clone() {
-                            f(&name);
+                    match store.record() {
+                        Ok(record) if reported.get(&name) != Some(&record) => {
+                            reported.insert(name.clone(), record);
+                            if let Some(f) = inner.on_change.lock().unwrap().clone() {
+                                f(&name);
+                            }
                         }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(repo = %name, "reading the record: {e}"),
                     }
-                    t.fetch_error
+                    failed_packs(&t.synced).or(t.fetch_error)
                 }
                 Err(e) => Some(format!("{e:#}")),
             };
@@ -290,5 +332,34 @@ fn follow(inner: Arc<Inner>, stopped: Arc<dyn Fn() -> bool + Send + Sync>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A stop ends a wait at once**, and an unasked wait runs its period.
+    #[test]
+    fn a_wait_ends_when_stopped_and_runs_its_period_otherwise() {
+        let started = Instant::now();
+        assert!(wait_or_stop(Duration::from_secs(30), &|| true));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let started = Instant::now();
+        assert!(!wait_or_stop(Duration::from_millis(150), &|| false));
+        assert!(started.elapsed() >= Duration::from_millis(150));
+    }
+
+    /// **A failed pack names itself and how many failed**; none, nothing.
+    #[test]
+    fn failed_packs_are_reported_by_name() {
+        assert_eq!(failed_packs(&Synced::default()), None);
+        let synced = Synced {
+            failed: vec![("ab".into(), "bad".into()), ("cd".into(), "worse".into())],
+            ..Synced::default()
+        };
+        let said = failed_packs(&synced).unwrap();
+        assert!(said.starts_with("2 pack(s) cannot be taken"), "{said}");
+        assert!(said.ends_with("pack ab: bad"), "{said}");
     }
 }

@@ -137,8 +137,12 @@ pub fn pack_checksum(pack: &[u8]) -> Option<String> {
     // 32 under SHA-256. The header says neither, so the caller's format
     // decides; SHA-1 is every repository this layer holds in process.
     let len = 20;
-    (pack.len() >= PACK_HEADER + len)
-        .then(|| pack[pack.len() - len..].iter().map(|b| format!("{b:02x}")).collect())
+    (pack.len() >= PACK_HEADER + len).then(|| {
+        pack[pack.len() - len..]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    })
 }
 
 #[cfg(test)]

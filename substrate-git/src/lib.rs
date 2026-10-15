@@ -30,9 +30,9 @@ pub mod substrate;
 pub use adopt::adopt;
 pub use import::{Imported, Importer};
 pub use publish::{publish, Published};
-pub use records::{Alone, Lease, Log, PackEntry, RefEntry, Records};
-pub use store::{Store, Synced};
 pub use records::import_lease;
+pub use records::{Alone, Lease, Log, PackEntry, Records, RefEntry};
+pub use store::{Store, Synced};
 
 /// The largest pack a member writes: one relocation stripe of the log
 /// (`candle-conversation/src/persistence/stripes.rs`), and 64 replication

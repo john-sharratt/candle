@@ -6,6 +6,7 @@ use crate::classify::classify;
 use crate::error::GitError;
 use crate::runner::Context;
 use crate::types::{BranchName, Oid, RefName, RemoteName, TagName};
+use crate::write::ref_txn::{RefOp, RefTransaction};
 use crate::Repo;
 
 /// What the remote ref must hold for the push to go ahead. There is no
@@ -178,12 +179,68 @@ impl Repo {
     /// Push every spec to `remote` in one atomic push: all refs change or
     /// none do — from this checkout, or from an agent's when the repository
     /// was opened [`pushing through`](Repo::pushing_through) one (§11.5).
+    ///
+    /// Each branch the remote accepted moves its tracking ref here
+    /// ([`Self::follow_push`]), whichever pusher made the push.
     pub fn push(
         &self,
         remote: &RemoteName,
         specs: &[PushSpec],
     ) -> Result<Vec<PushResult>, GitError> {
-        self.pusher.push(self, remote, specs)
+        let results = self.pusher.push(self, remote, specs)?;
+        // The push has landed on the remote: a tracking ref that cannot follow
+        // is reported, never the push's failure — a caller told it failed
+        // would retry under a lease the remote no longer holds. The next
+        // fetch brings the ref up.
+        if let Err(e) = self.follow_push(remote, specs, &results) {
+            tracing::warn!("{remote} took the push; its tracking refs here could not follow: {e}");
+        }
+        Ok(results)
+    }
+
+    /// Move `remote`'s tracking refs to where the accepted branch pushes in
+    /// `results` left the remote, as `git push` does for a push it makes
+    /// itself. An agent's push lands on the remote without touching this
+    /// repository's refs, and a store derived from the substrate publishes
+    /// its tracking refs as the record (`docs/substrate_git.md` §6.2).
+    fn follow_push(
+        &self,
+        remote: &RemoteName,
+        specs: &[PushSpec],
+        results: &[PushResult],
+    ) -> Result<(), GitError> {
+        let mut txn = RefTransaction::new();
+        for result in results.iter().filter(|r| r.accepted()) {
+            let PushTarget::Branch(branch) = &result.target else {
+                continue;
+            };
+            let Some(spec) = specs.iter().find(|s| s.target == result.target) else {
+                continue;
+            };
+            let tracking = remote.tracking(branch);
+            let op = match (&spec.action, self.ref_target(&tracking)?) {
+                (PushAction::Update(new), Some(old)) if old == *new => continue,
+                (PushAction::Update(new), Some(old)) => RefOp::Update {
+                    name: tracking,
+                    new: new.clone(),
+                    old,
+                },
+                (PushAction::Update(new), None) => RefOp::Create {
+                    name: tracking,
+                    new: new.clone(),
+                },
+                (PushAction::Delete, Some(old)) => RefOp::Delete {
+                    name: tracking,
+                    old,
+                },
+                (PushAction::Delete, None) => continue,
+            };
+            txn = txn.push(op);
+        }
+        if !txn.ops().is_empty() {
+            self.update_refs(&txn)?;
+        }
+        Ok(())
     }
 
     /// Push every spec to `remote` from this checkout, in one atomic push. A
@@ -260,8 +317,12 @@ impl Repo {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
     use super::*;
     use crate::remote::fetch::FetchSpec;
+    use crate::remote::pusher::Push;
     use crate::testing::{git_in, TestRepo};
 
     #[test]
@@ -366,6 +427,68 @@ mod tests {
 
     fn spec(source: &Oid, branch: &str, lease: Lease) -> PushSpec {
         PushSpec::branch(source.clone(), BranchName::parse(branch).unwrap(), lease)
+    }
+
+    /// Pushes from another clone, as an agent does: the remote moves, and
+    /// nothing in the repository the push was asked of does.
+    struct FromClone(PathBuf);
+
+    impl Push for FromClone {
+        fn push(
+            &self,
+            _repo: &Repo,
+            remote: &RemoteName,
+            specs: &[PushSpec],
+        ) -> Result<Vec<PushResult>, GitError> {
+            Repo::open(&self.0)?.push_here(remote, specs)
+        }
+    }
+
+    /// **A push made elsewhere moves the tracking ref here**, as `git push`
+    /// does for its own: a store derived from the substrate publishes its
+    /// tracking refs, and an agent's push never touched them. A delete
+    /// removes the tracking ref; a rejected push leaves it.
+    #[test]
+    fn a_push_made_elsewhere_moves_the_tracking_ref() {
+        let s = setup();
+        let agent = TestRepo::init();
+        agent.git(&["fetch", "-q", s.t.path.to_str().unwrap(), "main"]);
+        agent.git(&["remote", "add", "origin", &s.origin.url()]);
+        let repo = Repo::open(&s.t.path)
+            .unwrap()
+            .pushing_through(Arc::new(FromClone(agent.path.clone())));
+        let tracking = s.remote.tracking(&BranchName::parse("zen/work").unwrap());
+
+        repo.push(&s.remote, &[spec(&s.first, "zen/work", Lease::Absent)])
+            .unwrap();
+        assert_eq!(on_origin(&s, "zen/work"), Some(s.first.clone()));
+        assert_eq!(repo.ref_target(&tracking).unwrap(), Some(s.first.clone()));
+
+        repo.push(
+            &s.remote,
+            &[spec(&s.second, "zen/work", Lease::Expect(s.first.clone()))],
+        )
+        .unwrap();
+        assert_eq!(repo.ref_target(&tracking).unwrap(), Some(s.second.clone()));
+
+        let refused = repo
+            .push(
+                &s.remote,
+                &[spec(&s.first, "zen/work", Lease::Expect(s.first.clone()))],
+            )
+            .unwrap();
+        assert!(!refused[0].accepted());
+        assert_eq!(repo.ref_target(&tracking).unwrap(), Some(s.second.clone()));
+
+        repo.push(
+            &s.remote,
+            &[PushSpec::delete_branch(
+                BranchName::parse("zen/work").unwrap(),
+                s.second.clone(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(repo.ref_target(&tracking).unwrap(), None);
     }
 
     /// **A remote branch is deleted only when it holds what the caller

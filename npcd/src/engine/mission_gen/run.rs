@@ -792,7 +792,9 @@ mod tests {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"),
         )
         .unwrap();
-        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&mind))));
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(
+            &mind,
+        ))));
         let stores = MindStores::new(Some(&mind));
         stores.set_quiet(Box::new(|_| true));
         h.set_op_stores(Arc::clone(&stores));

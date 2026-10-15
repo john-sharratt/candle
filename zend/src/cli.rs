@@ -21,6 +21,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::secrets;
+use crate::substrate_git::open_workspace;
 use crate::tenant::ZendTenant;
 
 /// zend's flags.
@@ -83,7 +84,6 @@ pub struct ZendArgs {
     /// Unbounded when omitted.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub max_depth: Option<u32>,
-
 
     /// Force a whole-store redo-log compaction once during load (after the
     /// substrate reload, before serving) instead of leaving reclaim to the
@@ -298,7 +298,7 @@ impl ZendArgs {
         }
         // Every repository read from the substrate, through agents
         // (`docs/substrate_git.md` §7).
-        let workspace = crate::substrate_git::open_workspace(&root)?;
+        let workspace = open_workspace(&root)?;
         let secrets = secrets::load(self.secrets.as_deref())?;
         let ingest_dirs = self.ingest_dirs(&root)?;
         let mut config = DaemonConfig::new(workspace);

@@ -125,7 +125,6 @@ pub fn lore(root: &MindFiles) -> Arc<String> {
     text
 }
 
-
 /// The writers' terms `text` holds that the lore never uses, in the order of
 /// `vocabulary`. The lore is asked about the word itself, article or none: a
 /// lore that ever speaks of stacks has made them the world's.
@@ -170,8 +169,8 @@ fn has_term(text: &str, term: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use super::*;
+    use std::path::Path;
 
     fn words(ws: &[&str]) -> Vec<String> {
         ws.iter().map(|w| w.to_string()).collect()

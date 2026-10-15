@@ -9,7 +9,7 @@
 use anyhow::Context;
 use zend_vfs::{object_count, pack_checksum, Oid, RefName, Repo, Rev};
 
-use crate::records::{Log, PackEntry, RefEntry, Records};
+use crate::records::{Log, PackEntry, Records, RefEntry};
 use crate::MAX_PACK;
 
 /// What [`publish`] wrote.

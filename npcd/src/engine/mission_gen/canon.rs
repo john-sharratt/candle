@@ -70,7 +70,10 @@ mod tests {
     #[test]
     fn the_storyline_is_the_era_it_is_set_in_and_its_neighbours() {
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         let mut ops = Operations::default();
         ops.set_workflows(workflows());
         let life = ops
@@ -113,7 +116,10 @@ mod tests {
     #[test]
     fn a_document_is_worked_in_the_year_it_is_set_in() {
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         assert_eq!(
             set_in("life:keeper", "layers/life/keeper/2786 The Charge.md", &c),
             Some(2786)

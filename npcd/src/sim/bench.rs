@@ -36,8 +36,8 @@
 //! `.md` and `.yaml` documents the mind is actually made of.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

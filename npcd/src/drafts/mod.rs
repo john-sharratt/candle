@@ -37,7 +37,8 @@ use self::disk::Disk;
 use self::overlay::{Drafted, Overlay};
 
 /// Why a write is refused while the mind has not arrived.
-const PENDING: &str = "the mind has not arrived from the substrate yet — nothing can be written until it has";
+const PENDING: &str =
+    "the mind has not arrived from the substrate yet — nothing can be written until it has";
 
 /// One account's view of the mind, and where its writes go.
 pub enum Author {

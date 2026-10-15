@@ -546,7 +546,12 @@ impl Scheduler {
         // beside the pass it is part of.
         let idle: Vec<bool> = substrates
             .iter()
-            .map(|s| !self.slot_conversations.values().any(|c| c.same_substrate(s)))
+            .map(|s| {
+                !self
+                    .slot_conversations
+                    .values()
+                    .any(|c| c.same_substrate(s))
+            })
             .collect();
         let mut idle_us = 0u128;
         let outcome = {

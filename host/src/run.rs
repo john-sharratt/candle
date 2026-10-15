@@ -32,7 +32,6 @@ use crate::cli::HostArgs;
 use crate::cluster::leave::drain_and_send;
 use crate::cluster::upgrade::{setup as upgrade_setup, HostInstaller};
 use crate::cluster::{standalone_agent, watch_readiness, Cluster, Join};
-use agent::config::AgentConfig;
 use crate::ctrl_c::accept_ctrl_c;
 use crate::endpoints::{declared, routes, Shared};
 use crate::guard::{dispatch_table, Routes};
@@ -46,6 +45,7 @@ use crate::stopping::{Ending, Stopping};
 use crate::telemetry::Telemetry;
 use crate::tenant::{Reports, Stop, Tenant, TenantContext, TenantUi};
 use crate::ui::{build_id, COMMON};
+use agent::config::AgentConfig;
 
 /// One forward in this many records its GPU spans in a profiling build (see
 /// `set_gpu_span_period`). At a decode step of ~35 ms that is a sampled forward

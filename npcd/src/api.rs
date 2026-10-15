@@ -1914,7 +1914,11 @@ async fn mind_request(
 fn mind_view(s: &Authored, headers: &HeaderMap) -> Box<dyn Shelf> {
     match caller::admin(s, headers) {
         Some(author) => Box::new(author),
-        None => Box::new(s.mind.published().unwrap_or_else(|| Published::folder(PathBuf::new()))),
+        None => Box::new(
+            s.mind
+                .published()
+                .unwrap_or_else(|| Published::folder(PathBuf::new())),
+        ),
     }
 }
 

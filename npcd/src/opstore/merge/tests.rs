@@ -44,12 +44,11 @@ fn configure(dir: &Path) {
     }
 }
 
-/// The record: `origin` holding `main` with one era, the mind folder and
-/// another member's clone of it, and the stores over the mind.
+/// The record: `origin` holding `main` with one era, the stores over a clone
+/// of it, and another member's clone.
 struct Record {
     _dir: TempDir,
     origin: PathBuf,
-    _mind: PathBuf,
     other: PathBuf,
     stores: Arc<MindStores>,
 }
@@ -83,7 +82,6 @@ fn record() -> Record {
     stores.set_quiet(Box::new(|_| true));
     Record {
         origin: root.join("origin"),
-        _mind: root.join("mind"),
         other: root.join("other"),
         stores,
         _dir: dir,

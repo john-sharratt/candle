@@ -106,9 +106,12 @@ impl Fetch for AgentFetch {
             let Some(bundle) = &fetched.bundle else {
                 return Err(failed(remote, "a partial answer carried no objects".into()));
             };
+            if fetched.heads.is_empty() {
+                return Err(failed(remote, "a partial answer named no heads".into()));
+            }
             repo.take_bundle(bundle)?;
             let mut txn = RefTransaction::new();
-            for tip in fetched.tips.values() {
+            for tip in &fetched.heads {
                 let named = tip.to_string();
                 if have.contains(&named) {
                     continue;

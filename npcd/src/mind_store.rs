@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use candle_conversation::persistence::SharedSubstrate;
 use substrate_git::Store;
-use zend_vfs::{Oid, RefName, Repo};
+use zend_vfs::{BranchName, Oid, RefName, RemoteName, Repo, ORIGIN};
 
 use crate::mind::files::MindFiles;
 
@@ -37,8 +37,10 @@ impl MindSource {
         stores_root(data).join(&self.name)
     }
 
-    fn branch_ref(&self) -> anyhow::Result<RefName> {
-        Ok(RefName::parse(&format!("refs/heads/{}", self.branch))?)
+    /// Where the store holds the branch as the record: `origin`'s tracking
+    /// ref. Refuses a branch name git would not take.
+    fn record_ref(&self) -> anyhow::Result<RefName> {
+        Ok(RemoteName::parse(ORIGIN)?.tracking(&BranchName::parse(&self.branch)?))
     }
 }
 
@@ -65,9 +67,7 @@ pub fn at_record(repo: &Repo, source: &MindSource) -> anyhow::Result<Option<Arc<
 
 /// The branch's commit as the store `repo` holds it as the record.
 pub fn record_tip(repo: &Repo, source: &MindSource) -> anyhow::Result<Option<Oid>> {
-    let tracking = format!("refs/remotes/origin/{}", source.branch);
-    let _ = source.branch_ref()?;
-    Ok(repo.ref_target(&RefName::parse(&tracking)?)?)
+    Ok(repo.ref_target(&source.record_ref()?)?)
 }
 
 #[cfg(test)]
@@ -84,7 +84,11 @@ mod tests {
             .args(args)
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// **A mind adopted into the log reads from the log alone**: another
@@ -103,7 +107,8 @@ mod tests {
         let sub = tmp.path().join("substrate");
         std::fs::create_dir(&sub).unwrap();
         let mut substrate = Substrate::new();
-        let persistence = SubstratePersistence::open_in_with_substrate(&sub, &mut substrate).unwrap();
+        let persistence =
+            SubstratePersistence::open_in_with_substrate(&sub, &mut substrate).unwrap();
         let shared = SharedSubstrate::new(substrate, persistence);
         substrate_git::adopt(&shared, "battle-mind", &Repo::open(&mind).unwrap()).unwrap();
 
@@ -113,7 +118,10 @@ mod tests {
         };
         let data = tmp.path().join("member");
         let files = from_log(&data, &source, &shared).unwrap().unwrap();
-        assert_eq!(files.read("projection.yaml").as_deref(), Some("layers: []\n"));
+        assert_eq!(
+            files.read("projection.yaml").as_deref(),
+            Some("layers: []\n")
+        );
         assert!(files.is_file("layers/eras/first.md"));
         assert!(files.folder_root().is_none());
         // The store checks nothing out: its folder holds no file of the mind.

@@ -115,9 +115,7 @@ impl Ledger {
         }
         let hashes = ledger.hashes.lock().unwrap().len();
         if hashes > 0 {
-            tracing::info!(
-                "ingest ledger: {hashes} document(s) already in the substrate"
-            );
+            tracing::info!("ingest ledger: {hashes} document(s) already in the substrate");
         }
         ledger
     }
@@ -185,7 +183,10 @@ impl Ledger {
 
     /// Forget every document under the mind folder `dir`.
     pub fn forget_under(&self, dir: &Path) {
-        self.hashes.lock().unwrap().retain(|p, _| !p.starts_with(dir));
+        self.hashes
+            .lock()
+            .unwrap()
+            .retain(|p, _| !p.starts_with(dir));
     }
 
     /// The verdict [`Self::reconcile`] would give, **without recording it**.
@@ -446,11 +447,16 @@ mod tests {
         let new = Path::new("layers/world/x.md");
         assert_eq!(
             l.hashes.lock().unwrap().clone(),
-            [(new.to_path_buf(), h)].into_iter().collect::<HashMap<_, _>>()
+            [(new.to_path_buf(), h)]
+                .into_iter()
+                .collect::<HashMap<_, _>>()
         );
         assert_eq!(l.reconcile(new, Some("# X")), Reconcile::Unchanged);
         // Flushed once, so the next open reads mind paths straight off disk.
-        assert_eq!(Ledger::open(&data).inspect(new, Some("# X")), Reconcile::Unchanged);
+        assert_eq!(
+            Ledger::open(&data).inspect(new, Some("# X")),
+            Reconcile::Unchanged
+        );
         let _ = std::fs::remove_dir_all(&data);
     }
 

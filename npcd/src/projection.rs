@@ -215,10 +215,7 @@ impl Source {
     /// declares no such collection folder", because the caller does the same
     /// thing in either case: the collection stays empty.
     pub fn collection_dir(&self, name: &str) -> Option<String> {
-        self.files
-            .as_ref()?
-            .is_dir(name)
-            .then(|| name.to_string())
+        self.files.as_ref()?.is_dir(name).then(|| name.to_string())
     }
 }
 

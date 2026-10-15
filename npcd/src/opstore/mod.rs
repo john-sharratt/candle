@@ -41,9 +41,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use candle_conversation::persistence::SharedSubstrate;
 use store_events::Mirror;
 use tokio::sync::watch;
-use zend_vfs::{
-    fetch_here, here, Fetch, Push, RepoFiles, RepoSpec, Rev, VfsStore, Workspace,
-};
+use zend_vfs::{fetch_here, here, Fetch, Push, RepoFiles, RepoSpec, Rev, VfsStore, Workspace};
 
 use self::log::Substrate;
 use self::merge::Merge;

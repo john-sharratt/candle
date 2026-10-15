@@ -706,8 +706,8 @@ impl Record {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use super::*;
+    use std::path::PathBuf;
 
     fn record() -> Record {
         let mut r = Record::new();
@@ -921,7 +921,9 @@ mod tests {
     fn a_mind_with_no_such_layers_indexes_nothing_and_does_not_fail() {
         let mut r = record();
         let before = r.len();
-        r.index_canon(&crate::mind::files::MindFiles::folder("/no/such/mind/anywhere"));
+        r.index_canon(&crate::mind::files::MindFiles::folder(
+            "/no/such/mind/anywhere",
+        ));
         assert_eq!(r.len(), before);
     }
 

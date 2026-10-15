@@ -31,7 +31,6 @@
 //! guess — which is the habit that caused the problem above. It reports
 //! `chars`, which is a thing it can actually count.
 
-
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -190,17 +189,19 @@ impl Libraries {
     /// from". Joining the mind path here instead would be a second answer to
     /// that question, free to disagree the day the layout changes.
     pub fn load(schema: &Source) -> Self {
-        let open = |name: &'static str, folder: &str| match (&schema.files, schema.collection_dir(folder)) {
-            (Some(files), Some(dir)) => Library::load(name, files, &dir),
-            // No mind, or a mind without that folder. An empty library, which
-            // the console renders as a collection with no sections — the truth,
-            // and visibly different from one it failed to load.
-            _ => Library {
-                name,
-                folder: format!("{folder}/"),
-                sections: Vec::new(),
-            },
-        };
+        let open =
+            |name: &'static str, folder: &str| match (&schema.files, schema.collection_dir(folder))
+            {
+                (Some(files), Some(dir)) => Library::load(name, files, &dir),
+                // No mind, or a mind without that folder. An empty library, which
+                // the console renders as a collection with no sections — the truth,
+                // and visibly different from one it failed to load.
+                _ => Library {
+                    name,
+                    folder: format!("{folder}/"),
+                    sections: Vec::new(),
+                },
+            };
         Self {
             responses: open("response", "responses"),
             moods: open("mood", "moods"),
@@ -419,8 +420,8 @@ pub fn excludes_of(body: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use super::*;
+    use std::path::Path;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};

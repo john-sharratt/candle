@@ -11,13 +11,11 @@ struct Folder(PathBuf);
 
 impl Shelf for Folder {
     fn read(&self, key: &str) -> Option<String> {
-        Published::folder(self.0.clone())
-        .read(key)
+        Published::folder(self.0.clone()).read(key)
     }
 
     fn list(&self, dir: &str) -> BTreeSet<String> {
-        Published::folder(self.0.clone())
-        .list(dir)
+        Published::folder(self.0.clone()).list(dir)
     }
 
     fn commit(&self, changes: &[(String, Option<String>)]) -> Result<(), String> {
@@ -96,7 +94,9 @@ fn uncommitted_work_survives_a_save_and_restore() {
     let (mut fresh, fresh_root, fs) = rooted("restore-fresh");
     fresh.restore(saved);
     assert_eq!(
-        fresh.files().and_then(|f| f.folder_root().map(|p| p.to_path_buf())),
+        fresh
+            .files()
+            .and_then(|f| f.folder_root().map(|p| p.to_path_buf())),
         Some(fresh_root.clone())
     );
     assert_eq!(

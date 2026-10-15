@@ -212,7 +212,8 @@ impl NpcdArgs {
                 if explicit.is_none() {
                     anyhow::bail!("--mind-repo keeps its store under --data: name one");
                 }
-                let bad = name.is_empty() || name.contains(['/', '\\', ':']) || name.starts_with('.');
+                let bad =
+                    name.is_empty() || name.contains(['/', '\\', ':']) || name.starts_with('.');
                 if bad {
                     anyhow::bail!("--mind-repo `{name}` is not a repository's name");
                 }
@@ -448,7 +449,9 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     let mind_for_engine = mind.clone();
     match mind.files() {
         Some(files) => tracing::info!("mind: {files:?}"),
-        None => tracing::info!("mind: none yet — the file editor will report it has nothing to edit"),
+        None => {
+            tracing::info!("mind: none yet — the file editor will report it has nothing to edit")
+        }
     }
 
     // Portraits, as blobs in the substrate; a character naming an image kept
@@ -607,11 +610,7 @@ fn reload_on_move(runtime: &Arc<Runtime>, authored: &Arc<Authored>) {
 /// 3. The engine shuts down: its persistence drains, its writer flushes, the
 ///    substrate detaches — stopping the scheduler when npcd is the engine's
 ///    last attachment — and the writer lock is released.
-async fn stop(
-    runtime: Arc<Runtime>,
-    npcs: Arc<RwLock<Npcs>>,
-    guardian: Option<JoinHandle<()>>,
-) {
+async fn stop(runtime: Arc<Runtime>, npcs: Arc<RwLock<Npcs>>, guardian: Option<JoinHandle<()>>) {
     runtime.stop();
     if let Some(g) = guardian {
         g.abort();
@@ -958,7 +957,10 @@ mod tests {
             .resolve()
             .unwrap();
         let repo = t.repo.clone().unwrap();
-        assert_eq!(repo.store_dir(dir.path()), dir.path().join("git").join("mind"));
+        assert_eq!(
+            repo.store_dir(dir.path()),
+            dir.path().join("git").join("mind")
+        );
         assert_eq!(repo.branch.as_str(), "main");
         assert_eq!(t.schema.dir, None, "a mind in the substrate has no folder");
         assert!(t.schema.files.is_none(), "read once the substrate opens");
@@ -976,7 +978,10 @@ mod tests {
         .unwrap();
         assert_eq!(branch.repo.unwrap().branch.as_str(), "record");
 
-        assert!(Cli::try_parse_from(["npcd", "--mind", "../mind"]).is_err(), "a folder is no mind");
+        assert!(
+            Cli::try_parse_from(["npcd", "--mind", "../mind"]).is_err(),
+            "a folder is no mind"
+        );
         let no_data = parse(&["--mind-repo", "mind"]).resolve();
         assert!(no_data
             .err()

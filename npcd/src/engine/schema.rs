@@ -34,8 +34,8 @@
 //! the kind of divergence that shows up as a layer that gathers on some
 //! documents and not others.
 
-use std::collections::HashMap;
 use crate::mind::files::MindFiles;
+use std::collections::HashMap;
 
 use candle_conversation::models::DialectType;
 use candle_conversation::projection::{Builder, CorruptTurnPolicy, GroupId, LayerId};
@@ -483,8 +483,8 @@ fn boundary_faults(builder: &Builder) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn no_mind_means_no_projection() {
@@ -496,7 +496,8 @@ mod tests {
     #[test]
     fn the_bundled_minds_corrupt_turn_policies_are_its_own() {
         let mind = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let projection = build(Some(&MindFiles::folder(mind)), "world").expect("the bundled mind parses");
+        let projection =
+            build(Some(&MindFiles::folder(mind)), "world").expect("the bundled mind parses");
         let policies = corrupt_turn_policies(&projection.builder);
         let by_name: HashMap<&str, CorruptTurnPolicy> = projection
             .builder
@@ -667,7 +668,8 @@ mod tests {
         if !mind.join("projection.yaml").is_file() {
             return; // no bundled schema in this checkout
         }
-        let p = build(Some(&MindFiles::folder(mind)), "battle-cities").expect("the bundled schema parses");
+        let p = build(Some(&MindFiles::folder(mind)), "battle-cities")
+            .expect("the bundled schema parses");
         assert!(
             !p.builder.schema().layers.is_empty(),
             "a schema with no layers cannot gather, which is the whole point"
@@ -688,7 +690,8 @@ mod tests {
         if !mind.join("projection.yaml").is_file() {
             return; // no bundled schema in this checkout
         }
-        let p = build(Some(&MindFiles::folder(mind)), "battle-cities").expect("the bundled schema parses");
+        let p = build(Some(&MindFiles::folder(mind)), "battle-cities")
+            .expect("the bundled schema parses");
         let b = &p.builder;
         assert_eq!(
             document_target(b, "world"),

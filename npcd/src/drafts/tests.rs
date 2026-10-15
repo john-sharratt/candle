@@ -208,7 +208,6 @@ fn published_drafts_land_and_the_mind_follows() {
     let m = under_git();
     let author = m.author("ab");
     save(&author, "world", WORLDS, "fen", &json!({"name": "Low Fen"})).unwrap();
-    let _moves = m.stores.moves();
 
     let owner = author.owner().unwrap().clone();
     let published = m

@@ -78,7 +78,9 @@ fn at_the_merge_table() -> (TempDir, Hosted, u64) {
         )
         .unwrap()
     });
-    h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&mind))));
+    h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(
+        &mind,
+    ))));
     let stores = MindStores::new(Some(&mind));
     stores.set_quiet(Box::new(|_| true));
     h.set_op_stores(Arc::clone(&stores));
@@ -165,7 +167,10 @@ fn a_publish_lands_and_the_step_may_be_reported() {
         Some(on_origin.trim().to_string())
     );
     assert_eq!(
-        git(&dir.path().join("origin"), &["show", &format!("main:{STORY}")]),
+        git(
+            &dir.path().join("origin"),
+            &["show", &format!("main:{STORY}")]
+        ),
         "# The Gate\n\nA night at the gate.\n",
         "origin holds what was published"
     );

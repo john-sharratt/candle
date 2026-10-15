@@ -17,9 +17,11 @@
 //! read here can leave the mind, and a link is never followed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use zend_vfs::{FileMode, ObjectKind, Oid, Repo, Rev};
+use zend_vfs::{BlobReader, FileMode, ObjectKind, Oid, Repo, Rev};
 
 use crate::mind::path::MindPath;
 use crate::sim::bench::refuse_link;
@@ -28,7 +30,10 @@ use crate::sim::shelf::{Shelf, NO_OPERATION};
 /// One entry of a commit's tree.
 #[derive(Debug, Clone)]
 enum Node {
-    File { oid: Oid, size: u64 },
+    File {
+        oid: Oid,
+        size: u64,
+    },
     /// A symbolic link: never followed, never read as a document.
     Link,
     Dir,
@@ -39,7 +44,7 @@ enum Backing {
     Commit {
         commit: Oid,
         nodes: BTreeMap<String, Node>,
-        blobs: zend_vfs::BlobReader,
+        blobs: BlobReader,
     },
 }
 
@@ -48,8 +53,8 @@ pub struct MindFiles {
     backing: Backing,
 }
 
-impl std::fmt::Debug for MindFiles {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for MindFiles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.backing {
             Backing::Folder(root) => write!(f, "MindFiles(folder {})", root.display()),
             Backing::Commit { commit, nodes, .. } => {
@@ -123,8 +128,26 @@ impl MindFiles {
     pub fn bytes(&self, rel: &str) -> Option<Vec<u8>> {
         match &self.backing {
             Backing::Folder(root) => std::fs::read(folder_file(root, rel)?).ok(),
-            Backing::Commit { nodes, blobs, .. } => match nodes.get(&key(rel)?)? {
-                Node::File { oid, .. } => blobs.read_blob(oid).ok().flatten(),
+            Backing::Commit {
+                commit,
+                nodes,
+                blobs,
+            } => match nodes.get(&key(rel)?)? {
+                // The commit's tree names this document, so a blob that cannot
+                // be read is the store's fault, not an absence: said loudly,
+                // and read as no document by a caller that skips what it
+                // cannot read. A removal is judged by the tree, never by this.
+                Node::File { oid, .. } => match blobs.read_blob(oid) {
+                    Ok(Some(bytes)) => Some(bytes),
+                    Ok(None) => {
+                        tracing::error!(%commit, %oid, "mind: {rel} is in the commit's tree, and its blob is not in the store");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::error!(%commit, %oid, "mind: reading {rel}: {e}");
+                        None
+                    }
+                },
                 Node::Dir | Node::Link => None,
             },
         }
@@ -320,12 +343,12 @@ impl MindFiles {
 /// A snapshot held by something that compares itself: two are equal when they
 /// are the same snapshot. Empty when there is no mind.
 #[derive(Clone, Default)]
-pub struct MindRef(pub Option<std::sync::Arc<MindFiles>>);
+pub struct MindRef(pub Option<Arc<MindFiles>>);
 
 impl PartialEq for MindRef {
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
-            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             (None, None) => true,
             _ => false,
         }
@@ -334,8 +357,8 @@ impl PartialEq for MindRef {
 
 impl Eq for MindRef {}
 
-impl std::fmt::Debug for MindRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for MindRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
             Some(files) => files.fmt(f),
             None => f.write_str("no mind"),
@@ -389,7 +412,11 @@ mod tests {
             .args(args)
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
@@ -401,7 +428,10 @@ mod tests {
     }
 
     fn check(files: &MindFiles) {
-        assert_eq!(files.read("projection.yaml").as_deref(), Some("layers: []\n"));
+        assert_eq!(
+            files.read("projection.yaml").as_deref(),
+            Some("layers: []\n")
+        );
         assert_eq!(files.read("layers/eras/none.md"), None);
         assert!(files.is_file("layers/eras/first.md"));
         assert!(files.is_dir("layers/eras"));

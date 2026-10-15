@@ -125,11 +125,15 @@ last writer wins by version stamp), held in RAM and replicated; a pack's bytes a
   or fewer. candle's 1.3 GB adopts as about 21 packs. A blob already held is not written
   twice.
 - **Entries replicate apart from their blobs.** A branch whose `needs` are not all held
-  waits; a sync takes the pack once its blob arrives.
-- **Only forward.** A writer checks that a new tip descends from the log's before writing
-  it (`substrate-git/src/publish.rs`), and a store only moves a branch forward unless the
-  entry says `forced`. Last-writer-wins can still let a stale write land briefly; the next
-  import tick (2 s) corrects it.
+  waits; a sync takes the pack once its blob arrives. A pack whose blob cannot be read or
+  taken is reported by name (`Synced::failed`, the load's detail, the follower's warning)
+  and passed over; every other pack is still taken, and no branch moves while it stands.
+- **Never backwards.** A writer checks that a new tip descends from the log's before
+  writing it (`substrate-git/src/publish.rs`), and a store never moves a branch back to an
+  ancestor of what it holds unless the entry says `forced`. A tip on another line *is*
+  taken: `forced` belongs to the one entry that rewrote the branch, so a store that missed
+  that entry meets the commits written on top of it as plain entries. Last-writer-wins can
+  still let a stale write land briefly; the next import tick (2 s) corrects it.
 - Conversation branches are not entries. A conversation's branch per repository stays in
   its `ConvState` (`zend/src/conv_branches.rs`).
 
@@ -145,8 +149,8 @@ working tree, so `Repo` opens it unchanged:
 - **The record is `origin`'s tracking refs**, `refs/remotes/origin/<branch>`, which is
   where zend reads a repository's branches when it has an origin
   (`Repo::record_branches`). `Store::sync` takes each pack it lacks once its blob has
-  arrived (`git index-pack`), then moves each record branch whose packs are held,
-  forward only unless `forced`.
+  arrived (`git index-pack`), then moves each record branch whose packs are held, never
+  back to an ancestor unless `forced`.
 - **Two remotes, one URL.** `origin` is the record and where pushes go. `import` is where
   the importer fetches. A fetch therefore never moves what zend reads before the log does.
 - Local branches are the member's own and never touched.
@@ -169,8 +173,15 @@ every 2 s by zend's `substrate-git` thread (`zend/src/substrate_git.rs`). Each t
    30 s): fetches every branch into `import` through `Fetch` (`AgentFetch` with
    `--cluster`), and publishes every branch that moved ahead of the log. A fetch that
    fails (no agent, origin down) is reported and the tick carries on.
-3. **Syncs** the store up to the log. A record branch that moved wakes zend's ingest
-   worker.
+3. **Syncs** the store up to the log. A record that changed since the follower last
+   reported it — a sync, or this member's own push landing — wakes zend's ingest worker
+   and moves npcd's mind.
+
+A first pull of a long history comes through the agent in slices of 256 commits
+(`max_commits`). A slice is a prefix of the history, parents first, and its bundle is cut
+from every *head* of it — each commit of the slice no other commit of it descends from —
+so a slice across merges carries its whole budget. The member names those heads as held
+when it asks again, and keeps them under `refs/substrate-slices/` so a failed run resumes.
 
 ### 5.2 Everyone else
 
@@ -202,9 +213,12 @@ commits in the store, as they built them in a checkout. A commit always lands on
 ### 6.2 Pushing
 
 `Push` is unchanged. The bundle sent to the agent is built from the store, whose record is
-the log's. A push that `origin` accepts moves the store's record as it lands; the
-member's next tick publishes it, packs first. Since the push was compare-and-swap on
-`origin`, the new tip descends from the log's, and only-forward keeps it.
+the log's. A push that `origin` accepts moves the store's record as it lands:
+`Repo::push` moves each accepted branch's tracking ref after whichever pusher made it, as
+`git push` does for its own — an agent's push touches none of the store's refs. The
+member's next tick publishes it, packs first, and its follower reports the move, so the
+publishing member moves onto its own push at once. Since the push was compare-and-swap on
+`origin`, the new tip descends from the log's, and never-backwards keeps it.
 
 ---
 
@@ -303,6 +317,10 @@ one; no daemon reads a checkout, a folder or `origin` of its own.
   `Agents::in_process`). Tenants get it as `TenantContext::agent`.
 - **No agent at all** is a startup error naming the missing `agent:` file, unless the
   workspace names no repository.
+- **A member never acts alone.** With `--cluster`, a member whose cluster member has not
+  started, or has no replication to hold the import lease through, fails its load; it
+  never falls back to the in-process agent and the `Alone` lease, which would import
+  beside the other members.
 
 So zend has no checkout mode: every repository `workspace.yaml` names is read from its
 store, and `origin_watch` is gone. npcd has no `--mind <folder>`: the mind is
@@ -334,7 +352,7 @@ fixtures only; nothing in a daemon builds one.
 - The derived store, until stage 4.
 - About 1.7 GB of packs across the three repositories in every substrate, growing with
   history, and in a new member's catch-up.
-- Only-forward branches, and the two-look force-push rule (§5.3).
+- Never-backwards branches, and the two-look force-push rule (§5.3).
 
 ---
 

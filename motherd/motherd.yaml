@@ -39,9 +39,10 @@ zend:
   working_dir: ..
   max_depth: 3
 
-# npcd: its mind is the repository the agents hold as `battle-mind`, mirrored
-# under its data folder and reached through them only (§10.3); the substrate
-# and accounts live beside the mirror.
+# npcd: its mind is the repository the agents hold as `battle-mind`, read from
+# the substrate at the commit the log names (docs/substrate_git.md §8) and
+# reached through the agents only. The substrate, the accounts and the mind's
+# object store (`git/battle-mind`) live in the data folder.
 npcd:
   mind_repo: battle-mind
   data: ../npcd-data

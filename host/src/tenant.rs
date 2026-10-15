@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent::jobs::Jobs;
 use candle_conversation::projection::Conversation;
 use candle_conversation::{Capabilities, EngineSource};
 use futures::future::BoxFuture;
@@ -73,7 +74,7 @@ pub struct TenantContext {
     /// The agent in this process — the cluster's, or with no cluster the agent
     /// file's alone: what a tenant's repositories are read and written through
     /// (`docs/substrate_git.md` §9). `None` with no `agent:` file.
-    pub agent: Option<Arc<agent::jobs::Jobs>>,
+    pub agent: Option<Arc<Jobs>>,
     /// Where the tenant says what it is doing until [`Tenant::start`]
     /// returns — what the loading page shows of it meanwhile (`crate::boot`).
     pub starting: Arc<StartLine>,

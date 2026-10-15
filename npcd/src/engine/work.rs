@@ -2168,7 +2168,9 @@ mod tests {
         .unwrap();
 
         let h = vault();
-        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&root))));
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(
+            &root,
+        ))));
         on_operation(&h, &root);
         (h, root)
     }
@@ -2437,7 +2439,10 @@ mod tests {
         });
         // Each Maker step set on the table as the engine's loop sets it.
         let put_up = || {
-            let corpus = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(&root)), "creators-vault");
+            let corpus = Corpus::read(
+                &std::sync::Arc::new(crate::mind::files::MindFiles::folder(&root)),
+                "creators-vault",
+            );
             h.with_sim(|s| {
                 let ops = s.missions.operations();
                 let offer = ops.offer(id).unwrap();
@@ -3236,7 +3241,9 @@ mod tests {
             "# the fourth era\n\nQuiet, and then not.\n",
         )
         .unwrap();
-        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&root))));
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(
+            &root,
+        ))));
 
         h.sim(|s| {
             let names: Vec<&str> = s.record.iter().map(|i| i.name.as_str()).collect();
@@ -3393,7 +3400,9 @@ mod tests {
         // The record already names the courier and the eastern flats (the vault
         // seed); the world/ layers are made on the first commit into them.
         let h = vault();
-        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&root))));
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(
+            &root,
+        ))));
         on_operation(&h, &root);
         (h, root)
     }
@@ -3689,7 +3698,9 @@ mod tests {
         )
         .unwrap();
         // Re-index off the disk so the record adopts both documents.
-        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(&root))));
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(
+            &root,
+        ))));
         h.sim(|s| {
             assert_eq!(
                 s.record.path_of("the eastern flats").as_deref(),

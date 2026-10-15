@@ -477,7 +477,10 @@ mod tests {
             ("faults", ParamType::Array, 0, Some(FAULTS_MOST))
         );
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         let told = serde_json::json!({
             "quote": "We were given the plan.", "fault": "It is told, not shown."
         });
@@ -509,7 +512,10 @@ mod tests {
     #[test]
     fn a_runaway_event_is_kept_to_its_sentence() {
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         let runaway = format!("{EVENT} {}", "datethe is ".repeat(60));
         let r = check(
             &call(serde_json::json!({
@@ -533,7 +539,10 @@ mod tests {
     #[test]
     fn a_draft_in_which_nothing_happens_is_not_sound() {
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         let read = |event: &str, verdict: &str, strict: bool| {
             check(
                 &call(serde_json::json!({
@@ -577,7 +586,10 @@ mod tests {
     #[test]
     fn a_reading_is_checked_against_the_draft() {
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         let r = |checked: &str, faults: &str, verdict: &str| {
             check(
                 &call(serde_json::json!({
@@ -697,7 +709,10 @@ mod tests {
     #[test]
     fn what_a_review_reads_beside_the_document() {
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         let mut ops = Operations::default();
         ops.set_workflows(workflows());
         let id = ops

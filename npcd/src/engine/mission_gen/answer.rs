@@ -1232,7 +1232,10 @@ mod tests {
 
     fn keeper() -> (tempfile::TempDir, Corpus, Target) {
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         let t = next(Kind::LifeEvent, &c, &|k, _| k == "life:kaelor", 0).unwrap();
         (dir, c, t)
     }
@@ -1414,7 +1417,10 @@ mod tests {
     #[test]
     fn a_correction_must_quote_both_documents_exactly() {
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         let t = next(Kind::Contradiction, &c, &|_, _| false, 0).unwrap();
         let correction = |qa: &str, wrong: &str| {
             call(
@@ -1516,7 +1522,10 @@ mod tests {
         ] {
             std::fs::write(dir.path().join("layers/stories").join(file), text).unwrap();
         }
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         assert_eq!(taken_names(&c), ["Kaelen"]);
         assert_eq!(reused_names(&c, "Kaelen, a gunner; Keeper"), ["Kaelen"]);
         assert!(reused_names(&c, "Orsolya Fenn, a clerk; Keeper").is_empty());
@@ -1541,7 +1550,10 @@ mod tests {
     #[test]
     fn a_story_quotes_its_era_and_is_new() {
         let dir = mind();
-        let c = Corpus::read(&std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())), "test");
+        let c = Corpus::read(
+            &std::sync::Arc::new(crate::mind::files::MindFiles::folder(dir.path())),
+            "test",
+        );
         let t = next(Kind::Gap, &c, &|k, _| k != "era:layers/eras/the-fall.md", 0).unwrap();
         let story = |title: &str, agrees: &str| {
             call(
