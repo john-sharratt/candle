@@ -42,7 +42,7 @@ use crate::auth::forwarded::identify;
 use crate::auth::{Auth, Gateways};
 use crate::cluster::peers::dial_all;
 use crate::cluster::route::{self, Routed};
-use crate::cluster::{endpoint, page, ClusterPeer, Gateway, MemberOrigin};
+use crate::cluster::{endpoint, page, stamp_served_by, ClusterPeer, Gateway, MemberOrigin};
 use crate::compress;
 use crate::config::{Config, Site, Upstream};
 use crate::content::{self, Roots};
@@ -283,6 +283,21 @@ impl Builder {
             // APIs, sign-in, error pages — and compresses whatever arrived
             // uncompressed. See `compress`.
             .layer(middleware::from_fn(compress::layer));
+        // A gateway names itself on what it answers alone — its pages, an
+        // aggregate, a refusal; a member's answer keeps the member's name.
+        let router = match cluster.as_ref().and_then(|gw| gw.served_by()) {
+            Some(name) => router.layer(middleware::from_fn(
+                move |req: Request, next: middleware::Next| {
+                    let name = name.clone();
+                    async move {
+                        let mut res = next.run(req).await;
+                        stamp_served_by(&mut res, Some(name));
+                        res
+                    }
+                },
+            )),
+            None => router,
+        };
         let router = match wrap {
             Some(wrap) => wrap(router),
             None => router,

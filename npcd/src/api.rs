@@ -91,9 +91,10 @@ pub struct Authored {
     /// startup and there is deliberately no way to change it while running —
     /// see [`web::auth::role`].
     pub roles: Roles,
-    /// The response and mood libraries, read once from the mind. No lock: they
-    /// are authored in files and nothing here writes them.
-    pub libraries: Libraries,
+    /// The response and mood libraries, read from the mind at start — and once
+    /// more when a mind pending at start arrives, which is the only write.
+    /// Behind an `Arc` so a reader clones the handle out and lets the lock go.
+    libraries: SyncRwLock<Arc<Libraries>>,
     /// Uploaded portraits, on disk. No lock: it holds a path, and the writes
     /// are content-addressed and atomic — two uploads of the same image are the
     /// same file, and of different ones are different names.
@@ -168,7 +169,7 @@ impl Authored {
             accounts: RwLock::new(accounts),
             npcs: Arc::new(RwLock::new(npcs)),
             roles,
-            libraries,
+            libraries: SyncRwLock::new(Arc::new(libraries)),
             images,
             personality_portraits: SyncRwLock::new(personality_portraits),
             mind,
@@ -192,6 +193,17 @@ impl Authored {
         if !author.keeps_drafts() {
             self.reload_authored().await;
         }
+    }
+
+    /// The response and mood libraries as they stand.
+    pub fn libraries(&self) -> Arc<Libraries> {
+        Arc::clone(&self.libraries.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Take `libraries` in place of the ones read at start: the mind they
+    /// were read from had not arrived then.
+    pub fn set_libraries(&self, libraries: Libraries) {
+        *self.libraries.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(libraries);
     }
 
     /// Read the worlds and personalities again from the folder, as it stands
@@ -1938,9 +1950,10 @@ fn category_lookup(s: &Arc<Authored>) -> impl Fn(&MindPath) -> Option<String> + 
             return None;
         }
         let id = name.strip_suffix(".yaml")?;
+        let libraries = s.libraries();
         let library = match area {
-            "responses" => &s.libraries.responses,
-            "moods" => &s.libraries.moods,
+            "responses" => &libraries.responses,
+            "moods" => &libraries.moods,
             _ => return None,
         };
         library
@@ -2532,7 +2545,7 @@ async fn world_collections(
     else {
         return err(StatusCode::NOT_FOUND, "world_not_found", &wid);
     };
-    Json(s.libraries.world_wire(&excludes)).into_response()
+    Json(s.libraries().world_wire(&excludes)).into_response()
 }
 
 /// What a personality contributes to a projection, from its own document.

@@ -38,6 +38,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use axum::http::HeaderValue;
+use axum::response::Response;
 use axum::Router;
 use cluster::consensus::votes::{FileJournal, DEFAULT_SIZE};
 use cluster::gateway::upgrades::UpgradeConfig;
@@ -53,6 +55,32 @@ use crate::config::{Cluster as ClusterConfig, Config};
 
 /// How often the upgrades are judged: verdicts due, members left behind.
 const UPGRADE_TICK: Duration = Duration::from_secs(1);
+
+/// The header naming who answered a request: `<host> <node>`, the machine's
+/// name and its 16-hex node, the node as `x-tokera-holder` writes one. A
+/// member sets it on everything its router answers; a gateway passes a
+/// member's through untouched and names itself only on what it answers alone.
+pub const SERVED_BY_HEADER: &str = "x-served-by";
+
+/// The [`SERVED_BY_HEADER`] value for `host`, and `node` once there is one.
+pub fn served_by(host: &str, node: Option<u64>) -> Option<HeaderValue> {
+    let value = match node {
+        Some(node) => format!("{host} {node:016x}"),
+        None => host.to_string(),
+    };
+    HeaderValue::from_str(&value).ok()
+}
+
+/// Name `value` as who served `res`, unless whoever answered it already did:
+/// a response that came back through a gateway keeps the member's name.
+pub fn stamp_served_by(res: &mut Response, value: Option<HeaderValue>) {
+    if res.headers().contains_key(SERVED_BY_HEADER) {
+        return;
+    }
+    if let Some(v) = value {
+        res.headers_mut().insert(SERVED_BY_HEADER, v);
+    }
+}
 
 /// A request a gateway sent this member over its socket (§5.1): set by the
 /// member's host on every request it serves off a cluster stream. Its
@@ -75,6 +103,8 @@ pub struct MemberOrigin {
 
 pub struct Gateway {
     pub hub: Arc<Hub>,
+    /// This gateway's node: its peering's, or the one kept beside its key.
+    pub node: u64,
     /// The peer gateways answering the same names (§13.4), when
     /// `cluster.peers` names any.
     pub peering: Option<Arc<Peering>>,
@@ -126,6 +156,7 @@ impl Gateway {
         )?;
         Ok(Arc::new(Gateway {
             hub,
+            node: voter,
             peering,
             acme: OnceLock::new(),
             sites: groups(cfg).into_iter().map(|g| g.site).collect(),
@@ -172,6 +203,7 @@ impl Gateway {
     pub fn with_hub(hub: Arc<Hub>) -> Arc<Gateway> {
         Arc::new(Gateway {
             hub,
+            node: 0,
             peering: None,
             acme: OnceLock::new(),
             sites: Vec::new(),
@@ -187,5 +219,35 @@ impl Gateway {
 
     fn router(&self) -> Option<Router> {
         self.router.get().cloned()
+    }
+
+    /// The [`SERVED_BY_HEADER`] this gateway puts on what it answers itself.
+    pub fn served_by(&self) -> Option<HeaderValue> {
+        served_by(self.hub.name(), Some(self.node))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn served_by_names_the_machine_and_its_node() {
+        assert_eq!(
+            served_by("whiteworld", Some(0x31f6_62ee_0edb_ae23)).unwrap(),
+            "whiteworld 31f662ee0edbae23"
+        );
+        assert_eq!(served_by("whiteworld", None).unwrap(), "whiteworld");
+    }
+
+    #[test]
+    fn a_members_name_is_kept_over_the_gateways() {
+        let mut res = Response::new(axum::body::Body::empty());
+        stamp_served_by(&mut res, served_by("blackworld", Some(1)));
+        stamp_served_by(&mut res, served_by("dmz", Some(2)));
+        assert_eq!(
+            res.headers()[SERVED_BY_HEADER],
+            "blackworld 0000000000000001"
+        );
     }
 }

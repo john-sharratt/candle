@@ -45,9 +45,10 @@ use crate::effector::token::Tokens;
 use crate::engine;
 use crate::engine::guardian::{GuardianBuilder, GuardianConfig, RuntimeProbe};
 use crate::engine::identity::Authored as Identities;
-use crate::engine::runtime::{start as start_engine, LoadPlan, Runtime};
+use crate::engine::runtime::{start as start_engine, Arrived, LoadPlan, Runtime};
 use crate::identity::log_identity;
 use crate::images::Images;
+use crate::mind::files::MindFiles;
 use crate::mind::{Mind, MindRepo};
 use crate::mind_store::{self, MindSource};
 use crate::npcs::{Casting, Npcs};
@@ -369,27 +370,23 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // The mind. A repository the agents hold is read from the substrate, now
     // that it is open: the files of the commit the log names for its branch
     // (`docs/substrate_git.md` §8). One the log does not hold yet is pending:
-    // the load pulls it through an agent once joined, and the process
-    // restarts onto it. A `--mind` folder is read as it stands.
+    // the load pulls it through an agent once joined, and takes it in before
+    // it builds anything from it — what is read from it here is read again
+    // then (`read_again_on_arrival`). A `--mind` folder is read as it stands.
     let (schema, mind) = match &repo {
         Some(source) => {
             let (db, files) = mind_store::from_log(source, &npcs.substrate())?;
             match files {
                 Some(files) => {
-                    let label = format!(
-                        "{}@{} ({})",
-                        source.name,
-                        files.commit().map(|c| c.to_string()).unwrap_or_default(),
-                        source.branch
-                    );
+                    let label = mind_label(source, &files);
                     let schema = projection::Source::from_files(Arc::clone(&files), label)?;
                     (schema, Mind::of(files, MindRepo::Substrate(db)))
                 }
                 None => {
                     tracing::warn!(
                         "mind: the substrate holds no `{}` on `{}` yet — starting with no mind; \
-                         once joined it is pulled through an agent and the process restarts \
-                         onto it",
+                         once joined it is pulled through an agent and taken in before the \
+                         engine builds anything from it",
                         source.name,
                         source.branch
                     );
@@ -403,6 +400,9 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         }
     };
     tracing::info!("projection schema: {}", schema.label);
+    // Read before the mind moves into the API state: whether it still has to
+    // arrive, for the hook that takes it in (below).
+    let mind_pending = !mind.is_present();
 
     // Authored content — from the MIND when there is one, from the data
     // directory otherwise. Worlds and personalities are written by a person;
@@ -424,24 +424,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         personalities.len(),
     );
 
-    // The response and mood libraries, beside the schema. Read once: they are
-    // ingested untagged and shared by every world.
-    let libraries = Libraries::load(&schema);
-    tracing::info!(
-        "libraries: {} responses ({} with examples), {} moods ({} with examples)",
-        libraries.responses.len(),
-        libraries.responses.with_examples(),
-        libraries.moods.len(),
-        libraries.moods.with_examples(),
-    );
-    // The registers a character may say it is in, captured once: the list is
-    // compiled into a decoding grammar.
-    let feelings: Vec<String> = libraries
-        .moods
-        .sections
-        .iter()
-        .map(|s| s.id.clone())
-        .collect();
+    let (libraries, feelings) = read_libraries(&schema);
 
     // The editor and the engine read the same schema through the same `Mind`.
     // Only a `--mind` folder is watched: a mind read from the substrate moves
@@ -506,6 +489,11 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
 
     install_sinks(&runtime, &authored, feelings);
     reload_on_move(&runtime, &authored);
+    // Only for a mind still pending: the hook holds the authored state, which
+    // holds the runtime, and the load takes it back out once it has run.
+    if let Some(source) = repo.as_ref().filter(|_| mind_pending) {
+        read_again_on_arrival(&runtime, &authored, source.clone(), authored_dir.clone());
+    }
     // A member follows each world it hosts until its lease says otherwise
     // (`docs/replicated_substrate.md` §9.2): known before the first is hosted.
     if ctx.cluster.is_some() {
@@ -596,6 +584,100 @@ fn reload_on_move(runtime: &Arc<Runtime>, authored: &Arc<Authored>) {
             tracing::info!("authored: read again after the mind moved to a newer record");
         }
     });
+}
+
+/// Read again what was read from a mind pending at start, once the load has
+/// taken it in (`engine::runtime::MindArrived`): the worlds and personalities
+/// with their portraits, the libraries and the registers, the worlds to host
+/// — and the cast, caught up from the cluster meanwhile, with who everybody
+/// is, handed back to the load for the identities it installs and the
+/// characters it wakes.
+fn read_again_on_arrival(
+    runtime: &Arc<Runtime>,
+    authored: &Arc<Authored>,
+    source: MindSource,
+    authored_dir: PathBuf,
+) {
+    let state = authored.clone();
+    runtime.set_mind_arrived(Arc::new(move || -> BoxFuture<'static, anyhow::Result<Arrived>> {
+        let (state, source, authored_dir) = (state.clone(), source.clone(), authored_dir.clone());
+        Box::pin(async move {
+            state.reload_authored().await;
+            if let Some(files) = state.mind.files() {
+                let label = mind_label(&source, &files);
+                // Fatal here as it is at start: a schema that cannot be read
+                // leaves characters with no registers to decode under.
+                let schema = projection::Source::from_files(files, label).map_err(|e| {
+                    anyhow::anyhow!("mind: the schema that arrived could not be read: {e}")
+                })?;
+                tracing::info!("projection schema: {}", schema.label);
+                let (libraries, feelings) = read_libraries(&schema);
+                state.set_libraries(libraries);
+                if let Some(rt) = &state.runtime {
+                    rt.set_feelings(feelings);
+                }
+            }
+            if let Some(rt) = &state.runtime {
+                host_worlds(rt, &state, &authored_dir).await;
+            }
+            let cast = {
+                let mut npcs = state.npcs.write().await;
+                npcs.refresh();
+                npcs.cast()
+            };
+            let characters: Vec<String> = state
+                .personalities
+                .read()
+                .await
+                .iter()
+                .map(|r| r.id.clone())
+                .collect();
+            let worlds = state.worlds.read().await.len();
+            tracing::info!(
+                "authored content, read again: {worlds} worlds, {} personalities, {} character(s) \
+                 to wake",
+                characters.len(),
+                cast.len(),
+            );
+            Ok(Arrived {
+                cast,
+                characters,
+                authored: identities(&state).await,
+            })
+        })
+    }));
+}
+
+/// What a mind read from the substrate is called in the log: its repository,
+/// commit and branch.
+fn mind_label(source: &MindSource, files: &MindFiles) -> String {
+    format!(
+        "{}@{} ({})",
+        source.name,
+        files.commit().map(|c| c.to_string()).unwrap_or_default(),
+        source.branch
+    )
+}
+
+/// The response and mood libraries, beside the schema — ingested untagged
+/// and shared by every world — and the registers a character may say it is
+/// in, the moods' ids, which a turn's decoding grammar is built over.
+fn read_libraries(schema: &projection::Source) -> (Libraries, Vec<String>) {
+    let libraries = Libraries::load(schema);
+    tracing::info!(
+        "libraries: {} responses ({} with examples), {} moods ({} with examples)",
+        libraries.responses.len(),
+        libraries.responses.with_examples(),
+        libraries.moods.len(),
+        libraries.moods.with_examples(),
+    );
+    let feelings = libraries
+        .moods
+        .sections
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    (libraries, feelings)
 }
 
 /// Stop npcd, in the order that loses nothing.
@@ -1000,6 +1082,50 @@ mod tests {
         let plain = parse(&["--data", "unmade-npcd-data"]).resolve().unwrap();
         assert_eq!(plain.data, here.join("unmade-npcd-data"));
         assert!(!here.join("unmade-npcd-data").exists());
+    }
+
+    /// **A mind that arrives after start is read again in place**, not
+    /// restarted onto: the libraries and registers read from no mind are
+    /// empty, and those read from the one that arrived take their place in
+    /// the state the routes answer from.
+    #[test]
+    fn libraries_read_from_a_mind_that_arrived_replace_the_empty_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mind = dir.path().join("mind");
+        std::fs::create_dir_all(mind.join("moods")).unwrap();
+        std::fs::write(mind.join(projection::SCHEMA_FILE), "layers: []\n").unwrap();
+        std::fs::write(mind.join("moods").join("calm.yaml"), "template: Calm.\n").unwrap();
+
+        let (none, felt) = read_libraries(&projection::Source::bundled());
+        assert_eq!(none.moods.len(), 0);
+        assert!(felt.is_empty(), "no mind, no registers");
+
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let npcs = Npcs::load(&data).unwrap();
+        let accounts = Accounts::open(npcs.substrate(), &data.join("accounts")).unwrap();
+        let (images, _) = Images::open(npcs.substrate(), &data.join("images")).unwrap();
+        let authored = Authored::new(
+            Registry::load("world", data.join(WORLDS)).unwrap(),
+            Registry::load("personality", data.join(PERSONALITIES)).unwrap(),
+            accounts,
+            npcs,
+            Roles::default(),
+            none,
+            Mind::new(None),
+            images,
+            Default::default(),
+        );
+        assert_eq!(authored.libraries().moods.len(), 0);
+
+        let files = Arc::new(MindFiles::folder(&mind));
+        let schema = projection::Source::from_files(files, "arrived".to_string()).unwrap();
+        let (libraries, feelings) = read_libraries(&schema);
+        assert_eq!(feelings, ["calm"]);
+        authored.set_libraries(libraries);
+        let now = authored.libraries();
+        assert_eq!(now.moods.len(), 1);
+        assert_eq!(now.moods.sections[0].id, "calm");
     }
 
     /// npcd needs what zend needs of the model, and the prescribed one has it.

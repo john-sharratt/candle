@@ -16,10 +16,15 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::middleware;
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderValue};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::Router;
 use serde_json::{json, Value};
+use sysinfo::System;
 use web::auth::Gateways;
+use web::cluster::{served_by, stamp_served_by};
 use web::tls::{self_signed, Entrance};
 use web::{Builder, Config, Roots};
 
@@ -84,6 +89,38 @@ pub fn site_table(
     Config::from_yaml(&serde_yaml::to_string(&doc)?, base)
 }
 
+/// Whom this host names on `x-served-by`: the machine, and the node of the app
+/// whose site a request's `Host` names, once that app has joined a cluster.
+struct ServedBy {
+    host: String,
+    sites: Arc<Config>,
+    cluster: Option<Arc<Cluster>>,
+}
+
+impl ServedBy {
+    fn name(&self, req_host: Option<&str>) -> Option<HeaderValue> {
+        let node = self.cluster.as_ref().and_then(|c| {
+            let app = &self.sites.site_for(req_host).name;
+            c.link(app)?.member().map(|m| m.node())
+        });
+        served_by(&self.host, node)
+    }
+}
+
+/// Name this member on everything its router answers — its own listener's and
+/// a gateway's requests alike. An answer that came back down from a gateway
+/// already names whoever served it, and keeps that name.
+async fn name_server(State(s): State<Arc<ServedBy>>, req: Request, next: Next) -> Response {
+    let name = s.name(
+        req.headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok()),
+    );
+    let mut res = next.run(req).await;
+    stamp_served_by(&mut res, name);
+    res
+}
+
 /// The server for `uis` answering `router`, as `listen` describes: the site
 /// table, the trusted peers, and `--local-signin`. Paths resolve against the
 /// working directory.
@@ -117,19 +154,36 @@ pub fn builder(
             .content(name, Roots::embedded(&[ui.content]))
             .local_api(name, router.clone());
     }
-    if let Some(cluster) = cluster {
-        let listener = Arc::new(Listener {
-            cluster: cluster.clone(),
-            sites: Arc::new(site_table(uis, addr, &current_dir()?)?),
-            gateways,
-            local_signin,
-        });
-        builder = builder.wrap(Box::new(move |router: Router| {
-            let router = router.layer(middleware::from_fn_with_state(listener, listener::layer));
-            cluster.set_router(router.clone());
-            router
-        }));
-    }
+    let sites = Arc::new(site_table(uis, addr, &current_dir()?)?);
+    let served = Arc::new(ServedBy {
+        host: match &cluster {
+            Some(c) => c.host().to_string(),
+            None => System::host_name().unwrap_or_else(|| listen.bind.to_string()),
+        },
+        sites: sites.clone(),
+        cluster: cluster.clone(),
+    });
+    // Named outside the listener, so a `503` it answers is named too.
+    let named =
+        move |router: Router| router.layer(middleware::from_fn_with_state(served, name_server));
+    builder = match cluster {
+        Some(cluster) => {
+            let listener = Arc::new(Listener {
+                cluster: cluster.clone(),
+                sites,
+                gateways,
+                local_signin,
+            });
+            builder.wrap(Box::new(move |router: Router| {
+                let router =
+                    router.layer(middleware::from_fn_with_state(listener, listener::layer));
+                let router = named(router);
+                cluster.set_router(router.clone());
+                router
+            }))
+        }
+        None => builder.wrap(Box::new(named)),
+    };
     Ok(builder)
 }
 
@@ -364,6 +418,32 @@ mod tests {
             who(&local, "10.0.0.7:1", Some("forged@example.com")).await,
             "anonymous"
         );
+    }
+
+    /// Every answer the assembled server gives names the machine — the API,
+    /// a UI file, a miss — and one already named keeps its name.
+    #[tokio::test]
+    async fn every_answer_names_who_served_it() {
+        let app = assembled(&uis(), Vec::new(), None);
+        let machine = System::host_name().unwrap_or_else(|| "192.168.0.5".to_string());
+        for (host, path) in [
+            ("code.tokera.com", "/v1/who"),
+            ("bot.tokera.com", "/"),
+            ("code.tokera.com", "/v1/nothing-here"),
+        ] {
+            let mut req = Request::get(path)
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                res.headers()[web::cluster::SERVED_BY_HEADER],
+                machine.as_str(),
+                "{host}{path}"
+            );
+        }
     }
 
     /// One tenant is the default whatever it says; two must name exactly one.

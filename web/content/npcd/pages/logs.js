@@ -17,6 +17,11 @@ const COLOR = {
 };
 const MAX = 600;
 
+/* The machine a line came from. Behind a gateway every member's lines arrive on
+ * one socket, each tagged with its `host` (and `member`, host plus short node);
+ * a daemon read directly tags nothing, and the column stays empty. */
+const member = (l) => l.member || l.host || '';
+
 export async function render() {
   const el = h('div', { class: 'page wide' });
 
@@ -47,7 +52,7 @@ export async function render() {
 
   const copyBtn = h('button', { class: 'btn sm ghost' }, 'Copy');
   copyBtn.addEventListener('click', () => copyText(
-    visible().map((l) => `${l.ts} ${l.level} ${l.target} ${l.msg}`).join('\n'), copyBtn));
+    visible().map((l) => `${l.ts} ${l.level} ${member(l)} ${l.target} ${l.msg}`).join('\n'), copyBtn));
 
   const live = h('span', { class: 'chip ok' }, '● live');
   const tally = h('span', { class: 'tiny dim' });
@@ -89,13 +94,14 @@ export async function render() {
   const row = (l) => h('div', { class: 'log-row' },
     h('span', { class: 'ts' }, l.ts),
     h('span', { class: 'lvl', style: 'color:' + (COLOR[l.level] || 'var(--ink-faint)') }, l.level),
+    h('span', { class: 'mbr', title: l.member || '' }, member(l)),
     h('span', { class: 'tgt' }, l.target),
     h('span', { class: 'msg' }, l.msg));
 
   const ring = ringView({ max: MAX, row, host: list, scroller });
 
   const passes = (l) => LEVELS.indexOf(l.level) >= LEVELS.indexOf(minLevel)
-    && (!filter || (l.msg + ' ' + l.target).toLowerCase().includes(filter));
+    && (!filter || (l.msg + ' ' + l.target + ' ' + member(l)).toLowerCase().includes(filter));
   const visible = () => ring.items.filter(passes);
 
   // A filter change is the ONE case that legitimately rebuilds — the set itself

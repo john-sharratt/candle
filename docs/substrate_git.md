@@ -389,8 +389,11 @@ Built in `npcd/src/mind/files.rs` and `npcd/src/mind_store.rs`.
   with the mind pending.
 - After the cluster join, `load_mind` (`engine/runtime.rs`) loads the repository whole
   through `substrate_git::member::Repos`, over the mind's database: pulled through an
-  agent by the lease holder when no member has. A mind that was pending restarts the process onto it, since the
-  schema and the grammar built from it are read once.
+  agent by the lease holder when no member has. A mind that was pending is taken in, in
+  process: the load rebuilds the projection, its policies and the minds over it, and the
+  tenant reads the worlds, personalities, libraries and feelings again
+  (`Runtime::read_again`). Nothing is written under the schema before then, so no restart
+  is needed — in motherd a restart takes zend down with it.
 - Then the repository is followed. When its branch moves, every reader moves to the
   new commit (`Mind::replace`), the worlds and personalities are read again
   (`MindStores::moved`), and the documents added, changed and removed are reported as
@@ -441,7 +444,7 @@ fixtures only; nothing in a daemon builds one.
 | Before | After |
 |---|---|
 | A checkout per repository on every zend member | Nothing on the member; agents keep their own |
-| npcd's mirror, its 60 s follow, and its fetch-then-relaunch first start | Branches and packs in the log; a pending mind pulled once and restarted onto |
+| npcd's mirror, its 60 s follow, and its fetch-then-relaunch first start | Branches and packs in the log; a pending mind pulled once and taken in, in process |
 | Every member probing and fetching `origin` | One importer per repository, holding a lease, fetching every 15 s |
 | Members serving different mind tips for up to 60 s | One tip at each point in the log |
 | A schema that differs between members until each restarts | A restart driven by the branch move that changed it |
@@ -507,7 +510,7 @@ Built:
   becomes a mind path.
 
 Still to run: end to end on `.6` against `.5` — two members agreeing on a mind commit at
-one log point, a pending mind pulled and restarted onto, and a conversation's commits
+one log point, a pending mind pulled and taken in without a restart, and a conversation's commits
 read on another member.
 
 ---

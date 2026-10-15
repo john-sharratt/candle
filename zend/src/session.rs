@@ -1004,6 +1004,23 @@ pub type LastMaintenanceOp = Option<(String, u64)>;
 /// `(segment_count, last_op, compaction_in_progress)`.
 pub type MaintenanceStatus = (usize, LastMaintenanceOp, bool);
 
+/// Whether a stop has ended the load at the boundary after `step` — and if
+/// so, the engine drained here, on the loader thread that owns it, exactly as
+/// the startup-ingest cancel drains it. The caller then returns `Ok(None)`: a
+/// stopped load is a stop, not a failure, and what each step sealed so far is
+/// durable while what it left half-built is found and redone next start (a
+/// calibration case un-archived, an ingest unit uncommitted).
+fn load_stopped(engine: &ConversationEngine, step: &str) -> bool {
+    if !crate::ingest_cancel::cancelled() {
+        return false;
+    }
+    tracing::warn!("shutdown after {step} — draining the engine on the loader thread");
+    if let Err(e) = engine.shutdown() {
+        tracing::error!("shutdown after {step}: drain failed: {e}");
+    }
+    true
+}
+
 impl InferenceState {
     // Every argument is a distinct piece of deployment config read from the CLI
     // / config file at startup, used once here and never carried together
@@ -1429,6 +1446,10 @@ impl InferenceState {
             }
         }
 
+        if load_stopped(&engine, "the substrate reload") {
+            return Ok(None);
+        }
+
         // With `--cluster`, join the gateways now that the substrate — and the
         // node it carries — is open (`docs/replicated_substrate.md` §7.6). A
         // gateway that refuses this build for good leaves the daemon here, on
@@ -1516,6 +1537,12 @@ impl InferenceState {
                 )?)
             }
         };
+        // A stop ends the repositories' load between rounds, incomplete — and
+        // nothing after it should read a branch they have not brought up. The
+        // follower goes with `repositories`, whose drop stops it.
+        if load_stopped(&engine, "loading repositories") {
+            return Ok(None);
+        }
 
         let formatted_prompt = builder.format_system_prompt();
         let decoder = engine.token_decoder();
@@ -1559,16 +1586,25 @@ impl InferenceState {
         // `InferenceState` afterwards for the ingest worker's passes to mint
         // fresh ingest-layer timelines.
         let proj_builder_refresh = proj_builder.clone();
-        let mut base_conv = engine
-            .new_conversation_with_projection_progress(
-                &formatted_prompt,
-                proj_builder,
-                dialogue_layer,
-                primary_group,
-                conv_config.clone(),
-                Some(&section_hook),
-            )
-            .map_err(|e| anyhow::anyhow!("base conv create: {e}"))?;
+        let base_conv = engine.new_conversation_with_projection_progress(
+            &formatted_prompt,
+            proj_builder,
+            dialogue_layer,
+            primary_group,
+            conv_config.clone(),
+            Some(&section_hook),
+        );
+        // The section prefill checks the ingest-cancel latch between sections,
+        // and a stop asked during it ends the build `IngestCancelled`: the stop,
+        // not a failed load.
+        if matches!(
+            base_conv,
+            Err(candle_conversation::ConversationError::IngestCancelled)
+        ) && load_stopped(&engine, "prefilling tool sections")
+        {
+            return Ok(None);
+        }
+        let mut base_conv = base_conv.map_err(|e| anyhow::anyhow!("base conv create: {e}"))?;
 
         // Section ingestion (prelude + parallel tool-section forks +
         // outro) happens eagerly inside
@@ -1585,6 +1621,10 @@ impl InferenceState {
             free_low_water_mib = vram::available_low_water().map(|b| b / (1024 * 1024)),
             "base conversation ready (prelude + tool catalog + outro pinned at init)",
         );
+        // A stop asked as the last section sealed lands here.
+        if load_stopped(&engine, "prefilling tool sections") {
+            return Ok(None);
+        }
 
         // Tool-catalog summaries: one per tools mode that projects tools, each
         // listing exactly the tools that mode offers. Each is assembled
@@ -1663,6 +1703,9 @@ impl InferenceState {
         // later run reuses them via the idempotent section ingest. One throwaway
         // conversation per (tool, example); a failing case is logged and skipped so
         // it can never break daemon load.
+        if load_stopped(&engine, "the tool summaries") {
+            return Ok(None);
+        }
         progress.set_step(LoadStep::CalibratingSections);
         // Skip entirely for a tool-free projection — nothing to calibrate — and
         // on a read-only substrate, whose calibration corpus is whatever the
@@ -1997,6 +2040,15 @@ impl InferenceState {
             // each incremental sweep only re-demotes the fresh tail.
             let mut reclaimed_up_to = 0usize;
             loop {
+                // A stop ends the phase between waves: nothing more is
+                // submitted, and the cases in flight are dropped un-archived —
+                // the scheduler ends a turn whose handle is gone, as it does an
+                // ingest decode's, and the next load's resume filter tombstones
+                // and regenerates each one.
+                if crate::ingest_cancel::cancelled() {
+                    inflight.clear();
+                    break;
+                }
                 // Refill the window in ONE pipelined round-trip:
                 // `new_conversations_with_projection_batch` fires every slot
                 // allocation before awaiting any, so the whole window's cases
@@ -2325,6 +2377,11 @@ impl InferenceState {
                     );
                 }
             }
+            // Stopped mid-phase: no boundary sweep — the drain persists what
+            // sealed, and the rest is the next load's.
+            if load_stopped(&engine, "calibrating sections") {
+                return Ok(None);
+            }
             // Boundary sweep: flush the pending hot→warm migration so the final
             // window's just-sealed cases are warm-backed, then demote every
             // calibration timeline. This reclaims the tail before the repo-scan
@@ -2436,6 +2493,9 @@ impl InferenceState {
                 )
                 .map_err(|e| anyhow::anyhow!("{} ingest base create: {e}", il.name))?;
             ingest_bases.insert(il.name.clone(), Mutex::new(base));
+        }
+        if load_stopped(&engine.lock().unwrap(), "the ingest bases") {
+            return Ok(None);
         }
 
         // `--self-check`: every stored conversation asked whether it is intact,
@@ -2647,6 +2707,11 @@ impl InferenceState {
         // pass must find its links committed rather than read them unparented.
         progress.set_step(LoadStep::Priming);
         state.prime(&progress)?;
+        // The chain stops between links on a stop; the links it read are
+        // committed, and the next start reads only the rest.
+        if load_stopped(&state.engine.lock().unwrap(), "priming") {
+            return Ok(None);
+        }
         let worker_state = Arc::clone(&state);
         // Spawned on the daemon's runtime — the loader thread holds an enter
         // guard for exactly this kind of arming (see `start_loading`).
@@ -4994,8 +5059,9 @@ pub struct ZendSession {
     config: DaemonConfig,
     projection_builder: Builder,
     /// Fires `true` once the daemon transitions to fully-ready (every
-    /// load step complete). Used by submit-flow tasks waiting for the
-    /// engine to come up.
+    /// load step complete) — or once a stop has ended the load, so its
+    /// waiters wake and find whether an engine was published. Used by
+    /// submit-flow tasks waiting for the engine to come up.
     ready_tx: tokio::sync::watch::Sender<bool>,
     /// Current human-readable detail string for the active load step
     /// (e.g. `"Downloading shard 3/8"`). Surfaced as the loading
@@ -6632,6 +6698,14 @@ impl ZendSession {
                     Ok(Some(state)) => {
                         *slot.write().unwrap() = Some(Arc::clone(&state));
                         tracing::info!("inference engine ready");
+                        // A stop asked since the load's last boundary: the engine
+                        // is published, so `ZendSession::shutdown` drains it —
+                        // skip the warm-ups, the worker and the resumed turns, and
+                        // release whatever waits on the load.
+                        if crate::ingest_cancel::cancelled() {
+                            ready_tx.send(true).ok();
+                            return;
+                        }
                         // The last load step: the tool catalog's normalization hit
                         // levels, relearned from its corpus in batch on the GPU.
                         // Before `ready`, so no query is ever scored against cold
@@ -6643,6 +6717,10 @@ impl ZendSession {
                             .lock()
                             .unwrap()
                             .warm_collection_normalization(&schema);
+                        if crate::ingest_cancel::cancelled() {
+                            ready_tx.send(true).ok();
+                            return;
+                        }
                         load_progress.set_step(LoadStep::Preloading);
                         let t_preload = Instant::now();
                         let preload = state.engine.lock().unwrap().preload_galleries(&schema);
@@ -6754,15 +6832,30 @@ impl ZendSession {
                         }
                     }
                     Ok(None) => {
-                        // Shutdown arrived during the startup ingest: `load` already
+                        // Shutdown arrived during the load — at any step's
+                        // boundary, the startup ingest among them: `load` already
                         // drained the engine on this thread (scheduler join →
                         // persistence hot→warm→cold → writer flush). Do NOT mark
                         // ready or publish an engine — the loader thread just exits;
                         // `ZendSession::shutdown`, which is joining it, then returns
                         // and the process exits with everything durable.
+                        //
+                        // The waiters on the load are released all the same: a
+                        // request parked on it would otherwise hold the server's
+                        // drain open for good. Each wakes, finds no engine, and
+                        // answers so.
+                        ready_tx.send(true).ok();
                         tracing::info!(
-                            "zend-loader: shutdown during startup ingest — engine drained, loader exiting"
+                            "zend-loader: shutdown during the load — engine drained, loader exiting"
                         );
+                    }
+                    // A step that ended on the stop's latch — a conversation
+                    // create or ingest refused `IngestCancelled` between two
+                    // `load_stopped` checks — is the stop, not a failed load:
+                    // exiting 1 here would skip the drain and read as a crash.
+                    Err(e) if crate::ingest_cancel::cancelled() => {
+                        ready_tx.send(true).ok();
+                        tracing::info!("zend-loader: the load ended by the stop: {e:#}");
                     }
                     Err(e) => {
                         status_tx.send(format!("Load failed: {e}")).ok();
@@ -6904,8 +6997,10 @@ impl ZendSession {
         let mut ready_rx = self.ready_tx.subscribe();
         tokio::spawn(async move {
             loop {
+                // Loaded, or the load is over without an engine (a stop): the
+                // read below tells the two apart.
                 let loaded = inference.read().unwrap().is_some();
-                if loaded {
+                if loaded || *ready_rx.borrow_and_update() {
                     break;
                 }
                 if ready_rx.changed().await.is_err() {

@@ -282,6 +282,11 @@ impl Cluster {
         &self.build
     }
 
+    /// This machine's name, as its `HELLO` gives it.
+    pub fn host(&self) -> &str {
+        &self.settings.host
+    }
+
     /// The router gateway requests are served by, once the server built it.
     pub fn set_router(&self, router: Router) {
         let _ = self.router.set(router);

@@ -100,6 +100,27 @@ impl Tenant for ZendTenant {
             );
             let session = Arc::new(ZendSession::new(config));
             session.start_loading();
+            // A stop asked while zend is still loading reaches the load when it
+            // is ASKED, not when the host calls `stop`: that comes only once the
+            // server has drained, and a load left running meanwhile holds the
+            // process — and the requests parked on it — for minutes. The latch
+            // is what every load step polls; `start_loading` has re-armed it
+            // already, so a stop asked before this runs is heard at once.
+            //
+            // **Only while loading.** Once loaded, the latch also fails a
+            // request's own conversation create and ingest, so raising it at the
+            // ask would turn the drain's in-flight requests into errors; there
+            // the host's `stop`, after the drain, raises it as before.
+            let asked = Arc::clone(&ctx.stopping);
+            let loading = Arc::clone(&session);
+            tokio::spawn(async move {
+                let ending = asked.asked().await;
+                if loading.is_loaded() {
+                    return;
+                }
+                tracing::info!(?ending, "stop asked during the load — ending zend's load");
+                crate::ingest_cancel::token().request();
+            });
             let stopping = Arc::clone(&session);
             Ok(Running {
                 routes: routes(Arc::clone(&session), ctx.roles),

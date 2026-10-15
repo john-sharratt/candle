@@ -4,7 +4,10 @@
 //! carries. It exists before the engine does — handed to the model builder at
 //! load — so a shutdown that arrives while the model is still loading reaches
 //! the ingest the load is about to start, and every ingest loop (repo map, code
-//! reading, branch priming, raw reads) polls it without holding the engine.
+//! reading, branch priming, raw reads) polls it without holding the engine,
+//! as does every long load step between its units. It is raised the moment
+//! the process's stop is asked (`crate::tenant`), and again by
+//! `ZendSession::shutdown`.
 //! Another tenant on the same engine has its own, which this never touches.
 
 use std::sync::OnceLock;
