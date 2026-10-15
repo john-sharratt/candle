@@ -116,9 +116,10 @@ impl ClusterSettings {
             if key.is_some() {
                 anyhow::bail!("--group-key names a cluster's key, and no --cluster is given");
             }
-            if agent.is_some() {
-                anyhow::bail!("--agent joins a cluster's agents, and no --cluster is given");
-            }
+            // An agent with no cluster runs in this process alone: what a
+            // standalone daemon reads and writes its repositories through
+            // (`docs/substrate_git.md` §9). See [`standalone_agent`].
+            let _ = agent;
             if quorum_max.is_some() {
                 anyhow::bail!(
                     "--cluster-quorum-max sets a cluster's quorum, and no --cluster is given"
@@ -404,6 +405,16 @@ impl Cluster {
 /// commands run below normal priority — a build never takes the processor the
 /// decode needs — and the gateways send its jobs to it only when no dedicated
 /// agent can take them.
+/// The agent of a daemon with no cluster: the agent file's checkouts and slots
+/// in this process, joined to nothing. Its jobs — every fetch, push and command
+/// — are the tenants' only way to their repositories (`docs/substrate_git.md`
+/// §9).
+pub fn standalone_agent(cfg: &AgentConfig) -> anyhow::Result<Arc<Jobs>> {
+    let checkouts = Checkouts::open(cfg, &policy())?;
+    tracing::info!("an agent in process, with no cluster");
+    Ok(Jobs::new(checkouts, cfg.slots(measure().cores), Priority::Below))
+}
+
 fn start_agent(
     settings: &ClusterSettings,
     cfg: &AgentConfig,

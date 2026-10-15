@@ -165,14 +165,14 @@ fn a_publish_lands_and_the_step_may_be_reported() {
         Some(on_origin.trim().to_string())
     );
     assert_eq!(
-        std::fs::read_to_string(dir.path().join("mind").join(STORY)).unwrap(),
+        git(&dir.path().join("origin"), &["show", &format!("main:{STORY}")]),
         "# The Gate\n\nA night at the gate.\n",
-        "the mind folder holds what was published"
+        "origin holds what was published"
     );
     assert_eq!(
         *h.op_stores().unwrap().moves().borrow(),
-        1,
-        "the mind folder said it moved"
+        0,
+        "the mind moves when the log's branch does, not on the publish"
     );
     assert_eq!(report_block(&h, "m1"), None, "landed: the step stands");
     let reported = work::perform(

@@ -75,7 +75,8 @@ pub struct Ran {
 /// What a member's jobs go to.
 #[derive(Clone)]
 pub struct Agents {
-    member: Arc<AppMember>,
+    /// `None` for a daemon with no cluster: its agent is the one in process.
+    member: Option<Arc<AppMember>>,
     /// The agent in this process, reached only while cut off.
     in_process: Option<Arc<Jobs>>,
 }
@@ -94,11 +95,24 @@ struct Call<'a> {
 
 impl Agents {
     pub fn new(member: Arc<AppMember>, in_process: Option<Arc<Jobs>>) -> Agents {
-        Agents { member, in_process }
+        Agents {
+            member: Some(member),
+            in_process,
+        }
+    }
+
+    /// The agent in this process alone: a daemon with no cluster, whose
+    /// repositories are read and written through it as a member's are through
+    /// the cluster's (`docs/substrate_git.md` §9).
+    pub fn in_process(jobs: Arc<Jobs>) -> Agents {
+        Agents {
+            member: None,
+            in_process: Some(jobs),
+        }
     }
 
     async fn call(&self, call: Call<'_>) -> Result<(Option<u64>, Bytes), AgentError> {
-        let Some(conn) = self.member.open_group(APP) else {
+        let Some(conn) = self.member.as_ref().and_then(|m| m.open_group(APP)) else {
             return Err(AgentError::NoAgent(
                 "cut off from every cluster, and no agent runs in this process".into(),
             ));
@@ -172,7 +186,7 @@ impl Agents {
 
     /// Whether this member is cut off with an agent in its own process.
     fn local(&self) -> Option<&Arc<Jobs>> {
-        self.in_process.as_ref().filter(|_| !self.member.admitted())
+        self.in_process.as_ref().filter(|_| !self.admitted())
     }
 
     /// Run `job` for `lineage` and wait for it to end.
@@ -280,7 +294,7 @@ impl Agents {
     /// Whether any of the member's sockets is admitted, so the gateway's
     /// agents are in reach.
     pub fn admitted(&self) -> bool {
-        self.member.admitted()
+        self.member.as_ref().is_some_and(|m| m.admitted())
     }
 
     /// Where requests for agent `node` go: this process's own agent while it
@@ -328,7 +342,7 @@ impl Agents {
         if let Some(jobs) = self.local() {
             return Ok(vec![self.own_row(jobs)]);
         }
-        if !self.member.admitted() {
+        if !self.admitted() {
             return Ok(Vec::new());
         }
         let (_, body) = self
@@ -352,7 +366,7 @@ impl Agents {
         AgentRow {
             node: node_in(jobs.checkouts().jobs_dir())
                 .map_or_else(|_| String::new(), |n| format!("{n:016x}")),
-            host: self.member.host().to_string(),
+            host: self.member.as_ref().map_or_else(String::new, |m| m.host().to_string()),
             build: this_build(),
             state: state_name(cap.state).to_string(),
             os: cap.os,

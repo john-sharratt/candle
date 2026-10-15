@@ -1,8 +1,8 @@
 //! The daemon's single background ingest worker — the ONLY thing that runs
 //! an ingest pass after startup.
 //!
-//! Several things ask for a pass — startup, an origin watcher's fetch
-//! (`crate::origin_watch`), a tool round that published a branch — and any
+//! Several things ask for a pass — startup, a record branch moving in the log
+//! (`crate::substrate_git`), a tool round that published a branch — and any
 //! of them can ask while another pass runs. `repo_scan`'s process-global
 //! pricing statics (`SCAN_KV_BASELINE` / `SCAN_LIVE_CONVS`, re-anchored once
 //! per pool call on the assumption that the call is one fresh,

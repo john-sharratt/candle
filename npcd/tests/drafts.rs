@@ -60,7 +60,7 @@ fn configure(dir: &Path) {
 
 struct Rig {
     app: Router,
-    state: Arc<Authored>,
+    _state: Arc<Authored>,
     base: PathBuf,
     mind: PathBuf,
     origin: PathBuf,
@@ -118,7 +118,7 @@ fn rig(record: bool) -> Rig {
     let app = api(state.roles.clone()).into_routes(state.clone()).router;
     Rig {
         app,
-        state,
+        _state: state,
         base,
         mind,
         origin,
@@ -246,16 +246,9 @@ async fn a_save_is_a_draft_until_it_is_published() {
     );
     assert!(git(&r.origin, &["log", "-1", "--format=%B", "main"])
         .starts_with("Published from the console by "));
-    assert_eq!(
-        std::fs::read_to_string(r.mind.join("worlds/ardh.yaml")).unwrap(),
-        "# Ardh, as its author tells it.\nname: Ardh\nsetting: A republic.\n",
-        "the mind folder follows the record"
-    );
-    assert_eq!(r.setting(None).await, "A republic.");
-    assert_eq!(
-        r.state.worlds.read().await.get("ardh").unwrap().body["setting"],
-        "A republic."
-    );
+    // The mind itself moves when the log's branch does — the member's push,
+    // published by its importer — not on the publish (`docs/substrate_git.md`
+    // §8.2): nothing here follows a folder.
     assert_eq!(r.drafts(ADMIN).await["drafts"], json!([]));
 }
 

@@ -1,12 +1,18 @@
-//! A daemon's repositories loaded through a real substrate (feature `member`).
+//! A daemon's repositories loaded through a real substrate and an agent in
+//! process (feature `member`).
 #![cfg(feature = "member")]
 
 use std::path::Path;
 use std::process::Command;
 
+use agent::checkouts::Checkouts;
+use agent::client::Agents;
+use agent::config::AgentConfig;
+use agent::jobs::Jobs;
+use zend_vfs::{CommandPolicy, Priority};
 use candle_conversation::persistence::{SharedSubstrate, SubstratePersistence};
 use candle_conversation::substrate::Substrate;
-use substrate_git::member::{branches, Repos, Source};
+use substrate_git::member::{branches, Access, Repos};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -25,41 +31,64 @@ fn shared(dir: &Path) -> SharedSubstrate {
     SharedSubstrate::new(substrate, persistence)
 }
 
-/// **A standalone daemon loads its checkout whole**: adopted into the
-/// substrate as packs and branches, and its store holds every branch where
-/// the log does — then a second daemon on the same substrate loads it from
-/// the log alone, with no checkout.
-#[test]
-fn a_standalone_checkout_loads_whole_and_reloads_from_the_log() {
+/// **A standalone daemon loads a repository whole through its agent**: pulled
+/// through the agent's checkout into the substrate as packs and branches —
+/// then a second daemon on the same substrate loads it from the log alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repository_loads_whole_through_an_agent_in_process() {
     let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
     let work = tmp.path().join("work");
     std::fs::create_dir(&work).unwrap();
+    git(tmp.path(), &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
     git(&work, &["init", "-q", "-b", "main"]);
     for i in 0..3 {
         std::fs::write(work.join("f"), format!("{i}\n")).unwrap();
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-q", "-m", &format!("c{i}")]);
     }
+    git(&work, &["push", "-q", origin.to_str().unwrap(), "main"]);
     let head = git(&work, &["rev-parse", "HEAD"]);
+
+    // The agent: a clone of origin under its own folder.
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    git(&agent_dir, &["clone", "-q", origin.to_str().unwrap(), "r"]);
+    let yaml = format!(
+        "jobs_dir: '{}'\nslots: 1\ncheckouts:\n  - name: r\n    dir: '{}'\n",
+        agent_dir.join("jobs").display(),
+        agent_dir.join("r").display(),
+    );
+    let cfg_file = tmp.path().join("agent.yaml");
+    std::fs::write(&cfg_file, yaml).unwrap();
+    let cfg = AgentConfig::load(&cfg_file).unwrap();
+    let checkouts = Checkouts::open(&cfg, &CommandPolicy::allowing(Vec::<String>::new())).unwrap();
+    let jobs: std::sync::Arc<Jobs> = Jobs::new(checkouts, 1, Priority::Below);
+
     let sub = tmp.path().join("substrate");
     std::fs::create_dir(&sub).unwrap();
-
-    {
+    let runtime = tokio::runtime::Handle::current();
+    let names = ["r".to_string()];
+    let loaded = {
         let shared = shared(&sub);
-        let source = [Source { name: "r".into(), checkout: Some(work.clone()) }];
-        let repos = Repos::open(&tmp.path().join("git-a"), &source, shared.clone(), None).unwrap();
-        repos.load(&|| false, &|_| {}).unwrap();
-        let log = branches(&shared, "r").unwrap();
-        assert_eq!(log.values().next().unwrap().as_str(), head);
-        assert_eq!(repos.store("r").unwrap().record().unwrap(), log);
-    }
+        let access = Access {
+            agents: Agents::in_process(jobs.clone()),
+            runtime: runtime.clone(),
+            replicator: None,
+        };
+        let root = tmp.path().join("git-a");
+        let shared2 = shared.clone();
+        tokio::task::spawn_blocking(move || {
+            let repos = Repos::open(&root, &names, shared2, access).unwrap();
+            repos.load(&|| false, &|_| {}).unwrap();
+            repos.store("r").unwrap().record().unwrap()
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(loaded.values().next().unwrap().as_str(), head);
 
     let shared = shared(&sub);
-    let source = [Source { name: "r".into(), checkout: None }];
-    let repos = Repos::open(&tmp.path().join("git-b"), &source, shared.clone(), None).unwrap();
-    repos.load(&|| false, &|_| {}).unwrap();
-    assert_eq!(
-        repos.store("r").unwrap().record().unwrap(),
-        branches(&shared, "r").unwrap()
-    );
+    let log = branches(&shared, "r").unwrap();
+    assert_eq!(log.values().next().unwrap().as_str(), head);
 }

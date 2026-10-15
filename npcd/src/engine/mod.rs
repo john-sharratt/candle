@@ -92,7 +92,6 @@ pub mod prompt;
 pub mod prose;
 pub mod pulse;
 pub mod reach;
-pub mod record_follow;
 pub mod reflect;
 pub mod rendered;
 pub mod reported;

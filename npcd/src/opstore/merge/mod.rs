@@ -18,9 +18,7 @@
 //! | [`status`] | what the store changes, and whether it merges cleanly |
 //! | [`publish`] | the store landed on the record, or why not |
 //! | [`sync`] | the record's newer commit brought into the store |
-//! | [`follow`] | the mind folder brought up to the record |
 
-pub mod follow;
 pub mod publish;
 pub mod status;
 pub mod sync;

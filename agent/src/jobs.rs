@@ -168,6 +168,14 @@ fn read_from(path: &Path, from: u64, max: u64) -> io::Result<(Vec<u8>, u64)> {
     Ok((bytes, size))
 }
 
+impl std::fmt::Debug for Jobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Jobs")
+            .field("jobs_dir", &self.checkouts().jobs_dir())
+            .finish()
+    }
+}
+
 impl Jobs {
     /// The jobs of `checkouts`, `slots` at a time, their commands run at
     /// `priority`; switched on or off as its jobs folder keeps it.

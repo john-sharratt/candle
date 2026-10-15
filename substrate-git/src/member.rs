@@ -1,10 +1,10 @@
 //! A daemon's repositories kept with its log (`docs/substrate_git.md` §5, §7,
 //! §8): loaded in full during its loading phase, then followed.
 //!
-//! [`Repos::open`] opens a store per repository. With `--cluster`, each store
-//! fetches through the cluster's agents, and the lease `git/<repo>` is held
-//! through its consensus; standalone, each fetches from its checkout's own
-//! `origin`, whose branches are adopted once.
+//! [`Repos::open`] opens a store per repository, every fetch made by an agent
+//! holding the repository by name: the cluster's, or with no cluster the one
+//! in this process. A daemon has no checkout and no way to `origin` of its
+//! own. With a cluster, the lease `git/<repo>` is held through its consensus.
 //!
 //! [`Repos::load`] blocks until every repository is whole in the store: the
 //! log names its branches and every pack they need has arrived and been
@@ -18,7 +18,7 @@
 //! member's pushes and syncs; the lease holder fetches every [`FETCH_EVERY`].
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,12 +28,11 @@ use agent::fetcher::AgentFetch;
 use candle_conversation::persistence::SharedSubstrate;
 use cluster::replicate::Replicator;
 use tokio::runtime::Handle;
-use zend_vfs::{fetch_here, Oid, RefName, RemoteUrl, Repo};
+use zend_vfs::{Oid, RefName, RemoteUrl};
 
 use crate::import::Importer;
 use crate::records::{Alone, Lease, Log};
 use crate::store::Store;
-use crate::adopt;
 
 /// How often the follow thread ticks: publishes and syncs, all local.
 pub const TICK: Duration = Duration::from_secs(2);
@@ -49,13 +48,15 @@ const LEASE_RENEW: Duration = Duration::from_secs(30);
 /// How long a load waits between rounds while a repository is incomplete.
 const LOAD_ROUND: Duration = Duration::from_secs(1);
 
-/// What the cluster gives the importers: the consensus the lease is held
-/// through, and the agents fetches are made by, on the runtime their sockets
-/// live on.
-pub struct Cluster {
-    pub replicator: Arc<Replicator>,
+/// How a daemon reaches its repositories: the agents every fetch is made by —
+/// the cluster's, or with no cluster the one in this process — on the runtime
+/// their jobs run on, and the cluster's consensus the import lease is held
+/// through, when there is a cluster (`docs/substrate_git.md` §9).
+pub struct Access {
     pub agents: Agents,
     pub runtime: Handle,
+    /// `None` with no cluster: this daemon imports every repository itself.
+    pub replicator: Option<Arc<Replicator>>,
 }
 
 /// The import lease, held through the cluster's consensus.
@@ -83,13 +84,6 @@ impl Lease for ClusterLease {
     }
 }
 
-/// Where a repository loads from: its name, and for a daemon without a
-/// cluster the checkout whose `origin` it fetches and whose branches it adopts.
-pub struct Source {
-    pub name: String,
-    pub checkout: Option<PathBuf>,
-}
-
 /// One repository's state during a load.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Loading {
@@ -106,8 +100,8 @@ pub struct Loading {
 type OnChange = Arc<dyn Fn(&str) + Send + Sync>;
 
 struct Inner {
-    /// Each store, its importer, and whether it has anywhere to pull from.
-    repos: Vec<(Store, Importer, bool)>,
+    /// Each store and its importer.
+    repos: Vec<(Store, Importer)>,
     shared: SharedSubstrate,
     on_change: Mutex<Option<OnChange>>,
 }
@@ -126,61 +120,27 @@ impl Repos {
     /// in.
     pub fn open(
         root: &Path,
-        sources: &[Source],
+        names: &[String],
         shared: SharedSubstrate,
-        cluster: Option<Cluster>,
+        access: Access,
     ) -> anyhow::Result<Self> {
-        let lease: Arc<dyn Lease> = match &cluster {
-            Some(c) => Arc::new(ClusterLease {
-                replicator: Arc::clone(&c.replicator),
+        let lease: Arc<dyn Lease> = match &access.replicator {
+            Some(replicator) => Arc::new(ClusterLease {
+                replicator: Arc::clone(replicator),
                 renewed: Mutex::new(HashMap::new()),
             }),
             None => Arc::new(Alone),
         };
         let mut repos = Vec::new();
-        for source in sources {
-            let name = &source.name;
-            let mut store = Store::open(root, name)?;
-            let checkout = source
-                .checkout
-                .as_deref()
-                .filter(|dir| dir.join(".git").exists())
-                .and_then(|dir| Repo::open(dir).ok());
-            let mut pullable = true;
-            store = match (&cluster, &checkout) {
-                (Some(c), _) => store.with_origin(
-                    &RemoteUrl::parse(&format!("agent:{name}"))?,
-                    AgentFetch::shared(c.agents.clone(), c.runtime.clone(), name.clone()),
-                )?,
-                (None, Some(repo)) => {
-                    match repo.remotes()?.into_iter().find(|r| r.name.as_str() == "origin") {
-                        Some(origin) => store
-                            .with_origin(&RemoteUrl::parse(&origin.fetch_url)?, fetch_here())?,
-                        None => {
-                            pullable = false;
-                            store
-                        }
-                    }
-                }
-                (None, None) => {
-                    pullable = false;
-                    store
-                }
-            };
-            if cluster.is_none() {
-                if let Some(repo) = &checkout {
-                    match adopt(&shared, name, repo) {
-                        Ok(p) if !p.refs.is_empty() => tracing::info!(
-                            repo = %name, packs = p.packs, branches = p.refs.len(),
-                            "adopted the checkout's branches into the substrate"
-                        ),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(repo = %name, "adopting the checkout: {e:#}"),
-                    }
-                }
-            }
+        for name in names {
+            // Every fetch through an agent holding the repository by name: the
+            // daemon has no checkout and no way to origin of its own.
+            let store = Store::open(root, name)?.with_origin(
+                &RemoteUrl::parse(&format!("agent:{name}"))?,
+                AgentFetch::shared(access.agents.clone(), access.runtime.clone(), name.clone()),
+            )?;
             let importer = Importer::new(Arc::clone(&lease)).fetching_every(FETCH_EVERY);
-            repos.push((store, importer, pullable));
+            repos.push((store, importer));
         }
         Ok(Self {
             inner: Arc::new(Inner {
@@ -204,13 +164,13 @@ impl Repos {
             .inner
             .repos
             .iter()
-            .map(|(s, _, _)| Loading {
+            .map(|(s, _)| Loading {
                 repo: s.name().to_string(),
                 ..Loading::default()
             })
             .collect();
         loop {
-            for ((store, importer, pullable), loading) in self.inner.repos.iter().zip(state.iter_mut()) {
+            for ((store, importer), loading) in self.inner.repos.iter().zip(state.iter_mut()) {
                 if loading.whole {
                     continue;
                 }
@@ -225,10 +185,7 @@ impl Repos {
                         loading.held = t.synced.held;
                         loading.listed = t.synced.listed;
                         loading.error = t.fetch_error;
-                        // Nowhere to pull from and nothing in the log: an empty
-                        // repository, whole as it is.
-                        loading.whole = whole(store, &self.inner.shared)?
-                            || (!*pullable && !named);
+                        loading.whole = whole(store, &self.inner.shared)?;
                     }
                     Err(e) => loading.error = Some(format!("{e:#}")),
                 }
@@ -252,7 +209,7 @@ impl Repos {
         self.inner
             .repos
             .iter()
-            .map(|(s, _, _)| s)
+            .map(|(s, _)| s)
             .find(|s| s.name() == name)
     }
 
@@ -291,7 +248,7 @@ fn follow(inner: Arc<Inner>, stopped: Arc<dyn Fn() -> bool + Send + Sync>) {
         if stopped() {
             return;
         }
-        for (store, importer, _) in &inner.repos {
+        for (store, importer) in &inner.repos {
             let name = store.name().to_string();
             let error = match importer.tick(store, &inner.shared) {
                 Ok(t) => {

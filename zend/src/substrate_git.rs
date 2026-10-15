@@ -14,7 +14,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use ::substrate_git::member::{Cluster, Loading, Repos, Source};
+use ::substrate_git::member::{Access, Loading, Repos};
+use agent::client::Agents;
+use agent::jobs::Jobs;
+use host::cluster::Join;
+use tokio::runtime::Handle;
 use ::substrate_git::Store;
 use candle_conversation::persistence::{SharedSubstrate, SUBSTRATE_DIR};
 use tokio::sync::watch;
@@ -45,24 +49,52 @@ pub fn open_workspace(root: &Path) -> anyhow::Result<Workspace> {
     crate::workspace::with_uploads(workspace)
 }
 
-/// Load every repository of `names` whole — a checkout under `root` is the
-/// source only without a cluster — then follow them on a thread.
+/// The agents this daemon's repositories are read and written through: the
+/// cluster's, reaching the one in this process while cut off — or, with no
+/// cluster, the one in this process alone (`docs/substrate_git.md` §9).
+/// `None` when there is neither: a daemon with no `agent:` file and no
+/// cluster has no way to a repository.
+pub fn agents(cluster: Option<&Join>, agent: Option<&Arc<Jobs>>) -> Option<Agents> {
+    match cluster.and_then(|join| Some((join, join.link().member()?))) {
+        Some((join, member)) => Some(Agents::new(Arc::clone(member), join.in_process_agent())),
+        None => agent.map(|jobs| Agents::in_process(Arc::clone(jobs))),
+    }
+}
+
+/// How the repositories are reached: [`agents`], on `runtime`, and the
+/// cluster's consensus for the import lease when there is a cluster.
+pub fn access(
+    cluster: Option<&Join>,
+    agent: Option<&Arc<Jobs>>,
+    runtime: Handle,
+) -> anyhow::Result<Access> {
+    let agents = agents(cluster, agent).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the repositories are read and written through an agent, and there is none: give \
+             the process an `agent:` file naming a checkout of each"
+        )
+    })?;
+    let replicator = cluster
+        .and_then(|join| join.link().member())
+        .and_then(|member| member.replicator().cloned());
+    Ok(Access {
+        agents,
+        runtime,
+        replicator,
+    })
+}
+
+/// Load every repository of `names` whole, through `access`, then follow them
+/// on a thread.
 pub fn load(
     root: &Path,
     names: &[String],
     shared: SharedSubstrate,
-    cluster: Option<Cluster>,
+    access: Access,
     progress: &LoadProgress,
     status: &watch::Sender<String>,
 ) -> anyhow::Result<()> {
-    let sources: Vec<Source> = names
-        .iter()
-        .map(|name| Source {
-            name: name.clone(),
-            checkout: Some(root.join(name)),
-        })
-        .collect();
-    let repos = Repos::open(&stores_root(root), &sources, shared, cluster)?;
+    let repos = Repos::open(&stores_root(root), names, shared, access)?;
     progress.set_step(LoadStep::Repositories);
     repos.load(&crate::ingest_cancel::cancelled, &|state: &[Loading]| {
         let held: usize = state.iter().map(|l| l.held).sum();

@@ -102,19 +102,18 @@ use crate::engine::mission_gen::gates::{life_voice, Form};
 use crate::engine::mission_gen::material::strip_calls;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::prose::{decode_call, CallAsk};
-use crate::engine::record_follow;
 use crate::engine::reflect;
 use crate::engine::schema;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
-use crate::engine::watcher::{self, Ledger, Reconcile};
+use crate::engine::watcher::{Ledger, Reconcile};
 use crate::engine::witnessed;
 use crate::engine::work;
 use crate::mind::files::MindFiles;
 use crate::mind::Mind;
 use crate::mind_store::{self, MindSource};
 use crate::projection;
-use substrate_git::member::{Cluster, Repos, Source as RepoSource};
+use substrate_git::member::{Access, Repos};
 use crate::model;
 use crate::npcs::{Casting, Npcs};
 use crate::opstore::MindStores;
@@ -3782,6 +3781,9 @@ pub struct LoadPlan {
     /// through the agents once joined, and a mind the log did not hold at
     /// start is pulled and the process restarted onto it.
     pub mind_repo: Option<MindSource>,
+    /// The agent in this process, with no cluster: what the mind is read and
+    /// written through (`docs/substrate_git.md` §9).
+    pub agent: Option<Arc<agent::jobs::Jobs>>,
     /// The process's stop, asked for that restart.
     pub stopping: Arc<Stopping>,
 }
@@ -3795,17 +3797,14 @@ fn load_mind(
     rt: &Arc<Runtime>,
     source: &MindSource,
     shared: &SharedSubstrate,
-    cluster: Option<Cluster>,
+    access: Access,
 ) -> anyhow::Result<bool> {
     let p = &rt.progress;
     let repos = Repos::open(
         &mind_store::stores_root(&rt.data),
-        &[RepoSource {
-            name: source.name.clone(),
-            checkout: None,
-        }],
+        std::slice::from_ref(&source.name),
         shared.clone(),
-        cluster,
+        access,
     )?;
     let stopping = || rt.stopping();
     repos.load(&stopping, &|state| {
@@ -4157,30 +4156,53 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         // followed from now on (§9.2–§9.4).
         if let Some(member) = join.link().member() {
             rt.join_cluster(Arc::clone(member));
-            // The mind repository's fetches and pushes go through an agent
-            // holding it — this process's own while it is cut off (§10.3,
-            // §11.5). Its packs and branches are records in the substrate,
-            // loaded whole now — pulled through an agent first when no member
-            // has — and followed from then on (`docs/substrate_git.md` §8).
-            if let (Some(source), Some(handle)) = (&plan.mind_repo, &rt_handle) {
-                let agents = Agents::new(Arc::clone(member), join.in_process_agent());
-                let fetcher = AgentFetch::shared(agents.clone(), handle.clone(), &source.name);
-                rt.ops
-                    .set_pusher(AgentPush::shared(agents.clone(), handle.clone(), &source.name));
-                rt.ops.set_fetcher(Arc::clone(&fetcher));
-                let cluster = member.replicator().cloned().map(|replicator| Cluster {
-                    replicator,
-                    agents,
-                    runtime: handle.clone(),
-                });
-                let arrived = load_mind(rt, source, &shared, cluster)?;
-                if arrived {
-                    // The schema, the libraries and the grammar built from
-                    // them are read once, at start: onto the mind that arrived.
-                    plan.stopping.ask(Ending::Relaunch);
-                    return Ok(());
-                }
+        }
+    }
+
+    // The mind repository's fetches and pushes go through an agent holding it —
+    // the cluster's, reaching this process's own while cut off (§10.3, §11.5),
+    // or with no cluster the one in this process alone. Its packs and branches
+    // are records in the substrate, loaded whole now — pulled through an agent
+    // first when no member has — and followed from then on
+    // (`docs/substrate_git.md` §8, §9).
+    if let Some(source) = &plan.mind_repo {
+        let handle = rt_handle
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no async runtime for the agents' jobs to run on"))?;
+        let joined = plan
+            .cluster
+            .as_ref()
+            .and_then(|join| Some((join, join.link().member()?)));
+        let (agents, replicator) = match joined {
+            Some((join, member)) => (
+                Agents::new(Arc::clone(member), join.in_process_agent()),
+                member.replicator().cloned(),
+            ),
+            None => {
+                let jobs = plan.agent.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the mind is read through an agent, and there is none: give the process \
+                         an `agent:` file naming a checkout of `{}`",
+                        source.name
+                    )
+                })?;
+                (Agents::in_process(jobs), None)
             }
+        };
+        rt.ops
+            .set_pusher(AgentPush::shared(agents.clone(), handle.clone(), &source.name));
+        rt.ops
+            .set_fetcher(AgentFetch::shared(agents.clone(), handle.clone(), &source.name));
+        let access = Access {
+            agents,
+            runtime: handle,
+            replicator,
+        };
+        if load_mind(rt, source, &shared, access)? {
+            // The schema, the libraries and the grammar built from them are
+            // read once, at start: onto the mind that arrived.
+            plan.stopping.ask(Ending::Relaunch);
+            return Ok(());
         }
     }
 
@@ -4620,10 +4642,9 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     tracing::info!("engine ready in {:?}", rt.uptime());
 
     // The command table's generator, once there is a cast to set work for, and
-    // the mind folder kept at the record its publishes land on.
+    // the mind kept at the record by the substrate.
     if rt_handle.is_some() {
         mission_gen::run::spawn(Arc::clone(rt));
-        record_follow::spawn(Arc::clone(rt));
     }
 
     supervise(rt);
@@ -4807,9 +4828,7 @@ fn retire_misplaced(
     }
     drop(e);
     if retired > 0 {
-        for file in watcher::walk(&source.dir).unwrap_or_default() {
-            ledger.forget(&file);
-        }
+        ledger.forget_under(&source.dir);
         ledger.flush();
     }
     retired

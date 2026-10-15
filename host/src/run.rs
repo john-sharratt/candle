@@ -31,7 +31,8 @@ use crate::boot::{router as boot_router, Boot, BootLine};
 use crate::cli::HostArgs;
 use crate::cluster::leave::drain_and_send;
 use crate::cluster::upgrade::{setup as upgrade_setup, HostInstaller};
-use crate::cluster::{watch_readiness, Cluster, Join};
+use crate::cluster::{standalone_agent, watch_readiness, Cluster, Join};
+use agent::config::AgentConfig;
 use crate::ctrl_c::accept_ctrl_c;
 use crate::endpoints::{declared, routes, Shared};
 use crate::guard::{dispatch_table, Routes};
@@ -285,6 +286,16 @@ async fn serve_tenants(
         }
         None => None,
     };
+    // The agent: the cluster's in-process one, or — with no cluster — the
+    // agent file's checkouts in this process alone. Every tenant reads and
+    // writes its repositories through it (`docs/substrate_git.md` §9).
+    let agent = match &cluster {
+        Some(c) => c.agent().cloned(),
+        None => match &cfg.args.agent {
+            Some(file) => Some(standalone_agent(&AgentConfig::load(file)?)?),
+            None => None,
+        },
+    };
 
     let started_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -343,6 +354,7 @@ async fn serve_tenants(
                 .as_ref()
                 .and_then(|c| Join::new(Arc::clone(c), name)),
             stopping: Arc::clone(&stopping),
+            agent: agent.clone(),
             starting,
         };
         match tenant.start(ctx).await {

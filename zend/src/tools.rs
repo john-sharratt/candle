@@ -39,7 +39,7 @@ use candle_conversation::TurnText;
 use serde::Deserialize;
 use serde_json::Value;
 
-use agent::client::Agents;
+
 use host::cluster::Join;
 use tokio::runtime::Handle;
 use zend_tools::executor::Executor;
@@ -785,15 +785,17 @@ impl ToolHost {
         workspace: &Workspace,
         secrets: Arc<Secrets>,
         cluster: Option<&Join>,
+        agent: Option<&Arc<agent::jobs::Jobs>>,
     ) -> anyhow::Result<Self> {
-        let Some(join) = cluster else {
-            return Ok(Self::new(workspace, secrets)?);
-        };
-        let member = join
-            .link()
-            .member()
-            .ok_or_else(|| anyhow::anyhow!("the cluster's member was never started"))?;
-        let agents = Agents::new(Arc::clone(member), join.in_process_agent());
+        // Every command and push on an agent — the cluster's, or the one in
+        // this process alone (`docs/substrate_git.md` §9): a repository is
+        // a store with no working tree, which nothing runs in.
+        let agents = crate::substrate_git::agents(cluster, agent).ok_or_else(|| {
+            anyhow::anyhow!(
+                "commands and pushes run on an agent, and there is none: give the process an \
+                 `agent:` file"
+            )
+        })?;
         let executor =
             AgentExecutor::new(agents, Handle::current(), workspace.root().join(JOBS_DIR));
         Ok(Self::on(workspace, secrets, Arc::new(executor)))

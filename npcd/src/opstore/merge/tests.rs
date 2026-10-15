@@ -6,9 +6,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use zend_vfs::{fetch_here, GitError, Oid, Push, PushResult, PushSpec, RemoteName, Repo};
+use zend_vfs::{GitError, Push, PushResult, PushSpec, RemoteName, Repo};
 
-use super::follow::{follow, Followed};
 use super::publish::Publish;
 use super::status::Status;
 use super::sync::Synced;
@@ -50,7 +49,7 @@ fn configure(dir: &Path) {
 struct Record {
     _dir: TempDir,
     origin: PathBuf,
-    mind: PathBuf,
+    _mind: PathBuf,
     other: PathBuf,
     stores: Arc<MindStores>,
 }
@@ -84,7 +83,7 @@ fn record() -> Record {
     stores.set_quiet(Box::new(|_| true));
     Record {
         origin: root.join("origin"),
-        mind: root.join("mind"),
+        _mind: root.join("mind"),
         other: root.join("other"),
         stores,
         _dir: dir,
@@ -181,25 +180,6 @@ fn a_store_lands_on_the_record_and_the_mind_follows() {
         "the store holds nothing unpublished"
     );
     assert_eq!(r.publish(1), Publish::Nothing);
-    assert!(
-        !r.mind.join(story).exists(),
-        "the checkout has not moved yet"
-    );
-
-    assert_eq!(
-        follow(&r.mind, fetch_here()).unwrap(),
-        Some(Followed::Moved {
-            to: Oid::parse(&commit).unwrap()
-        })
-    );
-    assert_eq!(
-        std::fs::read_to_string(r.mind.join(story)).unwrap(),
-        "# The Gate\n\nA night at the gate.\n"
-    );
-    assert_eq!(
-        follow(&r.mind, fetch_here()).unwrap(),
-        Some(Followed::Level)
-    );
 }
 
 /// **A record that moved only at other lines is taken in as the work lands**:
@@ -334,34 +314,6 @@ fn a_publish_with_no_agent_waits_and_changes_nothing() {
     assert_eq!(r.on_record(story), None);
     assert_eq!(shelf.read(story).as_deref(), Some("A night at the gate.\n"));
     assert!(matches!(r.status(1), Status::Changes { .. }));
-}
-
-/// **The mind folder follows another member's publish**, and a folder with
-/// changes of its own on disk is left as it is.
-#[test]
-fn the_mind_follows_the_record_unless_it_has_changes_of_its_own() {
-    let r = record();
-    r.publish_other("layers/stories/elsewhere.md", "Somebody else's story.\n");
-    assert!(matches!(
-        follow(&r.mind, fetch_here()).unwrap(),
-        Some(Followed::Moved { .. })
-    ));
-    assert_eq!(
-        std::fs::read_to_string(r.mind.join("layers/stories/elsewhere.md")).unwrap(),
-        "Somebody else's story.\n"
-    );
-
-    std::fs::write(r.mind.join(ERA), "edited by hand\n").unwrap();
-    r.publish_other("layers/stories/more.md", "More.\n");
-    assert_eq!(
-        follow(&r.mind, fetch_here()).unwrap(),
-        Some(Followed::Dirty(vec![ERA.to_string()]))
-    );
-    assert_eq!(
-        std::fs::read_to_string(r.mind.join(ERA)).unwrap(),
-        "edited by hand\n"
-    );
-    assert!(!r.mind.join("layers/stories/more.md").exists());
 }
 
 /// A mind folder that is not a git repository has no record to land on.

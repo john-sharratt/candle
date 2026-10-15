@@ -70,6 +70,10 @@ pub struct TenantContext {
     /// something it read once, at start, and now holds anew — npcd's mind
     /// fetched through an agent (`docs/replicated_substrate.md` §10.3).
     pub stopping: Arc<Stopping>,
+    /// The agent in this process — the cluster's, or with no cluster the agent
+    /// file's alone: what a tenant's repositories are read and written through
+    /// (`docs/substrate_git.md` §9). `None` with no `agent:` file.
+    pub agent: Option<Arc<agent::jobs::Jobs>>,
     /// Where the tenant says what it is doing until [`Tenant::start`]
     /// returns — what the loading page shows of it meanwhile (`crate::boot`).
     pub starting: Arc<StartLine>,

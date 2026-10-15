@@ -80,7 +80,6 @@ use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
-use crate::origin_watch::OriginWatch;
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -1016,7 +1015,7 @@ impl InferenceState {
         ingest_dirs: HashMap<String, String>,
         max_depth: Option<usize>,
         host_runtime: Option<tokio::runtime::Handle>,
-        substrate_git: bool,
+        agent: Option<Arc<agent::jobs::Jobs>>,
         compact_substrate: bool,
         self_check: SelfCheck,
         read_only_substrate: bool,
@@ -1484,26 +1483,22 @@ impl InferenceState {
         // Repositories read from the substrate (`docs/substrate_git.md` §7):
         // every store brought up to the log before anything reads a branch,
         // then kept there — and with origin — on a thread of its own.
-        if substrate_git {
+        {
             let names: Vec<String> = workspace
                 .repos()
                 .iter()
                 .map(|r| r.name.clone())
                 .filter(|name| name != crate::workspace::UPLOADS_REPO)
                 .collect();
-            let git_cluster = cluster.as_ref().and_then(|join| {
-                let member = join.link().member()?;
-                Some(::substrate_git::member::Cluster {
-                    replicator: member.replicator().cloned()?,
-                    agents: Agents::new(Arc::clone(member), join.in_process_agent()),
-                    runtime: host_runtime.clone()?,
-                })
-            });
+            let runtime = host_runtime.clone().ok_or_else(|| {
+                anyhow::anyhow!("no async runtime for the agents' jobs to run on")
+            })?;
+            let access = crate::substrate_git::access(cluster.as_ref(), agent.as_ref(), runtime)?;
             crate::substrate_git::load(
                 &root,
                 &names,
                 engine.conversation().shared(),
-                git_cluster,
+                access,
                 &progress,
                 &status_tx,
             )?;
@@ -2626,7 +2621,7 @@ impl InferenceState {
             identity_builders,
             think_closer_phrase,
             tokenizer,
-            tool_host: ToolHost::deployed(&workspace, secrets, cluster.as_ref())?,
+            tool_host: ToolHost::deployed(&workspace, secrets, cluster.as_ref(), agent.as_ref())?,
             workspace,
             base_branches,
             tool_stencil,
@@ -5024,9 +5019,6 @@ pub struct ZendSession {
     /// the engine, so a stopped session never keeps its model resident — or
     /// its scan on the device — behind the next one.
     ingest_worker: Mutex<Option<crate::ingest_worker::IngestWorker>>,
-    /// The origin watchers (`crate::origin_watch`), started with the ingest
-    /// worker they wake and stopped before it.
-    origin_watch: Mutex<Option<OriginWatch>>,
 }
 
 /// Snapshot returned by `GET /v1/status`. `loading` is `None` once the
@@ -5179,7 +5171,6 @@ impl ZendSession {
             started_at_ms,
             load_thread: Mutex::new(None),
             ingest_worker: Mutex::new(None),
-            origin_watch: Mutex::new(None),
         }
     }
 
@@ -5322,13 +5313,12 @@ impl ZendSession {
         }
     }
 
-    /// The agents this daemon's commands run on (`docs/replicated_substrate.md`
-    /// §11.5) — `None` without `--cluster`, where they run on this host's own
-    /// sandboxes, and until the cluster's member has started.
+    /// The agents this daemon's commands, pushes and fetches run on
+    /// (`docs/replicated_substrate.md` §11.5, `docs/substrate_git.md` §9): the
+    /// cluster's, or with no cluster the one in this process. `None` with
+    /// neither.
     pub fn agents(&self) -> Option<Agents> {
-        let join = self.config.cluster.as_ref()?;
-        let member = join.link().member()?;
-        Some(Agents::new(Arc::clone(member), join.in_process_agent()))
+        crate::substrate_git::agents(self.config.cluster.as_ref(), self.config.agent.as_ref())
     }
 
     /// Snapshot for `GET /v1/status`. `loading=None` once every startup
@@ -6505,7 +6495,7 @@ impl ZendSession {
         let wiped_layers = self.config.wiped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
         let max_depth = self.config.max_depth;
-        let substrate_git = self.config.substrate_git;
+        let agent = self.config.agent.clone();
         let compact_substrate = self.config.compact_substrate;
         let self_check = self.config.self_check;
         let read_only_substrate = self.config.read_only_substrate;
@@ -6612,8 +6602,8 @@ impl ZendSession {
                     wiped_layers,
                     ingest_dirs,
                     max_depth,
-                    substrate_git.then_some(host_runtime).flatten(),
-                    substrate_git,
+                    host_runtime,
+                    agent,
                     compact_substrate,
                     self_check,
                     read_only_substrate,
@@ -6718,25 +6708,15 @@ impl ZendSession {
                             worker.wake();
                             *session_for_loader.ingest_worker.lock().unwrap() = Some(worker);
                             let _ = state.ingest_wake.set(Arc::clone(&wake));
-                            // Origin, watched: a branch moved there is fetched
-                            // within seconds, and the fetch wakes the worker.
+                            // A record branch that moves in the log — imported
+                            // from origin through an agent, or another
+                            // member's push — wakes the worker
+                            // (`docs/substrate_git.md` §5).
                             let on_change: Arc<dyn Fn() + Send + Sync> = {
                                 let wake = Arc::clone(&wake);
                                 Arc::new(move || wake.notify_one())
                             };
-                            if session_for_loader.config.substrate_git {
-                                // The importer keeps origin instead: a record
-                                // branch that moves in the log wakes the worker
-                                // (`docs/substrate_git.md` §5).
-                                crate::substrate_git::on_change(on_change);
-                            } else {
-                                let watch = OriginWatch::start(
-                                    &state.workspace,
-                                    session_for_loader.config.secrets.github_token(),
-                                    on_change,
-                                );
-                                *session_for_loader.origin_watch.lock().unwrap() = Some(watch);
-                            }
+                            crate::substrate_git::on_change(on_change);
                         }
                         // The engine is up — only NOW mark ready and unblock
                         // submit-flow waiters. Skipped on the shutdown-during-ingest
@@ -6806,12 +6786,6 @@ impl ZendSession {
                 }
             })
             .await;
-        }
-        //    Then the origin watchers, so no fetch wakes a worker being stopped;
-        //    a probe in flight is bounded by its timeout.
-        let watch = self.origin_watch.lock().unwrap().take();
-        if let Some(w) = watch {
-            w.stop().await;
         }
         //    Then the ingest worker. It holds the inference state for its whole
         //    life, so nothing outside this call may keep the engine alive past

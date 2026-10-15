@@ -92,6 +92,7 @@ impl Tenant for ZendTenant {
             config.engine = ctx.engine;
             config.roles = ctx.roles.clone();
             config.cluster = ctx.cluster;
+            config.agent = ctx.agent;
             tracing::info!(
                 workspace = %config.workspace.root().display(),
                 repos = %config.workspace.names().join(", "),

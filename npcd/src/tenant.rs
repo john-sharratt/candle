@@ -28,7 +28,6 @@ use futures::future::BoxFuture;
 use host::guard::{Api, Guarded, Routes};
 use host::{OneShot, Running, Tenant, TenantContext, TenantUi};
 use include_dir::{include_dir, Dir};
-use notify::RecommendedWatcher;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::runtime::Handle;
@@ -47,7 +46,6 @@ use crate::engine;
 use crate::engine::guardian::{GuardianBuilder, GuardianConfig, RuntimeProbe};
 use crate::engine::identity::Authored as Identities;
 use crate::engine::runtime::{start as start_engine, LoadPlan, Runtime};
-use crate::engine::watcher::{spawn as watch_mind, ReloadReport};
 use crate::identity::log_identity;
 use crate::images::Images;
 use crate::mind::Mind;
@@ -79,28 +77,18 @@ pub static CONSOLE: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../web/cont
 #[derive(Args, Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct NpcdArgs {
-    /// Where the engine's own state lives — `substrate/` and `accounts/`, the
-    /// things the daemon writes rather than a person. Also the fallback source
-    /// for authored content (`worlds/`, `personalities/`) when no `--mind` is
-    /// named. Defaults to the `--mind` directory, so a mind carries its own
-    /// substrate beside it; with no `--mind` either, the `npcd` directory in
-    /// the source tree.
+    /// Where the engine's own state lives — `substrate/`, `accounts/` and the
+    /// mind's store, the things the daemon writes rather than a person. The
+    /// `npcd` directory in the source tree when absent.
     #[arg(long)]
     pub data: Option<PathBuf>,
 
-    /// Load the projection schema and its content libraries from this
-    /// directory instead of the compiled-in default. The directory must hold a
-    /// `projection.yaml`; the folders beside it (`responses/`, `moods/`,
-    /// `personalities/`, `worlds/`, …) are what its folder-backed collections
-    /// and its authored registries read from.
-    #[arg(long, value_name = "DIR")]
-    pub mind: Option<PathBuf>,
-
-    /// The mind as a repository the cluster's agents hold, by its name there —
-    /// how a member with `--cluster` has a mind, in place of `--mind`
-    /// (`docs/replicated_substrate.md` §10.3). It is mirrored under `--data`,
-    /// at `mind/<name>`, and fetched and pushed through agents only, so this
-    /// machine needs neither the repository nor a way to its origin.
+    /// The mind: a repository an agent holds, by its name there — the
+    /// cluster's agents, or with no cluster the one in this process
+    /// (`docs/substrate_git.md` §8, §9). Its packs and branches are records in
+    /// the substrate and its files are read at a commit, so this machine needs
+    /// neither the repository nor a way to its origin. With none, the daemon
+    /// runs on the bundled schema with no authored content.
     #[arg(long, value_name = "NAME")]
     pub mind_repo: Option<String>,
 
@@ -186,7 +174,6 @@ impl Default for NpcdArgs {
     fn default() -> Self {
         Self {
             data: None,
-            mind: None,
             mind_repo: None,
             mind_branch: DEFAULT_MIND_BRANCH.to_string(),
             log_identity: false,
@@ -197,16 +184,6 @@ impl Default for NpcdArgs {
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION_DAYS,
         }
     }
-}
-
-/// Where the substrate and accounts go: `--data` when it is given, and the
-/// mind's own directory when it is not. `None` with neither, which leaves the
-/// caller its compiled-in default.
-///
-/// **The mind, not the source tree.** A substrate is a mind's corpus ingested,
-/// so run against a different mind it answers for the wrong canon.
-pub fn data_dir(explicit: Option<PathBuf>, mind: Option<&Path>) -> Option<PathBuf> {
-    explicit.or_else(|| mind.map(Path::to_path_buf))
 }
 
 impl NpcdArgs {
@@ -232,12 +209,6 @@ impl NpcdArgs {
         // bundled one stands in.
         let repo = match &self.mind_repo {
             Some(name) => {
-                if self.mind.is_some() {
-                    anyhow::bail!(
-                        "--mind and --mind-repo both name the mind: a folder here, or a \
-                         repository the agents hold — give one"
-                    );
-                }
                 if explicit.is_none() {
                     anyhow::bail!("--mind-repo keeps its store under --data: name one");
                 }
@@ -252,14 +223,11 @@ impl NpcdArgs {
             }
             None => None,
         };
-        let schema = match &repo {
-            Some(_) => projection::Source::bundled(),
-            None => projection::Source::resolve(self.mind.as_deref())?,
-        };
+        let schema = projection::Source::bundled();
         // **The compiled-in default is a path on the machine that built
         // this.** Used when it is really there; the working directory stands in
         // when it is not, and the choice is logged at start.
-        let (data, fell_back) = match data_dir(explicit, schema.dir.as_deref()) {
+        let (data, fell_back) = match explicit {
             Some(dir) => (absolute(&dir).context("the data directory")?, false),
             None => {
                 let built_at = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -326,27 +294,17 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         fell_back,
         repo,
     } = t;
-    // With `--cluster` the mind is a repository the agents hold; without it
-    // there are no agents to hold one (§10.3).
-    match (&repo, ctx.cluster.is_some(), args.mind.is_some()) {
-        (Some(_), false, _) => anyhow::bail!(
-            "--mind-repo reaches the mind through the cluster's agents, and there is no \
-             --cluster"
-        ),
-        (None, true, true) => anyhow::bail!(
-            "with --cluster the mind is a repository the agents hold: name it with \
-             --mind-repo, not a folder with --mind"
-        ),
-        _ => {}
+    // The mind is read through an agent: the cluster's, or the one in this
+    // process (`docs/substrate_git.md` §9).
+    if repo.is_some() && ctx.cluster.is_none() && ctx.agent.is_none() {
+        anyhow::bail!(
+            "--mind-repo is read through an agent, and there is none: give the process an \
+             `agent:` file naming a checkout of it, or a --cluster"
+        );
     }
-    match (&schema.dir, &repo) {
-        (Some(dir), _) => tracing::info!(
-            "projection schema: {} (collections resolve under {})",
-            schema.label,
-            dir.display()
-        ),
-        // A repository the agents hold: read from the substrate once it opens.
-        (None, Some(r)) => tracing::info!(
+    match &repo {
+        // A repository an agent holds: read from the substrate once it opens.
+        Some(r) => tracing::info!(
             "the mind is the repository `{}` on `{}`, read from the substrate",
             r.name,
             r.branch
@@ -354,10 +312,10 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         // A warning, not a note: a daemon with no mind starts, serves the
         // console and looks healthy, while every character in it has no world,
         // no personality and no libraries to think with.
-        (None, None) => tracing::warn!(
-            "no --mind given: running on the {} schema's layers with no content libraries, \
-             no worlds and no personalities, and the substrate goes to the data directory's \
-             default rather than beside a mind. Pass --mind <dir> to run a real one",
+        None => tracing::warn!(
+            "no --mind-repo given: running on the {} schema's layers with no content \
+             libraries, no worlds and no personalities. Pass --mind-repo <name> to run a real \
+             one",
             schema.label
         ),
     }
@@ -487,7 +445,6 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // The editor and the engine read the same schema through the same `Mind`.
     // Only a `--mind` folder is watched: a mind read from the substrate moves
     // when its branch does, not when a file does.
-    let mind_dir = schema.dir.clone();
     let mind_for_engine = mind.clone();
     match mind.files() {
         Some(files) => tracing::info!("mind: {files:?}"),
@@ -530,9 +487,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     // handed to the state, then given the resolvers that read that state back.
     // That order breaks the cycle between them.
     let runtime = Runtime::new(mind_for_engine, &data);
-    if repo.is_some() {
-        runtime.ops.read_from_substrate();
-    }
+
     // The engine adopts the substrate the cast was just loaded from: one
     // `substrate/` takes one writable handle. See `Npcs::substrate`.
     runtime.set_substrate(authored.npcs.read().await.substrate());
@@ -592,36 +547,10 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
             characters,
             authored: identities,
             mind_repo: repo,
+            agent: ctx.agent.clone(),
             stopping: ctx.stopping.clone(),
         },
     );
-
-    // The mind watcher, so an edited world file takes effect without a
-    // restart. Held by the stop closure, for the process's lifetime — dropping
-    // it stops the watch.
-    let mind_watcher = match &mind_dir {
-        Some(dir) => match watch_mind(
-            dir,
-            runtime.ledger.clone(),
-            Arc::new(|report: ReloadReport| {
-                tracing::info!(
-                    "mind reloaded: +{} ~{} -{}",
-                    report.added,
-                    report.changed,
-                    report.removed
-                );
-            }),
-        ) {
-            Ok(w) => Some(w),
-            // Not fatal: the reload is a convenience, the engine is the
-            // product.
-            Err(e) => {
-                tracing::warn!("mind watcher not armed: {e} — edits need a restart");
-                None
-            }
-        },
-        None => None,
-    };
 
     // The guardian, when `guardian.yaml` asks for one.
     let guardian = match GuardianConfig::load(&data)?.filter(|c| c.enabled) {
@@ -641,7 +570,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
     Ok(Running {
         routes,
         reports: Arc::new(NpcdReports::new(authored, data)),
-        stop: Box::new(move || Box::pin(stop(stopping, npcs, mind_watcher, guardian))),
+        stop: Box::new(move || Box::pin(stop(stopping, npcs, guardian))),
     })
 }
 
@@ -668,25 +597,21 @@ fn reload_on_move(runtime: &Arc<Runtime>, authored: &Arc<Authored>) {
 
 /// Stop npcd, in the order that loses nothing.
 ///
-/// 1. The mind watcher goes first, so an edit during the stop starts no
-///    ingest.
-/// 2. The flag is latched and the guardian stopped, then every character task
+/// 1. The flag is latched and the guardian stopped, then every character task
 ///    is cancelled and awaited out — not cosmetic: a character's decode writes
 ///    turns to the substrate, and a cast killed mid-tick leaves the redo log
 ///    with a turn whose sealing never happened. Every dropped turn future has
 ///    released its scheduler slot when this returns.
-/// 3. The character store's lock is taken once, so a place or mood write a
+/// 2. The character store's lock is taken once, so a place or mood write a
 ///    character left in flight lands before the substrate is closed.
-/// 4. The engine shuts down: its persistence drains, its writer flushes, the
+/// 3. The engine shuts down: its persistence drains, its writer flushes, the
 ///    substrate detaches — stopping the scheduler when npcd is the engine's
 ///    last attachment — and the writer lock is released.
 async fn stop(
     runtime: Arc<Runtime>,
     npcs: Arc<RwLock<Npcs>>,
-    mind_watcher: Option<RecommendedWatcher>,
     guardian: Option<JoinHandle<()>>,
 ) {
-    drop(mind_watcher);
     runtime.stop();
     if let Some(g) = guardian {
         g.abort();
@@ -973,22 +898,6 @@ mod tests {
         Cli::try_parse_from(all).unwrap().npcd
     }
 
-    /// **A named mind keeps its own substrate.** Without `--data`, the data
-    /// directory is the mind's; `--data` still wins when it is given; and with
-    /// neither there is nothing to choose, so the caller's default stands.
-    #[test]
-    fn the_data_directory_defaults_to_the_mind() {
-        let mind = Path::new("D:/prog/mind");
-        assert_eq!(data_dir(None, Some(mind)), Some(mind.to_path_buf()));
-        assert_eq!(
-            data_dir(Some(PathBuf::from("E:/elsewhere")), Some(mind)),
-            Some(PathBuf::from("E:/elsewhere")),
-            "an explicit --data wins"
-        );
-        assert_eq!(data_dir(None, None), None);
-        assert!(parse(&["--mind", "D:/prog/mind"]).data.is_none());
-    }
-
     /// **Off unless asked for**, each flag its own: a restart must not forget
     /// anything by accident, and a wipe is never implied by a narrower flag.
     #[test]
@@ -1012,8 +921,9 @@ mod tests {
             serde_yaml::from_str::<NpcdArgs>("{}").unwrap(),
             NpcdArgs::default()
         );
-        let flags = parse(&["--mind", "../mind", "--log-identity"]);
-        let yaml: NpcdArgs = serde_yaml::from_str("mind: ../mind\nlog_identity: true\n").unwrap();
+        let flags = parse(&["--mind-repo", "battle-mind", "--log-identity"]);
+        let yaml: NpcdArgs =
+            serde_yaml::from_str("mind_repo: battle-mind\nlog_identity: true\n").unwrap();
         assert_eq!(flags, yaml);
         assert!(Cli::try_parse_from(["npcd", "--content", "web/content/npcd"]).is_err());
         assert!(serde_yaml::from_str::<NpcdArgs>("content: x").is_err());
@@ -1066,8 +976,7 @@ mod tests {
         .unwrap();
         assert_eq!(branch.repo.unwrap().branch.as_str(), "record");
 
-        let both = parse(&["--mind-repo", "mind", "--data", data, "--mind", "../mind"]).resolve();
-        assert!(both.is_err());
+        assert!(Cli::try_parse_from(["npcd", "--mind", "../mind"]).is_err(), "a folder is no mind");
         let no_data = parse(&["--mind-repo", "mind"]).resolve();
         assert!(no_data
             .err()

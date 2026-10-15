@@ -289,16 +289,24 @@ marked `read_from_substrate` checks nothing out.
 
 ---
 
-## 9. Standalone and adoption
+## 9. Agents, with or without a cluster
 
-- **zend standalone** (`substrate_git: true`, no `--cluster`): each store fetches from
-  its checkout's own `origin` with this machine's credentials, and the checkout's
-  branches are adopted once (`substrate_git::adopt`). With a cluster nothing is adopted:
-  the agents' view of `origin` is the only source, so a stale local clone never leaks
-  in.
-- **npcd `--mind <dir>`** reads its folder as it stands (`MindFiles::folder`), and the
-  folder watcher stays. A standalone author edits the folder and sees it at once, which
-  a commit would not give.
+**Agents are the only way to a repository.** Every fetch, push and command goes through
+one; no daemon reads a checkout, a folder or `origin` of its own.
+
+- **With `--cluster`**, the cluster's agents, reaching the one in this process while cut
+  off.
+- **With no cluster**, the agent in this process alone: the host opens the `agent:`
+  file's checkouts and runs their jobs, joined to nothing (`host::cluster::standalone_agent`,
+  `Agents::in_process`). Tenants get it as `TenantContext::agent`.
+- **No agent at all** is a startup error naming the missing `agent:` file.
+
+So zend has no checkout mode: every repository `workspace.yaml` names is read from its
+store, and `origin_watch` is gone. npcd has no `--mind <folder>`: the mind is
+`--mind-repo <name>` or there is none, and the folder watcher, the checkout-based record
+follow (`record_follow`, `opstore/merge/follow.rs`) and direct folder writes in
+production are gone. `MindFiles::folder` and `Mind::new(Some(folder))` remain as test
+fixtures only; nothing in a daemon builds one.
 
 ---
 

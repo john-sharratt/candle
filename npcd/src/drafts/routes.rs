@@ -23,7 +23,6 @@ use web::auth::Role;
 use super::overlay::Drafted;
 use crate::accounts::user_id_of;
 use crate::api::{err, Authored};
-use crate::engine::archive::bring_up;
 use crate::identity::require;
 use crate::opstore::merge::publish::Publish;
 use crate::opstore::merge::sync::Synced;
@@ -130,9 +129,10 @@ pub async fn post_publish(State(s): State<Arc<Authored>>, headers: HeaderMap) ->
     match published {
         Publish::Landed { commit, paths } => {
             tracing::info!(%commit, ?paths, "drafts PUBLISHED from the console by {}", c.name);
-            let stores = Arc::clone(&c.stores);
-            let _ = spawn_blocking(move || bring_up(&stores)).await;
-            s.reload_authored().await;
+            // The push moved the store's record; the log takes it as the
+            // member's push, and the mind moves to it — the worlds and
+            // personalities read again — when its branch does
+            // (`docs/substrate_git.md` §6.2, §8.2).
             Json(json!({ "published": commit, "paths": paths })).into_response()
         }
         Publish::Nothing => {

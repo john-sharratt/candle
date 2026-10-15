@@ -27,7 +27,7 @@
 //! | [`owner`] | whose store, and the timeline it lives on |
 //! | [`log`] | the substrate as the stores' file log |
 //! | [`shelf`] | a store as a shelf to read and commit through |
-//! | [`merge`] | landing a store on the record: status, publish, sync, and the mind following the record |
+//! | [`merge`] | landing a store on the record: status, publish and sync |
 
 pub mod log;
 pub mod merge;
@@ -42,11 +42,10 @@ use candle_conversation::persistence::SharedSubstrate;
 use store_events::Mirror;
 use tokio::sync::watch;
 use zend_vfs::{
-    fetch_here, here, Fetch, GitError, Push, RepoFiles, RepoSpec, Rev, VfsStore, Workspace,
+    fetch_here, here, Fetch, Push, RepoFiles, RepoSpec, Rev, VfsStore, Workspace,
 };
 
 use self::log::Substrate;
-use self::merge::follow::{follow, Followed};
 use self::merge::Merge;
 use self::owner::Owner;
 
@@ -73,9 +72,6 @@ pub struct MindStores {
     /// How many times the mind folder has been moved to a newer record, for
     /// whatever reads the folder to read it again.
     moved: watch::Sender<u64>,
-    /// Set when the mind is read from the substrate (`docs/substrate_git.md`
-    /// §8).
-    substrate: OnceLock<()>,
 }
 
 impl MindStores {
@@ -100,24 +96,7 @@ impl MindStores {
             pusher: OnceLock::new(),
             fetcher: OnceLock::new(),
             moved: watch::channel(0).0,
-            substrate: OnceLock::new(),
         })
-    }
-
-    /// Bring the mind folder up to the record ([`follow`]), telling whatever
-    /// watches [`Self::moves`] when it moved. `None` for a daemon with no mind.
-    pub fn follow(&self) -> Option<Result<Option<Followed>, GitError>> {
-        // A mind read from the substrate checks nothing out: its record moves
-        // when the log's branch does, and [`Self::moved`] says so
-        // (`docs/substrate_git.md` §8.2).
-        if self.substrate.get().is_some() {
-            return Some(Ok(None));
-        }
-        let followed = follow(self.mind_dir()?, self.fetcher());
-        if let Ok(Some(Followed::Moved { .. })) = &followed {
-            self.moved.send_modify(|n| *n += 1);
-        }
-        Some(followed)
     }
 
     /// Each time the mind folder moves to a newer record.
@@ -128,12 +107,6 @@ impl MindStores {
     /// The mind moved to a newer record: tell whatever watches [`Self::moves`].
     pub fn moved(&self) {
         self.moved.send_modify(|n| *n += 1);
-    }
-
-    /// The mind is read from the substrate: its record moves with the log, and
-    /// [`Self::follow`] checks nothing out.
-    pub fn read_from_substrate(&self) {
-        let _ = self.substrate.set(());
     }
 
     /// Make every publish's push through `pusher`.

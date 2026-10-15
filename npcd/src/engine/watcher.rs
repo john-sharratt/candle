@@ -1,57 +1,25 @@
-//! The mind-directory watcher: an edited world file takes effect without a
-//! restart.
+//! The ingest ledger: what each mind document hashed to when it became turns in
+//! the substrate, so a start writes only what moved since.
 //!
-//! # What "reload" means here
+//! The mind is read at a commit from the substrate (`docs/substrate_git.md`
+//! §8), and its documents are keyed here by their mind path. Three cases, each a
+//! different write:
 //!
-//! Not "re-read the file". The mind's files are *ingested into the substrate* as
-//! turns — that is what makes a world's history and technology tree available to
-//! the gather at all — so a changed file has to reconcile against turns that are
-//! already there. Three cases, and each is a different write:
-//!
-//! - **Unchanged** — the content hash matches. Nothing is written. This is the
-//!   overwhelmingly common case during an editing session, because a save
-//!   touches one file in a directory of two hundred, and it has to cost nothing
-//!   or the daemon spends its life re-ingesting.
+//! - **Unchanged** — the content hash matches. Nothing is written.
 //! - **Changed** — the old turn is **tombstoned** and the new content ingested
 //!   as a fresh turn. Not overwritten: the substrate is an append-only redo log,
-//!   and the previous version stays reachable. A tombstone retires a turn from
-//!   selection; it does not delete it.
-//! - **Deleted** — reported by the reload, and **not yet retired from the
-//!   substrate**. The watcher sees the file go and the report counts it; the
-//!   ingest side has no path that tombstones the turn it wrote, so a deleted
-//!   document's content stays selectable by the gather. Stated here rather than
-//!   implied by an unused affordance: the method that listed a ledger's
-//!   no-longer-present files had no caller, which made the gap read as an
-//!   oversight in the wiring instead of as work that has not been done.
-//!
-//! # Why hashing, and why per file
-//!
-//! Filesystem events are unreliable in both directions: an editor's single save
-//! can fire create, modify and rename in quick succession, and a bulk operation
-//! (`git checkout`, a directory copy) can raise thousands at once. Debouncing
-//! collapses the burst into one pulse; hashing decides whether that pulse means
-//! anything. Without the hash, every save of any file in the mind would
-//! re-ingest the whole directory.
+//!   and the previous version stays reachable.
+//! - **Removed** — the document left the record; its conversations are
+//!   retired at the next start ([`Ledger::missing`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Mutex;
 
 use candle_conversation::persistence::SUBSTRATE_DIR;
-use notify::event::{EventKind, ModifyKind};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use sha2::{Digest, Sha256};
 
 use crate::mind::files::MindFiles;
-
-/// Quiet time after the first relevant event before a reload fires. Subsequent
-/// events inside the window extend it — an editor's burst lands well inside.
-pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(400);
-
-/// Ceiling on that extension, so a long bulk operation cannot defer the reload
-/// for ever.
-pub const MAX_DEBOUNCE_HOLD: Duration = Duration::from_secs(5);
 
 /// What a mind file's content hashed to, when it was last ingested.
 ///
@@ -71,22 +39,6 @@ pub const MAX_DEBOUNCE_HOLD: Duration = Duration::from_secs(5);
 #[derive(Debug, Default)]
 pub struct Ledger {
     hashes: Mutex<HashMap<PathBuf, String>>,
-    /// What the filesystem watcher has already reported, which is a different
-    /// fact from what has been ingested and therefore a different map.
-    ///
-    /// `hashes` means *this document is a turn in the substrate* and is written
-    /// only by the ingest seal. `seen` means *the watcher has already announced
-    /// this content* and is written only by [`reload`]. Sharing one map made
-    /// each corrupt the other: a watcher event during the multi-minute startup
-    /// load hashed the whole mind tree before `ingest::pending` reached it, so
-    /// every document then read `Unchanged`, nothing was written, and `flush`
-    /// persisted that across restarts — the mind never ingesting again on any
-    /// boot until the files were edited.
-    ///
-    /// Not persisted: a run's first reload should describe the tree as it finds
-    /// it, and a `seen` carried across restarts would suppress the report of a
-    /// file edited while the daemon was down.
-    seen: Mutex<HashMap<PathBuf, String>>,
     /// Where to persist. `None` keeps the ledger in memory — the shape the
     /// tests use, and the honest state for a daemon with no data directory.
     path: Option<PathBuf>,
@@ -106,26 +58,6 @@ pub enum Reconcile {
 }
 
 /// The ledger's file, inside the substrate directory it describes.
-/// A ledger key as a mind path: forward slashes, from the mind's root. A key an
-/// earlier build wrote as an absolute path under a mind folder is cut to the
-/// part from its `layers/` down, where every ingested document lives — so a
-/// ledger written over a folder still knows its documents once the mind is
-/// read from the substrate (`docs/substrate_git.md` §8.1), and nothing is
-/// retired for having moved.
-pub fn mind_relative(path: &Path) -> PathBuf {
-    if path.is_relative() {
-        return PathBuf::from(path.to_string_lossy().replace('\\', "/"));
-    }
-    let parts: Vec<String> = path
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    match parts.iter().rposition(|p| p == "layers") {
-        Some(at) => PathBuf::from(parts[at..].join("/")),
-        None => path.to_path_buf(),
-    }
-}
-
 pub fn ledger_path(data: &Path) -> PathBuf {
     data.join(SUBSTRATE_DIR).join("ingest-ledger.json")
 }
@@ -155,7 +87,7 @@ impl Ledger {
             .and_then(|t| serde_json::from_str::<HashMap<PathBuf, String>>(&t).ok())
             .unwrap_or_default()
             .into_iter()
-            .map(|(p, h)| (mind_relative(&p), h))
+
             .collect();
         if !hashes.is_empty() {
             tracing::info!(
@@ -165,7 +97,6 @@ impl Ledger {
         }
         Self {
             hashes: Mutex::new(hashes),
-            seen: Mutex::new(HashMap::new()),
             path: Some(path),
         }
     }
@@ -231,6 +162,11 @@ impl Ledger {
         self.hashes.lock().unwrap().remove(path);
     }
 
+    /// Forget every document under the mind folder `dir`.
+    pub fn forget_under(&self, dir: &Path) {
+        self.hashes.lock().unwrap().retain(|p, _| !p.starts_with(dir));
+    }
+
     /// The verdict [`Self::reconcile`] would give, **without recording it**.
     ///
     /// The ledger's entry is a claim that a document is a turn in the substrate, so writing one
@@ -256,37 +192,6 @@ impl Ledger {
                 match h.get(path) {
                     None => Reconcile::Added,
                     Some(prev) if *prev == digest => Reconcile::Unchanged,
-                    Some(_) => Reconcile::Changed,
-                }
-            }
-        }
-    }
-
-    /// What moved since the watcher last looked, recorded against [`Self::seen`].
-    ///
-    /// The reload report's counterpart to `reconcile`: same arithmetic, different map, and it
-    /// never touches the ingest claim. That is what lets an editor event land during the
-    /// startup load without convincing the ledger that the tree is already in the substrate.
-    ///
-    /// The two maps also answer over different sets. `reload` walks the whole mind directory —
-    /// `world.yaml`, the registries, everything — while only layer documents ever become turns,
-    /// so a shared map would leave every non-document file reading `Added` forever and report
-    /// the entire tree as new on every save.
-    fn observe(&self, path: &Path, content: Option<&str>) -> Reconcile {
-        let mut s = self.seen.lock().unwrap();
-        match content {
-            None => {
-                if s.remove(path).is_some() {
-                    Reconcile::Removed
-                } else {
-                    Reconcile::Unchanged
-                }
-            }
-            Some(text) => {
-                let digest = hash(text);
-                match s.insert(path.to_path_buf(), digest.clone()) {
-                    None => Reconcile::Added,
-                    Some(prev) if prev == digest => Reconcile::Unchanged,
                     Some(_) => Reconcile::Changed,
                 }
             }
@@ -320,17 +225,6 @@ impl Ledger {
             }
         }
     }
-
-    /// Files the *watcher* has reported that are no longer on disk.
-    ///
-    /// `observe`'s counterpart, over [`Self::seen`] and for the same reason: a deletion the
-    /// reload report has already announced is not a deletion the substrate has retired, and
-    /// asking the ingest map here would report every non-document file's removal on the first
-    /// save after it went.
-    fn unseen(&self, present: &[PathBuf]) -> Vec<PathBuf> {
-        let s = self.seen.lock().unwrap();
-        s.keys().filter(|p| !present.contains(p)).cloned().collect()
-    }
 }
 
 /// The content hash. Sha-256, hex, truncated — this identifies a version, it is
@@ -362,193 +256,6 @@ pub fn is_ingestible(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()),
         Some("yaml") | Some("yml") | Some("md")
     )
-}
-
-/// Walk the mind directory for ingestible files.
-pub fn walk(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            // An unreadable subdirectory is not a reason to fail the whole
-            // walk — a mind with one permission-denied folder should still
-            // ingest the rest, and the log says which one was skipped.
-            Err(e) => {
-                tracing::warn!("mind: skipping {}: {e}", dir.display());
-                continue;
-            }
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if is_ingestible_dir(&path) {
-                    stack.push(path);
-                }
-            } else if is_ingestible(&path) {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-fn is_ingestible_dir(path: &Path) -> bool {
-    !matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some(".git") | Some(SUBSTRATE_DIR) | Some("node_modules") | Some("target")
-    )
-}
-
-/* There is no `ingest_all` here any more, and its absence is the point.
- *
- * It walked the mind, moved the progress bar and wrote nothing — under a load
- * phase named "Ingesting mind layers". A world with sixty-six documents in
- * `layers/world/` booted in a second and no character could reach any of them,
- * with a full progress bar saying otherwise. The write lives in
- * `engine::ingest` now, which puts each document on its layer's conversation as
- * a turn; this module keeps the part it was always good at, which is deciding
- * what actually moved. */
-
-/// What one reload pass did, for the log and the Pulse view.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReloadReport {
-    pub added: usize,
-    pub changed: usize,
-    pub removed: usize,
-    pub unchanged: usize,
-}
-
-impl ReloadReport {
-    /// Whether anything actually moved. The common case during an editing
-    /// session is that nothing did.
-    pub fn is_noop(&self) -> bool {
-        self.added == 0 && self.changed == 0 && self.removed == 0
-    }
-}
-
-/// Diff the mind directory against the ledger.
-pub fn reload(root: &Path, ledger: &Ledger) -> std::io::Result<ReloadReport> {
-    let files = walk(root)?;
-    let mut report = ReloadReport::default();
-
-    for path in &files {
-        let content = std::fs::read_to_string(path).ok();
-        // `observe`, not `reconcile`: this records what the watcher has *reported*, which is a
-        // different claim from what has been ingested and lives in a different map. See
-        // `Ledger::seen` for what conflating the two cost.
-        match ledger.observe(path, content.as_deref()) {
-            Reconcile::Added => report.added += 1,
-            Reconcile::Changed => report.changed += 1,
-            Reconcile::Removed => report.removed += 1,
-            Reconcile::Unchanged => report.unchanged += 1,
-        }
-    }
-
-    // Files the ledger holds that are no longer present. Walked separately
-    // because the loop above only visits what exists.
-    for gone in ledger.unseen(&files) {
-        if ledger.observe(&gone, None) == Reconcile::Removed {
-            report.removed += 1;
-        }
-    }
-
-    Ok(report)
-}
-
-/// Whether a filesystem event could possibly have moved a content hash.
-///
-/// Access events and metadata-only modifies cannot, so they are dropped before
-/// the debounce window rather than after — otherwise a directory being read
-/// keeps extending the hold and the reload never fires.
-fn is_relevant(kind: &EventKind) -> bool {
-    matches!(
-        kind,
-        EventKind::Create(_)
-            | EventKind::Remove(_)
-            | EventKind::Modify(ModifyKind::Data(_))
-            | EventKind::Modify(ModifyKind::Name(_))
-            // `Any` and `Other` are what several platforms report for an
-            // ordinary save, so they have to be taken as possibly-relevant. The
-            // content hash is what decides afterwards, which is why being
-            // generous here costs nothing.
-            | EventKind::Modify(ModifyKind::Any)
-            | EventKind::Modify(ModifyKind::Other)
-    )
-}
-
-/// Arm the watcher. The returned handle must be held for the daemon's lifetime;
-/// dropping it stops the watch.
-///
-/// `ledger` is the **runtime's own**, not a fresh one. The startup ingest fills
-/// it as it writes each document, so the watcher starts knowing exactly what is
-/// already in the substrate — and the first edit after a boot is one changed
-/// file rather than a whole-tree rewrite. A private ledger here would have to
-/// re-hash the mind to catch up, and would disagree with the ingest about what
-/// had been written the moment either one raced the other.
-pub fn spawn(
-    root: &Path,
-    ledger: Arc<Ledger>,
-    on_reload: Arc<dyn Fn(ReloadReport) + Send + Sync + 'static>,
-) -> anyhow::Result<RecommendedWatcher> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let mut watcher = notify::recommended_watcher(move |res: NotifyResult<Event>| {
-        let Ok(event) = res else { return };
-        if !is_relevant(&event.kind) {
-            return;
-        }
-        if event.paths.iter().any(|p| is_ingestible(p)) {
-            let _ = tx.send(());
-        }
-    })?;
-    watcher.watch(root, RecursiveMode::Recursive)?;
-    tracing::info!("mind watcher armed at {}", root.display());
-
-    let root = root.to_path_buf();
-
-    tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            // Collapse the burst: extend on each follow-up, capped so a bulk
-            // operation cannot defer the reload for ever.
-            let deadline = tokio::time::Instant::now() + MAX_DEBOUNCE_HOLD;
-            loop {
-                let quiet = tokio::time::timeout_at(
-                    deadline.min(tokio::time::Instant::now() + DEBOUNCE_WINDOW),
-                    rx.recv(),
-                );
-                match quiet.await {
-                    // Another event inside the window — keep waiting.
-                    Ok(Some(())) if tokio::time::Instant::now() < deadline => continue,
-                    _ => break,
-                }
-            }
-            let root = root.clone();
-            let ledger = Arc::clone(&ledger);
-            let cb = Arc::clone(&on_reload);
-            // The reconcile is synchronous file work; off the async pool.
-            let _ = tokio::task::spawn_blocking(move || match reload(&root, &ledger) {
-                Ok(report) => {
-                    if report.is_noop() {
-                        tracing::debug!("mind: nothing moved ({} unchanged)", report.unchanged);
-                    } else {
-                        tracing::info!(
-                            "mind reload: +{} ~{} -{} ({} unchanged)",
-                            report.added,
-                            report.changed,
-                            report.removed,
-                            report.unchanged
-                        );
-                        cb(report);
-                    }
-                }
-                Err(e) => tracing::warn!("mind reload failed: {e}"),
-            })
-            .await;
-        }
-    });
-
-    Ok(watcher)
 }
 
 #[cfg(test)]
@@ -635,18 +342,6 @@ mod tests {
         assert_eq!(l.inspect(&gone, Some("y")), Reconcile::Added);
     }
 
-    /// **A key written as an absolute path under a mind folder becomes a mind
-    /// path**, from its `layers/` down; a relative key keeps its form.
-    #[test]
-    fn an_absolute_ledger_key_becomes_a_mind_path() {
-        let abs = Path::new("D:/prog/npcd-data/mind/battle-mind/layers/eras/first.md");
-        assert_eq!(mind_relative(abs), PathBuf::from("layers/eras/first.md"));
-        assert_eq!(
-            mind_relative(Path::new("layers\\world\\a.md")),
-            PathBuf::from("layers/world/a.md")
-        );
-    }
-
     /// An editor creating and deleting a temp file inside one debounce window
     /// must not produce a tombstone for a turn that never existed.
     #[test]
@@ -662,157 +357,6 @@ mod tests {
             l.reconcile(Path::new("never.yaml"), None),
             Reconcile::Unchanged
         );
-    }
-
-    #[test]
-    fn the_walk_finds_content_and_skips_the_rest() {
-        let root = tmp();
-        std::fs::write(root.join("world.yaml"), "a: 1").unwrap();
-        std::fs::write(root.join("notes.txt"), "ignored").unwrap();
-        std::fs::create_dir_all(root.join("layers")).unwrap();
-        std::fs::write(root.join("layers/history.md"), "# History").unwrap();
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join(".git/config.yaml"), "x: 1").unwrap();
-
-        let found = walk(&root).unwrap();
-        let names: Vec<String> = found
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert!(names.contains(&"world.yaml".to_string()));
-        assert!(names.contains(&"history.md".to_string()));
-        assert!(!names.contains(&"notes.txt".to_string()));
-        assert!(
-            !names.contains(&"config.yaml".to_string()),
-            "walked into .git"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The end-to-end reconcile: a real directory, edited.
-    #[test]
-    fn a_reload_reports_exactly_what_moved() {
-        let root = tmp();
-        std::fs::write(root.join("a.yaml"), "one").unwrap();
-        std::fs::write(root.join("b.yaml"), "two").unwrap();
-        let l = Ledger::new();
-
-        let first = reload(&root, &l).unwrap();
-        assert_eq!(
-            first,
-            ReloadReport {
-                added: 2,
-                changed: 0,
-                removed: 0,
-                unchanged: 0
-            }
-        );
-
-        // Nothing touched.
-        let second = reload(&root, &l).unwrap();
-        assert!(
-            second.is_noop(),
-            "an untouched mind reported work: {second:?}"
-        );
-        assert_eq!(second.unchanged, 2);
-
-        // One edited, one deleted, one new.
-        std::fs::write(root.join("a.yaml"), "one, revised").unwrap();
-        std::fs::remove_file(root.join("b.yaml")).unwrap();
-        std::fs::write(root.join("c.yaml"), "three").unwrap();
-        let third = reload(&root, &l).unwrap();
-        assert_eq!(
-            third,
-            ReloadReport {
-                added: 1,
-                changed: 1,
-                removed: 1,
-                unchanged: 0
-            }
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// **A reload does not claim anything was ingested.**
-    ///
-    /// The two maps answer different questions, and this is the failure that proved it. An
-    /// editor event during the multi-minute startup load ran a reload over the whole mind
-    /// tree; when `reload` recorded into the ingest map, `ingest::pending` then arrived to
-    /// find every document `Unchanged`, wrote nothing, and `flush` persisted that. The mind
-    /// never ingested again, on any boot, until the files were edited — and the loading
-    /// screen went green over a cast that knew nothing.
-    #[test]
-    fn a_reload_leaves_the_ingest_claim_alone() {
-        let root = tmp();
-        let doc = root.join("a.yaml");
-        std::fs::write(&doc, "one").unwrap();
-        let l = Ledger::new();
-
-        // The watcher gets there first, as it does during a slow startup.
-        assert_eq!(reload(&root, &l).unwrap().added, 1);
-
-        // Ingest still owes the document.
-        assert_eq!(
-            l.inspect(&doc, Some("one")),
-            Reconcile::Added,
-            "the reload marked the document ingested — nothing had ingested it"
-        );
-
-        // And once it has genuinely been sealed, it stops owing it.
-        l.reconcile(&doc, Some("one"));
-        assert_eq!(l.inspect(&doc, Some("one")), Reconcile::Unchanged);
-
-        // The reload's own record is likewise untouched by the seal: it already reported this
-        // content, so the next walk is a no-op rather than a second announcement.
-        assert!(reload(&root, &l).unwrap().is_noop());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Only layer documents ever become turns, but a reload walks the whole mind — `world.yaml`,
-    /// the registries, everything. Reading those against the ingest map would leave every one of
-    /// them `Added` forever, so each save would report the entire tree as new.
-    #[test]
-    fn files_that_never_become_turns_still_settle() {
-        let root = tmp();
-        std::fs::write(root.join("world.yaml"), "name: Ardh").unwrap();
-        std::fs::write(root.join("registry.yaml"), "cast: []").unwrap();
-        let l = Ledger::new();
-
-        assert_eq!(reload(&root, &l).unwrap().added, 2);
-        let second = reload(&root, &l).unwrap();
-        assert!(
-            second.is_noop(),
-            "a file nothing ingests reported as new twice: {second:?}"
-        );
-        assert_eq!(second.unchanged, 2);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Access events cannot move a hash, and a directory being read would
-    /// otherwise keep extending the debounce hold so the reload never fires.
-    #[test]
-    fn irrelevant_filesystem_events_are_dropped_before_the_debounce() {
-        use notify::event::{AccessKind, DataChange, MetadataKind};
-        assert!(!is_relevant(&EventKind::Access(AccessKind::Read)));
-        assert!(!is_relevant(&EventKind::Modify(ModifyKind::Metadata(
-            MetadataKind::Permissions
-        ))));
-        assert!(is_relevant(&EventKind::Modify(ModifyKind::Data(
-            DataChange::Content
-        ))));
-        assert!(is_relevant(&EventKind::Create(
-            notify::event::CreateKind::File
-        )));
-        assert!(is_relevant(&EventKind::Remove(
-            notify::event::RemoveKind::File
-        )));
-    }
-
-    /// The debounce must collapse an editor's burst but not defer a bulk
-    /// operation for ever.
-    #[test]
-    fn the_debounce_window_is_shorter_than_its_ceiling() {
-        assert!(DEBOUNCE_WINDOW < MAX_DEBOUNCE_HOLD);
     }
 
     /// **A restart must not re-ingest what is already in the substrate.**

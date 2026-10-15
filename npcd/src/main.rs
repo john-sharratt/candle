@@ -47,7 +47,6 @@ mod tests {
     use super::*;
 
     use std::net::IpAddr;
-    use std::path::Path;
 
     /// The process's flags and npcd's own live side by side without clashing.
     #[test]
@@ -60,8 +59,8 @@ mod tests {
             "8081",
             "--gateway",
             "192.168.0.5",
-            "--mind",
-            "../mind",
+            "--mind-repo",
+            "battle-mind",
         ])
         .unwrap();
         assert_eq!((cli.host.host.as_str(), cli.host.port), ("0.0.0.0", 8081));
@@ -69,7 +68,7 @@ mod tests {
             cli.host.gateways,
             ["192.168.0.5".parse::<IpAddr>().unwrap()]
         );
-        assert_eq!(cli.npcd.mind.as_deref(), Some(Path::new("../mind")));
+        assert_eq!(cli.npcd.mind_repo.as_deref(), Some("battle-mind"));
         assert!(Cli::try_parse_from(["npcd", "--bind", "0.0.0.0:8081"]).is_err());
     }
 }

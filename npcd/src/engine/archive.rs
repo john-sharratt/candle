@@ -18,7 +18,6 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use crate::api::now_ms;
 use crate::engine::body::Outcome;
 use crate::engine::workflow::Taker;
-use crate::opstore::merge::follow::Followed;
 use crate::opstore::merge::publish::Publish;
 use crate::opstore::merge::sync::Synced;
 use crate::opstore::owner::Owner;
@@ -83,7 +82,6 @@ fn publish(hosted: &Hosted, body: &str, stores: &Arc<MindStores>, op: &Operation
         (Publish::Landed { commit, paths }, _) => {
             hosted.with_sim(|s| s.missions.published(op.id, &commit));
             tracing::info!(operation = %op.name, %commit, ?paths, "operation PUBLISHED");
-            bring_up(stores);
             Outcome::Did(format!(
                 "It is in the record now, as {}: {}. Report it done at the table.",
                 short(&commit),
@@ -170,25 +168,6 @@ pub fn commit_message(world: &str, op: &Operation) -> String {
         steps.join("\n"),
         op.id
     )
-}
-
-/// Bring the mind folder up to the record a publish just moved, so the files
-/// on disk — what the watcher ingests, and what the registries read — are what
-/// was published.
-pub fn bring_up(stores: &MindStores) {
-    match blocking(|| stores.follow()) {
-        Some(Ok(Some(Followed::Dirty(paths)))) => tracing::warn!(
-            ?paths,
-            "the mind folder has changes of its own on disk, and was not brought up to the record"
-        ),
-        Some(Ok(Some(Followed::Diverged))) => tracing::warn!(
-            "the mind folder's branch holds commits the record does not, and was not brought up"
-        ),
-        Some(Err(e)) => {
-            tracing::warn!("the mind folder could not be brought up to the record: {e}")
-        }
-        _ => {}
-    }
 }
 
 /// The first ten characters of a commit id, as a Maker reads one.
