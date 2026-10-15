@@ -206,8 +206,13 @@ is running from, so the trial runs from `keep/stable/web.exe` or
 stays free for the next deploy. Its stderr goes to `keep/state/<name>.trial.log`,
 read until the line `INFO serving` or the 10 minute limit; those lines are logged. A
 file, not a pipe, so the process can go on writing to it after the proof, and after
-`keep` itself restarts, with nothing draining it. `web` and `motherd` print the line
-once they are serving and not during boot. **The line makes the trial the service: the
+`keep` itself restarts, with nothing draining it. `web` prints the line once it is
+serving; `motherd` once every tenant has *proven* the build (`TenantStatus::proven`):
+zend once section calibration is behind it — the model loaded, the substrate opened,
+real forwards run — not once it is ready. What follows calibration, priming above all,
+is as long as there is to read: after the ingest keys change it re-reads every
+repository's anchors, an hour that tests nothing the forwards before it did not, and a
+trial that waited for it ran out of time and rolled a working build back. **The line makes the trial the service: the
 set-aside file is deleted and the process goes on running — a promotion does not
 restart it.** No such line within 10 minutes, or the process dying, stops the trial,
 puts the set-aside file back and starts it. A process `keep` starts at startup or on

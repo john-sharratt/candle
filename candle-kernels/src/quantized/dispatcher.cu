@@ -45,6 +45,17 @@
 #include "narrow_layout.cuh"  // the narrow launch's geometry and shared memory
 #include "pdl.cuh"            // programmatic dependent launch for the weight GEMMs that wait
 
+// The CUDA call behind this thread's last QMM_LAUNCH_FAILED, and what it
+// returned (`matmul_status.cuh`).
+thread_local cudaError_t qmm_launch_error = cudaSuccess;
+thread_local const char* qmm_launch_site = "";
+
+// The error behind this thread's last QMM_LAUNCH_FAILED, as CUDA names it.
+extern "C" const char* qmm_last_launch_error() { return cudaGetErrorName(qmm_launch_error); }
+
+// The call that returned it.
+extern "C" const char* qmm_last_launch_site() { return qmm_launch_site; }
+
 // =============================================================================
 // L2 CACHE FLUSH UTILITY
 // =============================================================================
@@ -999,8 +1010,9 @@ extern "C" int run_dense_int8_splitk(
         (void*)&dst_stride, (void*)&sum_norm, (void*)&ws, (void*)&counters,
     };
     // The split-K entry waits (`pdl_wait`) before its activation, partials and counters.
-    if (launch_pdl(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
-        return QMM_LAUNCH_FAILED;
+    if (const cudaError_t e = launch_pdl(kfn, grid, block, args, 0, (cudaStream_t)stream);
+        e != cudaSuccess) {
+        return qmm_launch_failed(e, "dense split-K: launch");
     }
     return QMM_OK;
 }
@@ -1068,9 +1080,10 @@ extern "C" int run_dense_int8_narrow(
     segs.tile_start[num_segs] = tile;
     segs.num = num_segs;
     if (!dense_narrow_smem_opted[out_dtype][fmt].load(std::memory_order_acquire)) {
-        if (cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 NARROW_SMEM_CAP) != cudaSuccess) {
-            return QMM_LAUNCH_FAILED;
+        if (const cudaError_t e = cudaFuncSetAttribute(
+                kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, NARROW_SMEM_CAP);
+            e != cudaSuccess) {
+            return qmm_launch_failed(e, "dense narrow: cudaFuncSetAttribute");
         }
         dense_narrow_smem_opted[out_dtype][fmt].store(true, std::memory_order_release);
     }
@@ -1083,8 +1096,9 @@ extern "C" int run_dense_int8_narrow(
         (void*)&dst_stride, (void*)&sum_norm,
     };
     // The narrow entry waits (`pdl_wait`) before its activation.
-    if (launch_pdl(kfn, grid, block, args, (size_t)smem, (cudaStream_t)stream) != cudaSuccess) {
-        return QMM_LAUNCH_FAILED;
+    if (const cudaError_t e = launch_pdl(kfn, grid, block, args, (size_t)smem, (cudaStream_t)stream);
+        e != cudaSuccess) {
+        return qmm_launch_failed(e, "dense narrow: launch");
     }
     return QMM_OK;
 }
@@ -1129,9 +1143,11 @@ extern "C" int run_dense_int8_silu_q8ko_f32(
         (void*)&dst_stride, (void*)&sum_norm,
     };
     // The fused-activation entry waits (`pdl_wait`) before it reads `proj`.
-    if (launch_pdl(mode2 ? (void*)q8_ko_int8_f32_dense_silu_m2 : (void*)q8_ko_int8_f32_dense_silu,
-                   grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
-        return QMM_LAUNCH_FAILED;
+    if (const cudaError_t e = launch_pdl(
+            mode2 ? (void*)q8_ko_int8_f32_dense_silu_m2 : (void*)q8_ko_int8_f32_dense_silu,
+            grid, block, args, 0, (cudaStream_t)stream);
+        e != cudaSuccess) {
+        return qmm_launch_failed(e, "dense silu: launch");
     }
     return QMM_OK;
 }
@@ -1284,7 +1300,7 @@ extern "C" int run_quantized_matmul(
         const cudaError_t launched = ko ? launch_pdl(kfn, grid, block, args, 0, stream)
                                         : cudaLaunchKernel(kfn, grid, block, args, 0, stream);
         if (launched != cudaSuccess) {
-            return QMM_LAUNCH_FAILED;
+            return qmm_launch_failed(launched, ko ? "matmul KO: launch" : "matmul: launch");
         }
         return QMM_OK;
     }
@@ -1369,15 +1385,19 @@ extern "C" int run_quantized_matmul(
         dispatch_plan_t plan = get_dispatch_plan(remaining, use_l2_path, use_tc);
         
         if (is_tc32_kernel(plan.tc_kernel) && plan.tc_batch > 0) {
-            if (launch_tc32(kset, plan.tc_kernel == K_TC32_R, vx, vy_slice, dst_slice,
-                            ncols_x, nrows_x, nrows_y, nrows_dst, plan.tc_batch, stream) != cudaSuccess) {
-                return QMM_LAUNCH_FAILED;
+            if (const cudaError_t e = launch_tc32(kset, plan.tc_kernel == K_TC32_R, vx, vy_slice,
+                                                  dst_slice, ncols_x, nrows_x, nrows_y, nrows_dst,
+                                                  plan.tc_batch, stream);
+                e != cudaSuccess) {
+                return qmm_launch_failed(e, "segment tc32: launch");
             }
             remaining = 0;
         } else if (is_tc16_kernel(plan.tc_kernel) && plan.tc_batch > 0) {
-            if (launch_tc16(kset, plan.tc_kernel == K_TC16_R, vx, vy_slice, dst_slice,
-                            ncols_x, nrows_x, nrows_y, nrows_dst, plan.tc_batch, stream) != cudaSuccess) {
-                return QMM_LAUNCH_FAILED;
+            if (const cudaError_t e = launch_tc16(kset, plan.tc_kernel == K_TC16_R, vx, vy_slice,
+                                                  dst_slice, ncols_x, nrows_x, nrows_y, nrows_dst,
+                                                  plan.tc_batch, stream);
+                e != cudaSuccess) {
+                return qmm_launch_failed(e, "segment tc16: launch");
             }
             remaining = 0;
         }
@@ -1391,9 +1411,11 @@ extern "C" int run_quantized_matmul(
         // k1
         if (plan.k1 != K_NONE && plan.b1 > 0 && remaining > 0) {
             int actual_b1 = (plan.b1 <= remaining) ? plan.b1 : remaining;
-            if (launch_kernel_by_type(kset, plan.k1, actual_b1, vx, vy_slice, dst_slice,
-                                      ncols_x, nrows_x, nrows_y, nrows_dst, stream) != cudaSuccess) {
-                return QMM_LAUNCH_FAILED;
+            if (const cudaError_t e = launch_kernel_by_type(kset, plan.k1, actual_b1, vx, vy_slice,
+                                                            dst_slice, ncols_x, nrows_x, nrows_y,
+                                                            nrows_dst, stream);
+                e != cudaSuccess) {
+                return qmm_launch_failed(e, "segment k1: launch");
             }
             remaining -= actual_b1;
             vy_slice = static_cast<const char*>(vy_slice) + actual_b1 * nrows_y * y_elem_size;
@@ -1403,9 +1425,11 @@ extern "C" int run_quantized_matmul(
         // k2
         if (plan.k2 != K_NONE && plan.b2 > 0 && remaining > 0) {
             int actual_b2 = (plan.b2 <= remaining) ? plan.b2 : remaining;
-            if (launch_kernel_by_type(kset, plan.k2, actual_b2, vx, vy_slice, dst_slice,
-                                      ncols_x, nrows_x, nrows_y, nrows_dst, stream) != cudaSuccess) {
-                return QMM_LAUNCH_FAILED;
+            if (const cudaError_t e = launch_kernel_by_type(kset, plan.k2, actual_b2, vx, vy_slice,
+                                                            dst_slice, ncols_x, nrows_x, nrows_y,
+                                                            nrows_dst, stream);
+                e != cudaSuccess) {
+                return qmm_launch_failed(e, "segment k2: launch");
             }
             remaining -= actual_b2;
             vy_slice = static_cast<const char*>(vy_slice) + actual_b2 * nrows_y * y_elem_size;
@@ -1415,9 +1439,11 @@ extern "C" int run_quantized_matmul(
         // k3 (L2 path 3-kernel cases)
         if (plan.k3 != K_NONE && plan.b3 > 0 && remaining > 0) {
             int actual_b3 = (plan.b3 <= remaining) ? plan.b3 : remaining;
-            if (launch_kernel_by_type(kset, plan.k3, actual_b3, vx, vy_slice, dst_slice,
-                                      ncols_x, nrows_x, nrows_y, nrows_dst, stream) != cudaSuccess) {
-                return QMM_LAUNCH_FAILED;
+            if (const cudaError_t e = launch_kernel_by_type(kset, plan.k3, actual_b3, vx, vy_slice,
+                                                            dst_slice, ncols_x, nrows_x, nrows_y,
+                                                            nrows_dst, stream);
+                e != cudaSuccess) {
+                return qmm_launch_failed(e, "segment k3: launch");
             }
             remaining -= actual_b3;
             vy_slice = static_cast<const char*>(vy_slice) + actual_b3 * nrows_y * y_elem_size;
@@ -1429,9 +1455,11 @@ extern "C" int run_quantized_matmul(
         // =================================================================
         while (remaining >= 8) {
             int bulk = (remaining / 8) * 8;
-            if (launch_kernel(kset.s8, 8, vx, vy_slice, dst_slice,
-                              ncols_x, nrows_x, nrows_y, nrows_dst, bulk, GRID_LAYOUT_ROW_FAST, 0, stream) != cudaSuccess) {
-                return QMM_LAUNCH_FAILED;
+            if (const cudaError_t e = launch_kernel(kset.s8, 8, vx, vy_slice, dst_slice, ncols_x,
+                                                    nrows_x, nrows_y, nrows_dst, bulk,
+                                                    GRID_LAYOUT_ROW_FAST, 0, stream);
+                e != cudaSuccess) {
+                return qmm_launch_failed(e, "segment s8: launch");
             }
             remaining -= bulk;
             vy_slice = static_cast<const char*>(vy_slice) + bulk * nrows_y * y_elem_size;
@@ -1445,9 +1473,12 @@ extern "C" int run_quantized_matmul(
             void* remainder_kernels[] = {
                 nullptr, kset.s1, kset.s2, kset.s3, kset.s4, kset.s5, kset.s6, kset.s7
             };
-            if (launch_kernel(remainder_kernels[remaining], remaining, vx, vy_slice, dst_slice,
-                              ncols_x, nrows_x, nrows_y, nrows_dst, remaining, GRID_LAYOUT_ROW_FAST, 0, stream) != cudaSuccess) {
-                return QMM_LAUNCH_FAILED;
+            if (const cudaError_t e = launch_kernel(remainder_kernels[remaining], remaining, vx,
+                                                    vy_slice, dst_slice, ncols_x, nrows_x, nrows_y,
+                                                    nrows_dst, remaining, GRID_LAYOUT_ROW_FAST, 0,
+                                                    stream);
+                e != cudaSuccess) {
+                return qmm_launch_failed(e, "segment remainder: launch");
             }
         }
         
@@ -1744,8 +1775,9 @@ extern "C" int run_grouped_quantized_matmul(
             (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
             (void*)&row_fast_v, (void*)&sum_norm, (void*)&live_v,
         };
-        if (cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
-            return QMM_LAUNCH_FAILED;
+        if (const cudaError_t e = cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream);
+            e != cudaSuccess) {
+            return qmm_launch_failed(e, "grouped int8: launch");
         }
     } else {
         void* args[] = {
@@ -1754,8 +1786,9 @@ extern "C" int run_grouped_quantized_matmul(
             (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
             (void*)&row_fast,
         };
-        if (cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
-            return QMM_LAUNCH_FAILED;
+        if (const cudaError_t e = cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream);
+            e != cudaSuccess) {
+            return qmm_launch_failed(e, "grouped: launch");
         }
     }
     return QMM_OK;

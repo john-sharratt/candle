@@ -229,6 +229,15 @@ impl MatmulStatus {
 }
 
 extern "C" {
+    /// The CUDA error behind this thread's last [`MatmulStatus::LaunchFailed`],
+    /// as CUDA names it (`cudaErrorStreamCaptureUnsupported`, …). A static
+    /// string the runtime owns.
+    pub fn qmm_last_launch_error() -> *const std::ffi::c_char;
+
+    /// The call that returned [`qmm_last_launch_error`]'s error — which launch,
+    /// or the shared-memory opt-in before one. A static string.
+    pub fn qmm_last_launch_site() -> *const std::ffi::c_char;
+
     /// Dispatches to the appropriate quantized matmul kernel.
     ///
     /// # Parameters

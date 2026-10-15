@@ -599,53 +599,56 @@ fn read_again_on_arrival(
     authored_dir: PathBuf,
 ) {
     let state = authored.clone();
-    runtime.set_mind_arrived(Arc::new(move || -> BoxFuture<'static, anyhow::Result<Arrived>> {
-        let (state, source, authored_dir) = (state.clone(), source.clone(), authored_dir.clone());
-        Box::pin(async move {
-            state.reload_authored().await;
-            if let Some(files) = state.mind.files() {
-                let label = mind_label(&source, &files);
-                // Fatal here as it is at start: a schema that cannot be read
-                // leaves characters with no registers to decode under.
-                let schema = projection::Source::from_files(files, label).map_err(|e| {
-                    anyhow::anyhow!("mind: the schema that arrived could not be read: {e}")
-                })?;
-                tracing::info!("projection schema: {}", schema.label);
-                let (libraries, feelings) = read_libraries(&schema);
-                state.set_libraries(libraries);
-                if let Some(rt) = &state.runtime {
-                    rt.set_feelings(feelings);
+    runtime.set_mind_arrived(Arc::new(
+        move || -> BoxFuture<'static, anyhow::Result<Arrived>> {
+            let (state, source, authored_dir) =
+                (state.clone(), source.clone(), authored_dir.clone());
+            Box::pin(async move {
+                state.reload_authored().await;
+                if let Some(files) = state.mind.files() {
+                    let label = mind_label(&source, &files);
+                    // Fatal here as it is at start: a schema that cannot be read
+                    // leaves characters with no registers to decode under.
+                    let schema = projection::Source::from_files(files, label).map_err(|e| {
+                        anyhow::anyhow!("mind: the schema that arrived could not be read: {e}")
+                    })?;
+                    tracing::info!("projection schema: {}", schema.label);
+                    let (libraries, feelings) = read_libraries(&schema);
+                    state.set_libraries(libraries);
+                    if let Some(rt) = &state.runtime {
+                        rt.set_feelings(feelings);
+                    }
                 }
-            }
-            if let Some(rt) = &state.runtime {
-                host_worlds(rt, &state, &authored_dir).await;
-            }
-            let cast = {
-                let mut npcs = state.npcs.write().await;
-                npcs.refresh();
-                npcs.cast()
-            };
-            let characters: Vec<String> = state
-                .personalities
-                .read()
-                .await
-                .iter()
-                .map(|r| r.id.clone())
-                .collect();
-            let worlds = state.worlds.read().await.len();
-            tracing::info!(
+                if let Some(rt) = &state.runtime {
+                    host_worlds(rt, &state, &authored_dir).await;
+                }
+                let cast = {
+                    let mut npcs = state.npcs.write().await;
+                    npcs.refresh();
+                    npcs.cast()
+                };
+                let characters: Vec<String> = state
+                    .personalities
+                    .read()
+                    .await
+                    .iter()
+                    .map(|r| r.id.clone())
+                    .collect();
+                let worlds = state.worlds.read().await.len();
+                tracing::info!(
                 "authored content, read again: {worlds} worlds, {} personalities, {} character(s) \
                  to wake",
                 characters.len(),
                 cast.len(),
             );
-            Ok(Arrived {
-                cast,
-                characters,
-                authored: identities(&state).await,
+                Ok(Arrived {
+                    cast,
+                    characters,
+                    authored: identities(&state).await,
+                })
             })
-        })
-    }));
+        },
+    ));
 }
 
 /// What a mind read from the substrate is called in the log: its repository,

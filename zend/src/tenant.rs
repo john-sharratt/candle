@@ -164,7 +164,14 @@ impl Reports for ZendReports {
     fn status(&self) -> BoxFuture<'_, TenantStatus> {
         Box::pin(self.off_runtime(|session| {
             let snap = session.status_snapshot();
+            // Past section calibration the build has shown it works, and what
+            // remains — priming above all — is as long as there is to read.
+            let proven = snap
+                .loading
+                .as_ref()
+                .is_none_or(|l| l.current.proves_the_build());
             let mut s = TenantStatus::of(snap.loading.map(|l| loading_view(l, snap.detail)));
+            s.proven = proven;
             s.maintenance = session.substrate_maintenance().map(Maintenance::of);
             s.extra.insert(
                 "ingest_backlog".into(),

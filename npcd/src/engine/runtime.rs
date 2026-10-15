@@ -4343,7 +4343,9 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     // What the tenant handed the load, or what it read again from the mind
     // that arrived.
     let cast = read_again.as_ref().map_or(&plan.cast, |a| &a.cast);
-    let characters = read_again.as_ref().map_or(&plan.characters, |a| &a.characters);
+    let characters = read_again
+        .as_ref()
+        .map_or(&plan.characters, |a| &a.characters);
     let authored = read_again.as_ref().map_or(&plan.authored, |a| &a.authored);
 
     // ── the mind's layers ──────────────────────────────────────────────────
@@ -4663,10 +4665,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     }
     if plan.forget_dreams {
         if let Some(minds) = rt.minds.read().unwrap().as_ref() {
-            let retired: usize = cast
-                .iter()
-                .map(|c| minds.forget_dreams(c.npc_id))
-                .sum();
+            let retired: usize = cast.iter().map(|c| minds.forget_dreams(c.npc_id)).sum();
             tracing::info!(
                 "dreams: {retired} retired across {} character(s) — every character starts \
                  with nothing dreamt",
@@ -4676,10 +4675,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     }
     if plan.forget_journal {
         if let Some(minds) = rt.minds.read().unwrap().as_ref() {
-            let retired: usize = cast
-                .iter()
-                .map(|c| minds.forget_journal(c.npc_id))
-                .sum();
+            let retired: usize = cast.iter().map(|c| minds.forget_journal(c.npc_id)).sum();
             tracing::info!(
                 "journal: {retired} conversation record(s) emptied across {} character(s) — \
                  every character starts with an empty journal",

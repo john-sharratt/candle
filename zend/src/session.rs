@@ -6627,7 +6627,10 @@ impl ZendSession {
                     Ok(rt) => rt,
                     Err(e) => {
                         status_tx.send(format!("Runtime build failed: {e}")).ok();
-                        fatal("zend", &format!("local tokio runtime for download failed: {e:#}"));
+                        fatal(
+                            "zend",
+                            &format!("local tokio runtime for download failed: {e:#}"),
+                        );
                     }
                 };
                 // The device the pack is resolved for — its int8 mode and layer
@@ -6639,8 +6642,7 @@ impl ZendSession {
                         fatal("zend", &format!("device init failed: {e:#}"));
                     }
                 };
-                let pack = match ensure_model_pack(&model, &device, &download_runtime, &status_tx)
-                {
+                let pack = match ensure_model_pack(&model, &device, &download_runtime, &status_tx) {
                     Ok(p) => p,
                     Err(e) => {
                         // A missing model is fatal — the daemon cannot serve
@@ -6764,13 +6766,12 @@ impl ZendSession {
                         let wake = Arc::new(Notify::new());
                         if !read_only_substrate {
                             let pass_state = Arc::clone(&state);
-                            let pass: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                                match pass_state.refresh_ingest_layers() {
+                            let pass: Arc<dyn Fn() + Send + Sync> =
+                                Arc::new(move || match pass_state.refresh_ingest_layers() {
                                     Ok(true) => tracing::info!("ingest pass: layers updated"),
                                     Ok(false) => tracing::debug!("ingest pass: no layer changed"),
                                     Err(e) => tracing::warn!("ingest pass failed: {e:#}"),
-                                }
-                            });
+                                });
                             let warm_state = Arc::clone(&state);
                             let after_first_pass: Arc<dyn Fn() + Send + Sync> =
                                 Arc::new(move || {
@@ -6787,12 +6788,16 @@ impl ZendSession {
                                     // not held while it runs. The tool catalog's
                                     // own levels are already warmed by the load's
                                     // `Normalizing` step, before ready.
-                                    let warmer = { warm_state.engine.lock().unwrap().ingest_warmer() };
+                                    let warmer =
+                                        { warm_state.engine.lock().unwrap().ingest_warmer() };
                                     let schema = warm_state.refresh_builder.schema().clone();
                                     warmer.run(&schema);
                                 });
-                            let worker =
-                                crate::ingest_worker::spawn(Arc::clone(&wake), pass, after_first_pass);
+                            let worker = crate::ingest_worker::spawn(
+                                Arc::clone(&wake),
+                                pass,
+                                after_first_pass,
+                            );
                             // The startup handoff: the initial backlog — first-ever
                             // ingest, or whatever drifted while the daemon was down
                             // — starts NOW, in the background, while the lines

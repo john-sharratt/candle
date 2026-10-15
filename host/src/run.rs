@@ -207,15 +207,24 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     }
 }
 
-/// Print [`PROOF`] once, after every tenant reports ready. `start` returns
-/// while a model is still loading, and the boot server is already gone, so
-/// this is the moment the process is actually serving.
+/// Print [`PROOF`] once, after every tenant reports itself proven
+/// (`TenantStatus::proven`): the steps that test this build are behind it,
+/// whatever reading remains. `start` returns while a model is still loading,
+/// and the boot server is already gone, so this is the moment the process has
+/// shown it works.
+///
+/// **Proven, not ready.** The proof is what a supervisor (`keep`) waits on
+/// before keeping a build, with a limit. Ready includes reading the workspace,
+/// whose length is the data's: after the ingest keys change, priming reads
+/// every repository's anchors again, an hour of forwards that says nothing more
+/// about the build than the first did — and a build that had loaded, prefilled
+/// and calibrated was rolled back for running out of time on it.
 fn announce_when_ready(reports: Vec<Arc<dyn Reports>>) {
     tokio::spawn(async move {
         loop {
             let mut ready = !reports.is_empty();
             for report in &reports {
-                if report.status().await.state != "ready" {
+                if !report.status().await.proven {
                     ready = false;
                     break;
                 }

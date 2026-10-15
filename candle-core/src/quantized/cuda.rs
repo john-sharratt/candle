@@ -8,8 +8,11 @@ use super::decode_rows::DecodeRows;
 use super::{GgmlDType, Int8Mode, QStorage, SumScale};
 use crate::backend::{BackendDevice, BackendStorage};
 
+use std::ffi::CStr;
+
 use crate::cuda_backend::alloc_inheriting;
 use crate::cuda_backend::graph::outside_capture;
+use crate::cuda_backend::last_cuda_kernel_launch;
 use crate::cuda_backend::stream_alloc;
 use crate::cuda_backend::wave_provenance::{wave_alloc_attributed, LeaseOrigin};
 use crate::cuda_backend::Backing;
@@ -43,8 +46,9 @@ use candle_kernels::simple::fused_silu_mul::run_silu_mul_q8a128_op;
 // Import the new quantized matmul dispatcher
 // K/128 blocks have embedded scales, no external scale extraction needed.
 use candle_kernels::quantized::{
-    dispatch_info, flush_l2_cache, run_grouped_quantized_matmul, run_qkv_segmented_matmul,
-    run_quantized_matmul, MatmulStatus, OutDType, VxSegment, YType, SPLITK_MAX_SEGS,
+    dispatch_info, flush_l2_cache, qmm_last_launch_error, qmm_last_launch_site,
+    run_grouped_quantized_matmul, run_qkv_segmented_matmul, run_quantized_matmul, MatmulStatus,
+    OutDType, VxSegment, YType, SPLITK_MAX_SEGS,
 };
 /// The wait state of a grouped GEMM over a live weight table — see
 /// [`grouped_qmatmul_dev_q8a128`].
@@ -5374,9 +5378,28 @@ fn out_dtype_code(dtype: crate::DType) -> Result<i32> {
 /// The launchers pick a kernel from a static table; a miss leaves the destination
 /// holding whatever the arena last put there. Checking the code is what makes that
 /// a failure instead of wrong numbers.
+///
+/// A failed launch says which CUDA call failed, with what error, and the
+/// thread's recent launches: a launch inside a recorded wave can fail on its own
+/// refusal or report an earlier one, and the bare status told neither apart.
 fn check_matmul_status(code: i32, op: &str) -> Result<()> {
-    match MatmulStatus::from_code(code).failure() {
+    let status = MatmulStatus::from_code(code);
+    match status.failure() {
         None => Ok(()),
+        Some(reason) if status == MatmulStatus::LaunchFailed => {
+            // SAFETY: both return static strings the launcher's own thread wrote.
+            let (error, site) = unsafe {
+                (
+                    CStr::from_ptr(qmm_last_launch_error()).to_string_lossy(),
+                    CStr::from_ptr(qmm_last_launch_site()).to_string_lossy(),
+                )
+            };
+            crate::bail!(
+                "{op}: kernel not launched ({reason}, status {code}): {site} returned {error}; \
+                 {}",
+                last_cuda_kernel_launch()
+            )
+        }
         Some(reason) => crate::bail!("{op}: kernel not launched ({reason}, status {code})"),
     }
 }

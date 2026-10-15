@@ -101,6 +101,32 @@ impl LoadStep {
         LoadStep::Preloading,
     ];
 
+    /// Whether reaching this step proves the build: every step before it tests
+    /// the binary — the model loaded, the substrate opened and caught up, the
+    /// tool sections prefilled and calibrated, so real forwards have run — and
+    /// every step from it on is reading whose length is the data's. Priming
+    /// after an ingest key change reads every repository's anchors again: an
+    /// hour, and nothing about the build that the forwards before it did not
+    /// already show.
+    pub fn proves_the_build(self) -> bool {
+        match self {
+            LoadStep::Pack
+            | LoadStep::Opening
+            | LoadStep::Model
+            | LoadStep::Substrate
+            | LoadStep::Compacting
+            | LoadStep::Connecting
+            | LoadStep::CatchUp
+            | LoadStep::Repositories
+            | LoadStep::Sections
+            | LoadStep::CalibratingSections => false,
+            LoadStep::SelfCheck
+            | LoadStep::Priming
+            | LoadStep::Normalizing
+            | LoadStep::Preloading => true,
+        }
+    }
+
     /// The step's id on the wire — what a page keys on.
     pub fn id(self) -> &'static str {
         match self {
@@ -461,6 +487,28 @@ impl Default for LoadProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The build is proven once section calibration is behind it** — the
+    /// steps that prove it are exactly those after it, in the load's own order,
+    /// so a step added later lands on the side of the line its place says.
+    #[test]
+    fn the_build_is_proven_from_the_step_after_calibration() {
+        let at = LoadStep::ALL
+            .iter()
+            .position(|s| *s == LoadStep::CalibratingSections)
+            .unwrap();
+        for (i, step) in LoadStep::ALL.iter().enumerate() {
+            assert_eq!(step.proves_the_build(), i > at, "{step:?}");
+        }
+        assert!(
+            LoadStep::Priming.proves_the_build(),
+            "priming is reading, not the build"
+        );
+        assert!(
+            !LoadStep::Sections.proves_the_build(),
+            "the first forwards are the build"
+        );
+    }
 
     #[test]
     fn new_starts_at_the_pack_step_with_zero_progress() {
