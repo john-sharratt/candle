@@ -126,7 +126,7 @@
             ]) },
             { role: 'user', content: J([
               '<tool_response>[1/2 file_list]',
-              '{"entries":["conversations.rs","mod.rs"],"paging":{"page":0,"pages":1,"total":2}}</tool_response>',
+              '{"entries":["conversations.rs","mod.rs"],"paging":{"page":1,"pages":1,"total":2}}</tool_response>',
               '<tool_response>[2/2 file_list]',
               '{"error":"not_found","detail":"no such folder: zend/src/nope"}</tool_response>',
             ]) },

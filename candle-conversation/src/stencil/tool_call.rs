@@ -1621,8 +1621,8 @@ impl<'a> ToolTreeBuilder<'a> {
     /// `<end>` is what follows the value — the next key, the close — taken as
     /// each arm's text ([`Self::continuations`]), so the digit the model does
     /// not write and the separator it does are one choice. `-` is offered only
-    /// when the schema's `minimum` allows a negative, and a leading `0` ends the
-    /// number, as JSON requires.
+    /// when the schema's `minimum` allows a negative, `0` only when it allows
+    /// zero, and a leading `0` ends the number, as JSON requires.
     ///
     /// It was a free JSON value, which guarantees structure and not type: live,
     /// a `git_show` call decoded `"page": "7eb876659c1b…"` — a commit id in an
@@ -1650,7 +1650,12 @@ impl<'a> ToolTreeBuilder<'a> {
         }
         let leading: Vec<(String, SpecId)> =
             DIGITS[1..].iter().map(|d| (d.to_string(), more)).collect();
-        let mut first = vec![("0".to_string(), finished)];
+        // `0` is a whole value of its own, offered only where the schema's
+        // `minimum` admits it: a one-based page has no page 0 to write.
+        let mut first = Vec::with_capacity(DIGITS.len() + 1);
+        if p.minimum.is_none_or(|m| m <= 0.0) {
+            first.push(("0".to_string(), finished));
+        }
         first.extend(leading.iter().cloned());
         if p.minimum.is_none_or(|m| m < 0.0) {
             let negative = self.spec.push(NodeSpec::Branch { arms: leading });

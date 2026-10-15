@@ -380,14 +380,14 @@ mod tests {
             vec![result(
                 "file_list",
                 json!({"repo": "candle", "path": "zend/src"}),
-                json!({"entries": [], "paging": {"page": 0, "pages": 2, "next_page": 1}}),
+                json!({"entries": [], "paging": {"page": 1, "pages": 2, "next_page": 2}}),
             )]
         };
         passes(&mut guard, listing, NOTICE_FROM - 1);
         let mut again = listing();
         guard.screen(&mut again);
         let detail = again[0].response["detail"].as_str().unwrap();
-        assert!(detail.contains("`page: 1`"), "{detail}");
+        assert!(detail.contains("`page: 2`"), "{detail}");
         assert!(!detail.contains("create it with `write`"), "{detail}");
     }
 
@@ -457,14 +457,14 @@ mod tests {
         let log = || {
             result(
                 "git_log",
-                json!({"repo": "candle", "page": 0}),
+                json!({"repo": "candle", "page": 1}),
                 json!({"count": 2000, "commits": []}),
             )
         };
         let show = || {
             result(
                 "git_show",
-                json!({"repo": "candle", "what": "changes", "page": 0}),
+                json!({"repo": "candle", "what": "changes", "page": 1}),
                 json!({"subject": "s", "changes": []}),
             )
         };

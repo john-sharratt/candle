@@ -21,15 +21,15 @@ questions:
 - how many files have I changed
 - is everything I wrote already committed
 category: Git
-description: 'Report what you have not committed in a repository: every file you added, modified or deleted since your files'' base commit, each with its `status`. Also names the branch you are on and that commit (`head`); `incoming` — how many commits the branch has that you do not, which git_merge brings in and a commit waits for; `conflicts` — files a merge left for you to settle before committing; `merging` — while a merge is being finished, the commit it brings in; and, as `upstream`, how far the local branch is `ahead` and `behind` origin''s copy; when origin has no copy yet, or the repository has no origin, `no_upstream` says so. A `counts` block comes back with every reply — `added`, `modified`, `deleted` — so "how many have I changed" is READ off those totals rather than counted from the listing, and `clean` says outright whether there is anything uncommitted at all, a merge being finished included. Use for "what have I changed", "is this committed", "what branch am I on", "am I up to date", "what is still in conflict", or to see what a commit of your changes would hold. The changed paths page, 80 a page, and `page` is required: pass 0 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only: it commits nothing and changes nothing.'
+description: 'Report what you have not committed in a repository: every file you added, modified or deleted since your files'' base commit, each with its `status`. Also names the branch you are on and that commit (`head`); `incoming` — how many commits the branch has that you do not, which git_merge brings in and a commit waits for; `conflicts` — files a merge left for you to settle before committing; `merging` — while a merge is being finished, the commit it brings in; and, as `upstream`, how far the local branch is `ahead` and `behind` origin''s copy; when origin has no copy yet, or the repository has no origin, `no_upstream` says so. A `counts` block comes back with every reply — `added`, `modified`, `deleted` — so "how many have I changed" is READ off those totals rather than counted from the listing, and `clean` says outright whether there is anything uncommitted at all, a merge being finished included. Use for "what have I changed", "is this committed", "what branch am I on", "am I up to date", "what is still in conflict", or to see what a commit of your changes would hold. The changed paths page, 80 a page, and `page` is required and counts from 1: pass 1 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only: it commits nothing and changes nothing.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
     page:
-      description: Zero-based page of changed paths, 80 a page. Required — pass 0 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
+      description: Page of changed paths, from 1, 80 a page. Required — pass 1 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
       format: uint32
-      minimum: 0.0
+      minimum: 1.0
       type: integer
     repo:
       description: The repository to inspect. Required.

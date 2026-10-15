@@ -69,7 +69,7 @@ fn a_program_sees_the_conversations_files_and_keeps_what_it_writes() {
     assert_eq!(changed, ["input.txt", "out.txt"], "{status}");
 }
 
-/// **Long output comes back a page at a time**: the run returns page 0,
+/// **Long output comes back a page at a time**: the run returns page 1,
 /// and `run_output` the rest.
 #[test]
 fn long_output_pages() {
@@ -85,10 +85,10 @@ fn long_output_pages() {
     let first = &out["output"];
     assert_eq!(
         (&first["page"], &first["pages"], &first["total_lines"]),
-        (&json!(0), &json!(2), &json!(250))
+        (&json!(1), &json!(2), &json!(250))
     );
     let job = out["job"].as_str().unwrap();
-    let rest = conv.call("run_output", json!({"repo": "app", "job": job, "page": 1}));
+    let rest = conv.call("run_output", json!({"repo": "app", "job": job, "page": 2}));
     assert_eq!(rest["status"], "exited", "{rest}");
     assert_eq!(rest["exit_code"], 0);
     assert_eq!(
@@ -267,12 +267,12 @@ fn run_output_needs_a_real_job() {
     let conv = ws.conversation_running(&[shell()]);
     let bad = conv.call(
         "run_output",
-        json!({"repo": "app", "job": "../../etc", "page": 0}),
+        json!({"repo": "app", "job": "../../etc", "page": 1}),
     );
     assert_eq!(bad["error"], "invalid_arguments", "{bad}");
     let unknown = conv.call(
         "run_output",
-        json!({"repo": "app", "job": "AAAAAAAAAAA", "page": 0}),
+        json!({"repo": "app", "job": "AAAAAAAAAAA", "page": 1}),
     );
     assert_eq!(unknown["error"], "not_found", "{unknown}");
 }

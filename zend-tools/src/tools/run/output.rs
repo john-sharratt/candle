@@ -17,7 +17,9 @@ pub struct OutputRequest {
     /// The `job` a run_command result gave. Required.
     #[validate(length(min = 1))]
     pub job: String,
-    /// Which page of the output, 0-based; a page past the end is the last. Required.
+    /// Which page of the output, from 1; a page past the end is the last. Required.
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: usize,
 }
 

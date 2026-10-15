@@ -8,23 +8,30 @@
 //!   byte-identical to the ones a live read returns.
 //!
 //! ````text
-//! ```rust file=server/src/auth/handler.rs page=0/3 lines=620
+//! ```rust file=server/src/auth/handler.rs page=1 pages=4 lines=620
 //!   1  impl AuthHandler {
 //!   2      pub fn validate_token(&self, token: &str) -> Result<Claims> {
 //! 200      // ...
 //! ```
-//! end of server/src/auth/handler.rs page 0/3
+//! end of server/src/auth/handler.rs page 1 of 4 — next: page=2
 //! ````
 //!
 //! `cat -n` numbering, right-aligned to the widest line number, two spaces, then
 //! the source verbatim. There is no header line: the opening fence itself names
 //! the file as a workspace path (`<repo>/<path>` — a path alone is ambiguous
-//! across a workspace of several repositories), which page this is (0-based,
-//! matching `file_read`'s own request parameter), the page count, and the file's
-//! length. The line numbers give the range. The closing line names the file and
-//! page again, so the page's content is bracketed by its identity at both ends —
-//! content at the bottom of a long page sits next to its name, not 200 lines away
-//! from it, which is what keeps look-alike pages from different files apart.
+//! across a workspace of several repositories), which page this is, how many
+//! pages there are, and the file's length. The line numbers give the range. The
+//! closing line names the file and page again, so the page's content is
+//! bracketed by its identity at both ends — content at the bottom of a long page
+//! sits next to its name, not 200 lines away from it, which is what keeps
+//! look-alike pages from different files apart.
+//!
+//! **Pages count from 1, and the closing line says what comes next** — the page
+//! to ask for, or that this was the last. Zero-based, the last of two pages read
+//! `page 1/2`, which says "page one of two" to anyone reading it: a model that
+//! had read a file whole reasoned its way to a missing page, and the tool's own
+//! description taught it to probe for the end by asking until the page number
+//! stopped advancing.
 
 /// The attribute every page of a file opens with, `file=<repo>/<path>` — the
 /// file's anchor. A reply that points the model at pages it already holds names
@@ -36,9 +43,10 @@ pub fn file_anchor(repo: &str, path: &str) -> String {
 /// Fence + `cat -n` numbered body + closing line, as one string. The caller
 /// frames it in `<tool_response>` tags.
 ///
-/// `total_pages` and `total_lines` are always known by the time this is
-/// called — [`zend_vfs::VfsStore::read_page`] streams the whole file to compute
-/// them — so the fence always states them.
+/// `page` counts from 1, as `file_read`'s request does. `total_pages` and
+/// `total_lines` are always known by the time this is called —
+/// [`zend_vfs::VfsStore::read_page`] streams the whole file to compute them —
+/// so the fence always states them.
 ///
 /// `fence_tag` is the markdown language tag (`rust`, `python`, …); empty renders
 /// `text`, so the fence's first word is always a language and never the
@@ -79,13 +87,18 @@ pub fn numbered_excerpt(
         fence_tag
     };
     if total_lines == 0 {
-        // An empty file has no page to state; "page=0/0" reads as a bug the same
-        // way "lines 1-0" used to.
+        // An empty file has no page to state; "page=1 pages=0" reads as a bug
+        // the same way "lines 1-0" used to.
         return format!("\n```{lang} {anchor} lines=0\n```\nend of {file}\n");
     }
+    let after = if page < total_pages {
+        format!("— next: page={}", page + 1)
+    } else {
+        "— the last page".to_string()
+    };
     format!(
-        "\n```{lang} {anchor} page={page}/{total_pages} lines={total_lines}\n\
-         {numbered}```\nend of {file} page {page}/{total_pages}\n"
+        "\n```{lang} {anchor} page={page} pages={total_pages} lines={total_lines}\n\
+         {numbered}```\nend of {file} page {page} of {total_pages} {after}\n"
     )
 }
 
@@ -138,10 +151,11 @@ mod tests {
 
     #[test]
     fn numbers_right_aligned_and_fenced() {
-        let out = numbered_excerpt("r", "a.rs", 0, 1, 8, 10, 10, "rust", "one\ntwo\nthree\n");
+        let out = numbered_excerpt("r", "a.rs", 1, 1, 8, 10, 10, "rust", "one\ntwo\nthree\n");
         assert_eq!(
             out,
-            "\n```rust file=r/a.rs page=0/1 lines=10\n 8  one\n 9  two\n10  three\n```\nend of r/a.rs page 0/1\n",
+            "\n```rust file=r/a.rs page=1 pages=1 lines=10\n 8  one\n 9  two\n10  three\n```\n\
+             end of r/a.rs page 1 of 1 — the last page\n",
         );
     }
 
@@ -150,18 +164,31 @@ mod tests {
     #[test]
     fn the_anchor_is_what_the_fence_opens_with() {
         assert_eq!(file_anchor("r", "src/a.rs"), "file=r/src/a.rs");
-        let out = numbered_excerpt("r", "src/a.rs", 0, 1, 1, 1, 1, "rust", "x\n");
+        let out = numbered_excerpt("r", "src/a.rs", 1, 1, 1, 1, 1, "rust", "x\n");
         assert!(out.starts_with("\n```rust file=r/src/a.rs page="), "{out}");
     }
 
-    /// A page short of the last one says so in the fence, so the model knows
-    /// to ask for `page + 1` without being told the stride.
+    /// A page short of the last one names the page to ask for next, so the
+    /// model reads on without working out the stride or probing for the end.
     #[test]
-    fn a_partial_page_reports_the_total() {
-        let out = numbered_excerpt("r", "a.rs", 0, 3, 1, 2, 900, "rust", "one\ntwo\n");
+    fn a_page_before_the_last_names_the_next() {
+        let out = numbered_excerpt("r", "a.rs", 1, 3, 1, 2, 900, "rust", "one\ntwo\n");
         assert_eq!(
             out,
-            "\n```rust file=r/a.rs page=0/3 lines=900\n1  one\n2  two\n```\nend of r/a.rs page 0/3\n"
+            "\n```rust file=r/a.rs page=1 pages=3 lines=900\n1  one\n2  two\n```\n\
+             end of r/a.rs page 1 of 3 — next: page=2\n"
+        );
+    }
+
+    /// The last page says it is the last — never `page 2/3`-style arithmetic
+    /// the reader has to do, and never a number that looks like more to come.
+    #[test]
+    fn the_last_page_says_so() {
+        let out = numbered_excerpt("r", "a.rs", 3, 3, 401, 402, 402, "rust", "one\ntwo\n");
+        assert_eq!(
+            out,
+            "\n```rust file=r/a.rs page=3 pages=3 lines=402\n401  one\n402  two\n```\n\
+             end of r/a.rs page 3 of 3 — the last page\n"
         );
     }
 
@@ -169,16 +196,17 @@ mod tests {
     /// never read as the fence's info string.
     #[test]
     fn a_trailing_newline_does_not_invent_a_line() {
-        let out = numbered_excerpt("r", "a.txt", 0, 1, 1, 1, 1, "", "only\n");
+        let out = numbered_excerpt("r", "a.txt", 1, 1, 1, 1, 1, "", "only\n");
         assert_eq!(
             out,
-            "\n```text file=r/a.txt page=0/1 lines=1\n1  only\n```\nend of r/a.txt page 0/1\n"
+            "\n```text file=r/a.txt page=1 pages=1 lines=1\n1  only\n```\n\
+             end of r/a.txt page 1 of 1 — the last page\n"
         );
     }
 
     #[test]
     fn an_empty_file_says_so_instead_of_an_impossible_range() {
-        let out = numbered_excerpt("r", "a.rs", 0, 0, 1, 0, 0, "rust", "");
+        let out = numbered_excerpt("r", "a.rs", 1, 0, 1, 0, 0, "rust", "");
         assert_eq!(out, "\n```rust file=r/a.rs lines=0\n```\nend of r/a.rs\n");
     }
 
@@ -186,20 +214,22 @@ mod tests {
     /// trailing-newline heuristic, decides how many lines an excerpt has.
     #[test]
     fn a_blank_last_line_inside_the_range_is_kept() {
-        let out = numbered_excerpt("r", "a.rs", 0, 1, 1, 2, 2, "rust", "a\n");
+        let out = numbered_excerpt("r", "a.rs", 1, 1, 1, 2, 2, "rust", "a\n");
         assert_eq!(
             out,
-            "\n```rust file=r/a.rs page=0/1 lines=2\n1  a\n2  \n```\nend of r/a.rs page 0/1\n"
+            "\n```rust file=r/a.rs page=1 pages=1 lines=2\n1  a\n2  \n```\n\
+             end of r/a.rs page 1 of 1 — the last page\n"
         );
     }
 
     /// A body whose last line has no trailing newline keeps that line.
     #[test]
     fn a_body_without_a_trailing_newline_keeps_its_last_line() {
-        let out = numbered_excerpt("r", "a.rs", 0, 1, 1, 2, 2, "rust", "one\ntwo");
+        let out = numbered_excerpt("r", "a.rs", 1, 1, 1, 2, 2, "rust", "one\ntwo");
         assert_eq!(
             out,
-            "\n```rust file=r/a.rs page=0/1 lines=2\n1  one\n2  two\n```\nend of r/a.rs page 0/1\n"
+            "\n```rust file=r/a.rs page=1 pages=1 lines=2\n1  one\n2  two\n```\n\
+             end of r/a.rs page 1 of 1 — the last page\n"
         );
     }
 

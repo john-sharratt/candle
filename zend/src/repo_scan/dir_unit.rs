@@ -151,7 +151,7 @@ mod tests {
         let shown = zend_tools::run(
             "file_list",
             "test",
-            &serde_json::json!({"repo": "k", "page": 0}),
+            &serde_json::json!({"repo": "k", "page": 1}),
             &ctx,
         );
         let listed_by_tool: Vec<String> = shown["entries"]

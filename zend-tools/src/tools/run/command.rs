@@ -111,7 +111,7 @@ impl Tool for RunCommand {
                 command,
             },
         )?;
-        let output = page::read(&ran.log, 0).map_err(SandboxesError::Log)?;
+        let output = page::read(&ran.log, 1).map_err(SandboxesError::Log)?;
         let outcome = ran.outcome;
         Ok(RunResponse {
             repo: req.repo,

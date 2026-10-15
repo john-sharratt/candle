@@ -13,7 +13,7 @@ use crate::harness::{branch_rev, commit_rev, head_rev, parent_rev, tag_rev, GitW
 #[test]
 fn a_conversation_with_no_changes_is_clean_and_names_its_branch() {
     let ws = GitWorkspace::new();
-    let out = ws.read("git_status", json!({"repo": "app", "page": 0}));
+    let out = ws.read("git_status", json!({"repo": "app", "page": 1}));
     assert_eq!(out["clean"], true, "{out}");
     assert_eq!(out["branch"], "main");
     assert_eq!(out["head"], ws.oid("HEAD"));
@@ -79,7 +79,7 @@ fn status_reports_how_far_ahead_of_its_upstream_the_branch_is() {
     ws.git(&["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
     ws.git(&["config", "branch.main.remote", "origin"]);
     ws.git(&["config", "branch.main.merge", "refs/heads/main"]);
-    let out = ws.read("git_status", json!({"repo": "app", "page": 0}));
+    let out = ws.read("git_status", json!({"repo": "app", "page": 1}));
     assert_eq!(out["upstream"]["remote"], "origin", "{out}");
     assert_eq!(out["upstream"]["branch"], "main");
     assert_eq!(out["upstream"]["ahead"], 1);
@@ -92,7 +92,7 @@ fn status_reports_how_far_ahead_of_its_upstream_the_branch_is() {
 #[test]
 fn status_without_an_upstream_says_why() {
     let ws = GitWorkspace::new();
-    let out = ws.read("git_status", json!({"repo": "app", "page": 0}));
+    let out = ws.read("git_status", json!({"repo": "app", "page": 1}));
     assert!(out.get("upstream").is_none(), "{out}");
     let hint = out["no_upstream"].as_str().unwrap();
     assert!(hint.contains("no origin"), "{hint}");
@@ -103,7 +103,7 @@ fn status_without_an_upstream_says_why() {
         "origin",
         "https://example.com/acme/app.git",
     ]);
-    let out = ws.read("git_status", json!({"repo": "app", "page": 0}));
+    let out = ws.read("git_status", json!({"repo": "app", "page": 1}));
     let hint = out["no_upstream"].as_str().unwrap();
     assert!(hint.contains("origin has no copy"), "{hint}");
 }
@@ -122,9 +122,9 @@ fn status_pages_and_the_counts_cover_everything() {
     assert_eq!(first["counts"]["added"], 100, "{}", first["counts"]);
     assert_eq!(first["paging"]["total"], 100);
     assert_eq!(first["changes"].as_array().unwrap().len(), 80);
-    assert_eq!(first["paging"]["next_page"], 1);
+    assert_eq!(first["paging"]["next_page"], 2);
 
-    let second = conv.call("git_status", json!({"repo": "app", "page": 1}));
+    let second = conv.call("git_status", json!({"repo": "app", "page": 2}));
     assert_eq!(second["changes"].as_array().unwrap().len(), 20);
     assert!(second["paging"]["next_page"].is_null());
 }
@@ -138,14 +138,40 @@ fn a_page_past_the_end_clamps_to_the_last_page() {
     let conv = ws.conversation();
     conv.write("one.txt", "x\n");
     let out = conv.call("git_status", json!({"repo": "app", "page": 99}));
-    assert_eq!(out["paging"]["page"], 0, "{out}");
+    assert_eq!(out["paging"]["page"], 1, "{out}");
     assert_eq!(out["changes"].as_array().unwrap().len(), 1);
+}
+
+/// **There is no page 0** for any reader: a call for one is refused with a
+/// reason, never read as some other page.
+#[test]
+fn a_reader_asked_for_page_zero_is_refused() {
+    let ws = GitWorkspace::new();
+    for (tool, args) in [
+        ("git_status", json!({"repo": "app", "page": 0})),
+        ("git_log", json!({"repo": "app", "page": 0})),
+        (
+            "git_show",
+            json!({"repo": "app", "what": "changes", "page": 0}),
+        ),
+        (
+            "git_grep",
+            json!({"repo": "app", "pattern": "hello", "page": 0}),
+        ),
+        (
+            "git_refs",
+            json!({"repo": "app", "kind": "branches", "page": 0}),
+        ),
+    ] {
+        let out = ws.read(tool, args);
+        assert_eq!(out["error"], "invalid_arguments", "{tool}: {out}");
+    }
 }
 
 #[test]
 fn an_unknown_repo_names_the_ones_that_exist() {
     let ws = GitWorkspace::new();
-    let out = ws.read("git_status", json!({"repo": "nope", "page": 0}));
+    let out = ws.read("git_status", json!({"repo": "nope", "page": 1}));
     assert_eq!(out["error"], "unknown_repo", "{out}");
     assert!(out["detail"].as_str().unwrap().contains("app"), "{out}");
 }
@@ -155,7 +181,7 @@ fn an_unknown_repo_names_the_ones_that_exist() {
 #[test]
 fn history_comes_back_newest_first_with_full_ids_and_a_count() {
     let ws = GitWorkspace::new();
-    let out = ws.read("git_log", json!({"repo": "app", "page": 0}));
+    let out = ws.read("git_log", json!({"repo": "app", "page": 1}));
     let commits = out["commits"].as_array().unwrap();
     assert_eq!(out["count"], 2, "{out}");
     assert_eq!(out["counted_all"], true);
@@ -181,7 +207,7 @@ fn a_merge_lists_its_parents() {
     let side = ws.commit_all("side work");
     ws.git(&["checkout", "-q", "main"]);
     ws.git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
-    let out = ws.read("git_log", json!({"repo": "app", "page": 0}));
+    let out = ws.read("git_log", json!({"repo": "app", "page": 1}));
     let merge = &out["commits"][0];
     assert_eq!(merge["subject"], "merge side", "{out}");
     assert_eq!(merge["merge_of"], json!([base, side]));
@@ -190,7 +216,7 @@ fn a_merge_lists_its_parents() {
 #[test]
 fn a_commit_carries_an_iso_date_and_its_author() {
     let ws = GitWorkspace::new();
-    let a = &ws.read("git_log", json!({"repo": "app", "page": 0}))["commits"][0]["author"];
+    let a = &ws.read("git_log", json!({"repo": "app", "page": 1}))["commits"][0]["author"];
     assert_eq!(a["name"], "Setup");
     assert_eq!(a["date"], "2023-11-14T22:13:20+00:00");
 }
@@ -207,7 +233,7 @@ fn since_excludes_what_the_other_branch_already_has_and_counts_it() {
     let out = ws.read(
         "git_log",
         json!({"repo": "app", "rev": branch_rev("feature"), "since": branch_rev("main"),
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(out["count"], 1, "only the commit main lacks: {out}");
     assert_eq!(out["commits"][0]["subject"], "add the feature");
@@ -216,7 +242,7 @@ fn since_excludes_what_the_other_branch_already_has_and_counts_it() {
     let none = ws.read(
         "git_log",
         json!({"repo": "app", "rev": branch_rev("main"), "since": branch_rev("feature"),
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(none["count"], 0, "{none}");
 }
@@ -226,7 +252,7 @@ fn paths_narrow_history_to_the_files_that_changed() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_log",
-        json!({"repo": "app", "paths": ["README.md"], "page": 0}),
+        json!({"repo": "app", "paths": ["README.md"], "page": 1}),
     );
     assert_eq!(out["count"], 1, "{out}");
     assert_eq!(out["commits"][0]["subject"], "initial commit");
@@ -240,12 +266,12 @@ fn follow_renames_reaches_back_past_the_rename() {
 
     let plain = ws.read(
         "git_log",
-        json!({"repo": "app", "paths": ["src/core.rs"], "page": 0}),
+        json!({"repo": "app", "paths": ["src/core.rs"], "page": 1}),
     );
     assert_eq!(plain["count"], 1);
     let followed = ws.read(
         "git_log",
-        json!({"repo": "app", "paths": ["src/core.rs"], "follow_renames": true, "page": 0}),
+        json!({"repo": "app", "paths": ["src/core.rs"], "follow_renames": true, "page": 1}),
     );
     assert_eq!(followed["count"], 3, "{followed}");
 }
@@ -254,9 +280,9 @@ fn follow_renames_reaches_back_past_the_rename() {
 fn follow_renames_refuses_the_combinations_it_cannot_honour() {
     let ws = GitWorkspace::new();
     for args in [
-        json!({"repo": "app", "paths": ["a", "b"], "follow_renames": true, "page": 0}),
+        json!({"repo": "app", "paths": ["a", "b"], "follow_renames": true, "page": 1}),
         json!({"repo": "app", "paths": ["README.md"], "follow_renames": true,
-               "since": branch_rev("main"), "page": 0}),
+               "since": branch_rev("main"), "page": 1}),
     ] {
         assert_eq!(
             ws.read("git_log", args.clone())["error"],
@@ -279,7 +305,7 @@ fn lines_names_the_commits_behind_those_lines_not_the_files_latest() {
     let top = ws.read(
         "git_log",
         json!({"repo": "app", "paths": ["src/lib.rs"], "lines": {"start": 1, "end": 1},
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(top["count"], 1, "{top}");
     assert_eq!(
@@ -295,7 +321,7 @@ fn lines_names_the_commits_behind_those_lines_not_the_files_latest() {
     let all = ws.read(
         "git_log",
         json!({"repo": "app", "paths": ["src/lib.rs"], "lines": {"start": 1, "end": 3},
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(all["count"], 2, "{all}");
     // Newest first, as a history reads.
@@ -320,7 +346,7 @@ fn lines_past_the_end_clamp_or_say_how_long_the_file_is() {
     let clamped = ws.read(
         "git_log",
         json!({"repo": "app", "paths": ["src/lib.rs"], "lines": {"start": 2, "end": 99},
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(
         clamped["line_runs"].as_array().unwrap().len(),
@@ -331,7 +357,7 @@ fn lines_past_the_end_clamp_or_say_how_long_the_file_is() {
     let beyond = ws.read(
         "git_log",
         json!({"repo": "app", "paths": ["src/lib.rs"], "lines": {"start": 50, "end": 60},
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(beyond["error"], "invalid_arguments", "{beyond}");
     assert!(
@@ -344,17 +370,17 @@ fn lines_past_the_end_clamp_or_say_how_long_the_file_is() {
 fn lines_refuses_what_it_cannot_honour() {
     let ws = GitWorkspace::new();
     for args in [
-        json!({"repo": "app", "lines": {"start": 1, "end": 2}, "page": 0}),
+        json!({"repo": "app", "lines": {"start": 1, "end": 2}, "page": 1}),
         json!({"repo": "app", "paths": ["src/lib.rs", "README.md"],
-               "lines": {"start": 1, "end": 2}, "page": 0}),
+               "lines": {"start": 1, "end": 2}, "page": 1}),
         json!({"repo": "app", "paths": ["src/lib.rs"], "lines": {"start": 1, "end": 2},
-               "since": branch_rev("main"), "page": 0}),
+               "since": branch_rev("main"), "page": 1}),
         json!({"repo": "app", "paths": ["src/lib.rs"], "lines": {"start": 0, "end": 2},
-               "page": 0}),
+               "page": 1}),
         json!({"repo": "app", "paths": ["src/lib.rs"], "lines": {"start": 3, "end": 1},
-               "page": 0}),
+               "page": 1}),
         json!({"repo": "app", "paths": ["src/lib.rs"], "lines": {"start": 1, "end": 500},
-               "page": 0}),
+               "page": 1}),
     ] {
         assert_eq!(
             ws.read("git_log", args.clone())["error"],
@@ -369,7 +395,7 @@ fn an_unknown_revision_says_so() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_log",
-        json!({"repo": "app", "rev": branch_rev("nope"), "page": 0}),
+        json!({"repo": "app", "rev": branch_rev("nope"), "page": 1}),
     );
     assert_eq!(out["error"], "unknown_revision", "{out}");
 }
@@ -378,12 +404,12 @@ fn an_unknown_revision_says_so() {
 #[test]
 fn an_unknown_field_is_refused() {
     let ws = GitWorkspace::new();
-    let out = ws.read("git_log", json!({"repo": "app", "max_count": 5, "page": 0}));
+    let out = ws.read("git_log", json!({"repo": "app", "max_count": 5, "page": 1}));
     assert_eq!(out["error"], "invalid_arguments", "{out}");
 }
 
 /// **Every reader's page is required**, as `file_read`'s is: a call that
-/// leaves it out is refused rather than quietly served page 0, so the decoder's
+/// leaves it out is refused rather than quietly served page 1, so the decoder's
 /// grammar and the executor agree that there is no unpaged read.
 #[test]
 fn a_reader_called_without_a_page_is_refused() {
@@ -413,11 +439,11 @@ fn a_history_page_carries_subjects_and_no_bodies() {
         ws.git(&["add", "-A"]);
         ws.git(&["commit", "-q", "-m", &format!("change {i}"), "-m", &body]);
     }
-    let out = ws.read("git_log", json!({"repo": "app", "page": 0}));
+    let out = ws.read("git_log", json!({"repo": "app", "page": 1}));
     let commits = out["commits"].as_array().unwrap();
     assert_eq!(commits.len(), 20, "{}", out["paging"]);
     assert_eq!(out["count"], 32);
-    assert_eq!(out["paging"]["next_page"], 1);
+    assert_eq!(out["paging"]["next_page"], 2);
     assert_eq!(commits[0]["subject"], "change 29");
     assert!(commits[0].get("message").is_none(), "{}", commits[0]);
     let text = out.to_string();
@@ -448,16 +474,16 @@ fn a_commits_full_message_comes_with_the_first_page_of_its_changes() {
 
     let first = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "changes", "page": 0}),
+        json!({"repo": "app", "what": "changes", "page": 1}),
     );
     let message = first["message"].as_str().unwrap();
     assert!(message.starts_with("add many files"), "{first}");
     assert!(message.contains("why they were added"), "{first}");
-    assert_eq!(first["paging"]["next_page"], 1);
+    assert_eq!(first["paging"]["next_page"], 2);
 
     let second = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "changes", "page": 1}),
+        json!({"repo": "app", "what": "changes", "page": 2}),
     );
     assert!(second.get("message").is_none(), "{second}");
     assert_eq!(second["subject"], "add many files");
@@ -476,7 +502,7 @@ fn a_parent_revision_needs_no_object_id() {
     let out = ws.read(
         "git_show",
         json!({"repo": "app", "what": "file", "path": "src/lib.rs",
-               "rev": parent_rev("HEAD", None), "page": 0}),
+               "rev": parent_rev("HEAD", None), "page": 1}),
     );
     assert_eq!(out["commit"], previous, "{out}");
     assert!(out["content"].as_str().unwrap().contains("\"hi\""));
@@ -486,7 +512,7 @@ fn a_parent_revision_needs_no_object_id() {
     ws.commit_all("third");
     let two = ws.read(
         "git_log",
-        json!({"repo": "app", "rev": parent_rev("main", Some(2)), "page": 0}),
+        json!({"repo": "app", "rev": parent_rev("main", Some(2)), "page": 1}),
     );
     assert_eq!(two["commits"][0]["subject"], "initial commit", "{two}");
 }
@@ -506,7 +532,7 @@ fn a_remote_branch_is_named_as_origin_slash_branch() {
     let out = ws.read(
         "git_log",
         json!({"repo": "app", "rev": {"kind": "remote_branch", "name": "origin/main"},
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(out["commits"][0]["id"], older, "{out}");
 
@@ -515,7 +541,7 @@ fn a_remote_branch_is_named_as_origin_slash_branch() {
         "git_log",
         json!({"repo": "app",
                "rev": {"kind": "remote_branch", "name": "refs/remotes/origin/main"},
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(full["commits"][0]["id"], older, "{full}");
 
@@ -523,7 +549,7 @@ fn a_remote_branch_is_named_as_origin_slash_branch() {
     let ahead = ws.read(
         "git_log",
         json!({"repo": "app", "rev": branch_rev("main"),
-               "since": {"kind": "remote_branch", "name": "origin/main"}, "page": 0}),
+               "since": {"kind": "remote_branch", "name": "origin/main"}, "page": 1}),
     );
     assert_eq!(ahead["count"], 1, "one commit ahead of the remote: {ahead}");
 }
@@ -546,7 +572,7 @@ fn an_upstream_revision_resolves_what_the_branch_tracks() {
     let out = ws.read(
         "git_log",
         json!({"repo": "app", "rev": branch_rev("main"), "since": {"kind": "upstream"},
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(out["count"], 1, "{out}");
 
@@ -554,7 +580,7 @@ fn an_upstream_revision_resolves_what_the_branch_tracks() {
     let named = ws.read(
         "git_log",
         json!({"repo": "app", "rev": branch_rev("main"),
-               "since": {"kind": "upstream", "name": "main"}, "page": 0}),
+               "since": {"kind": "upstream", "name": "main"}, "page": 1}),
     );
     assert_eq!(named["count"], 1, "{named}");
 }
@@ -567,7 +593,7 @@ fn an_upstream_that_does_not_exist_names_the_alternative() {
     let out = ws.read(
         "git_log",
         json!({"repo": "app", "rev": branch_rev("main"), "since": {"kind": "upstream"},
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(out["error"], "invalid_arguments", "{out}");
     let detail = out["detail"].as_str().unwrap();
@@ -585,7 +611,7 @@ fn a_parent_past_the_root_explains_how_far_back_it_goes() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_log",
-        json!({"repo": "app", "rev": parent_rev("HEAD", Some(9)), "page": 0}),
+        json!({"repo": "app", "rev": parent_rev("HEAD", Some(9)), "page": 1}),
     );
     assert_eq!(out["error"], "invalid_arguments", "{out}");
     assert!(out["detail"].as_str().unwrap().contains("only"), "{out}");
@@ -608,7 +634,7 @@ fn a_parent_of_a_merge_is_its_first_parent() {
 
     let out = ws.read(
         "git_log",
-        json!({"repo": "app", "rev": parent_rev("HEAD", None), "page": 0}),
+        json!({"repo": "app", "rev": parent_rev("HEAD", None), "page": 1}),
     );
     assert_eq!(out["commits"][0]["id"], mainline, "{out}");
 }
@@ -620,7 +646,7 @@ fn a_short_name_as_a_ref_names_the_kind_it_should_be() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_log",
-        json!({"repo": "app", "rev": {"kind": "ref", "name": "origin/main"}, "page": 0}),
+        json!({"repo": "app", "rev": {"kind": "ref", "name": "origin/main"}, "page": 1}),
     );
     assert_eq!(out["error"], "invalid_arguments", "{out}");
     let detail = out["detail"].as_str().unwrap();
@@ -646,13 +672,13 @@ fn each_revision_kind_resolves_or_explains_itself() {
     ] {
         let out = ws.read(
             "git_log",
-            json!({"repo": "app", "rev": rev.clone(), "page": 0}),
+            json!({"repo": "app", "rev": rev.clone(), "page": 1}),
         );
         assert_eq!(out["commits"][0]["id"], head, "{rev}: {out}");
     }
     let nameless = ws.read(
         "git_log",
-        json!({"repo": "app", "rev": {"kind": "branch"}, "page": 0}),
+        json!({"repo": "app", "rev": {"kind": "branch"}, "page": 1}),
     );
     assert_eq!(nameless["error"], "invalid_arguments", "{nameless}");
     assert!(
@@ -679,7 +705,7 @@ fn changes_lists_the_files_a_commit_touched() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "changes", "page": 0}),
+        json!({"repo": "app", "what": "changes", "page": 1}),
     );
     assert_eq!(out["subject"], "say hello properly", "{out}");
     let changes = out["changes"].as_array().unwrap();
@@ -693,7 +719,7 @@ fn patch_gives_the_changed_lines() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "patch", "page": 0}),
+        json!({"repo": "app", "what": "patch", "page": 1}),
     );
     let f = &out["files"][0];
     assert_eq!(f["path"], "src/lib.rs", "{out}");
@@ -709,7 +735,7 @@ fn the_first_commit_shows_as_all_additions() {
     let out = ws.read(
         "git_show",
         json!({"repo": "app", "what": "changes", "rev": commit_rev(&ws.oid("HEAD~1")),
-               "page": 0}),
+               "page": 1}),
     );
     let changes = out["changes"].as_array().unwrap();
     assert_eq!(changes.len(), 2, "{out}");
@@ -727,7 +753,7 @@ fn from_compares_two_branches() {
     let out = ws.read(
         "git_show",
         json!({"repo": "app", "what": "changes",
-               "rev": branch_rev("feature"), "from": branch_rev("main"), "page": 0}),
+               "rev": branch_rev("feature"), "from": branch_rev("main"), "page": 1}),
     );
     let changes = out["changes"].as_array().unwrap();
     assert_eq!(changes.len(), 1, "{out}");
@@ -742,7 +768,7 @@ fn a_rename_reports_both_paths() {
     ws.commit_all("rename lib to core");
     let out = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "changes", "page": 0}),
+        json!({"repo": "app", "what": "changes", "page": 1}),
     );
     let changes = out["changes"].as_array().unwrap();
     assert_eq!(changes.len(), 1, "{out}");
@@ -758,7 +784,7 @@ fn file_returns_contents_as_that_revision_holds_them() {
     let ws = GitWorkspace::new();
     let now = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "file", "path": "src/lib.rs", "page": 0}),
+        json!({"repo": "app", "what": "file", "path": "src/lib.rs", "page": 1}),
     );
     assert!(
         now["content"].as_str().unwrap().contains("\"hello\""),
@@ -768,7 +794,7 @@ fn file_returns_contents_as_that_revision_holds_them() {
     let before = ws.read(
         "git_show",
         json!({"repo": "app", "what": "file", "path": "src/lib.rs",
-               "rev": commit_rev(&ws.oid("HEAD~1")), "page": 0}),
+               "rev": commit_rev(&ws.oid("HEAD~1")), "page": 1}),
     );
     assert!(
         before["content"].as_str().unwrap().contains("\"hi\""),
@@ -785,7 +811,7 @@ fn an_uncommitted_edit_is_not_visible_at_head() {
     let out = ws.read(
         "git_show",
         json!({"repo": "app", "what": "file", "path": "src/lib.rs", "rev": head_rev(),
-               "page": 0}),
+               "page": 1}),
     );
     assert!(!out["content"].as_str().unwrap().contains("todo!"), "{out}");
 }
@@ -800,7 +826,7 @@ fn a_large_file_pages() {
 
     let first = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "file", "path": "long.txt", "page": 0}),
+        json!({"repo": "app", "what": "file", "path": "long.txt", "page": 1}),
     );
     assert_eq!(first["paging"]["total"], 900, "{}", first["paging"]);
     assert_eq!(
@@ -808,11 +834,11 @@ fn a_large_file_pages() {
         200,
         "the same 200-line page file_read serves"
     );
-    assert_eq!(first["paging"]["next_page"], 1);
+    assert_eq!(first["paging"]["next_page"], 2);
 
     let last = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "file", "path": "long.txt", "page": 4}),
+        json!({"repo": "app", "what": "file", "path": "long.txt", "page": 5}),
     );
     assert_eq!(last["content"].as_str().unwrap().lines().count(), 100);
     assert!(last["paging"]["next_page"].is_null());
@@ -826,7 +852,7 @@ fn a_binary_file_is_reported_not_mangled() {
     ws.commit_all("add a binary file");
     let out = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "file", "path": "blob.bin", "page": 0}),
+        json!({"repo": "app", "what": "file", "path": "blob.bin", "page": 1}),
     );
     assert_eq!(out["binary"], true, "{out}");
     assert_eq!(out["bytes"], 5);
@@ -838,7 +864,7 @@ fn tree_lists_a_directory_at_a_revision() {
     let ws = GitWorkspace::new();
     let root = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "tree", "page": 0}),
+        json!({"repo": "app", "what": "tree", "page": 1}),
     );
     let entries = root["entries"].as_array().unwrap();
     let by = |p: &str| entries.iter().find(|e| e["path"] == p).cloned().unwrap();
@@ -847,7 +873,7 @@ fn tree_lists_a_directory_at_a_revision() {
 
     let src = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "tree", "path": "src", "page": 0}),
+        json!({"repo": "app", "what": "tree", "path": "src", "page": 1}),
     );
     let paths: Vec<&str> = src["entries"]
         .as_array()
@@ -865,7 +891,7 @@ fn blame_attributes_each_line_and_follows_renames() {
     let second = ws.oid("HEAD");
     let out = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "blame", "path": "src/lib.rs", "page": 0}),
+        json!({"repo": "app", "what": "blame", "path": "src/lib.rs", "page": 1}),
     );
     let lines = out["lines"].as_array().unwrap();
     assert_eq!(lines.len(), 3, "{out}");
@@ -877,7 +903,7 @@ fn blame_attributes_each_line_and_follows_renames() {
     ws.commit_all("rename lib to core");
     let renamed = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "blame", "path": "src/core.rs", "page": 0}),
+        json!({"repo": "app", "what": "blame", "path": "src/core.rs", "page": 1}),
     );
     let hello = renamed["lines"]
         .as_array()
@@ -903,16 +929,16 @@ fn blame_pages_a_long_file() {
     ws.commit_all("add a long file");
     let out = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "blame", "path": "long.txt", "page": 0}),
+        json!({"repo": "app", "what": "blame", "path": "long.txt", "page": 1}),
     );
     assert_eq!(out["paging"]["total"], 400, "{}", out["paging"]);
     assert_eq!(out["lines"].as_array().unwrap().len(), 40);
-    assert_eq!(out["paging"]["next_page"], 1);
+    assert_eq!(out["paging"]["next_page"], 2);
 
     // Each page blames its own window of the file, numbered as the file is.
     let last = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "blame", "path": "long.txt", "page": 9}),
+        json!({"repo": "app", "what": "blame", "path": "long.txt", "page": 10}),
     );
     let lines = last["lines"].as_array().unwrap();
     assert_eq!(lines.len(), 40, "{last}");
@@ -934,7 +960,7 @@ fn a_hunk_longer_than_a_page_is_split_across_pages() {
     ws.commit_all("add a long file");
 
     let mut texts = Vec::new();
-    for page in 0..3 {
+    for page in 1..=3 {
         let out = ws.read(
             "git_show",
             json!({"repo": "app", "what": "patch", "page": page}),
@@ -944,12 +970,12 @@ fn a_hunk_longer_than_a_page_is_split_across_pages() {
         assert_eq!(hunks.len(), 1, "{out}");
         assert_eq!(
             hunks[0]["new_start"],
-            1 + page * 200,
+            1 + (page - 1) * 200,
             "{}",
             hunks[0]["new_start"]
         );
         let lines = hunks[0]["lines"].as_array().unwrap();
-        assert_eq!(lines.len(), if page < 2 { 200 } else { 50 });
+        assert_eq!(lines.len(), if page < 3 { 200 } else { 50 });
         texts.extend(
             lines
                 .iter()
@@ -970,12 +996,12 @@ fn changes_are_limited_to_the_paths_asked_for() {
 
     let all = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "changes", "page": 0}),
+        json!({"repo": "app", "what": "changes", "page": 1}),
     );
     assert_eq!(all["changes"].as_array().unwrap().len(), 2, "{all}");
     let one = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "changes", "paths": ["b.txt"], "page": 0}),
+        json!({"repo": "app", "what": "changes", "paths": ["b.txt"], "page": 1}),
     );
     let changes = one["changes"].as_array().unwrap();
     assert_eq!(changes.len(), 1, "{one}");
@@ -994,18 +1020,18 @@ fn tree_pages_a_large_directory() {
     ws.commit_all("add a large directory");
     let out = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "tree", "path": "many", "page": 0}),
+        json!({"repo": "app", "what": "tree", "path": "many", "page": 1}),
     );
     assert_eq!(out["paging"]["total"], 120, "{}", out["paging"]);
     assert_eq!(out["entries"].as_array().unwrap().len(), 50);
-    assert_eq!(out["paging"]["next_page"], 1);
+    assert_eq!(out["paging"]["next_page"], 2);
 }
 
 #[test]
 fn a_mode_that_needs_a_path_says_so() {
     let ws = GitWorkspace::new();
     for what in ["file", "blame"] {
-        let out = ws.read("git_show", json!({"repo": "app", "what": what, "page": 0}));
+        let out = ws.read("git_show", json!({"repo": "app", "what": what, "page": 1}));
         assert_eq!(out["error"], "invalid_arguments", "{what}: {out}");
         assert!(out["detail"].as_str().unwrap().contains("path"), "{out}");
     }
@@ -1016,7 +1042,7 @@ fn a_path_the_revision_does_not_hold_says_so() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "file", "path": "nope.txt", "page": 0}),
+        json!({"repo": "app", "what": "file", "path": "nope.txt", "page": 1}),
     );
     assert_eq!(out["error"], "unknown_revision", "{out}");
 }
@@ -1036,9 +1062,9 @@ fn a_protected_path_is_refused_in_every_mode_and_at_every_revision() {
 
     for args in [
         json!({"repo": "app", "what": "file", "path": "secrets/keys.yaml",
-               "rev": commit_rev(&had_it), "page": 0}),
+               "rev": commit_rev(&had_it), "page": 1}),
         json!({"repo": "app", "what": "blame", "path": "secrets/keys.yaml",
-               "rev": commit_rev(&had_it), "page": 0}),
+               "rev": commit_rev(&had_it), "page": 1}),
     ] {
         let out = ws.read("git_show", args.clone());
         assert_eq!(out["error"], "invalid_arguments", "{args}: {out}");
@@ -1048,14 +1074,14 @@ fn a_protected_path_is_refused_in_every_mode_and_at_every_revision() {
     // A tree listing leaves the folder out entirely.
     let tree = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "tree", "rev": commit_rev(&had_it), "page": 0}),
+        json!({"repo": "app", "what": "tree", "rev": commit_rev(&had_it), "page": 1}),
     );
     assert!(!tree.to_string().contains("secrets"), "{tree}");
 
     // And a patch of the commit that added it carries none of its content.
     let patch = ws.read(
         "git_show",
-        json!({"repo": "app", "what": "patch", "rev": commit_rev(&had_it), "page": 0}),
+        json!({"repo": "app", "what": "patch", "rev": commit_rev(&had_it), "page": 1}),
     );
     assert!(!patch.to_string().contains("ghp_abcd"), "{patch}");
 }
@@ -1067,7 +1093,7 @@ fn a_match_reports_its_file_line_and_text_with_a_count() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_grep",
-        json!({"repo": "app", "pattern": "pub fn hello", "page": 0}),
+        json!({"repo": "app", "pattern": "pub fn hello", "page": 1}),
     );
     let m = &out["matches"][0];
     assert_eq!(m["path"], "src/lib.rs", "{out}");
@@ -1083,13 +1109,13 @@ fn an_older_revision_searches_its_own_content() {
     let ws = GitWorkspace::new();
     let now = ws.read(
         "git_grep",
-        json!({"repo": "app", "pattern": "\"hi\"", "fixed": true, "page": 0}),
+        json!({"repo": "app", "pattern": "\"hi\"", "fixed": true, "page": 1}),
     );
     assert_eq!(now["count"], 0, "{now}");
     let before = ws.read(
         "git_grep",
         json!({"repo": "app", "pattern": "\"hi\"", "fixed": true,
-               "rev": commit_rev(&ws.oid("HEAD~1")), "page": 0}),
+               "rev": commit_rev(&ws.oid("HEAD~1")), "page": 1}),
     );
     assert_eq!(before["count"], 1, "{before}");
 }
@@ -1101,13 +1127,13 @@ fn fixed_turns_the_pattern_into_a_literal() {
     ws.commit_all("add re");
     let regex = ws.read(
         "git_grep",
-        json!({"repo": "app", "pattern": "a.c", "paths": ["re.txt"], "page": 0}),
+        json!({"repo": "app", "pattern": "a.c", "paths": ["re.txt"], "page": 1}),
     );
     assert_eq!(regex["count"], 2, "{regex}");
     let literal = ws.read(
         "git_grep",
         json!({"repo": "app", "pattern": "a.c", "fixed": true, "paths": ["re.txt"],
-               "page": 0}),
+               "page": 1}),
     );
     assert_eq!(literal["count"], 1, "{literal}");
 }
@@ -1121,7 +1147,7 @@ fn a_single_file_is_capped_so_other_files_still_appear() {
     ws.commit_all("add both");
     let out = ws.read(
         "git_grep",
-        json!({"repo": "app", "pattern": "needle", "max_per_file": 3, "page": 0}),
+        json!({"repo": "app", "pattern": "needle", "max_per_file": 3, "page": 1}),
     );
     let matches = out["matches"].as_array().unwrap();
     assert_eq!(
@@ -1145,7 +1171,7 @@ fn a_very_long_matching_line_is_clipped() {
     ws.commit_all("add a minified bundle");
     let out = ws.read(
         "git_grep",
-        json!({"repo": "app", "pattern": "needle", "page": 0}),
+        json!({"repo": "app", "pattern": "needle", "page": 1}),
     );
     let text = out["matches"][0]["text"].as_str().unwrap();
     assert!(text.starts_with("needle"), "{text}");
@@ -1163,7 +1189,7 @@ fn a_search_with_no_paths_does_not_return_a_protected_files_lines() {
     ws.commit_all("add both");
     let out = ws.read(
         "git_grep",
-        json!({"repo": "app", "pattern": "needle", "page": 0}),
+        json!({"repo": "app", "pattern": "needle", "page": 1}),
     );
     assert!(!out.to_string().contains("ghp_needle_value"), "{out}");
     assert_eq!(out["files_matched"], 1, "{out}");
@@ -1174,7 +1200,7 @@ fn a_pattern_that_matches_nothing_is_an_empty_result_not_an_error() {
     let ws = GitWorkspace::new();
     let out = ws.read(
         "git_grep",
-        json!({"repo": "app", "pattern": "zzzznotpresent", "page": 0}),
+        json!({"repo": "app", "pattern": "zzzznotpresent", "page": 1}),
     );
     assert!(out.get("error").is_none(), "{out}");
     assert_eq!(out["count"], 0);
@@ -1188,7 +1214,7 @@ fn branches_list_with_the_current_one_marked_and_a_count() {
     ws.git(&["branch", "feature"]);
     let out = ws.read(
         "git_refs",
-        json!({"repo": "app", "kind": "branches", "page": 0}),
+        json!({"repo": "app", "kind": "branches", "page": 1}),
     );
     assert_eq!(out["current"], "main", "{out}");
     assert_eq!(out["count"], 2);
@@ -1218,7 +1244,7 @@ fn a_tracking_branch_reports_how_far_ahead_and_behind() {
     ws.git(&["config", "branch.main.merge", "refs/heads/main"]);
     let out = ws.read(
         "git_refs",
-        json!({"repo": "app", "kind": "branches", "page": 0}),
+        json!({"repo": "app", "kind": "branches", "page": 1}),
     );
     let up = &out["branches"]
         .as_array()
@@ -1237,7 +1263,7 @@ fn a_detached_head_names_no_current_branch() {
     ws.git(&["checkout", "-q", "--detach", "HEAD"]);
     let out = ws.read(
         "git_refs",
-        json!({"repo": "app", "kind": "branches", "page": 0}),
+        json!({"repo": "app", "kind": "branches", "page": 1}),
     );
     assert!(out.get("current").is_none(), "{out}");
 }
@@ -1249,7 +1275,7 @@ fn tags_tell_annotated_from_lightweight() {
     ws.git(&["tag", "-a", "v2.0", "-m", "release two"]);
     let out = ws.read(
         "git_refs",
-        json!({"repo": "app", "kind": "tags", "page": 0}),
+        json!({"repo": "app", "kind": "tags", "page": 1}),
     );
     assert_eq!(out["count"], 2, "{out}");
     let tags = out["tags"].as_array().unwrap();
@@ -1273,7 +1299,7 @@ fn remotes_list_with_credentials_redacted() {
     ]);
     let out = ws.read(
         "git_refs",
-        json!({"repo": "app", "kind": "remotes", "page": 0}),
+        json!({"repo": "app", "kind": "remotes", "page": 1}),
     );
     assert_eq!(out["count"], 1, "{out}");
     assert!(
@@ -1301,7 +1327,7 @@ fn remote_branches_list_what_the_last_fetch_left_and_where_it_came_from() {
     ws.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
     let out = ws.read(
         "git_refs",
-        json!({"repo": "app", "kind": "remote_branches", "page": 0}),
+        json!({"repo": "app", "kind": "remote_branches", "page": 1}),
     );
     assert_eq!(out["count"], 1, "{out}");
     assert_eq!(out["remote_branches"][0]["remote"], "origin");
@@ -1332,9 +1358,9 @@ fn refs_page() {
     }
     let out = ws.read(
         "git_refs",
-        json!({"repo": "app", "kind": "branches", "page": 0}),
+        json!({"repo": "app", "kind": "branches", "page": 1}),
     );
     assert_eq!(out["count"], 71, "{}", out["count"]);
     assert_eq!(out["branches"].as_array().unwrap().len(), 40);
-    assert_eq!(out["paging"]["next_page"], 1);
+    assert_eq!(out["paging"]["next_page"], 2);
 }

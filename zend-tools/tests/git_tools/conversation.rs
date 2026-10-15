@@ -529,11 +529,11 @@ fn switching_reads_the_other_branch_and_head_follows() {
     assert_eq!(out["id"], theirs);
     assert_eq!(conv.read("theirs.txt").as_deref(), Some("theirs\n"));
 
-    let log = conv.call("git_log", json!({"repo": "app", "page": 0}));
+    let log = conv.call("git_log", json!({"repo": "app", "page": 1}));
     assert_eq!(log["commits"][0]["id"], theirs, "{log}");
     let refs = conv.call(
         "git_refs",
-        json!({"repo": "app", "kind": "branches", "page": 0}),
+        json!({"repo": "app", "kind": "branches", "page": 1}),
     );
     assert_eq!(refs["current"], "theirs", "{refs}");
 

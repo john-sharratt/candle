@@ -541,7 +541,7 @@ mod tests {
         let read = || {
             call(
                 FILE_READ,
-                json!({"repo": "candle", "path": "a.rs", "page": 0}),
+                json!({"repo": "candle", "path": "a.rs", "page": 1}),
             )
         };
         let edit = call("file_edit", json!({"repo": "candle", "path": "a.rs"}));

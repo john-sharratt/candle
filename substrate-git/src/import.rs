@@ -66,6 +66,17 @@ impl Took {
     }
 }
 
+/// Whether a round fetches `origin`, when this member holds the lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fetching {
+    /// Once [`Importer::fetching_every`] has passed since the last.
+    IfDue,
+    /// Whether due or not.
+    Now,
+    /// Not at all.
+    Never,
+}
+
 /// The importer of one repository.
 pub struct Importer {
     lease: Arc<dyn Lease>,
@@ -97,21 +108,38 @@ impl Importer {
     /// One round: publish this member's pushes, import if holding the lease
     /// and a fetch is due, sync.
     pub fn tick(&self, store: &Store, records: &dyn Records) -> anyhow::Result<Imported> {
-        self.round(store, records, false)
+        self.round(store, records, Fetching::IfDue)
     }
 
     /// [`Self::tick`], fetching now if holding the lease, due or not: a
-    /// member's first load of a repository.
+    /// member's first load of a repository the log names no branch of.
     pub fn pull(&self, store: &Store, records: &dyn Records) -> anyhow::Result<Imported> {
-        self.round(store, records, true)
+        self.round(store, records, Fetching::Now)
     }
 
-    fn round(&self, store: &Store, records: &dyn Records, now: bool) -> anyhow::Result<Imported> {
+    /// [`Self::tick`] with no fetch: this member's pushes published and the
+    /// store synced to the log. A load of a repository the log already names
+    /// is whole from the log alone; origin's newer commits are the follower's
+    /// to bring in, and a fetch here only made the load wait on origin.
+    pub fn settle(&self, store: &Store, records: &dyn Records) -> anyhow::Result<Imported> {
+        self.round(store, records, Fetching::Never)
+    }
+
+    fn round(
+        &self,
+        store: &Store,
+        records: &dyn Records,
+        fetching: Fetching,
+    ) -> anyhow::Result<Imported> {
         let mut out = Imported::default();
         let repo = store.repo();
-        let due = now || {
-            let last = *self.last_fetch.lock().unwrap();
-            last.is_none_or(|at| at.elapsed() >= self.fetch_every)
+        let due = match fetching {
+            Fetching::Now => true,
+            Fetching::Never => false,
+            Fetching::IfDue => {
+                let last = *self.last_fetch.lock().unwrap();
+                last.is_none_or(|at| at.elapsed() >= self.fetch_every)
+            }
         };
 
         let started = Instant::now();

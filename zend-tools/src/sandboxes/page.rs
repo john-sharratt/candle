@@ -1,7 +1,8 @@
 //! A job's log, a page at a time.
 //!
-//! A page is [`PAGE_LINES`] lines, as `file_read`'s is, and a page past the
-//! end clamps to the last one rather than coming back empty — an empty page
+//! A page is [`PAGE_LINES`] lines, as `file_read`'s is, numbered from 1 as
+//! every paged tool's is, and a page past the end clamps to the last one
+//! rather than coming back empty — an empty page
 //! reads as "no output", which is the wrong answer. Terminal colour codes are
 //! stripped, since a program that thinks it prints to a terminal colours its
 //! output and the codes are noise to a reader; a line longer than
@@ -28,9 +29,9 @@ static ANSI: LazyLock<Regex> =
 /// One page of a job's output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LogPage {
-    /// This page, 0-based.
+    /// This page, from 1.
     pub page: usize,
-    /// How many pages the output has; at least one.
+    /// How many pages the output has — the last page; at least one.
     pub pages: usize,
     /// The first line on this page, 1-based; 0 when there is no output.
     pub first_line: usize,
@@ -41,20 +42,20 @@ pub struct LogPage {
     pub text: String,
 }
 
-/// Page `page` of the log at `path`.
+/// Page `page` (from 1) of the log at `path`.
 pub fn read(path: &Path, page: usize) -> io::Result<LogPage> {
     let bytes = std::fs::read(path)?;
     Ok(of(&String::from_utf8_lossy(&bytes), page))
 }
 
-/// Page `page` of `log`.
+/// Page `page` (from 1) of `log`, clamped into range.
 pub fn of(log: &str, page: usize) -> LogPage {
     let plain = ANSI.replace_all(log, "");
     let lines: Vec<&str> = plain.lines().collect();
     let total_lines = lines.len();
     let pages = total_lines.div_ceil(PAGE_LINES).max(1);
-    let page = page.min(pages - 1);
-    let start = page * PAGE_LINES;
+    let page = page.clamp(1, pages);
+    let start = (page - 1) * PAGE_LINES;
     let end = (start + PAGE_LINES).min(total_lines);
     let text = lines[start..end]
         .iter()
@@ -93,7 +94,7 @@ mod tests {
     #[test]
     fn a_page_is_its_lines_and_where_they_sit() {
         let log = numbered(450);
-        let first = of(&log, 0);
+        let first = of(&log, 1);
         assert_eq!(
             (
                 first.page,
@@ -102,12 +103,12 @@ mod tests {
                 first.last_line,
                 first.total_lines
             ),
-            (0, 3, 1, 200, 450)
+            (1, 3, 1, 200, 450)
         );
         assert!(first.text.starts_with("line 1\nline 2\n"));
         assert!(first.text.ends_with("line 200"));
-        let last = of(&log, 2);
-        assert_eq!((last.first_line, last.last_line), (401, 450));
+        let last = of(&log, 3);
+        assert_eq!((last.page, last.first_line, last.last_line), (3, 401, 450));
         assert_eq!(last.text.lines().count(), 50);
     }
 
@@ -115,16 +116,23 @@ mod tests {
     #[test]
     fn a_page_past_the_end_is_the_last() {
         let page = of(&numbered(250), 9);
-        assert_eq!((page.page, page.first_line, page.last_line), (1, 201, 250));
+        assert_eq!((page.page, page.first_line, page.last_line), (2, 201, 250));
+    }
+
+    /// There is no page 0: one asked for is the first page.
+    #[test]
+    fn pages_count_from_one() {
+        let page = of(&numbered(250), 0);
+        assert_eq!((page.page, page.first_line, page.last_line), (1, 1, 200));
     }
 
     /// No output is one empty page.
     #[test]
     fn no_output_is_one_empty_page() {
         assert_eq!(
-            of("", 0),
+            of("", 1),
             LogPage {
-                page: 0,
+                page: 1,
                 pages: 1,
                 first_line: 0,
                 last_line: 0,
@@ -137,11 +145,11 @@ mod tests {
     /// Colour codes go; CRLF endings read as lines; a long line is cut.
     #[test]
     fn colour_goes_and_a_long_line_is_cut() {
-        let page = of("\x1b[32m✔ passed\x1b[0m\r\nplain\r\n", 0);
+        let page = of("\x1b[32m✔ passed\x1b[0m\r\nplain\r\n", 1);
         assert_eq!(page.text, "✔ passed\nplain");
         let long = "x".repeat(MAX_LINE_CHARS + 7);
         assert_eq!(
-            of(&long, 0).text,
+            of(&long, 1).text,
             format!("{}… [7 more characters]", "x".repeat(MAX_LINE_CHARS))
         );
     }

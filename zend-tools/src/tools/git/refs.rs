@@ -37,8 +37,10 @@ pub struct RefsRequest {
     pub repo: String,
     /// Which refs to list. Required.
     pub kind: RefKind,
-    /// Zero-based page, 40 refs a page. Required — pass 0 to start. A page
+    /// Page of refs, from 1, 40 a page. Required — pass 1 to start. A page
     /// past the end clamps to the last one.
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: u32,
 }
 
@@ -84,7 +86,8 @@ impl Tool for GitRefs {
          are there\" is read rather than counted. Use for \"what branches exist\", \"am I \
          up to date with origin\", \"do I have unpushed commits\", \"what versions have \
          been released\", \"where does this push to\". Contacts no server. `page` is \
-         required — pass 0 to start, and `paging.next_page` for the next. Reads only.";
+         required and counts from 1 — pass 1 to start, and `paging.next_page` for the \
+         next. Reads only.";
 
     type Request = RefsRequest;
     type Response = RefsResponse;
@@ -103,7 +106,7 @@ impl Tool for GitRefs {
             kind: "",
             count: 0,
             current: None,
-            paging: Paging::of(0, 0, PER_PAGE),
+            paging: Paging::of(0, 1, PER_PAGE),
             branches: None,
             tags: None,
             remotes: None,

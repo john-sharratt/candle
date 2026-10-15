@@ -8,9 +8,11 @@
 //!
 //! [`Repos::load`] blocks until every repository is whole in its object
 //! database: the log names its branches and every pack they need has arrived
-//! and been taken in. A repository no member has pulled yet is pulled now, through an
-//! agent, by the member holding its lease; every other member waits for it to
-//! replicate. `max_depth` and every other bound on what is *read into
+//! and been taken in. A repository the log names is loaded from the log alone —
+//! no fetch: origin's newer commits are the follower's, and fetching here made
+//! a restart wait on origin for over a minute with nothing to bring. A
+//! repository no member has pulled yet is pulled now, through an agent, by the
+//! member holding its lease; every other member waits for it to replicate. `max_depth` and every other bound on what is *read into
 //! conversations* play no part here: the store holds every object of every
 //! branch.
 //!
@@ -242,9 +244,10 @@ impl Repos {
     }
 }
 
-/// One load round of one repository: a tick, or a pull when the log names
-/// none of its branches yet. `loading` is its state going in; the state coming
-/// out, and what the round's parts took.
+/// One load round of one repository: settled to the log when the log names its
+/// branches — whole from the log alone, with origin's newer commits left to the
+/// follower — or pulled when the log names none of them yet. `loading` is its
+/// state going in; the state coming out, and what the round's parts took.
 fn round(
     store: &Store,
     importer: &Importer,
@@ -254,7 +257,7 @@ fn round(
     loading.busy = false;
     let named = !branches(shared, store.name())?.is_empty();
     let ticked = if named {
-        importer.tick(store, shared)
+        importer.settle(store, shared)
     } else {
         importer.pull(store, shared)
     };

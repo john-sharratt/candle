@@ -326,7 +326,12 @@ Built, with no setting and no checkout mode, in `zend/src/substrate_git.rs`.
   sandbox is made for one: it has no folder, and its commands run on agents.
 - **Starting.** After the cluster join and catch-up, before anything reads a branch, each
   repository is brought up to the log once, pulled through an agent (§9) when the log
-  names no branch of it. Then a `substrate-git` thread ticks every 2 s until shutdown
+  names no branch of it. One the log names is not fetched at all (`Importer::settle`):
+  it is whole from the log, origin's newer commits are the follower's, and fetching
+  there made every restart wait on origin — 76 s for candle — with nothing to bring.
+  The repositories' rounds run side by side, the loading page has their packs held of
+  listed before the first round, and each logs `repository loaded` with its publish,
+  fetch and sync time. Then a `substrate-git` thread ticks every 2 s until shutdown
   stops and joins it, before the drain. A workspace naming no repository skips the step
   and needs no agent.
 - **Conversation bases.** A store has no local branch, so a conversation's base is the

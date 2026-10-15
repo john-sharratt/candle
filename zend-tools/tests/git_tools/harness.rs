@@ -450,7 +450,7 @@ impl Conversation {
     }
 
     pub fn status(&self) -> Value {
-        self.call("git_status", json!({"repo": "app", "page": 0}))
+        self.call("git_status", json!({"repo": "app", "page": 1}))
     }
 }
 

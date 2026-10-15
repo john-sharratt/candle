@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use substrate_git::{adopt, publish, Alone, Importer, Lease, Log, Records, Store};
 use zend_vfs::{
@@ -471,6 +472,48 @@ fn the_importer_follows_origin() {
     let other = store(&log, "r");
     other.sync(log.as_ref()).unwrap();
     assert_eq!(branch(&other), Some(tip(&work)));
+}
+
+/// **A settle never fetches**, even holding the lease with a fetch due: it
+/// syncs to the log and leaves origin's newer commits for the next tick. That
+/// is what a load of a repository the log already names runs, and fetching
+/// there made a restart wait on origin with nothing to bring.
+#[test]
+fn a_settle_syncs_to_the_log_and_leaves_origin_to_the_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    checkout(&work, 1);
+    let (origin, agent) = origin_and_agent(tmp.path(), &work);
+    let log = Arc::new(Mem::default());
+    let url = RemoteUrl::parse(origin.to_str().unwrap()).unwrap();
+    let s = store(&log, "r").with_origin(&url, Arc::new(agent)).unwrap();
+    let importer = Importer::new(Arc::new(Alone));
+    let tip = |dir: &Path| Oid::parse(&git(dir, &["rev-parse", "HEAD"])).unwrap();
+    importer.pull(&s, log.as_ref()).unwrap();
+    let logged = tip(&work);
+    assert_eq!(branch(&s), Some(logged.clone()));
+
+    std::fs::write(work.join("f"), "more\n").unwrap();
+    git(&work, &["commit", "-qam", "more"]);
+    git(&work, &["push", "-q", origin.to_str().unwrap(), "main"]);
+
+    // A restart: a fresh store and importer over the same log, settled with
+    // the lease held and a fetch due.
+    let restarted = store(&log, "r")
+        .with_origin(&url, Arc::new(Agent(tmp.path().join("agent"))))
+        .unwrap();
+    let importer = Importer::new(Arc::new(Alone));
+    let settled = importer.settle(&restarted, log.as_ref()).unwrap();
+    assert!(!settled.fetched, "a settle does not fetch");
+    assert_eq!(settled.took.fetch, Duration::ZERO);
+    assert_eq!(branch(&restarted), Some(logged), "whole from the log alone");
+
+    importer.tick(&restarted, log.as_ref()).unwrap();
+    assert_eq!(
+        branch(&restarted),
+        Some(tip(&work)),
+        "the tick brings origin in"
+    );
 }
 
 fn sig() -> Signature {

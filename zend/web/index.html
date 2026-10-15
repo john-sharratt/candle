@@ -805,25 +805,23 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     }
     // The call's own page, shown even before a response has come back —
     // `file_read`'s `page` is a required argument, so it is always present.
-    // The wire value is zero-based (page 0 is the top of the file); shown
-    // as one-based here, matching file_list's `paging.page + 1` below —
-    // "page 0" reads as a computer's off-by-one to a human, not the top.
+    // Pages count from 1 on the wire, so it is shown as it stands.
     let detail = '';
-    if (name === 'file_read' && typeof args.page === 'number') detail = 'page ' + (args.page + 1);
+    if (name === 'file_read' && typeof args.page === 'number') detail = 'page ' + args.page;
     // file_read's opening fence, once the response lands:
-    // "```rust file=repo/path page=1/5 lines=1420", or "lines=0" alone for an
-    // empty file — richer than the call alone. The page is shown one-based, and
-    // the line range it covers is derived from the fixed 200-line page stride.
-    const fence = resp && /^\s*```\S* file=\S+(?: page=(\d+)\/(\d+))? lines=(\d+)\n/.exec(resp.raw);
+    // "```rust file=repo/path page=2 pages=5 lines=1420", or "lines=0" alone
+    // for an empty file — richer than the call alone. The line range a page
+    // covers is derived from the fixed 200-line page stride.
+    const fence = resp && /^\s*```\S* file=\S+(?: page=(\d+) pages=(\d+))? lines=(\d+)\n/.exec(resp.raw);
     if (fence && fence[1] === undefined) detail = 'empty';
     else if (fence) {
       const page = Number(fence[1]), total = Number(fence[3]);
-      const first = page * 200 + 1, last = Math.min((page + 1) * 200, total);
-      detail = 'page ' + (page + 1) + ' of ' + fence[2] + ', lines ' + first + '-' + last + ' of ' + total;
+      const first = (page - 1) * 200 + 1, last = Math.min(page * 200, total);
+      detail = 'page ' + page + ' of ' + fence[2] + ', lines ' + first + '-' + last + ' of ' + total;
     }
     else if (resp && resp.obj && resp.obj.paging && typeof resp.obj.paging.total === 'number') {
       const p = resp.obj.paging;
-      detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + (p.page + 1) + '/' + p.pages : '');
+      detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + p.page + '/' + p.pages : '');
     }
     return { repo, subject, detail };
   }

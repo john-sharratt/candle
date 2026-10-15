@@ -33,10 +33,12 @@ pub struct ReadRequest {
     /// Path of the file to read, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
-    /// Zero-based page of the file to return, 200 lines a page. Required —
-    /// pass 0 to start at the top of the file. A page past the end clamps to
-    /// the last one — read page 0 first, its fence names the total, then
-    /// keep incrementing until a response's own page number stops advancing.
+    /// Page of the file to return, from 1, 200 lines a page. Required — pass 1
+    /// for the top of the file. Its fence names how many pages there are and
+    /// the next one to read, or says it is the last. A page past the end
+    /// returns the last one.
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: u32,
 }
 
@@ -48,14 +50,15 @@ impl Tool for FileRead {
         "Read a file, one 200-line page at a time. Resolves against this session's \
          edits first, then falls through to the repository on disk, so real \
          project files can be read directly. The repo, the path within it, and \
-         the page are all required — pass page 0 to read the top of the file; it \
-         is zero-based, so page 1 is lines 201-400. Returns the page as numbered \
-         source in a fenced block whose opening fence names the file, the page \
-         and page count, and the file's length — `rust file=candle/src/lib.rs \
-         page=1/5 lines=1420` — and which ends with `end of candle/src/lib.rs \
-         page 1/5`. Keep incrementing page until the fence's page number stops \
-         advancing; a short file is entirely on page 0. There is no need to find \
-         a file's length first: read page 0 and its fence reports it. To find the \
+         the page are all required. Pages count from 1: page 1 is lines 1-200, \
+         page 2 is lines 201-400. Returns the page as numbered source in a fenced \
+         block whose opening fence names the file, the page, how many pages there \
+         are and the file's length — `rust file=candle/src/lib.rs page=2 pages=8 \
+         lines=1420` — and which ends naming the next page to read, `end of \
+         candle/src/lib.rs page 2 of 8 — next: page=3`, or saying it is the \
+         last, `end of candle/src/lib.rs page 8 of 8 — the last page`. A short \
+         file is entirely on page 1. There is no need to find a file's length \
+         first: read page 1 and its fence reports it. To find the \
          page worth reading, use file_grep \
          rather than paging a large file to look for it. For remote filesystems \
          use remote_fs_session_get to download first, then file_read.";
@@ -77,15 +80,17 @@ impl Tool for FileRead {
         if lower.starts_with("http://") || lower.starts_with("https://") {
             return Err(FileError::IsUrl(req.path));
         }
+        // The request counts from 1, as the model does; the store's page is an
+        // index from 0. `page` is validated at least 1 before it gets here.
         let page = ctx
             .files
             .repo(&req.repo)?
-            .read_page(&req.path, req.page)?
+            .read_page(&req.path, req.page - 1)?
             .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
         Ok(numbered_excerpt(
             &req.repo,
             &req.path,
-            page.page,
+            page.page + 1,
             page.total_pages,
             page.start_line,
             page.end_line,

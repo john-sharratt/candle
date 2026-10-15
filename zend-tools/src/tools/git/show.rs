@@ -79,9 +79,11 @@ pub struct ShowRequest {
     #[serde(default)]
     #[schemars(with = "u32")]
     pub context: Option<u32>,
-    /// Zero-based page to return. Required — pass 0 to start. Every mode
-    /// pages; the reply's `paging.next_page` is the page to ask for next, and
-    /// an over-shot page clamps to the last one.
+    /// Page to return, from 1. Required — pass 1 to start. Every mode pages;
+    /// the reply's `paging.next_page` is the page to ask for next, and an
+    /// over-shot page clamps to the last one.
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: u32,
 }
 
@@ -260,7 +262,7 @@ impl Tool for GitShow {
          those show what one commit did, and their first page carries the commit's full \
          message. Use for \"show me that commit\", \"what did this change\", \"show me \
          this file as of that tag\", \"who wrote this line\", \"what is in that directory\". \
-         `page` is required in every mode — pass 0 to start, and `paging.next_page` for \
+         `page` is required in every mode and counts from 1 — pass 1 to start, and `paging.next_page` for \
          the next. For the file as it stands on disk right now, uncommitted edits \
          included, use file_read. Reads only.";
 
@@ -293,8 +295,10 @@ impl Tool for GitShow {
                     },
                 };
                 let subject = head.map(|c| c.subject().to_string());
-                let message_on =
-                    |paging: &Paging| head.filter(|_| paging.page == 0).map(|c| c.message.clone());
+                let message_on = |paging: &Paging| {
+                    head.filter(|_| paging.is_first())
+                        .map(|c| c.message.clone())
+                };
                 let paths = path_args(req.paths.as_deref().unwrap_or(&[]))?;
                 let path_refs: Vec<_> = paths.iter().collect();
 

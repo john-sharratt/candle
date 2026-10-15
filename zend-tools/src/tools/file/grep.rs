@@ -42,9 +42,11 @@ pub struct GrepRequest {
     /// Match without regard to case. Defaults to false (case-sensitive), which
     /// is what searching for a Rust identifier wants.
     pub ignore_case: Option<bool>,
-    /// Zero-based page of results — 0 to start. When the response's
+    /// Page of results, from 1 — 1 to start. When the response's
     /// `paging.next_page` is set, pass it here for the following page.
     /// Required, as on every paged tool (see `file_list`'s `page`).
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: u32,
 }
 
@@ -52,7 +54,7 @@ pub struct GrepRequest {
 pub struct GrepMatch {
     /// Relative to the group's repository.
     pub path: String,
-    /// 1-based line number — `(line - 1) / PAGE_LINES` is the page to pass
+    /// 1-based line number — `(line - 1) / PAGE_LINES + 1` is the page to pass
     /// `file_read` to see the surrounding code.
     pub line: u32,
     /// The matching line, trimmed of trailing whitespace and truncated if very
@@ -108,7 +110,7 @@ impl Tool for FileGrep {
          regex (`^pub fn `, `Error::\\w+`, `foo|bar`), an optional path prefix to \
          narrow the search, and optional ignore_case. Returns the matches grouped by \
          repo — path, line number and the matching line — paged, with files_searched so an empty result is \
-         unambiguous. `page` is required — pass 0 to start, and the response's \
+         unambiguous. `page` is required and counts from 1 — pass 1 to start, and the response's \
          `paging.next_page` for the next. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it \
          before guessing at directory names with file_list. Use file_search to find \
          a file by its NAME; use file_read with the line number this returns to see \

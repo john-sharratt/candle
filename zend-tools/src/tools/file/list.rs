@@ -22,13 +22,15 @@ pub struct ListRequest {
     /// Defaults to "" — the repository's root. Must name a real directory (or
     /// the root); a file path does not resolve.
     pub path: Option<String>,
-    /// Zero-based page of results to return — 0 to start. When the response's
+    /// Page of results to return, from 1 — 1 to start. When the response's
     /// `paging.next_page` is set, pass it here to read the following page.
     ///
     /// Required, as on every paged tool. Optional, a call for the next page
     /// that left it out was the first call again, word for word: measured, a
-    /// listing turn asked for "page 2" of four directories that way, got page
-    /// 0 back each time, and never saw the rest.
+    /// listing turn asked for "page 2" of four directories that way, got the
+    /// first page back each time, and never saw the rest.
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: u32,
 }
 
@@ -79,12 +81,12 @@ impl Tool for FileList {
          entry (`dir: true`), never expanded — so list it in turn to go \
          further. `path` must name a real directory; a file path does not \
          resolve. Ignored paths (per .gitignore and friends) never appear. \
-         Results are paged and `page` is required — pass 0 to start; the \
-         response's `paging` reports the total and, when more remain, a \
+         Results are paged from 1 and `page` is required — pass 1 to start; \
+         the response's `paging` reports the total and, when more remain, a \
          `next_page` to pass back as `page`. Returns names \
          and byte sizes, not file contents or line counts; a file entry carries \
          `modified: true` when this session has changed it. Use file_read to \
-         get a file's contents — read page 0 and its header reports the \
+         get a file's contents — read page 1 and its header reports the \
          file's length in pages, so there is no need to size a file before \
          reading it.";
 

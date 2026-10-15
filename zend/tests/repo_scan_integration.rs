@@ -181,7 +181,7 @@ fn each_directory_lists_once_and_then_summarises() {
     assert!(
         src[0].1.contains(
             "{\"name\": \"file_list\", \"arguments\": {\"repo\": \"demo\", \"path\": \"src\", \
-             \"page\": 0}}"
+             \"page\": 1}}"
         ),
         "{}",
         src[0].1

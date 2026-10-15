@@ -567,6 +567,28 @@ mod tests {
         }
     }
 
+    /// **A `minimum` of one offers no `0`**: a one-based page has no page 0, so
+    /// the grammar never offers the digit that would write it, while every
+    /// other first digit — and so 10, 20, 100 — stays open.
+    #[test]
+    fn a_one_based_integer_cannot_begin_with_zero() {
+        let (mut driver, set) = at_integer(
+            r#"[{"name":"read","params":[
+                 {"name":"page","type":"integer","minimum":1.0,"required":true}]}]"#,
+        );
+        assert!(!set.contains(b'0' as TokenId), "{set:?}");
+        assert!(!set.contains(b'-' as TokenId), "{set:?}");
+        for d in b'1'..=b'9' {
+            assert!(set.contains(d as TokenId), "digit {}", d as char);
+        }
+        // A zero after the first digit is an ordinary digit: page 10.
+        assert_eq!(driver.accept(b'1' as TokenId, b"1"), Healed::No);
+        let StepMask::Branch(next) = driver.step() else {
+            panic!("a second digit or the end is a masked choice");
+        };
+        assert!(next.contains(b'0' as TokenId), "{next:?}");
+    }
+
     /// **A leading zero ends the number**, as JSON requires — `07` is not a
     /// number — so after it only what follows the value can be written.
     #[test]

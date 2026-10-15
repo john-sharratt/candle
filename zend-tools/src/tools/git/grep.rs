@@ -47,8 +47,10 @@ pub struct GrepRequest {
     #[serde(default)]
     #[schemars(with = "u32")]
     pub max_per_file: Option<u32>,
-    /// Zero-based page of matches, 40 a page. Required — pass 0 to start. A
-    /// page past the end clamps to the last one.
+    /// Page of matches, from 1, 40 a page. Required — pass 1 to start. A page
+    /// past the end clamps to the last one.
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: u32,
 }
 
@@ -79,7 +81,7 @@ impl Tool for GitGrep {
          `rev` defaults to HEAD, the last commit. Binary files are skipped. **To search \
          the working tree as it stands right now, uncommitted edits and untracked files \
          included, use file_grep instead** — an untracked or since-edited file reads \
-         differently through the two. `page` is required — pass 0 to start, and \
+         differently through the two. `page` is required and counts from 1 — pass 1 to start, and \
          `paging.next_page` for the next. Reads only.";
 
     type Request = GrepRequest;
