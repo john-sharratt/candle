@@ -45,6 +45,7 @@
 pub mod address;
 pub mod catalog;
 pub mod doc;
+pub mod files;
 pub mod parts;
 pub mod path;
 pub mod scope;
