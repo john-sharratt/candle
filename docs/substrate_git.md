@@ -1,8 +1,8 @@
 # Git in the substrate: repositories replicate as packs
 
-**Status:** being built in §11's order. Stages 1 and 2 are built: the records, the
-derived store, the importer and adoption (`substrate-git/`), and zend behind
-`substrate_git: true`. Stages 3 and 4 are not.
+**Status:** stages 1–3 are built (§11): the records, the derived store, the importer and
+adoption (`substrate-git/`), zend behind `substrate_git: true`, and npcd's mind read from
+the substrate with `--mind-repo`. Stage 4 is not, and nothing has run end to end yet.
 **Scope:** where a member's git objects and refs come from. Today every zend member reads
 each workspace repository from its own checkout, and every npcd member reads its mind
 from a mirror it keeps under `--data`. This design moves both into the substrate: git's
@@ -236,39 +236,69 @@ Built behind `substrate_git: true` (`--substrate-git`), in `zend/src/substrate_g
 
 ### 8.1 Reading the mind
 
-A `MindFiles` reader answers `read(path)` and `list(dir)` at a commit, through the same
-`GitSource` as zend. Every module that reads the mind folder today reads through it: the
-schema (`npcd/src/engine/schema.rs`), the registries, the corpus, the console and API
-reads, mission generation, lifegen. An operation's store keeps its lower layer at its
-pinned commit, now resolved from the derived store.
+Built in `npcd/src/mind/files.rs` and `npcd/src/mind_store.rs`.
 
-### 8.2 Following the record
+- **`MindFiles`** is the mind's files at one commit of its store, or in a plain folder.
+  A commit's tree is indexed once with `ls_tree_all`, and each file's bytes are read in
+  process on demand. It answers `read`, `bytes`, `is_file`, `is_dir`, `size`, `list`,
+  `walk` and `not_a_document`. A link in a commit is never read as a document, as a
+  link in a folder is not.
+- **`Mind`** holds a swappable `Arc<MindFiles>`. Every clone shares one holder, so a
+  branch move moves every reader at once. A mind read from the substrate that has not
+  arrived yet is *pending*: no files until it is pulled.
+- **Everything reads through it**: the schema (`projection::Source::from_files`,
+  `engine/schema.rs`), the response and mood libraries, the world and personality
+  registries (`Registry::load_mind`, re-read at each reload), personality portraits,
+  the layer sources and their documents (`engine/ingest.rs`), the lives
+  (`engine/life.rs`), bearings, eras, the mission generator's corpus, glossary, lore
+  and `missions.yaml`, the bench's canon index, and the published shelf (`Published`)
+  that every API read goes through.
+- **Maps** load from the mind's `map/<id>/` files (`MapSet::load_texts`,
+  `Hosted::load_mind`). A reshape of one is kept as the owner's draft in the mind.
+- **Operations' stores** read through the store's record: `GitSource` defaults to
+  `origin/main` (else `master`) when the checked-out branch has no commit, which is a
+  store's case, and `Merge` publishes on that branch through the agent.
+- **The ingest ledger** is keyed by mind paths. A key an earlier build wrote as an
+  absolute path under a mind folder is cut to its `layers/…` part when the ledger
+  opens, so a mind that moved into the substrate retires nothing.
 
-The mind's branch is a `GitRef`. When it moves, npcd diffs the old tree against the new
-one (`git diff-tree`) and hands each changed path to the watcher's existing reconcile:
-unchanged costs nothing, changed tombstones and re-ingests, deleted is reported
-(`npcd/src/engine/watcher.rs`). Only the trigger changes, from file events to the
-`GitRef`. A move that changes `projection.yaml` restarts the tenant onto the new commit
-(`TenantContext::stopping`), since the grammar is built once at start.
+### 8.2 Startup and following
 
-### 8.3 What goes
+- `--mind-repo <name>` (with `--cluster` and `--data`): the tenant opens the substrate
+  first, brings the store at `<data>/git/<name>` up to the local log, and reads the
+  schema and the registries from the branch's commit. A log that holds no such branch
+  yet starts the daemon on the bundled schema, with the mind pending.
+- After the cluster join, `load_mind` (`engine/runtime.rs`) loads the repository whole
+  through `substrate_git::member::Repos`: pulled through an agent by the lease holder
+  when no member has. A mind that was pending restarts the process onto it, since the
+  schema and the grammar built from it are read once.
+- Then the repository is followed. When its branch moves, every reader moves to the
+  new commit (`Mind::replace`), the worlds and personalities are read again
+  (`MindStores::moved`), and the documents added, changed and removed are reported as
+  the folder watcher reports them. A move that changes `projection.yaml` restarts the
+  process.
+- **Runtime ingest is unchanged.** As with a watched folder, a changed document is read
+  into the substrate at the next start; nothing ingests at runtime today, from a folder
+  or a commit.
 
-`<data>/mind/<name>`, `MindRepo::bring_up` and the 60-second follow. A first start no
-longer runs without a mind and relaunches: it waits in its loading phase until the
-mind's `GitRef` and packs are held, as it waits for any catch-up.
+### 8.3 What went
+
+`npcd/src/mind_repo.rs` (the mirror at `<data>/mind/<name>`, its bring-up and its
+relaunch), and the checkout-based `follow` for a mind in the substrate: `MindStores`
+marked `read_from_substrate` checks nothing out.
 
 ---
 
 ## 9. Standalone and adoption
 
-- **Standalone** (no `--cluster`): the importer fetches with `FetchHere` from the
-  repository's local folder: `--mind <dir>` for npcd, the workspace folders for zend.
-  The read path is the cluster's. A folder that is not a git repository is imported as a
-  synthetic commit of its tree, so `--mind` keeps working on a plain folder.
-- **Adoption.** The first start of a member on this build packs each repository it can
-  read locally (`git pack-objects --all --max-pack-size=64m`) and writes the packs and
-  refs once, under the lease. Duplicate packs from two members adopting at once are kept,
-  and harmless (§3.1). A member with nothing local waits for the packs to replicate.
+- **zend standalone** (`substrate_git: true`, no `--cluster`): each store fetches from
+  its checkout's own `origin` with this machine's credentials, and the checkout's
+  branches are adopted once (`substrate_git::adopt`). With a cluster nothing is adopted:
+  the agents' view of `origin` is the only source, so a stale local clone never leaks
+  in.
+- **npcd `--mind <dir>`** reads its folder as it stands (`MindFiles::folder`), and the
+  folder watcher stays. A standalone author edits the folder and sees it at once, which
+  a commit would not give.
 
 ---
 
@@ -276,61 +306,62 @@ mind's `GitRef` and packs are held, as it waits for any catch-up.
 
 ### Removes
 
-| Today | After |
+| Before | After |
 |---|---|
 | A checkout per repository on every zend member | Nothing on the member; agents keep their own |
-| npcd's mirror, its 60 s follow, and the "no mind, fetch, relaunch" first start | A `GitRef` and the packs it needs |
-| `--mind` versus `--mind-repo`, and the refusals between them and `--cluster` | One read path; the flag says only where the importer fetches from |
-| Every member probing and fetching `origin` | One importer per repository, holding a lease |
-| Commits in one member's `.git` until pushed and fetched | Packs replicated before anything names them |
+| npcd's mirror, its 60 s follow, and its fetch-then-relaunch first start | Branches and packs in the log; a pending mind pulled once and restarted onto |
+| Every member probing and fetching `origin` | One importer per repository, holding a lease, fetching every 15 s |
 | Members serving different mind tips for up to 60 s | One tip at each point in the log |
-| `HELLO.repos` restricting routing | Every caught-up member holds every repository |
-| A schema that differs between members until each restarts | A restart driven by the `GitRef` that changed it |
+| A schema that differs between members until each restarts | A restart driven by the branch move that changed it |
+| A first fetch of a long history as one agent answer | Slices of 256 commits (`max_commits`, §5.1) |
 
 ### Adds
 
-- Two record types, with the `Blob` machinery reused for `GitPack`.
-- The importer and its lease.
+- Pack and branch entries as keyed objects, pack bytes as `Blob` records — no new
+  record type.
+- The importer and its lease; the `Repositories` load step in zend.
 - The derived store, until stage 4.
 - About 1.7 GB of packs across the three repositories in every substrate, growing with
   history, and in a new member's catch-up.
-- The descendant rule for `GitRef`, and the force-push handling in §5.3.
+- Only-forward branches, and the two-look force-push rule (§5.3).
 
 ---
 
 ## 11. Build order
 
-| Stage | Contents | Size |
+| Stage | Contents | State |
 |---|---|---|
-| 1 | `GitPack` and `GitRef` records; the derived store; the importer and its lease; adoption. zend behind a flag. | Medium. Record types follow `Blob`; the importer reuses `Fetch` and `remote/fetch_bundle.rs` |
-| 2 | zend reads from the derived store: manifest names, `GitSource`/`Repo` opened on it, branch ingest, objects emitted by every write (§6), `origin_watch` retired, `HELLO.repos` no longer restricting. Members drop their checkouts. | Medium. Seven files in `zend/src` open repositories today |
-| 3 | npcd: `MindFiles` through the ~25 modules that read the mind, the watcher's new trigger, schema restart on a `GitRef` move, the mirror retired, `--mind` through `FetchHere`. | Large. The widest change, spread across npcd |
-| 4 | An in-process object database: the remaining `git` program writes and reads (`merge_tree`, `commit`, `ref_txn`, `apply`, `log`, `grep`, `blame`) ported to libgit2 over packs read from the log, and the derived store deleted. | Large, and optional. Stages 1–3 stand without it |
+| 1 | Pack and branch records; the derived store; the importer and its lease; adoption | Built: `substrate-git/` |
+| 2 | zend reads from the derived store behind `substrate_git: true`; repositories loaded whole while zend loads; `origin_watch` replaced | Built: `zend/src/substrate_git.rs` |
+| 3 | npcd reads the mind at a commit through `MindFiles`; the mirror retired; the watcher's trigger a branch move | Built: `npcd/src/mind/files.rs`, `npcd/src/mind_store.rs` |
+| 4 | An in-process object database: the remaining `git` program writes and reads ported to libgit2 over packs read from the log, and the derived store deleted | Not started; optional |
 
-Each stage leaves the cluster working: stage 1 adds records nothing yet reads, stage 2
-moves zend, stage 3 moves npcd. Members on an older build ignore records of types they do
-not decode, deferring them as today (`docs/replicated_substrate.md` §6.5).
+Not yet done: `HELLO.repos` still advertises repositories (§7), and runtime ingest of a
+changed mind document is the next start's, as it was for a watched folder (§8.2).
 
 ---
 
 ## 12. Tests
 
-- **Packs.** A pack written on one member is held, verified and indexed on another; a
-  duplicate is dead on arrival; a corrupt one is refused on read; an import over 64 MiB
-  splits.
-- **Refs.** A `GitRef` arriving before its packs waits for them; a descendant wins
-  whatever the stamps; a stale importer record cannot rewind a member's push; a forced
-  move needs two agreeing probes.
-- **Derived store.** Deleting it and reopening rebuilds the same refs and objects; a pack
-  or ref the log lacks is removed at open.
-- **zend.** A conversation committed on one member continues on another with its commits
-  readable, before any push; branch ingest re-reads nothing after the switch; a member
-  with no checkouts serves every repository once caught up.
-- **npcd.** Two members report the same mind commit at the same log point; a
-  `projection.yaml` change restarts the tenant onto it; a changed corpus file is
-  tombstoned and re-ingested once, by the world's authority.
-- **Standalone.** `--mind` on a plain folder and on a git checkout both read through the
-  substrate, with the same results as before.
+Built:
+
+- **Packs and records** (`substrate-git/tests/members.rs`): an adopted checkout reaches
+  another member; a branch waits for its packs; only a descendant replaces a branch
+  unless forced; a deleted store is rebuilt from the log; the importer follows origin,
+  publishing a rewrite only on two agreeing looks; a member's own push is published
+  without the lease; a store reads as a repository for zend.
+- **A real substrate** (`substrate-git/tests/member.rs`, feature `member`): a standalone
+  checkout loads whole, and a second daemon with no checkout loads it from the log alone.
+- **Sliced fetches** (`zend-vfs/src/remote/fetch_bundle.rs`): a long history comes in
+  slices and the last moves the tracking ref to origin's commit.
+- **npcd** (`npcd/src/mind/files.rs`, `npcd/src/mind_store.rs`,
+  `npcd/src/engine/watcher.rs`): a folder and a commit read the same; a mind adopted
+  into the log reads with no checkout, its store holding no file; an absolute ledger key
+  becomes a mind path.
+
+Still to run: end to end on `.6` against `.5` — two members agreeing on a mind commit at
+one log point, a pending mind pulled and restarted onto, and a conversation's commits
+read on another member.
 
 ---
 
