@@ -1,0 +1,26 @@
+[package]
+name = "substrate-git"
+version = "0.1.0"
+edition = "2021"
+description = "A repository's git packs and refs as substrate records, and the object store each member derives from them (docs/substrate_git.md)."
+
+[lib]
+name = "substrate_git"
+path = "src/lib.rs"
+
+[features]
+default = []
+# `Records` for candle-conversation's `SharedSubstrate`. Off by default so the
+# crate's own tests build without the model stack.
+substrate = ["dep:candle-conversation"]
+
+[dependencies]
+anyhow     = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }
+zend-vfs   = { path = "../zend-vfs" }
+candle-conversation = { path = "../candle-conversation", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -649,6 +649,17 @@ impl Conversation {
         }
     }
 
+    /// This conversation's substrate as a [`SharedSubstrate`]: the same
+    /// in-RAM substrate and the same persistence handle, not a second opening —
+    /// for keyed objects and blobs written beside the conversations, such as a
+    /// repository's git records (`docs/substrate_git.md`).
+    pub fn shared(&self) -> SharedSubstrate {
+        SharedSubstrate {
+            substrate: Arc::clone(&self.inner),
+            persistence: Arc::clone(&self.persistence),
+        }
+    }
+
     /// Create a conversation backed by a real [`SubstratePersistence`].
     /// Equivalent to `from_parts(Substrate::new(), persistence)` — for
     /// callers that already have a populated persistence and want an

@@ -63,6 +63,9 @@ pub struct DaemonConfig {
     /// `2` = one folder down). Content ingested from deeper is not found by the
     /// walk and is retired. `None` = unbounded.
     pub max_depth: Option<usize>,
+    /// Repositories read from the substrate (`docs/substrate_git.md` §7):
+    /// `--substrate-git`.
+    pub substrate_git: bool,
     /// Force a whole-store redo-log compaction once during load, after the
     /// substrate reload and before serving. Normally reclaim is incremental and
     /// background (the persistence-thread maintenance pass); this flag forces
@@ -142,6 +145,7 @@ impl DaemonConfig {
             wiped_layers: HashSet::new(),
             ingest_dirs: HashMap::new(),
             max_depth: None,
+            substrate_git: false,
             compact_substrate: false,
             self_check: SelfCheck::Off,
             read_only_substrate: false,

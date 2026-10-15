@@ -1,0 +1,107 @@
+//! Writing a repository's new objects, then the refs that name them
+//! (`docs/substrate_git.md` §6.1).
+//!
+//! Objects first: every object a ref reaches that the log's refs do not is
+//! packed and written before the ref is, so no member ever holds a ref whose
+//! commit it cannot read — and a ref that replicates ahead of its packs waits
+//! for them in [`crate::Store::sync`].
+
+use anyhow::Context;
+use zend_vfs::{object_count, pack_checksum, Oid, RefName, Repo, Rev};
+
+use crate::records::{Log, PackEntry, RefEntry, Records};
+use crate::MAX_PACK;
+
+/// What [`publish`] wrote.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Published {
+    /// Packs written.
+    pub packs: usize,
+    /// Refs written, with where they point.
+    pub refs: Vec<(RefName, Option<Oid>)>,
+    /// Refs left as they were because the new value does not descend from the
+    /// log's, with the log's value.
+    pub refused: Vec<(RefName, Oid)>,
+}
+
+/// Write `refs` of repository `repo` to `records`, taking their objects from
+/// `source`. A ref the log already holds is replaced only by a descendant,
+/// unless `forced`; a `None` deletes, and is itself a forced move.
+pub fn publish(
+    records: &dyn Records,
+    repo: &str,
+    source: &Repo,
+    refs: &[(RefName, Option<Oid>)],
+    forced: bool,
+) -> anyhow::Result<Published> {
+    let log = Log::new(records, repo)?;
+    let held = log.refs()?;
+    let mut published = Published::default();
+
+    let mut moving = Vec::new();
+    for (name, new) in refs {
+        let old = match held.get(name.as_str()).and_then(|e| e.oid.as_deref()) {
+            Some(old) => Some(Oid::parse(old)?),
+            None => None,
+        };
+        if old == *new {
+            continue;
+        }
+        if let (Some(old), Some(new)) = (&old, new) {
+            if !forced && !descends(source, old, new)? {
+                published.refused.push((name.clone(), old.clone()));
+                continue;
+            }
+        }
+        if new.is_none() && !forced {
+            if let Some(old) = old {
+                published.refused.push((name.clone(), old));
+            }
+            continue;
+        }
+        moving.push((name.clone(), new.clone()));
+    }
+    if moving.is_empty() {
+        return Ok(published);
+    }
+
+    let tips: Vec<Oid> = moving.iter().filter_map(|(_, oid)| oid.clone()).collect();
+    let known: Vec<Oid> = held
+        .values()
+        .filter_map(|e| e.oid.as_deref())
+        .map(Oid::parse)
+        .collect::<Result<_, _>>()?;
+    let mut needs = Vec::new();
+    for pack in source
+        .pack_objects(&tips, &known, MAX_PACK)
+        .with_context(|| format!("packing {repo}"))?
+    {
+        let entry = PackEntry {
+            checksum: pack_checksum(&pack).context("a pack with no trailer")?,
+            objects: object_count(&pack),
+        };
+        needs.push(log.put_pack(pack, &entry)?);
+        published.packs += 1;
+    }
+    for (name, oid) in moving {
+        log.put_ref(
+            &name,
+            &RefEntry {
+                oid: oid.as_ref().map(|o| o.to_string()),
+                needs: needs.clone(),
+                forced,
+            },
+        )?;
+        published.refs.push((name, oid));
+    }
+    Ok(published)
+}
+
+/// Whether `new` descends from `old` in `source`; not when `source` lacks
+/// `old`, since then it cannot say.
+fn descends(source: &Repo, old: &Oid, new: &Oid) -> anyhow::Result<bool> {
+    if !source.has_object(old)? {
+        return Ok(false);
+    }
+    Ok(source.is_ancestor(&Rev::Oid(old.clone()), &Rev::Oid(new.clone()))?)
+}

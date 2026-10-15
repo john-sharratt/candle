@@ -85,6 +85,13 @@ pub struct ZendArgs {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub max_depth: Option<u32>,
 
+    /// Read each repository the manifest names from the substrate — the object
+    /// store derived from its log, `substrate/git/<name>` — instead of a folder
+    /// under the workspace (`docs/substrate_git.md` §7). A checkout already
+    /// there is adopted once. With `--cluster`, fetches go through agents.
+    #[arg(long)]
+    pub substrate_git: bool,
+
     /// Force a whole-store redo-log compaction once during load (after the
     /// substrate reload, before serving) instead of leaving reclaim to the
     /// incremental background maintenance pass.
@@ -175,6 +182,7 @@ impl Default for ZendArgs {
             wipe_layer: Vec::new(),
             ingest_dir: Vec::new(),
             max_depth: None,
+            substrate_git: false,
             compact_substrate: false,
             self_check: false,
             dry_run: false,
@@ -296,7 +304,11 @@ impl ZendArgs {
         if self.wipe_substrate {
             wipe_substrate(&root)?;
         }
-        let workspace = workspace::open(&root)?;
+        let workspace = if self.substrate_git {
+            crate::substrate_git::open_workspace(&root)?
+        } else {
+            workspace::open(&root)?
+        };
         let secrets = secrets::load(self.secrets.as_deref())?;
         let ingest_dirs = self.ingest_dirs(&root)?;
         let mut config = DaemonConfig::new(workspace);
@@ -305,6 +317,7 @@ impl ZendArgs {
         config.wiped_layers = self.wipe_layer.iter().cloned().collect();
         config.ingest_dirs = ingest_dirs;
         config.max_depth = self.max_depth.map(|d| d as usize);
+        config.substrate_git = self.substrate_git;
         config.compact_substrate = self.compact_substrate;
         config.self_check = match (self.self_check, self.dry_run) {
             (false, _) => SelfCheck::Off,

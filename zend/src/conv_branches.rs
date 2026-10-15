@@ -60,6 +60,14 @@ fn base_branch(dir: &Path) -> Result<Option<String>, GitError> {
             return Ok(Some(preferred.to_string()));
         }
     }
+    // A repository read from the substrate holds no local branch and checks
+    // nothing out: its branches are the record's (`docs/substrate_git.md` §4).
+    let record = repo.record_branches()?;
+    for preferred in PREFERRED {
+        if record.iter().any(|b| b.name.as_str() == preferred) {
+            return Ok(Some(preferred.to_string()));
+        }
+    }
     Ok(repo.head()?.branch().map(|b| b.as_str().to_string()))
 }
 

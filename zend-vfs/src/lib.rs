@@ -101,6 +101,7 @@ pub use remote::fetch_bundle::FetchBundle;
 pub use remote::fetcher::{fetch_here, Fetch, FetchHere};
 pub use remote::ls_remote::RemoteRefs;
 pub use remote::manage::UrlKind;
+pub use remote::packs::{object_count, pack_checksum};
 pub use remote::probe;
 pub use remote::push::{
     Lease, PushAction, PushOutcome, PushResult, PushSpec, PushTarget, Rejection,

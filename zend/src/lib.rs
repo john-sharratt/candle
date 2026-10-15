@@ -30,6 +30,7 @@ pub mod ingest;
 pub mod ingest_backlog;
 pub mod ingest_cancel;
 pub mod ingest_lease;
+pub mod substrate_git;
 pub mod ingest_report;
 pub mod ingest_worker;
 pub mod legacy_uploads;

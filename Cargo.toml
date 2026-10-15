@@ -18,6 +18,7 @@ members = [
     "npc-map",
     "npcd",
     "store-events",
+    "substrate-git",
     "motherd",
     "keep",
     "web",

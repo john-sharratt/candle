@@ -101,25 +101,7 @@ impl Workspace {
     /// repository's folder exists.
     pub fn load(root: impl Into<PathBuf>) -> Result<Self, WorkspaceError> {
         let root = root.into();
-        let file = root.join(MANIFEST_FILE);
-        let text = match std::fs::read_to_string(&file) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(WorkspaceError::Missing(root));
-            }
-            Err(e) => {
-                return Err(WorkspaceError::Unreadable {
-                    path: root,
-                    why: e.to_string(),
-                });
-            }
-        };
-        let manifest: Manifest =
-            serde_yaml::from_str(&text).map_err(|e| WorkspaceError::Unreadable {
-                path: root.clone(),
-                why: e.to_string(),
-            })?;
-        let workspace = Self::new(root, manifest.repos)?;
+        let workspace = Self::new(root.clone(), Self::manifest(&root)?)?;
         for repo in &workspace.repos {
             if !repo.dir.is_dir() {
                 return Err(WorkspaceError::NotADirectory {
@@ -129,6 +111,43 @@ impl Workspace {
             }
         }
         Ok(workspace)
+    }
+
+    /// The repositories `root`'s [`MANIFEST_FILE`] lists, read but not checked
+    /// against the disk: for a member whose repositories are not folders under
+    /// the workspace (`docs/substrate_git.md` §7).
+    pub fn manifest(root: &Path) -> Result<Vec<RepoSpec>, WorkspaceError> {
+        let file = root.join(MANIFEST_FILE);
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(WorkspaceError::Missing(root.to_path_buf()));
+            }
+            Err(e) => {
+                return Err(WorkspaceError::Unreadable {
+                    path: root.to_path_buf(),
+                    why: e.to_string(),
+                });
+            }
+        };
+        let manifest: Manifest =
+            serde_yaml::from_str(&text).map_err(|e| WorkspaceError::Unreadable {
+                path: root.to_path_buf(),
+                why: e.to_string(),
+            })?;
+        Ok(manifest.repos)
+    }
+
+    /// This workspace with repository `name` read from `dir` instead of its
+    /// folder under the root: a member's object store derived from its log
+    /// (`docs/substrate_git.md` §7). The repository keeps its name, so every
+    /// workspace-relative path is unchanged.
+    pub fn with_dir(mut self, name: &str, dir: impl Into<PathBuf>) -> Result<Self, WorkspaceError> {
+        let Some(repo) = self.repos.iter_mut().find(|r| r.name == name) else {
+            return Err(WorkspaceError::BadName(name.to_string()));
+        };
+        repo.dir = dir.into();
+        Ok(self)
     }
 
     /// Validate `specs` against `root` without touching the disk.

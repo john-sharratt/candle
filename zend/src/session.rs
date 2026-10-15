@@ -1015,6 +1015,8 @@ impl InferenceState {
         wiped_layers: HashSet<String>,
         ingest_dirs: HashMap<String, String>,
         max_depth: Option<usize>,
+        host_runtime: Option<tokio::runtime::Handle>,
+        substrate_git: bool,
         compact_substrate: bool,
         self_check: SelfCheck,
         read_only_substrate: bool,
@@ -1477,6 +1479,27 @@ impl InferenceState {
                 ingest_lease::install(replicator);
             }
             status_tx.send(String::new()).ok();
+        }
+
+        // Repositories read from the substrate (`docs/substrate_git.md` §7):
+        // every store brought up to the log before anything reads a branch,
+        // then kept there — and with origin — on a thread of its own.
+        if substrate_git {
+            let names: Vec<String> = workspace
+                .repos()
+                .iter()
+                .map(|r| r.name.clone())
+                .filter(|name| name != crate::workspace::UPLOADS_REPO)
+                .collect();
+            let git_cluster = cluster.as_ref().and_then(|join| {
+                let member = join.link().member()?;
+                Some(crate::substrate_git::Cluster {
+                    replicator: member.replicator().cloned()?,
+                    agents: Agents::new(Arc::clone(member), join.in_process_agent()),
+                    runtime: host_runtime.clone()?,
+                })
+            });
+            crate::substrate_git::start(&root, &names, engine.conversation().shared(), git_cluster)?;
         }
 
         let formatted_prompt = builder.format_system_prompt();
@@ -6475,6 +6498,7 @@ impl ZendSession {
         let wiped_layers = self.config.wiped_layers.clone();
         let ingest_dirs = self.config.ingest_dirs.clone();
         let max_depth = self.config.max_depth;
+        let substrate_git = self.config.substrate_git;
         let compact_substrate = self.config.compact_substrate;
         let self_check = self.config.self_check;
         let read_only_substrate = self.config.read_only_substrate;
@@ -6502,6 +6526,9 @@ impl ZendSession {
         // Held by the spawned thread, which stores the ingest worker on the
         // session and hands it to the resumed turns.
         let session_for_loader: Arc<Self> = Arc::clone(self);
+        // The host's runtime, where the cluster's sockets live: what an agent's
+        // fetch for a repository read from the substrate is made on.
+        let host_runtime = tokio::runtime::Handle::try_current().ok();
         // OS thread, not `tokio::spawn` — `start_loading` may be
         // called from contexts without an ambient Tokio runtime
         // (integration tests, alternative binaries).  The bits that
@@ -6578,6 +6605,8 @@ impl ZendSession {
                     wiped_layers,
                     ingest_dirs,
                     max_depth,
+                    substrate_git.then_some(host_runtime).flatten(),
+                    substrate_git,
                     compact_substrate,
                     self_check,
                     read_only_substrate,
@@ -6688,12 +6717,19 @@ impl ZendSession {
                                 let wake = Arc::clone(&wake);
                                 Arc::new(move || wake.notify_one())
                             };
-                            let watch = OriginWatch::start(
-                                &state.workspace,
-                                session_for_loader.config.secrets.github_token(),
-                                on_change,
-                            );
-                            *session_for_loader.origin_watch.lock().unwrap() = Some(watch);
+                            if session_for_loader.config.substrate_git {
+                                // The importer keeps origin instead: a record
+                                // branch that moves in the log wakes the worker
+                                // (`docs/substrate_git.md` §5).
+                                crate::substrate_git::on_change(on_change);
+                            } else {
+                                let watch = OriginWatch::start(
+                                    &state.workspace,
+                                    session_for_loader.config.secrets.github_token(),
+                                    on_change,
+                                );
+                                *session_for_loader.origin_watch.lock().unwrap() = Some(watch);
+                            }
                         }
                         // The engine is up — only NOW mark ready and unblock
                         // submit-flow waiters. Skipped on the shutdown-during-ingest
