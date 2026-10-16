@@ -1,0 +1,14 @@
+# The in-process agent on the laptop: agent.yaml's jobs and checkouts, on C:
+# (this machine has no D:). See agent.yaml for what each setting means.
+jobs_dir: C:/Users/johna/agent/jobs
+slots: 4
+checkouts:
+  - name: candle
+    dir: C:/Users/johna/agent/candle
+    push: true
+  - name: battle-cities
+    dir: C:/Users/johna/agent/battle-cities
+    push: true
+  - name: battle-mind
+    dir: C:/Users/johna/agent/battle-mind
+    push: true

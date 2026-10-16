@@ -1,0 +1,25 @@
+# motherd on the 16 GB laptop (RTX 4090 Laptop, 192.168.0.237): the same
+# process as motherd.yaml, which is blackworld's (.5), with this machine's
+# address and agent checkouts. Everything else, the gateway and the cluster it
+# joins included, is the same; see motherd.yaml for what each setting means.
+#
+# Run from the repository root:
+#
+#   target\release\motherd.exe --config motherd\motherd.laptop.yaml
+
+host:
+  host: 192.168.0.237
+  port: 8081
+  tls_port: 8444
+  clusters: ["https://gateway.tokera.com:9443"]
+  cluster_name: tokera.com
+  group_key: web/secrets/group.key
+  agent: motherd/agent.laptop.yaml
+
+zend:
+  working_dir: ..
+  max_depth: 3
+
+npcd:
+  mind_repo: battle-mind
+  data: ../npcd-data
