@@ -20,6 +20,13 @@
 //! key's `ttl`, capped at a decision's 2 s, then prepares again above every
 //! ballot seen. One proposer then completes a round while the other waits, and the
 //! other learns the result from its next promises.
+//!
+//! **A lease asked for again while its round runs starts nothing.** The round
+//! retries itself until it is held or beaten by a holder, and a fresh round
+//! would only replace it with a higher ballot. A caller that asks on every
+//! tick — a load round a second apart — otherwise cancelled its own round
+//! each time, never completed one longer than the tick, and pushed the ballot
+//! up under the holder's renewals.
 
 use std::io;
 use std::time::Duration;
@@ -201,8 +208,12 @@ impl<S: VoteStore> Paxos<S> {
         self.start(key, Goal::Decide(value), now)
     }
 
-    /// Take `key`'s lease for `ttl`, or renew it.
+    /// Take `key`'s lease for `ttl`, or renew it. Nothing new while a round
+    /// for `key` is in progress: that round retries itself until it resolves.
     pub fn acquire(&mut self, key: &[u8], ttl: Duration, now: Millis) -> io::Result<Vec<Out>> {
+        if self.proposing(key) {
+            return Ok(Vec::new());
+        }
         self.start(key, Goal::Lease(ttl), now)
     }
 

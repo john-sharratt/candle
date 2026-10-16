@@ -1710,6 +1710,12 @@ sit out for minutes, and a duel is over in a round or two however long the lease
 - A member that rendezvous stops naming for a key abandons its round for it, so it
   does not keep duelling the member that is named now. A lease it holds is unaffected;
   it runs out or is released.
+- **A lease asked for again while its round runs starts nothing.** The round retries
+  itself until it is held or a holder's promise stops it (`LeaseBusy`), so a second ask
+  could only replace it with a higher ballot. The import lease's load asked once a
+  second: each ask cancelled the member's own round before it could finish, and pushed
+  the ballot up under the holder's renewals, so nobody held `git/<repo>` long enough to
+  pull it and a joining member waited for good.
 
 ---
 

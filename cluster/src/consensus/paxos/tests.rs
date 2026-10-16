@@ -363,6 +363,46 @@ fn a_member_alone_in_a_group_of_three_never_holds_a_lease() {
     assert!(net.members[0].proposing(b"world/w"), "it keeps trying");
 }
 
+/// **Asking again while a round runs starts nothing.** The round keeps its
+/// ballot: a caller asking every second no longer replaces its own round with
+/// a higher one before it can finish.
+#[test]
+fn asking_again_while_a_round_runs_starts_no_new_round() {
+    let mut net = Net::new(3, 2);
+    net.cut[1] = true;
+    net.cut[2] = true;
+    let key = b"git/candle";
+    let ttl = Duration::from_secs(120);
+    net.act(0, |p, now| p.acquire(key, ttl, now));
+    let ballot = net.members[0].status(key, net.now).round.unwrap().0;
+    for _ in 0..5 {
+        let now = net.now;
+        let outs = net.members[0].acquire(key, ttl, now).unwrap();
+        assert!(outs.is_empty(), "a round is already running: {outs:?}");
+    }
+    assert_eq!(net.members[0].status(key, net.now).round.unwrap().0, ballot);
+    assert!(net.members[0].proposing(key));
+}
+
+/// Once its round has resolved, asking again is renewal: a new round starts.
+#[test]
+fn a_held_lease_asked_for_again_is_renewed() {
+    let mut net = Net::new(1, 1);
+    let key = b"git/candle";
+    let ttl = Duration::from_secs(120);
+    net.act(0, |p, now| p.acquire(key, ttl, now));
+    net.settle();
+    assert!(net.members[0].holds(key, net.now));
+    assert!(!net.members[0].proposing(key));
+    let now = net.now;
+    let outs = net.members[0].acquire(key, ttl, now).unwrap();
+    assert!(
+        outs.iter()
+            .any(|o| matches!(o, Out::Broadcast(Frame::Prepare(_)))),
+        "renewal prepares: {outs:?}"
+    );
+}
+
 fn held(m: usize, until: u64) -> (usize, Out) {
     let key = b"w".to_vec();
     let until = Millis(until);
