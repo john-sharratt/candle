@@ -19,6 +19,9 @@ use crate::pipe::{Message, PipeTx};
 
 pub const PING_EVERY: Duration = Duration::from_secs(15);
 
+/// A hand-off to the send pump this slow is logged.
+const SLOW_HANDOFF: Duration = Duration::from_secs(5);
+
 /// How often a writer with only catch-up frames waiting looks again at the
 /// socket's unsent bytes.
 const DRAIN_POLL: Duration = Duration::from_millis(1);
@@ -85,8 +88,21 @@ pub async fn run<T: PipeTx>(
                 Frame::Event { event, .. } => event.bytes.len(),
                 _ => bytes.len(),
             };
+            let (kind, len) = (crate::frame::name(next.frame.kind()), bytes.len());
+            let handing = std::time::Instant::now();
             if tx.send(Message::Frame(bytes)).await.is_err() {
                 return;
+            }
+            // Every frame behind this one — a PING included — waited on it: a
+            // hand-off this slow is a peer about to see "no frame for 45 s".
+            if handing.elapsed() >= SLOW_HANDOFF {
+                tracing::warn!(
+                    frame = kind,
+                    bytes = len,
+                    unsent = tx.unsent_bytes(),
+                    waited_ms = handing.elapsed().as_millis() as u64,
+                    "a frame waited on the socket's send pump"
+                );
             }
             gauges.written(next.lane, gauged);
             let number = counter.count_one();

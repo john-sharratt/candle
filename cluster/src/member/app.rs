@@ -363,6 +363,15 @@ impl AppMember {
                 Attempt::Session(Ended::Dropped) => Some("the socket dropped".into()),
                 Attempt::Session(Ended::Dead) => Some("no frame from the gateway for 45 s".into()),
             };
+            // Logged as well as shown: the next admission clears the view, so
+            // a socket that ends and is readmitted at once left no trace of why.
+            tracing::warn!(
+                app = %self.app(),
+                cluster = c,
+                attempt = entry.view.attempts,
+                why = close.as_deref().unwrap_or("—"),
+                "a cluster socket ended"
+            );
             entry.view.last_close = close;
         }
         lock(&self.links).failed(c);

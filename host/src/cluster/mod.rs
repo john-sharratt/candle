@@ -220,6 +220,24 @@ impl Cluster {
             .enable_all()
             .build()
             .map_err(|e| anyhow::anyhow!("could not start the cluster socket runtime: {e}"))?;
+        // A watchdog on that runtime: a reader it does not poll for 45 s closes
+        // both apps' sockets as "no frame from the gateway", and nothing else
+        // says the runtime was the one that stalled.
+        sockets.spawn(async {
+            const EVERY: Duration = Duration::from_millis(500);
+            let mut last = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(EVERY).await;
+                let late = last.elapsed().saturating_sub(EVERY);
+                if late >= Duration::from_secs(2) {
+                    tracing::warn!(
+                        late_ms = late.as_millis() as u64,
+                        "the cluster socket runtime was not polled on time"
+                    );
+                }
+                last = std::time::Instant::now();
+            }
+        });
         Ok(Arc::new(Cluster {
             targets,
             agent,
