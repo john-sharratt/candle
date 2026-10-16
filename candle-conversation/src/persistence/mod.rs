@@ -757,8 +757,7 @@ fn observe_replica(
     let id = h.identity();
     if !id.is_none() {
         locations.insert(
-            id.origin,
-            id.oseq,
+            h,
             Located {
                 segment: entry.segment,
                 offset: entry.offset,
@@ -1773,8 +1772,7 @@ impl SubstratePersistence {
         if id.is_none() {
             return;
         }
-        self.locations
-            .insert(id.origin, id.oseq, Located { segment, offset });
+        self.locations.insert(h, Located { segment, offset });
         if id.origin != self.node() {
             if self.replica.applied.insert(id.origin, id.oseq) {
                 self.replica_dirty = true;

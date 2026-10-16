@@ -7,11 +7,14 @@
 //!   because this build does not decode their type.
 //! - Both persist in a `Replica` record ([`ReplicaPayload`]).
 //! - The **location index** ([`LocationIndex`]) finds a record by its
-//!   identity, wherever maintenance has moved it.
+//!   identity, wherever maintenance has moved it, and keeps beside it what a
+//!   catch-up lists of it ([`ListedHeader`]).
 
+mod listed_header;
 mod location_index;
 mod payload;
 
 pub use applied_set::{AppliedSet, OriginApplied};
+pub use listed_header::ListedHeader;
 pub use location_index::{Located, LocationIndex};
 pub use payload::{DeferredRecord, ReplicaPayload};

@@ -366,14 +366,15 @@ rebuild` — which the member shows on its loading page and in `/v1/status`.
   |---|---|---|
   | `count` | commits on `origin/main` that HEAD contains: `git rev-list --count $(git merge-base HEAD origin/main)` | a pushed commit is fetched and built. A local commit does not move it. |
   | `hash` | `git rev-parse --short` of that merge base | with `count` |
-  | `local` | empty for a build exactly at that merge base. Otherwise a digest of everything beyond it: the commits HEAD has that `origin/main` does not (`git rev-list origin/main..HEAD`), the uncommitted diff (`git diff HEAD`), and the untracked files `git status` reports | any local commit, edit or new file |
+  | `local` | empty when the build's **inputs** — the workspace `Cargo.toml` and `Cargo.lock` and every workspace crate's directory — are exactly the merge base's. Otherwise a digest of how they differ: the working tree's diff against the merge base (`git diff <base> -- <inputs>`) and the untracked input files. A file outside the inputs (a doc, a tool's lock file) cannot change the binary and does not make a build local; and the same sources on the same base give the same `local` however they were reached — committed locally, left uncommitted, or built again | an edit, local commit or new file among the inputs |
 
   The build script reruns on `.git/HEAD`, the refs `HEAD` and `origin/main` name,
-  `.git/packed-refs`, and every workspace crate's `src/`, `Cargo.toml` and the UI
-  directories, but not `target/`. So `local` is accurate to the build: a binary built
-  from edited sources always says so. `local` is the first 16 hex digits of a SHA-256
-  over the three inputs; a tree with no git or no `origin/main` is count 0, hash
-  `none`, and a local build (`cluster/src/version/compute.rs`).
+  `.git/packed-refs`, the workspace `Cargo.toml` and `Cargo.lock`, and every workspace
+  crate's `src/`, `Cargo.toml` and the UI directories, but not `target/`. So `local` is
+  accurate to the build: a binary built from edited sources always says so. `local` is
+  the first 16 hex digits of a SHA-256 over the input diff and the untracked input
+  files; a tree with no git or no `origin/main` is count 0, hash `none`, and a local
+  build named by HEAD's history as well (`cluster/src/version/compute.rs`).
 
   The version therefore changes with any edit in the workspace, and every crate that
   links `cluster` rebuilds with it. Nothing below the daemons may link it for that
@@ -1792,8 +1793,10 @@ with no identity at all (every identity field zero).
   owes, and an answerer reads a fetched record, through this index. A location captured
   earlier would be stale. An `oseq` whose record maintenance dropped is gone, and its
   own origin knows it. An origin's `oseq`s are dense, so the index is a vector per
-  origin of one word per record: the segment and the record's offset in 4 KiB blocks,
-  the record's size read from its header when it is read.
+  origin of 48 bytes per record: one word for the segment and the record's offset in
+  4 KiB blocks, and beside it what a catch-up's headers list of the record (§7.2), so a
+  listing never reads the disk. The record's size is read from its header when it is
+  read.
 - **A substrate written before this design** has no origins. Its first writable open
   runs the full `compact()` once, stamping as it writes (`persistence/adoption.rs`):
   every record an origin writes takes this node's origin, a fresh `oseq`, the current
@@ -2425,20 +2428,29 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
    - Each range lists every record it holds, as
      `(oseq, type, stream_id, chunk_index, len, digest)`, about 40 bytes packed, never
      the payload. It also lists the `oseq`s in the range it knows are gone.
+   - `len` is the record as it travels, its header line and payload unpadded, with the
+     line's `crc` counted at its widest. A header-index digest carries every field of
+     the line but the `crc`, and the listing is read from memory (below), so `len` is
+     never under what travels and at most nine bytes over it.
    - The answer ends with `DONE`.
    - **One answer per requester.** A member far behind lacks everything, so an answer
-     lists the whole log, a header read per record, and runs for minutes. A requester
+     lists the whole log, and its fetches run for minutes. A requester
      asks again when its catch-up goes quiet (§7.1), and its gap watch asks again for as
      long as the answerer keeps writing. So a newer `CATCHUP` from the same `reply_to`
      cancels the answer before it, and an answer whose requester no gateway lists any
      more is cancelled too. A cancelled answer stops before its next range and sends no
      `DONE`. Without this, answers stacked by the dozen on `.5`, each re-listing the
-     same history: 70,000 4 KiB header reads a second, a persistence lock nothing else
-     could take, an engine that ran two forwards in fourteen minutes, and a requester
-     that never finished catching up.
-   - **The persistence lock is held per 512 records**, not per range. The scheduler's
-     and the leases' writes take turns with the listing, rather than waiting out 8192
-     disk reads.
+     same history, which was then read off disk: 70,000 4 KiB header reads a second, a
+     persistence lock nothing else could take, an engine that ran two forwards in
+     fourteen minutes, and a requester that never finished catching up.
+   - **A range is listed from memory.** The location index keeps, beside each record's
+     place, what the headers list of it (§6.2), so a listing is a walk over memory
+     under one short hold of the persistence lock. The hold, like a fetch's record
+     reads, is taken behind the lock's waiters: answering a peer is background work,
+     and the scheduler's and the leases' writes go first. Read off disk, 512 records
+     to a hold, the listing still kept the scheduler out 75–93 s at a time on `.5`
+     while whiteworld caught up: a lock released and re-taken at once is re-taken
+     before a waiter wakes.
 4. **Compare.** It decides what to fetch:
    - Every listed record it does not hold, and that none of its other catch-ups is
      already fetching, is wanted. It never compares by `digest`: a record keeps its
@@ -2490,7 +2502,8 @@ The headers for a million records are about 40 MB, which is cheap to send and to
 The records themselves are another matter. A member joining with an empty substrate
 fetches the whole log, which can be many gigabytes: that is the cost of D5. Headers
 first means it fetches each record once, and nothing it already holds.
-The headers' `len` gives the loading page an exact total to show progress against.
+The headers' `len` gives the loading page a total to show progress against, at most
+nine bytes a record over what travels (§7.2).
 
 ### 7.4 Backpressure
 

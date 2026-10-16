@@ -8,11 +8,10 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 use tempfile::TempDir;
 
-use super::replication::LIST_SLICE;
 use super::{Conversation, GroupId, LayerId};
 use crate::persistence::deleted::{DeletedEntry, DeletedTimeline};
 use crate::persistence::identity::GEN_DETACHED;
-use crate::persistence::record::decode_header;
+use crate::persistence::record::{decode_header, RecordType};
 use crate::persistence::SubstratePersistence;
 use crate::substrate::Substrate;
 
@@ -88,28 +87,31 @@ fn a_ticket_waits_for_the_writer() {
     assert!(conv.read_event(conv.node(), oseq).is_some());
 }
 
-/// A range longer than one lock hold is listed in slices, and lists exactly
-/// what one hold over the whole range lists: every record in `oseq` order,
-/// nothing at a slice's edge dropped or repeated.
+/// A long range lists every record in `oseq` order, one each, and a record
+/// appended a moment ago, with nothing committed, is listed with the rest: the
+/// listing reads the index, not the file.
 #[test]
-fn a_range_listed_in_slices_is_the_range_listed_at_once() {
+fn a_long_range_lists_every_record_staged_or_written() {
     let dir = TempDir::new().unwrap();
     let conv = open(&dir);
-    let n = LIST_SLICE * 2 + 7;
-    for k in 0..n {
+    for k in 0..1031 {
         conv.put_cluster_object(&format!("cluster/k{k}"), json!(k))
             .unwrap();
     }
     let node = conv.node();
-    let top = conv.last_oseq();
-    let sliced = conv.list_held(node, 1, top).unwrap();
-    let whole = conv.persistence.lock().unwrap().list(node, 1, top).unwrap();
-    assert_eq!(sliced.records, whole.records);
+    let top = {
+        let mut p = conv.persistence.lock().unwrap();
+        p.append_record(RecordType::Tokens, 0, 9, 0, 0, 0, &[1, 2, 3])
+            .unwrap();
+        p.applied_through(node)
+    };
+    let held = conv.list_held(node, 1, top);
     assert_eq!(
-        sliced.records.iter().map(|r| r.oseq).collect::<Vec<_>>(),
+        held.records.iter().map(|r| r.oseq).collect::<Vec<_>>(),
         (1..=top).collect::<Vec<_>>()
     );
-    assert!(sliced.gone.is_empty());
+    assert!(held.gone.is_empty());
+    assert_eq!(held.records.last().unwrap().stream_id, 9);
 }
 
 /// What one member lists and reads of its range applies on another, which
@@ -126,18 +128,23 @@ fn a_range_listed_and_read_applies_elsewhere() {
     }
     let node = a.node();
     let top = a.last_oseq();
-    let held = a.list_held(node, 1, top).unwrap();
+    let held = a.list_held(node, 1, top);
     assert_eq!(held.records.len() as u64, top);
     assert!(held.gone.is_empty());
     let bytes: Vec<Vec<u8>> = (1..=top).map(|q| a.read_event(node, q).unwrap()).collect();
     for (r, b) in held.records.iter().zip(&bytes) {
-        assert_eq!(r.len as usize, b.len(), "listed at its unpadded length");
+        let crc_digits = decode_header(b).unwrap().0.crc.to_string().len();
+        assert_eq!(
+            r.len as usize,
+            b.len() + 10 - crc_digits,
+            "listed unpadded, its crc at its widest"
+        );
     }
     let refs: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
     let batch = b.apply_remote(&refs, 0).unwrap();
     assert!(!batch.reload);
     assert_eq!(b.applied_set().through(node), top);
-    assert_eq!(b.list_held(node, 1, top).unwrap(), held);
+    assert_eq!(b.list_held(node, 1, top), held);
     assert_eq!(
         (1..=top)
             .map(|q| b.read_event(node, q).unwrap())
