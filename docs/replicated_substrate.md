@@ -2433,6 +2433,22 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      the line but the `crc`, and the listing is read from memory (below), so `len` is
      never under what travels and at most nine bytes over it.
    - The answer ends with `DONE`.
+   - **An answer is bounded** to 16 `HEADERS`, about 131,000 `oseq`s and 6 MiB
+     (`replicate/answer.rs`). The requester fetches what they list, and an admission
+     catch-up whose answer moved it on (a record it lacked is now held, or an `oseq`
+     learned gone) asks again, from where it then stands, before its socket is ready.
+     One that brings nothing has had everything its answerer covers. So a member far
+     behind catches up an answer at a time, fetching from the first.
+     Unbounded, an answer to a member lacking 8 million records was a thousand frames,
+     about 360 MB, queued at once. That is far past what a gateway holds for one member
+     (16 MiB, after which it drops catch-up frames). A requester waiting on frames that
+     never come goes quiet and asks again, and each new answer queues behind old ones it
+     ignores. Measured on `.5`: 156 catch-ups answered in 20 minutes, none of them
+     recorded by whiteworld, which re-asked every 30 s and fetched nothing.
+   - **A gateway never drops a `DONE`.** A dropped `HEADERS` or fetched record is
+     repaired: the next answer lists from where the requester stands, and a fetch that
+     ends short fetches the record again. A dropped `DONE` would leave its catch-up
+     waiting until it went quiet.
    - **One answer per requester.** A member far behind lacks everything, so an answer
      lists the whole log, and its fetches run for minutes. A requester
      asks again when its catch-up goes quiet (§7.1), and its gap watch asks again for as

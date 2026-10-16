@@ -395,7 +395,11 @@ function replication(c) {
   const through = c.applied.reduce((n, a) => n + Math.min(a.through, a.high_water), 0);
   const behind = Math.max(0, high - through);
   const missing = c.applied.reduce((n, a) => n + a.missing, 0);
-  if (behind || missing || (c.mode !== "joined" && high === 0)) {
+  // Shown while the member is not joined or a catch-up runs. A joined member is
+  // always a few records behind the highest each origin announced — its events in
+  // flight — and showing that flickered the bar with every write; one really
+  // behind starts a gap catch-up within 5 s, and shows it then.
+  if (c.mode !== "joined" || c.catchups.length) {
     const say = high
       ? `${through.toLocaleString()} of ${high.toLocaleString()} records applied · ${behind.toLocaleString()} behind${missing ? ` · ${missing.toLocaleString()} missing` : ""}`
       : "nothing applied yet";

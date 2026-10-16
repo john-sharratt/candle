@@ -177,7 +177,9 @@ impl Replicator {
             } else {
                 r.fetch_done(done.request, |o, q| applied.contains(o, q), &mut ids)
             };
-            let finished = r.finished().then_some((r.purpose, r.socket));
+            let finished = r
+                .finished()
+                .then_some((r.purpose, r.socket, r.asks_again()));
             s.next_request = next;
             for k in settled {
                 s.claimed.remove(&k);
@@ -196,8 +198,12 @@ impl Replicator {
                 let _ = handle.control(Frame::Fetch(f));
             }
         }
-        if let Some((purpose, socket)) = finished {
-            self.finished(purpose, socket).await;
+        match finished {
+            Some((Purpose::Admission, socket, true)) => {
+                self.start_catchup(socket, Purpose::Admission, None);
+            }
+            Some((purpose, socket, _)) => self.finished(purpose, socket).await,
+            None => {}
         }
     }
 
