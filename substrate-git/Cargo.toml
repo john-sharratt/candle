@@ -26,7 +26,7 @@ zend-vfs   = { path = "../zend-vfs" }
 candle-conversation = { path = "../candle-conversation", optional = true }
 agent      = { path = "../agent", optional = true }
 cluster    = { path = "../cluster", optional = true }
-tokio      = { version = "1", features = ["rt"], optional = true }
+tokio      = { version = "1", features = ["rt", "sync"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

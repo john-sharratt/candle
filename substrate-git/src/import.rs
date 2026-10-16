@@ -105,6 +105,12 @@ impl Importer {
         self
     }
 
+    /// The member last found holding `repo`'s import lease, when another
+    /// does.
+    pub fn holder(&self, repo: &str) -> Option<u64> {
+        self.lease.holder(&import_lease(repo))
+    }
+
     /// One round: publish this member's pushes, import if holding the lease
     /// and a fetch is due, sync.
     pub fn tick(&self, store: &Store, records: &dyn Records) -> anyhow::Result<Imported> {

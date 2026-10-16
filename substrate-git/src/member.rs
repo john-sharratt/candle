@@ -27,8 +27,9 @@ use std::time::{Duration, Instant};
 use agent::client::Agents;
 use agent::fetcher::AgentFetch;
 use candle_conversation::persistence::SharedSubstrate;
-use cluster::replicate::Replicator;
+use cluster::replicate::{LeaseEvent, Replicator};
 use tokio::runtime::Handle;
+use tokio::sync::broadcast;
 use zend_vfs::{ObjectDb, Oid, RefName, RemoteUrl};
 
 use crate::import::{Importer, Took};
@@ -61,27 +62,98 @@ pub struct Access {
 }
 
 /// The import lease, held through the cluster's consensus.
+///
+/// **Held means held.** [`Replicator::acquire`] answers whether the request was
+/// sent, not whether the lease was granted — the round completes later, and
+/// its outcome arrives as a [`LeaseEvent`]. Taking the send for the grant had a
+/// member that had just joined fetching as though it held a lease another
+/// member held, beside it.
+///
+/// **A lease another member holds is not asked for.** A request raises the
+/// ballot under the holder's renewal, and one every load round — a second —
+/// kept the holder's term from completing, so nobody held it long enough to
+/// pull and a joining member waited on the log for good. A refusal naming the
+/// holder stands for one lease term; the lease is asked for again only once
+/// that member's term could have run out unrenewed.
 struct ClusterLease {
     replicator: Arc<Replicator>,
     renewed: Mutex<HashMap<String, Instant>>,
+    events: Mutex<broadcast::Receiver<LeaseEvent>>,
+    /// The member each lease was found held by, and when.
+    busy: Mutex<HashMap<Vec<u8>, (u64, Instant)>>,
+}
+
+impl ClusterLease {
+    fn new(replicator: Arc<Replicator>) -> Self {
+        let events = Mutex::new(replicator.lease_events());
+        Self {
+            replicator,
+            renewed: Mutex::new(HashMap::new()),
+            events,
+            busy: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Take in what became of the lease requests sent since the last look.
+    fn take_events(&self) {
+        let mut events = self.events.lock().unwrap();
+        let mut busy = self.busy.lock().unwrap();
+        loop {
+            match events.try_recv() {
+                Ok(LeaseEvent::Busy { key, holder }) => {
+                    busy.insert(key, (holder, Instant::now()));
+                }
+                Ok(
+                    LeaseEvent::Held { key }
+                    | LeaseEvent::Lost { key }
+                    | LeaseEvent::Released { key, .. },
+                ) => {
+                    busy.remove(&key);
+                }
+                // Fallen behind: what was missed is learned again from the
+                // next refusal.
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 impl Lease for ClusterLease {
     fn hold(&self, key: &str) -> bool {
+        self.take_events();
         let mut renewed = self.renewed.lock().unwrap();
-        let fresh = renewed
-            .get(key)
-            .is_some_and(|at| at.elapsed() < LEASE_RENEW);
-        if fresh && self.replicator.holds(key.as_bytes()) {
+        if self.replicator.holds(key.as_bytes()) {
+            let fresh = renewed
+                .get(key)
+                .is_some_and(|at| at.elapsed() < LEASE_RENEW);
+            if !fresh && self.replicator.acquire(key.as_bytes(), LEASE_TTL) {
+                renewed.insert(key.to_string(), Instant::now());
+            }
             return true;
         }
-        let held = self.replicator.acquire(key.as_bytes(), LEASE_TTL);
-        if held {
-            renewed.insert(key.to_string(), Instant::now());
-        } else {
-            renewed.remove(key);
+        renewed.remove(key);
+        let held_elsewhere = self
+            .busy
+            .lock()
+            .unwrap()
+            .get(key.as_bytes())
+            .is_some_and(|(_, at)| at.elapsed() < LEASE_TTL);
+        if !held_elsewhere {
+            // Asked for; granted, if it is, by a later round's `holds`.
+            self.replicator.acquire(key.as_bytes(), LEASE_TTL);
         }
-        held
+        false
+    }
+
+    fn holder(&self, key: &str) -> Option<u64> {
+        self.take_events();
+        self.busy
+            .lock()
+            .unwrap()
+            .get(key.as_bytes())
+            .filter(|(_, at)| at.elapsed() < LEASE_TTL)
+            .map(|(holder, _)| *holder)
     }
 }
 
@@ -139,10 +211,7 @@ impl Repos {
         access: Access,
     ) -> anyhow::Result<Self> {
         let lease: Arc<dyn Lease> = match &access.replicator {
-            Some(replicator) => Arc::new(ClusterLease {
-                replicator: Arc::clone(replicator),
-                renewed: Mutex::new(HashMap::new()),
-            }),
+            Some(replicator) => Arc::new(ClusterLease::new(Arc::clone(replicator))),
             None => Arc::new(Alone),
         };
         let mut repos = Vec::new();
@@ -279,10 +348,16 @@ fn round(
         Some(e) => Some(e),
         // Not this member's to pull: it waits, as long as it takes, for the
         // member holding the lease.
-        None if !t.fetched && !named => Some(format!(
-            "waiting for the member holding `{}` to pull it",
-            import_lease(store.name())
-        )),
+        None if !t.fetched && !named => Some(match importer.holder(store.name()) {
+            Some(holder) => format!(
+                "waiting for member {holder:016x}, holding `{}`, to pull it",
+                import_lease(store.name())
+            ),
+            None => format!(
+                "waiting for the lease `{}` to pull it",
+                import_lease(store.name())
+            ),
+        }),
         None => None,
     };
     Ok((loading, t.took))

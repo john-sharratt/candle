@@ -38,6 +38,11 @@ pub trait Records: Send + Sync {
 pub trait Lease: Send + Sync {
     /// Take or renew `key`; whether this member holds it now.
     fn hold(&self, key: &str) -> bool;
+
+    /// The member last found holding `key`, while that may still stand.
+    fn holder(&self, _key: &str) -> Option<u64> {
+        None
+    }
 }
 
 /// A member alone: it always holds every lease. A daemon with no cluster.
