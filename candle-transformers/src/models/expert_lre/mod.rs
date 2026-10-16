@@ -129,6 +129,7 @@
 //! | `blend`        | one prediction list from votes, Markov and recency, ranked by learned cells |
 //! | `fault`        | the word a launch reports a lost cold expert in, and the forward's error |
 //! | `belady`, `routing_trace`, `replay` | the residency references and the offline policy replay |
+//! | `cpu_pool`     | the host CPU's pool for routed experts (`docs/cpu_expert_compute.md`) |
 //! | [`handle`]     | `ExpertCache` public API |
 
 /// The pad pins read-ahead holds for the pad-backed experts it lists.
@@ -143,6 +144,10 @@ mod blend;
 mod boundary;
 mod cache;
 pub(crate) mod compute;
+/// The host CPU's pool for routed experts: topology, pinning, and the DRAM
+/// rate it reads at.
+#[cfg(windows)]
+pub mod cpu_pool;
 #[cfg(feature = "cuda")]
 mod dispatch;
 #[cfg(test)]

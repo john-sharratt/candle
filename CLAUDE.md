@@ -63,7 +63,7 @@ rather than assuming, because sizing decisions differ between them:
 
 | Machine | VRAM | SM | Host | Link |
 |---|---|---|---|---|
-| **RTX 4090 Mobile** | 16 GB | sm_89 (Ada) | 32 GB RAM | PCIe 4.0 ×16, ~25 GB/s |
+| **RTX 4090 Mobile** | 16 GB | sm_89 (Ada) | Core Ultra 9 185H, 32 GB LPDDR5X-7467 | **PCIe 4.0 ×8, ~12 GB/s** |
 | **RTX 3090** | 24 GB | sm_86 (GA102) | i7-10700K 8C/16T, 64 GB RAM | **PCIe 3.0 ×16, ~12 GB/s** |
 | **RTX PRO 5000 Blackwell** | 72 GB | sm_120 | — | PCIe 5.0 ×16 |
 
@@ -71,10 +71,11 @@ Two traps specific to the **3090 box**, both easy to miss because the card
 looks like the biggest consumer part in the fleet:
 
 - **Its host caps the link at PCIe 3.0.** The i7-10700K is Comet Lake, so
-  host↔GPU is ~12 GB/s — roughly *half* the 4090 Mobile's, despite 50% more
-  VRAM. Any sizing that reuses the "~25 GB/s" figure from
-  `docs/expert_cache_design.md` is wrong there by 2×. That table now names its
-  machine per row; keep it that way.
+  host↔GPU is ~12 GB/s. That is the same as the 4090 Mobile, whose card
+  trains only ×8 lanes (`nvidia-smi` `pcie.link.width.current = 8`, read
+  2026-10-16). Any sizing that assumes ~25 GB/s is wrong by 2× on both
+  machines. `docs/expert_cache_design.md`'s link table names its machine per
+  row; keep it that way.
 - **sm_86 has no native FP8** (`device_caps.cuh` gates `has_native_fp8` at
   `sm >= 890`). The sm_89 b1 BMMA and Blackwell INT8 IMMA provenance backends
   also do not apply; both degrade to the next rung, so it runs — just not on

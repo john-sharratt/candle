@@ -50,6 +50,16 @@ tokenizers = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 ureq = { version = "2.12", default-features = false, features = ["native-tls"], optional = true }
 
+# The CPU expert pool's core topology and pinning (`expert_lre::cpu_pool`):
+# `GetSystemCpuSetInformation` names physical and performance cores, and
+# `SetThreadSelectedCpuSets` keeps each worker on one.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 hf-hub = { workspace = true }
 tokenizers = { workspace = true }

@@ -227,7 +227,7 @@ residency are properties of the card a row ran on.
 | **Native FP8** | yes | **no** (sm < 8.9) | yes |
 | **CPU** | AMD Ryzen 9 9950X3D, 16C/32T | Intel i7-10700K, 8C/16T | Intel Core Ultra 9 185H, 16C/22T |
 | **System RAM** | 189 GB | 64 GB | 32 GB (31.5 GiB) |
-| **Host↔GPU link** | PCIe 5.0 ×16 | **PCIe 3.0 ×16 (~12 GB/s)** | PCIe 4.0 ×16 (~25 GB/s) |
+| **Host↔GPU link** | PCIe 5.0 ×16 | **PCIe 3.0 ×16 (~12 GB/s)** | **PCIe 4.0 ×8 (~12 GB/s)**: live width read 2026-10-16 |
 | **Max SM / mem clock** | 3,090 / 14,001 MHz | — | 3,105 / 9,001 MHz |
 | **OS** | Windows 11 Pro (26200) | Windows 11 Pro (26200) | Windows 11 Pro (26200) |
 | **GPU driver model** | WDDM (not TCC) | WDDM (not TCC) | WDDM (not TCC), driver 596.08 |

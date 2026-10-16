@@ -71,6 +71,10 @@ pub mod kv_migrate;
 // a whole plan of quantized chunks, leaving the KV data on the device
 pub mod fletcher32;
 
+// The CPU expert pool's handoff, device side alone: ring a mapped doorbell,
+// spin on a mapped answer, n round trips in one launch
+pub mod handoff_ping;
+
 // Fused Sinkhorn (doubly-stochastic) normalization of the mHC combine matrix:
 // one launch replaces the ~120 tiny host-orchestrated ops per sub-block per layer
 pub mod bdp;
