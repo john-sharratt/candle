@@ -35,8 +35,6 @@
 //! reason [`admit::Ground::resident_weights`] gives: it moves under the fill's
 //! feet from places admission cannot see.
 
-use std::time::Instant;
-
 use super::admission::prefill_cost_bytes;
 use super::admit::{Budget, Cost, Ground, Headroom, Kind};
 use super::interleave;
@@ -404,17 +402,9 @@ impl AdmitPass<'_> {
         // The cursor is the pass's and this band's, so a band resumes where *it*
         // left off rather than where the previous band did, and nothing is
         // consumed by looking.
-        //
-        // **A turn paused behind higher-priority work is walked past too** — it
-        // waits in the queue, in order, until the work that outranks it has
-        // been idle for the cooldown (see `priority_pause`). Checked per turn,
-        // because the cursor walks the whole queue and only this band's turns
-        // are offered here.
         let band = band_index(prio);
-        let now = Instant::now();
         while let Some(w) = self.sched.prefill_queue.get(self.prefill_cursor[band]) {
-            let p = self.sched.decode_priority_or_high(w.sequence_id);
-            if p == prio && !self.sched.priority_pause.paused(p, now) {
+            if self.sched.decode_priority_or_high(w.sequence_id) == prio {
                 break;
             }
             self.prefill_cursor[band] += 1;

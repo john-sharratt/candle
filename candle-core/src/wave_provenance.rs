@@ -117,7 +117,22 @@ pub enum WaveCarve {
     /// short of what it carves, and the allocation is refused so the site that
     /// overran is named here rather than found later as memory the reservation
     /// never accounted for.
-    Exhausted,
+    Exhausted(SpanState),
+}
+
+/// Where an exhausted span stood when it refused a request: what it holds, and
+/// how much the generation had already carved.
+///
+/// The request alone does not say which term of the plan is short. The cursor
+/// does: a cursor near the capacity is a phase whose earlier carves the plan
+/// under-counts, and a cursor far below it beside a request larger than the
+/// remainder is one buffer the plan prices too small.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SpanState {
+    /// Bytes carved in this generation before the request.
+    pub cursor: usize,
+    /// Bytes the span holds.
+    pub capacity: usize,
 }
 
 /// Carve `bytes` (aligned to the third argument) from the arena a ticket names.
@@ -155,9 +170,11 @@ pub fn wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCarve {
 ///
 /// The message carries the stack that asked: the generic op that allocated is
 /// never the answer, the model code above it is. Captured only here, on the
-/// error path, so it costs nothing on any allocation that succeeds.
+/// error path, so it costs nothing on any allocation that succeeds. And it
+/// carries where the span stood ([`SpanState`]), which a stack without symbols
+/// — every release build — is the only evidence left of.
 #[track_caller]
-pub fn exhausted(ticket: WaveTicket, bytes: usize) -> crate::Error {
+pub fn exhausted(ticket: WaveTicket, bytes: usize, span: SpanState) -> crate::Error {
     let at = std::panic::Location::caller();
     let stack = std::backtrace::Backtrace::force_capture().to_string();
     let asked_by: Vec<&str> = stack
@@ -171,13 +188,15 @@ pub fn exhausted(ticket: WaveTicket, bytes: usize) -> crate::Error {
         .collect();
     crate::Error::Msg(format!(
         "wave arena exhausted: {bytes} B asked at {}:{} of arena {} (domain {}, epoch {}), \
-         past what the wave plan priced for this phase — price the buffer, do not \
-         allocate it elsewhere. Asked by: {}",
+         with {} B of the span's {} B already carved — past what the wave plan priced \
+         for this phase. Price the buffer, do not allocate it elsewhere. Asked by: {}",
         at.file(),
         at.line(),
         ticket.arena,
         ticket.domain,
         ticket.epoch,
+        span.cursor,
+        span.capacity,
         asked_by.join(" <- "),
     ))
 }
@@ -232,7 +251,7 @@ pub fn wave_alloc_attributed(
             record_decline(ArenaDecline::Closed, bytes);
             Ok(None)
         }
-        WaveCarve::Exhausted => Err(exhausted(ticket, bytes)),
+        WaveCarve::Exhausted(span) => Err(exhausted(ticket, bytes, span)),
     }
 }
 
@@ -324,7 +343,7 @@ pub fn last_wave_declines() -> (u64, u64) {
 mod decline_tests {
     use super::{
         arena_declines, exhausted, reset_arena_declines, wave_alloc_attributed, ArenaDecline,
-        WaveTicket,
+        SpanState, WaveTicket,
     };
 
     /// A ticketless origin is charged to `NoTicket`, with its bytes.
@@ -367,8 +386,8 @@ mod decline_tests {
         assert_eq!(arena_declines(ArenaDecline::NoTicket), (0, 0));
     }
 
-    /// An exhausted open generation is an error naming the request, never a
-    /// pool allocation.
+    /// An exhausted open generation is an error naming the request and where
+    /// the span stood, never a pool allocation.
     #[test]
     fn an_exhausted_generation_is_refused() {
         let ticket = WaveTicket {
@@ -376,9 +395,17 @@ mod decline_tests {
             arena: 1,
             epoch: 9,
         };
-        let msg = exhausted(ticket, 4096).to_string();
+        let span = SpanState {
+            cursor: 12_288,
+            capacity: 14_336,
+        };
+        let msg = exhausted(ticket, 4096, span).to_string();
         assert!(msg.contains("wave arena exhausted: 4096 B"), "{msg}");
         assert!(msg.contains("arena 1 (domain 3, epoch 9)"), "{msg}");
+        assert!(
+            msg.contains("with 12288 B of the span's 14336 B already carved"),
+            "{msg}"
+        );
     }
 }
 

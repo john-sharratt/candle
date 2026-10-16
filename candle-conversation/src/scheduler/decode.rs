@@ -1,6 +1,6 @@
+use super::band::rank;
 use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
-use super::priority_pause::rank;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{locate_rows, SpecChooser};
 use super::wave_retry::{Next, WaveRetry};
@@ -610,18 +610,13 @@ impl Scheduler {
             "decode row selection",
         );
 
-        // ── Interactive-decode priority ──────────────────────────────────────
-        // Lower-priority decodes sit out while higher-priority work is running
-        // and for a cooldown after it (`priority_pause`), so an ingest co-batch
-        // never widens the dialogue's forward and never takes the device in the
-        // gap between its tool rounds. A paused decode stays active and resumes
-        // where it stopped — pure scheduling. Among what remains, the highest
-        // priority leads, so the adapter rule below keeps the dialogue's.
-        // `decode_priority_or_high` treats an unresolvable slot as `High`, so a
-        // real decode is never wrongly paused. Tenants are equal: the band alone
-        // ranks.
-        self.observe_priorities();
-        seq_ids.retain(|&id| !self.priority_paused(id));
+        // ── Every band's decode rides the step ──────────────────────────────
+        // Decode is width-bound — the step's expert loads amortize across its
+        // rows — so an ingest row beside a dialogue's costs the dialogue little
+        // and is the ingest's whole progress. Bands share the step; none sits
+        // out (`band`). The highest band leads, so the adapter rule below keeps
+        // the dialogue's. `decode_priority_or_high` treats an unresolvable slot
+        // as `High`. Tenants are equal: the band alone ranks.
         seq_ids.sort_by_key(|&id| std::cmp::Reverse(rank(self.decode_priority_or_high(id))));
 
         // ── One adapter per wave ─────────────────────────────────────────────
@@ -648,17 +643,17 @@ impl Scheduler {
 
         if seq_ids.is_empty() {
             // Every active decode is excluded this wave — deferred-glue-pending,
-            // or paused behind higher-priority work (`priority_pause`) — so there
-            // is no decode row to run. But the work those rows would have carried
-            // must still move: `run_prefill_until_budget` is gated behind
-            // `decode_width() == 0`, which these excluded-but-live slots hold
-            // `> 0`, so the prefill cohort, section chunks and deferred glue ride
-            // ONLY the decode sweep. Without this, neither path advances them: a
-            // hard deadlock — 0 forwards, the queue standing still. Measured with
-            // the pause: ingest decodes paused, the dialogue's next-round prefill
-            // (1,856 tokens) never advanced, and the turn hung until killed.
-            // Drive a decode-less wave, exactly as `run_prefill_until_budget`
-            // would, whenever any of the three has work.
+            // or its next token already sampled by a stencil injection, or held
+            // back by the adapter rule — so there is no decode row to run. But
+            // the work those rows would have carried must still move:
+            // `run_prefill_until_budget` is gated behind `decode_width() == 0`,
+            // which these excluded-but-live slots hold `> 0`, so the prefill
+            // cohort, section chunks and deferred glue ride ONLY the decode
+            // sweep. Without this, neither path advances them: a hard deadlock —
+            // 0 forwards, the queue standing still, a dialogue's next-round
+            // prefill (1,856 tokens) never advancing. Drive a decode-less wave,
+            // exactly as `run_prefill_until_budget` would, whenever any of the
+            // three has work.
             if !self.deferred_glue_fires.is_empty()
                 || self.prefill_width() > 0
                 || self.section_ingest_width() > 0

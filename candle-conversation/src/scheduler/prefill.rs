@@ -4,12 +4,12 @@ use super::admission::{
 };
 use super::admit;
 use super::admit_ground::AdmitPass;
+use super::band::rank;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
 use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };
 use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
-use super::priority_pause::rank;
 use super::section_pack;
 use super::wave_logits::WaveLogits;
 use super::*;
@@ -1115,10 +1115,8 @@ impl Scheduler {
         if self.prefill_queue.is_empty() && self.section_queue.is_empty() {
             return;
         }
-        // Every gate below reads the priority pause; judge against the present.
         // `in_flight` counts only work that can advance — prefills and section
         // ingests alike, see `running_members`.
-        self.observe_priorities();
         let in_flight = self.running_members();
         if in_flight >= Self::MAX_PREFILL_WIDTH {
             return;
@@ -1220,7 +1218,7 @@ impl Scheduler {
             // 518 — and the only way to find it was to notice that the pass which should
             // have logged never did. A path that quietly costs an order of magnitude is
             // the one path that must not be quiet.
-            if let Some(work) = self.pop_unpaused_head() {
+            if let Some(work) = self.pop_highest_band_head() {
                 tracing::debug!(
                     target: "candle_conversation::scheduler::throttle",
                     queued = self.prefill_queue.len(),
@@ -1329,13 +1327,10 @@ impl Scheduler {
     /// that forced it, because a head admitted this way was never judged and a
     /// reader has to be able to tell that from an admission that was.
     ///
-    /// The head is the first entry **not paused** by priority
-    /// ([`Self::priority_paused`]): a dialogue turn queued behind ingest is the
-    /// one forced in, and paused ingest is never forced past a pause the
-    /// running conversation holds. Nothing paused can deadlock the engine — the
-    /// work pausing it is running.
+    /// The head is the first entry of the **highest band** queued: a dialogue
+    /// turn queued behind ingest is the one forced in.
     fn force_queue_head(&mut self, why: &'static str) {
-        if let Some(work) = self.pop_unpaused_head() {
+        if let Some(work) = self.pop_highest_band_head() {
             tracing::debug!(
                 target: "candle_conversation::scheduler::throttle",
                 queued = self.prefill_queue.len() + 1,
@@ -1354,12 +1349,17 @@ impl Scheduler {
         }
     }
 
-    /// Remove and return the first queued prefill that is not paused by
-    /// priority, in queue order.
-    fn pop_unpaused_head(&mut self) -> Option<PrefillWork> {
-        self.observe_priorities();
-        let at = (0..self.prefill_queue.len())
-            .find(|&i| !self.priority_paused(self.prefill_queue[i].sequence_id))?;
+    /// Remove and return the first queued prefill of the highest band queued,
+    /// in queue order.
+    fn pop_highest_band_head(&mut self) -> Option<PrefillWork> {
+        let top = self
+            .prefill_queue
+            .iter()
+            .map(|w| rank(self.decode_priority_or_high(w.sequence_id)))
+            .max()?;
+        let at = (0..self.prefill_queue.len()).find(|&i| {
+            rank(self.decode_priority_or_high(self.prefill_queue[i].sequence_id)) == top
+        })?;
         self.prefill_queue.remove(at)
     }
 
@@ -1998,14 +1998,33 @@ impl Scheduler {
     /// co-batched step.
     ///
     /// Each decode counts at its target layer's `decode_priority`, `High`
-    /// where that does not resolve — the band [`Self::priority_paused`] gates
-    /// it in.
+    /// where that does not resolve.
     pub(super) fn airtime_ratio_over(&self, work: DecodePriority) -> u32 {
         throttle_ratio(
             work,
             self.foreground_decodes()
                 .map(|sid| self.decode_priority_or_high(sid)),
         )
+    }
+
+    /// Whether a prompt waiting outside the creep in flight outranks it while
+    /// the creep is throttled — the case where letting the creep finish first
+    /// holds the prompt back for `R` steps.
+    pub(super) fn creep_outranked_by_a_waiting_prompt(&self) -> bool {
+        let band = self.creep_priority(&self.wave_prefill_members);
+        if self.airtime_ratio_over(band) <= 1 {
+            return false;
+        }
+        self.active_prefills
+            .iter()
+            .filter(|p| p.error.is_none() && p.finished.is_none() && p.offset < p.work.tokens.len())
+            .filter(|p| {
+                !self
+                    .wave_prefill_members
+                    .iter()
+                    .any(|m| m.seq_id() == p.work.sequence_id.0)
+            })
+            .any(|p| rank(self.decode_priority_or_high(p.work.sequence_id)) > rank(band))
     }
 
     /// The band a creep group runs at: its highest-ranked member's. A dialogue
@@ -2056,6 +2075,15 @@ impl Scheduler {
         self.active_prefills
             .iter()
             .filter(|p| p.error.is_none() && p.offset < p.work.tokens.len())
+            .count()
+    }
+
+    /// In-flight prefills that can advance: not errored. What admission's
+    /// progress gates count.
+    pub(super) fn running_prefills(&self) -> usize {
+        self.active_prefills
+            .iter()
+            .filter(|p| p.error.is_none())
             .count()
     }
 
@@ -2278,14 +2306,18 @@ impl Scheduler {
             }
         }
         let mut members: Vec<WaveMember> = Vec::new();
-        // A prefill paused behind higher-priority work sits this group out and
-        // keeps its place — see `priority_pause`.
-        self.observe_priorities();
-        for p in &self.active_prefills {
+        // **The highest band leads the group.** The group's adapter is its
+        // first member's, so leading with a lower band could leave a waiting
+        // dialogue prompt out of the group re-formed to carry it
+        // (`creep_outranked_by_a_waiting_prompt`) — and that restart would then
+        // fire again every step, the creep never completing. Stable, so a band
+        // keeps its queue order.
+        let mut candidates: Vec<&ActivePrefill> = self.active_prefills.iter().collect();
+        candidates.sort_by_key(|p| {
+            std::cmp::Reverse(rank(self.decode_priority_or_high(p.work.sequence_id)))
+        });
+        for p in candidates {
             if p.error.is_some() || p.finished.is_some() || p.offset >= p.work.tokens.len() {
-                continue;
-            }
-            if self.priority_paused(p.work.sequence_id) {
                 continue;
             }
             // Every prompt that can advance is a candidate, each offering at
@@ -2933,6 +2965,22 @@ impl Scheduler {
         // co-batch the creep (`form_wave_group(true)`), unless the standalone
         // section pass already ran this wave (no decode present).
         let (members, seq_ids, inputs, prefill_gidxs) = if !self.wave_cohort_advanced {
+            if (cursor > 0 || self.wave_prefill_residual.is_some())
+                && self.creep_outranked_by_a_waiting_prompt()
+            {
+                // **A prompt that outranks the creep in flight restarts it.** A
+                // group only re-forms at its sweep boundary, and a throttled
+                // group takes `R` steps to reach it: an ingest group creeping
+                // one layer a step behind a cast's decodes held a dialogue's
+                // tool result back for all of them. Restarted, the group
+                // re-forms with the prompt in it at the prompt's band, and the
+                // ingest members ride along at that band's ratio rather than
+                // losing their turn. Idempotent, as the mismatch restart below:
+                // offsets advance only at the head, so re-running `[0, cursor)`
+                // rewrites the same K/V at the same positions.
+                self.reset_wave_prefill();
+                cursor = 0;
+            }
             if cursor == 0 && self.wave_prefill_residual.is_none() {
                 let _g = super::profile::span("loop:wave:form_group");
                 self.form_wave_group(!self.wave_section_advanced);
@@ -5161,13 +5209,15 @@ layers:
             .insert(timeline, Arc::clone(builder));
     }
 
-    /// **A dialogue turn queued behind paused ingest is admitted.** The paused
-    /// ingest prefill moves no row, so it is not "in flight" for the
-    /// keep-one-alive rule: with admission closed until something settles, the
-    /// turn pausing it is the head that gets forced in. Counting the paused
-    /// prefill as in flight left the turn queued with nothing able to settle.
+    /// **Ingest shares the group with a dialogue prompt, and the dialogue
+    /// leads.** Nothing sits a group out for its band: an ingest prefill and a
+    /// dialogue prompt both join the creep, and the creep runs at the
+    /// dialogue's band — so the dialogue is not throttled and the ingest still
+    /// advances. The dialogue leads although it queued second: the group's
+    /// adapter is its first member's, and a restart to carry a waiting prompt
+    /// must not re-form a group that leaves the prompt out.
     #[test]
-    fn a_dialogue_turn_is_admitted_past_paused_ingest() {
+    fn ingest_and_a_dialogue_prompt_share_one_group() {
         let (mut sched, _tx) = make_test_scheduler();
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let ingest = SequenceId(sched.session.create_sequence().expect("create"));
@@ -5178,54 +5228,49 @@ layers:
             .active_prefills
             .push(dialogue_prefill(ingest, vec![1; 8]));
         sched
-            .prefill_queue
-            .push_back(dialogue_prefill(dialogue, vec![1; 8]).work);
-        sched.settled_since_admit = false;
+            .active_prefills
+            .push(dialogue_prefill(dialogue, vec![1; 8]));
 
-        sched.promote_new_prefills();
+        sched.form_wave_group(false);
 
-        assert!(
-            sched.priority_paused(ingest),
-            "the queued turn pauses ingest"
-        );
+        let members = sched.wave_prefill_members.clone();
+        let seqs: Vec<usize> = members.iter().map(|m| m.seq_id()).collect();
         assert_eq!(
-            sched.running_prefills(),
-            1,
-            "only the dialogue turn can run"
+            seqs,
+            vec![dialogue.0, ingest.0],
+            "both ride the group, the dialogue first"
         );
-        assert!(
-            sched
-                .active_prefills
-                .iter()
-                .any(|p| p.work.sequence_id == dialogue),
-            "the dialogue turn was left queued behind paused ingest"
-        );
+        assert_eq!(sched.creep_priority(&members), DecodePriority::High);
+        assert_eq!(sched.running_prefills(), 2, "both can advance");
     }
 
-    /// **A slot whose priority does not resolve pauses nobody.** It is gated as
-    /// `High` for itself, but it is not evidence that a conversation is running,
-    /// so ingest keeps its turn.
+    /// **The forced head is the highest band's.** With admission closed and
+    /// nothing in flight, a dialogue turn queued behind ingest is the one the
+    /// keep-one-alive rule forces in.
     #[test]
-    fn an_unresolvable_slot_does_not_pause_ingest() {
+    fn the_forced_head_is_the_highest_bands_first_turn() {
         let (mut sched, _tx) = make_test_scheduler();
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let ingest = SequenceId(sched.session.create_sequence().expect("create"));
-        let probe = SequenceId(sched.session.create_sequence().expect("create"));
+        let dialogue = SequenceId(sched.session.create_sequence().expect("create"));
         bind(&mut sched, &builder, ingest, "ingest", 1);
+        bind(&mut sched, &builder, dialogue, "dialogue", 2);
         sched
-            .active_prefills
-            .push(dialogue_prefill(ingest, vec![1; 8]));
+            .prefill_queue
+            .push_back(dialogue_prefill(ingest, vec![1; 8]).work);
         sched
-            .active_prefills
-            .push(dialogue_prefill(probe, vec![1; 8]));
+            .prefill_queue
+            .push_back(dialogue_prefill(dialogue, vec![1; 8]).work);
 
-        sched.observe_priorities();
+        let head = sched.pop_highest_band_head().expect("a head");
 
-        assert!(
-            !sched.priority_paused(probe),
-            "never paused: it counts as High"
+        assert_eq!(head.sequence_id, dialogue);
+        assert_eq!(
+            sched.prefill_queue.len(),
+            1,
+            "the ingest turn keeps its place"
         );
-        assert!(!sched.priority_paused(ingest), "and it pauses nothing");
+        assert_eq!(sched.prefill_queue[0].sequence_id, ingest);
     }
 
     /// **A second conversation's prompt is not held back by the first's
@@ -5263,9 +5308,10 @@ layers:
     }
 
     /// **Tenants are equal; the band decides.** npcd's live conversation
-    /// throttles and pauses zend's ingest exactly as zend's own would, and
-    /// zend's ingest never holds npcd's conversation back. Two tenants' ingests
-    /// run side by side.
+    /// throttles zend's ingest exactly as zend's own would — its creep yields
+    /// at the dialogue's ratio — and zend's ingest never holds npcd's
+    /// conversation back. Two tenants' ingests run side by side, and keep
+    /// running beside the conversation.
     #[test]
     fn a_second_tenants_dialogue_outranks_a_first_tenants_ingest() {
         let (mut sched, _tx) = make_test_scheduler();
@@ -5282,18 +5328,17 @@ layers:
         sched.slot_conversations.insert(npcd_dialogue, npcd());
         sched.slot_conversations.insert(npcd_ingest, npcd());
 
-        // Both tenants ingesting, nobody talking: neither pauses the other.
+        // Both tenants ingesting, nobody talking: both creep at full speed.
         sched
             .active_prefills
             .push(dialogue_prefill(zend_ingest, vec![1; 8]));
         sched
             .active_prefills
             .push(dialogue_prefill(npcd_ingest, vec![1; 8]));
-        sched.observe_priorities();
-        assert!(!sched.priority_paused(zend_ingest));
-        assert!(!sched.priority_paused(npcd_ingest));
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::Low), 1);
 
-        // npcd's conversation decodes: zend's ingest yields to it.
+        // npcd's conversation decodes: zend's ingest yields to it at the
+        // dialogue's ratio, and both ingests still advance beside it.
         let (state, _rx) = boundary_state();
         sched.active_decodes.insert(npcd_dialogue, state);
         let creep = [WaveMember::Prefill {
@@ -5303,10 +5348,56 @@ layers:
         let work = sched.creep_priority(&creep);
         assert_eq!(work, DecodePriority::Low);
         assert_eq!(sched.airtime_ratio_over(work), 64);
-        sched.observe_priorities();
-        assert!(sched.priority_paused(zend_ingest));
-        assert!(sched.priority_paused(npcd_ingest));
-        assert!(!sched.priority_paused(npcd_dialogue));
+        assert_eq!(sched.running_prefills(), 2, "neither ingest is held out");
+        sched.form_wave_group(false);
+        let seqs: Vec<usize> = sched
+            .wave_prefill_members
+            .iter()
+            .map(|m| m.seq_id())
+            .collect();
+        assert_eq!(seqs, vec![zend_ingest.0, npcd_ingest.0]);
+    }
+
+    /// **A dialogue prompt waiting behind a throttled ingest creep restarts
+    /// it.** The ingest group creeps at the cast's ratio (64); the prompt is
+    /// `High`, so the group is restarted to re-form with it. A creep that
+    /// is not throttled — or a waiting prompt that does not outrank it — is
+    /// left to finish.
+    #[test]
+    fn a_waiting_dialogue_prompt_outranks_a_throttled_ingest_creep() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let cast = SequenceId(sched.session.create_sequence().expect("create"));
+        let ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let other_ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let prompt = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, cast, "dialogue", 1);
+        bind(&mut sched, &builder, ingest, "ingest", 2);
+        bind(&mut sched, &builder, other_ingest, "ingest", 3);
+        bind(&mut sched, &builder, prompt, "dialogue", 4);
+        sched
+            .active_prefills
+            .push(dialogue_prefill(ingest, vec![1; 8]));
+        sched.form_wave_group(false);
+        sched.wave_prefill_cursor = 5;
+
+        // No decode outranks the creep: it runs unthrottled and finishes.
+        sched
+            .active_prefills
+            .push(dialogue_prefill(prompt, vec![1; 8]));
+        assert!(!sched.creep_outranked_by_a_waiting_prompt());
+
+        // The cast decodes: the ingest creep is throttled, the prompt waits.
+        let (state, _rx) = boundary_state();
+        sched.active_decodes.insert(cast, state);
+        assert!(sched.creep_outranked_by_a_waiting_prompt());
+
+        // Another ingest prompt waiting does not outrank it.
+        sched.active_prefills.pop();
+        sched
+            .active_prefills
+            .push(dialogue_prefill(other_ingest, vec![1; 8]));
+        assert!(!sched.creep_outranked_by_a_waiting_prompt());
     }
 
     /// A section chunk is background whatever slot carries it: alone it runs

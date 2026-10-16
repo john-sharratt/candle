@@ -552,12 +552,12 @@ priority is its layer's band alone, whichever daemon it belongs to:
 High (either daemon's live conversation) > Normal > Low (either daemon's ingest)
 ```
 
-- **Priority pause** (`scheduler/priority_pause.rs`) pauses every sequence in a band
-  below one that has work, and keeps it paused for `COOLDOWN` (15 s) after. So while
+- **Bands share the device** (`scheduler/band.rs`); none is held out of a forward. While
   either daemon has a conversation running — a chat turn, a tool round, a character's
-  turn — both daemons' ingest waits, and resumes within `PAUSED_POLL` (250 ms) of the
-  conversations falling idle for the cooldown. Section ingests and deferred glue stay
-  outside the pause.
+  turn — both daemons' ingest decodes ride the same steps and their prefills creep beside
+  it at the conversation's ratio (`docs/continuous_fair_waves.md` §3.1). A pause that held
+  ingest out for 15 s after every conversation's activity stopped zend's ingest outright
+  beside npcd's cast, which never falls idle for that long.
 - **The prefill throttle** (`prefill.rs` `throttle_ratio`) uses the same order: work
   yields to the decodes in a higher band, at that band's ratio, whichever daemon
   either belongs to. Two daemons' work in one band shares the wave as one daemon's
@@ -892,5 +892,5 @@ daemons regardless of whether the host is built.
 | 3 | yes — `host/`, `motherd/`, `zend::tenant`, `npcd::tenant` | `host` unit tests (site table, edit-on-disk, missing directory, path overlap including catch-alls and nests, build id, one-shot flags dropped on relaunch); the core's `thinking(true)` changes nothing for a tenant that set none (`models::builder::thinking_tests`, `engine_slot::core_requests`); `zend/tests/gui_api_harness.rs` over the assembled server; `cargo build -p zend`, `-p npcd`, `-p motherd`; zend restarted live through `host::run` |
 | 4 | yes — `host::endpoints`, `web::Builder::trust`, `host::access`, both UIs on the chosen fields | unit per endpoint with exact bodies; `/ws/logs` neither drops nor repeats across replay (`endpoints::logs`); a header from a non-gateway peer cleared, in the server and in the assembled host (`web/tests/roles.rs`, `host::server`); `--local-signin` refused beside `--gateway` |
 | 5 | yes — `host::MODEL` (Flash-Next `Q4_KO` since 2026-10-11, §5.1); zend's ladder and `--model` gone | both tenants' `requires()` against `MODEL`; `Capabilities::check` naming every lack. Live: zend under Flash-Next, 2026-10-11, on the substrate it had run on — written before keys, admitted by §4.2's check, then adopted (`docs/replicated_substrate.md` §6.2) |
-| 6 | yes — the band (`DecodePriority`) alone; first built tenant first, changed 2026-10-12 | `scheduler::priority_pause` and `scheduler::prefill` unit tests: two tenants' ingests together, a second tenant's dialogue pausing and throttling a first tenant's ingest, a section chunk yielding to another tenant's dialogue |
+| 6 | yes — the band (`DecodePriority`) alone; first built tenant first, changed 2026-10-12 | `scheduler::prefill` unit tests: two tenants' ingests together, a second tenant's dialogue throttling a first tenant's ingest while both ingests keep advancing, a section chunk yielding to another tenant's dialogue |
 | 7 | yes — 2026-10-12, as a member of the gateway's cluster (`docs/replicated_substrate.md` §15.1) | deployment, done with the operator |

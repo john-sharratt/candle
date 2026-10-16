@@ -29,6 +29,7 @@ mod admission;
 /// AIMD setpoint the *ingest* regulator moves.
 mod admit;
 mod admit_ground;
+mod band;
 mod block_guard;
 mod compaction_stall;
 mod decode;
@@ -49,7 +50,6 @@ pub mod phase_ring;
 mod phase_split;
 mod piece_identity;
 mod prefill;
-mod priority_pause;
 pub(crate) mod profile;
 pub(crate) mod projection_assembler;
 mod projection_identity;
@@ -149,7 +149,6 @@ use candle_transformers::models::sealed_injection::reconcile_sealed_prefix;
 
 use self::exported_state::{ExportedState, SharedState};
 use self::norm_warm::NormWarm;
-use self::priority_pause::PriorityPause;
 use self::projection_identity::{section_content_stamp, segments_identity, turn_start_identity};
 pub(crate) use self::seal_scan::SealedProbe;
 pub use self::settle::SettleReport;
@@ -159,7 +158,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::take;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ————————————————————————————————————————————————————————————————————————————
 // Scheduler request types (sent from caller threads)
@@ -3205,11 +3204,8 @@ pub(crate) struct Scheduler {
     /// Callers waiting on that settle ([`SchedulerRequest::Settle`]), each sent
     /// its report when the idle branch runs it.
     pub(super) settle_waiters: Vec<Sender<SettleReport>>,
-    /// Which priority bands have had work recently — lower bands wait while a
-    /// higher one runs, and for a cooldown after (see [`priority_pause`]).
-    pub(super) priority_pause: PriorityPause,
-    /// The dialogue normalization warm-up's replayed turns, scored in the gaps
-    /// higher-priority work leaves (see [`norm_warm`]).
+    /// The dialogue normalization warm-up's replayed turns, scored one per loop
+    /// iteration (see [`norm_warm`]).
     norm_warm: NormWarm,
     /// When the last KV compaction pass ran, so the cheap per-wave gate can hold a
     /// floor on the interval. `None` before the first pass.
@@ -3611,10 +3607,17 @@ pub(crate) struct Scheduler {
     /// the held residual only lines up if the input order is identical. Fixed at
     /// formation — new prefills / sections wait for the next group.
     wave_prefill_members: Vec<WaveMember>,
-    /// Set once per decode quantum after the co-batched decode wave advances the
-    /// prefill cohort, so only the FIRST decode step of the quantum folds the
-    /// cohort in (one budget-sized layer advance per wave, not per decode step).
+    /// The prefill cohort may not advance on this wave step: it already did, or
+    /// decode is still owed airtime for the last step that carried it
+    /// ([`Self::creep_owed`]). Set per decode step, so the cohort advances its
+    /// budget of layers on every step its airtime allows — a wave is one sweep.
     wave_cohort_advanced: bool,
+    /// Decode-only airtime still owed before the creep, or a section chunk, may
+    /// ride a decode step again: a co-batched step of length `d` at airtime
+    /// ratio `R` owes `d / R`, paid down by each decode-only step. Kept across
+    /// quanta, so the creep rides as often as its ratio allows, not once per
+    /// quantum.
+    creep_owed: Duration,
     /// Consecutive failures of the decode-less wave step and the wait owed
     /// before the next — see `wave_retry`.
     wave_retry: wave_retry::WaveRetry,
@@ -3626,9 +3629,8 @@ pub(crate) struct Scheduler {
     /// decode step from one that also paid for ingest.
     wave_cobatched: bool,
     /// The airtime ratio `R` the last wave step's co-batched work yielded to —
-    /// the ratio of the decodes that outrank it, 1 when none does. The decode
-    /// quantum owes decode that share of a co-batched step
-    /// (`decode_owed_after_cobatched`).
+    /// the ratio of the decodes that outrank it, 1 when none does. Decode is
+    /// owed that share of a co-batched step ([`Self::creep_owed`]).
     wave_step_ratio: u32,
     /// Set once per wave after the co-batched decode wave folded the active
     /// section-ingest chunk into its full sweep (section rides decode's `[0, N)`
@@ -3856,7 +3858,6 @@ impl Scheduler {
             settled_since_admit: true,
             settle_owed: false,
             settle_waiters: Vec::new(),
-            priority_pause: PriorityPause::default(),
             norm_warm: NormWarm::default(),
             last_kv_compaction: None,
             kv_compaction_stall: compaction_stall::CompactionStall::default(),
@@ -3922,6 +3923,7 @@ impl Scheduler {
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
             wave_cohort_advanced: false,
+            creep_owed: Duration::ZERO,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),
             wave_cobatched: false,

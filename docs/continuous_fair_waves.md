@@ -110,40 +110,32 @@ so it shares the next wave whole. Held to one layer a wave beside a `High`
 decode, a 26-token prompt waited 57 s for another conversation's tool round to
 finish (`scheduler::prefill::throttle_ratio`).
 
-### 3.1 Priority pause
+### 3.1 Bands share; nothing is paused
 
-The throttle shares the device; the pause yields it. While any sequence of a
-higher priority has work — queued, prefilling or decoding — every
-lower-priority sequence is **paused**: not admitted, and held out of every
-forward, decode rows and prefill cohort alike. The pause lasts until
-`COOLDOWN` (15 s) after the last higher-priority activity, so a dialogue
-running tool rounds keeps the device through the seconds each tool takes
-rather than handing it back to ingest between rounds.
+The throttle is the whole of priority. No band is held out of a forward for
+another's sake: every band's decode rows ride every decode step — decode is
+width-bound, so a row beside the dialogue's costs it little and is the other
+row's whole progress — and each band's prefill creeps at the ratio of the
+decodes that outrank it. Priority orders the rows (the highest band leads, so
+the one-adapter rule keeps the dialogue's), admission's per-band offer, and the
+keep-one-alive head (the highest band's first queued turn).
 
-A paused sequence keeps its K/V, recurrent state and queue position and
-resumes where it stopped. `High` is never paused, so a pause cannot deadlock
-the engine: the work that holds it is running. For that to hold, admission's
-progress gates — the width backstop, the pressure guard and the keep-one-alive
-rule — count only prefills that can advance (`running_prefills`): a paused
-prefill moves no row, and counting it as in flight kept a dialogue turn queued
-behind the very ingest it was pausing. When everything with work is paused,
-the loop waits on its request channel (`PAUSED_POLL`, 250 ms) instead of
-cycling empty quanta. Implemented in `scheduler/priority_pause.rs`; the gates
-are admission's per-band offer, decode row selection, and prefill wave
-membership.
+**Why there is no pause.** One was built: while any higher band had work, and
+for 15 s after, every lower band was held out of every forward. It was meant to
+keep one person's dialogue the device through its tool rounds. Beside npcd's
+cast it was a mode switch that never switched back — the characters tick every
+few seconds and are `High`, so the gap the pause waited for never came. Measured
+on `.5`, 2026-10-16, with two characters running and zend's repo-map ingest
+queued: decode one row wide, forwards on the device ~12% of the wall clock, and
+30 folder workers finishing 0.7 folders a minute. Its measured motivation — a
+dialogue's belief-scan index invalidated by ingest uploads, its forwards widened
+by ingest rows — is a cost the throttle bounds; stopping the ingest is not the
+price of it.
 
-Only a priority that resolves through a slot's projection target is evidence
-of running work. A slot with none (a summary probe, a slot reloaded without its
-projection) is gated as `High` for itself but pauses nobody.
-
-The normalization warm-up replay (`scheduler/norm_warm.rs`) runs at ingest
-priority: one replayed turn per loop iteration on the gallery arena, and none
-while a higher band is running or cooling down.
-
-Measured motivation: with sixteen ingest workers sealing turns, a dialogue's
-belief-scan index was invalidated by their uploads and its forwards widened by
-their rows; the earlier rule only capped ingest decode rows beside a dialogue
-decode, and lifted the moment that decode ended.
+The normalization warm-up replay (`scheduler/norm_warm.rs`) is the one piece of
+background work that does not ride a forward: it runs on the loop thread, one
+replayed turn per loop iteration, which a decode quantum bounds to one per
+`WAVE_SLICE`.
 
 ## 4. Glue rides with prefill
 
@@ -198,18 +190,35 @@ resume in the next quantum, so clipping simply passes the remaining work forward
 budget so the loop returns to the top on a predictable cadence no matter how fast
 or slow the steps run.
 
-That cadence matters because the top of the loop is where the creep cohort
-re-forms. Two consequences:
+The quantum is the cadence of the loop top — relief, guests, the warm-up,
+telemetry. It is **not** the cadence of the creep: every decode step is a wave.
 
+- **The creep rides every step its airtime allows.** A step that carried the
+  creep (or a section chunk, or glue) for `d` owes decode `d / R` of decode-only
+  airtime; decode-only steps pay it down, and the next step after it is paid
+  carries the creep again — across quantum boundaries, the debt kept on the
+  scheduler (`creep_owed`). At `R = 1` decode and creep alternate equal airtime;
+  at `R = 64` the creep advances its `N/64` layers on nearly every step, as §3
+  intends. The creep used to ride only a quantum's first step: whenever anything
+  decoded, a prefill advanced once per `WAVE_SLICE` — an 8K chunk that runs in
+  120 ms went once every 2 s, and a dialogue's tool result waited out the rest of
+  another conversation's slice before its prefill moved.
 - **Mid-wave admission.** After every step the quantum runs the same admission it
   runs at the loop top — `drain_submissions` → `promote_new_prefills`, under the
   identical `admit_window`/VRAM entry criteria —
   so a conversation that queues *while a wave is executing* is projected and
-  seated in `active_prefills` immediately rather than waiting for the whole
-  in-flight generation to finish. It joins the creep at the next quantum boundary,
-  bounded by `WAVE_SLICE`. The creep's held residual is a fixed-member-order
-  invariant, so new work is never injected mid-sweep — only picked up when
-  `form_wave_group` re-forms at a sweep boundary.
+  seated in `active_prefills` immediately. It joins the creep the next time
+  `form_wave_group` re-forms: the next step the creep rides with no group in
+  flight. The creep's held residual is a fixed-member-order invariant, so new
+  work is never injected mid-sweep — only picked up at the group's sweep
+  boundary.
+- **An outranked creep restarts.** A throttled group takes `R` steps to reach
+  its sweep boundary, so a prompt that outranks it — a dialogue's tool result
+  beside an ingest group creeping behind a cast's decodes — would wait all of
+  them. The group is restarted at layer 0 instead and re-forms with the prompt
+  in it, at the prompt's band; its members lose the layers already run (offsets
+  advance only at the head, so the rerun rewrites the same K/V) and ride on at
+  the new band's ratio (`creep_outranked_by_a_waiting_prompt`).
 - **Per-slice relief.** The cheap ingest throttle (`regulate_ingest_admission` +
   the gentle warm-backed demote) also runs after each step, self-gated on an
   active ingest, so KV production is bound to the hot→warm drain rate *across* a
