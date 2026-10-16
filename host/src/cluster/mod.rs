@@ -626,7 +626,19 @@ impl Join {
         loop {
             progress(&r.catchups());
             let ready = r.caught_up() && r.phase() == Phase::Joined;
-            if ready || self.link.state() == Link::CutOff || cancelled() {
+            if ready || cancelled() {
+                return;
+            }
+            // Cut off before catching up: the load goes on detached, and the
+            // catch-up resumes once a gateway admits it again. Said, because
+            // the step reads done either way.
+            if self.link.state() == Link::CutOff {
+                let catchups = r.catchups();
+                tracing::warn!(
+                    behind = %view::catchup_detail(&catchups),
+                    "cut off before catching up — loading on detached; the catch-up resumes \
+                     once rejoined"
+                );
                 return;
             }
             sleep(CONNECTING_POLL);

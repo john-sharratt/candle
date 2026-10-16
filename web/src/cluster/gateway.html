@@ -61,6 +61,12 @@
 .gw-member .host { font-weight: 650; color: var(--ink); }
 .gw-member .meta { grid-column: 1; color: var(--ink-faint); font-family: var(--mono); font-size: .72rem; display: flex; gap: 6px 14px; flex-wrap: wrap; }
 .gw-member .act { grid-row: 1 / span 2; grid-column: 2; }
+/* A member's replication, on its card: how much of the group's writes it has
+   applied, and the catch-up bringing in the rest. Shown only while it is
+   behind or catching up — a caught-up member says nothing here. */
+.gw-member .repl { grid-column: 1; display: flex; flex-direction: column; gap: 5px; font-family: var(--mono); font-size: .72rem; color: var(--ink-faint); }
+.gw-member .repl .row { display: grid; grid-template-columns: minmax(90px, 220px) minmax(0, 1fr); gap: 10px; align-items: center; }
+.gw-member .repl .bar.warn > i { background: var(--warn); }
 .gw-none { color: var(--ink-faint); font-size: .86rem; padding: 12px 0 4px; margin: 0; }
 
 /* Upgrades */
@@ -376,6 +382,36 @@ function sayApp(a, s) {
   return "Members are joined but none is ready.";
 }
 
+/* A member's replication as two bars: the group's writes it has applied, of
+   the highest each origin reached anywhere; and each catch-up running, records
+   fetched of those its answerer listed. A catch-up nobody has answered yet says
+   so — "0 of 0" read as finished. Nothing at all for a caught-up member. */
+function replication(c) {
+  if (!c) return "";
+  const pct = (done, of) => (of > 0 ? Math.min(100, (100 * done) / of) : 0);
+  const bar = (p, cls) => `<div class="bar${cls ? " " + cls : ""}"><i style="width:${p.toFixed(1)}%"></i></div>`;
+  const rows = [];
+  const high = c.applied.reduce((n, a) => n + a.high_water, 0);
+  const through = c.applied.reduce((n, a) => n + Math.min(a.through, a.high_water), 0);
+  const behind = Math.max(0, high - through);
+  const missing = c.applied.reduce((n, a) => n + a.missing, 0);
+  if (behind || missing || (c.mode !== "joined" && high === 0)) {
+    const say = high
+      ? `${through.toLocaleString()} of ${high.toLocaleString()} records applied · ${behind.toLocaleString()} behind${missing ? ` · ${missing.toLocaleString()} missing` : ""}`
+      : "nothing applied yet";
+    rows.push(`<div class="row">${bar(pct(through, high), behind ? "warn" : "")}<span>${say}</span></div>`);
+  }
+  for (const k of c.catchups) {
+    const who = k.answerer != null ? `from ${k.answerer.toString(16).padStart(16, "0").slice(0, 8)}` : null;
+    const what = typeof k.purpose === "string" ? k.purpose : Object.keys(k.purpose)[0];
+    const say = who
+      ? `catch-up (${esc(what)}) ${who}: ${k.fetched.toLocaleString()} of ${k.wanted.toLocaleString()} records · ${bytes(k.fetched_bytes)} of ${bytes(k.wanted_bytes)}${k.skipped ? ` · ${k.skipped.toLocaleString()} held already` : ""}`
+      : `catch-up (${esc(what)}) asked — no member has answered yet`;
+    rows.push(`<div class="row">${bar(who ? pct(k.fetched, k.wanted) : 0)}<span>${say}</span></div>`);
+  }
+  return rows.length ? `<div class="repl">${rows.join("")}</div>` : "";
+}
+
 function memberLine(m, s, operate) {
   const c = m.coord;
   const u = c && c.upgrade;
@@ -391,6 +427,7 @@ function memberLine(m, s, operate) {
   return `<div class="gw-member">
     <div class="who"><span class="host">${esc(m.host)}</span>${chip(STATE_CLS[m.state] || "", m.state)}${m.lagging ? chip("warn", "lagging") : ""}${c && c.mode !== "joined" ? chip(MODE_CLS[c.mode] || "", c.mode.replace("_", " ")) : ""}${u && u.step ? chip(u.step === "stranded" ? "crit" : "accent", u.step) : ""}${behind ? chip("warn", `behind floor ${floor.count}`) : ""}</div>
     <div class="meta">${bits.map((b) => `<span>${b}</span>`).join("")}</div>
+    ${replication(c)}
     <div class="act">${operate ? `<button class="btn sm" type="button" data-actions="${esc(m.app)}" data-node="${esc(m.node)}">Actions…</button>` : ""}</div>
   </div>`;
 }
