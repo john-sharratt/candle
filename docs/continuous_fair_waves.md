@@ -97,18 +97,57 @@ of forward progress per wave (fractional, accumulated):
   or two waves, creeping in the deep background while ~64 decode tokens land.
 
 `R` is the single knob that trades ingest throughput against decode latency, set
-per layer by how interactive that layer's conversations are.
+per layer by how interactive that layer's conversations are. The layer budget
+keeps each step's slice of the creep small; how often a slice rides is set by
+airtime — decode gets `R` times the creep's share of the device (§6).
 
-**Only an outranking decode is protected.** The creep yields to the decodes whose
-priority is strictly higher than its own, at the highest of their ratios; with
-none, `R = 1` and it clears every layer in one wave. A creep runs at the band of
-its highest-ranked prompt (a decode or prompt whose layer does not resolve counts
-as `High`, the band it is gated in), and section chunks, which are background
-ingest, ride at the band of the prompt they joined — alone they are `Low`. A
-second conversation's prompt is not background to the first: both are `High`,
-so it shares the next wave whole. Held to one layer a wave beside a `High`
-decode, a 26-token prompt waited 57 s for another conversation's tool round to
-finish (`scheduler::prefill::throttle_ratio`).
+**An outranking decode is protected, and a `High` one from `High` work too.**
+The creep yields to the decodes that outrank it — and, when it is `High`, to the
+`High` decodes — at the highest of their ratios; with none, `R = 1` and it clears
+every layer in one wave. `R` is re-read every wave, so the creep returns to full
+speed the wave the last such decode finishes. A creep runs at the band of its
+highest-ranked prompt (a decode or prompt whose layer does not resolve counts as
+`High`, the band it is gated in), and section chunks, which are background
+ingest, ride at the band of the prompt they joined — alone they are `Low`
+(`scheduler::prefill::throttle_ratio`).
+
+**Below `High`, a band never holds back its own work.** Latency matters less
+than throughput there, so a `Normal` or `Low` creep beside a decode of its own
+band runs whole, co-batched with it.
+
+**A `High` creep beside a `High` decode is paced in tokens.** A conversation is
+never on both sides: while it prefills (a turn, a tool result) it is not
+decoding. The collision is between two conversations of one band — two zend
+dialogues, or a dialogue and a client's passthrough conversation. When only an
+outranking decode counted, a same-band creep
+rode the step whole — a full chunk through every layer — and the decode beside it
+waited all of it: measured on `.5`, 2026-10-16, a dialogue's decode step that
+took 17–19 ms alone took 3.2 s (profile build) whenever an npcd turn's chunk,
+with the section chunks riding it, shared the step.
+
+So the creep keeps its chunk whole — each layer's experts are still loaded once
+for all its rows, which matters when they stream from RAM or NVMe — and is paced
+at **9 prefill tokens per decode token** (`SAME_BAND_PREFILL_PER_DECODE`), the
+mix the device runs best at: about 1.8k prefill tokens a second beside 200
+decode tokens a second, aggregated over a handful of sessions. It carries a debt
+in token-layers (one row through one layer): each step it rides adds its rows
+times its layers, each decode token that lands pays off 9 rows through all `N`
+layers, and it rides only once the debt is paid, advancing as many layers as its
+credit covers (at least one). An 8K chunk advances one layer every ~19 decode
+tokens; a 26-token prompt covers 16 layers a decode token, so it reaches its first
+token in about three steps. Credit is capped at one step's earnings, so steps the
+creep could not ride do not bank a whole sweep. Being counted in tokens, the pace
+scales with the decode width on every machine. The debt is dropped the step the
+last `High` decode finishes.
+
+Every decode has a band. zend's dialogue and a client's passthrough conversation
+are `High`. npcd's characters (its perception, action and interaction layers) and
+its prose jobs are `Normal`: zend outranks them, so a character's turn creeps
+beside a zend dialogue's decode, and a zend prompt is never paced by a
+character's. The titler and summary probes are `Normal` too: background to the
+dialogue they serve. Each creep group logs
+its band, ratio, budget and rows at debug on
+`candle_conversation::scheduler::creep`.
 
 ### 3.1 Bands share; nothing is paused
 
@@ -116,7 +155,7 @@ The throttle is the whole of priority. No band is held out of a forward for
 another's sake: every band's decode rows ride every decode step — decode is
 width-bound, so a row beside the dialogue's costs it little and is the other
 row's whole progress — and each band's prefill creeps at the ratio of the
-decodes that outrank it. Priority orders the rows (the highest band leads, so
+decodes that outrank it, a `High` one beside a `High` decode paced in tokens. Priority orders the rows (the highest band leads, so
 the one-adapter rule keeps the dialogue's), admission's per-band offer, and the
 keep-one-alive head (the highest band's first queued turn).
 
@@ -131,6 +170,17 @@ queued: decode one row wide, forwards on the device ~12% of the wall clock, and
 dialogue's belief-scan index invalidated by ingest uploads, its forwards widened
 by ingest rows — is a cost the throttle bounds; stopping the ingest is not the
 price of it.
+
+**Admission is not held behind a band it outranks.** The admission floors defend
+the residency the running slots decode at, and when those slots are a lower
+band's, they are what spent it — and they hold it until they finish. A prompt of
+a band some running slot yields to is judged on the forward's row cap alone
+(`admit::WaveRate::try_outranking`, `admit::Ground::outranks_active`), and the
+width backstop does not turn it away either. Measured on `.5`, 2026-10-17: with
+fourteen ingest and character slots in flight, a dialogue's two-row continuation
+was refused at the decode floor on every pass (21.5 GiB resident against a
+25.3 GiB floor), and the person's tool result waited for background work to drain
+before it was even admitted. Among equals the floors hold as before.
 
 The normalization warm-up replay (`scheduler/norm_warm.rs`) is the one piece of
 background work that does not ride a forward: it runs on the loop thread, one
@@ -194,15 +244,24 @@ The quantum is the cadence of the loop top — relief, guests, the warm-up,
 telemetry. It is **not** the cadence of the creep: every decode step is a wave.
 
 - **The creep rides every step its airtime allows.** A step that carried the
-  creep (or a section chunk, or glue) for `d` owes decode `d / R` of decode-only
-  airtime; decode-only steps pay it down, and the next step after it is paid
-  carries the creep again — across quantum boundaries, the debt kept on the
-  scheduler (`creep_owed`). At `R = 1` decode and creep alternate equal airtime;
-  at `R = 64` the creep advances its `N/64` layers on nearly every step, as §3
-  intends. The creep used to ride only a quantum's first step: whenever anything
+  creep (or a section chunk) owes decode its share times `R` of decode-only
+  airtime, its share being the step's length less what a decode-only step takes
+  now (an average over recent decode-only steps, `decode_only_step`); decode-only
+  steps pay it down, and the next step after it is paid carries the creep again —
+  across quantum boundaries, the debt kept on the scheduler (`creep_owed`). At
+  `R = 1` decode and creep get equal airtime; at `R = 64` decode gets 64 times the
+  creep's. The creep used to ride only a quantum's first step: whenever anything
   decoded, a prefill advanced once per `WAVE_SLICE` — an 8K chunk that runs in
   120 ms went once every 2 s, and a dialogue's tool result waited out the rest of
   another conversation's slice before its prefill moved.
+- **The debt is the creep's share, not the step's length over `R`.** Owing
+  `d / R` assumed the creep's `N/R` layers were a sliver of the step they rode.
+  At depth they are not: one layer of an eight-member ingest group at 300K
+  positions cost ~40 ms beside a ~30 ms dialogue decode, owed 1 ms at `R = 64`,
+  and so rode every step — the dialogue decoded 13–15 steps a second where it ran
+  33 alone (`.5`, 2026-10-17). Owed as its share times `R`, the ingest rides about
+  once per 2.5 s of dialogue decoding and at full speed the moment the dialogue
+  stops.
 - **Mid-wave admission.** After every step the quantum runs the same admission it
   runs at the loop top — `drain_submissions` → `promote_new_prefills`, under the
   identical `admit_window`/VRAM entry criteria —
@@ -212,13 +271,35 @@ telemetry. It is **not** the cadence of the creep: every decode step is a wave.
   flight. The creep's held residual is a fixed-member-order invariant, so new
   work is never injected mid-sweep — only picked up at the group's sweep
   boundary.
-- **An outranked creep restarts.** A throttled group takes `R` steps to reach
-  its sweep boundary, so a prompt that outranks it — a dialogue's tool result
-  beside an ingest group creeping behind a cast's decodes — would wait all of
-  them. The group is restarted at layer 0 instead and re-forms with the prompt
-  in it, at the prompt's band; its members lose the layers already run (offsets
-  advance only at the head, so the rerun rewrites the same K/V) and ride on at
-  the new band's ratio (`creep_outranked_by_a_waiting_prompt`).
+- **An outranked creep pauses.** A throttled group takes `R` steps to reach its
+  sweep boundary, so a prompt that outranks it — a dialogue's tool result beside
+  an ingest group creeping behind a cast's decodes — would wait all of them. The
+  group is set aside at the layer it reached with its residual, members and rows
+  (`scheduler::paused_creep`); the prompt's band forms a group of its own and
+  sweeps; the paused group resumes at the same layer once nothing above its band
+  is waiting. Nothing touches a paused member's state meanwhile — it is
+  mid-prefill — and a paused member is in no other group and no standalone
+  section pass. With a group already paused, the one in flight finishes its
+  remaining layers in one step instead (`creep_outranked_by_a_waiting_prompt`).
+- **A `High` group carries `High` prompts only.** Every row of a group rides
+  every layer of its sweep, so a person's prompt beside eight characters' and
+  ingest chunks waits for all of their rows: measured on `.5`, 2026-10-17, a
+  10-member, 8,190-row group creeping a layer a step held a dialogue's first
+  token ~24 s. Below `High`, throughput matters more than latency, and the bands
+  and section chunks mix as before.
+- **A sweep is never restarted.** Its finished layers have taken its rows into
+  their carried state — the QSA index, the DeltaNet state, the PLE history — and
+  nothing rolls that back; only the K/V is position-addressed, so only the K/V
+  survives a rerun. Restarted, an outranked group ran its rows into those layers
+  twice: measured on `.5`, 2026-10-16, three section slots' indexes stood 2,545
+  tokens ahead of their K/V after two restarts, and the next append needed an
+  index page inside the forward, which the partition refuses — failing the wave
+  and the dialogue decode riding it. So a member that leaves mid-sweep (its slot
+  freed, its prompt errored) takes its rows out of the held residual and the
+  survivors carry on (`Scheduler::drop_wave_members`); a window that fails
+  mid-sweep on a device OOM or a refused tier is retried in place, at most four
+  times, with its residual put back; and anything else mid-sweep fails the
+  creep's members rather than replaying them.
 - **Per-slice relief.** The cheap ingest throttle (`regulate_ingest_admission` +
   the gentle warm-backed demote) also runs after each step, self-gated on an
   active ingest, so KV production is bound to the hot→warm drain rate *across* a

@@ -11,7 +11,7 @@
 use super::pipeline::PipelineState;
 use super::slot_image::{build_slot_view, slot_offsets};
 use super::types::BoundaryAsk;
-use candle::cuda_backend::graph::try_without_recording;
+use candle::cuda_backend::graph::{try_without_recording, Quiet};
 use candle::{Device, Result};
 use candle_nn::kv_cache::{kv_spare_regions, set_weight_floor, wave_is_live, weight_floor_after};
 use cudarc::driver::CudaStream;
@@ -134,7 +134,7 @@ impl PipelineState {
         // failed, and the expert pipeline aborted. Held for the whole move, so no
         // recording can begin between the two quiesces; refused, it concedes
         // nothing now and the next negotiation asks again.
-        let conceded = match try_without_recording(|| self.renegotiate_boundary(ask)) {
+        let conceded = match try_without_recording(|quiet| self.renegotiate_boundary(quiet, ask)) {
             Some(conceded) => conceded,
             None => {
                 tracing::debug!(
@@ -174,7 +174,7 @@ impl PipelineState {
     ///
     /// Answers with the **bytes conceded to the KV side** — zero when the
     /// boundary held or moved the other way.
-    fn renegotiate_boundary(&mut self, ask: BoundaryAsk) -> Result<u64> {
+    fn renegotiate_boundary(&mut self, quiet: &Quiet, ask: BoundaryAsk) -> Result<u64> {
         let Device::Cuda(cd) = &self.device else {
             return Ok(0);
         };
@@ -209,7 +209,7 @@ impl PipelineState {
             // Taking ground is a handover too: those regions were the KV side's
             // until this instant, and "free" there means no host-side gid names
             // them, not that no kernel is still reading them.
-            self.quiesce_before_handover()?;
+            self.quiesce_before_handover(quiet)?;
             // **The floor moves first, and the zone follows it.** A refusal
             // (a wave generation open on the span) then lands with nothing yet
             // moved; growing the zone first once left it one slot wider than
@@ -257,7 +257,7 @@ impl PipelineState {
         // The device is idle after this and no invocation can begin (the pass
         // lock is held), so every entry may change at once: nothing can read
         // the table until the move is done.
-        self.quiesce_before_handover()?;
+        self.quiesce_before_handover(quiet)?;
         self.drain_ring(self.routed_served.load(Ordering::Acquire))?;
 
         // The zone decides who moves and who goes; this performs it. A
@@ -304,7 +304,7 @@ impl PipelineState {
         // truncation removes.
         self.inner.truncate_tables();
         // The conceded slots stop being ours the moment the floor moves.
-        self.quiesce_before_handover()?;
+        self.quiesce_before_handover(quiet)?;
         // **A refused publish here has to be undone, not carried out.** The
         // doomed slots were evicted or relocated, so they are free; growing
         // the zone back restores the agreement between the zone and the
@@ -333,16 +333,16 @@ impl PipelineState {
     /// **The boundary is the one place where memory changes side**, and neither
     /// side's own ordering reaches across it: ground arriving from the weight
     /// side is fresh to the KV side, claimed with no wait. A device-wide
-    /// synchronize, paid only when the boundary actually moves.
-    fn quiesce_before_handover(&self) -> Result<()> {
+    /// synchronize, paid only when the boundary actually moves — and only with
+    /// the record gate held (`quiet`), since it would invalidate any capture.
+    fn quiesce_before_handover(&self, quiet: &Quiet) -> Result<()> {
         let Device::Cuda(cd) = &self.device else {
             return Ok(());
         };
         let stream = cd.cuda_stream();
-        let ctx = stream.context();
-        ctx.bind_to_thread().map_err(candle::Error::wrap)?;
-        ctx.synchronize().map_err(candle::Error::wrap)?;
-        Ok(())
+        quiet
+            .synchronize_context(stream.context())
+            .map_err(candle::Error::wrap)
     }
 
     /// Move one expert's bytes from slot `from` to slot `to` on the copy

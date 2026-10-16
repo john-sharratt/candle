@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 
 use candle_conversation::projection::{
-    Builder, GroupId, LayerId, Reserved, SectionId, TimelineId, TurnIndex,
+    Builder, DecodePriority, GroupId, LayerId, Reserved, SectionId, TimelineId, TurnIndex,
 };
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnText};
@@ -380,8 +380,14 @@ pub fn open(
     // the unused space-prefixed token outranking the one presence penalty had
     // already demoted.
     let builder = || {
-        Builder::for_reserved_corpus(&transcript.system, Reserved::Passthrough, base)
-            .free_tool_calls_from_penalties()
+        // A client's conversation, with a person waiting on it.
+        Builder::for_reserved_corpus(
+            &transcript.system,
+            Reserved::Passthrough,
+            base,
+            DecodePriority::High,
+        )
+        .free_tool_calls_from_penalties()
     };
 
     let mut stored = engine.find_conversations_by_metadata(METADATA_KEY, &key);

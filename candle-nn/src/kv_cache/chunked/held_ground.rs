@@ -34,21 +34,24 @@ use super::held_ledger::{HeldLedger, HeldSite};
 #[cfg(feature = "cuda")]
 const REFUSAL_REPORT_SITES: usize = 8;
 
-/// Bytes of the span kept as held ground.
+/// Bytes of the span kept as held ground for the buffers every model holds — a
+/// model's runtime reserve widens it further (`region_pool::held_bytes`).
 ///
-/// Sized from what the serving loop holds this way on Flash-Next: ~160 MiB of
-/// decode slot-state slabs, a cold-load batch's staging (at most the 64 MiB
-/// pinned scratch it mirrors), a few MiB of launch tables and resident headers
-/// per stream handle, and the sampler's argument pack — the CUDA pool held
-/// ~1 GiB of such buffers and their churn outside the reservation before they
-/// moved here. The launchers' grow-only kernel scratch lives here too, and on
-/// its own outgrew the rest: the INT8 prefill split partials took 337 MiB in one
-/// block (Flash-Next, an 8192-token prefill wave), which at 384 MiB left the
-/// slot-state slabs, sampler packs and launch tables refused into the pool. A
-/// request the ground cannot hold is served from the pool and reported, so the
-/// figure is a budget to measure against
+/// Sized from what the serving loop holds this way on Flash-Next under a
+/// conversation and an ingest (`.5`, 2026-10-17): the launchers' kernel scratch
+/// 436 MiB at its peak (INT8 prefill and decode split partials, the provenance
+/// scans' accumulators), decode slot-state slabs 304 MiB, the penalty counts
+/// 76 MiB, the gallery scan 68 MiB, launch tables 23 MiB, and a cold-load
+/// batch's staging coming and going at up to 64 MiB — ~970 MiB, against the
+/// 512 MiB this was. Every byte past it was refused into the CUDA pool, outside
+/// the reservation, where it pushed the card past WDDM's residency budget.
+///
+/// The margin over the measurement is for placement: ranges are first-fit
+/// ([`super::held_extents`]), so a ground near full refuses a request its free
+/// bytes would cover. A request the ground cannot hold is still served from the
+/// pool and reported, so the figure is a budget to measure against
 /// ([`super::region_pool::held_ground_stats`]'s `peak`), not a wall.
-pub const HELD_GROUND_BYTES: usize = 512 * 1024 * 1024;
+pub const HELD_GROUND_BYTES: usize = 1280 * 1024 * 1024;
 
 /// Every range the ground hands out starts on this boundary.
 pub(crate) const HELD_ALIGN: usize = 256;

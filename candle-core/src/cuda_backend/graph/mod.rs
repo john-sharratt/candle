@@ -28,6 +28,8 @@
 //! take their stream from the caller can sit inside a recorded segment.
 
 mod budget;
+pub(crate) mod capture;
+mod device_wide;
 mod error;
 mod exec;
 mod hub;
@@ -47,7 +49,7 @@ pub use error::GraphError;
 pub use exec::GraphExec;
 pub(crate) use hub::CaptureHub;
 pub use hub::{CaptureStats, Paused, WaveCapture};
-pub use record_gate::try_without_recording;
+pub use record_gate::{try_without_recording, without_recording, Quiet};
 #[cfg(test)]
 use session::CaptureSession;
 #[cfg(test)]

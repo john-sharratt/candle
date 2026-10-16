@@ -1475,11 +1475,14 @@ impl Conversation {
         }
         // Collections (the tool catalog) live in the shared system prompt.
         let t_coll = Instant::now();
+        let coll_span = profile::span("beliefs:collections");
         scores =
             self.score_belief_collections(&schema.system_prompt, probe, probe_q, observe, arena);
+        coll_span.end();
         let coll_us = t_coll.elapsed().as_micros() as u64;
         // Belief-driven turn groups live across every layer.
         let t_groups = Instant::now();
+        let _groups_span = profile::span("beliefs:groups");
         for layer in &schema.layers {
             candidates.extend(self.score_belief_groups(
                 layer,

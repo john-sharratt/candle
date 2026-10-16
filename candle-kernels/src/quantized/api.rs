@@ -446,7 +446,10 @@ extern "C" {
     /// # Safety
     /// - src_data must be a valid device pointer to the source quantized data
     /// - dst_data must be a valid device pointer with at least get_repacked_size_bytes() bytes
-    /// - Returns 0 on success, -1 on error
+    /// - `stream` orders the repack: whatever reads `dst_data` or releases
+    ///   `src_data` afterwards must be ordered behind it there. The launch is not
+    ///   waited for.
+    /// - Returns 0 when the launch was accepted, -1 on error
     #[link_name = "run_repack_gemx"]
     pub fn run_repack_gemx(
         src_data: *const core::ffi::c_void,
@@ -454,6 +457,7 @@ extern "C" {
         nrows: i32,
         ncols: i32,
         qtype: i32,
+        stream: *mut c_void,
     ) -> i32;
 
     /// Get the size of repacked weights without actually repacking.
@@ -547,11 +551,12 @@ extern "C" {
     /// # Parameters
     /// - `buffer`: Pre-allocated device buffer (should be >= 2x L2 cache size)
     /// - `size`: Size of buffer in bytes
+    /// - `stream`: the stream the flush runs on, and is waited for
     ///
     /// # Safety
     /// - buffer must be a valid device pointer
-    /// - Synchronizes the device before returning
-    pub fn flush_l2_cache(buffer: *const c_void, size: usize);
+    /// - Synchronizes `stream` before returning
+    pub fn flush_l2_cache(buffer: *const c_void, size: usize, stream: *mut c_void);
 }
 
 // =============================================================================

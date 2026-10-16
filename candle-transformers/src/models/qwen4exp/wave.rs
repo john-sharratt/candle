@@ -2763,6 +2763,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Some(self.model.experts.expert_stats())
     }
 
+    fn expert_pipeline_dead(&self) -> bool {
+        self.model.experts.pipeline_dead()
+    }
+
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
         Some(self.model.experts.hit_counts())
     }

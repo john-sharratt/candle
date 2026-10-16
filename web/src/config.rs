@@ -82,6 +82,11 @@ pub struct Cluster {
     /// The group key's file (§13.1), resolved against this config. A file,
     /// never an inline value, like every other secret here.
     pub group_key_file: PathBuf,
+    /// The status key's file (§12), resolved against this config: a caller
+    /// presenting it reads `/gateway/status.json` without a session. Absent,
+    /// only an admin's session reads it. `web --new-status-key` writes one.
+    #[serde(default)]
+    pub status_key_file: Option<PathBuf>,
     /// This gateway's name in the coordination log; default its bind address.
     #[serde(default)]
     pub name: Option<String>,
@@ -642,6 +647,11 @@ impl Config {
             if cluster.group_key_file.is_relative() {
                 cluster.group_key_file = base.join(&cluster.group_key_file);
             }
+            if let Some(p) = &mut cluster.status_key_file {
+                if p.is_relative() {
+                    *p = base.join(&*p);
+                }
+            }
             // Peers share certificates through the ACME store, which only a
             // gateway with a TLS entrance has; its node id lives there too.
             if !cluster.peers.is_empty() && self.server.tls.is_none() {
@@ -899,6 +909,21 @@ sites:
         assert_eq!(
             (cluster.floor_grace_minutes, cluster.canary_share),
             (30, 10)
+        );
+        // No status key unless one is named; a named one resolves like the
+        // group key.
+        assert_eq!(cluster.status_key_file, None);
+        let keyed = Config::from_yaml(
+            &ok.replace(
+                "{group_key_file:",
+                "{status_key_file: \"secrets/status.key\", group_key_file:",
+            ),
+            Path::new("/srv/web"),
+        )
+        .unwrap();
+        assert_eq!(
+            keyed.cluster.unwrap().status_key_file,
+            Some(Path::new("/srv/web").join("secrets/status.key"))
         );
         let tuned = Config::from_yaml(
             &ok.replace(

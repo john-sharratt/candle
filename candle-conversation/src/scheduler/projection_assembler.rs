@@ -929,6 +929,7 @@ pub(super) fn apply_segments_build(
     // only the rest is walked. A projection whose selection moved at the end
     // costs the end, not the whole prefix (`super::piece_identity`).
     let identities = {
+        let _g = profile::span("apply:identities");
         let read = ctx.conversation.read();
         let slot_timeline = ctx.slot_target.map(|t| t.timeline);
         let mut newest: HashMap<TimelineId, Option<TurnIndex>> = HashMap::new();
@@ -1006,6 +1007,7 @@ pub(super) fn apply_segments_build(
         "apply_segments: kept prefix"
     );
     state.placed_pieces.truncate(keep);
+    let cut_span = profile::span("apply:cut_to_kept");
     let mut prefix_h = DefaultHasher::new();
     match state.placed_pieces.last() {
         None => {
@@ -1041,6 +1043,7 @@ pub(super) fn apply_segments_build(
         }
     }
     walker.kept_pieces = keep;
+    cut_span.end();
     // ── Island-cache keying: a rolling hash over the CONTENT identity of every
     // piece the walk has placed so far. A glue island's K/V is a function of its
     // own tokens, its (backward-unbounded) attended prefix, and — when its
@@ -1085,6 +1088,7 @@ pub(super) fn apply_segments_build(
         let pos_before = walker.logical_pos;
         match &pieces[i] {
             AssembledPiece::Glue(tokens) => {
+                let _g = profile::span("apply:glue_island");
                 // Causal-only dialects (DeepSeek) drop the forward bridge — glue
                 // attends backward-unbounded only (§E), matching the paged-glue
                 // kernel's `fwd_ahead ≡ 0` contract.
@@ -1222,6 +1226,7 @@ pub(super) fn apply_segments_build(
                 prefix_h.write_u32(fwd);
             }
             AssembledPiece::Section(id) => {
+                let _g = profile::span("apply:inject_section");
                 let t = std::time::Instant::now();
                 inject_sealed_section(ctx, &mut walker, *id)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
@@ -1242,6 +1247,7 @@ pub(super) fn apply_segments_build(
                 role,
                 timeline,
             } => {
+                let _g = profile::span("apply:inject_turn");
                 let t = std::time::Instant::now();
                 inject_sealed_turn(ctx, &mut walker, *timeline, *group, *index, *role)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
@@ -1342,9 +1348,11 @@ pub(super) fn apply_segments_build(
     // (a stratified QSA selection ranks it in every window). Read from the
     // placement records before an incomplete assembly clears them.
     let prompt_end = prompt_end_of(&pieces, &state.placed_pieces);
+    let prompt_span = profile::span("apply:set_selection_prompt");
     ctx.model
         .set_selection_prompt(parent_id.0, prompt_end as usize)
         .map_err(ConversationError::Model)?;
+    prompt_span.end();
 
     let complete = walker.skipped_turns == 0 && walker.skipped_sections == 0;
     // A slot missing a piece its list names does not hold what the list

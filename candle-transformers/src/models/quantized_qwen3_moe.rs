@@ -655,6 +655,12 @@ impl BatchedModelCore for ModelWeights {
         self.expert_cache.as_ref().map(|cache| cache.expert_stats())
     }
 
+    fn expert_pipeline_dead(&self) -> bool {
+        self.expert_cache
+            .as_ref()
+            .is_some_and(|cache| cache.pipeline_dead())
+    }
+
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
         self.expert_cache.as_ref().map(|cache| cache.hit_counts())
     }

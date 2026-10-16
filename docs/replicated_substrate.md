@@ -1436,14 +1436,15 @@ its sockets close, it is closed 4410, or it falls behind and stops being ready. 
 requests go to the configured upstream again. In-flight requests on the lost sockets
 fail as §5.6 says.
 
-**A loading member stands in for a down upstream.** While the app is dumb and its
-configured upstream is in its backoff window — its last attempt failed and none has
-succeeded since — a request goes to a member admitted and not yet ready, the lowest
-node first (`Registry::standing_by`), instead of the outage page. That member serves
-its own loading page and `/v1/status`, so a member replacing a retired upstream shows
-its load from the moment it joins. The status page names that state **loading** rather
-than dumb (`status::mode_name`): the app has a member, just none ready. The upstream's first failure is still answered with
-the outage page: that failure is how the gateway learns it is down.
+**While every member is loading, the gateway says it is restarting.** With members
+admitted and none ready, a request is answered by the gateway's own reconnecting page
+(`503` with `Retry-After`, `route::restarting`), which the consoles retry. It goes
+neither to the configured upstream, which is usually one of those members, nor to a
+loading member: either put that member's half-loaded startup card in front of players —
+measured 2026-10-16, with `.5` restarting and WhiteWorld stuck loading behind it,
+bot.tokera.com showed WhiteWorld's repository wait. The status page names that state
+**loading** rather than dumb (`status::mode_name`). The configured upstream serves
+only while no member is admitted at all.
 
 **The configured upstream gets nothing special in clustered mode.** It is often the
 same daemon as one of the members, for example zend on `.5`. While the app is
@@ -2439,6 +2440,13 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      learned gone) asks again, from where it then stands, before its socket is ready.
      One that brings nothing has had everything its answerer covers. So a member far
      behind catches up an answer at a time, fetching from the first.
+   - **An admission nobody answers does not hold the member.** One that goes quiet is
+     asked again; one that goes quiet twice (`tick::ADMISSION_QUIET_LIMIT`) is taken as
+     finished, and the member serves on what it holds — anything it lacks is a gap the
+     gap watch fetches once an origin announces it. On 2026-10-17 WhiteWorld's npcd,
+     ready at the gateway but with its sockets dropping every 45 s, was asked `.5`'s
+     admission again and again; `.5`'s npcd never finished loading and `keep` rolled
+     the build back after its ten minutes.
      Unbounded, an answer to a member lacking 8 million records was a thousand frames,
      about 360 MB, queued at once. That is far past what a gateway holds for one member
      (16 MiB, after which it drops catch-up frames). A requester waiting on frames that
@@ -3471,7 +3479,13 @@ says why.
 ## 12. The gateway status page
 
 `GET /gateway` serves the page and `GET /gateway/status.json` its data. Both are on
-every host, merged ahead of site routing, and admin only. tokera.com's top bar links to
+every host, merged ahead of site routing, and admin only. The data also answers a
+caller presenting the **status key** as `Authorization: Bearer <key>`: a server-side
+secret, written by `web --new-status-key <path>` and named by the `cluster:` block's
+`status_key_file`, so a script or an operator at a shell reads how the cluster stands
+without a browser session (`web/src/cluster/status_key.rs`). It reads the status and
+nothing else: the page and every command still want an admin's session, and it is its
+own key, never the group key, so it admits no member. tokera.com's top bar links to
 it as **Cluster** beside the signed-in name, for an admin or a creator only:
 `/auth/me` carries the caller's `role`, and `common/lib/auth.js` offers the link where
 the page would not be refused. The gateway resolves roles from `host/roles.yaml` itself

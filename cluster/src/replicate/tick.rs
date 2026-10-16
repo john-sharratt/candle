@@ -24,6 +24,35 @@ const SECOND: Duration = Duration::from_secs(1);
 /// A catch-up whose answerer has said nothing for this long is asked again.
 pub const QUIET: Duration = Duration::from_secs(30);
 
+/// Unanswered admission catch-ups after which a socket is taken as caught up.
+///
+/// **One stuck member must not keep another from serving.** The answerer is
+/// another member, and a member whose own sends stall answers nothing: on
+/// 2026-10-17 WhiteWorld's npcd, ready at the gateway but with its sockets
+/// dropping every 45 s, was asked `.5`'s admission catch-up again and again,
+/// and `.5`'s npcd never finished loading — so `keep` rolled the build back
+/// after its ten minutes. Past this many quiet asks the member serves on what
+/// it holds: anything it lacks is a gap the gap watch fetches once an origin
+/// announces it, from whichever member can answer.
+pub const ADMISSION_QUIET_LIMIT: u32 = 2;
+
+/// What an admission catch-up that went quiet does next, given how many times
+/// it already had: ask again, or stop asking and serve.
+pub fn after_quiet_admission(quiet_before: u32) -> QuietAdmission {
+    if quiet_before + 1 >= ADMISSION_QUIET_LIMIT {
+        QuietAdmission::Serve
+    } else {
+        QuietAdmission::AskAgain
+    }
+}
+
+/// See [`after_quiet_admission`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuietAdmission {
+    AskAgain,
+    Serve,
+}
+
 impl Replicator {
     pub(super) async fn ticker(self: Arc<Self>) {
         let mut tick = interval(TICK);
@@ -124,13 +153,40 @@ impl Replicator {
             self.start_catchup(c, Purpose::Periodic, None);
         }
         for (_, c, purpose) in quiet {
-            tracing::warn!(
-                node = self.node,
-                cluster = c,
-                "a catch-up went quiet: asking again"
-            );
-            if purpose == Purpose::Admission {
-                self.start_catchup(c, Purpose::Admission, None);
+            if purpose != Purpose::Admission {
+                tracing::warn!(
+                    node = self.node,
+                    cluster = c,
+                    "a catch-up went quiet; dropped, the gap watch asks again"
+                );
+                continue;
+            }
+            let quiet_before = {
+                let mut s = self.state();
+                let n = s.admission_quiet[c];
+                s.admission_quiet[c] = n + 1;
+                n
+            };
+            match after_quiet_admission(quiet_before) {
+                QuietAdmission::AskAgain => {
+                    tracing::warn!(
+                        node = self.node,
+                        cluster = c,
+                        "an admission catch-up went quiet: asking again"
+                    );
+                    self.start_catchup(c, Purpose::Admission, None);
+                }
+                QuietAdmission::Serve => {
+                    tracing::warn!(
+                        node = self.node,
+                        cluster = c,
+                        asks = quiet_before + 1,
+                        "an admission catch-up went unanswered {} times: serving on what this \
+                         member holds; what it lacks arrives as gaps",
+                        quiet_before + 1
+                    );
+                    self.finished(Purpose::Admission, c).await;
+                }
             }
         }
     }
@@ -155,5 +211,20 @@ impl Replicator {
             node = self.node,
             "cut off from every cluster: writing detached"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{after_quiet_admission, QuietAdmission, ADMISSION_QUIET_LIMIT};
+
+    /// The first quiet admission is asked again; the one that reaches the
+    /// limit serves.
+    #[test]
+    fn a_quiet_admission_is_asked_again_then_served() {
+        assert_eq!(ADMISSION_QUIET_LIMIT, 2);
+        assert_eq!(after_quiet_admission(0), QuietAdmission::AskAgain);
+        assert_eq!(after_quiet_admission(1), QuietAdmission::Serve);
+        assert_eq!(after_quiet_admission(7), QuietAdmission::Serve);
     }
 }

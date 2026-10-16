@@ -198,6 +198,7 @@ async fn ask(session: &ZendSession, conv_id: &str, question: &str, selection: &S
             | StreamItem::Prefill { .. }
             | StreamItem::Think { .. }
             | StreamItem::TurnEnd { .. } => {}
+            StreamItem::Error(e) => panic!("{conv_id}: {question:?}: the turn failed: {e}"),
         }
     }
 }

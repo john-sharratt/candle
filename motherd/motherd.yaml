@@ -30,6 +30,10 @@ host:
   cluster_name: tokera.com
   group_key: web/secrets/group.key
   agent: motherd/agent.yaml
+  # DEBUG for every tenant and engine crate (`candle_nn` at INFO): the
+  # per-reprojection timings and the scheduler's other per-event detail are
+  # logged there, and a slow conversation cannot be diagnosed without them.
+  verbose: 1
 
 # zend: the workspace folder holding `workspace.yaml`, and its `substrate/`. A
 # substrate is bound to the model that wrote it, so one written under another

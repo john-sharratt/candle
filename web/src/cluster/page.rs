@@ -110,13 +110,23 @@ struct LogQuery {
     log: Option<usize>,
 }
 
+/// The gateway's status, as the page reads it: an admin's, or a caller's that
+/// presents the status key (`status_key.rs`) — how a script or an operator
+/// without a browser session reads how the cluster stands.
 async fn status(
     State(s): State<PageState>,
     headers: HeaderMap,
     Query(q): Query<LogQuery>,
 ) -> Response {
-    if let Err(refused) = admin(&s, &headers) {
-        return *refused;
+    let keyed = s
+        .gateway
+        .status_key
+        .as_ref()
+        .is_some_and(|k| k.presented(&headers));
+    if !keyed {
+        if let Err(refused) = admin(&s, &headers) {
+            return *refused;
+        }
     }
     let mut status = match serde_json::to_value(s.gateway.hub.status(q.log.unwrap_or(LOG_LIMIT))) {
         Ok(v) => v,

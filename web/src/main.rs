@@ -17,6 +17,7 @@ use cluster::handshake::GroupKey;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
+use web::cluster::status_key::StatusKey;
 use web::log_file::RotatingFileLog;
 use web::{Builder, Config};
 
@@ -50,6 +51,13 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     new_group_key: Option<PathBuf>,
 
+    /// Write a fresh status key to this file, which must not exist, then exit
+    /// (`docs/replicated_substrate.md` §12). Name it in the `cluster:` block's
+    /// `status_key_file`, and present its contents as `Authorization: Bearer
+    /// <key>` to read `/gateway/status.json` without a session.
+    #[arg(long, value_name = "PATH")]
+    new_status_key: Option<PathBuf>,
+
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
@@ -57,10 +65,13 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // The `cluster` crate runs the gateway's hub, sessions and relays: its
+    // warnings — a member's writer stalled, a socket ended and why — are the
+    // gateway's own, and a filter naming `web` alone dropped every one of them.
     let level = match cli.verbose {
-        0 => "web=info",
-        1 => "web=debug",
-        _ => "web=trace",
+        0 => "web=info,cluster=info",
+        1 => "web=debug,cluster=debug",
+        _ => "web=trace,cluster=trace",
     };
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into());
     let stdout = tracing_subscriber::fmt::layer()
@@ -71,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
     // keeps no record of a failed request at all. A `--check` or a key write
     // opens no file — opening truncates it, and the gateway serving beside
     // the check would lose its log. An unopenable file degrades to stdout.
-    let serving = !cli.check && cli.new_group_key.is_none();
+    let serving = !cli.check && cli.new_group_key.is_none() && cli.new_status_key.is_none();
     let log_dir = cli
         .config
         .parent()
@@ -96,6 +107,15 @@ async fn main() -> anyhow::Result<()> {
         GroupKey::create(path)?;
         println!(
             "wrote a new group key to {}: copy it to every gateway and member",
+            path.display()
+        );
+        return Ok(());
+    }
+    if let Some(path) = &cli.new_status_key {
+        StatusKey::create(path)?;
+        println!(
+            "wrote a new status key to {}: name it as the `cluster:` block's status_key_file, \
+             and send its contents as `Authorization: Bearer <key>`",
             path.display()
         );
         return Ok(());

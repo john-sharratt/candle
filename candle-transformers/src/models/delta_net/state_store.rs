@@ -1384,6 +1384,8 @@ fn f32_le_bytes(v: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cuda")]
+    use crate::models::gpu_test_lock::gpu_serial;
 
     /// The wire bytes are each float's IEEE-754 little-endian image, in order.
     #[test]
@@ -2009,6 +2011,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn a_cuda_reset_zeroes_in_place_without_a_new_claim() -> Result<()> {
+        let _gpu = gpu_serial();
         let dev = Device::new_cuda(0)?;
         let mut store = filled_store_on(&dev);
         let before: Vec<[u64; 4]> = store.decode_table_addresses()?.collect();
@@ -2026,6 +2029,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn a_cuda_export_is_byte_identical_to_the_cpu_one() -> Result<()> {
+        let _gpu = gpu_serial();
         let cuda = filled_store_on(&Device::new_cuda(0)?).export()?;
         let cpu = filled_store().export()?;
         assert_eq!(cuda, cpu);
@@ -2037,20 +2041,30 @@ mod tests {
 
     /// **A released readback buffer unpins exactly what the seal pinned.** The
     /// fixture's three recurrent layers each read back 256 bytes of state and
-    /// 256 of conv tail, so one export pins 1,536 bytes of staging; releasing it
-    /// returns the process to where it stood — what an engine's shutdown relies
-    /// on to leave no pinned memory behind.
+    /// 256 of conv tail, so one export pins a 1,536-byte owned staging buffer;
+    /// releasing it empties the slot, and an owned buffer unpins on drop — what
+    /// an engine's shutdown relies on to leave no pinned memory behind.
+    ///
+    /// Read from the slot, not from the process's pinned-staging total: every
+    /// test that stages moves that total, and they run in parallel.
     #[cfg(feature = "cuda")]
     #[test]
     fn releasing_the_seal_readback_unpins_it() -> Result<()> {
-        use candle::vram::{host_pinned_bytes_for, PinnedUse};
+        let _gpu = gpu_serial();
+        let held = || {
+            READBACK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|b| (matches!(b, PinnedBuf::Owned { .. }), b.len()))
+        };
         let store = filled_store_on(&Device::new_cuda(0)?);
         release_seal_readback();
-        let before = host_pinned_bytes_for(PinnedUse::Staging);
+        assert_eq!(held(), None);
         store.export()?;
-        assert_eq!(host_pinned_bytes_for(PinnedUse::Staging), before + 1_536);
+        assert_eq!(held(), Some((true, 1_536)), "one owned, pinned buffer");
         release_seal_readback();
-        assert_eq!(host_pinned_bytes_for(PinnedUse::Staging), before);
+        assert_eq!(held(), None, "the release dropped it");
         // The next seal allocates it afresh and reads the same bytes.
         assert_eq!(store.export()?, filled_store().export()?);
         release_seal_readback();
@@ -2078,6 +2092,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn decode_addresses_are_the_halves_and_follow_a_commit() -> Result<()> {
+        let _gpu = gpu_serial();
         let dev = Device::new_cuda(0)?;
         let Device::Cuda(cuda) = &dev else {
             unreachable!("new_cuda answered a CUDA device")

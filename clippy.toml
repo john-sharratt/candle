@@ -1,0 +1,27 @@
+# Operations the CUDA driver refuses while any stream of the context captures a
+# graph. Refused, they invalidate the capture on whichever thread is recording —
+# a wave lost mid-segment, and the expert pipeline aborting behind it. Each is a
+# method on `candle::cuda_backend::graph::Quiet`, which only the record gate
+# (`try_without_recording`, `without_recording`) can make; issue them through
+# it. `graph/device_wide.rs` is the one module allowed the raw calls.
+#
+# And beginning a capture: the gate can only keep these operations away from
+# captures it has counted, so every capture begins through
+# `cuda_backend::graph::capture::begin`, the one module allowed the raw call.
+disallowed-methods = [
+    { path = "cudarc::driver::result::stream::begin_capture", reason = "a capture the record gate has not counted is one its gated synchronises walk into: begin it with `cuda_backend::graph::capture::begin`" },
+    { path = "cudarc::driver::CudaStream::begin_capture", reason = "a capture the record gate has not counted is one its gated synchronises walk into: begin it with `cuda_backend::graph::capture::begin`" },
+    { path = "cudarc::driver::sys::cuStreamBeginCapture_v2", reason = "a capture the record gate has not counted is one its gated synchronises walk into: begin it with `cuda_backend::graph::capture::begin`" },
+    { path = "cudarc::driver::CudaContext::synchronize", reason = "a context-wide synchronise invalidates any capture in flight: take a `Quiet` from the record gate and call `Quiet::synchronize_context`" },
+    { path = "cudarc::driver::result::ctx::synchronize", reason = "a context-wide synchronise invalidates any capture in flight: take a `Quiet` from the record gate and call `Quiet::synchronize_context`" },
+    { path = "cudarc::driver::sys::cuCtxSynchronize", reason = "a context-wide synchronise invalidates any capture in flight: take a `Quiet` from the record gate and call `Quiet::synchronize_context`" },
+    { path = "cudarc::cublas::CudaBlas::new", reason = "creating a cuBLAS handle synchronises the context and invalidates any capture in flight: use `CudaDevice::cublas`, this thread's handle, made once through the record gate" },
+    { path = "cudarc::cublas::result::create_handle", reason = "creating a cuBLAS handle synchronises the context and invalidates any capture in flight: use `CudaDevice::cublas`, this thread's handle, made once through the record gate" },
+    { path = "cudarc::cublas::sys::cublasCreate_v2", reason = "creating a cuBLAS handle synchronises the context and invalidates any capture in flight: use `CudaDevice::cublas`, this thread's handle, made once through the record gate" },
+    { path = "cudarc::driver::CudaContext::load_module", reason = "a module load can synchronise the context and invalidate any capture in flight: take a `Quiet` from the record gate and call `Quiet::load_module`" },
+    { path = "cudarc::driver::result::module::load_data", reason = "a module load can synchronise the context and invalidate any capture in flight: take a `Quiet` from the record gate and call `Quiet::load_module`" },
+    { path = "cudarc::driver::sys::cuModuleLoad", reason = "a module load can synchronise the context and invalidate any capture in flight: take a `Quiet` from the record gate and call `Quiet::load_module`" },
+    { path = "cudarc::driver::sys::cuModuleLoadData", reason = "a module load can synchronise the context and invalidate any capture in flight: take a `Quiet` from the record gate and call `Quiet::load_module`" },
+    { path = "cudarc::driver::sys::cuModuleLoadDataEx", reason = "a module load can synchronise the context and invalidate any capture in flight: take a `Quiet` from the record gate and call `Quiet::load_module`" },
+    { path = "cudarc::driver::sys::cuModuleLoadFatBinary", reason = "a module load can synchronise the context and invalidate any capture in flight: take a `Quiet` from the record gate and call `Quiet::load_module`" },
+]

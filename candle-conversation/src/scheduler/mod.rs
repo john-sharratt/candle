@@ -46,6 +46,7 @@ pub(crate) mod kv_zero_check;
 pub mod memory_report;
 mod named_tool;
 mod norm_warm;
+mod paused_creep;
 pub mod phase_ring;
 mod phase_split;
 mod piece_identity;
@@ -77,6 +78,7 @@ use phase_split::cobatched_shares;
 use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 
+use self::paused_creep::PausedCreep;
 use self::phase_ring::ProjectedKind;
 use self::vram_bands::VramBands;
 use self::wave_timing::WaveTiming;
@@ -3607,17 +3609,38 @@ pub(crate) struct Scheduler {
     /// the held residual only lines up if the input order is identical. Fixed at
     /// formation — new prefills / sections wait for the next group.
     wave_prefill_members: Vec<WaveMember>,
+    /// The rows each of [`Self::wave_prefill_members`] holds in
+    /// [`Self::wave_prefill_residual`], aligned with it: member `k`'s rows follow
+    /// members `0..k`'s. What lets a member leave mid-sweep without the sweep
+    /// being abandoned ([`Self::drop_wave_members`]).
+    wave_prefill_rows: Vec<usize>,
+    /// A creep set aside mid-sweep for a higher band's prompt, resumed at the
+    /// same layer once nothing above its band waits (`paused_creep`).
+    paused_creep: Option<PausedCreep>,
+    /// Consecutive failures of the creep's current mid-sweep window, retried in
+    /// place up to `prefill::MID_SWEEP_RETRIES`.
+    wave_sweep_failures: u32,
     /// The prefill cohort may not advance on this wave step: it already did, or
     /// decode is still owed airtime for the last step that carried it
     /// ([`Self::creep_owed`]). Set per decode step, so the cohort advances its
     /// budget of layers on every step its airtime allows — a wave is one sweep.
     wave_cohort_advanced: bool,
     /// Decode-only airtime still owed before the creep, or a section chunk, may
-    /// ride a decode step again: a co-batched step of length `d` at airtime
-    /// ratio `R` owes `d / R`, paid down by each decode-only step. Kept across
-    /// quanta, so the creep rides as often as its ratio allows, not once per
-    /// quantum.
+    /// ride a decode step again: a co-batched step owes its creep's share — its
+    /// length less [`Self::decode_only_step`] — times the airtime ratio `R`,
+    /// paid down by each decode-only step. Kept across quanta, so the creep
+    /// rides as often as its ratio allows, not once per quantum.
     creep_owed: Duration,
+    /// What a decode-only step takes now — an average over the recent ones, so
+    /// it follows the decode width and depth. `None` until one has run.
+    decode_only_step: Option<Duration>,
+    /// What a `High` creep beside a `High` decode owes in token-layers (one row
+    /// through one layer): each step it rides adds its rows times its layers,
+    /// each decode token that lands pays off
+    /// `prefill::SAME_BAND_PREFILL_PER_DECODE` tokens through every layer, and
+    /// it rides only while this is not positive. Negative is credit, at most
+    /// one step's earnings. Zero whenever the creep is not paced.
+    same_band_debt: i64,
     /// Consecutive failures of the decode-less wave step and the wait owed
     /// before the next — see `wave_retry`.
     wave_retry: wave_retry::WaveRetry,
@@ -3629,9 +3652,15 @@ pub(crate) struct Scheduler {
     /// decode step from one that also paid for ingest.
     wave_cobatched: bool,
     /// The airtime ratio `R` the last wave step's co-batched work yielded to —
-    /// the ratio of the decodes that outrank it, 1 when none does. Decode is
+    /// the ratio of the decodes that outrank it (and, for `High` work, of the
+    /// `High` decodes), 1 when there are none. Decode is
     /// owed that share of a co-batched step ([`Self::creep_owed`]).
     wave_step_ratio: u32,
+    /// The last wave step's creep was a `High` creep beside a `High` decode,
+    /// paced in tokens ([`Self::same_band_debt`]) rather than in airtime: it
+    /// owes no [`Self::creep_owed`], or a dialogue's tool result would wait out
+    /// `R` times its own airtime behind another dialogue's decode.
+    wave_step_token_paced: bool,
     /// Set once per wave after the co-batched decode wave folded the active
     /// section-ingest chunk into its full sweep (section rides decode's `[0, N)`
     /// as a prefill-group member — one shared MoE grouped GEMM per layer serves
@@ -3922,12 +3951,18 @@ impl Scheduler {
             wave_prefill_residual: None,
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
+            wave_prefill_rows: Vec::new(),
+            paused_creep: None,
+            wave_sweep_failures: 0,
             wave_cohort_advanced: false,
             creep_owed: Duration::ZERO,
+            decode_only_step: None,
+            same_band_debt: 0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),
             wave_cobatched: false,
             wave_step_ratio: 1,
+            wave_step_token_paced: false,
             wave_section_advanced: false,
             shutdown_requested: false,
             section_name_cache: HashMap::new(),
@@ -6825,19 +6860,36 @@ impl Scheduler {
         self.settled_since_admit = true;
         // The held wave cohort's residual is indexed by member POSITION, so a
         // member vanishing mid-cohort would desync every later member's slice
-        // against the residual (the exact reason the cohort is otherwise held
-        // stable). If the freed slot was a member, abandon the whole cohort — the
-        // survivors re-form a fresh group next wave, re-prefilling their partial
-        // progress. Fires only under teardown churn; a normally-completing turn
-        // frees its slot after its prefill has already drained out of the cohort,
-        // so `was_member` is false and the held cohort is untouched.
-        let was_member = self.wave_prefill_members.iter().any(|m| match m {
-            WaveMember::Prefill { seq_id, .. } | WaveMember::Section { seq_id, .. } => {
-                *seq_id == id.0
+        // against the residual. Its rows are taken out instead, here — before
+        // the id can be reissued to a slot whose prefill would otherwise be
+        // matched to the old member — and the survivors carry on from the
+        // layer they reached (`drop_wave_members`). Fires only under teardown
+        // churn; a normally-completing turn frees its slot after its prefill has
+        // already drained out of the cohort.
+        let keep: Vec<bool> = self
+            .wave_prefill_members
+            .iter()
+            .map(|m| m.seq_id() != id.0)
+            .collect();
+        if let Err(e) = self.drop_paused_member(id.0) {
+            tracing::error!(
+                slot = %id,
+                error = %e,
+                "could not take a freed member out of the paused creep; failing its \
+                 members rather than replaying layers they already ran"
+            );
+            self.fail_paused_creep(&e.to_string());
+        }
+        if keep.contains(&false) {
+            if let Err(e) = self.drop_wave_members(&keep) {
+                tracing::error!(
+                    slot = %id,
+                    error = %e,
+                    "could not take a freed member out of the creep in flight; failing \
+                     the creep's members rather than replaying layers they already ran"
+                );
+                self.fail_wave_members(&e.to_string());
             }
-        });
-        if was_member {
-            self.reset_wave_prefill();
         }
     }
 
@@ -10787,10 +10839,13 @@ impl Scheduler {
         // never yank a residence the current wave is using — the fix for the
         // multi-timeline belief scan reaching completed-file (evicted) turns.
         // See `Substrate::working_set_pins`.
+        let pins_span = profile::span("elevate:publish_pins");
         self.publish_working_set_pins(conversation, sections, turns);
+        pins_span.end();
         if sections.is_empty() && turns.is_empty() {
             return;
         }
+        let tier_span = profile::span("elevate:tier_check");
         // PER-ITEM SKIP: only lift the units NOT already hot. A unit already hot
         // needs no work — and the machinery below (`snapshot_promotion_state`, run
         // twice, + a `backings` clone) costs ~100 ms/turn for a fixed system prompt
@@ -10854,6 +10909,7 @@ impl Scheduler {
             }
             (sl, tl)
         };
+        tier_span.end();
         // Everything already hot → nothing to evict or lift.
         if secs_lift.is_empty() && turns_lift.is_empty() {
             return;
@@ -10868,7 +10924,9 @@ impl Scheduler {
             _ => panic!("scheduler: requires a CUDA device"),
         };
         // Keep-list = FULL working set (protect the already-hot units too).
+        let evict_span = profile::span("elevate:evict_to_fit");
         let evicted = self.evict_to_fit_incoming(conversation, sections, turns);
+        evict_span.end();
         if evicted.count > 0 {
             tracing::trace!(
                 target: "candle_conversation::persistence::tier",
@@ -10877,6 +10935,7 @@ impl Scheduler {
             );
         }
         // Lift only the non-hot subset; already-hot units are left untouched.
+        let _lift_span = profile::span("elevate:lift");
         match elevate_to_hot(
             conversation,
             &backings,
@@ -11083,6 +11142,7 @@ impl Scheduler {
         //    most recent turn chunks. A gather covering no real tokens means
         //    nothing to score.
         let t_probe = Instant::now();
+        let probe_span = profile::span("reproject:probe");
         let mut probe = Vec::new();
         if tail_lo > turn_start_chunk {
             let head_hi = (turn_start_chunk + QUERY_HEAD_CHUNKS).min(tail_lo);
@@ -11106,6 +11166,7 @@ impl Scheduler {
             q.truncate(q_tokens);
             q
         };
+        probe_span.end();
         let probe_ms = t_probe.elapsed().as_millis() as u64;
         record_phase(t_probe, "reproject_probe_extract");
         REPROJ_SCAN_US.fetch_add(
@@ -11121,8 +11182,11 @@ impl Scheduler {
         //    `group_candidates` carries each turn group's freshly-scored turns for
         //    the turn-boundary challenger below.
         let t_scan = Instant::now();
+        let warm_span = profile::span("reproject:queue_norm_warm");
         self.queue_norm_warm(&policy.substrate, &policy.projection, policy.target);
+        warm_span.end();
         let schema = policy.projection.schema();
+        let scan_span = profile::span("reproject:score_beliefs");
         // observe = false: a live reprojection only READS the normalization hit
         // levels; learning happens once per turn at seal (last_turn_belief_scores).
         // The hot reproject path scans on the GPU (paged segmented BDP over the
@@ -11141,12 +11205,15 @@ impl Scheduler {
             Observe::No,
             self.gallery_arena.as_deref(),
         );
+        scan_span.end();
         // The same fresh scores feed the dialogue's working-set momentum — once
         // per reprojection, the cadence the momentum's leak is defined over
         // (`docs/zend_working_set.md` §4.3).
+        let observe_span = profile::span("reproject:observe_working_set");
         policy
             .substrate
             .observe_working_set(schema, policy.target, &group_candidates);
+        observe_span.end();
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");
@@ -11235,6 +11302,7 @@ impl Scheduler {
         //    sealed substrate entries make the cut.  These two lists
         //    drive the zero-copy rebuild in step 6.
         let t_project = Instant::now();
+        let project_span = profile::span("reproject:project");
         let parent_id = view_state.parent_id;
         let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
         let (projected_sections, projected_segments, composition) = {
@@ -11336,6 +11404,7 @@ impl Scheduler {
             );
             (sections, segments, composition)
         };
+        project_span.end();
         let project_ms = t_project.elapsed().as_millis() as u64;
         record_phase(t_project, "reproject_project");
         REPROJ_LAYOUT_US.fetch_add(
@@ -11354,6 +11423,7 @@ impl Scheduler {
         // from a segment list with the same identity and placed all of it:
         // rebuilding would reproduce it exactly, at ~190 ms a time.
         let identity = {
+            let _g = profile::span("reproject:identity");
             let read = policy.substrate.read();
             segments_identity(&projected_segments, |id| {
                 section_content_stamp(&read.section_tokens_of(id))
@@ -11458,6 +11528,7 @@ impl Scheduler {
         // user message" symptom that derails generation past the
         // first reproject.
         let tail_per_layer = {
+            let _g = profile::span("reproject:snapshot_tail");
             // Reconcile a windowed creep's per-layer skew before this snapshot
             // — see `perform_seal_and_write` and
             // `BatchedInferenceSession::reconcile_block_counts`. This capture
@@ -11532,6 +11603,7 @@ impl Scheduler {
         // discarded, never dropped unannounced (`reproject_abandon.rs`). Until
         // the free below, the view's slot is still held.
         let turn_tokens = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
+        let seal_span = profile::span("reproject:seal_tail_index");
         let tail_index_page = or_abandon!(
             self,
             view_id,
@@ -11542,6 +11614,8 @@ impl Scheduler {
                 .seal_positional_tail_span(view_id.0, turn_tokens)
                 .map_err(ConversationError::Model)
         );
+        seal_span.end();
+        let free_span = profile::span("reproject:move_free_truncate");
         // Ordering: move before the free, or there is nothing left to read.
         // The move already removes the view's entry, so the release below is
         // just the general per-sequence cleanup.
@@ -11600,6 +11674,7 @@ impl Scheduler {
         if let Some(toks) = self.slot_tokens.get_mut(&parent_id) {
             toks.clear();
         }
+        free_span.end();
         // The pure swap work (tail snapshot + free + truncate) ends here —
         // captured disjoint from elevate/glue/complete so `swap_ms` reflects
         // only the chunk-pool rebalance, not the whole reproject.
@@ -11614,17 +11689,20 @@ impl Scheduler {
         // turning the per-unit `ensure_*_hot` calls inside `apply_projection` into
         // hot-hit no-ops — see `elevate_projection_working_set`.
         let t_elevate = Instant::now();
+        let elevate_span = profile::span("reproject:elevate");
         self.elevate_projection_working_set(
             &policy.substrate,
             &projected_sections,
             &turn_keys_for_elevate,
             "reproject",
         );
+        elevate_span.end();
         let elevate_ms = t_elevate.elapsed().as_millis() as u64;
 
         // Time the per-slot apply work (segment build now + finish later),
         // EXCLUDING the shared gap-fill wave — that wait is reported as `glue_ms`.
         let t_build = Instant::now();
+        let _build_span = profile::span("reproject:apply_build");
         // Build the gap-fill descriptor + inject the sealed prefix, but DON'T
         // fire the forward — the caller batches it across conversations.
         let plan = or_abandon!(
@@ -11727,6 +11805,7 @@ impl Scheduler {
         // so every exit goes through `or_abandon!` (`reproject_abandon.rs`).
         // The old view's slot was freed in prepare.
         let t_finish = Instant::now();
+        let finish_span = profile::span("reproject:apply_finish");
         let applied_identity = plan.complete.then_some(identity);
         or_abandon!(
             self,
@@ -11767,6 +11846,7 @@ impl Scheduler {
                 })
         );
         self.begin_unit(parent_id, "reprojected turn");
+        finish_span.end();
         // apply_ms = this slot's segment build + finish, NOT the shared gap-fill
         // wave (reported separately as glue_ms), so it no longer absorbs the
         // cross-slot wave wait.
@@ -11782,6 +11862,7 @@ impl Scheduler {
         // Append the captured tail to parent (metadata-only Arc clone).
         let tail_token_count: usize = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
         let t_inject = Instant::now();
+        let inject_span = profile::span("reproject:inject_tail");
         if tail_token_count > 0 {
             let placed = or_abandon!(
                 self,
@@ -11876,6 +11957,7 @@ impl Scheduler {
             );
         }
 
+        inject_span.end();
         let inject_ms = t_inject.elapsed().as_millis() as u64;
 
         // Carve a fresh view from the rebuilt parent.  Empty
@@ -11887,6 +11969,7 @@ impl Scheduler {
             vec![BlockRange::new(0, parent_block_count)]
         };
         let t_view = Instant::now();
+        let view_span = profile::span("reproject:create_view");
         let (new_view_id, new_borrowed) = or_abandon!(
             self,
             view_id,
@@ -11895,6 +11978,7 @@ impl Scheduler {
             false,
             self.create_view(parent_id, &effective_ranges)
         );
+        view_span.end();
         let view_ms = t_view.elapsed().as_millis() as u64;
         // Diagnostic log: the new view's slot index may have been
         // recycled from the freed old view's slot; drop any stale

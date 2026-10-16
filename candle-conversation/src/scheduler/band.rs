@@ -4,7 +4,8 @@
 //! is `High`, the ingest layers `Low`. Bands share the device rather than take
 //! turns with it (`docs/continuous_fair_waves.md` §3): every band's decode rows
 //! ride every forward, and a band's prefill creeps at the airtime ratio of the
-//! decodes that outrank it. Nothing is held out of a forward for its band.
+//! decodes that outrank it — and a `High` prefill, beside a `High` decode, is
+//! paced in tokens. Nothing is held out of a forward for its band.
 //!
 //! Tenants are equal: the band alone ranks, whichever tenant the work belongs
 //! to (`docs/shared_model_host.md` §3.6).

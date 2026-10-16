@@ -1127,6 +1127,11 @@ impl Hub {
         self.state().registry.clustered(app)
     }
 
+    /// Whether any member of `app` is admitted here, ready or not.
+    pub fn admitted(&self, app: &str) -> bool {
+        !self.state().registry.members(app).is_empty()
+    }
+
     pub fn member(&self, app: &str, node: u64) -> Option<MemberView> {
         self.state().registry.member(app, node).cloned()
     }

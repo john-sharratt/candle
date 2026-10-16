@@ -1,8 +1,8 @@
+use super::thread_blas::{self, BlasHandle, BLAS_WORKSPACE_BYTES};
 use crate::backend::BackendDevice;
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use cudarc;
 use cudarc::cublas::sys::cublasStatus_t;
-use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtrMut, DeviceRepr, HostSlice,
@@ -14,11 +14,13 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::graph::{enter_wave, CaptureHub, CaptureStats, Paused, WaveCapture};
+use super::graph::{enter_wave, without_recording, CaptureHub, CaptureStats, Paused, WaveCapture};
 use super::held::Held;
 use super::info_ring::InfoRing;
 use super::kernel_scratch;
+use super::module_loading;
 use super::staged::{pack_segments, SEGMENT_ALIGN};
+use super::sync_watch;
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
 use crate::cuda_backend::{alloc_inheriting, Backing};
 use crate::forbidden_alloc;
@@ -65,10 +67,6 @@ pub struct CudaDevice {
     context: Arc<cudarc::driver::CudaContext>,
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<CudaStream>,
-    pub(crate) blas: Arc<CudaBlas>,
-    /// The fixed workspace `blas` runs in — see [`new_blas`]. Held beside the
-    /// handle for as long as the handle exists.
-    blas_workspace: Arc<Held<u8>>,
     curand: Arc<Mutex<CudaRng>>,
     /// Memoized device copies of small layout/info tables (dims+strides blobs the
     /// strided kernels read), carved from one ring. See [`Self::info_table`].
@@ -93,37 +91,6 @@ pub struct CudaDevice {
     /// The wave capture shared by every clone of this handle — see
     /// [`Self::begin_wave_capture`]. Per stream, like the caches above.
     capture: Arc<CaptureHub>,
-}
-
-/// Bytes of the workspace every cuBLAS handle is given — NVIDIA's
-/// recommendation for this generation of card, and ample for the GEMMs and
-/// batched solves this backend issues.
-const BLAS_WORKSPACE_BYTES: usize = 4 << 20;
-
-/// A cuBLAS handle on `stream` with a workspace of its own.
-///
-/// Without one, cuBLAS allocates its workspace on the stream per call, which
-/// a wave capture records as a graph allocation and refuses; with one, a GEMM
-/// is kernels only, recorded or not.
-fn new_blas(stream: &Arc<CudaStream>) -> Result<(Arc<CudaBlas>, Arc<Held<u8>>)> {
-    let blas = CudaBlas::new(stream.clone()).w()?;
-    // SAFETY: cuBLAS writes its workspace before reading it.
-    let mut workspace = unsafe { Held::<u8>::alloc_on(stream, BLAS_WORKSPACE_BYTES) }?;
-    let (ptr, _g) = workspace.device_ptr_mut(stream);
-    // SAFETY: a live handle and a device buffer of the stated size that the
-    // returned pair keeps alive beside it.
-    let status = unsafe {
-        cudarc::cublas::sys::cublasSetWorkspace_v2(
-            *blas.handle(),
-            ptr as *mut std::ffi::c_void,
-            BLAS_WORKSPACE_BYTES,
-        )
-    };
-    drop(_g);
-    if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        crate::bail!("cublasSetWorkspace failed: {status:?}");
-    }
-    Ok((Arc::new(blas), Arc::new(workspace)))
 }
 
 /// One grow-only byte buffer, reused by every call that stages through it —
@@ -561,7 +528,7 @@ impl CudaDevice {
             // The pool hands the bytes out in this handle's stream order, and
             // `stream` may be another one: wait for the allocation to retire
             // before a copy on `stream` writes it. Growth only.
-            self.stream.synchronize().w()?;
+            sync_watch::synchronize(&self.stream).w()?;
         }
         let buf = slot.as_mut().expect("sized above");
         if !bytes.is_empty() {
@@ -572,7 +539,7 @@ impl CudaDevice {
         let base = buf.device_ptr(stream).0;
         let addrs: Vec<u64> = offsets.iter().map(|&o| base + o as u64).collect();
         let out = f(&addrs, base + room_at as u64);
-        stream.synchronize().w()?;
+        sync_watch::synchronize(stream).w()?;
         out
     }
 
@@ -889,18 +856,29 @@ impl CudaDevice {
     ///
     /// Re-bound on every call, because the stream a launch belongs on depends
     /// on whether this thread is recording a wave.
-    pub fn cublas(&self) -> Result<&CudaBlas> {
+    ///
+    /// The handle is this **thread's** ([`thread_blas`]): one per thread, made
+    /// the first time the thread asks. A thread asking for its first one while
+    /// it records a wave has the recording paused around the creation, which
+    /// would otherwise end its own capture.
+    pub fn cublas(&self) -> Result<BlasHandle> {
+        let handle = if thread_blas::has_handle(&self.stream) {
+            thread_blas::handle_for(&self.stream)?
+        } else {
+            let _eager = self.pause_capture()?;
+            thread_blas::handle_for(&self.stream)?
+        };
         let stream = self.cuda_stream();
-        // SAFETY: a live handle of this device and a stream of its context.
-        unsafe { cudarc::cublas::result::set_stream(*self.blas.handle(), stream.cu_stream() as _) }
+        // SAFETY: a live handle of this thread and a stream of its context.
+        unsafe { cudarc::cublas::result::set_stream(*handle.handle(), stream.cu_stream() as _) }
             .w()?;
         // Setting the stream hands the handle back to cuBLAS's own workspace
         // pool, which allocates on the stream; give it its fixed one again.
-        let (ptr, _g) = self.blas_workspace.device_ptr(&self.stream);
+        let ptr = handle.thread_blas().workspace_ptr(&self.stream);
         // SAFETY: the handle's own workspace, alive as long as the handle.
         let status = unsafe {
             cudarc::cublas::sys::cublasSetWorkspace_v2(
-                *self.blas.handle(),
+                *handle.handle(),
                 ptr as *mut std::ffi::c_void,
                 BLAS_WORKSPACE_BYTES,
             )
@@ -908,7 +886,7 @@ impl CudaDevice {
         if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             crate::bail!("cublasSetWorkspace failed: {status:?}");
         }
-        Ok(&self.blas)
+        Ok(handle)
     }
 
     /// Returns the underlying CUDA context.
@@ -951,20 +929,7 @@ impl CudaDevice {
             ..Default::default()
         };
         let ptx = cudarc::nvrtc::safe::compile_ptx_with_opts(cuda_code, opts).w()?;
-        let module = match self.context.load_module(ptx.clone()) {
-            Ok(module) => module,
-            // A driver older than the installed toolkit refuses the toolkit's
-            // PTX ISA at JIT time. The AOT kernels never hit this — they ship
-            // SASS only — so this runtime-generated kernel is the one PTX the
-            // driver is ever asked to JIT. The toolkit's own `ptxas` can still
-            // assemble that PTX to native SASS for this device, and a cubin
-            // loads without any PTX version check, so assemble toolkit-side
-            // and load native code instead.
-            Err(e) if e.0 == CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION => {
-                self.load_module_via_ptxas(func_name, &ptx)?
-            }
-            Err(e) => return Err(e).w()?,
-        };
+        let module = self.load_ptx(func_name, &ptx)?;
         let func = module.load_function(func_name).w()?;
         Ok(CudaFunc {
             func,
@@ -972,10 +937,35 @@ impl CudaDevice {
         })
     }
 
+    /// Load run-time PTX as a module of this device's context, through the
+    /// record gate: a module load can synchronise the context, which would
+    /// invalidate a capture in flight on any thread.
+    ///
+    /// A driver older than the installed toolkit refuses the toolkit's PTX ISA
+    /// at JIT time. The AOT kernels never hit this — they ship SASS only — so
+    /// run-time PTX is the only kind the driver is ever asked to JIT. The
+    /// toolkit's own `ptxas` can still assemble it to native SASS for this
+    /// device, and a cubin loads without any PTX version check, so that refusal
+    /// is answered by assembling toolkit-side and loading native code.
+    pub(crate) fn load_ptx(
+        &self,
+        func_name: &str,
+        ptx: &cudarc::nvrtc::Ptx,
+    ) -> Result<Arc<CudaModule>> {
+        let loaded = without_recording(|quiet| quiet.load_module(&self.context, ptx.clone()))?;
+        match loaded {
+            Ok(module) => Ok(module),
+            Err(e) if e.0 == CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION => {
+                self.load_module_via_ptxas(func_name, ptx)
+            }
+            Err(e) => Err(e).w(),
+        }
+    }
+
     /// Assemble `ptx` to this device's native SASS with the toolkit's `ptxas`
-    /// and load the cubin — the fallback for a driver that refuses to JIT the
-    /// toolkit's PTX ISA version (see [`Self::compile`]).
-    pub(crate) fn load_module_via_ptxas(
+    /// and load the cubin — for a driver that refuses to JIT the toolkit's PTX
+    /// ISA version (see [`Self::load_ptx`]).
+    fn load_module_via_ptxas(
         &self,
         func_name: &str,
         ptx: &cudarc::nvrtc::Ptx,
@@ -1002,9 +992,10 @@ impl CudaDevice {
                     String::from_utf8_lossy(&out.stderr)
                 );
             }
-            self.context
-                .load_module(cudarc::nvrtc::Ptx::from_file(&cubin_path))
-                .w()
+            without_recording(|quiet| {
+                quiet.load_module(&self.context, cudarc::nvrtc::Ptx::from_file(&cubin_path))
+            })?
+            .w()
         })();
         // `cuModuleLoad` has read the file by the time it returns; the module
         // keeps its own copy, so the temp files can go whatever the outcome.
@@ -1032,9 +1023,17 @@ impl CudaDevice {
             });
         }
         drop(ms);
-        let mut ms = self.custom_modules.write().unwrap();
-        let cuda_module = self.context.load_module(ptx.into()).w()?;
-        ms.insert(module_name.to_string(), cuda_module.clone());
+        // Loaded with no lock held: the gate waits for every recording to end,
+        // and a recording thread may be asking for a module this map holds.
+        let loaded =
+            without_recording(|quiet| quiet.load_module(&self.context, ptx.into()))?.w()?;
+        let cuda_module = self
+            .custom_modules
+            .write()
+            .unwrap()
+            .entry(module_name.to_string())
+            .or_insert(loaded)
+            .clone();
         let func = cuda_module.load_function(fn_name).w()?;
         Ok(CudaFunc {
             func,
@@ -1132,7 +1131,6 @@ impl CudaDevice {
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
         let base = Self::new(ordinal)?;
         let stream = base.context.new_stream().w()?;
-        let (blas, blas_workspace) = new_blas(&stream)?;
         let curand = cudarc::curand::CudaRng::new(DEFAULT_SEED, stream.clone()).w()?;
         // **Compiled modules are shared; memoised buffers are not.** A
         // `CudaModule` belongs to the context, is read-only once built, and is
@@ -1147,8 +1145,6 @@ impl CudaDevice {
             context: base.context.clone(),
             custom_modules: base.custom_modules.clone(),
             stream,
-            blas,
-            blas_workspace,
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             info_tables: Arc::new(Mutex::new(InfoRing::default())),
             perm_tables: Arc::new(Mutex::new(HashMap::new())),
@@ -1159,33 +1155,23 @@ impl CudaDevice {
         })
     }
 
-    /// Give this handle its own cuBLAS handle and curand generator.
+    /// Give this handle its own curand generator.
     ///
     /// **Everything stateful is rebuilt; everything memoised is shared.** The
     /// caches on a `CudaDevice` are content- and shape-keyed tables of immutable
-    /// bytes, so two handles reading one entry is the point of keeping them.
-    /// These two are neither, and inheriting either is a silent wrong answer
-    /// rather than a failure:
+    /// bytes, so two handles reading one entry is the point of keeping them. A
+    /// generator is neither: a device is built expecting to draw from
+    /// [`DEFAULT_SEED`], and one advancing generator makes what a caller draws a
+    /// function of who drew before it, so a `Tensor::randn` fixture stops being
+    /// a fixture. It cost two `candle-transformers` tests, each passing alone and
+    /// failing in the suite.
     ///
-    /// - **cuBLAS.** A handle carries internal workspace and stream state, and
-    ///   NVIDIA's contract is one handle per thread — sharing one is a data race
-    ///   between concurrent GEMMs, not merely contention. It cost `candle-core`'s
-    ///   `conv1d_gpu` a wrong result and two `conv2d_*_gpu` an illegal access,
-    ///   intermittently, only under a full parallel suite.
-    /// - **curand.** A device is built expecting to draw from [`DEFAULT_SEED`];
-    ///   one advancing generator makes what a caller draws a function of who
-    ///   drew before it, so a `Tensor::randn` fixture stops being a fixture. It
-    ///   cost two `candle-transformers` tests, each passing alone and failing in
-    ///   the suite.
-    ///
-    /// Both are cheap to build and neither is what leaked — 512 handles' worth of
-    /// each is a passing test (`cuda_device_reuse.rs`), which is how they were
-    /// ruled out as the cause of the exhaustion the cache exists to stop.
+    /// The cuBLAS handle, stateful too, is not a handle's but a thread's
+    /// ([`Self::cublas`], `thread_blas`).
     ///
     /// Called on **both** paths out of the cache: the hit, and the loser of a
     /// first-touch race, which is also handed a clone of a shared device.
     fn give_own_stateful(&mut self) -> Result<()> {
-        (self.blas, self.blas_workspace) = new_blas(&self.stream)?;
         self.curand = Arc::new(Mutex::new(CudaRng(
             cudarc::curand::CudaRng::new(DEFAULT_SEED, self.stream.clone()).w()?,
         )));
@@ -1416,21 +1402,19 @@ impl BackendDevice for CudaDevice {
             return Ok(dev);
         }
 
+        // Before the context: the driver reads its module-loading mode once, at
+        // initialisation, and a lazy load breaks another thread's capture.
+        module_loading::request_eager();
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+        module_loading::verify_eager()?;
         Self::validate_compute_capability(&context)?;
         Self::disable_per_arg_event_tracking(&context);
         let stream = context.default_stream();
-        // Before anything can launch: the launchers' own grow-only scratch is
-        // taken from the held allocator from the first launch on.
-        kernel_scratch::install(ordinal, &stream);
-        let (blas, blas_workspace) = new_blas(&stream)?;
         let curand = cudarc::curand::CudaRng::new(DEFAULT_SEED, stream.clone()).w()?;
         let dev = Self {
             id: DeviceId::new(),
             context,
             stream,
-            blas,
-            blas_workspace,
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             info_tables: Arc::new(Mutex::new(InfoRing::default())),
@@ -1460,6 +1444,11 @@ impl BackendDevice for CudaDevice {
         // rebuilds to avoid, and the exact conditions (a parallel test suite at
         // first touch) under which it was originally observed.
         let mut dev = slot.get_or_init(|| dev).clone();
+        // Before the handle is returned, so before anything can launch: the
+        // launchers' own grow-only scratch is taken from the held allocator from
+        // the first launch on, and a block they replace is retired through this
+        // device's capture hub.
+        kernel_scratch::install(&dev);
         dev.give_own_stateful()?;
         Ok(dev)
     }
@@ -1792,7 +1781,7 @@ impl BackendDevice for CudaDevice {
         // context showed up here as an endless identical retry with nothing
         // ever noticing.
         let _eager = self.pause_capture()?;
-        self.stream.synchronize().w()?;
+        sync_watch::synchronize(&self.stream).w()?;
         Ok(())
     }
 }

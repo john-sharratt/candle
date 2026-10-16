@@ -89,6 +89,9 @@ pub(super) struct State {
     pub sockets: Vec<Option<SessionHandle>>,
     /// Per socket: its admission catch-up has finished.
     pub ready: Vec<bool>,
+    /// Per socket: how many times its admission catch-up has gone unanswered
+    /// since the socket was admitted (`tick::ADMISSION_QUIET_LIMIT`).
+    pub admission_quiet: Vec<u32>,
     pub members: Vec<Option<Members>>,
     pub rr: usize,
     pub next_request: u64,
@@ -276,6 +279,7 @@ impl Replicator {
                 fresh: BTreeMap::new(),
                 sockets: vec![None; clusters],
                 ready: vec![false; clusters],
+                admission_quiet: vec![0; clusters],
                 members: vec![None; clusters],
                 rr: 0,
                 // A process's requests number from a random base: answers to a
@@ -383,6 +387,7 @@ impl Replicator {
             let mut s = self.state();
             s.sockets[c] = Some(handle);
             s.ready[c] = false;
+            s.admission_quiet[c] = 0;
             s.ack_dirty = true;
             if s.phase == Phase::CutOff && s.retry_rejoin.is_none() {
                 s.phase = Phase::Rejoining;

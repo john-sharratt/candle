@@ -31,7 +31,8 @@ use std::sync::{Arc, OnceLock};
 
 use candle_conversation::models::Dialect;
 use candle_conversation::projection::{
-    Builder as ProjectionBuilder, GroupId, LayerId, Reserved, SectionId, SelectionRule,
+    Builder as ProjectionBuilder, DecodePriority, GroupId, LayerId, Reserved, SectionId,
+    SelectionRule,
 };
 use candle_conversation::stencil::{function_blocks_to_json, ToolSpec};
 use candle_conversation::think_strip::strip_think_blocks_keep_layout;
@@ -187,8 +188,13 @@ pub fn build_calibration_projection(
          <tools>\n",
         sys_start = dialect.system_start,
     );
-    let mut builder =
-        ProjectionBuilder::for_reserved_corpus(&frame, Reserved::Calibration, CALIB_SECTION_BASE);
+    // Background to any dialogue that is up while it runs.
+    let mut builder = ProjectionBuilder::for_reserved_corpus(
+        &frame,
+        Reserved::Calibration,
+        CALIB_SECTION_BASE,
+        DecodePriority::Normal,
+    );
 
     let collection = builder
         .add_collection(

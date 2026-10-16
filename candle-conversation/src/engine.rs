@@ -17,8 +17,9 @@ use crate::persistence::vfs::{VfsEventId, VfsEventPayload, VfsWrite};
 use crate::persistence::BoundSubstrate;
 use crate::projection::CorruptTurnPolicy;
 use crate::projection::{
-    Builder, CollectionWarm, Conversation, GalleryPreload, GroupId, LayerId, PlainPromptFrames,
-    ProjectionTarget, Reserved, Schema, SectionId, TimelineId, TurnIndex, WorkingSetShare,
+    Builder, CollectionWarm, Conversation, DecodePriority, GalleryPreload, GroupId, LayerId,
+    PlainPromptFrames, ProjectionTarget, Reserved, Schema, SectionId, TimelineId, TurnIndex,
+    WorkingSetShare,
 };
 use crate::scheduler::{Scheduler, SchedulerRequest, SettleReport};
 use crate::sequence_handle::SequenceId;
@@ -44,6 +45,8 @@ use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelC
 use candle_transformers::models::delta_net::release_seal_readback;
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::process::exit;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -540,7 +543,19 @@ impl ConversationEngine {
                     reconstruct_ms = t_recon.elapsed().as_millis() as u64,
                     "scheduler thread: substrate reconstruct complete"
                 );
-                scheduler.run();
+                // **A scheduler that panics ends the process.** Every model
+                // forward runs on this thread, and nothing restarts it: a panic
+                // here left the daemon answering every request with "scheduler
+                // has shut down" until someone restarted it by hand. The panic
+                // hook has already logged the panic and its backtrace; exiting
+                // hands the restart to the supervisor (keep).
+                if catch_unwind(AssertUnwindSafe(|| scheduler.run())).is_err() {
+                    tracing::error!(
+                        "the scheduler thread panicked; ending the process so its \
+                         supervisor starts it again"
+                    );
+                    exit(SCHEDULER_PANIC_EXIT);
+                }
             })
             .map_err(|e| {
                 ConversationError::Channel(format!("failed to spawn scheduler thread: {e}"))
@@ -672,6 +687,10 @@ impl SubstrateReloader {
 
 /// How often a reload waited on is looked at.
 const RELOAD_POLL: Duration = Duration::from_millis(50);
+
+/// The process exit status when the scheduler thread panicked. `EX_SOFTWARE`:
+/// an internal fault, not a usage error.
+const SCHEDULER_PANIC_EXIT: i32 = 70;
 
 /// Attaches substrates to an engine — a cheap clone of its shared core, so the
 /// engine's own handle can stay with the tenant that built it.
@@ -1702,15 +1721,19 @@ impl ConversationEngine {
     ///
     /// `system_prompt` may be either pre-formatted with dialect markers
     /// or raw text — `new_conversation_with_projection` handles wrapping
-    /// the same way it does for user prompts.
+    /// the same way it does for user prompts. It decodes at
+    /// `decode_priority` (the titler, background to the dialogue it names,
+    /// is `Normal`).
     pub fn new_reserved_conversation(
         &self,
         system_prompt: &str,
         kind: Reserved,
+        decode_priority: DecodePriority,
         config: SequenceConfig,
     ) -> crate::Result<Sequence> {
         let frame = self.plain_prompt_section(system_prompt)?;
-        let builder = Builder::for_plain_prompt_reserved(system_prompt, kind, frame);
+        let builder =
+            Builder::for_plain_prompt_reserved(system_prompt, kind, frame, decode_priority);
         let layer_id = LayerId::reserved(kind);
         let group_id = GroupId::reserved(kind);
         self.new_conversation_with_projection(system_prompt, builder, layer_id, group_id, config)

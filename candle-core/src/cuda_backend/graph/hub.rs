@@ -27,6 +27,7 @@
 //! does not. A wave whose shape, tier placement or launch scalars differ from
 //! the last one therefore replays correctly with no key and no epoch to check.
 
+use super::capture;
 use super::exec::{audit, divergence, NodeKey, Template};
 use super::library::ExecLibrary;
 use super::record_gate;
@@ -289,24 +290,12 @@ impl Drop for Paused<'_> {
 }
 
 /// Start recording on the hub's stream, counted into the record gate for as
-/// long as the segment records — see [`record_gate`]. Every successful `begin`
-/// is paired with one [`end_capture`].
+/// long as the segment records. Every successful `begin` is paired with one
+/// [`end_capture`].
 fn begin(capture: &Arc<CudaStream>) -> Result<()> {
-    capture.context().bind_to_thread().w()?;
-    record_gate::recording_begins();
-    // SAFETY: the hub's own stream, not recording — a wave records on it only
-    // between `begin` and `end_segment`, under the hub's lock.
-    let begun = unsafe {
-        result::stream::begin_capture(
-            capture.cu_stream(),
-            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )
-    }
-    .w();
-    if begun.is_err() {
-        record_gate::recording_ends();
-    }
-    begun
+    // SAFETY: the hub's own created stream, not recording — a wave records on it
+    // only between `begin` and `end_segment`, under the hub's lock.
+    unsafe { capture::begin(capture) }
 }
 
 /// Nudge WDDM to submit what has been issued on `compute`.
@@ -323,10 +312,8 @@ fn query_submits(compute: &Arc<CudaStream>) -> Result<()> {
 /// End the capture [`begin`] started, and count the segment out of the record
 /// gate whether or not the driver hands back a graph.
 fn end_capture(capture: &Arc<CudaStream>) -> Result<sys::CUgraph> {
-    // SAFETY: this wave began the capture on the hub's stream.
-    let graph = unsafe { result::stream::end_capture(capture.cu_stream()) }.w();
-    record_gate::recording_ends();
-    graph
+    // SAFETY: this wave began the capture on the hub's stream, on this thread.
+    unsafe { capture::end(capture) }
 }
 
 impl CaptureHub {

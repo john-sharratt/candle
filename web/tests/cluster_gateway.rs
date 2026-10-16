@@ -5,7 +5,7 @@
 //! aggregate and socket-drop tables run here.
 
 use std::convert::Infallible;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -38,6 +38,7 @@ use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as TMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tower::Service;
+use web::cluster::status_key::StatusKey;
 use web::cluster::{ClusterPeer, Gateway};
 use web::{Builder, Config};
 
@@ -304,6 +305,11 @@ fn content_dir() -> &'static Path {
 }
 
 async fn gateway(dumb: SocketAddr) -> (SocketAddr, Arc<Hub>) {
+    gateway_keyed(dumb, None).await
+}
+
+/// [`gateway`], its status read with `status_key` too.
+async fn gateway_keyed(dumb: SocketAddr, status_key: Option<StatusKey>) -> (SocketAddr, Arc<Hub>) {
     let yaml = format!(
         r#"
 cluster: {{group_key_file: "secrets/group.key"}}
@@ -319,7 +325,7 @@ sites:
     let cfg = Config::from_yaml(&yaml, content_dir()).unwrap();
     let hub = Hub::new(key(), "gw-test");
     let router = Builder::new(cfg)
-        .cluster(Gateway::with_hub(hub.clone()))
+        .cluster(Gateway::with_hub_and_status_key(hub.clone(), status_key))
         .router();
     (spawn(router).await, hub)
 }
@@ -410,43 +416,29 @@ async fn the_mode_follows_the_ready_members() {
     assert_eq!(fetch(gw, "/v1/where").await.json()["by"], "dumb");
 }
 
-/// **A loading member stands in for a configured upstream that is down**
-/// (§5.7): with no member ready the app is dumb, and its first request finds
-/// the upstream refusing; from then on, while the upstream stays down, the
-/// member that is still loading answers — its loading page in place of the
-/// outage page. A route without `cluster:` has nobody to stand in.
+/// **While every member is loading, the gateway says it is restarting**
+/// (§5.7): neither the configured upstream — usually one of those members —
+/// nor a loading member answers, so nobody is shown a half-loaded member's
+/// startup page. With no member admitted the upstream serves again, and a
+/// route without `cluster:` always goes to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_loading_member_stands_in_for_a_down_upstream() {
-    // An address nothing listens on: the configured upstream, down.
-    let down = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
-    };
-    let (gw, hub) = gateway(down).await;
+async fn while_every_member_loads_the_gateway_says_it_is_restarting() {
+    let dumb = spawn(dumb_daemon()).await;
+    let (gw, hub) = gateway(dumb).await;
     let m = joined(gw, 1, 100, false);
-    until("admitted", || hub.standing_by("zend") == Some(1)).await;
-    assert!(!hub.clustered("zend"), "loading, so dumb");
+    until("admitted", || hub.admitted("zend")).await;
+    assert!(!hub.clustered("zend"), "loading, so not clustered");
 
-    assert_eq!(
-        fetch(gw, "/v1/where").await.status,
-        503,
-        "the upstream refused"
-    );
     let r = fetch(gw, "/v1/where").await;
-    assert_eq!(r.status, 200);
-    assert_eq!(r.json()["by"], "member-1", "the loading member stood in");
-    assert_eq!(
-        fetch(gw, "/plain/x").await.status,
-        503,
-        "no cluster on this route"
-    );
+    assert_eq!(r.status, 503, "restarting, not the upstream or the member");
+    assert_eq!(fetch(gw, "/plain/x").await.json()["by"], "dumb");
 
     m.leave();
-    until("gone", || hub.standing_by("zend").is_none()).await;
+    until("gone", || !hub.admitted("zend")).await;
     assert_eq!(
-        fetch(gw, "/v1/where").await.status,
-        503,
-        "nobody left to stand in"
+        fetch(gw, "/v1/where").await.json()["by"],
+        "dumb",
+        "no member admitted: the configured upstream serves"
     );
 }
 
@@ -718,6 +710,38 @@ async fn the_status_page_is_an_admins() {
     let member_command = "/gateway/member/zend/0000000000000001/v1/cluster/command/drain";
     assert_eq!(ask(gw, "POST", member_command, &[], "").await.status, 401);
     assert!(!hub.draining(), "a refused command does nothing");
+}
+
+/// **The status key** reads the status and nothing else: presented, the data
+/// answers; the page and the commands still refuse it, and any other key is
+/// refused like no key at all.
+#[tokio::test]
+async fn the_status_key_reads_the_status_and_nothing_else() {
+    let dumb = spawn(dumb_daemon()).await;
+    let key = "5a".repeat(32);
+    let (gw, hub) = gateway_keyed(dumb, StatusKey::from_hex(&key)).await;
+    let bearer = format!("Bearer {key}");
+    let with_key = [("authorization", bearer.as_str())];
+
+    let status = ask(gw, "GET", "/gateway/status.json", &with_key, "").await;
+    assert_eq!(status.status, 200, "{}", status.body);
+    assert!(status.json()["members"].is_array(), "{}", status.body);
+
+    let wrong = format!("Bearer {}", "5b".repeat(32));
+    let refused = ask(
+        gw,
+        "GET",
+        "/gateway/status.json",
+        &[("authorization", wrong.as_str())],
+        "",
+    )
+    .await;
+    assert_eq!(refused.status, 401);
+
+    assert_eq!(ask(gw, "GET", "/gateway", &with_key, "").await.status, 401);
+    let drain = ask(gw, "POST", "/gateway/command/drain-gateway", &with_key, "").await;
+    assert_eq!(drain.status, 401);
+    assert!(!hub.draining());
 }
 
 /// **The cluster socket** refuses an app that is none of the three, and a

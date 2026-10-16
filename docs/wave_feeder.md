@@ -731,6 +731,20 @@ the frontier the gap reads, and the growth policy withholds the last tier's
 ground from the weight side, so the margin only has to cover an arena the
 compressor creates between forwards.
 
+**While prompts wait, the growth policy withholds the next prefill's tier too.**
+The last tier predicts the next forward within a prefill and fails between two:
+an ingest runs one wide prefill forward, then a dozen decode forwards of a few
+regions each, then the next prefill. After the first decode the last tier read
+tiny, the weight side grew back into the prefill's ground, and the next prefill
+bought it straight back. Measured on `.5` (2026-10-16) with a 53–77k-token
+backlog: ~2,000 expert slots conceded per prefill, every 25–50 s, each inside a
+21–25 s wave whose co-batched decode forwards slowed to 1.6–12 s. The scheduler
+now states each pass whether prompt tokens are waiting
+(`region_pool::set_prompts_waiting`); while they are, the pool keeps the widest
+tier placed since they began waiting, and the policy leaves the wider of it and
+the last tier free. When the backlog clears it is forgotten, and the weight side
+grows back as before.
+
 **The engine publishes two numbers** in the memory report's admission section:
 `decode_carried` (decodes the last fill admitted) and `decode_starved` (eligible
 decodes it could not). Starved is the real allocation's answer that the device is
@@ -1938,7 +1952,13 @@ forward path (`strata_bench`).
   `select_layer_bytes` over fresh indexes), which was priced at zero: the bound
   on the scoring tiles of an 8,192-row chunk ending at 128K is 4.2 GB on the
   attention phase (`a_fresh_deep_chunk_prices_every_score_tile`), where the
-  turn's first chunk scores through the paged tables in kilobytes.
+  turn's first chunk scores through the paged tables in kilobytes. The score
+  buffer itself is carved per **run** of the wave's spans — bulk prompt chunks
+  together, decode and verify rows together (`indexer::score_runs`) — each as
+  wide as its own deepest row. One width for the wave priced a chunk's thousands
+  of rows at the candidates of whatever deep decode row rode beside it: an
+  8,202-row wave carved 78,939 columns, 2.6 GB on every attention layer's phase,
+  where its own rows ranked under 16K.
 * Nothing is bought at admission. A forward's KV claims buy `KV_BUY_STEP` on
   exhaustion (`claim_region`), and its placement buys exactly the shortfall it
   measured (`place_transient`, up to four purchases while they land) and refuses
@@ -2067,6 +2087,7 @@ closed the gap, from 124.6 / 129.0 / 98.1 t/s:
 | 29 | KV arena reclamation that cannot corrupt: relocation driven from the owner, not the arena | a full-corpus ingest with relocation active and zero corrupted generations | ✅ §4.11.11 — run 60, 352 dirs, 0 |
 | 30 | stop the arena count growing: a run that finds no tail reuses recycled slots before stamping a new arena | class 8192 occupancy stays high under ingest instead of collapsing | ✅ §4.11.11 — 6.3% → 84.7% |
 | 31 | the tier reserves what it spends: every phase priced from the wave's own width, no constants and no pads | zero reserved-and-unused bytes, on **every** forward and not just the widest | ✅ §4.11.12 — 0.8B 251.0 MiB → 0 |
+| 32 | while prompts wait, the growth policy withholds the waiting prefill's tier, not only the last forward's | no concession per prefill between the decodes of an ingest | built — §4.11.4; `.5` re-measure open |
 | 32 | admission charges an offer's tier: the rate model judges the claim **and** the tier it dislodges | the two judges of one admission agree about its cost | ✅ §4.11.12 — `Cost::dislodged_bytes` |
 | 33 | the residency identity's reserve follows the standing tier instead of a 1,296 MiB constant | the rate model is not shown weight ground the tier has already taken | ✅ §4.11.12 — `interleave::reserve_for`; **unvalidated on a live ingest** |
 

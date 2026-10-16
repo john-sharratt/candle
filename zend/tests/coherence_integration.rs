@@ -151,6 +151,7 @@ mod coherence {
                 StreamItem::Prefill { .. }
                 | StreamItem::Think { .. }
                 | StreamItem::TurnEnd { .. } => {}
+                StreamItem::Error(e) => panic!("the turn failed: {e}"),
             }
         }
         eprintln!("\n\n[FINAL RESPONSE — {token_events} token events]\n{response}");

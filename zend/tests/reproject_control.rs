@@ -195,6 +195,7 @@ mod control {
                 StreamItem::Prefill { .. }
                 | StreamItem::Think { .. }
                 | StreamItem::TurnEnd { .. } => {}
+                StreamItem::Error(e) => panic!("the turn failed: {e}"),
             }
         }
         // Print the decoded text so coherence can be eyeballed — a wrong

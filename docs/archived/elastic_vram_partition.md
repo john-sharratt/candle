@@ -283,6 +283,22 @@ that has been measured directly and found correct
 through cold ingest or six concurrent conversations. At 512 MiB the process
 peaks exactly 512 MiB below `capacity_c` — the cushion, untouched at peak.
 
+**One pool consumer outgrows it, and is planned beside it instead.** A window
+that stops short of the head hands its residual back for the next window to
+resume from, so it outlives the forward's span and comes from the pool
+(`WindowResiduals`). A plain model's is one `[rows, hidden]` block and fits the
+cushion. Flash-Next's is `[rows, hc, hidden]` F32 — four streams at four bytes —
+and a session holds up to four at once (the creep's held part, the assembled
+input, the window being written, a paused creep's). Measured on `.5`,
+2026-10-17: 1,235 MiB of them under two conversations and ingest, the next pool
+allocation found the card full, and a minute of out-of-memory errors poisoned
+the context. So a model may name a **runtime reserve** at load
+(`dense_span::open_for_load_sized`): CUDA-pool room left outside the span for
+the life of the process, beside the graph budget, and never reclaimed like the
+load headroom. `qwen4exp` reserves four of the widest forward's residual
+(`window_residual_reserve_bytes`), and the pool hands out buffers at exactly the
+width asked, so that bound holds.
+
 Keep 512 MiB. Driving it to zero by eagerly constructing every pool consumer is
 a later step, and `forbidden_alloc` is the instrument for it: arm it for the
 whole post-reservation process lifetime rather than only around the decode loop,

@@ -207,8 +207,9 @@ impl Replicator {
         }
     }
 
-    /// A catch-up finished.
-    async fn finished(self: &Arc<Self>, purpose: Purpose, c: usize) {
+    /// A catch-up finished — or, for an admission, went unanswered past
+    /// `tick::ADMISSION_QUIET_LIMIT`.
+    pub(super) async fn finished(self: &Arc<Self>, purpose: Purpose, c: usize) {
         if purpose != Purpose::Admission {
             return;
         }

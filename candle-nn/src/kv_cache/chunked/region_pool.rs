@@ -114,8 +114,10 @@ const MAX_WAVE_TRANSIENT_BYTES: usize = super::wave_spans::WAVE_ATTN_BYTES
     + super::wave_spans::WAVE_FFN_BYTES
     + super::wave_spans::WAVE_FORWARD_BYTES;
 
-/// The fixed block at the far **left** of the span: the held ground
-/// ([`HELD_GROUND_BYTES`]) first, then the persistence thread's staging.
+/// The fixed block at the far **left** of the span, for a model that holds no
+/// runtime reserve: the held ground ([`HELD_GROUND_BYTES`]) first, then the
+/// persistence thread's staging. A model's runtime reserve widens the held
+/// ground and with it this block ([`persist_bytes`]).
 ///
 /// Fixed for the process lifetime and out of both frontiers' way. Putting it
 /// left rather than letting it float is what lets the weight boundary move
@@ -124,14 +126,39 @@ const MAX_WAVE_TRANSIENT_BYTES: usize = super::wave_spans::WAVE_ATTN_BYTES
 /// region claim would be refused.
 const PERSIST_SPAN_BYTES: usize = HELD_GROUND_BYTES + MIGRATION_STAGING_CAP_BYTES;
 
-/// The smallest span that can run a forward: the fixed staging block plus one
-/// wave's transient tier, with nothing left for KV.
+/// The held ground for a model whose runtime reserve is `runtime_reserve`: the
+/// buffers every model holds ([`HELD_GROUND_BYTES`]) plus that reserve, rounded
+/// to whole regions so the fixed block stays region-aligned.
+///
+/// **The reserve stands inside the span, on held ground.** It used to be left
+/// outside it, as CUDA-pool room — the window residuals a wide-residual model
+/// hands from one forward to the next. Outside, they were memory the span did
+/// not count and WDDM could demote; and the pool they came from kept every
+/// width they had ever been, so its footprint only rose. Measured on `.5`,
+/// 2026-10-17: the pool reached 5.5 GiB under one conversation and an ingest,
+/// the card's residency budget ran out, and WDDM paged the process to host RAM
+/// — decode stalled 5–10 s every 10–15 s. Held ground is pinned span memory the
+/// driver may not migrate, and it is in the plan.
+fn held_bytes(runtime_reserve: usize) -> usize {
+    HELD_GROUND_BYTES + runtime_reserve.next_multiple_of(REGION_BYTES)
+}
+
+/// The fixed left block for a model whose runtime reserve is `runtime_reserve`:
+/// its held ground, then the persistence staging.
+fn persist_bytes(runtime_reserve: usize) -> usize {
+    held_bytes(runtime_reserve) + MIGRATION_STAGING_CAP_BYTES
+}
+
+/// The smallest span that can run a forward whose fixed block is `persist`
+/// bytes: that block plus one wave's transient tier, with nothing left for KV.
 ///
 /// Two callers, and they must agree. `create_with_headroom` will not concede
 /// load headroom past this point, and the same function refuses a span that
 /// comes up short of it — so a disagreement would let the first hand back ground
 /// the second then rejects, turning an optimisation into a startup failure.
-const SPAN_MINIMUM_BYTES: usize = PERSIST_SPAN_BYTES + MAX_WAVE_TRANSIENT_BYTES;
+fn span_minimum_bytes(persist: usize) -> usize {
+    persist + MAX_WAVE_TRANSIENT_BYTES
+}
 
 /// Alignment every dense weight tensor is placed on.
 ///
@@ -508,6 +535,14 @@ struct RegionPool {
     /// prefill chunk is the next chunk, a little deeper, and its tier stands on the
     /// same ground (see [`Occupancy::last_tier_bytes`]).
     last_tier_bytes: usize,
+    /// Whether prompts are waiting to be prefilled, as the scheduler last said
+    /// ([`set_prompts_waiting`]).
+    prompts_waiting: bool,
+    /// The widest tier placed since prompts began waiting; zero while none do.
+    /// The growth negotiation leaves it free (see
+    /// [`Occupancy::waiting_tier_bytes`]): between two prefills the last forward
+    /// is a decode, and the next prefill needs this ground back.
+    waiting_tier_bytes: usize,
     /// The largest tier placed since [`span_partition`] last read it — the
     /// wave's activation ground, which a reading taken between forwards would
     /// otherwise always see as zero.
@@ -515,6 +550,11 @@ struct RegionPool {
     /// Bytes of the fixed left block carved so far: the held ground, then the
     /// persistence staging.
     persist_carved: usize,
+    /// The whole fixed left block — [`persist_bytes`] of the model's runtime
+    /// reserve.
+    persist_bytes: usize,
+    /// The held ground at its base — [`held_bytes`] of the same reserve.
+    held_bytes: usize,
     /// Fresh regions claimed while a wave's transient tier was placed.
     ///
     /// **A tripwire that must read zero.** A region claim creates an arena, and
@@ -684,7 +724,8 @@ fn buy_ground(stream: &std::sync::Arc<CudaStream>, regions: usize) -> Result<u64
 }
 
 /// The span's target size: everything left, less the cushion the CUDA pool keeps
-/// and the graph executables' budget (`graph_reserve`).
+/// and what else is planned outside the span (`graph_reserve`): the graph
+/// executables' budget, and the model's runtime pool reserve.
 ///
 /// **The graph budget is planned here because it cannot be placed here.** The
 /// driver allocates an executable's memory itself, so it comes from outside the
@@ -804,17 +845,23 @@ struct Layout {
     slack: usize,
 }
 
-/// Divide a span of `span_bytes` at `span_base`, with `dense_bytes` of model
-/// weights after the persistence block and the weight side occupying
-/// `[weight_floor, span_end)`.
+/// Divide a span of `span_bytes` at `span_base` whose fixed left block is
+/// `persist` bytes, with `dense_bytes` of model weights after that block and
+/// the weight side occupying `[weight_floor, span_end)`.
 ///
 /// The dense block is rounded up to a whole region so the region grid stays
 /// aligned to the reservation's granule. That wastes under one region and buys
 /// an address for every region that is `region_base + i · REGION_BYTES` with no
 /// second alignment rule to keep in step.
-fn layout_span(span_base: u64, span_bytes: usize, dense_bytes: usize, weight_floor: u64) -> Layout {
+fn layout_span(
+    span_base: u64,
+    persist: usize,
+    span_bytes: usize,
+    dense_bytes: usize,
+    weight_floor: u64,
+) -> Layout {
     let span_end = span_base + span_bytes as u64;
-    let dense_base = span_base + PERSIST_SPAN_BYTES as u64;
+    let dense_base = span_base + persist as u64;
     let dense_span = dense_bytes.next_multiple_of(REGION_BYTES);
     // Saturating, and clamped into the span: a dense block wider than the span
     // is refused by `claim_dense` before it can be stored, but the arithmetic
@@ -862,9 +909,15 @@ impl RegionPool {
     /// in tensor size. It is bounded, not zero: `peak_load_pool_bytes` carries
     /// the `2 × REPACK_BAND_BYTES` term, and dropping it OOMs the first large
     /// repack.
+    ///
+    /// `runtime_reserve` is device memory the model holds for as long as it
+    /// runs, outside any forward — a wide-residual model's window residuals. It
+    /// widens the held ground ([`held_bytes`]), so it is inside the span and in
+    /// the plan rather than CUDA-pool room left beside it.
     fn create_with_headroom(
         stream: &std::sync::Arc<CudaStream>,
         load_headroom: usize,
+        runtime_reserve: usize,
     ) -> Result<Self> {
         let ordinal = stream.context().ordinal();
         // Read before the claim: mapping granules consumes headroom, so asking
@@ -897,9 +950,12 @@ impl RegionPool {
             .bind_to_thread()
             .map_err(|e| candle::Error::Msg(format!("reservation: bind: {e}")))?;
         let graph_reserve = graph_budget_bytes()? as usize;
+        let held_bytes = held_bytes(runtime_reserve);
+        let persist_bytes = persist_bytes(runtime_reserve);
+        let span_minimum = span_minimum_bytes(persist_bytes);
         let target = span_target(ordinal, graph_reserve)?;
         let measured = candle::vram::get(ordinal).is_some();
-        let concedable = target.saturating_sub(SPAN_MINIMUM_BYTES);
+        let concedable = target.saturating_sub(span_minimum);
         let for_span = if measured {
             target - load_headroom.min(concedable)
         } else {
@@ -958,10 +1014,10 @@ impl RegionPool {
         let span_bytes = (claimed / REGION_BYTES) * REGION_BYTES;
         let span_base = reservation.base();
         let span_end = span_base + span_bytes as u64;
-        if span_bytes < SPAN_MINIMUM_BYTES {
+        if span_bytes < span_minimum {
             candle::bail!(
                 "reservation: the card backed only {span_bytes} B of the {want} B asked \
-                 for, below the {SPAN_MINIMUM_BYTES} B of fixed staging and transient \
+                 for, below the {span_minimum} B of fixed staging and transient \
                  span a forward needs — there is not enough VRAM left to run one"
             )
         }
@@ -971,7 +1027,7 @@ impl RegionPool {
         // span to KV.
         // No dense block yet: the weights are claimed out of it by `claim_dense`
         // as the loader walks the checkpoint, and until then it is empty.
-        let layout = layout_span(span_base, span_bytes, 0, span_end);
+        let layout = layout_span(span_base, persist_bytes, span_bytes, 0, span_end);
         let total = layout.total;
         // The partition, on the one channel that survives a test binary (which
         // installs no tracing subscriber, so the log lines below are invisible
@@ -1007,7 +1063,7 @@ impl RegionPool {
                 mib(want),
                 mib(span_bytes),
                 mib(want.saturating_sub(span_bytes)),
-                mib(PERSIST_SPAN_BYTES),
+                mib(persist_bytes),
                 mib(total * REGION_BYTES),
                 mib(MAX_WAVE_TRANSIENT_BYTES),
                 mib((span_end - layout.weight_floor) as usize),
@@ -1025,11 +1081,12 @@ impl RegionPool {
             );
         } else {
             log::info!(
-                "reservation: {} MiB span = {} MiB persist + {total} regions \
-                 ({} MiB), transient placed per forward (≤{} MiB), in {} KiB granules; \
-                 {} MiB left outside it for graph executables",
+                "reservation: {} MiB span = {} MiB persist (held ground {} MiB) + {total} \
+                 regions ({} MiB), transient placed per forward (≤{} MiB), in {} KiB \
+                 granules; {} MiB left outside it for graph executables",
                 span_bytes / (1024 * 1024),
-                PERSIST_SPAN_BYTES / (1024 * 1024),
+                persist_bytes / (1024 * 1024),
+                held_bytes / (1024 * 1024),
                 (total * REGION_BYTES) / (1024 * 1024),
                 MAX_WAVE_TRANSIENT_BYTES / (1024 * 1024),
                 reservation.granularity() / 1024,
@@ -1039,7 +1096,7 @@ impl RegionPool {
 
         // The held ground stands at the very base of the span, before the
         // persistence staging is carved after it, and is live from here on.
-        let held = SpanHeldGround::new(span_base, HELD_GROUND_BYTES);
+        let held = SpanHeldGround::new(span_base, held_bytes);
         install_held_ground(ordinal, held.clone());
 
         Ok(Self {
@@ -1072,8 +1129,12 @@ impl RegionPool {
             transient_bytes: 0,
             transient_high_water: 0,
             last_tier_bytes: 0,
+            prompts_waiting: false,
+            waiting_tier_bytes: 0,
             tier_peak: 0,
-            persist_carved: HELD_GROUND_BYTES,
+            persist_carved: held_bytes,
+            persist_bytes,
+            held_bytes,
             fresh_claims_during_wave: 0,
             refusals_during_wave: 0,
             // Empty because nothing has been observed yet. The weight side must
@@ -1134,6 +1195,7 @@ impl RegionPool {
     fn relayout_for_dense(&mut self) {
         let layout = layout_span(
             self.span_base,
+            self.persist_bytes,
             self.span_bytes,
             self.dense_bytes,
             self.weight_floor,
@@ -1321,7 +1383,13 @@ impl RegionPool {
                 )
             }
         }
-        let layout = layout_span(self.span_base, self.span_bytes, self.dense_bytes, floor);
+        let layout = layout_span(
+            self.span_base,
+            self.persist_bytes,
+            self.span_bytes,
+            self.dense_bytes,
+            floor,
+        );
         let watermark = self.live_watermark();
         if layout.total < watermark {
             candle::bail!(
@@ -1429,6 +1497,7 @@ impl RegionPool {
             tier_bytes: self.transient_bytes,
             tier_high_water: self.transient_high_water,
             last_tier_bytes: self.last_tier_bytes,
+            waiting_tier_bytes: self.waiting_tier_bytes,
         };
         match self.growth.spare(occ, slack, REGION_BYTES) {
             Ok(spare) => {
@@ -1504,7 +1573,8 @@ fn with_pool<R>(
         // No headroom on the lazy path: reaching here means nothing called
         // `ensure_reservation`, so no model is loading and there is no repack
         // peak to leave room for. That is every test, and the CPU-device paths.
-        Entry::Vacant(v) => v.insert(RegionPool::create_with_headroom(stream, 0)?),
+        // No runtime reserve either, for the same reason: no model said it needs one.
+        Entry::Vacant(v) => v.insert(RegionPool::create_with_headroom(stream, 0, 0)?),
     };
     f(pool)
 }
@@ -1746,14 +1816,14 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
             // other mid-wave arena creation.
             let needs_sync = pool.dirty_epoch[index] == pool.quiesce_epoch;
             let quiesce_epoch = &mut pool.quiesce_epoch;
-            let cleaned = try_without_recording(|| {
+            let cleaned = try_without_recording(|quiet| {
                 let bound = stream.context().bind_to_thread();
                 let t_sync = Instant::now();
                 let synced = bound.and_then(|()| {
                     if !needs_sync {
                         return Ok(());
                     }
-                    let r = stream.context().synchronize();
+                    let r = quiet.synchronize_context(stream.context());
                     if r.is_ok() {
                         *quiesce_epoch += 1;
                     }
@@ -2045,6 +2115,9 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
         pool.transient_high_water = pool.transient_high_water.max(len);
         pool.tier_peak = pool.tier_peak.max(len);
         pool.last_tier_bytes = len;
+        if pool.prompts_waiting {
+            pool.waiting_tier_bytes = pool.waiting_tier_bytes.max(len);
+        }
         Ok(Placed::At(base))
     })
 }
@@ -2129,11 +2202,12 @@ pub fn forget_last_tier(stream: &std::sync::Arc<CudaStream>) {
 pub(crate) fn carve_persist(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<u64> {
     with_pool(stream, |pool| {
         let len = bytes.div_ceil(REGION_BYTES) * REGION_BYTES;
-        if pool.persist_carved + len > PERSIST_SPAN_BYTES {
+        if pool.persist_carved + len > pool.persist_bytes {
             candle::bail!(
                 "persistence staging block exhausted: {len} B on top of {} B carved \
-                 exceeds the {PERSIST_SPAN_BYTES} B block",
+                 exceeds the {} B block",
                 pool.persist_carved,
+                pool.persist_bytes,
             )
         }
         let base = pool.span_base + pool.persist_carved as u64;
@@ -2269,7 +2343,15 @@ pub fn dense_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
 /// Failing instead would turn "this is the second model in the process" — every
 /// multi-model test binary — into a load failure, and swallowing it silently
 /// would leave a reader unable to explain why `dense_bytes` was zero.
-pub fn ensure_reservation(device: &candle::Device, load_headroom: usize) -> Result<bool> {
+///
+/// `runtime_reserve` is device memory the model holds for as long as it runs,
+/// outside any forward; it widens the held ground inside the span
+/// ([`RegionPool::create_with_headroom`]).
+pub fn ensure_reservation(
+    device: &candle::Device,
+    load_headroom: usize,
+    runtime_reserve: usize,
+) -> Result<bool> {
     let candle::Device::Cuda(cuda) = device else {
         candle::bail!("ensure_reservation: the reservation is a CUDA allocation");
     };
@@ -2299,7 +2381,11 @@ pub fn ensure_reservation(device: &candle::Device, load_headroom: usize) -> Resu
     match map.entry(ordinal) {
         Entry::Occupied(_) => Ok(false),
         Entry::Vacant(v) => {
-            v.insert(RegionPool::create_with_headroom(&stream, load_headroom)?);
+            v.insert(RegionPool::create_with_headroom(
+                &stream,
+                load_headroom,
+                runtime_reserve,
+            )?);
             Ok(true)
         }
     }
@@ -2477,6 +2563,7 @@ pub fn reclaim_load_headroom(stream: &std::sync::Arc<CudaStream>) -> Result<usiz
         pool.weight_floor = pool.span_end();
         let layout = layout_span(
             pool.span_base,
+            pool.persist_bytes,
             pool.span_bytes,
             pool.dense_bytes,
             pool.weight_floor,
@@ -2502,7 +2589,7 @@ pub fn reclaim_load_headroom(stream: &std::sync::Arc<CudaStream>) -> Result<usiz
                  + {} regions ({} MiB); weight zone not yet carved",
                 mib(gained),
                 mib(pool.span_bytes),
-                mib(PERSIST_SPAN_BYTES),
+                mib(pool.persist_bytes),
                 mib(pool.dense_bytes),
                 pool.total,
                 mib(pool.total * REGION_BYTES),
@@ -2687,6 +2774,21 @@ pub fn set_kv_free_target(ordinal: usize, target: FreeRegionTarget) {
     let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(pool) = map.get_mut(&ordinal) {
         pool.kv_target = target;
+    }
+}
+
+/// State whether prompts are waiting to be prefilled on `ordinal`'s card, so the
+/// weight side's growth leaves the next prefill's tier standing between prefills
+/// (see [`Occupancy::waiting_tier_bytes`]). Called by the scheduler once per pass,
+/// before the pass issues any forward. When none wait, the tier their prefills
+/// stood is forgotten and the weight side may grow back into it.
+pub fn set_prompts_waiting(ordinal: usize, waiting: bool) {
+    let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pool) = map.get_mut(&ordinal) {
+        pool.prompts_waiting = waiting;
+        if !waiting {
+            pool.waiting_tier_bytes = 0;
+        }
     }
 }
 
@@ -3048,6 +3150,7 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
         weight_bytes: (pool.span_end() - pool.weight_floor) as usize,
         slack_bytes: layout_span(
             pool.span_base,
+            pool.persist_bytes,
             pool.span_bytes,
             pool.dense_bytes,
             pool.weight_floor,
@@ -3105,11 +3208,15 @@ impl SpanPartition {
     }
 }
 
-/// [`SpanPartition`] of a span of `span_bytes` holding `dense_bytes` of dense
-/// weights, its weight side from `weight_floor_offset` bytes into it, `live`
-/// of whose regions are held — `span_live` of them by span tenants — and whose
-/// widest tier since the last reading was `tier_peak` bytes.
+/// [`SpanPartition`] of a span of `span_bytes` whose fixed left block is
+/// `persist` bytes — `held` of them held ground — holding `dense_bytes` of
+/// dense weights, its weight side from `weight_floor_offset` bytes into it,
+/// `live` of whose regions are held — `span_live` of them by span tenants — and
+/// whose widest tier since the last reading was `tier_peak` bytes.
+#[allow(clippy::too_many_arguments)]
 fn partition(
+    persist: usize,
+    held_ground: usize,
     span_bytes: usize,
     dense_bytes: usize,
     weight_floor_offset: usize,
@@ -3117,15 +3224,21 @@ fn partition(
     span_live: usize,
     tier_peak: usize,
 ) -> SpanPartition {
-    let l = layout_span(0, span_bytes, dense_bytes, weight_floor_offset as u64);
+    let l = layout_span(
+        0,
+        persist,
+        span_bytes,
+        dense_bytes,
+        weight_floor_offset as u64,
+    );
     let regions = l.total * REGION_BYTES;
     let held = live.min(l.total) * REGION_BYTES;
     let kv = live.saturating_sub(span_live).min(l.total) * REGION_BYTES;
     let unheld = regions - held;
     let transient = tier_peak.min(unheld);
     SpanPartition {
-        held_ground: HELD_GROUND_BYTES,
-        persist_staging: PERSIST_SPAN_BYTES - HELD_GROUND_BYTES,
+        held_ground,
+        persist_staging: persist - held_ground,
         dense: dense_bytes,
         dense_padding: (l.region_base - l.dense_base) as usize - dense_bytes,
         kv,
@@ -3145,6 +3258,8 @@ pub fn span_partition(ordinal: usize) -> Option<SpanPartition> {
     let pool = map.get_mut(&ordinal)?;
     let peak = std::mem::replace(&mut pool.tier_peak, pool.transient_bytes);
     Some(partition(
+        pool.persist_bytes,
+        pool.held_bytes,
         pool.span_bytes,
         pool.dense_bytes,
         (pool.weight_floor - pool.span_base) as usize,
@@ -3169,7 +3284,16 @@ mod partition_tests {
         let dense = 2 * R + R / 2;
         let span = PERSIST_SPAN_BYTES + 3 * R + 40 * R + R / 2 + 8 * R;
         let floor = span - 8 * R;
-        let p = partition(span, dense, floor, 13, 3, 4 * R + R / 2);
+        let p = partition(
+            PERSIST_SPAN_BYTES,
+            HELD_GROUND_BYTES,
+            span,
+            dense,
+            floor,
+            13,
+            3,
+            4 * R + R / 2,
+        );
         assert_eq!(
             p,
             SpanPartition {
@@ -3193,20 +3317,73 @@ mod partition_tests {
     #[test]
     fn a_tier_never_reads_wider_than_the_free_ground() {
         let span = PERSIST_SPAN_BYTES + 6 * R;
-        let p = partition(span, 0, span, 4, 0, 10 * R);
+        let p = partition(
+            PERSIST_SPAN_BYTES,
+            HELD_GROUND_BYTES,
+            span,
+            0,
+            span,
+            4,
+            0,
+            10 * R,
+        );
         assert_eq!((p.kv, p.transient, p.regions_free), (4 * R, 2 * R, 0));
         assert_eq!(p.sum(), span);
+    }
+
+    /// **A runtime reserve widens the held ground and costs regions, nothing
+    /// else.** The persistence staging keeps its size, the bands still sum to
+    /// the span, and the regions given up are exactly the reserve's.
+    #[test]
+    fn a_runtime_reserve_is_held_ground_inside_the_span() {
+        let reserve = 1760 * 1024 * 1024;
+        let held = super::held_bytes(reserve);
+        let persist = super::persist_bytes(reserve);
+        assert_eq!(held, HELD_GROUND_BYTES + 110 * R);
+        assert_eq!(persist - held, PERSIST_SPAN_BYTES - HELD_GROUND_BYTES);
+        let span = persist + 40 * R;
+        let p = partition(persist, held, span, 0, span, 4, 0, 0);
+        assert_eq!(p.held_ground, held);
+        assert_eq!(p.persist_staging, PERSIST_SPAN_BYTES - HELD_GROUND_BYTES);
+        assert_eq!(p.kv + p.regions_free, 40 * R);
+        assert_eq!(p.sum(), span);
+        let without = partition(
+            PERSIST_SPAN_BYTES,
+            HELD_GROUND_BYTES,
+            span,
+            0,
+            span,
+            4,
+            0,
+            0,
+        );
+        assert_eq!(
+            (without.kv + without.regions_free) - (p.kv + p.regions_free),
+            110 * R
+        );
+    }
+
+    #[test]
+    fn a_reserve_of_a_part_region_takes_a_whole_one() {
+        assert_eq!(super::held_bytes(1), HELD_GROUND_BYTES + R);
+        assert_eq!(super::held_bytes(0), HELD_GROUND_BYTES);
+        assert_eq!(super::persist_bytes(0), PERSIST_SPAN_BYTES);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_region, frontier_relocations, kv_grow_step, place_transient, region_stats,
-        release_transient, REGION_BYTES,
+        claim_region, frontier_relocations, kv_grow_step, layout_span, place_transient,
+        region_stats, release_transient, Layout, PERSIST_SPAN_BYTES, REGION_BYTES,
     };
     use candle::{Device, Result};
     use std::sync::Arc;
+
+    /// The layout of a span whose fixed block holds no runtime reserve.
+    fn rest_layout(base: u64, span: usize, dense: usize, floor: u64) -> Layout {
+        layout_span(base, PERSIST_SPAN_BYTES, span, dense, floor)
+    }
 
     /// A tenant whose regions stand under another tenant's live region empties
     /// none: emptying them would only move a hole under a frontier it does not hold.
@@ -3409,6 +3586,40 @@ mod tests {
         );
         super::forget_last_tier(&s);
         assert_eq!(last()?, 0, "settled, nothing is coming");
+        Ok(())
+    }
+
+    /// While prompts wait, the widest tier placed is remembered through the
+    /// narrower ones after it; a tier placed with nothing waiting is not; and
+    /// the backlog clearing forgets it.
+    #[test]
+    fn the_waiting_prefills_tier_is_kept_until_the_backlog_clears() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let ordinal = s.context().ordinal();
+        let waiting = || -> Result<usize> { with_pool(&s, |p| Ok(p.waiting_tier_bytes)) };
+        let place = |regions: usize| -> Result<()> {
+            place_transient(&s, regions * REGION_BYTES)?;
+            release_transient(&s);
+            Ok(())
+        };
+
+        super::set_prompts_waiting(ordinal, false);
+        place(6)?;
+        assert_eq!(waiting()?, 0, "nothing waits, nothing is kept");
+
+        super::set_prompts_waiting(ordinal, true);
+        place(6)?;
+        place(1)?;
+        place(1)?;
+        assert_eq!(
+            waiting()?,
+            6 * REGION_BYTES,
+            "the prefill's tier, through the decodes after it"
+        );
+
+        super::set_prompts_waiting(ordinal, false);
+        assert_eq!(waiting()?, 0, "the backlog cleared");
         Ok(())
     }
 
@@ -4147,7 +4358,7 @@ mod tests {
         let base = 0x1_0000_0000u64;
         let mib = 1024 * 1024;
         let span = 4096 * mib;
-        let l = super::layout_span(base, span, 0, base + span as u64);
+        let l = rest_layout(base, span, 0, base + span as u64);
         // A tier placed 8 regions below the weight floor drops the ceiling by 8.
         let tier = 8 * REGION_BYTES;
         let tier_base = (base + span as u64) - tier as u64;
@@ -4186,10 +4397,10 @@ mod tests {
         let mib = 1024 * 1024;
         let span = 4096 * mib;
         let span_end = base + span as u64;
-        let empty = super::layout_span(base, span, 0, span_end);
+        let empty = rest_layout(base, span, 0, span_end);
         // 1,921 MiB — the measured dense footprint of Qwen3.6-35B.
         let dense = 1921 * mib;
-        let loaded = super::layout_span(base, span, dense, span_end);
+        let loaded = rest_layout(base, span, dense, span_end);
 
         assert_eq!(
             loaded.dense_base, empty.dense_base,
@@ -4225,7 +4436,7 @@ mod tests {
         let span = 4096 * 1024 * 1024;
         let span_end = base + span as u64;
         for bytes in [1usize, 255, 256, REGION_BYTES - 1, REGION_BYTES + 1] {
-            let l = super::layout_span(base, span, bytes, span_end);
+            let l = rest_layout(base, span, bytes, span_end);
             let held = (l.region_base - l.dense_base) as usize;
             assert!(held >= bytes, "the block must cover what was asked for");
             assert!(
@@ -4248,7 +4459,7 @@ mod tests {
         let span = 4096 * mib;
         let span_end = base + span as u64;
         let dense = 1921 * mib;
-        let l = super::layout_span(base, span, dense, span_end);
+        let l = rest_layout(base, span, dense, span_end);
 
         assert!(
             l.dense_base < l.region_base,
@@ -4281,14 +4492,14 @@ mod tests {
     ///
     /// The headroom exists to keep a *possible* pool OOM from happening during
     /// load. Trading that for a *certain* refusal at startup is never right, so
-    /// the concession stops at [`SPAN_MINIMUM_BYTES`] — and is skipped entirely
+    /// the concession stops at [`super::span_minimum_bytes`] — and is skipped entirely
     /// without a governor, since the fixed test constant is not a measurement
     /// of a card and has no capacity to leave room in. Clamping alone was not
     /// enough: it moved the failure from "reservation refused" to a span of
     /// exactly the floor with `0 regions`, which fails one step later.
     #[test]
     fn headroom_is_conceded_from_spare_ground_only() {
-        let floor = super::SPAN_MINIMUM_BYTES;
+        let floor = super::span_minimum_bytes(super::PERSIST_SPAN_BYTES);
         // Exactly the shape that failed: a target barely above the floor, and a
         // headroom several times larger than the whole span.
         let target = floor + 64 * 1024 * 1024;
@@ -4324,7 +4535,7 @@ mod tests {
         let base = 0x1_0000_0000u64;
         let span = 512 * 1024 * 1024;
         let span_end = base + span as u64;
-        let l = super::layout_span(base, span, span * 4, span_end);
+        let l = rest_layout(base, span, span * 4, span_end);
         assert_eq!(l.total, 0);
         assert!(
             l.region_base <= span_end,
@@ -4344,16 +4555,16 @@ mod tests {
         assert_eq!(super::span_from(0, 1024), 0, "a cushion larger than usable");
         let base = 0x1_0000_0000u64;
         let persist = super::PERSIST_SPAN_BYTES;
-        let l = super::layout_span(base, persist, 0, base + persist as u64);
+        let l = rest_layout(base, persist, 0, base + persist as u64);
         assert_eq!(l.total, 0, "the persist block leaves nothing for KV");
         assert_eq!(l.slack, 0);
         // A span below even that stays sane rather than wrapping.
-        let l = super::layout_span(base, persist / 2, 0, base + (persist / 2) as u64);
+        let l = rest_layout(base, persist / 2, 0, base + (persist / 2) as u64);
         assert_eq!(l.total, 0);
         assert_eq!(l.slack, 0);
         // And the tier's worth of ground *is* the KV side's while nothing runs.
         let with_tier = persist + super::MAX_WAVE_TRANSIENT_BYTES;
-        let l = super::layout_span(base, with_tier, 0, base + with_tier as u64);
+        let l = rest_layout(base, with_tier, 0, base + with_tier as u64);
         assert_eq!(
             l.total,
             super::MAX_WAVE_TRANSIENT_BYTES / REGION_BYTES,
@@ -4374,7 +4585,7 @@ mod tests {
                 let span = span_mib * mib;
                 let span_end = base + span as u64;
                 let floor = span_end - (weight_mib * mib) as u64;
-                let l = super::layout_span(base, span, 0, floor);
+                let l = rest_layout(base, span, 0, floor);
 
                 // Only the persist block is fixed; the regions start straight
                 // after it and run up to the weight floor. The wave tier is not
@@ -4402,12 +4613,9 @@ mod tests {
     fn the_layout_clamps_a_floor_outside_the_span() {
         let base = 0x1_0000_0000u64;
         let span = 4096 * 1024 * 1024;
-        let past_end = super::layout_span(base, span, 0, base + span as u64 + 4096);
-        assert_eq!(
-            past_end,
-            super::layout_span(base, span, 0, base + span as u64)
-        );
-        let before_start = super::layout_span(base, span, 0, 0);
+        let past_end = rest_layout(base, span, 0, base + span as u64 + 4096);
+        assert_eq!(past_end, rest_layout(base, span, 0, base + span as u64));
+        let before_start = rest_layout(base, span, 0, 0);
         assert_eq!(
             before_start.total, 0,
             "a floor left of the regions leaves none"
@@ -4430,7 +4638,7 @@ mod tests {
         let span_end = base + span as u64;
         let expected = base + super::PERSIST_SPAN_BYTES as u64;
         for weight_mib in [0usize, 512, 2048, 6144, 9216] {
-            let l = super::layout_span(base, span, 0, span_end - (weight_mib * mib) as u64);
+            let l = rest_layout(base, span, 0, span_end - (weight_mib * mib) as u64);
             assert_eq!(l.region_base, expected, "regions start after persist");
             // Every byte between the persist block and the weight floor is
             // available to regions when no forward is running.
@@ -4452,9 +4660,8 @@ mod tests {
         let mib = 1024 * 1024;
         let span = 12288 * mib;
         let span_end = base + span as u64;
-        let at = |weight_mib: usize| {
-            super::layout_span(base, span, 0, span_end - (weight_mib * mib) as u64)
-        };
+        let at =
+            |weight_mib: usize| rest_layout(base, span, 0, span_end - (weight_mib * mib) as u64);
 
         let wide = at(6144);
         let narrow = at(4096);
@@ -4476,7 +4683,7 @@ mod tests {
         let span_end = base + span as u64;
         for weight_mib in [0usize, 512, 2048, 6144] {
             let floor = span_end - (weight_mib * mib) as u64;
-            let l = super::layout_span(base, span, 0, floor);
+            let l = rest_layout(base, span, 0, floor);
             let weights = (span_end - l.weight_floor) as usize;
             let total = super::PERSIST_SPAN_BYTES + l.total * REGION_BYTES + l.slack + weights;
             assert_eq!(total, span, "span unaccounted at weight={weight_mib} MiB");

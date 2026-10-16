@@ -183,7 +183,7 @@ extern "C" __global__ void repack_gemx_q_awq_hf(
 // Cannot use function pointer table for __global__ kernels reliably.
 
 #define LAUNCH_REPACK_KERNEL(kernel_name, grid, block, src, dst, nrows, ncols) \
-    kernel_name<<<grid, block>>>(src, dst, nrows, ncols)
+    kernel_name<<<grid, block, 0, stream>>>(src, dst, nrows, ncols)
 
 // =============================================================================
 // DISPATCHER (C ABI for FFI - names kept for backwards compatibility)
@@ -201,8 +201,15 @@ extern "C" __global__ void repack_gemx_q_awq_hf(
 /// - nrows: Number of rows in tensor
 /// - ncols: Number of columns in tensor
 /// - qtype: Quantization type (0-13, see QType enum in block_compact.cuh)
+/// - stream: the stream the repack is ordered on; whatever reads `dst_data`
+///   or releases `src_data` afterwards is ordered behind it there
 ///
-/// Returns: 0 on success, -1 on error
+/// Returns: 0 when the launch was accepted, -1 on error
+///
+/// The launch is not waited for. It used to end with `cudaDeviceSynchronize`,
+/// which a capture on any thread refuses — and the refusal invalidates that
+/// capture, so a repack beside a recording wave broke the wave and failed
+/// itself (`docs/decode_graphs.md`, the record gate).
 ///
 /// IMPORTANT: The output is smaller than the input since scales are removed.
 /// Use get_repacked_size_bytes() to determine the required dst_data size.
@@ -211,7 +218,8 @@ extern "C" int32_t run_repack_gemx(
     void* dst_data,
     int32_t nrows,
     int32_t ncols,
-    int32_t qtype
+    int32_t qtype,
+    cudaStream_t stream
 ) {
     // Gate on whether this qtype has a GEMX output layout. This delegates to
     // the single source of truth in `qtype_output_block_size` and avoids the
@@ -277,13 +285,6 @@ extern "C" int32_t run_repack_gemx(
         printf("run_repack_gemx: launch failed: %s\n", cudaGetErrorString(err));
         return -1;
     }
-    
-    // Synchronize to ensure repacking is complete
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        return -1;
-    }
-    
     return 0;
 }
 

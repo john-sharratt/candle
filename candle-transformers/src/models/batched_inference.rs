@@ -5769,6 +5769,13 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// Whether the expert cache's pipeline thread or stager has exited. Neither
+    /// is restarted, and every forward after it fails, so a model whose cache
+    /// reports this can serve nothing again.
+    fn expert_pipeline_dead(&self) -> bool {
+        false
+    }
+
     /// The expert cache's `(hits, misses)` tallies so far, unsettled
     /// (`ExpertCache::hit_counts`) — the per-step read, where
     /// [`Self::expert_stats`] waits for the pipeline thread to serve every
@@ -6070,6 +6077,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.model().expert_stats()
+    }
+
+    fn expert_pipeline_dead(&self) -> bool {
+        self.model().expert_pipeline_dead()
     }
 
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {

@@ -163,6 +163,11 @@ pub(crate) trait Ground {
     /// the expensive work is never the cheapest.
     fn peek(&mut self, kind: Kind, prio: DecodePriority) -> Option<Cost>;
 
+    /// Whether some active slot belongs to a band below `prio` — work an offer
+    /// of `prio` outranks ([`rate::WaveRate::try_outranking`]). A section is
+    /// `Low`.
+    fn outranks_active(&self, prio: DecodePriority) -> bool;
+
     /// Admit the candidate [`Self::peek`] just priced at `cost`. `false` when the
     /// allocators refused it after all.
     ///
@@ -426,6 +431,29 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                 // the same way and counted the same way. Sections used to enter
                 // the wave without passing here at all, and one minute of them
                 // took the weight zone from 10,398 MiB to its hold.
+                // **A band the running work yields to is not held behind it.**
+                // The floors defend the residency the running slots decode at,
+                // and slots of a lower band are what spent it; they hold it until
+                // they finish. A turn they yield to is judged on the row cap
+                // alone (`WaveRate::try_outranking`), and a cap refusal re-offers
+                // it as a join like a rate refusal does.
+                Kind::Prefill if ground.outranks_active(prio) => {
+                    match rate.try_outranking(cost.rows, after) {
+                        rate::Admit::Admitted { .. } => true,
+                        rate::Admit::Refused(r @ rate::Refusal::Cap { .. })
+                            if cost.rows > 0 && ground.close_rows() =>
+                        {
+                            log_refusal(kind, prio, &cost, before, after, &budget, r);
+                            continue;
+                        }
+                        rate::Admit::Refused(r) => {
+                            rate.latch_full();
+                            out.note(r);
+                            log_refusal(kind, prio, &cost, before, after, &budget, r);
+                            false
+                        }
+                    }
+                }
                 Kind::Prefill | Kind::Section => {
                     // **A turn that will decode is judged by both models, here.**
                     //
@@ -535,6 +563,8 @@ mod tests {
     use candle_nn::kv_cache::REGION_BYTES;
     use rate::{DecodeModel, ExpertGeometry, RateModel};
 
+    use crate::scheduler::band::rank;
+
     /// One region of ground, the granularity a claim actually takes.
     const REGION: u64 = REGION_BYTES as u64;
     /// A floor with room above it for the tests to spend.
@@ -579,6 +609,8 @@ mod tests {
         /// whether it has been called: every prefill offered after it is a join.
         closes_rows: bool,
         rows_closed: bool,
+        /// The band of the slots already running, when one is set.
+        running_band: Option<DecodePriority>,
     }
 
     impl Fake {
@@ -601,6 +633,7 @@ mod tests {
                 join_after_head: false,
                 closes_rows: false,
                 rows_closed: false,
+                running_band: None,
             }
         }
         fn queue(&mut self, kind: Kind) -> &mut Vec<u64> {
@@ -700,6 +733,39 @@ mod tests {
             self.rows_closed = self.closes_rows;
             self.closes_rows
         }
+        fn outranks_active(&self, prio: DecodePriority) -> bool {
+            self.running_band.is_some_and(|b| rank(b) < rank(prio))
+        }
+    }
+
+    /// **A dialogue turn is not held behind the background work it outranks.**
+    /// Residency already stands under the floor — the running `Low` slots spent
+    /// it — so a `Low` turn is refused there, while a `High` one is admitted
+    /// past it.
+    #[test]
+    fn a_turn_outranking_the_running_slots_is_admitted_under_the_floor() {
+        let under = FLOOR - 4 * REGION;
+        let mut low = Fake::new(Vec::new(), vec![REGION], under);
+        low.active = 14;
+        low.running_band = Some(DecodePriority::Low);
+        let got = fill_once(&mut low);
+        assert_eq!(got.prefills, 0, "a turn of the running band waits");
+        assert!(got.stopped_on_weights);
+
+        let mut high = Fake::new(Vec::new(), vec![REGION], under);
+        high.active = 14;
+        high.running_band = Some(DecodePriority::Low);
+        high.prefill_prio = DecodePriority::High;
+        let got = fill_once(&mut high);
+        assert_eq!(got.prefills, 1, "the band they yield to is admitted");
+        assert!(!got.stopped_on_weights);
+
+        let mut peer = Fake::new(Vec::new(), vec![REGION], under);
+        peer.active = 14;
+        peer.running_band = Some(DecodePriority::High);
+        peer.prefill_prio = DecodePriority::High;
+        let got = fill_once(&mut peer);
+        assert_eq!(got.prefills, 0, "among equals the floor still holds");
     }
 
     /// **A turn whose rows do not pay joins the cohort instead of waiting for
@@ -969,6 +1035,9 @@ mod tests {
             fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
                 self.0.admit(kind, prio, cost)
             }
+            fn outranks_active(&self, prio: DecodePriority) -> bool {
+                self.0.outranks_active(prio)
+            }
         }
 
         // Residency far above the floor, so nothing here can be a weight
@@ -1049,6 +1118,9 @@ mod tests {
             }
             fn admit(&mut self, k: Kind, p: DecodePriority, c: Cost) -> bool {
                 self.0.admit(k, p, c)
+            }
+            fn outranks_active(&self, p: DecodePriority) -> bool {
+                self.0.outranks_active(p)
             }
         }
         // Ten queued at the floor: without the wave's own count every one lands.
@@ -1276,6 +1348,9 @@ mod tests {
                 }
                 self.committed = self.committed.saturating_add(cost.dislodged_bytes());
                 true
+            }
+            fn outranks_active(&self, prio: DecodePriority) -> bool {
+                self.inner.outranks_active(prio)
             }
         }
 

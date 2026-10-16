@@ -32,9 +32,9 @@ use candle_conversation::models::{Dialect, Model, StrataTokens};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, OpenProgressHook, OpenStage, SUBSTRATE_DIR};
 use candle_conversation::projection::{
-    self, Builder, Conversation, GroupSchema, LayerId, Reserved, SectionId, SectionLoads,
-    SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema, TimelineId, TurnIndex,
-    WorkingSetShare,
+    self, Builder, Conversation, DecodePriority, GroupSchema, LayerId, Reserved, SectionId,
+    SectionLoads, SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema, TimelineId,
+    TurnIndex, WorkingSetShare,
 };
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
@@ -76,6 +76,7 @@ use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
 use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
+use crate::conv_sweep::{self, Sweep, CONV_IDLE_TTL, CONV_SWEEP_EVERY};
 use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
@@ -523,6 +524,10 @@ struct InferenceState {
     /// in-flight exclusivity, and an async lock is what lets it live across an
     /// await without pinning a thread.
     conversations: Mutex<HashMap<String, Arc<ConvLock<ConvState>>>>,
+    /// When each resident conversation was last used, keyed like
+    /// `conversations` — what the idle sweep releases them by
+    /// ([`InferenceState::sweep_idle_conversations`]).
+    conv_used: Mutex<HashMap<String, Instant>>,
     /// The tools mode last applied to each conversation's projection, keyed like
     /// `conversations` and set at the start of every turn. The projection panel
     /// reads it to show the tool summary that was actually injected — the
@@ -1022,6 +1027,41 @@ fn load_stopped(engine: &ConversationEngine, step: &str) -> bool {
 }
 
 impl InferenceState {
+    /// Release every resident conversation nothing has used for
+    /// [`CONV_IDLE_TTL`] (`conv_sweep`), returning how many went. One a turn
+    /// holds is in use now, so its clock restarts: a long turn is not idle the
+    /// moment it finishes.
+    ///
+    /// The released states are dropped after the map's lock is let go — each
+    /// frees its scheduler slot as it drops.
+    fn sweep_idle_conversations(&self, now: Instant) -> usize {
+        let mut released: Vec<Arc<ConvLock<ConvState>>> = Vec::new();
+        {
+            let mut map = self.conversations.lock().unwrap();
+            let mut used = self.conv_used.lock().unwrap();
+            map.retain(|conv_id, conv| {
+                let last = *used.entry(conv_id.clone()).or_insert(now);
+                // The map's own reference is the only one when nothing holds it.
+                let held = Arc::strong_count(conv) > 1;
+                match conv_sweep::sweep(last, now, CONV_IDLE_TTL, held) {
+                    Sweep::Keep => true,
+                    Sweep::Touch => {
+                        used.insert(conv_id.clone(), now);
+                        true
+                    }
+                    Sweep::Release => {
+                        released.push(Arc::clone(conv));
+                        false
+                    }
+                }
+            });
+            // A clock outlives its conversation when the conversation leaves
+            // the map another way — deleted, or evicted after a failed turn.
+            used.retain(|conv_id, _| map.contains_key(conv_id));
+        }
+        released.len()
+    }
+
     // Every argument is a distinct piece of deployment config read from the CLI
     // / config file at startup, used once here and never carried together
     // afterwards, so there is no struct for them to already belong to.
@@ -1676,12 +1716,19 @@ impl InferenceState {
         // turns never enter a user conversation's projection.
         //
         // Its KV cache for the (tiny) system prompt is prefilled once here;
-        // every title-generation reuses it.
+        // every title-generation reuses it. It is background to the dialogue
+        // it names, so it decodes at `Normal`: it never holds that dialogue's
+        // prompt back.
         let titler_formatted = conv_config
             .dialect
             .format_system_prompt(TITLER_SYSTEM_PROMPT);
         let titler = engine
-            .new_reserved_conversation(&titler_formatted, Reserved::Titler, conv_config.clone())
+            .new_reserved_conversation(
+                &titler_formatted,
+                Reserved::Titler,
+                DecodePriority::Normal,
+                conv_config.clone(),
+            )
             .map_err(|e| anyhow::anyhow!("titler create: {e}"))?;
         let titler_timeline = titler.timeline_id();
         let tokenizer = Arc::new(engine.tokenizer().clone());
@@ -2671,6 +2718,7 @@ impl InferenceState {
             engine,
             substrate,
             conversations: Mutex::new(HashMap::new()),
+            conv_used: Mutex::new(HashMap::new()),
             tool_modes: Mutex::new(HashMap::new()),
             base_conv: Mutex::new(base_conv),
             ingest_bases,
@@ -2717,6 +2765,22 @@ impl InferenceState {
         // guard for exactly this kind of arming (see `start_loading`).
         let worker = tokio::spawn(titler_task(worker_state, titler, titler_rx));
         *state.titler_worker.lock().unwrap() = Some(worker);
+        // The idle sweep, on the same runtime. It holds the state weakly and
+        // ends with it.
+        let swept = Arc::downgrade(&state);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(CONV_SWEEP_EVERY);
+            loop {
+                every.tick().await;
+                let Some(state) = swept.upgrade() else {
+                    return;
+                };
+                let released = state.sweep_idle_conversations(Instant::now());
+                if released > 0 {
+                    tracing::info!(released, "released idle conversations");
+                }
+            }
+        });
         Ok(Some(state))
     }
 
@@ -3429,6 +3493,11 @@ fn run_inference_stream(
         // this guard is picked back up, and `zend_run_iteration_traps.md`
         // for the trace that found this.
         let mut minted_guard: Option<OwnedMutexGuard<ConvState>> = None;
+        state
+            .conv_used
+            .lock()
+            .unwrap()
+            .insert(conv_id.clone(), Instant::now());
         let forked: anyhow::Result<Arc<ConvLock<ConvState>>> = {
             let mut map = state.conversations.lock().unwrap();
             if let Some(existing) = map.get(&conv_id) {

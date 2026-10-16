@@ -53,8 +53,8 @@ repository is readable by the model.
 - **The cluster.** motherd's zend and npcd tenants join the gateway's cluster
   (`docs/replicated_substrate.md`): the gateway routes each name to a joined, ready
   member of its app over the member's socket, and to the route's `upstream` only while
-  the app has no member (dumb mode). While that upstream is down, a member still loading
-  stands in for it, so the name shows the member's loading page rather than an outage.
+  the app has no member (dumb mode). While every admitted member is still loading, the
+  gateway answers with its own reconnecting page, which the consoles retry.
   npcd on `.6` was stopped on 2026-10-12: `bot.tokera.com` is motherd's npcd alone until
   `.6` is rebuilt onto this framework and joins.
 - **cf-ddns** keeps the Cloudflare A records at the public IP, so a router reboot that
@@ -189,7 +189,9 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
   `upstream:`. The gateway serves a name from the app's ready members while it has any,
   and from the upstream while it has none.
 - **The status page** is `/gateway` on the gateway, its data `/gateway/status.json`
-  (both an admin's): each app's mode,
+  (both an admin's; the data also answers `Authorization: Bearer <key>` with the key
+  `web --new-status-key web/secrets/status.key` writes, named as the `cluster:` block's
+  `status_key_file`): each app's mode,
   members, lag and claims, the build floor, and the gateway's peers.
 
 ### keep

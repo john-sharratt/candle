@@ -1529,4 +1529,68 @@ mod tests {
             }
         }
     }
+
+    /// **A gallery too wide for one pass is scanned in probe chunks, bit for
+    /// bit.** The tensor launchers bound their accumulators to
+    /// `BDP_SCRATCH_BYTES` (`bdp_chunk.cuh`): at 18,000 cases over three groups
+    /// a probe token needs 1.08 MB, so 96 MiB holds 93 of this probe's 120 and
+    /// the scan runs in two passes. The single-pass scalar kernel is the
+    /// reference.
+    #[test]
+    fn a_wide_gallery_is_scanned_in_probe_chunks_bit_identically() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let (_, has_imma) = arena.tensor_caps();
+        if !has_imma {
+            return;
+        }
+        let mut rng = 0x5E_ED0F_C4A1_u64;
+        let turns: Vec<Vec<WideQSig>> = (0..64)
+            .map(|_| (0..8).map(|_| rand_sig(&mut rng)).collect())
+            .collect();
+        const SEGMENTS: usize = 4_500;
+        const CASES: usize = 4;
+        let segs: Vec<PagedSegment> = (0..SEGMENTS)
+            .map(|si| {
+                let windows = (0..CASES)
+                    .map(|case| {
+                        let ti = (si * CASES + case) % turns.len();
+                        let start = (si + case) % 6;
+                        PagedWindow {
+                            sid: turn_stream_id(9_000, ti as u32),
+                            fingerprint: ti as u64,
+                            turn: &turns[ti],
+                            start,
+                            end: start + 2,
+                            case,
+                        }
+                    })
+                    .collect();
+                PagedSegment {
+                    windows,
+                    n_cases: CASES,
+                }
+            })
+            .collect();
+        let probe: Vec<WideQSig> = (0..120).map(|_| rand_sig(&mut rng)).collect();
+        let scalar = arena
+            .scan_weighted_scalar(&segs, &[probe.as_slice()], &[])
+            .unwrap();
+        let imma = arena
+            .scan_weighted_imma(&segs, &[probe.as_slice()], &[])
+            .unwrap();
+        assert_eq!(scalar[0].len(), SEGMENTS * CASES);
+        assert!(scalar[0].iter().any(|v| *v != 0.0), "the scan voted");
+        for (ci, (s, m)) in scalar[0].iter().zip(&imma[0]).enumerate() {
+            assert_eq!(
+                s.to_bits(),
+                m.to_bits(),
+                "case {ci}: scalar {s} vs chunked IMMA {m} must be bit-identical"
+            );
+        }
+    }
 }

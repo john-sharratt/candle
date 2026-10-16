@@ -317,6 +317,38 @@ fn bench_qsa_select_cost_vs_depth() -> Result<()> {
     Ok(())
 }
 
+/// **A bulk prefill row group climbing to production depth.**
+///
+/// The shape a live chat turn's prefill selects at: one 8,192-row group per
+/// wave against an index that ends ~80K blocks wide (a 320K-token context).
+/// Each step's time is the whole selection for one layer, scoring and top-k.
+#[test]
+#[ignore = "microbenchmark; run with --ignored --nocapture"]
+fn bench_qsa_select_bulk_rows_to_depth() -> Result<()> {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0)?;
+    let w = weights(&dev)?;
+    let rope = rope_for(&dev)?;
+    let rows = 8192;
+
+    println!("\n  QSA selection — {rows}-row bulk group, cost vs depth");
+    println!("  {:>8} {:>10} {:>12}", "depth", "blocks", "ms/layer");
+    let mut wave = Wave::build(1, 0, rows, &w, &rope, &dev)?;
+    for step in 0..40 {
+        dev.synchronize()?;
+        let t = Instant::now();
+        wave.run(&w, &rope, &dev)?;
+        dev.synchronize()?;
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        if step % 4 == 3 {
+            let depth = wave.offsets[0] + rows;
+            println!("  {depth:>8} {:>10} {ms:>12.1}", depth / RATIO);
+        }
+        wave.advance();
+    }
+    Ok(())
+}
+
 /// The width sweep at engaged depth — both costs at once, which is the shape a
 /// deep multi-session wave actually runs.
 #[test]

@@ -179,8 +179,15 @@ roles_file: "../host/roles.yaml"
 # and copied to every member (`--group-key`, `group_key:` in motherd.yaml).
 # `floor_grace_minutes` and `canary_share` tune certification (§3.8); `peers`
 # names the other gateways answering these names (§13.4) — none yet.
+#
+# `status_key_file` lets a caller read `/gateway/status.json` without a browser
+# session, presenting the file's contents as `Authorization: Bearer <key>`
+# (§12). Made once with
+#
+#   target\release\web.exe --new-status-key web/secrets/status.key
 cluster:
   group_key_file: "secrets/group.key"
+  status_key_file: "secrets/status.key"
   name: "blackworld"
 
 sites:

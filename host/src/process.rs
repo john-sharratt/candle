@@ -13,6 +13,7 @@ use std::panic::set_hook;
 use std::path::Path;
 use std::process::exit;
 use std::sync::Arc;
+use std::thread::current;
 
 use candle_conversation::relief_trace;
 use tokio::signal::ctrl_c;
@@ -27,16 +28,28 @@ use anyhow::anyhow;
 use crate::logs::LogBus;
 use web::log_file::{is_resuming, RotatingFileLog};
 
-/// Print a full backtrace on every panic — no `RUST_BACKTRACE` needed — with
+/// Report a full backtrace on every panic — no `RUST_BACKTRACE` needed — with
 /// the last CUDA kernel launched on the crashing thread and the relief trace.
 /// The kernel name is written into a thread-local breadcrumb before every
 /// kernel launch, so it is available here even though a CUDA error surfaces
 /// asynchronously at a later readback or synchronize.
+///
+/// **Logged as well as printed.** keep runs a stable daemon with stderr
+/// detached, so a panic that only reached stderr went nowhere: a scheduler
+/// thread that panicked left its callers hearing "scheduler has shut down"
+/// and the log saying nothing about why. The log file is the record that
+/// survives, and `/v1/logs` searches it.
 pub fn install_panic_hook() {
     set_hook(Box::new(|info| {
         let bt = Backtrace::force_capture();
         let kernel = candle::last_cuda_kernel_launch();
         let relief = relief_trace::dump();
+        let me = current();
+        let name = me.name().unwrap_or("<unnamed>");
+        tracing::error!(
+            thread = name,
+            "PANIC: {info}\nLast CUDA kernel: {kernel}\n{relief}\n\n{bt}"
+        );
         eprintln!(
             "\n=== PANIC ===\n{info}\nLast CUDA kernel: {kernel}\n{relief}\n\n{bt}\n=============\n"
         );

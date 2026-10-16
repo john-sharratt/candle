@@ -670,13 +670,10 @@ async fn handle(
                             Routed::Answered(res) => return res,
                             Routed::Dumb(back) => req = back,
                         }
-                    } else if app.health.is_down(url) {
-                        // Dumb, and the configured upstream is not answering: a
-                        // member still loading serves its own loading page in
-                        // place of the outage page (§5.7).
-                        if let Some(node) = gw.hub.standing_by(cluster_app) {
-                            return route::forward(gw, cluster_app, node, &ctx(), req).await;
-                        }
+                    } else if gw.hub.admitted(cluster_app) {
+                        // Members, all still loading: the gateway's reconnecting
+                        // page, never one of them half-loaded (§5.7).
+                        return route::restarting(cluster_app, want_html);
                     }
                     gw.hub.traffic.request(Class::Configured);
                 }

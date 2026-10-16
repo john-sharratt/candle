@@ -1298,11 +1298,24 @@ impl Scheduler {
         // earlier arrangement truncated to `kept` here and tried to correct to
         // `committed` afterwards, which could not work for that reason and left
         // rejected tokens in the KV whenever the per-token path stopped early.
-        let targets: Vec<(usize, usize)> = seq_ids_raw
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| (s, poss[i] + committed[i]))
-            .collect();
+        //
+        // **A row that committed nothing is not rolled back with the others.**
+        // Every live row commits at least its first token, so zero means the
+        // sequence had already stopped — a degenerate row, a sink that closed —
+        // and the model refuses a rewind to zero rows. Asked anyway, that one
+        // refusal failed every decode in the step: on 2026-10-17 one
+        // conversation's NaN state took another's turn down with it. It fails
+        // alone instead, so its turn is discarded rather than sealed over a
+        // block the K/V still holds.
+        let (stopped, targets) = rollback_targets(&seq_ids_raw, &poss, &committed);
+        for &i in &stopped {
+            if let Some(state) = self.active_decodes.get_mut(&seq_ids[i]) {
+                state.fail(ConversationError::Channel(
+                    "the sequence stopped inside a speculative step before committing a token"
+                        .to_string(),
+                ));
+            }
+        }
         // Every read of the wave's rows is done; the rollback may run the next
         // forward, which reclaims their span.
         drop(captured);
@@ -2343,6 +2356,26 @@ impl Scheduler {
     }
 }
 
+/// Split a speculative step's rows for the rollback: the positions (into
+/// `seqs`) of the rows that committed nothing, which are not rolled back, and
+/// `(sequence, position after its committed tokens)` for every other row.
+fn rollback_targets(
+    seqs: &[usize],
+    poss: &[usize],
+    committed: &[usize],
+) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let mut stopped = Vec::new();
+    let mut targets = Vec::with_capacity(seqs.len());
+    for (i, &seq) in seqs.iter().enumerate() {
+        if committed[i] == 0 {
+            stopped.push(i);
+        } else {
+            targets.push((seq, poss[i] + committed[i]));
+        }
+    }
+    (stopped, targets)
+}
+
 /// Report whether a sequence's persistent recurrent state is finite, per layer.
 ///
 /// Called when a sequence first emits token 0 — the point at which its logits
@@ -2415,5 +2448,22 @@ fn describe_recurrent_state(model: &(dyn ManagedBatchedModel + Send), seq: Seque
             "degenerate decode: recurrent state is entirely FINITE — the fault is in \
              this wave's activations, not in carried state"
         ),
+    }
+}
+
+#[cfg(test)]
+mod rollback_target_tests {
+    use super::rollback_targets;
+
+    /// A row that committed nothing stays out of the rollback; the others
+    /// roll back to just past what they committed.
+    #[test]
+    fn a_row_that_committed_nothing_is_left_out_of_the_rollback() {
+        let (stopped, targets) = rollback_targets(&[21, 26, 30], &[100, 200, 300], &[3, 0, 1]);
+        assert_eq!(stopped, vec![1]);
+        assert_eq!(targets, vec![(21, 103), (30, 301)]);
+        let (stopped, targets) = rollback_targets(&[5], &[10], &[2]);
+        assert!(stopped.is_empty());
+        assert_eq!(targets, vec![(5, 12)]);
     }
 }

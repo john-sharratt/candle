@@ -14,6 +14,7 @@
 //! | [`aggregate`], [`merge_ws`] | a request every ready member answers |
 //! | [`tunnel`] | a WebSocket to a member, closed `1011` when its socket drops |
 //! | [`page`] | the status page |
+//! | [`status_key`] | the key that reads the status without a session |
 //! | [`peers`] | the peer gateways: node id, identity, dial loops (§13.4) |
 //! | [`upgrades`] | the gateway's upgrade commands, the forced rollout's plan |
 //!
@@ -29,6 +30,7 @@ pub mod mirror;
 pub mod page;
 pub mod peers;
 pub mod route;
+pub mod status_key;
 pub mod streams;
 pub mod transport;
 pub mod tunnel;
@@ -52,6 +54,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use crate::acme::names::groups;
 use crate::acme::peers::AcmePeers;
 use crate::config::{Cluster as ClusterConfig, Config};
+use status_key::StatusKey;
 
 /// How often the upgrades are judged: verdicts due, members left behind.
 const UPGRADE_TICK: Duration = Duration::from_secs(1);
@@ -108,6 +111,9 @@ pub struct Gateway {
     /// The peer gateways answering the same names (§13.4), when
     /// `cluster.peers` names any.
     pub peering: Option<Arc<Peering>>,
+    /// The key that reads the status without a session, when
+    /// `cluster.status_key_file` names one.
+    pub status_key: Option<StatusKey>,
     /// The ACME shared with the peers, once the TLS entrance's certificates
     /// are loaded.
     acme: OnceLock<Arc<AcmePeers>>,
@@ -154,10 +160,16 @@ impl Gateway {
                     .with_context(|| format!("opening {}", journal.display()))?,
             ),
         )?;
+        let status_key = cluster
+            .status_key_file
+            .as_deref()
+            .map(StatusKey::load)
+            .transpose()?;
         Ok(Arc::new(Gateway {
             hub,
             node: voter,
             peering,
+            status_key,
             acme: OnceLock::new(),
             sites: groups(cfg).into_iter().map(|g| g.site).collect(),
             router: OnceLock::new(),
@@ -201,10 +213,16 @@ impl Gateway {
 
     /// A gateway around `hub`, for tests that build the hub themselves.
     pub fn with_hub(hub: Arc<Hub>) -> Arc<Gateway> {
+        Gateway::with_hub_and_status_key(hub, None)
+    }
+
+    /// [`Self::with_hub`], reading its status with `status_key` too.
+    pub fn with_hub_and_status_key(hub: Arc<Hub>, status_key: Option<StatusKey>) -> Arc<Gateway> {
         Arc::new(Gateway {
             hub,
             node: 0,
             peering: None,
+            status_key,
             acme: OnceLock::new(),
             sites: Vec::new(),
             router: OnceLock::new(),

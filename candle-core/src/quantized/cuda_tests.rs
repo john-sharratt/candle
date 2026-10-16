@@ -14,7 +14,7 @@ use candle_kernels::simple::moe_bucketize::{
     run_moe_bucketize, BUCKETIZE_LAUNCHED, PROMO_EMPTY, PROMO_SKIP,
 };
 use cudarc::driver::sys::{cuMemFreeHost, CUstream};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use rand::Rng;
 use std::ffi::c_void;
@@ -12272,7 +12272,8 @@ impl LiveFixture {
             (raw, d)
         };
         let (table_h, table_d) = mapped(3 * n_experts * 8);
-        let (abort_h, abort_d) = mapped(16);
+        // The abort word, the fault word 8 bytes in, and the reached word 16 in.
+        let (abort_h, abort_d) = mapped(24);
         let chunk_bytes = expert_bytes / ((nrows / 8) * (ncols / 128));
         Ok(Self {
             vram_ptrs,
@@ -12307,14 +12308,82 @@ impl LiveFixture {
             CLS_PINNED => self.host_ptr(e),
             _ => 0,
         };
-        let n = self.vram_ptrs.len();
-        unsafe {
-            std::ptr::write_volatile(self.table_h.add(n + e), v);
-            std::ptr::write_volatile(self.table_h.add(2 * n + e), v);
-            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            std::ptr::write_volatile(self.table_h.add(e), v);
-        }
+        // SAFETY: the fixture's mapped table, `[3][n_experts]`, lives as long as it.
+        unsafe { publish_entry(self.table_h, self.vram_ptrs.len(), e, v) }
     }
+
+    /// Queue a store of 1 to the reached word on `stream`: it lands when the
+    /// stream reaches this point, which the publisher waits for.
+    fn mark_reached(&self, stream: &CudaStream) {
+        use cudarc::driver::sys;
+        let reached_d = self.abort_d + 16;
+        // SAFETY: the reached word is in the fixture's mapped allocation.
+        let r = unsafe { sys::cuMemsetD32Async(reached_d, 1, 1, stream.cu_stream()) };
+        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "mark the launch reached");
+    }
+
+    /// A publisher for the cold experts in `class`: their pinned copies, written
+    /// from another thread `delay` after the stream reaches the launch
+    /// ([`Self::mark_reached`]), as the stager does.
+    ///
+    /// **Not from the launching thread.** The stager makes no driver call, and a
+    /// live launch depends on that: its workers spin until the host publishes,
+    /// and a driver call on the publishing thread can wait behind another
+    /// thread's call that is itself waiting for the device to go idle — a module
+    /// load is one. Published from the launching thread after its next launch,
+    /// the parallel suite held that launch for the whole spin limit, the workers
+    /// gave the cold experts up, and the output was missing their rows.
+    ///
+    /// **Timed from the stream, not from the call.** With other tests' kernels on
+    /// the card, the launch can start after a delay counted from the host's
+    /// enqueue has already run out; the cold experts are then published before
+    /// any worker waits, and the launch never exercises the wait it is testing.
+    /// The publisher polls the reached word — a plain read of mapped memory,
+    /// still no driver call — and counts the delay from there.
+    fn publish_cold_later(
+        &self,
+        class: &[u8],
+        delay: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let n = self.vram_ptrs.len();
+        let cold: Vec<(usize, u64)> = class
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c == CLS_COLD)
+            .map(|(e, _)| (e, self.host_ptr(e)))
+            .collect();
+        let table = self.table_h as usize;
+        let reached = self.abort_h as usize + 16;
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            // SAFETY: the caller joins this thread before the fixture drops.
+            while unsafe { std::ptr::read_volatile(reached as *const u32) } == 0 {
+                assert!(
+                    t0.elapsed() < std::time::Duration::from_secs(60),
+                    "the stream never reached the live launch"
+                );
+                std::thread::yield_now();
+            }
+            std::thread::sleep(delay);
+            for (e, v) in cold {
+                // SAFETY: as above.
+                unsafe { publish_entry(table as *mut u64, n, e, v) }
+            }
+        })
+    }
+}
+
+/// Point expert `e`'s three entries in a mapped `[3][n]` table at `v`: up and
+/// down first, gate last, as the host publishes. Plain stores to mapped memory —
+/// no driver call.
+///
+/// # Safety
+/// `table` must address a live, mapped table of `3 * n` entries, `e < n`.
+unsafe fn publish_entry(table: *mut u64, n: usize, e: usize, v: u64) {
+    std::ptr::write_volatile(table.add(n + e), v);
+    std::ptr::write_volatile(table.add(2 * n + e), v);
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    std::ptr::write_volatile(table.add(e), v);
 }
 
 impl Drop for LiveFixture {
@@ -12409,10 +12478,21 @@ fn grouped_int8_tile_mode_bands() {
 
 /// One live launch at token-tile mode `n_sub` (tiles `16·n_sub` wide) against the
 /// all-VRAM launch at the same mode.
+///
+/// **One at a time.** A live launch holds the card's SMs while its workers wait
+/// for the host, which is the condition this measures: the cold wait must span
+/// the publisher's delay. A second live launch on the card — never a state
+/// production reaches, with one wave engine per device — keeps the first's
+/// blocks off the SMs for its own wait, so the first starts after its experts
+/// are already published and the wait it is testing never happens.
 fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
     use cudarc::driver::sys;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use std::sync::Mutex;
+
+    static ONE_LIVE_LAUNCH: Mutex<()> = Mutex::new(());
+    let _one = ONE_LIVE_LAUNCH.lock().unwrap_or_else(|p| p.into_inner());
 
     let dev = CudaDevice::new(0)?;
     let device = crate::Device::Cuda(dev.clone());
@@ -12569,6 +12649,11 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
         workers: W as i32,
         row: 3,
     };
+    // The cold experts published late from the stager's side, counted from the
+    // stream reaching the launch, and work queued behind the launch meanwhile.
+    let delay = std::time::Duration::from_millis(50);
+    fx.mark_reached(&stream);
+    let publisher = fx.publish_cold_later(&class, delay);
     let got = grouped_qmatmul_dev_q8a128(
         &op,
         table,
@@ -12584,19 +12669,13 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
         Some(&live),
         &dev,
     )?;
-    // Work queued behind the launch, then the cold experts published late.
     let tail = (&tail + 1.0)?;
     unsafe {
         let _ = sys::cuStreamQuery(stream.cu_stream());
     }
-    let delay = std::time::Duration::from_millis(50);
-    std::thread::sleep(delay);
-    for (e, &c) in class.iter().enumerate() {
-        if c == CLS_COLD {
-            fx.set(e, CLS_PINNED);
-        }
+    if let Err(panic) = publisher.join() {
+        std::panic::resume_unwind(panic);
     }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
     let got = read_f32_tensor(&dev, &got)?;
     let n_cmp = total_valid * nrows;
@@ -13400,10 +13479,7 @@ fn bench_pinned_host_read_bandwidth() -> Result<()> {
         },
     )
     .map_err(crate::Error::wrap)?;
-    let module = match dev.cuda_context().load_module(ptx.clone()) {
-        Ok(m) => m,
-        Err(_) => dev.load_module_via_ptxas("pinned_read_probe", &ptx)?,
-    };
+    let module = dev.load_ptx("pinned_read_probe", &ptx)?;
 
     const BYTES: usize = 256 << 20;
     let mut host: *mut c_void = std::ptr::null_mut();
@@ -13800,10 +13876,7 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
             },
         )
         .map_err(crate::Error::wrap)?;
-        match dev.cuda_context().load_module(ptx.clone()) {
-            Ok(m) => Ok(m),
-            Err(_) => dev.load_module_via_ptxas(name, &ptx),
-        }
+        dev.load_ptx(name, &ptx)
     };
     let module = compile(MOE_SIM, "moe_sim")?;
     let sim = module
@@ -14110,11 +14183,7 @@ fn bench_moe_worker_launch_simulation() -> Result<()> {
                 drop(dev.memcpy_stod(&[1.0f32; 32])?);
             }
             let t = Instant::now();
-            let late = dev.cuda_context().load_module(late_ptx.clone());
-            let late = match late {
-                Ok(m) => m,
-                Err(_) => dev.load_module_via_ptxas("late_module", &late_ptx)?,
-            };
+            let late = dev.load_ptx("late_module", &late_ptx)?;
             let f = late
                 .load_function("late_kernel")
                 .map_err(crate::Error::wrap)?;

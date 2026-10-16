@@ -84,19 +84,23 @@ __global__ void flush_l2_kernel(const char* __restrict__ buffer, size_t size, vo
 // Host function to flush L2 cache
 // buffer: Pre-allocated device buffer larger than L2 cache
 // size: Size of buffer in bytes (should be >= 2x L2 cache size)
-extern "C" void flush_l2_cache(const void* buffer, size_t size) {
+// stream: the stream the flush is ordered on, and waited for
+//
+// Waits for `stream`, never the whole device: a device-wide synchronise is
+// refused by a graph capture on any thread, and the refusal invalidates it.
+extern "C" void flush_l2_cache(const void* buffer, size_t size, cudaStream_t stream) {
     // Use enough threads to saturate memory bandwidth
     const int threads = 256;
     const int blocks = (size + threads * 16 - 1) / (threads * 16);  // 16 bytes per thread min
-    
+
     // Allocate a tiny dummy output to prevent optimization
     static int* d_dummy = nullptr;
     if (d_dummy == nullptr) {
         cudaMalloc(&d_dummy, sizeof(int));
     }
-    
-    flush_l2_kernel<<<blocks, threads>>>(static_cast<const char*>(buffer), size, d_dummy);
-    cudaDeviceSynchronize();
+
+    flush_l2_kernel<<<blocks, threads, 0, stream>>>(static_cast<const char*>(buffer), size, d_dummy);
+    cudaStreamSynchronize(stream);
 }
 
 // =============================================================================

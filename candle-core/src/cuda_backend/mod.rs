@@ -178,13 +178,17 @@ mod held;
 mod info_ring;
 mod kernel_scratch;
 pub mod link_probe;
+mod module_loading;
 pub mod staged;
 mod stream_alloc;
+mod sync_watch;
+mod thread_blas;
 mod utils;
 pub use device::{CudaDevice, DeviceId, Uploaded};
 pub use error::{CudaError, WrapErr};
 pub use held::{install_held_ground, Held, HeldGround};
 pub use stream_alloc::{stream_alloc, stream_alloc_zeros, stream_memcpy_stod};
+pub use thread_blas::BlasHandle;
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Out, OutS, S};
 
 pub enum SlicePtrOrNull<T> {
@@ -5177,7 +5181,7 @@ impl BackendStorage for CudaStorage {
                     && (rhs_l.start_offset() * 2).is_multiple_of(16);
                 unsafe {
                     gemm_strided_batched_bf16(
-                        self.device.cublas()?,
+                        &*self.device.cublas()?,
                         cfg,
                         rhs,
                         lhs,
@@ -5200,7 +5204,7 @@ impl BackendStorage for CudaStorage {
                     && (rhs_l.start_offset() * 2).is_multiple_of(16);
                 unsafe {
                     gemm_strided_batched_f16(
-                        self.device.cublas()?,
+                        &*self.device.cublas()?,
                         cfg,
                         rhs,
                         lhs,
@@ -5223,7 +5227,7 @@ impl BackendStorage for CudaStorage {
                     && (rhs_l.start_offset() * 4).is_multiple_of(16);
                 unsafe {
                     gemm_strided_batched_f32(
-                        self.device.cublas()?,
+                        &*self.device.cublas()?,
                         cfg,
                         rhs,
                         lhs,

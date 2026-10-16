@@ -345,6 +345,10 @@ last known-good binaries in `keep/stable/`. Design: `docs/replicated_substrate.m
 3. keep runs it as a trial from the stable path. If it prints `INFO serving` within ten
    minutes, it becomes the service. Otherwise keep restores the old binary. Confirm by polling
    `/v1/status` for a `started_at_ms` later than the switch and `state: ready`.
+   To restart a service on the binary it already runs, `curl -X POST
+   http://127.0.0.1:8092/restart/motherd` (no trial, no elevation). `/stop/<service>`
+   holds it down, `/start/<service>` brings it back, and `/exit` restarts keep itself
+   onto the newest `target\release\keep.exe` (rename the running one before building).
    Read logs from the gateway's aggregated `/ws/logs`, not a local file.
 4. The new `motherd` joins the cluster as a **candidate** at the higher build count.
    Once certified, it offers its binaries and the other members fetch and install

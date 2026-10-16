@@ -135,7 +135,7 @@ fn a_sampled_forward_stands_for_its_whole_period() {
     gpu_drain_blocking();
     set_gpu_span_period(4);
     for _ in 0..8 {
-        begin_gpu_span_forward();
+        begin_gpu_span_forward(false);
         let g = gpu_span("probe:sampled", &dev);
         let _ = a.matmul(&a).unwrap();
         g.end();
@@ -153,6 +153,25 @@ fn a_sampled_forward_stands_for_its_whole_period() {
         "two sampled spans, each counted for its period of 4"
     );
     assert!(row.1 > 0.0, "elapsed must be positive, got {}ms", row.1);
+}
+
+/// **A bulk forward is always recorded, and counts once.** Every other forward
+/// is recorded on the period's multiples, standing for the whole period.
+#[cfg(all(feature = "profile", feature = "cuda"))]
+#[test]
+fn a_bulk_forward_is_always_recorded_at_weight_one() {
+    use super::gpu::span_weight;
+    let period = 8;
+    let weights: Vec<u32> = (1..=16).map(|n| span_weight(false, n, period)).collect();
+    assert_eq!(weights.iter().filter(|&&w| w > 0).count(), 2);
+    assert_eq!(
+        weights.iter().sum::<u32>(),
+        16,
+        "the samples speak for every forward"
+    );
+    for n in 1..=16 {
+        assert_eq!(span_weight(true, n, period), 1, "forward {n}");
+    }
 }
 
 /// A run that never reaches a drain boundary must still be bounded. Opening far

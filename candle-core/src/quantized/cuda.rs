@@ -494,13 +494,17 @@ pub fn get_dispatch_info(batch_size: i32, weight_bytes: usize) -> String {
 /// * `device` - The CUDA device
 ///
 /// The buffer should be created once and reused. This function synchronizes
-/// the device before returning.
+/// the device's stream before returning.
 pub fn cuda_flush_l2(buffer: &CudaSlice<u8>, device: &CudaDevice) {
     let stream = device.cuda_stream();
     let (ptr, _guard) = buffer.device_ptr(&stream);
     let size = buffer.len();
     unsafe {
-        flush_l2_cache(ptr as *const core::ffi::c_void, size);
+        flush_l2_cache(
+            ptr as *const core::ffi::c_void,
+            size,
+            stream.cu_stream() as *mut core::ffi::c_void,
+        );
     }
 }
 
@@ -4052,6 +4056,8 @@ impl QCudaStorage {
             let stream = self.device.cuda_stream();
             let (src_ptr, _src_guard) = self.data.inner.device_ptr(&stream);
             let (dst_ptr, _dst_guard) = dst_data.device_ptr(&stream);
+            // Ordered on `stream`: the repacked buffer is only read behind it,
+            // and the source's release queues behind it there too.
             let result = unsafe {
                 run_repack_gemx(
                     src_ptr as *const std::ffi::c_void,
@@ -4059,6 +4065,7 @@ impl QCudaStorage {
                     nrows as i32,
                     ncols as i32,
                     qtype,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 )
             };
 
@@ -4915,7 +4922,7 @@ pub fn repack_gemx_to_host(
     // H2D: GGML bytes → src VRAM.
     device.memcpy_htod(ggml_bytes, &mut src_buf.slice_mut(..ggml_bytes.len()))?;
 
-    // GPU repack kernel (includes cudaDeviceSynchronize).
+    // GPU repack kernel, ordered on the stream the readback below waits for.
     {
         let stream = device.cuda_stream();
         let (src_ptr, _sg) = src_buf.device_ptr(&stream);
@@ -4927,6 +4934,7 @@ pub fn repack_gemx_to_host(
                 nrows as i32,
                 ncols as i32,
                 qtype,
+                stream.cu_stream() as *mut std::ffi::c_void,
             )
         };
         if result < 0 {

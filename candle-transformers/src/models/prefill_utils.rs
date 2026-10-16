@@ -1606,6 +1606,26 @@ impl<'k> PagedPrefillInt8<'k> {
                 self.qsa.as_ref(),
                 &stream,
                 |sel_e, sel_c, sel_pages, sel_win, sel_stride, sel_ratio| {
+                    // A bulk launch's shape, which is what its cost follows:
+                    // how many key chunks each row group re-stages and walks,
+                    // and how wide a row's selection is.
+                    if total_q >= PREFILL_KV_STAGE_MIN_Q_LEN {
+                        tracing::debug!(
+                            target: "candle_transformers::prefill_launch",
+                            seqs = self.batch_size,
+                            rows = total_q,
+                            max_q = self.max_q_len,
+                            max_kv = self.cut.max_kv_len,
+                            groups = self.cut.group_chunks.len(),
+                            chunks = self.cut.group_chunks.iter().sum::<u32>(),
+                            group_blocks = layout.group_blocks,
+                            stage_positions = layout.stage_positions,
+                            carry_tokens = layout.carry_tokens,
+                            selection_stride = sel_stride,
+                            paged = !sel_pages.is_null(),
+                            "bulk prefill attention launch",
+                        );
+                    }
                     run_paged_prefill_int8(
                         q_ptr as *const core::ffi::c_void,
                         k_ptr as *const core::ffi::c_void,
