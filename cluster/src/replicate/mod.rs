@@ -7,6 +7,7 @@
 //! one app's replication on a member and is driven by its sockets.
 
 mod answer;
+mod answering;
 mod catchup;
 mod consensus;
 mod coord;

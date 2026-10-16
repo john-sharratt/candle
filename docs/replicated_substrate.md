@@ -2420,6 +2420,19 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      `(oseq, type, stream_id, chunk_index, len, digest)`, about 40 bytes packed, never
      the payload. It also lists the `oseq`s in the range it knows are gone.
    - The answer ends with `DONE`.
+   - **One answer per requester.** A member far behind lacks everything, so an answer
+     lists the whole log, a header read per record, and runs for minutes. A requester
+     asks again when its catch-up goes quiet (§7.1), and its gap watch asks again for as
+     long as the answerer keeps writing. So a newer `CATCHUP` from the same `reply_to`
+     cancels the answer before it, and an answer whose requester no gateway lists any
+     more is cancelled too. A cancelled answer stops before its next range and sends no
+     `DONE`. Without this, answers stacked by the dozen on `.5`, each re-listing the
+     same history: 70,000 4 KiB header reads a second, a persistence lock nothing else
+     could take, an engine that ran two forwards in fourteen minutes, and a requester
+     that never finished catching up.
+   - **The persistence lock is held per 512 records**, not per range. The scheduler's
+     and the leases' writes take turns with the listing, rather than waiting out 8192
+     disk reads.
 4. **Compare.** It decides what to fetch:
    - Every listed record it does not hold, and that none of its other catch-ups is
      already fetching, is wanted. It never compares by `digest`: a record keeps its

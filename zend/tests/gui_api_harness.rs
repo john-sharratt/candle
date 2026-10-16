@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use host::access::LocalSignin;
 use host::endpoints::{routes, Shared};
-use host::logs::{BusWriter, LogBus};
+use host::logs::LogBus;
 use host::model::ModelView;
 use host::run::merge_routes;
 use host::server::{builder, Listen};
@@ -33,6 +33,7 @@ use host::telemetry::Telemetry;
 use host::ui::{build_id, COMMON};
 use host::Reports;
 use web::auth::Roles;
+use web::log_file::RotatingFileLog;
 use web::Roots;
 use zend::api;
 use zend::config::DaemonConfig;
@@ -41,7 +42,9 @@ use zend::tenant::{zend_ui, ZendReports, WEB};
 
 struct Harness {
     addr: SocketAddr,
-    log: Arc<LogBus>,
+    /// The log file feeding the host's bus, as the process's subscriber writes
+    /// it.
+    log: RotatingFileLog,
     _tmp: tempfile::TempDir,
 }
 
@@ -53,6 +56,8 @@ async fn boot() -> Harness {
         DaemonConfig::new(zend::workspace::single_repo(tmp.path(), "project").expect("workspace"));
     let session = Arc::new(ZendSession::new(config));
     let log = LogBus::new(&["zend"]);
+    let log_file = RotatingFileLog::new(tmp.path(), "harness.log").expect("log file");
+    log.attach(&log_file);
     // `boss` is the admin, so a test can say which caller it means by which
     // subject it sends.
     let roles: Roles = serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap();
@@ -109,7 +114,7 @@ async fn boot() -> Harness {
 
     Harness {
         addr,
-        log,
+        log: log_file,
         _tmp: tmp,
     }
 }
@@ -333,8 +338,9 @@ async fn conversation_files_wait_for_the_substrate() {
     assert_eq!(r.status(), 503);
 }
 
-/// The log pane is an admin's: it names paths on this host. Signed out, the
-/// upgrade is refused with a status the browser can read.
+/// The log pane is any signed-in caller's, never a stranger's: it names paths
+/// on this host. Signed out, the upgrade is refused with a status the browser
+/// can read.
 #[tokio::test]
 async fn ws_logs_is_refused_to_a_signed_out_caller() {
     let hz = boot().await;
@@ -351,21 +357,16 @@ async fn ws_logs_streams_structured_json() {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let hz = boot().await;
+    let mut hz = boot().await;
 
-    // One formatted line into the host's bus, as the subscriber writes it.
-    let mut w = BusWriter::new(Arc::clone(&hz.log));
+    // One formatted line into the log file, as the subscriber writes it.
     writeln!(
-        w,
+        hz.log,
         "2026-01-01T00:00:01.0Z  INFO zend::harness: structured frame check"
     )
     .unwrap();
-    assert!(
-        !hz.log.recent().is_empty(),
-        "log bus did not capture the line"
-    );
 
-    // As the admin, on the gateway's headers — a loopback peer is trusted.
+    // Signed in, on the gateway's headers — a loopback peer is trusted.
     let mut req = format!("ws://{}/ws/logs", hz.addr)
         .into_client_request()
         .unwrap();
@@ -377,7 +378,8 @@ async fn ws_logs_streams_structured_json() {
         .await
         .expect("ws connect");
 
-    // The first replayed frame is our line, framed as structured JSON.
+    // The first replayed frame is our line, read back from the file, framed as
+    // structured JSON. A replayed line carries no bus position.
     let msg = ws.next().await.expect("a frame").expect("frame ok");
     let text = msg.into_text().expect("text frame");
     let v: serde_json::Value = serde_json::from_str(&text).expect("frame is JSON");
@@ -388,5 +390,5 @@ async fn ws_logs_streams_structured_json() {
     assert_eq!(v["target"], "zend::harness");
     assert_eq!(v["tenant"], "zend");
     assert_eq!(v["msg"], "structured frame check");
-    assert_eq!(v["seq"], 1);
+    assert_eq!(v["seq"], 0);
 }

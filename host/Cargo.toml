@@ -24,6 +24,8 @@ futures    = { workspace = true }
 axum       = { version = "0.7", features = ["macros", "ws"] }
 tokio      = { version = "1", features = ["full"] }
 sha2       = "0.10"
+# `/v1/logs`: the log files searched by pattern.
+regex      = "1"
 # The shared front-end, compiled in (`ui::COMMON`).
 include_dir = { version = "0.7" }
 # The model download (`download`).

@@ -6,10 +6,10 @@
 //!
 //! # Neither lost nor repeated
 //!
-//! The subscription is taken *before* the ring is read, so a line written
-//! between the two is delivered rather than lost; and every line carries the
-//! bus's `seq`, so whatever the subscription then delivers that the replay
-//! already covered is skipped rather than shown twice.
+//! The replay is the log file's last [`REPLAY_BYTES`], read back from disk, and
+//! the subscription is taken under the file's lock in the same moment
+//! ([`LogBus::replay`]): a line written before it is in the replay, one written
+//! after is in the stream, and none is in both.
 
 use std::sync::Arc;
 
@@ -21,39 +21,17 @@ use tokio::sync::broadcast::error::RecvError;
 use super::Shared;
 use crate::logs::{LogBus, LogLine};
 
+/// How much of the file a reader is shown before the live tail: enough to see
+/// what happened just before you looked.
+pub const REPLAY_BYTES: u64 = 256 * 1024;
+
 pub async fn logs(ws: WebSocketUpgrade, State(s): State<Arc<Shared>>) -> Response {
     let bus = Arc::clone(&s.log);
     ws.on_upgrade(move |socket| stream(socket, bus))
 }
 
-/// The lines a reader that subscribed and then took `replay` should show, in
-/// order: the replay, then whatever comes after its last `seq`.
-pub struct Cursor {
-    last: u64,
-}
-
-impl Cursor {
-    /// Start after `replay`.
-    pub fn after(replay: &[LogLine]) -> Self {
-        Self {
-            last: replay.last().map_or(0, |l| l.seq),
-        }
-    }
-
-    /// Whether `line` from the subscription is new to this reader.
-    pub fn admit(&mut self, line: &LogLine) -> bool {
-        if line.seq <= self.last {
-            return false;
-        }
-        self.last = line.seq;
-        true
-    }
-}
-
 async fn stream(mut socket: WebSocket, bus: Arc<LogBus>) {
-    let mut rx = bus.subscribe();
-    let replay = bus.recent();
-    let mut cursor = Cursor::after(&replay);
+    let (mut rx, replay) = bus.replay(REPLAY_BYTES);
     for line in &replay {
         if send(&mut socket, line).await.is_err() {
             return;
@@ -63,7 +41,7 @@ async fn stream(mut socket: WebSocket, bus: Arc<LogBus>) {
         tokio::select! {
             got = rx.recv() => match got {
                 Ok(line) => {
-                    if cursor.admit(&line) && send(&mut socket, &line).await.is_err() {
+                    if send(&mut socket, &line).await.is_err() {
                         return;
                     }
                 }
@@ -100,54 +78,4 @@ async fn stream(mut socket: WebSocket, bus: Arc<LogBus>) {
 async fn send(socket: &mut WebSocket, line: &LogLine) -> Result<(), ()> {
     let text = serde_json::to_string(line).map_err(|_| ())?;
     socket.send(Message::Text(text)).await.map_err(|_| ())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::Write;
-
-    use super::*;
-    use crate::logs::BusWriter;
-
-    /// **A line written between subscribing and reading the ring is shown
-    /// once.** It is in both — the subscription saw it and so did the replay —
-    /// and the cursor skips the subscription's copy.
-    #[tokio::test]
-    async fn a_line_in_both_the_replay_and_the_stream_is_shown_once() {
-        let bus = LogBus::new(&["zend"]);
-        let mut w = BusWriter::new(bus.clone());
-        writeln!(w, "2026-01-01T00:00:01.0Z  INFO zend: before").unwrap();
-
-        let mut rx = bus.subscribe();
-        writeln!(w, "2026-01-01T00:00:02.0Z  INFO zend: between").unwrap();
-        let replay = bus.recent();
-        writeln!(w, "2026-01-01T00:00:03.0Z  INFO zend: after").unwrap();
-
-        let mut cursor = Cursor::after(&replay);
-        let mut shown: Vec<String> = replay.iter().map(|l| l.msg.clone()).collect();
-        for _ in 0..2 {
-            let line = rx.recv().await.unwrap();
-            if cursor.admit(&line) {
-                shown.push(line.msg);
-            }
-        }
-        assert_eq!(shown, ["before", "between", "after"]);
-    }
-
-    /// An empty ring admits everything.
-    #[test]
-    fn an_empty_replay_admits_the_first_line() {
-        let mut c = Cursor::after(&[]);
-        let line = |seq| LogLine {
-            ts: String::new(),
-            level: "INFO".into(),
-            target: String::new(),
-            msg: String::new(),
-            tenant: String::new(),
-            seq,
-        };
-        assert!(c.admit(&line(1)));
-        assert!(!c.admit(&line(1)));
-        assert!(c.admit(&line(2)));
-    }
 }

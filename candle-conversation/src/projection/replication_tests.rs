@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 use tempfile::TempDir;
 
+use super::replication::LIST_SLICE;
 use super::{Conversation, GroupId, LayerId};
 use crate::persistence::deleted::{DeletedEntry, DeletedTimeline};
 use crate::persistence::identity::GEN_DETACHED;
@@ -85,6 +86,30 @@ fn a_ticket_waits_for_the_writer() {
     let oseq = conv.last_oseq();
     assert!(seen.lock().unwrap().contains(&oseq));
     assert!(conv.read_event(conv.node(), oseq).is_some());
+}
+
+/// A range longer than one lock hold is listed in slices, and lists exactly
+/// what one hold over the whole range lists: every record in `oseq` order,
+/// nothing at a slice's edge dropped or repeated.
+#[test]
+fn a_range_listed_in_slices_is_the_range_listed_at_once() {
+    let dir = TempDir::new().unwrap();
+    let conv = open(&dir);
+    let n = LIST_SLICE * 2 + 7;
+    for k in 0..n {
+        conv.put_cluster_object(&format!("cluster/k{k}"), json!(k))
+            .unwrap();
+    }
+    let node = conv.node();
+    let top = conv.last_oseq();
+    let sliced = conv.list_held(node, 1, top).unwrap();
+    let whole = conv.persistence.lock().unwrap().list(node, 1, top).unwrap();
+    assert_eq!(sliced.records, whole.records);
+    assert_eq!(
+        sliced.records.iter().map(|r| r.oseq).collect::<Vec<_>>(),
+        (1..=top).collect::<Vec<_>>()
+    );
+    assert!(sliced.gone.is_empty());
 }
 
 /// What one member lists and reads of its range applies on another, which

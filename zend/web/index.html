@@ -3832,9 +3832,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // seeds synchronously, the live adapter fetches GET /v1/conversations. Either
   // way we pick an active conversation (prefer hydrated, else first) + hydrate.
   //
-  // The log stream is an admin's (`/ws/logs`), so the boot screen's log panel
-  // opens it only for one — see `loadAccess` — rather than retrying a refused
-  // socket for the life of the page.
+  // The log stream (`/ws/logs`) is any signed-in caller's, so the boot screen's
+  // log panel opens it only once one is known — see `loadAccess` — rather than
+  // retrying a refused socket for the life of the page.
 
   // `prefetched` is a list request already in flight (the first load asks for
   // it alongside the status); without one, or if it failed, ask now.
@@ -3894,7 +3894,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   const ADMIN_ROLES = { admin: 1, creator: 1 };
   function loadAccess() {
     Promise.resolve(API.getMe()).then((me) => {
-      if (me && ADMIN_ROLES[me.role] && !logUnsub) {
+      if (me && me.role !== 'unauthenticated' && !logUnsub) {
         logUnsub = API.subscribeLogs((line) => addLog(line));
       }
       if (me && ADMIN_ROLES[me.role] && !ACCESS.admin) {

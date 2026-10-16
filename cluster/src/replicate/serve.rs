@@ -14,16 +14,30 @@ use super::replicator::Replicator;
 use crate::frame::{Catchup, Done, Fetch, Frame, Have, Headers};
 
 impl Replicator {
+    /// List what the requester lacks, a range at a time. One answer runs per
+    /// requester (`answering.rs`): asking again
+    /// cancels the answer before, and so does the requester leaving every
+    /// gateway's member list. A cancelled answer stops before its next range
+    /// and sends no `DONE` — the requester has already dropped the request.
     pub(super) fn answer_catchup(self: &Arc<Self>, c: usize, asked: Catchup) {
-        let Some(handle) = self.state().sockets[c].clone() else {
-            return;
+        let (handle, ticket) = {
+            let mut s = self.state();
+            let Some(handle) = s.sockets[c].clone() else {
+                return;
+            };
+            s.stats.answered += 1;
+            (handle, s.answering.begin(asked.reply_to, asked.request))
         };
-        self.state().stats.answered += 1;
+        let me = self.clone();
         let store = self.store.clone();
         let node = self.node;
         tokio::task::spawn_blocking(move || {
             let mine = store.applied();
             for (origin, from, to) in answer_ranges(&mine, &asked.since) {
+                if !ticket.live() {
+                    me.state().answering.end(&ticket);
+                    return;
+                }
                 let listing = store.list(origin, from, to);
                 let frame = Frame::Headers(Headers {
                     request: asked.request,
@@ -36,6 +50,7 @@ impl Replicator {
                     records: listing.records,
                 });
                 if handle.catchup(frame).is_err() {
+                    me.state().answering.end(&ticket);
                     return;
                 }
             }
@@ -43,6 +58,7 @@ impl Replicator {
                 request: asked.request,
                 reply_to: asked.reply_to,
             }));
+            me.state().answering.end(&ticket);
         });
     }
 
