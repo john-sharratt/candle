@@ -327,6 +327,39 @@ make clean-ptx
 
 ---
 
+## Releasing and Testing Locally
+
+The live daemon is `motherd` (zend + npcd in one process) behind the `web` gateway.
+On each machine both are supervised by **keep** (`keep/keep.yaml`), which holds the
+last known-good binaries in `keep/stable/`. Design: `docs/replicated_substrate.md` §3.5–§3.11.
+
+**Release** (commit and push need the user's approval, as always):
+
+1. Commit and push to `main`. A build is identified by its merge base with `origin/main`
+   plus a digest of uncommitted changes to its build inputs. A build with local changes
+   never rolls out.
+2. On one member, build `cargo build --release -p motherd -p web`, copy the binary to
+   `keep/stage/<service>.exe` (the file name picks the service), and POST its path to keep:
+   `curl -X POST http://127.0.0.1:8092 --data "D:\prog\candle\keep\stage\motherd.exe"`.
+   A curl timeout (exit 28) is normal while keep switches.
+3. keep runs it as a trial from the stable path. If it prints `INFO serving` within ten
+   minutes, it becomes the service. Otherwise keep restores the old binary. Confirm by polling
+   `/v1/status` for a `started_at_ms` later than the switch and `state: ready`.
+   Read logs from the gateway's aggregated `/ws/logs`, not a local file.
+4. The new `motherd` joins the cluster as a **candidate** at the higher build count.
+   Once certified, it offers its binaries and the other members fetch and install
+   them themselves.
+   **`web` is not rolled out**: restart each gateway through its own machine's keep (step 2).
+
+**Test locally, not clustered.** A build with uncommitted changes that *joins* the
+cluster still serves real gateway traffic. Everything it writes replicates to every member
+and is permanent. To try work without that, run it outside the cluster: copy `motherd/motherd.yaml`
+to a scratch config, drop `clusters`/`cluster_name`/`group_key` from its `host:` block,
+and point `port`/`tls_port` and the `zend`/`npcd` data folders somewhere unused. Then run
+`target\release\motherd.exe --config <that file>` and talk to its own port directly.
+
+---
+
 ## Crate Architecture
 
 ```
