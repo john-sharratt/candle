@@ -427,6 +427,9 @@ impl Hub {
                     ),
                 ));
             }
+            // Joining a group that already has a member serving: it serves
+            // nothing until it has caught up with it, whatever it reports.
+            let syncing = s.registry.has_routable(app, node);
             s.registry.join(MemberView {
                 node,
                 host: hello.host.clone(),
@@ -439,6 +442,7 @@ impl Hub {
                 routes: None,
                 high_water: 0,
                 lagging: false,
+                syncing,
             });
         }
         let local = if hello.build.is_local() {

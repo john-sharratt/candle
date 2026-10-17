@@ -160,7 +160,9 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
         .route(
             "/v1/conversations",
             Role::Unauthenticated,
-            Dispatch::Any,
+            // Every member's list, merged by id: a member rejoining lists the
+            // conversations it wrote cut off, which no other member holds yet.
+            Dispatch::Aggregate(Merge::Union),
             get(conversations::list),
         )
         // Exactly: the list is replicated state, the same on every member —

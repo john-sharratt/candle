@@ -162,6 +162,7 @@ mod tests {
             routes: None,
             high_water: 0,
             lagging: false,
+            syncing: false,
         }
     }
 

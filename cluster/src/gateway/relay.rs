@@ -122,7 +122,7 @@ impl Hub {
     /// `node`'s socket's timer: a `RECEIPT` owed for 100 ms, and the end of
     /// its lagging once its lane has drained and it has caught up.
     pub(super) fn receipt_tick(&self, app: &str, node: u64) {
-        let (receipt, recovered) = {
+        let (receipt, recovered, synced) = {
             let mut guard = self.state();
             let s = &mut *guard;
             let Some(x) = s.sockets.get_mut(&(app.to_string(), node)) else {
@@ -148,13 +148,24 @@ impl Hub {
             if recovered {
                 s.registry.set_lagging(app, node, false);
             }
-            (receipt, recovered)
+            // Synced: its own `ACK`s cover every other origin this gateway has
+            // heard, members away included — judged here, not by the member,
+            // whose catch-up can end early (a `DONE` with nobody to answer).
+            let syncing = s.registry.member(app, node).is_some_and(|m| m.syncing);
+            let synced = syncing && s.registry.in_sync(app, node, &acks);
+            if synced {
+                s.registry.set_syncing(app, node, false);
+            }
+            (receipt, recovered, synced)
         };
         if let Some((handle, through)) = receipt {
             let _ = handle.control(Frame::Receipt(Receipt { through }));
         }
         if recovered {
             self.note(app, hex(node), "caught up: no longer lagging".into());
+        }
+        if synced {
+            self.note(app, hex(node), "in sync with the group: serving requests".into());
         }
     }
 
