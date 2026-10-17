@@ -365,13 +365,24 @@ impl AppMember {
             };
             // Logged as well as shown: the next admission clears the view, so
             // a socket that ends and is readmitted at once left no trace of why.
-            tracing::warn!(
-                app = %self.app(),
-                cluster = c,
-                attempt = entry.view.attempts,
-                why = close.as_deref().unwrap_or("—"),
-                "a cluster socket ended"
-            );
+            // Offline, every dial is refused by design, every few seconds:
+            // that is the state, not news.
+            if crate::offline::is_offline() {
+                tracing::debug!(
+                    app = %self.app(),
+                    cluster = c,
+                    attempt = entry.view.attempts,
+                    "offline: the cluster socket is not dialled"
+                );
+            } else {
+                tracing::warn!(
+                    app = %self.app(),
+                    cluster = c,
+                    attempt = entry.view.attempts,
+                    why = close.as_deref().unwrap_or("—"),
+                    "a cluster socket ended"
+                );
+            }
             entry.view.last_close = close;
         }
         lock(&self.links).failed(c);

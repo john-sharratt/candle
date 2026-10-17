@@ -61,6 +61,8 @@ pub enum JobError {
     NotFound(String),
     #[error("this agent is switched off")]
     Disabled,
+    #[error("this agent is offline: origin is not reached until the host is `online` again")]
+    Offline,
     #[error("{0}")]
     Bad(String),
 }
@@ -238,6 +240,11 @@ impl Jobs {
         if !self.enabled() {
             return Err(JobError::Disabled);
         }
+        // Offline, origin is the internet: nothing is fetched or pushed
+        // (`cluster::offline`). A run works on what the checkouts hold.
+        if cluster::offline::is_offline() && matches!(submit, Submit::Push(_) | Submit::Fetch(_)) {
+            return Err(JobError::Offline);
+        }
         match submit {
             Submit::Run(run) => self.run(run).await,
             Submit::Push(push) => self.push(push).await,
@@ -359,6 +366,15 @@ impl Jobs {
     /// prerequisites origin holds are held here.
     async fn fetch(self: &Arc<Self>, repo: &str) -> Result<(), JobError> {
         if self.checkout(repo)?.origin.is_empty() {
+            return Ok(());
+        }
+        // Offline, a run works on what the checkout holds; said, so a run that
+        // then misses an object names the reason rather than only the object.
+        if cluster::offline::is_offline() {
+            tracing::warn!(
+                repo,
+                "offline: origin is not fetched — the run works on what this checkout holds"
+            );
             return Ok(());
         }
         let jobs = Arc::clone(self);

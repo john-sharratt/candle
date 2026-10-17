@@ -3,7 +3,10 @@
 //! its certificate verified against the Mozilla roots built into the binary —
 //! by the URL's host, or by `--cluster-name` when the URL names an address —
 //! and never self-signed. An `http` cluster is refused unless its host is
-//! loopback.
+//! loopback. A process told the network is down ([`offline`]) dials only a
+//! gateway on this machine.
+
+pub use cluster::offline;
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -130,6 +133,10 @@ pub struct Dial {
 impl Dial {
     async fn open(&self) -> Result<Socket, String> {
         let t = &self.target;
+        offline::refresh();
+        if !offline::reaches(&t.host) {
+            return Err(offline::refused(&format!("{}:{}", t.host, t.port)));
+        }
         let tcp = TcpStream::connect((t.host.as_str(), t.port))
             .await
             .map_err(|e| format!("{}:{}: {e}", t.host, t.port))?;

@@ -18,6 +18,10 @@ use crate::cluster::disk::volume_of;
 use crate::stopping::Ending;
 use crate::tenant::CheckProgress;
 
+/// How long `offline` waits before closing the sockets — long enough for the
+/// job a command sent over one of them to report its end.
+const OFFLINE_CLOSE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// One app's substrate, and its replication when it is a member.
 struct Target {
     app: &'static str,
@@ -185,6 +189,48 @@ impl Commands {
                     job.step(name, "catching up, then taking work again");
                 }
                 Ok(json!({}))
+            }
+            Command::Offline | Command::Online => {
+                let offline = *command == Command::Offline;
+                ::cluster::offline::set(offline)
+                    .map_err(|e| format!("the switch is set but not kept across a restart: {e}"))?;
+                candle_conversation::set_hub_offline(offline);
+                if offline {
+                    // Dropped rather than left to their next failure: each
+                    // dials again, is refused, and the member writes detached.
+                    // A moment late, so a command sent over one of them — the
+                    // gateway page's — sees its job end before its socket does.
+                    if let Some(cluster) = &self.cluster {
+                        let members: Vec<_> = cluster
+                            .links()
+                            .filter_map(|l| l.member().cloned())
+                            .collect();
+                        for m in &members {
+                            job.step(m.app(), "closing every socket; dialling nothing");
+                        }
+                        tokio::spawn(async move {
+                            tokio::time::sleep(OFFLINE_CLOSE_AFTER).await;
+                            // An `online` inside the wait leaves the sockets up.
+                            if !::cluster::offline::is_offline() {
+                                return;
+                            }
+                            for m in members {
+                                m.close_all("offline: this machine is told the network is down");
+                            }
+                        });
+                    }
+                    tracing::warn!(
+                        "OFFLINE: no gateway is dialled, nothing is fetched from the internet \
+                         and only loopback callers are served, until `online`"
+                    );
+                } else {
+                    job.step(
+                        "process",
+                        "online: the gateways are dialled again within seconds",
+                    );
+                    tracing::info!("online again: the gateways are dialled");
+                }
+                Ok(json!({ "offline": offline }))
             }
             Command::Restart | Command::Shutdown => {
                 let ending = if *command == Command::Restart {

@@ -121,6 +121,41 @@ async fn name_server(State(s): State<Arc<ServedBy>>, req: Request, next: Next) -
     res
 }
 
+/// While the process is offline (`cluster::offline`), only a caller on
+/// this machine is served; anyone else is told the daemon is offline. A
+/// request with no peer address is not known to be local, so it is refused.
+async fn offline_gate(req: Request, next: Next) -> Response {
+    match offline_refusal(::cluster::offline::is_offline(), &req) {
+        Some(res) => res,
+        None => next.run(req).await,
+    }
+}
+
+/// The answer [`offline_gate`] gives `req` with the switch at `offline`:
+/// `None` to serve it.
+fn offline_refusal(offline: bool, req: &Request) -> Option<Response> {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    if ::cluster::offline::serves_when(offline, peer) {
+        return None;
+    }
+    let mut res = Response::new(axum::body::Body::from(
+        json!({
+            "error": "offline",
+            "detail": "this daemon is offline: it serves only callers on its own machine"
+        })
+        .to_string(),
+    ));
+    *res.status_mut() = axum::http::StatusCode::SERVICE_UNAVAILABLE;
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Some(res)
+}
+
 /// The server for `uis` answering `router`, as `listen` describes: the site
 /// table, the trusted peers, and `--local-signin`. Paths resolve against the
 /// working directory.
@@ -164,8 +199,13 @@ pub fn builder(
         cluster: cluster.clone(),
     });
     // Named outside the listener, so a `503` it answers is named too.
-    let named =
-        move |router: Router| router.layer(middleware::from_fn_with_state(served, name_server));
+    // Offline, only this machine's callers are let through; the refusal is
+    // inside the naming, so it is named too.
+    let named = move |router: Router| {
+        router
+            .layer(middleware::from_fn(offline_gate))
+            .layer(middleware::from_fn_with_state(served, name_server))
+    };
     builder = match cluster {
         Some(cluster) => {
             let listener = Arc::new(Listener {
@@ -326,6 +366,25 @@ mod tests {
                 "{host}"
             );
         }
+    }
+
+    /// **Offline, only this machine is served.** A caller on the LAN — this
+    /// machine's own LAN address included — is told the daemon is offline; a
+    /// loopback caller is served; online, both are.
+    #[test]
+    fn offline_a_lan_caller_is_refused_and_a_loopback_one_served() {
+        let at = |peer: &str| {
+            let mut req = Request::get("/v1/status").body(Body::empty()).unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            req
+        };
+        let refused = offline_refusal(true, &at("192.168.0.6:50000")).expect("refused");
+        assert_eq!(refused.status(), 503);
+        assert!(offline_refusal(true, &at("127.0.0.1:50000")).is_none());
+        assert!(offline_refusal(false, &at("192.168.0.6:50000")).is_none());
+        let unknown = Request::get("/v1/status").body(Body::empty()).unwrap();
+        assert!(offline_refusal(true, &unknown).is_some());
     }
 
     /// A deep link no file answers is the UI's `index.html` — the compiled-in
