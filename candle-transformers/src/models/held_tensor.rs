@@ -35,7 +35,7 @@ pub fn held_empty(shape: impl Into<Shape>, dtype: DType, device: &Device) -> Res
     let bytes = shape.elem_count() * dtype.size_in_bytes();
     // SAFETY: the caller writes every element before reading it.
     let held = unsafe { Held::<u8>::alloc(cuda, bytes)? };
-    let ptr = held.device_ptr(&cuda.compute_stream()).0;
+    let ptr = held.device_ptr(&cuda.cuda_stream()).0;
     // SAFETY: the range is `bytes` of held ground the anchor keeps for as long
     // as this tensor or any view of it exists.
     unsafe {
@@ -61,7 +61,7 @@ pub fn held_zeros(shape: impl Into<Shape>, dtype: DType, device: &Device) -> Res
         let candle::Storage::Cuda(c) = &*storage else {
             candle::bail!("held zeros: a CUDA tensor without CUDA storage");
         };
-        let stream = cuda.compute_stream();
+        let stream = cuda.cuda_stream();
         let at =
             c.slice.device_ptr(&stream) + (layout.start_offset() * dtype.size_in_bytes()) as u64;
         // SAFETY: `at` names the tensor's own `bytes`, which nothing has read.

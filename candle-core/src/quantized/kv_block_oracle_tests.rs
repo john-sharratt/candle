@@ -120,9 +120,6 @@ fn encode_on_device(dtype: GgmlDType, src: &[f32], is_k: bool) -> Result<Vec<u8>
         let stream = dev.cuda_stream();
         let (s, _gs) = src_d.device_ptr(&stream);
         let (d, _gd) = dst_d.device_ptr(&stream);
-        // The oracle launches on the legacy default stream: order it after the
-        // upload, and the download after it, with device-wide fences.
-        dev.synchronize()?;
         unsafe {
             run_kv_encode_oracle(
                 s as *const c_void,
@@ -131,10 +128,9 @@ fn encode_on_device(dtype: GgmlDType, src: &[f32], is_k: bool) -> Result<Vec<u8>
                 bb as i32,
                 arena_code(dtype),
                 is_k as i32,
-                std::ptr::null_mut(),
+                stream.cu_stream() as *mut c_void,
             )
         };
-        dev.synchronize()?;
     }
     dev.memcpy_dtov(&dst_d)
 }
@@ -150,7 +146,6 @@ fn decode_on_device(dtype: GgmlDType, bytes: &[u8], is_k: bool) -> Result<Vec<f3
         let stream = dev.cuda_stream();
         let (s, _gs) = src_d.device_ptr(&stream);
         let (d, _gd) = dst_d.device_ptr(&stream);
-        dev.synchronize()?;
         unsafe {
             run_kv_decode_oracle(
                 s as *const c_void,
@@ -159,10 +154,9 @@ fn decode_on_device(dtype: GgmlDType, bytes: &[u8], is_k: bool) -> Result<Vec<f3
                 bb as i32,
                 arena_code(dtype),
                 is_k as i32,
-                std::ptr::null_mut(),
+                stream.cu_stream() as *mut c_void,
             )
         };
-        dev.synchronize()?;
     }
     dev.memcpy_dtov(&dst_d)
 }

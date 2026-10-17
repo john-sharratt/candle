@@ -109,7 +109,7 @@ impl ResidentPage {
         // Placement allocates and uploads: it runs eagerly for its whole extent,
         // behind whatever this thread has recorded.
         let _eager = cuda.pause_capture()?;
-        let stream = cuda.compute_stream();
+        let stream = cuda.cuda_stream();
         let mut out = Vec::with_capacity(pages.len());
         let mut staging: Vec<Tensor> = Vec::new();
         let mut jobs: Vec<i64> = Vec::new();

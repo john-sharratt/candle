@@ -10,13 +10,27 @@
 //! real file is absent this writes an empty one, and an empty document overrides
 //! nothing.
 
+//!
+//! And refuses sources that reach the CUDA legacy null stream — see
+//! `lints/null_stream.rs` for the rule and why it holds here.
+
 use std::path::PathBuf;
+
+include!("../lints/null_stream.rs");
 
 /// Relative to this crate's directory, so it resolves the same wherever cargo is
 /// invoked from.
 const OVERRIDE_FILE: &str = "../models.override.yaml";
 
 fn main() {
+    println!("cargo:rerun-if-changed=../lints/null_stream.rs");
+    forbid_null_stream(&[
+        std::path::Path::new("src"),
+        std::path::Path::new("tests"),
+        std::path::Path::new("examples"),
+        std::path::Path::new("benches"),
+    ]);
+
     // Rebuild when the override changes or is deleted. Only a file that exists is
     // watched: cargo counts a missing `rerun-if-changed` path as stale on every
     // invocation, so watching the absent file — the ordinary case — rebuilt this

@@ -133,7 +133,7 @@ fn make_backings(device: &Device) -> Vec<ChunkedKvBacking> {
         .collect()
 }
 
-fn cuda_stream(device: &Device) -> Arc<CudaStream> {
+fn cuda_stream(device: &Device) -> candle::cuda_backend::StreamLease {
     match device {
         Device::Cuda(d) => d.cuda_stream(),
         _ => unreachable!("test gated on a CUDA device"),

@@ -118,33 +118,10 @@ pub fn draft_walk(
         .map(|&s| session.sequence_offset(s).unwrap_or(0))
         .collect();
 
-    // Pre-ensure the whole walk's write chunks — see the module docs.
-    //
-    // **Both allocators, not just the obvious one.** `ensure_for_offset` covers
-    // the span the walk writes, but the per-step `build_decode_metadata_at`
-    // below has an allocator of its own — `ensure_for_batch_entries_all`, which
-    // sizes each step's write chunk as it builds that step's headers. Running
-    // inside the loop it is normally a no-op, because the chunks are already
-    // there; when it is not, it is an arena created inside a forward that owns
-    // the partition, which is refused outright. That is invisible until a
-    // configuration turns up where the arena genuinely does not exist yet —
-    // compressed KV at width, where the formats in play are not the ones an
-    // uncompressed run created.
-    //
-    // So every step's entries are ensured here, where no forward is open and a
-    // refusal cannot happen. Inside the loop they are then no-ops by
-    // construction rather than by luck.
-    if let Some(backing) = session.backing(kv_layer) {
-        for (i, &s) in seqs.iter().enumerate() {
-            backing.ensure_for_offset(s, base[i], max_len)?;
-        }
-        let group = std::slice::from_ref(backing);
-        for j in 0..max_len {
-            let entries: Vec<(usize, usize)> =
-                seqs.iter().zip(&base).map(|(&s, &b)| (s, b + j)).collect();
-            ChunkedKvBacking::ensure_for_batch_entries_all(group, &entries, 1)?;
-        }
-    }
+    // Pre-ensure the whole walk's write chunks — see the module docs and
+    // [`draft_reserve`]. A caller that priced the walk's tier has already done
+    // this, so here it claims nothing.
+    draft_reserve(session, seqs, kv_layer, max_len)?;
 
     // Everything that allocates has now run; from here the walk only computes.
     let generation = session.begin_stager_generation();
@@ -299,17 +276,46 @@ fn upload_tokens(row: &Tensor, committed: &[u32]) -> Result<()> {
 /// [`draft_walk`] does this itself; a caller that reads the head layer's block
 /// structure before building its step closure forces the allocation first, so
 /// what it reads is the structure the walk will write into.
+///
+/// **A caller that covers the walk's tier calls this first.** Creating an arena
+/// hands a standing tier back and drops its plan, so a claim made after the
+/// cover leaves the walk's first phase to re-place the worst-case fallback plan
+/// from inside the walk's recording, where the weight side refuses to concede:
+/// measured on Flash-Next's BF16 ×4 gate row, a 912 MiB tier refused 19 regions
+/// short.
+///
+/// **Both allocators, not just the obvious one.** `ensure_for_offset` covers
+/// the span the walk writes, but the walk's per-step `build_decode_metadata_at`
+/// has an allocator of its own — `ensure_for_batch_entries_all`, which sizes
+/// each step's write chunk as it builds that step's headers. Running inside the
+/// walk it is normally a no-op, because the chunks are already there; when it
+/// is not, it is an arena created inside a forward that owns the partition,
+/// which is refused outright. That is invisible until a configuration turns up
+/// where the arena genuinely does not exist yet — compressed KV at width, where
+/// the formats in play are not the ones an uncompressed run created. So every
+/// step's entries are ensured here, where no forward is open and a refusal
+/// cannot happen, and inside the walk they are no-ops by construction.
 pub fn draft_reserve(
     session: &BatchedInferenceSession,
     seqs: &[usize],
     kv_layer: usize,
     max_len: usize,
 ) -> Result<()> {
-    if let Some(backing) = session.backing(kv_layer) {
-        for &s in seqs {
-            let base = session.sequence_offset(s).unwrap_or(0);
-            backing.ensure_for_offset(s, base, max_len)?;
-        }
+    let Some(backing) = session.backing(kv_layer) else {
+        return Ok(());
+    };
+    let base: Vec<usize> = seqs
+        .iter()
+        .map(|&s| session.sequence_offset(s).unwrap_or(0))
+        .collect();
+    for (&s, &b) in seqs.iter().zip(&base) {
+        backing.ensure_for_offset(s, b, max_len)?;
+    }
+    let group = std::slice::from_ref(backing);
+    for j in 0..max_len {
+        let entries: Vec<(usize, usize)> =
+            seqs.iter().zip(&base).map(|(&s, &b)| (s, b + j)).collect();
+        ChunkedKvBacking::ensure_for_batch_entries_all(group, &entries, 1)?;
     }
     Ok(())
 }

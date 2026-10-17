@@ -22,6 +22,27 @@ use rand::Rng;
 use std::ffi::c_void;
 use std::time::Instant;
 
+/// `bytes` from device address `src` into host memory at `dst`, on `dev`'s
+/// stream behind everything issued there, and waited for — the readback the
+/// raw-pointer tests below make, as a driver status.
+fn copy_to_host(
+    dev: &CudaDevice,
+    dst: *mut c_void,
+    src: u64,
+    bytes: usize,
+) -> cudarc::driver::sys::CUresult {
+    use cudarc::driver::sys;
+    let stream = dev.cuda_stream();
+    // SAFETY: the caller's `dst` holds `bytes`, and `src` names `bytes` of live
+    // device memory.
+    let r = unsafe { sys::cuMemcpyDtoHAsync_v2(dst, src, bytes, stream.cu_stream()) };
+    if r != sys::CUresult::CUDA_SUCCESS {
+        return r;
+    }
+    // SAFETY: the device's live stream.
+    unsafe { sys::cuStreamSynchronize(stream.cu_stream()) }
+}
+
 /// Guards the large-N (2*ffn) gemx matmul at batch=1: a fused ffn_gate+ffn_up
 /// weight has distinct gate (rows 0..N/2) and up (rows N/2..N) halves, and the
 /// kernel must not collapse the up half onto the gate half. This path was the
@@ -107,7 +128,7 @@ fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
                     0,
                     OutDType::F16 as i32,
                     SumScale::Raw.as_code(),
-                    std::ptr::null_mut(),
+                    stream.cu_stream() as *mut c_void,
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -210,7 +231,7 @@ fn cuda_mm_gemx_every_batch_matches_rows_alone() -> Result<()> {
                     0,
                     OutDType::F16 as i32,
                     SumScale::Raw.as_code(),
-                    std::ptr::null_mut(),
+                    stream.cu_stream() as *mut c_void,
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected batch {batch}");
@@ -741,7 +762,7 @@ fn cuda_mm_q4_k_repacked() -> Result<()> {
                 0, // tile_mode (tiling only; result-invariant)
                 OutDType::F16 as i32,
                 SumScale::Raw.as_code(),
-                std::ptr::null_mut(),
+                stream.cu_stream() as *mut c_void,
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -845,7 +866,7 @@ fn cuda_mm_q4_k_repacked_model_size() -> Result<()> {
                 0, // tile_mode (tiling only; result-invariant)
                 OutDType::F16 as i32,
                 SumScale::Raw.as_code(),
-                std::ptr::null_mut(),
+                stream.cu_stream() as *mut c_void,
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1004,7 +1025,7 @@ fn cuda_mm_q6_k_repacked() -> Result<()> {
                 0, // tile_mode (tiling only; result-invariant)
                 OutDType::F16 as i32,
                 SumScale::Raw.as_code(),
-                std::ptr::null_mut(),
+                stream.cu_stream() as *mut c_void,
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1253,7 +1274,7 @@ fn cuda_mm_q4_k_gguf_vs_dequant() -> Result<()> {
                     0, // tile_mode (tiling only; result-invariant)
                     OutDType::BF16 as i32,
                     SumScale::Raw.as_code(),
-                    std::ptr::null_mut(),
+                    stream.cu_stream() as *mut c_void,
                 )
             };
             assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -1428,7 +1449,7 @@ fn cuda_mm_q4_k_fused_qkv() -> Result<()> {
                 0, // tile_mode (tiling only; result-invariant)
                 OutDType::BF16 as i32,
                 SumScale::Raw.as_code(),
-                std::ptr::null_mut(),
+                stream.cu_stream() as *mut c_void,
             )
         };
         assert_eq!(status, 0, "matmul launcher rejected the call");
@@ -8704,7 +8725,7 @@ fn expert_grouped_launch_cost() -> Result<()> {
                 0, // tile_mode (tiling only; result-invariant)
                 OutDType::BF16 as i32,
                 SumScale::Raw.as_code(),
-                std::ptr::null_mut(),
+                stream.cu_stream() as *mut c_void,
             );
         };
 
@@ -12738,7 +12759,7 @@ impl LiveFixture {
         for (e, &p) in vram_ptrs.iter().enumerate() {
             let dst = host as u64 + (e * host_stride) as u64;
             assert_eq!(
-                unsafe { sys::cuMemcpyDtoH_v2(dst as *mut c_void, p, expert_bytes) },
+                copy_to_host(dev, dst as *mut c_void, p, expert_bytes),
                 sys::CUresult::CUDA_SUCCESS
             );
         }
@@ -13029,6 +13050,7 @@ fn cuda_cpu_class_back_to_back_layers_pull_their_own_results() -> Result<()> {
     split.copy_ns = 1e6;
     split.read_shared_ns = 1.0;
     split.read_alone_ns = 1.0;
+    split.max_experts = u32::MAX;
     for n in 1..=CPU_MAX_N {
         split.cpu_n_ns[n] = n as f32;
     }
@@ -13315,6 +13337,7 @@ fn cpu_class_round_trip(
     split.copy_ns = 1e6;
     split.read_shared_ns = 1.0;
     split.read_alone_ns = 1.0;
+    split.max_experts = u32::MAX;
     for n in 1..=CPU_MAX_N {
         split.cpu_n_ns[n] = n as f32;
     }
@@ -13494,10 +13517,7 @@ fn cpu_class_round_trip(
     // The ring holds the CPU rows' operand bytes, tile for tile.
     let src_bytes = op.with_device_ptr(&dev, |p| {
         let mut v = vec![0u8; op.byte_len()];
-        stream.synchronize().map_err(crate::Error::wrap)?;
-        let r = unsafe {
-            cudarc::driver::sys::cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut c_void, p, v.len())
-        };
+        let r = copy_to_host(&dev, v.as_mut_ptr() as *mut c_void, p, v.len());
         assert_eq!(
             r,
             cudarc::driver::sys::CUresult::CUDA_SUCCESS,
@@ -13958,16 +13978,15 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
             "log entry {i}"
         );
         let mut want = vec![0u8; fx.expert_bytes];
-        unsafe {
-            assert_eq!(
-                sys::cuMemcpyDtoH_v2(
-                    want.as_mut_ptr() as *mut c_void,
-                    fx.vram_ptrs[e],
-                    fx.expert_bytes
-                ),
-                sys::CUresult::CUDA_SUCCESS
-            );
-        }
+        assert_eq!(
+            copy_to_host(
+                &dev,
+                want.as_mut_ptr() as *mut c_void,
+                fx.vram_ptrs[e],
+                fx.expert_bytes
+            ),
+            sys::CUresult::CUDA_SUCCESS
+        );
         assert!(
             promoted[i * fx.expert_bytes..(i + 1) * fx.expert_bytes] == want[..],
             "promotion slot {i} does not hold expert {e}"
@@ -14277,9 +14296,12 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
         .map(|e| host as u64 + (e * host_stride) as u64)
         .collect();
     for e in 0..n_experts {
-        let r = unsafe {
-            sys::cuMemcpyDtoH_v2(host_ptrs[e] as *mut c_void, vram_ptrs[e], expert_bytes)
-        };
+        let r = copy_to_host(
+            &dev,
+            host_ptrs[e] as *mut c_void,
+            vram_ptrs[e],
+            expert_bytes,
+        );
         assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "copy expert to host");
     }
     let vram_table = dev.memcpy_stod(&vram_ptrs)?;
@@ -14401,7 +14423,7 @@ fn bench_grouped_gemm_weights_from_pinned_host() -> Result<()> {
         let mut sptrs = vec![0u64; n_experts];
         for (e, s) in small.iter().enumerate() {
             let hp = shost as u64 + (e * sstride) as u64;
-            let r = unsafe { sys::cuMemcpyDtoH_v2(hp as *mut c_void, s.data_ptr(), sb) };
+            let r = copy_to_host(&dev, hp as *mut c_void, s.data_ptr(), sb);
             assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "copy small expert");
             sptrs[e] = hp;
         }

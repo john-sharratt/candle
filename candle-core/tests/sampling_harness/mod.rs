@@ -984,7 +984,7 @@ pub fn make_uniform_logits(vocab_size: usize, value: f32) -> Vec<f32> {
 /// Create a CUDA stream on device 0 for testing.
 pub fn test_stream() -> Arc<CudaStream> {
     let ctx = CudaContext::new(0).expect("no CUDA device");
-    ctx.default_stream()
+    ctx.new_stream().expect("a CUDA stream")
 }
 
 // ============================================================================

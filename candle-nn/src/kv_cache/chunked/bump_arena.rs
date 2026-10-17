@@ -831,6 +831,18 @@ struct WaveDomain {
     /// path that opens a wave without going through the batched forward — tests,
     /// the migration helpers — and those get [`fallback_plan`].
     planned: Option<[usize; 3]>,
+    /// The width the caller running **between forwards** — a draft walk —
+    /// priced for itself through [`cover_wave_transient`], while it holds the
+    /// [`Covering`] that call returned.
+    ///
+    /// An arena window hands the standing tier back and drops `planned`, and a
+    /// walk creates arenas mid-walk (its module docs say why no pre-ensure
+    /// reaches every key). With no plan, the walk's next phase re-placed the
+    /// worst-case [`fallback_plan`] from inside its own recording, where the
+    /// weight side refuses to concede: Flash-Next's BF16 ×4 gate row failed on
+    /// a 912 MiB tier 19 regions short. The window leaves this as the plan
+    /// instead, so the walk re-places only its own width.
+    covering: Option<[usize; 3]>,
     /// Where the tier currently sits, while it exists.
     placed_at: Option<u64>,
     /// **How much ground that placement bought**, which is the only figure the
@@ -1195,6 +1207,7 @@ fn domain_entry<'a>(
             ],
             live_generations: 0,
             planned: None,
+            covering: None,
             placed_at: None,
             placed_bytes: None,
             reserved_by_forward: false,
@@ -1359,12 +1372,13 @@ pub fn enter_arena_window(stream: &Arc<CudaStream>, tenant: &'static str) -> Res
         // claimed its KV — an arena, so this — found no tier and re-placed the
         // prefill's 8 GB plan against KV that had grown since: refused by one
         // region, every walk, and the decodes on it failed. With the plan gone,
-        // the next caller prices itself.
+        // the next caller prices itself — unless the caller still running is
+        // one that already has, a walk mid-walk ([`WaveDomain::covering`]).
         let had_tier = domain.placed_at.take().is_some();
         domain.placed_bytes = None;
         if had_tier {
             domain.reserved_by_forward = false;
-            domain.planned = None;
+            domain.planned = domain.covering;
         }
         // Counted before the lock drops, so a forward cannot begin placing a
         // tier in the gap between here and the release below.
@@ -1633,11 +1647,17 @@ fn covering_plan(standing: [usize; 3], wanted: [usize; 3]) -> [usize; 3] {
 /// Flash-Next's C5×8 gate, a draft walk after the prefill asked for the
 /// prefill's 4.0 GB, against a partition whose KV had grown since and whose
 /// weight side would not concede mid-flight, and the wave failed.
-pub fn cover_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<()> {
+///
+/// **Hold the returned [`Covering`] for the whole walk.** While it lives, an
+/// arena the walk creates hands the tier back but leaves the walk's width as
+/// the plan ([`WaveDomain::covering`]); dropped, the width goes with it, so no
+/// guard after the walk lays its spans out at a walk's width.
+pub fn cover_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<Covering> {
     let wanted = align_phase_plan(per_phase);
-    let target = {
+    let (ordinal, target) = {
         let mut map = lock_domains();
-        let (_, domain) = domain_entry(&mut map, stream);
+        let (ordinal, domain) = domain_entry(&mut map, stream);
+        domain.covering = Some(wanted);
         let target = cover_target(
             domain.planned,
             domain.placed_at.and(domain.placed_bytes),
@@ -1648,11 +1668,29 @@ pub fn cover_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> 
         if let Cover::Relay(plan) = target {
             domain.planned = Some(plan);
         }
-        target
+        (ordinal, target)
     };
+    // Built first, so a refused placement clears the width on the way out.
+    let covering = Covering { ordinal };
     match target {
-        Cover::Place(plan) => plan_wave_transient(stream, plan),
-        Cover::Keep | Cover::Relay(_) => Ok(()),
+        Cover::Place(plan) => plan_wave_transient(stream, plan)?,
+        Cover::Keep | Cover::Relay(_) => {}
+    }
+    Ok(covering)
+}
+
+/// A walk's claim on its own width; see [`cover_wave_transient`].
+#[must_use = "the walk's width lasts only while this is held"]
+pub struct Covering {
+    ordinal: usize,
+}
+
+impl Drop for Covering {
+    fn drop(&mut self) {
+        let mut map = lock_domains();
+        if let Some(domain) = map.get_mut(&self.ordinal) {
+            domain.covering = None;
+        }
     }
 }
 
@@ -2487,8 +2525,8 @@ mod tests {
 #[cfg(all(test, feature = "cuda"))]
 mod wave_tests {
     use super::{
-        begin_forward, begin_wave, enter_arena_window, plan_wave_transient, wave_domain_stats,
-        LayerPhase,
+        begin_forward, begin_wave, cover_wave_transient, enter_arena_window, plan_wave_transient,
+        wave_domain_stats, LayerPhase,
     };
     use candle::{Device, Result};
 
@@ -2498,7 +2536,7 @@ mod wave_tests {
     /// a lock that only excludes this module would not exclude them.
     use super::super::gpu_test_lock::gpu_serial as serial;
 
-    fn stream() -> Option<std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>> {
+    fn stream() -> Option<candle::cuda_backend::StreamLease> {
         match Device::new_cuda(0) {
             Ok(Device::Cuda(d)) => Some(d.cuda_stream()),
             _ => None,
@@ -2664,6 +2702,60 @@ mod wave_tests {
             placed >= fallback && placed < wide_bytes,
             "the guard placed {placed} B: the fallback is {fallback} B, the finished \
              forward's plan {wide_bytes} B"
+        );
+        drop(guard);
+        Ok(())
+    }
+
+    /// **A walk keeps its own width when an arena it creates hands its tier
+    /// back**, and only while it holds its [`super::Covering`].
+    ///
+    /// A draft walk creates arenas mid-walk, inside its recording. With the
+    /// plan dropped, its next phase re-placed the worst-case fallback there,
+    /// where the weight side refuses to concede: Flash-Next's BF16 ×4 gate row
+    /// failed on a 912 MiB tier 19 regions short.
+    #[test]
+    fn a_walk_keeps_its_width_when_an_arena_hands_its_tier_back() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let ordinal = s.context().ordinal();
+        let tier = |ordinal| {
+            super::super::region_pool::region_stats(ordinal)
+                .map(|r| r.transient_bytes)
+                .unwrap_or(0)
+        };
+        let fallback: usize = super::fallback_plan().iter().sum();
+        let wide = super::fallback_plan().map(|b| b + (16 << 20));
+        {
+            let _open = begin_forward(&s);
+            plan_wave_transient(&s, wide)?;
+        }
+        // The walk fits inside the forward's standing tier, so the cover keeps
+        // the forward's plan and records the walk's width beside it.
+        let walk = [2 << 20, 2 << 20, 2 << 20];
+        let covering = cover_wave_transient(&s, walk)?;
+        drop(enter_arena_window(&s, "a test tenant")?);
+        assert_eq!(tier(ordinal), 0, "the window handed the tier back");
+        let guard = begin_wave(&s, LayerPhase::Attention)?;
+        let placed = tier(ordinal);
+        assert!(
+            placed > 0 && placed < fallback,
+            "the walk's guard placed {placed} B: its own width, not the {fallback} B fallback"
+        );
+        drop(guard);
+        drop(covering);
+
+        // The walk is over: a tier handed back after it leaves no plan.
+        {
+            let _open = begin_forward(&s);
+            plan_wave_transient(&s, wide)?;
+        }
+        drop(enter_arena_window(&s, "a test tenant")?);
+        let guard = begin_wave(&s, LayerPhase::Attention)?;
+        let placed = tier(ordinal);
+        assert!(
+            placed >= fallback,
+            "after the walk the guard placed {placed} B: the walk's width outlived it"
         );
         drop(guard);
         Ok(())

@@ -108,9 +108,11 @@ impl Drop for Generation {
                 // issue them first.
                 let dev = inner.dev.clone();
                 let _eager = dev.as_ref().and_then(|d| d.pause_capture().ok().flatten());
-                let stream = match (inner.explicit_stream.clone(), inner.dev.clone()) {
+                // Leased for as long as the fence below is being recorded.
+                let lease = dev.as_ref().map(|d| d.cuda_stream());
+                let stream = match (inner.explicit_stream.clone(), &lease) {
                     (Some(stream), _) => Some(stream),
-                    (None, Some(dev)) => Some(dev.compute_stream()),
+                    (None, Some(lease)) => Some((**lease).clone()),
                     (None, None) => None,
                 };
                 match stream {
@@ -260,9 +262,10 @@ impl GpuBuf {
     /// A `CudaDevice` reference is required to resolve the stable device pointer
     /// (a cudarc API requirement; the pointer is valid for the lifetime of the slice).
     pub fn from_raw_owned(slice: CudaSlice<u8>, dev: &CudaDevice) -> Self {
-        let stream = dev.compute_stream();
+        // Reading the address issues nothing on the stream: no lease.
+        let stream = dev.stream_unleased();
         let ptr = {
-            let (ptr, _guard) = slice.device_ptr(&stream);
+            let (ptr, _guard) = slice.device_ptr(stream);
             ptr
         }; // guard dropped; pointer remains valid while slice lives
         let len = slice.len();
@@ -761,15 +764,15 @@ impl PinnedStagerInner {
     /// stay valid until the arenas next reset.
     fn copy_to_device(&mut self, buf: &PinnedBuf) -> Result<u64> {
         let dev = self.dev.clone().expect("cuda stager missing device");
+        // Leased for the whole copy, which may allocate a slab and queues on
+        // the stream.
+        let lease = dev.cuda_stream();
         let stream = self
             .explicit_stream
             .clone()
-            .unwrap_or_else(|| dev.compute_stream());
+            .unwrap_or_else(|| (*lease).clone());
         let src = buf.as_slice();
         let mut _eager = None;
-        // The stream the copy is queued on: `stream`, unless an eager segment's
-        // launch stream (below).
-        let mut copy_on = stream.clone();
         let at = match self.resident.carve(buf.len()) {
             Carve::At(offset) => {
                 let slab = self
@@ -777,22 +780,18 @@ impl PinnedStagerInner {
                     .last()
                     .expect("a carve At names a held slab");
                 let at = slab.device_ptr(&stream).0 + offset as u64;
-                // **On the forward's own streams, a carve into a held slab
-                // cuts nothing.** Recording, the bytes are staged through the
-                // wave's ring and their copy recorded ahead of the launches
-                // that read them; in a segment that runs eagerly, the copy is
-                // queued on its launch stream — the capture stream the
-                // segment's launches are on — behind the launches already
-                // issued. Pausing in either cut the wave where the same wave
-                // without this copy is not cut, and every segment after it
-                // held other layers.
+                // **On the device's stream, a carve into a held slab cuts
+                // nothing.** Recording, the bytes are staged through the wave's
+                // ring and their copy recorded ahead of the launches that read
+                // them; in a segment that runs eagerly, the copy is queued
+                // behind the launches already issued. Pausing in either cut the
+                // wave where the same wave without this copy is not cut, and
+                // every segment after it held other layers.
                 if self.explicit_stream.is_none() {
                     if dev.record_upload(at, src) {
                         return Ok(at);
                     }
-                    if dev.eager_segment_here() {
-                        copy_on = dev.cuda_stream();
-                    } else {
+                    if !dev.eager_segment_here() {
                         _eager = dev.pause_capture()?;
                     }
                 } else {
@@ -821,12 +820,13 @@ impl PinnedStagerInner {
                     at,
                     src.as_ptr() as *const std::ffi::c_void,
                     src.len(),
-                    copy_on.cu_stream(),
+                    stream.cu_stream(),
                 )
             }
             .result()
             .w()?;
         }
+        drop(lease);
         Ok(at)
     }
 
@@ -1132,11 +1132,13 @@ impl PinnedStager {
                 // transfer this wide is rare and holding a slab its width for
                 // every later generation would cost more than the allocation.
                 let dev = inner.dev.clone().expect("checked above");
+                let _eager = dev.pause_capture()?;
+                // Leased for the allocation and the copy queued below.
+                let lease = dev.cuda_stream();
                 let stream = inner
                     .explicit_stream
                     .clone()
-                    .unwrap_or_else(|| dev.compute_stream());
-                let _eager = dev.pause_capture()?;
+                    .unwrap_or_else(|| (*lease).clone());
                 let mut gpu = unsafe { stream_alloc::<u8>(&stream, buf.len())? };
                 stream.memcpy_htod(buf.as_slice(), &mut gpu).w()?;
                 let dev_ptr = gpu.device_ptr(&stream).0;
@@ -1228,7 +1230,7 @@ impl PinnedStager {
         if let Some(stream) = explicit_stream {
             stream.synchronize().w()?;
         } else if let Some(dev) = &dev {
-            dev.compute_stream().synchronize().w()?;
+            dev.cuda_stream().synchronize().w()?;
         }
         let mut inner = self.inner.lock().unwrap();
         // Resets all arenas, drops the overflow slabs (keeping only the first),
@@ -1252,7 +1254,7 @@ impl PinnedStager {
         if let Some(stream) = explicit_stream {
             stream.synchronize().w()?;
         } else if let Some(dev) = &dev {
-            dev.compute_stream().synchronize().w()?;
+            dev.cuda_stream().synchronize().w()?;
         }
         let mut inner = self.inner.lock().unwrap();
         // The stream sync above subsumes any deferred fence — an event recorded
@@ -1289,7 +1291,7 @@ impl Drop for PinnedStagerInner {
                 let _ = stream.synchronize();
             } else if let Some(dev) = &self.dev {
                 let _eager = dev.pause_capture();
-                let _ = dev.compute_stream().synchronize();
+                let _ = dev.cuda_stream().synchronize();
             }
             self.pending_owned.clear();
         }
@@ -1391,8 +1393,18 @@ mod gpu_buf_clone_tests {
         drop(original);
         dev.synchronize().unwrap();
         let mut back = vec![0u8; 64];
-        // SAFETY: `clone` holds the 64 bytes at `dev_ptr` alive.
-        unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut back, clone.dev_ptr()) }.unwrap();
+        let stream = dev.cuda_stream();
+        // SAFETY: `clone` holds the 64 bytes at `dev_ptr` alive, and the wait
+        // below keeps `back` borrowed until the copy has landed.
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_async(
+                &mut back,
+                clone.dev_ptr(),
+                stream.cu_stream(),
+            )
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
         assert_eq!(back, bytes);
     }
 }

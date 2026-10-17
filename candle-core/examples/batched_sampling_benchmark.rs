@@ -563,7 +563,7 @@ mod bench {
         println!();
 
         let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
-        let stream = ctx.default_stream();
+        let stream = ctx.new_stream().expect("Failed to create a CUDA stream");
 
         // Print GPU info
         let dev_name = ctx.name().unwrap_or_else(|_| "Unknown".to_string());

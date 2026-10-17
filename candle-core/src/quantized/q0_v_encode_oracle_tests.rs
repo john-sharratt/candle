@@ -84,19 +84,15 @@ fn encode_on_device(src: &[f32], is_k: bool) -> Result<Vec<u8>> {
         let stream = dev.cuda_stream();
         let (s, _gs) = src_d.device_ptr(&stream);
         let (d, _gd) = dst_d.device_ptr(&stream);
-        // The oracle launches on the legacy default stream: order it after the
-        // upload, and the download after it, with device-wide fences.
-        dev.synchronize()?;
         unsafe {
             run_q0_v_encode_oracle(
                 s as *const c_void,
                 d as *mut c_void,
                 n as i32,
                 is_k as i32,
-                std::ptr::null_mut(),
+                stream.cu_stream() as *mut c_void,
             )
         };
-        dev.synchronize()?;
     }
     dev.memcpy_dtov(&dst_d)
 }

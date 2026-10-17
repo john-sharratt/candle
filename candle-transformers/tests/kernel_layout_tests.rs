@@ -37,7 +37,6 @@
 // Kernel-gate harness: the launch wrappers take the kernel's flat argument list.
 #![allow(clippy::clone_on_copy, clippy::too_many_arguments)]
 
-use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::quantized::pinned_staging::{PinnedBuf, PinnedStager};
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
@@ -49,7 +48,7 @@ use candle_transformers::models::prefill_utils::{
 };
 use candle_transformers::models::rope_schedule::{RopeRungs, RopeSchedule};
 use candle_transformers::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 
 // These tests share one GPU and the process-global quantized arena table, so
 // they must not run concurrently. Each test acquires this guard first; poison
@@ -1088,7 +1087,7 @@ const OFFSET_WINDOW_QUANT_CASES: &[(&str, usize, usize, u8)] = &[
     ("q_c3_deep_off50", 128, 50, 3),
 ];
 
-fn cuda_stream(device: &Device) -> Arc<CudaStream> {
+fn cuda_stream(device: &Device) -> candle::cuda_backend::StreamLease {
     match device {
         Device::Cuda(d) => d.cuda_stream(),
         _ => unreachable!("test gated on a CUDA device"),

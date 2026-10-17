@@ -669,54 +669,19 @@ impl Qwen4ExpBatched {
             rows
         };
 
-        // **The walk's KV first, then its tier.** Reserving can create an arena,
-        // and an arena is ground taken out from under a standing tier — so the
-        // tier is priced against the partition the reservation leaves, as every
-        // forward prices after its admit. Reserved after, an arena handed back
-        // the tier just covered and the walk's first phase found none.
+        // **Every claim the walk makes first, then its tier.** Claiming can
+        // create an arena — the walk's KV chunks, or a span region for the
+        // head's index pages — and creating one hands a standing tier back and
+        // drops its plan. So the tier is priced against the partition the claims
+        // leave, as every forward prices after its admit. Claimed after, an
+        // arena handed back the tier just covered, and the walk's first phase
+        // re-placed the worst-case fallback plan from inside its recording,
+        // where the weight side will not concede: Flash-Next's BF16 ×4 gate row
+        // failed every run on a 912 MiB tier 19 regions short.
         //
-        // The walk reserves these itself, but the rope depth below has to be
+        // The walk reserves its KV itself, but the rope depth below has to be
         // read after the reservation — it can grow the backing's block count.
         draft_reserve(session, seqs, kv_layer, max_len)?;
-
-        // **The walk runs on the previous forward's tier, priced for that
-        // forward's width rather than this cohort's.** Each step is one decode
-        // row per sequence through the head's assembly, its attention, its FFN
-        // and the shared head, so the tier must hold the plan for `n` decode
-        // rows; covering it is a no-op when it already does.
-        if let candle::Device::Cuda(d) = dev {
-            let plan = WavePlan::new(self.wave_geometry(DType::F32));
-            // The head's selection at the walk's deepest position, which is the
-            // widest any of its steps scores.
-            let deepest: Vec<usize> = seqs
-                .iter()
-                .map(|&s| session.sequence_offset(s).unwrap_or(0) + max_len - 1)
-                .collect();
-            let num_layers = m.cfg.num_layers;
-            let width = WaveWidth {
-                qsa_bytes: self.wave_qsa_bytes(
-                    seqs,
-                    &vec![1; n],
-                    &deepest,
-                    num_layers,
-                    num_layers,
-                )?,
-                ..WaveWidth::decode(n)
-            };
-            let per_phase = [
-                plan.phase_bytes(LayerPhase::Attention, width),
-                plan.phase_bytes(LayerPhase::Ffn, width),
-                plan.phase_bytes(LayerPhase::Forward, width),
-            ];
-            // The refusal names the partition; what this walk priced, and from
-            // which width, is what says which term of the price is wrong.
-            cover_wave_transient(&d.cuda_stream(), per_phase).map_err(|e| {
-                candle::Error::Msg(format!(
-                    "{e} — for a draft walk of {n} sequences, {max_len} deep, at {width:?}, \
-                     {per_phase:?} B"
-                ))
-            })?;
-        }
 
         let theta = m.cfg.rope_theta;
         let q_lens = vec![1usize; n];
@@ -751,6 +716,45 @@ impl Qwen4ExpBatched {
                 cache.ensure_capacity(base + max_len, ratio)?;
             }
         }
+
+        // **The walk runs on the previous forward's tier, priced for that
+        // forward's width rather than this cohort's.** Each step is one decode
+        // row per sequence through the head's assembly, its attention, its FFN
+        // and the shared head, so the tier must hold the plan for `n` decode
+        // rows; covering it is a no-op when it already does. Held to the end
+        // of the walk, so an arena the walk creates re-places this width.
+        let _covering = if let candle::Device::Cuda(d) = dev {
+            let plan = WavePlan::new(self.wave_geometry(DType::F32));
+            // The head's selection at the walk's deepest position, which is the
+            // widest any of its steps scores.
+            let deepest: Vec<usize> = seqs
+                .iter()
+                .map(|&s| session.sequence_offset(s).unwrap_or(0) + max_len - 1)
+                .collect();
+            let num_layers = m.cfg.num_layers;
+            let width = WaveWidth {
+                qsa_bytes: self
+                    .wave_qsa_bytes_in(&idx_map, seqs, &q_lens, &deepest, num_layers, num_layers)?,
+                ..WaveWidth::decode(n)
+            };
+            let per_phase = [
+                plan.phase_bytes(LayerPhase::Attention, width),
+                plan.phase_bytes(LayerPhase::Ffn, width),
+                plan.phase_bytes(LayerPhase::Forward, width),
+            ];
+            // The refusal names the partition; what this walk priced, and from
+            // which width, is what says which term of the price is wrong.
+            Some(
+                cover_wave_transient(&d.cuda_stream(), per_phase).map_err(|e| {
+                    candle::Error::Msg(format!(
+                        "{e} — for a draft walk of {n} sequences, {max_len} deep, at \
+                         {width:?}, {per_phase:?} B"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
 
         // **The walk opens no forward of its own, deliberately.**
         //

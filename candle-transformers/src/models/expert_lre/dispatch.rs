@@ -746,9 +746,12 @@ impl Dispatch {
         let stream = self.device.cuda_stream();
         let (ptr, _g) = self.stall.device_ptr(&stream);
         // SAFETY: the counter block this struct owns; the device is synchronized
-        // (the read above), so no worker is adding to it.
-        unsafe { cudarc::driver::result::memset_d8_sync(ptr, 0, rows.len() * 8) }
-            .map_err(candle::Error::wrap)?;
+        // (the read above), so no worker is adding to it, and the fill is queued
+        // on the stream every later worker runs behind.
+        unsafe {
+            cudarc::driver::result::memset_d8_async(ptr, 0, rows.len() * 8, stream.cu_stream())
+        }
+        .map_err(candle::Error::wrap)?;
         let mut c = WorkerCounters::default();
         for r in rows.chunks_exact(STALL_WORDS) {
             c.cold_wait_ns += r[0];

@@ -87,17 +87,14 @@ pub(super) fn write_pages(device: &Device, slots: &[ArenaSlot], pages: &[u64]) -
 /// does this). Synchronous, so the caller sees the bytes on return.
 #[cfg(test)]
 pub(super) fn read_page(device: &Device, slot: &ArenaSlot, n_words: usize) -> Result<Vec<u64>> {
-    use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync;
     let Device::Cuda(dev) = device else {
         candle::bail!("gallery page readback: the gallery lives on a CUDA device");
     };
     dev.bind_to_thread()?;
     let mut out = vec![0u64; n_words];
     // SAFETY: the slot spans at least `n_words` words and is live for the call.
-    unsafe {
-        memcpy_dtoh_sync(&mut out, slot.ptr())
-            .map_err(|e| candle::Error::Msg(format!("gallery page D2H: {e}")))?;
-    }
+    unsafe { dev.read_raw(slot.ptr(), &mut out) }
+        .map_err(|e| candle::Error::Msg(format!("gallery page D2H: {e}")))?;
     Ok(out)
 }
 

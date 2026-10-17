@@ -511,7 +511,6 @@ mod cuda_impl {
         };
         use half::f16;
 
-        use candle::cuda_backend::cudarc::driver::CudaStream;
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
@@ -528,7 +527,7 @@ mod cuda_impl {
             }
         }
 
-        fn cuda_stream(device: &candle::Device) -> Arc<CudaStream> {
+        fn cuda_stream(device: &candle::Device) -> candle::cuda_backend::StreamLease {
             match device {
                 candle::Device::Cuda(d) => d.cuda_stream(),
                 _ => unreachable!("gated on a CUDA device"),

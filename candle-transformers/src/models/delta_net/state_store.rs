@@ -51,8 +51,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
 use candle::{
-    cuda_backend::cudarc::driver::result::{memcpy_dtod_async, memcpy_dtod_sync},
-    quantized::pinned_staging::PinnedBuf,
+    cuda_backend::cudarc::driver::result::memcpy_dtod_async, quantized::pinned_staging::PinnedBuf,
     CudaDevice, DType, LeaseAnchor, Storage,
 };
 #[cfg(feature = "cuda")]
@@ -625,11 +624,14 @@ fn copy_state_into(device: &Device, src: &DeltaNetState, dst: &DeltaNetState) ->
         let bytes = s.elem_count() * s.dtype().size_in_bytes();
         let src_ptr = tensor_device_ptr(cuda, s)?;
         let dst_ptr = tensor_device_ptr(cuda, d)?;
+        // On the device's stream, behind the writes that produced the source
+        // and ahead of every launch that reads the copy.
+        let stream = cuda.cuda_stream();
         // SAFETY: both ranges are `bytes` long, live, and disjoint — the
         // destination belongs to a store being built, which nothing else has
         // yet seen.
         unsafe {
-            memcpy_dtod_sync(dst_ptr, src_ptr, bytes)
+            memcpy_dtod_async(dst_ptr, src_ptr, bytes, stream.cu_stream())
                 .map_err(|e| Error::Msg(format!("recurrent fork copy: {e}")))?;
         }
     }

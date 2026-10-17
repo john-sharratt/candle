@@ -220,9 +220,7 @@ pub fn host_to_flat(host: &[f32], n_heads: usize, n_tok: usize, device: &Device)
     Tensor::from_vec(host.to_vec(), (n_tok, n_heads, HEAD_DIM), device)?.to_dtype(DType::F16)
 }
 
-fn cuda_stream(
-    device: &Device,
-) -> Result<std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>> {
+fn cuda_stream(device: &Device) -> Result<candle::cuda_backend::StreamLease> {
     match device {
         Device::Cuda(d) => Ok(d.cuda_stream()),
         _ => candle::bail!("prefill_ab requires a CUDA device"),

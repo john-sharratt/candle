@@ -847,7 +847,6 @@ impl ExpertCache {
         // and the table is how the device finds a weight. Every condition that
         // path depends on is checked here and refused with its reason.
         let table = Arc::new(LiveTable::new(
-            cuda_dev_ref,
             &layer_geometries,
             experts_per_layer,
             experts_used,
@@ -1271,7 +1270,7 @@ impl ExpertCache {
             // could take?" — asked on this thread, between forwards, where its
             // answer is the pool as it stands (`spare_for_growth`). The pipeline
             // thread is asked only to make a move there is ground for.
-            let spare = match spare_for_growth(&self.device.compute_stream()) {
+            let spare = match spare_for_growth(&self.device.cuda_stream()) {
                 Ok(spare) => spare,
                 Err(e) => {
                     tracing::warn!("expert cache: growth question failed: {e}");

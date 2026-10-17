@@ -1622,12 +1622,10 @@ impl super::backing::ChunkedKvBacking {
         };
         cuda.bind_to_thread().ok()?;
         let mut out = vec![0u8; bytes];
-        // SAFETY: `addr` is a resident record's base address, taken from the chunk's
-        // own `MetaGid`, and `bytes` is that record's serialized length computed from
-        // the same geometry the serializer used.
-        unsafe {
-            candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync(&mut out, addr).ok()?;
-        }
+        // SAFETY: `addr` is a resident record's base address, taken from the
+        // chunk's own `MetaGid`, and `bytes` is that record's serialized length
+        // computed from the same geometry the serializer used.
+        unsafe { cuda.read_raw(addr, &mut out) }.ok()?;
         Some(out)
     }
 
@@ -1690,16 +1688,8 @@ impl super::backing::ChunkedKvBacking {
             // reservation — the same pair the migrate kernel was handed — and the
             // caller has fenced the copy that filled the destination.
             unsafe {
-                candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync(
-                    &mut src_buf,
-                    records.srcs[i] as u64,
-                )
-                .map_err(candle::Error::wrap)?;
-                candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync(
-                    &mut dst_buf,
-                    records.dsts[i] as u64,
-                )
-                .map_err(candle::Error::wrap)?;
+                cuda.read_raw(records.srcs[i] as u64, &mut src_buf)?;
+                cuda.read_raw(records.dsts[i] as u64, &mut dst_buf)?;
             }
             if src_buf != dst_buf {
                 let at = src_buf
@@ -1718,14 +1708,8 @@ impl super::backing::ChunkedKvBacking {
                 let mut dst2 = vec![0u8; len];
                 // SAFETY: as the reads above — same two addresses, same length.
                 unsafe {
-                    let _ = candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync(
-                        &mut src2,
-                        records.srcs[i] as u64,
-                    );
-                    let _ = candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync(
-                        &mut dst2,
-                        records.dsts[i] as u64,
-                    );
+                    cuda.read_raw(records.srcs[i] as u64, &mut src2)?;
+                    cuda.read_raw(records.dsts[i] as u64, &mut dst2)?;
                 }
                 let src_moved = src2 != src_buf;
                 let dst_moved = dst2 != dst_buf;

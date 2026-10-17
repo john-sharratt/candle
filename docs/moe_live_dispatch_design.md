@@ -73,7 +73,7 @@ of three places, and the live table says which:
 | **0** | cold — on the NVMe pack only (or in a pageable warm slot) | a worker spins on the entry until the stager publishes a pad address, then as above |
 
 ```text
-forward thread (null stream)            stager thread (new)              pipeline thread (off the critical path)
+forward thread (device stream)          stager thread (new)              pipeline thread (off the critical path)
 ────────────────────────────            ───────────────────              ───────────────────────────────────────
 router → route
 bucketize ── reads the live gate row,   polls summary word n             polls summary word n
@@ -1227,7 +1227,7 @@ rest of the process, the first time the weight zone concedes ground
 ## 2. The shape
 
 ```text
-forward thread (null stream)                      pipeline thread            copy stream
+forward thread (device stream)                    pipeline thread            copy stream
 ──────────────────────────────                    ───────────────            ───────────
 router → route (top-k, device)
 bucketize  ── reads live gate row, orders
@@ -1282,8 +1282,9 @@ dtypes. What changes:
   naming the model and the condition: KO weights in every row, uniform shapes
   across rows, one dtype within a row, `n_experts ≤ MOE_MAX_EXPERTS` (512),
   `k ≤ 16` (`moe_route`) / `≤ 32` (bucketize), N % 32 and K % 128 for both
-  projections, compute stream is the legacy null stream
-  (`gpu_dispatch.rs:358-369`). There is no host path to decline to.
+  projections (`expert_lre/live_table.rs`). There is no host path to decline to.
+  Bucketize and the grouped kernels are ordered by launching on the device's one
+  stream (`docs/decode_graphs.md` §2.2), not by a condition on which stream it is.
 - **The `hidden % 1024` condition is removed** (`gpu_dispatch.rs:241`). It cites
   "the q8a1024 byte-row gather", which is now tile-granular and serves any
   multiple of 128 (`candle-core/src/quantized/cuda.rs:7278-7281`); it is what
@@ -1322,9 +1323,9 @@ Copies on one stream execute in order, so the gate entry cannot become non-zero
 before the expert's bytes and its up/down entries have landed.
 
 `cudarc` 0.17.8's `CudaContext::new_stream` creates `CU_STREAM_NON_BLOCKING`
-streams (`core.rs:454-469`), so the copy, routing and streamer streams do not
-implicitly serialize with the null stream: a fill proceeds while a null-stream
-kernel spins.
+streams (`core.rs:454-469`) — the device's stream among them — so the copy,
+routing and streamer streams do not implicitly serialize with the device's
+stream: a fill proceeds while a device-stream kernel spins.
 
 ## 4. Kernel changes (existing kernels only)
 
@@ -1437,7 +1438,7 @@ all-resident DSpark drafter already chains exactly this
 
 After bucketize:
 
-1. record `e_route(n)` on the null stream;
+1. record `e_route(n)` on the device's stream;
 2. the routing stream waits `e_route(n)`, copies `summary_dev[n % RING]` →
    `summary_host[n % RING]` (pinned), records `C(n)`;
 3. `cuEventQuery(e_route(n))` — non-blocking; it makes WDDM submit the queued
@@ -1546,7 +1547,7 @@ while a kernel can still read it.
 
 **Fact F.** When the pipeline thread holds `C(n)` — and on the GPU, wherever the
 copy stream has passed its wait on `e_route(n)` — bucketize(`n`) has completed,
-and, the null stream being serial, so has every kernel enqueued before it,
+and, the device's stream being serial, so has every kernel enqueued before it,
 including every GEMM of every invocation `< n`. Edge 1 makes this a GPU-enforced
 property of every overwrite, not only a host-side inference.
 
@@ -1711,7 +1712,7 @@ those streams can encounter:
 | forward thread | channel `send` | no — the pipeline drains it unconditionally |
 | forward thread | pass lock | no — the pipeline holds it only for enqueues, or for a boundary move with no pass in flight to wait on |
 
-And nothing on the pipeline thread is ever enqueued on the null stream: it issues
+And nothing on the pipeline thread is ever enqueued on the device's stream: it issues
 no kernels and no allocations against the wave arena. Wave arenas reset in
 stream order (`bump_arena.rs:83-105, 721-728`), which stays correct because every
 expert kernel is now enqueued by the forward thread, in program order — the
@@ -1958,7 +1959,7 @@ to say which of three things moved when decode gets slower or faster:
 3. **The expert kernels themselves got slower** — nothing to do with streaming.
 
 Today's `profile` feature cannot separate these. Its GPU spans time only the
-null stream (`profile/gpu.rs`, `gpu_span(name, &Device)` → `dev.cuda_stream()`),
+device's stream (`profile/gpu.rs`, `gpu_span(name, &Device)` → `dev.cuda_stream()`),
 every copy-stream event is `DISABLE_TIMING`, `dma_h2d` times the host enqueue of
 an async copy rather than the transfer (`pipeline.rs:1010, 1057`), no kernel
 records time or counters, and `moe:gate_up` (`quantized_qwen3_moe.rs:473-532`)
@@ -1983,7 +1984,7 @@ the split-K path already uses (`kernel.cuh:2335-2341, 2447-2449`): each block
 `atomicMax`es into a launch scratch word and increments a done counter, and the
 block that brings the counter to `gridDim` adds the maximum into `stall_ns[row]`
 and resets both words itself. One scratch pair per device suffices because
-launches on the null stream do not overlap; a sliced gate (§4.4) folds per
+launches on the device's stream do not overlap; a sliced gate (§4.4) folds per
 slice, and since slices run in sequence the sum is still the stream's delay. No
 reset kernel and no memset — both would be unschedulable under spinning blocks
 (§3.3) — and the counters are never reset: the host subtracts readings.
@@ -2020,7 +2021,7 @@ makes them the control: if they slowed too, the kernels slowed; if only the gate
 moved and by the stall, streaming did.
 
 **M5 — miss service latency.** For a message with misses, a cross-stream span
-`moe:service` from `e_route(n)` (null stream) to the event after its last gate
+`moe:service` from `e_route(n)` (device stream) to the event after its last gate
 fill (copy stream) — the GPU-clock time from "routing known" to "the last missing
 expert is computable". `cuEventElapsedTime` accepts two timing-enabled events on
 different streams of one context. Its host-side breakdown, all on the pipeline

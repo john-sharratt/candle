@@ -2206,7 +2206,7 @@ int launch_int8_decode_attn(
     const T* v_new,
     const RopeRungs rungs,
     int rope_interleaved,
-    cudaStream_t stream = nullptr,
+    cudaStream_t stream,
     uint8_t* q8_out = nullptr,  // non-null → B2 fused q8a128 context (combine path, HEAD_DIM % 128 == 0)
     const O* gate = nullptr,    // non-null → combine applies sigmoid(gate) ⊙ val (requires q8_out)
     int64_t gate_slot_stride = 0, // elements between consecutive slots' gate rows

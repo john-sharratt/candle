@@ -194,32 +194,33 @@ extern "C" void run_conv1d(
     const size_t* info,
     const void* src,
     const void* kernel,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
-            conv1d_f32<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, dilation, info,
+            conv1d_f32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, dilation, info,
                        (const float*)src, (const float*)kernel, (float*)dst);
             break;
         case CONV_F64:
-            conv1d_f64<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, dilation, info,
+            conv1d_f64<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, dilation, info,
                        (const double*)src, (const double*)kernel, (double*)dst);
             break;
         case CONV_F16:
-            conv1d_f16<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, dilation, info,
+            conv1d_f16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, dilation, info,
                        (const __half*)src, (const __half*)kernel, (__half*)dst);
             break;
         case CONV_BF16:
-            conv1d_bf16<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, dilation, info,
+            conv1d_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, dilation, info,
                         (const __nv_bfloat16*)src, (const __nv_bfloat16*)kernel, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            conv1d_u8<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, dilation, info,
+            conv1d_u8<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, dilation, info,
                       (const uint8_t*)src, (const uint8_t*)kernel, (uint8_t*)dst);
             break;
         case CONV_U32:
-            conv1d_u32<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, dilation, info,
+            conv1d_u32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, dilation, info,
                        (const uint32_t*)src, (const uint32_t*)kernel, (uint32_t*)dst);
             break;
     }
@@ -254,32 +255,33 @@ extern "C" void run_conv2d(
     const size_t* info,
     const void* src,
     const void* kernel,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
-            conv2d_f32<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
+            conv2d_f32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
                        (const float*)src, (const float*)kernel, (float*)dst);
             break;
         case CONV_F64:
-            conv2d_f64<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
+            conv2d_f64<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
                        (const double*)src, (const double*)kernel, (double*)dst);
             break;
         case CONV_F16:
-            conv2d_f16<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
+            conv2d_f16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
                        (const __half*)src, (const __half*)kernel, (__half*)dst);
             break;
         case CONV_BF16:
-            conv2d_bf16<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
+            conv2d_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
                         (const __nv_bfloat16*)src, (const __nv_bfloat16*)kernel, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            conv2d_u8<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
+            conv2d_u8<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
                       (const uint8_t*)src, (const uint8_t*)kernel, (uint8_t*)dst);
             break;
         case CONV_U32:
-            conv2d_u32<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
+            conv2d_u32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, dilation, info,
                        (const uint32_t*)src, (const uint32_t*)kernel, (uint32_t*)dst);
             break;
     }
@@ -314,32 +316,33 @@ extern "C" void run_conv_transpose1d(
     const size_t* info,
     const void* src,
     const void* kernel,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
-            conv_transpose1d_f32<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
+            conv_transpose1d_f32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
                                  (const float*)src, (const float*)kernel, (float*)dst);
             break;
         case CONV_F64:
-            conv_transpose1d_f64<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
+            conv_transpose1d_f64<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
                                  (const double*)src, (const double*)kernel, (double*)dst);
             break;
         case CONV_F16:
-            conv_transpose1d_f16<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
+            conv_transpose1d_f16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
                                  (const __half*)src, (const __half*)kernel, (__half*)dst);
             break;
         case CONV_BF16:
-            conv_transpose1d_bf16<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
+            conv_transpose1d_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
                                   (const __nv_bfloat16*)src, (const __nv_bfloat16*)kernel, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            conv_transpose1d_u8<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
+            conv_transpose1d_u8<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
                                 (const uint8_t*)src, (const uint8_t*)kernel, (uint8_t*)dst);
             break;
         case CONV_U32:
-            conv_transpose1d_u32<<<grid, BLOCK_SIZE>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
+            conv_transpose1d_u32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, l_out, stride, padding, out_padding, dilation, info,
                                  (const uint32_t*)src, (const uint32_t*)kernel, (uint32_t*)dst);
             break;
     }
@@ -376,32 +379,33 @@ extern "C" void run_conv_transpose2d(
     const size_t* info,
     const void* src,
     const void* kernel,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
-            conv_transpose2d_f32<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
+            conv_transpose2d_f32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
                                  (const float*)src, (const float*)kernel, (float*)dst);
             break;
         case CONV_F64:
-            conv_transpose2d_f64<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
+            conv_transpose2d_f64<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
                                  (const double*)src, (const double*)kernel, (double*)dst);
             break;
         case CONV_F16:
-            conv_transpose2d_f16<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
+            conv_transpose2d_f16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
                                  (const __half*)src, (const __half*)kernel, (__half*)dst);
             break;
         case CONV_BF16:
-            conv_transpose2d_bf16<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
+            conv_transpose2d_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
                                   (const __nv_bfloat16*)src, (const __nv_bfloat16*)kernel, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            conv_transpose2d_u8<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
+            conv_transpose2d_u8<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
                                 (const uint8_t*)src, (const uint8_t*)kernel, (uint8_t*)dst);
             break;
         case CONV_U32:
-            conv_transpose2d_u32<<<grid, BLOCK_SIZE>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
+            conv_transpose2d_u32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info,
                                  (const uint32_t*)src, (const uint32_t*)kernel, (uint32_t*)dst);
             break;
     }
@@ -436,32 +440,33 @@ extern "C" void run_im2col(
     size_t dilation,
     const size_t* info,
     const void* src,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
-            im2col_f32<<<grid, BLOCK_SIZE>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
+            im2col_f32<<<grid, BLOCK_SIZE, 0, stream>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
                        (const float*)src, (float*)dst);
             break;
         case CONV_F64:
-            im2col_f64<<<grid, BLOCK_SIZE>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
+            im2col_f64<<<grid, BLOCK_SIZE, 0, stream>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
                        (const double*)src, (double*)dst);
             break;
         case CONV_F16:
-            im2col_f16<<<grid, BLOCK_SIZE>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
+            im2col_f16<<<grid, BLOCK_SIZE, 0, stream>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
                        (const __half*)src, (__half*)dst);
             break;
         case CONV_BF16:
-            im2col_bf16<<<grid, BLOCK_SIZE>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
+            im2col_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
                         (const __nv_bfloat16*)src, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            im2col_u8<<<grid, BLOCK_SIZE>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
+            im2col_u8<<<grid, BLOCK_SIZE, 0, stream>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
                       (const uint8_t*)src, (uint8_t*)dst);
             break;
         case CONV_U32:
-            im2col_u32<<<grid, BLOCK_SIZE>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
+            im2col_u32<<<grid, BLOCK_SIZE, 0, stream>>>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, info,
                        (const uint32_t*)src, (uint32_t*)dst);
             break;
     }
@@ -493,7 +498,8 @@ extern "C" void run_im2col1d(
     size_t dilation,
     const size_t* info,
     const void* src,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     // One thread per destination element. Sized by anything smaller, the
     // elements past it are never written and keep whatever the uninitialised
@@ -501,27 +507,27 @@ extern "C" void run_im2col1d(
     int grid = grid_size(numel);
     switch (dtype) {
         case CONV_F32:
-            im2col1d_f32<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_f32<<<grid, BLOCK_SIZE, 0, stream>>>(numel, l_out, l_k, stride, padding, dilation, info,
                          (const float*)src, (float*)dst);
             break;
         case CONV_F64:
-            im2col1d_f64<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_f64<<<grid, BLOCK_SIZE, 0, stream>>>(numel, l_out, l_k, stride, padding, dilation, info,
                          (const double*)src, (double*)dst);
             break;
         case CONV_F16:
-            im2col1d_f16<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_f16<<<grid, BLOCK_SIZE, 0, stream>>>(numel, l_out, l_k, stride, padding, dilation, info,
                          (const __half*)src, (__half*)dst);
             break;
         case CONV_BF16:
-            im2col1d_bf16<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(numel, l_out, l_k, stride, padding, dilation, info,
                           (const __nv_bfloat16*)src, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            im2col1d_u8<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_u8<<<grid, BLOCK_SIZE, 0, stream>>>(numel, l_out, l_k, stride, padding, dilation, info,
                         (const uint8_t*)src, (uint8_t*)dst);
             break;
         case CONV_U32:
-            im2col1d_u32<<<grid, BLOCK_SIZE>>>(numel, l_out, l_k, stride, padding, dilation, info,
+            im2col1d_u32<<<grid, BLOCK_SIZE, 0, stream>>>(numel, l_out, l_k, stride, padding, dilation, info,
                          (const uint32_t*)src, (uint32_t*)dst);
             break;
     }
@@ -550,32 +556,33 @@ extern "C" void run_col2im1d(
     size_t k_size,
     size_t stride,
     const void* src,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     int grid = grid_size(dst_el);
     switch (dtype) {
         case CONV_F32:
-            col2im1d_f32<<<grid, BLOCK_SIZE>>>(dst_el, l_out, l_in, c_out, k_size, stride,
+            col2im1d_f32<<<grid, BLOCK_SIZE, 0, stream>>>(dst_el, l_out, l_in, c_out, k_size, stride,
                          (const float*)src, (float*)dst);
             break;
         case CONV_F64:
-            col2im1d_f64<<<grid, BLOCK_SIZE>>>(dst_el, l_out, l_in, c_out, k_size, stride,
+            col2im1d_f64<<<grid, BLOCK_SIZE, 0, stream>>>(dst_el, l_out, l_in, c_out, k_size, stride,
                          (const double*)src, (double*)dst);
             break;
         case CONV_F16:
-            col2im1d_f16<<<grid, BLOCK_SIZE>>>(dst_el, l_out, l_in, c_out, k_size, stride,
+            col2im1d_f16<<<grid, BLOCK_SIZE, 0, stream>>>(dst_el, l_out, l_in, c_out, k_size, stride,
                          (const __half*)src, (__half*)dst);
             break;
         case CONV_BF16:
-            col2im1d_bf16<<<grid, BLOCK_SIZE>>>(dst_el, l_out, l_in, c_out, k_size, stride,
+            col2im1d_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(dst_el, l_out, l_in, c_out, k_size, stride,
                           (const __nv_bfloat16*)src, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            col2im1d_u8<<<grid, BLOCK_SIZE>>>(dst_el, l_out, l_in, c_out, k_size, stride,
+            col2im1d_u8<<<grid, BLOCK_SIZE, 0, stream>>>(dst_el, l_out, l_in, c_out, k_size, stride,
                         (const uint8_t*)src, (uint8_t*)dst);
             break;
         case CONV_U32:
-            col2im1d_u32<<<grid, BLOCK_SIZE>>>(dst_el, l_out, l_in, c_out, k_size, stride,
+            col2im1d_u32<<<grid, BLOCK_SIZE, 0, stream>>>(dst_el, l_out, l_in, c_out, k_size, stride,
                          (const uint32_t*)src, (uint32_t*)dst);
             break;
     }
@@ -604,32 +611,33 @@ extern "C" void run_avg_pool2d(
     size_t h_stride,
     const size_t* info,
     const void* src,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     int grid = grid_size(src_numel);
     switch (dtype) {
         case CONV_F32:
-            avg_pool2d_f32<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            avg_pool2d_f32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                            (const float*)src, (float*)dst);
             break;
         case CONV_F64:
-            avg_pool2d_f64<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            avg_pool2d_f64<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                            (const double*)src, (double*)dst);
             break;
         case CONV_F16:
-            avg_pool2d_f16<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            avg_pool2d_f16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                            (const __half*)src, (__half*)dst);
             break;
         case CONV_BF16:
-            avg_pool2d_bf16<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            avg_pool2d_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                             (const __nv_bfloat16*)src, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            avg_pool2d_u8<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            avg_pool2d_u8<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                           (const uint8_t*)src, (uint8_t*)dst);
             break;
         case CONV_U32:
-            avg_pool2d_u32<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            avg_pool2d_u32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                            (const uint32_t*)src, (uint32_t*)dst);
             break;
     }
@@ -658,32 +666,33 @@ extern "C" void run_max_pool2d(
     size_t h_stride,
     const size_t* info,
     const void* src,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     int grid = grid_size(src_numel);
     switch (dtype) {
         case CONV_F32:
-            max_pool2d_f32<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            max_pool2d_f32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                            (const float*)src, (float*)dst);
             break;
         case CONV_F64:
-            max_pool2d_f64<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            max_pool2d_f64<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                            (const double*)src, (double*)dst);
             break;
         case CONV_F16:
-            max_pool2d_f16<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            max_pool2d_f16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                            (const __half*)src, (__half*)dst);
             break;
         case CONV_BF16:
-            max_pool2d_bf16<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            max_pool2d_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                             (const __nv_bfloat16*)src, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            max_pool2d_u8<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            max_pool2d_u8<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                           (const uint8_t*)src, (uint8_t*)dst);
             break;
         case CONV_U32:
-            max_pool2d_u32<<<grid, BLOCK_SIZE>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
+            max_pool2d_u32<<<grid, BLOCK_SIZE, 0, stream>>>(src_numel, w_k, h_k, w_stride, h_stride, info,
                            (const uint32_t*)src, (uint32_t*)dst);
             break;
     }
@@ -712,7 +721,8 @@ extern "C" void run_upsample_nearest2d(
     double h_scale,
     const size_t* info,
     const void* src,
-    void* dst
+    void* dst,
+    cudaStream_t stream
 ) {
     // **The whole destination, not one plane of it.**
     //
@@ -731,27 +741,27 @@ extern "C" void run_upsample_nearest2d(
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
-            upsample_nearest2d_f32<<<grid, BLOCK_SIZE>>>(w_out, h_out, w_scale, h_scale, info,
+            upsample_nearest2d_f32<<<grid, BLOCK_SIZE, 0, stream>>>(w_out, h_out, w_scale, h_scale, info,
                                    (const float*)src, (float*)dst);
             break;
         case CONV_F64:
-            upsample_nearest2d_f64<<<grid, BLOCK_SIZE>>>(w_out, h_out, w_scale, h_scale, info,
+            upsample_nearest2d_f64<<<grid, BLOCK_SIZE, 0, stream>>>(w_out, h_out, w_scale, h_scale, info,
                                    (const double*)src, (double*)dst);
             break;
         case CONV_F16:
-            upsample_nearest2d_f16<<<grid, BLOCK_SIZE>>>(w_out, h_out, w_scale, h_scale, info,
+            upsample_nearest2d_f16<<<grid, BLOCK_SIZE, 0, stream>>>(w_out, h_out, w_scale, h_scale, info,
                                    (const __half*)src, (__half*)dst);
             break;
         case CONV_BF16:
-            upsample_nearest2d_bf16<<<grid, BLOCK_SIZE>>>(w_out, h_out, w_scale, h_scale, info,
+            upsample_nearest2d_bf16<<<grid, BLOCK_SIZE, 0, stream>>>(w_out, h_out, w_scale, h_scale, info,
                                     (const __nv_bfloat16*)src, (__nv_bfloat16*)dst);
             break;
         case CONV_U8:
-            upsample_nearest2d_u8<<<grid, BLOCK_SIZE>>>(w_out, h_out, w_scale, h_scale, info,
+            upsample_nearest2d_u8<<<grid, BLOCK_SIZE, 0, stream>>>(w_out, h_out, w_scale, h_scale, info,
                                   (const uint8_t*)src, (uint8_t*)dst);
             break;
         case CONV_U32:
-            upsample_nearest2d_u32<<<grid, BLOCK_SIZE>>>(w_out, h_out, w_scale, h_scale, info,
+            upsample_nearest2d_u32<<<grid, BLOCK_SIZE, 0, stream>>>(w_out, h_out, w_scale, h_scale, info,
                                    (const uint32_t*)src, (uint32_t*)dst);
             break;
     }

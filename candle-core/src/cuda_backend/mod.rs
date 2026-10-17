@@ -181,6 +181,8 @@ pub mod link_probe;
 mod module_loading;
 pub mod staged;
 mod stream_alloc;
+mod stream_lease;
+mod stream_owner;
 mod sync_watch;
 mod thread_blas;
 mod utils;
@@ -188,6 +190,7 @@ pub use device::{CudaDevice, DeviceId, Uploaded};
 pub use error::{CudaError, WrapErr};
 pub use held::{install_held_ground, Held, HeldGround};
 pub use stream_alloc::{stream_alloc, stream_alloc_zeros, stream_memcpy_stod};
+pub use stream_lease::StreamLease;
 pub use thread_blas::BlasHandle;
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Out, OutS, S};
 
@@ -699,6 +702,7 @@ impl Map1 for Im2Col1D {
                     ds_ptr as *const usize,
                     src_ptr as *const std::ffi::c_void,
                     dst_ptr as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -768,6 +772,7 @@ impl Map1 for Im2Col {
                     ds_ptr as *const usize,
                     src_ptr as *const std::ffi::c_void,
                     dst_ptr as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -1743,6 +1748,7 @@ impl Map2 for Conv1D<'_> {
                     inp_ptr as *const std::ffi::c_void,
                     k_ptr as *const std::ffi::c_void,
                     out_ptr as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -1809,6 +1815,7 @@ impl Map2 for Conv2D<'_> {
                     inp_ptr as *const std::ffi::c_void,
                     k_ptr as *const std::ffi::c_void,
                     out_ptr as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -1857,6 +1864,7 @@ impl Map1 for Col2Im1D {
                     stride,
                     col_ptr as *const std::ffi::c_void,
                     im_ptr as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -1923,6 +1931,7 @@ impl Map2 for ConvTranspose1D<'_> {
                     inp_ptr as *const std::ffi::c_void,
                     k_ptr as *const std::ffi::c_void,
                     out_ptr as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -1990,6 +1999,7 @@ impl Map2 for ConvTranspose2D<'_> {
                     inp_ptr as *const std::ffi::c_void,
                     k_ptr as *const std::ffi::c_void,
                     out_ptr as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -2062,6 +2072,7 @@ impl Map1 for Pool2D {
                             ds_ptr as *const usize,
                             inp_ptr as *const std::ffi::c_void,
                             out_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                     PoolOp::Avg => {
@@ -2075,6 +2086,7 @@ impl Map1 for Pool2D {
                             ds_ptr as *const usize,
                             inp_ptr as *const std::ffi::c_void,
                             out_ptr as *mut std::ffi::c_void,
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -2139,6 +2151,7 @@ impl Map1 for UpsampleNearest2D {
                     ds_ptr as *const usize,
                     inp_ptr as *const std::ffi::c_void,
                     out_ptr as *mut std::ffi::c_void,
+                    stream.cu_stream() as *mut std::ffi::c_void,
                 );
             }
         }
@@ -2646,7 +2659,8 @@ impl CudaStorage {
         device: &CudaDevice,
         origin: LeaseOrigin,
     ) -> Result<Self> {
-        let stream = device.compute_stream();
+        // Wrapping an address issues nothing on the stream: no lease.
+        let stream = device.stream_unleased();
         let slice = match dtype {
             DType::U8 => CudaStorageSlice::U8(stream.upgrade_device_ptr::<u8>(ptr, len)),
             DType::U32 => CudaStorageSlice::U32(stream.upgrade_device_ptr::<u32>(ptr, len)),
@@ -2754,7 +2768,9 @@ macro_rules! cuda_dtype {
                 device: CudaDevice,
                 origin: LeaseOrigin,
             ) -> CudaStorage {
-                let slice = device.compute_stream().upgrade_device_ptr::<Self>(ptr, len);
+                let slice = device
+                    .stream_unleased()
+                    .upgrade_device_ptr::<Self>(ptr, len);
                 CudaStorage {
                     slice: CudaStorageSlice::$dtype(slice),
                     device,
@@ -2827,7 +2843,7 @@ pub unsafe fn alloc_inheriting<T: DeviceRepr>(
         // nothing is freed. That is what makes the window between here and
         // the caller stamping `Backing::Lease` harmless.
         let slice = dev
-            .compute_stream()
+            .stream_unleased()
             .upgrade_device_ptr::<T>(ptr, elem_count);
         let ticket = ticket.expect("a carved range implies a ticket");
         return Ok((slice, Backing::Lease(LeaseOrigin::Wave(ticket))));
@@ -3383,7 +3399,7 @@ impl CudaStorage {
                 indices_ptr as *const u32,
                 num_indices,
                 penalty as f64,
-                std::ptr::null_mut(), // default stream
+                stream.cu_stream() as *mut std::ffi::c_void,
             );
         }
 

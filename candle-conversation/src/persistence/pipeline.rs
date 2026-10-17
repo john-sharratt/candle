@@ -233,7 +233,9 @@ pub fn run_pipeline(
         Device::Cuda(d) => d,
         _ => return Err(candle::Error::Msg("pipeline requires CUDA device".into())),
     };
-    let stream: Arc<CudaStream> = dev.cuda_stream();
+    // Leased for the pipeline's GPU work: the staging allocation, the per-unit
+    // copies and the migrate launches below.
+    let stream = dev.cuda_stream();
 
     // Ensure pinned scratch is sized; capture its raw base pointer
     // for cross-thread reader access.

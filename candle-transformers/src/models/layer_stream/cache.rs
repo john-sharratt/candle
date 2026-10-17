@@ -697,14 +697,18 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
             self.stats.evictions += 1;
         }
         // The slot's previous tenant may still be under read by a GEMM the
-        // compute stream has issued. Ordering the copy stream after the compute
+        // device's stream has issued. Ordering the copy stream after that
         // stream's current point is what keeps the eviction from overwriting
-        // bytes that are still being read.
-        let ready = self
-            .device
-            .compute_stream()
-            .record_event(None)
-            .map_err(candle::Error::wrap)?;
+        // bytes that are still being read. Recorded with no capture open on
+        // this thread: an event recorded into a segment is a graph node, and
+        // the copy stream waiting on it would be taken into the capture.
+        let ready = {
+            let _eager = self.device.pause_capture()?;
+            self.device
+                .cuda_stream()
+                .record_event(None)
+                .map_err(candle::Error::wrap)?
+        };
         self.copy.wait(&ready).map_err(candle::Error::wrap)?;
 
         let base = self.slots[op.slot].base;
@@ -797,13 +801,13 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
     /// subsystem exists to create.
     fn join(&mut self, layer: usize) -> Result<()> {
         if let Some(fence) = self.fences[layer].take() {
-            // Paused, the wait goes on the compute stream every recorded
-            // segment launches into, so the layer's GEMMs recorded after it
+            // Paused, the wait goes on the device's stream every recorded
+            // segment launches onto, so the layer's GEMMs recorded after it
             // run behind the copy. A resident layer has no fence and never
             // ends a segment here.
             let _eager = self.device.pause_capture()?;
             self.device
-                .compute_stream()
+                .cuda_stream()
                 .wait(&fence)
                 .map_err(candle::Error::wrap)?;
         }
@@ -1149,11 +1153,11 @@ mod tests {
         if let Some(wave) = wave {
             wave.finish().unwrap();
         }
-        cuda.compute_stream().synchronize().unwrap();
+        cuda.cuda_stream().synchronize().unwrap();
         let mut wrong = 0usize;
         if recorded {
             for layer in TEST_PINNED..TEST_LAYERS {
-                let got = cuda.compute_stream().memcpy_dtov(&copies[layer]).unwrap();
+                let got = cuda.cuda_stream().memcpy_dtov(&copies[layer]).unwrap();
                 for (i, p) in images[layer].placements.iter().enumerate() {
                     if got[p.offset..p.offset + p.bytes] != payload(layer, i, p.bytes)[..] {
                         eprintln!("  L{layer} projection {i} was read holding foreign bytes");

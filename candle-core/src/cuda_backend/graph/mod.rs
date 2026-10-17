@@ -5,10 +5,12 @@
 //! lives.
 //!
 //! * [`CaptureHub`] — one per device. While a thread holds a [`WaveCapture`]
-//!   its launches go to the hub's created, **non-blocking** capture stream in
-//!   `ThreadLocal` mode, so other threads' work neither breaks the capture nor
-//!   is recorded into it. The wave is cut into segments wherever the host has
-//!   to meet the device; each is launched into the compute stream as it ends.
+//!   its launches are recorded on the device's one stream in `ThreadLocal`
+//!   mode; every other thread issues under a lease the record gate keeps off a
+//!   recording segment (`record_gate`), so other threads' work neither breaks
+//!   the capture nor is recorded into it. The wave is cut into segments
+//!   wherever the host has to meet the device; each is launched onto the stream
+//!   as it ends.
 //! * `ExecLibrary` (`library`) — the executables kept across waves, found by
 //!   a segment's topology (its node kinds in order) rather than its ordinal,
 //!   so a run of layers folds into its own executables wherever the wave's
@@ -20,14 +22,14 @@
 //! * `ExecSlot` (`slot`) — one topology's executables, one per shape in steady
 //!   use, each recapture folded into them in place.
 //! * [`GraphExec`] — an instantiated graph, launched only into a
-//!   [`ComputeStream`]. A graph launched into the null stream orders against
+//!   [`ComputeStream`]. A graph launched onto the device's stream orders against
 //!   everything else on it exactly as the eager launches it replaces did.
 //! * `staging` — the rings a recorded upload is staged through.
 //!
-//! A launch is recorded only if it is issued **on the capture stream**. A
-//! kernel whose launcher takes no stream runs on the legacy default stream and
-//! is executed immediately instead of being recorded, so only launchers that
-//! take their stream from the caller can sit inside a recorded segment.
+//! A launch is recorded only if it is issued **on the device's stream**. The
+//! legacy null stream is not used anywhere — a launch there could neither be
+//! recorded nor ordered — and the build refuses code that reaches it
+//! (`candle-core/build.rs`, `candle-kernels/build_lints.rs`).
 
 mod budget;
 pub(crate) mod capture;
@@ -38,7 +40,7 @@ mod exec;
 mod hub;
 mod library;
 mod ordinals;
-mod record_gate;
+pub(crate) mod record_gate;
 mod regime;
 #[cfg(test)]
 mod session;

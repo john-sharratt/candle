@@ -602,7 +602,7 @@ mod tests {
             // step sees its producers by FIFO order. A dedicated DMA stream
             // needs event fences at every producer/consumer edge before it
             // can come back.
-            copy_stream: cuda_dev.cuda_stream(),
+            copy_stream: (*cuda_dev.cuda_stream()).clone(),
             pinned: None,
             stager: ColdLoadStager::new(),
         }

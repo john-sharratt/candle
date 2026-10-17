@@ -203,7 +203,7 @@ pub use bump_arena::{
     begin_forward, begin_guest, begin_wave, close_guest_arena, cover_wave_transient,
     end_wave_transient, guest_domain_stats, guest_stage, open_guest_arena,
     persistence_domain_stats, plan_wave_transient, wave_domain_stats, wave_is_live, BumpRange,
-    ForwardOpen, Generation as WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
+    Covering, ForwardOpen, Generation as WaveGeneration, GUEST_ARENA, KV_ARENA_MID_WAVE,
 };
 #[cfg(feature = "cuda")]
 pub use guard::{expect_kv_range, expect_kv_range_in};

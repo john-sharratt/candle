@@ -16,13 +16,14 @@ use std::panic::Location;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::graph::{enter_wave, without_recording, CaptureHub, CaptureStats, Paused, WaveCapture};
-use super::held::Held;
+use super::held::{release_on_its_stream, Held, Release};
 use super::info_ring::InfoRing;
 use super::kernel_scratch;
 use super::module_loading;
 use super::staged::{pack_segments, SEGMENT_ALIGN};
+use super::stream_owner;
 use super::sync_watch;
-use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
+use super::{CudaError, CudaStorage, CudaStorageSlice, StreamLease, WrapErr};
 use crate::cuda_backend::{alloc_inheriting, Backing};
 use crate::forbidden_alloc;
 use crate::wave_provenance::LeaseOrigin;
@@ -157,7 +158,7 @@ impl CudaDevice {
     pub unsafe fn alloc<T: DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc", len * std::mem::size_of::<T>());
         let _eager = self.pause_capture()?;
-        let s = self.stream.alloc::<T>(len).w()?;
+        let s = self.cuda_stream().alloc::<T>(len).w()?;
         Self::guard_fresh_allocation("CudaDevice::alloc", &s, len * std::mem::size_of::<T>());
         Ok(s)
     }
@@ -166,7 +167,7 @@ impl CudaDevice {
     pub fn alloc_zeros<T: DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> Result<CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc_zeros", len * std::mem::size_of::<T>());
         let _eager = self.pause_capture()?;
-        let s = self.stream.alloc_zeros::<T>(len).w()?;
+        let s = self.cuda_stream().alloc_zeros::<T>(len).w()?;
         Self::guard_fresh_allocation(
             "CudaDevice::alloc_zeros",
             &s,
@@ -192,7 +193,7 @@ impl CudaDevice {
         // touch — the driver refuses it and the refusal invalidates the capture.
         let _eager = self.pause_capture()?;
         self.guard_copy_dst::<T, _>("CudaDevice::memcpy_htod", dst, src.len());
-        self.stream.memcpy_htod(src, dst).w()
+        self.cuda_stream().memcpy_htod(src, dst).w()
     }
 
     /// Refuse a copy whose destination overlaps memory declared immutable.
@@ -218,7 +219,27 @@ impl CudaDevice {
     #[track_caller]
     pub fn memcpy_dtov<T: DeviceRepr, Src: DevicePtr<T>>(&self, src: &Src) -> Result<Vec<T>> {
         let _eager = self.pause_capture()?;
-        self.stream.memcpy_dtov(src).w()
+        self.cuda_stream().memcpy_dtov(src).w()
+    }
+
+    /// Read `out.len()` elements at device address `addr` into `out`, behind
+    /// everything issued on the stream, and wait for them — the readback of
+    /// device memory a caller holds by address rather than by slice.
+    ///
+    /// # Safety
+    ///
+    /// `addr` names at least `out.len()` live, initialised elements of `T`.
+    #[track_caller]
+    pub unsafe fn read_raw<T: DeviceRepr>(&self, addr: u64, out: &mut [T]) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        let _eager = self.pause_capture()?;
+        let stream = self.cuda_stream();
+        // SAFETY: the caller's contract, and the wait below keeps `out`
+        // borrowed until the copy has landed.
+        unsafe { cudarc::driver::result::memcpy_dtoh_async(out, addr, stream.cu_stream()) }.w()?;
+        sync_watch::synchronize(&stream).w()
     }
 
     #[track_caller]
@@ -232,7 +253,7 @@ impl CudaDevice {
         // the eager section for the reason `memcpy_htod` gives.
         let _eager = self.pause_capture()?;
         self.guard_copy_dst::<T, _>("CudaDevice::memcpy_dtod", dst, src.len());
-        self.stream.memcpy_dtod(src, dst).w()
+        self.cuda_stream().memcpy_dtod(src, dst).w()
     }
 
     #[track_caller]
@@ -250,7 +271,7 @@ impl CudaDevice {
         let bytes = src.len() * std::mem::size_of::<T>();
         forbidden_alloc::record("CudaDevice::memcpy_stod", bytes);
         let _eager = self.pause_capture()?;
-        let s = self.stream.memcpy_stod(src).w()?;
+        let s = self.cuda_stream().memcpy_stod(src).w()?;
         // Allocates as well as copying, so it is an allocation path like the
         // two above and needs the same guard — and unlike them it writes to the
         // range immediately, so a collision here corrupts before anything else
@@ -330,25 +351,24 @@ impl CudaDevice {
     ///
     /// While this thread records a wave capture, the bytes are staged in the
     /// wave's ring and their copy is recorded into the segment, so the upload
-    /// does not end it. In a segment that runs eagerly the copy goes straight
-    /// onto the **launch stream** — the capture stream an eager segment runs on
-    /// — behind the launches already issued and ahead of the ones that read
-    /// it; ending the segment there would cut the wave where a recorded one is
-    /// not cut, and every segment after it would hold different layers.
-    /// Queued on the compute stream instead, it would be unordered against the
-    /// segment's own launches. Otherwise — or when the ring is full — the copy
-    /// is queued on the compute stream behind everything issued before it. The
-    /// driver has staged pageable bytes before it returns, so `src` may go.
+    /// does not end it. In a segment that runs eagerly the copy is queued on the
+    /// stream at once, behind the launches already issued and ahead of the ones
+    /// that read it; ending the segment there would cut the wave where a
+    /// recorded one is not cut, and every segment after it would hold different
+    /// layers. Otherwise — or when the ring is full — the recording is paused
+    /// and the copy queued behind everything issued before it. The driver has
+    /// staged pageable bytes before it returns, so `src` may go.
     #[track_caller]
     pub fn upload_raw(&self, dst: u64, src: &[u8]) -> Result<()> {
         if src.is_empty() || self.record_upload(dst, src) {
             return Ok(());
         }
-        let (stream, _eager) = if self.capture.eager_segment_here() {
-            (self.cuda_stream(), None)
+        let _eager = if self.capture.eager_segment_here() {
+            None
         } else {
-            (self.stream.clone(), self.pause_capture()?)
+            self.pause_capture()?
         };
+        let stream = self.cuda_stream();
         // SAFETY: the caller's `dst` holds `src.len()` bytes; queued on the
         // stream the launches that read it are on.
         unsafe {
@@ -481,18 +501,19 @@ impl CudaDevice {
         }
         // The copy below is issued eagerly, not recorded, so a segment still
         // holding a read of the scratch must be launched ahead of it. A segment
-        // that runs eagerly holds none: the copy goes on its launch stream —
-        // the capture stream, where `f`'s launches go too — and ending it here
-        // would cut the wave where a recorded one is not cut (see
-        // [`Self::upload_raw`]).
-        let (stream, _eager) = if self.capture.eager_segment_here() {
-            (self.cuda_stream(), None)
+        // that runs eagerly holds none: the copy goes on the stream behind its
+        // launches, ahead of `f`'s, and ending it here would cut the wave where
+        // a recorded one is not cut (see [`Self::upload_raw`]).
+        let _eager = if self.capture.eager_segment_here() {
+            None
         } else {
-            (self.stream.clone(), self.pause_capture()?)
+            self.pause_capture()?
         };
         self.with_staging(bytes, |buf| {
             if bytes > 0 {
-                stream.memcpy_htod(src, &mut buf.slice_mut(..bytes)).w()?;
+                self.cuda_stream()
+                    .memcpy_htod(src, &mut buf.slice_mut(..bytes))
+                    .w()?;
             }
             let (ptr, _guard) = buf.device_ptr(&self.stream);
             f(ptr)
@@ -554,7 +575,7 @@ impl CudaDevice {
             // The pool hands the bytes out in this handle's stream order, and
             // `stream` may be another one: wait for the allocation to retire
             // before a copy on `stream` writes it. Growth only.
-            sync_watch::synchronize(&self.stream).w()?;
+            sync_watch::synchronize(&self.cuda_stream()).w()?;
         }
         let buf = slot.as_mut().expect("sized above");
         if !bytes.is_empty() {
@@ -573,7 +594,14 @@ impl CudaDevice {
     /// kernel reads), memoized by contents and carved from this handle's info
     /// ring — see [`super::info_ring`]. A steady-state wave hits the memo and
     /// uploads nothing; a new shape costs one small copy and no allocation.
+    ///
+    /// **Leased before the ring is locked.** A thread that is not recording
+    /// waits for its lease while a segment records, and the recording thread
+    /// takes this lock too: holding it across that wait would leave each
+    /// waiting on the other.
+    #[track_caller]
     pub fn info_table(&self, info: &[usize]) -> Result<Arc<Uploaded<usize>>> {
+        let _stream = self.cuda_stream();
         self.info_tables.lock().unwrap().table(self, info)
     }
 
@@ -731,8 +759,16 @@ impl<T> std::ops::Deref for Uploaded<T> {
 impl<T> Drop for Uploaded<T> {
     fn drop(&mut self) {
         match self.backing {
-            // SAFETY: `slice` is live and dropped exactly once, here.
-            Backing::Owned => unsafe { std::mem::ManuallyDrop::drop(&mut self.slice) },
+            // Freed on its stream through the device that owns it, behind any
+            // recorded launch that may still read it (`held::release_on_its_stream`).
+            //
+            // SAFETY: `slice` is live and taken exactly once, here.
+            Backing::Owned => {
+                let slice = unsafe { std::mem::ManuallyDrop::take(&mut self.slice) };
+                let stream = slice.stream().clone();
+                let ptr = slice.leak();
+                release_on_its_stream(Release::Pool { ptr, stream });
+            }
             // A view over a range the arena owns: the generation's reset reclaims
             // the bytes, so the memory must not be freed here. `leak` — not a bare
             // skip — is what does that correctly: it waits on the slice's
@@ -750,9 +786,11 @@ impl<T> Drop for Uploaded<T> {
     }
 }
 
+/// A loaded kernel and the lease its launches go out on: take one where the
+/// launch is built, and drop it once the launch is issued.
 pub struct CudaFunc {
     func: CudaFunction,
-    stream: Arc<CudaStream>,
+    stream: StreamLease,
 }
 
 impl std::ops::Deref for CudaFunc {
@@ -786,21 +824,23 @@ impl CudaFunc {
 }
 
 impl CudaDevice {
-    /// The stream to launch on: the capture stream while this thread records a
-    /// wave ([`Self::begin_wave_capture`]), the compute stream otherwise.
+    /// The device's one stream, leased to this thread for as long as the lease
+    /// lives (`stream_lease`).
     ///
-    /// Launches take their stream from here. Anything that outlives the call
-    /// — a slice's home stream, a fence, a readback — takes
-    /// [`Self::compute_stream`] instead, because the capture stream executes
-    /// nothing until its segment is launched.
-    pub fn cuda_stream(&self) -> Arc<CudaStream> {
-        self.capture.launch_stream(&self.stream)
+    /// Everything on this device goes on it: launches, copies, allocations and
+    /// the graphs a wave records, so issue order is execution order on every
+    /// thread. While this thread records a wave its launches are what the
+    /// segment captures; on any other thread the lease waits while a segment
+    /// records. Take it where the work is issued and let it go with the work.
+    #[track_caller]
+    pub fn cuda_stream(&self) -> StreamLease {
+        StreamLease::take(&self.stream)
     }
 
-    /// The device's compute stream — the legacy null stream every eager launch
-    /// and every graph launch goes on.
-    pub fn compute_stream(&self) -> Arc<CudaStream> {
-        self.stream.clone()
+    /// The stream itself, for the wave's own machinery on the thread that owns
+    /// the wave — which records on it and needs no lease to do so.
+    pub(crate) fn stream_unleased(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     /// Record this thread's launches as a chain of graphs until the returned
@@ -885,12 +925,17 @@ impl CudaDevice {
         self.capture.pause(&self.stream)
     }
 
-    /// Drop `value` — something owning device memory — once every launch this
-    /// thread has recorded so far has been issued; at once when it is not
-    /// recording. A free is refused while a capture records, and a recorded
-    /// launch may still read the memory, so it waits for its segment.
+    /// Drop `value` — something owning device memory — once every launch
+    /// recorded so far has been issued; at once, under a lease, when no segment
+    /// records. A free issued on the stream while it captures would be taken
+    /// into the capture, and a recorded launch may still read the memory, so it
+    /// waits for its segment.
+    #[track_caller]
     pub fn retire<T: Send + 'static>(&self, value: T) {
-        drop(self.capture.retire(Box::new(value)));
+        if let Some(now) = self.capture.retire(Box::new(value)) {
+            let _stream = self.cuda_stream();
+            drop(now);
+        }
     }
 
     /// What this device's wave captures have done so far.
@@ -911,8 +956,9 @@ impl CudaDevice {
     /// second handle, which would carry its own stream and lose the ordering
     /// every other op on this device relies on.
     ///
-    /// Re-bound on every call, because the stream a launch belongs on depends
-    /// on whether this thread is recording a wave.
+    /// The handle comes back holding a lease on the stream (`stream_lease`), so
+    /// every call made through it is issued under that lease: drop it once the
+    /// calls are made.
     ///
     /// The handle is this **thread's** ([`thread_blas`]): one per thread, made
     /// the first time the thread asks. A thread asking for its first one while
@@ -924,7 +970,7 @@ impl CudaDevice {
             thread_blas::handle_for(&self.stream)?
         } else {
             let _eager = self.pause_capture()?;
-            thread_blas::handle_for(&self.stream)?
+            thread_blas::handle_for(&self.cuda_stream())?
         };
         let stream = self.cuda_stream();
         // SAFETY: a live handle of this thread and a stream of its context.
@@ -944,7 +990,7 @@ impl CudaDevice {
         if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             crate::bail!("cublasSetWorkspace failed: {status:?}");
         }
-        Ok(handle)
+        Ok(handle.leased(stream))
     }
 
     /// Returns the underlying CUDA context.
@@ -991,7 +1037,7 @@ impl CudaDevice {
         let func = module.load_function(func_name).w()?;
         Ok(CudaFunc {
             func,
-            stream: self.stream.clone(),
+            stream: self.cuda_stream(),
         })
     }
 
@@ -1077,7 +1123,7 @@ impl CudaDevice {
             let func = mdl.load_function(fn_name).w()?;
             return Ok(CudaFunc {
                 func,
-                stream: self.stream.clone(),
+                stream: self.cuda_stream(),
             });
         }
         drop(ms);
@@ -1095,7 +1141,7 @@ impl CudaDevice {
         let func = cuda_module.load_function(fn_name).w()?;
         Ok(CudaFunc {
             func,
-            stream: self.stream.clone(),
+            stream: self.cuda_stream(),
         })
     }
 }
@@ -1175,42 +1221,6 @@ impl CudaDevice {
         // predates the setting (the documented hazard is mixing tracked and
         // untracked slices).
         unsafe { context.disable_event_tracking() };
-    }
-
-    /// A second handle on the same device with a **stream** of its own.
-    ///
-    /// A stream is all it adds. This used to build the whole device again for
-    /// the same ordinal, taking a fresh cuBLAS handle and curand generator with
-    /// it, which is the leak [`BackendDevice::new`] documents — reached by a
-    /// different door, and by a caller whose whole intent was "the same device,
-    /// another stream". Everything but the stream now comes from the cached
-    /// device, including the content-keyed caches below, so the two handles read
-    /// each other's uploads instead of each making their own.
-    pub fn new_with_stream(ordinal: usize) -> Result<Self> {
-        let base = Self::new(ordinal)?;
-        let stream = base.context.new_stream().w()?;
-        let curand = cudarc::curand::CudaRng::new(DEFAULT_SEED, stream.clone()).w()?;
-        // **Compiled modules are shared; memoised buffers are not.** A
-        // `CudaModule` belongs to the context, is read-only once built, and is
-        // expensive enough that rebuilding it per handle is the cost this
-        // function is trying to avoid. The two table caches memoise
-        // `Uploaded<_>` — device *buffers*, allocated and freed on the stream
-        // that made them. Handing one to the other handle would let a kernel on
-        // this stream read a buffer uploaded on the base's, with no event
-        // between them and a `cuMemFreeAsync` on the far stream to race.
-        Ok(Self {
-            id: DeviceId::new(),
-            context: base.context.clone(),
-            custom_modules: base.custom_modules.clone(),
-            stream,
-            curand: Arc::new(Mutex::new(CudaRng(curand))),
-            info_tables: Arc::new(Mutex::new(InfoRing::default())),
-            perm_tables: Arc::new(Mutex::new(HashMap::new())),
-            staging: Arc::new(Mutex::new(None)),
-            foreign_staging: Arc::new(Mutex::new(None)),
-            synced_staging: Arc::new(Mutex::new(None)),
-            capture: Arc::new(CaptureHub::default()),
-        })
     }
 
     /// Give this handle its own curand generator.
@@ -1467,7 +1477,11 @@ impl BackendDevice for CudaDevice {
         module_loading::verify_eager()?;
         Self::validate_compute_capability(&context)?;
         Self::disable_per_arg_event_tracking(&context);
-        let stream = context.default_stream();
+        // **The device's one stream**, created rather than the context's legacy
+        // null stream, which cannot be captured: every launch, copy and graph
+        // launch on this device goes on it, from every thread, and a wave
+        // records on it directly (`stream_lease`).
+        let stream = context.new_stream().w()?;
         let curand = cudarc::curand::CudaRng::new(DEFAULT_SEED, stream.clone()).w()?;
         let dev = Self {
             id: DeviceId::new(),
@@ -1507,6 +1521,7 @@ impl BackendDevice for CudaDevice {
         // the first launch on, and a block they replace is retired through this
         // device's capture hub.
         kernel_scratch::install(&dev);
+        stream_owner::register(&dev);
         dev.give_own_stateful()?;
         Ok(dev)
     }
@@ -1575,6 +1590,9 @@ impl BackendDevice for CudaDevice {
 
     fn rand_uniform(&self, shape: &Shape, dtype: DType, lo: f64, up: f64) -> Result<CudaStorage> {
         let elem_count = shape.elem_count();
+        // The generator fills on the device's stream: leased while it does, and
+        // before its lock, which a recording thread may want while this waits.
+        let _stream = self.cuda_stream();
         let curand = self.curand.lock().unwrap();
         let slice = match dtype {
             // TODO: Add support for F16 and BF16 though this is likely to require some upstream
@@ -1618,6 +1636,9 @@ impl BackendDevice for CudaDevice {
         // TODO: Add support for F16 and BF16 though this is likely to require some upstream
         // cudarc changes.
         let elem_count = shape.elem_count();
+        // The generator fills on the device's stream: leased while it does, and
+        // before its lock, which a recording thread may want while this waits.
+        let _stream = self.cuda_stream();
         let curand = self.curand.lock().unwrap();
         // curand can only generate an odd number of values.
         // https://github.com/huggingface/candle/issues/734
@@ -1840,7 +1861,7 @@ impl BackendDevice for CudaDevice {
         // context showed up here as an endless identical retry with nothing
         // ever noticing.
         let _eager = self.pause_capture()?;
-        sync_watch::synchronize(&self.stream).w()?;
+        sync_watch::synchronize(&self.cuda_stream()).w()?;
         Ok(())
     }
 }

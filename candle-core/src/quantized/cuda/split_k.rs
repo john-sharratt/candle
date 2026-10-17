@@ -48,10 +48,10 @@ fn registry() -> &'static Mutex<HashMap<usize, Arc<SplitKScratch>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The registry key of a device handle's stream — its compute stream, which a
-/// launch recorded into a wave capture also executes on.
+/// The registry key of a device handle's stream — the one stream its launches,
+/// recorded or not, run on.
 fn stream_key(device: &CudaDevice) -> usize {
-    Arc::as_ptr(&device.compute_stream()) as usize
+    Arc::as_ptr(device.stream_unleased()) as usize
 }
 
 /// This device stream's scratch, which [`ensure_split_k_scratch`] created when a KO matmul was
@@ -370,23 +370,6 @@ mod tests {
         // 80 tiles in 34 slices of 3: the last 7 slices would be empty.
         assert_eq!(dense_k_split_depth(10_240, 34), 27);
         assert!(run(&dev, &w, &x, 34).is_err());
-        Ok(())
-    }
-
-    /// A split launch on a stream no KO matmul was built on finds no scratch and is refused —
-    /// the forward never allocates it.
-    #[test]
-    fn a_split_on_a_stream_without_scratch_is_refused() -> Result<()> {
-        let dev = CudaDevice::new(0)?;
-        let (w, x) = operands(&dev, GgmlDType::Q8_0, 1, 416, 10_240, 9)?;
-        let other = CudaDevice::new_with_stream(0)?;
-        let x_other = x.to_device(&Device::Cuda(other.clone()))?;
-        let err = run(&other, &w, &x_other, dense_k_split_depth(10_240, 27))
-            .expect_err("no scratch on the second stream");
-        assert!(
-            err.to_string().contains("no scratch on this stream"),
-            "{err}"
-        );
         Ok(())
     }
 

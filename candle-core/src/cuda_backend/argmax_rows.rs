@@ -59,11 +59,11 @@ pub fn argmax_rows_f32(
     let s = match map.entry((device.id(), stream.cu_stream() as usize)) {
         Entry::Occupied(e) => e.into_mut(),
         // Zeroed once: every launch leaves the slots and counters it used at
-        // zero. Eagerly, on the compute stream every launch queues behind, and
-        // on held ground, since the pair lives as long as the stream.
+        // zero. Eagerly, on the stream every launch queues behind, and on held
+        // ground, since the pair lives as long as the stream.
         Entry::Vacant(e) => {
             let _eager = device.pause_capture()?;
-            let compute = device.compute_stream();
+            let compute = device.cuda_stream();
             // SAFETY: both are zeroed just below, before any launch reads them.
             let mut slots = unsafe { Held::<u64>::alloc(device, MAX_ROWS)? };
             let mut arrived = unsafe { Held::<u32>::alloc(device, MAX_ROWS)? };

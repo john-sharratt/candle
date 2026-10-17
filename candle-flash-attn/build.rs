@@ -319,8 +319,14 @@ fn compile_kernel_nvcc(
     Ok(out_obj)
 }
 
+// Refuses Rust sources that reach the CUDA legacy null stream — see
+// `lints/null_stream.rs` for the rule and why it holds here.
+include!("../lints/null_stream.rs");
+
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../lints/null_stream.rs");
+    forbid_null_stream(&[std::path::Path::new("src"), std::path::Path::new("tests")]);
     for kernel_file in KERNEL_FILES.iter() {
         println!("cargo:rerun-if-changed={kernel_file}");
     }

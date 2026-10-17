@@ -197,8 +197,7 @@ pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> 
         ))
     })?;
     let slot_bytes = SLOT_STATE_LADDER[class];
-    let stream = device.compute_stream();
-    let device_id = stream.context().ordinal();
+    let device_id = device.cuda_stream().context().ordinal();
 
     // Paused before the arena lock is taken, never under it: a pause launches
     // the recorded segment and frees what it retired, and nothing it frees may
@@ -239,11 +238,13 @@ pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> 
         // is read (`rebuild_decode` fills it, `update_chunk` overwrites in
         // place) and the kernel only reads through a pointer we hand it.
         let slab_bytes = per_slab * slot_bytes;
+        let stream = device.cuda_stream();
         let slab = unsafe { Held::<u8>::alloc_on(&stream, slab_bytes)? };
         let base = {
             let (base, _guard) = slab.device_ptr(&stream);
             base
         };
+        drop(stream);
         let slab_idx = inner.classes[class].slabs.len();
         inner.classes[class].slabs.push(slab);
         inner.classes[class].bases.push(base);
@@ -276,7 +277,7 @@ pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> 
 /// the next tenant writes every byte it reads, and nothing reads past what it
 /// wrote (`n_chunks` bounds the kernel's walk).
 pub(crate) fn release(device: &CudaDevice, slot: SlotStateSlot) {
-    let device_id = device.compute_stream().context().ordinal();
+    let device_id = device.cuda_stream().context().ordinal();
     let mut map = arenas().lock().unwrap();
     if let Some(inner) = map.get_mut(&device_id) {
         inner.classes[slot.class].free.push((slot.slab, slot.index));

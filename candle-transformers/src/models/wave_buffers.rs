@@ -340,7 +340,7 @@ pub(crate) fn upload_into<D: CudaDType + candle::WithDType>(
     let Device::Cuda(cuda) = dst.device() else {
         candle::bail!("upload_into: the buffer must be on CUDA");
     };
-    let stream = cuda.compute_stream();
+    let stream = cuda.cuda_stream();
     let (storage, layout) = dst.storage_and_layout();
     let candle::Storage::Cuda(c) = &*storage else {
         candle::bail!("upload_into: the buffer must be on CUDA");

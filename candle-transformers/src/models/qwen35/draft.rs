@@ -362,10 +362,13 @@ pub fn draft_cohort(
     // norm and shift, which a step does not carve, are the room its closing
     // norm takes in the dense form the LM head then quantizes from — the
     // forward phase prices that norm only in the head's packed encoding.
-    if let Device::Cuda(d) = dev {
+    //
+    // Held to the end of the walk, so an arena the walk creates re-places this
+    // width.
+    let _covering = if let Device::Cuda(d) = dev {
         let plan = WavePlan::new(model.wave_geometry(act_dtype));
         let width = WaveWidth::decode(n);
-        cover_wave_transient(
+        Some(cover_wave_transient(
             &d.cuda_stream(),
             [
                 plan.phase_bytes(LayerPhase::Attention, width),
@@ -373,8 +376,10 @@ pub fn draft_cohort(
                 plan.phase_bytes(LayerPhase::Forward, width)
                     + plan.chain_bytes(Chain::HeadPass, width),
             ],
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
 
     let theta = q.cfg.rope_theta;
     let rope_dtype = if act_dtype == DType::F8E4M3 {

@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
         println!("Test size: {} MB\n", (test_size * 4) / 1_000_000);
 
         let ctx = CudaContext::new(0)?;
-        let stream = ctx.default_stream();
+        let stream = ctx.new_stream()?;
 
         // Test 1: Regular Vec → GPU transfer (baseline)
         println!("Test 1: Regular memory (Vec → GPU, pageable)");

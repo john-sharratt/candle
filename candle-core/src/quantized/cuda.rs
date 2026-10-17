@@ -4470,7 +4470,11 @@ pub fn repack_ko_from_host(
         // SAFETY: the caller's contract — at least `bytes` of live, un-aliased device memory
         // outliving the storage.
         Some((ptr, origin)) => (
-            unsafe { device.compute_stream().upgrade_device_ptr::<u8>(ptr, bytes) },
+            unsafe {
+                device
+                    .stream_unleased()
+                    .upgrade_device_ptr::<u8>(ptr, bytes)
+            },
             Backing::Lease(origin),
         ),
         // SAFETY: filled by the loop below.
@@ -4779,7 +4783,7 @@ pub unsafe fn view_repacked(
         crate::bail!("view_repacked: extent {extent} is shorter than the {bytes}-byte payload");
     }
     let inner = device
-        .compute_stream()
+        .stream_unleased()
         .upgrade_device_ptr::<u8>(ptr, extent);
     Ok(QStorage::Cuda(QCudaStorage {
         data: std::mem::ManuallyDrop::new(PaddedCudaSlice { inner, len: bytes }),

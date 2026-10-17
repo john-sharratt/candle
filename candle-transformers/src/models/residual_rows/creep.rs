@@ -202,6 +202,8 @@ pub fn compact_creeps<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cuda")]
+    use crate::models::gpu_test_lock::gpu_serial;
     use crate::models::residual_rows::store::SpanRows;
     use candle::Tensor;
     #[cfg(feature = "cuda")]
@@ -293,6 +295,9 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn compaction_across_strides_keeps_every_row() -> Result<()> {
+        // The dropped creeps' ground is the region pool's, shared by every GPU
+        // test: another one claiming it leaves nothing to compact.
+        let _gpu = gpu_serial();
         let Ok(device) = Device::new_cuda(0) else {
             return Ok(());
         };

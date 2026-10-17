@@ -36,7 +36,7 @@ use std::ops::{Deref, DerefMut};
 use std::panic::Location;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DeviceRepr};
+use cudarc::driver::{CudaSlice, CudaStream, DeviceRepr};
 
 use super::stream_alloc::stream_alloc;
 use super::{CudaDevice, WrapErr};
@@ -92,7 +92,7 @@ pub struct Held<T: DeviceRepr> {
 }
 
 impl<T: DeviceRepr> Held<T> {
-    /// `len` elements for `dev`, released on its compute stream.
+    /// `len` elements for `dev`, released on its stream.
     ///
     /// # Safety
     ///
@@ -104,7 +104,7 @@ impl<T: DeviceRepr> Held<T> {
     /// callers' behalf carries `#[track_caller]` too.
     #[track_caller]
     pub unsafe fn alloc(dev: &CudaDevice, len: usize) -> Result<Self> {
-        Self::alloc_on(&dev.compute_stream(), len)
+        Self::alloc_on(&dev.cuda_stream(), len)
     }
 
     /// `len` elements whose last reader runs on `stream` — the stream the
@@ -135,14 +135,14 @@ impl<T: DeviceRepr> Held<T> {
         })
     }
 
-    /// A held copy of `data`, uploaded on `dev`'s compute stream.
+    /// A held copy of `data`, uploaded on `dev`'s stream.
     #[track_caller]
     pub fn from_host(dev: &CudaDevice, data: &[T]) -> Result<Self> {
         // SAFETY: every element is written by the upload below.
         let mut held = unsafe { Self::alloc(dev, data.len())? };
         if !data.is_empty() {
             let _eager = dev.pause_capture()?;
-            dev.compute_stream().memcpy_htod(data, &mut *held).w()?;
+            dev.cuda_stream().memcpy_htod(data, &mut *held).w()?;
         }
         Ok(held)
     }
@@ -170,15 +170,73 @@ impl<T: DeviceRepr> Drop for Held<T> {
     fn drop(&mut self) {
         // SAFETY: taken exactly once, here, and not touched again.
         let slice = unsafe { ManuallyDrop::take(&mut self.slice) };
-        match &self.origin {
-            Origin::Ground { ground, stream } => {
-                let ptr = slice.device_ptr(stream).0;
-                // The range is the ground's: the view goes without a free.
-                slice.leak();
-                ground.give_back(ptr, stream);
-            }
-            Origin::Pool => drop(slice),
+        let stream = slice.stream().clone();
+        // The view goes without a free: the release below frees the range, or
+        // gives it back to the ground it came from.
+        let ptr = slice.leak();
+        let release = match std::mem::replace(&mut self.origin, Origin::Pool) {
+            Origin::Ground { ground, stream } => Release::Ground {
+                ptr,
+                ground,
+                stream,
+            },
+            Origin::Pool => Release::Pool { ptr, stream },
+        };
+        release_on_its_stream(release);
+    }
+}
+
+/// A buffer's range, released when this drops: given back to its ground, or
+/// freed on its stream.
+pub(crate) enum Release {
+    Ground {
+        ptr: u64,
+        ground: Arc<dyn HeldGround>,
+        stream: Arc<CudaStream>,
+    },
+    Pool {
+        ptr: u64,
+        stream: Arc<CudaStream>,
+    },
+}
+
+impl Release {
+    fn stream(&self) -> &Arc<CudaStream> {
+        match self {
+            Self::Ground { stream, .. } | Self::Pool { stream, .. } => stream,
         }
+    }
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        match self {
+            Self::Ground {
+                ptr,
+                ground,
+                stream,
+            } => ground.give_back(*ptr, stream),
+            Self::Pool { ptr, stream } => {
+                let ctx = stream.context();
+                ctx.record_err(ctx.bind_to_thread());
+                // SAFETY: a pool allocation this release owns, freed once,
+                // behind everything queued on its stream.
+                ctx.record_err(unsafe {
+                    cudarc::driver::result::free_async(*ptr, stream.cu_stream())
+                });
+            }
+        }
+    }
+}
+
+/// Release `release` on its stream: through its device ([`CudaDevice::retire`])
+/// when the stream is a device's — a release issued there while a segment
+/// records would be taken into the capture — and at once on a stream of its
+/// own, which never captures.
+pub(crate) fn release_on_its_stream(release: Release) {
+    match super::stream_owner::device_of(release.stream()) {
+        Some(dev) => dev.retire(release),
+        None => drop(release),
     }
 }
 

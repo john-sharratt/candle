@@ -336,9 +336,6 @@ mod tests {
     /// sync below sits between the two.
     #[test]
     fn generation_drop_defers_the_reset_behind_a_fence() {
-        use candle_core::cuda_backend::cudarc::driver::CudaStream;
-        use std::sync::Arc;
-
         let dev = cuda_dev();
         let stager = PinnedStager::new(&dev);
         let gen = stager.begin_generation();
@@ -355,8 +352,7 @@ mod tests {
              NOT drain the stream, so the arena still stands here"
         );
 
-        let stream: Arc<CudaStream> = dev.cuda_stream();
-        stream.synchronize().expect("synchronize");
+        dev.cuda_stream().synchronize().expect("synchronize");
         let _next = stager.begin_generation();
         assert_eq!(
             stager.arena_used(),

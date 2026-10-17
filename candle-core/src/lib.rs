@@ -72,6 +72,13 @@ pub mod cuda_backend;
 mod custom_op;
 mod device;
 pub mod direct_io;
+/// The build's null-stream rule (`lints/null_stream.rs`), here so its matching
+/// is tested: the build scripts that run it are not.
+#[cfg(test)]
+#[allow(dead_code)]
+mod null_stream_lint {
+    include!("../../lints/null_stream.rs");
+}
 pub mod direct_write;
 pub mod display;
 mod dtype;

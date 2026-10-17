@@ -265,21 +265,16 @@ impl PersistenceThread {
         let backlog = BacklogGauge::default();
         let loop_backlog = backlog.clone();
 
-        // All persist-thread CUDA work runs on the device's primary
-        // stream — selection, convert, gather, DtoH. Sharing the primary
-        // stream with decode serialises persistence behind in-flight
-        // inference work but eliminates the cross-stream coordination
-        // bugs that arose when persist read shared mutable state
-        // (per-head table, head_gids) on a side stream without proper
-        // fences.
-        //
-        // Bound as `copy_stream` for compatibility with the migrate API's
-        // parameter name (it was originally a dedicated DMA-only side
-        // stream). It is now the primary stream.
-        let copy_stream: Arc<CudaStream> = match &device {
-            Device::Cuda(d) => d.cuda_stream(),
-            _ => panic!("substrate-persistence: requires a CUDA device"),
-        };
+        // All persist-thread CUDA work runs on the device's one stream —
+        // selection, convert, gather, DtoH — taken under a lease per group
+        // (`run_pass`). Sharing it with decode serialises persistence behind
+        // in-flight inference work but eliminates the cross-stream
+        // coordination bugs that arose when persist read shared mutable state
+        // (per-head table, head_gids) on a side stream without proper fences.
+        assert!(
+            matches!(device, Device::Cuda(_)),
+            "substrate-persistence: requires a CUDA device"
+        );
 
         let handle = std::thread::Builder::new()
             .name("substrate-persistence".into())
@@ -288,7 +283,6 @@ impl PersistenceThread {
                     conversation,
                     backings,
                     device,
-                    copy_stream,
                     compression_policy,
                     trigger_rx,
                     flush_rx,
@@ -347,7 +341,6 @@ fn run_loop(
     conversation: Conversation,
     backings: Arc<Vec<ChunkedKvBacking>>,
     device: Device,
-    copy_stream: Arc<CudaStream>,
     compression_policy: Option<CompressionPolicy>,
     trigger_rx: Receiver<()>,
     flush_rx: Receiver<FlushRequest>,
@@ -432,7 +425,6 @@ fn run_loop(
             &conversation,
             &backings,
             &device,
-            &copy_stream,
             compression_policy.as_ref(),
             &mut pinned_scratch,
             PassMaintenance {
@@ -533,7 +525,6 @@ fn run_loop(
                     &conversation,
                     &backings,
                     &device,
-                    &copy_stream,
                     compression_policy.as_ref(),
                     &mut pinned_scratch,
                     // No maintenance during the shutdown drain; the op in
@@ -955,7 +946,6 @@ fn run_pass(
     conversation: &Conversation,
     backings: &[ChunkedKvBacking],
     device: &Device,
-    copy_stream: &Arc<CudaStream>,
     compression_policy: Option<&CompressionPolicy>,
     pinned_scratch: &mut Option<PinnedBuf>,
     maintenance: PassMaintenance<'_>,
@@ -1194,10 +1184,17 @@ fn run_pass(
                 effective_turn_policy(compression_policy, cc)
             };
             let mut installs = Vec::new();
+            // The device's stream, leased for this group's GPU work alone and
+            // taken before any lock the group takes: a wave segment waits for
+            // nothing while it records, and runs as issued while this is held.
+            let Device::Cuda(cuda) = device else {
+                unreachable!("substrate-persistence runs on a CUDA device")
+            };
+            let copy_stream = cuda.cuda_stream();
             let wave_deferred = migrate_group_hot_to_warm(
                 backings,
                 device,
-                copy_stream,
+                &copy_stream,
                 effective.as_ref(),
                 &group,
                 pinned_scratch,
@@ -1209,6 +1206,7 @@ fn run_pass(
                 &mut alloc_ms,
                 &mut convert_ms,
             );
+            drop(copy_stream);
             // The fence that makes the install and the release safe: the group's
             // Q-format arenas are written and its captured addresses retired.
             //

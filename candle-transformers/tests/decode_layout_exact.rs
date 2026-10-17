@@ -709,7 +709,6 @@ fn decode_one_production(
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<Tensor> {
-    use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_sync;
     use candle_transformers::models::slot_state::{SlotStateHost, TokenSliceHost};
 
     let seq_offset = cache.current_seq_len();
@@ -762,7 +761,11 @@ fn decode_one_production(
     // the device — after the header submit, behind a full device sync.
     device.synchronize()?;
     let mut raw = vec![0u8; n_slices as usize * TokenSliceHost::SLICE_HEADER_SIZE];
-    unsafe { memcpy_dtoh_sync(&mut raw, ptr) }.map_err(candle::Error::wrap)?;
+    let candle::Device::Cuda(cuda) = device else {
+        candle::bail!("the slice table lives on a CUDA device");
+    };
+    // SAFETY: `ptr` is the slot's live slice table of `n_slices` headers.
+    unsafe { cuda.read_raw(ptr, &mut raw) }?;
     let prod: Vec<(u16, u16, u32)> = raw
         .as_chunks::<{ TokenSliceHost::SLICE_HEADER_SIZE }>()
         .0

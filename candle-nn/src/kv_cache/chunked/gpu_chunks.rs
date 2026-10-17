@@ -1063,7 +1063,7 @@ impl Drop for GpuChunksGuard<'_> {
                 None
             }
         };
-        let stream = device.compute_stream();
+        let stream = device.cuda_stream();
         let total: usize = ranges.iter().map(|r| r.len()).sum();
 
         let inner = &mut *self.inner;

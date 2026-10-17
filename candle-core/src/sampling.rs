@@ -177,7 +177,7 @@ impl CustomOp1 for MultinomialSampling {
                             self.seed,
                             num_threads,
                             shared_mem_size,
-                            std::ptr::null_mut(),
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -196,7 +196,7 @@ impl CustomOp1 for MultinomialSampling {
                             self.seed,
                             num_threads,
                             shared_mem_size,
-                            std::ptr::null_mut(),
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -215,7 +215,7 @@ impl CustomOp1 for MultinomialSampling {
                             self.seed,
                             num_threads,
                             shared_mem_size,
-                            std::ptr::null_mut(),
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }
@@ -234,7 +234,7 @@ impl CustomOp1 for MultinomialSampling {
                             self.seed,
                             num_threads,
                             shared_mem_size,
-                            std::ptr::null_mut(),
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }

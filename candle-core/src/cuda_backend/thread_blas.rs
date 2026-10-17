@@ -36,7 +36,7 @@ use cudarc::driver::{CudaStream, DevicePtrMut};
 
 use super::graph::without_recording;
 use super::held::Held;
-use super::WrapErr;
+use super::{StreamLease, WrapErr};
 use crate::Result;
 
 /// Bytes of the workspace every cuBLAS handle is given — NVIDIA's
@@ -97,18 +97,36 @@ fn destroy_orphans() {
 }
 
 /// This thread's handle, borrowed. Not `Send`: it is this thread's alone.
-pub struct BlasHandle(Rc<ThreadBlas>);
+///
+/// Handed out bound to the device's stream, it holds the lease its calls go out
+/// on (`stream_lease`) until it drops.
+pub struct BlasHandle {
+    blas: Rc<ThreadBlas>,
+    _lease: Option<StreamLease>,
+}
 
 impl BlasHandle {
+    fn unleased(blas: Rc<ThreadBlas>) -> Self {
+        Self { blas, _lease: None }
+    }
+
     pub(crate) fn thread_blas(&self) -> &ThreadBlas {
-        &self.0
+        &self.blas
+    }
+
+    /// This handle, its calls issued under `lease`.
+    pub(crate) fn leased(self, lease: StreamLease) -> Self {
+        Self {
+            blas: self.blas,
+            _lease: Some(lease),
+        }
     }
 }
 
 impl Deref for BlasHandle {
     type Target = CudaBlas;
     fn deref(&self) -> &CudaBlas {
-        self.0
+        self.blas
             .blas
             .as_ref()
             .expect("a handle is destroyed only when its thread ends")
@@ -140,7 +158,7 @@ pub(crate) fn handle_for(stream: &Arc<CudaStream>) -> Result<BlasHandle> {
             .find(|(k, _)| *k == key)
             .map(|(_, t)| t.clone())
     }) {
-        return Ok(BlasHandle(found));
+        return Ok(BlasHandle::unleased(found));
     }
     destroy_orphans();
     let blas = without_recording(|quiet| quiet.create_blas(stream))?.w()?;
@@ -166,7 +184,7 @@ pub(crate) fn handle_for(stream: &Arc<CudaStream>) -> Result<BlasHandle> {
         workspace,
     });
     HANDLES.with(|h| h.borrow_mut().0.push((key, made.clone())));
-    Ok(BlasHandle(made))
+    Ok(BlasHandle::unleased(made))
 }
 
 #[cfg(test)]
@@ -185,18 +203,17 @@ mod tests {
     #[test]
     fn an_ended_threads_handle_leaves_the_context_clean() -> Result<()> {
         let dev = CudaDevice::new(0)?;
-        let stream = dev.compute_stream();
-        let theirs = stream.clone();
-        thread::spawn(move || handle_for(&theirs).map(|_| ()))
+        let (theirs, again) = (dev.clone(), dev.clone());
+        thread::spawn(move || handle_for(&theirs.cuda_stream()).map(|_| ()))
             .join()
             .expect("the handle's thread panicked")?;
-        stream.context().check_err().w()?;
+        dev.cuda_stream().context().check_err().w()?;
         CudaDevice::new(0)?;
         // A thread making its first handle destroys what the ended one left.
-        thread::spawn(move || handle_for(&stream).map(|_| ()))
+        thread::spawn(move || handle_for(&again.cuda_stream()).map(|_| ()))
             .join()
             .expect("the second thread panicked")?;
-        dev.compute_stream().context().check_err().w()?;
+        dev.cuda_stream().context().check_err().w()?;
         Ok(())
     }
 }

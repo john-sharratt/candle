@@ -1,7 +1,6 @@
 #pragma once
 
 #include "reduce.cuh"
-#include <array>
 #include <utility>
 
 // =============================================================================
@@ -36,12 +35,12 @@
 // On SM89+ (Ada/Hopper), use hardware __nv_cvt_fp8x2_to_halfraw2 instead.
 // =============================================================================
 
-// Host-side initialization function (called once at module load)
-// The LUT is stored as uint16_t (raw half bits) to avoid constructor issues
+// The LUT is stored as uint16_t (raw half bits) to avoid constructor issues,
+// and initialised at compile time: no upload, so nothing reaches a stream.
 namespace fp8_lut {
 
 // Compile-time computation of FP8 E4M3 → half conversion
-constexpr uint16_t fp8_e4m3_to_half_bits(uint8_t bits) {
+__host__ __device__ constexpr uint16_t fp8_e4m3_to_half_bits(uint8_t bits) {
     uint32_t sign = (bits >> 7) & 1;
     uint32_t exp = (bits >> 3) & 0xF;
     uint32_t mant = bits & 0x7;
@@ -92,15 +91,6 @@ constexpr uint16_t fp8_e4m3_to_half_bits(uint8_t bits) {
     }
 }
 
-// Compile-time array generator
-template<size_t... Is>
-constexpr auto make_lut(std::index_sequence<Is...>) {
-    return std::array<uint16_t, sizeof...(Is)>{{fp8_e4m3_to_half_bits(Is)...}};
-}
-
-// The actual LUT (computed at compile time)
-inline constexpr auto fp8_e4m3_lut_data = make_lut(std::make_index_sequence<256>{});
-
 // =============================================================================
 // FP8 E5M2 LOOKUP TABLE (5 exponent bits, 2 mantissa bits)
 // =============================================================================
@@ -109,7 +99,7 @@ inline constexpr auto fp8_e4m3_lut_data = make_lut(std::make_index_sequence<256>
 // E5M2 has larger range but less precision than E4M3.
 
 // Compile-time computation of FP8 E5M2 → half conversion
-constexpr uint16_t fp8_e5m2_to_half_bits(uint8_t bits) {
+__host__ __device__ constexpr uint16_t fp8_e5m2_to_half_bits(uint8_t bits) {
     uint32_t sign = (bits >> 7) & 1;
     uint32_t exp = (bits >> 2) & 0x1F;  // 5 bits
     uint32_t mant = bits & 0x3;         // 2 bits
@@ -145,39 +135,37 @@ constexpr uint16_t fp8_e5m2_to_half_bits(uint8_t bits) {
     }
 }
 
-// Compile-time array generator for E5M2
+}  // namespace fp8_lut
+
+/// Raw half bits for every one of the 256 FP8 bit patterns.
+struct Fp8HalfLut {
+    uint16_t bits[256];
+};
+
+namespace fp8_lut {
+
 template<size_t... Is>
-constexpr auto make_lut_e5m2(std::index_sequence<Is...>) {
-    return std::array<uint16_t, sizeof...(Is)>{{fp8_e5m2_to_half_bits(Is)...}};
+constexpr Fp8HalfLut table_e4m3(std::index_sequence<Is...>) {
+    return Fp8HalfLut{{fp8_e4m3_to_half_bits(static_cast<uint8_t>(Is))...}};
 }
 
-// The actual E5M2 LUT (computed at compile time)
-inline constexpr auto fp8_e5m2_lut_data = make_lut_e5m2(std::make_index_sequence<256>{});
+template<size_t... Is>
+constexpr Fp8HalfLut table_e5m2(std::index_sequence<Is...>) {
+    return Fp8HalfLut{{fp8_e5m2_to_half_bits(static_cast<uint8_t>(Is))...}};
+}
 
 }  // namespace fp8_lut
 
-// Device-accessible constant memory LUTs
-// Initialized from fp8_lut::*_lut_data at kernel load time
-__device__ __constant__ uint16_t fp8_e4m3_to_half_lut[256];
-__device__ __constant__ uint16_t fp8_e5m2_to_half_lut[256];
-
-// Flag to track if LUTs have been initialized (host-side)
-inline bool fp8_lut_initialized = false;
-
-// Initialize the FP8 LUTs (call once before any FP8 kernel)
-inline void init_fp8_lut() {
-    if (!fp8_lut_initialized) {
-        cudaMemcpyToSymbol(fp8_e4m3_to_half_lut, fp8_lut::fp8_e4m3_lut_data.data(), 
-                          256 * sizeof(uint16_t));
-        cudaMemcpyToSymbol(fp8_e5m2_to_half_lut, fp8_lut::fp8_e5m2_lut_data.data(), 
-                          256 * sizeof(uint16_t));
-        fp8_lut_initialized = true;
-    }
-}
+// Constant-memory LUTs, filled by the compiler: their initialisers are
+// constant expressions, so the module carries them already written.
+__device__ __constant__ Fp8HalfLut fp8_e4m3_to_half_lut =
+    fp8_lut::table_e4m3(std::make_index_sequence<256>{});
+__device__ __constant__ Fp8HalfLut fp8_e5m2_to_half_lut =
+    fp8_lut::table_e5m2(std::make_index_sequence<256>{});
 
 // Device function to convert FP8 E4M3 byte to half using LUT
 __device__ __forceinline__ half fp8_e4m3_lut_to_half(uint8_t bits) {
-    uint16_t h_bits = fp8_e4m3_to_half_lut[bits];
+    uint16_t h_bits = fp8_e4m3_to_half_lut.bits[bits];
     return *reinterpret_cast<half*>(&h_bits);
 }
 
@@ -188,7 +176,7 @@ __device__ __forceinline__ float fp8_e4m3_to_float_lut(uint8_t bits) {
 
 // Device function to convert FP8 E5M2 byte to half using LUT
 __device__ __forceinline__ half fp8_e5m2_lut_to_half(uint8_t bits) {
-    uint16_t h_bits = fp8_e5m2_to_half_lut[bits];
+    uint16_t h_bits = fp8_e5m2_to_half_lut.bits[bits];
     return *reinterpret_cast<half*>(&h_bits);
 }
 
@@ -199,10 +187,10 @@ __device__ __forceinline__ float fp8_e5m2_to_float_lut(uint8_t bits) {
 
 // Convert 4 FP8 E4M3 values (packed in uint32_t) to 2 half2 using LUT
 __device__ __forceinline__ void fp8x4_to_half2x2_lut(uint32_t fp8x4, half2& h0, half2& h1) {
-    uint16_t h0_lo = fp8_e4m3_to_half_lut[fp8x4 & 0xFF];
-    uint16_t h0_hi = fp8_e4m3_to_half_lut[(fp8x4 >> 8) & 0xFF];
-    uint16_t h1_lo = fp8_e4m3_to_half_lut[(fp8x4 >> 16) & 0xFF];
-    uint16_t h1_hi = fp8_e4m3_to_half_lut[fp8x4 >> 24];
+    uint16_t h0_lo = fp8_e4m3_to_half_lut.bits[fp8x4 & 0xFF];
+    uint16_t h0_hi = fp8_e4m3_to_half_lut.bits[(fp8x4 >> 8) & 0xFF];
+    uint16_t h1_lo = fp8_e4m3_to_half_lut.bits[(fp8x4 >> 16) & 0xFF];
+    uint16_t h1_hi = fp8_e4m3_to_half_lut.bits[fp8x4 >> 24];
     
     uint32_t h0_bits = h0_lo | (static_cast<uint32_t>(h0_hi) << 16);
     uint32_t h1_bits = h1_lo | (static_cast<uint32_t>(h1_hi) << 16);
@@ -213,10 +201,10 @@ __device__ __forceinline__ void fp8x4_to_half2x2_lut(uint32_t fp8x4, half2& h0, 
 
 // Convert 4 FP8 E5M2 values (packed in uint32_t) to 2 half2 using LUT
 __device__ __forceinline__ void fp8x4_to_half2x2_lut_e5m2(uint32_t fp8x4, half2& h0, half2& h1) {
-    uint16_t h0_lo = fp8_e5m2_to_half_lut[fp8x4 & 0xFF];
-    uint16_t h0_hi = fp8_e5m2_to_half_lut[(fp8x4 >> 8) & 0xFF];
-    uint16_t h1_lo = fp8_e5m2_to_half_lut[(fp8x4 >> 16) & 0xFF];
-    uint16_t h1_hi = fp8_e5m2_to_half_lut[fp8x4 >> 24];
+    uint16_t h0_lo = fp8_e5m2_to_half_lut.bits[fp8x4 & 0xFF];
+    uint16_t h0_hi = fp8_e5m2_to_half_lut.bits[(fp8x4 >> 8) & 0xFF];
+    uint16_t h1_lo = fp8_e5m2_to_half_lut.bits[(fp8x4 >> 16) & 0xFF];
+    uint16_t h1_hi = fp8_e5m2_to_half_lut.bits[fp8x4 >> 24];
     
     uint32_t h0_bits = h0_lo | (static_cast<uint32_t>(h0_hi) << 16);
     uint32_t h1_bits = h1_lo | (static_cast<uint32_t>(h1_hi) << 16);

@@ -1,4 +1,5 @@
-//! The two streams a graph touches: where it is recorded and where it runs.
+//! The streams a graph touches: the device's stream it runs on, and, for the
+//! driver-level tests, a stream of their own to record single captures on.
 
 #[cfg(test)]
 use crate::cuda_backend::CudaDevice;
@@ -7,22 +8,20 @@ use crate::Result;
 use cudarc::driver::{sys, CudaContext, CudaStream};
 use std::sync::Arc;
 
-/// The stream a replayed graph is launched into: the device's own compute
-/// stream, the one every eager launch of the same work uses.
+/// The stream a replayed graph is launched into: the device's one stream, the
+/// one every eager launch of the same work uses and the one a wave records on.
 ///
-/// It has no capture method. The compute stream is the legacy null stream,
-/// which the driver refuses to capture; recording happens on the capture
-/// hub's own stream instead.
+/// It has no capture method: recording on it is the capture hub's alone.
 pub struct ComputeStream {
     stream: Arc<CudaStream>,
 }
 
 impl ComputeStream {
-    /// `dev`'s compute stream.
+    /// `dev`'s stream.
     #[cfg(test)]
     pub fn of(dev: &CudaDevice) -> Self {
         Self {
-            stream: dev.compute_stream(),
+            stream: dev.stream_unleased().clone(),
         }
     }
 

@@ -61,9 +61,6 @@ fn decode_on_device(is_k: bool, scale: f32) -> Result<[Vec<f32>; 4]> {
         let (i, _gi) = outs[1].device_ptr(&stream);
         let (q, _gq) = outs[2].device_ptr(&stream);
         let (h, _gh) = outs[3].device_ptr(&stream);
-        // The oracle launches on the legacy default stream: order it after the
-        // upload, and the downloads after it, with device-wide fences.
-        dev.synchronize()?;
         unsafe {
             run_q0_v_decode_oracle(
                 s as *const c_void,
@@ -74,10 +71,9 @@ fn decode_on_device(is_k: bool, scale: f32) -> Result<[Vec<f32>; 4]> {
                 CODES as i32,
                 is_k as i32,
                 scale,
-                std::ptr::null_mut(),
+                stream.cu_stream() as *mut c_void,
             );
         }
-        dev.synchronize()?;
     }
     Ok([
         dev.memcpy_dtov(&outs[0])?,

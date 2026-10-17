@@ -251,10 +251,6 @@ impl Device {
         }
     }
 
-    pub fn new_cuda_with_stream(ordinal: usize) -> Result<Self> {
-        Ok(Self::Cuda(crate::CudaDevice::new_with_stream(ordinal)?))
-    }
-
     pub fn new_metal(ordinal: usize) -> Result<Self> {
         Ok(Self::Metal(crate::MetalDevice::new(ordinal)?))
     }

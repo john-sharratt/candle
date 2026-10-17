@@ -90,8 +90,14 @@ fn prepend_a_usable_msvc_toolset_to_path() {
 #[cfg(not(windows))]
 fn prepend_a_usable_msvc_toolset_to_path() {}
 
+// Refuses sources that reach the CUDA legacy null stream — see
+// `lints/null_stream.rs` for the rule and why it holds here.
+include!("../lints/null_stream.rs");
+
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../lints/null_stream.rs");
+    forbid_null_stream(&[Path::new("src"), Path::new("examples"), Path::new("tests")]);
 
     #[cfg(feature = "cuda")]
     {

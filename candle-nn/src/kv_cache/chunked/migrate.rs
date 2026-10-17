@@ -196,8 +196,8 @@ pub fn kv_migrate_on(
         Default::default()
     };
 
-    let default_stream = dev.cuda_stream();
-    let used_stream = stream.unwrap_or(&default_stream);
+    let device_stream = dev.cuda_stream();
+    let used_stream = stream.unwrap_or(&device_stream);
     // Cross-stream ordering fence. The record sources, when they are freshly
     // written (e.g. Q arenas filled by the primary-stream convert moments
     // earlier), are written in PRIMARY-stream order. When the caller passes a

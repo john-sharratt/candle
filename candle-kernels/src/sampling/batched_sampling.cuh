@@ -2669,8 +2669,8 @@ inline void dispatch_stencil_sampling(
     uint64_t* rng_offsets,
     // Dispatch flag
     bool use_penalties,
-    // CUDA stream (0 = default stream)
-    cudaStream_t stream = 0
+    // The stream the launch goes on — the caller's, never the null stream
+    cudaStream_t stream
 ) {
     
     dim3 grid(batch_size);
@@ -3351,8 +3351,8 @@ inline void dispatch_batched_sampling(
     // Dispatch flags
     bool use_penalties,
     bool use_top_p,
-    // CUDA stream (0 = default stream)
-    cudaStream_t stream = 0
+    // The stream the launch goes on — the caller's, never the null stream
+    cudaStream_t stream
 ) {
 
     dim3 grid(batch_size);
@@ -3550,8 +3550,8 @@ inline void launch_batched_sampling_typed(
     uint64_t* rng_offsets,
     // Per-sequence dials ([batch_size] or null) — see SeqDials.
     const SeqDials* seq_dials,
-    // CUDA stream (0 = default stream)
-    cudaStream_t stream = 0
+    // The stream the launch goes on — the caller's, never the null stream
+    cudaStream_t stream
 ) {
     // Auto-detect whether penalties are needed
     bool use_penalties = (repeat_penalty != 1.0f) ||

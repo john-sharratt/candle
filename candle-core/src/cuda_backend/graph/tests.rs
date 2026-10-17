@@ -4,6 +4,7 @@
 //! every launch names its stream explicitly: the point of these tests is which
 //! stream a launch lands on.
 
+use super::record_gate::{admit_this_thread, exclusive, Exclusive};
 use super::{CaptureSession, CaptureStream, ComputeStream, GraphPhase};
 use crate::backend::BackendDevice;
 use crate::cuda_backend::{CudaDevice, WrapErr};
@@ -11,23 +12,24 @@ use crate::quantized::pinned_staging::PinnedBuf;
 use crate::Result;
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 const N: usize = 4096;
 
-/// `CudaDevice::new` hands back the one cached device per ordinal, so every
-/// test here shares its context and its capture hub: they take this first and
-/// run one at a time, so the stat deltas they assert are their own and no
-/// test's driver work lands inside another's capture.
-static WAVE: Mutex<()> = Mutex::new(());
-
 /// Take the device's waves to this test alone, with its executable library
-/// fresh: empty, learning, at the card's budget. The library's lifecycle
-/// (`regime`) is the hub's, so a test that left it locked would otherwise
-/// leave every later test running eagerly.
-fn wave_lock() -> MutexGuard<'static, ()> {
+/// fresh: empty, learning, at the card's budget.
+///
+/// `CudaDevice::new` hands back the one cached device per ordinal, so every
+/// test shares its context, its one stream and its capture hub. The gate held
+/// to this test ([`exclusive`]) runs the wave tests one at a time and holds
+/// every other test's stream lease off, so the stat deltas they assert are
+/// their own and no other test's lease turns a segment away. A thread a test
+/// spawns joins it with [`admit_this_thread`]. The library's lifecycle
+/// (`regime`) is the hub's, so a test that left it locked would otherwise leave
+/// every later test running eagerly.
+fn wave_lock() -> Exclusive {
     use super::budget::graph_budget_bytes;
-    let guard = WAVE.lock().unwrap_or_else(|p| p.into_inner());
+    let guard = exclusive();
     let dev = CudaDevice::new(0).expect("a CUDA device");
     let budget = graph_budget_bytes().expect("the card's graph budget");
     dev.capture_hub().reset_library(budget);
@@ -185,6 +187,7 @@ fn a_capture_survives_null_stream_work_from_another_thread() -> Result<()> {
     let worker = {
         let (dev, f, stop, rounds) = (dev.clone(), f.clone(), stop.clone(), rounds.clone());
         std::thread::spawn(move || -> Result<()> {
+            admit_this_thread();
             dev.cuda_context().bind_to_thread().w()?;
             let null = dev.cuda_stream();
             while !stop.load(Ordering::Acquire) {
@@ -820,7 +823,7 @@ fn other_threads_calls_during_capture() -> Result<()> {
             "cuBLAS handle (ungated)",
             #[allow(clippy::disallowed_methods)]
             Box::new(|d| {
-                cudarc::cublas::CudaBlas::new(d.cuda_stream())
+                cudarc::cublas::CudaBlas::new((*d.cuda_stream()).clone())
                     .map(drop)
                     .map_err(crate::Error::wrap)
             }),
@@ -828,7 +831,7 @@ fn other_threads_calls_during_capture() -> Result<()> {
         (
             "curand generator",
             Box::new(|d| {
-                cudarc::curand::CudaRng::new(0, d.cuda_stream())
+                cudarc::curand::CudaRng::new(0, (*d.cuda_stream()).clone())
                     .map(drop)
                     .map_err(crate::Error::wrap)
             }),
@@ -857,9 +860,12 @@ fn other_threads_calls_during_capture() -> Result<()> {
         launch(&f, s.stream(), &x, &mut y, 1.0, 0.0)?;
         let other = dev.clone();
         let outcome = std::thread::scope(|sc| {
-            sc.spawn(|| probe(&other).map_err(|e| e.to_string()))
-                .join()
-                .expect("the probe thread")
+            sc.spawn(|| {
+                admit_this_thread();
+                probe(&other).map_err(|e| e.to_string())
+            })
+            .join()
+            .expect("the probe thread")
         });
         let finished = s.finish(&compute, 1);
         println!(
@@ -1009,7 +1015,7 @@ fn an_upload_while_recording_lands_in_issue_order_without_a_cut() -> Result<()> 
     let _wave = wave_lock();
     let dev = CudaDevice::new(0)?;
     let f = scale_add(&dev)?;
-    let compute = dev.compute_stream();
+    let compute = dev.stream_unleased().clone();
     let mut table = dev.alloc_zeros::<f32>(N)?;
     let mut before = dev.alloc_zeros::<f32>(N)?;
     let mut after = dev.alloc_zeros::<f32>(N)?;
@@ -1151,12 +1157,12 @@ fn staging_scratch_while_recording_keeps_its_order_without_a_cut() -> Result<()>
     Ok(())
 }
 
-/// A launcher that took the launch stream while recording and launches inside
-/// a later eager section holds the capture stream, which is no longer
-/// capturing, so its launch runs at once. It must still run after everything
-/// recorded before it and before everything issued after it.
+/// A launcher that took the stream while recording and launches inside a later
+/// eager section runs after everything recorded before it and before
+/// everything issued after it: there is one stream, so the stream it holds is
+/// the one everything else is on.
 #[test]
-fn a_stale_capture_stream_launch_in_an_eager_section_stays_in_order() -> Result<()> {
+fn a_stream_held_into_an_eager_section_stays_in_order() -> Result<()> {
     let _wave = wave_lock();
     let dev = CudaDevice::new(0)?;
     let f = scale_add(&dev)?;
@@ -1197,36 +1203,114 @@ fn a_stale_capture_stream_launch_in_an_eager_section_stays_in_order() -> Result<
     Ok(())
 }
 
-/// Other threads keep the compute stream while one thread records: a launch
-/// from another thread during the capture executes at once, in its own order.
+/// **Another thread's lease keeps the wave from recording, and its work lands
+/// in issue order.** A segment that would begin while another thread holds the
+/// stream runs as issued — the capture would take that thread's launches in —
+/// and the next one, once the lease is back, records. The other thread's launch
+/// is ordered against the wave's by the one stream alone.
 #[test]
-fn only_the_capturing_thread_is_redirected() -> Result<()> {
+fn another_threads_lease_runs_the_segment_as_issued() -> Result<()> {
+    use std::sync::mpsc;
     let _wave = wave_lock();
-    let device = crate::Device::new_cuda(0)?;
-    let crate::Device::Cuda(dev) = &device else {
-        unreachable!("asked for a CUDA device")
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let mut z = dev.alloc_zeros::<f32>(N)?;
+    let before = dev.capture_stats();
+
+    let (leased, leased_rx) = mpsc::channel();
+    let (give_back, give_back_rx) = mpsc::channel::<()>();
+    let holder = {
+        let (dev, f) = (dev.clone(), f.clone());
+        let x = dev.memcpy_stod(&ramp(1.0))?;
+        std::thread::spawn(move || -> Result<CudaSlice<f32>> {
+            admit_this_thread();
+            let stream = dev.cuda_stream();
+            let mut w = dev.alloc_zeros::<f32>(N)?;
+            launch(&f, &stream, &x, &mut w, 4.0, 0.0)?;
+            leased.send(()).expect("the test is waiting");
+            give_back_rx.recv().expect("the test gives the word");
+            drop(stream);
+            Ok(w)
+        })
     };
+    leased_rx.recv().expect("the holder took its lease");
+
     let capture = dev.begin_wave_capture()?;
-    // Held: nothing is redirected until the wave starts recording.
-    assert_eq!(
-        dev.cuda_stream().cu_stream(),
-        dev.compute_stream().cu_stream()
-    );
     dev.record_launches()?;
-    let here = dev.cuda_stream();
-    let there = {
-        let dev = dev.clone();
-        std::thread::spawn(move || dev.cuda_stream())
-            .join()
-            .expect("the other thread panicked")
-    };
-    capture.finish()?;
-    assert_ne!(here.cu_stream(), dev.compute_stream().cu_stream());
-    assert_eq!(there.cu_stream(), dev.compute_stream().cu_stream());
-    assert_eq!(
-        dev.cuda_stream().cu_stream(),
-        dev.compute_stream().cu_stream()
+    assert!(
+        dev.recording_segment().is_none(),
+        "another thread holds the stream: the segment runs as issued"
     );
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 2.0, 0.0)?;
+    give_back.send(()).expect("the holder is waiting");
+    let w = holder.join().expect("the holder panicked")?;
+    dev.flush_launches()?;
+    assert!(
+        dev.recording_segment().is_some(),
+        "the lease is back: the next segment records"
+    );
+    launch(&f, &dev.cuda_stream(), &y, &mut z, 3.0, 1.0)?;
+    capture.finish()?;
+
+    let after = dev.capture_stats();
+    assert_eq!(after.leased_eager - before.leased_eager, 1);
+    assert_eq!(after.segments - before.segments, 1, "one segment recorded");
+    let want: Vec<f32> = ramp(1.0).iter().map(|v| v * 6.0 + 1.0).collect();
+    assert_eq!(dev.memcpy_dtov(&z)?, want);
+    let want_w: Vec<f32> = ramp(1.0).iter().map(|v| v * 4.0).collect();
+    assert_eq!(dev.memcpy_dtov(&w)?, want_w);
+    Ok(())
+}
+
+/// **Another thread's work waits while a segment records.** Its lease is
+/// granted once the segment ends, so nothing it issues is taken into the graph,
+/// and the segment's node count is exactly the wave's own launches.
+#[test]
+fn another_threads_lease_waits_for_the_recording_segment() -> Result<()> {
+    use std::sync::mpsc;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let mut z = dev.alloc_zeros::<f32>(N)?;
+    let a = dev.memcpy_stod(&ramp(1.0))?;
+    let mut b = dev.alloc_zeros::<f32>(N)?;
+    let before = dev.capture_stats();
+
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    assert!(dev.recording_segment().is_some(), "the segment records");
+    launch(&f, &dev.cuda_stream(), &x, &mut y, 2.0, 0.0)?;
+    let (started, started_rx) = mpsc::channel();
+    let other = {
+        let (dev, f) = (dev.clone(), f.clone());
+        std::thread::spawn(move || -> Result<Vec<f32>> {
+            admit_this_thread();
+            started.send(()).expect("the test is waiting");
+            launch(&f, &dev.cuda_stream(), &a, &mut b, 5.0, 0.0)?;
+            dev.memcpy_dtov(&b)
+        })
+    };
+    started_rx.recv().expect("the other thread started");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    launch(&f, &dev.cuda_stream(), &y, &mut z, 1.0, 1.0)?;
+    capture.finish()?;
+    let theirs = other.join().expect("the other thread panicked")?;
+
+    let after = dev.capture_stats();
+    assert_eq!(after.segments - before.segments, 1);
+    assert_eq!(
+        after.nodes - before.nodes,
+        2,
+        "the other thread's launch is not in the graph"
+    );
+    let want: Vec<f32> = ramp(1.0).iter().map(|v| v * 2.0 + 1.0).collect();
+    assert_eq!(dev.memcpy_dtov(&z)?, want);
+    let want_theirs: Vec<f32> = ramp(1.0).iter().map(|v| v * 5.0).collect();
+    assert_eq!(theirs, want_theirs);
     Ok(())
 }
 
@@ -1316,9 +1400,12 @@ fn a_release_from_another_thread_waits_for_the_recording_segment() -> Result<()>
     {
         let dev = dev.clone();
         let item = Freed(freed.clone());
-        std::thread::spawn(move || dev.retire(item))
-            .join()
-            .expect("the releasing thread panicked");
+        std::thread::spawn(move || {
+            admit_this_thread();
+            dev.retire(item)
+        })
+        .join()
+        .expect("the releasing thread panicked");
     }
     assert!(
         !freed.load(Ordering::SeqCst),
@@ -1419,6 +1506,9 @@ fn an_abandoned_wave_launches_its_recording_segment() -> Result<()> {
 /// reads it. The kernel then reads the segment's bytes as its own: measured in
 /// zend as the persistence thread's record fill taking a quantized activation
 /// for its descriptor table and writing a KV record to an unmapped address.
+///
+/// The other thread's call waits for its lease while the segment records, so
+/// it is joined only once the wave has finished.
 #[test]
 fn another_threads_eager_staging_is_not_the_waves_scratch() -> Result<()> {
     let _wave = wave_lock();
@@ -1426,16 +1516,16 @@ fn another_threads_eager_staging_is_not_the_waves_scratch() -> Result<()> {
     let capture = dev.begin_wave_capture()?;
     dev.record_launches()?;
     let (wave_scratch, _) = dev.with_staged_upload(&[1u8; 16], |at| Ok((at, ())))?;
-    let foreign_scratch = {
+    let foreign = {
         let dev = dev.clone();
         std::thread::spawn(move || -> Result<u64> {
+            admit_this_thread();
             dev.cuda_context().bind_to_thread().w()?;
             dev.with_staged_upload(&[2u8; 16], Ok)
         })
-        .join()
-        .expect("the eager thread panicked")?
     };
     capture.finish()?;
+    let foreign_scratch = foreign.join().expect("the eager thread panicked")?;
     assert_ne!(
         wave_scratch, foreign_scratch,
         "an eager copy from another thread landed in the scratch a recorded segment writes"
@@ -1443,47 +1533,48 @@ fn another_threads_eager_staging_is_not_the_waves_scratch() -> Result<()> {
     Ok(())
 }
 
-/// **A full info ring does not rewind under another thread's recording
-/// segment.** That segment's launches read layout tables from the ring and are
-/// not issued yet; a rewind from a second thread would overwrite those words
-/// before they run. The ring moves to a fresh buffer instead and retires the
-/// old one until the segment has launched.
+/// **A lease waiting on a recording segment is granted behind that segment's
+/// launch.** The other thread reads what the segment writes: granted when the
+/// capture ended but before its graph was launched, its read would run first
+/// and see the zeros the buffer started as.
 #[test]
-fn an_info_ring_wrap_from_another_thread_retires_instead_of_rewinding() -> Result<()> {
+fn a_waiting_lease_is_granted_behind_the_segments_launch() -> Result<()> {
+    use std::sync::mpsc;
     let _wave = wave_lock();
     let dev = CudaDevice::new(0)?;
     let f = scale_add(&dev)?;
     let x = dev.memcpy_stod(&ramp(1.0))?;
     let mut y = dev.alloc_zeros::<f32>(N)?;
+    let mut b = dev.alloc_zeros::<f32>(N)?;
+    let y_addr = y.device_ptr(dev.stream_unleased()).0;
+
     let capture = dev.begin_wave_capture()?;
     dev.record_launches()?;
-    launch(&f, &dev.cuda_stream(), &x, &mut y, 1.0, 0.0)?;
-    let before = dev.capture_hub().retired_len();
-    {
-        let dev = dev.clone();
-        // Distinct tables a sixteenth of the ring wide, enough to wrap it at
-        // least once from wherever earlier tests left it.
-        std::thread::spawn(move || -> Result<()> {
-            dev.cuda_context().bind_to_thread().w()?;
-            let words = crate::cuda_backend::info_ring::RING_WORDS / 16;
-            for i in 0..17usize {
-                let table: Vec<usize> = (0..words).map(|w| w ^ (i << 32)).collect();
-                dev.info_table(&table)?;
-            }
-            Ok(())
+    assert!(dev.recording_segment().is_some(), "the segment records");
+    for _ in 0..64 {
+        launch(&f, &dev.cuda_stream(), &x, &mut y, 2.0, 0.0)?;
+    }
+    let (started, started_rx) = mpsc::channel();
+    let reader = {
+        let (dev, f) = (dev.clone(), f.clone());
+        std::thread::spawn(move || -> Result<Vec<f32>> {
+            admit_this_thread();
+            started.send(()).expect("the test is waiting");
+            let stream = dev.cuda_stream();
+            // SAFETY: a view of `y`'s `N` f32s, which outlive this thread.
+            let y = unsafe { stream.upgrade_device_ptr::<f32>(y_addr, N) };
+            launch(&f, &stream, &y, &mut b, 5.0, 0.0)?;
+            y.leak();
+            drop(stream);
+            dev.memcpy_dtov(&b)
         })
-        .join()
-        .expect("the uploading thread panicked")?;
-    }
-    assert!(
-        dev.capture_hub().retired_len() > before,
-        "the ring rewound or freed its buffer under a recording segment"
-    );
-    {
-        let _eager = dev.pause_capture()?;
-        assert_eq!(dev.capture_hub().retired_len(), 0, "released once launched");
-    }
+    };
+    started_rx.recv().expect("the reader started");
+    std::thread::sleep(std::time::Duration::from_millis(50));
     capture.finish()?;
+    let read = reader.join().expect("the reader panicked")?;
+    let want: Vec<f32> = ramp(1.0).iter().map(|v| v * 10.0).collect();
+    assert_eq!(read, want, "the read ran ahead of the segment it waited on");
     Ok(())
 }
 
@@ -1573,8 +1664,7 @@ fn a_pause_guard_outliving_its_wave_leaves_the_next_alone() -> Result<()> {
     let second = dev.begin_wave_capture()?;
     dev.record_launches()?;
     drop(stale);
-    let recording =
-        |dev: &CudaDevice| dev.cuda_stream().cu_stream() != dev.compute_stream().cu_stream();
+    let recording = |dev: &CudaDevice| dev.recording_segment().is_some();
     assert!(
         recording(&dev),
         "the second wave records past the stale guard"

@@ -1,7 +1,8 @@
 //! FFI bindings for convolution operation dispatchers
 //!
 //! Provides unified interfaces to dispatch convolution operations based on
-//! data type enums.
+//! data type enums. Every launch goes on the `stream` the caller passes — the
+//! device's stream — never the legacy null stream.
 //!
 //! Operations:
 //! - conv1d: 1D convolution
@@ -59,6 +60,7 @@ extern "C" {
     /// - `src`: Source tensor
     /// - `kernel`: Convolution kernel
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_conv1d(
         dtype: i32,
         dst_numel: usize,
@@ -71,6 +73,7 @@ extern "C" {
         src: *const c_void,
         kernel: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatcher for 2D convolution.
@@ -88,6 +91,7 @@ extern "C" {
     /// - `src`: Source tensor
     /// - `kernel`: Convolution kernel
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_conv2d(
         dtype: i32,
         dst_numel: usize,
@@ -101,6 +105,7 @@ extern "C" {
         src: *const c_void,
         kernel: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatcher for 1D transposed convolution.
@@ -117,6 +122,7 @@ extern "C" {
     /// - `src`: Source tensor
     /// - `kernel`: Convolution kernel
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_conv_transpose1d(
         dtype: i32,
         dst_numel: usize,
@@ -130,6 +136,7 @@ extern "C" {
         src: *const c_void,
         kernel: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatcher for 2D transposed convolution.
@@ -148,6 +155,7 @@ extern "C" {
     /// - `src`: Source tensor
     /// - `kernel`: Convolution kernel
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_conv_transpose2d(
         dtype: i32,
         dst_numel: usize,
@@ -162,6 +170,7 @@ extern "C" {
         src: *const c_void,
         kernel: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatcher for 2D im2col transformation.
@@ -179,6 +188,7 @@ extern "C" {
     /// - `info`: Pointer to dims and strides info
     /// - `src`: Source tensor
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_im2col(
         dtype: i32,
         dst_numel: usize,
@@ -192,6 +202,7 @@ extern "C" {
         info: *const usize,
         src: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatcher for 1D im2col transformation.
@@ -210,6 +221,7 @@ extern "C" {
     /// - `info`: Pointer to dims and strides info
     /// - `src`: Source tensor
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_im2col1d(
         dtype: i32,
         numel: usize,
@@ -221,6 +233,7 @@ extern "C" {
         info: *const usize,
         src: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatcher for 1D col2im transformation.
@@ -235,6 +248,7 @@ extern "C" {
     /// - `stride`: Convolution stride
     /// - `src`: Source tensor
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_col2im1d(
         dtype: i32,
         dst_el: usize,
@@ -245,6 +259,7 @@ extern "C" {
         stride: usize,
         src: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatcher for 2D average pooling.
@@ -259,6 +274,7 @@ extern "C" {
     /// - `info`: Pointer to dims and strides info
     /// - `src`: Source tensor
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_avg_pool2d(
         dtype: i32,
         src_numel: usize,
@@ -269,6 +285,7 @@ extern "C" {
         info: *const usize,
         src: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatcher for 2D max pooling.
@@ -283,6 +300,7 @@ extern "C" {
     /// - `info`: Pointer to dims and strides info
     /// - `src`: Source tensor
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_max_pool2d(
         dtype: i32,
         src_numel: usize,
@@ -293,6 +311,7 @@ extern "C" {
         info: *const usize,
         src: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
 
     /// Dispatcher for 2D nearest neighbor upsampling.
@@ -309,6 +328,7 @@ extern "C" {
     /// - `info`: Pointer to dims and strides info
     /// - `src`: Source tensor
     /// - `dst`: Destination tensor
+    /// - `stream`: The stream the launch goes on
     pub fn run_upsample_nearest2d(
         dtype: i32,
         dst_numel: usize,
@@ -319,335 +339,8 @@ extern "C" {
         info: *const usize,
         src: *const c_void,
         dst: *mut c_void,
+        stream: *mut c_void,
     );
-}
-
-/// Safe wrapper for convolution operations dispatcher
-pub struct ConvDispatcher;
-
-impl ConvDispatcher {
-    /// Perform 1D convolution
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    /// - `info` must point to a valid dims/strides array
-    pub unsafe fn conv1d(
-        dtype: ConvDType,
-        dst_numel: usize,
-        src_numel: usize,
-        num_dims: usize,
-        stride: usize,
-        padding: usize,
-        dilation: usize,
-        info: *const usize,
-        src: *const c_void,
-        kernel: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_conv1d(
-            dtype as i32,
-            dst_numel,
-            src_numel,
-            num_dims,
-            stride,
-            padding,
-            dilation,
-            info,
-            src,
-            kernel,
-            dst,
-        )
-    }
-
-    /// Perform 2D convolution
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    /// - `info` must point to a valid dims/strides array
-    pub unsafe fn conv2d(
-        dtype: ConvDType,
-        dst_numel: usize,
-        src_numel: usize,
-        w_out: usize,
-        h_out: usize,
-        stride: usize,
-        padding: usize,
-        dilation: usize,
-        info: *const usize,
-        src: *const c_void,
-        kernel: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_conv2d(
-            dtype as i32,
-            dst_numel,
-            src_numel,
-            w_out,
-            h_out,
-            stride,
-            padding,
-            dilation,
-            info,
-            src,
-            kernel,
-            dst,
-        )
-    }
-
-    /// Perform 1D transposed convolution
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    /// - `info` must point to a valid dims/strides array
-    pub unsafe fn conv_transpose1d(
-        dtype: ConvDType,
-        dst_numel: usize,
-        src_numel: usize,
-        l_out: usize,
-        stride: usize,
-        padding: usize,
-        out_padding: usize,
-        dilation: usize,
-        info: *const usize,
-        src: *const c_void,
-        kernel: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_conv_transpose1d(
-            dtype as i32,
-            dst_numel,
-            src_numel,
-            l_out,
-            stride,
-            padding,
-            out_padding,
-            dilation,
-            info,
-            src,
-            kernel,
-            dst,
-        )
-    }
-
-    /// Perform 2D transposed convolution
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    /// - `info` must point to a valid dims/strides array
-    pub unsafe fn conv_transpose2d(
-        dtype: ConvDType,
-        dst_numel: usize,
-        src_numel: usize,
-        w_out: usize,
-        h_out: usize,
-        stride: usize,
-        padding: usize,
-        out_padding: usize,
-        dilation: usize,
-        info: *const usize,
-        src: *const c_void,
-        kernel: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_conv_transpose2d(
-            dtype as i32,
-            dst_numel,
-            src_numel,
-            w_out,
-            h_out,
-            stride,
-            padding,
-            out_padding,
-            dilation,
-            info,
-            src,
-            kernel,
-            dst,
-        )
-    }
-
-    /// Perform 2D im2col transformation
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    /// - `info` must point to a valid dims/strides array
-    pub unsafe fn im2col(
-        dtype: ConvDType,
-        dst_numel: usize,
-        h_out: usize,
-        w_out: usize,
-        h_k: usize,
-        w_k: usize,
-        stride: usize,
-        padding: usize,
-        dilation: usize,
-        info: *const usize,
-        src: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_im2col(
-            dtype as i32,
-            dst_numel,
-            h_out,
-            w_out,
-            h_k,
-            w_k,
-            stride,
-            padding,
-            dilation,
-            info,
-            src,
-            dst,
-        )
-    }
-
-    /// Perform 1D im2col transformation
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    /// - `info` must point to a valid dims/strides array
-    /// - `numel` is `b · l_out · c_in · l_k`, the element count `dst` holds
-    ///   (`run_im2col1d`)
-    pub unsafe fn im2col1d(
-        dtype: ConvDType,
-        numel: usize,
-        l_out: usize,
-        l_k: usize,
-        stride: usize,
-        padding: usize,
-        dilation: usize,
-        info: *const usize,
-        src: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_im2col1d(
-            dtype as i32,
-            numel,
-            l_out,
-            l_k,
-            stride,
-            padding,
-            dilation,
-            info,
-            src,
-            dst,
-        )
-    }
-
-    /// Perform 1D col2im transformation
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    pub unsafe fn col2im1d(
-        dtype: ConvDType,
-        dst_el: usize,
-        l_out: usize,
-        l_in: usize,
-        c_out: usize,
-        k_size: usize,
-        stride: usize,
-        src: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_col2im1d(
-            dtype as i32,
-            dst_el,
-            l_out,
-            l_in,
-            c_out,
-            k_size,
-            stride,
-            src,
-            dst,
-        )
-    }
-
-    /// Perform 2D average pooling
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    /// - `info` must point to a valid dims/strides array
-    pub unsafe fn avg_pool2d(
-        dtype: ConvDType,
-        src_numel: usize,
-        w_k: usize,
-        h_k: usize,
-        w_stride: usize,
-        h_stride: usize,
-        info: *const usize,
-        src: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_avg_pool2d(
-            dtype as i32,
-            src_numel,
-            w_k,
-            h_k,
-            w_stride,
-            h_stride,
-            info,
-            src,
-            dst,
-        )
-    }
-
-    /// Perform 2D max pooling
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    /// - `info` must point to a valid dims/strides array
-    pub unsafe fn max_pool2d(
-        dtype: ConvDType,
-        src_numel: usize,
-        w_k: usize,
-        h_k: usize,
-        w_stride: usize,
-        h_stride: usize,
-        info: *const usize,
-        src: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_max_pool2d(
-            dtype as i32,
-            src_numel,
-            w_k,
-            h_k,
-            w_stride,
-            h_stride,
-            info,
-            src,
-            dst,
-        )
-    }
-
-    /// Perform 2D nearest neighbor upsampling
-    ///
-    /// # Safety
-    /// - All pointers must be valid for the specified data type
-    /// - `info` must point to a valid dims/strides array
-    pub unsafe fn upsample_nearest2d(
-        dtype: ConvDType,
-        dst_numel: usize,
-        w_out: usize,
-        h_out: usize,
-        w_scale: f64,
-        h_scale: f64,
-        info: *const usize,
-        src: *const c_void,
-        dst: *mut c_void,
-    ) {
-        run_upsample_nearest2d(
-            dtype as i32,
-            dst_numel,
-            w_out,
-            h_out,
-            w_scale,
-            h_scale,
-            info,
-            src,
-            dst,
-        )
-    }
 }
 
 #[cfg(test)]

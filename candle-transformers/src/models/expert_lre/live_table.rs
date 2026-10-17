@@ -29,7 +29,6 @@
 
 use super::pinned::LayerGeometry;
 use super::slot_image::slot_offsets;
-use candle::cuda_backend::CudaDevice;
 use candle::quantized::cuda::{MOE_MAX_EXPERTS, MOE_MAX_TOPK};
 use candle::quantized::GgmlDType;
 use candle::Result;
@@ -79,12 +78,7 @@ impl LiveTable {
     /// Every condition the device-side expert forward depends on is checked here
     /// and refused with its reason: there is no other expert path, so a model
     /// that does not meet them cannot load.
-    pub(crate) fn new(
-        device: &CudaDevice,
-        geoms: &[LayerGeometry],
-        n_experts: usize,
-        k: usize,
-    ) -> Result<Self> {
+    pub(crate) fn new(geoms: &[LayerGeometry], n_experts: usize, k: usize) -> Result<Self> {
         let n_rows = geoms.len();
         if n_rows == 0 || n_experts == 0 {
             candle::bail!("live table: no expert grid ({n_rows} rows × {n_experts} experts)");
@@ -99,15 +93,6 @@ impl LiveTable {
         // tighter of the two is the one a routed model can use.
         if k == 0 || k > 16.min(MOE_MAX_TOPK) {
             candle::bail!("live table: top-{k} routing is outside the router's 1..=16");
-        }
-        // The grouped kernels launch on the legacy null stream while bucketize
-        // launches on the compute-stream handle; they are ordered only because
-        // that handle IS the null stream.
-        if !device.cuda_stream().cu_stream().is_null() {
-            candle::bail!(
-                "live table: the compute stream is not the legacy null stream, so the expert \
-                 chain's launches would be unordered"
-            );
         }
         let (gate_nrows, down_nrows, gate_dtype, down_dtype, offsets) = Self::check_rows(geoms)?;
         let len = 3 * n_rows * n_experts;

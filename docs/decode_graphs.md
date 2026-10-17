@@ -58,7 +58,8 @@ legacy null stream from the thread that is recording, `ThreadLocal` mode:
 | kernel launch on the null stream | **succeeds, runs at once** | intact |
 
 The first four fail loudly; the last two are silent and wrong — they run immediately,
-ahead of recorded work that should precede them. §2.3 is how each is kept out.
+ahead of recorded work that should precede them. §2.3 is how each is kept out; the legacy
+null stream itself is no longer used anywhere, and the build refuses code that reaches it.
 
 ---
 
@@ -80,19 +81,20 @@ it needs neither the key nor the combination.
 
 | Piece | Where | Does |
 |---|---|---|
-| `CaptureHub` | `cuda_backend/graph/hub.rs` | One per device, shared by every clone of the handle. Holds the capture stream (created, non-blocking), the open wave, the executables of each segment ordinal kept across waves, the graveyard, the two staging rings and the two hand-off events between the capture and compute streams (§2.3). |
+| `CaptureHub` | `cuda_backend/graph/hub.rs` | One per device, shared by every clone of the handle. Holds the open wave, the executables kept across waves, the graveyard and the two staging rings. A wave records on the device's one stream (§2.2). |
+| record gate | `cuda_backend/graph/record_gate.rs` | Keeps device-wide operations, stream leases and recordings apart. A lease from a thread that is not recording waits while a segment records on a device's stream, and is granted only once that segment's graph has been launched; a segment about to record while another thread holds a lease runs as issued instead of waiting (`CaptureStats::leased_eager`). A lease that waits 30 s is refused with a panic naming its site — a lease holder holding something the recording thread needs. |
 | `ExecLibrary` | `cuda_backend/graph/library.rs` | The executables kept across waves, by segment topology (node kinds in order), within a fixed device-memory budget sized by the card. Nothing is evicted to make room; only a trial's bans give ground back (§2.1.1). |
 | `ExecSlot` | `cuda_backend/graph/slot.rs` | One topology's executables — one per shape in steady use, most recently used first. A recapture is folded into the executable holding its shape; while the library learns, a recurring shape is otherwise given one of its own and a one-off folded over another's. Once it stops learning, a recapture folds only into its own shape's executable, or runs once. |
 | `Regime` | `cuda_backend/graph/regime.rs` | Which shapes the library keeps: learned, trialled, then locked (§2.1.1). |
-| `SegmentTimer` | `cuda_backend/graph/timing.rs` | Device time of the segments on trial: an event pair on the compute stream per segment, read once its end has fired — never a wait. |
+| `SegmentTimer` | `cuda_backend/graph/timing.rs` | Device time of the segments on trial: an event pair on the device's stream per segment, read once its end has fired — never a wait. |
 | `WaveCapture` | `cuda_backend/graph/hub.rs` | RAII for one forward. `CudaDevice::begin_wave_capture` opens it **held**; `finish` launches the last segment; dropping it unfinished discards what is recording (the forward has already failed). Not `Send`, like the `Paused` guard: the driver ends a thread-local capture only on the thread that began it. |
 | `Device::record_launches` | `eager.rs` | The model's mark: recording starts here. |
-| `CudaDevice::cuda_stream` | `device.rs` | The **launch stream**: the capture stream on the thread whose wave is recording a segment or running one eagerly (§2.1.1), the compute stream otherwise. Every launcher takes it. |
-| `CudaDevice::compute_stream` | same | The legacy null stream. Anything that outlives the call — a slice's home stream, an event, a readback, a registry key — uses this. |
+| `CudaDevice::cuda_stream` | `device.rs`, `stream_lease.rs` | The device's **one stream**, created (the legacy null stream cannot be captured), as a `StreamLease` the caller holds while it issues: every launch, copy, allocation and graph launch on the device goes on it, from every thread. Not `Send`; a lease from the recording thread is not counted, since its launches are the segment's. |
 | `Device::eager` / `CudaDevice::pause_capture` | `eager.rs`, `device.rs` | Suspend recording until the guard drops; see §2.2. |
-| `CudaDevice::flush_launches` | `device.rs` | End the segment, launch it, free what it retired, `cuStreamQuery` both streams, resume — with no cross-stream hand-off between recorded segments: a flush runs no eager call of its own, so the event pairs a pause records order nothing there. A segment run eagerly brings its own pair (§2.1.1). |
+| `CudaDevice::flush_launches` | `device.rs` | End the segment, launch it, free what it retired, `cuStreamQuery` the stream, resume. A thread with no wave open queries under a lease. |
 | `CudaDevice::recording_segment` | `device.rs` | The `(wave, segment ordinal)` this thread is recording into, or `None` when its launches run eagerly — what the MoE dispatch's flush schedule keys on. |
-| `CudaDevice::retire` | `device.rs`, `hub.rs` | Free device memory after the segment that may still read it has been launched, or has run eagerly and been handed back to the compute stream — whichever thread releases it. |
+| `CudaDevice::retire` | `device.rs`, `hub.rs` | Free device memory after the segment that may still read it has been launched — whichever thread releases it — and at once, under a lease, when nothing records. `Held` and `Uploaded` release through it when their stream is a device's (`stream_owner`). |
+| `CudaDevice::read_raw` | `device.rs` | Read device memory held by address back to the host, behind everything on the stream. |
 | `CudaDevice::upload_raw` | `device.rs`, `staging.rs` | A host upload that, while recording, is staged and recorded instead of ending the segment. |
 | `GraphExec::{instantiate_audited, try_fold}` | `exec.rs` | Instantiate and upload an audited recapture; or fold one in place with `cuGraphExecUpdate_v2`, reporting when the driver refuses it as a different topology. |
 | audit | `exec.rs` | Every node must be a kernel, a memset, a device-to-device copy or a profiling span's external event record; anything else is refused with the graph dumped as DOT (`cuGraphDebugDotPrint`) and named in the error. |
@@ -185,19 +187,16 @@ executables per 2 s window on `.5` (2026-10-17) to admit shapes that were evicte
    every cycle: one run on `.5` logged 49 reopens, each a learn and a full 512-wave trial with
    its eager halves.
 
-**A segment run as issued runs on the capture stream**, not the compute stream, with a
-hand-off at each end: the capture stream waits for everything the compute stream holds as the
-segment begins, and the compute stream waits for the capture stream as it ends. Recorded and
-eager segments alternate within a wave (a trial's halves, a locked library's held and unheld
-shapes), and a launcher may hold the stream a recording segment handed it across the flush or
-pause that ends that segment (§2.3). On the capture stream, that held launch lands in issue
-order with the eager launches around it. Were the segment on the compute stream, it would
-run at once on a capture stream capturing nothing, unordered against both: on the 16 GB
-Flash-Next gate the ×8 row, behind a library the earlier rows had locked, read
-half-written activations and sampled from NaN prefill logits (2026-10-18). Memory released
-while an eager segment runs waits in the graveyard until the segment is handed back, as it
-does while one records, and a flush queries the capture stream too, so WDDM submits an eager
-segment's MoE bucketize the stager polls for.
+**A segment run as issued runs on the same stream as every other.** Recorded and eager
+segments alternate within a wave (a trial's halves, a locked library's held and unheld
+shapes), and issue order on the device's one stream orders them: nothing hands off between
+them. The design once recorded on a second, capture stream, and every failure of its kind came
+from the two streams — a launcher holding the capture stream across the flush that ended a
+segment ran unordered against the compute stream (the 16 GB Flash-Next gate's ×8 row read
+half-written activations and sampled from NaN prefill logits, 2026-10-18), and with eager
+segments moved onto the capture stream, every compute-stream call made inside one ran
+unordered against it instead (`ILLEGAL_ADDRESS` in the first prefill with recording off).
+One stream removes the class: there is no other stream for a launch to land on.
 
 The constants are short on purpose: a decode wave is a token or so, so reaching the lock costs
 seconds of decode, not minutes — a trial whose shapes all recur every wave ends at its 64-wave
@@ -231,8 +230,8 @@ drive_wave
                                             segment holds its share of MoE
                                             invocations (1, 1, 2, 4, 8, 16, then
                                             32): the segment holding bucketize is
-                                            launched, the compute stream queried
-                                            for WDDM
+                                            launched, the stream queried for
+                                            WDDM
     head ................................ recorded
   finish()                        last segment launched
   logits readback                 the wave's one host wait, after the chain
@@ -269,13 +268,17 @@ time instead of one at a time — never their order: every eager call runs after
 issued before it, because the segment before it is launched first, and before everything
 issued after it, because recording resumes only when it returns.
 
-**Thread scoping without thread-local state.** The hub records the owning `ThreadId` in its
-mutex, and beside it in an atomic a tag folded from that id; `cuda_stream()` checks an atomic
-flag (one load when no wave is open), then the tag — a different tag is a different thread,
-answered without the lock — and confirms an equal one against the owner under the lock.
-Another thread asking for the launch stream during a wave — the persistence thread, the
-expert pipeline, the stager — gets the compute stream and runs exactly as before. The hub is
-`Send + Sync`; there is no `thread_local!`.
+**Other threads, on the same stream.** A capture takes in whatever is issued on its stream,
+from any thread, so a thread that is not recording issues under a `StreamLease`
+(`record_gate`): the lease waits while a segment records, and is granted once that segment's
+graph is on the stream, so the other thread's work lands behind it. A segment about to record
+while another thread holds a lease runs as issued instead — the recording thread never waits
+on a lease, so a lease holder blocked on a lock the recording thread holds cannot stall the
+wave. The persistence thread leases per hot→warm group, not per pass, so the wave records
+between its groups. **Take a lease before any lock the recording thread may take**
+(`CudaDevice::info_table`): a lease waiting under such a lock waits on the thread that needs
+it. The hub records the owning `ThreadId` in its mutex and a tag folded from it in an atomic,
+so another thread's question is answered without the lock.
 
 ### 2.3 What ends a segment, and the silent cases
 
@@ -294,9 +297,13 @@ know which of its calls are host interactions:
   it are otherwise **recorded** — the bytes into the ring, the copy into the segment — so a
   verify's attention layer and a draft-walk step build their headers without a cut.
 - The streamed layer store (`layer_stream::LayerCache`), when a layer must be loaded or
-  joined: its copies are ordered behind a compute-stream event and its joins wait on the
-  compute stream, so the recorded GEMMs still reading an evicted slot are launched first. A
-  resident layer, or a plan with nothing to load, touches nothing.
+  joined: its copies are ordered behind an event recorded on the device's stream with the
+  recording paused — an event recorded into a segment is a graph node, and the copy stream
+  waiting on it would be taken into the capture — and its joins wait on the device's stream,
+  so the recorded GEMMs still reading an evicted slot are launched first. A resident layer,
+  or a plan with nothing to load, touches nothing.
+- The launchers' own grow-only scratch, when it grows (`kernel_scratch`): growth may come from
+  the pool, and an allocation on a stream that is capturing is refused (`stream_alloc`).
 
 What does **not** end a segment:
 
@@ -317,7 +324,7 @@ What does **not** end a segment:
   append past the class rebuilds. Two rings alternate by wave, each fenced by an event
   recorded when its wave finishes, so staged bytes outlive every replay that reads them. A
   full ring falls back to an eager upload.
-- **cuBLAS.** `CudaDevice::cublas()` rebinds the handle to the launch stream on every call and
+- **cuBLAS.** `CudaDevice::cublas()` rebinds the handle to the device's stream, under a lease, on every call and
   re-applies the handle's fixed 4 MiB workspace — `cublasSetStream` resets it to cuBLAS's own
   pool, which allocates on the stream, and a graph allocation is refused by the audit.
 - **Launcher scratch growth** (split-KV partial pools in the paged decode and prefill
@@ -326,28 +333,24 @@ What does **not** end a segment:
 
 The silent cases of §0.2 are closed structurally:
 
-- **Default-stream launches.** Every launcher in `candle-kernels` takes its stream from the
-  caller (the remaining `<<<g, b>>>` sites are the convolution dispatcher, the GEMX repack and
-  the L2-flush benchmark, none on an inference path). A missed one runs at once, out of
-  order; finding the last of them is what restored Qwen3.6's draft acceptance (§3).
+- **The legacy null stream, at build time.** `candle-kernels/build_lints.rs` refuses a kernel
+  source with a `<<<>>>` launch that names no stream or stream 0, a stream parameter defaulted
+  to the null stream, a synchronous copy or fill, or the null streams' names; and
+  `lints/null_stream.rs`, run by every CUDA crate's build script, refuses Rust sources that
+  name `default_stream`, the synchronous copy and fill helpers, or the null streams' handles,
+  or that pass a null pointer as a `run_*` / `launch_*` launcher's last argument — its stream.
+  A missed one used to run at once, out of order; finding the last of them is what restored
+  Qwen3.6's draft acceptance (§3).
 - **Readbacks** go through device methods that pause.
-- **Host fences that cover "everything issued"** — an event recorded on the compute stream to
+- **Host fences that cover "everything issued"** — an event recorded on the device's stream to
   fence a reuse — are recorded after a pause, so they cover the recorded work too
   (`TableRing`, the pinned stager's generation fence, KV selection).
 - **Raw slices replaced while recording** (a workspace swapped for a larger one) are replaced
   inside an eager section, so the old buffers are freed behind their last reader.
-- **A launch-stream handle taken while recording and used in an eager section.** The handle
-  is the capture stream, which is not capturing during the section, so its launch ran at
-  once — unordered against the segments still executing on the compute stream. This was
-  Flash-Next's intermittent `ILLEGAL_ADDRESS` (§3.2): the indexer's staged uploads took the
-  stream before entering `with_staged_upload`. Two device-side event hand-offs close it for
-  every such launch, not only the ones found: pausing (and finishing a wave) records an event
-  on the compute stream that the capture stream waits on, so a stray launch runs after the
-  launched segments; resuming (and opening recording) records one on the capture stream that
-  the compute stream waits on, so it completes before anything issued after the section.
-  The indexer now also takes its stream inside the closure (rule 6). A segment the library
-  runs eagerly is the long form of the same section — it lasts until the next flush or pause,
-  not one call — and is closed the other way: it runs on the capture stream itself (§2.1.1).
+- **A stream handle held across a flush or a pause.** With one stream, the handle a launcher
+  holds is the stream everything else is on, whatever happened in between: its launch lands
+  in issue order. This was Flash-Next's intermittent `ILLEGAL_ADDRESS` (§3.2) when a second,
+  capture stream existed.
 - **Profiling spans.** `gpu_span` records its events with `CU_EVENT_RECORD_EXTERNAL` while the
   stream is capturing, so they become event-record nodes (which the audit admits) instead of
   invalidating the capture, and the span ring's high-water drain — it queries events — runs
@@ -355,16 +358,16 @@ The silent cases of §0.2 are closed structurally:
 
 ### 2.4 Rules for code that runs while recording
 
-1. Launch on `dev.cuda_stream()`; never on a stored stream or `slice.stream()`.
-2. Anything that must still name a stream after the call — a slice built with
-   `upgrade_device_ptr`, an event, a registry key, a fence — uses `dev.compute_stream()`.
+1. Launch on `dev.cuda_stream()`, and hold the lease only while issuing; never on a stored
+   stream or `slice.stream()` — a stored handle issues outside the gate, and a capture on the
+   recording thread takes its launches in.
+2. A struct that issues work later stores the `CudaDevice` and leases when it issues
+   (`SpanClaims`, `TableRing`), not the stream.
 3. Host protocol that allocates, frees raw slices, reads back or fences runs inside
-   `dev.eager()?`.
+   `dev.eager()?`. An event recorded for another stream to wait on is recorded there too.
 4. A host upload goes through `upload_raw` (recorded) or a device method (eager).
 5. A struct owning raw `CudaSlice`s is replaced only inside an eager section.
-6. Code inside an eager section takes the launch stream inside it, never before it — the
-   handle taken outside is the capture stream (the hand-offs of §2.3 keep a miss ordered,
-   but it is still a miss).
+6. Take a lease before any lock the recording thread may take.
 
 ---
 
@@ -432,7 +435,8 @@ Recording exposed two problems, a race and a pipeline that could not keep up.
 **The race.** With recording on, a wide prefill faulted (`ILLEGAL_ADDRESS`) intermittently.
 The cause was a stale launch-stream handle (§2.3): the indexer's staged uploads took the
 capture stream before entering their eager sections and launched on it there, unordered
-against the MoE segments still executing. The hand-offs close it structurally.
+against the MoE segments still executing. Recording on the device's one stream closes it
+structurally.
 
 **The expert pipeline.** Recording makes the forward cheap to issue, so the forward thread
 runs a wave ahead of the GPU — and the expert pipeline was built on two timing assumptions
@@ -530,7 +534,7 @@ which launches nothing.
 on Qwen3-30B-A3B's F16 and quantized-KV rows — copied its result into the retyped buffer with a
 synchronous legacy-stream copy, which ran at once, before the recorded cast; and freed the
 buffer it replaced at once, before the segment reading it. Every such row failed validation.
-The copy is queued on the launch stream and the old buffer retired
+The copy is queued on the device's stream and the old buffer retired
 (`an_in_place_cast_while_recording_reads_back_what_it_reads_eagerly`).
 
 RTX 3090, decode t/s, eager (2026-10-06 sweep) → recorded:
@@ -565,17 +569,21 @@ cost is left over.
 
 | Test | Proves |
 |---|---|
-| `replay_on_the_null_stream_orders_against_null_stream_work` | A graph captured on the side stream and launched into the null stream orders against null-stream work on both sides. |
-| `a_capture_survives_null_stream_work_from_another_thread` | Another thread's null-stream work neither breaks nor joins a capture (`ThreadLocal`, non-blocking capture stream). |
-| `a_default_stream_launch_is_not_recorded_and_the_capture_is_refused` | A default-stream launch runs at once and the short graph is refused. |
+| `replay_on_the_null_stream_orders_against_null_stream_work` | A graph captured on a stream of its own and launched onto the device's stream orders against that stream's work on both sides. |
+| `a_capture_survives_null_stream_work_from_another_thread` | Another thread's work on the device's stream neither breaks nor joins a capture on a stream of its own (`ThreadLocal`). |
+| `a_default_stream_launch_is_not_recorded_and_the_capture_is_refused` | A launch on another stream runs at once and the short graph is refused. |
 | `a_dropped_session_leaves_the_stream_usable` | An unfinished capture ends on drop. |
 | `migrated_launchers_record_on_the_capture_stream` | The repository's launchers record and replay bit-identical. |
 | `a_recapture_with_new_scalars_and_addresses_updates_in_place` | `update` folds new scalars and addresses in place; a new topology is re-instantiated. |
 | `a_host_copy_inside_a_capture_is_refused_and_a_device_copy_is_kept` | The audit. |
 | `a_wave_capture_is_bit_identical_to_eager_execution` | Element-wise ops, cuBLAS, reductions, a mid-chain readback, allocations, frees and a flush give bit-identical results recorded and eager, wave after wave, with in-place updates. |
 | `an_upload_while_recording_lands_in_issue_order_without_a_cut` | A recorded upload is ordered between the launches around it and does not end the segment. |
-| `only_the_capturing_thread_is_redirected` | A held wave redirects nothing; a recording one redirects only its own thread. |
-| `a_stale_capture_stream_launch_in_an_eager_section_stays_in_order` | A launch on a capture-stream handle taken while recording, issued inside an eager section, runs after the recorded work before it and before the recorded work after it (the hand-offs). |
+| `another_threads_lease_runs_the_segment_as_issued` | A segment that would begin while another thread holds a lease runs as issued; the next, once the lease is back, records; both threads' work lands in issue order. |
+| `another_threads_lease_waits_for_the_recording_segment` | Another thread's launch waits for the recording segment and is not taken into its graph. |
+| `a_waiting_lease_is_granted_behind_the_segments_launch` | A lease waiting on a segment is granted only once that segment's graph is on the stream: the other thread reads what the segment wrote. |
+| `a_stream_held_into_an_eager_section_stays_in_order` | A stream taken while recording and launched inside an eager section runs after the recorded work before it and before the work after it. |
+| `record_gate::tests::*` | Leases and stream recordings: another thread's lease turns a recording away, a lease waits for one, a thread's own leases are not in its way, a capture on a stream of its own holds no lease up. |
+| `null_stream_lint::*` (`candle-core`), `build_lint_tests::*` (`candle-kernels`) | The build-time null-stream rules, on raw source: names found with their lines, comments and strings ignored, launches spanning lines read whole. |
 | `a_held_stream_in_an_eager_segment_stays_in_order` | In a trial, a stream taken while a segment records and launched after a flush into an eager segment is the stream that segment launches on, and lands after the eager launches before it and before the ones after it. |
 | `alternating_wave_shapes_each_fold_into_their_own_executable` | Two wave shapes taking turns at one ordinal each fold in place once both have run. |
 | `two_shapes_of_one_node_count_each_keep_their_executable` | The same, for two shapes of equal node count and different topology. |
@@ -620,7 +628,7 @@ per segment, in-place updates, instantiations — and is unit-tested on its text
    while the host records. `expert_lre::flush_schedule` now launches a wave's segments at
    1, 1, 2, 4, 8, 16, then 32 MoE invocations (keyed on the hub's segment ordinal, so it
    restarts every wave and a segment some other cut began counts from its own start), and a
-   flush no longer records the pause's two cross-stream hand-offs. On Flash-Next's
+   flush records no cross-stream hand-off. On Flash-Next's
    single-session Strata benchmark segments per wave fell 19.5 → 4.4 and, with the
    bucketize and restock changes of the same round, decode rose 148.9 → 156.1 t/s at 4K and
    121.9 → 134.2 at 128K (RTX PRO 5000, 2026-10-09). What remains of the attention layers'
@@ -657,17 +665,18 @@ carries the current wave's addresses and scalars by construction. So:
   recorded fresh every wave;
 - the `Chained` fallback is unnecessary: there is no slot to refuse, and a failed recording
   fails the forward, which the wave driver already rolls back;
-- the typed API's guarantees are replaced by the ordering argument of §2.2 and the runtime
+- the typed API's guarantees are replaced by the ordering argument of §2.2, the runtime
   backstops of §2.3 (the audit refuses host copies and graph allocations; the driver refuses
-  syncs, allocations and frees on the capturing thread) — at the cost of the compile-time
-  bans, which remain a possible later hardening of the rules in §2.4.
+  syncs, allocations and frees on the capturing thread) and the build-time null-stream bans.
 
-What carried over unchanged: capture on a created non-blocking stream in `ThreadLocal` mode
-and launch into the null stream (§4.2 of the old design, proven by the first two tests), the
-MoE dispatch split into `before` / `record` / `after` with the flush in `after`, every launcher
-taking its stream, launchers reporting failure instead of skipping silently, and the node
-audit.
+What carried over: capture in `ThreadLocal` mode (§4.2 of the old design), the MoE dispatch
+split into `before` / `record` / `after` with the flush in `after`, every launcher taking its
+stream, launchers reporting failure instead of skipping silently, and the node audit. What
+did not: the old design captured on a created side stream and launched into the legacy null
+stream. The device's stream is now a created stream that the wave records on directly, and
+other threads reach it only under a lease (§2.2) — the second stream, its hand-offs and the
+stale-handle class they existed for are gone.
 
 Non-goals, unchanged: splitting a wave, row padding, a graph per slot combination, moving the
-MoE host protocol into a graph, device-data control flow, a per-model opt-out flag or an
-environment toggle, and moving the compute stream off the null stream.
+MoE host protocol into a graph, device-data control flow, and a per-model opt-out flag or an
+environment toggle.

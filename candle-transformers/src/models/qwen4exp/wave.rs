@@ -1903,12 +1903,28 @@ impl Qwen4ExpBatched {
         layer_start: usize,
         layer_end: usize,
     ) -> Result<usize> {
-        let spans = seq_spans(seq_ids, q_lens)?;
         let idx = self
             .index
             .read()
             .map_err(|_| candle::Error::Msg("index lock poisoned".into()))?;
-        self.qsa_bytes_over(&spans, offsets, &idx, layer_start, layer_end)
+        self.wave_qsa_bytes_in(&idx, seq_ids, q_lens, offsets, layer_start, layer_end)
+    }
+
+    /// [`Self::wave_qsa_bytes`] against index caches the caller already holds
+    /// locked — a draft walk prices its tier under the write lock it grew the
+    /// head's cache with.
+    #[cfg(feature = "cuda")]
+    pub(super) fn wave_qsa_bytes_in(
+        &self,
+        idx: &HashMap<usize, Vec<IndexCache>>,
+        seq_ids: &[usize],
+        q_lens: &[usize],
+        offsets: &[usize],
+        layer_start: usize,
+        layer_end: usize,
+    ) -> Result<usize> {
+        let spans = seq_spans(seq_ids, q_lens)?;
+        self.qsa_bytes_over(&spans, offsets, idx, layer_start, layer_end)
     }
 
     /// [`Self::wave_qsa_bytes`] for sequences that have not run yet — prefills of

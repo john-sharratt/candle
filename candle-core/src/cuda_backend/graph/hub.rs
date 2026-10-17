@@ -1,34 +1,29 @@
 //! The wave capture: one forward's launches recorded as a chain of graphs.
 //!
 //! A [`CaptureHub`] belongs to a device and is shared by every clone of its
-//! handle. While a wave capture is open, the thread that opened it gets the
-//! hub's capture stream from [`crate::cuda_backend::CudaDevice::cuda_stream`],
-//! so every launch that thread issues through the device — candle's own ops,
-//! the custom launchers, cuBLAS — is recorded instead of executed. Every other
-//! thread keeps getting the compute stream, so the persistence thread and the
-//! expert pipeline run exactly as before.
+//! handle. A device has one stream, and a wave records on it: while a segment
+//! records, every launch the wave's thread issues through the device — candle's
+//! own ops, the custom launchers, cuBLAS — is recorded instead of executed.
+//! Every other thread issues under a lease
+//! ([`crate::cuda_backend::StreamLease`]), which waits while a segment records,
+//! and a segment about to record while another thread holds one runs as issued
+//! instead — so the capture takes in the wave's launches and nothing else.
 //!
 //! **A segment ends wherever the host has to interact with the device.** The
 //! driver refuses a synchronise, an allocation, a free or a host upload from
 //! the capturing thread, and lets a readback through unordered against the
 //! recorded work. So each of those, at the device method that issues it,
 //! first [pauses](CaptureHub::pause) the wave: the open segment is ended,
-//! folded into its executable and launched into the compute stream, the eager
-//! call then runs in order behind it, and recording resumes on the next
-//! launch site. The MoE host protocol ends a segment the same way
-//! ([`CaptureHub::flush`]), because its stager polls for the bucketize the
-//! segment holds. What the chain changes is when launches reach the driver —
-//! batched per segment instead of one at a time — never their order.
+//! folded into its executable and launched onto the stream, the eager call then
+//! runs in order behind it, and recording resumes on the next launch site. The
+//! MoE host protocol ends a segment the same way ([`CaptureHub::flush`]),
+//! because its stager polls for the bucketize the segment holds. What the chain
+//! changes is when launches reach the driver — batched per segment instead of
+//! one at a time — never their order.
 //!
-//! **A segment the library does not keep runs eagerly on the capture stream**
-//! (`start_segment`), not on the compute stream: a launcher may hold the stream
-//! a recording segment handed it across the flush or pause that ended that
-//! segment, and its launch must land in issue order with everything around it.
-//! Were the segment on the compute stream, the held capture stream — capturing
-//! nothing — would run at once, unordered against the eager launches ahead of
-//! it and behind it. The segment is handed off at both ends: it runs behind
-//! everything the compute stream held when it began, and the compute stream
-//! waits for it when it ends.
+//! **A segment the library does not keep runs as issued** (`start_segment`), on
+//! the same stream: nothing orders it against the recorded segments around it
+//! but issue order, which is all one stream needs.
 //!
 //! **Per-wave scalars and addresses are refreshed, not keyed.** Segment `i` of
 //! every wave folds with `cuGraphExecUpdate` into the executable its ordinal
@@ -49,7 +44,7 @@ use super::staging::StagingRing;
 use super::thread_wave;
 use super::timing::SegmentTimer;
 use super::GraphError;
-use crate::cuda_backend::{set_kernel_breadcrumb, CudaDevice, WrapErr};
+use crate::cuda_backend::{set_kernel_breadcrumb, CudaDevice, StreamLease, WrapErr};
 use crate::Result;
 use cudarc::driver::{result, sys, CudaEvent, CudaStream};
 use std::hash::{Hash, Hasher};
@@ -95,6 +90,9 @@ pub struct CaptureStats {
     /// Segments run unrecorded: their predicted shape banned, not held once the
     /// learn is over, or on the eager half of a trial.
     pub eager_segments: u64,
+    /// Of those, the ones that were to be recorded but ran as issued because
+    /// another thread held a lease on the stream.
+    pub leased_eager: u64,
     /// Executables the library holds now — a gauge, not a count since start.
     pub execs_held: u64,
     /// Nodes across those executables, now.
@@ -173,8 +171,6 @@ pub(super) const RECHECK_EVERY: u32 = 32;
 #[derive(Default)]
 struct HubState {
     wave: Option<Wave>,
-    /// The non-blocking stream launches are recorded on, made on first use.
-    capture: Option<Arc<CudaStream>>,
     /// The executables kept across waves, by segment topology.
     library: ExecLibrary,
     /// What the library keeps, learned and trialled (`regime`).
@@ -193,53 +189,16 @@ struct HubState {
     /// The two staging rings recorded uploads go through, alternating by wave
     /// — see [`super::staging`].
     rings: Vec<StagingRing>,
-    /// The compute stream the wave launches into, kept for the hand-offs.
+    /// The device's stream, which the wave records on and launches into.
     compute: Option<Arc<CudaStream>>,
-    /// The two hand-off events — see [`HubState::hand_to_capture`].
-    to_capture: Option<CudaEvent>,
-    to_compute: Option<CudaEvent>,
     stats: CaptureStats,
-}
-
-impl HubState {
-    /// Order the capture stream behind everything issued on the compute stream
-    /// so far — a device-side wait, no host wait.
-    ///
-    /// A launcher that took its stream from [`CaptureHub::launch_stream`] while
-    /// recording and launches after an eager section has begun holds the
-    /// capture stream, which is no longer capturing: its launch runs at once.
-    /// Without this it would run unordered against the segments still in
-    /// flight on the compute stream; with it, it runs after them, exactly where
-    /// it was issued.
-    fn hand_to_capture(&self) -> Result<()> {
-        if let (Some(capture), Some(compute), Some(ev)) =
-            (&self.capture, &self.compute, &self.to_capture)
-        {
-            ev.record(compute).w()?;
-            capture.wait(ev).w()?;
-        }
-        Ok(())
-    }
-
-    /// The other direction, before recording resumes: whatever such a launch
-    /// put on the capture stream completes before anything issued on the
-    /// compute stream after it.
-    fn hand_to_compute(&self) -> Result<()> {
-        if let (Some(capture), Some(compute), Some(ev)) =
-            (&self.capture, &self.compute, &self.to_compute)
-        {
-            ev.record(capture).w()?;
-            compute.wait(ev).w()?;
-        }
-        Ok(())
-    }
 }
 
 struct Wave {
     owner: ThreadId,
     /// Which wave this is, so a [`Paused`] guard acts only on its own.
     serial: u64,
-    /// A capture is recording on the capture stream.
+    /// A capture is recording on the device's stream.
     recording: bool,
     /// Open [`Paused`] guards, plus one while `held`; recording resumes when
     /// the count reaches zero.
@@ -255,7 +214,7 @@ struct Wave {
     error: Option<String>,
     /// When the recording segment began, for [`CaptureStats::recording_us`].
     recording_since: Option<Instant>,
-    /// The current segment runs unrecorded on the capture stream
+    /// The current segment runs unrecorded, its launches issued as they come
     /// (`CaptureHub::start_segment`), as a run of this predicted key.
     eager: bool,
     eager_key: Option<Key>,
@@ -284,7 +243,7 @@ impl WaveCapture {
         self.finished = true;
         self.device
             .capture_hub()
-            .finish_wave(&self.device.compute_stream())
+            .finish_wave(self.device.stream_unleased())
     }
 }
 
@@ -293,7 +252,7 @@ impl Drop for WaveCapture {
         if !self.finished {
             self.device
                 .capture_hub()
-                .abandon_wave(&self.device.compute_stream());
+                .abandon_wave(self.device.stream_unleased());
         }
         // Finished or abandoned, the wave no longer records on this thread.
         thread_wave::leave(&self.device);
@@ -321,22 +280,21 @@ impl Drop for Paused<'_> {
         if wave.paused > 0 || wave.recording || wave.eager {
             return;
         }
-        let resumed = st
-            .hand_to_compute()
-            .and_then(|()| CaptureHub::start_segment(&mut st));
+        let resumed = CaptureHub::start_segment(&mut st);
         if let Err(e) = resumed {
             st.wave.as_mut().expect("checked above").error = Some(e.to_string());
         }
     }
 }
 
-/// Start recording on the hub's stream, counted into the record gate for as
-/// long as the segment records. Every successful `begin` is paired with one
+/// Start recording on the device's stream, counted into the record gate for as
+/// long as the segment records — or `false`, beginning nothing, while another
+/// thread holds a lease on the stream. Every `true` is paired with one
 /// [`end_capture`].
-fn begin(capture: &Arc<CudaStream>) -> Result<()> {
-    // SAFETY: the hub's own created stream, not recording — a wave records on it
-    // only between `begin` and `end_segment`, under the hub's lock.
-    unsafe { capture::begin(capture) }
+fn try_begin(stream: &Arc<CudaStream>) -> Result<bool> {
+    // SAFETY: the device's created stream, not recording — a wave records on it
+    // only between `try_begin` and `end_segment`, under the hub's lock.
+    unsafe { capture::try_begin_on_stream(stream) }
 }
 
 /// Act on every library phase that has ended (`regime`), at wave `wave`: a
@@ -458,43 +416,33 @@ fn act_on_transitions(st: &mut HubState, wave: u64) {
 }
 
 /// Nudge WDDM to submit what has been issued on `compute`.
+///
+/// Only between this thread's segments, or under a lease: a query on a stream
+/// that is capturing is refused, and refusing it invalidates the capture.
 fn query_submits(compute: &Arc<CudaStream>) -> Result<()> {
-    // SAFETY: a query on the compute stream, which is never recording, made
-    // while this thread captures nothing. Its only purpose is the WDDM
-    // submission it forces; `NOT_READY` is the expected answer.
+    // SAFETY: a query on the device's stream, made while nothing captures on
+    // it. Its only purpose is the WDDM submission it forces; `NOT_READY` is the
+    // expected answer.
     match unsafe { sys::cuStreamQuery(compute.cu_stream()) } {
         sys::CUresult::CUDA_SUCCESS | sys::CUresult::CUDA_ERROR_NOT_READY => Ok(()),
         e => e.result().w(),
     }
 }
 
-/// End the capture [`begin`] started, and count the segment out of the record
-/// gate whether or not the driver hands back a graph.
-fn end_capture(capture: &Arc<CudaStream>) -> Result<sys::CUgraph> {
-    // SAFETY: this wave began the capture on the hub's stream, on this thread.
-    unsafe { capture::end(capture) }
+/// End the capture [`try_begin`] started; the segment stays counted in the
+/// record gate until `counted` drops, once its graph is launched.
+fn end_capture(
+    stream: &Arc<CudaStream>,
+    counted: &record_gate::StreamRecording,
+) -> Result<sys::CUgraph> {
+    // SAFETY: this wave began the capture on the device's stream, on this
+    // thread.
+    unsafe { capture::end_on_stream(stream, counted) }
 }
 
 impl CaptureHub {
     fn lock(&self) -> MutexGuard<'_, HubState> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// The stream a launch from this thread goes on: the capture stream while
-    /// this thread records a segment or runs one eagerly, `compute` otherwise.
-    pub(crate) fn launch_stream(&self, compute: &Arc<CudaStream>) -> Arc<CudaStream> {
-        if !self.owned_here() {
-            return compute.clone();
-        }
-        let st = self.lock();
-        match (&st.wave, &st.capture) {
-            (Some(w), Some(c))
-                if (w.recording || w.eager) && w.owner == std::thread::current().id() =>
-            {
-                c.clone()
-            }
-            _ => compute.clone(),
-        }
     }
 
     /// Whether a wave may be open on this thread — `false` is exact, `true`
@@ -537,7 +485,7 @@ impl CaptureHub {
 
     /// Whether this thread's wave is in a segment that runs eagerly: its
     /// launches reach the device as issued, so an upload may go straight onto
-    /// the compute stream behind them instead of ending the segment.
+    /// the stream behind them instead of ending the segment.
     pub(crate) fn eager_segment_here(&self) -> bool {
         self.owned_here()
             && self
@@ -547,15 +495,19 @@ impl CaptureHub {
                 .is_some_and(|w| w.eager && w.paused == 0 && w.owner == std::thread::current().id())
     }
 
-    /// Nudge WDDM to submit what this thread has queued, ending nothing — on
-    /// both streams: an eager segment's launches are on the capture stream,
-    /// and a host protocol waiting on one of them (the MoE stager polling a
-    /// bucketize) would otherwise wait for WDDM to submit it on its own.
+    /// Nudge WDDM to submit what this thread has queued, ending nothing: a
+    /// host protocol waiting on an eagerly issued launch (the MoE stager
+    /// polling a bucketize) would otherwise wait for WDDM to submit it on its
+    /// own. Nothing to do while this thread records: what it issues waits for
+    /// the segment's launch, and what it issued before was submitted when the
+    /// segment began — a query now would end its capture. Leased on any thread
+    /// that is not recording.
+    #[track_caller]
     pub(crate) fn submit(&self, compute: &Arc<CudaStream>) -> Result<()> {
-        let capture = self.lock().capture.clone();
-        if let Some(capture) = capture {
-            query_submits(&capture)?;
+        if self.recording_segment().is_some() {
+            return Ok(());
         }
+        let _lease = StreamLease::take(compute);
         query_submits(compute)
     }
 
@@ -567,19 +519,6 @@ impl CaptureHub {
                 .wave
                 .as_ref()
                 .is_some_and(|w| w.owner == std::thread::current().id())
-    }
-
-    /// Whether another thread is recording a segment now — one whose launches
-    /// are not issued yet, so an eager write from this thread to memory they
-    /// read lands before them, not after — or running one eagerly on the
-    /// capture stream, unordered against this thread's compute-stream work
-    /// until it ends.
-    pub(crate) fn recording_elsewhere(&self) -> bool {
-        self.active.load(Ordering::Acquire)
-            && matches!(
-                &self.lock().wave,
-                Some(w) if (w.recording || w.eager) && w.owner != std::thread::current().id()
-            )
     }
 
     /// Open a wave capture on this thread, of the kind `opened_at` names
@@ -601,18 +540,7 @@ impl CaptureHub {
             let HubState { timer, regime, .. } = &mut *st;
             timer.drain(|key, mode, took| regime.sample(key, mode, took))?;
         }
-        if st.capture.is_none() {
-            st.capture = Some(compute.context().new_stream().w()?);
-        }
-        if st.to_capture.is_none() || st.to_compute.is_none() {
-            let flags = Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING);
-            st.to_capture = Some(compute.context().new_event(flags).w()?);
-            st.to_compute = Some(compute.context().new_event(flags).w()?);
-        }
         st.compute = Some(compute.clone());
-        // Anything a stale handle left on the capture stream after the last
-        // wave runs before this one's work.
-        st.hand_to_compute()?;
         while st.rings.len() < 2 {
             let ring = StagingRing::new(compute)?;
             st.rings.push(ring);
@@ -692,9 +620,6 @@ impl CaptureHub {
         wave.held = false;
         wave.paused -= 1;
         if wave.paused == 0 {
-            // Launches issued on the capture stream while the wave was held
-            // run before anything recorded from here.
-            st.hand_to_compute()?;
             Self::start_segment(&mut st)?;
         }
         Ok(())
@@ -705,7 +630,6 @@ impl CaptureHub {
     /// Memory retired while it recorded stays in the graveyard; the caller
     /// takes it once this succeeds and drops it after releasing the lock.
     fn end_segment(st: &mut HubState, compute: &Arc<CudaStream>) -> Result<()> {
-        let capture = st.capture.clone().expect("a wave has a capture stream");
         let wave = st.wave.as_mut().expect("called inside a wave");
         // A resume that failed left the wave eager, so there is no capture
         // to end — only the failure to report.
@@ -720,9 +644,6 @@ impl CaptureHub {
             wave.segment += 1;
             let key = wave.eager_key.take();
             let timing = wave.timing.take();
-            // Everything after the segment on the compute stream runs behind
-            // what it issued on the capture stream.
-            st.hand_to_compute()?;
             if let Some(start) = timing {
                 match key {
                     Some(k) => st.timer.end(compute, start, k, Mode::Eager)?,
@@ -739,13 +660,13 @@ impl CaptureHub {
             st.stats.recording_us += since.elapsed().as_micros() as u64;
         }
         let wave = st.wave.as_mut().expect("called inside a wave");
-        if let Err(e) = capture.context().bind_to_thread().w() {
-            // The capture cannot be ended from an unbound thread; it is lost,
-            // and so is its count in the gate.
-            record_gate::recording_ends();
-            return Err(e);
-        }
-        let graph = end_capture(&capture)?;
+        // Counted in the gate until this function returns — past the launch
+        // below — on every path, the failed ones included.
+        let counted = record_gate::StreamRecording::ending();
+        // The capture cannot be ended from an unbound thread; it is lost, and
+        // `counted` takes its count out of the gate.
+        compute.context().bind_to_thread().w()?;
+        let graph = end_capture(compute, &counted)?;
         if graph.is_null() {
             return Err(crate::Error::wrap(GraphError::NoGraph));
         }
@@ -949,10 +870,10 @@ impl CaptureHub {
     /// - otherwise recorded. An ordinal never recorded is recorded while the
     ///   library learns or trials, and runs as issued in the lock.
     ///
-    /// A segment run as issued goes on the capture stream, behind everything the
-    /// compute stream holds as it begins; [`Self::end_segment`] makes the
-    /// compute stream wait for it. A launcher still holding the capture stream
-    /// from the segment before therefore lands in issue order.
+    /// A segment to be recorded while another thread holds a lease on the
+    /// stream runs as issued instead: the capture would take in that thread's
+    /// launches, and waiting for the lease could wait on a lock this thread
+    /// holds. Such a run is credited to nothing ([`CaptureStats::leased_eager`]).
     ///
     /// An ordinal that has run as issued on its prediction alone
     /// [`RECHECK_EVERY`] times in a row is recorded once, so its prediction
@@ -1008,19 +929,26 @@ impl CaptureHub {
         };
         if mode == Mode::Eager {
             st.stats.eager_segments += 1;
-            // Issued on the capture stream, behind everything the compute
-            // stream holds so far.
-            st.hand_to_capture()?;
             let wave = st.wave.as_mut().expect("checked above");
             wave.eager = true;
             wave.eager_key = predicted;
             wave.timing = timing;
             return Ok(());
         }
-        st.wave.as_mut().expect("checked above").timing = timing;
-        let capture = st.capture.clone().expect("a wave has a capture stream");
-        begin(&capture)?;
+        let compute = st.compute.clone().expect("a wave has a compute stream");
+        if !try_begin(&compute)? {
+            if let Some(start) = timing {
+                st.timer.discard(start);
+            }
+            st.stats.eager_segments += 1;
+            st.stats.leased_eager += 1;
+            let wave = st.wave.as_mut().expect("checked above");
+            wave.eager = true;
+            wave.eager_key = None;
+            return Ok(());
+        }
         let wave = st.wave.as_mut().expect("checked above");
+        wave.timing = timing;
         wave.recording = true;
         wave.recording_since = Some(Instant::now());
         Ok(())
@@ -1046,21 +974,15 @@ impl CaptureHub {
             // Launched and submitted: the segment may hold MoE invocations whose
             // summary words the expert threads wait on, and on WDDM a launched
             // batch waits for a query before it reaches the GPU. Nothing is
-            // capturing between the launch and the hand-off, so the query is
-            // legal here.
-            // An eager segment's launches are on the capture stream: it is
-            // queried too.
-            let capture = st.capture.clone().expect("a wave has a capture stream");
-            let ended = Self::end_segment(&mut st, compute)
-                .and_then(|()| query_submits(&capture))
-                .and_then(|()| query_submits(compute));
+            // capturing once the segment has ended, so the query is legal here.
+            let ended = Self::end_segment(&mut st, compute).and_then(|()| query_submits(compute));
             // Everything released while the segment recorded can go once it
-            // is launched: the frees queue on the compute stream behind it.
+            // is launched: the frees queue on the stream behind it.
             let dead = match ended {
                 Ok(()) => std::mem::take(&mut st.graveyard),
                 Err(_) => Graveyard::new(),
             };
-            let paused = ended.and_then(|()| st.hand_to_capture()).map(|()| {
+            let paused = ended.map(|()| {
                 let wave = st.wave.as_mut().expect("capturing here");
                 wave.paused += 1;
                 wave.serial
@@ -1076,29 +998,20 @@ impl CaptureHub {
     }
 
     /// Hand everything this thread has issued to the driver: the recording
-    /// segment, if any, is launched, then both streams are queried so WDDM
-    /// submits it — and an eager segment's launches, which are on the capture
-    /// stream. The next segment begins at once.
+    /// segment, if any, is launched, then the stream is queried so WDDM submits
+    /// it. The next segment begins at once. A wave held, or paused by an outer
+    /// guard, is not recording: there is nothing to end, and resuming is the
+    /// guard's business.
     ///
-    /// **No hand-offs between recorded segments.** A flush runs no eager call of
-    /// its own: between launching the segment and beginning the next one this
-    /// thread issues nothing, and no other thread is ever given the capture
-    /// stream. So the two event pairs a [`Self::pause`] records — which exist to
-    /// order a stray launch made inside its eager call — order nothing here, and
-    /// they cost the device a four-hop chain to resolve before the next segment
-    /// may start, at every boundary. A segment run as issued brings its own
-    /// pair, one at each end ([`Self::start_segment`], [`Self::end_segment`]).
-    /// A wave held, or paused by an outer guard, is not recording: there is
-    /// nothing to end, and resuming is the guard's business.
-    ///
-    /// Everything that touches the legacy stream — the memory the segment
-    /// retired, freed behind it, and the query that forces WDDM to submit —
-    /// runs between the launch and the resume: a legacy-stream call made while
-    /// this thread captures is refused, and refusing it invalidates the
-    /// capture.
+    /// Everything that touches the stream outside the segment — the memory the
+    /// segment retired, freed behind it, and the query that forces WDDM to
+    /// submit — runs between the launch and the resume: a query or a free made
+    /// on the stream while it captures is refused, and refusing it invalidates
+    /// the capture. A thread with no wave open queries under a lease.
     #[track_caller]
     pub(crate) fn flush(&self, compute: &Arc<CudaStream>) -> Result<()> {
         if !self.capturing_here() {
+            let _lease = StreamLease::take(compute);
             return query_submits(compute);
         }
         let caller = Location::caller();
@@ -1111,8 +1024,7 @@ impl CaptureHub {
                 return query_submits(compute);
             }
             st.cuts.cut(caller);
-            let capture = st.capture.clone().expect("a wave has a capture stream");
-            match Self::end_segment(&mut st, compute).and_then(|()| query_submits(&capture)) {
+            match Self::end_segment(&mut st, compute) {
                 Ok(()) => (Ok(()), std::mem::take(&mut st.graveyard)),
                 Err(e) => (Err(e), Graveyard::new()),
             }
@@ -1140,7 +1052,6 @@ impl CaptureHub {
                 _ => crate::bail!("no wave capture is open on this thread"),
             }
             let ended = Self::end_segment(&mut st, compute);
-            let ended = ended.and_then(|()| st.hand_to_capture());
             st.wave = None;
             // Launched or abandoned, nothing recorded still waits to read these.
             let dead = std::mem::take(&mut st.graveyard);
@@ -1176,39 +1087,32 @@ impl CaptureHub {
         if !recording {
             return false;
         }
-        let capture = st.capture.clone().expect("a wave has a capture stream");
+        let stream = st.compute.clone().expect("a wave has a compute stream");
         let ring = ((st.stats.waves + 1) % 2) as usize;
-        st.rings[ring].record(&capture, dst, src)
+        st.rings[ring].record(&stream, dst, src)
     }
 
     /// Release `item` — device memory a recorded launch may still read —
     /// once that launch has been issued. Returns it to the caller to drop at
-    /// once when no wave is recording.
+    /// once, under a lease, when no segment is recording.
     ///
     /// Any thread's release waits while a segment records, not only the
     /// recording thread's: the last reference to memory a recorded launch
-    /// reads may be dropped elsewhere, and a free issued then would queue on
-    /// the compute stream ahead of the segment that still reads it. It waits
-    /// through an eager segment too: that segment's launches are on the capture
-    /// stream, which the compute stream does not wait for until it ends.
+    /// reads may be dropped elsewhere, and a free issued on the stream then
+    /// would be taken into the capture. A segment run as issued holds nothing
+    /// back: its launches are on the stream ahead of the free.
     pub(crate) fn retire(&self, item: Box<dyn Send>) -> Option<Box<dyn Send>> {
         if !self.active.load(Ordering::Acquire) {
             return Some(item);
         }
         let mut st = self.lock();
         match &st.wave {
-            Some(w) if w.recording || w.eager => {
+            Some(w) if w.recording => {
                 st.graveyard.push(item);
                 None
             }
             _ => Some(item),
         }
-    }
-
-    /// How many releases are waiting for the recording segment to launch.
-    #[cfg(test)]
-    pub(crate) fn retired_len(&self) -> usize {
-        self.lock().graveyard.len()
     }
 
     /// Replace the executable library with an empty one of `budget` bytes,
@@ -1242,11 +1146,7 @@ impl CaptureHub {
             if st.wave.is_none() {
                 return;
             }
-            let capture = st.capture.clone().expect("a wave has a capture stream");
-            let _ = Self::end_segment(&mut st, compute)
-                .and_then(|()| st.hand_to_capture())
-                .and_then(|()| query_submits(&capture))
-                .and_then(|()| query_submits(compute));
+            let _ = Self::end_segment(&mut st, compute).and_then(|()| query_submits(compute));
             st.wave = None;
             self.active.store(false, Ordering::Release);
             // Segments launched before and by this close may still read the ring.

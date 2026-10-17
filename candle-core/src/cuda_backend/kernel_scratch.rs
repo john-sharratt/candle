@@ -43,15 +43,30 @@ fn scratch() -> &'static Mutex<Scratch> {
 
 /// Serve `bytes` for a launcher's scratch on device `device`.
 unsafe extern "C" fn take_kernel_scratch(device: i32, bytes: usize) -> *mut c_void {
-    let mut s = scratch().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(dev) = s.devices.get(&(device as usize)) else {
+    let Some(dev) = scratch()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .devices
+        .get(&(device as usize))
+        .cloned()
+    else {
         return std::ptr::null_mut();
     };
-    let stream = dev.compute_stream();
+    // Growth may come from the pool, which this thread's recording segment
+    // would take in: the segment is launched first, and the launch that asked
+    // for the scratch lands behind it on the same stream.
+    let Ok(_eager) = dev.pause_capture() else {
+        return std::ptr::null_mut();
+    };
+    let stream = dev.cuda_stream();
     match Held::<u8>::alloc_on(&stream, bytes) {
         Ok(held) => {
             let ptr = held.device_ptr(&stream).0;
-            s.blocks.insert(ptr, held);
+            scratch()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .blocks
+                .insert(ptr, held);
             ptr as *mut c_void
         }
         Err(_) => std::ptr::null_mut(),
@@ -80,7 +95,7 @@ pub(crate) fn install(dev: &CudaDevice) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .devices
-        .entry(dev.compute_stream().context().ordinal())
+        .entry(dev.cuda_stream().context().ordinal())
         .or_insert_with(|| dev.clone());
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
@@ -99,7 +114,7 @@ mod tests {
     #[test]
     fn a_replaced_block_is_released_and_the_current_one_kept() {
         let dev = CudaDevice::new(0).unwrap();
-        let ordinal = dev.compute_stream().context().ordinal() as i32;
+        let ordinal = dev.cuda_stream().context().ordinal() as i32;
         let held = |p: *mut c_void| scratch().lock().unwrap().blocks.contains_key(&(p as u64));
         // SAFETY: the allocator's own entry points, as a launcher calls them.
         unsafe {

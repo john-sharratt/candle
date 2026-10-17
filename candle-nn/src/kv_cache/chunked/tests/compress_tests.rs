@@ -14,9 +14,6 @@
 // Test code: byte widths are spelled out to match the arena record layout.
 #![allow(clippy::unnecessary_cast)]
 
-use std::sync::Arc;
-
-use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{DType, Device, Tensor};
 use half::f16;
@@ -52,7 +49,7 @@ fn cuda_device_or_skip() -> Option<(Device, crate::kv_cache::chunked::gpu_test_l
     }
 }
 
-fn cuda_stream(device: &Device) -> Arc<CudaStream> {
+fn cuda_stream(device: &Device) -> candle::cuda_backend::StreamLease {
     match device {
         Device::Cuda(d) => d.cuda_stream(),
         _ => unreachable!("test gated on a CUDA device"),

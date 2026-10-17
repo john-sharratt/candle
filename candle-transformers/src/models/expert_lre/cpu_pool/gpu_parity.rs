@@ -17,7 +17,7 @@ use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::ko_quant::{dequant_ko, quantize_ko};
 use candle::quantized::{GgmlDType, Int8Mode, SumScale};
 use candle::{Device, Result, Tensor};
-use cudarc::driver::{sys, DevicePtr};
+use cudarc::driver::DevicePtr;
 use hf_hub::api::sync::Api;
 use hf_hub::{Repo, RepoType};
 
@@ -113,12 +113,9 @@ fn both_chains(
     let gpu: Vec<f32> = y.flatten_all()?.to_vec1()?;
 
     let bytes = op.with_device_ptr(dev, |p| {
-        stream.synchronize().map_err(candle::Error::wrap)?;
         let mut v = vec![0u8; op.byte_len()];
-        // SAFETY: `p` is the operand's live allocation of `byte_len` bytes;
-        // the device is synchronized.
-        let r = unsafe { sys::cuMemcpyDtoH_v2(v.as_mut_ptr().cast(), p, v.len()) };
-        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "operand to host");
+        // SAFETY: `p` is the operand's live allocation of `byte_len` bytes.
+        unsafe { dev.read_raw(p, &mut v) }?;
         Ok(v)
     })?;
     let rows: Vec<usize> = (0..tokens).collect();

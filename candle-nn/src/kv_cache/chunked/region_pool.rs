@@ -80,7 +80,7 @@ use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
-use candle::cuda_backend::cudarc::driver::result::memset_d8_sync;
+use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::cuda_backend::graph::{graph_budget_bytes, try_without_recording};
 use candle::cuda_backend::install_held_ground;
@@ -1811,7 +1811,11 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
                 });
                 let sync_ns = t_sync.elapsed().as_nanos() as u64;
                 let t_fill = Instant::now();
-                let zeroed = synced.and_then(|()| unsafe { memset_d8_sync(base, 0, REGION_BYTES) });
+                // On the device's stream, ahead of the region's next tenant;
+                // nothing records while the gate's `quiet` is held.
+                let zeroed = synced.and_then(|()| unsafe {
+                    memset_d8_async(base, 0, REGION_BYTES, stream.cu_stream())
+                });
                 record_recycle(needs_sync, sync_ns, t_fill.elapsed().as_nanos() as u64);
                 zeroed
             });
@@ -2085,7 +2089,7 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
             stream
                 .context()
                 .bind_to_thread()
-                .and_then(|()| unsafe { memset_d8_sync(base, 0xCD, len) })
+                .and_then(|()| unsafe { memset_d8_async(base, 0xCD, len, stream.cu_stream()) })
                 .map_err(candle::Error::wrap)?;
         }
         pool.transient_base = Some(base);
@@ -2898,7 +2902,7 @@ pub fn claim_span_region(
 /// Held open for the whole construction instead, a tenant pays for one window
 /// and one tier handback however many regions it takes.
 pub struct SpanClaims {
-    stream: std::sync::Arc<CudaStream>,
+    device: candle::CudaDevice,
     /// The window itself. Dropped with this, which is what re-arms the tier for
     /// the next forward.
     _window: super::bump_arena::ArenaWindow,
@@ -2911,14 +2915,16 @@ impl SpanClaims {
         let candle::Device::Cuda(cuda) = device else {
             candle::bail!("SpanClaims: the reservation is a CUDA allocation");
         };
-        let stream = cuda.cuda_stream();
-        let _window = super::bump_arena::enter_arena_window(&stream, tenant)?;
-        Ok(Self { stream, _window })
+        let _window = super::bump_arena::enter_arena_window(&cuda.cuda_stream(), tenant)?;
+        Ok(Self {
+            device: cuda.clone(),
+            _window,
+        })
     }
 
     /// One more region, or `None` when the KV side has none spare.
     pub fn claim(&self) -> Result<Option<SpanRegion>> {
-        Ok(claim_region(&self.stream)?.map(SpanRegion::adopt))
+        Ok(claim_region(&self.device.cuda_stream())?.map(SpanRegion::adopt))
     }
 }
 
@@ -3309,7 +3315,6 @@ mod tests {
         region_stats, release_transient, Layout, PERSIST_SPAN_BYTES, REGION_BYTES,
     };
     use candle::{Device, Result};
-    use std::sync::Arc;
 
     /// The layout of a span with the fixed block every span has.
     fn rest_layout(base: u64, span: usize, dense: usize, floor: u64) -> Layout {
@@ -3473,7 +3478,6 @@ mod tests {
         assert_eq!(spare(10, 0, 32), 0);
     }
 
-    use candle::cuda_backend::cudarc::driver::CudaStream;
     use std::cmp::Reverse;
 
     /// Direct pool access, for the two ownership guards: the states they refuse
@@ -3486,7 +3490,7 @@ mod tests {
     /// crate-wide lock and not a local `static`.
     use super::super::gpu_test_lock::gpu_serial as serial;
 
-    fn stream() -> Option<Arc<CudaStream>> {
+    fn stream() -> Option<candle::cuda_backend::StreamLease> {
         match Device::new_cuda(0) {
             Ok(Device::Cuda(d)) => Some(d.cuda_stream()),
             _ => None,

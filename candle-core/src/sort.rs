@@ -123,7 +123,7 @@ mod cuda {
                             ncols_pad as i32,
                             nrows as i32,
                             shared_mem_size,
-                            std::ptr::null_mut(), // Use default stream
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     } else {
                         kernels::simple::sort::run_argsort_desc(
@@ -134,7 +134,7 @@ mod cuda {
                             ncols_pad as i32,
                             nrows as i32,
                             shared_mem_size,
-                            std::ptr::null_mut(), // Use default stream
+                            stream.cu_stream() as *mut std::ffi::c_void,
                         );
                     }
                 }

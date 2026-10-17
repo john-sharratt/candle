@@ -23,10 +23,6 @@ macro_rules! fail {
 }
 
 impl CudaDevice {
-    pub fn new_with_stream(_: usize) -> Result<Self> {
-        Err(Error::NotCompiledWithCudaSupport)
-    }
-
     pub fn arange_int(
         &self,
         _dtype: crate::DType,

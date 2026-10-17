@@ -32,7 +32,7 @@
 use crate::cuda_backend::WrapErr;
 use crate::{CudaDevice, Result};
 use cudarc::driver::sys;
-use cudarc::driver::{CudaEvent, CudaStream};
+use cudarc::driver::CudaEvent;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -55,9 +55,8 @@ struct RingState {
 pub struct TableRing {
     host_base: *mut u8,
     dev_base: u64,
-    /// The compute stream every reader of a table runs on — never the capture
-    /// stream, even when the ring is made while a wave records.
-    stream: Arc<CudaStream>,
+    /// The device every reader of a table runs on; its fences go on the
+    /// device's stream under a lease.
     device: CudaDevice,
     state: Mutex<RingState>,
 }
@@ -95,7 +94,6 @@ impl TableRing {
         Ok(Self {
             host_base: host_ptr as *mut u8,
             dev_base: dev_ptr,
-            stream: dev.compute_stream(),
             device: dev.clone(),
             state: Mutex::new(RingState {
                 offset: 0,
@@ -126,7 +124,7 @@ impl TableRing {
             // wave capture some of those launches are recorded and not yet
             // issued, so they are issued first — the fence must follow them.
             let _eager = self.device.pause_capture()?;
-            let ev = self.stream.record_event(None).w()?;
+            let ev = self.device.cuda_stream().record_event(None).w()?;
             let leaving = st.half;
             st.fences[leaving] = Some(ev);
             st.half ^= 1;
@@ -147,7 +145,7 @@ impl TableRing {
 impl Drop for TableRing {
     fn drop(&mut self) {
         // Launches referencing the slab must drain before the memory goes away.
-        let _ = self.stream.synchronize();
+        let _ = self.device.cuda_stream().synchronize();
         unsafe {
             let _ = sys::cuMemFreeHost(self.host_base as *mut std::ffi::c_void);
         }
