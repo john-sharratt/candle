@@ -31,6 +31,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::Hasher;
 use std::sync::Arc;
+use std::time::Instant;
 
 use candle::{Device, Tensor};
 use candle_nn::kv_cache::{SealedSequence, WriterTail};
@@ -49,6 +50,7 @@ use crate::projection::{
     Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
 };
 use crate::scheduler::injected_piece::InjectedPiece;
+use crate::scheduler::pending_ranges::PendingRanges;
 use crate::scheduler::piece_identity::{
     chained_identities, fit_kept_prefix, kept_prefix, piece_label, PieceReads,
 };
@@ -745,7 +747,7 @@ pub(super) fn apply_segments(
             return apply_segments_finish(state, &mut ctx, plan, false);
         }
     }
-    let t_glue = std::time::Instant::now();
+    let t_glue = Instant::now();
     if let Err(e) = fire_gap_fill_batch(ctx.session, &**ctx.model, &[&plan]) {
         // The walk recorded the glue pieces as placed; unfilled, they are
         // zero chunks no later rebuild may keep.
@@ -895,7 +897,7 @@ pub(super) fn apply_segments_build(
     //    NewUserMessage is deferred to prefill after the gaps are filled.
     // The glue/order decision is owned by `assemble_pieces` (the single source
     // of truth, shared with the substrate debug view).
-    let mut walker = SegmentWalker::new();
+    let mut walker = SegmentWalker::new(ctx.conversation);
     // A sealed turn's `/no_think` switch needs no look-up here: it is baked into
     // the turn's own grid, so injecting the turn injects the switch it was
     // sealed with. Its ROLE MARKERS do need one: a turn sealed before the
@@ -928,7 +930,7 @@ pub(super) fn apply_segments_build(
     // cut back to the end of that run — K/V, index and token log together — and
     // only the rest is walked. A projection whose selection moved at the end
     // costs the end, not the whole prefix (`super::piece_identity`).
-    let t_identities = std::time::Instant::now();
+    let t_identities = Instant::now();
     let identities = {
         let _g = profile::span("apply:identities");
         let read = ctx.conversation.read();
@@ -1009,7 +1011,7 @@ pub(super) fn apply_segments_build(
         "apply_segments: kept prefix"
     );
     state.placed_pieces.truncate(keep);
-    let t_cut = std::time::Instant::now();
+    let t_cut = Instant::now();
     let cut_span = profile::span("apply:cut_to_kept");
     let mut prefix_h = DefaultHasher::new();
     match state.placed_pieces.last() {
@@ -1093,7 +1095,7 @@ pub(super) fn apply_segments_build(
     check_drift(ctx, &walker, &|| "kept prefix".to_string());
     for i in keep..pieces.len() {
         let pos_before = walker.logical_pos;
-        let t_piece = std::time::Instant::now();
+        let t_piece = Instant::now();
         let kind = match &pieces[i] {
             AssembledPiece::Section(_) => 0,
             AssembledPiece::Turn { .. } | AssembledPiece::TurnHalf { .. } => 1,
@@ -1240,7 +1242,7 @@ pub(super) fn apply_segments_build(
             }
             AssembledPiece::Section(id) => {
                 let _g = profile::span("apply:inject_section");
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 inject_sealed_section(ctx, &mut walker, *id)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
                 prefix_h.write_u8(2);
@@ -1261,7 +1263,7 @@ pub(super) fn apply_segments_build(
                 timeline,
             } => {
                 let _g = profile::span("apply:inject_turn");
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 inject_sealed_turn(ctx, &mut walker, *timeline, *group, *index, *role)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
                 prefix_h.write_u8(3);
@@ -1278,7 +1280,7 @@ pub(super) fn apply_segments_build(
                 index,
                 timeline,
             } => {
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 inject_sealed_turn_half(ctx, &mut walker, *timeline, *group, *index)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
                 prefix_h.write_u8(4);
@@ -1304,6 +1306,9 @@ pub(super) fn apply_segments_build(
         walk_us[kind] += t_piece.elapsed().as_micros() as u64;
         walked[kind] += 1;
     }
+    let t_ranges = Instant::now();
+    walker.ranges.flush();
+    let ranges_us = t_ranges.elapsed().as_micros() as u64;
     // What the rebuild cost, by what it walked — a kept prefix is free, and every
     // piece past it is re-injected.
     tracing::debug!(
@@ -1317,6 +1322,10 @@ pub(super) fn apply_segments_build(
         turns = walked[1],
         glue_us = walk_us[2],
         glue = walked[2],
+        ranges_us,
+        turn_resolve_us = walker.turn_resolve_us,
+        turn_inject_us = walker.turn_inject_us,
+        turn_pages_us = walker.turn_pages_us,
         kept = keep,
         "apply split"
     );
@@ -1411,7 +1420,7 @@ pub(super) fn apply_segments_build(
 /// State carried across a single `apply_segments` walk. Accumulates the gap-fill
 /// new region (every glue island) plus each column's TRUE logical position, so
 /// the walk emits one batched gap-fill forward instead of N per-island prefills.
-struct SegmentWalker {
+struct SegmentWalker<'c> {
     /// All glue tokens across every island, in logical order — the gap-fill Q.
     glue_tokens: Vec<u32>,
     /// Per glue token: the reserved gap chunk's block index (its scatter target).
@@ -1450,10 +1459,20 @@ struct SegmentWalker {
     pages_pushed: usize,
     /// Leading pieces kept from the slot's last assembly rather than walked.
     kept_pieces: usize,
+    /// Where each turn and section this walk placed now sits in the slot,
+    /// written back to the substrate under one lock once the walk ends — or
+    /// as it leaves early on an error ([`PendingRanges`]).
+    ranges: PendingRanges<'c, Conversation>,
+    /// Microseconds the walk's turns spent resolving their sealed K/V and
+    /// index rows, injecting the K/V, and pushing the index pages — the parts of
+    /// a turn's cost the `apply split` line breaks out.
+    turn_resolve_us: u64,
+    turn_inject_us: u64,
+    turn_pages_us: u64,
 }
 
-impl SegmentWalker {
-    fn new() -> Self {
+impl<'c> SegmentWalker<'c> {
+    fn new(conversation: &'c Conversation) -> Self {
         Self {
             glue_tokens: Vec::new(),
             glue_write_slice: Vec::new(),
@@ -1471,6 +1490,10 @@ impl SegmentWalker {
             skipped_sections: 0,
             pages_pushed: 0,
             kept_pieces: 0,
+            ranges: PendingRanges::new(conversation),
+            turn_resolve_us: 0,
+            turn_inject_us: 0,
+            turn_pages_us: 0,
         }
     }
 
@@ -1726,13 +1749,17 @@ fn inject_sealed_section(
         }
     }
 
-    let toks = ctx.conversation.read().section_tokens_of(sid);
+    // Written with the walk's other ranges, under one write lock (see the turn path).
     let (start_block, end_block) = injected.range;
-    ctx.conversation
-        .write()
-        .set_section_block_range(sid, start_block as u64, end_block as u64);
+    walker
+        .ranges
+        .section((sid, start_block as u64, end_block as u64));
 
-    log_injected_tokens(ctx, &toks[..injected.tokens.min(toks.len())]);
+    #[cfg(feature = "context-dump")]
+    {
+        let toks = ctx.conversation.read().section_tokens_of(sid);
+        log_injected_tokens(ctx, &toks[..injected.tokens.min(toks.len())]);
+    }
     walker.sealed_sections += 1;
     walker.sealed_tokens += injected.tokens;
     walker.record_sealed(injected.tokens);
@@ -1831,6 +1858,7 @@ fn inject_sealed_turn(
     // that predates it misses there and the record is the only copy — which is
     // the whole reason the pages are written to the log rather than kept in RAM.
     let key = TurnKey { timeline, index };
+    let t_resolve = Instant::now();
     let fetch = profile::span("inject:turn:fetch_page");
     let resident = ctx.turn_positional.get(&key).cloned();
     let (sealed, page) = {
@@ -1873,6 +1901,7 @@ fn inject_sealed_turn(
             }
         }
     };
+    walker.turn_resolve_us += t_resolve.elapsed().as_micros() as u64;
     let sealed = match sealed {
         Some(s) => s,
         None => {
@@ -1949,7 +1978,10 @@ fn inject_sealed_turn(
         return Ok(());
     }
     let what = InjectedPiece::Turn(timeline, index);
-    let Some(injected) = inject_arc_sealed(ctx.session, parent_id, &sealed, &what)? else {
+    let t_inject = Instant::now();
+    let injected = inject_arc_sealed(ctx.session, parent_id, &sealed, &what)?;
+    walker.turn_inject_us += t_inject.elapsed().as_micros() as u64;
+    let Some(injected) = injected else {
         walker.skipped_turns += 1;
         return Ok(());
     };
@@ -1966,6 +1998,7 @@ fn inject_sealed_turn(
     // A cut turn's pages describe tokens the slot does not hold — see the same
     // rule in `inject_sealed_section`.
     let page = page.filter(|_| !injected.was_cut());
+    let t_pages = Instant::now();
     // The rows that go with those chunks. Borrowing the K/V is what makes a
     // reprojection cheap; the index cannot be borrowed the same way, because
     // its keys come from hidden states this slot never computed.
@@ -2051,17 +2084,27 @@ fn inject_sealed_turn(
         }
     }
 
-    let toks: Vec<u32> = ctx
-        .conversation
-        .read()
-        .assistant_token_ids_of(timeline, index)
-        .to_vec();
+    walker.turn_pages_us += t_pages.elapsed().as_micros() as u64;
+    // Recorded on the walker and written once the walk ends, under one write
+    // lock for every turn it placed: a write lock per turn queued each one
+    // behind whatever reader held the substrate — the persistence thread mid-pass.
     let (start_block, end_block) = injected.range;
-    ctx.conversation
-        .write()
-        .set_block_range(timeline, index, start_block as u64, end_block as u64);
+    walker
+        .ranges
+        .turn((timeline, index, start_block as u64, end_block as u64));
 
-    log_injected_tokens(ctx, &toks);
+    // The slot's token log is a `context-dump` diagnostic; without the feature
+    // the turn's ids are not read at all — copying them was a full turn's worth
+    // of ids, under a read lock, for every turn a rebuild placed.
+    #[cfg(feature = "context-dump")]
+    {
+        let toks: Vec<u32> = ctx
+            .conversation
+            .read()
+            .assistant_token_ids_of(timeline, index)
+            .to_vec();
+        log_injected_tokens(ctx, &toks);
+    }
     walker.sealed_turns += 1;
     walker.sealed_tokens += injected.tokens;
     walker.record_sealed(injected.tokens);
@@ -2312,7 +2355,7 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
     // in-flight user message); `drain_add_us` only counts the former. The tokens go
     // to `DRAIN_PREFILL_TOKENS` so the Prefill phase can reclaim them from the
     // otherwise-token-less projection band.
-    let t_fwd = std::time::Instant::now();
+    let t_fwd = Instant::now();
     let mut offset = 0;
     while offset < tokens.len() {
         let chunk_len = (tokens.len() - offset).min(ctx.max_prefill_pass_tokens);
@@ -2721,7 +2764,7 @@ pub(super) fn apply_segments_finish(
     // inject when there is no glue), so the user message must push a fresh writer
     // chunk rather than extend it — `last_was_sealed = true` unconditionally.
     if let Some(tokens) = deferred_user {
-        let mut walker = SegmentWalker::new();
+        let mut walker = SegmentWalker::new(ctx.conversation);
         walker.last_was_sealed = true;
         handle_new_user_message(state, ctx, &mut walker, &tokens)?;
     }
