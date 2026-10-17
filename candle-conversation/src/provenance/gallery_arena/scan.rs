@@ -32,6 +32,7 @@ use super::super::gpu::{needle_tally_segments, BDP_TQ};
 use super::super::WideQSig;
 use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
+use super::scan_split::{self, LaunchTiming};
 use super::GalleryArena;
 
 /// A sub-window of a resident turn that contributes to a scan: `[start, end)`
@@ -417,6 +418,11 @@ impl GalleryArena {
         // conversation's. With `reused` it separates "my working set churned"
         // from "someone else's did".
         let mutations = self.residency_gen().saturating_sub(gen_before);
+        scan_split::add(|s| {
+            s.scans += 1;
+            s.segments += segments.len() as u64;
+            s.index_us += index_us;
+        });
         let t_launch = Instant::now();
         let result = self.launch_paged(&idx, probes, group_weights, force);
         let launch_us = t_launch.elapsed().as_micros() as u64;
@@ -497,8 +503,13 @@ impl GalleryArena {
         let mut rows = idx.rows.lock().unwrap_or_else(|e| e.into_inner());
         let fresh = rows.plan(&probe_words, wpt);
         profile::record("arena:rows_plan", t_plan.elapsed());
-        let (upload_us, kernel_us, readback_us) = if fresh.is_empty() {
-            (0, 0, 0)
+        let mut rows_us = t_plan.elapsed().as_micros() as u64;
+        let LaunchTiming {
+            upload_us,
+            kernel_us,
+            readback_us,
+        } = if fresh.is_empty() {
+            LaunchTiming::default()
         } else {
             let tokens: Vec<&[u64]> = fresh
                 .iter()
@@ -510,6 +521,7 @@ impl GalleryArena {
             let t_insert = Instant::now();
             rows.insert(&tokens, &case, &vote);
             profile::record("arena:rows_insert", t_insert.elapsed());
+            rows_us += t_insert.elapsed().as_micros() as u64;
             timing
         };
         let t_assemble = Instant::now();
@@ -518,6 +530,7 @@ impl GalleryArena {
             .expect("every probe token has a row once its launch is in");
         drop(rows);
         profile::record("arena:rows_assemble", t_assemble.elapsed());
+        rows_us += t_assemble.elapsed().as_micros() as u64;
 
         let t_tally = Instant::now();
         let votes = needle_tally_segments(
@@ -534,6 +547,16 @@ impl GalleryArena {
         profile::record("arena:launch_kernel", Duration::from_micros(kernel_us));
         profile::record("arena:launch_readback", Duration::from_micros(readback_us));
         profile::record("arena:launch_tally", t_tally.elapsed());
+        let tally_us = t_tally.elapsed().as_micros() as u64;
+        scan_split::add(|s| {
+            s.launches += u64::from(!fresh.is_empty());
+            s.fresh_tokens += fresh.len() as u64;
+            s.upload_us += upload_us;
+            s.kernel_us += kernel_us;
+            s.readback_us += readback_us;
+            s.rows_us += rows_us;
+            s.tally_us += tally_us;
+        });
         // Where a launch's time goes: the probe upload, the kernel (to its
         // synchronize), the vote readback, and the host tally — over the
         // `scored` tokens no earlier launch over this index had scored.
@@ -543,6 +566,7 @@ impl GalleryArena {
             probe_tokens = n_probe_tokens,
             scored = fresh.len(),
             segments = n_segments,
+            cases = n_cases,
             upload_us,
             kernel_us,
             readback_us,
@@ -555,7 +579,7 @@ impl GalleryArena {
     /// One kernel launch over `n_probe_tokens` probe tokens (`probe_words`,
     /// `wpt` words each) against `idx`, on the fastest backend the device and
     /// geometry admit. Returns the raw output — one row per probe token — and
-    /// the `(upload, kernel, readback)` microseconds.
+    /// where the launch's time went.
     #[allow(clippy::type_complexity)]
     fn launch_kernel(
         &self,
@@ -565,7 +589,7 @@ impl GalleryArena {
         probe_words: &[u64],
         n_probe_tokens: usize,
         force: Option<PagedBackend>,
-    ) -> Result<(Vec<i32>, Vec<f32>, (u64, u64, u64))> {
+    ) -> Result<(Vec<i32>, Vec<f32>, LaunchTiming)> {
         let wpt = self.wpt();
         let n_groups = self.n_groups();
         let gw = wpt / n_groups;
@@ -771,7 +795,15 @@ impl GalleryArena {
             launch,
         )?;
         let kernel_us = (t_kernel.elapsed().as_micros() as u64).saturating_sub(readback_us);
-        Ok((out_case, out_vote, (upload_us, kernel_us, readback_us)))
+        Ok((
+            out_case,
+            out_vote,
+            LaunchTiming {
+                upload_us,
+                kernel_us,
+                readback_us,
+            },
+        ))
     }
 }
 
@@ -1526,6 +1558,87 @@ mod tests {
                         "probe {pi} case {ci}: scalar {s} vs IMMA {m} must be bit-identical"
                     );
                 }
+            }
+        }
+    }
+
+    /// **The live reprojection's widest scan, timed per backend.** The shape a
+    /// turn group took in zend on `.5` (2026-10-17): 8.08 M index tokens over 9
+    /// segments and 1,041 cases, scored for 66 fresh probe tokens — 16–23 ms a
+    /// launch, the largest single cost in a reprojection — and for a seal's
+    /// whole turn. Fresh probes each repetition, so the row cache never answers.
+    /// Run with the card otherwise idle:
+    ///
+    /// `cargo test --release -p candle-conversation --lib bench_wide_turn_group_scan -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: needs an idle card"]
+    fn bench_wide_turn_group_scan() {
+        let device = Device::new_cuda(0).expect("a CUDA card");
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let mut rng = 0xBE_4C11_0017_u64;
+        // ~1 M distinct tokens: more than L2, as the resident corpus is.
+        const TURN_TOKENS: usize = 512;
+        let turns: Vec<Vec<WideQSig>> = (0..2_048)
+            .map(|_| (0..TURN_TOKENS).map(|_| rand_sig(&mut rng)).collect())
+            .collect();
+        const SEGMENTS: usize = 9;
+        const CASES_PER_SEGMENT: usize = 116;
+        const WINDOWS_PER_CASE: usize = 15;
+        let mut next = 0usize;
+        let segs: Vec<PagedSegment> = (0..SEGMENTS)
+            .map(|_| {
+                let mut windows = Vec::new();
+                for case in 0..CASES_PER_SEGMENT {
+                    for _ in 0..WINDOWS_PER_CASE {
+                        let ti = next % turns.len();
+                        next += 1;
+                        windows.push(PagedWindow {
+                            sid: turn_stream_id(7_000, ti as u32),
+                            fingerprint: ti as u64,
+                            turn: &turns[ti],
+                            start: 0,
+                            end: TURN_TOKENS,
+                            case,
+                        });
+                    }
+                }
+                PagedSegment {
+                    windows,
+                    n_cases: CASES_PER_SEGMENT,
+                }
+            })
+            .collect();
+        let tokens = SEGMENTS * CASES_PER_SEGMENT * WINDOWS_PER_CASE * TURN_TOKENS;
+        let (has_bmma, has_imma) = arena.tensor_caps();
+        let mut backends: Vec<&str> = Vec::new();
+        if has_bmma {
+            backends.push("bmma");
+        }
+        if has_imma {
+            backends.push("imma");
+        }
+        backends.push("auto");
+        let scan = |name: &str, probe: &[WideQSig]| match name {
+            "bmma" => arena.scan_weighted_bmma(&segs, &[probe], &[]),
+            "imma" => arena.scan_weighted_imma(&segs, &[probe], &[]),
+            _ => arena.scan_weighted(&segs, &[probe], &[]),
+        };
+        println!("gallery: {tokens} index tokens, {SEGMENTS} segments");
+        for probe_tokens in [66usize, 256, 1_024] {
+            for name in &backends {
+                // The first scan builds the index and uploads the pages.
+                let warm: Vec<WideQSig> = (0..probe_tokens).map(|_| rand_sig(&mut rng)).collect();
+                scan(name, &warm).unwrap();
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let probe: Vec<WideQSig> =
+                        (0..probe_tokens).map(|_| rand_sig(&mut rng)).collect();
+                    let t = Instant::now();
+                    scan(name, &probe).unwrap();
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                }
+                println!("  {name:>5} probe {probe_tokens:>5}: {best:8.2} ms");
             }
         }
     }

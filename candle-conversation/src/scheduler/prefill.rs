@@ -6,6 +6,7 @@ use super::admit;
 use super::admit_ground::AdmitPass;
 use super::band::rank;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
+use super::creep_slice::time_bounded_layers;
 use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };
@@ -3382,21 +3383,36 @@ impl Scheduler {
         self.wave_step_token_paced = token_paced;
         // A `High` creep beside a `High` decode is paced in tokens: it rides
         // only once its debt is paid (`run`'s gate), and advances the layers its
-        // credit covers. Every other creep advances `ceil(N / R)`.
+        // credit covers. Every other creep advances `ceil(N / R)` — and beside
+        // decode rows no more than a decode-only step's worth of them
+        // (`creep_slice`), so the share `R` sets is paid in steps, not seconds.
+        let creep_rows: usize = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(0))
+            .sum();
         let budget = if finish_sweep {
             n - cursor.min(n)
         } else if token_paced {
-            let rows: usize = inputs
-                .iter()
-                .map(|t| t.dims().get(1).copied().unwrap_or(0))
-                .sum();
-            let layers = same_band_layers(self.same_band_debt, rows, n - cursor.min(n));
-            self.same_band_debt += (rows * layers) as i64;
+            let layers = same_band_layers(self.same_band_debt, creep_rows, n - cursor.min(n));
+            self.same_band_debt += (creep_rows * layers) as i64;
             layers
+        } else if head_rows > 0 {
+            time_bounded_layers(
+                creep_layer_budget(n, ratio).min(n - cursor.min(n)),
+                creep_rows,
+                self.creep_layer_row_cost,
+                self.decode_only_step,
+            )
         } else {
             creep_layer_budget(n, ratio)
         };
         let win_end = (cursor + budget).min(n);
+        // What rode beside decode, for the next slice's cost estimate.
+        self.wave_step_creep_layer_rows = if head_rows > 0 && !seq_ids.is_empty() {
+            creep_rows * (win_end - cursor.min(win_end))
+        } else {
+            0
+        };
 
         // No creep group → one full-sweep [0, N) forward folding decode + a
         // standalone section chunk (if pending) + glue. All full-sweep, no residual

@@ -1,4 +1,5 @@
 use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
+use super::creep_slice::next_layer_row_cost;
 use super::prefill::{VramPhase, LOAD_TARGET};
 use super::vram_bands::vram_bands;
 use super::wave_retry::{Next, WaveRetry};
@@ -290,6 +291,7 @@ impl Scheduler {
                 // decode-only, then filed by the shape the wave turned out to be.
                 self.wave_cobatched = false;
                 self.wave_step_token_paced = false;
+                self.wave_step_creep_layer_rows = 0;
                 let generated = self.decode_tokens_generated();
                 let t_step = Instant::now();
                 self.batch_decode_step();
@@ -320,6 +322,15 @@ impl Scheduler {
                 );
                 if !self.wave_cobatched {
                     self.decode_only_step = Some(next_decode_only(self.decode_only_step, step));
+                } else if let Some(decode_only) = self.decode_only_step {
+                    // What the creep that rode cost beside decode, so the next
+                    // slice fits a decode step's worth of it.
+                    self.creep_layer_row_cost = next_layer_row_cost(
+                        self.creep_layer_row_cost,
+                        step,
+                        decode_only,
+                        self.wave_step_creep_layer_rows,
+                    );
                 }
             }
             // Drain any continuous-re-projection swaps queued during the

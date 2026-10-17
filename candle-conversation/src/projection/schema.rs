@@ -54,6 +54,8 @@
 //!
 //! `LayerSchema.window` has no default — it must be declared.
 
+use std::num::NonZeroUsize;
+
 use super::adaptive::{AnchorConfig, BudgetAdaptive, LocalityConfig, MemberBudgetAdaptive};
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::policy::{PolicyConfig, SelectionPolicy};
@@ -1051,7 +1053,8 @@ pub struct GroupSchema {
     /// group's selection (`docs/projection_swap_cap.md`); the rest wait for the
     /// next. Belief-driven groups only — the working set fades by its own
     /// momentum, and section collections (the tool catalog) are not capped.
-    pub max_swaps: usize,
+    /// Never zero: the smallest cap still admits one whole conversation.
+    pub max_swaps: NonZeroUsize,
 }
 
 impl GroupSchema {

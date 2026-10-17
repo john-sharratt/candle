@@ -1,5 +1,7 @@
 //! A dialogue layer's `working_set:` block (`docs/zend_working_set.md` §4.2).
 
+use std::num::NonZeroUsize;
+
 use super::state::Limits;
 
 /// The fresh score of a full-strength hit — the top of the normalized band a
@@ -37,7 +39,8 @@ pub struct WorkingSetConfig {
     /// The most provenance members one reprojection admits; the rest keep
     /// their momentum and enter on later ones (`WorkingSet::observe`). Locks
     /// and seeds are not counted — a lock answers a call the model just made.
-    pub max_admits: usize,
+    /// Never zero: the smallest cap still admits one whole conversation.
+    pub max_admits: NonZeroUsize,
 }
 
 impl WorkingSetConfig {
@@ -82,7 +85,7 @@ mod tests {
             max_file_tokens: 100_000,
             seeds: Vec::new(),
             release_on: vec!["write".into(), "file_edit".into()],
-            max_admits: 2,
+            max_admits: NonZeroUsize::new(2).unwrap(),
         }
     }
 

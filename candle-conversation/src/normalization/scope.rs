@@ -1,6 +1,7 @@
 //! One scope's normalization state: a hit level per child, plus the read
 //! (`normalize_with_floors`) and write (`observe`) operations over them.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use super::hit_level::HitLevel;
@@ -31,6 +32,13 @@ pub(super) struct ScopeState {
     /// distinct observation — a turn stream id — which for the corpora here is
     /// hundreds to low thousands per scope.
     observed: HashSet<u64>,
+    /// [`Self::floor`], kept until a child's level changes. The floor is a
+    /// percentile over every child's level — a sort of the whole scope — and
+    /// a pooled scope is normalized once per document in it, so recomputing it
+    /// per call sorted ~1,000 levels ~1,000 times a scan: 9.7 ms of a live
+    /// reprojection's belief scan (`.5`, 2026-10-17). Only [`Self::observe`]
+    /// changes a level, and it clears this.
+    floor: Cell<Option<f32>>,
 }
 
 impl ScopeState {
@@ -88,6 +96,7 @@ impl ScopeState {
         cfg: &NormConfig,
         probe_tokens: usize,
     ) {
+        self.floor.set(None);
         for (k, r) in raw {
             self.children
                 .entry(k.clone())
@@ -102,6 +111,16 @@ impl ScopeState {
     /// Floors compare against reference-scaled scores (see [`to_ref`]) because
     /// that is what the levels now hold, so nothing here needs its own scaling.
     fn floor(&self, cfg: &NormConfig) -> f32 {
+        if let Some(floor) = self.floor.get() {
+            return floor;
+        }
+        let floor = self.compute_floor(cfg);
+        self.floor.set(Some(floor));
+        floor
+    }
+
+    /// [`Self::floor`] from the levels as they stand.
+    fn compute_floor(&self, cfg: &NormConfig) -> f32 {
         let mut levels: Vec<f32> = self
             .children
             .values()
@@ -126,5 +145,61 @@ impl ScopeState {
     /// denominator. `None` when the scope has never seen it at all.
     pub(super) fn count_of(&self, k: &ChildKey) -> Option<u32> {
         self.children.get(k).map(|h| h.count())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(scores: &[(u64, f32)]) -> Vec<(ChildKey, f32)> {
+        scores
+            .iter()
+            .map(|&(k, v)| (ChildKey::turn(k), v))
+            .collect()
+    }
+
+    /// **The kept floor is the floor the levels give**, before and after an
+    /// observe moves them: a normalize after an observe divides by the new
+    /// percentile, never a stale one, and repeated normalizes agree exactly.
+    #[test]
+    fn the_kept_floor_follows_every_observe() {
+        let cfg = NormConfig::default();
+        let mut scope = ScopeState::default();
+        scope.observe(
+            &raw(&[(1, 40.0), (2, 900.0), (3, 120.0)]),
+            &cfg,
+            cfg.probe_t_ref,
+        );
+        let probe = raw(&[(1, 50.0), (2, 50.0), (3, 50.0), (4, 50.0)]);
+        let first = scope.normalize_with_floors(&probe, &[], &cfg, cfg.probe_t_ref);
+        assert_eq!(scope.floor.get(), Some(scope.compute_floor(&cfg)));
+        let again = scope.normalize_with_floors(&probe, &[], &cfg, cfg.probe_t_ref);
+        assert_eq!(
+            first, again,
+            "a kept floor normalizes as the computed one did"
+        );
+
+        // Raise every level well past the old floor: the next normalize must
+        // divide by the new one.
+        for _ in 0..20 {
+            scope.observe(
+                &raw(&[(1, 5_000.0), (2, 9_000.0), (3, 7_000.0)]),
+                &cfg,
+                cfg.probe_t_ref,
+            );
+        }
+        assert_eq!(scope.floor.get(), None, "an observe drops the kept floor");
+        let after = scope.normalize_with_floors(&probe, &[], &cfg, cfg.probe_t_ref);
+        assert_eq!(scope.floor.get(), Some(scope.compute_floor(&cfg)));
+        let fresh = ScopeState {
+            children: scope.children.clone(),
+            ..ScopeState::default()
+        }
+        .normalize_with_floors(&probe, &[], &cfg, cfg.probe_t_ref);
+        assert_eq!(
+            after, fresh,
+            "the same levels, the same scores, kept or not"
+        );
     }
 }

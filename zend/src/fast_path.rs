@@ -321,6 +321,7 @@ fn lines_in(meta: &BTreeMap<String, String>) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
 
     use zend_vfs::{ObjectFormat, RepoSpec};
 
@@ -528,7 +529,7 @@ mod tests {
             max_file_tokens: 500,
             seeds: Vec::new(),
             release_on: vec!["write".into(), "file_edit".into()],
-            max_admits: 2,
+            max_admits: NonZeroUsize::new(2).unwrap(),
         }
     }
 

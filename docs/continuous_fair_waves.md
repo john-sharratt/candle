@@ -101,6 +101,17 @@ per layer by how interactive that layer's conversations are. The layer budget
 keeps each step's slice of the creep small; how often a slice rides is set by
 airtime — decode gets `R` times the creep's share of the device (§6).
 
+**Beside decode rows the slice is also bounded in time** (`scheduler/creep_slice.rs`):
+no more than one decode-only step's worth of layers, at what a layer-row of creep
+has cost on the steps it rode (learned per step; a single layer until measured).
+`N / R` alone made the `R = 1` slice the whole sweep: an 8K-row ingest group at
+depth rode one decode step for 1.7 s, and every decode beside it stood still for
+each of them — ~5 tokens a second where it ran ~100 alone (`.5`, 2026-10-17;
+`decode:cobatched:step` 1,737 ms against 34 ms decode-only). Bounded, the same
+group's co-batched steps measured 133 ms. The share `R` sets is unchanged — the
+debt is still the slice times `R` — it is only paid in steps rather than seconds.
+With nothing decoding there is nothing to protect, and the creep runs its `N / R`.
+
 **An outranking decode is protected, and a `High` one from `High` work too.**
 The creep yields to the decodes that outrank it — and, when it is `High`, to the
 `High` decodes — at the highest of their ratios; with none, `R = 1` and it clears

@@ -32,6 +32,7 @@ mod admit_ground;
 mod band;
 mod block_guard;
 mod compaction_stall;
+mod creep_slice;
 mod decode;
 mod detached;
 mod ephemeral_fork;
@@ -71,6 +72,7 @@ pub mod vram_bands;
 mod wave_logits;
 mod wave_retry;
 mod wave_timing;
+mod whole_conversations;
 
 use detached::Detached;
 use graph_window::graph_window;
@@ -1415,8 +1417,11 @@ struct ReprojectInFlight {
     question_tokens: usize,
     /// The identity of the segment list this rebuild applies — recorded on the
     /// re-carved view's [`ViewState::applied_identity`] when the rebuild placed
-    /// every piece.
-    identity: u64,
+    /// every piece. `None` when a conversation was withdrawn for not being
+    /// whole in VRAM (`whole_conversations`): the slot then does not hold the
+    /// selection the identity names, and claiming it would keep the next
+    /// reprojection of the same selection from ever bringing that conversation.
+    identity: Option<u64>,
 }
 
 /// A finished turn between its disposition and its seal — what
@@ -3634,6 +3639,13 @@ pub(crate) struct Scheduler {
     /// What a decode-only step takes now — an average over the recent ones, so
     /// it follows the decode width and depth. `None` until one has run.
     decode_only_step: Option<Duration>,
+    /// What one row of creep through one layer costs beside decode rows — an
+    /// average over the steps it rode (`creep_slice::next_layer_row_cost`), so
+    /// a slice can be bounded in time. `None` until a creep has ridden one.
+    creep_layer_row_cost: Option<Duration>,
+    /// Rows times layers of creep the last wave step carried beside decode
+    /// rows; zero when it carried none, or carried no decode.
+    wave_step_creep_layer_rows: usize,
     /// What a `High` creep beside a `High` decode owes in token-layers (one row
     /// through one layer): each step it rides adds its rows times its layers,
     /// each decode token that lands pays off
@@ -3957,6 +3969,8 @@ impl Scheduler {
             wave_cohort_advanced: false,
             creep_owed: Duration::ZERO,
             decode_only_step: None,
+            creep_layer_row_cost: None,
+            wave_step_creep_layer_rows: 0,
             same_band_debt: 0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),
@@ -4547,6 +4561,7 @@ impl Scheduler {
                 // Skipped when nothing was projected — `elevate_to_hot`
                 // would no-op anyway, but the substrate read-lock
                 // snapshot is cheap to avoid.
+                let mut projected_segments = projected_segments;
                 if let Some(conversation) = self.slot_conversations.get(&parent_id).cloned() {
                     // Free VRAM held by yesterday's working set (warm-backed hot
                     // residences NOT in the incoming projection), then batch
@@ -4560,6 +4575,13 @@ impl Scheduler {
                         &conversation,
                         &projected_sections,
                         &turn_keys_for_elevate,
+                        "submit",
+                    );
+                    // Every other conversation whole, or not this time.
+                    Self::keep_conversations_whole(
+                        &conversation,
+                        slot_target.map(|t| t.timeline),
+                        &mut projected_segments,
                         "submit",
                     );
                 }
@@ -10839,12 +10861,15 @@ impl Scheduler {
         // never yank a residence the current wave is using — the fix for the
         // multi-timeline belief scan reaching completed-file (evicted) turns.
         // See `Substrate::working_set_pins`.
+        let t_pins = Instant::now();
         let pins_span = profile::span("elevate:publish_pins");
         self.publish_working_set_pins(conversation, sections, turns);
         pins_span.end();
+        let pins_us = t_pins.elapsed().as_micros() as u64;
         if sections.is_empty() && turns.is_empty() {
             return;
         }
+        let t_tier = Instant::now();
         let tier_span = profile::span("elevate:tier_check");
         // PER-ITEM SKIP: only lift the units NOT already hot. A unit already hot
         // needs no work — and the machinery below (`snapshot_promotion_state`, run
@@ -10910,8 +10935,28 @@ impl Scheduler {
             (sl, tl)
         };
         tier_span.end();
+        let tier_us = t_tier.elapsed().as_micros() as u64;
+        // Where an elevate's time went: the keep-set publish every call pays, the
+        // tier walk, and — only when something is not hot — the eviction and the
+        // lift itself, with how much was lifted.
+        let split = |evict_us: u64, lift_us: u64| {
+            tracing::debug!(
+                target: "candle_conversation::scheduler::reproject",
+                whence,
+                pins_us,
+                tier_us,
+                evict_us,
+                lift_us,
+                sections = sections.len(),
+                turns = turns.len(),
+                lifted_sections = secs_lift.len(),
+                lifted_turns = turns_lift.len(),
+                "elevate split"
+            );
+        };
         // Everything already hot → nothing to evict or lift.
         if secs_lift.is_empty() && turns_lift.is_empty() {
+            split(0, 0);
             return;
         }
         let backings = self.session.backings().to_vec();
@@ -10924,9 +10969,11 @@ impl Scheduler {
             _ => panic!("scheduler: requires a CUDA device"),
         };
         // Keep-list = FULL working set (protect the already-hot units too).
+        let t_evict = Instant::now();
         let evict_span = profile::span("elevate:evict_to_fit");
         let evicted = self.evict_to_fit_incoming(conversation, sections, turns);
         evict_span.end();
+        let evict_us = t_evict.elapsed().as_micros() as u64;
         if evicted.count > 0 {
             tracing::trace!(
                 target: "candle_conversation::persistence::tier",
@@ -10935,8 +10982,9 @@ impl Scheduler {
             );
         }
         // Lift only the non-hot subset; already-hot units are left untouched.
-        let _lift_span = profile::span("elevate:lift");
-        match elevate_to_hot(
+        let t_lift = Instant::now();
+        let lift_span = profile::span("elevate:lift");
+        let lifted = elevate_to_hot(
             conversation,
             &backings,
             &device,
@@ -10945,7 +10993,10 @@ impl Scheduler {
             &mut self.cold_load_stager,
             &secs_lift,
             &turns_lift,
-        ) {
+        );
+        lift_span.end();
+        split(evict_us, t_lift.elapsed().as_micros() as u64);
+        match lifted {
             Ok(report) => {
                 if report.missing > 0 || report.failed > 0 {
                     tracing::warn!(
@@ -11185,7 +11236,9 @@ impl Scheduler {
         let warm_span = profile::span("reproject:queue_norm_warm");
         self.queue_norm_warm(&policy.substrate, &policy.projection, policy.target);
         warm_span.end();
+        let warm_us = t_scan.elapsed().as_micros() as u64;
         let schema = policy.projection.schema();
+        let t_score = Instant::now();
         let scan_span = profile::span("reproject:score_beliefs");
         // observe = false: a live reprojection only READS the normalization hit
         // levels; learning happens once per turn at seal (last_turn_belief_scores).
@@ -11206,14 +11259,17 @@ impl Scheduler {
             self.gallery_arena.as_deref(),
         );
         scan_span.end();
+        let score_us = t_score.elapsed().as_micros() as u64;
         // The same fresh scores feed the dialogue's working-set momentum — once
         // per reprojection, the cadence the momentum's leak is defined over
         // (`docs/zend_working_set.md` §4.3).
+        let t_observe = Instant::now();
         let observe_span = profile::span("reproject:observe_working_set");
         policy
             .substrate
             .observe_working_set(schema, policy.target, &group_candidates);
         observe_span.end();
+        let observe_us = t_observe.elapsed().as_micros() as u64;
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");
@@ -11422,6 +11478,7 @@ impl Scheduler {
         // The parent already holds this selection when its last rebuild came
         // from a segment list with the same identity and placed all of it:
         // rebuilding would reproduce it exactly, at ~190 ms a time.
+        let t_identity = Instant::now();
         let identity = {
             let _g = profile::span("reproject:identity");
             let read = policy.substrate.read();
@@ -11429,6 +11486,7 @@ impl Scheduler {
                 section_content_stamp(&read.section_tokens_of(id))
             })
         };
+        let identity_us = t_identity.elapsed().as_micros() as u64;
         if view_state.applied_identity == Some(identity) {
             self.keep_unchanged_projection(view_id, composition);
             tracing::debug!(
@@ -11527,6 +11585,7 @@ impl Scheduler {
         // That dropped content is exactly the "the model has lost the
         // user message" symptom that derails generation past the
         // first reproject.
+        let t_snapshot = Instant::now();
         let tail_per_layer = {
             let _g = profile::span("reproject:snapshot_tail");
             // Reconcile a windowed creep's per-layer skew before this snapshot
@@ -11602,7 +11661,9 @@ impl Scheduler {
         // every exit goes through `or_abandon!`: the turn is told why and
         // discarded, never dropped unannounced (`reproject_abandon.rs`). Until
         // the free below, the view's slot is still held.
+        let snapshot_us = t_snapshot.elapsed().as_micros() as u64;
         let turn_tokens = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
+        let t_seal = Instant::now();
         let seal_span = profile::span("reproject:seal_tail_index");
         let tail_index_page = or_abandon!(
             self,
@@ -11615,6 +11676,8 @@ impl Scheduler {
                 .map_err(ConversationError::Model)
         );
         seal_span.end();
+        let seal_us = t_seal.elapsed().as_micros() as u64;
+        let t_free = Instant::now();
         let free_span = profile::span("reproject:move_free_truncate");
         // Ordering: move before the free, or there is nothing left to read.
         // The move already removes the view's entry, so the release below is
@@ -11675,6 +11738,7 @@ impl Scheduler {
             toks.clear();
         }
         free_span.end();
+        let free_us = t_free.elapsed().as_micros() as u64;
         // The pure swap work (tail snapshot + free + truncate) ends here —
         // captured disjoint from elevate/glue/complete so `swap_ms` reflects
         // only the chunk-pool rebalance, not the whole reproject.
@@ -11698,6 +11762,16 @@ impl Scheduler {
         );
         elevate_span.end();
         let elevate_ms = t_elevate.elapsed().as_millis() as u64;
+        // Every other conversation whole, or not this time — and a rebuild that
+        // withdrew one does not hold the selection its identity names.
+        let mut projected_segments = projected_segments;
+        let identity = (!Self::keep_conversations_whole(
+            &policy.substrate,
+            Some(policy.target.timeline),
+            &mut projected_segments,
+            "reproject",
+        ))
+        .then_some(identity);
 
         // Time the per-slot apply work (segment build now + finish later),
         // EXCLUDING the shared gap-fill wave — that wait is reported as `glue_ms`.
@@ -11714,6 +11788,22 @@ impl Scheduler {
             self.apply_projection_build(parent_id, &projected_segments)
         );
         let build_ms = t_build.elapsed().as_millis() as u64;
+        // The prepare half step by step, where the reproject line has one field
+        // per phase: which part of `scan_ms` / `swap_ms` / `apply_ms` the time is.
+        tracing::debug!(
+            target: "candle_conversation::scheduler::reproject",
+            view = view_id.0,
+            warm_us,
+            score_us,
+            observe_us,
+            identity_us,
+            snapshot_us,
+            seal_us,
+            free_us,
+            build_us = t_build.elapsed().as_micros() as u64,
+            probe_tokens = probe.len(),
+            "reproject prepare split"
+        );
         Ok(Some(ReprojectInFlight {
             view_id,
             parent_id,
@@ -11806,7 +11896,7 @@ impl Scheduler {
         // The old view's slot was freed in prepare.
         let t_finish = Instant::now();
         let finish_span = profile::span("reproject:apply_finish");
-        let applied_identity = plan.complete.then_some(identity);
+        let applied_identity = identity.filter(|_| plan.complete);
         or_abandon!(
             self,
             view_id,
