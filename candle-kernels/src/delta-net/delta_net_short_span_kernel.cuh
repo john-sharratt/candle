@@ -1,8 +1,8 @@
 #pragma once
 // Gated DeltaNet — the short-span scan: the causal conv, the intra-chunk solve
-// and the state pass of the prefill scan in ONE launch, for spans of at most
-// DNS_ROWS rows (a speculative verify block: the drafts plus the accepted
-// token).
+// and the state pass's reads of the prefill scan in ONE launch, for spans of at
+// most DNS_ROWS rows (a speculative verify block — the drafts plus the
+// accepted token — or a prompt that short).
 //
 // At that width the three-kernel path (delta_net_prefill_kernel.cuh) is three
 // tiny latency-bound grids chained through global memory — conv output, then
@@ -19,32 +19,38 @@
 //       handed through a conv-output buffer;
 //   (c) gates, the G scan, the A / kq grid and the forward-substitution solve
 //       for w (all 128 columns) and u (the tile's 32);
-//   (d) v_new = u − w·Sᵀ, o = e^G·(q·Sᵀ) + Σ kq·v_new, and the S update —
-//       the state pass's three phases over a single chunk;
-//   (e) the advanced tile and the `o` rows.
+//   (d) v_new = u − w·Sᵀ and o = e^G·(q·Sᵀ) + Σ kq·v_new — the state pass's
+//       first two phases over a single chunk;
+//   (e) the `o` rows and the span's timeline (delta_net_timeline.cuh).
 //
-// **Bit-identical to the three-kernel path, by construction.** Every value is
-// the same operation sequence on the same operands: the conv's j-ascending FMA
-// chain, the epilogue through the same helpers (delta_net_common.cuh) and the
-// same reduction tree, the same Hillis–Steele scan over the chunk's 64 slots,
-// one sequential d-ascending FMA chain per A/kq entry, the same substitution
-// order, and the state pass's phases through `dnp_dot4` and its own
-// accumulation order. Only where a value lives (registers and shared memory
-// instead of global buffers) and which thread computes it differ — neither
-// changes a bit. `a_short_span_fused_launch_is_the_three_launches_bit_for_bit`
+// **It advances nothing.** S and the conv tail are read, never written: the
+// span's contribution to them goes to the timeline as the generators the
+// state phase would have summed — G, k, v_new and the raw conv input per row —
+// and the fold (delta_net_fold_kernel.cuh) applies the rows the step keeps.
+// Every row quantity is prefix-stable (row t reads only rows 0..=t), so the
+// fold of the first m rows is the state the three-kernel scan writes for a
+// span of those m rows, bit for bit (docs/deltanet_timeline.md §3).
+//
+// **Bit-identical to the three-kernel path in everything it shares with it.**
+// Every value is the same operation sequence on the same operands: the conv's
+// j-ascending FMA chain, the epilogue through the same helpers
+// (delta_net_common.cuh) and the same reduction tree, the same Hillis–Steele
+// scan over the chunk's 64 slots, one sequential d-ascending FMA chain per
+// A/kq entry, the same substitution order, and the state pass's reads through
+// `dnp_dot4`. Only where a value lives (registers and shared memory instead of
+// global buffers) and which thread computes it differ — neither changes a bit.
+// `a_short_span_timeline_folds_to_the_three_launches_bit_for_bit`
 // (delta_net/cuda.rs) holds it.
 //
-// What it writes: the span's `o` rows, every element of the advanced state
-// (`state_out`, which may be the entering buffer — each block reads its tile
-// before it stores), and the advanced conv tail (`tail_out`, a separate buffer
-// from the entering tail every block reads), each element by exactly one
-// block. It writes no conv-output rows: this kernel is the only consumer of
-// the span's conv output, so it is never materialised.
+// What it writes: the span's `o` rows and its timeline rows, each element by
+// exactly one block. It writes no conv-output rows: this kernel is the only
+// consumer of the span's conv output, so it is never materialised.
 //
 // Concrete (non-template) and `static`, as the prefill header: compiled by the
 // single translation unit delta_net_api_f32.cu.
 
 #include "delta_net_prefill_kernel.cuh"
+#include "delta_net_timeline.cuh"
 
 // The longest span the fused kernel takes — every per-row buffer below is
 // sized by it. Must match `DELTA_NET_SHORT_SPAN_ROWS` in api.rs.
@@ -67,8 +73,34 @@ static_assert(DNP_DIM + DNP_TV <= DNS_THREADS - DNS_ROWS * DNS_ROWS,
 static_assert(DNS_ROWS * DNS_THREADS <= DNP_TV * DNP_SLD,
               "the norm scratch does not fit the S tile");
 static_assert(DNS_ROWS <= 32, "the G scan runs in one warp");
+static_assert(DNS_ROWS == DNT_ROWS, "every span this kernel runs keeps a timeline");
 
 namespace delta_net {
+
+// One short span: its carried buffers, read only, and the timeline it writes.
+//   ptrs  [3, n] i64 — conv tail, state, timeline
+//   spans [2, n] u32 — first row in the packed wave buffer, row count
+struct DnShortSpan {
+    const float* tail;
+    const float* state;
+    float*       timeline;
+    int          start;
+    int          len;
+};
+
+__device__ __forceinline__ DnShortSpan dn_short_span(
+        const long long* __restrict__ ptrs,
+        const unsigned int* __restrict__ spans,
+        int n_spans,
+        int z) {
+    DnShortSpan s;
+    s.tail     = reinterpret_cast<const float*>(ptrs[z]);
+    s.state    = reinterpret_cast<const float*>(ptrs[n_spans + z]);
+    s.timeline = reinterpret_cast<float*>(ptrs[2 * n_spans + z]);
+    s.start    = (int)spans[z];
+    s.len      = (int)spans[n_spans + z];
+    return s;
+}
 
 static __global__ void __launch_bounds__(DNS_THREADS, 2) delta_net_short_span_f32_kernel(
         const float* __restrict__ x_wave,     // [T_wave, C] raw conv input (QKV)
@@ -78,7 +110,7 @@ static __global__ void __launch_bounds__(DNS_THREADS, 2) delta_net_short_span_f3
         const float* __restrict__ dt_bias,    // [h_v]
         const float* __restrict__ a_neg,      // [h_v]
         float*       __restrict__ o_wave,     // [T_wave, h_v·D]
-        const long long*    __restrict__ ptrs,  // [4, n_spans]
+        const long long*    __restrict__ ptrs,  // [3, n_spans]
         const unsigned int* __restrict__ spans, // [2, n_spans]
         int n_spans,
         int n_v_heads,
@@ -101,18 +133,17 @@ static __global__ void __launch_bounds__(DNS_THREADS, 2) delta_net_short_span_f3
     __shared__ float sg[DNS_ROWS];  // G, the within-chunk log-decay cumsum
     __shared__ float sb[DNS_ROWS];  // β
     __shared__ float sge[DNS_ROWS]; // e^{G}
-    __shared__ float sgd[DNS_ROWS]; // e^{G_last − G}
     __shared__ float snorm[DNS_ROWS * 2]; // Σx² per token, q head then k head
-    __shared__ float s_decay;            // e^{G_last}
     float* red = s_tile;
 
-    const DnSpan sp = dn_span(ptrs, spans, n_spans, (int)blockIdx.z);
+    const DnShortSpan sp = dn_short_span(ptrs, spans, n_spans, (int)blockIdx.z);
     const int len = sp.len;
     // The launcher admits the table by its longest span and every row buffer
     // is sized by DNS_ROWS; a span outside 1..=DNS_ROWS is a table that
     // disagrees with the extent it was launched under, and stops the kernel
-    // rather than overrunning those buffers or leaving `state_out` unwritten.
+    // rather than overrunning those buffers or the timeline.
     if (len < 1 || len > DNS_ROWS) __trap();
+    const DnTimeline tl = dn_timeline(sp.timeline, n_v_heads, n_k_heads, channels);
 
     const int h = blockIdx.x;
     const int kh = h % n_k_heads; // ggml's tiled GQA broadcast
@@ -184,19 +215,16 @@ static __global__ void __launch_bounds__(DNS_THREADS, 2) delta_net_short_span_f3
         g_a = a_neg[h];
     }
 
-    // ---- the advanced conv tail -------------------------------------------
-    // The RAW inputs the next window starts from. Every block of the span
-    // shares the copy, one element each, so each element has one writer.
+    // ---- the span's raw conv rows, into the timeline ---------------------
+    // What the fold builds the conv tail from: the RAW inputs, as the next
+    // window wants them. Every block of the span shares the copy, one element
+    // each, so each element has one writer.
     {
         const int nblk = (int)(gridDim.x * gridDim.y);
         const int b = (int)(blockIdx.y * gridDim.x + blockIdx.x);
-        const int total = channels * DNS_TAIL;
+        const int total = len * channels;
         for (int e = b * DNS_THREADS + tid; e < total; e += nblk * DNS_THREADS) {
-            const int c = e / DNS_TAIL;
-            const int jj = e - c * DNS_TAIL;
-            const int idx = len - DNS_TAIL + jj;
-            sp.tail_out[e] = (idx >= 0) ? x[(size_t)idx * channels + c]
-                                        : tail[(size_t)c * DNS_TAIL + (DNS_TAIL + idx)];
+            tl.x[e] = x[e];
         }
     }
 
@@ -244,6 +272,8 @@ static __global__ void __launch_bounds__(DNS_THREADS, 2) delta_net_short_span_f3
             sg[lane] = g;
             sb[lane] = bv;
         }
+        // G[t] for this V head, once: tile 0's block of the head writes it.
+        if (blockIdx.y == 0 && lane < len) tl.g[(size_t)lane * n_v_heads + h] = g;
     }
     __syncthreads();
 
@@ -280,17 +310,19 @@ static __global__ void __launch_bounds__(DNS_THREADS, 2) delta_net_short_span_f3
     for (int t = 0; t < DNS_ROWS; ++t) {
         if (t < len) {
             const float y = dn_l2_scale(qk_sv[t], snorm[t * 2 + (tid >> 7)], eps);
-            if (tid < DNP_DIM) sq[t * DNP_SLD + tid] = y * q_scale;
-            else               sk[t * DNP_SLD + (tid - DNP_DIM)] = y;
+            if (tid < DNP_DIM) {
+                sq[t * DNP_SLD + tid] = y * q_scale;
+            } else {
+                sk[t * DNP_SLD + (tid - DNP_DIM)] = y;
+                // k for this K head, once: the group's first V head (h == kh),
+                // tile 0.
+                if (blockIdx.y == 0 && h < n_k_heads) {
+                    tl.k[((size_t)t * n_k_heads + kh) * DNP_DIM + (tid - DNP_DIM)] = y;
+                }
+            }
         }
     }
-    if (tid < len) {
-        const float gv = sg[tid];
-        const float gl = sg[len - 1];
-        sge[tid] = expf(gv);
-        sgd[tid] = expf(gl - gv); // G decreases, so the exponent is ≤ 0
-    }
-    if (tid == 0) s_decay = expf(sg[len - 1]);
+    if (tid < len) sge[tid] = expf(sg[tid]);
     #pragma unroll
     for (int rr = 0; rr < DNP_TV / 2; ++rr) s_tile[(r0 + rr) * DNP_SLD + j] = s_reg[rr];
     __syncthreads();
@@ -359,17 +391,20 @@ static __global__ void __launch_bounds__(DNS_THREADS, 2) delta_net_short_span_f3
     }
     __syncthreads();
 
-    // ---- (d) the state pass over the one chunk ----------------------------
+    // ---- (d) the state pass's reads over the one chunk --------------------
     // Phase 1 and phase 2's inter-chunk read share a pass: both read the
-    // pre-update S, and neither reads the other. warp → t, lane → r, as the
-    // state kernel maps them.
+    // entering S, and neither reads the other. warp → t, lane → r, as the
+    // state kernel maps them. v_new is the span's contribution to the state,
+    // so it goes to the timeline as well as to the intra-chunk read below.
     float inter = 0.f;
     if (warp < len) {
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
         dnp_dot4(&s_tile[lane * DNP_SLD], sw, warp, len, acc);
         float qs[4] = {0.f, 0.f, 0.f, 0.f};
         dnp_dot4(&s_tile[lane * DNP_SLD], sq, warp, len, qs);
-        vnew[warp * DNP_VLD + lane] = su[warp * DNP_TV + lane] - acc[0];
+        const float vn = su[warp * DNP_TV + lane] - acc[0];
+        vnew[warp * DNP_VLD + lane] = vn;
+        tl.v[((size_t)warp * n_v_heads + h) * DNP_DIM + (i_base + lane)] = vn;
         inter = qs[0];
     }
     __syncthreads(); // v_new complete
@@ -383,32 +418,6 @@ static __global__ void __launch_bounds__(DNS_THREADS, 2) delta_net_short_span_f3
         }
         o[(size_t)tc * o_stride + (size_t)h * DNP_DIM + (i_base + lane)] =
             inter * sge[tc] + intra;
-    }
-
-    // Phase 3: S ← e^{G_last}·S + v_newᵀ(k ⊙ e^{G_last−G}), straight to
-    // `state_out` from the registers that loaded the entering tile.
-    {
-        float acc[DNP_TV / 2];
-        #pragma unroll
-        for (int rr = 0; rr < DNP_TV / 2; ++rr) acc[rr] = 0.f;
-        for (int t = 0; t < len; ++t) {
-            const float kg = sk[t * DNP_SLD + j] * sgd[t];
-            const float4* vrow = reinterpret_cast<const float4*>(&vnew[t * DNP_VLD + r0]);
-            #pragma unroll
-            for (int r4 = 0; r4 < DNP_TV / 8; ++r4) {
-                const float4 vv = vrow[r4];
-                acc[4 * r4 + 0] += vv.x * kg;
-                acc[4 * r4 + 1] += vv.y * kg;
-                acc[4 * r4 + 2] += vv.z * kg;
-                acc[4 * r4 + 3] += vv.w * kg;
-            }
-        }
-        const float dec = s_decay;
-        #pragma unroll
-        for (int rr = 0; rr < DNP_TV / 2; ++rr) {
-            sp.state_out[((size_t)h * DNP_DIM + (i_base + r0 + rr)) * DNP_DIM + j] =
-                s_reg[rr] * dec + acc[rr];
-        }
     }
 }
 

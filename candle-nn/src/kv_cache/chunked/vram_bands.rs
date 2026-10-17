@@ -29,7 +29,8 @@ pub struct VramBands {
     pub expert_free: f64,
     /// KV arenas.
     pub kv: f64,
-    /// Span tenants: recurrent state, the provenance gallery, index caches.
+    /// Span tenants: recurrent state (timelines and prefill scratch included),
+    /// the provenance gallery, index caches, creep residuals.
     pub state: f64,
     /// The widest forward's activations since the last wave.
     pub transient: f64,

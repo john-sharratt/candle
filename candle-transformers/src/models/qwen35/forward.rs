@@ -46,7 +46,7 @@ use super::mtp::MTP_MAX_DRAFT;
 use super::quantized_attention::Qwen35AttentionLayer;
 use super::quantized_delta_net::quantized_delta_net_ffn;
 use super::quantized_weights::QuantModel;
-use super::spec::{split_block_rows, StashSpan, VerifyStash};
+use super::spec::split_block_rows;
 use super::wave::delta_net_mix_wave;
 
 #[cfg(feature = "cuda")]
@@ -54,7 +54,7 @@ use crate::models::delta_net::cuda::build_wave_table;
 use crate::models::delta_net::seq_spans;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::LayerKind;
-use crate::models::delta_net::{RecurrentCompaction, RecurrentStateStore, StashSlot};
+use crate::models::delta_net::{RecurrentCompaction, RecurrentStateStore, TIMELINE_ROWS};
 use crate::models::profile::pipeline_record_duration;
 use crate::models::verify_wave::{upload_plan_rows, VerifyPlan};
 use candle_nn::kv_cache::ModelGeometry;
@@ -82,6 +82,10 @@ use crate::models::wave_driver::{
     WaveSweep,
 };
 use crate::models::wave_token_ids::device_token_ids;
+
+// A verify block is the drafts plus the row they follow, and it must fit the
+// DeltaNet timeline to be partially acceptable.
+const _: () = assert!(MTP_MAX_DRAFT < TIMELINE_ROWS);
 
 /// The hybrid as the scheduler drives it.
 ///
@@ -253,11 +257,13 @@ impl ManagedBatchedModel for HybridBatched {
     /// rather than two, and the MoE's per-layer expert traffic amortizes across
     /// both cohorts.
     ///
-    /// Naming the verifying sequences does two things inside the sweep: the
-    /// head scores every one of their rows (a block position's prediction is
-    /// what a proposal is checked against), and each DeltaNet layer stashes
-    /// their recurrence operands so [`Self::truncate_sequence`] can replay the
-    /// accepted prefix. Cleared in `end_verify` / `abort_verify`, error or not.
+    /// Naming the verifying sequences does two things: the head scores every
+    /// one of their rows (a block position's prediction is what a proposal is
+    /// checked against), and the sequences are **armed** — their DeltaNet layers
+    /// keep the block's timeline pending past the forward's commit, so
+    /// [`Self::truncate_sequences`] can fold the accepted prefix. The row set is
+    /// cleared in `end_verify` / `abort_verify`, error or not; the arming ends
+    /// at the truncate or the abort.
     fn begin_verify(
         &self,
         session: &mut BatchedInferenceSession,
@@ -286,7 +292,7 @@ impl ManagedBatchedModel for HybridBatched {
         // `plain` and never here, and a 1-row prefill would be folded into the
         // decode group by the driver — where the head scores it as one row
         // anyway, so the row split below would still hold. Refuse it rather
-        // than rely on that: the stash's `len` would disagree with the block.
+        // than rely on that: the armed block's `len` would disagree with it.
         if let Some(b) = blocks.iter().find(|b| b.len() < 2) {
             candle::bail!(
                 "qwen35 verify: a {}-token block is a plain decode step, not a verify",
@@ -300,21 +306,15 @@ impl ManagedBatchedModel for HybridBatched {
         let tokens: Vec<u32> = plain.iter().map(|&(_, t)| t).collect();
         let (dinputs, pinputs) = upload_plan_rows(&tokens, blocks)?;
 
-        // **Size every verifying sequence's stash before the forward opens.**
-        // A wave's storage is claimed by `admit_wave_kv` and the transient tier
-        // is placed against that claim, so the arena refuses a device
-        // allocation from inside the forward — which is what a stash that
-        // allocated as the sweep reached each layer would be. (It is also not
-        // hypothetical: the 9B at four contexts is where the pool first had no
-        // room to spare and the wave failed outright. That failure looked like a
-        // VRAM ceiling and was recorded as one; it was this, and the width-4 row
-        // of `speculative_decode_9b` is what holds the fix down.)
+        // Arm the cohort: each block's DeltaNet timeline stays pending past the
+        // forward's commit until the accept says how many rows it keeps. A
+        // block deeper than the timeline is refused here, before any forward.
         let cohort: Vec<(usize, usize)> = seqs
             .iter()
             .enumerate()
             .map(|(i, &seq)| (seq, blocks[i].len()))
             .collect();
-        self.begin_verify_stash(&cohort)?;
+        self.arm_verify(&cohort)?;
         // Arm the MTP seed capture over BOTH cohorts: a plain row's hidden is
         // what lets a sequence that drafted nothing this step draft on the
         // next, and it is the only way the very first step after prefill ever
@@ -360,8 +360,7 @@ impl ManagedBatchedModel for HybridBatched {
             }
         }
         // Naming the verifying sequences makes the head score every one of
-        // their rows and each DeltaNet layer stash its recurrence operands.
-        // Cleared in `end_verify` / `abort_verify`, error or not.
+        // their rows. Cleared in `end_verify` / `abort_verify`, error or not.
         self.set_verify_row_seqs(seqs)?;
         Ok(Some(VerifyPlan {
             decode_seqs: dseqs,
@@ -398,9 +397,11 @@ impl ManagedBatchedModel for HybridBatched {
     fn abort_verify(&self, seqs: &[usize]) {
         let _ = self.set_verify_row_seqs(&[]);
         self.disarm_hidden_capture();
-        // The wave rolled its recurrent state back, so the stash names a rewind
-        // point that no longer exists.
-        self.drop_verify_stashes(seqs);
+        // The step keeps none of its blocks: their timelines go, and each
+        // sequence's state stands exactly as the step entered it.
+        if let Err(e) = self.disarm_verify(seqs) {
+            tracing::error!("qwen35 abort_verify: {e}");
+        }
     }
 
     /// Roll `seq` back to `tokens`, recurrent state included.
@@ -410,11 +411,11 @@ impl ManagedBatchedModel for HybridBatched {
     /// * `tokens == 0` — a full reset. The state returns to its sequence-start
     ///   value, which is what a fresh store holds, so the store is dropped.
     /// * `tokens` inside a block this model just verified — the speculative
-    ///   rewind. `S` is a running sum with no suffix to remove, so the state is
-    ///   re-advanced *forward* over the accepted prefix from the wave's
-    ///   entering state, which the store's ping-pong still holds
-    ///   ([`super::spec`]). Exact, not approximate: the replay runs the same
-    ///   mixer over the same operands.
+    ///   rewind. `S` is a running sum with no suffix to remove, but the block
+    ///   never wrote it: each DeltaNet layer holds the block's timeline, and
+    ///   the fold applies the accepted prefix of it ([`super::spec`]). Exact,
+    ///   not approximate: the fold is the scan's own state carry over those
+    ///   rows.
     /// * `tokens` equal to the sequence's current length — a no-op, which is
     ///   what the driver's uniform truncate is for a plain decode row.
     ///
@@ -432,14 +433,13 @@ impl ManagedBatchedModel for HybridBatched {
         self.truncate_sequences(session, &[(seq, tokens)])
     }
 
-    /// The whole step's truncates in one call, so the cohort's recurrent
-    /// rewinds batch: every rewinding sequence's replay runs as ONE launch pair
-    /// per DeltaNet layer through the shared stash, instead of one per layer
-    /// per sequence.
+    /// The whole step's truncates in one call, so the cohort's folds batch:
+    /// every armed sequence's kept rows fold in ONE launch over every sequence
+    /// and DeltaNet layer, instead of one per layer per sequence.
     ///
     /// Validation runs for every target before anything mutates — a target with
-    /// no rewind point aborts the call with nothing absorbed and nothing
-    /// replayed, and the stash goes back untouched.
+    /// no rewind point aborts the call with nothing truncated and nothing
+    /// folded, and the armed cohort stands for the caller's abort to discard.
     fn truncate_sequences(
         &self,
         session: &mut BatchedInferenceSession,
@@ -448,13 +448,12 @@ impl ManagedBatchedModel for HybridBatched {
         if targets.is_empty() {
             return Ok(());
         }
-        let mut stash = self.take_verify_stash()?;
 
         // What each target needs, decided before anything is touched.
         enum Plan {
             Reset,
             NoOp,
-            Rewind { span: StashSpan, kept: usize },
+            Fold { kept: usize },
         }
         let mut plans: Vec<Plan> = Vec::with_capacity(targets.len());
         for &(seq, tokens) in targets {
@@ -462,43 +461,30 @@ impl ManagedBatchedModel for HybridBatched {
                 plans.push(Plan::Reset);
                 continue;
             }
-            let span = stash.as_ref().and_then(|st| st.span_of(seq));
             let current = session.sequence_offset(seq).unwrap_or(0);
-            match span {
-                Some(sp) if tokens >= sp.start && tokens <= sp.start + sp.len => {
-                    plans.push(Plan::Rewind {
-                        span: sp,
-                        kept: tokens - sp.start,
+            // The verify wave advanced the sequence by the whole block, so the
+            // block starts `len` before where it stands.
+            let block = self
+                .armed_block(seq)?
+                .and_then(|len| current.checked_sub(len));
+            match block {
+                Some(start) if tokens >= start && tokens <= current => {
+                    plans.push(Plan::Fold {
+                        kept: tokens - start,
                     });
                 }
                 _ if tokens == current => plans.push(Plan::NoOp),
-                _ => {
-                    // Nothing has mutated yet; hand the buffers back before
-                    // aborting the step.
-                    if let Some(st) = stash {
-                        self.put_verify_stash(st)?;
-                    }
-                    candle::bail!(
-                        "qwen35: cannot truncate sequence {seq} to {tokens} tokens — it \
-                         stands at {current} and no verified block covers that offset, so \
-                         the DeltaNet recurrent state has no rewind point. Truncate to 0 \
-                         (full reset), or rewind inside a block this model just verified."
-                    )
-                }
+                _ => candle::bail!(
+                    "qwen35: cannot truncate sequence {seq} to {tokens} tokens — it \
+                     stands at {current} and no verified block covers that offset, so \
+                     the DeltaNet recurrent state has no rewind point. Truncate to 0 \
+                     (full reset), or rewind inside a block this model just verified."
+                ),
             }
         }
 
-        // Every target's span is consumed now, whatever its plan: a stash span
-        // is good for exactly one step, and a failed replay's must not survive
-        // to rewind a later one.
-        if let Some(st) = stash.as_mut() {
-            for &(seq, _) in targets {
-                st.remove(seq);
-            }
-        }
-
-        let mut jobs: Vec<(StashSpan, usize)> = Vec::new();
-        let result = (|| -> Result<()> {
+        let mut jobs: Vec<(usize, usize)> = Vec::new();
+        (|| -> Result<()> {
             // Take each sequence's next draft seed from the hiddens this wave
             // captured — the row at the last position the accept kept. This
             // runs for no-ops exactly as for rewinds, because a PLAIN row's
@@ -522,7 +508,7 @@ impl ManagedBatchedModel for HybridBatched {
                 .filter_map(|(&(seq, _), plan)| match plan {
                     Plan::Reset => None,
                     Plan::NoOp => Some((seq, None)),
-                    Plan::Rewind { kept, .. } => Some((seq, Some(*kept))),
+                    Plan::Fold { kept } => Some((seq, Some(*kept))),
                 })
                 .collect();
             self.mtp_take_seeds(&seeds)?;
@@ -534,28 +520,21 @@ impl ManagedBatchedModel for HybridBatched {
                         self.release_recurrent(seq)?;
                     }
                     Plan::NoOp => {}
-                    Plan::Rewind { span, kept } => {
-                        jobs.push((*span, *kept));
+                    Plan::Fold { kept } => {
+                        jobs.push((seq, *kept));
                         session.truncate_sequence_to_tokens(seq, tokens)?;
                     }
                 }
             }
-            // The KV truncate above walks every layer's chunk list; the replay
-            // below advances the recurrence over the kept tokens alone. They
-            // scale with different things — the cache's depth against the draft
-            // budget — so they are timed apart.
-            let t_replay = std::time::Instant::now();
-            let r = match stash.as_ref() {
-                Some(st) => self.replay_recurrent(st, &jobs),
-                None => Ok(()),
-            };
-            pipeline_record_duration("rewind:replay", t_replay.elapsed(), 1);
+            // The KV truncate above walks every layer's chunk list; the fold
+            // below applies the kept rows alone. They scale with different
+            // things — the cache's depth against the cohort — so they are timed
+            // apart.
+            let t_fold = std::time::Instant::now();
+            let r = self.fold_armed(&jobs);
+            pipeline_record_duration("rewind:fold", t_fold.elapsed(), 1);
             r
-        })();
-        if let Some(st) = stash {
-            self.put_verify_stash(st)?;
-        }
-        result
+        })()
     }
 
     /// **This lineage cannot be rewound.** The DeltaNet state is a running sum
@@ -581,16 +560,16 @@ impl ManagedBatchedModel for HybridBatched {
     /// the default `!carries_recurrent_state()`.
     ///
     /// `S` has no per-token decomposition, so there is no suffix to subtract —
-    /// but a rewind does not need one. [`Self::truncate_sequences`] replays the
-    /// mixer over the accepted prefix from the state the block was entered with,
-    /// which the wave's ping-pong leaves intact in the half it was not writing,
-    /// and the mixer's row `i` depends on no row after it. The result is the
-    /// state those `m` tokens alone would have produced (`super::spec`).
+    /// but a rewind does not need one. The verify block never wrote `S`: each
+    /// DeltaNet layer holds the block's timeline, every row of which depends on
+    /// no row after it, and [`Self::truncate_sequences`] folds the accepted
+    /// prefix. The result is the state those `m` tokens alone would have
+    /// produced (`super::spec`).
     ///
-    /// The claim is bounded: it covers offsets inside a block this model stashed
-    /// operands for. `truncate_sequences` refuses anything else by name rather
-    /// than silently resetting, so a caller that rewinds somewhere no replay can
-    /// reach gets an error instead of a zeroed recurrence.
+    /// The claim is bounded: it covers offsets inside a block this model armed.
+    /// `truncate_sequences` refuses anything else by name rather than silently
+    /// resetting, so a caller that rewinds somewhere no fold can reach gets an
+    /// error instead of a zeroed recurrence.
     fn can_rewind_speculative_block(&self) -> bool {
         true
     }
@@ -886,7 +865,12 @@ impl WaveSweep for HybridBatched {
         // every segment before it placed the tier they share
         // (`docs/wave_step.md` §2.1), and a claim under that tier is refused.
         if !matches!(mode, SweepMode::InStep(_)) {
-            self.prologue(session, &seqs)?;
+            let q_lens: Vec<usize> = wave
+                .inputs
+                .iter()
+                .map(|t| t.dims().get(1).copied().unwrap_or(1))
+                .collect();
+            self.prologue(session, &seqs, &q_lens)?;
         }
         // A segment being prepared prices itself and runs nothing, so it opens
         // no recurrent wave and lifts no store.
@@ -911,7 +895,14 @@ impl WaveSweep for HybridBatched {
 
         self.put_recurrent(&seqs, stores)?;
         match &swept {
-            Ok(_) => self.commit_recurrent_wave(&seqs)?,
+            // A close that fails commits nothing (`commit_stores`), so the wave
+            // is rolled back like any other that failed, and leaves no trace.
+            Ok(_) => {
+                if let Err(e) = self.commit_recurrent_wave(&seqs) {
+                    self.rollback_recurrent_wave(&seqs)?;
+                    return Err(e);
+                }
+            }
             Err(_) => self.rollback_recurrent_wave(&seqs)?,
         }
         swept
@@ -920,8 +911,14 @@ impl WaveSweep for HybridBatched {
 
 impl HybridBatched {
     /// Everything a forward does before its recurrent bracket opens: hand back
-    /// the last tier, move the boundary, claim the state its sequences need.
-    fn prologue(&self, session: &BatchedInferenceSession, seqs: &[usize]) -> Result<()> {
+    /// the last tier, move the boundary, claim the state its sequences need —
+    /// the prefill scratch too, for each whose span (`q_lens`) is a prefill one.
+    fn prologue(
+        &self,
+        session: &BatchedInferenceSession,
+        seqs: &[usize],
+        q_lens: &[usize],
+    ) -> Result<()> {
         // Hand back the previous wave's transient tier, and let the elastic
         // boundary grow in the one gap it is legal in — every guard from that
         // wave is dropped and this one has opened none.
@@ -952,7 +949,7 @@ impl HybridBatched {
             .iter()
             .map(|&s| session.sequence_offset(s).unwrap_or(0))
             .collect();
-        self.ensure_recurrent(seqs, &offsets)
+        self.ensure_recurrent(seqs, &offsets, q_lens)
     }
 }
 
@@ -1105,9 +1102,6 @@ fn sweep_layers(
             // A wave that stops short of the last layer returns its residual and
             // runs no head, so it scores no rows at all.
             let verify_seqs = model.verify_row_seqs()?;
-            // Armed before the forward opened (`begin_verify_stash`), so it is
-            // readable here and describes exactly what a rewind would stage.
-            let staged = model.verify_stash_width()?;
             let scored_prefill: usize = pre_q
                 .iter()
                 .enumerate()
@@ -1138,24 +1132,6 @@ fn sweep_layers(
                 // A one-row prefill group takes the decode kernels, so it carves
                 // no span-table entry and, alone, no scan transient.
                 prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
-                // **The rewind this wave may owe.** A verify wave's accept can
-                // reject proposals, and the replay that rewinds the recurrence
-                // then carves its conv, scan and span table per recurrent layer
-                // off THIS span (`replay_accepted_prefixes`). These two units
-                // are what price that chain; left at zero it prices to nothing,
-                // and the span this forward reserves has no room for a replay
-                // that arrives behind it.
-                //
-                // Measured on the 35B-A3B gate at 16 contexts: the replay
-                // asking 1,572,864 B of a 240,384 B span — this wave's own
-                // attention price, *smaller* than the one-context case, because
-                // `staged_rows` was 0. Reserved by the forward rather than
-                // re-planned at accept time: the tier is one three-phase
-                // reservation replaced wholesale, so re-planning it for the
-                // replay alone zeroes the Ffn and Forward spans the next wave
-                // needs (measured: `wave-ffn … exceeds the 0 B budget`).
-                staged_rows: staged.map_or(0, |(rows, _)| rows),
-                staged_spans: staged.map_or(0, |(_, spans)| spans),
                 // The prefill launch's carve: up to one key chunk of each bulk
                 // chunk's sequence, and the carry beside it.
                 kv_stage: PrefillKvStageLayout::new(
@@ -1324,53 +1300,7 @@ fn sweep_layers(
     let dn_table = build_wave_table(&spans, stores, fwd_ticket)?;
     g_dntab.end();
 
-    // Spans a speculative verify will have to rewind stash each DeltaNet
-    // layer's recurrence operands as the sweep passes through it — every
-    // verifying span into its own rows of ONE shared set of buffers, which is
-    // what lets the replay advance the whole cohort per layer in one launch.
-    // The buffers were sized by `verify_blocks` BEFORE this forward opened —
-    // nothing here allocates. `None` on every ordinary wave, so nothing is
-    // copied either.
-    //
-    // **Only the wave that actually carries the armed rows touches the stash.**
-    // `verify_row_seqs` is model state that stays set for the whole speculative
-    // step — from `begin_verify` to `end_verify` — so every OTHER wave the
-    // scheduler runs inside that window sees it too: an ingest creep, a section
-    // batch, a glue drain. Those carry none of the verifying sequences, so
-    // taking the stash there would move it out of the model for a sweep that
-    // captures nothing into it, and lose it outright if that sweep then failed.
-    // Every armed sequence rides the same `decode_forward_cobatched` call, so a
-    // wave carries all of them or none.
     let verify_seqs = model.verify_row_seqs()?;
-    let carries_verify = spans.iter().any(|s| verify_seqs.contains(&s.seq));
-    let mut cohort_stash: Option<VerifyStash> = if carries_verify {
-        model.take_verify_stash()?
-    } else {
-        None
-    };
-    // Each span's row in the shared buffers, resolved once rather than per
-    // layer.
-    let stash_rows: Vec<Option<usize>> = spans
-        .iter()
-        .map(|s| {
-            cohort_stash
-                .as_ref()
-                .and_then(|st| st.span_of(s.seq))
-                .map(|sp| sp.row)
-        })
-        .collect();
-    // Which recurrent layer each DeltaNet index is, counted the way
-    // `RecurrentStateStore::recurrent_layer_indices` counts — the order the
-    // replay walks the stash in.
-    // Counted from the config rather than from the loaded layers. `layer_kinds`
-    // is what *built* each layer's mixer (`quantized_weights::load_layer`
-    // matches on it), so it is the primary fact and a layer's `mix` is derived
-    // from it — and on a streamed checkpoint the layers before `layer_start` are
-    // not resident to be counted.
-    let mut dn_ord = q.cfg.layer_kinds[..layer_start]
-        .iter()
-        .filter(|k| matches!(k, LayerKind::DeltaNet))
-        .count();
 
     // The sweep's own input, before any layer has touched it. A fault reported
     // downstream of here is this sweep's; a fault reported AT here arrived
@@ -1499,21 +1429,6 @@ fn sweep_layers(
                 };
                 #[cfg(not(feature = "cuda"))]
                 let layer_table = None;
-                let slots: Vec<Option<StashSlot<'_>>> = stash_rows
-                    .iter()
-                    .map(|row| {
-                        row.and_then(|r| {
-                            cohort_stash.as_ref().map(|st| StashSlot {
-                                ops: &st.layers[dn_ord],
-                                row: r,
-                            })
-                        })
-                    })
-                    .collect();
-                // Whether this layer actually wrote the cohort's operands, which
-                // is what `filled` records — a stash with no row on this wave
-                // captures nothing here and must not claim the ordinal.
-                let captured = slots.iter().any(|s| s.is_some());
                 // The recurrent state as it stands ENTERING this layer's scan.
                 //
                 // This is the one value on the path that survives between waves:
@@ -1543,35 +1458,12 @@ fn sweep_layers(
                     stores,
                     eps,
                     layer_table.as_ref(),
-                    &slots,
                 )?;
-                // And as the scan LEAVES it. Reaching here means the entering
-                // state and the entering residual were both finite, so a fault
-                // now was produced by the scan on this pass — where a fault at
-                // `state_in` was carried from an earlier wave, since the
-                // recurrent state is the one value that survives between them.
-                #[cfg(feature = "tensor-assert")]
-                for st in stores.iter() {
-                    let Ok(state) = st.layer_state(li) else {
-                        continue;
-                    };
-                    crate::models::nan_capture::checkpoint(
-                        candle::tensor_assert::site("dn.state_out.s.L", li),
-                        &state.s,
-                        &[("conv_tail", &state.conv_tail)],
-                        capture_dev,
-                    )?;
-                }
-                // Releases the borrow of `cohort_stash` the slots hold.
-                drop(slots);
-                if captured {
-                    if let Some(st) = cohort_stash.as_mut() {
-                        if let Some(f) = st.filled.get_mut(dn_ord) {
-                            *f = true;
-                        }
-                    }
-                }
-                dn_ord += 1;
+                // The scan writes no live state — its advance lands in a
+                // timeline or the prefill scratch, applied by the fold or the
+                // commit — so the state's exit is checked there
+                // (`gdn.exit` / `gdn.fold`), not here.
+                //
                 // Sampled BETWEEN the mixer and the FFN: "layer N is bad" is
                 // ambiguous while the expert FFN is inside the same layer, and
                 // a routed expert arriving late is as good a NaN candidate as
@@ -1625,34 +1517,6 @@ fn sweep_layers(
         // expert dispatch flushes only on `expert_lre::flush_schedule`'s doubling
         // cadence, which was measured for Flash-Next's own sweep, not this one.
         dev.flush_launches()?;
-    }
-
-    // File the stash back, whether this sweep was whole or one window of a
-    // segmented one. `dn_ord` counts the recurrent layers BEFORE `layer_start`,
-    // so a window writes its own layers' operands into the GLOBAL slots
-    // `begin_verify_stash` sized before the first forward opened, and the window
-    // that follows fills the rest. Putting it back at every boundary is what
-    // lets the windows accumulate into the one complete stash the rewind needs
-    // — a verify rides the prefill slot of EVERY segment, so the segments
-    // together always cover `[0, num_layers)`, and the accept walk does not read
-    // the stash until the last of them has run.
-    //
-    // Stamp each span's ABSOLUTE start — not `span.start`, which is its row in
-    // the packed wave buffer, a different number entirely for anything but the
-    // first span; the driver rewinds to `sequence_offset + accepted`. The value
-    // is the same in every window (a sequence does not advance between them), so
-    // restamping is idempotent.
-    if let Some(mut st) = cohort_stash {
-        for sp in st.spans.iter_mut() {
-            let at = spans.iter().position(|s| s.seq == sp.seq).ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "qwen35 wave: stash span for sequence {} has no wave span",
-                    sp.seq
-                ))
-            })?;
-            sp.start = offsets[at];
-        }
-        model.put_verify_stash(st)?;
     }
 
     // A window that stops short hands its residual on as it stands, on the

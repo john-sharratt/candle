@@ -219,8 +219,8 @@ pub(crate) fn wave_root_ticketed(ticket: Option<WaveTicket>) -> candle::cuda_bac
 /// **This is the constructor for a provenance root that has no device operand to
 /// inherit from.** `Tensor::empty` can only produce an `Owned` tensor, and
 /// `empty_beside` only relays provenance an operand already has — so a chain
-/// starting from a buffer the sequence owns across waves (a rewind stash, a
-/// carried conv tail) lands wholly on the pool unless it is staged through this
+/// starting from a buffer the sequence owns across waves (a carried conv tail, a
+/// recurrent state) lands wholly on the pool unless it is staged through this
 /// first. See [`Tensor::empty_beside`]'s note that "one broken provenance root
 /// becomes dozens of sites in a report".
 ///

@@ -947,8 +947,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                         // Every prefill and glue sequence: the ragged tables
                         // hold an entry for each, whatever its length.
                         prefill_spans: n_prefill + n_glue,
-                        staged_rows: 0,
-                        staged_spans: 0,
                         // The caller's accept walk selects on the head's span
                         // only when it reads the logits there.
                         accept_rows: if accept_in_place { scored_rows } else { 0 },

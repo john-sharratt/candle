@@ -1,29 +1,33 @@
 //! CUDA wrappers for the Gated DeltaNet kernels, parity-locked to the
 //! sequential reference in [`super::delta_net`].
 //!
-//! The decode step updates the state **in place** on the device — the state
-//! is the recurrent memory the state arena owns; a token step must not
-//! reallocate it. All tensors are F32 and contiguous; dims are validated
-//! here because the launchers refuse silently past their shared-memory cap.
+//! A short span — a decode row, a verify block, a short prompt — reads its
+//! state and writes a timeline ([`super::timeline`]); [`delta_net_fold`]
+//! applies the rows a step keeps, in place. A long span writes its advanced
+//! state to a separate buffer. All tensors are F32 and contiguous; dims are
+//! validated here, and every launcher reports a refused shape.
 
 use candle::cuda_backend::cudarc::cublas::sys as cublas;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::quantized::cuda::{produce_q8a128, Q8a128Operand};
 use candle::quantized::SumScale;
-use candle::{DType, Device, LiveTensor, Result, Storage, Tensor};
+use candle::{DType, Device, Error, LiveTensor, Result, Storage, Tensor};
 pub use candle_kernels::delta_net::DELTA_NET_PREFILL_DIM;
 use candle_kernels::delta_net::{
     run_delta_net_batch_ptrs, run_delta_net_conv_decode_f32, run_delta_net_conv_prefill_f32,
-    run_delta_net_decode_step_f32, run_delta_net_norm_gate_f32, run_delta_net_prefill_intra_f32,
-    run_delta_net_prefill_state_f32, run_delta_net_short_span_f32, DELTA_NET_PREFILL_CHUNK,
-    DELTA_NET_PREFILL_CONV_MAX,
+    run_delta_net_decode_step_f32, run_delta_net_fold_f32, run_delta_net_norm_gate_f32,
+    run_delta_net_prefill_intra_f32, run_delta_net_prefill_state_f32, run_delta_net_short_span_f32,
+    DELTA_NET_MAX_SPANS, DELTA_NET_PREFILL_CHUNK, DELTA_NET_PREFILL_CONV_MAX,
 };
 pub use candle_kernels::delta_net::{DELTA_NET_SHORT_SPAN_CONV, DELTA_NET_SHORT_SPAN_ROWS};
 
-use super::mix::{DeltaNetLayerTable, DeltaNetSeq, DeltaNetSpanTable, SeqSpan};
+use super::mix::{DeltaNetLayerTable, DeltaNetSeq, DeltaNetSpanTable, DeltaNetState, SeqSpan};
 use super::state_store::RecurrentStateStore;
+use super::timeline::{TimelineLayout, TIMELINE_ROWS};
+use super::types::DeltaNetDims;
 use super::ZGate;
-use crate::models::wave_buffers::wave_from_vec_ticketed;
+use crate::models::held_tensor::held_empty;
+use crate::models::wave_buffers::{upload_into, wave_from_vec_ticketed};
 use candle::wave_provenance::WaveTicket;
 use std::ffi::c_void;
 
@@ -138,11 +142,18 @@ impl<'a, 'w> DeltaNetFused<'a, 'w> {
 
 const MAX_HEAD_DIM: usize = 256;
 
-/// Rows of a decode pointer table: conv tail in, conv tail out, state in,
-/// state out. Both carried buffers name their read and write halves, so the
-/// kernels advance a sequence without a copy anywhere and `commit_wave`
-/// installs the result by exchanging handles.
-const TABLE_ROWS: usize = 4;
+/// Rows of a decode or short-span pointer table: conv tail, state, timeline.
+/// The kernels read the first two and write only the third, so a step that
+/// fails leaves every state as it entered.
+const TABLE_ROWS: usize = 3;
+
+/// Rows of a long-span pointer table: conv tail in, conv tail out, state in,
+/// state out — the entering buffers and the prefill scratch the advance is
+/// written to, which `commit_wave` exchanges in.
+const LONG_TABLE_ROWS: usize = 4;
+
+/// Rows of a fold table: conv tail, state, timeline, and the rows to fold.
+const FOLD_TABLE_ROWS: usize = 4;
 
 /// Device address of `t`'s first element, checking dtype and contiguity.
 ///
@@ -216,18 +227,18 @@ pub fn aligned16(ptr: u64, what: &str) -> Result<u64> {
 /// thing this exists to avoid: a host→device copy syncs the stream, and 24 of
 /// them per token would serialise the launch pipeline.
 ///
-/// **Valid for this forward only, and rebuilt every forward.** A layer's two
-/// halves exchange roles at `commit_wave`, which runs after the sweep, so a table
-/// kept into the next forward would read the advanced half as the entering one.
-/// The buffers themselves do not move during a forward: the store holds them, and
-/// each tensor's anchor keeps its state-arena slot held while anything can read it.
-/// Built once per forward and read by **every** layer, which is what
-/// [`LayerPhase::Forward`] exists for: a buffer carved from the attention span
-/// is reclaimed when layer 0's guard drops, and layer 1 would overwrite the
-/// table it is still reading. The `'w` ties it to that guard.
+/// **Valid for this forward only, and rebuilt every forward.** Compaction moves
+/// state slots between forwards, so a table kept into the next forward could
+/// name a slot another sequence now holds. The buffers themselves do not move
+/// during a forward: the store holds them, and each tensor's anchor keeps its
+/// state-arena slot held while anything can read it. Built once per forward and
+/// read by **every** layer, which is what [`LayerPhase::Forward`] exists for: a
+/// buffer carved from the attention span is reclaimed when layer 0's guard
+/// drops, and layer 1 would overwrite the table it is still reading. The `'w`
+/// ties it to that guard.
 pub struct DeltaNetWaveTable<'w> {
-    /// `[n_dn_layers, 4, n_decode]` I64 — per layer, the entering and advanced
-    /// halves of both carried buffers: tail-in, tail-out, state-in, state-out.
+    /// `[n_dn_layers, 3, n_decode]` I64 — per layer, each decode sequence's
+    /// conv tail, state and timeline.
     ptrs: LiveTensor<'w>,
     /// `[n_decode]` U32 wave rows, shared by every layer.
     rows: LiveTensor<'w>,
@@ -245,7 +256,7 @@ impl DeltaNetWaveTable<'_> {
         Ok(DeltaNetLayerTable {
             // A narrow on the leading axis of a contiguous tensor is itself
             // contiguous, so the reshape is a view — no copy per layer.
-            ptrs: self.ptrs.narrow(0, ord, 1)?.reshape((4, n))?,
+            ptrs: self.ptrs.narrow(0, ord, 1)?.reshape((TABLE_ROWS, n))?,
             rows: self.rows.clone(),
         })
     }
@@ -271,21 +282,19 @@ pub fn build_wave_table<'w>(
     };
     let layers: Vec<usize> = first.recurrent_layer_indices().collect();
     let n = decode.len();
-    // Four rows per layer: the conv tail's entering and advanced buffers, then
-    // the state's. Every one of the four is a distinct allocation — the wave
-    // reads one half and writes the other, and `commit_wave` exchanges them —
-    // so the kernels need both addresses of both buffers.
+    // Three rows per layer: the conv tail and the state the step reads, and the
+    // timeline it writes.
     //
     // Read off each store's slots (`decode_table_addresses`), which marks
     // nothing: this table covers every recurrent layer, but a sweep may run
-    // only part of the stack, and a layer that never ran must not be swapped
-    // at commit (its write buffer still holds an older wave's output). Each
-    // layer records itself when it actually runs.
+    // only part of the stack, and a layer that never ran must not be left
+    // holding a pending timeline. Each layer records itself when it actually
+    // runs.
     //
     // A store answers its layers in slot order, so every store must carry the
     // same schedule as the first for its rows to land under the right layer.
     let schedule = first.schedule_hash();
-    let mut ptrs: Vec<i64> = vec![0; layers.len() * 4 * n];
+    let mut ptrs: Vec<i64> = vec![0; layers.len() * TABLE_ROWS * n];
     for (k, &i) in decode.iter().enumerate() {
         if stores[i].schedule_hash() != schedule {
             candle::bail!(
@@ -296,7 +305,7 @@ pub fn build_wave_table<'w>(
         }
         for (ord, addrs) in stores[i].decode_table_addresses()?.enumerate() {
             for (row, addr) in addrs.into_iter().enumerate() {
-                ptrs[(ord * 4 + row) * n + k] = addr as i64;
+                ptrs[(ord * TABLE_ROWS + row) * n + k] = addr as i64;
             }
         }
     }
@@ -309,7 +318,7 @@ pub fn build_wave_table<'w>(
     // on it yields a driver allocation while implying otherwise.
     let dev = stores[decode[0]].layer_state(layers[0])?.s.device().clone();
     Ok(Some(DeltaNetWaveTable {
-        ptrs: wave_from_vec_ticketed(ptrs, (layers.len(), 4, n), &dev, forward)?,
+        ptrs: wave_from_vec_ticketed(ptrs, (layers.len(), TABLE_ROWS, n), &dev, forward)?,
         rows: wave_from_vec_ticketed(rows, n, &dev, forward)?,
         layers,
     }))
@@ -329,107 +338,75 @@ pub fn build_layer_table(
         candle::bail!("delta_net cuda: no decode spans to table");
     }
     let n = decode.len();
-    // Same four rows as the wave table, taken from each span's own read and
-    // write halves. A caller carrying one state (`DeltaNetState::solo_out`)
-    // names the same buffer in both rows of `s`, which the state kernel accepts
-    // because it holds its `S` tile in registers for the whole sequence; its
-    // conv tail always has a distinct write buffer, because the prefill conv's
-    // readers of the entering tail run alongside the block writing the advance.
-    let mut ptrs: Vec<i64> = Vec::with_capacity(4 * n);
+    // Same three rows as the wave table, taken from each span's own state and
+    // timeline.
+    let mut ptrs: Vec<i64> = Vec::with_capacity(TABLE_ROWS * n);
     for s in &decode {
-        ptrs.push(f32_ptr(&s.state.conv_tail, "conv tail in")? as i64);
+        ptrs.push(f32_ptr(&s.state.conv_tail, "conv tail")? as i64);
     }
     for s in &decode {
-        ptrs.push(f32_ptr(&s.out.conv_tail, "conv tail out")? as i64);
+        ptrs.push(f32_ptr(&s.state.s, "state")? as i64);
     }
     for s in &decode {
-        ptrs.push(f32_ptr(&s.state.s, "state in")? as i64);
-    }
-    for s in &decode {
-        ptrs.push(f32_ptr(&s.out.s, "state out")? as i64);
+        ptrs.push(timeline_ptr(s)? as i64);
     }
     let rows: Vec<u32> = decode.iter().map(|s| s.start as u32).collect();
     let dev = decode[0].state.s.device().clone();
     Ok(DeltaNetLayerTable {
-        ptrs: wave_from_vec_ticketed(ptrs, (4, n), &dev, ticket)?,
+        ptrs: wave_from_vec_ticketed(ptrs, (TABLE_ROWS, n), &dev, ticket)?,
         rows: wave_from_vec_ticketed(rows, n, &dev, ticket)?,
     })
 }
 
-/// The multi-row spans of a wave, tabled for one launch per kernel.
-///
-/// Returns `None` when the wave carries no span longer than a row — every
-/// sequence decoding, which the batched decode kernels already handle — so the
-/// caller can skip the prefill launches entirely rather than issue empty ones.
-///
-/// The pointer rows are built exactly as [`build_layer_table`] builds them, and
-/// for the same reason: a span's conv tail and state live in that sequence's own
-/// allocation, so batching needs their addresses where the kernel can read them.
-/// `anchor` names the wave whose transient tier the two uploads land on — the
-/// packed activation the spans index into, which is carved from that same tier.
-/// It is read for its provenance only; its shape and dtype are irrelevant.
-pub fn build_span_table<'w>(
-    seqs: &[DeltaNetSeq<'_>],
-    anchor: &LiveTensor<'w>,
-) -> Result<Option<DeltaNetSpanTable<'w>>> {
-    let spans: Vec<&DeltaNetSeq<'_>> = seqs.iter().filter(|s| s.len > 1).collect();
-    if spans.is_empty() {
-        return Ok(None);
-    }
-    build_span_rows(&spans, anchor).map(Some)
+/// The address of a short span's timeline, 16-byte aligned (the kernels write
+/// its rows four floats at a time).
+fn timeline_ptr(s: &DeltaNetSeq<'_>) -> Result<u64> {
+    let Some(tl) = s.write.timeline() else {
+        candle::bail!(
+            "delta_net cuda: a {}-row span was handed a state to write, where every span \
+             of at most {TIMELINE_ROWS} rows writes a timeline",
+            s.len
+        );
+    };
+    aligned16(f32_ptr(tl, "timeline")?, "timeline")
 }
 
-fn build_span_rows<'w>(
-    spans: &[&DeltaNetSeq<'_>],
+/// The multi-row spans of a wave, tabled for one launch per kernel, split by
+/// length: `(short, long)` — spans of at most [`TIMELINE_ROWS`] rows for the
+/// short-span scan, longer ones for the conv + scan pair. Either is `None` when
+/// the wave carries no such span, so the caller issues no empty launch.
+///
+/// The pointer rows are built as [`build_layer_table`] builds them, and for the
+/// same reason: a span's conv tail and state live in that sequence's own
+/// allocation, so batching needs their addresses where the kernel can read
+/// them. `anchor` names the wave whose transient tier the uploads land on — the
+/// packed activation the spans index into, which is carved from that same tier.
+/// It is read for its provenance only; its shape and dtype are irrelevant.
+///
+/// **One upload of pointers and one of extents for both tables**, each table a
+/// view into them — the carves the tier prices for a wave's span tables
+/// (`WaveBuffer::DeltaNetLiveSpanPtrs` / `…Extents`, four pointers and two
+/// extents a span, which covers a short span's three pointers too). Two tables
+/// uploaded apart would be four carves against two priced, and the cursor's
+/// alignment of each would overrun the price.
+#[allow(clippy::type_complexity)]
+pub fn build_span_tables<'w>(
+    seqs: &[DeltaNetSeq<'_>],
     anchor: &LiveTensor<'w>,
-) -> Result<DeltaNetSpanTable<'w>> {
-    let n = spans.len();
-    let mut ptrs: Vec<i64> = Vec::with_capacity(4 * n);
-    for s in spans {
-        ptrs.push(f32_ptr(&s.state.conv_tail, "conv tail in")? as i64);
+) -> Result<(Option<DeltaNetSpanTable<'w>>, Option<DeltaNetSpanTable<'w>>)> {
+    let short: Vec<&DeltaNetSeq<'_>> = seqs
+        .iter()
+        .filter(|s| s.len > 1 && s.len <= TIMELINE_ROWS)
+        .collect();
+    let long: Vec<&DeltaNetSeq<'_>> = seqs.iter().filter(|s| s.len > TIMELINE_ROWS).collect();
+    if short.is_empty() && long.is_empty() {
+        return Ok((None, None));
     }
-    for s in spans {
-        // The prefill conv's blocks that read the entering tail run alongside
-        // the one that writes the advance, so the two must be distinct buffers.
-        // Checked here, where the table is assembled and both are in hand,
-        // rather than inside a kernel that cannot report it.
-        if s.state.conv_tail.same_storage(&s.out.conv_tail) {
-            candle::bail!(
-                "delta_net cuda: a prefill span's entering and advanced conv tails \
-                 must be separate buffers"
-            );
-        }
-        ptrs.push(f32_ptr(&s.out.conv_tail, "conv tail out")? as i64);
-    }
-    for s in spans {
-        // The geometry the launch shares is derived from the wave tensors
-        // (`DeltaNetFused::resolve_wave`), so each span's own state has to be
-        // checked against it here — a span carrying a differently shaped state
-        // would otherwise be read with the cohort's strides.
-        let (h_v, d_v, d_k) = s.state.s.dims3()?;
-        if d_v != d_k {
-            candle::bail!("delta_net cuda: state must be square per head, got ({d_v}, {d_k})");
-        }
-        if s.out.s.dims3()? != (h_v, d_v, d_k) {
-            candle::bail!(
-                "delta_net cuda: a span's entering and advanced states differ in shape: \
-                 {:?} against {:?}",
-                s.state.s.dims(),
-                s.out.s.dims()
-            );
-        }
-        ptrs.push(aligned16(f32_ptr(&s.state.s, "state in")?, "state in")? as i64);
-    }
-    for s in spans {
-        ptrs.push(aligned16(f32_ptr(&s.out.s, "state out")?, "state out")? as i64);
-    }
-    // `start` is the span's row in the PACKED wave buffer; the transients the
-    // scan hands between its two passes are indexed by the same number, which
-    // is what lets them be one wave-wide allocation instead of one per span.
-    let mut extents: Vec<u32> = Vec::with_capacity(2 * n);
-    extents.extend(spans.iter().map(|s| s.start as u32));
-    extents.extend(spans.iter().map(|s| s.len as u32));
-    let max_len = spans.iter().map(|s| s.len).max().unwrap_or(0);
+    let mut ptrs = short_rows(&short)?;
+    let short_ptrs = ptrs.len();
+    ptrs.extend(long_rows(&long)?);
+    let mut extents = span_extents(&short);
+    extents.extend(span_extents(&long));
     // Uploaded onto the wave's transient tier, named by `anchor`. These tables
     // are rebuilt every wave — the pointers and extents are what changes — so
     // they are transients, and `Tensor::from_vec` would put them in driver
@@ -439,18 +416,129 @@ fn build_span_rows<'w>(
     // memory tagged `LeaseOrigin::Foreign`, and `Foreign` carries no ticket by
     // design — a KV arena slot is not a scratch space, and its `'static` handle
     // must not be able to hand out wave-scoped memory.
-    Ok(DeltaNetSpanTable {
-        ptrs: anchor.from_vec_beside(ptrs, (4, n))?,
-        spans: anchor.from_vec_beside(extents, (2, n))?,
-        n,
-        max_len,
-    })
+    let n_ptrs = ptrs.len();
+    let n_ext = extents.len();
+    let ptrs = anchor.from_vec_beside(ptrs, n_ptrs)?;
+    let extents = anchor.from_vec_beside(extents, n_ext)?;
+    let table = |group: &[&DeltaNetSeq<'_>],
+                 ptr_at: usize,
+                 rows: usize,
+                 ext_at: usize|
+     -> Result<Option<DeltaNetSpanTable<'w>>> {
+        let n = group.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(DeltaNetSpanTable {
+            ptrs: ptrs.narrow(0, ptr_at, rows * n)?.reshape((rows, n))?,
+            spans: extents.narrow(0, ext_at, 2 * n)?.reshape((2, n))?,
+            n,
+            max_len: group.iter().map(|s| s.len).max().unwrap_or(0),
+        }))
+    };
+    Ok((
+        table(&short, 0, TABLE_ROWS, 0)?,
+        table(&long, short_ptrs, LONG_TABLE_ROWS, 2 * short.len())?,
+    ))
+}
+
+/// The state's shape, checked square per head: the geometry a launch shares is
+/// derived from the wave tensors (`DeltaNetFused::resolve_wave`), so each span's
+/// own state is checked here — a span carrying a differently shaped state would
+/// otherwise be read with the cohort's strides.
+fn checked_state_dims(s: &Tensor) -> Result<(usize, usize, usize)> {
+    let (h_v, d_v, d_k) = s.dims3()?;
+    if d_v != d_k {
+        candle::bail!("delta_net cuda: state must be square per head, got ({d_v}, {d_k})");
+    }
+    Ok((h_v, d_v, d_k))
+}
+
+/// The short-span table's pointer rows: `[tail, state, timeline]` per span.
+fn short_rows(spans: &[&DeltaNetSeq<'_>]) -> Result<Vec<i64>> {
+    let n = spans.len();
+    let mut ptrs: Vec<i64> = Vec::with_capacity(TABLE_ROWS * n);
+    for s in spans {
+        ptrs.push(f32_ptr(&s.state.conv_tail, "conv tail")? as i64);
+    }
+    for s in spans {
+        checked_state_dims(&s.state.s)?;
+        ptrs.push(aligned16(f32_ptr(&s.state.s, "state")?, "state")? as i64);
+    }
+    for s in spans {
+        ptrs.push(timeline_ptr(s)? as i64);
+    }
+    Ok(ptrs)
+}
+
+/// The long-span table's pointer rows: `[tail in, tail out, state in, state
+/// out]` per span, the outs in the prefill scratch.
+fn long_rows(spans: &[&DeltaNetSeq<'_>]) -> Result<Vec<i64>> {
+    let n = spans.len();
+    let outs = spans
+        .iter()
+        .map(|s| {
+            s.write.state().ok_or_else(|| {
+                Error::Msg(format!(
+                    "delta_net cuda: a {}-row span was handed a timeline, where every span \
+                     longer than {TIMELINE_ROWS} rows writes a state",
+                    s.len
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut ptrs: Vec<i64> = Vec::with_capacity(LONG_TABLE_ROWS * n);
+    for s in spans {
+        ptrs.push(f32_ptr(&s.state.conv_tail, "conv tail in")? as i64);
+    }
+    for (s, out) in spans.iter().zip(&outs) {
+        // The prefill conv's blocks that read the entering tail run alongside
+        // the one that writes the advance, so the two must be distinct buffers.
+        // Checked here, where the table is assembled and both are in hand,
+        // rather than inside a kernel that cannot report it.
+        if s.state.conv_tail.same_storage(&out.conv_tail) {
+            candle::bail!(
+                "delta_net cuda: a prefill span's entering and advanced conv tails \
+                 must be separate buffers"
+            );
+        }
+        ptrs.push(f32_ptr(&out.conv_tail, "conv tail out")? as i64);
+    }
+    for (s, out) in spans.iter().zip(&outs) {
+        let dims = checked_state_dims(&s.state.s)?;
+        if out.s.dims3()? != dims {
+            candle::bail!(
+                "delta_net cuda: a span's entering and advanced states differ in shape: \
+                 {:?} against {:?}",
+                s.state.s.dims(),
+                out.s.dims()
+            );
+        }
+        ptrs.push(aligned16(f32_ptr(&s.state.s, "state in")?, "state in")? as i64);
+    }
+    for out in &outs {
+        ptrs.push(aligned16(f32_ptr(&out.s, "state out")?, "state out")? as i64);
+    }
+    Ok(ptrs)
+}
+
+/// Each span's `(start, len)`, as the table's two extent rows.
+///
+/// `start` is the span's row in the PACKED wave buffer; the transients the scan
+/// hands between its two passes are indexed by the same number, which is what
+/// lets them be one wave-wide allocation instead of one per span.
+fn span_extents(spans: &[&DeltaNetSeq<'_>]) -> Vec<u32> {
+    let mut extents: Vec<u32> = Vec::with_capacity(2 * spans.len());
+    extents.extend(spans.iter().map(|s| s.start as u32));
+    extents.extend(spans.iter().map(|s| s.len as u32));
+    extents
 }
 
 /// One fused gated-delta-rule token step for EVERY decode sequence in the
-/// wave — one launch however many sessions it carries. States are updated in
-/// place through the pointer table; each sequence's output lands in its own
-/// row of the wave's `o`. Gates are computed in-kernel from the raw
+/// wave — one launch however many sessions it carries. States are read through
+/// the pointer table and never written: each token's generators go to row 0 of
+/// its sequence's timeline, for the fold. Each sequence's output lands in its
+/// own row of the wave's `o`. Gates are computed in-kernel from the raw
 /// projections; q/k come from the conv output with the tiled GQA mapping.
 pub fn delta_net_decode_batch(
     fused: &DeltaNetFused<'_, '_>,
@@ -465,12 +553,12 @@ pub fn delta_net_decode_batch(
         );
     }
     let d = cols / h_v;
-    if d > MAX_HEAD_DIM {
-        candle::bail!("delta_net cuda: head dim {d} exceeds the {MAX_HEAD_DIM} cap");
-    }
-    // The step kernel reads a state row as whole float4s.
-    if !d.is_multiple_of(4) {
-        candle::bail!("delta_net cuda: head dim {d} is not a multiple of 4");
+    // The timeline's fields are laid out for the fused kernels' head width.
+    if d != DELTA_NET_PREFILL_DIM {
+        candle::bail!(
+            "delta_net cuda: the decode step writes a timeline at d == \
+             {DELTA_NET_PREFILL_DIM}, got {d}"
+        );
     }
     if !conv_dim.is_multiple_of(d) || conv_dim <= h_v * d {
         candle::bail!("delta_net cuda: conv row {conv_dim} is not [Q|K|V] at d = {d}");
@@ -489,9 +577,9 @@ pub fn delta_net_decode_batch(
         _ => candle::bail!("delta_net cuda: conved must live on a CUDA device"),
     };
     let stream = dev.cuda_stream();
-    // Row 2 holds the entering state pointers, row 3 the advanced ones.
-    let states_p = typed_ptr(&table.ptrs.narrow(0, 2, 1)?, DType::I64, "state table")?;
-    let states_out_p = typed_ptr(&table.ptrs.narrow(0, 3, 1)?, DType::I64, "state out table")?;
+    // Row 1 holds the state pointers, row 2 the timelines.
+    let states_p = typed_ptr(&table.ptrs.narrow(0, 1, 1)?, DType::I64, "state table")?;
+    let timelines_p = typed_ptr(&table.ptrs.narrow(0, 2, 1)?, DType::I64, "timeline table")?;
     let rows_p = typed_ptr(&table.rows, DType::U32, "row table")?;
     let conved_p = f32_ptr(fused.conved, "conved")?;
     let alpha_p = f32_ptr(fused.alpha, "alpha")?;
@@ -499,10 +587,10 @@ pub fn delta_net_decode_batch(
     let dt_p = f32_ptr(fused.dt_bias, "dt_bias")?;
     let a_p = f32_ptr(fused.a, "a")?;
     let o_p = f32_ptr(fused.o, "o")?;
-    unsafe {
+    let status = unsafe {
         run_delta_net_decode_step_f32(
             states_p as *const i64,
-            states_out_p as *const i64,
+            timelines_p as *const i64,
             conved_p as *const f32,
             rows_p as *const u32,
             alpha_p as *const f32,
@@ -518,15 +606,21 @@ pub fn delta_net_decode_batch(
             conv_dim as i32,
             fused.q_scale,
             stream.cu_stream() as *mut core::ffi::c_void,
+        )
+    };
+    if status != 0 {
+        candle::bail!(
+            "delta_net cuda: the decode step refused {n_decode} rows over h_v {h_v} / h_k {h_k} \
+             at d {d} and wrote nothing"
         );
     }
     Ok(())
 }
 
 /// The batched decode conv: one launch over every decode sequence in the
-/// wave, reading each sequence's raw QKV row of `qkv` and writing its
-/// post-epilogue row of `conved`; tails are shifted in place through the
-/// pointer table.
+/// wave, reading each sequence's raw QKV row of `qkv` and its conv tail, and
+/// writing its post-epilogue row of `conved` and its raw input into row 0 of
+/// its timeline. The tail is read and never written.
 pub fn delta_net_conv_decode(
     qkv: &LiveTensor<'_>,
     kernel: &Tensor,
@@ -556,19 +650,19 @@ pub fn delta_net_conv_decode(
         _ => candle::bail!("delta_net cuda: qkv must live on a CUDA device"),
     };
     let stream = dev.cuda_stream();
-    // Row 0 holds the entering tail pointers, row 1 the advanced ones.
+    // Row 0 holds the tail pointers, row 2 the timelines.
     let tails_p = typed_ptr(&table.ptrs.narrow(0, 0, 1)?, DType::I64, "tail table")?;
-    let tails_out_p = typed_ptr(&table.ptrs.narrow(0, 1, 1)?, DType::I64, "tail out table")?;
+    let timelines_p = typed_ptr(&table.ptrs.narrow(0, 2, 1)?, DType::I64, "timeline table")?;
     let rows_p = typed_ptr(&table.rows, DType::U32, "row table")?;
     let x_p = f32_ptr(qkv, "qkv")?;
     let k_p = f32_ptr(kernel, "kernel")?;
     let y_p = f32_ptr(conved, "conved")?;
-    unsafe {
+    let status = unsafe {
         run_delta_net_conv_decode_f32(
             x_p as *const f32,
             k_p as *const f32,
             tails_p as *const i64,
-            tails_out_p as *const i64,
+            timelines_p as *const i64,
             rows_p as *const u32,
             y_p as *mut f32,
             n_decode as i32,
@@ -577,9 +671,143 @@ pub fn delta_net_conv_decode(
             qk_channels as i32,
             eps,
             stream.cu_stream() as *mut core::ffi::c_void,
+        )
+    };
+    if status != 0 {
+        candle::bail!(
+            "delta_net cuda: the decode conv refused {n_decode} rows over {channels} channels \
+             ({qk_channels} Q|K), window {kwidth}, and wrote nothing"
         );
     }
     Ok(())
+}
+
+/// Whether the fold kernel serves `dims`: the fused head width, and a conv
+/// window the tail's registers hold.
+pub fn fold_runs_fused(dims: &DeltaNetDims) -> bool {
+    dims.head_dim == DELTA_NET_PREFILL_DIM
+        && (2..=DELTA_NET_PREFILL_CONV_MAX).contains(&dims.conv_kernel)
+}
+
+/// One sequence's layer to fold: its conv tail, state and timeline addresses,
+/// and the rows to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldEntry {
+    pub tail: u64,
+    pub state: u64,
+    pub timeline: u64,
+    pub m: usize,
+}
+
+/// Apply every entry's first `m` timeline rows to its state and conv tail, in
+/// place, in ONE launch however many sequences and layers it covers — up to the
+/// grid's z extent, [`DELTA_NET_MAX_SPANS`] entries, a launch each beyond it
+/// (`delta_net_fold_kernel.cuh`).
+///
+/// The table — three pointers and a count per entry, one `[4, n]` upload — goes
+/// on held ground: a fold is issued after a forward, where no wave span stands,
+/// and its table is dead once the launch is behind it.
+pub fn delta_net_fold(entries: &[FoldEntry], dims: &DeltaNetDims, device: &Device) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if !fold_runs_fused(dims) {
+        candle::bail!(
+            "delta_net cuda: the fold kernel runs at d == {DELTA_NET_PREFILL_DIM} with a conv \
+             window of 2..={DELTA_NET_PREFILL_CONV_MAX}, got d {} and window {}",
+            dims.head_dim,
+            dims.conv_kernel
+        );
+    }
+    let Device::Cuda(dev) = device else {
+        candle::bail!("delta_net cuda: the fold kernel runs on a CUDA device");
+    };
+    // **Eager, in issue order behind whatever this thread has recorded.** A fold
+    // is issued at a forward's commit and at a step's reconcile, both inside a
+    // wave capture, and its table is held ground: giving the range back fences
+    // it on the stream, which a recording stream cannot take. Declared first so
+    // it is dropped last — the table goes back while the stream is still eager.
+    let _eager = device.eager()?;
+    // Every entry checked before anything launches, so a refusal writes nothing.
+    for e in entries {
+        if e.m == 0 || e.m > TIMELINE_ROWS {
+            candle::bail!(
+                "delta_net cuda: a fold of {} rows from a {TIMELINE_ROWS}-row timeline",
+                e.m
+            );
+        }
+        if !e.state.is_multiple_of(16) || !e.timeline.is_multiple_of(16) {
+            candle::bail!(
+                "delta_net cuda: a fold entry's state or timeline is not 16-byte aligned"
+            );
+        }
+    }
+    // One launch per grid's worth: an entry is a block column of the grid's z
+    // extent. The launcher refuses only by geometry, which every chunk shares,
+    // so a refusal comes on the first launch, before anything is written.
+    let stream = dev.cuda_stream();
+    for chunk in entries.chunks(DELTA_NET_MAX_SPANS) {
+        let n = chunk.len();
+        let mut table: Vec<i64> = Vec::with_capacity(FOLD_TABLE_ROWS * n);
+        table.extend(chunk.iter().map(|e| e.tail as i64));
+        table.extend(chunk.iter().map(|e| e.state as i64));
+        table.extend(chunk.iter().map(|e| e.timeline as i64));
+        table.extend(chunk.iter().map(|e| e.m as i64));
+        let table_t = held_empty((FOLD_TABLE_ROWS, n), DType::I64, device)?;
+        upload_into(&table_t, &table)?;
+        let status = unsafe {
+            run_delta_net_fold_f32(
+                typed_ptr(&table_t, DType::I64, "fold table")? as *const i64,
+                n as i32,
+                dims.n_v_heads as i32,
+                dims.n_k_heads as i32,
+                dims.conv_dim() as i32,
+                dims.conv_kernel as i32,
+                stream.cu_stream() as *mut c_void,
+            )
+        };
+        if status != 0 {
+            candle::bail!(
+                "delta_net cuda: the fold refused {n} entries over h_v {} / h_k {} and wrote \
+                 nothing",
+                dims.n_v_heads,
+                dims.n_k_heads
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`delta_net_fold`] over states and timelines held as tensors — the
+/// single-sequence entry points and the kernel tests.
+pub fn delta_net_fold_states(
+    jobs: &[(&DeltaNetState, &Tensor, usize)],
+    dims: &DeltaNetDims,
+) -> Result<()> {
+    let Some((first, _, _)) = jobs.first() else {
+        return Ok(());
+    };
+    let lay = TimelineLayout::of(dims);
+    let entries = jobs
+        .iter()
+        .map(|(st, tl, m)| {
+            if tl.dims1()? != lay.elems() {
+                candle::bail!(
+                    "delta_net cuda: a {:?} timeline for a geometry of {} elements",
+                    tl.dims(),
+                    lay.elems()
+                );
+            }
+            Ok(FoldEntry {
+                tail: f32_ptr(&st.conv_tail, "conv tail")?,
+                state: f32_ptr(&st.s, "state")?,
+                timeline: f32_ptr(tl, "timeline")?,
+                m: *m,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let device = first.s.device().clone();
+    delta_net_fold(&entries, dims, &device)
 }
 
 /// Validate the epilogue geometry both conv wrappers share: `qk_channels`
@@ -688,18 +916,18 @@ pub fn solve_unit_lower<'w>(a: &LiveTensor<'w>, rhs: LiveTensor<'w>) -> Result<L
     Ok(rhs)
 }
 
-/// Token-parallel causal conv over one prefill span, with the SiLU +
-/// Q|K-norm epilogue, written directly into the span's rows of the
-/// whole-wave `conved` buffer — the operand buffer the scan kernels read
-/// q/k/v from through strides.
+/// Token-parallel causal conv over every prefill span of a wave, with the SiLU
+/// and Q|K-norm epilogue, written directly into each span's rows of the
+/// whole-wave `conved` buffer — the operand buffer the scan kernels read q/k/v
+/// from through strides.
 ///
-/// `x [len, channels]` is **token-major** — the projection's own rows, so the
-/// caller narrows the fused QKV buffer instead of transposing it to
-/// channel-major. `tail_out` receives the advanced tail (raw values) and must
-/// be a **different** allocation from `tail`: blocks computing the first
-/// `kwidth−1` outputs read the entering tail concurrently, so writing over it
-/// would race. It is the wave's write half of the sequence's state, so the
-/// advance lands where `commit_wave` will install it and nothing is copied.
+/// `qkv [T_wave, channels]` is **token-major** — the projection's own rows, so
+/// nothing is transposed to channel-major. Each span's advanced tail (raw
+/// values) goes to its tail-out, a **different** allocation from its entering
+/// tail: blocks computing the first `kwidth−1` outputs read the entering tail
+/// concurrently, so writing over it would race. The tail-out is the sequence's
+/// prefill scratch, so the advance lands where `commit_wave` installs it and
+/// nothing is copied.
 // Eight: the kernel's own operands. Boxing them into a struct would put a
 // shape-checked argument list behind a constructor that checks nothing.
 #[allow(clippy::too_many_arguments)]
@@ -736,6 +964,7 @@ pub fn delta_net_conv_prefill(
         _ => candle::bail!("delta_net cuda: x must live on a CUDA device"),
     };
     let stream = dev.cuda_stream();
+    check_table_rows(table, LONG_TABLE_ROWS, "the prefill conv")?;
     let x_p = f32_ptr(qkv, "qkv")?;
     let k_p = f32_ptr(kernel, "kernel")?;
     let y_p = f32_ptr(conved, "conved")?;
@@ -749,9 +978,6 @@ pub fn delta_net_conv_prefill(
             ptrs_p as *const i64,
             spans_p as *const u32,
             table.n as i32,
-            std::ptr::null(),
-            1,
-            t_wave as i32,
             table.max_len as i32,
             channels as i32,
             kwidth as i32,
@@ -771,11 +997,12 @@ pub fn delta_net_conv_prefill(
     Ok(())
 }
 
-/// The fused prefill scan for the span `[start, start + len)`: the chunked
+/// The fused prefill scan for every prefill span of a wave: the chunked
 /// parallel form of the gated delta rule in two launches, replacing
 /// `delta_chunked`'s ~65 ops per chunk.
 ///
-/// `state [h_v, 128, 128]` is updated **in place** in the stored orientation
+/// Each span's entering state `[h_v, 128, 128]` is read and its advanced state
+/// written to its state-out — the prefill scratch — in the stored orientation
 /// (no `s_fla` transpose exists anywhere on this path); everything else is
 /// read from — and written into — the wave tensors in `fused`, through
 /// strides. The intra-chunk kernel (parallel over chunks × heads) hands
@@ -825,6 +1052,7 @@ pub fn delta_net_prefill_scan(
         let w_p = aligned16(f32_ptr(&w, "w")?, "w")?;
         let kq_p = aligned16(f32_ptr(&kq, "kq")?, "kq")?;
         let gcs_p = f32_ptr(&g_cs, "g_cs")?;
+        check_table_rows(table, LONG_TABLE_ROWS, "the prefill scan")?;
         let ptrs_p = typed_ptr(&table.ptrs, DType::I64, "span ptrs")?;
         let spans_p = typed_ptr(&table.spans, DType::U32, "span extents")?;
         let raw = stream.cu_stream() as *mut core::ffi::c_void;
@@ -842,8 +1070,6 @@ pub fn delta_net_prefill_scan(
                 gcs_p as *mut f32,
                 spans_p as *const u32,
                 table.n as i32,
-                std::ptr::null(),
-                1,
                 table.max_len as i32,
                 t_wave as i32,
                 p.h_v as i32,
@@ -862,8 +1088,6 @@ pub fn delta_net_prefill_scan(
                 ptrs_p as *const i64,
                 spans_p as *const u32,
                 table.n as i32,
-                std::ptr::null(),
-                1,
                 t_wave as i32,
                 p.h_v as i32,
                 p.h_k as i32,
@@ -876,20 +1100,35 @@ pub fn delta_net_prefill_scan(
     Ok(())
 }
 
-/// The conv and the fused prefill scan for a wave whose multi-row spans are
-/// all at most [`DELTA_NET_SHORT_SPAN_ROWS`] long — a verify wave — in ONE
-/// launch, where [`delta_net_conv_prefill`] + [`delta_net_prefill_scan`] take
-/// three chained through global memory.
+/// A span table's pointer rows, checked: a short table carries
+/// [`TABLE_ROWS`], a long one [`LONG_TABLE_ROWS`], one column per span.
+fn check_table_rows(table: &DeltaNetSpanTable, rows: usize, what: &str) -> Result<()> {
+    if table.ptrs.dims2()? != (rows, table.n) {
+        candle::bail!(
+            "delta_net cuda: {what} takes a [{rows}, {}] span table, got {:?}",
+            table.n,
+            table.ptrs.dims()
+        );
+    }
+    Ok(())
+}
+
+/// The conv, the intra-chunk solve and the state pass's reads of the fused
+/// scan for the wave's short spans — each at most [`DELTA_NET_SHORT_SPAN_ROWS`]
+/// rows — in ONE launch, where [`delta_net_conv_prefill`] +
+/// [`delta_net_prefill_scan`] take three chained through global memory.
 ///
-/// The same bits as that pair in every output it writes: `fused.o`'s span rows,
-/// every span's advanced state and advanced conv tail. It reads the raw `qkv`
-/// rows and convolves them itself, so the span rows of `fused.conved` are
-/// neither read nor written — that buffer supplies the wave's geometry here, and
-/// holds only the decode rows the batched decode conv writes beside this.
+/// The same bits as that pair in `fused.o`'s span rows. It writes each span's
+/// timeline (G, k, v_new and the raw conv rows) and leaves the span's state and
+/// conv tail as they were — the fold applies the rows the step keeps. It reads
+/// the raw `qkv` rows and convolves them itself, so the span rows of
+/// `fused.conved` are neither read nor written — that buffer supplies the
+/// wave's geometry here, and holds only the decode rows the batched decode conv
+/// writes beside this.
 ///
 /// Refused with an error, nothing written, when a span is longer than
 /// [`DELTA_NET_SHORT_SPAN_ROWS`] or the conv is not
-/// [`DELTA_NET_SHORT_SPAN_CONV`] wide — the shapes the pair serves.
+/// [`DELTA_NET_SHORT_SPAN_CONV`] wide — the shapes the kernel serves.
 pub fn delta_net_short_span_scan(
     fused: &DeltaNetFused<'_, '_>,
     qkv: &LiveTensor<'_>,
@@ -897,6 +1136,7 @@ pub fn delta_net_short_span_scan(
     table: &DeltaNetSpanTable,
     eps: f32,
 ) -> Result<()> {
+    check_table_rows(table, TABLE_ROWS, "the short-span scan")?;
     if table.max_len > DELTA_NET_SHORT_SPAN_ROWS {
         candle::bail!(
             "delta_net cuda: the short-span scan takes spans of at most \
@@ -1416,36 +1656,45 @@ mod tests {
             s_refs.push(s_r);
         }
 
-        // GPU: one batched launch per step over BOTH sequences.
+        // GPU: one batched launch per step over BOTH sequences, then one fold
+        // of each sequence's one-row timeline — the decode step reads its state
+        // and writes only the timeline.
+        let dims = DeltaNetDims {
+            head_dim: d,
+            n_k_heads: h_k,
+            n_v_heads: h_v,
+            conv_kernel: 4,
+        };
+        let lay = TimelineLayout::of(&dims);
         let states = [
-            Tensor::zeros((h_v, d, d), DType::F32, &gpu).unwrap(),
-            Tensor::zeros((h_v, d, d), DType::F32, &gpu).unwrap(),
+            DeltaNetState::zeros(&dims, &gpu).unwrap(),
+            DeltaNetState::zeros(&dims, &gpu).unwrap(),
         ];
-        // Tails are unused by the step kernel but the table carries both rows.
-        let tails = [
-            Tensor::zeros((4, 3), DType::F32, &gpu).unwrap(),
-            Tensor::zeros((4, 3), DType::F32, &gpu).unwrap(),
-        ];
+        let timelines = [lay.alloc(&gpu).unwrap(), lay.alloc(&gpu).unwrap()];
         let o = Tensor::zeros((t_wave, h_v * d), DType::F32, &gpu).unwrap();
         let fused = case.fused(&o);
         for i in 0..steps {
-            // Entering and advanced rows name the same buffers: this test
-            // advances its states in place, as the reference path does.
             let ptrs: Vec<i64> = vec![
-                f32_ptr(&tails[0], "tail").unwrap() as i64,
-                f32_ptr(&tails[1], "tail").unwrap() as i64,
-                f32_ptr(&tails[0], "tail").unwrap() as i64,
-                f32_ptr(&tails[1], "tail").unwrap() as i64,
-                f32_ptr(&states[0], "state").unwrap() as i64,
-                f32_ptr(&states[1], "state").unwrap() as i64,
-                f32_ptr(&states[0], "state").unwrap() as i64,
-                f32_ptr(&states[1], "state").unwrap() as i64,
+                f32_ptr(&states[0].conv_tail, "tail").unwrap() as i64,
+                f32_ptr(&states[1].conv_tail, "tail").unwrap() as i64,
+                f32_ptr(&states[0].s, "state").unwrap() as i64,
+                f32_ptr(&states[1].s, "state").unwrap() as i64,
+                f32_ptr(&timelines[0], "timeline").unwrap() as i64,
+                f32_ptr(&timelines[1], "timeline").unwrap() as i64,
             ];
             let table = DeltaNetLayerTable {
-                ptrs: Tensor::from_vec(ptrs, (4, 2), &gpu).unwrap(),
+                ptrs: Tensor::from_vec(ptrs, (3, 2), &gpu).unwrap(),
                 rows: Tensor::from_vec(vec![2 * i as u32, 2 * i as u32 + 1], 2, &gpu).unwrap(),
             };
             delta_net_decode_batch(&fused, &table).unwrap();
+            delta_net_fold_states(
+                &[
+                    (&states[0], &timelines[0], 1),
+                    (&states[1], &timelines[1], 1),
+                ],
+                &dims,
+            )
+            .unwrap();
         }
 
         let o_cpu = o
@@ -1455,7 +1704,7 @@ mod tests {
             .unwrap();
         for (first, (o_ref, s_ref)) in o_refs.iter().zip(s_refs.iter()).enumerate() {
             let o_gpu = gather(&o_cpu, &seq_rows(first));
-            let s_gpu = states[first].to_device(&cpu).unwrap();
+            let s_gpu = states[first].s.to_device(&cpu).unwrap();
             let od = max_diff(o_ref, &o_gpu);
             let sd = max_diff(s_ref, &s_gpu);
             assert!(
@@ -1532,21 +1781,23 @@ mod tests {
         }
 
         // GPU: one batched launch per step over both sequences, interleaved
-        // wave rows (A on even, B on odd). Each sequence carries two tail
-        // buffers and they are exchanged after every step — the store's
-        // ping-pong, which is what the kernel's two pointer tables are for.
-        let mut tails = [
-            Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap(),
-            Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap(),
-        ];
-        let mut tails_out = [
-            Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap(),
-            Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap(),
-        ];
+        // wave rows (A on even, B on odd). The conv reads each tail and writes
+        // the row's raw input into its timeline; the fold shifts it in. 512
+        // channels with 256 of them Q|K is h_k 1, h_v 2 at d 128. The timeline's
+        // S fields stay zero (no decode step runs), so the fold leaves S as it is.
+        let dims = DeltaNetDims {
+            head_dim: 128,
+            n_k_heads: 1,
+            n_v_heads: 2,
+            conv_kernel: kw,
+        };
+        assert_eq!(dims.conv_dim(), c);
+        let lay = TimelineLayout::of(&dims);
         let states = [
-            Tensor::zeros((1,), DType::F32, &gpu).unwrap(),
-            Tensor::zeros((1,), DType::F32, &gpu).unwrap(),
+            DeltaNetState::zeros(&dims, &gpu).unwrap(),
+            DeltaNetState::zeros(&dims, &gpu).unwrap(),
         ];
+        let timelines = [lay.alloc(&gpu).unwrap(), lay.alloc(&gpu).unwrap()];
         let t_wave = 2 * steps;
         // The wave's raw QKV rows: row 2i = A's token i, row 2i+1 = B's.
         let mut xw = Vec::with_capacity(t_wave * c);
@@ -1575,24 +1826,28 @@ mod tests {
         let qkv = Tensor::from_vec(xw, (t_wave, c), &gpu).unwrap();
         let conved = Tensor::zeros((t_wave, c), DType::F32, &gpu).unwrap();
         for i in 0..steps {
-            // The state rows are unused by the conv kernel; the tail rows name
-            // this step's read and write halves.
+            // The state row is unused by the conv kernel.
             let ptrs: Vec<i64> = vec![
-                f32_ptr(&tails[0], "tail in").unwrap() as i64,
-                f32_ptr(&tails[1], "tail in").unwrap() as i64,
-                f32_ptr(&tails_out[0], "tail out").unwrap() as i64,
-                f32_ptr(&tails_out[1], "tail out").unwrap() as i64,
-                f32_ptr(&states[0], "state").unwrap() as i64,
-                f32_ptr(&states[1], "state").unwrap() as i64,
-                f32_ptr(&states[0], "state").unwrap() as i64,
-                f32_ptr(&states[1], "state").unwrap() as i64,
+                f32_ptr(&states[0].conv_tail, "tail").unwrap() as i64,
+                f32_ptr(&states[1].conv_tail, "tail").unwrap() as i64,
+                f32_ptr(&states[0].s, "state").unwrap() as i64,
+                f32_ptr(&states[1].s, "state").unwrap() as i64,
+                f32_ptr(&timelines[0], "timeline").unwrap() as i64,
+                f32_ptr(&timelines[1], "timeline").unwrap() as i64,
             ];
             let table = DeltaNetLayerTable {
-                ptrs: Tensor::from_vec(ptrs, (4, 2), &gpu).unwrap(),
+                ptrs: Tensor::from_vec(ptrs, (3, 2), &gpu).unwrap(),
                 rows: Tensor::from_vec(vec![2 * i as u32, 2 * i as u32 + 1], 2, &gpu).unwrap(),
             };
             delta_net_conv_decode(&qkv, &kern_g, &table, &conved, qkc, eps as f32).unwrap();
-            std::mem::swap(&mut tails, &mut tails_out);
+            delta_net_fold_states(
+                &[
+                    (&states[0], &timelines[0], 1),
+                    (&states[1], &timelines[1], 1),
+                ],
+                &dims,
+            )
+            .unwrap();
         }
 
         let y_cpu = conved.to_device(&cpu).unwrap();
@@ -1611,11 +1866,14 @@ mod tests {
                 .unwrap()
                 .contiguous()
                 .unwrap();
-            let tail_gpu = tails[s].to_device(&cpu).unwrap();
+            let tail_gpu = states[s].conv_tail.to_device(&cpu).unwrap();
             let yd = max_diff(y_ref, &y_gpu);
             let td = max_diff(tail_ref, &tail_gpu);
             assert!(yd <= 1e-5, "seq {s}: conv outputs diverged: {yd}");
-            assert!(td <= 1e-6, "seq {s}: conv tail diverged: {td}");
+            assert_eq!(
+                td, 0.0,
+                "seq {s}: the folded conv tail is not the raw inputs"
+            );
         }
     }
 
@@ -1637,9 +1895,10 @@ mod tests {
         // Segments 9, then 2 (shorter than kw−1, so the new tail mixes old
         // tail and fresh tokens), then 5 — one running CPU oracle throughout.
         let mut tail_cpu = Tensor::zeros((c, kw - 1), DType::F32, &cpu).unwrap();
-        // Two halves, exchanged after each segment — the store's ping-pong, in
-        // the smallest form that still exercises the kernel's contract that the
-        // entering and advanced tails are separate allocations.
+        // Two buffers, exchanged after each segment — the store's live state and
+        // prefill scratch, in the smallest form that still exercises the
+        // kernel's contract that the entering and advanced tails are separate
+        // allocations.
         let mut tail_gpu = Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap();
         let mut tail_gpu_out = Tensor::zeros((c, kw - 1), DType::F32, &gpu).unwrap();
         for (seg, seed) in [(9usize, 42u64), (2, 43), (5, 44)] {
@@ -1969,134 +2228,385 @@ mod tests {
         }
     }
 
-    /// **The short-span launch is the three launches, to the bit.**
+    /// A short-span table from tensors: each span's conv tail, state and
+    /// timeline, then its extents — the layout [`build_span_tables`] writes for
+    /// short spans.
+    fn short_table(
+        rows: &[(&Tensor, &Tensor, &Tensor, usize, usize)],
+    ) -> DeltaNetSpanTable<'static> {
+        let n = rows.len();
+        let mut ptrs: Vec<i64> = Vec::with_capacity(3 * n);
+        for field in 0..3 {
+            for r in rows {
+                let t = [r.0, r.1, r.2][field];
+                ptrs.push(f32_ptr(t, "short span").unwrap() as i64);
+            }
+        }
+        let mut ext: Vec<u32> = rows.iter().map(|r| r.3 as u32).collect();
+        ext.extend(rows.iter().map(|r| r.4 as u32));
+        let dev = rows[0].0.device().clone();
+        DeltaNetSpanTable {
+            ptrs: Tensor::from_vec(ptrs, (3, n), &dev).unwrap(),
+            spans: Tensor::from_vec(ext, (2, n), &dev).unwrap(),
+            n,
+            max_len: rows.iter().map(|r| r.4).max().unwrap(),
+        }
+    }
+
+    /// **The fold of a short span's timeline is the three-launch scan over that
+    /// many rows, to the bit, at every prefix** (`docs/deltanet_timeline.md`
+    /// §10, test 1).
     ///
-    /// A verify wave takes [`delta_net_short_span_scan`] where every other wave
-    /// takes [`delta_net_conv_prefill`] + [`delta_net_prefill_scan`], and a
-    /// rewind replays the verify wave's rows through the pair
-    /// (`replay_stack`) — so any bit the fused kernel computes differently is a
-    /// rewind that diverges from the wave it rewinds. Two waves of two spans
-    /// each — {5, 1} with separate state buffers, {8, 3} advancing in place —
-    /// from random entering states and tails, every output pre-filled with
-    /// distinct poison per path so an element either path leaves unwritten
-    /// cannot agree by accident: `o`, every advanced state and every advanced
-    /// conv tail must match bit for bit.
+    /// A short span reads its state and writes a timeline; the fold of its
+    /// first `m` rows must be exactly the state and conv tail the conv + scan
+    /// pair writes for a span of those `m` rows alone — the arithmetic a
+    /// speculative rewind is locked to. One wave carries a span of every short
+    /// length, 2..=8, from random entering states and tails; for every span and
+    /// every `m`, the pair runs over its first `m` rows into poisoned buffers,
+    /// and the fold runs over a copy of the entering state. `S`, the conv tail
+    /// and the `o` rows of the prefix must match bit for bit — the `o` rows
+    /// because a row's output reads only the rows before it, whatever the span's
+    /// length.
     #[test]
-    fn a_short_span_fused_launch_is_the_three_launches_bit_for_bit() {
+    fn a_short_span_timeline_folds_to_the_three_launches_bit_for_bit() {
         let Ok(gpu) = Device::new_cuda(0) else {
             eprintln!("skipping: no CUDA device");
             return;
         };
         let d = ShortCase::D;
         let eps = 1e-6f32;
-        for (case, (lens, in_place)) in [(&[5usize, 1][..], false), (&[8, 3], true)]
-            .into_iter()
-            .enumerate()
-        {
-            let t: usize = lens.iter().sum();
-            let seed = 300 + 50 * case as u64;
-            let c = ShortCase::build(t, seed, &gpu);
-            let (h_v, conv_dim) = (c.h_v, c.conv_dim);
-            let starts: Vec<usize> = lens
-                .iter()
-                .scan(0usize, |acc, &l| {
-                    let s = *acc;
-                    *acc += l;
-                    Some(s)
-                })
-                .collect();
-            let entering: Vec<Tensor> = (0..lens.len())
-                .map(|i| lcg_tensor(&[h_v, d, d], seed + 10 + i as u64, &gpu))
-                .collect();
-            let tails: Vec<Tensor> = (0..lens.len())
-                .map(|i| lcg_tensor(&[conv_dim, 3], seed + 20 + i as u64, &gpu))
-                .collect();
-            let poison =
-                |shape: &[usize], s: u64| lcg_tensor(shape, s, &gpu).affine(1e3, 0.0).unwrap();
+        let lens: Vec<usize> = (2..=DELTA_NET_SHORT_SPAN_ROWS).collect();
+        let t: usize = lens.iter().sum();
+        let seed = 300u64;
+        let c = ShortCase::build(t, seed, &gpu);
+        let (h_v, conv_dim) = (c.h_v, c.conv_dim);
+        let dims = DeltaNetDims {
+            head_dim: d,
+            n_k_heads: c.h_k,
+            n_v_heads: h_v,
+            conv_kernel: DELTA_NET_SHORT_SPAN_CONV,
+        };
+        let lay = TimelineLayout::of(&dims);
+        let starts: Vec<usize> = lens
+            .iter()
+            .scan(0usize, |acc, &l| {
+                let s = *acc;
+                *acc += l;
+                Some(s)
+            })
+            .collect();
+        let entering: Vec<Tensor> = (0..lens.len())
+            .map(|i| lcg_tensor(&[h_v, d, d], seed + 10 + i as u64, &gpu))
+            .collect();
+        let tails: Vec<Tensor> = (0..lens.len())
+            .map(|i| lcg_tensor(&[conv_dim, 3], seed + 30 + i as u64, &gpu))
+            .collect();
+        let poison = |shape: &[usize], s: u64| lcg_tensor(shape, s, &gpu).affine(1e3, 0.0).unwrap();
 
-            // Per path: its own advanced buffers, poisoned differently, and —
-            // advancing in place — its own copy of the entering state.
-            struct PathBufs {
-                state_in: Vec<Tensor>,
-                state_out: Vec<Tensor>,
-                tail_out: Vec<Tensor>,
-                o: Tensor,
+        // The short path: every span in one launch, each into its own timeline.
+        // The states and tails it reads are the entering ones — it must leave
+        // them as they were.
+        let states: Vec<Tensor> = entering.iter().map(|s| s.copy().unwrap()).collect();
+        let timelines: Vec<Tensor> = (0..lens.len())
+            .map(|i| poison(&[lay.elems()], seed + 50 + i as u64))
+            .collect();
+        let o_short = poison(&[t, h_v * d], seed + 70);
+        let geometry = Tensor::zeros((t, conv_dim), DType::F32, &gpu).unwrap();
+        let rows: Vec<_> = (0..lens.len())
+            .map(|i| (&tails[i], &states[i], &timelines[i], starts[i], lens[i]))
+            .collect();
+        delta_net_short_span_scan(
+            &c.fused(&geometry, &o_short),
+            &c.qkv,
+            &c.kern,
+            &short_table(&rows),
+            eps,
+        )
+        .unwrap();
+        for i in 0..lens.len() {
+            assert_eq!(
+                f32_bits(&states[i]),
+                f32_bits(&entering[i]),
+                "span {i}: S was written"
+            );
+        }
+        let o_short = o_short.to_device(&Device::Cpu).unwrap();
+
+        for (i, &len) in lens.iter().enumerate() {
+            for m in 1..=len {
+                // The oracle: the pair over the span's first `m` rows alone.
+                let state_out = poison(&[h_v, d, d], seed + 1000 + m as u64);
+                let tail_out = poison(&[conv_dim, 3], seed + 2000 + m as u64);
+                let o_three = poison(&[t, h_v * d], seed + 3000 + m as u64);
+                let conved = Tensor::zeros((t, conv_dim), DType::F32, &gpu).unwrap();
+                let tbl = span_table(&[TestSpan {
+                    tail: &tails[i],
+                    tail_out: &tail_out,
+                    state: &entering[i],
+                    state_out: &state_out,
+                    start: starts[i],
+                    len: m,
+                }]);
+                delta_net_conv_prefill(&c.qkv, &c.kern, &tbl, 2 * c.h_k * d, eps, &conved).unwrap();
+                delta_net_prefill_scan(&c.fused(&conved, &o_three), &tbl).unwrap();
+
+                // The fold of the first `m` rows into a copy of the entering state.
+                let folded = DeltaNetState {
+                    s: entering[i].copy().unwrap(),
+                    conv_tail: tails[i].copy().unwrap(),
+                };
+                delta_net_fold_states(&[(&folded, &timelines[i], m)], &dims).unwrap();
+
+                assert_eq!(
+                    f32_bits(&folded.s),
+                    f32_bits(&state_out),
+                    "span of {len}, m = {m}: S"
+                );
+                assert_eq!(
+                    f32_bits(&folded.conv_tail),
+                    f32_bits(&tail_out),
+                    "span of {len}, m = {m}: conv tail"
+                );
+                let o_three = o_three.to_device(&Device::Cpu).unwrap();
+                assert_eq!(
+                    f32_bits(&o_three.narrow(0, starts[i], m).unwrap()),
+                    f32_bits(&o_short.narrow(0, starts[i], m).unwrap()),
+                    "span of {len}, m = {m}: o"
+                );
             }
-            let bufs = |salt: u64| PathBufs {
-                state_in: entering.iter().map(|s| s.copy().unwrap()).collect(),
-                state_out: (0..lens.len())
-                    .map(|i| poison(&[h_v, d, d], salt + i as u64))
-                    .collect(),
-                tail_out: (0..lens.len())
-                    .map(|i| poison(&[conv_dim, 3], salt + 5 + i as u64))
-                    .collect(),
-                o: poison(&[t, h_v * d], salt + 9),
-            };
-            let table = |b: &PathBufs| {
-                let rows: Vec<TestSpan<'_>> = (0..lens.len())
-                    .map(|i| TestSpan {
-                        tail: &tails[i],
-                        tail_out: &b.tail_out[i],
-                        state: &b.state_in[i],
-                        state_out: if in_place {
-                            &b.state_in[i]
-                        } else {
-                            &b.state_out[i]
-                        },
-                        start: starts[i],
-                        len: lens[i],
-                    })
-                    .collect();
-                span_table(&rows)
-            };
+        }
+    }
 
-            let three = bufs(seed + 1000);
-            let conved = Tensor::zeros((t, conv_dim), DType::F32, &gpu).unwrap();
-            let tbl = table(&three);
-            delta_net_conv_prefill(&c.qkv, &c.kern, &tbl, 2 * c.h_k * d, eps, &conved).unwrap();
-            delta_net_prefill_scan(&c.fused(&conved, &three.o), &tbl).unwrap();
+    /// **The tensor-op fold is the kernel fold** (`docs/deltanet_timeline.md`
+    /// §10, test 3b): from the timelines the short-span kernel writes, for every
+    /// span length 2..=8 and every kept prefix, `fold_by_ops` lands the state the
+    /// fold kernel lands within the reference's parity tolerance, and the conv
+    /// tail exactly — the tail is a copy of raw inputs, with no arithmetic to
+    /// differ in.
+    #[test]
+    fn the_tensor_op_fold_matches_the_kernel_fold() {
+        let Ok(gpu) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        use super::super::timeline::fold_by_ops;
+        let d = ShortCase::D;
+        let lens: Vec<usize> = (2..=DELTA_NET_SHORT_SPAN_ROWS).collect();
+        let t: usize = lens.iter().sum();
+        let seed = 500u64;
+        let c = ShortCase::build(t, seed, &gpu);
+        let (h_v, conv_dim) = (c.h_v, c.conv_dim);
+        let dims = DeltaNetDims {
+            head_dim: d,
+            n_k_heads: c.h_k,
+            n_v_heads: h_v,
+            conv_kernel: DELTA_NET_SHORT_SPAN_CONV,
+        };
+        let lay = TimelineLayout::of(&dims);
+        let starts: Vec<usize> = lens
+            .iter()
+            .scan(0usize, |acc, &l| {
+                let s = *acc;
+                *acc += l;
+                Some(s)
+            })
+            .collect();
+        let entering: Vec<Tensor> = (0..lens.len())
+            .map(|i| lcg_tensor(&[h_v, d, d], seed + 10 + i as u64, &gpu))
+            .collect();
+        let tails: Vec<Tensor> = (0..lens.len())
+            .map(|i| lcg_tensor(&[conv_dim, 3], seed + 30 + i as u64, &gpu))
+            .collect();
+        let timelines: Vec<Tensor> = (0..lens.len()).map(|_| lay.alloc(&gpu).unwrap()).collect();
+        let o = Tensor::zeros((t, h_v * d), DType::F32, &gpu).unwrap();
+        let geometry = Tensor::zeros((t, conv_dim), DType::F32, &gpu).unwrap();
+        let rows: Vec<_> = (0..lens.len())
+            .map(|i| (&tails[i], &entering[i], &timelines[i], starts[i], lens[i]))
+            .collect();
+        delta_net_short_span_scan(
+            &c.fused(&geometry, &o),
+            &c.qkv,
+            &c.kern,
+            &short_table(&rows),
+            1e-6,
+        )
+        .unwrap();
 
-            let short = bufs(seed + 2000);
-            let geometry = Tensor::zeros((t, conv_dim), DType::F32, &gpu).unwrap();
-            delta_net_short_span_scan(
-                &c.fused(&geometry, &short.o),
-                &c.qkv,
-                &c.kern,
-                &table(&short),
-                eps,
-            )
+        for (i, &len) in lens.iter().enumerate() {
+            for m in 1..=len {
+                let kernel = DeltaNetState {
+                    s: entering[i].copy().unwrap(),
+                    conv_tail: tails[i].copy().unwrap(),
+                };
+                delta_net_fold_states(&[(&kernel, &timelines[i], m)], &dims).unwrap();
+                let mut ops = DeltaNetState {
+                    s: entering[i].copy().unwrap(),
+                    conv_tail: tails[i].copy().unwrap(),
+                };
+                fold_by_ops(&mut ops, &timelines[i], m, &dims).unwrap();
+                let sd = max_diff(&kernel.s, &ops.s);
+                assert!(sd < 1e-4, "span of {len}, m = {m}: S differs by {sd}");
+                assert_eq!(
+                    f32_bits(&kernel.conv_tail),
+                    f32_bits(&ops.conv_tail),
+                    "span of {len}, m = {m}: conv tail"
+                );
+            }
+        }
+    }
+
+    /// **Each span of a mixed wave takes its own kernel** (§10, test 6): a wave
+    /// carrying two verify blocks beside a prefill chunk runs the blocks through
+    /// the short-span kernel into their timelines and the chunk through the
+    /// conv + scan pair into its scratch — and every span's output rows, state
+    /// and conv tail are, bit for bit, what it produces running alone.
+    ///
+    /// The short spans' states are checked untouched before their fold, which
+    /// is what says they took the timeline path at all; the long span's live
+    /// state likewise, because its advance belongs in the scratch.
+    #[test]
+    fn a_mixed_wave_runs_each_span_through_its_own_kernel() {
+        let Ok(gpu) = Device::new_cuda(0) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        use super::super::mix::{
+            delta_net_mix_spans, finish_solo, solo_write, DeltaNetConstants, DeltaNetOut,
+            DeltaNetProjections, SpanWrite,
+        };
+        let dims = DeltaNetDims {
+            head_dim: 128,
+            n_k_heads: 1,
+            n_v_heads: 2,
+            conv_kernel: 4,
+        };
+        let lens = [5usize, TIMELINE_ROWS + 12, 3];
+        let total: usize = lens.iter().sum();
+        let starts = [0usize, lens[0], lens[0] + lens[1]];
+        let p = DeltaNetProjections {
+            qkv: lcg_tensor(&[total, dims.conv_dim()], 11, &gpu),
+            z: lcg_tensor(&[total, dims.value_dim()], 12, &gpu),
+            beta_lin: lcg_tensor(&[total, dims.n_v_heads], 13, &gpu),
+            alpha_lin: lcg_tensor(&[total, dims.n_v_heads], 14, &gpu),
+        };
+        let dt_bias = lcg_tensor(&[dims.n_v_heads], 15, &gpu);
+        let a = lcg_tensor(&[dims.n_v_heads], 16, &gpu)
+            .abs()
+            .unwrap()
+            .affine(1.0, 0.1)
+            .unwrap()
+            .neg()
             .unwrap();
+        let conv = lcg_tensor(&[dims.conv_dim(), dims.conv_kernel], 17, &gpu);
+        let norm = lcg_tensor(&[dims.head_dim], 18, &gpu).abs().unwrap();
+        let c = DeltaNetConstants {
+            dt_bias: &dt_bias,
+            a: &a,
+            conv: &conv,
+            norm: &norm,
+        };
+        let entering = |i: usize| DeltaNetState {
+            s: lcg_tensor(&[2, 128, 128], 40 + i as u64, &gpu),
+            conv_tail: lcg_tensor(&[dims.conv_dim(), 3], 60 + i as u64, &gpu),
+        };
 
-            let advanced = |b: &PathBufs, i: usize| -> Vec<u32> {
-                f32_bits(if in_place {
-                    &b.state_in[i]
-                } else {
-                    &b.state_out[i]
-                })
+        // Each span alone, over its own rows of the same projections.
+        let mut alone_o = Vec::new();
+        let mut alone_states = Vec::new();
+        for i in 0..lens.len() {
+            let rows = |x: &Tensor| {
+                x.narrow(0, starts[i], lens[i])
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
             };
-            assert_eq!(f32_bits(&three.o), f32_bits(&short.o), "{lens:?}: o");
-            for (i, entered) in entering.iter().enumerate().take(lens.len()) {
-                let state = advanced(&three, i);
-                assert_ne!(
+            let ps = DeltaNetProjections {
+                qkv: rows(&p.qkv),
+                z: rows(&p.z),
+                beta_lin: rows(&p.beta_lin),
+                alpha_lin: rows(&p.alpha_lin),
+            };
+            let mut st = entering(i);
+            let write = solo_write(&st, lens[i], &dims).unwrap();
+            let mut seqs = [DeltaNetSeq {
+                start: 0,
+                len: lens[i],
+                state: &mut st,
+                write,
+            }];
+            let o = delta_net_mix_spans(&ps, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None)
+                .unwrap();
+            let [s] = seqs;
+            finish_solo(s.state, &s.write, s.len, &dims).unwrap();
+            alone_o.push(o.to_device(&Device::Cpu).unwrap());
+            alone_states.push(st);
+        }
+
+        // Together: one call, a timeline for each block and — as a store hands
+        // a prefilling sequence — a scratch apart from the live state for the
+        // chunk.
+        let mut states: Vec<DeltaNetState> = (0..lens.len()).map(entering).collect();
+        let scratch = DeltaNetOut {
+            s: Tensor::zeros((2, 128, 128), DType::F32, &gpu).unwrap(),
+            conv_tail: Tensor::zeros((dims.conv_dim(), 3), DType::F32, &gpu).unwrap(),
+        };
+        let writes: Vec<SpanWrite> = states
+            .iter()
+            .zip(lens)
+            .map(|(s, l)| match l > TIMELINE_ROWS {
+                true => SpanWrite::State(scratch.clone()),
+                false => solo_write(s, l, &dims).unwrap(),
+            })
+            .collect();
+        assert!(writes[0].timeline().is_some() && writes[2].timeline().is_some());
+        assert!(writes[1].state().is_some());
+        let mixed = {
+            let mut seqs: Vec<DeltaNetSeq<'_>> = states
+                .iter_mut()
+                .zip(writes.iter())
+                .enumerate()
+                .map(|(i, (state, write))| DeltaNetSeq {
+                    start: starts[i],
+                    len: lens[i],
                     state,
-                    f32_bits(entered),
-                    "{lens:?} span {i}: the three launches left the state where it entered"
-                );
-                assert!(
-                    state.iter().any(|&b| b != 0),
-                    "{lens:?} span {i}: the advanced state is zero"
-                );
-                assert_eq!(
-                    state,
-                    advanced(&short, i),
-                    "{lens:?} span {i}: advanced state"
-                );
-                assert_eq!(
-                    f32_bits(&three.tail_out[i]),
-                    f32_bits(&short.tail_out[i]),
-                    "{lens:?} span {i}: advanced conv tail"
-                );
-            }
+                    write: write.clone(),
+                })
+                .collect();
+            delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap()
+        };
+        for (i, st) in states.iter().enumerate() {
+            assert_eq!(
+                f32_bits(&st.s),
+                f32_bits(&entering(i).s),
+                "span {i}: the wave wrote the live state it read"
+            );
+        }
+        // The blocks fold whole; the chunk's advance is the scratch, as a
+        // commit would make it.
+        for i in [0, 2] {
+            finish_solo(&mut states[i], &writes[i], lens[i], &dims).unwrap();
+        }
+        states[1] = DeltaNetState {
+            s: scratch.s.clone(),
+            conv_tail: scratch.conv_tail.clone(),
+        };
+        let mixed = mixed.to_device(&Device::Cpu).unwrap();
+        for i in 0..lens.len() {
+            assert_eq!(
+                f32_bits(&mixed.narrow(0, starts[i], lens[i]).unwrap()),
+                f32_bits(&alone_o[i]),
+                "span {i}: output rows"
+            );
+            assert_eq!(
+                f32_bits(&states[i].s),
+                f32_bits(&alone_states[i].s),
+                "span {i}: state"
+            );
+            assert_eq!(
+                f32_bits(&states[i].conv_tail),
+                f32_bits(&alone_states[i].conv_tail),
+                "span {i}: conv tail"
+            );
         }
     }
 
@@ -2113,17 +2623,10 @@ mod tests {
         let d = ShortCase::D;
         let state = Tensor::zeros((c.h_v, d, d), DType::F32, &gpu).unwrap();
         let tail = Tensor::zeros((c.conv_dim, 3), DType::F32, &gpu).unwrap();
-        let tail_out = Tensor::zeros((c.conv_dim, 3), DType::F32, &gpu).unwrap();
+        let timeline = Tensor::zeros(16, DType::F32, &gpu).unwrap();
         let o = Tensor::zeros((t, c.h_v * d), DType::F32, &gpu).unwrap();
         let conved = Tensor::zeros((t, c.conv_dim), DType::F32, &gpu).unwrap();
-        let tbl = span_table(&[TestSpan {
-            tail: &tail,
-            tail_out: &tail_out,
-            state: &state,
-            state_out: &state,
-            start: 0,
-            len: t,
-        }]);
+        let tbl = short_table(&[(&tail, &state, &timeline, 0, t)]);
         let err = delta_net_short_span_scan(&c.fused(&conved, &o), &c.qkv, &c.kern, &tbl, 1e-6)
             .unwrap_err();
         assert!(
@@ -2343,23 +2846,29 @@ mod tests {
         // Decode: batched over 4 sequences (the gate's multi-context shape),
         // one launch pair regardless of the count.
         let n_dec = 4usize;
-        let dec_states: Vec<Tensor> = (0..n_dec)
-            .map(|_| Tensor::zeros((h_v, d, d), DType::F32, &gpu).unwrap())
+        let dims = DeltaNetDims {
+            head_dim: d,
+            n_k_heads: h_k,
+            n_v_heads: h_v,
+            conv_kernel: kw,
+        };
+        let lay = TimelineLayout::of(&dims);
+        let dec_states: Vec<DeltaNetState> = (0..n_dec)
+            .map(|_| DeltaNetState::zeros(&dims, &gpu).unwrap())
             .collect();
-        let dec_tails: Vec<Tensor> = (0..2 * n_dec)
-            .map(|_| Tensor::zeros((conv_dim, kw - 1), DType::F32, &gpu).unwrap())
-            .collect();
+        let dec_timelines: Vec<Tensor> = (0..n_dec).map(|_| lay.alloc(&gpu).unwrap()).collect();
         let mut ptrs: Vec<i64> = Vec::new();
-        for tl in &dec_tails {
-            ptrs.push(f32_ptr(tl, "tail").unwrap() as i64);
+        for st in &dec_states {
+            ptrs.push(f32_ptr(&st.conv_tail, "tail").unwrap() as i64);
         }
-        for _ in 0..2 {
-            for st in &dec_states {
-                ptrs.push(f32_ptr(st, "state").unwrap() as i64);
-            }
+        for st in &dec_states {
+            ptrs.push(f32_ptr(&st.s, "state").unwrap() as i64);
+        }
+        for tl in &dec_timelines {
+            ptrs.push(f32_ptr(tl, "timeline").unwrap() as i64);
         }
         let dec_table = DeltaNetLayerTable {
-            ptrs: Tensor::from_vec(ptrs, (4, n_dec), &gpu).unwrap(),
+            ptrs: Tensor::from_vec(ptrs, (3, n_dec), &gpu).unwrap(),
             rows: Tensor::from_vec((0..n_dec as u32).collect::<Vec<_>>(), n_dec, &gpu).unwrap(),
         };
         let d_us = time("decode step (batch of 4)", &mut || {
@@ -2368,10 +2877,26 @@ mod tests {
         let dc = time("conv_decode (batch of 4)", &mut || {
             delta_net_conv_decode(&qkv, &kern, &dec_table, &conved, qk_channels, 1e-6).unwrap();
         });
+        let jobs: Vec<(&DeltaNetState, &Tensor, usize)> = dec_states
+            .iter()
+            .zip(&dec_timelines)
+            .map(|(s, tl)| (s, tl, 1))
+            .collect();
+        let df = time("fold (4 × 1 row)", &mut || {
+            delta_net_fold_states(&jobs, &dims).unwrap();
+        });
+        let jobs8: Vec<(&DeltaNetState, &Tensor, usize)> = dec_states
+            .iter()
+            .zip(&dec_timelines)
+            .map(|(s, tl)| (s, tl, TIMELINE_ROWS))
+            .collect();
+        time("fold (4 × 8 rows)", &mut || {
+            delta_net_fold_states(&jobs8, &dims).unwrap();
+        });
         eprintln!(
             "  {:<26} {:9.1} µs/layer (4-seq decode)",
             "TOTAL",
-            d_us + dc
+            d_us + dc + df
         );
     }
 

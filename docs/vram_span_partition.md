@@ -788,8 +788,7 @@ set is a bitmap, so an arena of thousands of slots is as cheap as one of five.
 
 | Tenant | Slot | Holder |
 |---|---|---|
-| `RecurrentState` | one DeltaNet layer state (`s` + conv tail) | `RecurrentStateStore` |
-| `RewindStash` | one operand buffer of a speculative verify cohort, `[cap, width]` | `VerifyStash` (`SpanOperands::in_slots`) |
+| `RecurrentState` | one DeltaNet layer state (`s` + conv tail + 8-row timeline), or the prefill scratch beside it (`docs/deltanet_timeline.md`) | `RecurrentStateStore` |
 | `Gallery` | one 6 KiB provenance gallery page (32 tokens × 24 words) | `GalleryArena`'s page runs |
 | `QsaIndex` | one live-tail key page (256 block keys), an open block, or a rewind copy of one | `IndexCache` (`qwen4exp::index_keys`) |
 

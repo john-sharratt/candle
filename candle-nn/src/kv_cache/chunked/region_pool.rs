@@ -3148,7 +3148,7 @@ pub struct SpanPartition {
     /// Regions held by KV arenas.
     pub kv: usize,
     /// Regions held by span tenants — recurrent state, the provenance
-    /// gallery, index caches, rewind stashes.
+    /// gallery, index caches, creep residuals.
     pub tenants: usize,
     /// The largest wave transient tier placed since the last reading: the
     /// activations of the widest forward. It stands on regions nobody holds, so

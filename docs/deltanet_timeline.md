@@ -1,9 +1,10 @@
 # DeltaNet timeline: one state buffer, and a partial accept that picks a row
 
-**Status:** design, revised after a full audit against the code (2026-10-17, §11),
-with the audit's open questions decided (§12). Implementation follows this
-document; where the code and this document disagree, this document is the
-authority until it is amended.
+**Status:** implemented (2026-10-18, branch `more_tuning`), after a full audit
+against the code (2026-10-17, §11) with its open questions decided (§12). §13 records
+what the implementation settled that the design left open, and what it measured.
+Where the code and this document disagree, this document is the authority until it
+is amended.
 
 **Scope:** the Gated DeltaNet recurrent state of every hybrid model —
 `qwen35`/`qwen36`/`qwen38` (`models/qwen35/`) and Qwen3.8-Flash-Next
@@ -249,13 +250,16 @@ output rows and its timeline rows.
   matches `dn_decay_gate` bit for bit (`decode_kernel.cuh:95`, `common.cuh:45-47`).
   Every `len == 1` span takes this path, a one-token prefill included
   (`mix.rs:1705-1709`).
-- **Tables.** Both table builders emit `[tail in, tail out, state in, state out]`
-  today (`cuda.rs:288-301, 387-402`). A short span's rows become
-  `[tail, state, timeline]`; a long span's keep four rows, pointing at the scratch.
-  `build_span_rows`' refusal of a shared entering/advanced tail (`cuda.rs:396`) no
-  longer applies to short spans. Tables are rebuilt every forward and decode graphs
-  are re-recorded and updated in place each wave (`docs/decode_graphs.md:153-163`),
-  so no slot address has to outlive a forward.
+- **Tables.** A decode row's and a short span's rows are `[tail, state, timeline]`;
+  a long span's keep four rows, `[tail in, tail out, state in, state out]`, the outs
+  pointing at the scratch. The short and long tables of one layer are views of **one
+  pointer upload and one extent upload** (`build_span_tables`): the tier prices four
+  pointers and two extents per multi-row span as one carve each
+  (`WaveBuffer::DeltaNetLiveSpanPtrs`/`…Extents`), and two tables uploaded apart
+  would be four carves whose alignment overruns that price. The refusal of a shared
+  entering/advanced tail applies to long spans only. Tables are rebuilt every
+  forward and decode graphs are re-recorded and updated in place each wave
+  (`docs/decode_graphs.md:153-163`), so no slot address has to outlive a forward.
 
 ### 6.2 Kept length
 
@@ -280,16 +284,18 @@ accept. The Flash-Next profiling ladders at depths 8, 12 and 16
 ### 6.3 Fold
 
 One launch over every (sequence, recurrent layer, V head, `d_v` tile) to fold, from
-a descriptor table of `{slot base, m}` per (sequence, layer):
+a descriptor table `[4, n]` i64 — each (sequence, layer)'s conv tail, state and
+timeline addresses, then its `m` — uploaded once (`delta_net_fold`):
 
 ```
 S[i][j] ← S[i][j] · e^{G[m−1]} + Σ_{t<m} v_new[t][i] · (k[t][j] · e^{G[m−1] − G[t]})
 tail    ← last K − 1 of [tail | x[0] .. x[m−1]]
 ```
 
-- **`S`:** the three-kernel state pass's thread map or the short-span one — the
-  mapping does not change a bit (`prefill_kernel.cuh:1098-1142` vs `short_span:394-411`);
-  the operations are §3.3's.
+- **`S`:** the operations are §3.3's; which thread computes an element does not
+  enter its arithmetic, so the fold takes its own map — a lane owns four
+  consecutive columns and a warp four rows, every access a 128-bit load, and the
+  tile is loaded before the timeline is read (§13).
 - **Tail:** one thread owns a whole channel's `K − 1` elements, reads them, then
   writes them. An in-place fold with `m < K − 1` reads `tail[c][jj + m]` while
   writing `tail[c][jj]`, so the tail writer's per-element spread would race
@@ -324,11 +330,19 @@ armed cohort's layers stay pending across the segments' commits until the reconc
 The store's rules:
 
 - A forward refuses to hand a layer a timeline while that layer is pending — the
-  overlapping-wave refusal, moved from the store to the layer.
-- `commit_wave(armed)` folds every pending layer of a store that is not armed and
-  leaves an armed store's layers pending.
-- `fold(m)` and `discard()` end pending; `discard` writes nothing — `S` and the tail
-  are as the step entered.
+  overlapping-wave refusal, moved from the store to the layer
+  (`RecurrentStateStore::layer_span_mut`).
+- The sweep's recurrent bracket closes a successful wave with `commit_stores`: it
+  first folds every pending layer of every store **not** in the armed cohort, in
+  one launch over all of them, with the waves still open, then runs each store's
+  `commit_wave`, which exchanges every layer a long span advanced and leaves the
+  armed stores' layers pending. The fold is the one step of the close that can
+  fail, and a refused fold writes nothing, so a failure is rolled back like any
+  failed wave; the commits after it are infallible. A rollback drops only the
+  pending rows its own wave wrote; rows an earlier, committed segment left stay for
+  the reconcile.
+- `fold_stores` with `Some(m)` and `discard_pending` end pending; a discard writes
+  nothing — `S` and the tail are as the step entered.
 - `export`, `import`, `fork_from`, `relocate` and `compact_stores` refuse a store
   with a pending layer, as they refuse an open wave today (`state_store.rs:1123, 1304,
   967, 350, 917`).
@@ -537,8 +551,8 @@ latent-MoE architecture and has no DeltaNet.)
    tolerance, for every span length in `1..=R` and every `m` up to it.
 4. **The store's rules.** A pending layer refuses a second timeline; `export`,
    `fork_from`, `relocate` and `compact_stores` refuse a pending store;
-   `commit_wave(false)` folds; `commit_wave(true)` leaves pending; fold and discard
-   clear it.
+   `commit_wave` leaves pending and the caller's fold lands it; a rollback drops its
+   own wave's rows and keeps an earlier segment's; fold and discard clear it.
 5. **Exits.** Every path in §6.4's list ends pending: a zero-commit row, a truncate
    failure, a standalone-walk error.
 6. **Per-span kernel choice.** A wave carrying a verify block and a long creep span
@@ -644,3 +658,79 @@ atomicity they lack today. Not chosen: atomicity on the fused path only.
 **D4. qwen35's fold is recorded as one wave capture** at the reconcile, as qwen4exp's
 rewind is: eager issue measured ~3.6 ms of wall for ~0.8 ms of kernels
 (`qwen4exp/spec.rs:328-347`).
+
+## 13. Implementation notes (2026-10-18)
+
+Where each part landed, and what building it settled.
+
+**The store** (`delta_net/state_store.rs`). A layer is `{live: Half, scratch:
+Option<Half>, pending: Option<Pending>, advanced}`; a `Half` is a state, its conv
+tail and its timeline, views into one `SlotTenant::RecurrentState` slot laid out
+`S | tail | timeline`, each on a 256-byte boundary. `layer_span_mut(li, len)` hands
+a span the live state and its write — `SpanWrite::Timeline` for `len ≤ 8`,
+`SpanWrite::State` (the scratch) beyond — and refuses a pending layer or a long span
+with no scratch. `Pending` carries `this_wave`, so a rollback drops only its own
+wave's rows. The scratch is claimed in the prepare pass (`ensure_scratch`: qwen35's
+`ensure_recurrent`, which now takes the span lengths, and qwen4exp's
+`ensure_seq_state`), and released by a commit that ran recurrent layers with no long
+span, by `export` (the seal), and with the store; a commit that ran no recurrent
+layer — a window of attention layers — keeps it. `fold_stores` is the one fold entry
+point, CUDA (one launch over every store) or tensor ops.
+
+**The armed cohort.** qwen35 records it as `armed: seq → block length`, set by
+`begin_verify` (`arm_verify`, which refuses a block past 8 rows), folded by
+`truncate_sequences` (`fold_armed`) and discarded by `abort_verify`
+(`disarm_verify`). qwen4exp's is its `SpecCapture`'s sequences; `rewind_cohort`
+folds the targets it reconciles and `release_capture` discards every armed sequence
+the step did not, so a capture never outlives its step with rows pending.
+`CaptureRows` keeps the cohort's row layout itself (`SpecCapture::new` packs the
+blocks in wave order).
+
+**Exits.** Beyond §6.4's list, `verify_blocks`' own `begin_verify` and `end_verify`
+failures abort, and the scheduler's two "wrong row count" returns after
+`end_verify` abort. `describe_recurrent_state` runs after the rollback on a
+speculative step, and at once on a plain one, whose rows folded at commit.
+
+**The fold runs eagerly** (`Device::eager`). It is issued inside a wave capture at
+both sites — the forward's commit and the reconcile — and its table is held ground,
+whose give-back fences the range on the stream; a recording stream cannot take that.
+So D4's capture records nothing at qwen35's reconcile: the DeltaNet half of a rewind
+is one launch, not the replay's chain of conv, scan and table uploads that D4 was
+measured against, and `fold_armed` issues it directly. qwen4exp's rewind keeps its
+capture for the PLE, QSA and seed work around the fold.
+
+**Kernels.** The short-span kernel writes its timeline and no state; the decode step
+and the conv step write row 0 of it; the fold is `delta_net_fold_kernel.cuh`. The
+prefill kernels' layer-stack path (`DnLayerOps`, the replay's) is gone. Micro-
+optimisation, held by the bit-for-bit tests (§10, test 1) throughout:
+
+- the fold: a lane owns four columns and a warp four rows, so every S, k and v
+  access is a 128-bit load; the S tile is loaded before the timeline is read; the
+  conv tail is rebuilt with static-index selects rather than a runtime-indexed array
+  (which spilled to local memory); the table is one `[4, n]` upload rather than a
+  pointer table and a row-count table;
+- the decode step stages each row's `err` and output in shared memory and writes
+  both as coalesced rows, where lane 0 of each warp stored one float per row.
+
+**Pricing.** `WaveWidth::{staged_rows, staged_spans}`, `WaveWidth::replay`,
+`Chain::DeltaNetReplay`, its eight `WaveBuffer`s and `DeltaNetWidths::replay_*` are
+gone; the decode table prices three addresses per row per layer, not four.
+Admission prices an arriving sequence (`recurrent_store_bytes`) at its store plus
+its scratch, since a sequence arrives prefilling; a decoding sequence holds the
+store alone.
+
+**Measured** (RTX 4090 Mobile, 16 GiB, Flash-Next Q3_KO, the batched gate
+`test_parallel_batched_forwarding`, all 10 rows valid), the `state` band at decode
+end against the same tree without this change — §5's predictions to the region:
+
+| row | before | timeline | decode t/s before → after |
+|---|---:|---:|---:|
+| BF16 ×1 | 352 MiB | **208 MiB** | 15.1 → 15.3 |
+| BF16 ×4 | 1,072 MiB | **640 MiB** | 49.2 → 49.0 |
+| BF16 ×8 | 2,048 MiB | **1,216 MiB** | 66.5 → 67.4 |
+| C0/C5/C8/C10 ×2 | 576 MiB | **352 MiB** | 29.8/27.7/26.9/25.9 → 29.1/27.6/27.1/26.3 |
+| C5 ×8 / C10 ×8 | 2,048 MiB | **1,216 MiB** | 62.4/59.8 → 62.8/59.9 |
+
+Acceptance per step is identical in every row. Both columns were run with main's
+`6e60c910a` (the graph library's learn/trial/lock) reverted: with it, the ×8 rows'
+sliced prefill comes back NaN on this card with or without this change.

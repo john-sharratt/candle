@@ -846,8 +846,8 @@ pub(crate) mod tests {
     ///
     /// It measured flat (242.6 / 257.1 / 262.8 tok/s at 64 / 128 / 256 tokens,
     /// width 10), which is what pointed at DeltaNet: 30 recurrent layers each
-    /// holding a `32 × 128 × 128` F32 state per sequence, doubled for the
-    /// live/backup ping-pong, is 120 MiB per session and is untouched by KV
+    /// holding a `32 × 128 × 128` F32 state per sequence, with its conv tail and
+    /// timeline, is ~80 MiB per decoding session and is untouched by KV
     /// compression.
     ///
     /// **Each length is its own `params.run` and therefore its own model load**,
@@ -981,9 +981,10 @@ pub(crate) mod tests {
     cold_point!(cold_w20_b1, 20, 1);
     cold_point!(cold_w20_b2, 20, 2);
     // **Width 32 needs a card this lineage's dev machines do not have.** Thirty
-    // recurrent layers holding a `32 × 128 × 128` F32 state per sequence, doubled
-    // for the live/backup ping-pong, is ~120 MiB per session and compression
-    // cannot touch it — so 32 sessions is ~3.8 GiB of DeltaNet state before any
+    // recurrent layers holding a `32 × 128 × 128` F32 state per sequence, with
+    // its conv tail and timeline, is ~80 MiB per decoding session — twice that
+    // while it prefills — and compression cannot touch it, so 32 sessions
+    // prefilling together is ~5 GiB of DeltaNet state before any
     // KV, and admission refuses on the 16 GB and 24 GB boxes. They are kept, and
     // `#[ignore]`d like every other point here, because they are the instrument
     // for the 72 GB Blackwell: the answer they carry is whether the turn at 16

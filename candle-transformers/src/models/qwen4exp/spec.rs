@@ -9,29 +9,33 @@
 //!
 //! | Carried state | Why it cannot be truncated | How it rewinds |
 //! |---|---|---|
-//! | GDN `S` (DeltaNet) | a running sum over every token, no per-token decomposition | replay the mixer over the accepted rows from the entering state |
+//! | GDN `S` (DeltaNet) | a running sum over every token, no per-token decomposition | never written by the block: fold the accepted rows of its timeline |
 //! | PLE conv history | a sliding window of derived rows, not of tokens | slice the window that the accepted rows would have left |
 //! | QSA index cache | pooled block keys, appended as blocks complete | restore the entering snapshot, re-append the accepted rows' keys |
 //!
-//! # The way back is forward, and the entering state is already free
+//! # The GDN half writes nothing it would have to undo
 //!
-//! Each of the three is snapshotted at wave entry *anyway*, for the failure
-//! bracket that rolls a failed wave back ([`super::wave`]). A verify wave keeps
-//! those snapshots instead of dropping them, so the "state the block was
-//! entered with" costs nothing extra. What a rewind adds is the block's own
-//! per-row operands, because the wave arena reclaims them when the forward
-//! ends — so a verifying span stashes them as it goes.
+//! A verify block is a short span, so each DeltaNet layer reads its state and
+//! writes the block's **timeline** — the per-row generators of its advance —
+//! and stays pending past the forward's commit (`docs/deltanet_timeline.md`).
+//! Once the accept walk knows the block keeps `m` rows, the fold applies the
+//! first `m`; nothing is replayed, and a sequence that keeps none discards them.
+//! It is the hybrid's fold (`fold_stores`), one launch over the cohort.
 //!
-//! Only the GDN half replays arithmetic; it runs through
-//! [`replay_accepted_prefixes`], the same function the hybrid runs, against the
-//! same [`VerifyStash`]. The other two are bookkeeping over rows already
-//! computed: the PLE window is a slice, and the index cache re-appends through
-//! [`IndexCache::append`] — the same call the wave made.
+//! # The other two keep their snapshots
+//!
+//! The PLE history and the index caches are snapshotted at wave entry for the
+//! failure bracket that rolls a failed wave back ([`super::wave`]). A verify
+//! wave keeps those snapshots instead of dropping them, so the "state the block
+//! was entered with" costs nothing extra; the rewind is bookkeeping over rows
+//! the wave already computed: the PLE window is a slice, and the index cache
+//! re-appends through [`IndexCache::append`] — the same call the wave made.
+//! Their rows sit in [`CaptureRows`], one row per verify row of the cohort.
 //!
 //! # Cost
 //!
-//! For a block of `k` proposals accepted at `m`: one mixer call per DeltaNet
-//! layer over `m ≤ k+1` rows, one narrow, and one `append` per attention layer,
+//! For a block of `k` proposals accepted at `m`: one fold launch over the
+//! cohort's DeltaNet layers, one narrow, and one `append` per attention layer,
 //! against a whole forward's 48 layers of projections, attention and a
 //! 512-expert MoE.
 
@@ -48,9 +52,7 @@ use super::ple::PleState;
 use super::qsa::IndexerWeights;
 use super::wave::Qwen4ExpBatched;
 use crate::models::batched_inference::BatchedInferenceSession;
-use crate::models::delta_net::{DeltaNetConstants, LayerKind, RecurrentStateStore, SpanOperands};
-use crate::models::qwen35::spec::{replay_accepted_prefixes, ReplayLayer, StashSpan, VerifyStash};
-use candle_nn::kv_cache::vram_budget_available;
+use crate::models::delta_net::{fold_stores, LayerKind, RecurrentStateStore};
 
 /// One verifying sequence's rewind material.
 #[derive(Default)]
@@ -84,43 +86,45 @@ pub struct SeqStash {
 /// single `is_none` check — which is what keeps a plain decode wave paying
 /// nothing for machinery only a speculative one uses.
 pub struct SpecCapture {
-    /// Per verifying sequence.
+    /// Per verifying sequence — the armed cohort, whose DeltaNet layers stay
+    /// pending until the rewind.
     pub seqs: HashMap<usize, SeqStash>,
-    /// The cohort's GDN operands, one buffer set per recurrent layer.
-    pub delta: VerifyStash,
-    /// The cohort's kept rows, at the same row layout as `delta`.
+    /// The cohort's kept rows: one row per verify row, each sequence's block at
+    /// its `row`, packed in wave order.
     pub rows: CaptureRows,
 }
 
 impl SpecCapture {
     /// Arm for `blocks` — `(sequence, block length)`, in wave order — over
-    /// buffers already sized for the cohort
-    /// ([`Qwen4ExpBatched::verify_stash_for`]).
-    pub fn new(
-        blocks: &[(usize, usize)],
-        (mut delta, rows): (VerifyStash, CaptureRows),
-    ) -> Result<Self> {
-        delta.begin(blocks)?;
-        let mut seqs = HashMap::with_capacity(blocks.len());
-        for &(seq, len) in blocks {
-            let span = delta.span_of(seq).ok_or_else(|| {
-                candle::Error::Msg(format!("qwen4exp verify: no stash span for sequence {seq}"))
-            })?;
-            seqs.insert(
-                seq,
-                SeqStash {
-                    row: span.row,
-                    len,
-                    ..SeqStash::default()
-                },
+    /// row buffers already sized for the cohort
+    /// ([`Qwen4ExpBatched::capture_rows_for`]).
+    pub fn new(blocks: &[(usize, usize)], rows: CaptureRows) -> Result<Self> {
+        let total: usize = blocks.iter().map(|&(_, len)| len).sum();
+        let cap = rows.capacity()?;
+        if total > cap {
+            candle::bail!(
+                "qwen4exp verify: a {total}-row cohort against {cap}-row capture buffers"
             );
         }
-        Ok(Self { seqs, delta, rows })
-    }
-
-    /// The GDN stash rows for `seq`, or `None` when it is not verifying.
-    pub fn delta_span(&self, seq: usize) -> Option<StashSpan> {
-        self.delta.span_of(seq)
+        let mut seqs = HashMap::with_capacity(blocks.len());
+        let mut row = 0usize;
+        for &(seq, len) in blocks {
+            if seqs
+                .insert(
+                    seq,
+                    SeqStash {
+                        row,
+                        len,
+                        ..SeqStash::default()
+                    },
+                )
+                .is_some()
+            {
+                candle::bail!("qwen4exp verify: sequence {seq} carries two blocks in one cohort");
+            }
+            row += len;
+        }
+        Ok(Self { seqs, rows })
     }
 
     /// Record the entering state, taken from the snapshots the wave's failure
@@ -149,39 +153,32 @@ impl SpecCapture {
             }
         }
     }
-
-    /// A GDN layer's operand buffers, for a sweep that is about to run the
-    /// mixer over this cohort.
-    pub fn delta_layer(&mut self, ord: usize) -> Option<&mut SpanOperands> {
-        self.delta.layers.get_mut(ord)
-    }
 }
 
 impl Qwen4ExpBatched {
-    /// The rewind stash for a cohort of `rows` verify rows: the one the last
-    /// step used when it is wide enough, a new one sized for `rows` otherwise.
+    /// The capture's row buffers for a cohort of `rows` verify rows: the ones
+    /// the last step used when they are wide enough, new ones sized for `rows`
+    /// otherwise.
     ///
-    /// **Before the forward opens**, never inside it: the stash is claimed from
-    /// rewind-stash arena slots, and a wave's storage is claimed up front. The
-    /// buffers are reused across steps and replaced only when a wider cohort
-    /// arrives — the old one released first, so two cohorts' slots are never
-    /// held at once at the moment the wider one is hardest to satisfy.
-    pub(super) fn verify_stash_for(&self, rows: usize) -> Result<(VerifyStash, CaptureRows)> {
+    /// **Before the forward opens**, never inside it: a wave's storage is
+    /// claimed up front. The buffers are reused across steps and replaced only
+    /// when a wider cohort arrives — the old ones released first, so two
+    /// cohorts' buffers are never held at once.
+    pub(super) fn capture_rows_for(&self, rows: usize) -> Result<CaptureRows> {
         let mut slot = self
-            .verify_stash
+            .parked_rows
             .lock()
-            .map_err(|_| candle::Error::Msg("verify stash lock poisoned".into()))?;
+            .map_err(|_| candle::Error::Msg("parked capture rows lock poisoned".into()))?;
         let fits = match slot.as_ref() {
-            Some((s, r)) => s.capacity()? >= rows && r.capacity()? >= rows,
+            Some(r) => r.capacity()? >= rows,
             None => false,
         };
         if fits {
             return Ok(slot.take().expect("checked above"));
         }
         drop(slot.take());
-        // At least one row: a stash of none would be zero-width tensors, which
-        // the arena slots cannot hold and the driver was asked for instead —
-        // a round trip per buffer for memory that holds nothing.
+        // At least one row: buffers of none would be zero-width tensors — a
+        // round trip per buffer for memory that holds nothing.
         let rows = rows.max(1);
         let cfg = &self.model.cfg;
         let widths = CaptureWidths {
@@ -190,23 +187,34 @@ impl Qwen4ExpBatched {
             kv_layers: self.kv_layer_count(),
             index_dim: cfg.indexer.head_dim,
         };
-        Ok((
-            VerifyStash::new(&cfg.layer_kinds, &cfg.delta_net, rows, &self.model.device)?,
-            CaptureRows::new(rows, widths, &self.model.device)?,
-        ))
+        CaptureRows::new(rows, widths, &self.model.device)
     }
 
-    /// Hand a released capture's buffers back for the next step, the stash
-    /// naming no span: whatever it held was good for the one rewind it was
-    /// armed for.
-    pub(super) fn park_verify_stash(&self, cap: SpecCapture) {
-        let SpecCapture {
-            mut delta, rows, ..
-        } = cap;
-        delta.spans.clear();
-        if let Ok(mut slot) = self.verify_stash.lock() {
-            *slot = Some((delta, rows));
+    /// Hand a consumed capture's row buffers back for the next step: whatever
+    /// they held was good for the one rewind the capture was armed for.
+    pub(super) fn park_capture(&self, cap: SpecCapture) {
+        if let Ok(mut slot) = self.parked_rows.lock() {
+            *slot = Some(cap.rows);
         }
+    }
+
+    /// Release a capture whose step keeps none of its blocks: every armed
+    /// sequence's pending timelines are dropped — its GDN state stands as the
+    /// step entered it — and the row buffers are parked.
+    pub(super) fn release_capture(&self, cap: SpecCapture) -> Result<()> {
+        let discarded = self
+            .recurrent
+            .write()
+            .map_err(|_| candle::Error::Msg("recurrent lock poisoned".into()))
+            .map(|mut rec| {
+                for seq in cap.seqs.keys() {
+                    if let Some(store) = rec.get_mut(seq) {
+                        store.discard_pending();
+                    }
+                }
+            });
+        self.park_capture(cap);
+        discarded
     }
 
     /// The KV layers a sequence holds an index cache for: every trunk
@@ -219,37 +227,6 @@ impl Qwen4ExpBatched {
             .filter(|k| !matches!(k, LayerKind::DeltaNet))
             .count();
         trunk + usize::from(self.model.mtp.is_some())
-    }
-
-    /// The deepest budget whose rewind stash the KV side can currently hold.
-    ///
-    /// `usize::MAX` when the question does not arise — no reservation to
-    /// measure (a CPU device, or a test). The caller `min`s with the ladder, so
-    /// an unmeasurable bound never *raises* a budget.
-    pub(super) fn affordable_draft_budget(&self, width: usize) -> usize {
-        let dims = &self.model.cfg.delta_net;
-        let layers = self
-            .model
-            .cfg
-            .layer_kinds
-            .iter()
-            .filter(|k| matches!(k, LayerKind::DeltaNet))
-            .count();
-        // The four operands `SpanOperands` holds, per row, per DeltaNet layer.
-        let per_row = (dims.conv_dim() + dims.value_dim() + 2 * dims.n_v_heads)
-            * std::mem::size_of::<f32>()
-            * layers;
-        if per_row == 0 || width == 0 {
-            return usize::MAX;
-        }
-        let Some(budget) = vram_budget_available(&self.model.device) else {
-            return usize::MAX;
-        };
-        // Half of what is claimable, not all of it: the stash is one tenant
-        // among several, and a wave that spends every free region on its own
-        // rewind buffer has nothing left to decode into.
-        let rows = (budget / 2) / per_row;
-        (rows / width).saturating_sub(1)
     }
 
     /// Roll every target back to exactly `tokens` tokens — K/V and all three
@@ -269,14 +246,14 @@ impl Qwen4ExpBatched {
             .write()
             .map_err(|_| candle::Error::Msg("verify lock poisoned".into()))?;
 
-        // **Taken, not borrowed.** A stash span is good for exactly one step,
-        // and a failed replay's must not survive to rewind a later one. The
-        // borrow left the capture armed on every `?` below, so a cohort that
-        // bailed partway — some sequences rewound, none truncated — kept a
-        // stash whose spans still read as a valid rewind point for the next
+        // **Taken, not borrowed.** A capture is good for exactly one step, and
+        // a failed rewind's must not survive to rewind a later one. The borrow
+        // left the capture armed on every `?` below, so a cohort that bailed
+        // partway — some sequences rewound, none truncated — kept a capture
+        // that still read as a valid rewind point for the next
         // `truncate_sequences`. Consuming it up front makes a later rewind
         // refuse outright, which is the honest report of a step that failed.
-        // qwen35 consumes unconditionally for the same reason (`qwen35/forward.rs`).
+        // qwen35 consumes its armed cohort the same way (`qwen35/batched.rs`).
         //
         // Without a capture there is no block in flight, so the only honest
         // rewind is none at all — and a non-trivial target here would be a
@@ -296,43 +273,50 @@ impl Qwen4ExpBatched {
         // How many of each block's rows survived. The wave advanced the
         // sequence by the whole block, so its start is `offset - len`.
         let mut jobs: Vec<(usize, usize)> = Vec::with_capacity(targets.len());
-        for &(seq, tokens) in targets {
-            let Some(stash) = cap.seqs.get(&seq) else {
-                // A plain decode row: it wrote one token and kept it.
-                if session.sequence_offset(seq) != Some(tokens) {
-                    candle::bail!(
-                        "qwen4exp rewind: sequence {seq} did not verify a block this step but \
-                         is asked to move to {tokens} tokens"
-                    );
-                }
-                continue;
-            };
-            let offset = session.sequence_offset(seq).unwrap_or(0);
-            let base = offset.checked_sub(stash.len).ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "qwen4exp rewind: sequence {seq} stands at {offset} tokens after a \
-                     {}-row block, which cannot have started before zero",
-                    stash.len
-                ))
-            })?;
-            let kept = tokens.checked_sub(base).ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "qwen4exp rewind: sequence {seq} asked to move to {tokens} tokens, before \
-                     the block this capture covers (starts at {base}) — a replay covers the \
-                     block it stashed operands for and nothing else"
-                ))
-            })?;
-            jobs.push((seq, kept));
+        let planned = (|| -> Result<()> {
+            for &(seq, tokens) in targets {
+                let Some(stash) = cap.seqs.get(&seq) else {
+                    // A plain decode row: it wrote one token and kept it.
+                    if session.sequence_offset(seq) != Some(tokens) {
+                        candle::bail!(
+                            "qwen4exp rewind: sequence {seq} did not verify a block this step \
+                             but is asked to move to {tokens} tokens"
+                        );
+                    }
+                    continue;
+                };
+                let offset = session.sequence_offset(seq).unwrap_or(0);
+                let base = offset.checked_sub(stash.len).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "qwen4exp rewind: sequence {seq} stands at {offset} tokens after a \
+                         {}-row block, which cannot have started before zero",
+                        stash.len
+                    ))
+                })?;
+                let kept = tokens.checked_sub(base).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "qwen4exp rewind: sequence {seq} asked to move to {tokens} tokens, \
+                         before the block this capture covers (starts at {base}) — a fold \
+                         covers the block whose timeline it holds and nothing else"
+                    ))
+                })?;
+                jobs.push((seq, kept));
+            }
+            Ok(())
+        })();
+        if let Err(e) = planned {
+            self.release_capture(cap)?;
+            return Err(e);
         }
 
         // **Recorded as one wave, like the draft walk.** Everything below is a
-        // chain of small launches — the stacked DeltaNet replay's table uploads
-        // and three mixer kernels; per attention layer an index append — with
-        // no host decision between them. Issued
-        // eagerly they left the GPU idle between every pair: measured on
+        // chain of small launches — the DeltaNet fold; per attention layer an
+        // index append; the seed rewrites — with no host decision between them.
+        // Issued eagerly they left the GPU idle between every pair: measured on
         // Flash-Next's single-session verify, ~3.6 ms of wall a step for ~0.8 ms
         // of kernels. Anything below that must reach the driver (an allocation,
-        // a readback) pauses the recording at its own call site and resumes it.
+        // an upload, a readback) pauses the recording at its own call site and
+        // resumes it.
         #[cfg(feature = "cuda")]
         let capture = match &self.model.device {
             Device::Cuda(cuda) => Some(cuda.begin_wave_capture()?),
@@ -345,16 +329,19 @@ impl Qwen4ExpBatched {
             (Ok(()), Some(capture)) => capture.finish(),
             (rewound, _) => rewound,
         };
+        // Consumed either way: its rows named this step's blocks and nothing
+        // later. A sequence the fold reached is no longer pending; any armed
+        // sequence it did not — one the step never reconciled, or every one when
+        // the rewind failed — has its timelines dropped, so no pending layer
+        // outlives the step.
+        let released = self.release_capture(cap);
         rewound?;
-        // Consumed: its spans named this step's blocks and nothing later. The
-        // buffers go back for the next step to lay its own cohort over.
-        self.park_verify_stash(cap);
-        Ok(())
+        released
     }
 
-    /// The device half of [`Self::rewind_cohort`]: the GDN replay, the PLE and
+    /// The device half of [`Self::rewind_cohort`]: the GDN fold, the PLE and
     /// QSA rewinds, the draft head's seed and the K/V truncation, for `jobs`
-    /// (`(sequence, rows kept)`) of the block `cap` stashed.
+    /// (`(sequence, rows kept)`) of the blocks `cap` armed.
     fn rewind_recorded(
         &self,
         session: &mut BatchedInferenceSession,
@@ -363,68 +350,36 @@ impl Qwen4ExpBatched {
         jobs: &[(usize, usize)],
     ) -> Result<()> {
         let cfg = &self.model.cfg;
-        // ── The GDN half: one batched replay over the whole cohort. ──
-        let short: Vec<(usize, usize)> = jobs
-            .iter()
-            .copied()
-            .filter(|&(seq, kept)| cap.seqs.get(&seq).is_some_and(|s| kept < s.len))
-            .collect();
-        if !short.is_empty() {
-            let recurrent: Vec<usize> = cfg
-                .layer_kinds
-                .iter()
-                .enumerate()
-                .filter(|(_, k)| matches!(k, LayerKind::DeltaNet))
-                .map(|(i, _)| i)
-                .collect();
-            let layers: Vec<ReplayLayer<'_>> = recurrent
-                .iter()
-                .map(|&li| match &self.model.layers[li].mix {
-                    GpuLayerMix::DeltaNet(w) => Ok(ReplayLayer {
-                        layer_index: li,
-                        consts: DeltaNetConstants {
-                            dt_bias: &w.dt_bias,
-                            a: &w.a,
-                            conv: &w.conv,
-                            norm: &w.norm,
-                        },
-                    }),
-                    GpuLayerMix::Attention { .. } => candle::bail!(
-                        "qwen4exp rewind: layer {li} carries recurrent state but is not DeltaNet"
-                    ),
-                })
-                .collect::<Result<_>>()?;
-
+        // ── The GDN half: one fold over the whole cohort, each sequence its
+        // own kept rows — a full accept folds every row. The fold runs eagerly
+        // inside the rewind's recording (`delta_net_fold`). ──
+        {
             let mut rec = self
                 .recurrent
                 .write()
                 .map_err(|_| candle::Error::Msg("recurrent lock poisoned".into()))?;
             let mut stores: HashMap<usize, &mut RecurrentStateStore> = rec
                 .iter_mut()
-                .filter(|(seq, _)| short.iter().any(|&(s, _)| s == **seq))
+                .filter(|(seq, _)| jobs.iter().any(|&(s, _)| s == **seq))
                 .map(|(seq, st)| (*seq, st))
                 .collect();
-            let mut full: Vec<(StashSpan, usize, &mut RecurrentStateStore)> =
-                Vec::with_capacity(short.len());
-            for &(seq, kept) in &short {
-                let span = cap.delta.span_of(seq).ok_or_else(|| {
-                    candle::Error::Msg(format!("qwen4exp rewind: no stash span for {seq}"))
-                })?;
+            let mut folds: Vec<(&mut RecurrentStateStore, Option<usize>)> =
+                Vec::with_capacity(jobs.len());
+            for &(seq, kept) in jobs {
+                let len = cap.seqs.get(&seq).map_or(0, |s| s.len);
+                if kept > len {
+                    candle::bail!(
+                        "qwen4exp rewind: sequence {seq} keeps {kept} rows of a {len}-row block"
+                    );
+                }
                 let store = stores.remove(&seq).ok_or_else(|| {
                     candle::Error::Msg(format!(
                         "qwen4exp rewind: sequence {seq} has no recurrent state"
                     ))
                 })?;
-                full.push((span, kept, store));
+                folds.push((store, Some(kept)));
             }
-            replay_accepted_prefixes(
-                &layers,
-                &cfg.delta_net,
-                cfg.rms_norm_eps,
-                &self.model.device,
-                &cap.delta,
-                &mut full,
-            )?;
+            fold_stores(&mut folds)?;
         }
 
         // ── The PLE and QSA halves: per sequence, bookkeeping over rows the
@@ -534,9 +489,9 @@ impl Qwen4ExpBatched {
 /// nothing: the live state already covers exactly those tokens. The GDN half is
 /// handled by the caller in one batched pass over the whole cohort — this is
 /// the per-sequence bookkeeping the other two need.
-// The rewind needs the stash, the cut, and then every piece of per-layer state
-// the replay has to advance again — PLE, index caches, ratios, indexer weights —
-// plus the window scalars. They are independent inputs to one operation, not a
+// The rewind needs the captured rows, the cut, and then every piece of per-layer
+// state it rebuilds — PLE, index caches, ratios, indexer weights — plus the
+// window scalars. They are independent inputs to one operation, not a
 // bundle that travels together anywhere else.
 #[allow(clippy::too_many_arguments)]
 pub fn rewind_row_state(

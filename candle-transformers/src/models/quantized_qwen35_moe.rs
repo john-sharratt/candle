@@ -255,10 +255,11 @@ mod tests {
         //
         // What bounds concurrency here is per-session state, not the
         // checkpoint: DeltaNet holds `n_v_heads × head_dim × head_dim` in F32
-        // per recurrent layer per sequence, doubled for the live/backup
-        // ping-pong — about 120 MiB a session on this geometry — and C10 KV adds
-        // only a couple more. So 32 sessions want ~4 GiB of per-session state
-        // and 64 want ~8 GiB, on top of a resident footprint that already fills
+        // per recurrent layer per sequence, with its conv tail and timeline —
+        // about 80 MiB a decoding session on this geometry, twice that while it
+        // prefills — and C10 KV adds only a couple more. So 32 sessions want
+        // ~2.5 GiB of per-session state and 64 want ~5 GiB, on top of a
+        // resident footprint that already fills
         // a 16 GiB card. Forty is the gate: comfortably past what this laptop
         // can hold, comfortably inside a workstation card.
         //

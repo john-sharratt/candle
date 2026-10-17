@@ -24,13 +24,12 @@
 //! # The residue is resident in both
 //!
 //! Norms, the DeltaNet recurrence's F32 constants, and the two sub-tile gates
-//! never enter a slot (see `layer_stream::descriptor`). Consumers that want
-//! only those — the speculative verify replay, which runs at accept time when
-//! the layer may well have been evicted, and the activation-dtype change, which
-//! runs at session setup — go through [`LayerStore::residue`] and never touch
-//! the streaming machinery at all. That is not an optimisation: `ensure` at
-//! accept time would fetch a whole layer over PCIe to read four small
-//! constants that were in VRAM the entire time.
+//! never enter a slot (see `layer_stream::descriptor`). A consumer that wants
+//! only those — the activation-dtype change, which runs at session setup when
+//! any layer may be evicted — goes through [`LayerStore::residue`] and never
+//! touches the streaming machinery at all. That is not an optimisation:
+//! `ensure` there would fetch a whole layer over PCIe to read small constants
+//! that were in VRAM the entire time.
 
 use std::sync::Arc;
 

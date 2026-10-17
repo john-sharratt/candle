@@ -15943,6 +15943,7 @@ mod tests {
     mod faulted_turn;
     mod refused_decode_tier;
     mod reproject_abandoned;
+    mod speculation_exits;
     mod speculation_in_a_grammar;
 
     // —— admission (`admit_ground::AdmitPass`) ———————————————————————————————

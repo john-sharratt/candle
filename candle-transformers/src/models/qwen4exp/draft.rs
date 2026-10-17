@@ -62,7 +62,7 @@ use super::wave::Qwen4ExpBatched;
 use crate::models::batched_inference::BatchedInferenceSession;
 use crate::models::batched_inference::ManagedBatchedModel;
 use crate::models::batched_layer::{forward_attn_batched, BatchedAttentionParams, DecodeHeaders};
-use crate::models::delta_net::SeqSpan;
+use crate::models::delta_net::{SeqSpan, TIMELINE_ROWS};
 use crate::models::draft_walk::{draft_reserve, draft_walk};
 use crate::models::held_tensor::held_empty;
 use crate::models::kv_cache_utils::SequenceContext;
@@ -327,7 +327,7 @@ impl Qwen4ExpBatched {
         // sequences that can be rewound, and `rewind_cohort` reseeds from them.
         //
         // The capture copies the block's rows into the cohort's kept-row
-        // buffer at the sequence's stash row — buffers sized once for the
+        // buffer at the sequence's capture row — buffers sized once for the
         // cohort and reused across steps, so keeping them allocates nothing.
         let mut carry_runs: Vec<RowRun<'_>> = Vec::with_capacity(w.spans.len());
         let mut flips: Vec<(usize, Tensor)> = Vec::with_capacity(w.spans.len());
@@ -638,6 +638,16 @@ impl Qwen4ExpBatched {
         };
         if n == 0 || max_len == 0 {
             return Ok(vec![Vec::new(); n]);
+        }
+        // A block is the drafts plus the row they follow, and it must fit the
+        // DeltaNet timeline to be partially acceptable (`begin_verify`).
+        if max_len >= TIMELINE_ROWS {
+            candle::bail!(
+                "qwen4exp draft: {max_len} drafts make a {}-row block, deeper than the \
+                 {TIMELINE_ROWS}-row timeline — at most {} drafts a block",
+                max_len + 1,
+                TIMELINE_ROWS - 1
+            );
         }
         let eps = m.cfg.rms_norm_eps;
         let dev = &m.device;

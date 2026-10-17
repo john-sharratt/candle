@@ -107,8 +107,8 @@ pub(crate) mod slot_upload_batch;
 /// Where the tier may stand and what the KV side may reach. Pure arithmetic, and
 /// outside the `cuda` gate so it can be exercised on any machine.
 pub mod span_geometry;
-/// Fixed-stride slot arenas, dedicated per span tenant: recurrent state, rewind
-/// stashes, gallery pages, QSA index pages. The bookkeeping is host arithmetic and
+/// Fixed-stride slot arenas, dedicated per span tenant: recurrent state, gallery
+/// pages, QSA index pages, creep residuals. The bookkeeping is host arithmetic and
 /// tested anywhere; the pool that claims regions is CUDA-only.
 pub mod tenant_arena;
 /// The chunked cache's core types: sealed sequences and chunks, and their

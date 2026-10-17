@@ -1,5 +1,5 @@
 //! Fixed-stride slot arenas for the span's per-sequence tenants: recurrent state,
-//! speculative rewind stashes, provenance gallery pages and QSA index pages.
+//! provenance gallery pages, QSA index pages and creep residuals.
 //!
 //! # Why an arena
 //!
@@ -30,8 +30,9 @@
 //!
 //! The stride is the block size rounded up to [`SLOT_ALIGN`], exactly — there is no
 //! ladder, because pools are looked up by stride and nothing needs the set of strides
-//! to be finite. An arena holds `REGION_BYTES / stride` slots: five recurrent states on
-//! Flash-Next (2.6 % of the region unused), 2,730 gallery pages of 6 KiB. A block
+//! to be finite. An arena holds `REGION_BYTES / stride` slots: four recurrent-state
+//! slots on Flash-Next — `S`, its conv tail and its timeline, 3,859,968 B (8.0 % of
+//! the region unused) — and 2,730 gallery pages of 6 KiB. A block
 //! larger than one region is refused. The free set is a bitmap, so taking and returning
 //! a slot stay cheap at thousands of slots per arena.
 //!
@@ -78,10 +79,9 @@ pub fn slot_stride(bytes: usize) -> usize {
 /// Who a slot arena belongs to. Arenas are never shared across tenants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlotTenant {
-    /// One DeltaNet layer state (`s` plus its conv tail) of one sequence.
+    /// One DeltaNet layer state of one sequence — `s`, its conv tail and its
+    /// timeline — or the prefill scratch beside it.
     RecurrentState,
-    /// One operand buffer of a speculative verify cohort's rewind stash.
-    RewindStash,
     /// One page of the provenance gallery's resident signatures.
     Gallery,
     /// One page of a QSA index cache's block keys, or its open block.
@@ -96,9 +96,8 @@ impl SlotTenant {
     /// ground. Exhaustive by construction — a new variant that is not added here
     /// goes missing from the accounting, and ground nothing can total is ground
     /// that goes missing.
-    pub const ALL: [SlotTenant; 5] = [
+    pub const ALL: [SlotTenant; 4] = [
         Self::RecurrentState,
-        Self::RewindStash,
         Self::Gallery,
         Self::QsaIndex,
         Self::CreepResidual,
@@ -108,7 +107,6 @@ impl SlotTenant {
     pub fn label(self) -> &'static str {
         match self {
             Self::RecurrentState => "recurrent state",
-            Self::RewindStash => "a speculative rewind stash",
             Self::Gallery => "the provenance gallery",
             Self::QsaIndex => "a QSA index cache",
             Self::CreepResidual => "a creep's residual",
@@ -501,10 +499,10 @@ impl ArenaSlot {
 /// move in `moves`, taking that destination out of the map; answers whether it
 /// moved.
 ///
-/// For a holder whose slot is viewed as a tensor — a QSA key page, a rewind
-/// stash operand. One device copy of the tensor's own bytes, then `t` is rebuilt
-/// as an anchored view of the destination, so every later reader resolves the new
-/// address and the old slot goes back when its last view drops.
+/// For a holder whose slot is viewed as a tensor — a QSA key page. One device copy
+/// of the tensor's own bytes, then `t` is rebuilt as an anchored view of the
+/// destination, so every later reader resolves the new address and the old slot
+/// goes back when its last view drops.
 ///
 /// A tensor on a device with no reservation, or whose slot is not a planned
 /// source, is left exactly as it was.
@@ -586,9 +584,10 @@ impl Drop for ArenaSlot {
                 .get_mut(&key)
                 .and_then(|set| set.give_back(self.arena, self.index));
             // **A pool that holds no arenas is removed, not left behind.** A stride
-            // is not a fixed set: the rewind stash's follows its verify cap, so a
-            // long run meets a new one whenever a cohort width does, and entries
-            // that are never removed grow without bound. They also skew the census
+            // is not a fixed set: a creep residual's follows its row's width and
+            // dtype, so a long run meets a new one whenever a session's
+            // activation width does, and entries that are never removed grow
+            // without bound. They also skew the census
             // — `pools` is meant to say how many strides a tenant is spread over,
             // and an emptied entry is a stride it no longer occupies.
             if map.get(&key).is_some_and(|set| set.regions() == 0) {
