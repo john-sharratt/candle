@@ -41,9 +41,10 @@ pub const PAGE_BLOCKS: usize = 256;
 ///
 /// A wave takes one for its failure bracket, a speculative verify keeps the first
 /// of those as the block's entering state for the rest of the step, and the draft
-/// head takes one around its walk: three. One more is headroom, and running out is
-/// refused by name rather than met with an allocation.
-pub const SNAPSHOT_BUFFERS: usize = 4;
+/// head takes one around its walk, and a step swept in segments holds one across
+/// them (`ManagedBatchedModel::begin_step`): four. One more is headroom, and
+/// running out is refused by name rather than met with an allocation.
+pub const SNAPSHOT_BUFFERS: usize = 5;
 
 /// `n` uninitialised F32 buffers of `[rows, d]`: on CUDA, anchored views of
 /// QSA-index arena slots claimed in one call; on any other device, ordinary

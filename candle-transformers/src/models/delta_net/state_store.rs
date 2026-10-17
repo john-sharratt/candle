@@ -235,7 +235,20 @@ pub struct RecurrentStateStore {
     /// Store-level, unlike `advanced`, because seeding is a property of where
     /// the whole state came from rather than of which layers a sweep reached.
     seeded: bool,
+    /// The step open on this store, if any — see [`Self::begin_step`].
+    step: Option<StepRecord>,
     device: Device,
+}
+
+/// What a step's waves committed, so the step can be taken back whole.
+#[derive(Debug)]
+struct StepRecord {
+    /// Per slot: whether one of the step's waves swapped it.
+    swapped: Vec<bool>,
+    /// Whether something the record cannot undo happened inside the step — a
+    /// slot swapped twice (its first wave's entering state was overwritten by
+    /// the second's writes), or the live state written outside a wave.
+    broken: bool,
 }
 
 /// Where one layer state sits in its arena slot: `s` at the start, the conv tail
@@ -514,6 +527,7 @@ impl RecurrentStateStore {
             // A fresh store already holds the sequence-start value, so there is
             // nothing for a reset to destroy.
             seeded: false,
+            step: None,
             device: device.clone(),
         })
     }
@@ -538,6 +552,7 @@ impl RecurrentStateStore {
         if self.open {
             self.rollback_wave()?;
         }
+        self.break_step();
         for slot in &mut self.slots {
             slot.advanced = false;
             #[cfg(feature = "cuda")]
@@ -595,6 +610,7 @@ impl RecurrentStateStore {
     /// *different* tensor is one where prefill and decode end up advancing the
     /// state two different ways.
     pub fn layer_state_mut(&mut self, layer_index: usize) -> Result<&mut DeltaNetState> {
+        self.break_step();
         self.slots
             .iter_mut()
             .find(|s| s.layer_index == layer_index)
@@ -825,8 +841,12 @@ impl RecurrentStateStore {
     /// buffer holds an older wave's output, which is exactly why the flag is per
     /// slot.
     pub fn commit_wave(&mut self) {
-        for slot in &mut self.slots {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.advanced {
+                if let Some(step) = self.step.as_mut() {
+                    step.broken |= step.swapped[i];
+                    step.swapped[i] = true;
+                }
                 // The whole state: `s` and the conv tail are both written into
                 // the backup half by the wave's kernels — the conv kernels take
                 // the entering and advanced tails as two pointers — so they are
@@ -862,6 +882,75 @@ impl RecurrentStateStore {
         }
         self.open = false;
         Ok(())
+    }
+
+    /// Open a step: several waves that stand or fall together.
+    ///
+    /// **A decode step is swept in segments**, each its own wave, and each
+    /// commits as it ends — so a refused second segment rolled back only its own
+    /// layers and left the first segment's advanced. The scheduler retries the
+    /// step from layer 0, which ran those layers' tokens into their state a
+    /// second time: a recurrent state that has absorbed the same token twice is
+    /// wrong in a way nothing downstream can see, until it is far enough wrong to
+    /// be NaN.
+    ///
+    /// Free, like the wave bracket: a commit swaps `live` and `backup`, so the
+    /// entering state of every layer a step's wave committed is still in that
+    /// layer's `backup` as long as no later wave of the step wrote it again. The
+    /// segments of a step cover disjoint layers, so none does, and
+    /// [`Self::undo_step`] swaps back. Refused mid-wave.
+    pub fn begin_step(&mut self) -> Result<()> {
+        if self.open {
+            candle::bail!("recurrent store: begin_step mid-wave");
+        }
+        self.step = Some(StepRecord {
+            swapped: vec![false; self.slots.len()],
+            broken: false,
+        });
+        Ok(())
+    }
+
+    /// The step's waves stand.
+    pub fn end_step(&mut self) {
+        self.step = None;
+    }
+
+    /// The step never happened: every layer a wave of the step committed goes
+    /// back to the state the step entered with. Refuses mid-wave, with no step
+    /// open, and when the record cannot vouch for the undo — a layer committed
+    /// twice in the step, or the state written outside a wave — closing the
+    /// step either way.
+    pub fn undo_step(&mut self) -> Result<()> {
+        if self.open {
+            candle::bail!("recurrent store: undo_step mid-wave");
+        }
+        let Some(step) = self.step.take() else {
+            candle::bail!("recurrent store: undo_step with no step open");
+        };
+        if step.broken {
+            candle::bail!(
+                "recurrent store: the step cannot be undone — a layer was committed twice \
+                 in it, or its state was written outside a wave"
+            );
+        }
+        for (slot, swapped) in self.slots.iter_mut().zip(step.swapped) {
+            if swapped {
+                std::mem::swap(&mut slot.live, &mut slot.backup);
+                #[cfg(feature = "cuda")]
+                if let Some(held) = slot.held.as_mut() {
+                    held.swap(0, 1);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whatever just happened to the live state outside a wave, the open step
+    /// (if any) can no longer be undone by swapping.
+    fn break_step(&mut self) {
+        if let Some(step) = self.step.as_mut() {
+            step.broken = true;
+        }
     }
 
     /// An independent store carrying this one's state — the fork primitive.
@@ -943,6 +1032,7 @@ impl RecurrentStateStore {
             slots,
             open: false,
             seeded: true,
+            step: None,
             device: self.device.clone(),
         })
     }
@@ -1338,6 +1428,7 @@ impl RecurrentStateStore {
                 );
             }
         }
+        self.break_step();
         for (slot, l) in self.slots.iter_mut().zip(layers) {
             let state_f: Vec<f32> = l
                 .state
@@ -1948,6 +2039,69 @@ mod tests {
             "layer 1 was never reached and must not have moved"
         );
         assert_eq!(after[2].state, entry[2].state, "nor layer 3");
+    }
+
+    /// **A step whose later segment fails is undone whole.** Segment one
+    /// commits layers 0 and 1, segment two is refused on layer 3: undoing the
+    /// step puts the committed layers back, so the step's retry runs their
+    /// tokens into the state once rather than twice.
+    #[test]
+    fn an_undone_step_returns_every_committed_segment_to_its_entry_state() {
+        let mut store = filled_store();
+        let entry = store.export().unwrap();
+
+        store.begin_step().unwrap();
+        store.begin_wave().unwrap();
+        for layer in [0, 1] {
+            let (live, out) = store.layer_state_pair_mut(layer).unwrap();
+            bump_into(live, &out);
+        }
+        store.commit_wave();
+        store.begin_wave().unwrap();
+        {
+            let (live, out) = store.layer_state_pair_mut(3).unwrap();
+            bump_into(live, &out);
+        }
+        store.rollback_wave().unwrap();
+        assert_ne!(store.export().unwrap()[0].state, entry[0].state);
+
+        store.undo_step().unwrap();
+        let after = store.export().unwrap();
+        for (a, e) in after.iter().zip(&entry) {
+            assert_eq!(a.state, e.state, "layer {} back at entry", e.layer_index);
+            assert_eq!(a.conv_tail, e.conv_tail, "layer {} tail", e.layer_index);
+        }
+    }
+
+    /// A committed step keeps its writes, and a step the record cannot vouch
+    /// for — a layer committed twice — refuses its undo instead of installing
+    /// a state from the middle of the step.
+    #[test]
+    fn a_step_undo_refuses_what_a_swap_cannot_restore() {
+        let mut store = filled_store();
+        let entry = store.export().unwrap();
+        store.begin_step().unwrap();
+        for _ in 0..2 {
+            store.begin_wave().unwrap();
+            let (live, out) = store.layer_state_pair_mut(0).unwrap();
+            bump_into(live, &out);
+            store.commit_wave();
+        }
+        assert!(store.undo_step().is_err(), "layer 0 was committed twice");
+        assert!(
+            store.undo_step().is_err(),
+            "the refused undo closed the step"
+        );
+
+        store.begin_step().unwrap();
+        store.begin_wave().unwrap();
+        {
+            let (live, out) = store.layer_state_pair_mut(1).unwrap();
+            bump_into(live, &out);
+        }
+        store.commit_wave();
+        store.end_step();
+        assert_ne!(store.export().unwrap()[1].state, entry[1].state);
     }
 
     /// **The resume oracle.** Seal → drop the store entirely → resume from the

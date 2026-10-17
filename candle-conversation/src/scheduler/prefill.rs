@@ -3135,6 +3135,49 @@ impl Scheduler {
             .map(|(ids, _, _)| ids.clone())
             .unwrap_or_default();
         let out = self.wave_step(decode_seqs, decode_inputs, verify_seqs, verify_inputs, glue);
+        // **A segmented step stands or falls whole for its full-sweep members.**
+        // A refused later segment rolled back only its own layers; the ones
+        // before it committed, and the retry would run their tokens in again —
+        // a qwen4exp index a verify block ahead of its K/V per refusal, the
+        // K/V a token long on those layers, the recurrence advanced twice.
+        let out = match (self.wave_step_open.take(), out) {
+            (None, out) => out,
+            (Some(_), Ok(l)) => {
+                if let Err(e) = self.model.end_step(&mut self.session, true, 0) {
+                    tracing::warn!("closing a wave step that ran: {e}");
+                }
+                Ok(l)
+            }
+            (Some(committed), Err(e)) => {
+                match self.model.end_step(&mut self.session, false, committed) {
+                    Ok(()) => {
+                        if committed > 0 {
+                            tracing::info!(
+                                committed,
+                                "a wave step failed past its first segment; the layers its \
+                                 earlier segments committed were taken back"
+                            );
+                        }
+                        Err(e)
+                    }
+                    // Not the original error: a refusal is retried, and a retry
+                    // on state the undo could not restore is what this exists
+                    // to prevent. Worded without the refusal's marker so the
+                    // turns fail instead.
+                    Err(u) => {
+                        tracing::error!(
+                            committed,
+                            error = %e,
+                            "a wave step failed and its undo failed too; its decodes fail: {u}"
+                        );
+                        Err(candle::Error::Msg(format!(
+                            "a wave step's segment failed and the step could not be undone \
+                             ({u}) — the sequences' carried state is not trustworthy"
+                        )))
+                    }
+                }
+            }
+        };
         if out.is_err() {
             // The glue was taken off the queue and its fill did not complete.
             // Each slot's assembly recorded those glue pieces as placed;
@@ -3444,6 +3487,25 @@ impl Scheduler {
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
             .sum();
 
+        // A step of more than one segment carrying full-sweep members is opened
+        // on the model, so a later segment's failure takes the earlier ones back
+        // for them (closed in `decode_forward_cobatched`). The creep needs none:
+        // it holds its residual and cursor and retries only the failed window.
+        // Nor does glue: its K/V is reserved past its offset, and a failed step
+        // clears its placed pieces so the slot rebuilds them anyway.
+        let full_sweep: Vec<usize> = decode_seqs.iter().chain(verify_seqs).copied().collect();
+        if !full_sweep.is_empty() && (cursor > 0 || win_end < n) {
+            // Unbracketed, a later segment's failure is the bug the bracket
+            // exists for, so the step does not run: the error carries no
+            // refusal marker, and the decodes fail rather than retry.
+            if let Err(e) = self.model.begin_step(&full_sweep) {
+                return Err(candle::Error::Msg(format!(
+                    "a segmented wave step could not open its step bracket: {e}"
+                )));
+            }
+            self.wave_step_open = Some(0);
+        }
+
         // Segment 1 — full-sweep members only over [0, cursor). Runs when there is
         // any full-sweep member (decode or glue) and cursor > 0; the creep resumes
         // from its held residual at `cursor`. Yields caller order `[decode | glue]`.
@@ -3452,20 +3514,22 @@ impl Scheduler {
                 self.session.set_pending_glue(p.clone());
             }
             let _g = super::profile::span("loop:wave:forward");
-            self.model
-                .forward_wave(
-                    &mut self.session,
-                    decode_seqs,
-                    decode_inputs,
-                    verify_seqs,
-                    verify_inputs,
-                    glue_seqs,
-                    glue_inputs,
-                    0,
-                    cursor,
-                    None,
-                )?
-                .into_residual()
+            let seg1 = self.model.forward_wave(
+                &mut self.session,
+                decode_seqs,
+                decode_inputs,
+                verify_seqs,
+                verify_inputs,
+                glue_seqs,
+                glue_inputs,
+                0,
+                cursor,
+                None,
+            )?;
+            if let Some(committed) = self.wave_step_open.as_mut() {
+                *committed = cursor;
+            }
+            seg1.into_residual()
         } else {
             None
         };
@@ -3525,6 +3589,9 @@ impl Scheduler {
         ) {
             Ok(s) => {
                 self.wave_sweep_failures = 0;
+                if let Some(committed) = self.wave_step_open.as_mut() {
+                    *committed = win_end;
+                }
                 s
             }
             Err(e) => {
