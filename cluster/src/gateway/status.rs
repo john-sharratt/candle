@@ -17,6 +17,9 @@ use crate::frame::{BuildId, MemberState};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HubStatus {
+    /// The build this gateway runs: the one thing a script asking "is the
+    /// gateway on the new web?" otherwise could not read anywhere.
+    pub build: BuildId,
     pub gateway: String,
     pub now_ms: u64,
     /// Admitting no sockets, its members sent to their other clusters

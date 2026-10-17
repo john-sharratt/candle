@@ -249,6 +249,14 @@ async fn envelope(
     gateway.hub.traffic.aggregate(late);
     let mut out = json!({ "members": members });
     if path == STATUS_PATH {
+        // Who answered for the members, and on which build: a member's status
+        // names its own, and nothing else public named the gateway's.
+        let b = cluster::version::this_build();
+        out["gateway"] = json!({
+            "host": gateway.hub.name(),
+            "node": format!("{:016x}", gateway.node),
+            "build": { "count": b.count, "hash": b.hash, "local": b.local },
+        });
         let g = gateway.hub.group(app);
         out["group"] = json!({
             "floor": g.floor.map(|f| json!({ "count": f.count, "hash": f.hash, "local": f.local })),

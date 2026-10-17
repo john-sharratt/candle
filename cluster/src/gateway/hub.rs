@@ -1225,6 +1225,7 @@ impl Hub {
             })
             .collect();
         HubStatus {
+            build: crate::version::this_build(),
             gateway: self.name.clone(),
             now_ms: now,
             draining: s.draining,
