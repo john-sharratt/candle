@@ -852,6 +852,9 @@ pub struct TenantArenas {
     /// region per pool however small its slots are, which no packing walk can
     /// recover — only giving it fewer strides can.
     pub pools: usize,
+    /// One past the highest region the tenant holds — set against the pool's
+    /// frontier, whether this tenant is the one standing on it.
+    pub top: usize,
 }
 
 /// Every tenant's ground on `device`, in one pass under one lock.
@@ -875,6 +878,7 @@ pub fn arena_census(device: &Device) -> Vec<TenantArenas> {
             regions: 0,
             held_bytes: 0,
             pools: 0,
+            top: 0,
         })
         .collect();
     let DeviceLocation::Cuda { gpu_id } = device.location() else {
@@ -891,6 +895,7 @@ pub fn arena_census(device: &Device) -> Vec<TenantArenas> {
         row.regions += set.regions();
         row.held_bytes += set.held() * stride;
         row.pools += 1;
+        row.top = set.ranks().map(|r| r + 1).fold(row.top, usize::max);
     }
     out
 }

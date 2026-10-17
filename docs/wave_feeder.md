@@ -1968,10 +1968,12 @@ forward path (`strata_bench`).
   (4,592 → 4,414 t/s); at 4K, 3.4%. Ground bought forward by forward lets the
   experts the later chunks dislodge keep serving the earlier ones.
 * The ground between two of a turn's forwards is protected by the growth
-  policy, not by a purchase: the weight side's growth leaves the last forward's
-  tier free (`Occupancy::last_tier_bytes`). Before it, a compaction between
-  forwards let the zone grow back 1,631 slots that the next placement conceded
-  again (1,877), twice per 128K turn.
+  policy, not by a purchase: the weight side's growth leaves the widest tier of
+  the last 16 forwards free (`Occupancy::recent_tier_bytes`). Before it, a
+  compaction between forwards let the zone grow back 1,631 slots that the next
+  placement conceded again (1,877), twice per 128K turn. A window rather than the
+  last forward alone because a speculative decode step alternates narrow drafts
+  with a wide verify, and a draft's tier handed the verify's ground away.
 
 **The relief ladder stands, without a quantize rung, at the target growth
 leaves.** `relieve_vram_pressure` releases empty arenas, evicts cold galleries,

@@ -101,7 +101,7 @@ pub use chunked::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    empty_sweep_stats, forget_last_tier, held_ground_sites, held_ground_stats,
+    empty_sweep_stats, forget_recent_tiers, held_ground_sites, held_ground_stats,
     reclaim_empty_arenas, region_stats, span_partition, spare_tally, vram_bands, RegionStats,
     SpanPartition, VramBands, REGION_BYTES,
 };

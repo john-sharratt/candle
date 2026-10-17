@@ -704,7 +704,7 @@ impl Soak {
             // The model packs its arenas, so every free region is in the gap.
             free_above_live: free,
             tier_bytes: self.tier_bytes,
-            last_tier_bytes: self.tier_bytes,
+            recent_tier_bytes: self.tier_bytes,
             // The bare forward path has no scheduler stating a backlog.
             waiting_tier_bytes: 0,
             tier_high_water: self.tier_high_water,
