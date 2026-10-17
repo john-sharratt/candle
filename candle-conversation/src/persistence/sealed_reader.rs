@@ -362,4 +362,29 @@ mod tests {
         worker.join().expect("worker");
         assert_eq!(got, Some(Some(b"read under a held lock".to_vec())));
     }
+
+    /// **A whole record reads back as the log wrote it**, header and padding
+    /// included, sized from its own header — what a peer's fetch sends without
+    /// the persistence lock. The active segment is declined, and an unlinked one
+    /// fails, so the caller falls back to the locked read.
+    #[test]
+    fn a_raw_read_returns_the_whole_record_and_declines_what_it_cannot_vouch_for() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = open(dir.path());
+        let written = record(9, b"fetched by a peer catching up");
+        let loc = write(&mut log, 9, b"fetched by a peer catching up");
+        assert!(log.sealed_reader().read_raw(loc.segment, loc.offset).is_none());
+        log.seal_and_rotate().expect("seal");
+        let raw = log
+            .sealed_reader()
+            .read_raw(loc.segment, loc.offset)
+            .expect("sealed")
+            .expect("read");
+        assert_eq!(raw, written);
+        log.drop_sealed(loc.segment).expect("drop");
+        log.sealed_reader()
+            .read_raw(loc.segment, loc.offset)
+            .expect("still counts as sealed")
+            .expect_err("the file is gone");
+    }
 }
