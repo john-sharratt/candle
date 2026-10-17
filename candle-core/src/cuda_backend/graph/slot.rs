@@ -24,7 +24,7 @@
 
 use std::collections::VecDeque;
 
-use super::exec::{divergence, Audited, GraphExec, Template};
+use super::exec::{divergence, explaining, Audited, GraphExec, Template};
 use super::ComputeStream;
 use crate::Result;
 
@@ -72,10 +72,17 @@ impl ExecSlot {
     ///   used first — or instantiate it and keep it;
     /// - with [`Admit::Never`], instantiate it for this launch alone.
     ///
+    /// **A one-off never reshapes a `proven` topology's executables**: it runs
+    /// once instead. Each of them holds a shape the trial proved, and nothing
+    /// past the learn reshapes it back — reshaped by a prompt-length prefill in
+    /// a later learn, the steady shape it held was instantiated for every
+    /// launch of the lock that followed.
+    ///
     /// Returns the executable to launch when it is not kept (`Some`, the
     /// [`Folded::Transient`] case) — otherwise it is [`Self::front`] — how it
     /// got there, and, for an instantiation beside executables the slot
-    /// already holds, why none of them would take it ([`Refusal`]).
+    /// already holds, why none of them would take it ([`Refusal`]) — named only
+    /// while the graph's debug log is on, since naming it costs driver calls.
     pub(super) fn fold(
         &mut self,
         template: Template,
@@ -83,6 +90,7 @@ impl ExecSlot {
         on: &ComputeStream,
         nodes: usize,
         admit: Admit,
+        proven: bool,
     ) -> Result<(Option<GraphExec>, Folded, Option<Refusal>)> {
         let Audited {
             shape, topology, ..
@@ -99,7 +107,10 @@ impl ExecSlot {
                 outcome = Some((i, Folded::InPlace));
             }
         }
-        if outcome.is_none() && admit == Admit::Keep && !recurring {
+        // A one-off of a proven topology runs once rather than reshape what the
+        // trial proved.
+        let one_off_of_proven = proven && !recurring;
+        if outcome.is_none() && admit == Admit::Keep && !recurring && !proven {
             for i in 0..self.execs.len() {
                 if self.execs[i].try_fold(&template, on, nodes, shape)? {
                     outcome = Some((i, Folded::Reshaped));
@@ -115,12 +126,14 @@ impl ExecSlot {
                 how
             }
             None => {
-                refusal = self.execs.first().map(|last| Refusal {
-                    kept_nodes: self.execs.iter().map(GraphExec::node_count).collect(),
-                    divergence: divergence(&topology, last.topology()),
-                });
+                if explaining() {
+                    refusal = self.execs.first().map(|last| Refusal {
+                        kept_nodes: self.execs.iter().map(GraphExec::node_count).collect(),
+                        divergence: divergence(&topology, last.topology()),
+                    });
+                }
                 let exec = GraphExec::instantiate_audited(template, on, nodes, shape, topology)?;
-                if admit != Admit::Keep {
+                if admit != Admit::Keep || one_off_of_proven {
                     return Ok((Some(exec), Folded::Transient, refusal));
                 }
                 self.execs.insert(0, exec);

@@ -1842,26 +1842,65 @@ fn past_the_learn_a_new_shape_runs_once_and_reshapes_nothing() -> Result<()> {
     };
 
     let (t, a) = captured_n(&f, &stream, &x, &mut y, N, 1.0)?;
-    let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Keep)?;
+    let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Keep, false)?;
     assert!(once.is_none());
     assert_eq!(how, Folded::Instantiated);
     slot.front().expect("kept").launch(&compute)?;
     assert_eq!(dev.memcpy_dtov(&y)?, want(N, 1.0, 1.0));
 
     let (t, a) = captured_n(&f, &stream, &x, &mut y, half, 2.0)?;
-    let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Never)?;
+    let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Never, false)?;
     assert_eq!(how, Folded::Transient, "never: run once, kept nothing");
     once.expect("instantiated for its launch")
         .launch(&compute)?;
     assert_eq!(dev.memcpy_dtov(&y)?, want(half, 2.0, 1.0));
 
     let (t, a) = captured_n(&f, &stream, &x, &mut y, N, 3.0)?;
-    let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Never)?;
+    let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Never, false)?;
     assert!(once.is_none());
     assert_eq!(how, Folded::InPlace, "the held shape was not rewritten");
     slot.front().expect("held").launch(&compute)?;
     assert_eq!(dev.memcpy_dtov(&y)?, want(N, 3.0, 3.0));
     assert_eq!(slot.held().0, 1);
+    Ok(())
+}
+
+/// **A learn's one-off never reshapes a proven topology's executable.** In a
+/// learn, a shape seen once folds over another executable of its topology —
+/// unless the topology is proven: then it runs once, and the shape the trial
+/// proved still folds in place after it. Unproven, the same one-off reshapes.
+#[test]
+fn a_learns_one_off_leaves_a_proven_topology_alone() -> Result<()> {
+    use super::slot::{Admit, ExecSlot, Folded};
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let stream = dev.cuda_context().new_stream().w()?;
+    let compute = ComputeStream::of(&dev);
+    let half = N / 2;
+    for proven in [true, false] {
+        let mut slot = ExecSlot::default();
+        let (t, a) = captured_n(&f, &stream, &x, &mut y, N, 1.0)?;
+        let (_, how, _) = slot.fold(t, a, &compute, 1, Admit::Keep, false)?;
+        assert_eq!(how, Folded::Instantiated);
+
+        let (t, a) = captured_n(&f, &stream, &x, &mut y, half, 2.0)?;
+        let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Keep, proven)?;
+        if proven {
+            assert_eq!(how, Folded::Transient, "proven: the one-off runs once");
+            once.expect("instantiated for its launch")
+                .launch(&compute)?;
+            let (t, a) = captured_n(&f, &stream, &x, &mut y, N, 3.0)?;
+            let (_, how, _) = slot.fold(t, a, &compute, 1, Admit::Never, proven)?;
+            assert_eq!(how, Folded::InPlace, "the proven shape is still held");
+        } else {
+            assert!(once.is_none());
+            assert_eq!(how, Folded::Reshaped, "unproven: the one-off reshapes");
+        }
+        assert_eq!(slot.held().0, 1, "proven = {proven}");
+    }
     Ok(())
 }
 

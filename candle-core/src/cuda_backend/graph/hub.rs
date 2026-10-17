@@ -39,7 +39,7 @@
 
 use super::capture;
 use super::cuts::CutCounter;
-use super::exec::{audit, divergence, reshaped_at, Template};
+use super::exec::{audit, divergence, explaining, reshaped_at, Template};
 use super::library::ExecLibrary;
 use super::ordinals::{wave_kind, OrdinalHistory, WaveKind};
 use super::record_gate;
@@ -107,8 +107,9 @@ pub struct CaptureStats {
     /// Topologies the trials banned as not faster, and proved, so far.
     pub banned: u64,
     pub proven: u64,
-    /// Topologies the trials benched as too rarely hit to judge, in all.
-    pub banned_rare: u64,
+    /// Benches the trials have handed out, in all — topologies too rarely hit
+    /// to judge, or never timed (`regime`).
+    pub benched: u64,
     /// Times a lock has reopened to learn traffic it never saw.
     pub reopened: u64,
 }
@@ -390,7 +391,7 @@ fn act_on_transitions(st: &mut HubState, wave: u64) {
                 starts,
                 tallies,
             } => {
-                st.stats.banned_rare += rare as u64;
+                st.stats.benched += (rare + untimed) as u64;
                 let (execs, nodes, bytes) = st.library.held();
                 // The few with the most hits, which are what a verdict turns
                 // on: `hits/graphed/eager` each.
@@ -413,8 +414,8 @@ fn act_on_transitions(st: &mut HubState, wave: u64) {
                     proven,
                     graphed_over_eager =
                         proven_ratio.map(|r| format!("{r:.2}")).unwrap_or_default(),
-                    banned_rare = rare,
-                    banned_untimed = untimed,
+                    benched_rare = rare,
+                    benched_untimed = untimed,
                     banned_slower = slower,
                     next = next.name(),
                     banned_total,
@@ -423,11 +424,11 @@ fn act_on_transitions(st: &mut HubState, wave: u64) {
                     nodes_held = nodes,
                     held_mib = bytes >> 20,
                     budget_mib,
-                    "graph library: trial ended — of {judged} judged, {proven} proven, {} banned \
-                     ({rare} rarely hit, {untimed} never timed, {slower} not faster), {}",
-                    rare + untimed + slower,
+                    "graph library: trial ended — of {judged} judged, {proven} proven, {} benched \
+                     ({rare} rarely hit, {untimed} never timed), {slower} banned as not faster, {}",
+                    rare + untimed,
                     match next {
-                        Phase::Learn => "learning again into the ground the bans freed",
+                        Phase::Learn => "learning again into the ground they freed",
                         _ => "nothing new worth keeping: locked",
                     }
                 );
@@ -592,6 +593,14 @@ impl CaptureHub {
         if st.wave.is_some() {
             crate::bail!("a wave capture is already open on this device");
         }
+        // Segments on trial that have finished on the device are credited —
+        // first, because it can fail: a pair the driver will not time leaves
+        // this call with nothing else changed, not with the wave counted and a
+        // staging ring reopened for a wave that never opened.
+        {
+            let HubState { timer, regime, .. } = &mut *st;
+            timer.drain(|key, mode, took| regime.sample(key, mode, took))?;
+        }
         if st.capture.is_none() {
             st.capture = Some(compute.context().new_stream().w()?);
         }
@@ -621,15 +630,10 @@ impl CaptureHub {
             }
         }
         {
-            // Segments on trial that have finished on the device are credited,
-            // and a trial that has run its course drops what it did not prove.
+            // A trial that has run its course drops what it did not prove.
             let HubState {
-                timer,
-                regime,
-                library,
-                ..
+                regime, library, ..
             } = &mut *st;
-            timer.drain(|key, mode, took| regime.sample(key, mode, took))?;
             for key in regime.wave_begins(now) {
                 library.drop_topology(key);
             }
@@ -770,28 +774,34 @@ impl CaptureHub {
         let first_sight = !st.library.holds(audited.key);
         let (key, shape) = (audited.key, audited.shape);
         let holds_shape = st.library.holds_shape(key, shape);
+        // The explanations name kernels through the driver; only for the log.
+        let explain = explaining();
         let kind = wave.kind;
         let o = st.ordinals.at(kind, segment);
         let prev_topology = &o.topology[segment];
-        let departs = if first_sight && !prev_topology.is_empty() {
+        let departs = if explain && first_sight && !prev_topology.is_empty() {
             divergence(&audited.topology, prev_topology)
         } else {
             None
         };
-        o.topology[segment].clone_from(&audited.topology);
+        if explain {
+            o.topology[segment].clone_from(&audited.topology);
+        }
         // **A shape the library does not hold, of the topology this ordinal
         // held last wave.** The same launches at other dimensions are a key of
         // their own, so the launch whose grid or variant moved names what keeps
         // a segment from recurring.
         st.regime.recorded(o.key[segment].map(|(k, _)| k), key);
         let reshaped = match o.key[segment] {
-            Some((k, s)) if k == key && s != shape && !holds_shape => {
+            Some((k, s)) if explain && k == key && s != shape && !holds_shape => {
                 reshaped_at(&audited.dims, &o.dims[segment])
             }
             _ => None,
         };
-        o.dims[segment].clone_from(&audited.dims);
-        o.key[segment] = Some((key, shape));
+        if explain {
+            o.dims[segment].clone_from(&audited.dims);
+        }
+        o.recorded(segment, (key, shape));
         let topologies = st.library.len() + usize::from(first_sight);
         // Only the learn keeps anything new, and never a banned topology;
         // after it, a shape the library does not hold runs once (`slot`).
@@ -800,10 +810,11 @@ impl CaptureHub {
         } else {
             Admit::Never
         };
+        let proven = st.regime.proven(key);
         let (transient, folded, refusal) = match st
             .library
             .slot(key)
-            .fold(template, audited, &on, nodes, admit)
+            .fold(template, audited, &on, nodes, admit, proven)
         {
             Ok(done) => done,
             Err(e) => {
@@ -930,9 +941,9 @@ impl CaptureHub {
     /// (`ordinals`):
     ///
     /// - banned: as issued — its graph was not worth keeping;
-    /// - not held, in the lock: as issued — recording it would buy one launch
-    ///   of an executable nothing keeps (in the trial it records, so its
-    ///   prediction follows the wave: [`Regime::runs_unkept`]);
+    /// - its shape not held, in the lock: as issued — recording it would buy
+    ///   one launch of an executable nothing keeps (in the trial it records, so
+    ///   its prediction follows the wave: [`Regime::runs_unkept`]);
     /// - on trial: graphed or eager by turns ([`Regime::mode_for`]), its start
     ///   recorded for the device time the trial compares;
     /// - otherwise recorded. An ordinal never recorded is recorded while the
@@ -956,10 +967,16 @@ impl CaptureHub {
         let ordinal = wave.segment;
         let o = st.ordinals.at(wave.kind, ordinal);
         // The regime judges topologies; the shape is the ordinal's own record.
-        let predicted = o.predicted(ordinal).map(|(topology, _)| topology);
+        let recorded = o.predicted(ordinal);
+        let predicted = recorded.map(|(topology, _)| topology);
+        let stable = o.stable(ordinal);
         // Eager on the prediction alone (`Regime::runs_unkept`), as opposed to
-        // the eager half of a trial.
-        let held = predicted.is_some_and(|k| st.library.holds(k));
+        // the eager half of a trial. **Held means the predicted shape is**: a
+        // held topology at a shape the library does not hold would be recorded
+        // only to be instantiated for its one launch, which costs more than
+        // issuing it — measured in the lock as 10–90 ms of instantiation every
+        // two seconds.
+        let held = recorded.is_some_and(|(t, s)| st.library.holds_shape(t, s));
         st.regime.start(predicted);
         let unkept = st.regime.runs_unkept(predicted, held);
         let runs = &mut o.eager_runs[ordinal];
@@ -978,8 +995,12 @@ impl CaptureHub {
                 None => Mode::Graph,
             }
         };
+        // An eager run is credited to its prediction, since it is never
+        // recorded; only a prediction that has held is trusted with that
+        // (`Ordinals::stable`). A graphed run is credited to what it recorded.
+        let trusted = mode == Mode::Graph || stable;
         let timing = match predicted {
-            Some(k) if st.regime.timed(k) => {
+            Some(k) if trusted && st.regime.timed(k) => {
                 let compute = st.compute.clone().expect("a wave has a compute stream");
                 Some(st.timer.start(&compute)?)
             }

@@ -43,6 +43,10 @@ pub(super) struct Ordinals {
     /// What each ordinal held in the last wave that recorded it — the
     /// prediction a segment's mode is decided by.
     pub(super) key: Vec<Option<Recorded>>,
+    /// Whether each ordinal's last two recordings held the same thing: its
+    /// prediction has held at least once, so an eager run of it is likely what
+    /// was predicted ([`Self::stable`]).
+    stable: Vec<bool>,
     /// Segments each ordinal has run eagerly in a row on its prediction alone
     /// (`hub::RECHECK_EVERY`).
     pub(super) eager_runs: Vec<u32>,
@@ -52,6 +56,27 @@ impl Ordinals {
     /// What `ordinal` is predicted to hold.
     pub(super) fn predicted(&self, ordinal: usize) -> Option<Recorded> {
         self.key.get(ordinal).copied().flatten()
+    }
+
+    /// `ordinal` recorded `what`: it becomes the prediction, stable if it is
+    /// what the prediction already was.
+    pub(super) fn recorded(&mut self, ordinal: usize, what: Recorded) {
+        self.reach(ordinal);
+        self.stable[ordinal] = self.key[ordinal] == Some(what);
+        self.key[ordinal] = Some(what);
+    }
+
+    /// Whether `ordinal`'s prediction held the last time it was recorded.
+    ///
+    /// **What an eager run of a trial is credited by.** An eager segment is
+    /// never recorded, so its real topology is unknown and its timing goes to
+    /// the prediction; on `.5` (2026-10-17) about a fifth of a trial's
+    /// recorded candidates had been predicted as something else, and their
+    /// eager twins' timings landed on the wrong topology's median. A prediction
+    /// that has held at least once is the evidence an eager run is what it
+    /// was predicted to be.
+    pub(super) fn stable(&self, ordinal: usize) -> bool {
+        self.stable.get(ordinal).copied().unwrap_or(false)
     }
 
     /// Grow every table to hold `ordinal`.
@@ -65,6 +90,9 @@ impl Ordinals {
         }
         if self.key.len() < n {
             self.key.resize(n, None);
+        }
+        if self.stable.len() < n {
+            self.stable.resize(n, false);
         }
         if self.eager_runs.len() < n {
             self.eager_runs.resize(n, 0);
@@ -129,6 +157,24 @@ mod tests {
             ),
             (4, 4, 4, 4)
         );
+    }
+
+    /// **A prediction is stable once it has held**: the first recording of an
+    /// ordinal is not, the same thing recorded again is, and anything else
+    /// recorded next is not again.
+    #[test]
+    fn a_prediction_is_stable_once_it_has_held() {
+        let mut h = OrdinalHistory::default();
+        let o = h.at(VERIFY, 2);
+        assert!(!o.stable(2), "never recorded");
+        o.recorded(2, (1, 10));
+        assert!(!o.stable(2), "recorded once: nothing to have held");
+        o.recorded(2, (1, 10));
+        assert!(o.stable(2), "the same again: held");
+        o.recorded(2, (1, 11));
+        assert!(!o.stable(2), "another shape: the prediction missed");
+        assert_eq!(o.predicted(2), Some((1, 11)));
+        assert!(!o.stable(9), "past the end: not stable");
     }
 
     /// A clear forgets every kind's predictions.

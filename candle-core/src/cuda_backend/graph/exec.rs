@@ -7,6 +7,7 @@ use cudarc::driver::{result, sys, CudaContext};
 use std::ffi::{c_char, CStr, CString};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
+use tracing::Level;
 
 /// A recorded run of launches, ready to replay into a [`ComputeStream`].
 ///
@@ -278,6 +279,14 @@ impl NodeKey {
         func_name(self.func as sys::CUfunction)
             .unwrap_or_else(|| format!("kernel {:#x}", self.func))
     }
+}
+
+/// Whether the graph's debug log is on — what the explanations below
+/// ([`divergence`], [`reshaped_at`]) are for. They name kernels through the
+/// driver and format strings; with the log off, computing them is host time
+/// spent on every segment that misses, for lines nobody reads.
+pub(super) fn explaining() -> bool {
+    tracing::enabled!(target: "candle_core::graph", Level::DEBUG)
 }
 
 /// Where a recapture's topology first departs from an executable's, for the

@@ -128,7 +128,15 @@ executables per 2 s window on `.5` (2026-10-17) to admit shapes that were evicte
    verify widths was a candidate of its own: decode waves carrying up to eight sequences
    (ingest and npcd riding a conversation) made hundreds of shapes, and a 512-wave trial of
    352 proved 8. Past the learn, a shape the slot holds folds in place and any other is
-   instantiated for its one launch.
+   instantiated for its one launch. A later learn never reshapes a proven topology's
+   executables for a one-off — it runs once instead — since nothing past the learn would
+   reshape them back, and the steady shape they held would be instantiated every launch.
+
+   **An eager trial run is credited only where its prediction has held.** An eager segment is
+   never recorded, so its timing goes to the topology its ordinal predicted; about a fifth of
+   a trial's recorded candidates had been predicted as something else, which put their eager
+   twins' timings on the wrong median. An eager run is timed only once its ordinal recorded
+   the same key twice running (`Ordinals::stable`).
 
    **Nothing reshapes past the learn.** Reshaping a held executable to whatever shape the
    trial and the lock met — the same topology at another row count, often another kernel
@@ -152,8 +160,11 @@ executables per 2 s window on `.5` (2026-10-17) to admit shapes that were evicte
    `CU_EVENT_DEFAULT`, and a pair the driver will not time is an error.
 3. A trial that proved anything returns to the learn, which fills the ground the bans freed.
    One that proved nothing **locks** the library until new traffic reopens it (4): nothing is
-   admitted, evicted or timed, a held shape records and replays, and every other segment —
-   banned, unheld, or an ordinal never recorded — runs as issued.
+   admitted, evicted or timed, a segment predicted as a shape the library holds records and
+   replays, and every other segment — banned, benched, a shape not held, or an ordinal never
+   recorded — runs as issued. Recording a held topology at a shape it does not hold would buy
+   one instantiation for one launch, which costs more than issuing it (10–90 ms of
+   instantiation every two seconds in the lock before this).
 
    The trial's summary line reports what its segment starts were predicted as
    (`starts_candidate`/`starts_other`/`starts_unpredicted`), the candidate segments whose
@@ -163,10 +174,16 @@ executables per 2 s window on `.5` (2026-10-17) to admit shapes that were evicte
    at startup sees startup's: on `.5` (2026-10-17) a learn went quiet after 185 waves of
    background ingest and locked at 185 MiB of a 2 GiB budget, to run every shape the
    conversations brought later as issued. So an ordinal's recheck that meets a shape the lock
-   does not hold counts it, and once `REOPEN_SHAPES` (4) unbanned shapes — benched ones
-   included — have each been met `REOPEN_SIGHTINGS` (3) times, the lock has stood
-   `MIN_LOCK_WAVES` (256) and the library is under half its budget, the learn begins again —
-   keeping every shape already proven and banned, and clearing the bench.
+   does not hold counts it, and once `REOPEN_SHAPES` (4) unbanned topologies — benched ones
+   included — have each been met their sightings, the lock has stood `MIN_LOCK_WAVES` (256)
+   and the library is under half its budget, the learn begins again — keeping every topology
+   already proven and banned, and taking back the benched ones that met their sightings.
+
+   **A topology's sightings double with every bench it has served** — `REOPEN_SIGHTINGS` (3)
+   `<< benches`, capped at 6 doublings (192). Taken back on every reopen, a topology that
+   keeps recurring at a rate too low to judge was benched, reopened for and trialled again on
+   every cycle: one run on `.5` logged 49 reopens, each a learn and a full 512-wave trial with
+   its eager halves.
 
 **A segment run as issued runs on the capture stream**, not the compute stream, with a
 hand-off at each end: the capture stream waits for everything the compute stream holds as the
