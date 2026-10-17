@@ -189,8 +189,25 @@ impl Hub {
                         );
                         self.to_member(app, n, Frame::Catchup(c));
                     }
-                    // No other member here: nothing is owed through this
-                    // gateway.
+                    // No member ready to answer, and writes seen here that the
+                    // requester lacks: their member is away — restarting, or
+                    // still loading. A `DONE` now would tell a newcomer it had
+                    // caught up on nothing, and it joined empty for good (an
+                    // admission catch-up answered in 15 ms while .5 restarted).
+                    // Left unanswered, the requester asks again once it goes
+                    // quiet, by when a member may answer.
+                    None if self.state().registry.owed(app, requester, &c.since) => {
+                        self.note(
+                            app,
+                            hex(from),
+                            format!(
+                                "catch-up {} left open: no member can answer what it lacks yet",
+                                c.request
+                            ),
+                        );
+                    }
+                    // No other member here and nothing seen it lacks: nothing
+                    // is owed through this gateway.
                     None => self.to_catchup(
                         app,
                         requester,

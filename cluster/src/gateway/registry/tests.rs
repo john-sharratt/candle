@@ -275,3 +275,21 @@ fn a_replaced_session_leaving_removes_nothing() {
     let (epoch, listed) = r.listing("zend");
     assert_eq!((epoch, listed.len()), (2, 1));
 }
+
+/// **A member away still holds what it wrote.** A catch-up the gateway cannot
+/// route is owed while the requester lacks writes seen from an origin whose
+/// member has left — `DONE` then made a newcomer join empty — and is not owed
+/// once the requester holds them, or when no other origin was ever heard.
+#[test]
+fn writes_seen_from_a_member_that_left_are_still_owed() {
+    let mut r = Registry::new();
+    assert!(!r.owed("zend", 2, &AppliedSet::default()), "a group's first member is owed nothing");
+    r.join(member(1, 7));
+    r.high_water("zend", 1, 500);
+    assert!(r.leave("zend", 1, 7));
+    assert!(r.owed("zend", 2, &AppliedSet::default()));
+    let mut held = AppliedSet::default();
+    held.insert_range(1, 1, 500);
+    assert!(!r.owed("zend", 2, &held));
+    assert!(!r.owed("zend", 1, &AppliedSet::default()), "its own writes are not owed to it");
+}

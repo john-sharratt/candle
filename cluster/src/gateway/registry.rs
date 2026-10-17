@@ -8,6 +8,8 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 
+use applied_set::AppliedSet;
+
 use super::agents::{choose, Choice, Need};
 use super::claims::Claims;
 use crate::dispatch::{Dispatch, RouteTable};
@@ -83,6 +85,9 @@ struct AppMembers {
     rr: usize,
     /// Bumped on every change, for `MEMBERS`.
     epoch: u64,
+    /// The highest `oseq` each origin was heard at, kept when its member
+    /// leaves: what a catch-up is owed while nobody is here to answer it.
+    seen: BTreeMap<u64, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -138,9 +143,22 @@ impl Registry {
 
     /// `node`'s own highest `oseq`, from its `ACK`.
     pub fn high_water(&mut self, app: &str, node: u64, high_water: u64) {
-        if let Some(m) = self.app(app).members.get_mut(&node) {
+        let a = self.app(app);
+        let seen = a.seen.entry(node).or_default();
+        *seen = (*seen).max(high_water);
+        if let Some(m) = a.members.get_mut(&node) {
             m.high_water = m.high_water.max(high_water);
         }
+    }
+
+    /// Whether `since` lacks writes this gateway has seen an origin other than
+    /// `requester` make — records a member now away still holds. With nobody
+    /// to answer, such a catch-up is not done: it waits for an answerer.
+    pub fn owed(&mut self, app: &str, requester: u64, since: &AppliedSet) -> bool {
+        self.app(app)
+            .seen
+            .iter()
+            .any(|(origin, top)| *origin != requester && since.through(*origin) < *top)
     }
 
     /// Mark `node` lagging or not; whether that changed.
