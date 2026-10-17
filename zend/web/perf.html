@@ -142,8 +142,12 @@ let lastAt = 0;          // when the newest sample landed, for the age readout
 let paused = false;
 let failures = 0;
 /* Through a clustered gateway every endpoint answers for each member
- * (`common/lib/aggregate.js`); the page shows one, picked here. */
-let member = null;
+ * (`common/lib/aggregate.js`). The page shows the cluster as a whole — `''`,
+ * the default with more than one member — or one member, picked here. */
+let member = '';
+/* The cluster view's members: each one's latest wave and host, for the totals
+ * and the nodes panel. Empty while one member is shown. */
+let NODES = [];
 
 /* ── page ───────────────────────────────────────────────────────────────── */
 
@@ -156,16 +160,23 @@ const memberPick = h('select', { id: 'member', class: 'btn sm', 'aria-label': 'M
 
 memberPick.addEventListener('change', () => { member = memberPick.value; refresh(); });
 
-/* One option per member that answered, shown only when there is a choice. */
+/* The cluster as a whole, then one option per member that answered — shown
+ * only when there is a choice. */
 function paintMembers(members) {
   memberPick.hidden = members.length < 2;
   const want = members.map((m) => m.node).join(',');
   if (memberPick.dataset.nodes !== want) {
     memberPick.dataset.nodes = want;
-    mount(memberPick, ...members.map((m) => h('option', { value: m.node }, `${m.host || m.node.slice(0, 8)}`)));
+    mount(memberPick,
+      h('option', { value: '' }, '[Cluster]'),
+      ...members.map((m) => h('option', { value: m.node }, `${m.host || m.node.slice(0, 8)}`)));
   }
-  if (member) memberPick.value = member;
+  memberPick.value = member;
 }
+
+/* Whether the page shows the cluster as a whole: more than one member, and
+ * none picked. */
+const clusterView = () => !member && NODES.length > 1;
 
 pauseBtn.addEventListener('click', () => {
   paused = !paused;
@@ -809,37 +820,138 @@ function drawFailure(cv, err) {
   g.fillText('this chart failed to draw: ' + (err && err.message ? err.message : err), 12, 24);
 }
 
+/* ── the cluster as a whole ──────────────────────────────────────────────
+ * Every panel draws one engine's rows. The cluster view hands them one
+ * engine's worth made of every member's: rows on a shared 2 s clock, each
+ * field the cluster's — sizes, counts and VRAM bands summed; a wave's own
+ * durations the longest of the members', so a rate (tokens over the wave's
+ * wall-clock) reads as the cluster's. Nothing is left out: a member with no
+ * row in a slot adds nothing to it. */
+const FUSE_MS = 2000;
+const LONGEST = new Set(['ws', 'fwd', 'wave_ms', 'quanta_ms']);
+
+function fuseInto(into, row) {
+  for (const [k, v] of Object.entries(row)) {
+    if (k === 'at' || k === 'age') continue;
+    if (typeof v === 'number') {
+      into[k] = LONGEST.has(k) ? Math.max(into[k] ?? v, v) : (into[k] || 0) + v;
+    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+      into[k] = fuseInto(into[k] && typeof into[k] === 'object' ? into[k] : {}, v);
+    } else if (typeof v === 'boolean') {
+      into[k] = !!into[k] || v;
+    } else if (into[k] === undefined) {
+      into[k] = v;
+    }
+  }
+  return into;
+}
+
+/* Each member's rows, one fused row per slot of the shared clock. */
+function fuseRows(lists) {
+  const slots = new Map();
+  for (const rows of lists) {
+    for (const r of rows) {
+      const s = Math.round(r.at / FUSE_MS);
+      if (!slots.has(s)) slots.set(s, { at: s * FUSE_MS, age: r.age });
+      fuseInto(slots.get(s), r);
+    }
+  }
+  return [...slots.values()].sort((a, b) => a.at - b.at);
+}
+
+const byTime = (rows) => rows.sort((a, b) => a.at - b.at);
+
+/* The hosts' memory added up; a reading any member lacks is absent. */
+function sumHost(hosts) {
+  const out = {};
+  for (const h of hosts) {
+    for (const [k, v] of Object.entries(h)) {
+      if (typeof v !== 'number') { if (!(k in out)) out[k] = v; continue; }
+      out[k] = out[k] === null ? null : (out[k] || 0) + v;
+    }
+    for (const k of Object.keys(out)) if (h[k] === null) out[k] = null;
+  }
+  return out;
+}
+
+/* The arena mix: every member's formats, each member's counts moved onto
+ * them, summed per slot. */
+function fuseMix(mixes) {
+  const formats = [];
+  for (const x of mixes) for (const f of x.formats) if (!formats.includes(f)) formats.push(f);
+  const lists = mixes.map((x) => x.rows.map((row) => {
+    const tok = formats.map(() => 0);
+    (row.tok || []).forEach((n, i) => { tok[formats.indexOf(x.formats[i])] += n; });
+    return { ...row, tok };
+  }));
+  const slots = new Map();
+  for (const rows of lists) {
+    for (const row of rows) {
+      const s = Math.round(row.at / FUSE_MS);
+      const have = slots.get(s);
+      if (!have) { slots.set(s, { ...row, at: s * FUSE_MS }); continue; }
+      have.tok = have.tok.map((n, i) => n + row.tok[i]);
+    }
+  }
+  return { formats, rows: [...slots.values()].sort((a, b) => a.at - b.at) };
+}
+
+/* The layer flow draws single forwards, which do not add up across cards: the
+ * busiest member's — the one whose newest wave moved the most tokens. */
+function busiest(passes, tels) {
+  let best = 0, most = -1;
+  tels.forEach((b, i) => {
+    const w = (b.waves || [])[(b.waves || []).length - 1] || {};
+    if ((w.tok || 0) > most) { most = w.tok || 0; best = i; }
+  });
+  return passes[best] || [];
+}
+
 async function refresh() {
   if (paused) return;
   try {
     // Only the first is required. The rest degrade to `null` so a daemon that
     // has not instrumented one greys a panel rather than blanking the page.
-    const [telAll, ph, pr, mem, ly] = await Promise.all([
+    const [t, p, r, m, l] = await Promise.all([
       fetch('/v1/telemetry', { cache: 'no-store' }).then((r) => r.json()),
       fetch('/v1/phases', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       fetch('/v1/projections', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       fetch('/v1/memory', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       fetch('/v1/layers', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
-    ]).then(([t, p, r, m, l]) => {
-      // The telemetry answer names the member; the rest are that member's.
-      const first = pick(t, member);
-      member = first.node;
-      paintMembers(first.members);
-      const of = (x) => (x === null ? null : pick(x, member).body);
-      return [first.body, of(p), of(r), of(m), of(l)];
-    });
-    const tel = telAll || {};
+    ]);
+    // The telemetry answer names the members. A member picked that has left
+    // falls back to the cluster.
+    NODES = pick(t, null).members;
+    if (member && !NODES.some((n) => n.node === member)) member = '';
+    paintMembers(NODES);
     // Each row's wall-clock time, fixed once on arrival: `age` is seconds
     // before the server answered, so it grows every poll, and anything keyed
     // on it slides. `stable` holds it to the first reading.
     const at = Date.now();
     const pin = (rows) => (rows || []).map((r) => ({ ...r, at: stable(at - r.age * 1000) }));
-    W = pin(tel.waves); MG = pin(tel.migrate); HOST = tel.host || {};
-    MIX = { formats: (tel.mix && tel.mix.formats) || [], rows: pin(tel.mix && tel.mix.rows) };
-    PTS = pin(ph && ph.points);
-    PROM = (pr && pr.items) || [];
-    LAYERS = (ly && ly.passes) || [];
-    MEM = mem;
+    if (clusterView()) {
+      // Every member's answer to each endpoint, fused into the one view every
+      // panel already draws — see `fuseRows`.
+      const each = (x) => (x === null ? [] : NODES.map((n) => pick(x, n.node).body).filter(Boolean));
+      const tels = each(t);
+      W = fuseRows(tels.map((b) => pin(b.waves)));
+      MG = byTime(tels.flatMap((b) => pin(b.migrate)));
+      HOST = sumHost(tels.map((b) => b.host || {}));
+      MIX = fuseMix(tels.map((b) => ({ formats: (b.mix && b.mix.formats) || [], rows: pin(b.mix && b.mix.rows) })));
+      PTS = byTime(each(p).flatMap((b) => pin(b.points)));
+      PROM = each(r).flatMap((b) => b.items || []);
+      LAYERS = busiest(each(l).map((b) => b.passes || []), tels);
+      MEM = each(m)[0] || null;
+    } else {
+      const of = (x) => (x === null ? null : pick(x, member || null).body);
+      const tel = of(t) || {}, ph = of(p), pr = of(r), ly = of(l);
+      W = pin(tel.waves); MG = pin(tel.migrate); HOST = tel.host || {};
+      MIX = { formats: (tel.mix && tel.mix.formats) || [], rows: pin(tel.mix && tel.mix.rows) };
+      PTS = pin(ph && ph.points);
+      PROM = (pr && pr.items) || [];
+      LAYERS = (ly && ly.passes) || [];
+      MEM = of(m);
+    }
     forgetBefore(at - 5 * 3600 * 1000);
     lastAt = Date.now();
     failures = 0;

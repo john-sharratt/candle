@@ -281,22 +281,17 @@ impl Scheduler {
                 // Every step is a wave: the creep and a section chunk ride it
                 // whenever decode has been paid what the last co-batched step
                 // owed it (`creep_owed_after`), so work admitted mid-quantum
-                // joins the next step rather than the next quantum. A `High`
-                // creep beside a `High` decode also waits out its token debt
-                // (`same_band_owed`).
-                let owed = !self.creep_owed.is_zero() || self.same_band_owed();
+                // joins the next step rather than the next quantum.
+                let owed = !self.creep_owed.is_zero();
                 self.wave_cohort_advanced = owed;
                 self.wave_section_advanced = owed;
                 // Reset before the step so a step that runs no wave reads as
                 // decode-only, then filed by the shape the wave turned out to be.
                 self.wave_cobatched = false;
-                self.wave_step_token_paced = false;
                 self.wave_step_creep_layer_rows = 0;
-                let generated = self.decode_tokens_generated();
                 let t_step = Instant::now();
                 self.batch_decode_step();
                 let step = t_step.elapsed();
-                self.pay_same_band_debt(self.decode_tokens_generated().saturating_sub(generated));
                 profile::record(
                     if self.wave_cobatched {
                         "decode:cobatched:step"
@@ -308,11 +303,7 @@ impl Scheduler {
                 // Glue rides every step it is due and is a decode row's own
                 // reprojection, not the creep: only the creep or a section chunk
                 // riding this step runs up the debt.
-                // A token-paced creep (`High` beside `High`) owes its debt in
-                // tokens, not airtime.
-                let carried = !owed
-                    && !self.wave_step_token_paced
-                    && (self.wave_cohort_advanced || self.wave_section_advanced);
+                let carried = !owed && (self.wave_cohort_advanced || self.wave_section_advanced);
                 self.creep_owed = next_creep_owed(
                     self.creep_owed,
                     step,

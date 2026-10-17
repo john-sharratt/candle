@@ -74,12 +74,15 @@ impl Replicator {
         tokio::spawn(async move {
             let sending = handle.clone();
             let Ok(written) = tokio::task::spawn_blocking(move || {
+                // Read together: a store whose reads take a lock takes it once
+                // for the whole fetch, or not at all (`Store::read_many`).
+                let read = store.read_many(f.origin, &f.oseqs);
                 f.oseqs
                     .iter()
-                    .filter_map(|oseq| {
-                        let bytes = store.read(f.origin, *oseq)?;
+                    .zip(read)
+                    .filter_map(|(oseq, bytes)| {
                         sending
-                            .event(f.origin, *oseq, &bytes, Some(f.reply_to), true)
+                            .event(f.origin, *oseq, &bytes?, Some(f.reply_to), true)
                             .ok()
                     })
                     .collect::<Vec<_>>()

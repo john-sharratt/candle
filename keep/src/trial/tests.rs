@@ -142,6 +142,64 @@ fn no_proof_line_within_the_limit_is_a_timeout() {
     assert!(elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(5));
 }
 
+/// Syncing lines every 200 ms for `syncs` lines, then — when `proves` — the
+/// proof line; then running on.
+fn compile_syncing(dir: &Path, name: &str, syncs: u32, proves: bool) -> PathBuf {
+    let proof = if proves {
+        "    eprintln!(\"INFO serving\");\n"
+    } else {
+        ""
+    };
+    compile(
+        dir,
+        name,
+        &format!(
+            "fn main() {{\n    for i in 0..{syncs} {{\n        std::thread::sleep(std::time::Duration::from_millis(200));\n        eprintln!(\"INFO syncing test {{i}}/{syncs} records\");\n    }}\n{proof}    loop {{ std::thread::sleep(std::time::Duration::from_secs(60)); }}\n}}\n"
+        ),
+    )
+}
+
+/// **Receiving sync data restarts the limit.** Ten syncing lines 200 ms
+/// apart outlast a 600 ms limit three times over, and the proof after them
+/// still counts.
+#[cfg(windows)]
+#[test]
+fn a_trial_that_keeps_syncing_is_waited_out() {
+    let dir = scratch();
+    let exe = compile_syncing(&dir, "syncs_then_proves", 10, true);
+    let log = dir.join(LOG);
+    let mut child = spawn_trial(&exe, &[], &dir, &log).unwrap();
+    let started = Instant::now();
+    let verdict = watch_proof(&mut child, &log, Duration::from_millis(600));
+    let elapsed = started.elapsed();
+    reap(&mut child);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(verdict, Verdict::Proven);
+    assert!(elapsed >= Duration::from_millis(1_800), "{elapsed:?}");
+}
+
+/// **A sync that stalls runs the limit down** from its last line, not from
+/// the start: past every syncing line, then one limit more.
+#[cfg(windows)]
+#[test]
+fn a_stalled_sync_times_out_a_limit_after_its_last_line() {
+    let dir = scratch();
+    let exe = compile_syncing(&dir, "syncs_then_stalls", 5, false);
+    let log = dir.join(LOG);
+    let mut child = spawn_trial(&exe, &[], &dir, &log).unwrap();
+    let started = Instant::now();
+    let verdict = watch_proof(&mut child, &log, Duration::from_millis(600));
+    let elapsed = started.elapsed();
+    reap(&mut child);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(verdict, Verdict::TimedOut);
+    // The last line lands ~1 s in; the limit then runs out ~0.6 s later.
+    assert!(
+        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
+        "{elapsed:?}"
+    );
+}
+
 /// **A proven trial is the service: it goes on running, never restarted.**
 /// It was started from the stable path — the path the firewall allows and a
 /// self-relaunch starts — the stable file is its bytes, nothing is left set

@@ -215,6 +215,7 @@ mod tests {
             last_close: None,
             high_water: 0,
             lagging: false,
+            syncing: false,
             queues: Queues::default(),
         }
     }

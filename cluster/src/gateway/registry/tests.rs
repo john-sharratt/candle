@@ -35,6 +35,7 @@ fn member(node: u64, session: u64) -> MemberView {
         routes: None,
         high_water: 0,
         lagging: false,
+        syncing: false,
     }
 }
 
@@ -274,4 +275,94 @@ fn a_replaced_session_leaving_removes_nothing() {
     assert!(r.member("zend", 5).is_some());
     let (epoch, listed) = r.listing("zend");
     assert_eq!((epoch, listed.len()), (2, 1));
+}
+
+/// **A member away still holds what it wrote.** A catch-up the gateway cannot
+/// route is owed while the requester lacks writes seen from an origin whose
+/// member has left — `DONE` then made a newcomer join empty — and is not owed
+/// once the requester holds them, or when no other origin was ever heard.
+#[test]
+fn writes_seen_from_a_member_that_left_are_still_owed() {
+    let mut r = Registry::new();
+    assert!(
+        !r.owed("zend", 2, &AppliedSet::default()),
+        "a group's first member is owed nothing"
+    );
+    r.join(member(1, 7));
+    r.high_water("zend", 1, 500);
+    assert!(r.leave("zend", 1, 7));
+    assert!(r.owed("zend", 2, &AppliedSet::default()));
+    let mut held = AppliedSet::default();
+    held.insert_range(1, 1, 500);
+    assert!(!r.owed("zend", 2, &held));
+    assert!(
+        !r.owed("zend", 1, &AppliedSet::default()),
+        "its own writes are not owed to it"
+    );
+}
+
+/// **A member joining a serving group serves nothing until it is in sync** —
+/// the gateway's judgement from its `ACK`s, not the member's word. Its own
+/// conversations still reach it, aggregates still ask it, and with nobody
+/// else to serve, it serves.
+#[test]
+fn a_syncing_member_is_routed_only_its_own() {
+    let mut r = three();
+    r.high_water("zend", 1, 500);
+    r.set_syncing("zend", 3, true);
+    for _ in 0..6 {
+        assert_ne!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(3));
+        assert_ne!(r.answerer("zend", 2), Some(3));
+    }
+    let sticky = Dispatch::sticky_path("id");
+    r.claims("zend").claim(b"mine", Epoch { ms: 1, node: 3 });
+    assert_eq!(
+        r.pick("zend", &sticky, Some("mine"), None),
+        Pick::Member(3),
+        "a conversation it holds is its, syncing or not"
+    );
+    let Pick::All(asked) = r.pick("zend", &Dispatch::Aggregate(Merge::Union), None, None) else {
+        panic!("an aggregate asks every loaded member");
+    };
+    assert!(
+        asked.contains(&3),
+        "a syncing member is asked: it holds what it wrote cut off"
+    );
+
+    let serving: BTreeMap<u64, u64> = [(1, 500), (2, 80)].into_iter().collect();
+    assert!(
+        !Registry::in_sync(3, &[(1, 400), (2, 80)], &serving),
+        "100 behind node 1"
+    );
+    assert!(
+        Registry::in_sync(3, &[(1, 500 - SYNC_SLACK), (2, 80)], &serving),
+        "within the slack"
+    );
+    assert!(
+        !Registry::in_sync(3, &[(1, 500)], &serving),
+        "nothing applied of node 2, which the serving members hold"
+    );
+    assert!(
+        Registry::in_sync(3, &[(1, 500), (2, 80)], &serving),
+        "a write seen of a member away that nobody serving holds is not waited on"
+    );
+    assert!(r.set_syncing("zend", 3, false));
+
+    r.set_syncing("zend", 3, true);
+    r.set_lagging("zend", 1, true);
+    r.set_lagging("zend", 2, true);
+    assert_eq!(
+        r.pick("zend", &Dispatch::Any, None, None),
+        Pick::Member(3),
+        "nobody in sync is serving: the syncing member serves"
+    );
+}
+
+/// A member joining beside a serving one starts syncing; the first member of a
+/// group does not.
+#[test]
+fn only_a_member_joining_beside_a_serving_one_syncs() {
+    let r = three();
+    assert!(r.has_routable("zend", 4));
+    assert!(!Registry::new().has_routable("zend", 1));
 }

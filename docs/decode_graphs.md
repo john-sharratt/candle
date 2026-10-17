@@ -81,8 +81,10 @@ it needs neither the key nor the combination.
 | Piece | Where | Does |
 |---|---|---|
 | `CaptureHub` | `cuda_backend/graph/hub.rs` | One per device, shared by every clone of the handle. Holds the capture stream (created, non-blocking), the open wave, the executables of each segment ordinal kept across waves, the graveyard, the two staging rings and the two hand-off events between the capture and compute streams (§2.3). |
-| `ExecLibrary` | `cuda_backend/graph/library.rs` | The executables kept across waves, by segment topology (node kinds in order); up to 512 topologies, least recently used dropped. |
-| `ExecSlot` | `cuda_backend/graph/slot.rs` | One topology's executables — up to sixteen, one per shape in steady use, most recently used first. A recapture is folded into the executable holding its shape, else the first that accepts it, and instantiated only when none does. |
+| `ExecLibrary` | `cuda_backend/graph/library.rs` | The executables kept across waves, by segment topology (node kinds in order), within a fixed device-memory budget sized by the card. Nothing is evicted to make room; only a trial's bans give ground back (§2.1.1). |
+| `ExecSlot` | `cuda_backend/graph/slot.rs` | One topology's executables — one per shape in steady use, most recently used first. A recapture is folded into the executable holding its shape; while the library learns, a recurring shape is otherwise given one of its own and a one-off folded over another's. Once it stops learning, a recapture folds only into its own shape's executable, or runs once. |
+| `Regime` | `cuda_backend/graph/regime.rs` | Which shapes the library keeps: learned, trialled, then locked (§2.1.1). |
+| `SegmentTimer` | `cuda_backend/graph/timing.rs` | Device time of the segments on trial: an event pair on the compute stream per segment, read once its end has fired — never a wait. |
 | `WaveCapture` | `cuda_backend/graph/hub.rs` | RAII for one forward. `CudaDevice::begin_wave_capture` opens it **held**; `finish` launches the last segment; dropping it unfinished discards what is recording (the forward has already failed). Not `Send`, like the `Paused` guard: the driver ends a thread-local capture only on the thread that began it. |
 | `Device::record_launches` | `eager.rs` | The model's mark: recording starts here. |
 | `CudaDevice::cuda_stream` | `device.rs` | The **launch stream**: the capture stream on the thread that is recording, the compute stream otherwise. Every launcher takes it. |
@@ -95,6 +97,33 @@ it needs neither the key nor the combination.
 | `GraphExec::{instantiate_audited, try_fold}` | `exec.rs` | Instantiate and upload an audited recapture; or fold one in place with `cuGraphExecUpdate_v2`, reporting when the driver refuses it as a different topology. |
 | audit | `exec.rs` | Every node must be a kernel, a memset, a device-to-device copy or a profiling span's external event record; anything else is refused with the graph dumped as DOT (`cuGraphDebugDotPrint`) and named in the error. |
 | `grow_scratch` | `candle-kernels/src/grow_scratch.cuh` | Grow-only launcher scratch that is safe to grow while recording. |
+
+#### 2.1.1 What the library keeps: learn, trial, lock
+
+A kept shape costs something every wave — it is recorded (that is how its arguments are
+refreshed), the record gate holds other threads' quiet calls while it records, and its
+executable is driver memory outside the reservation. A shape is worth that only if it recurs
+and its graph beats its launches issued one by one, so the library measures it and then stops
+changing. Kept instead by least-invoked eviction with a cooldown, a full library evicted 17–39
+executables per 2 s window on `.5` (2026-10-17) to admit shapes that were evicted again later.
+
+1. **Learn.** Segments record and the library admits what it folds into its fixed budget. The
+   learn ends at the first admission that does not fit, or after `LEARN_IDLE_WAVES` (32) waves
+   with no admission.
+2. **Trial**, for `TRIAL_WAVES` (64) waves. Each shape the learn admitted alternates graphed
+   and eager every time a segment predicts it, timed on the device from the segment's start to
+   its end — host lateness included, which is what a graph removes. A shape hit in fewer than
+   one trial wave in `MIN_HIT_DIVISOR` (8), or whose graphed median is not at least 5 % below
+   its eager median, is **banned**: dropped, and never admitted again. A tie is banned too — a
+   kept shape pays for its recording every wave. The rest are proven and never trialled again.
+3. A trial that proved anything returns to the learn, which fills the ground the bans freed.
+   One that proved nothing **locks** the library for the life of the process: nothing is
+   admitted, evicted or timed, a held shape records and replays, and every other segment —
+   banned, unheld, or an ordinal never recorded — runs as issued.
+
+The constants are short on purpose: a decode wave is a token or so, so reaching the lock costs
+a few seconds of decode, not minutes. The wave line reports the phase, and how many shapes have
+been banned and proven (`graph_window.rs`).
 
 ### 2.2 One forward
 

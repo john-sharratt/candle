@@ -47,7 +47,8 @@ use zend_vfs::{ObjectFormat, Oid};
 use self::lines::line_count;
 use crate::branch_ingest::filter::{language_of, MAX_FILE_BYTES};
 use crate::branch_ingest::keys::{
-    branches_value, file_key, BLOB_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY, LINES_KEY,
+    branches_value, file_key, quant_tags, BLOB_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY,
+    LINES_KEY,
 };
 use crate::branch_ingest::plan::Committed;
 use crate::ingest_lease::{self, Share};
@@ -154,6 +155,7 @@ fn scan_ingest_chains(engine: &Mutex<ConversationEngine>) -> IngestChains {
     // the read guard below: a second read of the same lock while one is held
     // waits behind any queued writer, which is waiting for this guard.
     let paths = eng.conversations_with_metadata_key(PATH_KEY);
+    let quants = quant_tags(&eng);
     let conv = eng.conversation();
     let substrate = conv.read();
     let mut out = IngestChains {
@@ -173,6 +175,7 @@ fn scan_ingest_chains(engine: &Mutex<ConversationEngine>) -> IngestChains {
                 stamp: substrate
                     .first_turn_stamp(timeline.raw())
                     .unwrap_or_default(),
+                quant: quants.get(&timeline).copied(),
             }),
         }
     }
@@ -938,6 +941,12 @@ fn process_one_file(
     tags.insert(BLOB_KEY.to_string(), file.blob.to_string());
     tags.insert(LINES_KEY.to_string(), lines.to_string());
     tags.insert(CONTENT_KEY.to_string(), job.key.to_string());
+    if let Some(bits) = crate::branch_ingest::keys::model_bits() {
+        tags.insert(
+            crate::branch_ingest::keys::QUANT_KEY.to_string(),
+            bits.to_string(),
+        );
+    }
     tags.insert("lang".to_string(), format!("{:?}", file.language));
     if !file.branches.is_empty() {
         tags.insert(BRANCHES_KEY.to_string(), branches_value(&file.branches));

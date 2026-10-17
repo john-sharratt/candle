@@ -754,6 +754,7 @@ pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
         .conversations_with_metadata_key(CONTENT_KEY)
         .into_iter()
         .collect();
+    let quants = crate::branch_ingest::keys::quant_tags(&e);
     let conv = e.conversation();
     let substrate = conv.read();
     e.conversations_with_metadata_key(DIR_KEY)
@@ -766,6 +767,7 @@ pub fn committed(engine: &Mutex<ConversationEngine>) -> Vec<Committed> {
                 stamp: substrate
                     .first_turn_stamp(timeline.raw())
                     .unwrap_or_default(),
+                quant: quants.get(&timeline).copied(),
             })
         })
         .collect()
@@ -1193,6 +1195,12 @@ fn process_one_dir(
     tags.insert("kind".to_string(), "repo_map".to_string());
     tags.insert(DIR_KEY.to_string(), unit.dir.clone());
     tags.insert(CONTENT_KEY.to_string(), unit.content_key.clone());
+    if let Some(bits) = crate::branch_ingest::keys::model_bits() {
+        tags.insert(
+            crate::branch_ingest::keys::QUANT_KEY.to_string(),
+            bits.to_string(),
+        );
+    }
     tags.insert("files".to_string(), unit.listed.len().to_string());
     if !job.branches.is_empty() {
         tags.insert(BRANCHES_KEY.to_string(), branches_value(&job.branches));

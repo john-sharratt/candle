@@ -72,6 +72,13 @@ pub trait Store: Send + Sync + 'static {
     /// wherever maintenance has moved it, or `None` when it is not held here.
     fn read(&self, origin: u64, oseq: u64) -> Option<Vec<u8>>;
 
+    /// [`Self::read`] for each of `oseqs`, in order. A store that reads under
+    /// a lock takes it once for many: a fetch answered one record a hold
+    /// waited once a record behind whatever held the lock.
+    fn read_many(&self, origin: u64, oseqs: &[u64]) -> Vec<Option<Vec<u8>>> {
+        oseqs.iter().map(|oseq| self.read(origin, *oseq)).collect()
+    }
+
     /// Every `(origin, oseq)` applied here or known gone, this member's own
     /// through [`Self::own_through`] included.
     fn applied(&self) -> AppliedSet;
@@ -86,6 +93,12 @@ pub trait Store: Send + Sync + 'static {
     /// `oseq`s of `origin` a catch-up learned are gone; an expired
     /// tombstone's deleted-set entry is applied before anything else.
     fn gone(&self, origin: u64, gone: &[Gone]);
+
+    /// Whether a record of type `record_type` (a listed header's tag) is one
+    /// this store takes from another member. One it would refuse on arrival
+    /// — it never leaves the member that wrote it — is not fetched: a
+    /// catch-up counts it gone (`receive.rs`).
+    fn travels(&self, record_type: u8) -> bool;
 
     /// A position in the store's write queue: every record handed to the
     /// writer before this call is at or below it.

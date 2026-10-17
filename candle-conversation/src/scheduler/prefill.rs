@@ -73,14 +73,18 @@ fn phase_target(phase: VramPhase) -> FreeRegionTarget {
 /// among the decodes that **outrank** it — and, for `High` work, among the
 /// `High` decodes too — or 1 when there are none.
 ///
-/// **A `High` decode protects itself from `High` work.** A creep that rode
-/// beside a same-band decode whole made that decode wait the full pass:
-/// measured on `.5`, 2026-10-16, a dialogue's decode step that took 17–19 ms
-/// alone took 3.2 s (profile build) whenever an npcd turn's chunk shared it.
-/// Beside one, a `High` creep keeps its chunk whole — each layer's experts are
-/// still loaded once for all its rows — and is paced by
-/// [`SAME_BAND_PREFILL_PER_DECODE`]. The ratio is re-read every wave, so the
-/// creep returns to full speed (`R = 1`) the wave the last such decode finishes.
+/// **A `High` decode protects itself from `High` work — at
+/// [`HIGH_BESIDE_HIGH_RATIO`], not its own ratio.** Two live conversations are
+/// equals: one decoding, the other waiting on its prompt — a tool result, the
+/// next question — to reach its first token. A slice of creep can no longer
+/// stall the decode (`creep_slice` bounds it to a decode step's worth), so the
+/// decode keeps two-thirds of the device and the waiting conversation's prompt
+/// a third. It was paced in tokens instead — nine prompt tokens per decode
+/// token landed — which beside one decoding dialogue moved a prompt at ~180
+/// tokens a second: a 26K-token file read waited 20–27 s for its first token
+/// (`.5`, 2026-10-17), and would have waited minutes. The ratio is re-read every
+/// wave, so the creep returns to full speed (`R = 1`) the wave the last such
+/// decode finishes.
 ///
 /// Below `High`, latency matters less than throughput, so a `Normal` or `Low`
 /// creep is never held back by its own band — only by a decode that outranks it.
@@ -89,55 +93,22 @@ fn phase_target(phase: VramPhase) -> FreeRegionTarget {
 fn throttle_ratio(work: DecodePriority, decodes: impl IntoIterator<Item = DecodePriority>) -> u32 {
     decodes
         .into_iter()
-        .filter(|&d| protects_against(d, work))
-        .map(|d| d.ratio())
+        .filter_map(|d| {
+            if rank(d) > rank(work) {
+                Some(d.ratio())
+            } else if d == DecodePriority::High && work == DecodePriority::High {
+                Some(HIGH_BESIDE_HIGH_RATIO)
+            } else {
+                None
+            }
+        })
         .max()
         .unwrap_or(1)
         .max(1)
 }
 
-/// Whether a decode of band `decode` holds back co-batched work of band `work`:
-/// it outranks it, or both are `High`.
-fn protects_against(decode: DecodePriority, work: DecodePriority) -> bool {
-    rank(decode) > rank(work) || (decode == DecodePriority::High && work == DecodePriority::High)
-}
-
-/// Prefill tokens a `High` creep advances per decode token that lands while a
-/// `High` decode runs beside it.
-///
-/// The mix the device runs best at: about 1.8k prefill tokens a second beside
-/// 200 decode tokens a second, aggregated over a handful of decoding sessions.
-/// Counted in tokens, not airtime, so it scales with the decode width on every
-/// machine: more sessions decoding buy the creep proportionally more rows.
-pub(super) const SAME_BAND_PREFILL_PER_DECODE: usize = 9;
-
-/// The creep debt, in token-layers (one row through one layer), that `landed`
-/// decode tokens pay off: [`SAME_BAND_PREFILL_PER_DECODE`] tokens through all
-/// `n` layers each.
-fn same_band_earned(landed: usize, n: usize) -> i64 {
-    (landed * SAME_BAND_PREFILL_PER_DECODE * n.max(1)) as i64
-}
-
-/// The same-band debt after a step that landed `landed` decode tokens. Paid
-/// down, it may go into credit, but never by more than the step earned: credit
-/// banked over steps the creep could not ride (it still owed airtime) would let
-/// it ride a whole sweep in one step, which is the stall the pacing exists to
-/// prevent.
-fn same_band_debt_after(debt: i64, landed: usize, n: usize) -> i64 {
-    let earned = same_band_earned(landed, n);
-    (debt - earned).max(-earned)
-}
-
-/// Layers a `High` creep of `rows` rows advances on a step it rides beside a
-/// `High` decode: as many as its credit (`-debt`) covers, at least one — the
-/// creep only rides once its debt is paid — and no more than `remaining`.
-///
-/// A short prompt's credit covers many layers, so it reaches its first token in
-/// a few steps; an 8K chunk's covers one layer every ~19 decode tokens.
-fn same_band_layers(debt: i64, rows: usize, remaining: usize) -> usize {
-    let credit = (-debt).max(0) as usize;
-    (credit / rows.max(1)).clamp(1, remaining.max(1))
-}
+/// `R` for a `High` creep beside a `High` decode — see [`throttle_ratio`].
+const HIGH_BESIDE_HIGH_RATIO: u32 = 2;
 
 /// Consecutive failures of one mid-sweep creep window that are retried in place
 /// before its members fail. A refusal is usually ground the next step finds —
@@ -2063,43 +2034,6 @@ impl Scheduler {
         )
     }
 
-    /// Whether a creep of band `work` is paced by [`SAME_BAND_PREFILL_PER_DECODE`]:
-    /// it is `High` and a `High` foreground decode runs beside it.
-    pub(super) fn same_band_paced(&self, work: DecodePriority) -> bool {
-        work == DecodePriority::High
-            && self
-                .foreground_decodes()
-                .any(|sid| self.decode_priority_or_high(sid) == DecodePriority::High)
-    }
-
-    /// Whether the creep in flight is paced and still owes decode tokens before
-    /// it may ride again. A creep that is no longer paced — no `High` decode
-    /// beside it, or no creep at all — owes nothing, so its debt is dropped and
-    /// it runs at full speed from the next step.
-    pub(super) fn same_band_owed(&mut self) -> bool {
-        let band = self.creep_priority(&self.wave_prefill_members);
-        if self.wave_prefill_members.is_empty() || !self.same_band_paced(band) {
-            self.same_band_debt = 0;
-            return false;
-        }
-        self.same_band_debt > 0
-    }
-
-    /// Decode tokens generated so far across every active decode — read either
-    /// side of a step to count what it landed.
-    pub(super) fn decode_tokens_generated(&self) -> usize {
-        self.active_decodes
-            .values()
-            .map(|s| s.generated_tokens.len())
-            .sum()
-    }
-
-    /// Pay down the same-band debt with the `landed` decode tokens of a step.
-    pub(super) fn pay_same_band_debt(&mut self, landed: usize) {
-        let n = self.model.num_layers().max(1);
-        self.same_band_debt = same_band_debt_after(self.same_band_debt, landed, n);
-    }
-
     /// Whether a prompt waiting outside the creep in flight outranks it while
     /// the creep is throttled — the case where letting the creep finish first
     /// holds the prompt back for `R` steps.
@@ -2420,7 +2354,6 @@ impl Scheduler {
             band,
         });
         self.reset_wave_prefill();
-        self.same_band_debt = 0;
     }
 
     /// Put the paused creep back in flight when no creep is and nothing above
@@ -3379,23 +3312,15 @@ impl Scheduler {
         };
         let ratio = self.airtime_ratio_over(work);
         self.wave_step_ratio = ratio;
-        let token_paced = !seq_ids.is_empty() && self.same_band_paced(work);
-        self.wave_step_token_paced = token_paced;
-        // A `High` creep beside a `High` decode is paced in tokens: it rides
-        // only once its debt is paid (`run`'s gate), and advances the layers its
-        // credit covers. Every other creep advances `ceil(N / R)` — and beside
-        // decode rows no more than a decode-only step's worth of them
-        // (`creep_slice`), so the share `R` sets is paid in steps, not seconds.
+        // A creep advances `ceil(N / R)` layers — and beside decode rows no
+        // more than a decode-only step's worth of them (`creep_slice`), so the
+        // share `R` sets is paid in steps, not seconds.
         let creep_rows: usize = inputs
             .iter()
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
             .sum();
         let budget = if finish_sweep {
             n - cursor.min(n)
-        } else if token_paced {
-            let layers = same_band_layers(self.same_band_debt, creep_rows, n - cursor.min(n));
-            self.same_band_debt += (creep_rows * layers) as i64;
-            layers
         } else if head_rows > 0 {
             time_bounded_layers(
                 creep_layer_budget(n, ratio).min(n - cursor.min(n)),
@@ -5649,23 +5574,23 @@ mod creep_member_drop_tests {
 
 #[cfg(test)]
 mod creep_throttle_tests {
-    use super::{
-        creep_layer_budget, same_band_debt_after, same_band_layers, throttle_ratio,
-        SAME_BAND_PREFILL_PER_DECODE,
-    };
+    use super::{creep_layer_budget, throttle_ratio, HIGH_BESIDE_HIGH_RATIO};
     use crate::projection::DecodePriority::{High, Low, Normal};
 
-    /// Work yields to a decode that outranks it, and `High` work to a `High`
-    /// decode too, at the highest such ratio; it runs whole beside none.
+    /// Work yields to a decode that outranks it at that decode's ratio, and
+    /// `High` work to a `High` decode at [`HIGH_BESIDE_HIGH_RATIO`] — two
+    /// conversations share the device, the decoding one keeping two-thirds; it
+    /// runs whole beside none.
     #[test]
     fn work_yields_to_an_outranking_decode_and_high_to_high() {
         assert_eq!(throttle_ratio(High, []), 1, "nothing decoding");
+        assert_eq!(HIGH_BESIDE_HIGH_RATIO, 2);
         assert_eq!(
             throttle_ratio(High, [High]),
-            64,
+            2,
             "a second conversation's prompt beside the first's decode"
         );
-        assert_eq!(throttle_ratio(High, [High, Normal, Low]), 64);
+        assert_eq!(throttle_ratio(High, [High, Normal, Low]), 2);
         assert_eq!(throttle_ratio(High, [Normal, Low]), 1, "outranks them all");
         assert_eq!(
             throttle_ratio(Low, [Low]),
@@ -5682,47 +5607,6 @@ mod creep_throttle_tests {
         assert_eq!(throttle_ratio(Low, [Normal, High]), 64, "the highest ratio");
         assert_eq!(throttle_ratio(Normal, [High, Low]), 64);
         assert_eq!(throttle_ratio(Normal, [Normal, Low]), 1);
-    }
-
-    /// A decode token pays off `SAME_BAND_PREFILL_PER_DECODE` rows through all
-    /// `n` layers, and the debt goes into credit by at most one step's earnings.
-    #[test]
-    fn decode_tokens_pay_the_same_band_debt_and_bank_one_step_of_credit() {
-        let n = 48;
-        let per_token = (SAME_BAND_PREFILL_PER_DECODE * n) as i64;
-        assert_eq!(per_token, 432);
-        // One layer of an 8K chunk: 8192 token-layers, paid off by 19 tokens.
-        let mut debt = 8192;
-        for _ in 0..18 {
-            debt = same_band_debt_after(debt, 1, n);
-            assert!(debt > 0, "still owed: {debt}");
-        }
-        debt = same_band_debt_after(debt, 1, n);
-        assert_eq!(debt, 8192 - 19 * per_token);
-        assert!(debt <= 0);
-        // Credit never exceeds what the last step earned.
-        assert_eq!(same_band_debt_after(-100, 4, n), -4 * per_token);
-        assert_eq!(same_band_debt_after(-10_000, 1, n), -per_token);
-        assert_eq!(same_band_debt_after(0, 0, n), 0, "nothing landed");
-    }
-
-    /// A paced creep rides as many layers as its credit covers, at least one,
-    /// and never past the layers left in its sweep.
-    #[test]
-    fn a_paced_creep_rides_the_layers_its_credit_covers() {
-        assert_eq!(same_band_layers(0, 8192, 48), 1, "no credit: one layer");
-        assert_eq!(same_band_layers(-432, 8192, 48), 1);
-        assert_eq!(
-            same_band_layers(-432, 26, 48),
-            16,
-            "a short prompt covers 16 layers a decode token"
-        );
-        assert_eq!(
-            same_band_layers(-432, 26, 10),
-            10,
-            "capped at the sweep's end"
-        );
-        assert_eq!(same_band_layers(-432, 0, 48), 48, "zero rows read as one");
     }
 
     /// `ceil(n / R)` layers a wave, never zero.
@@ -5744,6 +5628,7 @@ mod priority_admission_tests {
     use super::super::tests::{boundary_state, make_test_scheduler};
     use super::super::*;
     use super::wave_chunk_tests::dialogue_prefill;
+    use super::HIGH_BESIDE_HIGH_RATIO;
     use crate::projection::{Conversation, DecodePriority};
     use crate::tenant_rank::TenantRank;
 
@@ -5857,9 +5742,10 @@ layers:
         assert_eq!(sched.prefill_queue[0].sequence_id, ingest);
     }
 
-    /// **A second conversation's prompt creeps beside the first's decode**, at
-    /// the dialogue's ratio, as an ingest prompt does — and runs every layer in
-    /// one wave again once that decode is gone.
+    /// **A second conversation's prompt creeps beside the first's decode** at
+    /// `HIGH_BESIDE_HIGH_RATIO`, while an ingest prompt takes the dialogue's own
+    /// ratio — and both run every layer in one wave again once that decode is
+    /// gone.
     #[test]
     fn a_dialogue_prompt_creeps_beside_a_dialogue_decode_until_it_clears() {
         let (mut sched, _tx) = make_test_scheduler();
@@ -5879,7 +5765,7 @@ layers:
         }];
         let work = sched.creep_priority(&creep);
         assert_eq!(work, DecodePriority::High);
-        assert_eq!(sched.airtime_ratio_over(work), 64);
+        assert_eq!(sched.airtime_ratio_over(work), HIGH_BESIDE_HIGH_RATIO);
 
         let ingest_creep = [WaveMember::Prefill {
             seq_id: ingest.0,
@@ -6105,7 +5991,7 @@ layers:
         sched.active_decodes.insert(probe, state);
 
         assert_eq!(sched.airtime_ratio_over(DecodePriority::Low), 64);
-        assert_eq!(sched.airtime_ratio_over(DecodePriority::High), 64);
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::High), 2);
     }
 
     /// **A summary probe decodes at `Normal`**, though its slot is bound to the
@@ -6122,14 +6008,17 @@ layers:
         sched.active_decodes.insert(probe, state);
 
         assert_eq!(sched.decode_priority_or_high(probe), DecodePriority::Normal);
-        assert!(!sched.same_band_paced(DecodePriority::High));
+        assert_eq!(
+            sched.airtime_ratio_over(DecodePriority::High),
+            1,
+            "a Normal probe never holds a dialogue prompt back"
+        );
     }
 
-    /// **A `High` creep is paced only beside a `High` decode**, and the debt
-    /// it ran up is dropped the moment that decode is gone — it runs at full
-    /// speed again.
+    /// **A `High` creep yields to a `High` decode at the shared ratio**, and
+    /// runs at full speed the moment that decode is gone.
     #[test]
-    fn a_high_creep_is_paced_beside_a_high_decode_and_freed_when_it_clears() {
+    fn a_high_creep_shares_with_a_high_decode_and_runs_whole_when_it_clears() {
         let (mut sched, _tx) = make_test_scheduler();
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let decoding = SequenceId(sched.session.create_sequence().expect("create"));
@@ -6143,14 +6032,15 @@ layers:
         let (state, _rx) = boundary_state();
         sched.active_decodes.insert(decoding, state);
 
-        assert!(sched.same_band_paced(DecodePriority::High));
-        assert!(!sched.same_band_paced(DecodePriority::Low));
-        sched.same_band_debt = 500;
-        assert!(sched.same_band_owed());
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::High), 2);
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::Low), 64);
 
         sched.active_decodes.remove(&decoding);
-        assert!(!sched.same_band_owed(), "the decode cleared");
-        assert_eq!(sched.same_band_debt, 0);
+        assert_eq!(
+            sched.airtime_ratio_over(DecodePriority::High),
+            1,
+            "the decode cleared"
+        );
     }
 
     /// A finished decode and a compression pass protect nothing: only a

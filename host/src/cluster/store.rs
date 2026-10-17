@@ -13,7 +13,7 @@ use std::sync::Arc;
 use applied_set::AppliedSet;
 use candle_conversation::persistence::deleted::{DeletedEntry, DeletedKey, DeletedTimeline};
 use candle_conversation::persistence::identity::VersionStamp;
-use candle_conversation::persistence::record::decode_header;
+use candle_conversation::persistence::record::{decode_header, RecordType};
 use candle_conversation::persistence::remote::RemoteOutcome;
 use candle_conversation::projection::replication::CLUSTER_PREFIX;
 use candle_conversation::projection::Conversation;
@@ -140,6 +140,10 @@ impl Store for ConversationStore {
         self.conversation.read_event(origin, oseq)
     }
 
+    fn read_many(&self, origin: u64, oseqs: &[u64]) -> Vec<Option<Vec<u8>>> {
+        self.conversation.read_events(origin, oseqs)
+    }
+
     fn applied(&self) -> AppliedSet {
         self.conversation.applied_set()
     }
@@ -174,14 +178,39 @@ impl Store for ConversationStore {
                 };
             }
         };
+        // A refused record is fetched again, so one refused for good is fetched
+        // for ever — a catch-up that receives and never holds. Say which, and
+        // why: the refusal is the only place the reason exists.
+        let mut refused = Vec::new();
         let taken = honest
             .iter()
-            .map(|ok| {
-                *ok && outcomes
-                    .next()
-                    .is_some_and(|o| !matches!(o, RemoteOutcome::Refused(_)))
+            .zip(records)
+            .map(|(ok, (origin, oseq, bytes))| {
+                if !*ok {
+                    refused.push(format!(
+                        "{origin:x}/{oseq} ({} B): its header names another identity",
+                        bytes.len()
+                    ));
+                    return false;
+                }
+                match outcomes.next() {
+                    Some(RemoteOutcome::Refused(why)) => {
+                        refused.push(format!("{origin:x}/{oseq} ({} B): {why:?}", bytes.len()));
+                        false
+                    }
+                    Some(_) => true,
+                    None => false,
+                }
             })
             .collect();
+        if !refused.is_empty() {
+            tracing::warn!(
+                refused = refused.len(),
+                of = records.len(),
+                first = %refused.iter().take(4).cloned().collect::<Vec<_>>().join("; "),
+                "records from other members refused — each is fetched again",
+            );
+        }
         Applied { taken, reload }
     }
 
@@ -222,6 +251,10 @@ impl Store for ConversationStore {
                 "what a catch-up learned is gone was not recorded: {e}"
             );
         }
+    }
+
+    fn travels(&self, record_type: u8) -> bool {
+        !RecordType::from_tag(record_type).is_local_only()
     }
 
     fn ticket(&self) -> u64 {

@@ -38,7 +38,8 @@
 //! queued still drains. It is ready again once the lane is empty and its
 //! `ACK`s cover every other member's `high_water`. A catch-up frame that would
 //! take a member's catch-up lane past [`CATCHUP_CAP`] is dropped and counted;
-//! the requester fetches again.
+//! the requester fetches again. A record larger than the cap counts as the
+//! cap: it crosses an empty lane.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -104,8 +105,10 @@ pub fn rolls_out(app: &str) -> bool {
 /// Live events unsent on a member's ordered lane past which it is lagging.
 pub const LAG_CAP: usize = 256 << 20;
 
-/// Bytes on a member's catch-up lane past which a catch-up frame is dropped.
-pub const CATCHUP_CAP: usize = 16 << 20;
+/// Bytes on a member's catch-up lane past which a catch-up frame is dropped —
+/// twice the requester's fetch window (`replicate::FETCH_WINDOW`), so a full
+/// window and the headers beside it fit.
+pub const CATCHUP_CAP: usize = 128 << 20;
 
 /// How often each socket's `RECEIPT` timer and lagging state are looked at.
 const RECEIPT_TICK: Duration = Duration::from_millis(100);
@@ -427,6 +430,9 @@ impl Hub {
                     ),
                 ));
             }
+            // Joining a group that already has a member serving: it serves
+            // nothing until it has caught up with it, whatever it reports.
+            let syncing = s.registry.has_routable(app, node);
             s.registry.join(MemberView {
                 node,
                 host: hello.host.clone(),
@@ -439,6 +445,7 @@ impl Hub {
                 routes: None,
                 high_water: 0,
                 lagging: false,
+                syncing,
             });
         }
         let local = if hello.build.is_local() {
@@ -1220,6 +1227,7 @@ impl Hub {
             })
             .collect();
         HubStatus {
+            build: crate::version::this_build(),
             gateway: self.name.clone(),
             now_ms: now,
             draining: s.draining,

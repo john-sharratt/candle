@@ -17,6 +17,9 @@ use crate::frame::{BuildId, MemberState};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HubStatus {
+    /// The build this gateway runs: the one thing a script asking "is the
+    /// gateway on the new web?" otherwise could not read anywhere.
+    pub build: BuildId,
     pub gateway: String,
     pub now_ms: u64,
     /// Admitting no sockets, its members sent to their other clusters
@@ -136,6 +139,9 @@ pub struct MemberRow {
     /// Its own highest `oseq`, from its `ACK`s.
     pub high_water: u64,
     pub lagging: bool,
+    /// Admitted beside a serving member and not yet in sync with it: routed
+    /// no request.
+    pub syncing: bool,
     #[serde(flatten)]
     pub queues: Queues,
 }
@@ -185,6 +191,7 @@ impl MemberRow {
             last_close,
             high_water: m.high_water,
             lagging: m.lagging,
+            syncing: m.syncing,
             queues: socket.queues,
         }
     }
@@ -289,6 +296,7 @@ mod tests {
             last_close: None,
             high_water: 0,
             lagging: false,
+            syncing: false,
             queues: Queues::default(),
         }
     }

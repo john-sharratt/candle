@@ -350,6 +350,9 @@ impl Store for Recording {
     fn gone(&self, origin: u64, gone: &[Gone]) {
         self.inner.gone(origin, gone)
     }
+    fn travels(&self, record_type: u8) -> bool {
+        self.inner.travels(record_type)
+    }
     fn ticket(&self) -> u64 {
         self.inner.ticket()
     }

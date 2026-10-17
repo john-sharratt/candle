@@ -24,6 +24,9 @@ pub struct Committed {
     pub key: String,
     pub subject: String,
     pub stamp: VersionStamp,
+    /// The bits per weight of the model that wrote it ([`super::keys::QUANT_KEY`]),
+    /// `None` for a unit written before that was recorded.
+    pub quant: Option<u32>,
 }
 
 /// One pass over one layer.
@@ -48,11 +51,11 @@ pub struct Plan {
 /// that replacement commits — its ingest tombstones it then — so a path is
 /// never missing from the layer while it is being read again.
 ///
-/// **A key is held by its conversation with the lowest stamp**
-/// (`docs/replicated_substrate.md` §10.4). Two members can ingest one unit
-/// before either sees the other's; both conversations arrive everywhere, and
-/// every member keeps the same one and tombstones the other, whatever order
-/// they arrived in.
+/// **A key is held by its conversation with the lowest stamp, unless a better
+/// model wrote one** (`docs/replicated_substrate.md` §10.4, [`holder_of`]).
+/// Two members can ingest one unit before either sees the other's; both
+/// conversations arrive everywhere, and every member keeps the same one and
+/// tombstones the other, whatever order they arrived in.
 ///
 /// **A conversation under a newer [`KEY_VERSION`] is not this member's to
 /// judge.** A peer upgraded first writes units this build cannot key, so none
@@ -66,14 +69,19 @@ pub fn plan(ingest: &[Live<'_>], retain: &HashSet<&str>, committed: &[Committed]
         .iter()
         .filter(|c| key_version(&c.key) <= KEY_VERSION)
         .collect();
-    let mut holder: HashMap<&str, &Committed> = HashMap::new();
+    // Decided per key over all its conversations, never pair by pair: "better
+    // quantization, else the lower stamp" between pairs is no order once a
+    // conversation with no quantization is among them (a Q4 beats a Q3, the
+    // Q3 an unrecorded one by stamp, that one the Q4 by stamp), and members
+    // seeing them in different orders would keep different holders.
+    let mut by_key: HashMap<&str, Vec<&Committed>> = HashMap::new();
     for &c in &committed {
-        let lower =
-            |held: &&Committed| (c.stamp, c.timeline.raw()) < (held.stamp, held.timeline.raw());
-        if holder.get(c.key.as_str()).is_none_or(lower) {
-            holder.insert(&c.key, c);
-        }
+        by_key.entry(c.key.as_str()).or_default().push(c);
     }
+    let holder: HashMap<&str, &Committed> = by_key
+        .into_iter()
+        .filter_map(|(key, all)| holder_of(&all).map(|h| (key, h)))
+        .collect();
     let mut tombstone: Vec<TimelineId> = committed
         .iter()
         .filter(|c| holder.get(c.key.as_str()).map(|h| h.timeline) != Some(c.timeline))
@@ -98,6 +106,27 @@ pub fn plan(ingest: &[Live<'_>], retain: &HashSet<&str>, committed: &[Committed]
     Plan { queued, tombstone }
 }
 
+/// The conversation that holds a key, of every one committed under it.
+///
+/// **The one there first, unless a better model wrote one.** When every
+/// conversation records its model's quantization ([`Committed::quant`]), the
+/// highest holds — a member on a Q4 pack replaces what a Q3 member read, and
+/// the Q3 copy is tombstoned whichever arrived first — the lowest stamp
+/// breaking a tie. When any does not (one written before the quantization was
+/// recorded), the lowest stamp holds, as it always has: the existing record
+/// is kept, and a duplicate arriving from a member that joined is the one let
+/// go.
+fn holder_of<'a>(all: &[&'a Committed]) -> Option<&'a Committed> {
+    let earliest = |c: &&&Committed| (c.stamp, c.timeline.raw());
+    match all.iter().map(|c| c.quant).collect::<Option<Vec<u32>>>() {
+        Some(_) => all
+            .iter()
+            .min_by_key(|c| (std::cmp::Reverse(c.quant), c.stamp, c.timeline.raw()))
+            .copied(),
+        None => all.iter().min_by_key(earliest).copied(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +149,7 @@ mod tests {
                 hlc,
                 ..VersionStamp::default()
             },
+            quant: None,
         }
     }
 
@@ -194,6 +224,72 @@ mod tests {
         assert_eq!(p.tombstone, [tl(4)]);
     }
 
+    /// A conversation stamped at `hlc`, written under a `bits`-per-weight model.
+    fn quantized(n: u64, key: &str, hlc: u64, bits: Option<u32>) -> Committed {
+        Committed {
+            quant: bits,
+            ..stamped(n, key, key, hlc)
+        }
+    }
+
+    /// **The better quantization holds a key**, the earlier one tombstoned
+    /// whichever arrived first; at one quantization the lower stamp holds.
+    #[test]
+    fn a_better_quantized_duplicate_replaces_the_existing_one() {
+        let q3 = quantized(1, "a@1", 10, Some(3));
+        let q4 = quantized(2, "a@1", 20, Some(4));
+        for committed in [[q3.clone(), q4.clone()], [q4, q3]] {
+            let p = unbounded(&[live("a@1", "a@1")], &committed);
+            assert_eq!(
+                p.tombstone,
+                [tl(1)],
+                "the Q3 copy goes, though it was first"
+            );
+        }
+        let p = unbounded(
+            &[live("b@1", "b@1")],
+            &[
+                quantized(3, "b@1", 10, Some(4)),
+                quantized(4, "b@1", 20, Some(4)),
+            ],
+        );
+        assert_eq!(
+            p.tombstone,
+            [tl(4)],
+            "the same quantization: the later goes"
+        );
+    }
+
+    /// **A key any copy of which records no quantization is judged by stamp
+    /// alone**: the existing record is kept. And the rule is one per key, not
+    /// per pair — a Q4, a Q3 and an unrecorded copy pick one holder in every
+    /// order they are seen.
+    #[test]
+    fn an_unrecorded_quantization_keeps_the_existing_record() {
+        let old = quantized(1, "a@1", 10, None);
+        let new = quantized(2, "a@1", 20, Some(8));
+        let p = unbounded(&[live("a@1", "a@1")], &[new.clone(), old.clone()]);
+        assert_eq!(
+            p.tombstone,
+            [tl(2)],
+            "the existing record, written before the tag, stays"
+        );
+
+        let q4 = quantized(3, "c@1", 30, Some(4));
+        let q3 = quantized(4, "c@1", 10, Some(3));
+        let none = quantized(5, "c@1", 20, None);
+        let orders = [
+            [q4.clone(), q3.clone(), none.clone()],
+            [q3.clone(), none.clone(), q4.clone()],
+            [none.clone(), q4.clone(), q3.clone()],
+        ];
+        for committed in orders {
+            let p = unbounded(&[live("c@1", "c@1")], &committed);
+            let mut gone = p.tombstone.clone();
+            gone.sort_by_key(|t| t.raw());
+            assert_eq!(gone, [tl(3), tl(5)], "the lowest stamp holds: q3 at 10");
+        }
+    }
     /// **A unit past the depth bound is retained, not ingested**: held, it
     /// stays for as long as a branch holds it; not held, nothing reads it.
     #[test]

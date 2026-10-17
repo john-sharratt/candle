@@ -340,6 +340,24 @@ impl RecordType {
         self as u8
     }
 
+    /// Whether records of this type never leave the member that wrote them
+    /// (`docs/replicated_substrate.md` §6.1): the header index, the model
+    /// binding, the projection schema, the branch-checkpoint cache, and the
+    /// member's own housekeeping.
+    pub fn is_local_only(self) -> bool {
+        matches!(
+            self,
+            RecordType::HeaderIndex
+                | RecordType::ModelKey
+                | RecordType::Tokenizer
+                | RecordType::Template
+                | RecordType::BranchCheckpoint
+                | RecordType::Replica
+                | RecordType::Rebase
+                | RecordType::Deleted
+        )
+    }
+
     /// The type a header names `name` — `"chunk"`, `"stream_decl"` — or
     /// [`RecordType::Unknown`] for a name this build does not know, by the
     /// header's own rule.

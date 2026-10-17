@@ -31,9 +31,11 @@ use super::capture;
 use super::exec::{audit, divergence, NodeKey, Template};
 use super::library::ExecLibrary;
 use super::record_gate;
-use super::slot::Folded;
+use super::regime::{Key, LearnEnd, Mode, Phase, Regime, Transition};
+use super::slot::{Admit, Folded};
 use super::staging::StagingRing;
 use super::thread_wave;
+use super::timing::SegmentTimer;
 use super::GraphError;
 use crate::cuda_backend::{set_kernel_breadcrumb, CudaDevice, WrapErr};
 use crate::Result;
@@ -74,24 +76,24 @@ pub struct CaptureStats {
     /// Graph nodes launched — kernels, memsets, device copies and event
     /// records alike.
     pub nodes: u64,
-    /// Executables evicted to keep the library within its budget, and the
-    /// bytes they were charged.
-    pub evicted: u64,
-    pub evicted_bytes: u64,
-    /// Segments instantiated for one launch and not kept — their key was
-    /// cooling and nothing of their topology would take the fold.
+    /// Segments instantiated for one launch and not kept — the library was not
+    /// admitting their shape, and no executable held it.
     pub transient: u64,
-    /// Segments run unrecorded because their predicted key was cooling.
+    /// Segments run unrecorded: their predicted shape banned, not held once the
+    /// learn is over, or on the eager half of a trial.
     pub eager_segments: u64,
     /// Executables the library holds now — a gauge, not a count since start.
     pub execs_held: u64,
     /// Nodes across those executables, now.
     pub nodes_held: u64,
     /// Device bytes those executables are charged, now: driver memory outside
-    /// the reservation, kept within `budget::GRAPH_BUDGET_BYTES`.
+    /// the reservation, kept within the library's fixed budget.
     pub bytes_held: u64,
-    /// Evicted keys still cooling, now.
-    pub cooling: u64,
+    /// Where the library is: learning, on trial, or locked (`regime`).
+    pub phase: Phase,
+    /// Shapes the trials banned, and proved, so far.
+    pub banned: u64,
+    pub proven: u64,
 }
 
 /// One device's wave-capture state, shared by every clone of its handle.
@@ -138,6 +140,18 @@ impl Hasher for IdFold {
 /// released — so an item whose own drop retires or pauses cannot deadlock.
 type Graveyard = Vec<Box<dyn Send>>;
 
+/// Eager runs in a row after which an ordinal records once, to see what it
+/// carries now.
+///
+/// An eager segment is never recorded, so its ordinal's prediction is never
+/// refreshed: an ordinal that once carried a shape the library does not hold
+/// would run eagerly for good, even once the wave's composition puts a held,
+/// proven shape there — and a locked library would drift towards running
+/// everything eagerly. Recorded once in this many, the ordinal learns its
+/// shape again: a held one folds in place and it is back on graphs; anything
+/// else runs once, unkept, at the cost of one instantiation.
+pub(super) const RECHECK_EVERY: u32 = 32;
+
 #[derive(Default)]
 struct HubState {
     wave: Option<Wave>,
@@ -145,12 +159,19 @@ struct HubState {
     capture: Option<Arc<CudaStream>>,
     /// The executables kept across waves, by segment topology.
     library: ExecLibrary,
+    /// What the library keeps, learned and trialled (`regime`).
+    regime: Regime,
+    /// Device time of the segments on trial.
+    timer: SegmentTimer,
     /// The topology each segment ordinal held in the last wave that reached
     /// it — what a new topology is compared against when it is logged.
     last_topology: Vec<Vec<NodeKey>>,
     /// The `(topology, shape)` key each ordinal held in the last wave that
-    /// recorded it — the prediction `start_segment` checks for a cooldown.
-    last_key: Vec<Option<(u64, u64)>>,
+    /// recorded it — the prediction `start_segment` decides a segment's mode by.
+    last_key: Vec<Option<Key>>,
+    /// Segments each ordinal has run eagerly in a row on its prediction alone
+    /// — see [`RECHECK_EVERY`].
+    eager_runs: Vec<u32>,
     /// Device memory released while recording, freed once the segment that
     /// may still read it has been launched — see [`CaptureHub::retire`].
     graveyard: Graveyard,
@@ -217,9 +238,12 @@ struct Wave {
     error: Option<String>,
     /// When the recording segment began, for [`CaptureStats::recording_us`].
     recording_since: Option<Instant>,
-    /// The current segment runs unrecorded: its predicted key is cooling
-    /// (`CaptureHub::start_segment`).
+    /// The current segment runs unrecorded (`CaptureHub::start_segment`), as
+    /// a run of this predicted key.
     eager: bool,
+    eager_key: Option<Key>,
+    /// The current segment is on trial: the event its start was recorded at.
+    timing: Option<CudaEvent>,
 }
 
 /// One forward's wave capture on the thread that opened it — see
@@ -296,6 +320,72 @@ fn begin(capture: &Arc<CudaStream>) -> Result<()> {
     // SAFETY: the hub's own created stream, not recording — a wave records on it
     // only between `begin` and `end_segment`, under the hub's lock.
     unsafe { capture::begin(capture) }
+}
+
+/// Log every library phase that has ended (`regime`), at wave `wave`, with what
+/// the library holds once it has.
+fn log_transitions(st: &mut HubState, wave: u64) {
+    for t in st.regime.take_transitions() {
+        let (execs, nodes, bytes) = st.library.held();
+        let (banned_total, proven_total) = st.regime.counts();
+        let budget_mib = st.library.budget() >> 20;
+        match t {
+            Transition::Learned {
+                waves,
+                admitted,
+                ended,
+                next,
+            } => tracing::info!(
+                target: "candle_core::graph",
+                wave,
+                waves,
+                admitted,
+                ended = match ended {
+                    LearnEnd::Full => "budget full",
+                    LearnEnd::Quiet => "no new shape",
+                },
+                next = next.name(),
+                execs_held = execs,
+                nodes_held = nodes,
+                held_mib = bytes >> 20,
+                budget_mib,
+                "graph library: learn ended — {admitted} shape(s) admitted in {waves} wave(s), {}",
+                match next {
+                    Phase::Trial => "trialling them graphed against eager",
+                    _ => "nothing to trial: locked",
+                }
+            ),
+            Transition::Trialled {
+                waves,
+                proven,
+                proven_ratio,
+                rare,
+                slower,
+                next,
+            } => tracing::info!(
+                target: "candle_core::graph",
+                wave,
+                waves,
+                proven,
+                graphed_over_eager = proven_ratio.map(|r| format!("{r:.2}")).unwrap_or_default(),
+                banned_rare = rare,
+                banned_slower = slower,
+                next = next.name(),
+                banned_total,
+                proven_total,
+                execs_held = execs,
+                nodes_held = nodes,
+                held_mib = bytes >> 20,
+                budget_mib,
+                "graph library: trial ended — {proven} proven, {} banned ({rare} rarely hit, {slower} not faster), {}",
+                rare + slower,
+                match next {
+                    Phase::Learn => "learning again into the ground the bans freed",
+                    _ => "nothing new worth keeping: locked",
+                }
+            ),
+        }
+    }
 }
 
 /// Nudge WDDM to submit what has been issued on `compute`.
@@ -412,7 +502,21 @@ impl CaptureHub {
                 st.library.set_budget(budget);
             }
         }
-        st.library.wave_passed(now);
+        {
+            // Segments on trial that have finished on the device are credited,
+            // and a trial that has run its course drops what it banned.
+            let HubState {
+                timer,
+                regime,
+                library,
+                ..
+            } = &mut *st;
+            timer.drain(|key, mode, took| regime.sample(key, mode, took));
+            for key in regime.wave_begins(now) {
+                library.ban(key);
+            }
+        }
+        log_transitions(&mut st, now);
         st.wave = Some(Wave {
             owner: std::thread::current().id(),
             serial: st.stats.waves,
@@ -423,6 +527,8 @@ impl CaptureHub {
             error: None,
             recording_since: None,
             eager: false,
+            eager_key: None,
+            timing: None,
         });
         // The tag before the flag: a thread that sees the wave active reads
         // its owner's tag.
@@ -468,10 +574,18 @@ impl CaptureHub {
             crate::bail!("wave capture failed to resume: {e}");
         }
         if wave.eager {
-            // A segment left unrecorded because its key is cooling: its launches
-            // went to the device as issued, so it ends with nothing to launch.
+            // A segment left unrecorded: its launches went to the device as
+            // issued, so it ends with nothing to launch — only, on trial, the
+            // end of its timing.
             wave.eager = false;
             wave.segment += 1;
+            let key = wave.eager_key.take();
+            if let Some(start) = wave.timing.take() {
+                match key {
+                    Some(k) => st.timer.end(compute, start, k, Mode::Eager)?,
+                    None => st.timer.discard(start),
+                }
+            }
             return Ok(());
         }
         if !wave.recording {
@@ -529,9 +643,12 @@ impl CaptureHub {
         let (key, shape) = (audited.key, audited.shape);
         st.last_key[segment] = Some((key, shape));
         let topologies = st.library.len() + usize::from(first_sight);
-        // A key evicted within its cooldown may fold into what its topology
-        // keeps, but is not kept again yet.
-        let admit = !st.library.cooling(key, shape, serial);
+        // Only the learn keeps anything new, and never a banned shape.
+        let admit = if st.regime.admits() && !st.regime.banned((key, shape)) {
+            Admit::Keep
+        } else {
+            Admit::Never
+        };
         let (transient, folded, refusal) = match st
             .library
             .slot(key)
@@ -599,6 +716,13 @@ impl CaptureHub {
                 .launch(&on)?,
         }
         drop(transient);
+        if let Some(start) = st.wave.as_mut().and_then(|w| w.timing.take()) {
+            if st.regime.timed((key, shape)) {
+                st.timer.end(compute, start, (key, shape), Mode::Graph)?;
+            } else {
+                st.timer.discard(start);
+            }
+        }
         st.stats.segments += 1;
         st.stats.nodes += nodes as u64;
         match folded {
@@ -614,9 +738,13 @@ impl CaptureHub {
             Folded::Instantiated => {
                 st.stats.instantiated += 1;
                 st.stats.instantiated_us += fold_us;
-                let evicted = st.library.admitted(key, serial);
-                st.stats.evicted += evicted.execs as u64;
-                st.stats.evicted_bytes += evicted.bytes;
+                // Launched above, so a refusal may destroy it at once.
+                if st.library.admitted(key) {
+                    st.regime.admitted((key, shape), serial);
+                } else {
+                    st.regime.full(serial);
+                    log_transitions(st, serial);
+                }
             }
             Folded::Transient => {
                 st.stats.transient += 1;
@@ -627,27 +755,69 @@ impl CaptureHub {
         Ok(())
     }
 
-    /// Begin the wave's next segment: recording, unless the key this ordinal
-    /// held last wave is cooling and nothing of its topology is kept — then the
-    /// segment runs as issued, unrecorded, because instantiating it would buy
-    /// one launch and an executable the library may not keep.
+    /// Begin the wave's next segment, recorded or as issued, by the key this
+    /// ordinal held the last time it was recorded:
+    ///
+    /// - banned: as issued — its graph was not worth keeping;
+    /// - not held, once the learn is over: as issued — recording it would buy
+    ///   one launch of an executable nothing keeps;
+    /// - on trial: graphed or eager by turns ([`Regime::mode_for`]), its start
+    ///   recorded for the device time the trial compares;
+    /// - otherwise recorded. An ordinal never recorded is recorded while the
+    ///   library learns, and runs as issued after.
+    ///
+    /// An ordinal that has run as issued on its prediction alone
+    /// [`RECHECK_EVERY`] times in a row is recorded once, so its prediction
+    /// follows what the wave now puts there.
     ///
     /// The key is a prediction: a segment's real key is known only once it has
-    /// been recorded. A miss either way is harmless — an unrecorded segment
-    /// that could have been kept is recorded next wave, and a recorded one
-    /// whose key turns out to be cooling folds into its topology or runs once
-    /// ([`Folded::Transient`]).
+    /// been recorded. A miss either way is harmless — a recorded segment whose
+    /// shape the library does not hold runs once ([`Folded::Transient`]), and
+    /// an unrecorded one is simply eager.
     fn start_segment(st: &mut HubState) -> Result<()> {
         let wave = st.wave.as_ref().expect("called inside a wave");
-        let serial = wave.serial;
-        let predicted = st.last_key.get(wave.segment).copied().flatten();
-        let skip = predicted
-            .is_some_and(|(k, s)| st.library.cooling(k, s, serial) && !st.library.holds(k));
-        if skip {
+        let ordinal = wave.segment;
+        let predicted = st.last_key.get(ordinal).copied().flatten();
+        // Eager on the prediction alone — banned, unheld, or never recorded —
+        // as opposed to the eager half of a trial.
+        let unkept = match predicted {
+            None => !st.regime.admits(),
+            Some(k) => st.regime.banned(k) || (!st.regime.admits() && !st.library.holds_shape(k)),
+        };
+        if st.eager_runs.len() <= ordinal {
+            st.eager_runs.resize(ordinal + 1, 0);
+        }
+        let mode = if unkept {
+            st.eager_runs[ordinal] += 1;
+            if st.eager_runs[ordinal] > RECHECK_EVERY {
+                st.eager_runs[ordinal] = 0;
+                Mode::Graph
+            } else {
+                Mode::Eager
+            }
+        } else {
+            st.eager_runs[ordinal] = 0;
+            match predicted {
+                Some(k) => st.regime.mode_for(k),
+                None => Mode::Graph,
+            }
+        };
+        let timing = match predicted {
+            Some(k) if st.regime.timed(k) => {
+                let compute = st.compute.clone().expect("a wave has a compute stream");
+                Some(st.timer.start(&compute)?)
+            }
+            _ => None,
+        };
+        if mode == Mode::Eager {
             st.stats.eager_segments += 1;
-            st.wave.as_mut().expect("checked above").eager = true;
+            let wave = st.wave.as_mut().expect("checked above");
+            wave.eager = true;
+            wave.eager_key = predicted;
+            wave.timing = timing;
             return Ok(());
         }
+        st.wave.as_mut().expect("checked above").timing = timing;
         let capture = st.capture.clone().expect("a wave has a capture stream");
         begin(&capture)?;
         let wave = st.wave.as_mut().expect("checked above");
@@ -823,13 +993,16 @@ impl CaptureHub {
         self.lock().graveyard.len()
     }
 
-    /// Replace the executable library with an empty one of `budget` bytes, and
-    /// forget every ordinal's last key.
+    /// Replace the executable library with an empty one of `budget` bytes,
+    /// learning from scratch, and forget every ordinal's last key.
     #[cfg(test)]
     pub(crate) fn reset_library(&self, budget: u64) {
         let mut st = self.lock();
         st.library = ExecLibrary::with_budget(budget);
+        st.regime = Regime::default();
+        st.timer = SegmentTimer::default();
         st.last_key.clear();
+        st.eager_runs.clear();
     }
 
     /// Close the wave of a forward that failed, **launching what is recording**.
@@ -868,11 +1041,14 @@ impl CaptureHub {
     pub(crate) fn stats(&self) -> CaptureStats {
         let st = self.lock();
         let (execs_held, nodes_held, bytes_held) = st.library.held();
+        let (banned, proven) = st.regime.counts();
         CaptureStats {
             execs_held: execs_held as u64,
             nodes_held: nodes_held as u64,
             bytes_held,
-            cooling: st.library.cooling_len() as u64,
+            phase: st.regime.phase(),
+            banned: banned as u64,
+            proven: proven as u64,
             ..st.stats
         }
     }

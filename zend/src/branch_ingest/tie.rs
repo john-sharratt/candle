@@ -164,6 +164,7 @@ mod tests {
             key: key.to_string(),
             subject: "s".to_string(),
             stamp: VersionStamp::default(),
+            quant: None,
         }
     }
 

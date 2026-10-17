@@ -6,12 +6,20 @@
 //! own written records — so an `oseq` with no location is one compaction or a
 //! skip on arrival dropped (§6.5, §6.8), never one this member lacks.
 //!
+//! **A record that never travels is listed gone.** A local-only record — the
+//! model binding, the tokenizer, a branch checkpoint (§6.1) — is refused by
+//! every member it reaches, so a requester that saw one listed fetched it,
+//! refused it, and fetched it again, every try of every catch-up: a member
+//! joining `.5` on 2026-10-17 refused 164 such records and caught up on
+//! nothing. Gone, the requester marks the `oseq` applied and moves on.
+//!
 //! **Listed from memory.** Each header comes from the location index
 //! ([`ListedHeader`]), never off disk, so a listing holds the persistence lock
 //! for a walk over memory. Read off disk, a catch-up's headers were a 4 KiB
 //! read per record under the lock, and a peer catching up kept the scheduler
 //! out of it for 75–93 s at a time.
 
+use super::record::RecordType;
 use super::replica::ListedHeader;
 use super::SubstratePersistence;
 
@@ -57,8 +65,10 @@ impl SubstratePersistence {
         let mut listing = Listing::default();
         for oseq in from..=to {
             match self.locations.listed(origin, oseq) {
-                Some(h) => listing.records.push(ListedRecord::new(oseq, h)),
-                None => listing.gone.push(oseq),
+                Some(h) if !RecordType::from_tag(h.record_type).is_local_only() => {
+                    listing.records.push(ListedRecord::new(oseq, h))
+                }
+                _ => listing.gone.push(oseq),
             }
         }
         listing
@@ -103,6 +113,29 @@ mod tests {
             vec![b.identity.oseq + 1],
             "past the last record, nothing holds the oseq"
         );
+    }
+
+    /// A local-only record is listed gone, never as something to fetch: every
+    /// member it reached would refuse it.
+    #[test]
+    fn a_local_only_record_is_listed_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut substrate = Substrate::new();
+        let mut sp =
+            SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+        let node = sp.node();
+        let local = sp
+            .append_record(RecordType::BranchCheckpoint, 0, 3, 0, 0, 0, &[7; 16])
+            .unwrap();
+        let shared = sp
+            .append_record(RecordType::Tokens, 0, 9, 0, 0, 0, &[1, 2])
+            .unwrap();
+        let listing = sp.list(node, local.identity.oseq, shared.identity.oseq);
+        assert_eq!(
+            listing.records.iter().map(|r| r.oseq).collect::<Vec<_>>(),
+            vec![shared.identity.oseq]
+        );
+        assert_eq!(listing.gone, vec![local.identity.oseq]);
     }
 
     /// What is listed of a record is what reading it gives: the header's

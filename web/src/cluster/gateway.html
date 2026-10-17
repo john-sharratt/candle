@@ -429,7 +429,7 @@ function memberLine(m, s, operate) {
     m.slots_free != null ? `${m.slots_free} slots free` : null,
   ].filter(Boolean);
   return `<div class="gw-member">
-    <div class="who"><span class="host">${esc(m.host)}</span>${chip(STATE_CLS[m.state] || "", m.state)}${m.lagging ? chip("warn", "lagging") : ""}${c && c.mode !== "joined" ? chip(MODE_CLS[c.mode] || "", c.mode.replace("_", " ")) : ""}${u && u.step ? chip(u.step === "stranded" ? "crit" : "accent", u.step) : ""}${behind ? chip("warn", `behind floor ${floor.count}`) : ""}</div>
+    <div class="who"><span class="host">${esc(m.host)}</span>${chip(STATE_CLS[m.state] || "", m.state)}${m.lagging ? chip("warn", "lagging") : ""}${m.syncing ? chip("warn", "syncing — not serving yet") : ""}${c && c.mode !== "joined" ? chip(MODE_CLS[c.mode] || "", c.mode.replace("_", " ")) : ""}${u && u.step ? chip(u.step === "stranded" ? "crit" : "accent", u.step) : ""}${behind ? chip("warn", `behind floor ${floor.count}`) : ""}</div>
     <div class="meta">${bits.map((b) => `<span>${b}</span>`).join("")}</div>
     ${replication(c)}
     <div class="act">${operate ? `<button class="btn sm" type="button" data-actions="${esc(m.app)}" data-node="${esc(m.node)}">Actions…</button>` : ""}</div>

@@ -4,9 +4,11 @@
 //! lagging state of a member that cannot keep up, and world pulses. The
 //! gateway never decodes a record; it moves bytes between sockets.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use super::hub::{hex, Hub, CATCHUP_CAP, LAG_CAP};
+use super::registry::Registry;
 use crate::fragment::Whole;
 use crate::frame::{Done, Frame, MemberState, Receipt};
 use crate::session::SessionHandle;
@@ -26,7 +28,7 @@ impl Hub {
             let s = &mut *guard;
             match whole.reply_to {
                 Some(to) => match s.sockets.get_mut(&(app.to_string(), to)) {
-                    Some(x) if x.handle.gauges().catchup() + bytes > CATCHUP_CAP => {
+                    Some(x) if over_cap(bytes, x.handle.gauges().catchup()) => {
                         x.dropped += 1;
                         Vec::new()
                     }
@@ -122,7 +124,7 @@ impl Hub {
     /// `node`'s socket's timer: a `RECEIPT` owed for 100 ms, and the end of
     /// its lagging once its lane has drained and it has caught up.
     pub(super) fn receipt_tick(&self, app: &str, node: u64) {
-        let (receipt, recovered) = {
+        let (receipt, recovered, synced) = {
             let mut guard = self.state();
             let s = &mut *guard;
             let Some(x) = s.sockets.get_mut(&(app.to_string(), node)) else {
@@ -148,13 +150,42 @@ impl Hub {
             if recovered {
                 s.registry.set_lagging(app, node, false);
             }
-            (receipt, recovered)
+            // Synced: its own `ACK`s cover every other origin this gateway has
+            // heard, members away included — judged here, not by the member,
+            // whose catch-up can end early (a `DONE` with nobody to answer).
+            let syncing = s.registry.member(app, node).is_some_and(|m| m.syncing);
+            let synced = syncing && {
+                // The most any member serving now has applied of each origin.
+                let mut serving: BTreeMap<u64, u64> = BTreeMap::new();
+                for ((a, n), x) in &s.sockets {
+                    let routable = s.registry.member(a, *n).is_some_and(|m| m.routable());
+                    if a != app || *n == node || !routable {
+                        continue;
+                    }
+                    for (origin, through) in &x.acks {
+                        let top = serving.entry(*origin).or_default();
+                        *top = (*top).max(*through);
+                    }
+                }
+                Registry::in_sync(node, &acks, &serving)
+            };
+            if synced {
+                s.registry.set_syncing(app, node, false);
+            }
+            (receipt, recovered, synced)
         };
         if let Some((handle, through)) = receipt {
             let _ = handle.control(Frame::Receipt(Receipt { through }));
         }
         if recovered {
             self.note(app, hex(node), "caught up: no longer lagging".into());
+        }
+        if synced {
+            self.note(
+                app,
+                hex(node),
+                "in sync with the group: serving requests".into(),
+            );
         }
     }
 
@@ -189,8 +220,25 @@ impl Hub {
                         );
                         self.to_member(app, n, Frame::Catchup(c));
                     }
-                    // No other member here: nothing is owed through this
-                    // gateway.
+                    // No member ready to answer, and writes seen here that the
+                    // requester lacks: their member is away — restarting, or
+                    // still loading. A `DONE` now would tell a newcomer it had
+                    // caught up on nothing, and it joined empty for good (an
+                    // admission catch-up answered in 15 ms while .5 restarted).
+                    // Left unanswered, the requester asks again once it goes
+                    // quiet, by when a member may answer.
+                    None if self.state().registry.owed(app, requester, &c.since) => {
+                        self.note(
+                            app,
+                            hex(from),
+                            format!(
+                                "catch-up {} left open: no member can answer what it lacks yet",
+                                c.request
+                            ),
+                        );
+                    }
+                    // No other member here and nothing seen it lacks: nothing
+                    // is owed through this gateway.
                     None => self.to_catchup(
                         app,
                         requester,
@@ -248,7 +296,21 @@ impl Hub {
 /// ending short of a record fetches it again — but a dropped `DONE` leaves its
 /// catch-up waiting until it goes quiet, 30 s on. It is a few bytes.
 fn dropped_at_cap(frame: &Frame, queued: usize) -> bool {
-    !matches!(frame, Frame::Done(_)) && queued + frame.encoded_len() > CATCHUP_CAP
+    !matches!(frame, Frame::Done(_)) && over_cap(frame.encoded_len(), queued)
+}
+
+/// Whether `bytes` more would take a catch-up lane holding `queued` past
+/// [`CATCHUP_CAP`].
+///
+/// **A record larger than the cap counts as the cap**: it goes onto an empty
+/// lane, and waits for one. The cap bounds a lane's backlog, not the size of
+/// what crosses it. Measured against its own length, a record over 16 MiB
+/// was dropped however empty the lane — every try, so it was left after its
+/// third and the next catch-up dropped it again: npcd on `.5`, 2026-10-17,
+/// caught up 6 of 192 records (24 of 21,290 MiB) in ten minutes, every
+/// record it landed a small one.
+fn over_cap(bytes: usize, queued: usize) -> bool {
+    queued + bytes.min(CATCHUP_CAP) > CATCHUP_CAP
 }
 
 #[cfg(test)]
@@ -280,5 +342,18 @@ mod tests {
         assert!(dropped_at_cap(&headers(), CATCHUP_CAP));
         assert!(!dropped_at_cap(&done, CATCHUP_CAP));
         assert!(!dropped_at_cap(&done, usize::MAX / 2));
+    }
+
+    /// **A record over the cap crosses an empty lane and waits for a busy
+    /// one**; one under it fills the lane up to the cap, as before.
+    #[test]
+    fn a_record_larger_than_the_cap_needs_only_an_empty_lane() {
+        let big = CATCHUP_CAP * 2;
+        assert!(!over_cap(big, 0));
+        assert!(over_cap(big, 1));
+        assert!(!over_cap(CATCHUP_CAP, 0));
+        assert!(!over_cap(CATCHUP_CAP - 10, 10));
+        assert!(over_cap(CATCHUP_CAP - 10, 11));
+        assert!(!over_cap(1 << 20, CATCHUP_CAP - (1 << 20)));
     }
 }

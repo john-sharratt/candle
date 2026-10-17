@@ -123,6 +123,7 @@ mod tests {
             routes: None,
             high_water: 0,
             lagging: false,
+            syncing: false,
         };
         assert_eq!(
             serde_json::to_value(AgentRow::of(&agent, 1_700_000_000_000)).unwrap(),

@@ -42,6 +42,7 @@ use crate::self_heal::spawn_watchdog;
 use crate::server::serve;
 use crate::starting::StartLine;
 use crate::stopping::{Ending, Stopping};
+use crate::syncing::next_syncing_line;
 use crate::telemetry::Telemetry;
 use crate::tenant::{Reports, Stop, Tenant, TenantContext, TenantUi};
 use crate::ui::{build_id, COMMON};
@@ -219,15 +220,23 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
 /// every repository's anchors again, an hour of forwards that says nothing more
 /// about the build than the first did — and a build that had loaded, prefilled
 /// and calibrated was rolled back for running out of time on it.
+///
+/// **Until then, each catch-up that receives more prints a syncing line**
+/// (`syncing`), which restarts `keep`'s limit: a member that is behind is
+/// waited out while its sync keeps arriving, and rolled back once it stalls.
 fn announce_when_ready(reports: Vec<Arc<dyn Reports>>) {
     tokio::spawn(async move {
+        let mut synced = vec![0u64; reports.len()];
         loop {
             let mut ready = !reports.is_empty();
-            for report in &reports {
-                if !report.status().await.proven {
-                    ready = false;
-                    break;
+            for (tenant, report) in reports.iter().enumerate() {
+                let status = report.status().await;
+                if let Some(line) =
+                    next_syncing_line(tenant, status.loading.as_ref(), &mut synced[tenant])
+                {
+                    eprintln!("{line}");
                 }
+                ready &= status.proven;
             }
             if ready {
                 eprintln!("{PROOF}");

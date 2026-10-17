@@ -27,8 +27,6 @@ pub struct GraphExec {
     /// Device memory it is charged against the library's budget
     /// ([`budget::charge`]).
     bytes: u64,
-    /// Launches, decayed each wave — what least-invoked eviction ranks by.
-    invocations: f64,
 }
 
 // SAFETY: a `CUgraphExec` is a driver handle usable from any thread once the
@@ -358,7 +356,6 @@ impl GraphExec {
             topology,
             ctx: on.context(),
             bytes: 0,
-            invocations: 0.0,
         };
         // Uploading ahead of the first launch keeps the one-time setup off the
         // launch that the wave is waiting on.
@@ -451,21 +448,6 @@ impl GraphExec {
     /// Device memory it is charged.
     pub(super) fn bytes(&self) -> u64 {
         self.bytes
-    }
-
-    /// Its decayed launch count.
-    pub(super) fn invocations(&self) -> f64 {
-        self.invocations
-    }
-
-    /// One more launch.
-    pub(super) fn credit(&mut self) {
-        self.invocations += 1.0;
-    }
-
-    /// A wave has passed.
-    pub(super) fn decay(&mut self) {
-        self.invocations *= budget::INVOCATION_DECAY;
     }
 }
 

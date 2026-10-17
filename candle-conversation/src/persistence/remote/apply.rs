@@ -14,23 +14,6 @@ use super::incoming::Incoming;
 use super::outcome::{Refusal, RemoteBatch, RemoteOutcome};
 use crate::substrate::{StreamKey, Substrate};
 
-/// Whether records of type `rt` never leave the member that wrote them
-/// (§6.1): the header index, the model binding, the projection schema, the
-/// branch-checkpoint cache, and this member's own housekeeping.
-fn is_local_only(rt: RecordType) -> bool {
-    matches!(
-        rt,
-        RecordType::HeaderIndex
-            | RecordType::ModelKey
-            | RecordType::Tokenizer
-            | RecordType::Template
-            | RecordType::BranchCheckpoint
-            | RecordType::Replica
-            | RecordType::Rebase
-            | RecordType::Deleted
-    )
-}
-
 /// Whether the record declares a turn. A turn's declaration is written even
 /// when a tombstone here covers it, dead at read like the rest of its
 /// timeline: it is the one record of the turn that names the timeline, so the
@@ -121,7 +104,7 @@ impl SubstratePersistence {
             });
             return Ok(RemoteOutcome::Deferred);
         }
-        if is_local_only(h.record_type) {
+        if h.record_type.is_local_only() {
             return Ok(RemoteOutcome::Refused(Refusal::LocalOnly(h.record_type)));
         }
         if self.is_applied(id.origin, id.oseq) {

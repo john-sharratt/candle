@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::resolver::Conversation;
 use crate::persistence::deleted::{DeletedEntry, DeletedPayload};
-use crate::persistence::identity::{MintGeneration, VersionStamp};
+use crate::persistence::identity::{MintGeneration, VersionStamp, GEN_DETACHED};
 use crate::persistence::listing::ListedRecord;
 use crate::persistence::record::{decode_header, CustomObjectPayload};
 use crate::persistence::replica::AppliedSet;
@@ -82,6 +82,52 @@ impl Conversation {
         let (header, head) = decode_header(&bytes).ok()?;
         bytes.truncate(head + header.payload_len as usize);
         Some(bytes)
+    }
+
+    /// [`Self::read_event`] for each of `oseqs`, in order, read off disk
+    /// without the persistence lock.
+    ///
+    /// A peer's fetch read one record a hold, each hold waiting its turn
+    /// behind the scheduler's — answering ran at the pace of the lock, not the
+    /// disk (about 9 MB/s to a member catching up while `.5` ingested). Now one
+    /// short hold, memory only, takes every record's location and whether any
+    /// rebase exists; the records are read from their sealed segments with no
+    /// lock (`SealedReader`), so the scheduler waits on no fetch's I/O. A
+    /// record the lock-free read cannot vouch for — in the active segment,
+    /// moved since its location was taken, or detached while a rebase exists —
+    /// is read the locked way, as before.
+    pub fn read_events(&self, origin: u64, oseqs: &[u64]) -> Vec<Option<Vec<u8>>> {
+        let (reader, places, no_rebases) = {
+            let p = self.persistence.lock_behind_waiters().unwrap();
+            let places: Vec<_> = oseqs.iter().map(|oseq| p.locate(origin, *oseq)).collect();
+            (p.sealed_reader(), places, p.no_rebases())
+        };
+        oseqs
+            .iter()
+            .zip(places)
+            .map(|(&oseq, place)| {
+                let read = place
+                    .and_then(|(segment, offset)| reader.read_raw(segment, offset))
+                    .and_then(|r| r.ok())
+                    .and_then(|mut bytes| {
+                        let (header, head) = decode_header(&bytes).ok()?;
+                        let id = header.identity();
+                        let vouched = (id.origin, id.oseq) == (origin, oseq)
+                            && (no_rebases || id.gen != GEN_DETACHED);
+                        vouched.then(|| {
+                            bytes.truncate(head + header.payload_len as usize);
+                            bytes
+                        })
+                    });
+                match read {
+                    Some(bytes) => Some(bytes),
+                    // Never located, or not vouched for: the locked read
+                    // decides, as it did for every record before.
+                    None if place.is_some() => self.read_event(origin, oseq),
+                    None => None,
+                }
+            })
+            .collect()
     }
 
     /// What this member holds of `origin`'s `from..=to`, a range it covers

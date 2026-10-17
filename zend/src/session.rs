@@ -1268,6 +1268,11 @@ impl InferenceState {
 
         // The model pack, from the model cache: shared by every workspace on
         // this model, it survives `--wipe-substrate`, and carries the tokenizer.
+        // What every unit this process ingests says it was computed under: a
+        // duplicate a better-quantized member wrote replaces this one's.
+        crate::branch_ingest::keys::set_model_bits(
+            candle_conversation::guest::checkpoint::weight_bits(&pack),
+        );
         let mut builder = model
             .builder()
             .system_prompt(&before_text)

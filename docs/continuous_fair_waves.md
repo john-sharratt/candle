@@ -126,30 +126,24 @@ ingest, ride at the band of the prompt they joined — alone they are `Low`
 than throughput there, so a `Normal` or `Low` creep beside a decode of its own
 band runs whole, co-batched with it.
 
-**A `High` creep beside a `High` decode is paced in tokens.** A conversation is
-never on both sides: while it prefills (a turn, a tool result) it is not
-decoding. The collision is between two conversations of one band — two zend
-dialogues, or a dialogue and a client's passthrough conversation. When only an
-outranking decode counted, a same-band creep
-rode the step whole — a full chunk through every layer — and the decode beside it
-waited all of it: measured on `.5`, 2026-10-16, a dialogue's decode step that
-took 17–19 ms alone took 3.2 s (profile build) whenever an npcd turn's chunk,
-with the section chunks riding it, shared the step.
+**A `High` creep beside a `High` decode shares airtime at `R = 2`**
+(`HIGH_BESIDE_HIGH_RATIO`). A conversation is never on both sides: while it
+prefills (a turn, a tool result) it is not decoding. The collision is between two
+conversations of one band — two zend dialogues, or a dialogue and a client's
+passthrough conversation. When only an outranking decode counted, a same-band
+creep rode the step whole — a full chunk through every layer — and the decode
+beside it waited all of it: measured on `.5`, 2026-10-16, a dialogue's decode
+step that took 17–19 ms alone took 3.2 s (profile build) whenever an npcd turn's
+chunk, with the section chunks riding it, shared the step.
 
 So the creep keeps its chunk whole — each layer's experts are still loaded once
-for all its rows, which matters when they stream from RAM or NVMe — and is paced
-at **9 prefill tokens per decode token** (`SAME_BAND_PREFILL_PER_DECODE`), the
-mix the device runs best at: about 1.8k prefill tokens a second beside 200
-decode tokens a second, aggregated over a handful of sessions. It carries a debt
-in token-layers (one row through one layer): each step it rides adds its rows
-times its layers, each decode token that lands pays off 9 rows through all `N`
-layers, and it rides only once the debt is paid, advancing as many layers as its
-credit covers (at least one). An 8K chunk advances one layer every ~19 decode
-tokens; a 26-token prompt covers 16 layers a decode token, so it reaches its first
-token in about three steps. Credit is capped at one step's earnings, so steps the
-creep could not ride do not bank a whole sweep. Being counted in tokens, the pace
-scales with the decode width on every machine. The debt is dropped the step the
-last `High` decode finishes.
+for all its rows, which matters when they stream from RAM or NVMe — and takes the
+same time-bounded slices and airtime debt as any other outranked creep, with the
+decode keeping two thirds of the device. Pacing it in tokens instead (9 prefill
+tokens per decode token) starved it: a tool result's prefill beside another
+dialogue's decode took 8–27 s to reach its first token, which is the pause a user
+sees at the end of a tool call. Airtime keeps the decode's step bounded by the
+slice and the prefill's progress bounded below by the ratio, on every machine.
 
 Every decode has a band. zend's dialogue and a client's passthrough conversation
 are `High`. npcd's characters (its perception, action and interaction layers) and

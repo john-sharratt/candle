@@ -41,7 +41,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::manifest::RecordLoc;
-use super::record::{decode_record, verify_record_crc};
+use super::record::{
+    decode_header, decode_record, padded_record_len, verify_record_crc, HEADER_PROBE_SIZE,
+};
 use super::segment::SegmentId;
 use super::segmented_log::segment_path;
 use super::{PersistenceError, Result};
@@ -119,6 +121,38 @@ impl SealedReader {
         let (header, payload, _) = decode_record(&bytes)?;
         verify_record_crc(&header, payload)?;
         Ok(payload.to_vec())
+    }
+
+    /// The whole record at `offset` of `segment` — header line, payload and
+    /// padding, as the log's own `read_event` reads it — or `None` when the
+    /// segment is the active one. Its size is not known ahead, so a header
+    /// probe comes first and then the record; both positioned reads of a file
+    /// nothing writes. The caller checks the header names what it asked for:
+    /// a location taken before a relocation may name a file since unlinked.
+    pub fn read_raw(&self, segment: SegmentId, offset: u64) -> Option<Result<Vec<u8>>> {
+        if !self.active.is_sealed(segment) {
+            return None;
+        }
+        Some(self.read_raw_sealed(segment, offset))
+    }
+
+    fn read_raw_sealed(&self, segment: SegmentId, offset: u64) -> Result<Vec<u8>> {
+        let mut file = File::open(segment_path(&self.dir, segment))?;
+        let mut probe = vec![0u8; HEADER_PROBE_SIZE];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut probe)?;
+        let (header, header_bytes) = decode_header(&probe)?;
+        let len = padded_record_len(header_bytes - 1, header.payload_len);
+        let mut bytes = vec![0u8; len];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut bytes).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                PersistenceError::Truncated { need: len, have: 0 }
+            } else {
+                PersistenceError::Io(e)
+            }
+        })?;
+        Ok(bytes)
     }
 }
 
@@ -327,5 +361,33 @@ mod tests {
             .expect("the read finished while the log was held");
         worker.join().expect("worker");
         assert_eq!(got, Some(Some(b"read under a held lock".to_vec())));
+    }
+
+    /// **A whole record reads back as the log wrote it**, header and padding
+    /// included, sized from its own header — what a peer's fetch sends without
+    /// the persistence lock. The active segment is declined, and an unlinked one
+    /// fails, so the caller falls back to the locked read.
+    #[test]
+    fn a_raw_read_returns_the_whole_record_and_declines_what_it_cannot_vouch_for() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = open(dir.path());
+        let written = record(9, b"fetched by a peer catching up");
+        let loc = write(&mut log, 9, b"fetched by a peer catching up");
+        assert!(log
+            .sealed_reader()
+            .read_raw(loc.segment, loc.offset)
+            .is_none());
+        log.seal_and_rotate().expect("seal");
+        let raw = log
+            .sealed_reader()
+            .read_raw(loc.segment, loc.offset)
+            .expect("sealed")
+            .expect("read");
+        assert_eq!(raw, written);
+        log.drop_sealed(loc.segment).expect("drop");
+        log.sealed_reader()
+            .read_raw(loc.segment, loc.offset)
+            .expect("still counts as sealed")
+            .expect_err("the file is gone");
     }
 }

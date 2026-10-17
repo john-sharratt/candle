@@ -724,7 +724,11 @@ build is certified (§3.8):
      allows, and the one a self-relaunch starts. `keep` reads its stderr, written
      to a file under `keep/state/`, for the line `INFO serving`, which the process
      prints only after it is serving, not while it is booting. The wait is at most
-     10 minutes.
+     10 minutes **from the newest sync data received**: a member catching up
+     (§7.6) prints `INFO syncing …` each time its catch-up count rises, and every
+     such line restarts the 10 minutes. A catch-up is as long as the backlog, not
+     the build, so one that keeps receiving is waited out; one that stalls prints
+     nothing and is rolled back 10 minutes after its last line.
    - **No line in that time, or the process dying,** kills the trial, puts the
      set-aside file back and starts it.
    - **The line** makes the trial the service: the set-aside file is deleted and
@@ -1135,11 +1139,18 @@ Each member has an outbound queue per lane.
   pace. When it has drained the lane and its catch-up is done, it is ready again and
   receives live events once more. Closing the socket would instead fail every exchange
   on it (§5.6), for a member that is only slow.
-- **The catch-up lane is capped at 16 MiB per member.** The requester sets the pace: it
-  keeps no more than 8 MiB of fetched records outstanding (§7.2), so an answer stays
-  under the cap. A frame that would pass the cap anyway is dropped and counted. The
+- **The catch-up lane is capped at 128 MiB per member.** The requester sets the pace: it
+  keeps no more than 64 MiB of fetched records outstanding (§7.2), so an answer stays
+  under the cap. A catch-up moves one window per round trip — the answerer's reads, the
+  gateway hop and the spare-capacity gate, about 170 ms on `.5` — so the window is the
+  throughput: at 8 MiB it moved ~46 MB/s, and two members whose npcd each wrote faster
+  than that kept 34 and 40 GB backlogs of each other's writes (2026-10-17). A frame that would pass the cap anyway is dropped and counted. The
   requester sees the missing records when its `FETCH` ends with `DONE` short of them,
-  and fetches them again.
+  and fetches them again. **A record larger than the cap counts as the cap**: it is
+  fetched alone (§7.2) and crosses an empty lane. The cap bounds the backlog, not
+  what crosses it — weighed by its own length, a record over 16 MiB was dropped on
+  every try and never arrived (npcd on `.5`, 2026-10-17: 6 of 192 records, 24 of
+  21,290 MiB, in ten minutes).
 
 ---
 
@@ -2015,6 +2026,13 @@ member's own record past every `oseq` it issued — another member holding what 
 lost. The member's clock observes every record it applies or skips, so what it writes
 next ranks above it (`persistence/remote/`).
 
+**A type that never leaves its writer is never fetched either.** A catch-up's answerer
+lists such a record gone (`persistence/listing.rs`), and a requester counts any it is
+listed gone too (`Store::travels`, whatever the answerer runs): the requester marks the
+`oseq` applied, and its applied set has no hole there. Listed as a record, it was
+fetched, refused and fetched again on every try of every catch-up — a member joining
+`.5` on 2026-10-17 refused 164 of them and caught up on nothing.
+
 **Taking the substrate lock.** Apply takes the substrate write lock once per batch and
 never nests a read inside a held guard. Windows SRW locks deadlock on that
 (`docs/shared_model_host.md`, `projection/resolver.rs` `recover_turn_chunks`).
@@ -2449,7 +2467,7 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      the build back after its ten minutes.
      Unbounded, an answer to a member lacking 8 million records was a thousand frames,
      about 360 MB, queued at once. That is far past what a gateway holds for one member
-     (16 MiB, after which it drops catch-up frames). A requester waiting on frames that
+     (128 MiB, after which it drops catch-up frames). A requester waiting on frames that
      never come goes quiet and asks again, and each new answer queues behind old ones it
      ignores. Measured on `.5`: 156 catch-ups answered in 20 minutes, none of them
      recorded by whiteworld, which re-asked every 30 s and fetched nothing.
@@ -2492,7 +2510,7 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
    oseqs }` to the member that sent the headers. That member reads each record from its
    log and sends it as an addressed `EVENT`, then `DONE` once the last of them is
    written; the catch-up lane keeps their order (§4.2). Fetches are windowed: at most
-   8 MiB of records outstanding at once, so the requester sets the pace. A record a
+   64 MiB of records outstanding at once, so the requester sets the pace. A record a
    `FETCH` ends short of is fetched again; one its answerer cannot deliver after three
    fetches is left wanted for a later catch-up rather than holding this one open.
    Request numbers start from a random base in each process, so answers to a previous
@@ -2533,9 +2551,10 @@ nine bytes a record over what travels (§7.2).
 
 A catch-up uses only spare capacity:
 
-- The requester's fetch window (8 MiB outstanding) keeps the gateway's 16 MiB catch-up
-  cap per member (§4.4) from being reached. A `FETCH` whose `DONE` arrives short of
-  records is fetched again.
+- The requester's fetch window (64 MiB outstanding) keeps the gateway's 128 MiB catch-up
+  cap per member (§4.4) from being reached; a record larger than the window is fetched
+  alone, and crosses the gateway on an empty lane. A `FETCH` whose `DONE` arrives
+  short of records is fetched again.
 - The answerer sends catch-up frames only when its ordered lane is empty and its
   socket's unsent bytes are under 1 MiB (§4.2). Live traffic that keeps the socket
   busy therefore holds catch-up back entirely, and a live event queued behind catch-up
