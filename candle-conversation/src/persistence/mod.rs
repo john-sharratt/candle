@@ -2803,6 +2803,21 @@ impl SubstratePersistence {
         self.segments.sealed_reader()
     }
 
+    /// Where `(origin, oseq)` lies, from memory — for a read made without
+    /// this persistence's lock (`SealedReader::read_raw`). `None` when it is
+    /// not held here.
+    pub fn locate(&self, origin: u64, oseq: u64) -> Option<(SegmentId, u64)> {
+        self.locations
+            .get(origin, oseq)
+            .map(|at| (at.segment, at.offset))
+    }
+
+    /// Whether a record read off disk is already as it travels: no rebase
+    /// can apply to a detached identity (`read_event`'s fix-up).
+    pub fn no_rebases(&self) -> bool {
+        self.rebases.is_empty()
+    }
+
     /// Read one record's payload back by location — the snapshot-restore
     /// read (the caller got `loc` from the substrate's snapshot index).
     pub fn read_record_payload(&mut self, loc: &RecordLoc) -> Result<Vec<u8>> {

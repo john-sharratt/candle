@@ -72,6 +72,13 @@ pub trait Store: Send + Sync + 'static {
     /// wherever maintenance has moved it, or `None` when it is not held here.
     fn read(&self, origin: u64, oseq: u64) -> Option<Vec<u8>>;
 
+    /// [`Self::read`] for each of `oseqs`, in order. A store that reads under
+    /// a lock takes it once for many: a fetch answered one record a hold
+    /// waited once a record behind whatever held the lock.
+    fn read_many(&self, origin: u64, oseqs: &[u64]) -> Vec<Option<Vec<u8>>> {
+        oseqs.iter().map(|oseq| self.read(origin, *oseq)).collect()
+    }
+
     /// Every `(origin, oseq)` applied here or known gone, this member's own
     /// through [`Self::own_through`] included.
     fn applied(&self) -> AppliedSet;

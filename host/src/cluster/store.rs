@@ -140,6 +140,10 @@ impl Store for ConversationStore {
         self.conversation.read_event(origin, oseq)
     }
 
+    fn read_many(&self, origin: u64, oseqs: &[u64]) -> Vec<Option<Vec<u8>>> {
+        self.conversation.read_events(origin, oseqs)
+    }
+
     fn applied(&self) -> AppliedSet {
         self.conversation.applied_set()
     }
