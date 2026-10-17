@@ -164,11 +164,9 @@ impl Registry {
     /// Whether a member of `app` other than `except` is serving now: what a
     /// member joining beside it waits for being in sync with.
     pub fn has_routable(&self, app: &str, except: u64) -> bool {
-        self.apps.get(app).is_some_and(|a| {
-            a.members
-                .values()
-                .any(|m| m.node != except && m.routable())
-        })
+        self.apps
+            .get(app)
+            .is_some_and(|a| a.members.values().any(|m| m.node != except && m.routable()))
     }
 
     /// Whether `acks` — a member's applied-through per origin — cover what the

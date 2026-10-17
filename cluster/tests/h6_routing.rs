@@ -78,9 +78,11 @@ impl Model {
             }
             Dispatch::Best => self.best(),
             Dispatch::Any => self.rr(),
+            // A key held by a member here goes to it, ready or still loading:
+            // the conversation is the holder's.
             Dispatch::Sticky(_) | Dispatch::Owner(_) => {
                 match key.and_then(|k| self.claims.get(k)).map(|e| e.node) {
-                    Some(h) if is_ready(self, h) => Some(h),
+                    Some(h) if self.members.contains_key(&h) => Some(h),
                     _ => self.best(),
                 }
             }
@@ -112,6 +114,7 @@ fn view(node: u64, session: u64) -> MemberView {
         routes: None,
         high_water: 0,
         lagging: false,
+        syncing: false,
     }
 }
 

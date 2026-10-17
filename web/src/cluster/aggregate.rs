@@ -340,7 +340,13 @@ mod tests {
             .map(|c| c["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["a", "b", "c"]);
-        assert_eq!(merged["conversations"][0]["turn_count"], 4, "the in-sync copy is further along");
-        assert_eq!(merged["conversations"][1]["turn_count"], 3, "the rejoining copy is further along");
+        assert_eq!(
+            merged["conversations"][0]["turn_count"], 4,
+            "the in-sync copy is further along"
+        );
+        assert_eq!(
+            merged["conversations"][1]["turn_count"], 3,
+            "the rejoining copy is further along"
+        );
     }
 }

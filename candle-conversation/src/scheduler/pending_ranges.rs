@@ -137,7 +137,10 @@ mod tests {
             Ok(())
         };
         assert_eq!(cut_short(), Err(()));
-        assert_eq!(sink.writes.borrow().as_slice(), &[(vec![turn(0, 0)], vec![])]);
+        assert_eq!(
+            sink.writes.borrow().as_slice(),
+            &[(vec![turn(0, 0)], vec![])]
+        );
     }
 
     /// A walk that placed nothing takes no lock.

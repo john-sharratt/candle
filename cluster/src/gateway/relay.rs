@@ -181,7 +181,11 @@ impl Hub {
             self.note(app, hex(node), "caught up: no longer lagging".into());
         }
         if synced {
-            self.note(app, hex(node), "in sync with the group: serving requests".into());
+            self.note(
+                app,
+                hex(node),
+                "in sync with the group: serving requests".into(),
+            );
         }
     }
 

@@ -324,11 +324,20 @@ fn a_syncing_member_is_routed_only_its_own() {
     let Pick::All(asked) = r.pick("zend", &Dispatch::Aggregate(Merge::Union), None, None) else {
         panic!("an aggregate asks every loaded member");
     };
-    assert!(asked.contains(&3), "a syncing member is asked: it holds what it wrote cut off");
+    assert!(
+        asked.contains(&3),
+        "a syncing member is asked: it holds what it wrote cut off"
+    );
 
     let serving: BTreeMap<u64, u64> = [(1, 500), (2, 80)].into_iter().collect();
-    assert!(!Registry::in_sync(3, &[(1, 400), (2, 80)], &serving), "100 behind node 1");
-    assert!(Registry::in_sync(3, &[(1, 500 - SYNC_SLACK), (2, 80)], &serving), "within the slack");
+    assert!(
+        !Registry::in_sync(3, &[(1, 400), (2, 80)], &serving),
+        "100 behind node 1"
+    );
+    assert!(
+        Registry::in_sync(3, &[(1, 500 - SYNC_SLACK), (2, 80)], &serving),
+        "within the slack"
+    );
     assert!(
         !Registry::in_sync(3, &[(1, 500)], &serving),
         "nothing applied of node 2, which the serving members hold"

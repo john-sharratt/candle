@@ -21,8 +21,13 @@ fn the_performance_pages_module_parses() {
 /// the page as written and run: what every panel draws for the cluster as a
 /// whole is one engine's worth made of every member's.
 fn fused(expr: &str) -> serde_json::Value {
-    let from = PAGE.find("/* ── the cluster as a whole").expect("the fusion block");
-    let to = PAGE[from..].find("async function refresh()").expect("its end") + from;
+    let from = PAGE
+        .find("/* ── the cluster as a whole")
+        .expect("the fusion block");
+    let to = PAGE[from..]
+        .find("async function refresh()")
+        .expect("its end")
+        + from;
     let script = format!("{}\nJSON.stringify({expr})", &PAGE[from..to]);
     let mut ctx = Context::default();
     let out = ctx
