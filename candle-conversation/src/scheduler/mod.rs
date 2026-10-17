@@ -48,6 +48,7 @@ pub mod memory_report;
 mod named_tool;
 mod norm_warm;
 mod paused_creep;
+mod pending_ranges;
 pub mod phase_ring;
 mod phase_split;
 mod piece_identity;
@@ -3646,13 +3647,6 @@ pub(crate) struct Scheduler {
     /// Rows times layers of creep the last wave step carried beside decode
     /// rows; zero when it carried none, or carried no decode.
     wave_step_creep_layer_rows: usize,
-    /// What a `High` creep beside a `High` decode owes in token-layers (one row
-    /// through one layer): each step it rides adds its rows times its layers,
-    /// each decode token that lands pays off
-    /// `prefill::SAME_BAND_PREFILL_PER_DECODE` tokens through every layer, and
-    /// it rides only while this is not positive. Negative is credit, at most
-    /// one step's earnings. Zero whenever the creep is not paced.
-    same_band_debt: i64,
     /// Consecutive failures of the decode-less wave step and the wait owed
     /// before the next — see `wave_retry`.
     wave_retry: wave_retry::WaveRetry,
@@ -3668,11 +3662,6 @@ pub(crate) struct Scheduler {
     /// `High` decodes), 1 when there are none. Decode is
     /// owed that share of a co-batched step ([`Self::creep_owed`]).
     wave_step_ratio: u32,
-    /// The last wave step's creep was a `High` creep beside a `High` decode,
-    /// paced in tokens ([`Self::same_band_debt`]) rather than in airtime: it
-    /// owes no [`Self::creep_owed`], or a dialogue's tool result would wait out
-    /// `R` times its own airtime behind another dialogue's decode.
-    wave_step_token_paced: bool,
     /// Set once per wave after the co-batched decode wave folded the active
     /// section-ingest chunk into its full sweep (section rides decode's `[0, N)`
     /// as a prefill-group member — one shared MoE grouped GEMM per layer serves
@@ -3971,12 +3960,10 @@ impl Scheduler {
             decode_only_step: None,
             creep_layer_row_cost: None,
             wave_step_creep_layer_rows: 0,
-            same_band_debt: 0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),
             wave_cobatched: false,
             wave_step_ratio: 1,
-            wave_step_token_paced: false,
             wave_section_advanced: false,
             shutdown_requested: false,
             section_name_cache: HashMap::new(),
