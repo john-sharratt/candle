@@ -733,4 +733,8 @@ end against the same tree without this change — §5's predictions to the regio
 
 Acceptance per step is identical in every row. Both columns were run with main's
 `6e60c910a` (the graph library's learn/trial/lock) reverted: with it, the ×8 rows'
-sliced prefill comes back NaN on this card with or without this change.
+sliced prefill came back NaN on this card with or without this change. The cause was the
+hub's, not the timeline's: an eager segment ran on the compute stream, unordered against a
+launch on a capture stream held across the flush before it. Eager segments run on the
+capture stream now (`decode_graphs.md` §2.1.1), and the gate passes all ten rows with the
+library's learn/trial/lock in place.

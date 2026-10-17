@@ -1755,6 +1755,72 @@ fn the_library_learns_trials_and_locks_quickly() -> Result<()> {
     Ok(())
 }
 
+/// **A stream taken while recording and launched in a later eager segment stays
+/// in issue order.** An eager segment runs on the capture stream — the stream a
+/// recording segment hands out — so a launcher holding it from before a flush
+/// lands in order with everything the eager segment issues around it. On the
+/// compute stream instead, the held stream ran at once, unordered against the
+/// eager launches ahead of it and the ones behind it: on the Flash-Next gate a
+/// trial or a locked library, mixing recorded and eager segments in one wave,
+/// read half-written activations and sampled from NaN logits.
+///
+/// The library is taken to its trial, where the wave's first segment — the
+/// shape the learn admitted — alternates recorded and eager, and the segment
+/// after the flush, never recorded, runs eagerly.
+#[test]
+fn a_held_stream_in_an_eager_segment_stays_in_order() -> Result<()> {
+    use super::budget::graph_budget_bytes;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let mut z = dev.alloc_zeros::<f32>(N)?;
+    let mut w = dev.alloc_zeros::<f32>(N)?;
+    let mut v = dev.alloc_zeros::<f32>(N)?;
+    dev.capture_hub().reset_library(graph_budget_bytes()?);
+    let mut waves = 0u32;
+    while dev.capture_stats().phase != GraphPhase::Trial {
+        assert!(waves < 100, "no trial after {waves} waves");
+        add_wave(&dev, &f, &x, &mut y, 3, 0.0)?;
+        waves += 1;
+    }
+    let s0 = dev.capture_stats();
+    for round in 0..16 {
+        let add = round as f32;
+        let capture = dev.begin_wave_capture()?;
+        dev.record_launches()?;
+        let held = dev.cuda_stream();
+        for _ in 0..3 {
+            launch(&f, &dev.cuda_stream(), &x, &mut y, 1.0, add)?;
+        }
+        dev.flush_launches()?;
+        assert!(
+            Arc::ptr_eq(&held, &dev.cuda_stream()),
+            "round {round}: the eager segment launches on the stream the wave handed out"
+        );
+        // A long eager run ahead of the held launch, and one behind it.
+        for _ in 0..64 {
+            launch(&f, &dev.cuda_stream(), &y, &mut z, 1.0, 1.0)?;
+        }
+        launch(&f, &held, &z, &mut w, 3.0, 0.0)?;
+        launch(&f, &dev.cuda_stream(), &w, &mut v, 1.0, 5.0)?;
+        capture.finish()?;
+        let want: Vec<f32> = ramp(1.0)
+            .iter()
+            .map(|x| (x + add + 1.0) * 3.0 + 5.0)
+            .collect();
+        assert_eq!(dev.memcpy_dtov(&v)?, want, "round {round}");
+    }
+    let s = dev.capture_stats();
+    assert!(
+        s.segments > s0.segments && s.eager_segments >= s0.eager_segments + 16,
+        "recorded first segments and eager second ones: {s:?}"
+    );
+    dev.capture_hub().reset_library(graph_budget_bytes()?);
+    Ok(())
+}
+
 /// What one instantiated executable costs the device, by node count: the
 /// driver's free memory read across `EXECS` instantiations of one captured
 /// graph, at each size. Every byte of it is outside the reservation, and the
