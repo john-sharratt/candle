@@ -42,6 +42,7 @@ pub mod handshake;
 pub mod launch;
 pub mod machine;
 pub mod member;
+pub mod offline;
 pub mod peer;
 pub mod pipe;
 pub mod replicate;

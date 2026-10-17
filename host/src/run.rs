@@ -149,6 +149,17 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
              line in the preserved log for why =========================================="
         );
     }
+    // Before anything dials: a process told the network is down stays down
+    // across its restarts (`cluster::offline`).
+    let offline = ::cluster::offline::init(&state_dir);
+    candle_conversation::set_hub_offline(offline);
+    if offline {
+        tracing::warn!(
+            marker = %state_dir.join(::cluster::offline::MARKER_NAME).display(),
+            "starting OFFLINE: no gateway is dialled, nothing is fetched from the internet and \
+             only loopback callers are served — the `online` command lifts it"
+        );
+    }
     // A sticky CUDA fault or an unbroken out-of-memory streak kills the
     // context for good; nothing supervises this process, so it relaunches
     // itself (`self_heal.rs`).

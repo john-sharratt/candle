@@ -559,7 +559,7 @@ impl Agents {
 
 fn refused(e: JobError) -> AgentError {
     match e {
-        JobError::UnknownRepo(_) | JobError::NoPush(_) | JobError::Disabled => {
+        JobError::UnknownRepo(_) | JobError::NoPush(_) | JobError::Disabled | JobError::Offline => {
             AgentError::NoAgent(e.to_string())
         }
         other => AgentError::Refused {

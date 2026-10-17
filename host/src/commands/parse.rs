@@ -65,6 +65,12 @@ pub enum Command {
     },
     /// Install a verified build now (§12.4).
     UpgradeNow,
+    /// Behave as if the network were down: dial no gateway that is not on this
+    /// machine, fetch nothing from the internet, serve only loopback callers.
+    /// Kept across restarts until `online` (`cluster::offline`).
+    Offline,
+    /// Lift `offline`.
+    Online,
 }
 
 impl Command {
@@ -93,6 +99,8 @@ impl Command {
             Command::Rollback { .. } => "rollback",
             Command::PruneBuilds { .. } => "prune-builds",
             Command::UpgradeNow => "upgrade-now",
+            Command::Offline => "offline",
+            Command::Online => "online",
         }
     }
 
@@ -124,7 +132,9 @@ impl Command {
 
     pub fn reach(&self) -> Reach {
         match self {
-            Command::Restart | Command::Shutdown => Reach::Process,
+            Command::Restart | Command::Shutdown | Command::Offline | Command::Online => {
+                Reach::Process
+            }
             Command::Compact
             | Command::Maintain
             | Command::ExpireTombstones
@@ -229,8 +239,16 @@ pub fn parse(name: &str, body: &Body, host: &str) -> Result<Command, String> {
             }
         }
         "upgrade-now" => Command::UpgradeNow,
+        "offline" => Command::Offline,
+        "online" => Command::Online,
         other => return Err(format!("there is no command {other:?}")),
     };
+    if matches!(command, Command::Offline | Command::Online) && body.app.is_some() {
+        return Err(format!(
+            "`{}` turns this machine's network for every app: it takes no `app`",
+            command.name()
+        ));
+    }
     // Typed out, the target is named twice: once by where the request went,
     // once by the hand that sent it.
     if matches!(
@@ -285,6 +303,8 @@ mod tests {
             "resume-rollout",
             "rollback",
             "upgrade-now",
+            "offline",
+            "online",
         ] {
             assert_eq!(parse(name, &none, "m1").unwrap().name(), name);
         }
@@ -300,6 +320,17 @@ mod tests {
             parse("frobnicate", &none, "m1"),
             Err("there is no command \"frobnicate\"".into())
         );
+    }
+
+    /// `offline` and `online` turn the whole machine's network, so naming one
+    /// app is refused rather than quietly applied to every one.
+    #[test]
+    fn the_network_switch_names_no_app() {
+        for name in ["offline", "online"] {
+            assert!(parse(name, &Body::default(), "m1").is_ok());
+            let err = parse(name, &body(r#"{"app":"zend"}"#), "m1").unwrap_err();
+            assert!(err.contains("every app"), "{err}");
+        }
     }
 
     /// `shutdown` and `set-quorum` need the machine's name typed as `confirm`.

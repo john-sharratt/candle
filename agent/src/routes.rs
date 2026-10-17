@@ -109,7 +109,7 @@ fn failed(e: JobError) -> Response {
     let status = match &e {
         JobError::NotFound(_) => StatusCode::NOT_FOUND,
         JobError::UnknownRepo(_) | JobError::NoPush(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        JobError::Disabled => {
+        JobError::Disabled | JobError::Offline => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "no_agent", "message": e.to_string() })),

@@ -186,5 +186,15 @@ pub use candle_transformers::models::expert_lre::layer_trace;
 /// for a daemon's loading screen.
 pub use candle_transformers::models::load_phase::{LoadPhase, LoadProgress};
 
+/// Refuse every model download from now on, or allow them again: what the
+/// caches hold still loads. A host turns it with its network switch. Nothing to
+/// refuse in a build without the `hub` feature.
+pub fn set_hub_offline(offline: bool) {
+    #[cfg(feature = "hub")]
+    candle_transformers::models::hub_download::set_offline(offline);
+    #[cfg(not(feature = "hub"))]
+    let _ = offline;
+}
+
 /// Convenience type alias for Results in this crate.
 pub type Result<T> = std::result::Result<T, ConversationError>;
