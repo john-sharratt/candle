@@ -29,13 +29,46 @@ const answered = (body) =>
 /* `tenant`'s line in one process's answer, or `null`. */
 const lineOf = (body, tenant) => (body.tenants || {})[tenant] || null;
 
+/* Every member's ingest backlog for `tenant` as one — the work is the
+ * cluster's, split by lease, so the member that speaks for the app may have
+ * none of its own while another reads on. Processed and total summed; the item
+ * named is the one being read by the member with the most still to go. `null`
+ * when no member has a backlog. */
+function clusterBacklog(members, tenant) {
+  const backlogs = members
+    .map((m) => (lineOf(m.body, tenant) || {}).ingest_backlog)
+    .filter((b) => b && typeof b === 'object');
+  if (!backlogs.length) return null;
+  const left = (b) => (b.total || 0) - (b.processed || 0);
+  const busiest = backlogs.reduce((a, b) => (left(b) > left(a) ? b : a));
+  return {
+    processed: backlogs.reduce((n, b) => n + (b.processed || 0), 0),
+    total: backlogs.reduce((n, b) => n + (b.total || 0), 0),
+    last_item: busiest.last_item ?? null,
+  };
+}
+
 /** The status a console for `tenant` reads from a `/v1/status` body. */
 export function memberStatus(body, tenant) {
   if (!isEnvelope(body)) return body;
   const members = answered(body);
   const ready = members.find((m) => (lineOf(m.body, tenant) || {}).state === 'ready');
   const chosen = ready || members[0];
-  if (chosen) return chosen.body;
+  if (chosen) {
+    // The chosen member speaks for the app — its state, its build, when it
+    // started — but its ingest backlog is the cluster's.
+    const line = lineOf(chosen.body, tenant);
+    if (!line || members.length < 2) return chosen.body;
+    const backlog = clusterBacklog(members, tenant);
+    if (backlog === null && !('ingest_backlog' in line)) return chosen.body;
+    return {
+      ...chosen.body,
+      tenants: {
+        ...chosen.body.tenants,
+        [tenant]: { ...line, ingest_backlog: backlog },
+      },
+    };
+  }
   return {
     state: 'loading',
     started_at_ms: 0,

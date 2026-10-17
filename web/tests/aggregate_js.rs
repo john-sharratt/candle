@@ -155,3 +155,28 @@ fn a_page_picks_a_member_by_node() {
         json!({ "members": [], "node": null, "body": null })
     );
 }
+
+/// **The ingest backlog is the cluster's.** The member that speaks for the
+/// app can have none of its own while another reads on — through a gateway
+/// with two members the indexing bar vanished whenever the first to answer
+/// was the idle one. Summed across members, naming the busiest one's item.
+#[test]
+fn the_ingest_backlog_is_every_members() {
+    let line = |backlog: Value| {
+        json!({ "state": "ready", "build": "b",
+                "tenants": { "zend": { "state": "ready", "loading": null, "ingest_backlog": backlog } } })
+    };
+    let envelope = json!({ "members": [
+        member("ww", ".6", line(Value::Null)),
+        member("bw", ".5", line(json!({ "processed": 5, "total": 233, "last_item": "candle/a.rs" }))),
+        member("xx", ".7", line(json!({ "processed": 10, "total": 12, "last_item": "candle/b.rs" }))),
+    ]});
+    let got = call("memberStatus", &[envelope, json!("zend")]);
+    assert_eq!(got["build"], "b");
+    assert_eq!(
+        got["tenants"]["zend"]["ingest_backlog"],
+        json!({ "processed": 15, "total": 245, "last_item": "candle/a.rs" })
+    );
+    let idle = json!({ "members": [member("ww", ".6", line(Value::Null)), member("bw", ".5", line(Value::Null))] });
+    assert_eq!(call("memberStatus", &[idle, json!("zend")])["tenants"]["zend"]["ingest_backlog"], Value::Null);
+}
