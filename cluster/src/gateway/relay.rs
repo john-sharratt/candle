@@ -348,7 +348,7 @@ mod tests {
     /// one**; one under it fills the lane up to the cap, as before.
     #[test]
     fn a_record_larger_than_the_cap_needs_only_an_empty_lane() {
-        let big = 110 << 20;
+        let big = CATCHUP_CAP * 2;
         assert!(!over_cap(big, 0));
         assert!(over_cap(big, 1));
         assert!(!over_cap(CATCHUP_CAP, 0));

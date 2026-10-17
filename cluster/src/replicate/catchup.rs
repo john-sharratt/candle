@@ -19,7 +19,14 @@ use serde::{Deserialize, Serialize};
 use crate::frame::{Fetch, Gone, Headers};
 
 /// The most bytes of fetched records outstanding at once.
-pub const FETCH_WINDOW: u64 = 8 << 20;
+///
+/// A catch-up moves one window a round trip, and a round trip is the
+/// answerer's reads, the gateway hop and the spare-capacity gate — about
+/// 170 ms on `.5`, so 8 MiB moved ~46 MB/s, under half the LAN, and a member
+/// whose peer's npcd wrote faster than that could never close its gap (34 and
+/// 40 GB backlogs each way, 2026-10-17). Half the gateway's catch-up cap, so a
+/// window in flight never fills the lane on its own.
+pub const FETCH_WINDOW: u64 = 64 << 20;
 
 /// How many times one record is fetched before it is left for a later
 /// catch-up.
@@ -343,13 +350,13 @@ mod tests {
         assert!(r.outstanding_wants().is_empty());
     }
 
-    /// No more than 8 MiB is outstanding; the next fetch goes once a `DONE`
-    /// frees the window.
+    /// No more than `FETCH_WINDOW` is outstanding; the next fetch goes once a
+    /// `DONE` frees the window.
     #[test]
     fn fetches_stay_within_the_window() {
         let mut r = Requester::new(1, 0, Purpose::Admission, 7);
-        let mib = 1 << 20;
-        r.headers(listing(3, 9, 1, 12, &[mib; 12]), |_, _| false);
+        let eighth = (FETCH_WINDOW / 8) as u32;
+        r.headers(listing(3, 9, 1, 12, &[eighth; 12]), |_, _| false);
         let first = r.headers_done(counter());
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].oseqs, (1..=8).collect::<Vec<_>>());
@@ -363,7 +370,8 @@ mod tests {
     #[test]
     fn an_outsized_record_is_fetched_alone() {
         let mut r = Requester::new(1, 0, Purpose::Admission, 7);
-        r.headers(listing(3, 9, 1, 2, &[1 << 20, 63 << 20]), |_, _| false);
+        let outsized = (FETCH_WINDOW + 1) as u32;
+        r.headers(listing(3, 9, 1, 2, &[1 << 20, outsized]), |_, _| false);
         let first = r.headers_done(counter());
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].oseqs, vec![1]);

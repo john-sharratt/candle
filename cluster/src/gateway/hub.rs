@@ -105,8 +105,10 @@ pub fn rolls_out(app: &str) -> bool {
 /// Live events unsent on a member's ordered lane past which it is lagging.
 pub const LAG_CAP: usize = 256 << 20;
 
-/// Bytes on a member's catch-up lane past which a catch-up frame is dropped.
-pub const CATCHUP_CAP: usize = 16 << 20;
+/// Bytes on a member's catch-up lane past which a catch-up frame is dropped —
+/// twice the requester's fetch window (`replicate::FETCH_WINDOW`), so a full
+/// window and the headers beside it fit.
+pub const CATCHUP_CAP: usize = 128 << 20;
 
 /// How often each socket's `RECEIPT` timer and lagging state are looked at.
 const RECEIPT_TICK: Duration = Duration::from_millis(100);
