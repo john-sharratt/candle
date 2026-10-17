@@ -199,6 +199,7 @@ fn write_dispatch(w: &mut Writer, d: &Dispatch) {
                 Merge::Envelope => 0,
                 Merge::FirstFound => 1,
                 Merge::Lines => 2,
+                Merge::Union => 3,
             };
             w.u8(3).u8(m);
         }
@@ -224,6 +225,7 @@ fn read_dispatch(r: &mut Reader) -> Result<Dispatch, WireError> {
             0 => Merge::Envelope,
             1 => Merge::FirstFound,
             2 => Merge::Lines,
+            3 => Merge::Union,
             v => return Err(invalid(r, v)),
         }),
         4 => Dispatch::Any,

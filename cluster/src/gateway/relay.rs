@@ -4,9 +4,11 @@
 //! lagging state of a member that cannot keep up, and world pulses. The
 //! gateway never decodes a record; it moves bytes between sockets.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use super::hub::{hex, Hub, CATCHUP_CAP, LAG_CAP};
+use super::registry::Registry;
 use crate::fragment::Whole;
 use crate::frame::{Done, Frame, MemberState, Receipt};
 use crate::session::SessionHandle;
@@ -122,7 +124,7 @@ impl Hub {
     /// `node`'s socket's timer: a `RECEIPT` owed for 100 ms, and the end of
     /// its lagging once its lane has drained and it has caught up.
     pub(super) fn receipt_tick(&self, app: &str, node: u64) {
-        let (receipt, recovered) = {
+        let (receipt, recovered, synced) = {
             let mut guard = self.state();
             let s = &mut *guard;
             let Some(x) = s.sockets.get_mut(&(app.to_string(), node)) else {
@@ -148,13 +150,38 @@ impl Hub {
             if recovered {
                 s.registry.set_lagging(app, node, false);
             }
-            (receipt, recovered)
+            // Synced: its own `ACK`s cover every other origin this gateway has
+            // heard, members away included — judged here, not by the member,
+            // whose catch-up can end early (a `DONE` with nobody to answer).
+            let syncing = s.registry.member(app, node).is_some_and(|m| m.syncing);
+            let synced = syncing && {
+                // The most any member serving now has applied of each origin.
+                let mut serving: BTreeMap<u64, u64> = BTreeMap::new();
+                for ((a, n), x) in &s.sockets {
+                    let routable = s.registry.member(a, *n).is_some_and(|m| m.routable());
+                    if a != app || *n == node || !routable {
+                        continue;
+                    }
+                    for (origin, through) in &x.acks {
+                        let top = serving.entry(*origin).or_default();
+                        *top = (*top).max(*through);
+                    }
+                }
+                Registry::in_sync(node, &acks, &serving)
+            };
+            if synced {
+                s.registry.set_syncing(app, node, false);
+            }
+            (receipt, recovered, synced)
         };
         if let Some((handle, through)) = receipt {
             let _ = handle.control(Frame::Receipt(Receipt { through }));
         }
         if recovered {
             self.note(app, hex(node), "caught up: no longer lagging".into());
+        }
+        if synced {
+            self.note(app, hex(node), "in sync with the group: serving requests".into());
         }
     }
 

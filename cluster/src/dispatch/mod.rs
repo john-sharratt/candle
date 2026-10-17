@@ -44,6 +44,11 @@ pub enum Merge {
     FirstFound,
     /// One WebSocket, every member's lines interleaved and tagged.
     Lines,
+    /// One body: every `2xx` answer's arrays merged by each item's `id`, a
+    /// member still syncing included — what it wrote cut off is in no other
+    /// member's answer yet. Where two members list one item, the one further
+    /// along (`turn_count`, then `updated_ms`) is kept.
+    Union,
 }
 
 /// A route's dispatch.

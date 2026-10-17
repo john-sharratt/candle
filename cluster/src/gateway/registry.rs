@@ -35,7 +35,16 @@ pub struct MemberView {
     /// Its ordered lane passed its cap: it is sent no live event and routed
     /// no request until it has drained and caught up (§4.4).
     pub lagging: bool,
+    /// Admitted while the group already had a member serving: routed no
+    /// request until its own `ACK`s cover what every other origin has written
+    /// — the gateway's judgement, not the member's. Unlike lagging, it is sent
+    /// live events throughout, so it catches up rather than chasing them.
+    pub syncing: bool,
 }
+
+/// How many of an origin's latest writes a member may still lack and count
+/// as in sync: events in flight when its `ACK` was sent.
+pub const SYNC_SLACK: u64 = 64;
 
 impl MemberView {
     pub fn state(&self) -> MemberState {
@@ -48,9 +57,10 @@ impl MemberView {
         self.state() == MemberState::Ready
     }
 
-    /// Ready, and not lagging: a request may be routed to it.
+    /// Ready, not lagging and not still syncing: a request may be routed to
+    /// it.
     pub fn routable(&self) -> bool {
-        self.ready() && !self.lagging
+        self.ready() && !self.lagging && !self.syncing
     }
 
     pub fn info(&self) -> MemberInfo {
@@ -151,6 +161,45 @@ impl Registry {
         }
     }
 
+    /// Whether a member of `app` other than `except` is serving now: what a
+    /// member joining beside it waits for being in sync with.
+    pub fn has_routable(&self, app: &str, except: u64) -> bool {
+        self.apps.get(app).is_some_and(|a| {
+            a.members
+                .values()
+                .any(|m| m.node != except && m.routable())
+        })
+    }
+
+    /// Whether `acks` — a member's applied-through per origin — cover what the
+    /// members serving now hold (`serving`, the most any of them has applied of
+    /// each origin), within [`SYNC_SLACK`]. Not every write ever seen: one a
+    /// member away wrote cut off is held by nobody serving, and a newcomer
+    /// waiting on it would wait as long as that member is gone, while exactly
+    /// as complete as the members answering.
+    pub fn in_sync(node: u64, acks: &[(u64, u64)], serving: &BTreeMap<u64, u64>) -> bool {
+        serving.iter().all(|(origin, top)| {
+            *origin == node
+                || acks
+                    .iter()
+                    .any(|(o, through)| o == origin && through.saturating_add(SYNC_SLACK) >= *top)
+        })
+    }
+
+    /// Mark `node` syncing or not; whether that changed.
+    pub fn set_syncing(&mut self, app: &str, node: u64, syncing: bool) -> bool {
+        let a = self.app(app);
+        let Some(m) = a.members.get_mut(&node) else {
+            return false;
+        };
+        let changed = m.syncing != syncing;
+        m.syncing = syncing;
+        if changed {
+            a.epoch += 1;
+        }
+        changed
+    }
+
     /// Whether `since` lacks writes this gateway has seen an origin other than
     /// `requester` make — records a member now away still holds. With nobody
     /// to answer, such a catch-up is not done: it waits for an answerer.
@@ -239,15 +288,24 @@ impl Registry {
 
     /// The members a request may go to, but `except`.
     fn ready_but(&self, app: &str, except: Option<u64>) -> Vec<&MemberView> {
-        self.apps
-            .get(app)
-            .map(|a| {
-                a.members
-                    .values()
-                    .filter(|m| m.routable() && Some(m.node) != except)
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(a) = self.apps.get(app) else {
+            return Vec::new();
+        };
+        let routable: Vec<&MemberView> = a
+            .members
+            .values()
+            .filter(|m| m.routable() && Some(m.node) != except)
+            .collect();
+        if !routable.is_empty() {
+            return routable;
+        }
+        // Nobody in sync is serving — the one that was has left: the members
+        // still syncing are the most anyone has, and serve rather than leave
+        // the app answering nothing.
+        a.members
+            .values()
+            .filter(|m| m.ready() && !m.lagging && Some(m.node) != except)
+            .collect()
     }
 
     /// The next routable member other than `except`, round robin: the
@@ -337,13 +395,31 @@ impl Registry {
         let ready_here =
             |r: &Registry, node: u64| r.member(app, node).is_some_and(MemberView::routable);
         let node = match dispatch {
+            // Every member loaded, a syncing one included: each answers from
+            // what it holds, and one rejoining holds what it wrote cut off
+            // that no other member has yet.
             Dispatch::Aggregate(_) => {
-                return Pick::All(self.ready(app).iter().map(|m| m.node).collect());
+                return Pick::All(
+                    self.apps
+                        .get(app)
+                        .map(|a| {
+                            a.members
+                                .values()
+                                .filter(|m| m.ready())
+                                .map(|m| m.node)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
             }
             Dispatch::Best => self.best(app),
             Dispatch::Any => self.round_robin(app),
-            // A key held by a member here goes to it. One held elsewhere goes
-            // `Best`, and the member reached names the holder (§5.4).
+            // A key held by a member here goes to it — syncing, or still
+            // loading, included: the conversation is the holder's, possibly
+            // with turns it wrote cut off that no other member has, and a
+            // holder still loading answers its loading page until it serves.
+            // One held elsewhere goes `Best`, and the member reached names the
+            // holder (§5.4).
             Dispatch::Sticky(_) | Dispatch::Owner(_) => {
                 let holder = key.and_then(|k| {
                     self.apps
@@ -351,7 +427,7 @@ impl Registry {
                         .and_then(|a| a.claims.holder(k.as_bytes()))
                 });
                 match holder {
-                    Some(h) if ready_here(self, h) => Some(h),
+                    Some(h) if self.member(app, h).is_some() => Some(h),
                     _ => self.best(app),
                 }
             }
@@ -392,7 +468,7 @@ impl Registry {
                         .get(app)
                         .and_then(|a| a.claims.holder(k.as_bytes()))
                 })
-                .is_none_or(|h| !routable(self, h)),
+                .is_none_or(|h| self.member(app, h).is_none()),
             _ => false,
         };
         if !shared || !routable(self, canary) {
