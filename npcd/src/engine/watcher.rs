@@ -148,6 +148,38 @@ impl Ledger {
         }
     }
 
+    /// Take what the substrate says is already in it: `held` pairs a mind path
+    /// with the content hash its conversation was written from
+    /// ([`crate::engine::mind_record::META_HASH`]). A path the ledger has no
+    /// entry for gets that hash, so the inspect that follows reads the document
+    /// as unchanged — or as changed, when the file moved on — instead of as new.
+    /// Paths the ledger already records are left as they are. Answers how many
+    /// were taken, and persists them.
+    ///
+    /// **The ledger is a file beside one member's substrate; the substrate is
+    /// the cluster's.** A member joining with no ledger, or rejoining after its
+    /// ledger and its replica parted, saw every document as new and wrote it
+    /// again — and replication then held both copies on every member.
+    pub fn adopt_held(&self, held: impl IntoIterator<Item = (String, String)>) -> usize {
+        let mut taken = 0;
+        {
+            let mut h = self.hashes.lock().unwrap();
+            for (rel, digest) in held {
+                let Some(key) = mind_key(Path::new(&rel)) else {
+                    continue;
+                };
+                if let std::collections::hash_map::Entry::Vacant(v) = h.entry(key) {
+                    v.insert(digest);
+                    taken += 1;
+                }
+            }
+        }
+        if taken > 0 {
+            self.flush();
+        }
+        taken
+    }
+
     /// Forget every document, and persist that.
     ///
     /// For a substrate whose conversations have all been retired
@@ -252,7 +284,7 @@ impl Ledger {
 /// The content hash. Sha-256, hex, truncated — this identifies a version, it is
 /// not a security boundary, and sixteen hex characters is far past the point
 /// where a collision within one mind directory is credible.
-fn hash(content: &str) -> String {
+pub(crate) fn hash(content: &str) -> String {
     // Line endings are normalised first. A mind directory edited on Windows and
     // on Linux would otherwise re-ingest wholesale on every platform change,
     // and the *content* is identical — which is the thing the hash is for.
@@ -425,6 +457,34 @@ mod tests {
         assert_eq!(
             second.reconcile(&doc, Some("# Alpha, revised")),
             Reconcile::Changed
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// **What the substrate already holds is not owed again.** A member with no
+    /// ledger takes each held document's recorded hash: the same text reads as
+    /// unchanged, an edited one as changed, and a path its own ledger already
+    /// records is left as it records it.
+    #[test]
+    fn a_ledger_takes_what_the_substrate_holds_without_overwriting_its_own() {
+        let data = tmp();
+        let held = PathBuf::from("layers/world/a.md");
+        let own = PathBuf::from("layers/world/b.md");
+        let l = Ledger::open(&data);
+        assert_eq!(l.reconcile(&own, Some("# B")), Reconcile::Added);
+
+        let taken = l.adopt_held([
+            ("layers/world/a.md".to_string(), hash("# A")),
+            ("layers/world/b.md".to_string(), hash("# B, elsewhere")),
+        ]);
+        assert_eq!(taken, 1, "only the path the ledger lacked is taken");
+        assert_eq!(l.inspect(&held, Some("# A")), Reconcile::Unchanged);
+        assert_eq!(l.inspect(&held, Some("# A, edited")), Reconcile::Changed);
+        assert_eq!(l.inspect(&own, Some("# B")), Reconcile::Unchanged);
+        assert_eq!(
+            Ledger::open(&data).inspect(&held, Some("# A")),
+            Reconcile::Unchanged,
+            "taken entries are persisted"
         );
         let _ = std::fs::remove_dir_all(&data);
     }

@@ -5265,6 +5265,37 @@ pub trait ManagedBatchedModel {
         let _ = seqs;
     }
 
+    /// Open a step over `seqs`: the [`Self::forward_wave`] calls that follow,
+    /// until [`Self::end_step`], stand or fall together for these sequences.
+    ///
+    /// **A wave is atomic; a step swept in segments is not.** Each segment is
+    /// its own wave and keeps what it did when it ends, so a step whose second
+    /// segment fails leaves its first segment's layers advanced while the
+    /// sequences' offsets stay where they were — and the retry runs those
+    /// layers' tokens in again. The step bracket is what takes the committed
+    /// segments back. No-op for a model whose waves carry nothing a retry
+    /// could run in twice.
+    fn begin_step(&self, seqs: &[usize]) -> Result<()> {
+        let _ = seqs;
+        Ok(())
+    }
+
+    /// Close the step [`Self::begin_step`] opened. With `keep`, its waves
+    /// stand. Without, everything its waves committed for the step's
+    /// sequences goes back to where the step found it: the K/V of trunk
+    /// layers `[0, committed)` truncated to each sequence's offset, and every
+    /// carried state restored. An error means the sequences' state can no
+    /// longer be vouched for.
+    fn end_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        keep: bool,
+        committed: usize,
+    ) -> Result<()> {
+        let _ = (session, keep, committed);
+        Ok(())
+    }
+
     fn verify_blocks(
         &self,
         session: &mut BatchedInferenceSession,

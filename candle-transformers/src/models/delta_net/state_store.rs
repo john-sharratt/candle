@@ -305,7 +305,25 @@ pub struct RecurrentStateStore {
     /// Store-level, unlike `advanced`, because seeding is a property of where
     /// the whole state came from rather than of which layers a sweep reached.
     seeded: bool,
+    /// The step open on this store, if any — see [`Self::begin_step`].
+    step: Option<StepRecord>,
     device: Device,
+}
+
+/// What a step's waves left pending, so the step can be kept or taken back
+/// whole — see [`RecurrentStateStore::begin_step`].
+#[derive(Debug)]
+struct StepRecord {
+    /// Per slot: whether it held rows when the step began. They are not the
+    /// step's — an undo leaves them — and no span of the step ran that layer,
+    /// because a pending layer refuses one.
+    entered_pending: Vec<bool>,
+    /// A commit inside the step owed this store a fold — it is outside the
+    /// armed verify cohort — which the step's end runs instead.
+    fold_owed: bool,
+    /// Something an undo cannot take back happened inside the step: a long
+    /// span's exchange, a fold, or the live state written outside a wave.
+    broken: bool,
 }
 
 /// Where one layer's half sits in its arena slot: `s` at the start, the conv
@@ -487,12 +505,21 @@ pub fn fold_stores(jobs: &mut [(&mut RecurrentStateStore, Option<usize>)]) -> Re
 /// the caller rolls the waves back and the stores stand exactly as they
 /// entered. Once it has run, the commits are infallible host bookkeeping, so a
 /// wave is never reported failed over state it already moved.
+///
+/// **A store inside a step folds nothing here** ([`RecurrentStateStore::begin_step`]):
+/// its rows stay pending, and the fold it is owed runs at [`end_steps`], so an
+/// undo can still drop them.
 pub fn commit_stores(stores: &mut [(&mut RecurrentStateStore, bool)]) -> Result<()> {
-    let mut folds: Vec<(&mut RecurrentStateStore, Option<usize>)> = stores
-        .iter_mut()
-        .filter(|(s, fold)| *fold && s.has_pending())
-        .map(|(s, _)| (&mut **s, None))
-        .collect();
+    let mut folds: Vec<(&mut RecurrentStateStore, Option<usize>)> = Vec::new();
+    for (store, fold) in stores.iter_mut() {
+        if !*fold || !store.has_pending() {
+            continue;
+        }
+        match store.step.as_mut() {
+            Some(step) => step.fold_owed = true,
+            None => folds.push((&mut **store, None)),
+        }
+    }
     fold_pending(&mut folds)?;
     for (store, _) in stores.iter_mut() {
         store.commit_wave();
@@ -500,8 +527,33 @@ pub fn commit_stores(stores: &mut [(&mut RecurrentStateStore, bool)]) -> Result<
     Ok(())
 }
 
+/// Close the step on every store in `stores` and keep its waves: each store a
+/// commit inside the step owed a fold folds every pending row, in ONE launch
+/// over all of them. A store whose rows belong to the armed verify cohort was
+/// owed none, and its rows stay pending for the reconcile.
+///
+/// Between waves, like [`fold_stores`]. A refused fold writes nothing and the
+/// rows stay pending; the steps are closed either way.
+pub fn end_steps(stores: &mut [&mut RecurrentStateStore]) -> Result<()> {
+    if stores.iter().any(|s| s.open) {
+        candle::bail!("recurrent store: a step closed with a wave open");
+    }
+    let mut folds: Vec<(&mut RecurrentStateStore, Option<usize>)> = Vec::new();
+    for store in stores.iter_mut() {
+        let owed = store.step.take().is_some_and(|s| s.fold_owed);
+        if owed && store.has_pending() {
+            folds.push((&mut **store, None));
+        }
+    }
+    fold_pending(&mut folds)
+}
+
 /// [`fold_stores`]' body, for a caller that knows no wave is still writing.
+/// A fold moves the live state, so a store inside a step can no longer undo it.
 fn fold_pending(jobs: &mut [(&mut RecurrentStateStore, Option<usize>)]) -> Result<()> {
+    for (store, _) in jobs.iter_mut() {
+        store.break_step();
+    }
     let Some((first, _)) = jobs.first() else {
         return Ok(());
     };
@@ -659,6 +711,7 @@ impl RecurrentStateStore {
             // A fresh store already holds the sequence-start value, so there is
             // nothing for a reset to destroy.
             seeded: false,
+            step: None,
             device: device.clone(),
         })
     }
@@ -681,6 +734,7 @@ impl RecurrentStateStore {
         if self.open {
             self.rollback_wave()?;
         }
+        self.break_step();
         self.discard_pending();
         self.release_scratch();
         for slot in &mut self.slots {
@@ -749,6 +803,7 @@ impl RecurrentStateStore {
     /// *different* tensor is one where prefill and decode end up advancing the
     /// state two different ways.
     pub fn layer_state_mut(&mut self, layer_index: usize) -> Result<&mut DeltaNetState> {
+        self.break_step();
         Ok(&mut self.slot_mut(layer_index)?.live.state)
     }
 
@@ -947,6 +1002,10 @@ impl RecurrentStateStore {
     /// prefill, and the scratch goes back; one that ran no layer — a segment of
     /// attention layers only — leaves it.
     pub fn commit_wave(&mut self) {
+        // An exchange inside a step is not one an undo can take back.
+        if self.slots.iter().any(|s| s.advanced) {
+            self.break_step();
+        }
         for slot in &mut self.slots {
             if let Some(p) = slot.pending.as_mut() {
                 p.this_wave = false;
@@ -1091,6 +1150,73 @@ impl RecurrentStateStore {
         self.slots.iter().any(|s| s.scratch.is_some())
     }
 
+    /// Open a step: several waves that stand or fall together.
+    ///
+    /// **A decode step is swept in segments**, each its own wave, and each
+    /// commits as it ends — so a refused second segment would roll back only its
+    /// own layers and leave the first segment's advanced. The scheduler retries
+    /// the step from layer 0, which would run those layers' tokens into their
+    /// state a second time: a recurrent state that has absorbed the same token
+    /// twice is wrong in a way nothing downstream can see, until it is far
+    /// enough wrong to be NaN.
+    ///
+    /// **Free: the timeline is the undo.** Inside a step a commit folds nothing
+    /// ([`commit_stores`]): every short span's rows stay pending, so each layer's
+    /// live state is still the one the step entered with. [`end_steps`] folds
+    /// them; [`Self::undo_step`] drops them. The segments of a step cover
+    /// disjoint layers, and a pending layer refuses a second span, so no layer
+    /// is advanced twice within one. Refused mid-wave.
+    pub fn begin_step(&mut self) -> Result<()> {
+        if self.open {
+            candle::bail!("recurrent store: begin_step mid-wave");
+        }
+        self.step = Some(StepRecord {
+            entered_pending: self.slots.iter().map(|s| s.pending.is_some()).collect(),
+            fold_owed: false,
+            broken: false,
+        });
+        Ok(())
+    }
+
+    /// Close the step and keep its waves — [`end_steps`] for one store.
+    pub fn end_step(&mut self) -> Result<()> {
+        end_steps(&mut [self])
+    }
+
+    /// The step never happened: every row a wave of the step left pending is
+    /// dropped, so each layer stands at the state the step entered with.
+    /// Refuses mid-wave, with no step open, and when the record cannot vouch
+    /// for the undo — the state moved inside the step other than by a short
+    /// span — closing the step either way.
+    pub fn undo_step(&mut self) -> Result<()> {
+        if self.open {
+            candle::bail!("recurrent store: undo_step mid-wave");
+        }
+        let Some(step) = self.step.take() else {
+            candle::bail!("recurrent store: undo_step with no step open");
+        };
+        if step.broken {
+            candle::bail!(
+                "recurrent store: the step cannot be undone — its state moved by an exchange, \
+                 a fold or a write outside a wave"
+            );
+        }
+        for (slot, entered) in self.slots.iter_mut().zip(step.entered_pending) {
+            if !entered {
+                slot.pending = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whatever just happened to the live state, the open step (if any) can no
+    /// longer be undone by dropping its rows.
+    fn break_step(&mut self) {
+        if let Some(step) = self.step.as_mut() {
+            step.broken = true;
+        }
+    }
+
     /// An independent store carrying this one's state — the fork primitive.
     ///
     /// Device-to-device: each layer's live `s` and conv tail are copied into the
@@ -1162,6 +1288,7 @@ impl RecurrentStateStore {
             ran_this_wave: false,
             long_this_wave: false,
             seeded: true,
+            step: None,
             device: self.device.clone(),
         })
     }
@@ -1535,6 +1662,7 @@ impl RecurrentStateStore {
         if self.open {
             candle::bail!("recurrent store: import mid-wave");
         }
+        self.break_step();
         if self.has_pending() {
             candle::bail!(
                 "recurrent store: import with timeline rows pending — fold or discard them, \
@@ -1575,6 +1703,7 @@ impl RecurrentStateStore {
                 );
             }
         }
+        self.break_step();
         for (slot, l) in self.slots.iter_mut().zip(layers) {
             let state_f: Vec<f32> = l
                 .state
@@ -2332,6 +2461,136 @@ mod tests {
             "layer 1 was never reached and must not have moved"
         );
         assert_eq!(after[2].state, entry[2].state, "nor layer 3");
+    }
+
+    /// **A step whose later segment fails is undone whole.** Segment one
+    /// commits layers 0 and 1 — their rows stay pending, the step folding
+    /// nothing — and segment two is refused on layer 3: undoing the step drops
+    /// the committed rows, the state never having moved, so the step's retry
+    /// runs their tokens into the state once rather than twice.
+    #[test]
+    fn an_undone_step_returns_every_committed_segment_to_its_entry_state() {
+        let mut store = filled_store();
+        let entry = store.export().unwrap();
+
+        store.begin_step().unwrap();
+        store.begin_wave().unwrap();
+        for layer in [0, 1] {
+            short_span(&mut store, layer, 2.0, 7.0);
+        }
+        commit_stores(&mut [(&mut store, true)]).unwrap();
+        assert!(
+            store.has_pending(),
+            "inside a step the commit folds nothing"
+        );
+        store.begin_wave().unwrap();
+        short_span(&mut store, 3, 2.0, 7.0);
+        store.rollback_wave().unwrap();
+
+        store.undo_step().unwrap();
+        assert!(!store.has_pending());
+        assert_eq!(store.export().unwrap(), entry, "every layer back at entry");
+        // The retry runs the step's layers again.
+        store.begin_wave().unwrap();
+        short_span(&mut store, 0, 2.0, 7.0);
+        store.rollback_wave().unwrap();
+    }
+
+    /// **A kept step folds at its end what its commits owed**, in one fold
+    /// over every store; an armed store was owed none and stays pending for
+    /// its reconcile.
+    #[test]
+    fn a_kept_step_folds_what_its_commits_owed() {
+        let mut plain = filled_store();
+        let mut armed = filled_store();
+        let entry = plain.export().unwrap();
+        for store in [&mut plain, &mut armed] {
+            store.begin_step().unwrap();
+        }
+        for layer in [0, 1] {
+            for store in [&mut plain, &mut armed] {
+                store.begin_wave().unwrap();
+                short_span(store, layer, 2.0, 7.0);
+            }
+            commit_stores(&mut [(&mut plain, true), (&mut armed, false)]).unwrap();
+        }
+        assert_eq!(
+            plain.pending_layers().collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1)],
+            "nothing folded mid-step"
+        );
+        end_steps(&mut [&mut plain, &mut armed]).unwrap();
+        assert!(!plain.has_pending());
+        let after = plain.export().unwrap();
+        assert_ne!(after[0], entry[0]);
+        assert_ne!(after[1], entry[1]);
+        assert_eq!(after[2], entry[2], "layer 3 never ran");
+        assert_eq!(
+            armed.pending_layers().collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1)],
+            "the armed rows wait for the reconcile"
+        );
+        // Both steps closed: a commit folds again.
+        plain.begin_wave().unwrap();
+        short_span(&mut plain, 3, 2.0, 7.0);
+        commit_stores(&mut [(&mut plain, true)]).unwrap();
+        assert!(!plain.has_pending());
+    }
+
+    /// Rows pending when the step began are not the step's: an undo keeps them
+    /// and drops only what the step's waves wrote.
+    #[test]
+    fn a_step_undo_keeps_the_rows_it_entered_with() {
+        let mut store = filled_store();
+        store.begin_wave().unwrap();
+        short_span(&mut store, 0, 2.0, 7.0);
+        commit_stores(&mut [(&mut store, false)]).unwrap();
+
+        store.begin_step().unwrap();
+        store.begin_wave().unwrap();
+        short_span(&mut store, 1, 2.0, 7.0);
+        commit_stores(&mut [(&mut store, false)]).unwrap();
+        store.undo_step().unwrap();
+        assert_eq!(store.pending_layers().collect::<Vec<_>>(), vec![(0, 1)]);
+    }
+
+    /// A step whose state moved other than by a short span refuses its undo
+    /// instead of dropping rows from a state they no longer describe — an
+    /// exchange, or a fold — and the refusal closes the step. A layer the step
+    /// already ran refuses a second span outright.
+    #[test]
+    fn a_step_undo_refuses_what_dropping_rows_cannot_restore() {
+        let mut store = filled_store();
+        store.ensure_scratch().unwrap();
+        store.begin_step().unwrap();
+        store.begin_wave().unwrap();
+        long_span(&mut store, 0);
+        commit_stores(&mut [(&mut store, true)]).unwrap();
+        assert!(store.undo_step().is_err(), "a long span's exchange");
+        assert!(
+            store.undo_step().is_err(),
+            "the refused undo closed the step"
+        );
+
+        store.begin_step().unwrap();
+        store.begin_wave().unwrap();
+        short_span(&mut store, 1, 2.0, 7.0);
+        commit_stores(&mut [(&mut store, false)]).unwrap();
+        store.fold(None).unwrap();
+        assert!(store.undo_step().is_err(), "a fold inside the step");
+
+        store.begin_step().unwrap();
+        store.begin_wave().unwrap();
+        short_span(&mut store, 1, 2.0, 7.0);
+        commit_stores(&mut [(&mut store, true)]).unwrap();
+        store.begin_wave().unwrap();
+        assert!(
+            store.layer_span_mut(1, 1).is_err(),
+            "a layer the step ran holds its rows"
+        );
+        store.rollback_wave().unwrap();
+        store.undo_step().unwrap();
+        assert!(!store.has_pending());
     }
 
     /// **The resume oracle.** Seal → drop the store entirely → resume from the

@@ -51,6 +51,7 @@
 use candle::Result;
 use candle_nn::kv_cache::KvCache;
 
+use super::batched_inference::BatchedInferenceSession;
 use super::kv_cache_utils::SequenceContext;
 use crate::models::profile::{pipeline_record, profile_now};
 
@@ -174,6 +175,38 @@ pub(crate) fn rollback_wave_kv(
                     layer = layer_idx,
                     offset,
                     "wave rollback: layer truncate failed; continuing so the remaining \
+                     layers are not left advanced against the truncated ones: {e}"
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// [`rollback_wave_kv`] for a step's committed segments: `seqs`' K/V on KV
+/// layers `[layer_start, layer_end)` back to each sequence's session offset.
+/// The offsets are the step's entry ones — the scheduler advances them only
+/// once the whole step has run.
+pub(crate) fn rollback_step_kv(
+    session: &mut BatchedInferenceSession,
+    seqs: &[usize],
+    layer_start: usize,
+    layer_end: usize,
+) -> Result<()> {
+    let mut first_err: Option<candle::Error> = None;
+    for (_, offset, caches) in session.caches_for_sequences_mut(seqs) {
+        for layer_idx in layer_start..layer_end.min(caches.caches.len()) {
+            if let Err(e) = caches.caches[layer_idx].truncate_to_offset(offset) {
+                tracing::warn!(
+                    layer = layer_idx,
+                    offset,
+                    "step rollback: layer truncate failed; continuing so the remaining \
                      layers are not left advanced against the truncated ones: {e}"
                 );
                 if first_err.is_none() {

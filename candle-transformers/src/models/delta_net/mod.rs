@@ -39,8 +39,8 @@ pub use quantized::{
     QuantDeltaNetWeights,
 };
 pub use state_store::{
-    commit_stores, compact_stores, fold_stores, release_seal_readback, ExportedLayerState,
-    RecurrentCompaction, RecurrentStateStore, StagedSnapshot,
+    commit_stores, compact_stores, end_steps, fold_stores, release_seal_readback,
+    ExportedLayerState, RecurrentCompaction, RecurrentStateStore, StagedSnapshot,
 };
 pub use timeline::{fold_by_ops, TimelineLayout, TIMELINE_ROWS};
 pub use types::{DeltaNetDims, LayerKind, ZGate};

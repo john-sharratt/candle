@@ -4420,12 +4420,54 @@ impl Conversation {
         // model: ~65 MB per turn — 2,998 exemplars would write ~195 GB of
         // snapshots, which dwarfed even their KV and was enough on its own to
         // fill the disk and wedge the daemon on failing fsyncs.
-        if self.read().is_timeline_transient(timeline) {
-            return;
+        //
+        // Nor do timelines that are kept but never resumed
+        // (`Substrate::mark_timeline_unresumed`), for the same reason.
+        {
+            let s = self.read();
+            if s.is_timeline_transient(timeline) || s.is_timeline_unresumed(timeline) {
+                return;
+            }
         }
         let stream_id = snapshot_stream_id(timeline.raw());
         self.writer
             .enqueue(WriteJob::Snapshot { stream_id, payload });
+    }
+
+    /// Mark `timeline` as kept but never resumed
+    /// (`Substrate::mark_timeline_unresumed`): no further snapshot is written
+    /// for it, and the tail it already has is retired.
+    ///
+    /// **Retired by superseding, not by deletion.** An empty snapshot — no
+    /// layers, no aux — is enqueued under the timeline's snapshot stream, and
+    /// the single-tail rule makes it the tail: the full one reads as dead to
+    /// maintenance, which reclaims it, and the empty one replicates like any
+    /// snapshot, so every member that copied the full one retires it too.
+    /// [`Self::read_recurrent_snapshot`] reads an empty tail as none kept.
+    ///
+    /// Enqueued unconditionally rather than only when a tail is indexed: a seal
+    /// that ran just before this may still be in the writer's queue, unindexed,
+    /// and the queue's order is what puts the empty record after it.
+    pub fn mark_timeline_unresumed(&self, timeline: TimelineId) {
+        self.note_timeline_unresumed(timeline);
+        let stream_id = snapshot_stream_id(timeline.raw());
+        self.writer.enqueue(WriteJob::Snapshot {
+            stream_id,
+            payload: SnapshotPayload::retired(timeline.raw()),
+        });
+    }
+
+    /// [`Self::mark_timeline_unresumed`] without the retiring write: the flag
+    /// alone, for a timeline whose tail is already retired or absent.
+    pub fn note_timeline_unresumed(&self, timeline: TimelineId) {
+        self.write().mark_timeline_unresumed(timeline);
+    }
+
+    /// Bytes of the recurrent snapshot `timeline` keeps, if any — a retired
+    /// (empty) tail reads as a few dozen bytes. For a sweep deciding whether a
+    /// tail still needs retiring, without reading it.
+    pub fn recurrent_snapshot_bytes(&self, timeline: TimelineId) -> Option<u64> {
+        self.recurrent_snapshot_loc(timeline).map(|l| l.payload_len)
     }
 
     /// Enqueue a **prompt branch's** recurrent checkpoint — the state after the
@@ -4564,7 +4606,7 @@ impl Conversation {
                 break;
             };
             match read {
-                Ok(bytes) => return Self::decode_snapshot(timeline, &bytes).map(Some),
+                Ok(bytes) => return Self::decode_kept_snapshot(timeline, &bytes),
                 // Unmoved — a torn or corrupt record, or one the index names in
                 // a missing file: the locked read reports it, with the same
                 // message it always gave.
@@ -4587,7 +4629,7 @@ impl Conversation {
                 .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
                 .read_record_payload(&loc);
             match read {
-                Ok(bytes) => return Self::decode_snapshot(timeline, &bytes).map(Some),
+                Ok(bytes) => return Self::decode_kept_snapshot(timeline, &bytes),
                 Err(e) => {
                     attempt += 1;
                     match self.moved_snapshot_loc(timeline, loc) {
@@ -4623,6 +4665,15 @@ impl Conversation {
                 timeline.raw()
             ))
         })
+    }
+
+    /// [`Self::decode_snapshot`], reading a retired tail
+    /// ([`Self::mark_timeline_unresumed`]) as no snapshot kept.
+    fn decode_kept_snapshot(
+        timeline: TimelineId,
+        bytes: &[u8],
+    ) -> Result<Option<SnapshotPayload>, ConversationError> {
+        Self::decode_snapshot(timeline, bytes).map(|p| (!p.is_retired()).then_some(p))
     }
 
     /// Declare a section stream — appends a `StreamDecl::PromptSection`
@@ -5949,8 +6000,36 @@ mod recurrent_snapshot_read_tests {
             turn_index,
             schedule_hash: 0xC0FF_EE00,
             layers: Vec::new(),
-            aux: Vec::new(),
+            // Some state: a snapshot with neither layers nor aux is a retired
+            // tail, which reads as none kept.
+            aux: vec![turn_index as u8; 8],
         }
+    }
+
+    /// **A retired tail reads as no snapshot.** A timeline marked as never
+    /// resumed supersedes its state with an empty record; the read must answer
+    /// `None` — the ordinary "nothing kept" — rather than an empty state.
+    #[test]
+    fn a_retired_tail_reads_as_no_snapshot() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(41);
+        store(&conv, timeline, 0, true);
+        assert!(conv.read_recurrent_snapshot(timeline).unwrap().is_some());
+
+        let stream = snapshot_stream_id(timeline.raw());
+        let loc = {
+            let mut p = conv.persistence.lock().expect("persistence");
+            let loc = p
+                .write_snapshot(
+                    stream,
+                    &SnapshotPayload::retired(timeline.raw()).parts().slices(),
+                )
+                .expect("append");
+            p.commit().expect("commit");
+            loc
+        };
+        conv.write().apply_snapshot_loc(stream, loc.value, loc.id);
+        assert!(conv.read_recurrent_snapshot(timeline).unwrap().is_none());
     }
 
     /// Store a snapshot exactly as the writer thread does — append under the
