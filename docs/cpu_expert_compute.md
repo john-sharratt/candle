@@ -8,8 +8,10 @@ Decisions taken by the author, 2026-10-16:
 - **CPU results are not byte-identical to the GPU's.** Output may depend on
   placement (§6).
 - **The invariant amendments in §4 are approved as written.**
-- **CPU-served misses claim no promotion slot.** Prediction and read-ahead
-  bring a recurring expert in ahead of its next use (§5.11).
+- **CPU-served misses claim no promotion slot of their own launch.** Revised
+  2026-10-17: the next launch may promote them behind the pool, copying from
+  their pinned image off the result's path (`promote`, §5.11) — cold ones
+  first, then every one, to measure which helps.
 - **The build runs straight through.** The measurements in §8 run alongside it
   and tune it; they do not gate it.
 
@@ -402,59 +404,85 @@ The summary word is `count | pinned<<29 | cold<<30 | decode<<31`
 The forward thread's sequence for a MoE layer:
 
 ```
-hc_mix_with_operand  (decode: also stores the q8a128 rows to the row ring)
 router + shared gate_up      (unchanged: one stacked launch)
-moe_bucketize                (classes, split, work slot, doorbell)
-[prefill: row export]        (only rows of CPU tokens; §5.9)
-shared expert down           (moved here from before the routed path)
-gather → grouped gate → up → SwiGLU → down   (CPU-class tiles exit; one down
-                              worker item waits for `done` and pulls each CPU
-                              token's pre-summed row into VRAM; §5.5)
-scatter                      (adds the token's CPU row, if it has one)
+moe_bucketize                (classes, split, work slot, input map, carry)
+moe_cpu_export               (each distinct CPU token's input row → row ring;
+                              doorbell — ahead of the gather, from the MoE input)
+gather                       (unchanged: every assignment's q8a128 row, grouped)
+grouped gate → up → SwiGLU → down   (CPU-class experts own no tiles; down
+                              workers take "CPU result" items after their
+                              demand items: each waits for `done` and pulls
+                              16 result rows into `down_out` at their grouped
+                              rows; §5.5)
+scatter                      (unchanged)
 ```
 
-- **The stacked launch stays.** The shared SwiGLU and down already run after
-  the stack (`quantized_moe.rs:173-175`, before the routed path at `:202-204`).
-  `forward_from_gate_up` simply moves to after bucketize, so it runs while the
-  pool computes.
+**Inputs once per token, results once per assignment.** A token's activation
+is the same row for every expert it routes, so it crosses the link once
+however many CPU experts it routes: bucketize ranks the distinct tokens of the
+layer's CPU ring rows (`cpu_inputs`, in order of each token's first ring row)
+into **input rows**, and publishes each ring row's input row. A decode token
+routed to three CPU experts is one 2,880 B row out, not three. The export
+copies the input rows straight from the token-major MoE input, so it runs
+right after bucketize, before the gather, and the pool's doorbell rings as
+early as the layer allows. A layer with no CPU expert exports, fences and
+rings nothing; the export's few blocks only count themselves out.
+
+The result ring holds one unweighted F32 down row per CPU *assignment*, ring
+order, each landing in `down_out` exactly where the GPU's grouped down would
+have written it, so the scatter, the permutation and the routing weights are
+untouched: the scatter cannot tell which device computed a row. Pre-summing
+per token would return fewer bytes but needs a per-token bitmap and a second
+scatter input, and the bytes it saves are small next to the experts' (a 10 KB
+row against a 2 MB expert).
+
+- **The stacked launch stays.** The shared SwiGLU and down run after the
+  stack (`quantized_moe.rs:173-175`, before the routed path at `:202-204`).
 - **These launches are serial.** Everything is on one stream
   (`live_table.rs:103-110`), so the overlap is between the CPU pool and the GPU
   stream, not among GPU branches. The GPU work behind bucketize is what hides
   the pool's time:
-  - the shared expert;
-  - the gather;
-  - the GPU-class experts' copies and GEMMs.
+  - the GPU-class experts' copies and grouped gate/up GEMMs;
+  - the down launch's demand items, which every worker drains before it takes
+    a CPU result item.
 
 ### 5.2 The rings
 
-All rings live in mapped pinned memory. The forward thread assigns an
-invocation's `seq` **before it enqueues `hc_mix`**, so every producer knows its
-slot (`slot = seq % RING`, with `RING` = `SUMMARY_RING` = 64).
+All buffers live in mapped pinned memory (`cpu_pool/rings.rs`), one of each
+per dispatch.
 
-| Ring | Written by | Holds |
+| Buffer | Written by | Holds |
 |---|---|---|
-| **Doorbell** (one cache line) | bucketize, only when `n_cpu > 0` | A monotone u64: the `seq` of the latest invocation with CPU work. This is the single line the pool monitor-waits on. |
-| **Row ring** | `hc_mix` epilogue (decode), the row-export kernel (prefill) | q8a128 rows, 2,880 B per token |
-| **Work ring** | bucketize | For each CPU expert: id, layer, source address (pinned warm, pad or pageable; §5.7), count, and each assignment's token index and routing weight; then the CPU tokens' row indices |
-| **Result ring** | pool | One F32 row per CPU token: Σ over that token's CPU experts of weight × expert output. Then `done = seq`, with the pool's start and end times and its lateness record (§5.3) |
-| **Pool liveness** (one word) | pool | A generation and a heartbeat; a drop guard writes `dead` (§5.13) |
+| **Work slot** | bucketize, only when the split takes something | A 16-byte header `{n_experts, n_rows, row, seq}`, then per CPU expert `{expert, ring_start, count, gate, up, down}` (40 B): its ring rows — one per assignment — and the host addresses of its slot image's three projections (0 for a cold expert, §5.4) |
+| **Input map** | bucketize | The input rows' count, then each ring row's input row |
+| **Row ring** | `moe_cpu_export` | The input rows: one q8a128 row per distinct token the CPU experts route, 2,880 B, in the operand's own q8a1024 layout |
+| **Doorbell** (one cache line) | `moe_cpu_export`'s last block, only when it exported rows | A monotone u64: the invocation's sequence. The single line the pool monitor-waits on |
+| **Result ring** | the pool | One unweighted F32 down row per CPU assignment, ring order |
+| **Done** (one cache line) | the pool | The sequence whose results have landed |
+| **Alive** (one word) | the pool | Non-zero while the service runs; a drop guard clears it on any exit (§5.13) |
 
-**Flow control.** The forward thread may not reuse a slot until the pool's
-`done` for it has landed: the pool joins the stager and the GPU as a reader in
-`hold_for_ring` (`dispatch.rs:26-28`).
+Bucketize also writes `dst_row`, a device array mapping ring row → grouped
+row, which the down launch's CPU item writes through, and `in_tok`, input row
+→ token, which the export reads through.
 
-**Sizing** is per slot, from the wave plan, at load:
+**One slot of each is enough.** The down launch of invocation S waits for
+`done == S` before anything after it runs, and S + 1's bucketize and export
+come after it in stream order. By then the pool has read S's work and rows and
+written S's results, so nothing on the host has to hold the device back, and
+`hold_for_ring` is unchanged.
 
-| Case | Rows out | Results back |
+**Sizing.** `cap_rows` = `max_cpu_assignments` rows, from the knob at load.
+
+| Buffer | Per row | At the default cap (1,024) |
 |---|---|---|
-| Worst decode wave: ×64 sessions × 4 verify rows (`dispatch.rs:124-127`) | 256 tokens × 2,880 B = 737 KB | ≤ 256 tokens × 10 KB = 2.6 MB |
-| Prefill | bounded by `max_cpu_assignments` | ≤ min(CPU tokens, `max_cpu_assignments`) × 10 KB |
+| Row ring | 2,880 B | 2.9 MB |
+| Result ring | 10,240 B | 10.5 MB |
 
 `max_cpu_assignments` is a **constraint inside the split** (§5.3), counted in
 assignments, not experts. Below the crossover the CPU could otherwise take up
-to 512 × (b_x − 1) assignments, about 15k on the PRO 5000. The ring's size,
-and so the cap, is chosen against the pinned budget at load. On the laptop
-that budget is tight.
+to 512 × (b_x − 1) assignments, about 15k on the PRO 5000. The rings, and so
+the cap, are sized against the pinned budget at load. On the laptop that
+budget is tight.
 
 ### 5.3 The split, decided on the device
 
@@ -474,47 +502,62 @@ c(n)     CPU compute for one expert at n tokens                    (measured tab
 B_d      DRAM read bandwidth the pool gets alone
 B_c      the same while the link's DMA streams                     (measured, ≤ B_d)
 t_h      fixed handoff per layer (§5.9)
-r        = 2,880 B, a token's row;  y = 10,240 B, a result row
+ρ        per CPU assignment: its 2,880 B row out and 10,240 B result back (row_ns)
 ```
 
-**The pool's time.** It reads its k experts' kS bytes at B_c while the GPU's
-copies run, then at B_d once they finish:
+**The pool's time.** It reads its k experts at S/B_c each while the GPU still
+has copies to make, and at S/B_d once it has taken every miss:
 
 ```
-mem(k)  = kS / B_c                                   if kS ≤ B_c · T_copy
-        = T_copy + (kS − B_c · T_copy) / B_d         otherwise
-T_cpu   = t_h + R_out/B_l + max( mem(k), Σ_{i∈C} c(n_i) ) + Y_back/B_l
+read(k) = S / B_c   if k < misses,   S / B_d   otherwise
+T_cpu   = t_h + max( k · read(k), Σ_{i∈C} c(n_i) ) + ρ · Σ_{i∈C} n_i
 ```
 
-- R_out is the bytes of CPU-token rows still to export: 0 at decode, where the
-  rows went out before routing.
-- Y_back = y × (distinct tokens with at least one CPU expert). The pool
-  pre-sums, so a token costs one row back however many of its experts the CPU
-  took.
+A token's input goes out once however many CPU experts it routes, and a
+result row comes back per assignment (§5.1), so ρ, priced per assignment from
+the link's measured rate at load, over-counts the inputs of a token routed to
+several: an upper bound, by at most the 2,880 B input against the 10,240 B
+result.
 
-**The GPU's time.** The link carries the GPU's copies *and* the CPU's
-transfers:
+**The GPU's time** is the misses it keeps, each a copy then its grouped GEMM:
 
 ```
-T_copy = ( Σ_{i∈M_g} S + R_out + Y_back ) / B_l
-T_gpu  = W_fixed + max( T_copy ,  Σ_{i∈R_g ∪ M_g} c_g(n_i) )
+T_gpu   = Σ_{i∈M_g} ( g + c_g(n_i) )
 layer expert time = max(T_cpu, T_gpu)
 ```
 
-- W_fixed is the GPU's work that doesn't depend on the split: the shared
-  expert, gather, SwiGLU, the launch tails, and the per-launch PCIe round trips
-  of the worker items (`kernel.cuh:2995-3050`).
-- How far copies overlap GEMMs inside one launch is measured, not assumed (§8).
+- This charges the copy and the GEMM in series. Inside one launch they overlap
+  across experts, so it overstates the GPU's time; `gpu_scale` and the online
+  loop (§5.3.2) absorb the difference, and the overlap is measured, not
+  assumed (§8).
+- The GPU's work that doesn't depend on the split (the shared expert, the
+  gather, SwiGLU, launch tails) is the same on both sides and cancels.
 
 **The rule.**
 
 1. **Cut.** An expert with c(n_i) > g + c_g(n_i) stays on the GPU.
-2. **Order.** Missed experts ascending by n, then resident experts ascending
-   by n. For a fixed number of CPU experts, the lowest counts are the cheapest
-   set for the CPU and cost the GPU the same.
+2. **Order.** Missed experts ascending by n, cold before pinned at the same n,
+   then resident experts ascending by n. For a fixed number of CPU experts, the
+   lowest counts are the cheapest set for the CPU and cost the GPU the same.
+   Cold goes first because both sides wait on its pack read, but only the GPU
+   waits in its gate launch, where the whole layer stalls; the pool waits
+   beside the GPU's own work. On the laptop this took the GPU's cold waits from
+   ~20 a decode step to under one (`cpu_order_key`).
 3. **Pick the split.** For k misses and j residents given to the CPU, T_cpu
    rises and T_gpu falls. A two-pointer scan finds the (k, j) minimising
-   max(T_cpu, T_gpu) subject to `max_cpu_assignments`. It is exact under this
+   max(T_cpu, T_gpu) subject to `max_cpu_assignments` and to k + j ≤
+   `max_experts` — two per performance core of the pool (the laptop's ten;
+   `attach::EXPERTS_PER_FAST_CORE`). Every run takes all the performance cores
+   whatever its expert count (§5.6), so the cap is not a core count: under it
+   the price decides, and it stops only the rare launch the price would load
+   past what the device can wait for. On the laptop one a core bound the
+   split at ~4.3 experts a layer (split decode 17.8–18.4 t/s); two let the
+   price settle at ~5.2 (19.4 t/s); four took no more on average and ran
+   17.6–18.6, the device waiting longer on the rare large layer. Past the cap
+   a layer's misses stay on the GPU, at every width: a prompt's layer gains
+   little from the pool
+   (prefill measured ~5% slower with it uncapped on the laptop) and has as
+   much reason to keep off the slow cores as decode. It is exact under this
    model and linear in the layer's expert count.
    - Counts at decode are ≤ T, so the order comes from a **histogram over
      counts**, not a sort. Bucketize's single block pays a pass, not an
@@ -593,22 +636,23 @@ the offsets byte for byte.
   forward thread reads it at each invocation. A half-updated copy is still
   valid, because every field is independently meaningful.
 
-**Measured fields** (f32 ns): calibration fills them at load, and the online
-loop (§5.3.2) refines them.
+**Measured fields** (f32 ns, `cpu_pool/params.rs` `Measured`): calibration
+fills them at load (`cpu_pool/calibrate.rs`), and the online loop (§5.3.2)
+refines the CPU ones.
 
 | Field | Meaning |
 |---|---|
-| `copy_ns` | g |
+| `copy_ns` | g, from the link rate measured at load |
 | `cpu_read_alone_ns` | S / B_d |
 | `cpu_read_shared_ns` | S / B_c |
-| `cpu_n_ns[10]` | c(n) at n ∈ {1, 2, 3, 4, 6, 8, 12, 16, 24, 32}, interpolated, linear beyond 32 |
+| `cpu_n_ns[10]` | c(n) at n ∈ {1, 2, 3, 4, 6, 8, 12, 16, 24, 32}; the device table holds every n to 32, interpolated, and is linear beyond. Timed on experts read from DRAM, as a layer's are: the timed layers rotate through 256 MiB of synthetic experts, past any last-level cache here. Timed over one set of eight (16 MB, inside the laptop's 24 MB L3) c(1) came out at 48 µs against the ~90 µs the pool then took per expert in decode; from DRAM it measures 69 µs plus 56 µs per layer, which predicts decode's layers within 10% |
 | `gpu_n_ns[10]` | c_g(n), same buckets |
-| `gpu_fixed_ns` | W_fixed |
 | `handoff_ns` | t_h |
-| `cold_read_ns` | the stager's pack read (§5.4, §5.11) |
+| `row_ns` | ρ: one assignment's row out and result back |
 
-**Knobs.** Defaults are neutral, meaning "trust the measurements". Each exists
-because the model leaves out something the measurement can't capture.
+**Knobs** (`Knobs`). Defaults are neutral, meaning "trust the measurements".
+Each exists because the model leaves out something the measurement can't
+capture.
 
 | Knob | Default | Effect |
 |---|---|---|
@@ -616,102 +660,164 @@ because the model leaves out something the measurement can't capture.
 | `gpu_scale` | 1.0 | Multiplies `copy_ns`. |
 | `handoff_extra_ns` | 0 | Added to t_h. |
 | `cut_scale` | 1.0 | Step 1's cut: GPU when c(n) > `cut_scale` · (g + c_g(n)). |
-| `resident_to_cpu` | 1.0 | Weight of the GPU saving when a resident expert moves (step 3's j). 0 keeps residents on the GPU. |
 | `min_gain_ns` | 0 | Hysteresis against near-ties. |
-| `max_cpu_assignments` | ring capacity | The cap. **0 sends everything to the GPU.** This is a deployment value, not a feature flag: the same arithmetic with a cap of zero. |
-| `cold_bias` | 1.0 | Residency, not the split: the weight of NVMe-only refill cost (§5.11). |
-| `wait_tight_scale` | 1.0 | Tight polling until the predicted finish × this (§5.5). |
-| `wait_backoff_max_ns` | 32,000 | Back-off ceiling past it. |
-
-Host-side settings live in the same config section but are not kernel inputs:
-- the EWMA time constant and the exploration period (§5.3.2);
-- the pool's cores (§5.6);
-- monitor-wait versus spin.
+| `max_cpu_assignments` | 1,024 | The cap, and the rings' rows at load. **0 sends everything to the GPU.** A deployment value, not a feature flag: the same arithmetic with a cap of zero. A live raise is held to the rings' rows. |
+| `wait_tight_ns` | 200,000 | How long the down launch's CPU item polls tightly before it backs off (§5.5). |
+| `explore_period` | 3,072 | Invocations without CPU work before one explores (§5.3.2). 0 never explores. |
+| `explore_ns` | 20,000 | How much an exploring invocation's single CPU expert may lose by. |
+| `online_tau_ms` | 500 | The online loop's time constant. |
+| `cold_bias` | 1.0 | Residency, not the split: the weight of the pack read in a pack-only expert's refill cost (§5.11). Applies whether or not the split runs. |
+| `promote` | `cold` | Which experts the pool served the next launch copies into VRAM behind it: `none`, `cold`, `all` (§5.11). |
 
 **Writers:**
 1. calibration at load;
 2. the daemon config: an `expert_split:` section under `host:` in
-   `motherd.yaml` and the zend/npcd configs, which is deployment config, not an
-   env flag;
-3. `POST /v1/expert_split` (admin role) for live tuning, which returns the
-   active knobs and the measured values;
+   `motherd.yaml`, and the same settings as `--expert-split*` flags on `zend`
+   and `npcd` (`host/src/expert_split.rs`). Deployment config, not an env flag:
+   `enabled` decides whether the pool starts with the engine;
+3. `POST /v1/expert_split` (admin role) for live tuning. Its body names any
+   subset of the knobs; an unknown knob refuses the whole patch. It returns the
+   knobs, the measured costs, the cut and the layers served;
 4. the online loop;
 5. tests and benches.
 
 #### 5.3.2 The online loop
 
-**Sources.** Every measurement has a source in the production build, not only
-the profile build (`stall` is null outside it, `kernel.cuh:1676`):
+`cpu_pool/online.rs`, run by the service thread after each layer's `done` is
+published, so nothing on the device waits on it.
+
+**Sources.** Both exist in the production build, not only the profile build:
 
 | What | Measured by | Gives |
 |---|---|---|
-| GPU timing | The down launch's CPU-wait item stamps `%globaltimer` when it starts polling and when `done` lands. Bucketize stamps when it rings the doorbell. Each grouped launch stamps its worker phase start and end (two stores per launch, not per item). | t_h and lateness; `copy_ns`, tagged with how many copies ran concurrently |
-| Pool timing | The pool stamps its own start and end per expert (QPC/TSC), and writes them into the result slot | c(n) per count bucket; `cpu_read_*`, tagged with whether the link was streaming |
-| Clock domains | The two clocks are never compared directly. t_h = (GPU done-observed − GPU doorbell) − pool busy time. | t_h |
+| Pool time | The service, doorbell seen → `done` published, per layer | the observed cost of exactly the experts the device handed over |
+| Device lateness | The down launch's CPU items: each that waited raises the mapped `wait` word to its wait (`atomicMax`), and the service reads and clears it at the next doorbell | how long the GPU sat on the pool |
 
-**Correction.** Each sample updates its field through an EWMA. The time
-constant is a config value, chosen against the laptop's throttle period (§8),
-so a thermal swing moves the costs within a few waves without chasing
-per-layer noise.
+The two clocks are never compared: each source is a duration in its own
+domain.
 
-**No absorbing state.** If the split has given the CPU nothing for
-`explore_period` waves while the model's predicted gain is within
-`min_gain_ns` of the threshold, one layer of the next wave sends its single
-lowest-count miss to the CPU. That refreshes c(n) and t_h. It costs at most one
-expert's mis-placement per period, and keeps a throttle spell from locking the
-CPU out for good.
+**Correction.** Each layer's pool time is set against what the measured tables
+predict for the same experts: the longer of k · S/B_d and Σ c(n_i). The ratio,
+clamped to [¼, 4] so a preemption or a page fault is not taken for the pool's
+speed, moves every CPU cost (`cpu_n_ns`, both read rates) through an EWMA whose
+weight follows wall time, `1 − e^(−Δt/τ)` with τ = `online_tau_ms`. A thermal
+swing therefore reaches the split within a few waves without the loop chasing
+one layer's noise. The ratio scales the whole CPU table, not one bucket: a
+layer mixes counts, and throttling and contention slow every count alike.
+Because the pool time includes the service's own overhead (reading the ring,
+writing results), the correction prices that overhead into the CPU side too,
+which is where the device's decision needs it.
 
-**Visibility.** Mean lateness (actual `done` minus predicted) above a bound for
-N consecutive waves is logged with its cause bucket:
-- cold-read wait;
-- pool slower than c(n);
-- handoff.
+**No absorbing state.** When the pool has served nothing for `explore_period`
+invocations, the next invocation carries `explore_ns` in its split. If that
+invocation's split takes nothing, but giving the CPU the single cheapest
+eligible expert loses to all-GPU by at most `explore_ns`, it takes that one
+expert (`moe_bucketize_cpu.cuh`). That refreshes the correction. It costs at
+most one expert's mis-placement per period, and keeps a throttle spell from
+locking the CPU out for good.
 
-A CPU path that is losing time is never silent.
+**Visibility.** A device wait past 50 µs on 64 consecutive served layers is
+logged once per streak with its likelier cause:
+- the pool running slower than its tables (its mean ratio over the streak
+  above 1.25);
+- otherwise the handoff.
+
+A CPU path that is losing time is never silent. A layer's wait on a cold
+expert's pack read is the drive's, not the pool's: the service takes it out of
+both the pool's time and the device's wait before the loop sees them, and
+counts it apart (`stats`, `cold_wait`).
 
 ### 5.4 Cold experts
 
 A cold expert is read by the stager into a pad slot either way: the CPU class
-keeps summary bit 30. When the split gives it to the CPU:
-- the pool waits on the slot's publish word, the same one the GPU's workers
-  wait on;
-- it computes from the pad, saving the PCIe crossing.
+keeps summary bit 30, and its snapshot entries are 0. When the split gives it
+to the CPU (`cpu_pool/cold.rs`):
+- the pool waits on the expert's live gate entry — the word a GPU worker would
+  wait on, which the stager stores last, after up and down — in `umwait` on its
+  line, which the store wakes;
+- it computes from the pad, so the expert never crosses the link.
 
-The pool orders its work so warm experts run first and cold ones last. A worker
-never sits idle on a publish while warm work is queued.
+The pool runs the experts already in memory first, then each cold one as its
+publish lands. The pad slot cannot move while the pool reads it: the
+invocation is not done until its down launch has the pool's results, and the
+stager's demand rule evicts only slots the current invocation does not route.
+
+**A pageable copy is computed at once.** An expert the warm tier holds in
+pageable memory is cold to the device, which cannot read that memory, and the
+stager stages it into the pad with a `memcpy` for the GPU. The pool can read
+it, though, so it does not wait for that copy: it computes from the pageable
+slot (`PagedImages`), whose image has the pad slot's layout byte for byte. The
+copies are written once at startup and never move, and the cache holds the
+tier for as long as the pool runs. Bucketize's cold-first order hands these
+to the pool before any pinned miss, so the pageable tier is what runs on the
+CPU up to the cap. Past the cap, those experts stream to the GPU through the
+pad. A machine whose RAM the pinned part fills (the 16 GB laptop: 0 pageable
+slots) never takes this path.
+
+**Only unmarked.** A cold expert with a promotion in flight stays on the GPU:
+the promotion lands by publishing a VRAM address into the entry the pool
+would be waiting on, which the GPU's wait reads and the pool cannot. The
+pipeline thread publishes a landing's VRAM entry before it clears the mark,
+so an unmarked cold expert never sees one.
+
+**Giving up.** A wait ends without the expert on the abort word, another
+wait's fault, or past the device's spin limit; an expert published where the
+pool cannot read is given up at once. The pool claims the fault word naming
+the expert, exactly as a GPU worker would, and publishes no `done`: the down
+launch's wait on the pool sees the word and gives up, and the host fails the
+forward (§5.13).
+
+**The device's cold waits are measured** (`cold_wait`): the worker holding a
+cold expert's first row tile in the gate launch adds its wait for the publish
+to a mapped `{ns, count}` pair, one sample per cold expert per layer — on the
+laptop all-GPU, ~25–30 a decode step at ~1 ms each.
 
 ### 5.5 The device side of the wait
 
-**The wait is a worker item of the down launch.** Bucketize adds one item, "CPU
-results", to the down launch's worker queue whenever `n_cpu > 0`. The worker
-that claims it:
+**The wait is a worker item of the down launch** (`kernel.cuh`, the live
+worker loop). The down launch's `MoeLive` carries the pool's `done` word, the
+sequence it must read, the result ring, `dst_row`, the liveness word and
+`cpu_tight_ns`. Its worker queue is:
 
-1. **Polls `done`.** It polls tightly until the predicted finish ×
-   `wait_tight_scale`, then backs off to `wait_backoff_max_ns`. The cold
-   wait's 32 µs back-off is tuned for an NVMe read and would add up to 32 µs to
-   a CPU result ready in 30.
+```
+[ remote-expert items | ceil(CPU rows / 16) CPU items | read-ahead pieces ]
+```
+
+so a worker reaches a CPU item only once every remote expert's copy has been
+claimed, and waiting on the pool never delays a GPU expert. The worker that
+claims a CPU item:
+
+1. **Polls `done`** (`moe_live_cpu_wait`). It polls tightly for
+   `cpu_tight_ns` (the `wait_tight_ns` knob), then backs off. The cold wait's
+   back-off is tuned for an NVMe read and would add tens of microseconds to a
+   CPU result ready in 30.
    - It honours `SPIN_LIMIT_NS`, the abort word, the fault word and the pool
-     liveness word (§5.13).
-2. **Pulls the CPU rows in bulk.** It copies each CPU token's pre-summed row
-   into `cpu_partial[token]`, a VRAM buffer of one F32 row per wave token. It
-   uses the wide-copy loop the workers already use for weight slices. Many
-   loads are in flight at once, so the pull is bandwidth-bound (Y_back / B_l),
-   not a chain of dependent round trips.
+     liveness word. A wait that ends without results claims the fault word
+     naming expert `0xffff` (§5.13).
+2. **Pulls its 16 result rows** from the mapped result ring into `down_out` at
+   `dst_row[r]`, with the wide 16-byte load loop the workers use for weight
+   slices: many loads in flight, so the pull is bandwidth-bound, not a chain of
+   round trips. The loads are `ld.global.cv`, not the weight copy's `.cg`.
+   The host rewrites the ring at the same addresses every layer, and
+   consecutive layers' down launches run back to back in one captured graph
+   with nothing between them to invalidate L2, so a `.cg` pull can return the
+   previous layer's rows.
 3. **Exits.** The down launch completes in stream order.
 
 This is the existing wait shape: a worker spinning on a host store. No block
 waits on another block, so there is no co-residency assumption at any grid
 size.
 
-**The scatter's one change.** It still sums the token's GPU assignments from
-`down_out`, weighted, in assignment order (`moe_scatter.cu:197-205`). If the
-token has CPU work, which bucketize records in a per-token bitmap, it then adds
-`cpu_partial[token]`. The CPU row already carries its routing weights, so the
-scatter adds it with weight 1.
-
-CPU-class experts' tiles in gate, up and down exit like a remote expert's tile,
-and the scatter skips their assignments. Per invariant 6, `cpu_partial` is
-allocated uninitialised, because only flagged tokens read it.
+**Nothing else changes.** CPU-class experts get `n_tiles = 0` in bucketize, so
+gate, up and down emit no tile for them; their grouped rows in `down_out` are
+written only by the CPU items. The scatter sums every assignment's row from
+`down_out`, weighted, in assignment order, as it always has.
+- The rows of CPU experts in `gate_out` and `up_out` are never written. Nothing
+  reads them, but a `tensor-assert` check over the whole of either buffer sees
+  stale bytes there; the checks on those operands cover GPU rows only.
+- The CPU item writes F32 rows, which is what the grouped int8 down emits; the
+  dispatch asserts the output's type (`expect_dtype`) whenever the layer has a
+  CPU class.
 
 ### 5.6 The pool
 
@@ -751,8 +857,35 @@ token.
 - An idle worker takes a late worker's unclaimed rows.
 - Measurements report p99, not only p50 (§8).
 
-**Wake.** Workers monitor-wait on the doorbell line for the whole of a step and
-park between steps (§5.9).
+**Participants.** A run takes every performance core of the pool
+(`layer::participants_for`, `Pool::fast`) — the caller and the workers before
+the first slower core — whatever its expert count. The matvec is
+compute-bound on a core (§5.10: Q3 one token unpacks at ~16 GB/s, against
+~22 one core reads), so each performance core adds to a layer's rate until
+together they meet DRAM's: one DRAM-cold one-token expert on the laptop takes
+~62 µs on four, ~60 on five, and five beat four at every shape measured. A
+cold expert the pool waited on runs alone on the critical path, which is
+where this matters most. No run takes a slower core, so inference never
+runs on an E-core, whatever the split's cap (`CpuSplit::max_experts`, §5.3);
+the E-core workers take only calibration's jobs. The workers a run does not
+take are not woken. Inside a run, a participant with nothing to claim waits
+in `tpause` (C0.1), not a `pause` loop.
+
+**Warm through inference, parked outside it.** The forward calls
+`CpuService::wake` ahead of every invocation, and each call holds the pool
+warm for a 100 ms cool-down (`service::COOL_DOWN`). Inside that window the
+service thread waits on the doorbell, and the performance-core workers on the
+job word, in `umwait` (C0.1, woken by the store at no latency cost), and never
+park; the first call after an idle spell unparks them, ahead of the doorbell
+that follows. Once inference has been quiet for the cool-down, the service
+waits 5 ms after a layer and a worker 200 µs after a job (`attach::SPIN`,
+`WORKER_SPIN`), then park. A parked worker costs 50–100 µs to wake on
+Windows; fourteen workers kept waiting held the laptop's CPU at ~75% of base
+clock, which is why only the performance cores stay warm.
+
+`has_waitpkg` is asked once: every wait loop asks it each pass, and `cpuid`
+serializes the core and, under Windows' virtualization-based security, traps
+to the hypervisor.
 
 **Schedule.** Dataflow per expert, with no pool-wide barrier:
 1. **Gate + up.** All CPU experts' gate and up rows are split into tasks and
@@ -766,9 +899,14 @@ park between steps (§5.9).
    that expert's unweighted rows into per-assignment scratch, which stays in L2
    (10 KB per assignment), and decrements its row range's countdown.
    - The task that takes a row range's countdown to zero sums weight × scratch
-     over each token's CPU experts into the token's result row.
+     over each row's experts into the row's result.
    - Each result element therefore has exactly one writer, with no atomics.
-5. **The last reduction** stores `done` after a release fence.
+   - The service hands `run_layer` one row per *assignment* (§5.1), each with
+     one expert at weight 1, so the reduce is the identity: each result row is
+     one assignment's unweighted down output, which the device places and the
+     scatter weights.
+5. **After the last reduction** the service copies the results into the mapped
+   result ring and stores `done` after a release fence.
 
 **FP environment.** The workers run with MXCSR FTZ | DAZ: denormals are
 flushed, the same as the device's fast-math code.
@@ -969,8 +1107,22 @@ of it.
    them. They stay only if the TLB cost measures.
 8. **Which cores.** P only, P+E, and SMT on or off, swept per machine. This
    replaces §5.6's starting sizes.
-9. **ISA tiers.** AVX2 (10700K), AVX-VNNI ymm (laptop), AVX-512 VNNI + VBMI zmm
-   (9950X3D, 7970X).
+9. **ISA tiers.** AVX2 (10700K), AVX-VNNI ymm (laptop), AVX-512 VNNI zmm
+   (9950X3D, 7970X; `kernel::simd512`, built 2026-10-17).
+   - Detection takes AVX-512 VNNI first. A Zen 4 part reports it without
+     the VEX `avxvnni` flag, so the 256-bit tiers alone would leave it on
+     AVX2.
+   - Every tier runs one loop (`simd`'s `matvec_tier`), so the tiers this
+     machine has test all of it but the 512-bit unpack, load and dot. The
+     512-bit unpack is also checked on any CPU by a model of its steps on
+     plain bytes, with the real tables
+     (`the_modelled_512_unpack_is_the_scalar_unpack`). On an AVX-512
+     machine, the instruction-level unpack test and the byte-equality tests
+     of every tier run; elsewhere they report themselves skipped or pass
+     over the tier.
+   - Its unpack is ~11 vector ops a row against ~25: one `vpsrlvw` makes two
+     bit pairs, and one `vptestmb` with a masked add makes the hi bit.
+     Unmeasured until it runs on an AMD box (`kernel_profile`).
    - They are dispatched at runtime with `is_x86_feature_detected!` +
      `#[target_feature(enable)]` (stable on rustc 1.97), so a test can force
      every tier on one machine.
@@ -983,6 +1135,132 @@ of it.
 - clocks sampled inside the run;
 - on the laptop, with the GPU loaded as in production;
 - results per machine and ISA tier in `docs/performance.md`.
+
+**First runs, laptop** (2026-10-16, AVX-VNNI, GPU idle; `cpu_pool::kernel_bench`).
+Built so far:
+- `cpu_pool::kernel` (scalar reference + AVX2 + AVX-VNNI, byte-equal to each
+  other);
+- `cpu_pool::pool` (pinned workers; UMWAIT spin, then park);
+- `cpu_pool::layer` (the §5.6 dataflow schedule).
+
+Q3_KO experts at Flash-Next geometry. The pool is the 5 non-reserved P-cores
+plus the 8 E-cores on their cache (`topology::pool_cores`). The caller, standing
+in for the forward thread, is on the reserved P-core.
+
+| Experts × tokens | µs / layer | µs / expert | Weight GB/s | GMAC/s |
+|---|---:|---:|---:|---:|
+| 1 × 1 | 57–72 (p50 ~63) | ~63 | ~32 | ~78 |
+| 5 × 1 | 191 | 38 | 52 | 129 |
+| 10 × 1 | 366 | 37 | 55 | 134 |
+| 5 × 4 | 434 | 87 | 23 | 227 |
+| 1 × 32 | 840 | 840 | 2.4 | 187 |
+
+Two optimisation levers are in:
+- **Eight-row chunk blocking.** A chunk's rows are unpacked once into L1, each
+  token's eight dots reduce in one transpose, and the fold is vectorised over
+  rows.
+- **Task sizes scaled to experts × participants.** Together with the blocking,
+  this took 10 × 1 from 46 to 37 µs per expert and lifted multi-token
+  throughput ~1.5×.
+
+Against the targets:
+- **Memory-bound:** 55 GB/s is ~70% of the ~80 GB/s this core set reads, short
+  of 80%.
+- **Compute-bound:** ~230 GMAC/s is well short of 50% of peak.
+
+The remaining levers are 2-token register blocking, fused gate + up, prefetch
+distance and pages, and AVX-512 on the AMD machines. Even now, a decode-shaped
+expert costs 37–63 µs on the CPU against ~166 µs to copy it over this link.
+
+**Second round, laptop** (2026-10-17, AVX-VNNI, the production pool: five
+P-cores, the caller on the first, held warm). The harness is
+`cpu_pool::kernel_profile` (`#[ignore]`, ~20 s, `cargo test --release -p
+candle-transformers --features cuda --lib cpu_kernel_profile -- --ignored
+--nocapture`). Run it on each machine; it prints:
+- the DRAM roof of one core and of the performance cores;
+- the hot (L2) matvec in **cycles per chunk** at a measured clock, so
+  throttling cancels, per ISA, format and token count;
+- one core DRAM-cold;
+- the serial per-expert steps;
+- decode and prefill shapes on the pool, DRAM-cold and L3-hot, with the
+  pool's own join and busy share.
+
+The laptop's thermal state moves the roof 41–69 GB/s between runs, so pool
+rows compare as **% of roof**.
+
+What the first profile showed:
+- **The kernel is compute-bound.** One core runs the hot matvec at 12 GB/s
+  against the 23 GB/s it reads.
+- **The pool reached only 31–47% of roof.**
+- **A row group's chunks sit 33–133 KB apart**, so the hardware streamers never
+  saw them coming.
+
+Kept:
+
+| Change | Effect |
+|---|---|
+| One-token path dots each row from its unpack, the 8 rows' sums in a register across K blocks; raw chunk pointers | hot 12.1 → 14.5 GB/s a core |
+| Software prefetch 4 chunks ahead **in the loop's own order**, carrying into the next row group, the run's first chunks in flight at once | cold 1×1 90 → 60 µs; 5×1 339 → 198 µs |
+| Q3 hi-bit unpack: `min_epu8` against 4 replaces cmpeq + and | 3 of ~25 ops a row |
+| SwiGLU applied by each gate/up task to its own rows | serial step gone |
+| Activation permute and the down input's quantize in AVX2 | serial per expert 3.1 → 1.1 µs (1 token), 37 → 12 µs (16) |
+| Every layer takes all performance cores (`participants_for`) | five beat four at every shape |
+| Each projection's groups split into near-equal tasks (`task_range`) | busy 68–91% → 86–93% |
+
+Rejected, measured:
+- **Prefetch distance 2 or 8:** both worse than 4.
+- **Six tasks per participant:** worse at 4 tokens.
+- **Prefetching the down weights during gate/up:** worse everywhere. The
+  burst fills the line-fill buffers ahead of the demand loads.
+- **Staging decode's predictions down to a 25% cell probability** (listing
+  kept at 50%), to start the CPU's cold reads a layer early: pack reads
+  rose ~47 → ~75 a step for ~6 more staged hits. The cold experts the pool
+  waits on stayed at 0.4–0.6 a layer and decode was unchanged within noise
+  (split 19.4–20.5 vs 19.3–21.1 t/s). Those cold misses are the long tail of
+  rarely routed experts, and their rarity is both why they are cold and why
+  routing history cannot predict them.
+
+All kept changes are byte-equal to the scalar reference: same int sums, and
+the fold in the same order.
+
+| Pool, DRAM-cold, 5 P-cores | before | after |
+|---|---:|---:|
+| 1 × 1 | 92 µs (33% of roof) | 54–61 µs (51–56%) |
+| 3 × 1 | 221 µs | 125–135 µs (69–71%) |
+| 5 × 1 | 320 µs (47%) | 196–210 µs (74–76%) |
+| 5 × 4 | 640 µs | 351–550 µs |
+| 1 × 1, L3-hot | 54 µs | 36–39 µs |
+
+Remaining bounds:
+- **Q3 compute.** Q3 at one token is ~105–115 cycles per chunk at 4.1 GHz,
+  ~11 a row, almost all of it the 3-bit unpack (Q4 is 56–65). Each extra token
+  costs ~29 cycles, the 32 `vpdpbusd` a chunk needs.
+- **The single-miss barrier.** A single cold miss still waits on the gate/up →
+  down barrier (~11% idle). A per-tile dataflow, with down starting on each
+  128-row tile of the SwiGLU output as it completes, is the next lever.
+
+In the engine (`tests/cpu_expert_speed.rs`, the split with promote none):
+- decode 15.1–15.4 → **17.8–18.4 t/s**;
+- the CPU's experts per decode layer 3.5 → 4.3, against a cap of 5;
+- pool compute per layer 503 → 260–290 µs;
+- the last worker's join 23–40 → 3–4 µs.
+
+Calibration prices one expert at 42 µs (was 79), so the split then ran
+against `max_experts`, one a core. Raised to two a core (§5.3), the price
+settles at ~5.2 experts a layer and split decode reaches 19.4 t/s.
+
+**Tests.** Byte-level checks run fast in `cargo test`:
+- `simd::tiers_match_scalar_bytes`;
+- `a_nan_weight_scale_poisons_only_its_row`, which checks a NaN's row is NaN
+  and every other row is bit-equal;
+- `permute_tile_is_the_scalar_permutation`;
+- `act::tile_codes_are_the_scalar_definition`, covering halves, NaN, ±∞, −0
+  and a dead tile;
+- `prefetch_lookahead_carries_into_the_next_group`;
+- the task split;
+- `layer::pooled_layer_is_the_per_expert_sum`.
+
+The measurements are the `#[ignore]` benches.
 
 ### 5.11 Residency: priced by what a miss costs
 
@@ -997,44 +1275,83 @@ expert falls back to:
 A warm miss shrinks by up to B_d/B_l and a cold one does not. **The gap widens,
 and residency must price it.**
 
-**Eviction.** Today the victim is the lowest `score × behind_protection(dist)`
-(`cache.rs:699-702`, `:282-310`). It becomes:
+**Eviction.** The ranking already orders its passes by eviction class (whether
+the row routed the victim on its last visit, and whether a warm copy backs it),
+each class costed at its measured regret rate × what restoring one costs
+(`regret::eviction_costs`, set per pass by `pipeline.rs`'s
+`set_eviction_order`). The CPU class changes the restore costs, which
+`SplitParams::refill_secs` now supplies:
 
 ```
-keep_value(e)  = score(e) · behind_protection(dist_e) · refill_cost(e)
-refill_cost(e) = min(copy_ns + gpu_n_ns[1], handoff_ns + cpu_read_shared_ns + cpu_n_ns[1])
-               + (backing(e) == NVMe ? cold_bias · cold_read_ns : 0)
+warm refill = copy                                                  split off
+            = min(copy, handoff + cpu_read_shared + c(1) − c_g(1))  split on
+pack refill = cold_bias · pack_read + copy
 ```
 
-- Between two equally hot experts, the one with a RAM copy is evicted first.
-- `cold_bias` (default 1.0, in `SplitParams` and on the admin route) is the
+- A resident expert pays its GEMM too, so a refill is priced by what it adds.
+  The pool's path replaces the GPU's GEMM, which is why c_g(1) comes off.
+- A pack refill's read lands ahead of whichever side computes the expert, the
+  GPU's workers or the pool (§5.4), so it is priced the same on both.
+- Between two equally hot experts, the one with a RAM copy is evicted first,
+  and more so as the CPU makes warm misses cheaper.
+- `cold_bias` (default 1.0, on the config section and the admin route) is the
   tuning knob. On the laptop it is the most important one in this design.
 
 **Promotion.** A decode miss's GPU copy also installs the expert into a
 promotion slot: the workers store each slice into `remote_dst` as they copy it
-(`kernel.cuh:1650-1653`, `dispatch.rs:16-23`). **A CPU-served miss claims no
-promotion slot**, by the author's decision. Bucketize gives slots only to the
-misses that stayed on the GPU (§5.3, step 5).
+(`kernel.cuh:1650-1653`, `dispatch.rs:16-23`). A CPU-served miss has no GPU
+copy to ride on, so its own launch claims nothing for it.
 
-An expert the CPU served and that recurs is brought into VRAM by prediction
-and read-ahead ahead of its next use. The gate launch's read-ahead workers fill
-spare link time with plain byte copies into claimed slots
-(`kernel.cuh:1654-1663`). The miss rate that leaves is expected to be small.
-Three things keep that path working:
+**Promotion behind the pool** (`promote`: `none`, `cold`, `all`). The launch
+that hands the pool its experts leaves the ones `promote` names in a device
+**carry** (`moe_bucketize_cpu.cuh`, THE CARRY), and the next launch — any row
+— promotes them: each takes an offer as a miss does, is logged with
+`CARRY_FLAG` and marked, and its gate launch's workers copy its pinned image
+into the slot and publish it, as a read-ahead item. By then the pool has the
+expert's result and, for a cold one, the stager has published the pad slot
+the copy reads. Nothing waits on the copy: it is off the path the pool's
+result is on, and lands for the row's next visit. A carry is the next launch's
+only — it names the writer's sequence word — and the stager pins the pad
+slots of every CPU-served expert until that launch is done, since its demand
+rule could otherwise overwrite one under the copy. The pipeline thread books a
+carry claim as it books a read-ahead one (the device published it) but judges
+it with the demand claims, and counts it apart (`carry_claims`).
+
+`cold` was the first setting tried — a cold expert the pool served without
+promoting comes back from the pack at its next miss — then `all`. Measured on
+the laptop (§8), alternating in one run: `cold` 9.9 / 9.0 t/s, `none` 9.3 /
+8.0, `all` 8.3 / 8.1 — `cold` ahead by 7–12%, `all` behind, its ~135 copies a
+step costing more link than its promotions save. `cold` is the default. Every
+split arm was measured on a CPU the pool's load throttled to ~75% of base
+(§8), so the ranking stands and the absolute figures do not.
+
+Without a carry, an expert the CPU served and that recurs is brought into VRAM
+by prediction and read-ahead ahead of its next use. The gate launch's
+read-ahead workers fill spare link time with plain byte copies into claimed
+slots (`kernel.cuh:1654-1663`). Three things keep that path working:
 
 1. **A CPU-served miss is still recorded as a miss.** Its summary word carries
    the CPU bit, and the pipeline thread scores it like any miss
    (`record_miss`). Eviction, the look-ahead votes and read-ahead claims all
    see it.
-2. **Read-ahead's gate counts GPU-class copies only.** The gate prices link
-   time per invocation (`read_ahead_gate.rs:12-20, 39-44`, hysteresis
-   `ON_US = 80` / `OFF_US = 40`). `link_us` counts only GPU-class copy time, so
-   a CPU-heavy split *opens* read-ahead, on link time the CPU has freed,
-   instead of switching it off.
+2. **Read-ahead's gate counts GPU-class copies only; its window counts the
+   CPU's experts too.** The gate prices link time per invocation
+   (`read_ahead_gate.rs:12-20, 39-44`, hysteresis `ON_US = 80` /
+   `OFF_US = 40`). `link_us` counts only GPU-class copy time, so a CPU-heavy
+   split keeps read-ahead *on* instead of switching it off. But each launch's
+   budget — the layer's window less what it already spends — charges a CPU
+   expert as a copy (`promotion_walk`). Uncharged, the window the split freed
+   went to read-ahead copies of predicted experts, ~40% of them wrong, whose
+   victims came back as pack reads: on the laptop (Flash-Next, 1K prompt,
+   128 greedy steps) read-ahead claims went from 27 to 110 a step and decode
+   from 13.0 to 11.2 t/s. Charged, claims stay near all-GPU's and decode
+   rose to 12.3–12.6 t/s.
 3. **Promotion is priced by backing.** Promoting an NVMe-only expert saves more
-   than promoting an equally hot RAM-backed one, so the offer order
-   (`expert_lre/promo.rs`) takes the same `refill_cost` factor. Promotion is
-   tuned before eviction, which is the standing order for this cache.
+   than promoting an equally hot RAM-backed one, so bucketize's promotion walk
+   offers slots to the routed **cold** experts first, then the pinned ones
+   (`moe_bucketize_live.cuh`, `promotion_walk`). When offers run short they go
+   where the next miss would wait on the pack. Promotion is tuned before
+   eviction, which is the standing order for this cache.
 
 Measurement 6 (§8) confirms the expectation: steady-state VRAM hit rate with
 the split on versus off.
@@ -1070,79 +1387,121 @@ both. Nothing changes.
 
 ### 5.13 Faults
 
-- **Pool liveness.** The pool owns a liveness word: a generation plus a
-  heartbeat per step. A drop guard on the pool writes `dead` if it panics or
-  exits.
+- **Pool liveness.** The service sets the mapped `alive` word before it
+  calibrates, and a drop guard clears it however the thread exits, panic
+  included.
 - **Waiter outcomes.** The down launch's CPU item checks liveness while it
   polls:
   - `done` lands: normal path.
-  - `dead`, or `SPIN_LIMIT_NS` passes: the worker claims the fault word with a
-    **CPU-wait encoding** (invocation, layer, the late expert) and gives the
-    item up.
-  - The host fails the forward through the existing `take_segment_fault` path
-    (`handle.rs:1046-1051`), so no result computed from the layer is returned.
-- **Abort and drain.** The pool watches the abort and fault words.
-  - On either, it stops claiming tasks and finishes or abandons the current
-    slot.
-  - It then writes `done` with an *abandoned* mark, so `hold_for_ring` can
-    release the slot.
-  - A slot is never reused while the pool might still write it.
-- **Persistent failure.** A pool that faults on consecutive forwards is logged,
-  and its costs are driven to infinity by the online loop. The split stops
-  using it until a restart.
+  - `alive` falls, the abort word rises, another fault is claimed, or
+    `SPIN_LIMIT_NS` passes: the worker claims the fault word with expert
+    `0xffff` (`MOE_FAULT_CPU_EXPERT`), the row and the wait, and gives the item
+    up. The error names the pool, not a cold expert (`fault.rs`).
+  - The host fails the forward through `take_segment_fault`, so no result
+    computed from the layer is returned. A cache with a CPU class always takes
+    the check, even with every expert resident or pinned, because the pool can
+    fault where no cold expert could.
+- **No drain is needed.** There is one work slot, and the device waits for the
+  pool's `done` before anything after the layer runs, so the pool never holds
+  a slot the device has moved past. A pool still finishing a failed forward's
+  layer writes results nobody reads, then serves the next doorbell; it reads
+  the work entries once, at the start, and only from pinned memory that
+  outlives it.
+- **Persistent failure.** A pool that fails three forwards in a row
+  (`CPU_FAULT_LIMIT`) has its measured costs withdrawn, so every later split
+  is all-GPU, and the log says so. The split stops using it until a restart.
 
 ---
 
-## 6. Accuracy, not identity
+## 6. Accuracy: the device's arithmetic, but for one division
 
 **Decision (author, 2026-10-16): CPU results are not required to be
-byte-identical to the GPU's.** Output may depend on placement, as Strata's
-does. The difference is far below the 3-bit weight and int8 activation noise
-both sides already carry. The GPU kernels are not touched for the CPU's sake:
-no change to `ko_affine_fold`, `fast_exp` or the sigmoid.
+byte-identical to the GPU's**, and the GPU kernels are not touched for the
+CPU's sake: no change to `ko_affine_fold`, `fast_exp` or the sigmoid. The
+author confirmed both on 2026-10-17, with the measurements below in hand.
 
-**What the CPU kernel is free to do:**
-- fold the per-128-K blocks in any order, with FMAs wherever they are fastest;
-- use its own vectorised `exp` for SiLU;
-- **pre-sum** a token's CPU experts, weighted, into one row (§5.5). That costs
-  one row back per token instead of one per assignment: ~3 µs per layer saved
-  at ×1 on PCIe 3;
-- keep SwiGLU's output in whatever form its down projection reads fastest.
-  Re-quantising to q8a128 keeps the down projection on the int8 path.
+**What was measured.** A CPU kernel free to fold, round and quantize its own
+way, with a mathematically exact SiLU and f32 tile scales, matched each expert
+to ~1e-3 relative and was far below the 3-bit weight noise (both sides 2.7e-2
+from the f32 chain). It still moved the model a long way: one decode step's
+CPU layers moved that position's logits by KL 3e-3, and a run with the split
+on gave mean KL 3e-2 to 4e-2 and top-1 93–97% against all-GPU. This model
+amplifies sub-noise differences in its expert outputs; matching the noise
+level is not enough. So the CPU kernel reproduces the device's arithmetic:
 
-**What it must keep:**
+- **The down projection's input is the device's tile**
+  (`kernel/act.rs`, `ActTiles::quantize`): codes `rint(x · 127/amax)`, the
+  scale as f16(amax/127), and Σx summed in the warp's order (each lane's four
+  in turn, then the xor butterfly) and rounded to f16. These are the stored
+  values the int8 GEMM reads.
+- **The SiLU is the device's** (`kernel/expert.rs`, `device_silu`): the same
+  cubic polynomial for 2^x in the same three FMAs, the same clamp and the same
+  branch. Only the division differs. The device divides approximately
+  (`rcp.approx`, and `e · rcp(1 + e)` for x < 0), and no CPU instruction
+  reproduces that reciprocal, so here it is exact. Over 4.2M gate values, 7%
+  of results sit an ulp from the device's, and every one of them is that
+  division (`gpu_parity`).
+- **The int8 dots and the per-128 fold** are exact integer arithmetic folded
+  in f32; they agree bit for bit.
+
+With that, the pool's experts are the GPU's bit for bit on the pack's own
+experts at every count tested (1–9, 40, 130) and every tile mode. The one
+exception is the rare SwiGLU value the device's division puts an ulp across an
+int8 code boundary: one flipped code measured 2.3e-4 over 130 rows. End to
+end:
+
+| Arm (Flash-Next, laptop, 2,048-token prompt + 256 decode steps) | CPU rows | Mean KL | Top-1 |
+|---|---|---|---|
+| All-GPU again (control) | 0 | 0 | 100% |
+| CPU in decode only | 755 | 1.3e-2 | 97.7% |
+| CPU in prefill only | 20,267 | 2.5e-2 | 94.2% |
+| CPU in both | 21,499 | 4.1e-2 | 92.2% |
+| GPU's SiLU dividing exactly (`__fdiv_rn`), CPU in prefill | 21,059 | 0 (bit-exact) | 100% |
+
+A run is bit-exact until the first flipped code; decode arms that served only
+23–57 rows measured exactly 0, and one with 755 did not.
+
+The last row is an experiment, not the build. It shows the flipped codes are
+the whole prefill difference. Making the device divide exactly would make the
+CPU path bit-identical end to end, but the author chose to leave the GPU
+kernels as they are.
+
+**What the CPU kernel must keep:**
 - the same weights and the same activation bytes in (§5.2);
-- the same quantised arithmetic: int8 × KO codes, the per-128 affine scale and
-  min;
+- the device's arithmetic, as above;
 - finite outputs.
+
+It is still free to order its work: tasks, threads and SIMD width do not
+change a value, because every reduction it does is exact integer arithmetic
+or the device's own order.
 
 **The gates:**
 
 1. **Per expert, against a common reference.** Both sides are measured against
-   the f32 dequantised reference (`dequant_ko`, `ko_quant.rs:641-699`, over the
-   f32 activation). The CPU's error, as relative L2 over a real layer's
-   activations, must be **no worse than 1.1 × the GPU's own error** against
-   that reference. The CPU is held to the GPU's standard, not to a number
-   picked in advance.
-2. **End to end.** Over a fixed prompt corpus, greedy decode with the split
-   forced all-CPU against all-GPU must give:
-   - mean KL ≤ 1 × 10⁻³;
-   - top-1 agreement ≥ 99.5%.
+   the f32 dequantised reference (`dequant_ko` over the f32 activation). The
+   CPU's error, as relative L2, must be **no worse than 1.1 × the GPU's own
+   error** against that reference (`gpu_parity`; it measures equal).
+2. **Per expert, against the GPU, on the pack's own experts**: within the
+   flipped-code bound above (`gpu_parity`, `#[ignore]`d — it reads the pack).
+3. **End to end** (`tests/cpu_expert_gate.rs`): over a 2,048-token prompt and
+   256 teacher-forced decode steps, with the split on in both phases, against
+   all-GPU:
+   - mean KL ≤ 0.1;
+   - top-1 agreement ≥ 90%.
 
-   For scale, Strata's lossy tail skip measured KL 0.003–0.006 and 97.7–98.2%
-   top-1. These bounds are the starting gate, and measurement 9 records where
-   the kernel actually lands.
+   These were set from the measured prefill flips with the GPU's kernels
+   unchanged (the author's decision, 2026-10-17). A second all-GPU arm must be
+   exactly 0, so whatever the CPU arm shows is the CPU path's.
 3. **KV compression.** Re-run the C0–C10 gate once with the split forced
    all-CPU, to confirm the per-model `*_KV_FACTORS` thresholds still hold under
    CPU-computed experts.
 
-**Codec pieces are still exact.** `CLAUDE.md`'s rule for codec code applies to
-the parts that are codecs, and those tests assert raw bytes:
+**Codec pieces are exact.** `CLAUDE.md`'s rule for codec code applies to the
+parts that are codecs, and those tests assert raw bytes:
 - unpacking Q3_KO/Q4_KO codes;
 - permuting the activation block;
-- emitting q8a128.
-
-The float GEMV is the only part judged by the accuracy gates above.
+- emitting q8a128 (the device's tile, including the f16 scale and the warp's
+  Σx order).
 
 **Reproducibility where it is needed.**
 - **Replays.** Any run that needs exact replay sets `max_cpu_assignments = 0`
@@ -1229,6 +1588,86 @@ measure, not scripts. Each machine's figures go into `docs/performance.md`.
 8. **The EWMA time constant** against the laptop's measured throttle period.
 9. **Accuracy** (§6): the per-expert error ratio, and the end-to-end KL and
    top-1, per machine and ISA tier.
+
+**The laptop, measured** (`tests/cpu_expert_speed.rs`: Flash-Next, a 1,024-token
+prompt then 128 greedy steps, all-GPU and split runs alternating, online loop
+held still). Per decode step of 480 routed experts:
+
+| | all-GPU | split |
+|---|---:|---:|
+| decode t/s | 13.0–13.4 | 12.4–12.7 |
+| prefill t/s | 305–311 | 293–299 |
+| VRAM hits | ~308 | 238–257 |
+| CPU-served | — | ~140 (3.3 a layer, 290–350 µs; the device waits 20–35 µs) |
+| pinned copies over the link | ~144 | ~45 |
+| cold demand reads (the layer waits on the pack) | ~28 | ~47 |
+| pack reads, demand and staged ahead | 175–178 | 171–181 |
+
+Measurements 4, 6 and 7 together say why it doesn't pay here yet:
+- **Decode is bound by the drive, not the link.** ~178 pack reads a step at
+  13 t/s is ~4.7 GB/s against the drive's ~6.3 GB/s ceiling. The split
+  removes ~100 link copies a step, and that link time was overlapping waits on
+  the drive anyway.
+- **The split moves drive waits onto the critical path.** It reads no more
+  from the pack, but its staging lands late: 50% of predicted stagings
+  are routed in time against 70%. A layer that sheds its copies reaches its
+  successor's bucketize sooner, and the predictions lose the lead time they
+  were made with.
+- **The pageable warm tier has no room here.** The warm tier was bound by
+  available RAM (12.9 GB free at launch of 33.8 GB, 4,829 pinned slots of
+  24,064 wanted, 2.5 GB free once loaded), so §5.7 can't grow the RAM-backed
+  share on this machine as loaded. That share is what would turn pack reads
+  into CPU work.
+
+**The pool's own load throttles the laptop's CPU.** Logged alongside the
+alternating bench (`typeperf`, `% Processor Performance`): idle 185% of base,
+all-GPU arms 120–155% at 30–36% CPU load, split arms 71–78% at 72–83% load —
+the pool's fourteen raised-priority threads hold the package busy between
+layers whether they compute or wait. The pool then computes a decode layer in
+0.8–1.15 ms against calibration's ~0.3 ms, and every split arm lands below
+all-GPU (8–10 t/s against 11.0–11.4 in the same run). Decode hands the pool
+~3 one-row experts a layer, which a few cores read as fast as fourteen
+(measured: a P-core-only pool matched the full one), so the pool's size and
+its idle policy are what to cut next on this machine.
+
+**After the pool was cut to its participants, cold-first and the decode
+lookahead** (same bench, 2026-10-17, arms rotated each run, warm tier
+4,300–5,600 slots as free RAM allowed):
+
+| | all-GPU | split, promote none |
+|---|---:|---:|
+| decode t/s | 11.3–12.8 | 12.2–13.4 |
+| the GPU's cold waits a step | 36–46, ~0.8–1.0 ms each | ~1 |
+| CPU-served a layer | — | 3.0–3.7 experts, 1.0–1.3 of them cold |
+| pool per layer | — | ~600 µs computing, ~500 µs waiting on pack reads |
+| the device's wait on the pool, a layer | — | 700–800 µs |
+
+- **The decode step is now a chain of pack reads.** Two thirds of the layers
+  hand the pool a cold expert. Its read (~0.9 ms, against the drive's ~0.6 ms
+  for a lone 2 MB record) and then its compute (~300 µs) sit between the
+  layer's bucketize and its down launch, and the GPU's own work in between is
+  ~350 µs. `moe:down` is ~38 ms of a profiled step's ~95.
+- **The pool computes 2–3× slower in the run than alone, and the clock is why.**
+  Each participant's matvecs take 190–330 µs a run, against ~55 µs alone for
+  the same share; the last participant joins 50–100 µs in. `% Processor
+  Performance` falls from ~180% to 80–110% over a run. DRAM contention with
+  the link was ruled out earlier (6%), and pinned memory reads as fast as
+  pageable (`decode_layer_latency`).
+- **Measured and rejected:**
+  - workers spinning through the layer gap (3 ms): no faster;
+  - helper threads (readers, stager, pipeline) kept off the pool's P-cores:
+    their matvecs got ~15% faster, but the stager's publish got slower;
+  - only cold experts on the CPU: 6–12% slower — the GPU then copies every
+    pinned miss;
+  - a cold expert read in two parts, gate+up landing first so the pool starts
+    on it: the two requests made each read ~15% slower, and the pool's
+    participants spun through the rest of it, so it was 8–15% slower;
+  - staging the router look-ahead's whole voted set for the next two rows:
+    no change, because the predicted cold experts were already staged — the
+    cold misses left are the ones it does not predict;
+  - one speculative read in flight, or four: slower than two;
+  - a pad of four layers, out of the warm tier's budget: prefill ~15%
+    slower, and no fewer cold misses.
 
 **Where it is expected to pay** (to be confirmed by 4 and 7):
 - **The 3090 box:** PCIe 3.0, with as much of the expert set warm as WDDM

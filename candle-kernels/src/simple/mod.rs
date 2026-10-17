@@ -75,6 +75,9 @@ pub mod fletcher32;
 // spin on a mapped answer, n round trips in one launch
 pub mod handoff_ping;
 
+// The CPU class's input rows out to the pool's mapped row ring, then its doorbell
+pub mod moe_cpu_export;
+
 // Fused Sinkhorn (doubly-stochastic) normalization of the mHC combine matrix:
 // one launch replaces the ~120 tiny host-orchestrated ops per sub-block per layer
 pub mod bdp;

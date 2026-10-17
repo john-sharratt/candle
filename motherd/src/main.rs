@@ -58,7 +58,7 @@ struct Cli {
 }
 
 /// `motherd.yaml`.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
     host: HostArgs,

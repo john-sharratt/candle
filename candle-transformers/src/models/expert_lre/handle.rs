@@ -8,14 +8,23 @@
 //! MoE layer, tells both the layer's routing, and moves on; the GPU waits only
 //! on a cold expert the stager is still reading.
 //!
-//! There is no host-side expert path, and no CPU one: a build without `cuda`
-//! cannot construct the cache.
+//! A build without `cuda` cannot construct the cache: the experts are routed,
+//! classified and dispatched on the device. Where the process's CPU split is on
+//! (`cpu_pool::params`), the device gives the host pool the cheap pinned misses
+//! of each layer and pulls back its results (`docs/cpu_expert_compute.md`);
+//! everything else runs on the device.
 
 #[cfg(feature = "cuda")]
 use super::boundary::{grow_note, spare_for_growth, GrowOutcome};
 use super::cache::{minimum_resident_slots, pinned_layer_count, ExpertCacheInner};
 #[cfg(feature = "cuda")]
-use super::dispatch::{Dispatch, OwnerTags};
+use super::cpu_pool::attach::start as start_cpu_service;
+#[cfg(feature = "cuda")]
+use super::cpu_pool::cold::PagedImages;
+#[cfg(feature = "cuda")]
+use super::cpu_pool::params::shared as cpu_params;
+#[cfg(feature = "cuda")]
+use super::dispatch::{CpuPath, Dispatch, OwnerTags};
 #[cfg(feature = "cuda")]
 use super::link_rate::measure_link_rate;
 #[cfg(feature = "cuda")]
@@ -67,7 +76,7 @@ use candle_nn::kv_cache::WaveGeneration;
 use candle_nn::kv_cache::WeightZone;
 use std::path::Path;
 #[cfg(feature = "cuda")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 /// Pad slots an all-resident cache takes: nothing is ever cold there, so the
@@ -424,6 +433,12 @@ pub(crate) fn warm_slots_for(stride: usize, total_slots: usize) -> usize {
 // ExpertCache — the public handle
 // ============================================================================
 
+/// Consecutive forwards the CPU expert pool may fail before the split stops
+/// using it: one is a pool preempted past the spin limit, three is a pool that
+/// is not coming back.
+#[cfg(feature = "cuda")]
+const CPU_FAULT_LIMIT: u32 = 3;
+
 /// Global expert cache / pipeline handle.
 ///
 /// Shared across all MoE blocks via `Arc<ExpertCache>`. A background pipeline
@@ -455,12 +470,18 @@ pub struct ExpertCache {
     _warm: Arc<WarmTier>,
     #[cfg(feature = "cuda")]
     _pad: Arc<Pad>,
-    /// Whether a worker can ever wait on a cold expert — and so give one up
-    /// (`fault`). Not when every expert is in VRAM or has a pinned warm copy:
-    /// the warm tier is filled once at startup and never repurposed, so an
-    /// expert evicted from VRAM is always read from pinned memory.
+    /// Whether a worker can ever wait on a cold expert or on the CPU pool — and
+    /// so give one up (`fault`). Not when every expert is in VRAM or has a
+    /// pinned warm copy and no CPU class runs: every evictable expert then
+    /// holds a resident pad slot, so none is ever read from the pack, no churn
+    /// copy arises for the stager to promote, and the resident set — which
+    /// no slot outside it can join — never changes.
     #[cfg(feature = "cuda")]
     can_fault: bool,
+    /// Consecutive forwards the CPU pool failed (`take_fault`): at
+    /// [`CPU_FAULT_LIMIT`] the split stops using the pool until a restart.
+    #[cfg(feature = "cuda")]
+    cpu_faults: AtomicU32,
     /// The device the cache serves, for the region pool's growth question
     /// ([`Self::reclaim_spare_ground`]).
     #[cfg(feature = "cuda")]
@@ -832,13 +853,32 @@ impl ExpertCache {
             experts_used,
         )?);
         let mut places = Residency::new(table.clone());
+        // Shared from here: the pageable copies' addresses go to the CPU pool,
+        // and the tier is held by what reads them.
+        let warm = Arc::new(warm);
+        // The warm tier's pinned block, as the fill left it, becomes the pad's
+        // resident region: one pinned tier the stager labels — residents fixed
+        // through a wave, churn for its cold reads — re-chosen between waves
+        // (`resident`). The pageable rest stays the warm tier's.
+        let mut pad = pad;
+        let churn = pad.churn_slots();
+        pad.attach_resident(warm.clone());
+        let mut residents = Vec::new();
+        let mut paged = PagedImages::new(num_moe_layers, experts_per_layer, warm.clone());
         for (row, layer) in residency.iter().enumerate() {
             for (expert, res) in layer.iter().enumerate() {
                 if let Some(slot) = res.vram {
                     places.set_vram(row, expert, Some((slot, inner.slot_base(slot))));
                 }
                 if let Some(ws) = res.ram {
-                    places.set_warm(row, expert, Some((ws, warm.pinned_addr(ws))));
+                    if warm.is_pinned(ws) {
+                        let slot = churn + ws;
+                        places.set_pad(row, expert, Some((slot, pad.slot_addr(slot))));
+                        residents.push((slot, row, expert));
+                    } else {
+                        places.set_warm(row, expert, Some(ws));
+                        paged.set(row, expert, warm.slot_ref(ws, 1).as_ptr() as u64);
+                    }
                 }
             }
         }
@@ -881,6 +921,28 @@ impl ExpertCache {
         #[cfg(not(feature = "tensor-assert"))]
         let owner = OwnerTags::none();
         let image_bytes: Vec<usize> = layer_geometries.iter().map(|g| slot_offsets(g).3).collect();
+        // The link's rate: what read-ahead's window is sized from, and the CPU
+        // class's copy cost — measured only where either runs.
+        let cpu_enabled = cpu_params().lock().map(|p| p.enabled).unwrap_or(false);
+        let link_rate = if promo.is_some() || cpu_enabled {
+            measure_link_rate(cuda_dev_ref, &copy_stream)?
+        } else {
+            0.0
+        };
+        // The CPU class (`docs/cpu_expert_compute.md`): the host pool takes the
+        // cheap pinned misses bucketize gives it, when the process's split is on.
+        let cpu = match start_cpu_service(&layer_geometries, link_rate)? {
+            Some(service) => Some(CpuPath::new(
+                cuda_dev_ref,
+                service,
+                Arc::new(paged),
+                experts_used,
+            )?),
+            None => None,
+        };
+        // The down launch's CPU items wait on the pool, and give its results up
+        // through the same fault word, whatever is resident.
+        let can_fault = can_fault || cpu.is_some();
         let dispatch = Dispatch::new(
             cuda_dev_ref,
             table,
@@ -890,20 +952,16 @@ impl ExpertCache {
             experts_used,
             promo.clone(),
             owner,
+            cpu,
         )?;
-        // The link read-ahead's window is sized from — only where there is
-        // anything to read ahead.
-        let link_rate = if promo.is_some() {
-            measure_link_rate(cuda_dev_ref, &copy_stream)?
-        } else {
-            0.0
-        };
         if let Ok(mut s) = stats.lock() {
             s.pad_slots = pad.num_slots();
+            s.resident_capacity = warm.pinned_slots();
         }
+        let resident_capacity = warm.pinned_slots();
+        let host_backed = inner.warm_backed.clone();
 
         let pack = Arc::new(pack);
-        let warm = Arc::new(warm);
         let pad = Arc::new(pad);
         let stager_dead = Arc::new(AtomicBool::new(false));
         // The speculative reads the stager lands, for the pipeline thread to
@@ -923,6 +981,9 @@ impl ExpertCache {
                 stats: stats.clone(),
                 rows: num_moe_layers,
                 n_experts: experts_per_layer,
+                residents,
+                resident_capacity,
+                host_backed,
             },
             stager_dead.clone(),
         )?;
@@ -963,6 +1024,7 @@ impl ExpertCache {
             _warm: warm,
             _pad: pad,
             can_fault,
+            cpu_faults: AtomicU32::new(0),
             device: cuda_dev_ref.clone(),
             stats,
             trace,
@@ -1061,11 +1123,31 @@ impl ExpertCache {
     /// land a demand promotion, and the drop sent behind them removes every one
     /// still pending. Cleared first, a queued landing would read the word clear
     /// and install a slot the given-up item never wrote.
+    ///
+    /// A pool that fails [`CPU_FAULT_LIMIT`] forwards in a row is taken out of
+    /// the split until a restart (`docs/cpu_expert_compute.md` §5.13): its
+    /// measured costs are withdrawn, so every later split is all-GPU.
     #[cfg(feature = "cuda")]
     pub fn take_fault(&self) -> Result<()> {
         let Some(fault) = self.dispatch.fault.peek() else {
+            self.cpu_faults.store(0, Ordering::Relaxed);
             return Ok(());
         };
+        if fault.is_cpu() {
+            let n = self.cpu_faults.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == CPU_FAULT_LIMIT {
+                if let Ok(mut p) = cpu_params().lock() {
+                    p.measured = None;
+                }
+                tracing::error!(
+                    forwards = n,
+                    "cpu experts: the pool failed {n} forwards in a row — the split stops using \
+                     it until a restart"
+                );
+            }
+        } else {
+            self.cpu_faults.store(0, Ordering::Relaxed);
+        }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         if self
             .tx
@@ -1278,7 +1360,15 @@ impl ExpertCache {
     /// trip, which after the sampler's synchronize finds the thread idle.
     pub fn expert_stats(&self) -> PipelineStats {
         self.settle();
-        PipelineStats::snapshot(&self.stats)
+        #[allow(unused_mut)]
+        let mut s = PipelineStats::snapshot(&self.stats);
+        #[cfg(feature = "cuda")]
+        {
+            let (ns, n) = self.dispatch.cold_wait.since_reset();
+            s.cold_wait_ns = ns;
+            s.cold_waits = n as usize;
+        }
+        s
     }
 
     /// The routed experts' hit and miss tallies as the pipeline thread has
@@ -1311,8 +1401,11 @@ impl ExpertCache {
         self.settle();
         PipelineStats::reset(&self.stats);
         #[cfg(feature = "cuda")]
-        if let Ok(mut t) = self.trace.lock() {
-            t.reset();
+        {
+            self.dispatch.cold_wait.reset();
+            if let Ok(mut t) = self.trace.lock() {
+                t.reset();
+            }
         }
     }
 

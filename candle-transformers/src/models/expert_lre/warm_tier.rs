@@ -233,14 +233,15 @@ impl WarmTier {
         i < self.pinned.num_slots()
     }
 
-    /// Where slot `i` is device-readable — its address, when it is pinned.
-    pub(crate) fn pinned_addr(&self, i: usize) -> Option<u64> {
-        self.is_pinned(i).then(|| self.pinned.slot_addr(i))
-    }
-
     /// The pinned part's addresses, `[lo, hi)`.
     pub(crate) fn pinned_range(&self) -> (u64, u64) {
         self.pinned.range()
+    }
+
+    /// Slots in the pinned part: `0..pinned_slots()`. Once the startup fill
+    /// has written them they are the pad's resident region (`pad.rs`).
+    pub(crate) fn pinned_slots(&self) -> usize {
+        self.pinned.num_slots()
     }
 
     pub(crate) fn slot_ref(&self, i: usize, len: usize) -> &[u8] {

@@ -455,6 +455,13 @@ impl Qwen4ExpGpu {
         if let Some(report) = progress {
             report(LoadPhase::Weights, n_blocks, n_blocks);
         }
+        // The PLE table reads through direct-I/O handles of its own
+        // (`DiskPleFetch`); the GGUF reader — a buffered handle on the pack —
+        // closes here, before the expert cache fills its warm tier from the
+        // same file. The pack's own mapping (`ModelPack::mmap`) stays open
+        // through the fill; nothing reads it after load.
+        let ple_table = open_cached_ple(&gguf, &cfg, device)?;
+        drop(gguf);
         let experts = build_expert_cache_for(
             &pack,
             cfg.moe.n_experts,
@@ -514,12 +521,6 @@ impl Qwen4ExpGpu {
                 Some(dense.with_block(block))
             }
         };
-
-        // The PLE table reads through direct-I/O handles of its own; the GGUF
-        // reader — a buffered handle on the pack — closes here, so nothing holds
-        // a cached view of the file the expert stager reads (`DiskPleFetch`).
-        let ple_table = open_cached_ple(&gguf, &cfg, device)?;
-        drop(gguf);
 
         Ok(Self {
             cfg,

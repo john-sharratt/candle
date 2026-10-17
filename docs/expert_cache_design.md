@@ -373,6 +373,13 @@ per-tensor checksum of its own.
 
 ## 6. The warm tier — static, stratified, immutable
 
+> **Superseded for the pinned part by §6.5.** The warm tier's pinned block is
+> now the pad's resident region, whose membership is re-chosen between waves
+> from decode's host accesses; the startup fill below is only where it begins.
+> What stays static is the pageable part. The reasoning of §6.1 — that VRAM has
+> already skimmed the skew — did not survive measurement on a card whose VRAM
+> holds 12 % of the experts (§6.5).
+
 The warm tier is filled **once**, at startup, and never changes. No eviction
 policy, no ranking, no background filler, no demand-versus-speculative priority,
 no thrash. It is a partial mirror of the pack file, pinned for DMA.
@@ -507,6 +514,96 @@ behind. So the strata need not be equal. Flat first: it removes the defect that
 matters (§6.2) and costs one line, where a taper needs a curve and a curve needs
 evidence. The extreme case is already handled — layers 0–2 are VRAM-pinned
 regardless.
+
+### 6.5 The pinned tiers: resident and churn
+
+Every pinned host copy of an expert is a **pad slot** (`expert_lre/pad.rs`).
+The pad has two regions: its own churn block, which a cold read lands in, and
+the warm tier's pinned block, appended once the startup fill has written it.
+Each slot carries a label, **resident** or **churn**, independent of its region:
+
+- **Churn** slots are what a wave's reads evict. A cold read inside a wave
+  takes a free slot or a churn victim, never a resident: the set the device
+  reads through stays put for the wave.
+- **Resident** slots are never a victim. Their labels change only at a pass
+  boundary (`expert_lre/resident.rs`).
+
+At each pass boundary the stager re-chooses the resident set:
+
+- **Decode's own host accesses, over many waves.** A host access is a decode
+  routing that found its expert outside VRAM: the summary's pinned or cold bit,
+  with its decode bit. Prompt routings are not counted. A prompt sweeps most of
+  every layer once, and residency chosen from it would churn for a pass that
+  never comes back. Scores decay 0.95 per pass that credited a decode access,
+  so a prompt's pass ages nothing.
+- **A relabel, never a copy.** A candidate is a churn slot that already holds
+  its expert. An expert decode keeps missing on has, by definition, just been
+  read into a churn slot. Promoting it is a label change, and the resident it
+  displaces becomes churn and ages out as any churn slot does.
+- **Hysteresis.** A candidate displaces the coldest resident only when its
+  score beats the resident's by 1.5× plus 0.5. At most 512 labels change in one
+  boundary.
+- **Per-layer bands.** Each layer's resident count moves only inside a band of
+  half to twice its startup share (`Bands::around`). Inside the band the set
+  follows the scores, so a layer decode misses on more often takes slots from
+  one it misses on less: on Flash-Next the deeper layers settle at 3–4× the
+  shallowest seventh's share. The floor is what keeps the wave's latency hiding:
+  a cold read stalls the device only once the wave reaches its layer, and a
+  layer stripped of residents would turn every routing there into such a read.
+  The ceiling stops one hot layer taking the pinned budget as it churns. A
+  candidate whose row is at its ceiling may displace only a resident of its own
+  row; one whose row is below its ceiling may displace any resident whose row
+  is above its floor.
+
+The startup fill (§6.1–6.3) seeds the resident set as before, and the scores
+replace it within a few hundred steps. The VRAM eviction's cost classes (§12.6)
+read the resident labels (`HostBacked`): an evicted resident reloads over the
+link alone, an evicted churn copy may already be gone.
+
+**Measured** (Flash-Next Q3_KO, the 16 GB laptop, `tests/cpu_expert_speed.rs`,
+1,024-token prompt then 128 decode steps):
+
+| | before | resident pad | with bands |
+|---|---:|---:|---:|
+| cold misses a decode step, all-GPU | 36–46 | 21–26 | 19–24 |
+| cold misses a decode step, CPU split | 50–58 | 28–34 | 25–26 |
+| decode t/s, all-GPU | 11.3–12.8 | 12.4–12.9 | 12.6–13.3 |
+| decode t/s, CPU split | 12.2–13.4 | 13.4–13.6 | 13.4–14.3 |
+| prefill t/s | ~280–300 | ~280–300 | ~280–300 |
+
+At a cap of 64 relabels a boundary the set was still replacing the startup draw
+128 steps in. At 512 it settles to 20–50 relabels a boundary. Widening the band
+to a quarter–four times bought nothing at the same resident capacity (all-GPU
+cold misses 20–27, split decode 13.4–14.2): the shallowest layers fall to the
+lower floor, and the reads that then land there cost what the deeper layers
+saved.
+
+### 6.6 What the page cache may hold
+
+The warm tier is sized out of available RAM less a headroom, so every byte
+the page cache keeps for something read only from disk is a byte of expert
+memory lost, or worse, pressure that pages the pageable warm part out. The
+rule is that **nothing read only from NVMe goes through the page cache**:
+
+| Reader | How |
+|---|---|
+| expert pack (stager, startup fill) | `DirectFile`, unbuffered |
+| PLE / n-gram table (qwen4exp) | own row cache over `DirectFile` |
+| streamed layers (dense checkpoints) | direct reads |
+| substrate redo log (cold KV) | `candle::direct_write::UnbufferedFile`, reads and writes |
+| sealed-sequence reads | `UnbufferedFile`, read-only |
+
+The GGUF part of a pack is the one mapping. Each routed loader passes as
+`offloaded_bytes` what it never reads from the mapping after load, so the host
+budget does not reserve that as live weight:
+- qwen35, qwen3_moe and latent_moe pass the whole part, since each keeps its
+  dense tensors on the card and its embedding in an allocation of its own;
+- qwen4exp passes its device-resident tensors plus the PLE table beyond its row
+  cache.
+
+qwen4exp also closes its buffered GGUF reader before the warm fill begins. The
+pack's own mapping stays open through the fill (and latent_moe's GGUF reader
+through `ExpertCache::new`); nothing reads either after load.
 
 ---
 
@@ -901,7 +998,10 @@ keeps `O_DIRECT`; other unixes open buffered, which is correct but cached.
 made this an error where it had been a silent success followed by a panic on the
 first MoE layer — but the doc still advertised a non-CUDA path and the caller
 still built a plausible-looking host-side `WeightZone` for it. Both are gone, and
-the message now names the reason and the two ways out.
+the message now names the reason and the two ways out. This refusal is about a
+cache on a CPU *device*, and it stands. The CPU expert class
+(`docs/cpu_expert_compute.md`) is a different thing: a CUDA cache whose device
+hands some pinned misses to a host pool, per layer.
 
 ### 12.8 Ephemeral packs are unlinked while open, not deleted on drop
 

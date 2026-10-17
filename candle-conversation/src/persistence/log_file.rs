@@ -6,15 +6,29 @@
 //! durability. Records are never rewritten in place — only the
 //! superblock is (file identity, format version, and the advisory
 //! `HeaderIndex` hint recovery anchors its backward chain on).
+//!
+//! **Nothing goes through the page cache** ([`UnbufferedFile`]). The log
+//! grows by gigabytes a conversation and is read back cold, if at all, so a
+//! cached copy of it is RAM taken from the expert tiers for nothing — and a
+//! cached handle open on the file serialises the cold-load path's direct reads
+//! of it. Every write is whole sectors from an aligned buffer: records and the
+//! superblock are already 4 KB-aligned in the file, and the bytes are staged
+//! aligned. Every read rounds out to whole sectors.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 
 use super::record::{crc32, decode_record, verify_record_crc, Record, ALIGN};
 use super::{PersistenceError, Result};
-use candle::direct_io::DirectFile;
+use candle::direct_io::{AlignedScratch, DirectFile};
+use candle::direct_write::{Access, UnbufferedFile};
+
+/// The aligned window every unbuffered transfer streams through — a record
+/// written from its parts ([`LogFile::append_parts`]), a flush, a read: a 65 MB
+/// recurrent snapshot moves in pieces of this, so the scratch is one window,
+/// never a buffer the size of the largest transfer.
+const PARTS_WINDOW: usize = 4 << 20;
 
 /// Size of the file superblock — the first block, holding file identity,
 /// the format version, and the latest `HeaderIndex` hint.
@@ -144,14 +158,15 @@ impl Superblock {
 
 /// An open append-only log file.
 pub struct LogFile {
-    file: File,
-    /// A second open handle on the same file, opened with `O_DIRECT` /
-    /// `FILE_FLAG_NO_BUFFERING`. Used exclusively for the cold-load fast
-    /// path ([`LogFile::direct_file`]) so bulk reads bypass the OS page
-    /// cache and let the NVMe controller DMA straight into sector-aligned
-    /// host scratch. The buffered `file` handle still owns every write
-    /// and every non-aligned small read (superblock, single-record
-    /// lookups, etc.).
+    /// Every write and every small read (superblock, single-record lookups,
+    /// recovery's walk), unbuffered.
+    file: UnbufferedFile,
+    /// Aligned staging for what `file` writes and the sectors it reads.
+    scratch: AlignedScratch,
+    /// The cold-load fast path's handles on the same file
+    /// ([`LogFile::direct_file`]): many overlapped ones, so its concurrent
+    /// stripe reads queue at the drive together and the NVMe controller DMAs
+    /// straight into sector-aligned host scratch.
     ///
     /// Shared (`Arc`) so a cold-load can hold the handle set for its whole
     /// duration without borrowing this `LogFile` — see
@@ -180,11 +195,7 @@ impl LogFile {
     /// Create a fresh log file, writing the superblock. Fails if the path
     /// already exists.
     pub fn create(path: &Path) -> Result<LogFile> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let file = UnbufferedFile::open(path, Access::CreateNew)?;
         let superblock = Superblock {
             format_version: FILE_FORMAT_VERSION,
             last_index: (0, 0),
@@ -192,6 +203,7 @@ impl LogFile {
         let direct = Arc::new(DirectFile::open(path)?);
         let mut log = LogFile {
             file,
+            scratch: AlignedScratch::new(),
             direct,
             superblock,
             write_offset: SUPERBLOCK_SIZE,
@@ -218,11 +230,12 @@ impl LogFile {
     /// (the file isn't a substrate log), and a valid-CRC superblock with an
     /// unsupported version stays a hard error (a genuinely old format).
     pub fn open(path: &Path) -> Result<LogFile> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let allocated = file.metadata()?.len();
+        let file = UnbufferedFile::open(path, Access::ReadWrite)?;
+        let allocated = file.len()?;
         let direct = Arc::new(DirectFile::open(path)?);
         let mut log = LogFile {
             file,
+            scratch: AlignedScratch::new(),
             direct,
             superblock: Superblock {
                 format_version: FILE_FORMAT_VERSION,
@@ -262,11 +275,12 @@ impl LogFile {
     /// superblock with an unsupported version, is still a hard error — same as
     /// [`LogFile::open`]. Every write path on the returned handle asserts.
     pub fn open_read_only(path: &Path) -> Result<LogFile> {
-        let file = OpenOptions::new().read(true).open(path)?;
-        let allocated = file.metadata()?.len();
+        let file = UnbufferedFile::open(path, Access::ReadOnly)?;
+        let allocated = file.len()?;
         let direct = Arc::new(DirectFile::open(path)?);
         let mut log = LogFile {
             file,
+            scratch: AlignedScratch::new(),
             direct,
             superblock: Superblock {
                 format_version: FILE_FORMAT_VERSION,
@@ -339,15 +353,42 @@ impl LogFile {
     /// many bytes there.
     pub fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut buf).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                PersistenceError::Truncated { need: len, have: 0 }
-            } else {
-                PersistenceError::Io(e)
-            }
-        })?;
+        self.read_into(offset, &mut buf)?;
         Ok(buf)
+    }
+
+    /// Fill `dest` from `offset`, through the whole sectors around it, a
+    /// [`PARTS_WINDOW`] at a time — so the scratch stays one window, however
+    /// large a cold load's stripe is.
+    fn read_into(&mut self, offset: u64, dest: &mut [u8]) -> Result<()> {
+        let need = dest.len();
+        for (i, piece) in dest.chunks_mut(PARTS_WINDOW).enumerate() {
+            let at = offset + (i * PARTS_WINDOW) as u64;
+            self.file
+                .read_span(at, piece, &mut self.scratch)
+                .map_err(|e| {
+                    if e.kind() == ErrorKind::UnexpectedEof {
+                        PersistenceError::Truncated { need, have: 0 }
+                    } else {
+                        PersistenceError::Io(e)
+                    }
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Write `bytes` — whole sectors — at `offset`, through the aligned
+    /// scratch a [`PARTS_WINDOW`] at a time, so the scratch stays one window
+    /// however much a flush writes.
+    fn write_aligned(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        for (i, piece) in bytes.chunks(PARTS_WINDOW).enumerate() {
+            self.scratch.ensure(piece.len())?;
+            let buf = self.scratch.as_mut_slice(piece.len());
+            buf.copy_from_slice(piece);
+            self.file
+                .write_at(offset + (i * PARTS_WINDOW) as u64, buf)?;
+        }
+        Ok(())
     }
 
     /// Stage one already-encoded, 4 KB-aligned record into the group-commit
@@ -371,7 +412,8 @@ impl LogFile {
     ///
     /// For a record large enough that copying it into the group-commit buffer
     /// would cost more than the buffer saves: a ~65 MB recurrent snapshot goes
-    /// from the caller's slices to the file with no intermediate copy.
+    /// from the caller's slices to the file through an aligned window of
+    /// [`PARTS_WINDOW`], never a buffer its own size.
     pub fn append_parts(&mut self, head: &[u8], payload: &[&[u8]], pad: usize) -> Result<u64> {
         assert!(!self.read_only, "append_parts on a read-only LogFile");
         let total = head.len() + payload.iter().map(|p| p.len()).sum::<usize>() + pad;
@@ -383,12 +425,31 @@ impl LogFile {
         self.flush()?;
         let offset = self.write_offset;
         self.grow_to(offset + total as u64)?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(head)?;
-        for part in payload {
-            self.file.write_all(part)?;
+        let window = total.min(PARTS_WINDOW);
+        self.scratch.ensure(window)?;
+        // Whole windows out as they fill; the last is the record's tail, a
+        // whole number of sectors since the record is.
+        let zeros = [0u8; ALIGN];
+        let parts = std::iter::once(head)
+            .chain(payload.iter().copied())
+            .chain(std::iter::once(&zeros[..pad]));
+        let (mut filled, mut at) = (0usize, offset);
+        for mut part in parts {
+            while !part.is_empty() {
+                let n = part.len().min(window - filled);
+                self.scratch.as_mut_slice(window)[filled..filled + n].copy_from_slice(&part[..n]);
+                filled += n;
+                part = &part[n..];
+                if filled == window {
+                    self.file.write_at(at, self.scratch.as_slice(window))?;
+                    at += window as u64;
+                    filled = 0;
+                }
+            }
         }
-        self.file.write_all(&[0u8; ALIGN][..pad])?;
+        if filled > 0 {
+            self.file.write_at(at, self.scratch.as_slice(filled))?;
+        }
         self.write_offset = offset + total as u64;
         self.unsynced = true;
         Ok(offset)
@@ -412,8 +473,9 @@ impl LogFile {
         assert!(!self.read_only, "flush on a read-only LogFile");
         let end = self.write_offset + self.pending.len() as u64;
         self.grow_to(end)?;
-        self.file.seek(SeekFrom::Start(self.write_offset))?;
-        self.file.write_all(&self.pending)?;
+        let pending = std::mem::take(&mut self.pending);
+        self.write_aligned(self.write_offset, &pending)?;
+        self.pending = pending;
         self.write_offset = end;
         self.pending.clear();
         self.unsynced = true;
@@ -468,9 +530,7 @@ impl LogFile {
     fn write_superblock(&mut self) -> Result<()> {
         assert!(!self.read_only, "write_superblock on a read-only LogFile");
         let bytes = self.superblock.encode();
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&bytes)?;
-        Ok(())
+        self.write_aligned(0, &bytes)
     }
 
     /// Grow the physical file so it holds at least `end` bytes, rounding up
@@ -518,22 +578,11 @@ impl LogSource for LogFile {
     }
 
     fn read_into(&mut self, offset: u64, dest: &mut [u8]) -> Result<()> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(dest).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                PersistenceError::Truncated {
-                    need: dest.len(),
-                    have: 0,
-                }
-            } else {
-                PersistenceError::Io(e)
-            }
-        })?;
-        Ok(())
+        LogFile::read_into(self, offset, dest)
     }
 
     fn size(&mut self) -> Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file.len()?)
     }
 }
 
@@ -611,6 +660,7 @@ pub fn read_record_at(src: &mut dyn LogSource, offset: u64, record_size: u64) ->
 mod tests {
     use super::*;
     use crate::persistence::record::{encode_record, record_head, RecordHeader, RecordType};
+    use std::fs::OpenOptions;
 
     /// A log file path in the temp directory, removed when the guard drops —
     /// whether the test returns or panics.

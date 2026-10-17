@@ -192,10 +192,17 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
    `candle-kernels/src/arena_table.cuh` (`ArenaTableEntry`/`PerHeadTableEntry`) for the paged
    attention kernels, the gallery's `region_ptr_cache`, and `bdp_recall_batched`'s per-gallery
    sign-pointer table (which replaced an O(Σ len × words) concatenation).
-3. **No unnecessary GPU→CPU transfers.** Exactly one sanctioned readback on the forward
-   path: the embedding lookup (token ids → host, CPU `index_select`, transfer in), a pure
-   index + transfer that keeps the embed table off VRAM. Everything else — MoE routing,
-   comp-idx assembly, select remaps, gather indices — stays on the GPU.
+3. **No unnecessary GPU→CPU transfers.** Two sanctioned transfers on the forward path:
+   - the embedding lookup (token ids → host, CPU `index_select`, transfer in), a pure
+     index + transfer that keeps the embed table off VRAM;
+   - the CPU expert class (`docs/cpu_expert_compute.md`): the q8a128 rows of the
+     assignments the device gave the host pool, written by the device into mapped host
+     memory, and the pool's result rows, pulled by the device from mapped host memory.
+     No host CUDA call reads or waits on either; the device waits only for the results
+     of work it handed out, through a mapped word, as it waits for a cold expert.
+
+   Everything else — MoE routing, comp-idx assembly, select remaps, gather indices —
+   stays on the GPU.
    > **MoE routing has no readback.** The live MoE dispatch (`docs/moe_live_dispatch_design.md`)
    > is the expert path for every `ExpertCache` model: `bucketize` classifies each routed
    > expert VRAM / pinned / cold on the device and writes a routing *summary* into a mapped
@@ -207,7 +214,9 @@ architecture says is unnecessary. Full study + per-invariant violation catalogue
    > "3.3 ms per layer, 43 times per token") describe the removed path.
 4. **Run as much as possible on the GPU.** No host-side compute a kernel can do: no host
    counting-sort, no host set-union/dedup/remap. Host code issues launches; it does not
-   compute over per-token data. (The transfer in #3 is the only exception.)
+   compute over per-token data. The exceptions are the embedding transfer in #3, and the
+   CPU expert pool computing the experts the device assigned to it — the decision of
+   what the pool gets is made on the device, in `moe_bucketize`.
 5. **Everything in prefill and decode runs fully batched.** One launch over all slots / all
    sessions, not a per-seq or per-token loop. Decode batches select, gather, attention, and
    out-proj across sessions; prefill must reach the same shape — a multi-slot attention kernel

@@ -189,6 +189,14 @@ once every kernel that could hold its old address has finished. The kernels
 that read row `r`'s entries are row `r`'s `bucketize`, gate, up and down, all
 enqueued before row `r + 1`'s `bucketize`.
 
+The host CPU expert pool (`docs/cpu_expert_compute.md`) is the one reader that
+is not a kernel. It reads the pinned warm slots of the experts row `r`'s
+`bucketize` gave it, through the addresses in its work slot, and row `r`'s down
+launch does not complete until the pool's `done` for that invocation has
+landed. So the pool's reads end inside row `r`'s kernels, and every rule below
+covers them as written. Under Rule R′, the pool reads only row `n`'s own routed
+experts, which that rule already excludes.
+
 **Tickets.** Every invocation gets a ticket (`seq + 1`). The forward thread
 records each row's latest ticket, then a full fence, *before* it enqueues the
 row's `bucketize`; the host threads record the highest ticket whose summary word

@@ -42,7 +42,30 @@ struct MoeLive {
     // Backstop below the display watchdog: a worker waiting longer gives the
     // expert up and claims the fault word.
     unsigned long long spin_limit_ns;
+    // The down launch only — the CPU class's results (`moe_bucketize_cpu.cuh`),
+    // pulled by the workers' CPU items into the rows bucketize left the CPU
+    // experts: the host pool's mapped `done` word and the value that means this
+    // invocation's rows have landed; the mapped result rows (ring order, one F32
+    // row of the output width each); the ring row → grouped row map; the pool's
+    // mapped liveness word (non-zero while it lives); how long a CPU item
+    // polls tightly before it backs off; and the mapped word each CPU item
+    // raises to the nanoseconds it waited for the pool (atomicMax), which the
+    // pool reads back as the device's lateness for the split's online loop.
+    // Null `cpu_done` everywhere else.
+    const unsigned long long* cpu_done;
+    unsigned long long cpu_seq;
+    const float* cpu_rows;
+    const unsigned int* cpu_dst_row;
+    const unsigned int* cpu_alive;
+    unsigned long long cpu_tight_ns;
+    unsigned long long* cpu_wait;
+    // The gate launch only: a mapped `{ns, count}` pair the worker holding a
+    // cold expert's first row tile adds its wait for the publish to — one
+    // sample per cold expert per layer. Null on the up and down launches,
+    // which find the expert published.
+    unsigned long long* cold_wait;
     int workers;
     // The launch's MoE row, which a fault names.
     int row;
 };
+static_assert(sizeof(MoeLive) == 23 * 8, "MoeLive is api.rs's MoeLive byte for byte");

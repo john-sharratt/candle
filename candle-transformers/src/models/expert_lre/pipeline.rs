@@ -16,8 +16,8 @@
 //!   rows' scored ones instead), and this thread writes each row's prediction
 //!   into the promotion ring (`PromotionRing::predict`) while a launch that
 //!   reads it has yet to begin. A later launch claims offers for the predicted
-//!   experts whose pinned copy this thread vetted (a warm slot, or a pad slot
-//!   it pinned — `ahead_pins`) with the link time its own misses leave
+//!   experts whose pinned copy this thread vetted (a pad slot it pinned —
+//!   `ahead_pins`) with the link time its own misses leave
 //!   (`read_ahead`), and its gate launch's workers copy them into the slots and
 //!   publish their entries — no copy issued here and no landing waited for. A
 //!   predicted cold expert is handed to the stager to stage into the pad, and
@@ -34,6 +34,7 @@
 use super::ahead_pins::{AheadPins, Candidate};
 use super::blend::{cell_axes, gather, CellTable, MARKOV_MIN_CONF};
 use super::cache::{ExpertCacheInner, DECODE_RECENCY_DECAY};
+use super::cpu_pool::params::shared as cpu_params;
 use super::dispatch::{AbortWord, PassState, SummaryRing};
 use super::fault::FaultWord;
 use super::layer_trace::{publish as publish_layer_trace, RowRouting, TraceBuilder};
@@ -52,7 +53,7 @@ use super::types::{PipelineMessage, PipelineStats, RoutedLayer};
 use super::votes::{ranked, voted_set, VoteRing, Votes};
 use crate::models::profile::{profile_now, ProfileAccumulator};
 use candle::{Device, Result};
-use candle_kernels::simple::moe_bucketize::AHEAD_MAX;
+use candle_kernels::simple::moe_bucketize::{AHEAD_MAX, SUMMARY_COUNT_MASK, SUMMARY_CPU_BIT};
 use cudarc::driver::CudaStream;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashSet;
@@ -175,8 +176,11 @@ fn ring_stock(
     }
 }
 
-/// The summary bits the pipeline reads.
-const SUMMARY_COUNT: u32 = 0x1fff_ffff;
+/// The summary bits the pipeline reads. The count is the field below the CPU
+/// class's bit (`moe_bucketize_cpu.cuh`), which marks an expert the host pool
+/// computed: still a miss for scoring, but no copy over the link.
+const SUMMARY_COUNT: u32 = SUMMARY_COUNT_MASK;
+const SUMMARY_CPU: u32 = 1 << SUMMARY_CPU_BIT;
 const SUMMARY_PINNED: u32 = 1 << 29;
 const SUMMARY_COLD: u32 = 1 << 30;
 const SUMMARY_DECODE: u32 = 1 << 31;
@@ -537,7 +541,7 @@ impl PipelineState {
 
         let mut expert_ids: Vec<usize> = Vec::new();
         let mut decode: HashSet<usize> = HashSet::new();
-        let (mut pinned, mut cold) = (0usize, 0usize);
+        let (mut pinned, mut cold, mut cpu) = (0usize, 0usize, 0usize);
         for (e, &w) in summary.iter().enumerate() {
             if w & SUMMARY_COUNT == 0 {
                 continue;
@@ -548,6 +552,9 @@ impl PipelineState {
             }
             pinned += usize::from(w & SUMMARY_PINNED != 0);
             cold += usize::from(w & SUMMARY_COLD != 0);
+            // The pinned misses the pool served; a cold one it served is
+            // counted cold — it waited on the pack either way.
+            cpu += usize::from(w & SUMMARY_CPU != 0 && w & SUMMARY_COLD == 0);
         }
         let routing = RowRouting {
             pass: msg.pass,
@@ -738,10 +745,13 @@ impl PipelineState {
         }
         // ── Whether reading ahead pays (`read_ahead_gate`), judged on decode
         // invocations — the width the look-ahead runs at. The misses bucketize
-        // found cold wait on a pack read; the rest, and the read-ahead claims,
-        // are pinned copies over the link ──
+        // found cold wait on a pack read, and those it gave the CPU pool cross
+        // no link; the rest, and the read-ahead claims, are pinned copies over
+        // the link. Counting only those is what lets a CPU-heavy split OPEN
+        // read-ahead on the link time it freed ──
         if !msg.prefill_width {
-            let copies = misses.saturating_sub(cold) + std::mem::take(&mut self.ahead_uncounted);
+            let copies =
+                misses.saturating_sub(cold + cpu) + std::mem::take(&mut self.ahead_uncounted);
             let cold_secs = self
                 .pack_read_secs
                 .unwrap_or(self.image_bytes as f64 / self.link_rate.max(1.0));
@@ -863,6 +873,7 @@ impl PipelineState {
         let head = ring.head();
         let (mut taken, mut claimed, mut skipped) = (0usize, 0usize, 0usize);
         let (mut ahead, mut ahead_bytes, mut ahead_pad) = (0usize, 0usize, 0usize);
+        let mut carried = 0usize;
         while self.ring_taken != head {
             let i = self.ring_taken as usize % ring.cap();
             let logged = ring.log(self.ring_taken);
@@ -891,17 +902,22 @@ impl PipelineState {
                 self.residency()?.device_evicted(vr, ve);
                 self.release_offer(&offer)?;
                 let tag = self.victim_tag(vr, ve);
+                // A carry promotes an expert its row routed, as a demand
+                // claim does: judged with them, not with the predictions.
                 self.regret.evicted(
                     vr,
                     ve,
-                    logged.ahead,
+                    logged.ahead && !logged.carry,
                     ticket_from_word(logged.word, near),
                     tag,
                 );
                 claimed += 1;
             }
             taken += 1;
-            if logged.ahead {
+            if logged.carry {
+                carried += 1;
+                ahead_bytes += slot_offsets(&self.layer_geometries[logged.row]).3;
+            } else if logged.ahead {
                 ahead += 1;
                 ahead_bytes += slot_offsets(&self.layer_geometries[logged.row]).3;
                 // Listed from the pad: its pin holds until this lands.
@@ -912,7 +928,7 @@ impl PipelineState {
             self.regret.promoted(
                 logged.row,
                 logged.expert,
-                logged.ahead,
+                logged.ahead && !logged.carry,
                 ticket_from_word(logged.word, near),
             );
             self.device_promotions.push(DevicePromotion {
@@ -923,13 +939,15 @@ impl PipelineState {
                 ahead: logged.ahead,
             });
         }
-        self.ahead_uncounted += ahead;
+        // Both are copies over the link.
+        self.ahead_uncounted += ahead + carried;
         if let Ok(mut s) = self.stats.lock() {
             s.ring_taken += taken;
             s.victims_claimed += claimed;
             s.victims_skipped += skipped;
             s.evictions += claimed;
             s.ahead_claims += ahead;
+            s.carry_claims += carried;
             s.ahead_bytes += ahead_bytes;
             s.ahead_pad_claims += ahead_pad;
         }
@@ -1011,7 +1029,6 @@ impl PipelineState {
                     pinned += 1;
                 }
                 Fallback::Cold => places.set_offered_cold(r, e, true),
-                Fallback::Warm => {}
             }
             chosen.push(Chosen {
                 slot,
@@ -1037,7 +1054,7 @@ impl PipelineState {
                 self.pad_pinned_offers -= 1;
             }
             Some(((r, e), Fallback::Cold)) => self.residency()?.set_offered_cold(r, e, false),
-            Some((_, Fallback::Warm)) | None => {}
+            None => {}
         }
         Ok(())
     }
@@ -1059,9 +1076,6 @@ impl PipelineState {
             }
             let p = self.device_promotions.swap_remove(i);
             self.promoting.remove(&(p.row, p.expert));
-            if let Some(ring) = &self.promo_ring {
-                ring.clear_mark(p.row, p.expert);
-            }
             // Promoted twice — by the GPU on two invocations: nothing ever
             // named this slot, so it is free.
             if self
@@ -1070,6 +1084,9 @@ impl PipelineState {
                 .get(&(p.row, p.expert))
                 .is_some_and(|&s| self.inner.slots[s].is_some())
             {
+                if let Some(ring) = &self.promo_ring {
+                    ring.clear_mark(p.row, p.expert);
+                }
                 self.inner.put_free(p.slot);
                 continue;
             }
@@ -1079,6 +1096,13 @@ impl PipelineState {
             self.inner.install(p.slot, p.row, p.expert, view);
             self.residency()?
                 .set_vram(p.row, p.expert, Some((p.slot, base)));
+            // The mark only after the VRAM entry is published: a bucketize that
+            // finds the expert unmarked and cold may hand it to the CPU pool,
+            // which can read only host memory, so no VRAM publish may follow
+            // an unmarked cold read (`moe_bucketize_cpu.cuh`).
+            if let Some(ring) = &self.promo_ring {
+                ring.clear_mark(p.row, p.expert);
+            }
             landed += 1;
         }
         if landed > 0 {
@@ -1263,9 +1287,9 @@ impl PipelineState {
     /// copy, each with its slot image as the vetted source, replacing the last
     /// listing — only while a launch that reads it has yet to begin
     /// (`listing_readable`), since a launch at `r` reads the lists of `r + 2`
-    /// on. A warm copy is listed as it is; a pad copy only with its slot
-    /// pinned for the listing (`ahead_pins`), since the stager may otherwise
-    /// reuse it under another row's launch. With `stage`, the cold ones (no
+    /// on. Every pinned copy is a pad slot, listed only with the slot pinned
+    /// for the listing (`ahead_pins`), since the stager may otherwise reuse it
+    /// under another row's launch. With `stage`, the cold ones (no
     /// device-readable copy) go to the stager to stage into the pad, whether
     /// or not the row is listed now — staged in time for its own workers at the
     /// least, and listed from the pad as each lands (`list_landed`). Returns
@@ -1624,11 +1648,13 @@ impl PipelineState {
     }
 
     /// Order the eviction passes by each class's expected miss cost — its
-    /// running regret rate (`regret`) times what restoring one costs: the copy
-    /// over the link for a warm-backed expert (one image at the measured link
-    /// rate), and the pack read the layer then waits on (the stager's mean,
-    /// latest measured) plus that copy for a pack-only one. Before the first
-    /// pack read is measured the default order stands.
+    /// running regret rate (`regret`) times what restoring one costs, priced by
+    /// its backing (`SplitParams::refill_secs`, `docs/cpu_expert_compute.md`
+    /// §5.11): for a warm-backed expert the copy over the link (one image at
+    /// the measured link rate), or the CPU pool's path where that is cheaper;
+    /// for a pack-only one the pack read the layer then waits on (the stager's
+    /// mean, latest measured), weighted by `cold_bias`, plus that copy. Before
+    /// the first pack read is measured the default order stands.
     fn set_eviction_order(&mut self) {
         if let Ok(s) = self.stats.lock() {
             if let Some(read) = s.pack_reads.mean_secs() {
@@ -1642,7 +1668,11 @@ impl PipelineState {
             return;
         }
         let copy = self.image_bytes as f64 / self.link_rate;
-        let cost = eviction_costs(self.regret.class_rates(), copy, read);
+        let (warm, pack) = cpu_params()
+            .lock()
+            .map(|p| p.refill_secs(copy, read))
+            .unwrap_or((copy, read + copy));
+        let cost = eviction_costs(self.regret.class_rates(), warm, pack);
         self.inner.set_eviction_costs(cost);
         if let Ok(mut s) = self.stats.lock() {
             s.eviction_cost_us = cost.map(|c| c * 1e6);

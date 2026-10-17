@@ -34,6 +34,7 @@
 #pragma once
 
 #include "moe_bucketize_common.cuh"
+#include "moe_bucketize_cpu.cuh"
 #include "moe_bucketize_live.cuh"
 
 // The widest launch the narrow kernel takes: `n_tokens · k` at most this.
@@ -93,6 +94,9 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
     // The remote list's experts, in list order, for the promotion walk.
     __shared__ int32_t sh_remote_e[BUCKETIZE_NARROW];
     __shared__ unsigned long long sh_scan[BUCKETIZE_WARPS + 1];
+    // Per expert: computed by the host CPU pool (1), and the split's scratch.
+    __shared__ uint8_t sh_cpu[MAX_EXPERTS];
+    __shared__ CpuSplitShared sh_cpu_split;
 
     const bool live = gate_row != nullptr;
 
@@ -182,14 +186,27 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
     }
     __syncthreads();
 
+    // ── P1c: the CPU class (`moe_bucketize_cpu.cuh`) ──
+    // `sh_cls` holds only routed experts' classes, and only over a live table:
+    // with no table there is nothing pinned to give the CPU.
+    {
+        CpuSplit c = cpu;
+        if (!live) {
+            c.cap_rows = 0;
+        }
+        cpu_split_decide(c, n_experts, sh_counts, sh_cls, sh_marked, sh_cpu, sh_cpu_split);
+    }
+
     // ── P2: offsets, tile order, remote list (one packed scan), summary ──
     const bool in = tid < n_experts;
     const int32_t cnt = in ? sh_counts[tid] : 0;
     const bool routed = cnt > 0;
     const uint8_t cls = routed && live ? sh_cls[tid] : (uint8_t)CLS_VRAM;
     const int rank = class_rank(cls);
-    const int32_t n_tiles = (cnt + tile_w - 1) / tile_w;
-    const bool is_remote = routed && cls != CLS_VRAM;
+    // A CPU expert keeps its rows but emits no tiles: no GEMM computes it.
+    const bool is_cpu = in && sh_cpu[tid];
+    const int32_t n_tiles = is_cpu ? 0 : (cnt + tile_w - 1) / tile_w;
+    const bool is_remote = routed && cls != CLS_VRAM && !is_cpu;
     const unsigned long long packed =
         ((unsigned long long)cnt << (NARROW_LANE_BITS * NL_OFF)) |
         ((unsigned long long)n_tiles << (NARROW_LANE_BITS * (NL_TILES + rank))) |
@@ -233,6 +250,7 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
     // their mapped writes delayed it (decode-16, live: 6.7 → 7.4 µs).
     if (summary != nullptr && in) {
         summary[tid] = (uint32_t)cnt
+                     | ((uint32_t)is_cpu << SUMMARY_CPU_BIT)
                      | ((uint32_t)(cls == CLS_PINNED) << 29)
                      | ((uint32_t)(cls == CLS_COLD) << 30)
                      | ((uint32_t)sh_dec[tid] << 31);
@@ -244,6 +262,10 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
         header[3] = remote != nullptr ? r_pinned + r_cold : 0;
         header[4] = t_pinned + t_cold;
     }
+    // The CPU experts' work slot, ring rows and header words.
+    cpu_publish(cpu_out, n_experts, tid, cnt, (int32_t)narrow_lane(before, NL_OFF), is_cpu, snap,
+                row, summary_seq, header, sh_cpu_split);
+    cpu_inputs(cpu_out, n_tokens, tok_ids, header, sh_cpu_split);
 
     // ── The promotion walk, then the summary's sequence word ──
     // With no remote expert routed and no read-ahead there is nothing to claim,
@@ -271,14 +293,16 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
                 claiming += !sh_marked[x] && sh_dec[x];
             }
         }
-        promotion_walk(n_remote, claiming, sh_remote_e, sh_marked, sh_dec, sh_counts, gate_row,
+        promotion_walk(n_remote, r_pinned, claiming, sh_remote_e, sh_marked, sh_dec, sh_counts, gate_row,
                        table_plane, n_experts, row, summary_seq, promo_slots, promo_log, promo_head,
                        promo_tail, promo_cap, promo_marks, promo_reserve, promo_sweep, promo_victims,
                        promo_retarget, remote_dst,
                        ReadAhead{ahead_window, ahead_depth, ahead_n, ahead_list, ahead_src, ahead_cap,
-                                 rows, row_layout, ahead_items, ahead_done},
+                                 rows, row_layout, ahead_items, ahead_done, ahead_predict != 0},
                        ZoneRanges{pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi, slot_owner,
-                                  zone_end, zone_slot_bytes, zone_slots});
+                                  zone_end, zone_slot_bytes, zone_slots},
+                       CpuCarry{sh_cpu_split.order, sh_cpu_split.take, sh_cls, cpu.promote,
+                                cpu_out.carry});
     }
     // The sequence word is the host's signal: it lands only after every summary
     // word, the promotion log and its head are visible system-wide.

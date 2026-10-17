@@ -46,7 +46,7 @@
 
 use candle::quantized::cuda::PromoRing;
 use candle::Result;
-use candle_kernels::simple::moe_bucketize::{AHEAD_FLAG, PROMO_EMPTY, PROMO_SKIP};
+use candle_kernels::simple::moe_bucketize::{AHEAD_FLAG, CARRY_FLAG, PROMO_EMPTY, PROMO_SKIP};
 use cudarc::driver::sys;
 use std::sync::atomic::{fence, Ordering};
 
@@ -97,18 +97,29 @@ pub(crate) struct Logged {
     pub(crate) word: u32,
     pub(crate) row: usize,
     pub(crate) expert: usize,
+    /// Copied and published by the gate launch's workers — a prediction read
+    /// ahead, or a carry.
     pub(crate) ahead: bool,
+    /// Of `ahead`, a carry: an expert the previous launch's CPU pool served,
+    /// promoted behind it, not a prediction.
+    pub(crate) carry: bool,
 }
 
 impl Logged {
     fn decode(v: u64) -> Self {
         let x = (v & 0xffff) as u32;
         let ahead = x != PROMO_SKIP && x & AHEAD_FLAG != 0;
+        let carry = ahead && x & CARRY_FLAG != 0;
         Self {
             word: (v >> 32) as u32,
             row: ((v >> 16) & 0xffff) as usize,
-            expert: if ahead { x & !AHEAD_FLAG } else { x } as usize,
+            expert: if ahead {
+                x & !(AHEAD_FLAG | CARRY_FLAG)
+            } else {
+                x
+            } as usize,
             ahead,
+            carry,
         }
     }
 
@@ -357,8 +368,9 @@ mod tests {
     use super::*;
 
     /// A log entry carries the word, the row and the expert; a read-ahead
-    /// claim's expert field carries `AHEAD_FLAG` over the expert, and a skip's
-    /// `PROMO_SKIP` — whose bits include the flag's — is no read-ahead.
+    /// claim's expert field carries `AHEAD_FLAG` over the expert, a carry's
+    /// `CARRY_FLAG` with it, and a skip's `PROMO_SKIP` — whose bits include
+    /// both flags' — is neither.
     #[test]
     fn a_log_entry_decodes() {
         let v = (0xdead_beefu64 << 32) | (39 << 16) | 255;
@@ -368,7 +380,8 @@ mod tests {
                 word: 0xdead_beef,
                 row: 39,
                 expert: 255,
-                ahead: false
+                ahead: false,
+                carry: false,
             }
         );
         let a = (7u64 << 32) | (41 << 16) | AHEAD_FLAG as u64 | 300;
@@ -378,11 +391,23 @@ mod tests {
                 word: 7,
                 row: 41,
                 expert: 300,
-                ahead: true
+                ahead: true,
+                carry: false,
+            }
+        );
+        let c = (8u64 << 32) | (40 << 16) | (AHEAD_FLAG | CARRY_FLAG) as u64 | 511;
+        assert_eq!(
+            Logged::decode(c),
+            Logged {
+                word: 8,
+                row: 40,
+                expert: 511,
+                ahead: true,
+                carry: true,
             }
         );
         let skip = Logged::decode((7u64 << 32) | (2 << 16) | PROMO_SKIP as u64);
-        assert!(skip.skipped() && !skip.ahead);
+        assert!(skip.skipped() && !skip.ahead && !skip.carry);
     }
 
     /// The read-ahead words follow the retarget entries: window, depth, the

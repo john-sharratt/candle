@@ -50,6 +50,15 @@ unsafe impl Sync for VxSegment {}
 /// - `ahead`, `ahead_done` — the gate launch's read-ahead items and their piece
 ///   counters (`moe_read_ahead.cuh`), 0 on the up and down launches;
 /// - `spin_limit_ns` — the backstop on any single wait;
+/// - `cpu_done`, `cpu_seq`, `cpu_rows`, `cpu_dst_row`, `cpu_alive`,
+///   `cpu_tight_ns`, `cpu_wait` — the down launch only: the CPU class's results
+///   (`moe_bucketize_cpu.cuh`), which the workers' CPU items pull into the rows
+///   bucketize left the CPU experts once the pool's mapped `done` word reads
+///   `cpu_seq`, raising the mapped `cpu_wait` word to the nanoseconds they
+///   waited; 0 on every other launch;
+/// - `cold_wait` — the gate launch only: a mapped `{ns, count}` pair the
+///   worker holding a cold expert's first row tile adds its wait for the
+///   publish to; 0 on the up and down launches;
 /// - `workers` — the worker-block count;
 /// - `row` — the launch's MoE row, which a fault names.
 #[repr(C)]
@@ -69,8 +78,43 @@ pub struct MoeLive {
     pub ahead: u64,
     pub ahead_done: u64,
     pub spin_limit_ns: u64,
+    pub cpu_done: u64,
+    pub cpu_seq: u64,
+    pub cpu_rows: u64,
+    pub cpu_dst_row: u64,
+    pub cpu_alive: u64,
+    pub cpu_tight_ns: u64,
+    pub cpu_wait: u64,
+    pub cold_wait: u64,
     pub workers: i32,
     pub row: i32,
+}
+
+/// Result rows one CPU item of the down launch pulls, mirrored from
+/// `MOE_LIVE_CPU_ROWS` in `kernel.cuh`.
+pub const MOE_LIVE_CPU_ROWS: usize = 16;
+/// The expert a CPU item's fault names, mirrored from `MOE_FAULT_CPU_EXPERT`:
+/// the pool's results never landed.
+pub const MOE_FAULT_CPU_EXPERT: u64 = 0xffff;
+
+#[cfg(test)]
+mod moe_live_layout {
+    use super::MoeLive;
+    use std::mem::{offset_of, size_of};
+
+    /// The Rust struct is `moe_live.cuh`'s byte for byte: twenty-two 8-byte
+    /// fields, then the two `i32`s.
+    #[test]
+    fn moe_live_layout() {
+        assert_eq!(offset_of!(MoeLive, spin_limit_ns), 13 * 8);
+        assert_eq!(offset_of!(MoeLive, cpu_done), 14 * 8);
+        assert_eq!(offset_of!(MoeLive, cpu_tight_ns), 19 * 8);
+        assert_eq!(offset_of!(MoeLive, cpu_wait), 20 * 8);
+        assert_eq!(offset_of!(MoeLive, cold_wait), 21 * 8);
+        assert_eq!(offset_of!(MoeLive, workers), 22 * 8);
+        assert_eq!(offset_of!(MoeLive, row), 22 * 8 + 4);
+        assert_eq!(size_of::<MoeLive>(), 23 * 8);
+    }
 }
 
 /// The fault word's fields (`MoeLive::fault`), mirrored from `kernel.cuh`:

@@ -545,9 +545,9 @@ impl BatchedAttentionLayer for LayerWeights {
 
 pub struct ModelWeights {
     /// Resident embedding table. `None` when [`Self::host_embedding`] serves it
-    /// from the mmap instead — exactly one of the two is populated.
+    /// from pinned host memory instead — exactly one of the two is populated.
     embeddings: Option<Embedding>,
-    /// Embedding table left in the GGUF mmap and gathered per forward, chosen at
+    /// Embedding table copied into pinned host memory and gathered per forward, chosen at
     /// load when the table is large relative to the card (see
     /// [`crate::models::host_embedding`]).
     #[cfg(feature = "cuda")]
@@ -960,8 +960,8 @@ impl ModelWeights {
 
         // Embeddings. The table is the worst VRAM-per-access ratio in the model —
         // one row read per token, but the whole thing resident and dequantized —
-        // so on a card where it is a meaningful fraction of capacity it stays in
-        // the mmap and is gathered per forward instead. See
+        // so on a card where it is a meaningful fraction of capacity it is copied
+        // into pinned host memory and gathered per forward instead. See
         // `crate::models::host_embedding`.
         #[cfg(feature = "cuda")]
         let (embeddings, host_embedding, embed_dense_bytes) = {
@@ -1016,7 +1016,7 @@ impl ModelWeights {
                         target: "candle_transformers::quantized_qwen3_moe",
                         resident_mib = resident_bytes >> 20,
                         capacity_mib = capacity >> 20,
-                        "embedding served from the mmap; VRAM reclaimed"
+                        "embedding served from pinned host memory; VRAM reclaimed"
                     );
                     (None, Some(h), 0usize)
                 }
@@ -1352,9 +1352,13 @@ impl ModelWeights {
                 progress,
                 int8mode,
                 mapped_bytes: pack.gguf_len(),
-                // The embedding is copied into pinned host memory and every
-                // other tensor of the mapping is paged on demand.
-                offloaded_bytes: 0,
+                // Nothing in the mapping is read from the host after load: the
+                // dense tensors above are resident on the card, and the
+                // embedding is either copied into its own pinned allocation or
+                // dequantized into a host tensor of its own. Counted as live
+                // weight, the whole GGUF part would be reserved as page cache
+                // out of the warm tier's RAM.
+                offloaded_bytes: pack.gguf_len(),
             })?;
             // Record the resident expert footprint with the governor. Reporting
             // only — nothing sizes itself from this any more.

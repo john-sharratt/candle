@@ -271,12 +271,21 @@ impl LiveTable {
         fence(Ordering::SeqCst);
     }
 
-    /// The current value of one entry.
-    #[cfg(test)]
+    /// The current value of one entry. Read after a gate entry, an up or down
+    /// entry is the one published with it (`publish`'s order).
     pub(crate) fn entry(&self, proj: Proj, row: usize, expert: usize) -> u64 {
         let at = self.index(proj, row, expert);
         // SAFETY: as `store`.
-        unsafe { std::ptr::read_volatile(self.host().add(at)) }
+        let v = unsafe { std::ptr::read_volatile(self.host().add(at)) };
+        fence(Ordering::Acquire);
+        v
+    }
+
+    /// Host address of one entry: what a host thread waiting on it monitors.
+    pub(crate) fn entry_ptr(&self, proj: Proj, row: usize, expert: usize) -> *const u64 {
+        let at = self.index(proj, row, expert);
+        // SAFETY: in bounds by `index`.
+        unsafe { self.host().add(at) }
     }
 
     /// Device address of `row`'s entries of `proj`.

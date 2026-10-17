@@ -629,9 +629,14 @@ mod tests {
         // experts actually have. The section starts sector-aligned, so every
         // `base + k × stride` is a legal direct-I/O offset.
         let mut head = [0u8; 32];
-        let mut f = File::open(path).unwrap();
-        f.seek(SeekFrom::Start(base)).unwrap();
-        f.read_exact(&mut head).unwrap();
+        // Closed before the sweep: a buffered handle that has read leaves a
+        // cached view open, and Windows then serves the unbuffered reads one at
+        // a time.
+        {
+            let mut f = File::open(path).unwrap();
+            f.seek(SeekFrom::Start(base)).unwrap();
+            f.read_exact(&mut head).unwrap();
+        }
         assert_eq!(
             &head[..8],
             b"CNDLXPK2",

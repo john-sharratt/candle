@@ -50,9 +50,14 @@ tokenizers = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 ureq = { version = "2.12", default-features = false, features = ["native-tls"], optional = true }
 
-# The CPU expert pool's core topology and pinning (`expert_lre::cpu_pool`):
-# `GetSystemCpuSetInformation` names physical and performance cores, and
-# `SetThreadSelectedCpuSets` keeps each worker on one.
+# The CPU expert pool's thread pinning on Linux (`expert_lre::cpu_pool::pin`):
+# `sched_setaffinity` keeps each worker on one core.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+# The CPU expert pool's core topology and pinning on Windows
+# (`expert_lre::cpu_pool`): `GetSystemCpuSetInformation` names physical and
+# performance cores, and `SetThreadSelectedCpuSets` keeps each worker on one.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -121,6 +126,14 @@ hub = ["dep:hf-hub", "dep:ureq"]
 # binary it did not need to build reads as a red suite.
 #
 # Keep this list in step with the `#![cfg(feature = "cuda")]` files in `tests/`.
+[[test]]
+name = "cpu_expert_gate"
+required-features = ["cuda"]
+
+[[test]]
+name = "cpu_expert_speed"
+required-features = ["cuda"]
+
 [[test]]
 name = "decode_layout_exact"
 required-features = ["cuda"]

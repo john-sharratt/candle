@@ -36,13 +36,14 @@
 //! reading the layers ahead while a layer's workers wait on its own cold set.
 //! Its requests come from two places: the pipeline thread's predictions for
 //! the rows within two (`blend`'s list, router votes, Markov and recent
-//! routing ranked together), and the stager's own lookahead — when it begins
-//! a row, the next rows' highest-scored
-//! experts in its pad score table, which is what recent passes routed there. A
+//! routing ranked together), and, for a wide (prefill) row, the stager's own
+//! lookahead — when it begins the row, the next rows' highest-scored experts
+//! in its pad score table, which is what recent passes routed there. A decode
+//! row leaves the coming rows to the pipeline's predictions (`begin_row`). A
 //! lookahead read may only evict a slot scoring below the candidate. A
 //! speculative read never delays a demand read: the readers take demand jobs
 //! first (`read_queue`), at most [`SPEC_IN_FLIGHT`] speculative reads are out
-//! at once so half the readers are always free for demand, and a speculative
+//! at once so three readers in four are always free for demand, and a speculative
 //! read the wave catches up with before it starts is promoted to demand. Its
 //! victims are any held slot but the demand row's routed experts, a pinned
 //! one, or a slot staged ahead and not yet reached (`pad`'s fresh slots) —
@@ -54,6 +55,7 @@
 //! which lists the expert from the pad for the device's read-ahead.
 
 use super::cache::pinned_layer_count;
+use super::cpu_pool::backoff::{Backoff, COOL_DOWN, INTER_LAYER_SPINS, LOW_POWER_CYCLES};
 use super::dispatch::{AbortWord, SummaryRing, SPIN_LIMIT_NS};
 use super::pack::ExpertPack;
 use super::pad::{Fresh, Pad, PadBook, PadSlot};
@@ -61,30 +63,33 @@ use super::read_latency::ReadSource;
 use super::read_queue::{Priority, ReadQueue};
 use super::reclaim::ReclaimClock;
 use super::residency::Residency;
+use super::resident::{plan, Bands, HostBacked, HostScores};
 use super::types::PipelineStats;
 use super::warm_tier::WarmTier;
 use candle::direct_io::AlignedScratch;
 use candle::Result;
+use candle_kernels::simple::moe_bucketize::{SUMMARY_COUNT_MASK, SUMMARY_CPU_BIT};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ptr::read_volatile;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Reader threads, one pack file handle each: the queue depth the drive sees.
 /// One whole-expert read already saturates the dev-box drive (~3 GB/s at
 /// 819 KB, §0.10.2); eight covers smaller records and faster drives.
 pub(crate) const NVME_QD: usize = 8;
 
-/// Speculative reads out at once: half the readers, so a demand read never
-/// waits for more than the reads already in flight on the other half. Three
-/// quarters measured ~4% slower on Flash-Next decode (RTX 4090 Laptop): the
-/// extra speculative reads lengthened the demand reads queued behind them.
-/// One measured worse the other way, though only 12–32% of speculative reads
-/// are then routed: the mean pack read fell ~1.04 → 0.76 ms, but the reads
-/// that do land are pack misses that never happen, and without them decode's
-/// pack misses rose 25–54% (×1–×8) and its pack-miss time with them (×8:
-/// ~15.9 → 20.5 s per interval).
-const SPEC_IN_FLIGHT: usize = NVME_QD / 2;
+/// Speculative reads out at once: a quarter of the readers, so a demand read
+/// shares the drive with at most two of them. Half the readers measured the
+/// same decode all-GPU and ~2% slower with the CPU class taking cold experts
+/// (Flash-Next, RTX 4090 Laptop, 2026-10-17: mean pack read 1.15 → 0.90 ms),
+/// whose pool waits on every demand read; three quarters ~4% slower than
+/// half: the extra speculative reads lengthened the demand reads queued
+/// behind them. One measured worse the other way: the mean pack read did not
+/// fall further, and the reads that land ahead are pack misses that never
+/// happen — without them decode's cold misses rose ~15–25%.
+const SPEC_IN_FLIGHT: usize = NVME_QD / 4;
 
 /// Adjacent pack records a reader serves in one request (≈ 15 MiB at the
 /// Q3_KO rung's 1.9 MiB stride): a wide prefill's cold set, queued in expert
@@ -94,6 +99,11 @@ const SPEC_IN_FLIGHT: usize = NVME_QD / 2;
 /// it was worth 12%; with the reads overlapped the drive is full at eight
 /// single-record requests, and runs only trim the request count.)
 const RUN_RECORDS: usize = 8;
+
+/// The stager's low-power wait for a landing past its hot spins: `tpause` for
+/// ~2 µs — a landing comes over the channel, which no line watches, so the
+/// wait is short against a ~0.9 ms read.
+const LANDING_PAUSE_CYCLES: u64 = 6_000;
 
 /// Rows ahead of the one just begun that the stager's lookahead stages for.
 const LOOKAHEAD_ROWS: usize = 2;
@@ -107,8 +117,11 @@ const LOOKAHEAD_PER_ROW: usize = 32;
 /// expert decode routed there within the last four passes.
 const LOOKAHEAD_MIN_SCORE: f32 = 0.5;
 
-/// The summary bits the stager reads.
-const SUMMARY_COUNT: u32 = 0x1fff_ffff;
+/// The summary bits the stager reads. The count is the field below the CPU
+/// class's bit (`moe_bucketize_cpu.cuh`).
+const SUMMARY_COUNT: u32 = SUMMARY_COUNT_MASK;
+const SUMMARY_CPU: u32 = 1 << SUMMARY_CPU_BIT;
+const SUMMARY_PINNED: u32 = 1 << 29;
 const SUMMARY_COLD: u32 = 1 << 30;
 const SUMMARY_DECODE: u32 = 1 << 31;
 
@@ -194,6 +207,14 @@ pub(crate) struct StagerCtx {
     pub(crate) stats: Arc<Mutex<PipelineStats>>,
     pub(crate) rows: usize,
     pub(crate) n_experts: usize,
+    /// The startup fill's residents, `(pad slot, row, expert)`: the pad's
+    /// resident region as the fill left it.
+    pub(crate) residents: Vec<(usize, usize, usize)>,
+    /// How many pad slots may be resident: the resident region's size.
+    pub(crate) resident_capacity: usize,
+    /// Which experts hold a resident slot, for the VRAM eviction's cost
+    /// classes; the stager keeps it current as it relabels.
+    pub(crate) host_backed: Arc<HostBacked>,
 }
 
 struct Stager {
@@ -222,6 +243,21 @@ struct Stager {
     wide: bool,
     last_row: Option<usize>,
     disconnected: bool,
+    /// Pad pins held for the CPU pool's experts, `(key, row, expert)` in key
+    /// order: the next invocation may copy each from its pad slot into VRAM
+    /// (the carry, `moe_bucketize_live.cuh`), so it is not evicted until
+    /// every invocation up to `key`, that one, is done.
+    carry_pins: VecDeque<(u64, usize, usize)>,
+    /// How the loop waits when a pass made no progress (`cpu_pool::backoff`).
+    backoff: Backoff,
+    /// When the stager last heard of inference — a routed row, a prediction,
+    /// a landing. Inside the cool-down after it, a pass that made no progress
+    /// waits in low power; past it, asleep on the channel.
+    active: Instant,
+    /// Decode's host accesses, the resident set's policy input (`resident`).
+    host: HostScores,
+    /// How many residents each layer may hold, around the startup fill's.
+    bands: Bands,
 }
 
 /// The share of a layer's experts a row must route to count as wide
@@ -234,8 +270,8 @@ const WIDE_ROW_SHARE: usize = 4;
 ///
 /// A decode row routes a few experts per token; a prefill row of a few hundred
 /// tokens or more routes about half its layer. The second's staging keeps the
-/// drive busy through the layer; the first keeps half the readers free for its
-/// demand.
+/// drive busy through the layer; the first keeps three readers in four free
+/// for its demand.
 fn wide_row(routed: usize, n_experts: usize) -> bool {
     n_experts > 0 && routed * WIDE_ROW_SHARE >= n_experts
 }
@@ -293,7 +329,13 @@ pub(crate) fn spawn_stager(
             .spawn(move || reader(handle, &jobs, &done, &pack, &warm, &pad))
             .map_err(|e| candle::Error::Msg(format!("expert stager: reader spawn: {e}")))?;
     }
-    let book = PadBook::new(ctx.pad.num_slots(), ctx.rows, ctx.n_experts);
+    let book = PadBook::new(ctx.pad.num_slots(), ctx.rows, ctx.n_experts, &ctx.residents);
+    let host = HostScores::new(ctx.rows, ctx.n_experts);
+    let mut startup_counts = vec![0usize; ctx.rows];
+    for &(_, row, _) in &ctx.residents {
+        startup_counts[row] += 1;
+    }
+    let bands = Bands::around(&startup_counts);
     let mut s = Stager {
         ctx,
         book,
@@ -310,6 +352,11 @@ pub(crate) fn spawn_stager(
         wide: false,
         last_row: None,
         disconnected: false,
+        carry_pins: VecDeque::new(),
+        backoff: Backoff::new(INTER_LAYER_SPINS),
+        active: Instant::now(),
+        host,
+        bands,
     };
     std::thread::Builder::new()
         .name("expert-stager".into())
@@ -465,15 +512,57 @@ impl Stager {
                     Ok(m) => self.handle(m)?,
                     Err(_) => self.disconnected = true,
                 }
-            } else if !progressed {
-                std::thread::yield_now();
+            } else if progressed {
+                self.backoff.reset();
+            } else {
+                self.wait_step()?;
+            }
+        }
+    }
+
+    /// One wait after a pass that made no progress, the way the pool's threads
+    /// wait (`cpu_pool::backoff`): hot spins first, then low power —
+    /// - with the next routed row's summary still to come, `umwait` on its
+    ///   sequence word, which the device's bucketize stores: the read it
+    ///   starts is on the layer's critical path, so the store wakes the wait
+    ///   at once;
+    /// - otherwise — reads in flight, whose landings come over the channel —
+    ///   `tpause` for ~2 µs, then the channel again;
+    /// - and once inference has been quiet for the cool-down, asleep on the
+    ///   channel, a millisecond at a time.
+    fn wait_step(&mut self) -> Result<()> {
+        if self.demand.is_none() {
+            if let Some(&(_, slot, word, _)) = self.routed.front() {
+                let p = self.ctx.ring.word_ptr(slot);
+                // SAFETY: the mapped ring outlives the stager; the device
+                // writes the word.
+                let seen = unsafe { read_volatile(p) };
+                if seen != word {
+                    // SAFETY: as above.
+                    unsafe { self.backoff.wait_u32(p, seen, LOW_POWER_CYCLES) };
+                }
+                return Ok(());
+            }
+        }
+        if self.active.elapsed() < COOL_DOWN {
+            self.backoff.pause(LANDING_PAUSE_CYCLES);
+            return Ok(());
+        }
+        match self.rx.recv_timeout(Duration::from_millis(1)) {
+            Ok(m) => self.handle(m),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.disconnected = true;
+                Ok(())
             }
         }
     }
 
     fn handle(&mut self, m: StagerMsg) -> Result<()> {
-        // Any message can change what the speculative queue may take.
+        // Any message can change what the speculative queue may take, and
+        // every one is inference running.
         self.spec_stalled = false;
+        self.active = Instant::now();
         match m {
             StagerMsg::Routed {
                 row,
@@ -544,6 +633,63 @@ impl Stager {
         Ok(())
     }
 
+    /// Re-choose the resident set at a pass boundary (`resident::plan`): a
+    /// relabel each, no bytes moved — a promoted slot already holds its
+    /// expert, a demoted one keeps its own until churn evicts it.
+    fn rebalance(&mut self) -> Result<()> {
+        let (mut churn, mut residents) = (Vec::new(), Vec::new());
+        for (slot, row, expert, resident) in self.book.held() {
+            let s = (slot, row, self.host.score(row, expert));
+            if resident {
+                residents.push(s);
+            } else {
+                churn.push(s);
+            }
+        }
+        let relabels = plan(churn, residents, self.ctx.resident_capacity, &self.bands);
+        if relabels.is_empty() {
+            return Ok(());
+        }
+        // A demoted expert stays host-backed if the warm tier also holds a
+        // pageable copy of it: its reload needs no pack read either way.
+        let residency = self.ctx.residency.clone();
+        let places = residency
+            .lock()
+            .map_err(|_| candle::Error::Msg("expert stager: residency poisoned".into()))?;
+        let label = |book: &mut PadBook, slot: usize, resident: bool, backed: &HostBacked| {
+            book.set_resident(slot, resident);
+            if let PadSlot::Held(row, expert) = book.state(slot) {
+                backed.set(
+                    row,
+                    expert,
+                    resident || places.place(row, expert).warm.is_some(),
+                );
+            }
+        };
+        let (mut promoted, mut demoted) = (0usize, 0usize);
+        for r in &relabels {
+            if let Some(d) = r.demote {
+                label(&mut self.book, d, false, &self.ctx.host_backed);
+                demoted += 1;
+            }
+            label(&mut self.book, r.promote, true, &self.ctx.host_backed);
+            promoted += 1;
+        }
+        drop(places);
+        let mut rows = vec![0usize; self.ctx.rows];
+        for (_, row, _, resident) in self.book.held() {
+            if resident {
+                rows[row] += 1;
+            }
+        }
+        if let Ok(mut s) = self.ctx.stats.lock() {
+            s.resident_promotions += promoted;
+            s.resident_demotions += demoted;
+            s.resident_rows = rows;
+        }
+        Ok(())
+    }
+
     fn residency(&self) -> Result<std::sync::MutexGuard<'_, Residency>> {
         self.ctx
             .residency
@@ -558,22 +704,41 @@ impl Stager {
         // not rewrite the slot until `consumed` passes this ticket.
         let summary: Vec<u32> = unsafe { self.ctx.ring.read(slot) }.to_vec();
         self.ctx.consumed.store(ticket, Ordering::Release);
-        if self.last_row.is_some_and(|l| row <= l) {
-            self.book.decay(0.85);
+        if let Some(last) = self.last_row {
+            if row <= last {
+                self.book.decay(0.85);
+            }
+            // A pass boundary — the one place the resident set changes — is a
+            // row before the last. The same row again is not one: the draft
+            // head's repeated steps are one pass to decode's host scores, which
+            // would otherwise age, and relabel, once per draft step.
+            if row < last && self.host.end_pass() {
+                self.rebalance()?;
+            }
         }
         self.last_row = Some(row);
         let mut routed = vec![false; self.ctx.n_experts];
         let mut cold = Vec::new();
+        let mut pooled = Vec::new();
         for (e, &w) in summary.iter().enumerate() {
             if w & SUMMARY_COUNT == 0 {
                 continue;
             }
             routed[e] = true;
-            self.book.credit(row, e, w & SUMMARY_DECODE != 0);
+            let decode = w & SUMMARY_DECODE != 0;
+            self.book.credit(row, e, decode);
+            // Decode reaching the host for it: pinned or cold, not VRAM.
+            if decode && w & (SUMMARY_COLD | SUMMARY_PINNED) != 0 {
+                self.host.credit(row, e);
+            }
             if w & SUMMARY_COLD != 0 {
                 cold.push(e);
             }
+            if w & SUMMARY_CPU != 0 {
+                pooled.push(e);
+            }
         }
+        self.pin_carries(row, ticket, &pooled)?;
         // The wave has reached this row: what was staged ahead for it is no
         // longer ahead, and a prediction for it not yet read is its demand's.
         let hit: Vec<usize> = self
@@ -590,10 +755,17 @@ impl Stager {
         self.spec.retain(|s| s.row != row);
         // By what the row routes, not by what is still cold: staged ahead, a
         // prefill row's cold set shrinks below the mark at ×2, which took its
-        // speculative reads back to half the readers and left ~3,300 of its
+        // speculative reads back to decode's cap and left ~3,300 of its
         // successor's stagings unstarted a config (Flash-Next, 16 GB laptop).
         self.wide = wide_row(routed.iter().filter(|&&r| r).count(), self.ctx.n_experts);
-        self.look_ahead(row);
+        // A decode row's coming rows are predicted from the router look-ahead
+        // (the pipeline's `Stage`): queuing the pad's own scores beside them
+        // put 30–80 unrouted reads a step on the drive ahead of the predicted
+        // ones, and without them Flash-Next decode ran 11% faster all-GPU
+        // (RTX 4090 Laptop, 2026-10-17: 11.5 → 12.8 t/s).
+        if self.wide {
+            self.look_ahead(row);
+        }
         if let Ok(mut s) = self.ctx.stats.lock() {
             s.staged_ahead_routed += hit.len();
             s.staged_predicted_routed += predicted_hits;
@@ -643,6 +815,42 @@ impl Stager {
         }
         if !d.unassigned.is_empty() || !d.pending.is_empty() {
             self.demand = Some(d);
+        }
+        Ok(())
+    }
+
+    /// Pin the pad slots of `pooled` — the experts the CPU pool serves for
+    /// invocation `ticket` of `row` — until the next invocation is done: it may
+    /// copy them into VRAM (the carry), and under the demand rule a pad slot
+    /// its own row does not route could otherwise be overwritten while it
+    /// reads. Every one is pinned, whatever the split's `promote` says, so no
+    /// copy ever runs unpinned; a pin with no copy costs only the slot's
+    /// eviction for one invocation. First releases the pins whose invocation
+    /// is done.
+    ///
+    /// A cold expert is pinned here, at `begin_row`, before its read has
+    /// landed: the pin count is kept per `(row, expert)`, not per slot, so it
+    /// holds whichever pad slot the read lands in from the moment it does.
+    fn pin_carries(&mut self, row: usize, ticket: u64, pooled: &[usize]) -> Result<()> {
+        let clock = &self.ctx.clock;
+        let done = self
+            .carry_pins
+            .iter()
+            .take_while(|&&(key, _, _)| clock.reclaimable(key))
+            .count();
+        if done == 0 && pooled.is_empty() {
+            return Ok(());
+        }
+        let residency = self.ctx.residency.clone();
+        let mut r = residency
+            .lock()
+            .map_err(|_| candle::Error::Msg("expert stager: residency poisoned".into()))?;
+        for (_, pr, pe) in self.carry_pins.drain(..done) {
+            r.pin_pad(pr, pe, -1);
+        }
+        for &e in pooled {
+            r.pin_pad(row, e, 1);
+            self.carry_pins.push_back((ticket + 1, row, e));
         }
         Ok(())
     }
@@ -832,13 +1040,13 @@ impl Stager {
     /// the pack.
     fn source(&self, row: usize, expert: usize) -> Result<Source> {
         Ok(match self.residency()?.place(row, expert).warm {
-            Some((ws, None)) => {
+            Some(ws) => {
                 if let Ok(mut s) = self.ctx.stats.lock() {
                     s.staged_paged += 1;
                 }
                 Source::Warm(ws)
             }
-            _ => Source::Pack { row, expert },
+            None => Source::Pack { row, expert },
         })
     }
 
@@ -857,7 +1065,7 @@ impl Stager {
         let mut progressed = false;
         // A wide row's read-ahead is the next layer whole, and the readers
         // still take demand jobs first, so it may use every reader; decode's
-        // scored lookahead keeps half of them free for demand.
+        // predictions keep three in four free for demand.
         let cap = if self.wide { NVME_QD } else { SPEC_IN_FLIGHT };
         while self.spec_loads.len() < cap {
             let Some(&SpecRead {

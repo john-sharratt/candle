@@ -242,6 +242,9 @@ async fn serve_tenants(
         .map(|t| (t.name(), t.substrate_dir()))
         .collect();
     check_substrates(&substrates)?;
+    // Before any tenant starts the engine: the expert cache reads it at load
+    // to decide whether to start the CPU pool.
+    cfg.args.expert_split.apply();
     let listen = cfg.args.listen()?;
     let uis: Vec<(&'static str, TenantUi)> = tenants.iter().map(|t| (t.name(), t.ui())).collect();
     let common = Roots::embedded(&[&COMMON]);

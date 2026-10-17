@@ -131,9 +131,9 @@
 // VRAM expert needs nothing, a cold one is the stager's to stage, and an image
 // the host did not vet may be a pad slot nobody pinned — the stager may evict
 // it while this launch reads it, since the pad's reuse rules guard the pad's
-// own row's invocations, not this one. The host vets a warm slot as it is (it
-// never changes) and a pad slot only once it has pinned it, and keeps the pin
-// until every launch that could read the listing has finished. An unmarked
+// own row's invocations, not this one. Every pinned host copy is a pad slot,
+// so the host vets one only once it has pinned it, and keeps the pin until
+// every launch that could read the listing has finished. An unmarked
 // vetted expert takes the next offer exactly as a miss does (a victim of this row that this
 // launch routes is skipped; a claimed victim is retargeted first), is logged
 // `summary_seq << 32 | t << 16 | AHEAD_FLAG | expert` and marked, and gets an
@@ -164,6 +164,7 @@
 // =============================================================================
 
 #include "moe_bucketize_common.cuh"
+#include "moe_bucketize_cpu.cuh"
 #include "moe_bucketize_live.cuh"
 #include "moe_bucketize_narrow.cuh"
 
@@ -267,7 +268,14 @@ extern "C" __global__ void moe_bucketize_kernel(
     const int32_t rows,
     const uint64_t* row_layout,
     uint64_t* ahead_items,
-    uint32_t* ahead_done)
+    uint32_t* ahead_done,
+    // Non-zero: the predictions are read ahead. Zero with `ahead_items` set:
+    // the items carry only the CPU pool's promotions.
+    const int ahead_predict,
+    // The CPU class (`moe_bucketize_cpu.cuh`): the split's costs, and where
+    // the chosen experts are published. `cpu.cap_rows == 0` turns it off.
+    const CpuSplit cpu,
+    const CpuOut cpu_out)
 {
     const int tid = (int)threadIdx.x;
     const int a_ub = n_tokens * k;
@@ -292,6 +300,9 @@ extern "C" __global__ void moe_bucketize_kernel(
     // Per-warp per-expert counts for the phase-3 stable scatter, flat
     // `[BUCKETIZE_WARPS][n_experts]` with a runtime `n_experts` stride.
     __shared__ int32_t sh_cc[SH_CC_INTS];
+    // Per expert: computed by the host CPU pool (1), and the split's scratch.
+    __shared__ uint8_t sh_cpu[MAX_EXPERTS];
+    __shared__ CpuSplitShared sh_cpu_split;
 
     // ── Phase 1: per-expert histogram (grid-stride, shared-memory atomics) ──
     // Each assignment is read ONCE and atomically bumped into its expert's
@@ -396,9 +407,12 @@ extern "C" __global__ void moe_bucketize_kernel(
         }
         __syncthreads();
     }
+    // ── Phase 1c: the CPU class (`moe_bucketize_cpu.cuh`) ──
+    cpu_split_decide(cpu, n_experts, sh_counts, sh_cls, sh_marked, sh_cpu, sh_cpu_split);
     if (summary != nullptr) {
         for (int e = tid; e < n_experts; e += BUCKETIZE_THREADS) {
             summary[e] = (uint32_t)sh_counts[e]
+                       | ((uint32_t)sh_cpu[e] << SUMMARY_CPU_BIT)
                        | ((uint32_t)(sh_cls[e] == CLS_PINNED) << 29)
                        | ((uint32_t)(sh_cls[e] == CLS_COLD) << 30)
                        | ((uint32_t)sh_dec[e] << 31);
@@ -418,7 +432,9 @@ extern "C" __global__ void moe_bucketize_kernel(
         const int e = tid;
         const bool in = e < n_experts;
         const int32_t cnt = in ? sh_counts[e] : 0;
-        const int32_t n_tiles = (cnt + tile_w - 1) / tile_w;
+        // A CPU expert keeps its rows but emits no tiles: no GEMM computes it.
+        const bool is_cpu = in && sh_cpu[e];
+        const int32_t n_tiles = is_cpu ? 0 : (cnt + tile_w - 1) / tile_w;
         const uint8_t cls = in ? sh_cls[e] : (uint8_t)CLS_VRAM;
         const int rank = class_rank(cls);
 
@@ -448,7 +464,8 @@ extern "C" __global__ void moe_bucketize_kernel(
         // and decides nothing — counting it would let a zone's holes turn a
         // short prompt into a sweep and defer its decode rows' claims.
         const int32_t claiming = __syncthreads_count(
-            promo_slots != nullptr && in && cnt > 0 && cls != CLS_VRAM && !sh_marked[e] && sh_dec[e]);
+            promo_slots != nullptr && in && cnt > 0 && cls != CLS_VRAM && !is_cpu && !sh_marked[e] &&
+            sh_dec[e]);
 
         if (in) {
             sh_offsets[e] = (int32_t)off;
@@ -484,8 +501,8 @@ extern "C" __global__ void moe_bucketize_kernel(
             }
         }
         __syncthreads();
-        // The promotion walk: in list order, each remote expert takes the next
-        // slot while the ring has one. Serial because each grant moves the head
+        // The promotion walk: cold experts first, then pinned, each remote
+        // expert takes the next slot while the ring has one. Serial because each grant moves the head
         // the next one is judged against — but over the remote list alone, which
         // a decode step whose experts are all resident leaves empty. With no
         // remote expert and no read-ahead there is nothing to claim, so the ring
@@ -495,15 +512,27 @@ extern "C" __global__ void moe_bucketize_kernel(
         // is when the layer's link window is free.
         if (tid == 0 && remote != nullptr && remote_dst != nullptr &&
             (r_pinned + r_cold > 0 || ahead_items != nullptr)) {
-            promotion_walk(r_pinned + r_cold, claiming, sh_remote_e, sh_marked, sh_dec, sh_counts,
+            promotion_walk(r_pinned + r_cold, r_pinned, claiming, sh_remote_e, sh_marked, sh_dec, sh_counts,
                            gate_row, table_plane, n_experts, row, summary_seq, promo_slots,
                            promo_log, promo_head, promo_tail, promo_cap, promo_marks,
                            promo_reserve, promo_sweep, promo_victims, promo_retarget, remote_dst,
                            ReadAhead{ahead_window, ahead_depth, ahead_n, ahead_list, ahead_src,
-                                     ahead_cap, rows, row_layout, ahead_items, ahead_done},
+                                     ahead_cap, rows, row_layout, ahead_items, ahead_done,
+                                     ahead_predict != 0},
                            ZoneRanges{pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi, slot_owner,
-                                      zone_end, zone_slot_bytes, zone_slots});
+                                      zone_end, zone_slot_bytes, zone_slots},
+                           CpuCarry{sh_cpu_split.order, sh_cpu_split.take, sh_cls, cpu.promote,
+                                    cpu_out.carry});
         }
+    }
+    __syncthreads();
+    // The CPU experts' work slot, ring rows and header words, now that the
+    // offsets are known.
+    {
+        const int e = tid;
+        const bool in = e < n_experts;
+        cpu_publish(cpu_out, n_experts, e, in ? sh_counts[e] : 0, in ? sh_offsets[e] : 0,
+                    in && sh_cpu[e], snap, row, summary_seq, header, sh_cpu_split);
     }
     __syncthreads();
     // The sequence word is the host's signal: it polls this word, so it lands
@@ -610,7 +639,7 @@ extern "C" __global__ void moe_bucketize_kernel(
     // ── Phase 4: tile tables + padding ──
     for (int e = tid; e < n_experts; e += BUCKETIZE_THREADS) {
         const int32_t count = sh_counts[e];
-        if (count <= 0) {
+        if (count <= 0 || sh_cpu[e]) {
             continue;
         }
         const int32_t base = sh_tile_pref[e];
@@ -709,6 +738,8 @@ extern "C" __global__ void moe_bucketize_kernel(
         perm[j] = 0;
         rw_ids[j] = 0;
     }
+    // The CPU experts' input rows, now that `tok_ids` is final.
+    cpu_inputs(cpu_out, n_tokens, tok_ids, header, sh_cpu_split);
 }
 
 // Single-block launch: one BUCKETIZE_THREADS-wide block over ≤ MAX_EXPERTS
@@ -779,8 +810,31 @@ extern "C" int32_t run_moe_bucketize(
     const void* row_layout,
     void* ahead_items,
     void* ahead_done,
+    int32_t ahead_predict,
+    const CpuSplit* cpu,
+    void* cpu_work,
+    void* cpu_dst_row,
+    void* cpu_carry,
+    void* cpu_tok_first,
+    void* cpu_in_tok,
+    void* cpu_input_map,
     void* stream)
 {
+    // The split's costs come by host pointer, copied into the launch
+    // parameters; null, or `cap_rows == 0`, turns the CPU class off.
+    CpuSplit cpu_split = {};
+    if (cpu != nullptr) {
+        cpu_split = *cpu;
+    }
+    if (cpu_split.cap_rows != 0 && (cpu_dst_row == nullptr || gate_row == nullptr)) {
+        return 1;
+    }
+    if (cpu_input_map != nullptr && (cpu_tok_first == nullptr || cpu_in_tok == nullptr)) {
+        return 1;
+    }
+    const CpuOut cpu_out = {(unsigned char*)cpu_work, (uint32_t*)cpu_dst_row, (uint32_t*)cpu_carry,
+                            (uint32_t*)cpu_tok_first, (uint32_t*)cpu_in_tok,
+                            (uint32_t*)cpu_input_map};
     if (ahead_items != nullptr &&
         (promo_slots == nullptr || remote == nullptr || ahead_window == nullptr ||
          ahead_depth == nullptr || ahead_n == nullptr || ahead_list == nullptr ||
@@ -839,7 +893,7 @@ extern "C" int32_t run_moe_bucketize(
         (const uint32_t*)ahead_window, (const uint32_t*)ahead_depth, (const uint32_t*)ahead_n,
         (const uint32_t*)ahead_list, (const uint64_t*)ahead_src, ahead_cap, rows,
         (const uint64_t*)row_layout,
-        (uint64_t*)ahead_items, (uint32_t*)ahead_done);
+        (uint64_t*)ahead_items, (uint32_t*)ahead_done, ahead_predict, cpu_split, cpu_out);
     cudaError_t launched = cudaPeekAtLastError();
     if (launched != cudaSuccess) {
         fprintf(stderr, "moe_bucketize: launch failed: %s\n", cudaGetErrorString(launched));

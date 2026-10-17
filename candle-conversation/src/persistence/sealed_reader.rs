@@ -36,8 +36,6 @@
 //! gets one that exists. What the error says is not what the caller acts on;
 //! whether the index moved is.
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -47,6 +45,8 @@ use super::record::{decode_record, verify_record_crc};
 use super::segment::SegmentId;
 use super::segmented_log::segment_path;
 use super::{PersistenceError, Result};
+use candle::direct_io::AlignedScratch;
+use candle::direct_write::{Access, UnbufferedFile};
 
 /// The active segment's id, published by the log and read without a lock.
 ///
@@ -89,14 +89,13 @@ impl SealedReader {
     /// active segment — whose records may still be staged in RAM, and which
     /// only the locked path can read.
     ///
-    /// One plain read-only open and one positioned read of exactly the record's
-    /// bytes, then the same decode and CRC check the log's own read applies.
-    /// Not a [`super::log_file::LogFile`]: that opens a pool of direct-I/O
-    /// handles and reads the superblock, none of which a single record read
-    /// uses, and a direct-I/O open fails outright on a filesystem without
-    /// `O_DIRECT` — which would send every read here to the locked path. It
-    /// also leaves the log's own handle pool untouched: the pool is `&mut`
-    /// state behind the mutex this exists to avoid.
+    /// One read-only unbuffered open and one read of the record's whole
+    /// sectors — the page cache keeps nothing of it, as it keeps nothing of
+    /// the log (`log_file`) — then the same decode and CRC check the log's own
+    /// read applies. Not a [`super::log_file::LogFile`]: that opens a pool of
+    /// direct-I/O handles and reads the superblock, none of which a single
+    /// record read uses. It also leaves the log's own handle pool untouched:
+    /// the pool is `&mut` state behind the mutex this exists to avoid.
     pub fn read_record_payload(&self, loc: &RecordLoc) -> Option<Result<Vec<u8>>> {
         if !self.active.is_sealed(loc.segment) {
             return None;
@@ -105,17 +104,18 @@ impl SealedReader {
     }
 
     fn read_sealed(&self, loc: &RecordLoc) -> Result<Vec<u8>> {
-        let mut file = File::open(segment_path(&self.dir, loc.segment))?;
-        file.seek(SeekFrom::Start(loc.offset))?;
+        let file = UnbufferedFile::open(&segment_path(&self.dir, loc.segment), Access::ReadOnly)?;
         let len = loc.record_size as usize;
         let mut bytes = vec![0u8; len];
-        file.read_exact(&mut bytes).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                PersistenceError::Truncated { need: len, have: 0 }
-            } else {
-                PersistenceError::Io(e)
-            }
-        })?;
+        let mut scratch = AlignedScratch::new();
+        file.read_span(loc.offset, &mut bytes, &mut scratch)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    PersistenceError::Truncated { need: len, have: 0 }
+                } else {
+                    PersistenceError::Io(e)
+                }
+            })?;
         let (header, payload, _) = decode_record(&bytes)?;
         verify_record_crc(&header, payload)?;
         Ok(payload.to_vec())

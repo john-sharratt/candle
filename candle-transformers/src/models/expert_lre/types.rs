@@ -36,6 +36,11 @@ pub struct PipelineStats {
     pub worker_pinned: usize,
     /// Misses bucketize found cold — waited on until the stager published them.
     pub worker_cold: usize,
+    /// The device's waits for cold experts' publish (`cold_wait`): nanoseconds
+    /// summed over cold experts, one sample per expert per layer, and how many
+    /// samples. Filled when the stats are read, not by the pipeline thread.
+    pub cold_wait_ns: u64,
+    pub cold_waits: usize,
     /// Experts evicted from VRAM. A retarget, not a copy — every expert has a
     /// copy in the pack, and usually one in pinned memory.
     pub evictions: usize,
@@ -105,6 +110,19 @@ pub struct PipelineStats {
     /// bytes, the link time read-ahead spent.
     pub ahead_claims: usize,
     pub ahead_bytes: usize,
+    /// Carry claims: experts the CPU pool served, promoted behind it by the
+    /// next launch (`moe_bucketize_live.cuh`, THE CARRY). Their bytes are in
+    /// `ahead_bytes` with the read-ahead claims'.
+    pub carry_claims: usize,
+    /// Pad slots relabelled at pass boundaries (`resident`): churn slots made
+    /// resident, and residents made churn.
+    pub resident_promotions: usize,
+    pub resident_demotions: usize,
+    /// **Gauge**: how many pad slots may be resident — the warm tier's pinned
+    /// block.
+    pub resident_capacity: usize,
+    /// **Gauge**: residents per MoE layer, as of the last relabel.
+    pub resident_rows: Vec<usize>,
     /// Of the read-ahead claims, those copied from the pad — staged ahead off
     /// the drive first, then read ahead into VRAM.
     pub ahead_pad_claims: usize,
@@ -260,6 +278,8 @@ impl PipelineStats {
             s.expert_misses = 0;
             s.worker_pinned = 0;
             s.worker_cold = 0;
+            s.cold_wait_ns = 0;
+            s.cold_waits = 0;
             s.evictions = 0;
             s.worker_promotions = 0;
             s.staged_cold = 0;
@@ -280,6 +300,9 @@ impl PipelineStats {
             s.pad_evictions = 0;
             s.ahead_claims = 0;
             s.ahead_bytes = 0;
+            s.carry_claims = 0;
+            s.resident_promotions = 0;
+            s.resident_demotions = 0;
             s.ahead_pad_claims = 0;
             s.predicted_hits = 0;
             s.predicted_total = 0;

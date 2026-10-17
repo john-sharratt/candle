@@ -89,10 +89,49 @@ pub fn performance_cores(cores: &[PhysicalCore]) -> Vec<PhysicalCore> {
         .collect()
 }
 
+/// The cores the pool runs on, in pool order: the performance cores less the
+/// first `reserved` (left to the forward thread and the other threads that must
+/// not be starved, §5.6), then every slower core that shares a last-level
+/// cache with them. A core on a cache of its own — Meteor Lake's low-power
+/// E-cores on the SoC tile — streams DRAM slowly and finishes its task last,
+/// so it is left out.
+pub fn pool_cores(cores: &[PhysicalCore], reserved: usize) -> Vec<PhysicalCore> {
+    let perf = performance_cores(cores);
+    let llcs: Vec<u8> = perf.iter().map(|c| c.llc).collect();
+    let top = perf.first().map(|c| c.efficiency_class);
+    let mut out: Vec<PhysicalCore> = perf.into_iter().skip(reserved).collect();
+    out.extend(
+        cores
+            .iter()
+            .filter(|c| Some(c.efficiency_class) != top && llcs.contains(&c.llc))
+            .cloned(),
+    );
+    out
+}
+
 /// This machine's physical cores, fastest class first.
 #[cfg(windows)]
 pub fn physical_cores() -> std::io::Result<Vec<PhysicalCore>> {
     Ok(group_cores(&windows_cpus::logical_cpus()?))
+}
+
+/// Elsewhere: one core per logical processor, every one of one class — the
+/// CPU-set ids are the logical indices `pin` binds by. SMT siblings are not
+/// told apart here; the dev machines are Windows.
+#[cfg(not(windows))]
+pub fn physical_cores() -> std::io::Result<Vec<PhysicalCore>> {
+    let n = std::thread::available_parallelism()?.get();
+    let cpus: Vec<LogicalCpu> = (0..n)
+        .map(|i| LogicalCpu {
+            cpu_set: i as u32,
+            group: 0,
+            core: (i % 256) as u8,
+            efficiency_class: 0,
+            llc: 0,
+            numa: 0,
+        })
+        .collect();
+    Ok(group_cores(&cpus))
 }
 
 #[cfg(windows)]
@@ -229,6 +268,31 @@ mod tests {
         let cores = group_cores(&cpus);
         assert_eq!(cores[0].cpu_sets, [256, 257]);
         assert_eq!(cores[1].cpu_sets, [258, 259]);
+    }
+
+    /// Meteor Lake H: 6 P-cores and 8 E-cores on one cache, 2 LP E-cores on
+    /// another. With one reserved: 5 P, then the 8 E, never the LP E.
+    #[test]
+    fn pool_cores_skip_reserved_and_foreign_cache() {
+        let mut cpus = Vec::new();
+        for core in 0..6u8 {
+            cpus.push(cpu(256 + core as u32, core, 1));
+        }
+        for core in 6..14u8 {
+            cpus.push(cpu(256 + core as u32, core, 0));
+        }
+        for core in 14..16u8 {
+            let mut c = cpu(256 + core as u32, core, 0);
+            c.llc = 1;
+            cpus.push(c);
+        }
+        let pool = pool_cores(&group_cores(&cpus), 1);
+        assert_eq!(pool.len(), 13);
+        assert!(pool[..5].iter().all(|c| c.efficiency_class == 1));
+        assert_eq!(pool[0].core, 1);
+        assert!(pool[5..]
+            .iter()
+            .all(|c| c.efficiency_class == 0 && c.llc == 0));
     }
 
     #[test]

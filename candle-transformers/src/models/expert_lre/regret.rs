@@ -58,13 +58,12 @@ pub(crate) fn class_index(hit_last: bool, warm: bool) -> usize {
 }
 
 /// Each eviction class's expected miss cost, by class index: its regret rate
-/// times what restoring one costs — `copy` (one image over the link) for a
-/// warm-backed class, `read + copy` (the pack read the layer waits on, then
-/// the copy) for a pack-only one.
-pub(crate) fn eviction_costs(rates: [f64; CLASSES], copy: f64, read: f64) -> [f64; CLASSES] {
+/// times what restoring one costs — `warm` for a warm-backed class, `pack` for
+/// a pack-only one (`cpu_pool::params::SplitParams::refill_secs`).
+pub(crate) fn eviction_costs(rates: [f64; CLASSES], warm: f64, pack: f64) -> [f64; CLASSES] {
     array::from_fn(|c| {
-        let warm = c == class_index(false, true) || c == class_index(true, true);
-        rates[c] * if warm { copy } else { read + copy }
+        let backed = c == class_index(false, true) || c == class_index(true, true);
+        rates[c] * if backed { warm } else { pack }
     })
 }
 
@@ -314,8 +313,8 @@ mod tests {
     }
 
     /// Classes are `hit * 2 + warm`; a warm-backed class costs its rate × the
-    /// copy, a pack-only one its rate × (read + copy). Raw: copy 0.25, read
-    /// 1.75, every rate 0.5.
+    /// warm refill, a pack-only one its rate × the pack refill. Raw: warm 0.25,
+    /// pack 2.0, every rate 0.5.
     #[test]
     fn eviction_costs_price_each_class_by_its_restore() {
         assert_eq!(
@@ -328,7 +327,7 @@ mod tests {
             [0, 1, 2, 3]
         );
         assert_eq!(
-            eviction_costs([0.5; CLASSES], 0.25, 1.75),
+            eviction_costs([0.5; CLASSES], 0.25, 2.0),
             [1.0, 0.125, 1.0, 0.125]
         );
     }

@@ -28,6 +28,7 @@ use std::ffi::c_void;
 use std::hint::spin_loop;
 use std::ptr::{self, null_mut};
 use std::sync::atomic::{fence, Ordering};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -68,19 +69,25 @@ pub enum HostWait {
     Umwait { deadline_cycles: u64 },
 }
 
-/// Whether this CPU has WAITPKG (`umonitor`/`umwait`/`tpause`).
+/// Whether this CPU has WAITPKG (`umonitor`/`umwait`/`tpause`). Asked once:
+/// every wait loop asks it each pass, and `cpuid` serializes the core — and
+/// under a hypervisor, which Windows' virtualization-based security puts
+/// beneath every process, traps to it for a microsecond or more.
 pub fn has_waitpkg() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // CPUID leaf 7 subleaf 0 exists on every x86-64 part that runs this
-        // code; WAITPKG is ECX bit 5.
-        let leaf7 = __cpuid_count(7, 0);
-        leaf7.ecx & (1 << 5) != 0
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
+    static WAITPKG: OnceLock<bool> = OnceLock::new();
+    *WAITPKG.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // CPUID leaf 7 subleaf 0 exists on every x86-64 part that runs
+            // this code; WAITPKG is ECX bit 5.
+            let leaf7 = __cpuid_count(7, 0);
+            leaf7.ecx & (1 << 5) != 0
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
 }
 
 /// The mapped words, one per cache line.
@@ -286,18 +293,34 @@ fn respond(words: &Words, iterations: u32, wait: HostWait) -> Result<Vec<Instant
     Ok(seen)
 }
 
+/// Arms the monitor on `addr`'s cache line.
 #[cfg(target_arch = "x86_64")]
-unsafe fn umonitor(addr: *const u8) {
+pub(crate) unsafe fn umonitor(addr: *const u8) {
     asm!("umonitor {0}", in(reg) addr, options(nostack, preserves_flags));
 }
 
 /// `umwait` in C0.1 (the lighter state, faster to wake) until `cycles` TSC
 /// ticks from now or the monitored line is written.
 #[cfg(target_arch = "x86_64")]
-unsafe fn umwait(cycles: u64) {
+pub(crate) unsafe fn umwait(cycles: u64) {
     let deadline = _rdtsc().wrapping_add(cycles);
     asm!(
         "umwait {ctrl:e}",
+        ctrl = in(reg) 1u32,
+        in("edx") (deadline >> 32) as u32,
+        in("eax") deadline as u32,
+        options(nostack),
+    );
+}
+
+/// `tpause` in C0.1 for `cycles` TSC ticks: a timed wait with nothing to
+/// monitor, at a fraction of a `pause` loop's power and none of its pressure
+/// on the SMT sibling.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn tpause(cycles: u64) {
+    let deadline = _rdtsc().wrapping_add(cycles);
+    asm!(
+        "tpause {ctrl:e}",
         ctrl = in(reg) 1u32,
         in("edx") (deadline >> 32) as u32,
         in("eax") deadline as u32,

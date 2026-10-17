@@ -12,10 +12,11 @@ use cluster::upgrade::kept::KEEP_DEFAULT;
 use serde::Deserialize;
 
 use crate::cluster::ClusterSettings;
+use crate::expert_split::ExpertSplitArgs;
 use crate::server::Listen;
 
 /// The process's flags.
-#[derive(Args, Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Args, Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct HostArgs {
     /// Address to bind the HTTP server to. Loopback by default — reachable from
@@ -109,6 +110,10 @@ pub struct HostArgs {
     #[serde(skip)]
     pub after_pid: Option<u32>,
 
+    /// The CPU expert split (`expert_split:` in the file).
+    #[command(flatten)]
+    pub expert_split: ExpertSplitArgs,
+
     /// Increase log verbosity. -v = DEBUG, -vv = TRACE.
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -131,6 +136,7 @@ impl Default for HostArgs {
             keep_builds: KEEP_DEFAULT,
             upgrade_failed: None,
             after_pid: None,
+            expert_split: ExpertSplitArgs::default(),
             verbose: 0,
         }
     }
@@ -221,6 +227,28 @@ mod tests {
             HostArgs::default()
         );
         assert!(serde_yaml::from_str::<HostArgs>("bind: 1.2.3.4").is_err());
+    }
+
+    /// The split's settings are a section of their own under `host:`, and the
+    /// same flags beside the process's.
+    #[test]
+    fn the_expert_split_is_a_section() {
+        let yaml: HostArgs =
+            serde_yaml::from_str("port: 8081\nexpert_split:\n  enabled: true\n  cpu_scale: 1.5\n")
+                .unwrap();
+        let flags = Cli::try_parse_from([
+            "x",
+            "--port",
+            "8081",
+            "--expert-split",
+            "--expert-split-cpu-scale",
+            "1.5",
+        ])
+        .unwrap()
+        .host;
+        assert_eq!(flags, yaml);
+        assert!(yaml.expert_split.enabled);
+        assert!(serde_yaml::from_str::<HostArgs>("expert_split:\n  bogus: 1\n").is_err());
     }
 
     #[test]
