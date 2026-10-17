@@ -152,6 +152,35 @@ pub fn gguf_header(path: &Path) -> candle::Result<Arc<gguf_file::Content>> {
     Ok(content)
 }
 
+/// The weights' quantization of the GGUF at `path`, as the bits per weight its
+/// `general.file_type` names — `Q3_K_M` is 3, `Q4_K_M` 4, `Q8_0` 8, `F16` and
+/// `BF16` 16, `F32` 32 — or `None` when the header has no file type, or one
+/// this table does not know. What an ingested record says it was computed
+/// under, so a member running a better quantization replaces a duplicate a
+/// lesser one wrote (zend's `branch_ingest::plan`).
+pub fn weight_bits(path: &Path) -> Option<u32> {
+    let ct = gguf_header(path).ok()?;
+    let ftype = ct.metadata.get("general.file_type")?.to_u32().ok()?;
+    file_type_bits(ftype)
+}
+
+/// `general.file_type`'s value (llama.cpp's `LLAMA_FTYPE_*`) as bits per weight.
+pub fn file_type_bits(ftype: u32) -> Option<u32> {
+    Some(match ftype {
+        0 => 32,
+        1 | 32 => 16,
+        24 | 31 | 36 => 1,
+        10 | 19 | 20 | 21 | 28 | 29 | 37 => 2,
+        11 | 12 | 13 | 22 | 23 | 26 | 27 => 3,
+        2 | 3 | 14 | 15 | 25 | 30 => 4,
+        8 | 9 | 16 | 17 => 5,
+        18 => 6,
+        7 => 8,
+        _ => return None,
+    })
+}
+
+
 /// The checkpoint's bytes, mapped rather than read.
 ///
 /// **Why a mapping and not a buffer.** The loader used to `read_exact` each

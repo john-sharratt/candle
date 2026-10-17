@@ -12,6 +12,40 @@ use crate::repo_scan::types::ModuleHint;
 /// ingest succeeds, so a conversation carrying it is committed.
 pub const CONTENT_KEY: &str = "content_key";
 
+/// Conversation metadata: the bits per weight of the model that wrote the unit
+/// — `3` for a Q3 pack, `4` for a Q4 — as `candle_conversation::guest::
+/// checkpoint::weight_bits` reads it. Optional: a unit written before it has
+/// none, and a key held by one such is judged by stamp alone
+/// (`super::plan::plan`).
+pub const QUANT_KEY: &str = "quant";
+
+/// The bits per weight of the model this process ingests with, set once the
+/// model pack is known; `None` before, or when the pack names no file type.
+static MODEL_BITS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+/// Record the model pack's bits per weight, once per process.
+pub fn set_model_bits(bits: Option<u32>) {
+    let _ = MODEL_BITS.set(bits);
+}
+
+/// What a unit ingested now is tagged with under [`QUANT_KEY`].
+pub fn model_bits() -> Option<u32> {
+    MODEL_BITS.get().copied().flatten()
+}
+
+/// Every conversation's [`QUANT_KEY`], read as bits per weight; one that has
+/// none, or one that does not parse, is absent. Takes the substrate lock
+/// itself, so it is called before a read guard is held.
+pub fn quant_tags(
+    engine: &candle_conversation::ConversationEngine,
+) -> std::collections::HashMap<candle_conversation::projection::TimelineId, u32> {
+    engine
+        .conversations_with_metadata_key(QUANT_KEY)
+        .into_iter()
+        .filter_map(|(timeline, bits)| Some((timeline, bits.parse().ok()?)))
+        .collect()
+}
+
 /// Conversation metadata: a file unit's blob id.
 pub const BLOB_KEY: &str = "blob";
 
