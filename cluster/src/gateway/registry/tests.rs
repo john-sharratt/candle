@@ -320,8 +320,17 @@ fn a_syncing_member_is_routed_only_its_own() {
     };
     assert!(asked.contains(&3), "a syncing member is asked: it holds what it wrote cut off");
 
-    assert!(!r.in_sync("zend", 3, &[(1, 400)]), "100 behind node 1");
-    assert!(r.in_sync("zend", 3, &[(1, 500 - SYNC_SLACK)]), "within the slack");
+    let serving: BTreeMap<u64, u64> = [(1, 500), (2, 80)].into_iter().collect();
+    assert!(!Registry::in_sync(3, &[(1, 400), (2, 80)], &serving), "100 behind node 1");
+    assert!(Registry::in_sync(3, &[(1, 500 - SYNC_SLACK), (2, 80)], &serving), "within the slack");
+    assert!(
+        !Registry::in_sync(3, &[(1, 500)], &serving),
+        "nothing applied of node 2, which the serving members hold"
+    );
+    assert!(
+        Registry::in_sync(3, &[(1, 500), (2, 80)], &serving),
+        "a write seen of a member away that nobody serving holds is not waited on"
+    );
     assert!(r.set_syncing("zend", 3, false));
 
     r.set_syncing("zend", 3, true);

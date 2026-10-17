@@ -171,11 +171,14 @@ impl Registry {
         })
     }
 
-    /// Whether `acks` — a member's applied-through per origin — cover every
-    /// other origin's writes this gateway has seen, within [`SYNC_SLACK`].
-    /// Origins whose member has left count: their writes are the group's.
-    pub fn in_sync(&mut self, app: &str, node: u64, acks: &[(u64, u64)]) -> bool {
-        self.app(app).seen.iter().all(|(origin, top)| {
+    /// Whether `acks` — a member's applied-through per origin — cover what the
+    /// members serving now hold (`serving`, the most any of them has applied of
+    /// each origin), within [`SYNC_SLACK`]. Not every write ever seen: one a
+    /// member away wrote cut off is held by nobody serving, and a newcomer
+    /// waiting on it would wait as long as that member is gone, while exactly
+    /// as complete as the members answering.
+    pub fn in_sync(node: u64, acks: &[(u64, u64)], serving: &BTreeMap<u64, u64>) -> bool {
+        serving.iter().all(|(origin, top)| {
             *origin == node
                 || acks
                     .iter()

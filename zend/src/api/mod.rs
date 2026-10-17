@@ -296,7 +296,7 @@ mod tests {
             );
         }
         for (method, path, want) in [
-            ("GET", "/v1/conversations", Dispatch::Any),
+            ("GET", "/v1/conversations", Dispatch::Aggregate(Merge::Union)),
             ("GET", "/v1/models", Dispatch::Any),
             ("GET", "/v1/repo_map", Dispatch::Any),
             ("GET", "/v1/agents", Dispatch::Any),
