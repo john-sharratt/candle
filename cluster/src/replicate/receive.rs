@@ -72,10 +72,11 @@ impl Replicator {
             self.applied_upto.send_if_modified(advance);
             return;
         }
-        let fetched: Vec<(usize, u64)> = records
+        // Per record, in the batch's order: its socket and length when it was
+        // fetched for a catch-up.
+        let fetched: Vec<Option<(usize, u64)>> = records
             .iter()
-            .filter(|(_, w, _)| w.reply_to.is_some())
-            .map(|(c, w, _)| (*c, w.bytes.len() as u64))
+            .map(|(c, w, _)| w.reply_to.map(|_| (*c, w.bytes.len() as u64)))
             .collect();
         let batch: Vec<(u64, u64, Vec<u8>)> = records
             .into_iter()
@@ -96,7 +97,15 @@ impl Replicator {
             s.stats.applied += applied;
             s.stats.refused += taken.len() as u64 - applied;
             s.ack_dirty |= applied > 0;
-            for (c, len) in fetched {
+            // Only a record the store took counts as caught up on. A refused
+            // one is fetched again, and counting each arrival made a catch-up
+            // that refused everything read as one that kept receiving — past
+            // its own total, and enough to hold a trial open (`switch::SYNCING`).
+            let received = fetched
+                .into_iter()
+                .zip(&taken)
+                .filter_map(|(f, took)| f.filter(|_| *took));
+            for (c, len) in received {
                 let now = Instant::now();
                 let ids: Vec<u64> = s
                     .catchups

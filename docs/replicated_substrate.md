@@ -724,7 +724,11 @@ build is certified (§3.8):
      allows, and the one a self-relaunch starts. `keep` reads its stderr, written
      to a file under `keep/state/`, for the line `INFO serving`, which the process
      prints only after it is serving, not while it is booting. The wait is at most
-     10 minutes.
+     10 minutes **from the newest sync data received**: a member catching up
+     (§7.6) prints `INFO syncing …` each time its catch-up count rises, and every
+     such line restarts the 10 minutes. A catch-up is as long as the backlog, not
+     the build, so one that keeps receiving is waited out; one that stalls prints
+     nothing and is rolled back 10 minutes after its last line.
    - **No line in that time, or the process dying,** kills the trial, puts the
      set-aside file back and starts it.
    - **The line** makes the trial the service: the set-aside file is deleted and
@@ -1139,7 +1143,11 @@ Each member has an outbound queue per lane.
   keeps no more than 8 MiB of fetched records outstanding (§7.2), so an answer stays
   under the cap. A frame that would pass the cap anyway is dropped and counted. The
   requester sees the missing records when its `FETCH` ends with `DONE` short of them,
-  and fetches them again.
+  and fetches them again. **A record larger than the cap counts as the cap**: it is
+  fetched alone (§7.2) and crosses an empty lane. The cap bounds the backlog, not
+  what crosses it — weighed by its own length, a record over 16 MiB was dropped on
+  every try and never arrived (npcd on `.5`, 2026-10-17: 6 of 192 records, 24 of
+  21,290 MiB, in ten minutes).
 
 ---
 
@@ -2534,8 +2542,9 @@ nine bytes a record over what travels (§7.2).
 A catch-up uses only spare capacity:
 
 - The requester's fetch window (8 MiB outstanding) keeps the gateway's 16 MiB catch-up
-  cap per member (§4.4) from being reached. A `FETCH` whose `DONE` arrives short of
-  records is fetched again.
+  cap per member (§4.4) from being reached; a record larger than the window is fetched
+  alone, and crosses the gateway on an empty lane. A `FETCH` whose `DONE` arrives
+  short of records is fetched again.
 - The answerer sends catch-up frames only when its ordered lane is empty and its
   socket's unsent bytes are under 1 MiB (§4.2). Live traffic that keeps the socket
   busy therefore holds catch-up back entirely, and a live event queued behind catch-up

@@ -174,6 +174,8 @@ pub struct MemoryStore {
     full: AtomicBool,
     /// The record types it reports holding, set by the tests.
     census: Mutex<Vec<u8>>,
+    /// Origins whose records it refuses, set by the tests.
+    refused_origins: Mutex<Vec<u64>>,
 }
 
 impl MemoryStore {
@@ -193,7 +195,17 @@ impl MemoryStore {
             }),
             full: AtomicBool::new(false),
             census: Mutex::new(Vec::new()),
+            refused_origins: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Refuse every record of `origin` from now on, as a store refuses one it
+    /// cannot take — so it is fetched again.
+    pub fn refuse_origin(&self, origin: u64) {
+        self.refused_origins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(origin);
     }
 
     /// It holds record types `tags` (§3.9).
@@ -347,10 +359,19 @@ impl Store for MemoryStore {
     }
 
     fn apply(&self, records: &[(u64, u64, Vec<u8>)]) -> Applied {
+        let refused = self
+            .refused_origins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut s = self.inner();
         let mut out = Applied::default();
         for (origin, oseq, bytes) in records {
             let (origin, oseq) = (*origin, *oseq);
+            if refused.contains(&origin) {
+                out.taken.push(false);
+                continue;
+            }
             let Some(r) = MemoryRecord::decode(bytes) else {
                 out.taken.push(false);
                 continue;

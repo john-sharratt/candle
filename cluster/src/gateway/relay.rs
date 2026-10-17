@@ -26,7 +26,7 @@ impl Hub {
             let s = &mut *guard;
             match whole.reply_to {
                 Some(to) => match s.sockets.get_mut(&(app.to_string(), to)) {
-                    Some(x) if x.handle.gauges().catchup() + bytes > CATCHUP_CAP => {
+                    Some(x) if over_cap(bytes, x.handle.gauges().catchup()) => {
                         x.dropped += 1;
                         Vec::new()
                     }
@@ -265,7 +265,21 @@ impl Hub {
 /// ending short of a record fetches it again — but a dropped `DONE` leaves its
 /// catch-up waiting until it goes quiet, 30 s on. It is a few bytes.
 fn dropped_at_cap(frame: &Frame, queued: usize) -> bool {
-    !matches!(frame, Frame::Done(_)) && queued + frame.encoded_len() > CATCHUP_CAP
+    !matches!(frame, Frame::Done(_)) && over_cap(frame.encoded_len(), queued)
+}
+
+/// Whether `bytes` more would take a catch-up lane holding `queued` past
+/// [`CATCHUP_CAP`].
+///
+/// **A record larger than the cap counts as the cap**: it goes onto an empty
+/// lane, and waits for one. The cap bounds a lane's backlog, not the size of
+/// what crosses it. Measured against its own length, a record over 16 MiB
+/// was dropped however empty the lane — every try, so it was left after its
+/// third and the next catch-up dropped it again: npcd on `.5`, 2026-10-17,
+/// caught up 6 of 192 records (24 of 21,290 MiB) in ten minutes, every
+/// record it landed a small one.
+fn over_cap(bytes: usize, queued: usize) -> bool {
+    queued + bytes.min(CATCHUP_CAP) > CATCHUP_CAP
 }
 
 #[cfg(test)]
@@ -297,5 +311,18 @@ mod tests {
         assert!(dropped_at_cap(&headers(), CATCHUP_CAP));
         assert!(!dropped_at_cap(&done, CATCHUP_CAP));
         assert!(!dropped_at_cap(&done, usize::MAX / 2));
+    }
+
+    /// **A record over the cap crosses an empty lane and waits for a busy
+    /// one**; one under it fills the lane up to the cap, as before.
+    #[test]
+    fn a_record_larger_than_the_cap_needs_only_an_empty_lane() {
+        let big = 110 << 20;
+        assert!(!over_cap(big, 0));
+        assert!(over_cap(big, 1));
+        assert!(!over_cap(CATCHUP_CAP, 0));
+        assert!(!over_cap(CATCHUP_CAP - 10, 10));
+        assert!(over_cap(CATCHUP_CAP - 10, 11));
+        assert!(!over_cap(1 << 20, CATCHUP_CAP - (1 << 20)));
     }
 }

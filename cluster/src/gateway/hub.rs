@@ -38,7 +38,8 @@
 //! queued still drains. It is ready again once the lane is empty and its
 //! `ACK`s cover every other member's `high_water`. A catch-up frame that would
 //! take a member's catch-up lane past [`CATCHUP_CAP`] is dropped and counted;
-//! the requester fetches again.
+//! the requester fetches again. A record larger than the cap counts as the
+//! cap: it crosses an empty lane.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;

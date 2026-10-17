@@ -283,7 +283,10 @@ fn a_replaced_session_leaving_removes_nothing() {
 #[test]
 fn writes_seen_from_a_member_that_left_are_still_owed() {
     let mut r = Registry::new();
-    assert!(!r.owed("zend", 2, &AppliedSet::default()), "a group's first member is owed nothing");
+    assert!(
+        !r.owed("zend", 2, &AppliedSet::default()),
+        "a group's first member is owed nothing"
+    );
     r.join(member(1, 7));
     r.high_water("zend", 1, 500);
     assert!(r.leave("zend", 1, 7));
@@ -291,5 +294,8 @@ fn writes_seen_from_a_member_that_left_are_still_owed() {
     let mut held = AppliedSet::default();
     held.insert_range(1, 1, 500);
     assert!(!r.owed("zend", 2, &held));
-    assert!(!r.owed("zend", 1, &AppliedSet::default()), "its own writes are not owed to it");
+    assert!(
+        !r.owed("zend", 1, &AppliedSet::default()),
+        "its own writes are not owed to it"
+    );
 }

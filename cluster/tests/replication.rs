@@ -108,6 +108,38 @@ async fn a_compacted_record_is_learned_gone() {
     assert!(b.store.value(b"a/3").is_none());
 }
 
+/// **A refused record is not caught up on.** It arrives, the store refuses
+/// it, and it is fetched again — so no catch-up may count it: counted, a
+/// catch-up that refused everything read as one that kept receiving, past its
+/// own total, and held a deploy's trial open (`switch::SYNCING`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_record_is_not_counted_as_caught_up() {
+    let gw = gateway("gw");
+    let a = member(&[&gw], 1, store(1), MemoryVotes::new(), true);
+    until("a ready", WITHIN, || a.ready()).await;
+    for k in 0..10u32 {
+        a.store.write(format!("a/{k}").as_bytes(), b"x");
+    }
+    let refusing = store(2);
+    refusing.refuse_origin(1);
+    let b = member(&[&gw], 2, refusing, MemoryVotes::new(), true);
+    let mut counted = 0;
+    until("b refused a's records", WITHIN, || {
+        let view = b.app.replicator().unwrap().view();
+        counted = counted.max(
+            view.catchups
+                .iter()
+                .map(|c| c.progress.fetched)
+                .max()
+                .unwrap_or(0),
+        );
+        view.stats.refused >= 10
+    })
+    .await;
+    assert_eq!(counted, 0, "a refused record counted as fetched");
+    assert!(b.store.value(b"a/0").is_none());
+}
+
 /// A restarted member offers what it holds; a member lacking some of it
 /// catches up from it directly (§7.5). Here A holds records of an origin
 /// that never joins.

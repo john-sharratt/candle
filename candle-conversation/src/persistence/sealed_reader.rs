@@ -373,7 +373,10 @@ mod tests {
         let mut log = open(dir.path());
         let written = record(9, b"fetched by a peer catching up");
         let loc = write(&mut log, 9, b"fetched by a peer catching up");
-        assert!(log.sealed_reader().read_raw(loc.segment, loc.offset).is_none());
+        assert!(log
+            .sealed_reader()
+            .read_raw(loc.segment, loc.offset)
+            .is_none());
         log.seal_and_rotate().expect("seal");
         let raw = log
             .sealed_reader()

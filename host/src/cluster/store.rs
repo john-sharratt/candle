@@ -178,14 +178,39 @@ impl Store for ConversationStore {
                 };
             }
         };
+        // A refused record is fetched again, so one refused for good is fetched
+        // for ever — a catch-up that receives and never holds. Say which, and
+        // why: the refusal is the only place the reason exists.
+        let mut refused = Vec::new();
         let taken = honest
             .iter()
-            .map(|ok| {
-                *ok && outcomes
-                    .next()
-                    .is_some_and(|o| !matches!(o, RemoteOutcome::Refused(_)))
+            .zip(records)
+            .map(|(ok, (origin, oseq, bytes))| {
+                if !*ok {
+                    refused.push(format!(
+                        "{origin:x}/{oseq} ({} B): its header names another identity",
+                        bytes.len()
+                    ));
+                    return false;
+                }
+                match outcomes.next() {
+                    Some(RemoteOutcome::Refused(why)) => {
+                        refused.push(format!("{origin:x}/{oseq} ({} B): {why:?}", bytes.len()));
+                        false
+                    }
+                    Some(_) => true,
+                    None => false,
+                }
             })
             .collect();
+        if !refused.is_empty() {
+            tracing::warn!(
+                refused = refused.len(),
+                of = records.len(),
+                first = %refused.iter().take(4).cloned().collect::<Vec<_>>().join("; "),
+                "records from other members refused — each is fetched again",
+            );
+        }
         Applied { taken, reload }
     }
 
