@@ -12,6 +12,7 @@ use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::panic::Location;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::graph::{enter_wave, without_recording, CaptureHub, CaptureStats, Paused, WaveCapture};
@@ -152,6 +153,7 @@ impl CudaDevice {
     /// unless the buffer is provably fully written: the hot-path rule is that a
     /// buffer a kernel completely overwrites must come from here, so the zeroing
     /// memset is not paid on bytes that are about to be stamped anyway.
+    #[track_caller]
     pub unsafe fn alloc<T: DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc", len * std::mem::size_of::<T>());
         let _eager = self.pause_capture()?;
@@ -160,6 +162,7 @@ impl CudaDevice {
         Ok(s)
     }
 
+    #[track_caller]
     pub fn alloc_zeros<T: DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> Result<CudaSlice<T>> {
         forbidden_alloc::record("CudaDevice::alloc_zeros", len * std::mem::size_of::<T>());
         let _eager = self.pause_capture()?;
@@ -172,6 +175,7 @@ impl CudaDevice {
         Ok(s)
     }
 
+    #[track_caller]
     pub fn memcpy_htod<T: DeviceRepr, Src: HostSlice<T> + ?Sized, Dst: DevicePtrMut<T>>(
         &self,
         src: &Src,
@@ -211,11 +215,13 @@ impl CudaDevice {
     #[inline(always)]
     fn guard_copy_dst<T, D: DevicePtrMut<T>>(&self, _what: &str, _dst: &mut D, _elems: usize) {}
 
+    #[track_caller]
     pub fn memcpy_dtov<T: DeviceRepr, Src: DevicePtr<T>>(&self, src: &Src) -> Result<Vec<T>> {
         let _eager = self.pause_capture()?;
         self.stream.memcpy_dtov(src).w()
     }
 
+    #[track_caller]
     pub fn memcpy_dtod<T, Src: DevicePtr<T>, Dst: DevicePtrMut<T>>(
         &self,
         src: &Src,
@@ -229,6 +235,7 @@ impl CudaDevice {
         self.stream.memcpy_dtod(src, dst).w()
     }
 
+    #[track_caller]
     pub fn memcpy_stod<T: DeviceRepr, Src: HostSlice<T> + ?Sized>(
         &self,
         src: &Src,
@@ -323,14 +330,23 @@ impl CudaDevice {
     ///
     /// While this thread records a wave capture, the bytes are staged in the
     /// wave's ring and their copy is recorded into the segment, so the upload
-    /// does not end it. Otherwise — or when the ring is full — the copy is
-    /// queued on the compute stream behind everything issued before it; the
-    /// driver has staged pageable bytes before it returns, so `src` may go.
+    /// does not end it. In a segment that runs eagerly the copy goes straight
+    /// onto the compute stream, behind the launches already issued — ending
+    /// the segment there would cut the wave where a recorded one is not cut,
+    /// and every segment after it would hold different layers. Otherwise — or
+    /// when the ring is full — the copy is queued on the compute stream behind
+    /// everything issued before it; the driver has staged pageable bytes before
+    /// it returns, so `src` may go.
+    #[track_caller]
     pub fn upload_raw(&self, dst: u64, src: &[u8]) -> Result<()> {
         if src.is_empty() || self.record_upload(dst, src) {
             return Ok(());
         }
-        let _eager = self.pause_capture()?;
+        let _eager = if self.capture.eager_segment_here() {
+            None
+        } else {
+            self.pause_capture()?
+        };
         // SAFETY: the caller's `dst` holds `src.len()` bytes; queued on the
         // compute stream.
         unsafe {
@@ -391,6 +407,7 @@ impl CudaDevice {
     /// address. Recorded segments never touch the other scratch, so nothing
     /// can be launched between its copy and its read but that thread's own
     /// work, which the lock already orders.
+    #[track_caller]
     pub fn with_staging<R>(
         &self,
         bytes: usize,
@@ -438,6 +455,7 @@ impl CudaDevice {
     /// ahead of it. Pausing instead ended the wave's segment at every call: a
     /// QSA index append per attention layer, each a graph launch and a host
     /// round trip behind it. Growth still runs eagerly; it allocates.
+    #[track_caller]
     pub fn with_staged_upload<T: DeviceRepr, R>(
         &self,
         data: &[T],
@@ -461,8 +479,14 @@ impl CudaDevice {
         }
         // The copy below is issued on the compute stream itself, not recorded,
         // so a segment still holding a read of the scratch must be launched
-        // ahead of it.
-        let _eager = self.pause_capture()?;
+        // ahead of it. A segment that runs eagerly holds none: its launches
+        // are already on the stream, and ending it here would cut the wave
+        // where a recorded one is not cut (see [`Self::upload_raw`]).
+        let _eager = if self.capture.eager_segment_here() {
+            None
+        } else {
+            self.pause_capture()?
+        };
         self.with_staging(bytes, |buf| {
             if bytes > 0 {
                 self.stream
@@ -508,6 +532,7 @@ impl CudaDevice {
     /// and is never handed back, so a steady stream of launches allocates
     /// nothing. Its own lock: a caller waiting out a long copy here never
     /// holds the forward's [`Self::with_staging`].
+    #[track_caller]
     pub fn with_synced_upload<R>(
         &self,
         stream: &Arc<CudaStream>,
@@ -571,6 +596,7 @@ impl CudaDevice {
     /// wholesale past a bound, like the info-table cache — in-flight users hold their own `Arc`,
     /// and the cleared entries are retired to the capture hub rather than dropped, so a launch
     /// another thread recorded against one is issued before its bytes go back.
+    #[track_caller]
     pub fn group_major_ids(&self, rows: usize, groups: usize) -> Result<Arc<Uploaded<u32>>> {
         let key = (rows, groups);
         let mut cache = self.perm_tables.lock().unwrap();
@@ -791,8 +817,13 @@ impl CudaDevice {
     /// the launches it wants recorded and calls [`Self::record_launches`], so a
     /// forward's setup — its admission, tier placement and tables — runs
     /// eagerly as it always has.
+    ///
+    /// The caller's location names the kind of wave this is: each call site
+    /// (a draft walk, a verify, a forward) keeps its own predictions of what
+    /// its segments hold (`graph::ordinals`).
+    #[track_caller]
     pub fn begin_wave_capture(&self) -> Result<WaveCapture> {
-        self.capture.begin_wave(&self.stream)?;
+        self.capture.begin_wave(&self.stream, Location::caller())?;
         enter_wave(self.clone());
         Ok(WaveCapture {
             device: self.clone(),
@@ -809,7 +840,9 @@ impl CudaDevice {
 
     /// Hand everything this thread has issued to the driver and nudge WDDM to
     /// submit it — the point a host protocol polling the device for a launch's
-    /// output waits on. Inside a wave capture this ends the recording segment.
+    /// output waits on. Inside a wave capture this ends the recording segment,
+    /// and the caller's location is what the cut is attributed to.
+    #[track_caller]
     pub fn flush_launches(&self) -> Result<()> {
         self.capture.flush(&self.stream)
     }
@@ -821,9 +854,32 @@ impl CudaDevice {
         self.capture.recording_segment()
     }
 
+    /// The serial of the wave capture open on this thread — `None` with no
+    /// wave open — whatever it is doing: recording, running a segment eagerly,
+    /// held or paused.
+    pub fn wave_in_progress(&self) -> Option<u64> {
+        self.capture.wave_here()
+    }
+
+    /// Whether this thread's wave is in a segment that runs eagerly and is not
+    /// paused: an upload queued on the compute stream now lands behind the
+    /// launches already issued, with no segment to end ahead of it.
+    pub fn eager_segment_here(&self) -> bool {
+        self.capture.eager_segment_here()
+    }
+
+    /// Hand what this thread has issued to the driver, ending no segment —
+    /// for a host protocol that waits on eagerly issued launches between the
+    /// points where it ends segments.
+    pub fn submit_launches(&self) -> Result<()> {
+        self.capture.submit(&self.stream)
+    }
+
     /// Suspend this thread's wave capture, if it has one, until the guard
     /// drops: the recorded segment is launched first, and the caller's eager
-    /// device calls run in order behind it.
+    /// device calls run in order behind it. The caller's location is what the
+    /// cut is attributed to (`graph::cuts`).
+    #[track_caller]
     pub fn pause_capture(&self) -> Result<Option<Paused<'_>>> {
         self.capture.pause(&self.stream)
     }
@@ -861,6 +917,7 @@ impl CudaDevice {
     /// the first time the thread asks. A thread asking for its first one while
     /// it records a wave has the recording paused around the creation, which
     /// would otherwise end its own capture.
+    #[track_caller]
     pub fn cublas(&self) -> Result<BlasHandle> {
         let handle = if thread_blas::has_handle(&self.stream) {
             thread_blas::handle_for(&self.stream)?
@@ -1771,6 +1828,7 @@ impl BackendDevice for CudaDevice {
         })
     }
 
+    #[track_caller]
     fn synchronize(&self) -> Result<()> {
         // `.w()` (not `Error::wrap`) so a sticky fault or a sustained
         // out-of-memory streak on THIS call is visible to `gpu_poison` —

@@ -110,23 +110,76 @@ executables per 2 s window on `.5` (2026-10-17) to admit shapes that were evicte
 1. **Learn.** Segments record and the library admits what it folds into its fixed budget. The
    learn ends at the first admission that does not fit, or after `LEARN_IDLE_WAVES` (32) waves
    with no admission.
-2. **Trial**, for `TRIAL_WAVES` (64) waves. It judges every shape the library **holds**
-   unproven when it begins — not the keys the learn admitted: the learn folds a one-off shape
-   over another executable, which then holds the one-off's shape, so judged by admitted key a
-   trial on `.5` (2026-10-17) banned all 1,065 of them as rarely hit and left 681 executables
-   held and never judged. A later learn never folds a one-off over a proven executable. Each
-   shape on trial alternates graphed and eager every time a segment predicts it, timed on the
-   device from the segment's start to its end — host lateness included, which is what a graph removes. A shape hit in fewer than
-   one trial wave in `MIN_HIT_DIVISOR` (8), or whose graphed median is not at least 5 % below
-   its eager median, is **banned**: dropped, and never admitted again. A tie is banned too — a
-   kept shape pays for its recording every wave. The rest are proven and never trialled again.
+2. **Trial**, for at least `TRIAL_WAVES` (64) waves and until every candidate has
+   `MIN_SAMPLES` (4) timed runs in each mode, or `TRIAL_MAX_WAVES` (512). It judges every
+   **topology** the library holds unproven when it begins. Each topology on trial alternates
+   graphed and eager every time a segment predicts it, timed on the device from the segment's
+   start to its end — host lateness included, which is what a graph removes. One whose
+   graphed median is not at least 5 % below its eager median is **banned**: dropped, and never
+   admitted again. A tie is banned too — a kept topology pays for its recording every wave. One
+   hit fewer than `MIN_HITS` (8) times, or never timed, is **benched**: dropped and not
+   admitted again until the lock reopens (4), which takes it back. Whether a segment recurs is
+   a property of the traffic the trial happened to see; whether its graph is faster is a
+   property of the segment. Banned for good, every shape a trial's traffic missed ran eagerly
+   for the life of the process — on `.5` (2026-10-17) 894 bans held a lock to graphing one
+   segment in eight. The rest are proven and never trialled again.
+
+   **Judged by topology.** Judged by `(topology, shape)`, every combination of sessions and
+   verify widths was a candidate of its own: decode waves carrying up to eight sequences
+   (ingest and npcd riding a conversation) made hundreds of shapes, and a 512-wave trial of
+   352 proved 8. Past the learn, a shape the slot holds folds in place and any other is
+   instantiated for its one launch.
+
+   **Nothing reshapes past the learn.** Reshaping a held executable to whatever shape the
+   trial and the lock met — the same topology at another row count, often another kernel
+   variant at a node — bought nothing measurable: on `.5` (2026-10-17) a lock that reshaped
+   replayed as few segments as one that ran them once, since what it missed were topologies
+   it did not hold at all.
+
+   **The trial waits for samples, not for a share of the waves.** A decode step opens waves of
+   several kinds and its segments come at a few widths, so a segment every step uses is in a
+   small fraction of all waves: with a fixed 64-wave trial and a one-in-eight hit floor, the
+   most-hit shape on `.5` had 7 hits and 174 of 176 steadily recurring shapes were banned as
+   rare. A segment's mode is decided on a *prediction* — what that ordinal held the last time
+   a wave **of the same kind** (its `begin_wave_capture` call site) recorded it
+   (`graph/ordinals.rs`); kept by ordinal alone, the verify's prediction was the draft walk's.
+   During the trial an ordinal predicted as a topology the library does not hold is recorded,
+   so its prediction catches up at once rather than at its periodic recheck.
+
+   **The trial times with timing events.** `CudaContext::new_event(None)` is cudarc's
+   `CU_EVENT_DISABLE_TIMING`, whose pairs `cuEventElapsedTime` refuses; the timer that used it
+   dropped every sample unseen, and every trial judged on nothing. The timer names
+   `CU_EVENT_DEFAULT`, and a pair the driver will not time is an error.
 3. A trial that proved anything returns to the learn, which fills the ground the bans freed.
-   One that proved nothing **locks** the library for the life of the process: nothing is
+   One that proved nothing **locks** the library until new traffic reopens it (4): nothing is
    admitted, evicted or timed, a held shape records and replays, and every other segment —
    banned, unheld, or an ordinal never recorded — runs as issued.
 
+   The trial's summary line reports what its segment starts were predicted as
+   (`starts_candidate`/`starts_other`/`starts_unpredicted`), the candidate segments whose
+   prediction named another shape (`hits_missed`), and the most-hit candidates'
+   `hits/graphed/eager` — what the verdicts were drawn from.
+4. **A lock with room reopens.** A learn's traffic is whatever ran while it learned, and one
+   at startup sees startup's: on `.5` (2026-10-17) a learn went quiet after 185 waves of
+   background ingest and locked at 185 MiB of a 2 GiB budget, to run every shape the
+   conversations brought later as issued. So an ordinal's recheck that meets a shape the lock
+   does not hold counts it, and once `REOPEN_SHAPES` (4) unbanned shapes — benched ones
+   included — have each been met `REOPEN_SIGHTINGS` (3) times, the lock has stood
+   `MIN_LOCK_WAVES` (256) and the library is under half its budget, the learn begins again —
+   keeping every shape already proven and banned, and clearing the bench.
+
 The constants are short on purpose: a decode wave is a token or so, so reaching the lock costs
-a few seconds of decode, not minutes. The wave line reports the phase, and how many shapes have
+seconds of decode, not minutes — a trial whose shapes all recur every wave ends at its 64-wave
+minimum, and the cap is about twenty seconds.
+
+**A shape is only as stable as its launches' grids.** A kernel whose grid follows a per-token
+count makes every segment holding it a new shape. Launches inside a recorded wave size their
+grid from a bound the wave's widths fix, and skip the blocks past the live count: the QSA index
+append and carry launch every token over `AppendGrids` (`qwen4exp/append_grids.rs`), and the
+paged scorer sizes its grid and tile arm by the candidate count rounded up to a power of two.
+`segment of a new shape` (debug, `candle_core::graph`) names the first launch whose grid or
+variant changed, against what that ordinal held last — on `.5` the append and the scorer were
+the first difference in 774 of 1,298 such segments. The wave line reports the phase, and how many shapes have
 been banned and proven (`graph_window.rs`).
 
 ### 2.2 One forward

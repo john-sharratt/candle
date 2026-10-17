@@ -42,6 +42,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::append_grids::AppendGrids;
 use super::capture_rows::CaptureRows;
 use super::config::IndexerConfig;
 /// Block keys per live-tail key page — see `index_keys`.
@@ -2182,52 +2183,57 @@ pub fn append_wave(
         commits.push((n_blocks + n_new, left));
     }
 
-    if !jobs.is_empty() || !carries.is_empty() {
-        let candle::Device::Cuda(dev) = &device else {
-            candle::bail!("qsa append runs on CUDA");
-        };
-        let n_jobs = jobs.len() / JOB_WORDS;
-        let n_carry = carries.len() / CARRY_WORDS;
-        // Both tables in one upload through the device's staging scratch — the
-        // jobs, then the carries — so an append allocates nothing, whether it
-        // runs inside a forward or in a rewind between two.
-        let carries_at = jobs.len();
-        let mut table = jobs;
-        table.extend_from_slice(&carries);
-        let k_norm = tensor_ptr(&w.k_norm)?;
-        // The stream is taken inside, where the launches are — the staged
-        // upload runs eagerly, so they belong on the stream it names there.
-        dev.with_staged_upload(&table, |base| {
-            let stream = dev.cuda_stream();
-            let raw_stream = stream.cu_stream() as *mut c_void;
-            if n_jobs > 0 {
-                candle::set_kernel_breadcrumb("run_qsa_index_append", file!(), line!());
-                unsafe {
-                    run_qsa_index_append(
-                        base as *const i64,
-                        k_norm as *const f32,
-                        d as i32,
-                        ratio as i32,
-                        rms_eps as f32,
-                        n_jobs as i32,
-                        raw_stream,
-                    );
-                }
-            }
-            if n_carry > 0 {
-                candle::set_kernel_breadcrumb("run_qsa_index_carry", file!(), line!());
-                unsafe {
-                    run_qsa_index_carry(
-                        (base as *const i64).add(carries_at),
-                        d as i32,
-                        n_carry as i32,
-                        raw_stream,
-                    );
-                }
-            }
-            Ok(())
-        })?;
+    let candle::Device::Cuda(dev) = &device else {
+        candle::bail!("qsa append runs on CUDA");
+    };
+    let n_jobs = jobs.len() / JOB_WORDS;
+    let n_carry = carries.len() / CARRY_WORDS;
+    let grids = AppendGrids::for_spans(work.iter().map(|s| s.rows), ratio);
+    if n_jobs > grids.jobs || n_carry > grids.carries {
+        candle::bail!(
+            "qsa append: {n_jobs} jobs and {n_carry} carries past the grids' bound {grids:?}"
+        );
     }
+    // Both tables in one upload through the device's staging scratch — the
+    // jobs, then the carries — so an append allocates nothing, whether it runs
+    // inside a forward or in a rewind between two. Every span with rows
+    // completes a block or carries rows, so the table is never empty.
+    let carries_at = jobs.len();
+    let mut table = jobs;
+    table.extend_from_slice(&carries);
+    let k_norm = tensor_ptr(&w.k_norm)?;
+    // The stream is taken inside, where the launches are — the staged upload
+    // runs eagerly, so they belong on the stream it names there.
+    dev.with_staged_upload(&table, |base| {
+        let stream = dev.cuda_stream();
+        let raw_stream = stream.cu_stream() as *mut c_void;
+        // Both launch every wave, over the bound's grids, whatever this wave
+        // completes or carries ([`AppendGrids`]).
+        candle::set_kernel_breadcrumb("run_qsa_index_append", file!(), line!());
+        unsafe {
+            run_qsa_index_append(
+                base as *const i64,
+                k_norm as *const f32,
+                d as i32,
+                ratio as i32,
+                rms_eps as f32,
+                n_jobs as i32,
+                grids.jobs as i32,
+                raw_stream,
+            );
+        }
+        candle::set_kernel_breadcrumb("run_qsa_index_carry", file!(), line!());
+        unsafe {
+            run_qsa_index_carry(
+                (base as *const i64).add(carries_at),
+                d as i32,
+                n_carry as i32,
+                grids.carries as i32,
+                raw_stream,
+            );
+        }
+        Ok(())
+    })?;
 
     for (span, (n_blocks, n_open)) in work.iter_mut().zip(commits) {
         span.cache.n_blocks = n_blocks;

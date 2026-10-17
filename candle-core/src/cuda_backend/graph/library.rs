@@ -85,17 +85,18 @@ impl ExecLibrary {
         self.slots.get(&key).is_some_and(|s| !s.execs().is_empty())
     }
 
-    /// Every `(topology, shape)` an executable holds now — what a trial judges.
-    pub(super) fn held_keys(&self) -> Vec<Key> {
+    /// Every topology with executables kept — what a trial judges.
+    pub(super) fn held_topologies(&self) -> Vec<Key> {
         self.slots
             .iter()
-            .flat_map(|(&k, s)| s.execs().iter().map(move |e| (k, e.shape())))
+            .filter(|(_, s)| !s.execs().is_empty())
+            .map(|(&k, _)| k)
             .collect()
     }
 
-    /// Whether an executable holds exactly `(topology, shape)` — what a
+    /// Whether an executable holds exactly `shape` of topology `key` — what a
     /// segment needs to replay without reshaping anything.
-    pub(super) fn holds_shape(&self, (key, shape): Key) -> bool {
+    pub(super) fn holds_shape(&self, key: Key, shape: u64) -> bool {
         self.slots.get(&key).is_some_and(|s| s.holds_shape(shape))
     }
 
@@ -138,21 +139,18 @@ impl ExecLibrary {
         false
     }
 
-    /// Drop the executables a trial banned for `(topology, shape)`, giving
-    /// their bytes back to the budget. Returns how many there were.
-    pub(super) fn ban(&mut self, (key, shape): Key) -> usize {
-        let Some(slot) = self.slots.get_mut(&key) else {
+    /// Drop every executable of a topology a trial did not prove — banned or
+    /// benched — giving their bytes back to the budget. Returns how many there
+    /// were.
+    pub(super) fn drop_topology(&mut self, key: Key) -> usize {
+        let Some(slot) = self.slots.remove(&key) else {
             return 0;
         };
-        let gone = slot.remove_shape(shape);
-        for e in &gone {
+        for e in slot.execs() {
             self.used = self.used.saturating_sub(e.bytes());
         }
-        let n = gone.len();
         // Destroying an executable still in flight is legal.
-        drop(gone);
-        self.drop_if_empty(key);
-        n
+        slot.execs().len()
     }
 }
 

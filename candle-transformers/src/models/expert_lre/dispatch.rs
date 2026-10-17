@@ -798,25 +798,31 @@ impl Dispatch {
 
     /// Submit what [`Self::record`] queued. Both host threads wait on the
     /// summary word bucketize writes, and nothing on the forward thread
-    /// synchronizes, so on WDDM nothing else would flush it. Issued eagerly,
+    /// synchronizes, so on WDDM nothing else would flush it. With no wave open,
     /// every invocation is submitted. Inside a wave capture this is where a
-    /// segment ends — once it holds the invocations the flush schedule gives
-    /// its ordinal (`flush_schedule`): the recorded launches, bucketize among them, are
-    /// launched as one graph before the query.
+    /// segment ends, at the invocations the flush schedule names
+    /// (`flush_schedule`) — the same ones whether the segment records or runs
+    /// eagerly, so a wave is cut after the same layers either way. Between
+    /// them a recorded invocation waits for its segment's launch; any other —
+    /// an eager segment's, or one issued while the wave is held or paused,
+    /// whose launches are already on the stream — is submitted without a cut.
     fn after(&self, device: &CudaDevice) -> Result<()> {
-        let flush = match device.recording_segment() {
-            None => true,
-            Some((wave, ordinal)) => self
-                .forward
-                .lock()
-                .map_err(|_| candle::Error::Msg("expert dispatch: forward state poisoned".into()))?
-                .fill
-                .record(wave, ordinal),
+        let Some(wave) = device.wave_in_progress() else {
+            return device.flush_launches();
         };
-        if flush {
-            device.flush_launches()?;
+        let ends = self
+            .forward
+            .lock()
+            .map_err(|_| candle::Error::Msg("expert dispatch: forward state poisoned".into()))?
+            .fill
+            .record(wave);
+        if ends {
+            device.flush_launches()
+        } else if device.recording_segment().is_some() {
+            Ok(())
+        } else {
+            device.submit_launches()
         }
-        Ok(())
     }
 
     /// The launches of one reserved invocation, and nothing else: bucketize,

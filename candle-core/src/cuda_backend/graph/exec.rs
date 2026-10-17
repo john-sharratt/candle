@@ -62,6 +62,7 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<Audited> {
     let mut shape = ShapeFold::default();
     let mut key = ShapeFold::default();
     let mut topology = Vec::with_capacity(expected);
+    let mut dims = Vec::with_capacity(expected);
     let mut recorded = 0usize;
     // SAFETY: a null node array asks only for the count.
     unsafe { sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut recorded).result() }.w()?;
@@ -102,6 +103,18 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<Audited> {
                 shape.word(u64::from(p.gridDimZ) | (u64::from(p.blockDimX) << 32));
                 shape.word(u64::from(p.blockDimY) | (u64::from(p.blockDimZ) << 32));
                 shape.word(u64::from(p.sharedMemBytes));
+                dims.push(NodeDims {
+                    func: node_key.func,
+                    words: [
+                        p.gridDimX,
+                        p.gridDimY,
+                        p.gridDimZ,
+                        p.blockDimX,
+                        p.blockDimY,
+                        p.blockDimZ,
+                        p.sharedMemBytes,
+                    ],
+                });
             }
             sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMSET => {
                 let mut p = MaybeUninit::<sys::CUDA_MEMSET_NODE_PARAMS>::uninit();
@@ -115,6 +128,7 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<Audited> {
                 shape.word(u64::from(p.elementSize));
                 shape.word(p.width as u64);
                 shape.word(p.height as u64);
+                dims.push(NodeDims::extent(p.elementSize, p.width, p.height, 1));
             }
             // An event-record node is a profiling span's timestamp, recorded
             // on purpose as external so it fires on every replay.
@@ -136,6 +150,7 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<Audited> {
                     shape.word(p.WidthInBytes as u64);
                     shape.word(p.Height as u64);
                     shape.word(p.Depth as u64);
+                    dims.push(NodeDims::extent(1, p.WidthInBytes, p.Height, p.Depth));
                     key.word(u64::from(node_key.kind));
                     topology.push(node_key);
                     continue;
@@ -170,6 +185,7 @@ pub(super) fn audit(graph: sys::CUgraph, expected: usize) -> Result<Audited> {
         shape: shape.finish(),
         key: key.finish(),
         topology,
+        dims,
     })
 }
 
@@ -185,6 +201,61 @@ pub(super) struct Audited {
     pub(super) key: u64,
     /// The topology itself, for naming where a refused fold departs.
     pub(super) topology: Vec<NodeKey>,
+    /// What the shape folds, node by node (event records carry none), for
+    /// naming the launch that made a shape new ([`reshaped_at`]).
+    pub(super) dims: Vec<NodeDims>,
+}
+
+/// What one node contributes to a graph's [shape](audit): for a kernel its
+/// function, grid, block and shared memory; for a memset or a device copy its
+/// extent, with no function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NodeDims {
+    func: u64,
+    /// A kernel's grid x, y, z, block x, y, z and shared bytes; an extent's
+    /// element size, width, height and depth.
+    words: [u32; 7],
+}
+
+impl NodeDims {
+    fn extent(element: u32, width: usize, height: usize, depth: usize) -> Self {
+        Self {
+            func: 0,
+            words: [element, width as u32, height as u32, depth as u32, 0, 0, 0],
+        }
+    }
+
+    fn describe(&self) -> String {
+        let w = self.words;
+        if self.func == 0 {
+            return format!("extent {}x{}x{}x{}", w[0], w[1], w[2], w[3]);
+        }
+        format!(
+            "grid {}x{}x{} block {}x{}x{} smem {}",
+            w[0], w[1], w[2], w[3], w[4], w[5], w[6]
+        )
+    }
+}
+
+/// Where a recapture's shape first departs from `kept`'s — two captures of
+/// one topology — naming the launch and its dimensions in each, and how many
+/// nodes differ in all. `None` when they agree node for node.
+pub(super) fn reshaped_at(recaptured: &[NodeDims], kept: &[NodeDims]) -> Option<String> {
+    let differ = |(a, b): (&NodeDims, &NodeDims)| a != b;
+    let at = recaptured.iter().zip(kept).position(differ)?;
+    let count = recaptured.iter().zip(kept).filter(|&p| differ(p)).count();
+    let name = |d: &NodeDims| match d.func {
+        0 => "copy or memset".to_string(),
+        f => func_name(f as sys::CUfunction).unwrap_or_else(|| format!("kernel {f:#x}")),
+    };
+    let (a, b) = (&recaptured[at], &kept[at]);
+    Some(format!(
+        "{count} node(s), first {at}: recaptured {} {} / kept {} {}",
+        name(a),
+        a.describe(),
+        name(b),
+        b.describe()
+    ))
 }
 
 /// One node of a graph's topology: its kind and, for a kernel, its function.
@@ -490,6 +561,36 @@ mod divergence_tests {
         assert_eq!(
             divergence(&[node(0), node(0), node(2)], &[node(0), node(0)]).as_deref(),
             Some("node 2 (after node kind 0): recaptured node kind 2 / kept end")
+        );
+    }
+
+    /// Two captures of one shape have nowhere to reshape.
+    #[test]
+    fn matching_shapes_do_not_reshape() {
+        let a = [NodeDims::extent(4, 64, 1, 1)];
+        assert_eq!(reshaped_at(&a, &a), None);
+    }
+
+    /// The first node whose dimensions differ is named, with both sides and
+    /// how many nodes differ in all.
+    #[test]
+    fn the_first_reshaped_node_is_named() {
+        let kept = [
+            NodeDims::extent(4, 64, 1, 1),
+            NodeDims::extent(1, 256, 1, 1),
+            NodeDims::extent(1, 8, 1, 1),
+        ];
+        let recaptured = [
+            NodeDims::extent(4, 64, 1, 1),
+            NodeDims::extent(1, 512, 1, 1),
+            NodeDims::extent(1, 16, 1, 1),
+        ];
+        assert_eq!(
+            reshaped_at(&recaptured, &kept).as_deref(),
+            Some(
+                "2 node(s), first 1: recaptured copy or memset extent 1x512x1x1 \
+                 / kept copy or memset extent 1x256x1x1"
+            )
         );
     }
 }

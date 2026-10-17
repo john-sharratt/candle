@@ -240,6 +240,12 @@ __global__ void carry_kernel(
 
 } // namespace qsa_index_append
 
+// **The grid is the caller's bound, not the count.** Both launches run over
+// `grid` blocks, and the blocks past `n_jobs` / `n_carry` return at once — so a
+// wave that completes one block and a wave that completes none issue the same
+// launch at the same grid, which is what lets a recorded segment holding them
+// replay from one executable whatever the decode position. Sized by the count,
+// the grid (and, at a count of zero, the launch itself) followed every token.
 extern "C" void run_qsa_index_append(
     const long long* jobs,
     const float* k_norm,
@@ -247,11 +253,12 @@ extern "C" void run_qsa_index_append(
     int32_t ratio,
     float eps,
     int32_t n_jobs,
+    int32_t grid,
     void* stream
 ) {
-    if (n_jobs <= 0) return;
+    if (grid <= 0) return;
     const unsigned shmem = (unsigned)d * (unsigned)sizeof(float);
-    qsa_index_append::append_kernel<<<(unsigned)n_jobs, (unsigned)d, shmem,
+    qsa_index_append::append_kernel<<<(unsigned)grid, (unsigned)d, shmem,
                                      (cudaStream_t)stream>>>(
         jobs, k_norm, d, ratio, eps, n_jobs);
 }
@@ -260,10 +267,11 @@ extern "C" void run_qsa_index_carry(
     const long long* carries,
     int32_t d,
     int32_t n_carry,
+    int32_t grid,
     void* stream
 ) {
-    if (n_carry <= 0) return;
-    qsa_index_append::carry_kernel<<<(unsigned)n_carry, 256, 0,
+    if (grid <= 0) return;
+    qsa_index_append::carry_kernel<<<(unsigned)grid, 256, 0,
                                     (cudaStream_t)stream>>>(carries, d, n_carry);
 }
 

@@ -10,18 +10,19 @@
 //! Folding into an executable of another shape also succeeds, since the
 //! topology matches, but it rewrites grids too and costs several times as much
 //! (see [`audit`](super::exec::audit)). So a shape that recurs is given an
-//! executable of its own when the library will keep one, and only a shape seen
-//! once — a prompt's own length — is folded over another's. How many the slot
-//! holds is the library's budget to decide, not a count here.
+//! executable of its own while the library learns, and a shape seen once — a
+//! prompt's own length — is folded over another's. How many the slot holds is
+//! the library's budget to decide, not a count here.
 //!
-//! **Only the learn reshapes.** Once the library stops admitting (`regime`),
-//! a recapture folds only into the executable already holding its shape. Folded
-//! over another's, it would leave that executable holding a different shape
-//! from the one its trial proved — and the shape it was proven for would then
-//! miss in turn.
+//! **Once the learn is over, nothing reshapes.** A shape the slot holds folds
+//! in place; any other is instantiated for its one launch. Reshaping a held
+//! executable to every shape the trial and the lock met instead — the same
+//! topology at another row count, often another kernel variant at a node —
+//! bought nothing measurable: on `.5` (2026-10-17) a lock that reshaped
+//! replayed as few segments as one that ran them once, since what it missed
+//! were topologies it did not hold at all.
 
 use std::collections::VecDeque;
-use std::mem::take;
 
 use super::exec::{divergence, Audited, GraphExec, Template};
 use super::ComputeStream;
@@ -40,8 +41,8 @@ pub(super) enum Folded {
     Reshaped,
     /// Instantiated afresh and kept.
     Instantiated,
-    /// Instantiated for this launch alone: the library does not admit it —
-    /// banned, or no longer learning — and no executable of its shape holds.
+    /// Instantiated for this launch alone: the library does not admit it and
+    /// the slot holds no executable it would fold into.
     Transient,
 }
 
@@ -51,7 +52,7 @@ pub(super) enum Admit {
     /// The learn: a recurring shape is given an executable of its own, and a
     /// one-off is folded over another's.
     Keep,
-    /// Nothing new is kept: into its own shape's executable, or once.
+    /// Nothing is kept or reshaped: into its own shape's executable, or once.
     Never,
 }
 
@@ -64,12 +65,12 @@ pub(super) struct ExecSlot {
 }
 
 impl ExecSlot {
-    /// Fold `template` into the executable holding its shape. Failing that,
-    /// with [`Admit::Keep`]: give a recurring shape a new executable, or fold a
-    /// one-off into the first executable that accepts it — most recently used
-    /// first, never one whose shape is `protected` (proven by a trial) — or
-    /// instantiate it and keep it. With [`Admit::Never`]: instantiate it for
-    /// this launch alone.
+    /// Fold `template` into the executable holding its shape. Failing that:
+    ///
+    /// - with [`Admit::Keep`], give a recurring shape a new executable, or fold
+    ///   a one-off into the first executable that accepts it, most recently
+    ///   used first — or instantiate it and keep it;
+    /// - with [`Admit::Never`], instantiate it for this launch alone.
     ///
     /// Returns the executable to launch when it is not kept (`Some`, the
     /// [`Folded::Transient`] case) — otherwise it is [`Self::front`] — how it
@@ -82,9 +83,7 @@ impl ExecSlot {
         on: &ComputeStream,
         nodes: usize,
         admit: Admit,
-        protected: impl Fn(u64) -> bool,
     ) -> Result<(Option<GraphExec>, Folded, Option<Refusal>)> {
-        let keep = admit == Admit::Keep;
         let Audited {
             shape, topology, ..
         } = audited;
@@ -100,11 +99,8 @@ impl ExecSlot {
                 outcome = Some((i, Folded::InPlace));
             }
         }
-        if outcome.is_none() && keep && !recurring {
+        if outcome.is_none() && admit == Admit::Keep && !recurring {
             for i in 0..self.execs.len() {
-                if protected(self.execs[i].shape()) {
-                    continue;
-                }
                 if self.execs[i].try_fold(&template, on, nodes, shape)? {
                     outcome = Some((i, Folded::Reshaped));
                     break;
@@ -124,7 +120,7 @@ impl ExecSlot {
                     divergence: divergence(&topology, last.topology()),
                 });
                 let exec = GraphExec::instantiate_audited(template, on, nodes, shape, topology)?;
-                if !keep {
+                if admit != Admit::Keep {
                     return Ok((Some(exec), Folded::Transient, refusal));
                 }
                 self.execs.insert(0, exec);
@@ -147,15 +143,6 @@ impl ExecSlot {
     /// Whether an executable holds `shape`.
     pub(super) fn holds_shape(&self, shape: u64) -> bool {
         self.execs.iter().any(|e| e.shape() == shape)
-    }
-
-    /// Remove the executables holding `shape`.
-    pub(super) fn remove_shape(&mut self, shape: u64) -> Vec<GraphExec> {
-        let (gone, kept): (Vec<GraphExec>, Vec<GraphExec>) = take(&mut self.execs)
-            .into_iter()
-            .partition(|e| e.shape() == shape);
-        self.execs = kept;
-        gone
     }
 
     /// Remove the executable at the front — the one the last kept fold put

@@ -17,12 +17,16 @@
 //! 8, 16, then [`MAX_UNFLUSHED_INVOCATIONS`] invocations, the wave's own finish
 //! launching the tail.
 //!
-//! The schedule is keyed on the hub's segment ordinal, so it restarts with every
-//! wave — the draft walk's steps, the verify — and a segment some other host
-//! interaction cut short counts from its own start. Cuts made before a wave's
-//! first MoE invocation advance the ordinal too, so that wave's first MoE
-//! segment starts further up the ramp: the GPU is already running the work
-//! those cuts launched, which is what the ramp's short first segments are for.
+//! **Keyed on the invocation's place in its wave, not on the segment.** The
+//! flushes land after the same MoE layers in every wave — 1, 2, 4, 8, 16, 32,
+//! then every 32nd — whatever else cut the wave, and whether its segments run
+//! recorded or eagerly. Keyed on the hub's segment ordinal, an eager cut
+//! anywhere earlier in a wave moved every flush after it, and a segment running
+//! eagerly (where the dispatch flushed at every invocation) cut the wave at
+//! every MoE layer: the same layers fell into different segments from one wave
+//! to the next, each a topology of its own whose graph was never reused — on
+//! `.5` (2026-10-17) half of 4,915 new topologies began with a different kernel
+//! from the executable they were compared against.
 
 /// The most invocations a segment holds. The dispatch keeps this at half its
 /// summary ring, so the ring hold — which waits for the readers of the ticket a
@@ -30,37 +34,36 @@
 /// to write it.
 pub(crate) const MAX_UNFLUSHED_INVOCATIONS: usize = 32;
 
-/// MoE invocations the segment at `ordinal` within its wave holds before it is
-/// launched: 1, 1, 2, 4, 8, 16, 32, 32, ….
-pub(crate) fn segment_invocations(ordinal: usize) -> usize {
-    if ordinal <= 1 {
-        1
-    } else {
-        1usize
-            .checked_shl((ordinal - 1) as u32)
-            .unwrap_or(usize::MAX)
-            .min(MAX_UNFLUSHED_INVOCATIONS)
-    }
+/// Whether the wave's `n`th MoE invocation (counting from one) ends its
+/// segment: the 1st, 2nd, 4th, 8th, 16th and 32nd, then every 32nd — segments
+/// of 1, 1, 2, 4, 8, 16, then [`MAX_UNFLUSHED_INVOCATIONS`] invocations.
+pub(crate) fn ends_segment(n: usize) -> bool {
+    n > 0
+        && if n <= MAX_UNFLUSHED_INVOCATIONS {
+            n.is_power_of_two()
+        } else {
+            n.is_multiple_of(MAX_UNFLUSHED_INVOCATIONS)
+        }
 }
 
-/// The invocations recorded into the current segment.
+/// The MoE invocations issued so far in the current wave.
 #[derive(Debug, Default)]
 pub(crate) struct SegmentFill {
-    /// The segment counted, as `(wave, ordinal)` — `None` before the first.
-    segment: Option<(u64, usize)>,
+    /// The wave counted — `None` before the first.
+    wave: Option<u64>,
     count: usize,
 }
 
 impl SegmentFill {
-    /// Count one invocation recorded into segment `ordinal` of wave `wave`, and
-    /// answer whether it ends the segment.
-    pub(crate) fn record(&mut self, wave: u64, ordinal: usize) -> bool {
-        if self.segment != Some((wave, ordinal)) {
-            self.segment = Some((wave, ordinal));
+    /// Count one invocation issued in wave `wave`, and answer whether it ends
+    /// the segment it is in.
+    pub(crate) fn record(&mut self, wave: u64) -> bool {
+        if self.wave != Some(wave) {
+            self.wave = Some(wave);
             self.count = 0;
         }
         self.count += 1;
-        self.count >= segment_invocations(ordinal)
+        ends_segment(self.count)
     }
 }
 
@@ -68,46 +71,41 @@ impl SegmentFill {
 mod tests {
     use super::*;
 
+    /// Segments double to the cap, then hold the cap: the 1st, 2nd, 4th, 8th,
+    /// 16th and 32nd invocations end one, then every 32nd.
     #[test]
     fn segments_double_to_the_cap() {
-        let sizes: Vec<usize> = (0..9).map(segment_invocations).collect();
-        assert_eq!(sizes, vec![1, 1, 2, 4, 8, 16, 32, 32, 32]);
-        assert_eq!(segment_invocations(200), 32);
+        let ends: Vec<usize> = (1..=128).filter(|&n| ends_segment(n)).collect();
+        assert_eq!(ends, vec![1, 2, 4, 8, 16, 32, 64, 96, 128]);
+        assert!(!ends_segment(0));
     }
 
-    /// A 48-layer pass recorded from segment 0, the ordinal advancing each time
-    /// a flush launches the segment: the flushes land after invocations 0, 1,
-    /// 3, 7, 15 and 31, and the last 16 are left to the wave's finish.
+    /// **The flushes land after the same layers in every wave**, however the
+    /// wave is cut otherwise: a 48-layer pass flushes after invocations 0, 1,
+    /// 3, 7, 15 and 31 (counting from zero), and the last 16 are left to the
+    /// wave's finish — in this wave and the next.
     #[test]
-    fn a_trunk_pass_flushes_at_each_doubling() {
+    fn every_wave_flushes_after_the_same_layers() {
         let mut fill = SegmentFill::default();
-        let mut ordinal = 0;
-        let mut flushed = Vec::new();
-        for i in 0..48 {
-            if fill.record(1, ordinal) {
-                flushed.push(i);
-                ordinal += 1;
-            }
+        for wave in 1..=3 {
+            let flushed: Vec<usize> = (0..48).filter(|_| fill.record(wave)).collect();
+            assert_eq!(flushed, vec![0, 1, 3, 7, 15, 31], "wave {wave}");
         }
-        assert_eq!(flushed, vec![0, 1, 3, 7, 15, 31]);
     }
 
-    /// A new wave starts over at one invocation, whatever the last one reached;
-    /// and a segment some other cut began counts from its own start.
+    /// A new wave starts its count over, whatever the last one reached.
     #[test]
-    fn the_count_restarts_with_the_wave_and_the_segment() {
+    fn the_count_restarts_with_the_wave() {
         let mut fill = SegmentFill::default();
-        assert!(!fill.record(1, 4));
-        assert!(!fill.record(1, 4));
-        // The wave closes mid-segment; the next wave's first invocation flushes.
-        assert!(fill.record(2, 0));
-        // Segment 3 holds four; an eager cut moves recording to segment 4 after
-        // two of them, which then holds eight from its own start.
-        assert!(!fill.record(2, 3));
-        assert!(!fill.record(2, 3));
-        for _ in 0..7 {
-            assert!(!fill.record(2, 4));
+        for _ in 0..5 {
+            fill.record(1);
         }
-        assert!(fill.record(2, 4));
+        assert!(
+            fill.record(2),
+            "the next wave's first invocation ends a segment"
+        );
+        assert!(fill.record(2));
+        assert!(!fill.record(2));
+        assert!(fill.record(2));
     }
 }

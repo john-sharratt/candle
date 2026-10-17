@@ -15,7 +15,8 @@ use candle::cuda_backend::graph::CaptureStats;
 /// executable library keeps now — executables, their nodes, and the device
 /// bytes they are charged against its budget, all outside the reservation —
 /// `phase` where the library is (learning, on trial, or locked), `banned` and
-/// `proven` how many shapes its trials have judged each way so far, and
+/// `proven` how many shapes its trials have judged each way so far,
+/// `reopened` how often a lock has given way to learn new traffic, and
 /// `unkept` the window's segments run unrecorded plus those instantiated for
 /// one launch.
 pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> String {
@@ -27,7 +28,7 @@ pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> Strin
     let segs = d(after.segments, before.segments);
     format!(
         " | graphs waves={waves} segs={} fold={}/{}ms reshape={}/{}ms inst={}/{}ms rec={}ms \
-         nodes/seg={} held={}x/{}n/{}MiB phase={} banned={} proven={} unkept={}+{}",
+         nodes/seg={} held={}x/{}n/{}MiB phase={} banned={} proven={} reopened={} unkept={}+{}",
         segs,
         d(after.updated, before.updated).saturating_sub(d(after.reshaped, before.reshaped)),
         d(after.in_place_us, before.in_place_us) / 1000,
@@ -43,6 +44,7 @@ pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> Strin
         after.phase.name(),
         after.banned,
         after.proven,
+        after.reopened,
         d(after.eager_segments, before.eager_segments),
         d(after.transient, before.transient),
     )
@@ -88,6 +90,7 @@ mod tests {
             phase: GraphPhase::Trial,
             banned: 4,
             proven: 9,
+            reopened: 1,
             eager_segments: 3,
             transient: 1,
             ..stats(160, 1_380, 43, 81_500)
@@ -103,7 +106,8 @@ mod tests {
         assert_eq!(
             graph_window(&before, &after),
             " | graphs waves=60 segs=480 fold=475/9ms reshape=2/1ms inst=3/6ms rec=31ms \
-             nodes/seg=145 held=212x/61480n/600MiB phase=trial banned=4 proven=9 unkept=2+1"
+             nodes/seg=145 held=212x/61480n/600MiB phase=trial banned=4 proven=9 reopened=1 \
+             unkept=2+1"
         );
     }
 

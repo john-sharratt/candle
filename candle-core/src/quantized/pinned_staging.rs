@@ -761,22 +761,42 @@ impl PinnedStagerInner {
     /// stay valid until the arenas next reset.
     fn copy_to_device(&mut self, buf: &PinnedBuf) -> Result<u64> {
         let dev = self.dev.clone().expect("cuda stager missing device");
-        // A host copy, and possibly a slab allocation: eager, behind whatever
-        // this thread has recorded.
-        let _eager = dev.pause_capture()?;
         let stream = self
             .explicit_stream
             .clone()
             .unwrap_or_else(|| dev.compute_stream());
+        let src = buf.as_slice();
+        let mut _eager = None;
         let at = match self.resident.carve(buf.len()) {
             Carve::At(offset) => {
                 let slab = self
                     .resident_slabs
                     .last()
                     .expect("a carve At names a held slab");
-                slab.device_ptr(&stream).0 + offset as u64
+                let at = slab.device_ptr(&stream).0 + offset as u64;
+                // **On the compute stream, a carve into a held slab cuts
+                // nothing.** Recording, the bytes are staged through the
+                // wave's ring and their copy recorded ahead of the launches
+                // that read them; in a segment that runs eagerly, the copy
+                // below lands behind the launches already issued. Pausing in
+                // either cut the wave where the same wave without this copy
+                // is not cut, and every segment after it held other layers.
+                if self.explicit_stream.is_none() {
+                    if dev.record_upload(at, src) {
+                        return Ok(at);
+                    }
+                    if !dev.eager_segment_here() {
+                        _eager = dev.pause_capture()?;
+                    }
+                } else {
+                    _eager = dev.pause_capture()?;
+                }
+                at
             }
             Carve::NewSlab(width) => {
+                // An allocation: eager, behind whatever this thread has
+                // recorded.
+                _eager = dev.pause_capture()?;
                 // SAFETY: every byte a launch reads is written by the copy
                 // below, into the range carved for it.
                 let slab = unsafe { Held::<u8>::alloc_on(&stream, width)? };
@@ -785,7 +805,6 @@ impl PinnedStagerInner {
                 base
             }
         };
-        let src = buf.as_slice();
         if !src.is_empty() {
             // SAFETY: `at` names `src.len()` bytes of a held slab, carved for
             // this copy alone until the arenas reset; `src` is pinned and stays

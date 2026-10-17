@@ -23,6 +23,7 @@
 
 /// The attention output's capture: the stored K/V audited and the launch
 /// rerun, in the pass that went non-finite.
+pub mod append_grids;
 #[cfg(feature = "tensor-assert")]
 mod attn_capture;
 #[cfg(feature = "cuda")]

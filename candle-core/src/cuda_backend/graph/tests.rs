@@ -1709,6 +1709,46 @@ fn a_budget_nothing_fits_locks_and_runs_eagerly() -> Result<()> {
     Ok(())
 }
 
+/// **A lock with room reopens for traffic it never learned.** The library
+/// locks holding nothing; waves then cycle four topologies it does not hold.
+/// The ordinal's rechecks meet each of them again and again, and once the lock
+/// has stood its minimum, it reopens. Every wave's result is still what the
+/// eager forward would have produced.
+#[test]
+fn a_lock_reopens_for_shapes_it_keeps_meeting() -> Result<()> {
+    use super::budget::graph_budget_bytes;
+    use super::regime::MIN_LOCK_WAVES;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    dev.capture_hub().reset_library(1);
+    let want = |add: f32| -> Vec<f32> { ramp(1.0).iter().map(|v| v + add).collect() };
+    assert_eq!(add_wave(&dev, &f, &x, &mut y, 3, 1.0)?, want(1.0));
+    assert_eq!(dev.capture_stats().phase, GraphPhase::Lock);
+
+    let limit = MIN_LOCK_WAVES as u32 + 40 * super::hub::RECHECK_EVERY;
+    let mut waves = 0u32;
+    while dev.capture_stats().reopened == 0 {
+        assert!(waves < limit, "never reopened: {:?}", dev.capture_stats());
+        let add = (waves % 5) as f32;
+        let launches = 3 + (waves % 4) as usize;
+        assert_eq!(
+            add_wave(&dev, &f, &x, &mut y, launches, add)?,
+            want(add),
+            "wave {waves}"
+        );
+        waves += 1;
+    }
+    assert!(
+        u64::from(waves) >= MIN_LOCK_WAVES,
+        "reopened after {waves} waves, before the lock's minimum"
+    );
+    dev.capture_hub().reset_library(graph_budget_bytes()?);
+    Ok(())
+}
+
 /// **The library learns, trials and locks within a couple of hundred waves.**
 /// One shape: the learn admits it and goes quiet, the trial runs it graphed and
 /// eager by turns, and the verdict either proves it (the next learn finds
@@ -1752,6 +1792,105 @@ fn the_library_learns_trials_and_locks_quickly() -> Result<()> {
         "what is held is what was proven: {s:?}"
     );
     dev.capture_hub().reset_library(graph_budget_bytes()?);
+    Ok(())
+}
+
+/// One `y = x + add` over the first `n` elements, captured on `stream` and
+/// audited: a template the slot tests fold.
+fn captured_n(
+    f: &CudaFunction,
+    stream: &Arc<CudaStream>,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    n: usize,
+    add: f32,
+) -> Result<(super::exec::Template, super::exec::Audited)> {
+    use super::exec::{audit, Template};
+    // SAFETY: a created stream the caller owns, not capturing.
+    unsafe { super::capture::begin(stream)? };
+    launch_n(f, stream, x, y, 1.0, add, n)?;
+    // SAFETY: the capture begun above, on this thread.
+    let template = Template(unsafe { super::capture::end(stream)? });
+    let audited = audit(template.0, 1)?;
+    Ok((template, audited))
+}
+
+/// **Past the learn, a held topology at a shape it does not hold runs once,
+/// and the held executable keeps its own shape.** The same launch at another
+/// grid is one topology. Under `Never` — the trial's and the lock's mode — it
+/// is instantiated for its launch and computes its own extent, nothing in the
+/// slot is rewritten, and the held shape still folds in place after it.
+#[test]
+fn past_the_learn_a_new_shape_runs_once_and_reshapes_nothing() -> Result<()> {
+    use super::slot::{Admit, ExecSlot, Folded};
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let stream = dev.cuda_context().new_stream().w()?;
+    let compute = ComputeStream::of(&dev);
+    let mut slot = ExecSlot::default();
+    let half = N / 2;
+    // `y = x + head` over the first `n` elements, `x + tail` past them.
+    let want = |n: usize, head: f32, tail: f32| -> Vec<f32> {
+        ramp(1.0)
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + if i < n { head } else { tail })
+            .collect()
+    };
+
+    let (t, a) = captured_n(&f, &stream, &x, &mut y, N, 1.0)?;
+    let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Keep)?;
+    assert!(once.is_none());
+    assert_eq!(how, Folded::Instantiated);
+    slot.front().expect("kept").launch(&compute)?;
+    assert_eq!(dev.memcpy_dtov(&y)?, want(N, 1.0, 1.0));
+
+    let (t, a) = captured_n(&f, &stream, &x, &mut y, half, 2.0)?;
+    let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Never)?;
+    assert_eq!(how, Folded::Transient, "never: run once, kept nothing");
+    once.expect("instantiated for its launch")
+        .launch(&compute)?;
+    assert_eq!(dev.memcpy_dtov(&y)?, want(half, 2.0, 1.0));
+
+    let (t, a) = captured_n(&f, &stream, &x, &mut y, N, 3.0)?;
+    let (once, how, _) = slot.fold(t, a, &compute, 1, Admit::Never)?;
+    assert!(once.is_none());
+    assert_eq!(how, Folded::InPlace, "the held shape was not rewritten");
+    slot.front().expect("held").launch(&compute)?;
+    assert_eq!(dev.memcpy_dtov(&y)?, want(N, 3.0, 3.0));
+    assert_eq!(slot.held().0, 1);
+    Ok(())
+}
+
+/// **A bracketed segment yields its device time.** A start and an end recorded
+/// around launches on the compute stream drain, once the end has fired, as one
+/// sample of the key and mode they were recorded for. The trial is judged on
+/// nothing else: events made without timing drained as no sample at all.
+#[test]
+fn a_timed_segment_yields_one_sample() -> Result<()> {
+    use super::regime::Mode;
+    use super::timing::SegmentTimer;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    let stream = dev.cuda_stream();
+    let mut timer = SegmentTimer::default();
+    let start = timer.start(&stream)?;
+    for _ in 0..8 {
+        launch(&f, &stream, &x, &mut y, 1.0, 2.0)?;
+    }
+    timer.end(&stream, start, 7, Mode::Eager)?;
+    stream.synchronize().w()?;
+    let mut samples = Vec::new();
+    timer.drain(|key, mode, took| samples.push((key, mode, took)))?;
+    assert_eq!(samples.len(), 1, "one pair, one sample: {samples:?}");
+    let (key, mode, _took) = samples[0];
+    assert_eq!((key, mode), (7, Mode::Eager));
     Ok(())
 }
 

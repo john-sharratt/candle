@@ -28,6 +28,9 @@ pub const FLUSH_WORDS: usize = 3;
 pub const MAX_D: usize = 1024;
 
 extern "C" {
+    /// Over `grid` blocks, of which the first `n_jobs` append; the rest return
+    /// at once. `grid` is the caller's bound on `n_jobs`, so the launch keeps
+    /// its shape from one wave to the next.
     pub fn run_qsa_index_append(
         jobs: *const i64,
         k_norm: *const f32,
@@ -35,10 +38,18 @@ extern "C" {
         ratio: i32,
         eps: f32,
         n_jobs: i32,
+        grid: i32,
         stream: *mut c_void,
     );
 
-    pub fn run_qsa_index_carry(carries: *const i64, d: i32, n_carry: i32, stream: *mut c_void);
+    /// Over `grid` blocks, of which the first `n_carry` carry, as above.
+    pub fn run_qsa_index_carry(
+        carries: *const i64,
+        d: i32,
+        n_carry: i32,
+        grid: i32,
+        stream: *mut c_void,
+    );
 
     /// Close a turn on a block boundary: pool the carried rows into ONE short
     /// block, over the count actually present rather than `ratio`.

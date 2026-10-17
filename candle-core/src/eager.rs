@@ -23,7 +23,9 @@ pub struct Eager<'a> {
 
 impl Device {
     /// Run what follows eagerly, in issue order behind every launch this
-    /// thread has recorded, until the guard drops.
+    /// thread has recorded, until the guard drops. The caller's location is
+    /// what the wave's cut is attributed to (`graph::cuts`).
+    #[track_caller]
     pub fn eager(&self) -> Result<Eager<'_>> {
         match self {
             #[cfg(feature = "cuda")]
@@ -53,6 +55,7 @@ impl Device {
     /// Hand what this thread has recorded to the device now, so it starts
     /// executing while the rest of the forward records. Does nothing on
     /// another device or on a thread with no wave capture open.
+    #[track_caller]
     pub fn flush_launches(&self) -> Result<()> {
         match self {
             #[cfg(feature = "cuda")]

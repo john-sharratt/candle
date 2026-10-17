@@ -28,8 +28,10 @@
 //! the last one therefore replays correctly with no key and no epoch to check.
 
 use super::capture;
-use super::exec::{audit, divergence, NodeKey, Template};
+use super::cuts::CutCounter;
+use super::exec::{audit, divergence, reshaped_at, Template};
 use super::library::ExecLibrary;
+use super::ordinals::{wave_kind, OrdinalHistory, WaveKind};
 use super::record_gate;
 use super::regime::{Key, LearnEnd, Mode, Phase, Regime, Transition};
 use super::slot::{Admit, Folded};
@@ -42,6 +44,7 @@ use crate::Result;
 use cudarc::driver::{result, sys, CudaEvent, CudaStream};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::ThreadId;
@@ -91,9 +94,13 @@ pub struct CaptureStats {
     pub bytes_held: u64,
     /// Where the library is: learning, on trial, or locked (`regime`).
     pub phase: Phase,
-    /// Shapes the trials banned, and proved, so far.
+    /// Topologies the trials banned as not faster, and proved, so far.
     pub banned: u64,
     pub proven: u64,
+    /// Topologies the trials benched as too rarely hit to judge, in all.
+    pub banned_rare: u64,
+    /// Times a lock has reopened to learn traffic it never saw.
+    pub reopened: u64,
 }
 
 /// One device's wave-capture state, shared by every clone of its handle.
@@ -163,15 +170,12 @@ struct HubState {
     regime: Regime,
     /// Device time of the segments on trial.
     timer: SegmentTimer,
-    /// The topology each segment ordinal held in the last wave that reached
-    /// it — what a new topology is compared against when it is logged.
-    last_topology: Vec<Vec<NodeKey>>,
-    /// The `(topology, shape)` key each ordinal held in the last wave that
-    /// recorded it — the prediction `start_segment` decides a segment's mode by.
-    last_key: Vec<Option<Key>>,
-    /// Segments each ordinal has run eagerly in a row on its prediction alone
-    /// — see [`RECHECK_EVERY`].
-    eager_runs: Vec<u32>,
+    /// Where waves are cut into segments, by the site that asked (`cuts`).
+    cuts: CutCounter,
+    /// What each segment ordinal held the last time a wave of the same kind
+    /// reached it — the predictions `start_segment` decides a segment's mode
+    /// by (`ordinals`).
+    ordinals: OrdinalHistory,
     /// Device memory released while recording, freed once the segment that
     /// may still read it has been launched — see [`CaptureHub::retire`].
     graveyard: Graveyard,
@@ -233,6 +237,8 @@ struct Wave {
     held: bool,
     /// The next segment's ordinal.
     segment: usize,
+    /// Where it was opened, which its segments' predictions are kept by.
+    kind: WaveKind,
     /// A resume that failed inside a guard's `drop`, reported at the next
     /// segment boundary.
     error: Option<String>,
@@ -337,7 +343,7 @@ fn act_on_transitions(st: &mut HubState, wave: u64) {
                 ended,
                 next,
             } => {
-                let judging = st.regime.begin_trial(st.library.held_keys());
+                let judging = st.regime.begin_trial(st.library.held_topologies());
                 let (execs, nodes, bytes) = st.library.held();
                 tracing::info!(
                     target: "candle_core::graph",
@@ -371,12 +377,28 @@ fn act_on_transitions(st: &mut HubState, wave: u64) {
                 untimed,
                 slower,
                 next,
+                starts,
+                tallies,
             } => {
+                st.stats.banned_rare += rare as u64;
                 let (execs, nodes, bytes) = st.library.held();
+                // The few with the most hits, which are what a verdict turns
+                // on: `hits/graphed/eager` each.
+                let top: Vec<String> = tallies
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .map(|(h, g, e)| format!("{h}/{g}/{e}"))
+                    .collect();
                 tracing::info!(
                     target: "candle_core::graph",
                     wave,
                     waves,
+                    starts_candidate = starts.candidate,
+                    starts_other = starts.other,
+                    starts_unpredicted = starts.unpredicted,
+                    hits_missed = starts.missed,
+                    most_hit = top.join(" "),
                     judged,
                     proven,
                     graphed_over_eager =
@@ -398,6 +420,26 @@ fn act_on_transitions(st: &mut HubState, wave: u64) {
                         Phase::Learn => "learning again into the ground the bans freed",
                         _ => "nothing new worth keeping: locked",
                     }
+                );
+            }
+            Transition::Reopened { waves, recurring } => {
+                st.stats.reopened += 1;
+                let (execs, nodes, bytes) = st.library.held();
+                tracing::info!(
+                    target: "candle_core::graph",
+                    wave,
+                    waves,
+                    recurring,
+                    banned_total,
+                    proven_total,
+                    execs_held = execs,
+                    nodes_held = nodes,
+                    held_mib = bytes >> 20,
+                    budget_mib,
+                    "graph library: lock reopened after {waves} wave(s) — {recurring} recurring \
+                     shape(s) it does not hold, {} of {budget_mib} MiB held: learning again, \
+                     keeping {proven_total} proven",
+                    bytes >> 20
                 );
             }
         }
@@ -463,6 +505,40 @@ impl CaptureHub {
             .map(|w| (w.serial, w.segment))
     }
 
+    /// This thread's open wave's serial — `None` when it has no wave open,
+    /// whether the wave is recording, running a segment eagerly, held or
+    /// paused. A host protocol that ends segments at fixed points in the wave
+    /// counts by this rather than by [`Self::recording_segment`], so an eager
+    /// segment is cut where a recorded one would be
+    /// (`expert_lre::flush_schedule`).
+    pub(crate) fn wave_here(&self) -> Option<u64> {
+        if !self.owned_here() {
+            return None;
+        }
+        self.lock()
+            .wave
+            .as_ref()
+            .filter(|w| w.owner == std::thread::current().id())
+            .map(|w| w.serial)
+    }
+
+    /// Whether this thread's wave is in a segment that runs eagerly: its
+    /// launches reach the device as issued, so an upload may go straight onto
+    /// the compute stream behind them instead of ending the segment.
+    pub(crate) fn eager_segment_here(&self) -> bool {
+        self.owned_here()
+            && self
+                .lock()
+                .wave
+                .as_ref()
+                .is_some_and(|w| w.eager && w.paused == 0 && w.owner == std::thread::current().id())
+    }
+
+    /// Nudge WDDM to submit what `compute` has queued, ending nothing.
+    pub(crate) fn submit(&self, compute: &Arc<CudaStream>) -> Result<()> {
+        query_submits(compute)
+    }
+
     /// Whether this thread has a wave capture open, recording or paused.
     pub(crate) fn capturing_here(&self) -> bool {
         self.owned_here()
@@ -484,8 +560,13 @@ impl CaptureHub {
             )
     }
 
-    /// Open a wave capture on this thread.
-    pub(crate) fn begin_wave(&self, compute: &Arc<CudaStream>) -> Result<()> {
+    /// Open a wave capture on this thread, of the kind `opened_at` names
+    /// (`ordinals`).
+    pub(crate) fn begin_wave(
+        &self,
+        compute: &Arc<CudaStream>,
+        opened_at: &'static Location<'static>,
+    ) -> Result<()> {
         let mut st = self.lock();
         if st.wave.is_some() {
             crate::bail!("a wave capture is already open on this device");
@@ -520,19 +601,35 @@ impl CaptureHub {
         }
         {
             // Segments on trial that have finished on the device are credited,
-            // and a trial that has run its course drops what it banned.
+            // and a trial that has run its course drops what it did not prove.
             let HubState {
                 timer,
                 regime,
                 library,
                 ..
             } = &mut *st;
-            timer.drain(|key, mode, took| regime.sample(key, mode, took));
+            timer.drain(|key, mode, took| regime.sample(key, mode, took))?;
             for key in regime.wave_begins(now) {
-                library.ban(key);
+                library.drop_topology(key);
             }
         }
         act_on_transitions(&mut st, now);
+        if let Some(report) = st.cuts.wave() {
+            let waves = report.waves.max(1) as f64;
+            let sites: Vec<String> = report
+                .sites
+                .iter()
+                .map(|((file, line), n)| format!("{file}:{line} {:.1}/wave", *n as f64 / waves))
+                .collect();
+            tracing::debug!(
+                target: "candle_core::graph::cuts",
+                waves = report.waves,
+                cuts = report.cuts,
+                per_wave = format!("{:.1}", report.cuts as f64 / waves),
+                "segment cuts by site: {}",
+                sites.join("; ")
+            );
+        }
         st.wave = Some(Wave {
             owner: std::thread::current().id(),
             serial: st.stats.waves,
@@ -540,6 +637,7 @@ impl CaptureHub {
             paused: 1,
             held: true,
             segment: 0,
+            kind: wave_kind(opened_at),
             error: None,
             recording_since: None,
             eager: false,
@@ -645,34 +743,42 @@ impl CaptureHub {
         // predecessor at the same place in the wave names what made it new —
         // a kernel chosen by width, a launch count that follows the wave.
         let first_sight = !st.library.holds(audited.key);
-        let departs = match st.last_topology.get(segment) {
-            Some(prev) if first_sight => divergence(&audited.topology, prev),
+        let (key, shape) = (audited.key, audited.shape);
+        let holds_shape = st.library.holds_shape(key, shape);
+        let kind = wave.kind;
+        let o = st.ordinals.at(kind, segment);
+        let prev_topology = &o.topology[segment];
+        let departs = if first_sight && !prev_topology.is_empty() {
+            divergence(&audited.topology, prev_topology)
+        } else {
+            None
+        };
+        o.topology[segment].clone_from(&audited.topology);
+        // **A shape the library does not hold, of the topology this ordinal
+        // held last wave.** The same launches at other dimensions are a key of
+        // their own, so the launch whose grid or variant moved names what keeps
+        // a segment from recurring.
+        st.regime.recorded(o.key[segment].map(|(k, _)| k), key);
+        let reshaped = match o.key[segment] {
+            Some((k, s)) if k == key && s != shape && !holds_shape => {
+                reshaped_at(&audited.dims, &o.dims[segment])
+            }
             _ => None,
         };
-        if st.last_topology.len() <= segment {
-            st.last_topology.resize_with(segment + 1, Vec::new);
-        }
-        st.last_topology[segment].clone_from(&audited.topology);
-        if st.last_key.len() <= segment {
-            st.last_key.resize(segment + 1, None);
-        }
-        let (key, shape) = (audited.key, audited.shape);
-        st.last_key[segment] = Some((key, shape));
+        o.dims[segment].clone_from(&audited.dims);
+        o.key[segment] = Some((key, shape));
         let topologies = st.library.len() + usize::from(first_sight);
-        // Only the learn keeps anything new, and never a banned shape.
-        let admit = if st.regime.admits() && !st.regime.banned((key, shape)) {
+        // Only the learn keeps anything new, and never a banned topology;
+        // after it, a shape the library does not hold runs once (`slot`).
+        let admit = if st.regime.admits() && !st.regime.banned(key) {
             Admit::Keep
         } else {
             Admit::Never
         };
-        // A proven executable keeps the shape its trial proved: a one-off is
-        // never folded over it.
-        let regime = &st.regime;
-        let protected = |s| regime.proven((key, s));
         let (transient, folded, refusal) = match st
             .library
             .slot(key)
-            .fold(template, audited, &on, nodes, admit, protected)
+            .fold(template, audited, &on, nodes, admit)
         {
             Ok(done) => done,
             Err(e) => {
@@ -710,6 +816,16 @@ impl CaptureHub {
                 "segment of a new topology, against this ordinal's last"
             );
         }
+        if let Some(d) = reshaped {
+            tracing::debug!(
+                target: "candle_core::graph",
+                wave = serial,
+                segment,
+                nodes,
+                reshaped = d.as_str(),
+                "segment of a new shape, against this ordinal's last"
+            );
+        }
         if let Some(r) = refusal {
             tracing::debug!(
                 target: "candle_core::graph",
@@ -737,8 +853,8 @@ impl CaptureHub {
         }
         drop(transient);
         if let Some(start) = st.wave.as_mut().and_then(|w| w.timing.take()) {
-            if st.regime.timed((key, shape)) {
-                st.timer.end(compute, start, (key, shape), Mode::Graph)?;
+            if st.regime.timed(key) {
+                st.timer.end(compute, start, key, Mode::Graph)?;
             } else {
                 st.timer.discard(start);
             }
@@ -770,21 +886,32 @@ impl CaptureHub {
                 st.stats.transient += 1;
                 st.stats.instantiated_us += fold_us;
                 st.library.drop_if_empty(key);
+                // Locked, a recorded segment the library holds nothing for is
+                // traffic the lock never learned: enough of it, with room in
+                // the budget, reopens the learn.
+                st.regime.missed(key);
+                let (_, _, held) = st.library.held();
+                if st.regime.reopen_due(serial) && held * 2 < st.library.budget() {
+                    st.regime.reopen(serial);
+                    act_on_transitions(st, serial);
+                }
             }
         }
         Ok(())
     }
 
     /// Begin the wave's next segment, recorded or as issued, by the key this
-    /// ordinal held the last time it was recorded:
+    /// ordinal held the last time a wave of this kind recorded it
+    /// (`ordinals`):
     ///
     /// - banned: as issued — its graph was not worth keeping;
-    /// - not held, once the learn is over: as issued — recording it would buy
-    ///   one launch of an executable nothing keeps;
+    /// - not held, in the lock: as issued — recording it would buy one launch
+    ///   of an executable nothing keeps (in the trial it records, so its
+    ///   prediction follows the wave: [`Regime::runs_unkept`]);
     /// - on trial: graphed or eager by turns ([`Regime::mode_for`]), its start
     ///   recorded for the device time the trial compares;
     /// - otherwise recorded. An ordinal never recorded is recorded while the
-    ///   library learns, and runs as issued after.
+    ///   library learns or trials, and runs as issued in the lock.
     ///
     /// An ordinal that has run as issued on its prediction alone
     /// [`RECHECK_EVERY`] times in a row is recorded once, so its prediction
@@ -792,31 +919,30 @@ impl CaptureHub {
     ///
     /// The key is a prediction: a segment's real key is known only once it has
     /// been recorded. A miss either way is harmless — a recorded segment whose
-    /// shape the library does not hold runs once ([`Folded::Transient`]), and
-    /// an unrecorded one is simply eager.
+    /// topology the library does not hold runs once ([`Folded::Transient`]),
+    /// and an unrecorded one is simply eager.
     fn start_segment(st: &mut HubState) -> Result<()> {
         let wave = st.wave.as_ref().expect("called inside a wave");
         let ordinal = wave.segment;
-        let predicted = st.last_key.get(ordinal).copied().flatten();
-        // Eager on the prediction alone — banned, unheld, or never recorded —
-        // as opposed to the eager half of a trial.
-        let unkept = match predicted {
-            None => !st.regime.admits(),
-            Some(k) => st.regime.banned(k) || (!st.regime.admits() && !st.library.holds_shape(k)),
-        };
-        if st.eager_runs.len() <= ordinal {
-            st.eager_runs.resize(ordinal + 1, 0);
-        }
+        let o = st.ordinals.at(wave.kind, ordinal);
+        // The regime judges topologies; the shape is the ordinal's own record.
+        let predicted = o.predicted(ordinal).map(|(topology, _)| topology);
+        // Eager on the prediction alone (`Regime::runs_unkept`), as opposed to
+        // the eager half of a trial.
+        let held = predicted.is_some_and(|k| st.library.holds(k));
+        st.regime.start(predicted);
+        let unkept = st.regime.runs_unkept(predicted, held);
+        let runs = &mut o.eager_runs[ordinal];
         let mode = if unkept {
-            st.eager_runs[ordinal] += 1;
-            if st.eager_runs[ordinal] > RECHECK_EVERY {
-                st.eager_runs[ordinal] = 0;
+            *runs += 1;
+            if *runs > RECHECK_EVERY {
+                *runs = 0;
                 Mode::Graph
             } else {
                 Mode::Eager
             }
         } else {
-            st.eager_runs[ordinal] = 0;
+            *runs = 0;
             match predicted {
                 Some(k) => st.regime.mode_for(k),
                 None => Mode::Graph,
@@ -852,12 +978,17 @@ impl CaptureHub {
     /// does. Otherwise the recording segment is launched into `compute` first,
     /// so everything recorded so far executes before the eager call, and
     /// recording resumes when the guard drops.
+    #[track_caller]
     pub(crate) fn pause(&self, compute: &Arc<CudaStream>) -> Result<Option<Paused<'_>>> {
         if !self.capturing_here() {
             return Ok(None);
         }
+        let caller = Location::caller();
         let (paused, dead) = {
             let mut st = self.lock();
+            if st.wave.as_ref().is_some_and(|w| w.recording || w.eager) {
+                st.cuts.cut(caller);
+            }
             // Launched and submitted: the segment may hold MoE invocations whose
             // summary words the expert threads wait on, and on WDDM a launched
             // batch waits for a query before it reaches the GPU. Nothing is
@@ -904,10 +1035,12 @@ impl CaptureHub {
     /// runs between the launch and the resume: a legacy-stream call made while
     /// this thread captures is refused, and refusing it invalidates the
     /// capture.
+    #[track_caller]
     pub(crate) fn flush(&self, compute: &Arc<CudaStream>) -> Result<()> {
         if !self.capturing_here() {
             return query_submits(compute);
         }
+        let caller = Location::caller();
         let (ended, dead) = {
             let mut st = self.lock();
             if !st.wave.as_ref().is_some_and(|w| w.recording || w.eager) {
@@ -916,6 +1049,7 @@ impl CaptureHub {
                 drop(st);
                 return query_submits(compute);
             }
+            st.cuts.cut(caller);
             match Self::end_segment(&mut st, compute) {
                 Ok(()) => (Ok(()), std::mem::take(&mut st.graveyard)),
                 Err(e) => (Err(e), Graveyard::new()),
@@ -1021,8 +1155,7 @@ impl CaptureHub {
         st.library = ExecLibrary::with_budget(budget);
         st.regime = Regime::default();
         st.timer = SegmentTimer::default();
-        st.last_key.clear();
-        st.eager_runs.clear();
+        st.ordinals.clear();
     }
 
     /// Close the wave of a forward that failed, **launching what is recording**.

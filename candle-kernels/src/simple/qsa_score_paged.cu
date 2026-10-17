@@ -438,7 +438,7 @@ __global__ __launch_bounds__(QSA_PAGED_THREADS) void qsa_score_paged_generic_ker
             + (size_t)(QSA_PAGED_THREADS / 32) * (CP) * QSA_RUNS * pairs            \
                   * sizeof(float2);                                                 \
         const int span = QSA_PAGED_SPAN(TR, CP);                                    \
-        int bx = (n_cand + span - 1) / span;                                        \
+        int bx = (n_grid + span - 1) / span;                                        \
         if (bx < 1) bx = 1;                                                         \
         if (bx > 65535) bx = 65535;                                                 \
         dim3 grid(bx, (rows + (TR) - 1) / (TR));                                     \
@@ -469,7 +469,24 @@ static int qsa_paged_sm_count()
 /// Blocks the grid would hold at a given tile pair.
 #define QSA_PAGED_GRID(TR, CP)                                                      \
     ((long long)((rows + (TR) - 1) / (TR))                                          \
-     * (long long)((n_cand + QSA_PAGED_SPAN(TR, CP) - 1) / QSA_PAGED_SPAN(TR, CP)))
+     * (long long)((n_grid + QSA_PAGED_SPAN(TR, CP) - 1) / QSA_PAGED_SPAN(TR, CP)))
+
+/// The candidate count the grid and the tile arm are chosen for: `n_cand`
+/// rounded up to a power of two.
+///
+/// **The launch's shape follows the index's depth only by doublings.** Both
+/// kernels stride over candidates by the grid, so any grid scores them all and
+/// the blocks past `n_cand` leave at the loop test. Sized by `n_cand` itself,
+/// the grid — and, across the fill threshold, the tile arm — moved every few
+/// tokens as the index grew, and every recorded segment holding a score was a
+/// new shape: on `.5` (2026-10-17) grids of 91 and 129 blocks one decode step
+/// apart. Rounded, a segment's executable is reused until the depth doubles.
+static int qsa_paged_grid_cands(int n_cand)
+{
+    int n = 1;
+    while (n < n_cand && n < (1 << 30)) n <<= 1;
+    return n;
+}
 
 /// Pick the row tile and the candidate tile: searched from most reuse to least,
 /// and the first whose grid fills the device wins. If none does — a shallow
@@ -497,6 +514,7 @@ extern "C" void run_qsa_score_paged(
     cudaStream_t stream)
 {
     if (rows <= 0 || n_cand <= 0 || P <= 0) return;
+    const int n_grid = qsa_paged_grid_cands(n_cand);
     const float2* tab2 = reinterpret_cast<const float2*>(tab);
     const float2* steps2 = reinterpret_cast<const float2*>(steps);
     // The templated arms need whole `float4` groups on both sides of the
@@ -511,7 +529,7 @@ extern "C" void run_qsa_score_paged(
             default: break;
         }
     }
-    const int want = (n_cand + QSA_PAGED_THREADS - 1) / QSA_PAGED_THREADS;
+    const int want = (n_grid + QSA_PAGED_THREADS - 1) / QSA_PAGED_THREADS;
     const int blocks_x = want < 1 ? 1 : (want > 65535 ? 65535 : want);
     qsa_score_paged_generic_kernel<<<blocks_x, QSA_PAGED_THREADS, 0, stream>>>(
         q, pages, page_first, cnt, tab2, out, rows, H, D, n_cand, P, pairs, ratio,

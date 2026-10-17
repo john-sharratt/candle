@@ -31,11 +31,13 @@
 
 mod budget;
 pub(crate) mod capture;
+mod cuts;
 mod device_wide;
 mod error;
 mod exec;
 mod hub;
 mod library;
+mod ordinals;
 mod record_gate;
 mod regime;
 #[cfg(test)]

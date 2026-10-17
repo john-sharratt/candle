@@ -1,29 +1,38 @@
 //! Which executables the library keeps: learned, trialled, then locked.
 //!
-//! A graph launch replaces a segment's launches with one, but keeping a shape
-//! has costs of its own: it is recorded every wave (that is how its arguments
-//! are refreshed), the record gate holds other threads' quiet calls while it
-//! records, and its executable is driver memory outside the reservation. A
-//! shape is worth those only if it recurs and its graph is faster than its
-//! launches issued one by one. So the library finds out, shape by shape, and
-//! then stops changing:
+//! A graph launch replaces a segment's launches with one, but keeping a
+//! segment's topology has costs of its own: it is recorded every wave (that is
+//! how its arguments are refreshed), the record gate holds other threads' quiet
+//! calls while it records, and its executables are driver memory outside the
+//! reservation. A topology is worth those only if it recurs and its graph is
+//! faster than its launches issued one by one. So the library finds out,
+//! topology by topology ([`Key`]), and then stops changing:
 //!
 //! 1. **Learn.** Segments record, and the library admits what it folds, into
 //!    its fixed budget. Nothing is evicted to make room: the learn ends at the
 //!    first admission that does not fit, or once [`LEARN_IDLE_WAVES`] pass
-//!    with no admission at all — the traffic has shown its shapes.
-//! 2. **Trial**, for [`TRIAL_WAVES`] waves. Every shape admitted in the learn
-//!    alternates graphed and eager each time a segment predicts it, and each
-//!    run is timed on the device from the segment's start to its end — host
-//!    lateness included, which is what a graph removes. A shape hit in fewer
-//!    than one trial wave in [`MIN_HIT_DIVISOR`], or whose graphed median is not
-//!    at least [`MIN_GAIN`] faster than its eager one, is **banned**: dropped,
-//!    and never admitted again. The rest are proven and never trialled again.
+//!    with no admission at all — the traffic has shown its topologies.
+//! 2. **Trial**, for at least [`TRIAL_WAVES`] waves and until every candidate
+//!    has [`MIN_SAMPLES`] timed in each mode, or [`TRIAL_MAX_WAVES`]. Every
+//!    topology the library holds unproven alternates graphed and eager each
+//!    time a segment predicts it, and each run is timed on the device from the
+//!    segment's start to its end — host lateness included, which is what a
+//!    graph removes. One whose graphed median is not at least [`MIN_GAIN`]
+//!    faster than its eager one is **banned**: dropped, and never admitted
+//!    again. One hit fewer than [`MIN_HITS`] times, or never timed, is
+//!    **benched** until the lock reopens. The rest are proven and never
+//!    trialled again.
 //! 3. A trial that proved anything returns to the learn, which fills the
 //!    ground the bans freed. One that proved nothing — no candidate left
-//!    worth keeping — **locks** the library: nothing is admitted, evicted or
-//!    timed again, a held shape records and replays, and every other runs
-//!    eagerly.
+//!    worth keeping — **locks** the library: nothing is admitted or timed, a
+//!    held shape records and replays, a shape it does not hold runs once, and
+//!    every other runs eagerly.
+//! 4. A lock with room **reopens** when traffic keeps bringing topologies it
+//!    does not hold — [`REOPEN_SHAPES`] of them met [`REOPEN_SIGHTINGS`] times each,
+//!    after it has stood [`MIN_LOCK_WAVES`], with the library under half its
+//!    budget. A learn's traffic is whatever ran while it learned, and one that
+//!    learns at startup sees startup's; reopened, it learns the traffic that
+//!    came since, keeping everything already proven and banned.
 //!
 //! Every phase that ends leaves a summary ([`Transition`]) — a learn's length,
 //! what it admitted and why it stopped; a trial's verdicts and why each ban
@@ -34,30 +43,58 @@
 //! without a device.
 
 use std::collections::{HashMap, HashSet};
+use std::mem::take;
 use std::time::Duration;
 
-/// A segment's `(topology, shape)`: what an executable is kept for.
-pub(crate) type Key = (u64, u64);
+/// A segment's topology: what the library judges and keeps.
+///
+/// **Not its shape.** Judged by `(topology, shape)`, each combination of
+/// sessions and verify widths was a candidate of its own, hit too rarely to
+/// prove. A held topology's shapes fold in place; any other runs once (`slot`).
+pub(crate) type Key = u64;
 
-/// Waves a trial lasts. Short on purpose: a decode wave is a token or so, and
-/// reaching the lock should cost a few seconds of decode, not minutes. A shape
-/// hit every wave is timed 32 times in each mode, ample for a median.
+/// Waves a trial lasts at least. A trial whose every candidate has its
+/// [`MIN_SAMPLES`] in both modes by then ends here: a shape hit every wave is
+/// timed 32 times in each mode, ample for a median.
 pub(crate) const TRIAL_WAVES: u64 = 64;
+
+/// Waves a trial lasts at most, waiting for its candidates' samples.
+///
+/// **A trial waits for samples, not for a share of all waves.** A decode step
+/// opens several waves of its own kinds (`ordinals`), and its segments come at
+/// a few widths, so a shape every step uses is in a small fraction of the
+/// waves: on `.5` (2026-10-17), with timing working, the most-hit shape of a
+/// 64-wave trial had 7 hits, the rest 3 or fewer, and the trial banned 174 of
+/// 176 as rare while each recurred steadily. Measured by the samples it needs
+/// instead, a trial lasts until every candidate is judged or this cap — about
+/// twenty seconds of decode — and a shape hit fewer than [`MIN_HITS`] times by
+/// then is rare by any measure worth a graph.
+pub(crate) const TRIAL_MAX_WAVES: u64 = 512;
 
 /// Waves without an admission that end a learn — about a second of decode.
 pub(crate) const LEARN_IDLE_WAVES: u64 = 32;
 
-/// A candidate is hit in at least one trial wave in this many, or banned.
-pub(crate) const MIN_HIT_DIVISOR: u64 = 8;
-
-/// Timed runs of each mode a candidate needs for a verdict on its speed — the
-/// fewest hits a candidate may have, split between the modes.
+/// Timed runs of each mode a candidate needs for a verdict on its speed.
 pub(crate) const MIN_SAMPLES: usize = 4;
+
+/// Hits a candidate needs over its trial, or it is banned as rare: enough to
+/// time [`MIN_SAMPLES`] in each mode.
+pub(crate) const MIN_HITS: u64 = 2 * MIN_SAMPLES as u64;
 
 /// How much faster a graph must run than its eager launches to be kept: its
 /// median at most this fraction of the eager median. A tie is not kept — a
 /// kept shape pays for its recording every wave.
 pub(crate) const MIN_GAIN: f64 = 0.95;
+
+/// Times a lock must meet a shape it does not hold before that shape counts
+/// as recurring — a prompt's own length is met once.
+pub(crate) const REOPEN_SIGHTINGS: u32 = 3;
+
+/// Recurring shapes the lock does not hold that reopen it.
+pub(crate) const REOPEN_SHAPES: usize = 4;
+
+/// Waves a lock stands before anything may reopen it.
+pub(crate) const MIN_LOCK_WAVES: u64 = 256;
 
 /// How a segment runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +142,7 @@ struct Tally {
 enum Judged {
     /// Kept; its graphed median over its eager one.
     Proven(f64),
-    /// Hit in fewer than one trial wave in [`MIN_HIT_DIVISOR`].
+    /// Hit fewer than [`MIN_HITS`] times.
     Rare,
     /// Hit enough, but its timings did not arrive in time to judge — reported
     /// apart from [`Self::Rare`] because it says the trial failed to measure,
@@ -116,12 +153,17 @@ enum Judged {
 }
 
 impl Tally {
-    /// What this candidate earned over a trial of `waves`.
-    fn judge(&self, waves: u64) -> Judged {
-        if self.hits * MIN_HIT_DIVISOR < waves {
+    /// Whether its speed can be judged: [`MIN_SAMPLES`] timed in each mode.
+    fn sampled(&self) -> bool {
+        self.graph.len() >= MIN_SAMPLES && self.eager.len() >= MIN_SAMPLES
+    }
+
+    /// What this candidate earned over its trial.
+    fn judge(&self) -> Judged {
+        if self.hits < MIN_HITS {
             return Judged::Rare;
         }
-        if self.graph.len() < MIN_SAMPLES || self.eager.len() < MIN_SAMPLES {
+        if !self.sampled() {
             return Judged::Untimed;
         }
         let eager = median(&self.eager).as_secs_f64();
@@ -136,6 +178,20 @@ impl Tally {
             Judged::Slower(ratio)
         }
     }
+}
+
+/// A trial's segment starts, by what each was predicted to be.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Starts {
+    /// A shape on trial: a hit.
+    pub(crate) candidate: u64,
+    /// A shape known but not on trial — proven, banned, or not held.
+    pub(crate) other: u64,
+    /// An ordinal no wave of its kind had recorded.
+    pub(crate) unpredicted: u64,
+    /// Recorded segments that were a shape on trial and had been predicted as
+    /// another — hits the prediction lost.
+    pub(crate) missed: u64,
 }
 
 /// Why a learn ended.
@@ -167,6 +223,18 @@ pub(crate) enum Transition {
         untimed: usize,
         slower: usize,
         next: Phase,
+        /// What the trial's segment starts were predicted to be.
+        starts: Starts,
+        /// The judged shapes' hits, fewest first, as `(hits, graphed
+        /// samples, eager samples)` — what the verdicts were drawn from.
+        tallies: Vec<(u64, usize, usize)>,
+    },
+    /// A lock gave way to a learn: traffic kept bringing shapes it does not
+    /// hold, and its budget had room for them.
+    Reopened {
+        waves: u64,
+        /// Shapes met at least [`REOPEN_SIGHTINGS`] times, unheld.
+        recurring: usize,
     },
 }
 
@@ -181,21 +249,34 @@ pub(crate) struct Regime {
     last_admit: Option<u64>,
     /// The wave the current phase began at, once it has seen one.
     began: Option<u64>,
-    /// The wave the trial ends at.
-    trial_until: u64,
-    /// Shapes the current learn has admitted — whether it has anything to
+    /// Executables the current learn has admitted — whether it has anything to
     /// trial, and what its summary reports.
     admitted: usize,
-    /// What the trial judges: every shape the library held, unproven, when it
-    /// began ([`Self::begin_trial`]) — not the keys the learn admitted. A learn
-    /// folds a one-off shape over another executable, which then holds the
-    /// one-off's shape; judged by its admitted key, that executable was never
-    /// hit, and its real shape was never judged at all. On `.5` (2026-10-17)
-    /// every one of 1,065 admitted keys was banned as rarely hit and 681
-    /// executables were left held, untrialled.
+    /// What the trial judges: every topology the library held, unproven, when
+    /// it began ([`Self::begin_trial`]).
     candidates: HashMap<Key, Tally>,
+    /// The current trial's segment starts ([`Self::start`]).
+    starts: Starts,
     proven: HashSet<Key>,
+    /// Topologies a trial measured and found not faster: never kept again.
     banned: HashSet<Key>,
+    /// Topologies a trial could not judge — too rarely hit, or never timed —
+    /// dropped and not admitted again until the lock reopens.
+    ///
+    /// **Benched, not banned.** Whether a segment recurs is a property of the
+    /// traffic a trial happened to see — a trial during an ingest prefill
+    /// misses every segment a conversation's decode uses — while whether its
+    /// graph is faster is a property of the segment. Banned for good, every
+    /// shape a trial's traffic missed ran eagerly for the life of the process:
+    /// on `.5` (2026-10-17) 894 bans held a lock to graphing one segment in
+    /// eight. Benched, it waits out the current cycle, so the learn that
+    /// follows a trial does not admit it straight back, and the lock's
+    /// rechecks count it like any topology it does not hold — traffic that
+    /// keeps bringing it reopens the learn, which may keep it.
+    benched: HashSet<Key>,
+    /// Topologies the lock has met and does not hold, by how often — what
+    /// reopens it ([`Self::reopen_due`]).
+    unheld: HashMap<Key, u32>,
     /// Phases that have ended and not yet been logged ([`Self::take_transitions`]).
     transitions: Vec<Transition>,
 }
@@ -210,13 +291,14 @@ impl Regime {
         self.phase == Phase::Learn
     }
 
-    /// Whether `key` may never be kept.
+    /// Whether `key` may not be kept now: banned, or benched until the lock
+    /// reopens.
     pub(crate) fn banned(&self, key: Key) -> bool {
-        self.banned.contains(&key)
+        self.banned.contains(&key) || self.benched.contains(&key)
     }
 
-    /// Whether `key` was proven: a later learn must not reshape its executable
-    /// into another shape.
+    /// Whether `key` was proven: kept, and never trialled again.
+    #[cfg(test)]
     pub(crate) fn proven(&self, key: Key) -> bool {
         self.proven.contains(&key)
     }
@@ -243,9 +325,10 @@ impl Regime {
         }
         self.candidates = held
             .into_iter()
-            .filter(|k| !self.proven.contains(k) && !self.banned.contains(k))
+            .filter(|&k| !self.proven.contains(&k) && !self.banned(k))
             .map(|k| (k, Tally::default()))
             .collect();
+        self.starts = Starts::default();
         if self.candidates.is_empty() {
             self.phase = Phase::Lock;
         }
@@ -264,11 +347,59 @@ impl Regime {
         std::mem::take(&mut self.transitions)
     }
 
+    /// The lock met `key`, a shape it does not hold, on a segment it recorded
+    /// to see what the wave puts there. A banned shape does not count: its
+    /// graph was judged and lost. A benched one does: it was never judged.
+    pub(crate) fn missed(&mut self, key: Key) {
+        if self.phase == Phase::Lock && !self.banned.contains(&key) {
+            *self.unheld.entry(key).or_default() += 1;
+        }
+    }
+
+    /// Whether the lock should give way to a learn at wave `wave`: it has stood
+    /// [`MIN_LOCK_WAVES`], and traffic keeps bringing [`REOPEN_SHAPES`] shapes
+    /// or more that it does not hold. Whether the budget has room for them is
+    /// the library's to say.
+    ///
+    /// A lock trusts the traffic its learn saw, and a learn begun at startup
+    /// sees startup's: on `.5` (2026-10-17) one went quiet in 185 waves of
+    /// background ingest and locked at 185 MiB of a 2 GiB budget, to run every
+    /// shape the conversations brought later as issued, for good.
+    pub(crate) fn reopen_due(&self, wave: u64) -> bool {
+        self.phase == Phase::Lock
+            && wave.saturating_sub(self.began.unwrap_or(wave)) >= MIN_LOCK_WAVES
+            && self.recurring() >= REOPEN_SHAPES
+    }
+
+    fn recurring(&self) -> usize {
+        self.unheld
+            .values()
+            .filter(|&&n| n >= REOPEN_SIGHTINGS)
+            .count()
+    }
+
+    /// Reopen the lock at wave `wave`: a learn begins, keeping what the trials
+    /// proved and banned, and taking back what they benched.
+    pub(crate) fn reopen(&mut self, wave: u64) {
+        if self.phase != Phase::Lock {
+            return;
+        }
+        self.transitions.push(Transition::Reopened {
+            waves: wave.saturating_sub(self.began.unwrap_or(wave)),
+            recurring: self.recurring(),
+        });
+        self.benched.clear();
+        self.unheld.clear();
+        self.admitted = 0;
+        self.last_admit = Some(wave);
+        self.phase = Phase::Learn;
+        self.began = Some(wave);
+    }
+
     fn end_learn(&mut self, wave: u64, ended: LearnEnd) {
         let next = if self.admitted == 0 {
             Phase::Lock
         } else {
-            self.trial_until = wave + TRIAL_WAVES;
             Phase::Trial
         };
         self.transitions.push(Transition::Learned {
@@ -284,8 +415,8 @@ impl Regime {
     }
 
     /// Wave `wave` begins: a learn that has gone quiet ends, and a trial that
-    /// has run its course reaches its verdict. Returns the shapes it banned,
-    /// for the library to drop.
+    /// has run its course reaches its verdict. Returns the shapes it did not
+    /// prove — banned or benched — for the library to drop.
     pub(crate) fn wave_begins(&mut self, wave: u64) -> Vec<Key> {
         match self.phase {
             Phase::Learn => {
@@ -296,29 +427,52 @@ impl Regime {
                 }
                 Vec::new()
             }
-            Phase::Trial if wave >= self.trial_until => self.verdict(wave),
+            Phase::Trial if self.trial_over(wave) => self.verdict(wave),
             Phase::Trial | Phase::Lock => Vec::new(),
         }
     }
 
+    /// Whether the trial reaches its verdict at wave `wave`: it has run
+    /// [`TRIAL_WAVES`] and every candidate is [sampled](Tally::sampled), or it
+    /// has run [`TRIAL_MAX_WAVES`].
+    fn trial_over(&self, wave: u64) -> bool {
+        let ran = wave.saturating_sub(self.began.unwrap_or(wave));
+        ran >= TRIAL_MAX_WAVES
+            || (ran >= TRIAL_WAVES && self.candidates.values().all(Tally::sampled))
+    }
+
     fn verdict(&mut self, wave: u64) -> Vec<Key> {
-        let mut banned = Vec::new();
+        let mut dropped = Vec::new();
         let mut ratios = Vec::new();
         let judged = self.candidates.len();
         let (mut rare, mut untimed, mut slower) = (0, 0, 0);
+        let mut tallies: Vec<(u64, usize, usize)> = self
+            .candidates
+            .values()
+            .map(|t| (t.hits, t.graph.len(), t.eager.len()))
+            .collect();
+        tallies.sort_unstable();
         for (key, tally) in self.candidates.drain() {
-            match tally.judge(TRIAL_WAVES) {
+            match tally.judge() {
                 Judged::Proven(r) => {
                     self.proven.insert(key);
                     ratios.push(r);
                     continue;
                 }
-                Judged::Rare => rare += 1,
-                Judged::Untimed => untimed += 1,
-                Judged::Slower(_) => slower += 1,
+                Judged::Rare => {
+                    rare += 1;
+                    self.benched.insert(key);
+                }
+                Judged::Untimed => {
+                    untimed += 1;
+                    self.benched.insert(key);
+                }
+                Judged::Slower(_) => {
+                    slower += 1;
+                    self.banned.insert(key);
+                }
             }
-            self.banned.insert(key);
-            banned.push(key);
+            dropped.push(key);
         }
         let next = if ratios.is_empty() {
             Phase::Lock
@@ -336,10 +490,63 @@ impl Regime {
             untimed,
             slower,
             next,
+            starts: take(&mut self.starts),
+            tallies,
         });
         self.phase = next;
         self.began = Some(wave);
-        banned
+        dropped
+    }
+
+    /// Whether a segment predicted to be `predicted` runs as issued on the
+    /// prediction alone, unrecorded — `held` saying whether the library holds
+    /// that shape:
+    ///
+    /// - a banned or benched shape, always: its graph was judged and lost, or
+    ///   waits out the cycle — recording it would buy one launch of an
+    ///   executable nothing keeps, at every segment it fills;
+    /// - in the learn, never otherwise: everything records, to be admitted;
+    /// - in the lock, a shape the library does not hold, or an ordinal never
+    ///   recorded: recording it would buy one launch of an executable nothing
+    ///   keeps;
+    /// - **in the trial, never otherwise.** Unrecorded, an ordinal's
+    ///   prediction never changes: one predicted as a shape the library does
+    ///   not hold — a width it did not admit, a one-off — ran as issued until
+    ///   its periodic recheck, which outlasts the trial, so the held shapes
+    ///   that ordinal really runs collected no hits and were banned as rare.
+    ///   Recorded, it is replayed once if it is not held and its prediction
+    ///   follows what the wave put there.
+    pub(crate) fn runs_unkept(&self, predicted: Option<Key>, held: bool) -> bool {
+        match (self.phase, predicted) {
+            (_, Some(k)) if self.banned(k) => true,
+            (Phase::Learn | Phase::Trial, _) => false,
+            (Phase::Lock, None) => true,
+            (Phase::Lock, Some(_)) => !held,
+        }
+    }
+
+    /// A segment predicted to be `predicted` is starting: counted into the
+    /// trial's [`Starts`], whatever mode it then runs in.
+    pub(crate) fn start(&mut self, predicted: Option<Key>) {
+        if self.phase != Phase::Trial {
+            return;
+        }
+        match predicted {
+            None => self.starts.unpredicted += 1,
+            Some(k) if self.candidates.contains_key(&k) => self.starts.candidate += 1,
+            Some(_) => self.starts.other += 1,
+        }
+    }
+
+    /// A segment predicted as `predicted` recorded as `actual`: a shape on
+    /// trial predicted as another counts as a hit lost ([`Starts::missed`]).
+    pub(crate) fn recorded(&mut self, predicted: Option<Key>, actual: Key) {
+        if self.phase == Phase::Trial
+            && predicted != Some(actual)
+            && self.candidates.contains_key(&actual)
+        {
+            self.starts.missed += 1;
+        }
     }
 
     /// A segment predicted to be `key` is about to run: how. A candidate on
@@ -400,8 +607,8 @@ mod tests {
         Duration::from_micros(n)
     }
 
-    const A: Key = (1, 10);
-    const B: Key = (2, 20);
+    const A: Key = 1;
+    const B: Key = 2;
 
     /// A learn that admitted one shape for each of `held`, ended full at
     /// `wave`, and handed its trial what the library holds — `held`.
@@ -444,20 +651,19 @@ mod tests {
         assert_eq!(r.mode_for(B), Mode::Graph);
     }
 
-    /// **The trial judges what is held, not what was admitted**: an
-    /// executable a one-off reshaped holds the one-off's shape, and that is
-    /// the shape judged. Proven and banned shapes are not judged again, and a
-    /// trial with nothing left to judge locks at once.
+    /// **The trial judges the topologies the library holds**, whatever the
+    /// learn counted as admissions. Proven and banned topologies are not judged
+    /// again, and a trial with nothing left to judge locks at once.
     #[test]
-    fn the_trial_judges_the_shapes_the_library_holds() {
+    fn the_trial_judges_the_topologies_the_library_holds() {
         let mut r = Regime::default();
         r.admitted(1);
         r.full(2);
-        let reshaped: Key = (1, 99);
-        assert_eq!(r.begin_trial([reshaped]), 1);
+        let held: Key = 9;
+        assert_eq!(r.begin_trial([held]), 1);
         assert!(
-            r.timed(reshaped) && !r.timed(A),
-            "the held shape, not the admitted one"
+            r.timed(held) && !r.timed(A),
+            "what is held, not what was counted"
         );
 
         let mut r = Regime::default();
@@ -471,6 +677,40 @@ mod tests {
             "A proven, B banned: nothing to judge"
         );
         assert_eq!(r.phase(), Phase::Lock);
+    }
+
+    /// **Only a banned shape, or the lock, runs a segment unrecorded on its
+    /// prediction.** A trial records an ordinal predicted as a shape the
+    /// library does not hold, so its prediction follows the wave; the lock
+    /// runs it as issued; the learn records everything but a banned shape.
+    #[test]
+    fn a_trial_records_what_it_does_not_hold() {
+        let mut r = Regime::default();
+        assert!(!r.runs_unkept(None, false), "the learn records the unseen");
+        assert!(!r.runs_unkept(Some(A), false));
+        learned(&mut r, 2, &[A, B]);
+        trial(&mut r, 2, &[(A, us(50), us(100)), (B, us(100), us(100))]);
+        assert!(r.banned(B));
+        r.admitted(200);
+        r.full(201);
+        let unheld: Key = 3;
+        assert_eq!(r.begin_trial([A, unheld]), 1);
+        assert_eq!(r.phase(), Phase::Trial);
+        assert!(!r.runs_unkept(None, false), "a trial records the unseen");
+        assert!(
+            !r.runs_unkept(Some(4), false),
+            "a trial records an ordinal predicted as a shape it does not hold"
+        );
+        assert!(!r.runs_unkept(Some(A), true));
+        assert!(r.runs_unkept(Some(B), true), "banned runs as issued");
+
+        let mut locked = Regime::default();
+        learned(&mut locked, 2, &[A]);
+        trial(&mut locked, 2, &[(A, us(100), us(100))]);
+        assert_eq!(locked.phase(), Phase::Lock);
+        assert!(locked.runs_unkept(None, false));
+        assert!(locked.runs_unkept(Some(4), false));
+        assert!(locked.runs_unkept(Some(A), true), "A was banned as slower");
     }
 
     /// A learn whose traffic has shown every shape ends on its own.
@@ -549,10 +789,12 @@ mod tests {
                 next: Phase::Trial,
             }]
         );
-        const C: Key = (3, 30);
-        const D: Key = (4, 40);
+        const C: Key = 3;
+        const D: Key = 4;
         r.begin_trial([A, B, C, D]);
-        // C is hit every wave but never timed; D is never hit.
+        // C is hit every wave but never timed; D is never hit. Neither is
+        // sampled, so the trial runs to its cap; the traffic stops at
+        // `TRIAL_WAVES`.
         for wave in 130..130 + TRIAL_WAVES {
             r.wave_begins(wave);
             for (key, graph, eager) in [(A, us(50), us(100)), (B, us(100), us(90))] {
@@ -560,12 +802,22 @@ mod tests {
                 r.sample(key, mode, if mode == Mode::Graph { graph } else { eager });
             }
             r.mode_for(C);
+            for start in [Some(A), Some(B), Some(C), None, Some(9)] {
+                r.start(start);
+            }
+            r.recorded(Some(A), A);
+            r.recorded(Some(B), A);
+            r.recorded(None, 9);
         }
-        r.wave_begins(130 + TRIAL_WAVES);
+        for wave in 130 + TRIAL_WAVES..130 + TRIAL_MAX_WAVES {
+            r.wave_begins(wave);
+        }
+        assert!(r.take_transitions().is_empty(), "held open to the cap");
+        r.wave_begins(130 + TRIAL_MAX_WAVES);
         assert_eq!(
             r.take_transitions(),
             vec![Transition::Trialled {
-                waves: TRIAL_WAVES,
+                waves: TRIAL_MAX_WAVES,
                 judged: 4,
                 proven: 1,
                 proven_ratio: Some(0.5),
@@ -573,10 +825,22 @@ mod tests {
                 untimed: 1,
                 slower: 1,
                 next: Phase::Learn,
+                starts: Starts {
+                    candidate: 3 * TRIAL_WAVES,
+                    other: TRIAL_WAVES,
+                    unpredicted: TRIAL_WAVES,
+                    missed: TRIAL_WAVES,
+                },
+                tallies: vec![
+                    (0, 0, 0),
+                    (TRIAL_WAVES, 0, 0),
+                    (TRIAL_WAVES, 32, 32),
+                    (TRIAL_WAVES, 32, 32),
+                ],
             }]
         );
         assert!(r.take_transitions().is_empty(), "each is taken once");
-        let back = 130 + TRIAL_WAVES;
+        let back = 130 + TRIAL_MAX_WAVES;
         r.wave_begins(back + LEARN_IDLE_WAVES);
         assert_eq!(
             r.take_transitions(),
@@ -611,19 +875,84 @@ mod tests {
         assert_eq!(trial(&mut r, 2, &[(A, us(97), us(100))]), vec![A]);
     }
 
-    /// **A rarely hit candidate is banned whatever its speed**: fewer than one
-    /// trial wave in `MIN_HIT_DIVISOR`.
+    /// **A rarely hit candidate is banned whatever its speed**: fewer than
+    /// `MIN_HITS` hits by the time the trial runs out. Unsampled, it holds the
+    /// trial open until `TRIAL_MAX_WAVES`.
     #[test]
     fn a_rarely_hit_candidate_is_banned() {
         let mut r = Regime::default();
         learned(&mut r, 2, &[A]);
-        let hits_needed = TRIAL_WAVES / MIN_HIT_DIVISOR;
-        for i in 0..hits_needed - 1 {
+        for i in 0..MIN_HITS - 1 {
             let m = r.mode_for(A);
             r.sample(A, m, if m == Mode::Graph { us(10) } else { us(100) });
             assert!(r.wave_begins(2 + i).is_empty());
         }
-        assert_eq!(r.wave_begins(2 + TRIAL_WAVES), vec![A]);
+        assert!(
+            r.wave_begins(2 + TRIAL_WAVES).is_empty(),
+            "unsampled, it holds the trial open"
+        );
+        assert_eq!(r.wave_begins(2 + TRIAL_MAX_WAVES), vec![A], "dropped");
+        assert_eq!(r.phase(), Phase::Lock);
+        assert!(r.banned(A), "benched: not kept this cycle");
+        assert_eq!(r.counts(), (0, 0), "but not banned for good");
+        assert!(r.runs_unkept(Some(A), false));
+    }
+
+    /// **A benched shape counts toward a reopen, and the reopen takes it
+    /// back**: the lock meets it like any shape it does not hold, and the learn
+    /// it reopens to may admit it again. A banned shape stays banned.
+    #[test]
+    fn a_reopen_takes_back_what_a_trial_benched() {
+        let mut r = Regime::default();
+        learned(&mut r, 2, &[A, B]);
+        // A is never hit — benched; B is hit every wave and is a tie — banned.
+        for wave in 2..2 + TRIAL_MAX_WAVES {
+            r.wave_begins(wave);
+            let m = r.mode_for(B);
+            r.sample(B, m, us(100));
+        }
+        r.wave_begins(2 + TRIAL_MAX_WAVES);
+        assert_eq!(r.phase(), Phase::Lock);
+        assert!(r.banned(A) && r.banned(B));
+        let locked_at = 2 + TRIAL_MAX_WAVES;
+        let others: Vec<Key> = (10..10 + REOPEN_SHAPES as u64 - 1).collect();
+        for _ in 0..REOPEN_SIGHTINGS {
+            r.missed(A);
+            r.missed(B);
+            for &k in &others {
+                r.missed(k);
+            }
+        }
+        assert!(
+            r.reopen_due(locked_at + MIN_LOCK_WAVES),
+            "A counts as recurring, B does not"
+        );
+        r.reopen(locked_at + MIN_LOCK_WAVES);
+        assert!(!r.banned(A), "the reopen takes A back");
+        assert!(r.banned(B), "B stays banned");
+    }
+
+    /// **A trial waits for its candidates' samples**: a shape hit once every
+    /// sixteen waves has too few samples at `TRIAL_WAVES`, and the trial runs on
+    /// until it has them — then proves it, well before the cap.
+    #[test]
+    fn a_trial_waits_for_a_sparse_shape() {
+        let mut r = Regime::default();
+        learned(&mut r, 2, &[A]);
+        let mut ended = None;
+        for wave in 2..2 + TRIAL_MAX_WAVES {
+            if !r.wave_begins(wave).is_empty() || r.phase() != Phase::Trial {
+                ended = Some(wave);
+                break;
+            }
+            if (wave - 2) % 16 == 0 {
+                let m = r.mode_for(A);
+                r.sample(A, m, if m == Mode::Graph { us(50) } else { us(100) });
+            }
+        }
+        let ended = ended.expect("the trial ended before its cap");
+        assert!(ended > 2 + TRIAL_WAVES, "it outlasted the minimum: {ended}");
+        assert!(r.proven(A), "sparse but steady, and faster");
     }
 
     /// **A trial that proves nothing locks the library for good**: nothing is
@@ -657,6 +986,50 @@ mod tests {
         assert_eq!(trial(&mut r, next + 1, &[(B, us(100), us(100))]), vec![B]);
         assert_eq!(r.phase(), Phase::Lock);
         assert_eq!(r.counts(), (1, 1));
+    }
+
+    /// **A lock reopens once traffic keeps bringing shapes it does not hold**:
+    /// not before it has stood `MIN_LOCK_WAVES`, not for shapes met once, not
+    /// for banned ones — and the learn it reopens to keeps what was proven.
+    #[test]
+    fn a_lock_reopens_for_recurring_shapes_it_does_not_hold() {
+        let mut r = Regime::default();
+        learned(&mut r, 2, &[A, B]);
+        trial(&mut r, 2, &[(A, us(50), us(100)), (B, us(100), us(100))]);
+        r.wave_begins(2 + TRIAL_WAVES + LEARN_IDLE_WAVES);
+        assert_eq!(r.phase(), Phase::Lock);
+        let locked_at = 2 + TRIAL_WAVES + LEARN_IDLE_WAVES;
+        r.take_transitions();
+
+        let new: Vec<Key> = (10..10 + REOPEN_SHAPES as u64).collect();
+        // Each met once, and the banned B met often: not recurring.
+        for &k in &new {
+            r.missed(k);
+        }
+        for _ in 0..10 {
+            r.missed(B);
+        }
+        assert!(!r.reopen_due(locked_at + MIN_LOCK_WAVES));
+        // Met enough times — but the lock has not stood long enough yet.
+        for _ in 1..REOPEN_SIGHTINGS {
+            for &k in &new {
+                r.missed(k);
+            }
+        }
+        assert!(!r.reopen_due(locked_at + MIN_LOCK_WAVES - 1));
+        assert!(r.reopen_due(locked_at + MIN_LOCK_WAVES));
+
+        r.reopen(locked_at + MIN_LOCK_WAVES);
+        assert_eq!(
+            r.take_transitions(),
+            vec![Transition::Reopened {
+                waves: MIN_LOCK_WAVES,
+                recurring: REOPEN_SHAPES,
+            }]
+        );
+        assert!(r.admits(), "learning again");
+        assert!(r.proven(A) && r.banned(B), "the verdicts stand");
+        assert!(!r.reopen_due(1 << 40), "a learn does not reopen");
     }
 
     /// The median ignores a few stalled runs.

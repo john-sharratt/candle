@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cudarc::driver::{result, CudaEvent, CudaStream};
+use cudarc::driver::{result, sys, CudaEvent, CudaStream};
 
 use super::regime::{Key, Mode};
 use crate::cuda_backend::WrapErr;
@@ -40,8 +40,13 @@ impl SegmentTimer {
     fn event(&mut self, on: &Arc<CudaStream>) -> Result<CudaEvent> {
         match self.free.pop() {
             Some(e) => Ok(e),
-            // Timing enabled: the default flags.
-            None => on.context().new_event(None).w(),
+            // Timing enabled, named: `new_event(None)` is cudarc's
+            // `CU_EVENT_DISABLE_TIMING`, whose pairs `elapsed` refuses — every
+            // trial on `.5` (2026-10-17) judged with no sample at all.
+            None => on
+                .context()
+                .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .w(),
         }
     }
 
@@ -78,23 +83,23 @@ impl SegmentTimer {
     }
 
     /// Hand `took` every pair that has finished, oldest first, stopping at the
-    /// first still in flight.
-    pub(super) fn drain(&mut self, mut took: impl FnMut(Key, Mode, Duration)) {
+    /// first still in flight. A pair the driver will not time is an error, not
+    /// a sample quietly dropped: dropped, the trial judges on nothing.
+    pub(super) fn drain(&mut self, mut took: impl FnMut(Key, Mode, Duration)) -> Result<()> {
         while self.pending.front().is_some_and(|t| t.end.is_complete()) {
             let t = self.pending.pop_front().expect("checked above");
             // SAFETY: both events are this timer's, of one context, and both
             // have completed — the end was queried, and the start precedes it
             // on the same stream — so the read does not wait.
-            if let Ok(ms) = unsafe { result::event::elapsed(t.start.cu_event(), t.end.cu_event()) }
-            {
-                took(
-                    t.key,
-                    t.mode,
-                    Duration::from_secs_f64(f64::from(ms.max(0.0)) / 1e3),
-                );
-            }
+            let ms = unsafe { result::event::elapsed(t.start.cu_event(), t.end.cu_event()) };
             self.free.push(t.start);
             self.free.push(t.end);
+            took(
+                t.key,
+                t.mode,
+                Duration::from_secs_f64(f64::from(ms.w()?.max(0.0)) / 1e3),
+            );
         }
+        Ok(())
     }
 }
