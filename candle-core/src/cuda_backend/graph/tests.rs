@@ -4,7 +4,7 @@
 //! every launch names its stream explicitly: the point of these tests is which
 //! stream a launch lands on.
 
-use super::{CaptureSession, CaptureStream, ComputeStream};
+use super::{CaptureSession, CaptureStream, ComputeStream, GraphPhase};
 use crate::backend::BackendDevice;
 use crate::cuda_backend::{CudaDevice, WrapErr};
 use crate::quantized::pinned_staging::PinnedBuf;
@@ -21,8 +21,17 @@ const N: usize = 4096;
 /// test's driver work lands inside another's capture.
 static WAVE: Mutex<()> = Mutex::new(());
 
+/// Take the device's waves to this test alone, with its executable library
+/// fresh: empty, learning, at the card's budget. The library's lifecycle
+/// (`regime`) is the hub's, so a test that left it locked would otherwise
+/// leave every later test running eagerly.
 fn wave_lock() -> MutexGuard<'static, ()> {
-    WAVE.lock().unwrap_or_else(|p| p.into_inner())
+    use super::budget::graph_budget_bytes;
+    let guard = WAVE.lock().unwrap_or_else(|p| p.into_inner());
+    let dev = CudaDevice::new(0).expect("a CUDA device");
+    let budget = graph_budget_bytes().expect("the card's graph budget");
+    dev.capture_hub().reset_library(budget);
+    guard
 }
 
 const SCALE_ADD: &str = r#"
@@ -1621,15 +1630,33 @@ fn two_shapes_of_one_node_count_each_keep_their_executable() -> Result<()> {
     Ok(())
 }
 
-/// **The library keeps executables within a byte budget, evicts the least
-/// invoked, and cools what it evicted.** With a budget of one byte every
-/// admission evicts everything else: topology B's executable evicts A's, and A
-/// then cools. A recorded again during its cooldown runs once and is not kept
-/// (`transient`); recorded once more, its ordinal's last key is known to be
-/// cooling and the segment is not recorded at all (`eager_segments`). Every
-/// wave's result is what the eager forward would have produced.
+/// One wave of `launches` launches of `y = x + add`: its topology is the
+/// launch count. Returns what `y` holds after it.
+fn add_wave(
+    dev: &CudaDevice,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    launches: usize,
+    add: f32,
+) -> Result<Vec<f32>> {
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    for _ in 0..launches {
+        launch(f, &dev.cuda_stream(), x, y, 1.0, add)?;
+    }
+    capture.finish()?;
+    dev.memcpy_dtov(y)
+}
+
+/// **A budget nothing fits locks the library at once, and a locked library
+/// runs what it does not hold as issued.** The first admission does not fit:
+/// nothing is evicted to make room, the executable is dropped once launched,
+/// and with nothing admitted there is nothing to trial. The next wave's segment
+/// is not recorded at all. Every wave's result is what the eager forward
+/// would have produced.
 #[test]
-fn the_library_evicts_to_its_budget_and_cools_what_it_evicts() -> Result<()> {
+fn a_budget_nothing_fits_locks_and_runs_eagerly() -> Result<()> {
     use super::budget::graph_budget_bytes;
     let _wave = wave_lock();
     let dev = CudaDevice::new(0)?;
@@ -1637,70 +1664,93 @@ fn the_library_evicts_to_its_budget_and_cools_what_it_evicts() -> Result<()> {
     let x = dev.memcpy_stod(&ramp(1.0))?;
     let mut y = dev.alloc_zeros::<f32>(N)?;
     dev.capture_hub().reset_library(1);
-    // One wave of `launches` launches of `y = x + add`: its topology is the
-    // launch count, so A (3) and B (4) are different topologies.
-    let wave = |launches: usize, add: f32, y: &mut CudaSlice<f32>| -> Result<Vec<f32>> {
-        let capture = dev.begin_wave_capture()?;
-        dev.record_launches()?;
-        for _ in 0..launches {
-            launch(&f, &dev.cuda_stream(), &x, y, 1.0, add)?;
-        }
-        capture.finish()?;
-        dev.memcpy_dtov(y)
-    };
     let want = |add: f32| -> Vec<f32> { ramp(1.0).iter().map(|v| v + add).collect() };
 
     let s0 = dev.capture_stats();
-    assert_eq!(wave(3, 1.0, &mut y)?, want(1.0));
+    assert_eq!(add_wave(&dev, &f, &x, &mut y, 3, 1.0)?, want(1.0));
     let s1 = dev.capture_stats();
     assert_eq!(
-        (
-            s1.instantiated - s0.instantiated,
-            s1.evicted - s0.evicted,
-            s1.execs_held
-        ),
-        (1, 0, 1),
-        "A is kept: there is nothing else to evict"
+        (s1.instantiated - s0.instantiated, s1.execs_held, s1.phase),
+        (1, 0, GraphPhase::Lock),
+        "the first admission does not fit: nothing is kept, and the library locks"
     );
 
-    assert_eq!(wave(4, 2.0, &mut y)?, want(2.0));
+    assert_eq!(add_wave(&dev, &f, &x, &mut y, 3, 2.0)?, want(2.0));
     let s2 = dev.capture_stats();
     assert_eq!(
         (
+            s2.eager_segments - s1.eager_segments,
+            s2.segments - s1.segments,
             s2.instantiated - s1.instantiated,
-            s2.evicted - s1.evicted,
-            s2.execs_held,
-            s2.cooling
         ),
-        (1, 1, 1, 1),
-        "B evicts A, and A cools"
+        (1, 0, 0),
+        "locked, a shape it does not hold runs unrecorded"
     );
 
-    assert_eq!(wave(3, 3.0, &mut y)?, want(3.0));
+    // Its ordinal rechecks once it has run eagerly `RECHECK_EVERY` times in a
+    // row: recorded, not held, so run once and not kept.
+    for wave in 0..super::hub::RECHECK_EVERY {
+        let add = 3.0 + wave as f32;
+        assert_eq!(add_wave(&dev, &f, &x, &mut y, 3, add)?, want(add));
+    }
     let s3 = dev.capture_stats();
     assert_eq!(
         (
-            s3.instantiated - s2.instantiated,
-            s3.transient - s2.transient,
-            s3.execs_held
+            s3.eager_segments - s1.eager_segments,
+            s3.transient - s1.transient,
+            s3.execs_held,
         ),
-        (0, 1, 1),
-        "A, recorded while cooling, runs once and is not kept"
+        (u64::from(super::hub::RECHECK_EVERY), 1, 0),
+        "{} eager runs, then one recorded to recheck its shape",
+        super::hub::RECHECK_EVERY
     );
 
-    assert_eq!(wave(3, 4.0, &mut y)?, want(4.0));
-    let s4 = dev.capture_stats();
+    dev.capture_hub().reset_library(graph_budget_bytes()?);
+    Ok(())
+}
+
+/// **The library learns, trials and locks within a couple of hundred waves.**
+/// One shape: the learn admits it and goes quiet, the trial runs it graphed and
+/// eager by turns, and the verdict either proves it (the next learn finds
+/// nothing new, and locks) or bans it (and locks). Whichever, the library ends
+/// locked holding exactly what was proven, the trial ran eager halves, and every
+/// wave's result is what the eager forward would have produced.
+#[test]
+fn the_library_learns_trials_and_locks_quickly() -> Result<()> {
+    use super::budget::graph_budget_bytes;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let mut y = dev.alloc_zeros::<f32>(N)?;
+    dev.capture_hub().reset_library(graph_budget_bytes()?);
+    let s0 = dev.capture_stats();
+    let mut waves = 0u32;
+    while dev.capture_stats().phase != GraphPhase::Lock {
+        assert!(
+            waves < 300,
+            "still {:?} after {waves} waves",
+            dev.capture_stats()
+        );
+        let add = (waves % 7) as f32;
+        let want: Vec<f32> = ramp(1.0).iter().map(|v| v + add).collect();
+        assert_eq!(
+            add_wave(&dev, &f, &x, &mut y, 3, add)?,
+            want,
+            "wave {waves}"
+        );
+        waves += 1;
+    }
+    let s = dev.capture_stats();
+    assert!(
+        s.eager_segments > s0.eager_segments,
+        "the trial ran eager halves"
+    );
+    assert_eq!(s.banned + s.proven, 1, "one shape, one verdict: {s:?}");
     assert_eq!(
-        (
-            s4.eager_segments - s3.eager_segments,
-            s4.transient - s3.transient,
-            s4.instantiated - s3.instantiated,
-            s4.segments - s3.segments,
-        ),
-        (1, 0, 0, 0),
-        "A's ordinal is known to be cooling: the segment is not recorded"
+        s.execs_held, s.proven,
+        "what is held is what was proven: {s:?}"
     );
-
     dev.capture_hub().reset_library(graph_budget_bytes()?);
     Ok(())
 }

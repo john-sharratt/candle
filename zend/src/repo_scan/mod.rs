@@ -1196,7 +1196,10 @@ fn process_one_dir(
     tags.insert(DIR_KEY.to_string(), unit.dir.clone());
     tags.insert(CONTENT_KEY.to_string(), unit.content_key.clone());
     if let Some(bits) = crate::branch_ingest::keys::model_bits() {
-        tags.insert(crate::branch_ingest::keys::QUANT_KEY.to_string(), bits.to_string());
+        tags.insert(
+            crate::branch_ingest::keys::QUANT_KEY.to_string(),
+            bits.to_string(),
+        );
     }
     tags.insert("files".to_string(), unit.listed.len().to_string());
     if !job.branches.is_empty() {

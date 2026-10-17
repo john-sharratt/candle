@@ -14,9 +14,10 @@ use candle::cuda_backend::graph::CaptureStats;
 /// set against the forward bench's own `launches/segment`. `held` is what the
 /// executable library keeps now — executables, their nodes, and the device
 /// bytes they are charged against its budget, all outside the reservation —
-/// `evicted` how many the window evicted to stay within it, `cooling` how many
-/// evicted keys may not be kept yet, and `unkept` the window's segments run
-/// unrecorded on a cooling key plus those instantiated for one launch.
+/// `phase` where the library is (learning, on trial, or locked), `banned` and
+/// `proven` how many shapes its trials have judged each way so far, and
+/// `unkept` the window's segments run unrecorded plus those instantiated for
+/// one launch.
 pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> String {
     let waves = after.waves.saturating_sub(before.waves);
     if waves == 0 {
@@ -26,7 +27,7 @@ pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> Strin
     let segs = d(after.segments, before.segments);
     format!(
         " | graphs waves={waves} segs={} fold={}/{}ms reshape={}/{}ms inst={}/{}ms rec={}ms \
-         nodes/seg={} held={}x/{}n/{}MiB evicted={} cooling={} unkept={}+{}",
+         nodes/seg={} held={}x/{}n/{}MiB phase={} banned={} proven={} unkept={}+{}",
         segs,
         d(after.updated, before.updated).saturating_sub(d(after.reshaped, before.reshaped)),
         d(after.in_place_us, before.in_place_us) / 1000,
@@ -39,8 +40,9 @@ pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> Strin
         after.execs_held,
         after.nodes_held,
         after.bytes_held >> 20,
-        d(after.evicted, before.evicted),
-        after.cooling,
+        after.phase.name(),
+        after.banned,
+        after.proven,
         d(after.eager_segments, before.eager_segments),
         d(after.transient, before.transient),
     )
@@ -49,6 +51,8 @@ pub(super) fn graph_window(before: &CaptureStats, after: &CaptureStats) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use candle::cuda_backend::graph::GraphPhase;
 
     fn stats(waves: u64, segments: u64, instantiated: u64, recording_us: u64) -> CaptureStats {
         CaptureStats {
@@ -81,25 +85,25 @@ mod tests {
             execs_held: 212,
             nodes_held: 61_480,
             bytes_held: 600 << 20,
-            evicted: 9,
-            cooling: 4,
+            phase: GraphPhase::Trial,
+            banned: 4,
+            proven: 9,
             eager_segments: 3,
             transient: 1,
             ..stats(160, 1_380, 43, 81_500)
         };
         let before = CaptureStats {
-            evicted: 2,
             eager_segments: 1,
             ..before
         };
         // 477 updates in the window, 2 of them reshapes: 475 plain folds; 69,600
-        // nodes over 480 segments. What the library holds and how many keys
-        // cool are gauges, read off the later snapshot alone; evictions and
-        // unkept segments are the window's.
+        // nodes over 480 segments. What the library holds, its phase and its
+        // verdicts are gauges, read off the later snapshot alone; unkept
+        // segments are the window's.
         assert_eq!(
             graph_window(&before, &after),
             " | graphs waves=60 segs=480 fold=475/9ms reshape=2/1ms inst=3/6ms rec=31ms \
-             nodes/seg=145 held=212x/61480n/600MiB evicted=7 cooling=4 unkept=2+1"
+             nodes/seg=145 held=212x/61480n/600MiB phase=trial banned=4 proven=9 unkept=2+1"
         );
     }
 

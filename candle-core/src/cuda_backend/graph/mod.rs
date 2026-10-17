@@ -12,9 +12,11 @@
 //! * `ExecLibrary` (`library`) — the executables kept across waves, found by
 //!   a segment's topology (its node kinds in order) rather than its ordinal,
 //!   so a run of layers folds into its own executables wherever the wave's
-//!   cuts put it, whichever kernel variants its width chose. Kept within a
-//!   device-memory budget (`budget`): least-invoked eviction, and a cooldown
-//!   before an evicted key may be kept again.
+//!   cuts put it, whichever kernel variants its width chose. Kept within a fixed
+//!   device-memory budget (`budget`), and decided by measurement (`regime`): a
+//!   learn fills it, a trial times each shape graphed against eager and bans
+//!   what is rarely hit or not faster, and once a trial keeps nothing new the
+//!   library locks. Segment device time comes from event pairs (`timing`).
 //! * `ExecSlot` (`slot`) — one topology's executables, one per shape in steady
 //!   use, each recapture folded into them in place.
 //! * [`GraphExec`] — an instantiated graph, launched only into a
@@ -35,6 +37,7 @@ mod exec;
 mod hub;
 mod library;
 mod record_gate;
+mod regime;
 #[cfg(test)]
 mod session;
 mod slot;
@@ -43,6 +46,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 mod thread_wave;
+mod timing;
 
 pub use budget::{budget_for as graph_budget_for, graph_budget_bytes};
 pub use error::GraphError;
@@ -50,6 +54,7 @@ pub use exec::GraphExec;
 pub(crate) use hub::CaptureHub;
 pub use hub::{CaptureStats, Paused, WaveCapture};
 pub use record_gate::{try_without_recording, without_recording, Quiet};
+pub use regime::Phase as GraphPhase;
 #[cfg(test)]
 use session::CaptureSession;
 #[cfg(test)]

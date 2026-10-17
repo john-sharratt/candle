@@ -178,5 +178,8 @@ fn the_ingest_backlog_is_every_members() {
         json!({ "processed": 15, "total": 245, "last_item": "candle/a.rs" })
     );
     let idle = json!({ "members": [member("ww", ".6", line(Value::Null)), member("bw", ".5", line(Value::Null))] });
-    assert_eq!(call("memberStatus", &[idle, json!("zend")])["tenants"]["zend"]["ingest_backlog"], Value::Null);
+    assert_eq!(
+        call("memberStatus", &[idle, json!("zend")])["tenants"]["zend"]["ingest_backlog"],
+        Value::Null
+    );
 }

@@ -25,27 +25,19 @@
 
 use std::collections::HashMap;
 
-use super::budget::{self, Candidate, Cooldown};
+use super::budget;
 use super::exec::GraphExec;
+use super::regime::Key;
 use super::slot::ExecSlot;
 
-/// What one admission evicted.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Evicted {
-    pub(super) execs: usize,
-    pub(super) bytes: u64,
-}
-
-/// Executables by segment topology, within a device-memory budget.
+/// Executables by segment topology, within a fixed device-memory budget.
 #[derive(Default)]
 pub(super) struct ExecLibrary {
     slots: HashMap<u64, ExecSlot>,
     /// Bytes charged across every kept executable.
     used: u64,
-    /// `None` until the card's size is known ([`Self::size_budget`]).
+    /// `None` until the card's size is known ([`Self::set_budget`]).
     budget: Option<u64>,
-    /// `(topology, shape)` keys evicted recently.
-    cooldown: Cooldown<(u64, u64)>,
 }
 
 impl ExecLibrary {
@@ -69,7 +61,7 @@ impl ExecLibrary {
     }
 
     /// The budget in force — the smallest band's until the card is known.
-    fn budget(&self) -> u64 {
+    pub(super) fn budget(&self) -> u64 {
         self.budget.unwrap_or_else(|| budget::budget_for(0))
     }
 
@@ -93,15 +85,10 @@ impl ExecLibrary {
         self.slots.get(&key).is_some_and(|s| !s.execs().is_empty())
     }
 
-    /// Whether `(key, shape)` was evicted too recently to be kept again in
-    /// wave `now`.
-    pub(super) fn cooling(&self, key: u64, shape: u64, now: u64) -> bool {
-        self.cooldown.cooling(&(key, shape), now)
-    }
-
-    /// Keys cooling now.
-    pub(super) fn cooling_len(&self) -> usize {
-        self.cooldown.len()
+    /// Whether an executable holds exactly `(topology, shape)` — what a
+    /// segment needs to replay without reshaping anything.
+    pub(super) fn holds_shape(&self, (key, shape): Key) -> bool {
+        self.slots.get(&key).is_some_and(|s| s.holds_shape(shape))
     }
 
     /// Executables kept across every topology, their nodes, and the bytes they
@@ -123,59 +110,41 @@ impl ExecLibrary {
         }
     }
 
-    /// Topology `key` has just kept a new executable at its front: charge it,
-    /// then evict the least invoked of the rest until the library fits its
-    /// budget, cooling each evicted key from wave `now`.
-    pub(super) fn admitted(&mut self, key: u64, now: u64) -> Evicted {
-        if let Some(e) = self.front(key) {
-            self.used += e.bytes();
+    /// Topology `key` has just kept a new executable at its front: charge it
+    /// against the budget. `false` when it does not fit — it is removed again,
+    /// uncharged, and the caller ends the learn; nothing else is evicted to
+    /// make room. Call once the executable has been launched: destroying one
+    /// in flight is legal, and the driver frees it when its launch completes.
+    pub(super) fn admitted(&mut self, key: u64) -> bool {
+        let Some(bytes) = self.front(key).map(GraphExec::bytes) else {
+            return true;
+        };
+        if self.used + bytes <= self.budget() {
+            self.used += bytes;
+            return true;
         }
-        let candidates: Vec<Candidate<(u64, usize)>> = self
-            .slots
-            .iter()
-            .flat_map(|(&k, slot)| {
-                slot.execs()
-                    .iter()
-                    .enumerate()
-                    .filter(move |&(i, _)| !(k == key && i == 0))
-                    .map(move |(i, e)| Candidate {
-                        id: (k, i),
-                        invocations: e.invocations(),
-                        bytes: e.bytes(),
-                    })
-            })
-            .collect();
-        let mut victims = budget::victims(&candidates, self.used, self.budget());
-        // Highest index first within a slot, so each removal leaves the
-        // indices still to come in place.
-        victims.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        let mut evicted = Evicted::default();
-        for (k, i) in victims {
-            let Some(slot) = self.slots.get_mut(&k) else {
-                continue;
-            };
-            let exec = slot.evict(i);
-            self.used -= exec.bytes();
-            self.cooldown.cool((k, exec.shape()), now);
-            evicted.execs += 1;
-            evicted.bytes += exec.bytes();
-            // Destroying an executable still in flight is legal: the driver
-            // frees it once its launches complete.
-            drop(exec);
-            if slot.execs().is_empty() {
-                self.slots.remove(&k);
-            }
+        if let Some(slot) = self.slots.get_mut(&key) {
+            drop(slot.remove_front());
         }
-        evicted
+        self.drop_if_empty(key);
+        false
     }
 
-    /// Wave `now` has begun: invocations decay, and cooldowns that are over
-    /// are forgotten.
-    pub(super) fn wave_passed(&mut self, now: u64) {
-        for slot in self.slots.values_mut() {
-            slot.decay();
+    /// Drop the executables a trial banned for `(topology, shape)`, giving
+    /// their bytes back to the budget. Returns how many there were.
+    pub(super) fn ban(&mut self, (key, shape): Key) -> usize {
+        let Some(slot) = self.slots.get_mut(&key) else {
+            return 0;
+        };
+        let gone = slot.remove_shape(shape);
+        for e in &gone {
+            self.used = self.used.saturating_sub(e.bytes());
         }
-        self.cooldown.prune(now);
+        let n = gone.len();
+        // Destroying an executable still in flight is legal.
+        drop(gone);
+        self.drop_if_empty(key);
+        n
     }
 }
 
@@ -210,11 +179,11 @@ mod tests {
     #[test]
     fn the_budget_is_set_once() {
         let mut lib = ExecLibrary::default();
-        assert_eq!(lib.budget(), 512 << 20, "the smallest band until known");
-        lib.set_budget(768 << 20);
-        assert_eq!(lib.budget(), 768 << 20);
+        assert_eq!(lib.budget(), 256 << 20, "the smallest band until known");
+        lib.set_budget(512 << 20);
+        assert_eq!(lib.budget(), 512 << 20);
         lib.set_budget(2 << 30);
-        assert_eq!(lib.budget(), 768 << 20, "set once");
+        assert_eq!(lib.budget(), 512 << 20, "set once");
         let mut fixed = ExecLibrary::with_budget(1);
         fixed.set_budget(2 << 30);
         assert_eq!(fixed.budget(), 1);

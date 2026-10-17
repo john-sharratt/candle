@@ -224,7 +224,6 @@ mod tests {
         assert_eq!(p.tombstone, [tl(4)]);
     }
 
-
     /// A conversation stamped at `hlc`, written under a `bits`-per-weight model.
     fn quantized(n: u64, key: &str, hlc: u64, bits: Option<u32>) -> Committed {
         Committed {
@@ -241,13 +240,24 @@ mod tests {
         let q4 = quantized(2, "a@1", 20, Some(4));
         for committed in [[q3.clone(), q4.clone()], [q4, q3]] {
             let p = unbounded(&[live("a@1", "a@1")], &committed);
-            assert_eq!(p.tombstone, [tl(1)], "the Q3 copy goes, though it was first");
+            assert_eq!(
+                p.tombstone,
+                [tl(1)],
+                "the Q3 copy goes, though it was first"
+            );
         }
         let p = unbounded(
             &[live("b@1", "b@1")],
-            &[quantized(3, "b@1", 10, Some(4)), quantized(4, "b@1", 20, Some(4))],
+            &[
+                quantized(3, "b@1", 10, Some(4)),
+                quantized(4, "b@1", 20, Some(4)),
+            ],
         );
-        assert_eq!(p.tombstone, [tl(4)], "the same quantization: the later goes");
+        assert_eq!(
+            p.tombstone,
+            [tl(4)],
+            "the same quantization: the later goes"
+        );
     }
 
     /// **A key any copy of which records no quantization is judged by stamp
@@ -259,7 +269,11 @@ mod tests {
         let old = quantized(1, "a@1", 10, None);
         let new = quantized(2, "a@1", 20, Some(8));
         let p = unbounded(&[live("a@1", "a@1")], &[new.clone(), old.clone()]);
-        assert_eq!(p.tombstone, [tl(2)], "the existing record, written before the tag, stays");
+        assert_eq!(
+            p.tombstone,
+            [tl(2)],
+            "the existing record, written before the tag, stays"
+        );
 
         let q4 = quantized(3, "c@1", 30, Some(4));
         let q3 = quantized(4, "c@1", 10, Some(3));

@@ -180,7 +180,6 @@ pub fn file_type_bits(ftype: u32) -> Option<u32> {
     })
 }
 
-
 /// The checkpoint's bytes, mapped rather than read.
 ///
 /// **Why a mapping and not a buffer.** The loader used to `read_exact` each

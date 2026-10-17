@@ -47,7 +47,8 @@ use zend_vfs::{ObjectFormat, Oid};
 use self::lines::line_count;
 use crate::branch_ingest::filter::{language_of, MAX_FILE_BYTES};
 use crate::branch_ingest::keys::{
-    branches_value, file_key, quant_tags, BLOB_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY, LINES_KEY,
+    branches_value, file_key, quant_tags, BLOB_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY,
+    LINES_KEY,
 };
 use crate::branch_ingest::plan::Committed;
 use crate::ingest_lease::{self, Share};
@@ -941,7 +942,10 @@ fn process_one_file(
     tags.insert(LINES_KEY.to_string(), lines.to_string());
     tags.insert(CONTENT_KEY.to_string(), job.key.to_string());
     if let Some(bits) = crate::branch_ingest::keys::model_bits() {
-        tags.insert(crate::branch_ingest::keys::QUANT_KEY.to_string(), bits.to_string());
+        tags.insert(
+            crate::branch_ingest::keys::QUANT_KEY.to_string(),
+            bits.to_string(),
+        );
     }
     tags.insert("lang".to_string(), format!("{:?}", file.language));
     if !file.branches.is_empty() {
