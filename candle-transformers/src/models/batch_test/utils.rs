@@ -27,6 +27,8 @@ use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_
 use crate::models::batch_test::side_compression::{print_side_table, SideCompression};
 use crate::models::batch_test::span_report::print_span;
 use crate::models::batch_test::story_normalize::normalize_story;
+#[cfg(feature = "cuda")]
+use crate::models::batch_test::vram_wave_log::VramWaveLog;
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, InferenceMode, ManagedBatchedModel,
 };
@@ -1355,6 +1357,12 @@ impl TestParams {
 
         let mut results = Vec::new();
 
+        // The card wave by wave, to a CSV under `target/` as the run goes — the
+        // performance page's bands, for the whole sweep. Closed when this
+        // function returns, however it returns.
+        #[cfg(feature = "cuda")]
+        let wave_log = VramWaveLog::start(&self.device, model.expert_stats_shared());
+
         // The load's VRAM accounting is NOT done here: the weights are already
         // resident by the time this runs, so a baseline taken now measures
         // nothing. [`account_model_load`] wraps the load itself — `run` calls it
@@ -1363,6 +1371,10 @@ impl TestParams {
 
         for (n, config) in configs.into_iter().enumerate() {
             println!("\n=== Running tests for config: {:?} ===", config);
+            #[cfg(feature = "cuda")]
+            if let Some(log) = &wave_log {
+                log.set_config(&format!("{:?} x{}", config.mode, config.num_contexts));
+            }
 
             // Per-config user-prompt override (used by routing-trace capture).
             if let Some(p) = self.per_config_prompts.get(n) {

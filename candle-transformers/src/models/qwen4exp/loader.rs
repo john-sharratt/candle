@@ -23,7 +23,7 @@ use candle::quantized::gguf_file::{Content, TensorInfo, Value};
 use candle::quantized::ko_quant::dequant_ko;
 use candle::quantized::GgmlDType;
 use candle::wave_provenance::WaveTicket;
-use candle::{DType, Device, Result, Tensor};
+use candle::{Device, Result, Tensor};
 
 use super::config::Qwen4ExpConfig;
 use super::hyper::HcWeights;
@@ -34,13 +34,11 @@ use super::ple_cache::dequant_rows_on_device;
 use super::ple_cache::{PleCacheStats, PleRowCache, PleRowFetch, RECORD_BYTES, RECORD_ELEMS};
 use super::qsa::IndexerWeights;
 use super::record_windows;
-use crate::models::batched_inference::{prefill_slack_cap, MAX_PREFILL_TOKENS};
 use crate::models::delta_net::{DeltaNetWeights, LayerKind};
 use crate::models::dense_span::peak_load_pool_bytes;
 use crate::models::latent_moe::GgufModel;
 use crate::models::qwen35::attention::{AttentionWeights, RopeTables};
 use crate::models::qwen35::moe::FfnWeights;
-use crate::models::window_residuals::window_residual_buffer_bytes;
 
 /// A quantized tensor left on disk, addressed by ranges of its outermost
 /// dimension. `dims` is the full candle shape (outermost first); a range of
@@ -356,42 +354,6 @@ pub(crate) fn load_headroom_bytes(content: &Content) -> usize {
     ) + embedding
 }
 
-/// Window residuals one session can hold at once: the creep's held residual,
-/// the input a resumed window assembles, the residual that window writes, and
-/// a paused creep's (`candle_conversation::scheduler::paused_creep`).
-pub(crate) const WINDOW_RESIDUALS_HELD: usize = 4;
-
-/// Rows a forward carries besides its prefill: decode rows, speculative verify
-/// blocks and gap-fill glue.
-pub(crate) const WINDOW_RESIDUAL_EXTRA_ROWS: usize = 1024;
-
-/// Held ground the window residuals need for as long as the model runs — the
-/// runtime reserve that widens the reservation's held ground.
-///
-/// **This model's residual is wide.** A window that stops short of the head hands
-/// its residual back as `[rows, hc, hidden]` F32 (`WindowResiduals`), four streams
-/// at four bytes where a plain model holds one BF16 row — eight times as much,
-/// and several of them at once. Nothing planned for them: they came from the
-/// CUDA pool's 512 MiB cushion, which they outgrow on their own — measured on
-/// `.5`, 2026-10-17, the pool held 1,235 MiB of them under two conversations and
-/// ingest, the next allocation found the card full, and an unbroken minute of
-/// out-of-memory errors poisoned the context and restarted the daemon.
-///
-/// Bounded by the widest forward the scheduler can send — the prefill cap with
-/// the slack a straggling group may absorb, plus the rows riding beside it — for
-/// each residual one session can hold, each in the whole steps a buffer is
-/// taken in (`window_residual_buffer_bytes`).
-pub(crate) fn window_residual_reserve_bytes(cfg: &Qwen4ExpConfig) -> usize {
-    window_residual_reserve_for(cfg.hc.count, cfg.hidden_size)
-}
-
-/// [`window_residual_reserve_bytes`] for `hc` streams of `hidden` channels.
-fn window_residual_reserve_for(hc: usize, hidden: usize) -> usize {
-    let rows = prefill_slack_cap(MAX_PREFILL_TOKENS) + WINDOW_RESIDUAL_EXTRA_ROWS;
-    let row_bytes = hc * hidden * DType::F32.size_in_bytes();
-    WINDOW_RESIDUALS_HELD * window_residual_buffer_bytes(rows * row_bytes)
-}
-
 /// One HC module's four (or three, at the head) tensors.
 fn hc_weights(
     gguf: &mut GgufModel,
@@ -674,19 +636,6 @@ mod tests {
             load_headroom_bytes(&content),
             32 * 34 + 2 * REPACK_BAND_BYTES + 16 * 34
         );
-    }
-
-    /// The runtime reserve: four held residuals, each the widest forward —
-    /// 8,192 prefill rows plus the quarter a straggling group may absorb, and
-    /// 1,024 riding beside them — of `hc × hidden` F32, in the whole 64 MiB
-    /// steps a buffer is taken in. Flash-Next's 440 MiB residual takes 448.
-    #[test]
-    fn the_window_reserve_holds_four_of_the_widest_forwards_residual() {
-        let rows = 8192 + 2048 + 1024;
-        assert_eq!(rows * 4 * 2560 * 4, 440 * 1024 * 1024);
-        let mib = 1024 * 1024;
-        assert_eq!(window_residual_reserve_for(4, 2560), 4 * 448 * mib);
-        assert_eq!(window_residual_reserve_for(1, 1), 4 * 64 * mib);
     }
 
     /// Offloaded is every non-expert tensor the load puts on the device, plus

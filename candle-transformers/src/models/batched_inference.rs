@@ -32,11 +32,11 @@ use crate::models::delta_net::RecurrentCompaction;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::layer_parallel;
 use crate::models::piece_key::PieceKey;
+use crate::models::residual_rows::CreepResidual;
 use crate::models::rope_schedule::RungSelect;
 use crate::models::sealed_injection::{reconcile_sealed_prefix, SealedInjection};
 use crate::models::selection_strata::StrataTokens;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
-use crate::models::window_residuals::WindowResiduals;
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
@@ -51,21 +51,23 @@ use candle_nn::kv_cache::{
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cuda")]
 use super::batched_layer::GlueMeta;
-use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePhase};
+use super::batched_model::{
+    activation_dtype, BatchedInference, BatchedModelCore, WaveGuard, WavePhase,
+};
 use super::held_tensor::held_empty;
 #[cfg(feature = "cuda")]
 use super::wave_buffers::wave_from_vec_ticketed;
-use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
+use super::wave_driver::{drive_step, drive_wave, StepOutcome, StepSpec, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
 use crate::models::profile::{gpu_span, pipeline_record_duration, span};
 use crate::models::speculative_choice::{
     all_rows, AcceptWalk, SpeculativeStep, TokenChooser, TypicalAcceptance,
 };
-use crate::models::verify_wave::{issue_verify_wave, upload_plan_rows, VerifyPlan, WaveCoBatch};
+use crate::models::verify_wave::{issue_verify_wave, upload_plan_rows, VerifyPlan};
 #[cfg(feature = "cuda")]
 use candle::wave_provenance::WaveTicket;
 
@@ -660,9 +662,6 @@ pub struct BatchedInferenceSession {
     accept_in_place: bool,
     /// The draft walk's token buffer — see [`Self::walk_tokens`].
     walk_tokens: Option<Tensor>,
-    /// The residuals layer windows hand on to each other — see
-    /// [`Self::window_residuals`].
-    window_residuals: Arc<WindowResiduals>,
 }
 
 /// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
@@ -744,7 +743,6 @@ impl BatchedInferenceSession {
             rope: RungSelect::unbounded(),
             accept_in_place: false,
             walk_tokens: None,
-            window_residuals: Arc::default(),
         })
     }
 
@@ -855,7 +853,6 @@ impl BatchedInferenceSession {
             rope: RungSelect::unbounded(),
             accept_in_place: false,
             walk_tokens: None,
-            window_residuals: Arc::default(),
         }
     }
 
@@ -902,15 +899,6 @@ impl BatchedInferenceSession {
         }
         let buf = self.walk_tokens.as_ref().expect("sized above");
         buf.narrow(0, 0, want)?.reshape((rows, n))
-    }
-
-    /// The pool of residuals that layer windows hand on to each other — a
-    /// window that stops short of the head writes its residual into one, the
-    /// driver reorders through them, and a caller that splices residual parts
-    /// for the next window composes into one. Shared, so a caller can hold it
-    /// across a forward that borrows the session.
-    pub fn window_residuals(&self) -> Arc<WindowResiduals> {
-        self.window_residuals.clone()
     }
 
     /// Get the configuration used for this session.
@@ -1119,6 +1107,36 @@ impl BatchedInferenceSession {
             .first()
             .expect("begin_stager_generation: no backings")
             .begin_stager_generation_required()
+    }
+
+    /// Claim the write chunk each decode row's next token lands in, over the
+    /// stream's layers — the allocation [`Self::build_decode_metadata`] makes
+    /// before it describes the rows, which can create an arena.
+    ///
+    /// A step's prepare pass runs it, so the claim lands between forwards,
+    /// before the step's tier and forward span stand; the build inside the step
+    /// then finds nothing left to allocate (`docs/wave_step.md` §2.1).
+    #[cfg(feature = "cuda")]
+    pub fn ensure_decode_writes(&self, seq_indices: &[usize]) -> Result<()> {
+        if seq_indices.is_empty() {
+            return Ok(());
+        }
+        let entries: Vec<(usize, usize)> = seq_indices
+            .iter()
+            .map(|&seq_idx| {
+                let offset = self
+                    .sequences
+                    .get(seq_idx)
+                    .and_then(|s| s.as_ref())
+                    .map_or(0, |s| s.offset);
+                (seq_idx, offset)
+            })
+            .collect();
+        ChunkedKvBacking::ensure_for_batch_entries_all(
+            &self.backings[0..self.stream_layers],
+            &entries,
+            1,
+        )
     }
 
     /// Build decode kernel metadata for ALL layers from scratch.
@@ -4093,15 +4111,12 @@ pub struct ModelCoreProperties {
     pub carries_recurrent_state: bool,
 }
 
-/// Result of a re-entrant [`ManagedBatchedModel::forward_batched_layers`] wave.
+/// Result of a wave forward.
 ///
-/// Exactly one of the two fields is populated: `residual` when the wave paused
-/// before the last layer (the packed inter-layer stream to persist and feed back
-/// next wave), or `logits` when it ran the head (one row per input sequence).
+/// `logits` when it ran the head (one row per scored input sequence), `None`
+/// when it stopped short — whose residual went to the caller's
+/// [`CreepResidual`] — or carried only glue rows, which score nothing.
 pub struct WaveStep {
-    /// Packed residual stream to persist + resume, when the range stopped short
-    /// of the final layer.
-    pub residual: Option<Tensor>,
     /// Per-sequence logits (in `seq_indices` order), when the range reached the head.
     pub logits: Option<Vec<Tensor>>,
 }
@@ -4199,21 +4214,6 @@ impl WaveResult {
             start += n;
         }
         Ok(out)
-    }
-
-    /// Take the residual stream, which is pool-backed and outlives the span.
-    ///
-    /// Deliberately available by value where the logits are not: a paused wave's
-    /// residual is persisted and resumed on a *later* forward, so it cannot live
-    /// on a span that resets at the end of this one — and does not.
-    pub fn into_residual(mut self) -> Option<Tensor> {
-        self.step.residual.take()
-    }
-
-    /// [`Self::into_residual`] without giving up the result — for a caller that
-    /// takes the residual and still reads the logits through the guard.
-    pub fn take_residual(&mut self) -> Option<Tensor> {
-        self.step.residual.take()
     }
 
     /// The scored rows as views on the head's span, for reading **while this
@@ -4493,9 +4493,13 @@ pub trait ManagedBatchedModel {
     /// (`docs/continuous_fair_waves.md`). Glue rows are staged on the session via
     /// `set_pending_glue` before the call, as for a plain glue forward.
     ///
-    /// Returns a [`WaveStep`]: `residual` (persist + resume) when the range stops
-    /// short of the head, else `logits` for the **decode + prefill** rows only
-    /// (in `decode_seqs ++ prefill_seqs` order — glue rows carry no logits).
+    /// Returns a [`WaveStep`] carrying `logits` for the **decode + prefill** rows
+    /// only (in `decode_seqs ++ prefill_seqs` order — glue rows carry no
+    /// logits) when the range reaches the head, and none when it stops short.
+    ///
+    /// A range starting past layer 0 resumes from `residual`'s committed rows; a
+    /// range stopping short of the head writes its residual there and commits it
+    /// (`docs/wave_step.md` §3.2). [`Self::claim_residual`] sizes one.
     #[allow(clippy::too_many_arguments)]
     fn forward_wave(
         &self,
@@ -4508,8 +4512,26 @@ pub trait ManagedBatchedModel {
         glue_inputs: &[Tensor],
         layer_start: usize,
         layer_end: usize,
-        residual_in: Option<Tensor>,
+        residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult>;
+
+    /// One co-batched step: rows that cross every layer, and a creep that
+    /// crosses its window, in one forward span with one tier
+    /// (`docs/wave_step.md` §2).
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome>;
+
+    /// Room for `rows` rows of this model's residual stream, held between
+    /// forwards — for a sweep paused and resumed by layer range. Between
+    /// forwards, as every span claim is.
+    fn claim_residual(
+        &self,
+        session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual>;
 
     // ── Speculative decoding (model-agnostic hook) ──────────────────────────────
     //
@@ -5258,7 +5280,6 @@ pub trait ManagedBatchedModel {
                 &plan.decode_inputs,
                 &plan.verify_seqs,
                 &plan.verify_inputs,
-                &WaveCoBatch::standalone(),
                 layer_end,
             );
             return match issued {
@@ -5776,6 +5797,12 @@ pub trait ManagedBatchedModel {
         false
     }
 
+    /// The expert pipeline counters' shared home, for a reader on another
+    /// thread that reads gauges while forwards run (`ExpertCache::stats_shared`).
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        None
+    }
+
     /// The expert cache's `(hits, misses)` tallies so far, unsettled
     /// (`ExpertCache::hit_counts`) — the per-step read, where
     /// [`Self::expert_stats`] waits for the pipeline thread to serve every
@@ -6054,7 +6081,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         glue_inputs: &[Tensor],
         layer_start: usize,
         layer_end: usize,
-        residual_in: Option<Tensor>,
+        residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult> {
         session.expect_rope_select(self.rope().select())?;
         drive_wave(
@@ -6068,9 +6095,28 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             glue_inputs,
             layer_start,
             layer_end,
-            residual_in,
+            residual,
         )
     }
+
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome> {
+        session.expect_rope_select(self.rope().select())?;
+        drive_step(self, session, spec)
+    }
+
+    fn claim_residual(
+        &self,
+        session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual> {
+        let (width, dtype) = WaveSweep::residual_row(self, session)?;
+        CreepResidual::claim(WaveSweep::device(self), rows, width, dtype)
+    }
+
     fn prune(&self) -> Result<()> {
         self.model().prune()
     }
@@ -6081,6 +6127,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn expert_pipeline_dead(&self) -> bool {
         self.model().expert_pipeline_dead()
+    }
+
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        self.model().expert_stats_shared()
     }
 
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
@@ -6255,6 +6305,13 @@ impl<M: BatchedModelCore> WaveSweep for BatchedInference<M> {
 
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
         <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
+    }
+
+    /// The single-stream residual: `hidden` wide, in the width the sweep embeds
+    /// in — the activation width of the live KV's dtype.
+    fn residual_row(&self, session: &BatchedInferenceSession) -> Result<(usize, DType)> {
+        let dtype = activation_dtype(session.kv_live_dtype());
+        Ok((self.model().wave_geometry(dtype).hidden, dtype))
     }
 
     fn sweep(

@@ -1351,6 +1351,14 @@ impl ExpertCache {
         snap
     }
 
+    /// The counters' shared home, for a reader on another thread that must
+    /// not wait for the pipeline thread — a gauge such as
+    /// `resident_vram_bytes` read while forwards run. [`Self::expert_stats`]
+    /// is the settled read.
+    pub fn stats_shared(&self) -> Arc<Mutex<PipelineStats>> {
+        self.stats.clone()
+    }
+
     /// The pipeline telemetry counters, complete for every routed layer sent
     /// before the call.
     ///

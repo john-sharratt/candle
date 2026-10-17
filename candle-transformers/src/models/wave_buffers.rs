@@ -190,8 +190,14 @@ impl<'w, T: CudaDType + DeviceRepr> KernelOutput<'w, T> {
 /// `Backing::Owned` without a guard, which is the correct answer rather than a
 /// fallback: outside a wave there is no arena to seed from.
 pub(crate) fn wave_root(wave: Option<&WaveGeneration>) -> candle::cuda_backend::Backing {
-    match wave {
-        Some(g) => candle::cuda_backend::Backing::Lease(LeaseOrigin::Wave(g.ticket())),
+    wave_root_ticketed(wave.map(WaveGeneration::ticket))
+}
+
+/// [`wave_root`] for a holder of a [`WaveTicket`] rather than of the guard — a
+/// segment of a step, whose forward span is the step's.
+pub(crate) fn wave_root_ticketed(ticket: Option<WaveTicket>) -> candle::cuda_backend::Backing {
+    match ticket {
+        Some(t) => candle::cuda_backend::Backing::Lease(LeaseOrigin::Wave(t)),
         None => candle::cuda_backend::Backing::Owned,
     }
 }

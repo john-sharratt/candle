@@ -1363,6 +1363,7 @@ mod tests {
         for k in [0usize, 1, 2, 3, 4, 5, 8, 12, 16, 24, 32, 40, 47, 48] {
             let mut session = model.create_batched_session(BatchedConfig::default())?;
             let seq = session.create_sequence()?;
+            let mut residual = model.claim_residual(&session, ids.len())?;
             let step = model.forward_wave(
                 &mut session,
                 &[],
@@ -1373,12 +1374,10 @@ mod tests {
                 &[],
                 0,
                 k.min(n_layers),
-                None,
+                Some(&mut residual),
             )?;
             if k < n_layers {
-                let r = step
-                    .into_residual()
-                    .ok_or_else(|| candle::Error::Msg("expected a residual".into()))?;
+                let r = residual.committed().to_tensor()?;
                 let m = r
                     .abs()?
                     .flatten_all()?

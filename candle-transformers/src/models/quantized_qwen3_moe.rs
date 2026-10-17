@@ -63,7 +63,7 @@ use candle_nn::{kv_cache::KvCache, Embedding, Module};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Initial number of RoPE positions to precompute.
 pub const MAX_ROPE_SEQ_LEN: usize = 0;
@@ -659,6 +659,10 @@ impl BatchedModelCore for ModelWeights {
         self.expert_cache
             .as_ref()
             .is_some_and(|cache| cache.pipeline_dead())
+    }
+
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        self.expert_cache.as_ref().map(|cache| cache.stats_shared())
     }
 
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
@@ -2010,6 +2014,8 @@ mod tests {
             use crate::models::batched_inference::{
                 BatchedConfig, BatchedInferenceSession, ManagedBatchedModel, WaveResult,
             };
+            use crate::models::residual_rows::CreepResidual;
+            use crate::models::wave_driver::{StepCreep, StepRows, StepSpec};
 
             let device = match Device::new_cuda(0) {
                 Ok(d) => d,
@@ -2052,9 +2058,20 @@ mod tests {
                        inputs: &[Tensor],
                        ls: usize,
                        le: usize,
-                       residual: Option<Tensor>|
+                       residual: &mut CreepResidual|
              -> Result<WaveResult> {
-                model.forward_wave(session, &[], &[], seqs, inputs, &[], &[], ls, le, residual)
+                model.forward_wave(
+                    session,
+                    &[],
+                    &[],
+                    seqs,
+                    inputs,
+                    &[],
+                    &[],
+                    ls,
+                    le,
+                    Some(residual),
+                )
             };
             // Prefill an identical `ctx` context into `s`, leaving offset at ctx.len().
             let prep =
@@ -2107,13 +2124,12 @@ mod tests {
             let b = session.create_sequence()?;
             prep(&mut session, a, &ctx_p)?;
             prep(&mut session, b, &ctx_p)?;
-            let full = fbl(&mut session, &[a], &[mk(&pre_tok)?], 0, n, None)?.logits_owned()?;
+            let full = fb(&mut session, &[a], &[mk(&pre_tok)?])?;
             let k = n / 2;
-            let mid = fbl(&mut session, &[b], &[mk(&pre_tok)?], 0, k, None)?
-                .into_residual()
-                .expect("paused sweep must return a residual");
+            let mut mid = model.claim_residual(&session, pre_tok.len())?;
+            fbl(&mut session, &[b], &[mk(&pre_tok)?], 0, k, &mut mid)?;
             let split =
-                fbl(&mut session, &[b], &[mk(&pre_tok)?], k, n, Some(mid))?.logits_owned()?;
+                fbl(&mut session, &[b], &[mk(&pre_tok)?], k, n, &mut mid)?.logits_owned()?;
             let c_split = cos(&full[0], &split[0])?;
             println!("split sweep [0,{k})+[{k},{n}) vs full: cos={c_split:.5}");
             assert!(c_split > 0.999, "re-entrant sweep diverged (cos={c_split})");
@@ -2215,33 +2231,32 @@ mod tests {
 
             // ── Test 3d: a MIXED cohort split across TWO layer windows. This is the
             // re-entrant residual path with reclassification: single-token prefills
-            // are folded into the decode group internally, but the residual crosses
-            // the API in CALLER order — `forward_wave` reorders caller→internal on
-            // resume, so re-feeding the returned residual round-trips. A broken
-            // reorder would corrupt the whole cohort. Split-sweep logits must equal
-            // the full-sweep of the same mixed batch (and each row its solo reference).
+            // are folded into the decode group internally, but the residual is held
+            // in CALLER order — the forward moves it out of its internal layout into
+            // the arena, and gathers it back in on resume. A broken layout would
+            // corrupt the whole cohort. Split-sweep logits must equal the full-sweep
+            // of the same mixed batch (and each row its solo reference).
             let w0 = session.create_sequence()?;
             let w1 = session.create_sequence()?;
             prep(&mut session, w0, &ctx_p)?;
             prep(&mut session, w1, &ctx_d)?;
             let kk = n / 2;
-            let mixed_res = fbl(
+            let mut mixed_res = model.claim_residual(&session, pre_tok.len() + one_tok.len())?;
+            fbl(
                 &mut session,
                 &[w0, w1],
                 &[mk(&pre_tok)?, mk(&one_tok)?],
                 0,
                 kk,
-                None,
-            )?
-            .into_residual()
-            .expect("paused mixed cohort must return a residual");
+                &mut mixed_res,
+            )?;
             let mixed_split = fbl(
                 &mut session,
                 &[w0, w1],
                 &[mk(&pre_tok)?, mk(&one_tok)?],
                 kk,
                 n,
-                Some(mixed_res),
+                &mut mixed_res,
             )?
             .logits_owned()?;
             assert_eq!(mixed_split.len(), 2, "split cohort = one logit row per seq");
@@ -2257,17 +2272,14 @@ mod tests {
                 "split mixed 1-token row corrupted on resume (cos={c_ss})"
             );
 
-            // ── Test 3e: DECODE + a MULTI-MEMBER GROUP co-batched, then the
-            // combined `[decode | group]` residual split by `narrow` at n_dec and
-            // each part resumed INDEPENDENTLY — exactly the residual bookkeeping in
-            // `decode_forward_cobatched` when section chunks creep alongside the
-            // prefill cohort (group = [prefill-multi, section-multi, section-1tok]).
-            // The residual is in CALLER order `[decode | group]`, so `narrow(0, n_dec)`
-            // is the decode part and `narrow(n_dec, ..)` the group part (held WHOLE,
-            // never split within) — even though the 1-token member is folded into the
-            // decode kernel internally, caller order keeps it inside the group span.
-            // Every resumed row must equal its solo full-sweep — a mis-split would
-            // corrupt decode or the ingest.
+            // ── Test 3e: a STEP — decode co-batched with a creep group whose
+            // window stops mid-stack, then the creep alone to the head
+            // (`docs/wave_step.md`). The decode row crosses every layer in the
+            // first step; the group (prefill-multi, section-multi, section-1tok —
+            // the 1-token member folded into the decode kernel internally) parks
+            // its rows in its arena at the window's end and resumes from there.
+            // Every row must equal its solo full-sweep — a row handed to the wrong
+            // place would corrupt decode or the ingest.
             let kk2 = n / 2;
             // Solo references (each row alone, full sweep) on their own sequences.
             let rda = session.create_sequence()?;
@@ -2289,85 +2301,84 @@ mod tests {
             for &s in &[da, ga, gb, gc] {
                 prep(&mut session, s, &ctx_d)?;
             }
-            let combined = model
-                .forward_wave(
-                    &mut session,
-                    &[da],
-                    &[mk(&dec_tok)?],
-                    &[ga, gb, gc],
-                    &[mk(&pre_tok)?, mk(&pre_tok)?, mk(&one_tok)?],
-                    &[],
-                    &[],
-                    0,
-                    kk2,
-                    None,
-                )?
-                .into_residual()
-                .expect("paused co-batch must return a residual");
-            // Split: 1 decode token, then the group's tokens (held whole).
-            let gtok = pre_tok.len() + pre_tok.len() + one_tok.len();
-            let dec_part = combined.narrow(1, 0, 1)?;
-            let grp_part = combined.narrow(1, 1, gtok)?;
-            // Resume decode alone to N.
-            let dec_fin = model
-                .forward_wave(
-                    &mut session,
-                    &[da],
-                    &[mk(&dec_tok)?],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    kk2,
-                    n,
-                    Some(dec_part),
-                )?
-                .logits_owned()?;
-            // Resume the group alone to N (members re-passed in the SAME order).
-            let grp_fin = model
-                .forward_wave(
-                    &mut session,
-                    &[],
-                    &[],
-                    &[ga, gb, gc],
-                    &[mk(&pre_tok)?, mk(&pre_tok)?, mk(&one_tok)?],
-                    &[],
-                    &[],
-                    kk2,
-                    n,
-                    Some(grp_part),
-                )?
-                .logits_owned()?;
-            assert_eq!(dec_fin.len(), 1, "decode resume = one row");
+            let dec_in = [mk(&dec_tok)?];
+            let grp_in = [mk(&pre_tok)?, mk(&pre_tok)?, mk(&one_tok)?];
+            let mut grp_res: Option<CreepResidual> = None;
+            let first = model.forward_step(
+                &mut session,
+                StepSpec {
+                    decode: StepRows {
+                        seqs: &[da],
+                        inputs: &dec_in,
+                    },
+                    verify: StepRows::NONE,
+                    glue: StepRows::NONE,
+                    creep: Some(StepCreep {
+                        rows: StepRows {
+                            seqs: &[ga, gb, gc],
+                            inputs: &grp_in,
+                        },
+                        cursor: 0,
+                        win_end: kk2,
+                        residual: &mut grp_res,
+                    }),
+                },
+            )?;
+            assert!(first.creep_advanced, "the window ran and committed");
+            let dec_fin = first.head?.logits_owned()?;
+            // The group alone, from the layer its window stopped at to the head.
+            let rest = model.forward_step(
+                &mut session,
+                StepSpec {
+                    decode: StepRows::NONE,
+                    verify: StepRows::NONE,
+                    glue: StepRows::NONE,
+                    creep: Some(StepCreep {
+                        rows: StepRows {
+                            seqs: &[ga, gb, gc],
+                            inputs: &grp_in,
+                        },
+                        cursor: kk2,
+                        win_end: n,
+                        residual: &mut grp_res,
+                    }),
+                },
+            )?;
+            assert!(rest.creep_advanced);
+            assert!(
+                grp_res.is_none(),
+                "a creep that reached the head gives its arena back"
+            );
+            let grp_fin = rest.head?.logits_owned()?;
+            assert_eq!(dec_fin.len(), 1, "the step scored its decode row");
             assert_eq!(grp_fin.len(), 3, "group resume = one row per member");
             let c_ed = cos(&sref_d[0], &dec_fin[0])?;
             let c_ea = cos(&sref_a[0], &grp_fin[0])?;
             let c_eb = cos(&sref_b[0], &grp_fin[1])?;
             let c_ec = cos(&sref_c[0], &grp_fin[2])?;
-            println!(
-                "co-batch split-residual resume: decode={c_ed:.5} group=[{c_ea:.5},{c_eb:.5},{c_ec:.5}]"
-            );
+            println!("step: decode={c_ed:.5} creep resumed=[{c_ea:.5},{c_eb:.5},{c_ec:.5}]");
             assert!(
                 c_ed > 0.999,
-                "decode part corrupted by residual split (cos={c_ed})"
+                "decode corrupted crossing the step (cos={c_ed})"
             );
             assert!(
                 c_ea > 0.999 && c_eb > 0.999 && c_ec > 0.999,
-                "group member corrupted by residual split (cos=[{c_ea},{c_eb},{c_ec}])"
+                "group member corrupted through its arena (cos=[{c_ea},{c_eb},{c_ec}])"
             );
 
-            // ── Test 3f: the THREE-group co-batch — decode + creep group + a GLUE
-            // group — paused mid-sweep and its `[decode | creep | glue]` residual
-            // split THREE ways, each part resumed independently. This is the unified
-            // wave step's full geometry (`decode_forward_cobatched` folding deferred
-            // glue as a full-sweep member): glue rides the caller-order TAIL, so the
-            // creep still narrows contiguously between decode and glue. The creep
-            // carries a 1-token member (folded into decode internally) to exercise
-            // the caller-order reorder under a trailing glue group. (Here the glue
-            // group runs as a plain ragged group — no pending scatter descriptors —
-            // which is enough to validate the residual geometry; the glue kernel's
-            // scatter/mask is covered by the gap-fill tests.) Every resumed row must
-            // equal its solo full-sweep.
+            // ── Test 3f: the THREE-group step — decode + a creep group + a GLUE
+            // group — with the creep's window ending mid-stack. This is the step's
+            // full geometry (`decode_forward_cobatched` folding deferred glue as a
+            // full-sweep member): caller order `[decode | creep | glue]`, so the
+            // segment after the window takes the decode rows from ahead of the
+            // creep and the glue rows from behind it, and the creep's rows leave
+            // from between them. The creep carries a 1-token member (folded into
+            // decode internally) so the layouts differ from caller order. (The
+            // glue group runs as a plain ragged group — no pending scatter
+            // descriptors — which is enough for the geometry; the glue kernel's
+            // scatter/mask is covered by the gap-fill tests. Glue scores nothing,
+            // so its rows are checked by the decode row it rides beside.) Every
+            // scored row must equal its solo full-sweep.
             let kk3 = n / 2;
             let hda = session.create_sequence()?;
             let hca = session.create_sequence()?;
@@ -2376,91 +2387,200 @@ mod tests {
             for &s in &[hda, hca, hcb, hgl] {
                 prep(&mut session, s, &ctx_d)?;
             }
-            // Solo references (each row alone, full sweep).
-            let href_d = fb(&mut session, &[hda], &[mk(&dec_tok)?])?;
-            let href_ca = fb(&mut session, &[hca], &[mk(&pre_tok)?])?;
-            let href_cb = fb(&mut session, &[hcb], &[mk(&one_tok)?])?;
-            let href_gl = fb(&mut session, &[hgl], &[mk(&pre_tok)?])?;
-            // Co-batch decode [da] + creep [ca(multi), cb(1tok)] + glue [gl(multi)],
-            // paused at kk3. Residual crosses in caller order [decode | creep | glue].
-            let combined3 = model
-                .forward_wave(
-                    &mut session,
-                    &[hda],
-                    &[mk(&dec_tok)?],
-                    &[hca, hcb],
-                    &[mk(&pre_tok)?, mk(&one_tok)?],
-                    &[hgl],
-                    &[mk(&pre_tok)?],
-                    0,
-                    kk3,
-                    None,
-                )?
-                .into_residual()
-                .expect("paused three-group co-batch must return a residual");
-            let creep_tok3 = pre_tok.len() + one_tok.len();
-            let glue_tok3 = pre_tok.len();
-            let dec_part3 = combined3.narrow(1, 0, 1)?;
-            let creep_part3 = combined3.narrow(1, 1, creep_tok3)?;
-            let glue_part3 = combined3.narrow(1, 1 + creep_tok3, glue_tok3)?;
-            // Resume each group alone to N, members re-passed in the SAME order.
-            let dec_fin3 = model
-                .forward_wave(
-                    &mut session,
-                    &[hda],
-                    &[mk(&dec_tok)?],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    kk3,
-                    n,
-                    Some(dec_part3),
-                )?
-                .logits_owned()?;
-            let creep_fin3 = model
-                .forward_wave(
-                    &mut session,
-                    &[],
-                    &[],
-                    &[hca, hcb],
-                    &[mk(&pre_tok)?, mk(&one_tok)?],
-                    &[],
-                    &[],
-                    kk3,
-                    n,
-                    Some(creep_part3),
-                )?
-                .logits_owned()?;
-            let glue_fin3 = model
-                .forward_wave(
-                    &mut session,
-                    &[],
-                    &[],
-                    &[hgl],
-                    &[mk(&pre_tok)?],
-                    &[],
-                    &[],
-                    kk3,
-                    n,
-                    Some(glue_part3),
-                )?
-                .logits_owned()?;
+            // Solo references (each row alone, full sweep), on sequences of their
+            // own: a reference run writes its rows into its sequence's KV.
+            let rhd = session.create_sequence()?;
+            let rhca = session.create_sequence()?;
+            let rhcb = session.create_sequence()?;
+            for &s in &[rhd, rhca, rhcb] {
+                prep(&mut session, s, &ctx_d)?;
+            }
+            let href_d = fb(&mut session, &[rhd], &[mk(&dec_tok)?])?;
+            let href_ca = fb(&mut session, &[rhca], &[mk(&pre_tok)?])?;
+            let href_cb = fb(&mut session, &[rhcb], &[mk(&one_tok)?])?;
+            let dec_in3 = [mk(&dec_tok)?];
+            let creep_in3 = [mk(&pre_tok)?, mk(&one_tok)?];
+            let glue_in3 = [mk(&pre_tok)?];
+            let mut creep_res3: Option<CreepResidual> = None;
+            let first3 = model.forward_step(
+                &mut session,
+                StepSpec {
+                    decode: StepRows {
+                        seqs: &[hda],
+                        inputs: &dec_in3,
+                    },
+                    verify: StepRows::NONE,
+                    glue: StepRows {
+                        seqs: &[hgl],
+                        inputs: &glue_in3,
+                    },
+                    creep: Some(StepCreep {
+                        rows: StepRows {
+                            seqs: &[hca, hcb],
+                            inputs: &creep_in3,
+                        },
+                        cursor: 0,
+                        win_end: kk3,
+                        residual: &mut creep_res3,
+                    }),
+                },
+            )?;
+            let dec_fin3 = first3.head?.logits_owned()?;
+            let rest3 = model.forward_step(
+                &mut session,
+                StepSpec {
+                    decode: StepRows::NONE,
+                    verify: StepRows::NONE,
+                    glue: StepRows::NONE,
+                    creep: Some(StepCreep {
+                        rows: StepRows {
+                            seqs: &[hca, hcb],
+                            inputs: &creep_in3,
+                        },
+                        cursor: kk3,
+                        win_end: n,
+                        residual: &mut creep_res3,
+                    }),
+                },
+            )?;
+            let creep_fin3 = rest3.head?.logits_owned()?;
             let c_fd = cos(&href_d[0], &dec_fin3[0])?;
             let c_fca = cos(&href_ca[0], &creep_fin3[0])?;
             let c_fcb = cos(&href_cb[0], &creep_fin3[1])?;
-            let c_fgl = cos(&href_gl[0], &glue_fin3[0])?;
-            println!(
-                "three-group split-residual resume: decode={c_fd:.5} creep=[{c_fca:.5},{c_fcb:.5}] glue={c_fgl:.5}"
-            );
-            assert!(c_fd > 0.999, "decode corrupted by 3-way split (cos={c_fd})");
+            println!("three-group step: decode={c_fd:.5} creep resumed=[{c_fca:.5},{c_fcb:.5}]");
+            assert!(c_fd > 0.999, "decode corrupted beside glue (cos={c_fd})");
             assert!(
                 c_fca > 0.999 && c_fcb > 0.999,
-                "creep member corrupted by 3-way split (cos=[{c_fca},{c_fcb}])"
+                "creep member corrupted leaving from between decode and glue \
+                 (cos=[{c_fca},{c_fcb}])"
+            );
+            // Glue scores nothing, so its rows are checked through the next
+            // token: a decode on the glue sequence attends to the K/V the step
+            // wrote for it, and must equal a decode on a sequence that took the
+            // same rows alone.
+            let glue_next = |session: &mut BatchedInferenceSession, glue: usize| -> Result<f32> {
+                let r = session.create_sequence()?;
+                prep(session, r, &ctx_d)?;
+                fb(session, &[r], &[mk(&pre_tok)?])?;
+                let want = fb(session, &[r], &[mk(&dec_tok)?])?;
+                let got = fb(session, &[glue], &[mk(&dec_tok)?])?;
+                cos(&want[0], &got[0])
+            };
+            let c_fg = glue_next(&mut session, hgl)?;
+            println!("three-group step: glue's next token={c_fg:.5}");
+            assert!(
+                c_fg > 0.999,
+                "glue rows corrupted beside the creep (cos={c_fg})"
+            );
+
+            // ── Test 3g: a step of THREE segments — the creep resuming mid-stack
+            // with decode and glue riding every layer — so the full-sweep rows
+            // run alone up to the creep's window, are handed around the creep
+            // through it, and run alone again after it. The creep carries a
+            // three-token and a one-token member, so every hand-off crosses a
+            // layout that differs from caller order.
+            let (kk4a, kk4b) = (n / 4, 3 * n / 4);
+            let gda = session.create_sequence()?;
+            let gca = session.create_sequence()?;
+            let gcb = session.create_sequence()?;
+            let ggl = session.create_sequence()?;
+            let rgd = session.create_sequence()?;
+            let rgca = session.create_sequence()?;
+            let rgcb = session.create_sequence()?;
+            for &s in &[gda, gca, gcb, ggl, rgd, rgca, rgcb] {
+                prep(&mut session, s, &ctx_d)?;
+            }
+            let gref_d = fb(&mut session, &[rgd], &[mk(&dec_tok)?])?;
+            let gref_ca = fb(&mut session, &[rgca], &[mk(&pre_tok)?])?;
+            let gref_cb = fb(&mut session, &[rgcb], &[mk(&one_tok)?])?;
+            let creep_in4 = [mk(&pre_tok)?, mk(&one_tok)?];
+            let creep4 = StepRows {
+                seqs: &[gca, gcb],
+                inputs: &creep_in4,
+            };
+            let mut creep_res4: Option<CreepResidual> = None;
+            // The creep alone to its first stop.
+            let lead = model.forward_step(
+                &mut session,
+                StepSpec {
+                    decode: StepRows::NONE,
+                    verify: StepRows::NONE,
+                    glue: StepRows::NONE,
+                    creep: Some(StepCreep {
+                        rows: creep4,
+                        cursor: 0,
+                        win_end: kk4a,
+                        residual: &mut creep_res4,
+                    }),
+                },
+            )?;
+            assert!(lead.creep_advanced);
+            lead.head?;
+            // Decode and glue across every layer, the creep across [kk4a, kk4b).
+            let dec_in4 = [mk(&dec_tok)?];
+            let glue_in4 = [mk(&pre_tok)?];
+            let mid = model.forward_step(
+                &mut session,
+                StepSpec {
+                    decode: StepRows {
+                        seqs: &[gda],
+                        inputs: &dec_in4,
+                    },
+                    verify: StepRows::NONE,
+                    glue: StepRows {
+                        seqs: &[ggl],
+                        inputs: &glue_in4,
+                    },
+                    creep: Some(StepCreep {
+                        rows: creep4,
+                        cursor: kk4a,
+                        win_end: kk4b,
+                        residual: &mut creep_res4,
+                    }),
+                },
+            )?;
+            assert!(mid.creep_advanced);
+            let dec_fin4 = mid.head?.logits_owned()?;
+            assert_eq!(dec_fin4.len(), 1, "the step scored its decode row alone");
+            // The creep alone to the head.
+            let tail = model.forward_step(
+                &mut session,
+                StepSpec {
+                    decode: StepRows::NONE,
+                    verify: StepRows::NONE,
+                    glue: StepRows::NONE,
+                    creep: Some(StepCreep {
+                        rows: creep4,
+                        cursor: kk4b,
+                        win_end: n,
+                        residual: &mut creep_res4,
+                    }),
+                },
+            )?;
+            assert!(
+                creep_res4.is_none(),
+                "a creep at the head gives its arena back"
+            );
+            let creep_fin4 = tail.head?.logits_owned()?;
+            let c_gd = cos(&gref_d[0], &dec_fin4[0])?;
+            let c_gca = cos(&gref_ca[0], &creep_fin4[0])?;
+            let c_gcb = cos(&gref_cb[0], &creep_fin4[1])?;
+            let c_gg = glue_next(&mut session, ggl)?;
+            println!(
+                "three-segment step: decode={c_gd:.5} creep=[{c_gca:.5},{c_gcb:.5}] \
+                 glue's next token={c_gg:.5}"
             );
             assert!(
-                c_fgl > 0.999,
-                "glue-tail member corrupted by 3-way split (cos={c_fgl})"
+                c_gd > 0.999,
+                "decode corrupted around a mid-stack creep (cos={c_gd})"
+            );
+            assert!(
+                c_gca > 0.999 && c_gcb > 0.999,
+                "creep corrupted resuming beside full-sweep rows (cos=[{c_gca},{c_gcb}])"
+            );
+            assert!(
+                c_gg > 0.999,
+                "glue corrupted around a mid-stack creep (cos={c_gg})"
             );
 
             Ok(())

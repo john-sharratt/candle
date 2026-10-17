@@ -1153,13 +1153,13 @@ pub enum WaveBuffer {
     /// width, in either head mode.
     AcceptRows,
     /// The wide residual, `[rows, streams · hidden]` F32 — on a multi-stream
-    /// stack, for a wave that reaches the head.
+    /// stack, for every forward.
     ///
     /// One buffer for the whole sweep, combined into in place by every layer,
     /// so it lives on the forward span rather than a layer's: it crosses every
-    /// layer phase's reset. A wave that stops short of the head hands its
-    /// residual on to the next window, past this span's reset, and keeps it
-    /// off the span — so it is charged only where the head runs.
+    /// layer phase's reset. A resumed forward gathers its input into it, and a
+    /// forward that stops short of the head hands it on from here
+    /// (`docs/wave_step.md`), so it is charged whether or not the head runs.
     HyperResidual,
     /// The rows' bare embeddings, `[rows, hidden]` F32: the draft head's
     /// `embed(t)` half, gathered with the residual and read after the trunk.
@@ -1193,12 +1193,12 @@ pub enum WaveBuffer {
     /// span every layer's glue scatter reads them from. Single-stream stacks,
     /// which are the ones that carry glue.
     GlueWriteTables,
-    /// The residual stream a single-stream stack embeds into, `[rows, hidden]`
+    /// The residual stream a single-stream stack sweeps in, `[rows, hidden]`
     /// in the compute dtype: the resident table's gather inherits the arena of
-    /// the ids it reads, which are on this span. Every forward that embeds —
-    /// a window that stops short copies it off the span into a held window
-    /// buffer as it hands it on, so it is here for the window's whole sweep
-    /// either way. A multi-stream stack's is [`Self::HyperResidual`].
+    /// the ids it reads, which are on this span, and a resumed forward gathers
+    /// its input into one here. A window that stops short hands it on from
+    /// here, so it is charged for every forward. A multi-stream stack's is
+    /// [`Self::HyperResidual`].
     ForwardResidual,
     /// A hybrid stack's DeltaNet **decode table**: four state addresses (the
     /// conv tail's entering and advanced buffers, then the state's) per decode
@@ -2187,12 +2187,14 @@ impl WaveBuffer {
             Self::HeadLogitsF32 => dense(0, 0, DType::F32),
             Self::AcceptRows => dense(w.accept_rows, g.vocab, g.act_dtype),
             Self::HeadNormF32 => dense(0, 0, g.act_dtype),
-            // Every row of the wave, where the head runs.
-            Self::HyperResidual if w.scored_rows > 0 => dense(hyper_rows, hc_dim, DType::F32),
+            // Every row of the wave, fresh or resumed, whether or not the head
+            // runs: a window that stops short hands its residual on from here.
+            Self::HyperResidual => dense(hyper_rows, hc_dim, DType::F32),
+            // The rows' embeddings, where the head runs.
             Self::HeadRowEmbeds if w.scored_rows > 0 && hyper.draft_head => {
                 dense(rows, g.hidden, DType::F32)
             }
-            Self::HyperResidual | Self::HeadRowEmbeds => dense(0, 0, DType::F32),
+            Self::HeadRowEmbeds => dense(0, 0, DType::F32),
             Self::HeadScoredResidual if g.hyper.is_some() => {
                 dense(hyper_scored, hc_dim, DType::F32)
             }
@@ -2938,12 +2940,13 @@ mod tests {
         );
     }
 
-    /// The wide residual and the rows' embeddings ride the forward span when
-    /// the head runs: at 100 rows, `100 × 10240 × 4` and `100 × 2560 × 4`. A
-    /// window that stops short of the head hands its residual on, so it is
-    /// charged neither; a stack without a draft head gathers no bare rows.
+    /// The wide residual rides the forward span for every forward, and the
+    /// rows' embeddings where the head runs: at 100 rows, `100 × 10240 × 4` and
+    /// `100 × 2560 × 4`. A window that stops short of the head hands its
+    /// residual on from the span, so it is charged there too, and gathers no
+    /// bare rows; a stack without a draft head gathers none either.
     #[test]
-    fn the_forward_span_carries_the_residual_where_the_head_runs() {
+    fn the_forward_span_carries_the_residual_for_every_forward() {
         let g = hyper_moe_full();
         let wide = WaveWidth::prefill(100, 1);
         assert_eq!(WaveBuffer::HyperResidual.bytes(&g, wide), 4_096_000);
@@ -2955,7 +2958,7 @@ mod tests {
             prefill_rows: 100,
             ..WaveWidth::default()
         };
-        assert_eq!(WaveBuffer::HyperResidual.bytes(&g, window), 0);
+        assert_eq!(WaveBuffer::HyperResidual.bytes(&g, window), 4_096_000);
         assert_eq!(WaveBuffer::HeadRowEmbeds.bytes(&g, window), 0);
         let headless = hyper_moe();
         assert_eq!(WaveBuffer::HyperResidual.bytes(&headless, wide), 4_096_000);

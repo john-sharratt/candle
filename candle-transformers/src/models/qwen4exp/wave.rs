@@ -82,7 +82,7 @@ use crate::models::delta_net::{
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
 use crate::models::expert_lre::{
-    WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
+    PipelineStats, WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
 };
 use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
@@ -96,6 +96,7 @@ use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows, VerifyStash};
 use crate::models::residency_rows::residency_decode_rows;
+use crate::models::residual_rows::{CreepResidual, ResidualIn};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
 use crate::models::selection_strata::StrataTokens;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
@@ -104,9 +105,11 @@ use super::rope::flash_next_schedule;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::verify_wave::{upload_plan_rows, VerifyPlan};
 use crate::models::wave_admit::admit_wave_kv;
-use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
+use crate::models::wave_driver::{
+    assemble_wave_contexts, drive_step, drive_wave, StepOutcome, StepSpec, SweepMode, WaveGroups,
+    WaveSweep,
+};
 use crate::models::wave_token_ids::host_token_ids;
-use crate::models::window_residuals::WindowResiduals;
 
 /// Seal `c`'s live tail into a **position-free** record: its completed rows and
 /// its open block, read back to the host.
@@ -2759,12 +2762,16 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Ok(())
     }
 
-    fn expert_stats(&self) -> Option<crate::models::expert_lre::PipelineStats> {
+    fn expert_stats(&self) -> Option<PipelineStats> {
         Some(self.model.experts.expert_stats())
     }
 
     fn expert_pipeline_dead(&self) -> bool {
         self.model.experts.pipeline_dead()
+    }
+
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        Some(self.model.experts.stats_shared())
     }
 
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
@@ -2832,7 +2839,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         glue_inputs: &[Tensor],
         layer_start: usize,
         layer_end: usize,
-        residual_in: Option<Tensor>,
+        residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult> {
         session.expect_rope_select(self.rope.select())?;
         drive_wave(
@@ -2846,8 +2853,26 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             glue_inputs,
             layer_start,
             layer_end,
-            residual_in,
+            residual,
         )
+    }
+
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome> {
+        session.expect_rope_select(self.rope.select())?;
+        drive_step(self, session, spec)
+    }
+
+    fn claim_residual(
+        &self,
+        session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual> {
+        let (width, dtype) = WaveSweep::residual_row(self, session)?;
+        CreepResidual::claim(&self.model.device, rows, width, dtype)
     }
 }
 
@@ -2866,6 +2891,12 @@ impl WaveSweep for Qwen4ExpBatched {
 
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
         <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
+    }
+
+    /// The Gated Residual's wide stream: `hc` streams of `hidden`, in F32.
+    fn residual_row(&self, _session: &BatchedInferenceSession) -> Result<(usize, DType)> {
+        let cfg = &self.model.cfg;
+        Ok((cfg.hc.count * cfg.hidden_size, DType::F32))
     }
 
     /// Caches are indexed by KV layer: three quarters of the trunk owns no
@@ -2911,13 +2942,15 @@ impl WaveSweep for Qwen4ExpBatched {
             layer_start,
             layer_end,
             x_in,
-            window,
+            mode,
             act_dtype: _,
             adapter,
         } = wave;
         if seq_ids.is_empty() {
             candle::bail!("qwen4exp wave: empty batch");
         }
+        let preparing = matches!(mode, SweepMode::Prepare);
+        let in_step = matches!(mode, SweepMode::InStep(_));
         let accept_in_place = session.accept_in_place();
         // Flash-Next runs its layers under the Gated Residual, which carries no
         // adapter plumbing, so `project_qkv_gated` is called with an empty
@@ -2955,8 +2988,13 @@ impl WaveSweep for Qwen4ExpBatched {
         // the wave that placed it. It also has to precede `ensure_seq_state`
         // below, which claims span regions for any store it creates — and a
         // claim under a standing tier is refused outright.
+        //
+        // A segment of a step skips this, the boundary move, the admit and the
+        // state claims below: the step ran all four for every segment before it
+        // placed the tier they share, and its forward span is live
+        // (`docs/wave_step.md` §2.1).
         #[cfg(feature = "cuda")]
-        if let Device::Cuda(d) = &m.device {
+        if let (Device::Cuda(d), false) = (&m.device, in_step) {
             end_wave_transient(&d.cuda_stream());
         }
         pipeline_record("q4e:pre:end_tier", t_pre);
@@ -2974,7 +3012,9 @@ impl WaveSweep for Qwen4ExpBatched {
         // blanket `BatchedModel` wave's phase 0; Flash-Next runs its own engine
         // rather than `BatchedModelCore`, so it does not inherit either.
         let t_pre = profile_now();
-        m.experts.reclaim_spare_ground();
+        if !in_step {
+            m.experts.reclaim_spare_ground();
+        }
         pipeline_record("q4e:pre:reclaim", t_pre);
 
         let n_glue = seq_ids.len() - n_decode - n_prefill;
@@ -3004,8 +3044,14 @@ impl WaveSweep for Qwen4ExpBatched {
         // session's STREAM layers — the draft head's layer is stepped by the
         // head's own pass, and `build_decode_metadata` scopes itself to the
         // stream for exactly that reason.
+        // A segment being prepared runs no layer, so it builds no header — but
+        // it claims the decode rows' write chunks the build would, here, before
+        // the step's span stands.
         let t_pre = profile_now();
-        let decode_headers = if n_decode > 0 {
+        if preparing {
+            session.ensure_decode_writes(&seq_ids[..n_decode])?;
+        }
+        let decode_headers = if n_decode > 0 && !preparing {
             let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
             DecodeHeaders::Decode { buf, stride }
         } else {
@@ -3027,7 +3073,9 @@ impl WaveSweep for Qwen4ExpBatched {
         // Admit: claim every KV chunk this wave writes, over the KV range.
         let t_pre = profile_now();
         let (kv_start, kv_end) = self.kv_layer_range(layer_start, layer_end);
-        admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
+        if !in_step {
+            admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
+        }
         pipeline_record("q4e:pre:admit", t_pre);
 
         // ── Carried state: ensure (reset at offset 0), open the GDN wave,
@@ -3056,8 +3104,10 @@ impl WaveSweep for Qwen4ExpBatched {
         // moves the frontier under a tier already standing on it (hot-path
         // invariant 7).
         let t_pre = profile_now();
-        for ((&seq, &off), &q) in seq_ids.iter().zip(&offsets).zip(&q_lens) {
-            self.ensure_seq_state(seq, off, off + q, layer_start)?;
+        if !in_step {
+            for ((&seq, &off), &q) in seq_ids.iter().zip(&offsets).zip(&q_lens) {
+                self.ensure_seq_state(seq, off, off + q, layer_start)?;
+            }
         }
         pipeline_record("q4e:pre:ensure_state", t_pre);
 
@@ -3067,9 +3117,12 @@ impl WaveSweep for Qwen4ExpBatched {
         // it, and before `begin_forward` below, because the placement may buy
         // ground from the weight side and `set_weight_floor` refuses while a
         // forward is open.
+        //
+        // A segment being prepared returns its price for the step to place; a
+        // segment running in the step places nothing — the step's tier stands.
         let t_pre = profile_now();
         #[cfg(feature = "cuda")]
-        if total_rows > 0 {
+        if total_rows > 0 && !in_step {
             if let Device::Cuda(d) = &m.device {
                 let geometry = self.wave_geometry(tier_act_dtype);
                 let plan = WavePlan::new(geometry);
@@ -3163,6 +3216,9 @@ impl WaveSweep for Qwen4ExpBatched {
                     plan.phase_bytes(LayerPhase::Ffn, width),
                     plan.phase_bytes(LayerPhase::Forward, width),
                 ];
+                if preparing {
+                    return Ok((WavePhase::Priced(per_phase), None));
+                }
                 // The refusal names the partition; the wave it was refused for
                 // is what says which of the wave's parts to look at.
                 plan_wave_transient(&d.cuda_stream(), per_phase).map_err(|e| {
@@ -3171,6 +3227,9 @@ impl WaveSweep for Qwen4ExpBatched {
             }
         }
         pipeline_record("q4e:pre:plan_tier", t_pre);
+        if preparing {
+            return Ok((WavePhase::Priced([0; 3]), None));
+        }
 
         // From here the forward owns the span partition: the tier is placed and
         // must not move under it.
@@ -3189,13 +3248,18 @@ impl WaveSweep for Qwen4ExpBatched {
         // `WAVE_FORWARD_BYTES` describes. Its ticket travels instead of the
         // guard, because the builders are deep in the sweep and a `Copy`
         // coordinate reaches them without changing any signature's lifetime.
+        // A segment of a step carves from the step's span, which outlives it.
         #[cfg(feature = "cuda")]
-        let fwd_span = match &m.device {
-            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
+        let fwd_span = match (&m.device, mode) {
+            (_, SweepMode::InStep(_)) => None,
+            (Device::Cuda(d), _) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
             _ => None,
         };
         #[cfg(feature = "cuda")]
-        let fwd_ticket = fwd_span.as_ref().map(|g| g.ticket());
+        let fwd_ticket = match mode {
+            SweepMode::InStep(ticket) => ticket,
+            _ => fwd_span.as_ref().map(|g| g.ticket()),
+        };
         #[cfg(not(feature = "cuda"))]
         let fwd_ticket: Option<candle::cuda_backend::wave_provenance::WaveTicket> = None;
 
@@ -3282,7 +3346,6 @@ impl WaveSweep for Qwen4ExpBatched {
             (total_rows, pre_rows),
             (layer_start, layer_end),
             x_in,
-            window,
             (decode_headers, prefill_headers),
             generation,
             eps,
@@ -3399,15 +3462,10 @@ impl WaveSweep for Qwen4ExpBatched {
         // head GEMM run on its ticket), so a wave that reached the head hands
         // the span's guard back with them: `WaveResult` keeps the span alive
         // while the caller reads, instead of the head copying the `[R, vocab]`
-        // block off it first.
+        // block off it first. A window that stopped short hands its residual
+        // back on the same span, and the guard goes with it for the same reason.
         #[cfg(feature = "cuda")]
-        let swept = swept.map(|(phase, guard)| {
-            if matches!(phase, WavePhase::Logits(_)) {
-                (phase, guard.or(fwd_span))
-            } else {
-                (phase, guard)
-            }
-        });
+        let swept = swept.map(|(phase, guard)| (phase, guard.or(fwd_span)));
         swept
     }
 }
@@ -3487,8 +3545,7 @@ impl Qwen4ExpBatched {
         offs: (&[usize], &[usize], &[usize], &[usize]),
         rows: (usize, usize),
         range: (usize, usize),
-        x_in: Option<TensorCat>,
-        window: &WindowResiduals,
+        x_in: Option<ResidualIn<'_>>,
         headers: (DecodeHeaders, DecodeHeaders),
         generation: &candle::quantized::pinned_staging::Generation,
         eps: f64,
@@ -3520,22 +3577,15 @@ impl Qwen4ExpBatched {
         // One launch fills both: the fresh residual is the embedding repeated
         // across the `hc` streams, written by the gather itself, and the head
         // reads the bare rows. Both are fully written (invariant 6), and both
-        // are on the forward span whenever the sweep reaches the head
-        // (`WaveBuffer::HyperResidual`, `WaveBuffer::HeadRowEmbeds`) — see the
-        // residual below for the window that does not.
+        // are on the forward span (`WaveBuffer::HyperResidual`,
+        // `WaveBuffer::HeadRowEmbeds`).
         let fresh = x_in.is_none();
         let reaches_head = layer_end == num_layers;
         let head_embeds = reaches_head && m.mtp.is_some();
         let res_dims = (total_rows, hc, n_embd);
-        // The residual's home: the forward span for a sweep that reaches the
-        // head, a held window buffer for one that hands it on.
-        let residual_buffer = || -> Result<Tensor> {
-            if reaches_head {
-                wave_empty_ticketed(res_dims, DType::F32, dev, fwd_ticket)
-            } else {
-                window.take(res_dims, DType::F32, dev)
-            }
-        };
+        // The residual's home, fresh or resumed: the forward span, which
+        // outlives every layer phase of the sweep.
+        let residual_buffer = || wave_empty_ticketed(res_dims, DType::F32, dev, fwd_ticket);
         let entry = if fresh {
             Some(residual_buffer()?)
         } else {
@@ -3575,24 +3625,21 @@ impl Qwen4ExpBatched {
         // **One buffer for the whole forward, updated in place.** `hc_combine`
         // adds each block's scatter into `res` where it stands, so the wide
         // `[rows, hc, hidden]` stream is this one buffer, not one per combine.
-        // It crosses every layer phase's reset, so a sweep that reaches the
-        // head carves it from the forward span, which outlives them all. A
-        // window that stops short hands it back as `WavePhase::Residual` for
-        // the next wave to resume from — past this span's reset — so there it
-        // is one of the session's held window buffers.
+        // It crosses every layer phase's reset, so it is carved from the
+        // forward span, which outlives them all. A window that stops short
+        // hands it back as `WavePhase::Residual`, still on the span, and the
+        // driver moves it on (`docs/wave_step.md`).
         //
-        // **A resumed residual is copied first.** `x_in` is the caller's tensor:
-        // the residual a previous window handed back to be persisted, which the
-        // driver passes through without a copy. Combining into it in place would
-        // rewrite the persisted state under its owner — and a wave that fails
-        // part-way would leave it advanced by the layers that did run. One copy
-        // per resumed forward is the price; the fresh path writes its gathered
-        // rows straight into a buffer it owns.
+        // **A resumed residual is gathered in, never combined into where it
+        // lies.** What `x_in` names is the caller's: a creep's committed half,
+        // the last segment's rows. Combining into it would rewrite it under its
+        // owner, and a wave that failed part-way would leave it advanced by the
+        // layers that did run. The gather lands the rows in this forward's own
+        // buffer in its row order, which is the copy a resume costs.
         let mut res = match x_in {
-            Some(t) => {
-                let src = t.to_tensor().reshape(res_dims)?;
+            Some(resume) => {
                 let dst = residual_buffer()?;
-                dst.slice_set(&src, 0, 0)?;
+                resume.gather_into(&dst)?;
                 dst
             }
             None => entry.expect("allocated whenever the residual is fresh"),

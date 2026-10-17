@@ -1721,16 +1721,15 @@ fn which_layer_a_chunk_boundary_crossing_first_changes() -> Result<()> {
     }
 
     // The crossing forward, one layer at a time. The residual stream is carried
-    // between slices and copied off the forward span each time — the span is
-    // reclaimed when its guard drops, so a borrowed tensor would dangle into the
-    // next slice's own span.
+    // between slices in an arena of its own — each slice resumes from its
+    // committed rows and hands its own on — and read back from there.
     let nx = top_n(&lg, 1)[0] as u32;
     let x = Tensor::from_vec(vec![nx], (1, 1), &Device::Cpu)?;
     println!("\ncrossing forward (token {nx}), layer by layer:");
     let mut residuals: Vec<Vec<Vec<f32>>> = Vec::new();
     for slot in [ctl, inj] {
         let mut per_layer = Vec::with_capacity(n_layers);
-        let mut carry: Option<Tensor> = None;
+        let mut carry = model.claim_residual(&s, 1)?;
         for l in 0..n_layers {
             let st = model.forward_wave(
                 &mut s,
@@ -1742,30 +1741,27 @@ fn which_layer_a_chunk_boundary_crossing_first_changes() -> Result<()> {
                 &[],
                 l,
                 l + 1,
-                carry.take(),
+                Some(&mut carry),
             )?;
-            match &st.residual {
-                Some(t) => {
-                    let owned = t.copy()?;
-                    per_layer.push(
-                        owned
-                            .flatten_all()?
-                            .to_dtype(candle::DType::F32)?
-                            .to_vec1::<f32>()?,
-                    );
-                    carry = Some(owned);
-                }
-                None => {
-                    // The final slice runs the head instead of emitting a
-                    // residual; record the logits so the sweep ends on the
-                    // quantity the sampler actually sees.
-                    per_layer.push(
-                        st.logits_owned()?[0]
-                            .i(0)?
-                            .to_dtype(candle::DType::F32)?
-                            .to_vec1::<f32>()?,
-                    );
-                }
+            if l + 1 < n_layers {
+                per_layer.push(
+                    carry
+                        .committed()
+                        .to_tensor()?
+                        .flatten_all()?
+                        .to_dtype(candle::DType::F32)?
+                        .to_vec1::<f32>()?,
+                );
+            } else {
+                // The final slice runs the head instead of emitting a residual;
+                // record the logits so the sweep ends on the quantity the
+                // sampler actually sees.
+                per_layer.push(
+                    st.logits_owned()?[0]
+                        .i(0)?
+                        .to_dtype(candle::DType::F32)?
+                        .to_vec1::<f32>()?,
+                );
             }
         }
         s.advance_sequence(slot, 1)?;

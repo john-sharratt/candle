@@ -29,7 +29,10 @@
 //! marks a failure that was diagnosed the hard way, and they hold for every
 //! model that drives a wave.
 
-use candle::{DType, Device, Result, Tensor};
+use std::time::Instant;
+
+use candle::cuda_backend::wave_provenance::WaveTicket;
+use candle::{DType, Device, Error, Result, Tensor};
 
 use super::batched_inference::{
     pack_prefill_slabs, prefill_slack_cap, BatchedInferenceSession, PendingGlue, WaveResult,
@@ -39,11 +42,30 @@ use super::batched_model::{WaveGuard, WavePhase};
 use super::held_tensor::hold_rows;
 use super::kv_cache_utils::SequenceContext;
 use super::profile::{begin_gpu_span_forward, gpu_span};
-use super::residual_order::{caller_runs, reorder, Run};
-use super::tensor_cat::TensorCat;
-use super::window_residuals::WindowResiduals;
+use super::residual_rows::{
+    move_rows, segment_parts, CreepResidual, HandedOn, Part, ResidualIn, RowMap, RowStore, SpanRows,
+};
 use candle::quantized::pinned_staging::Generation;
 use candle_nn::kv_cache::PREFILL_KV_STAGE_MIN_Q_LEN;
+use candle_nn::kv_cache::{begin_wave, end_wave_transient, plan_wave_transient, LayerPhase};
+
+/// What a sweep does with the forward it is handed (`docs/wave_step.md` §2.1).
+#[derive(Debug, Clone, Copy)]
+pub enum SweepMode {
+    /// A forward on its own: hand back the last tier, move the boundary, admit,
+    /// place this forward's tier, open its forward span, sweep.
+    Whole,
+    /// One segment of a step, before the step's tier is placed: the prologue and
+    /// the admit, and the segment's per-phase price returned as
+    /// [`WavePhase::Priced`] — nothing placed, nothing swept.
+    Prepare,
+    /// One segment of a step whose tier is placed and whose forward span is
+    /// open: no prologue, no admit, no placement, and every forward-span carve
+    /// from the step's generation, named by this ticket. `None` for a model that
+    /// priced its segments at nothing — it keeps no buffer on the tier, so the
+    /// step places none and opens no span for it.
+    InStep(Option<WaveTicket>),
+}
 
 /// Everything the layer sweep needs that the driver assembled for it.
 ///
@@ -83,11 +105,16 @@ pub struct WaveGroups<'a> {
     pub generation: &'a Generation,
     pub layer_start: usize,
     pub layer_end: usize,
-    /// A paused wave's residual stream, already permuted into internal order.
-    pub x_in: Option<TensorCat>,
-    /// Where a sweep that stops short of the head puts the residual it hands
-    /// back: off the forward span, which a later window resumes past.
-    pub window: &'a WindowResiduals,
+    /// The residual a resumed forward starts from. The sweep carves its own
+    /// residual on its forward span and gathers this into it
+    /// ([`ResidualIn::gather_into`]) — internal order is baked into the gather —
+    /// so it never writes what it read. `None` for a forward that embeds.
+    ///
+    /// A forward that stops short returns that buffer, still on its span, with
+    /// the span's guard; the driver moves it on.
+    pub x_in: Option<ResidualIn<'a>>,
+    /// Whole forward, step preparation, or step segment.
+    pub mode: SweepMode,
     /// The width every activation in this wave flows in.
     ///
     /// Decided ONCE, here, from the session's declared activation dtype, and
@@ -133,6 +160,11 @@ pub trait WaveSweep {
 
     /// Widest prefill this model runs in one forward, in tokens.
     fn prefill_width_cap(&self, act_dtype: DType) -> usize;
+
+    /// One row of this model's residual stream: its elements and their type —
+    /// what a creep's arena holds per row (`docs/wave_step.md` §3). Asked
+    /// before a step places its tier, since the arena is claimed then.
+    fn residual_row(&self, session: &BatchedInferenceSession) -> Result<(usize, DType)>;
 
     /// The **KV-cache** index range a trunk-layer range writes to.
     ///
@@ -287,7 +319,12 @@ pub trait WaveSweep {
     fn take_device_fault(&self) -> Result<()>;
 
     /// Run `[layer_start, layer_end)` over the wave, returning the residual
-    /// (range stopped short of the head) or the logits (range reached it).
+    /// (range stopped short of the head) or the logits (range reached it) —
+    /// or, under [`SweepMode::Prepare`], the segment's price.
+    ///
+    /// **A residual comes back on the forward span, with the span's guard.**
+    /// The driver moves it where it goes next — a step's next segment, a
+    /// creep's arena — while the guard still holds it.
     ///
     /// The sweep owns the session for its duration. It builds its own attention
     /// metadata (see the module docs for why the driver cannot), assembles its
@@ -362,6 +399,11 @@ pub(crate) fn assemble_wave_contexts<'s>(
 /// `contexts` are ordered `[decode… | prefill… | glue…]`. When the range
 /// reaches the head, the result carries logits for the **decode + prefill**
 /// rows only, in the caller's order — glue rows scatter K/V and carry none.
+///
+/// A range that starts past layer 0 resumes from `residual`'s committed rows; a
+/// range that stops short of the head writes its residual to `residual`'s
+/// pending half and commits it. Both are in caller order, one row per input
+/// token (`docs/wave_step.md` §3.2).
 #[allow(clippy::too_many_arguments)]
 pub fn drive_wave<S: WaveSweep + ?Sized>(
     model: &S,
@@ -374,7 +416,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     glue_inputs: &[Tensor],
     layer_start: usize,
     layer_end: usize,
-    residual_in: Option<Tensor>,
+    residual: Option<&mut CreepResidual>,
 ) -> Result<WaveResult> {
     if decode_inputs.len() != decode_seqs.len()
         || prefill_inputs.len() != prefill_seqs.len()
@@ -398,7 +440,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     let num_layers = model.num_layers();
     if decode_seqs.is_empty()
         && glue_seqs.is_empty()
-        && residual_in.is_none()
+        && residual.is_none()
         && layer_start == 0
         && layer_end == num_layers
     {
@@ -447,7 +489,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
                 let lg = step
                     .logits
                     .as_ref()
-                    .ok_or_else(|| candle::Error::Msg("forward_wave slice: no logits".into()))?;
+                    .ok_or_else(|| Error::Msg("forward_wave slice: no logits".into()))?;
                 // Copied off the span, not moved off it. Each slice is a whole
                 // forward and reclaims its own forward span when `step` drops
                 // at the end of this iteration — so a borrowed logits row would
@@ -468,12 +510,165 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
                 }
             }
             return Ok(WaveResult::owned(WaveStep {
-                residual: None,
                 logits: Some(all_logits),
             }));
         }
     }
 
+    // The residual is checked against this forward's rows before anything
+    // runs: past the sweep, a mismatch would surface only after the window's
+    // recurrent and KV state had committed.
+    let rows = caller_rows(decode_inputs) + caller_rows(prefill_inputs) + caller_rows(glue_inputs);
+    match residual.as_deref() {
+        Some(r) => check_residual(model, session, r, rows)?,
+        None if layer_start > 0 || layer_end < num_layers => candle::bail!(
+            "forward_wave: layers [{layer_start}, {layer_end}) of {num_layers} need a residual to \
+             resume from or write to"
+        ),
+        None => {}
+    }
+    let pending_glue = take_pending_glue(session, glue_inputs);
+    // A range past layer 0 resumes from the residual's committed rows — all of
+    // them, in caller order, one per input row.
+    let input = match residual.as_deref() {
+        Some(r) if layer_start > 0 => Some(vec![Part {
+            store: r.committed(),
+            layout: r.layout(),
+            start: 0,
+            len: r.rows(),
+        }]),
+        _ => None,
+    };
+    let out = forward_core(
+        model,
+        session,
+        GroupRows {
+            decode_seqs,
+            decode_inputs,
+            prefill_seqs,
+            prefill_inputs,
+            glue_seqs,
+            glue_inputs,
+        },
+        (layer_start, layer_end),
+        pending_glue,
+        input,
+        SweepMode::Whole,
+    )?;
+    match out {
+        // The head's outputs sit on the forward span, so the guard goes back
+        // with them: `WaveResult` is what stops the span being reclaimed while
+        // the caller still holds the logits.
+        CoreOut::Logits { step, guard } => Ok(WaveResult::on_span(step, guard)),
+        CoreOut::Residual {
+            working,
+            layout,
+            guard,
+        } => {
+            let Some(r) = residual else {
+                candle::bail!(
+                    "forward_wave: a range ending at layer {layer_end} of {num_layers} stops short \
+                     of the head and was given no residual to write"
+                );
+            };
+            let width = r.committed().width();
+            move_rows(
+                &SpanRows::new(&working, width)?,
+                &layout,
+                0,
+                r.pending(),
+                &r.layout(),
+                0,
+                layout.rows(),
+            )?;
+            // The copy is queued behind the sweep on the same stream; the guard
+            // goes once it is.
+            drop(guard);
+            r.commit();
+            Ok(WaveResult::owned(WaveStep { logits: None }))
+        }
+        CoreOut::Priced(_) => candle::bail!("forward_wave: a whole forward came back priced"),
+    }
+}
+
+/// A forward's caller-order rows: decode, prefill and glue, each with its inputs.
+#[derive(Clone, Copy)]
+pub(crate) struct GroupRows<'a> {
+    pub decode_seqs: &'a [usize],
+    pub decode_inputs: &'a [Tensor],
+    pub prefill_seqs: &'a [usize],
+    pub prefill_inputs: &'a [Tensor],
+    pub glue_seqs: &'a [usize],
+    pub glue_inputs: &'a [Tensor],
+}
+
+/// What one forward produced.
+pub(crate) enum CoreOut {
+    /// [`SweepMode::Prepare`]: the forward's per-phase price.
+    Priced([usize; 3]),
+    /// The range stopped short: the forward's residual, still on its span, in
+    /// the forward's internal layout, with what holds the span.
+    Residual {
+        working: Tensor,
+        layout: RowMap,
+        guard: Option<WaveGuard>,
+    },
+    /// The range reached the head.
+    Logits {
+        step: WaveStep,
+        guard: Option<WaveGuard>,
+    },
+}
+
+/// The glue scatter descriptors staged for a forward that carries glue rows.
+///
+/// Staged glue is consumed only by a wave that carries glue rows. The
+/// descriptors are staged immediately before the gap-fill forward they describe
+/// — but that forward can die before reaching this point, and the staging then
+/// sits on the session for whatever wave comes next, which is how a dead wave's
+/// leftovers killed the titler twice. Stale staging is dropped, loudly: the
+/// reproject that staged it re-stages when its own retry runs.
+fn take_pending_glue(
+    session: &mut BatchedInferenceSession,
+    glue_inputs: &[Tensor],
+) -> Option<Vec<PendingGlue>> {
+    if glue_inputs.is_empty() {
+        if let Some(stale) = session.take_pending_glue() {
+            tracing::warn!(
+                n = stale.len(),
+                "dropping glue descriptors staged by a wave that never ran its \
+                 gap-fill forward — this wave carries no glue rows"
+            );
+        }
+        None
+    } else {
+        session.take_pending_glue()
+    }
+}
+
+/// One forward over `[layer_start, layer_end)`: everything the driver does
+/// around the sweep, in `mode`.
+///
+/// `input` is the resumed residual's parts in caller order; the forward gathers
+/// them into its own buffer in its internal layout.
+fn forward_core<S: WaveSweep + ?Sized>(
+    model: &S,
+    session: &mut BatchedInferenceSession,
+    rows: GroupRows<'_>,
+    (layer_start, layer_end): (usize, usize),
+    pending_glue: Option<Vec<PendingGlue>>,
+    input: Option<Vec<Part<'_>>>,
+    mode: SweepMode,
+) -> Result<CoreOut> {
+    let GroupRows {
+        decode_seqs,
+        decode_inputs,
+        prefill_seqs,
+        prefill_inputs,
+        glue_seqs,
+        glue_inputs,
+    } = rows;
+    let num_layers = model.num_layers();
     let n_decode_in = decode_seqs.len();
     let n_prefill_in = prefill_seqs.len();
 
@@ -521,28 +716,6 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
 
     let glue_lens = input_len(glue_inputs);
 
-    // Glue staging: taken HERE — the one `&mut`-session step the sweep's shared
-    // borrows could not perform — and handed through raw; the sweep decides
-    // what kernel metadata to build from it. Staged glue is consumed only by a
-    // wave that carries glue rows. The descriptors are staged immediately
-    // before the gap-fill forward they describe — but that forward can die
-    // before reaching this point, and the staging then sits on the session for
-    // whatever wave comes next, which is how a dead wave's leftovers killed the
-    // titler twice. Stale staging is dropped, loudly: the reproject that staged
-    // it re-stages when its own retry runs.
-    let pending_glue: Option<Vec<PendingGlue>> = if glue_lens.is_empty() {
-        if let Some(stale) = session.take_pending_glue() {
-            tracing::warn!(
-                n = stale.len(),
-                "dropping glue descriptors staged by a wave that never ran its \
-                 gap-fill forward — this wave carries no glue rows"
-            );
-        }
-        None
-    } else {
-        session.take_pending_glue()
-    };
-
     // Assemble the combined sequence list in [decode | prefill | glue] order.
     let mut all_seqs: Vec<usize> = Vec::with_capacity(n_decode + n_prefill + glue_seqs.len());
     all_seqs.extend_from_slice(&proc_decode_seqs);
@@ -586,41 +759,17 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     // to give one group's conversations another group's fine-tune.
     let wave_adapter = session.wave_adapter(&all_seqs)?;
 
-    // Residual token order (`residual_order`). The sweep packs rows in internal
-    // order and the residual crosses the API in caller order, so a co-batched
-    // caller can split it by contiguous group — decode, section, cohort, glue —
-    // and hold a creeping cohort whole across a wave while the full-sweep
-    // members continue. Reordered caller→internal on the way in and
-    // internal→caller on the way out, exact inverses, so re-feeding the
-    // returned residual on the next layer window round-trips. With no
-    // single-token prefill the two orders coincide and nothing is reordered.
-    //
-    // Only where a residual crosses the API — resumed in, or handed back by a
-    // window that stops short of the head. A sweep that starts fresh and
-    // reaches the head reorders its logits on the host below.
-    let residual_crosses = residual_in.is_some() || layer_end < num_layers;
-    let runs: Option<Vec<Run>> = if single.is_empty() || !residual_crosses {
-        None
-    } else {
-        Some(caller_runs(
-            n_decode_in,
-            &pre_lens_in,
-            glue_lens.iter().sum(),
-        ))
-    };
-    let window = session.window_residuals();
-
-    let x_in = match residual_in {
-        // Tokens are dim 1 (`[batch, tokens, hidden]`).
-        Some(t) => Some(TensorCat::from_cat_tensor(
-            match runs.as_deref() {
-                Some(r) => reorder(&t, r, true, &window)?,
-                None => t,
-            },
-            0,
-        )?),
+    // The forward's layout (`residual_rows::row_map`): the sweep packs rows in
+    // internal order, and every residual that crosses into or out of it is in
+    // caller order. A resumed residual is gathered straight into internal order
+    // and one handed on is moved out of it, so nothing is reordered through a
+    // buffer of its own. With no single-token prefill the two coincide.
+    let layout = RowMap::wave(n_decode_in, &pre_lens_in, glue_lens.iter().sum());
+    let x_in = match input {
+        Some(parts) => Some(ResidualIn::new(parts, layout.clone())?),
         None => None,
     };
+    let preparing = matches!(mode, SweepMode::Prepare);
     // The layer sweep plus the head, so the forward's stream time divides into
     // "the model" and "everything the driver and its caller do around it". The
     // gap between this and the caller's own forward span is where a per-row copy
@@ -631,8 +780,10 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     // each segment ending where the forward meets the device eagerly — the MoE
     // host protocol, an upload, a readback. A failed sweep drops the capture,
     // discarding the segment it was recording; the rollback below runs eagerly.
+    // A segment being prepared records nothing: it admits and prices, and
+    // launches no layer.
     let capture = match dev {
-        Device::Cuda(cuda) => Some(cuda.begin_wave_capture()?),
+        Device::Cuda(cuda) if !preparing => Some(cuda.begin_wave_capture()?),
         _ => None,
     };
     let wave = model.sweep(
@@ -648,7 +799,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
             layer_start,
             layer_end,
             x_in,
-            window: &window,
+            mode,
             act_dtype,
         },
     );
@@ -668,13 +819,13 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     // The sweep's mutable session borrow ended with it, so the rollback
     // re-assembles the contexts it needs. An assembly failure here is the same
     // unrecoverable shape as a failed rollback: report both.
-    let fail = |session: &mut BatchedInferenceSession, e: candle::Error| -> candle::Error {
+    let fail = |session: &mut BatchedInferenceSession, e: Error| -> Error {
         let (kv_start, kv_end) = model.kv_layer_range(layer_start, layer_end);
         let rolled = assemble_wave_contexts(session, &all_seqs, &all_inputs)
             .and_then(|mut contexts| model.rollback_wave(&mut contexts, kv_start, kv_end));
         match rolled {
             Ok(()) => e,
-            Err(rb) => candle::Error::Msg(format!(
+            Err(rb) => Error::Msg(format!(
                 "wave failed ({e}) and the KV rollback that keeps that failure \
                  recoverable also failed ({rb}) — the affected sequences may hold \
                  per-layer token windows"
@@ -689,7 +840,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
         Err(e) => {
             let e = match model.take_device_fault() {
                 Ok(()) => e,
-                Err(f) => candle::Error::Msg(format!("{f} (the sweep stopped on: {e})")),
+                Err(f) => Error::Msg(format!("{f} (the sweep stopped on: {e})")),
             };
             return Err(fail(session, e));
         }
@@ -701,24 +852,27 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     // - Logits (final, head ran) are restored to the caller's
     //   `[decode | prefill-in-caller-order]` so `pf_logits[k]` aligns with the
     //   caller's `pf_seqs[k]`.
-    // - The intermediate residual is returned in CALLER order (see the
-    //   `token_perm` note above): internal→caller on the way out, caller→internal
-    //   on the way back in, exact inverses that round-trip across layer windows.
-    let step = match phase {
+    // - The intermediate residual stays in internal order, on the forward span,
+    //   with the forward's layout beside it: whoever moves it on moves it
+    //   through the layout.
+    let out = match phase {
+        WavePhase::Priced(per_phase) => return Ok(CoreOut::Priced(per_phase)),
+        // A glue-only forward that reached the head scored nothing: its rows
+        // scattered K/V and that was the whole of it.
+        WavePhase::Residual(_) if layer_end == num_layers => CoreOut::Logits {
+            step: WaveStep { logits: None },
+            guard: head_span,
+        },
         WavePhase::Residual(x) => {
             // A segment that faulted must not commit: the next segment would
             // carry its residual on and roll back only its own layers.
             if let Err(e) = model.take_device_fault() {
                 return Err(fail(session, e));
             }
-            // Internal order → caller order. Tokens are dim 1.
-            let res = match runs.as_deref() {
-                Some(r) => reorder(&x.to_tensor(), r, false, &window)?,
-                None => x.to_tensor(),
-            };
-            WaveStep {
-                residual: Some(res),
-                logits: None,
+            CoreOut::Residual {
+                working: x.to_tensor(),
+                layout,
+                guard: head_span,
             }
         }
         WavePhase::Logits(l) => {
@@ -788,9 +942,9 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
                 }
                 o
             };
-            WaveStep {
-                residual: None,
-                logits: Some(out),
+            CoreOut::Logits {
+                step: WaveStep { logits: Some(out) },
+                guard: head_span,
             }
         }
     };
@@ -827,16 +981,441 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
         }
     }
 
-    // The head's outputs sit on the forward span, so the guard goes back with
-    // them: `WaveResult` is what stops the span being reclaimed while the caller
-    // still holds the logits.
-    #[cfg(feature = "cuda")]
-    {
-        Ok(WaveResult::on_span(step, head_span))
+    Ok(out)
+}
+
+/// One group of a step's rows: its sequences and their inputs.
+#[derive(Clone, Copy)]
+pub struct StepRows<'a> {
+    pub seqs: &'a [usize],
+    pub inputs: &'a [Tensor],
+}
+
+impl StepRows<'_> {
+    pub const NONE: StepRows<'static> = StepRows {
+        seqs: &[],
+        inputs: &[],
+    };
+
+    /// Caller rows: one per token.
+    fn tokens(&self) -> usize {
+        caller_rows(self.inputs)
     }
-    #[cfg(not(feature = "cuda"))]
+}
+
+/// Caller rows of a group's inputs: one per token.
+fn caller_rows(inputs: &[Tensor]) -> usize {
+    inputs
+        .iter()
+        .map(|t| t.dims().get(1).copied().unwrap_or(1))
+        .sum()
+}
+
+/// Refuses a residual that cannot hold `rows` of this model's residual rows —
+/// the wrong row count, width or dtype.
+fn check_residual<S: WaveSweep + ?Sized>(
+    model: &S,
+    session: &BatchedInferenceSession,
+    residual: &CreepResidual,
+    rows: usize,
+) -> Result<()> {
+    let (width, dtype) = model.residual_row(session)?;
+    let held = residual.committed();
+    if !residual_fits(residual, rows, width, dtype) {
+        candle::bail!(
+            "wave residual: {} rows of {} × {:?} held for {rows} rows of {width} × {dtype:?}",
+            residual.rows(),
+            held.width(),
+            held.dtype()
+        );
+    }
+    Ok(())
+}
+
+/// The residual holds exactly `rows` rows of `width` × `dtype`.
+fn residual_fits(residual: &CreepResidual, rows: usize, width: usize, dtype: DType) -> bool {
+    residual.rows() == rows
+        && residual.committed().width() == width
+        && residual.committed().dtype() == dtype
+}
+
+/// The creep riding a step: its rows, the layers it crosses this step, and the
+/// arena its residual is held in between steps.
+pub struct StepCreep<'a> {
+    pub rows: StepRows<'a>,
+    /// First layer this step's window runs.
+    pub cursor: usize,
+    /// Layer the window stops at.
+    pub win_end: usize,
+    /// Read when the window resumes (`cursor > 0`); written and committed when
+    /// it stops short of the head. A step that needs one and finds none claims
+    /// it, sized to the creep's rows, before it places its tier.
+    pub residual: &'a mut Option<CreepResidual>,
+}
+
+/// One co-batched step: rows that ride every layer, and an optional creep.
+pub struct StepSpec<'a> {
+    /// One row per sequence, decode kernels.
+    pub decode: StepRows<'a>,
+    /// Full-sweep rows in the prefill slot: speculative verify blocks.
+    pub verify: StepRows<'a>,
+    /// Gap-fill rows, which scatter K/V and score nothing.
+    pub glue: StepRows<'a>,
+    pub creep: Option<StepCreep<'a>>,
+}
+
+/// What a step did.
+///
+/// [`drive_step`] returns `Err` only for a failure of the creep's own segment —
+/// its admit or its sweep — after which the creep's window has not run and its
+/// arena's committed half is exactly as it was. A failure of a segment that
+/// carried only the full-sweep rows lands in [`Self::head`], with
+/// [`Self::creep_advanced`] saying whether the creep's window had committed.
+pub struct StepOutcome {
+    /// The creep's window ran and its residual — or its head — committed.
+    pub creep_advanced: bool,
+    /// Host wall-clock of the creep's segment, microseconds: the forward the
+    /// creep actually rode, apart from the full-sweep rows' segments around it.
+    pub creep_us: u64,
+    /// The head: logits `[decode | verify | creep]` when the creep reached the
+    /// head with the rest, `[decode | verify]` when it stopped short, and none
+    /// when nothing rode every layer.
+    pub head: Result<WaveResult>,
+}
+
+/// One forward of a step: its layer range, and whether the creep rides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Segment {
+    pub start: usize,
+    pub end: usize,
+    pub creep: bool,
+}
+
+/// A step's forwards, in layer order: the full-sweep rows alone up to the
+/// creep's window, with the creep across it, alone again after it. Without
+/// full-sweep rows, the creep's window alone.
+pub(crate) fn segments(n: usize, cursor: usize, win_end: usize, full: bool) -> Vec<Segment> {
+    let seg = |start, end, creep| Segment { start, end, creep };
+    if !full {
+        return vec![seg(cursor, win_end, true)];
+    }
+    let mut out = Vec::with_capacity(3);
+    if cursor > 0 {
+        out.push(seg(0, cursor, false));
+    }
+    out.push(seg(cursor, win_end, true));
+    if win_end < n {
+        out.push(seg(win_end, n, false));
+    }
+    out
+}
+
+/// The tier a step places for its segments: each layer phase's span at the
+/// widest any segment needs — they reset per layer phase, so the segments
+/// share them — and the forward span at the sum, since the step's forward
+/// generation does not reset between segments (`docs/wave_step.md` §2.1).
+pub(crate) fn step_plan(prices: &[[usize; 3]]) -> [usize; 3] {
+    prices.iter().fold([0; 3], |acc, p| {
+        [acc[0].max(p[0]), acc[1].max(p[1]), acc[2] + p[2]]
+    })
+}
+
+/// Drive one co-batched step (`docs/wave_step.md` §2).
+///
+/// The full-sweep rows cross every layer; the creep crosses its window. Every
+/// segment's KV is admitted before the step's tier is placed, the tier is
+/// placed once, and the segments run inside one forward span, the full-sweep
+/// rows' residual handed from segment to segment on it.
+pub fn drive_step<S: WaveSweep + ?Sized>(
+    model: &S,
+    session: &mut BatchedInferenceSession,
+    spec: StepSpec<'_>,
+) -> Result<StepOutcome> {
+    let StepSpec {
+        decode,
+        verify,
+        glue,
+        creep,
+    } = spec;
+    let n = model.num_layers();
+    let full = !decode.seqs.is_empty() || !verify.seqs.is_empty() || !glue.seqs.is_empty();
+    let Some(creep) = creep else {
+        let head = drive_wave(
+            model,
+            session,
+            decode.seqs,
+            decode.inputs,
+            verify.seqs,
+            verify.inputs,
+            glue.seqs,
+            glue.inputs,
+            0,
+            n,
+            None,
+        );
+        return Ok(StepOutcome {
+            creep_advanced: false,
+            creep_us: 0,
+            head,
+        });
+    };
+    let StepCreep {
+        rows: creep_rows,
+        cursor,
+        win_end,
+        residual,
+    } = creep;
+    if cursor >= win_end || win_end > n {
+        candle::bail!("wave step: a creep window [{cursor}, {win_end}) of {n} layers");
+    }
+    let head = decode.seqs.len() + verify.tokens();
+    let creep_tok = creep_rows.tokens();
+    let glue_tok = glue.tokens();
+    let stops_short = win_end < n;
+    let (width, dtype) = model.residual_row(session)?;
+    // A creep starting at layer 0 reads nothing from its arena, so one left by
+    // an earlier attempt whose rows no longer match — a group that re-formed —
+    // is given back rather than carried into the move-out.
+    if cursor == 0
+        && residual
+            .as_ref()
+            .is_some_and(|r| !residual_fits(r, creep_tok, width, dtype))
     {
-        let _ = head_span;
-        Ok(WaveResult::owned(step))
+        *residual = None;
+    }
+    // The creep's arena, claimed now if the window needs one: between forwards.
+    // The previous forward's tier is handed back first — it stands past its
+    // guards until the next forward's prologue — so the claim is measured
+    // against a pool no forward holds any of (`docs/wave_step.md` §3).
+    if stops_short && residual.is_none() {
+        if let Device::Cuda(cuda) = model.device() {
+            end_wave_transient(&cuda.cuda_stream());
+        }
+        *residual = Some(CreepResidual::claim(
+            model.device(),
+            creep_tok,
+            width,
+            dtype,
+        )?);
+    }
+    // Every shape the move-out depends on is settled here, before any segment
+    // runs: past its sweep, a refusal would come after the window's recurrent
+    // and KV state had committed.
+    match residual.as_ref() {
+        Some(r) => check_residual(model, session, r, creep_tok)?,
+        None if cursor > 0 => {
+            candle::bail!("wave step: a creep resuming at layer {cursor} holds no residual")
+        }
+        None => {}
+    }
+
+    let segs = segments(n, cursor, win_end, full);
+    let mid_seqs: Vec<usize> = verify.seqs.iter().chain(creep_rows.seqs).copied().collect();
+    let mid_inputs: Vec<Tensor> = verify
+        .inputs
+        .iter()
+        .chain(creep_rows.inputs)
+        .cloned()
+        .collect();
+    let rows_of = |s: &Segment| GroupRows {
+        decode_seqs: decode.seqs,
+        decode_inputs: decode.inputs,
+        prefill_seqs: if s.creep { &mid_seqs } else { verify.seqs },
+        prefill_inputs: if s.creep { &mid_inputs } else { verify.inputs },
+        glue_seqs: glue.seqs,
+        glue_inputs: glue.inputs,
+    };
+    let pending_glue = take_pending_glue(session, glue.inputs);
+    // A failure before the creep's window has run, in a segment that carried
+    // only the full-sweep rows: reported in the outcome's head, not as the
+    // creep's failure.
+    let full_sweep_failed = |e: Error| StepOutcome {
+        creep_advanced: false,
+        creep_us: 0,
+        head: Err(e),
+    };
+
+    // ── Prepare: every segment's prologue and admit, priced. ──
+    let mut prices = Vec::with_capacity(segs.len());
+    for s in &segs {
+        match forward_core(
+            model,
+            session,
+            rows_of(s),
+            (s.start, s.end),
+            pending_glue.clone(),
+            None,
+            SweepMode::Prepare,
+        ) {
+            Ok(CoreOut::Priced(p)) => prices.push(p),
+            Ok(_) => candle::bail!("wave step: a segment being prepared ran"),
+            Err(e) if s.creep => return Err(e),
+            Err(e) => return Ok(full_sweep_failed(e)),
+        }
+    }
+
+    // ── Place the step's tier and open its forward span. ──
+    //
+    // Not for a model that priced every segment at nothing: it keeps no buffer
+    // on the tier, and a live span would refuse the arena claims it makes inside
+    // its own sweeps. A placement the partition refuses fails the creep's window
+    // with the rest: nothing has run.
+    let plan = step_plan(&prices);
+    let step_span = match model.device() {
+        Device::Cuda(cuda) if plan != [0; 3] => {
+            let stream = cuda.cuda_stream();
+            plan_wave_transient(&stream, plan)?;
+            Some(begin_wave(&stream, LayerPhase::Forward)?)
+        }
+        _ => None,
+    };
+    let ticket = step_span.as_ref().map(|g| g.ticket());
+
+    // ── Run: each segment inside the step's span. ──
+    let mut prev: Option<(SpanRows, RowMap)> = None;
+    let mut creep_advanced = false;
+    let mut creep_us = 0;
+    for (i, s) in segs.iter().enumerate() {
+        let last = i + 1 == segs.len();
+        let width = |t: &Tensor, layout: &RowMap| t.elem_count() / layout.rows().max(1);
+        let result = {
+            let creep_in = residual
+                .as_ref()
+                .filter(|_| s.creep && s.start > 0)
+                .map(|r| Part {
+                    store: r.committed() as &dyn RowStore,
+                    layout: r.layout(),
+                    start: 0,
+                    len: creep_tok,
+                });
+            let handed_on = prev.as_ref().map(|(rows, layout)| HandedOn {
+                store: rows as &dyn RowStore,
+                layout,
+                carried_creep: segs[i - 1].creep,
+            });
+            let input = segment_parts(handed_on, creep_in, head, creep_tok, glue_tok);
+            let t = Instant::now();
+            let r = forward_core(
+                model,
+                session,
+                rows_of(s),
+                (s.start, s.end),
+                pending_glue.clone(),
+                input,
+                SweepMode::InStep(ticket),
+            );
+            if s.creep {
+                creep_us = t.elapsed().as_micros() as u64;
+            }
+            r
+        };
+        let out = match result {
+            Ok(out) => out,
+            Err(e) if s.creep => return Err(e),
+            Err(e) => {
+                return Ok(StepOutcome {
+                    creep_advanced,
+                    creep_us,
+                    head: Err(e),
+                })
+            }
+        };
+        match out {
+            CoreOut::Residual {
+                working, layout, ..
+            } => {
+                // A full-sweep segment's failure is the head's, as in its sweep.
+                let rows = match SpanRows::new(&working, width(&working, &layout)) {
+                    Ok(rows) => rows,
+                    Err(e) if s.creep => return Err(e),
+                    Err(e) => {
+                        return Ok(StepOutcome {
+                            creep_advanced,
+                            creep_us,
+                            head: Err(e),
+                        })
+                    }
+                };
+                if s.creep {
+                    // The window stopped short: its rows go to the pending half,
+                    // and the window commits.
+                    let r = residual
+                        .as_mut()
+                        .expect("claimed above for a window that stops short");
+                    move_rows(&rows, &layout, head, r.pending(), &r.layout(), 0, creep_tok)?;
+                    r.commit();
+                    creep_advanced = true;
+                }
+                if last {
+                    return Ok(StepOutcome {
+                        creep_advanced,
+                        creep_us,
+                        head: Ok(WaveResult::owned(WaveStep { logits: None })),
+                    });
+                }
+                prev = Some((rows, layout));
+            }
+            CoreOut::Logits { step, guard } => {
+                if s.creep {
+                    // The creep reached the head with the rest: its sweep is
+                    // done, and its arena goes with it.
+                    *residual = None;
+                    creep_advanced = true;
+                }
+                // The logits are on the step's span; the result holds it.
+                return Ok(StepOutcome {
+                    creep_advanced,
+                    creep_us,
+                    head: Ok(WaveResult::on_span(step, step_span.or(guard))),
+                });
+            }
+            CoreOut::Priced(_) => candle::bail!("wave step: a running segment came back priced"),
+        }
+    }
+    candle::bail!("wave step: no segment ran")
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    fn seg(start: usize, end: usize, creep: bool) -> Segment {
+        Segment { start, end, creep }
+    }
+
+    #[test]
+    fn a_creep_mid_stack_splits_the_step_in_three() {
+        assert_eq!(
+            segments(40, 10, 20, true),
+            vec![seg(0, 10, false), seg(10, 20, true), seg(20, 40, false)]
+        );
+    }
+
+    #[test]
+    fn a_creep_from_layer_zero_to_the_head_is_one_segment() {
+        assert_eq!(segments(40, 0, 40, true), vec![seg(0, 40, true)]);
+    }
+
+    #[test]
+    fn a_creep_reaching_the_head_ends_the_step() {
+        assert_eq!(
+            segments(40, 30, 40, true),
+            vec![seg(0, 30, false), seg(30, 40, true)]
+        );
+    }
+
+    #[test]
+    fn a_creep_alone_runs_only_its_window() {
+        assert_eq!(segments(40, 10, 20, false), vec![seg(10, 20, true)]);
+    }
+
+    /// Layer-phase spans at the widest segment; the forward span at the sum.
+    #[test]
+    fn the_step_tier_shares_layer_phases_and_sums_forward_spans() {
+        assert_eq!(
+            step_plan(&[[10, 20, 5], [30, 15, 7], [5, 5, 3]]),
+            [30, 20, 15]
+        );
+        assert_eq!(step_plan(&[]), [0, 0, 0]);
     }
 }

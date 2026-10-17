@@ -103,8 +103,8 @@ pub use chunked::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     empty_sweep_stats, forget_last_tier, held_ground_sites, held_ground_stats,
-    reclaim_empty_arenas, region_stats, span_partition, spare_tally, RegionStats, SpanPartition,
-    REGION_BYTES,
+    reclaim_empty_arenas, region_stats, span_partition, spare_tally, vram_bands, RegionStats,
+    SpanPartition, VramBands, REGION_BYTES,
 };
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]
@@ -112,6 +112,8 @@ pub use chunked::{
     initial_weight_bytes, kv_spare_regions, set_ground_broker, set_kv_free_target,
     set_prompts_waiting, set_weight_floor, span_end, weight_capacity_bytes, weight_floor_after,
 };
+/// Claimed regions coalesced into contiguous runs — see `chunked::region_runs`.
+pub use chunked::{runs_from, RegionRun};
 /// Fixed-stride slot arenas, one set per span tenant — see `chunked::tenant_arena`.
 pub use chunked::{slot_stride, SlotTenant, SLOT_ALIGN};
 /// The weight side of the reservation. Pure arithmetic, so it is available

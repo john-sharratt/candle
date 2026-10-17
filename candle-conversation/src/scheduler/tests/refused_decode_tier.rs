@@ -61,7 +61,7 @@ impl ManagedBatchedModel for RefusingDrafter {
         _glue_inputs: &[Tensor],
         _layer_start: usize,
         _layer_end: usize,
-        _residual_in: Option<Tensor>,
+        _residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult> {
         let mut rows = Vec::new();
         for t in decode_inputs {
@@ -71,10 +71,23 @@ impl ManagedBatchedModel for RefusingDrafter {
                 rows.push(Tensor::from_vec(row, (1, VOCAB), self.inner.device())?);
             }
         }
-        Ok(WaveResult::owned(WaveStep {
-            residual: None,
-            logits: Some(rows),
-        }))
+        Ok(WaveResult::owned(WaveStep { logits: Some(rows) }))
+    }
+
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome> {
+        stub_step(self, session, spec)
+    }
+
+    fn claim_residual(
+        &self,
+        _session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual> {
+        stub_residual(rows)
     }
 
     fn speculative_draft(

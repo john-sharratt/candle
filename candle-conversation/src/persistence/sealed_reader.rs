@@ -36,6 +36,8 @@
 //! gets one that exists. What the error says is not what the caller acts on;
 //! whether the index moved is.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

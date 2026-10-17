@@ -69,7 +69,6 @@ mod spec_chooser;
 #[cfg(test)]
 mod test_substrate;
 mod turn_group;
-pub mod vram_bands;
 mod wave_logits;
 mod wave_retry;
 mod wave_timing;
@@ -82,8 +81,7 @@ use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 
 use self::paused_creep::PausedCreep;
-use self::phase_ring::ProjectedKind;
-use self::vram_bands::VramBands;
+use self::phase_ring::{ProjectedKind, VramBands};
 use self::wave_timing::WaveTiming;
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
@@ -150,6 +148,7 @@ use candle_transformers::models::batched_inference::{
 use candle_transformers::models::delta_net::ExportedLayerState;
 use candle_transformers::models::draft_depth::DraftDepth;
 use candle_transformers::models::piece_key::PieceKey;
+use candle_transformers::models::residual_rows::CreepResidual;
 use candle_transformers::models::sealed_injection::reconcile_sealed_prefix;
 
 use self::exported_state::{ExportedState, SharedState};
@@ -3602,12 +3601,13 @@ pub(crate) struct Scheduler {
     parked_forks: Vec<ephemeral_fork::ParkedFork>,
 
     /// Continuous-fair-wave prefill cohort (`docs/continuous_fair_waves.md`): the
-    /// packed inter-layer residual stream of the in-flight prefill batch, the next
-    /// layer it resumes at, and the sequences in the cohort. One cohort advances
-    /// in lockstep — held across waves so decode sweeps every layer between the
-    /// cohort's throttled layer advances, keeping the decode expert set hot.
-    /// `cursor == 0` with no residual means no cohort is in flight.
-    wave_prefill_residual: Option<Tensor>,
+    /// in-flight prefill batch's inter-layer residual, held between steps in its
+    /// arena (`docs/wave_step.md` §3), the next layer it resumes at, and the
+    /// sequences in the cohort. One cohort advances in lockstep — held across
+    /// waves so decode sweeps every layer between the cohort's throttled layer
+    /// advances, keeping the decode expert set hot. `cursor == 0` with no
+    /// residual means no cohort is in flight.
+    wave_prefill_residual: Option<CreepResidual>,
     wave_prefill_cursor: usize,
     /// The in-flight wave group's members in a STABLE order (dialogue prefills
     /// then section chunks). The order must not change between waves: `forward_wave`
@@ -12371,6 +12371,7 @@ mod tests {
     use candle_transformers::models::batched_inference::{
         BatchedConfig, BatchedInferenceSession, KvLayers, ManagedBatchedModel, WaveResult,
     };
+    use candle_transformers::models::wave_driver::{StepOutcome, StepSpec};
     use std::str::FromStr;
     use std::time::Duration;
 
@@ -12460,25 +12461,100 @@ mod tests {
             _glue_inputs: &[Tensor],
             _layer_start: usize,
             layer_end: usize,
-            _residual_in: Option<Tensor>,
+            _residual: Option<&mut CreepResidual>,
         ) -> candle::Result<candle_transformers::models::batched_inference::WaveResult> {
             use candle_transformers::models::batched_inference::{WaveResult, WaveStep};
-            if layer_end >= self.num_layers() {
-                Ok(WaveResult::owned(WaveStep {
-                    residual: None,
-                    logits: Some(self.dummy_logits(decode_seqs.len() + prefill_seqs.len())?),
-                }))
+            let logits = if layer_end >= self.num_layers() {
+                Some(self.dummy_logits(decode_seqs.len() + prefill_seqs.len())?)
             } else {
-                Ok(WaveResult::owned(WaveStep {
-                    residual: Some(Tensor::zeros((1, 1, 1), DType::F32, &self.device)?),
-                    logits: None,
-                }))
-            }
+                None
+            };
+            Ok(WaveResult::owned(WaveStep { logits }))
+        }
+
+        fn forward_step(
+            &self,
+            session: &mut BatchedInferenceSession,
+            spec: StepSpec<'_>,
+        ) -> candle::Result<StepOutcome> {
+            stub_step(self, session, spec)
+        }
+
+        fn claim_residual(
+            &self,
+            _session: &BatchedInferenceSession,
+            rows: usize,
+        ) -> candle::Result<CreepResidual> {
+            stub_residual(rows)
         }
 
         fn prune(&self) -> candle::Result<()> {
             Ok(())
         }
+    }
+
+    /// A one-layer stub's step: every row rides the stub's single forward, so a
+    /// creep window — which on one layer always ends at the head — reaches the
+    /// head with the rest, and its arena goes with it.
+    pub(super) fn stub_step<M: ManagedBatchedModel + ?Sized>(
+        model: &M,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> candle::Result<StepOutcome> {
+        let n = model.num_layers();
+        let StepSpec {
+            decode,
+            verify,
+            glue,
+            creep,
+        } = spec;
+        let (creep_seqs, creep_inputs): (&[usize], &[Tensor]) = match &creep {
+            Some(c) => (c.rows.seqs, c.rows.inputs),
+            None => (&[], &[]),
+        };
+        if let Some(c) = &creep {
+            if c.win_end < n {
+                candle::bail!(
+                    "stub step: a creep window [{}, {}) short of {n} layers",
+                    c.cursor,
+                    c.win_end
+                );
+            }
+        }
+        let pre_seqs: Vec<usize> = verify.seqs.iter().chain(creep_seqs).copied().collect();
+        let pre_inputs: Vec<Tensor> = verify.inputs.iter().chain(creep_inputs).cloned().collect();
+        let head = model.forward_wave(
+            session,
+            decode.seqs,
+            decode.inputs,
+            &pre_seqs,
+            &pre_inputs,
+            glue.seqs,
+            glue.inputs,
+            0,
+            n,
+            None,
+        );
+        let Some(c) = creep else {
+            return Ok(StepOutcome {
+                creep_advanced: false,
+                creep_us: 0,
+                head,
+            });
+        };
+        // The creep rode the one forward, so its failure is the creep's.
+        let head = head?;
+        *c.residual = None;
+        Ok(StepOutcome {
+            creep_advanced: true,
+            creep_us: 0,
+            head: Ok(head),
+        })
+    }
+
+    /// A stub's residual arena: one-wide rows on the host.
+    pub(super) fn stub_residual(rows: usize) -> candle::Result<CreepResidual> {
+        CreepResidual::claim(&candle::Device::Cpu, rows, 1, DType::F32)
     }
 
     // —— Recurrent dummy model ————————————————————————————————————————————————
@@ -12746,7 +12822,7 @@ mod tests {
             glue_inputs: &[Tensor],
             layer_start: usize,
             layer_end: usize,
-            residual_in: Option<Tensor>,
+            residual: Option<&mut CreepResidual>,
         ) -> candle::Result<candle_transformers::models::batched_inference::WaveResult> {
             for (seqs, inputs) in [(decode_seqs, decode_inputs), (prefill_seqs, prefill_inputs)] {
                 for (i, &seq) in seqs.iter().enumerate() {
@@ -12773,8 +12849,24 @@ mod tests {
                 glue_inputs,
                 layer_start,
                 layer_end,
-                residual_in,
+                residual,
             )
+        }
+
+        fn forward_step(
+            &self,
+            session: &mut BatchedInferenceSession,
+            spec: StepSpec<'_>,
+        ) -> candle::Result<StepOutcome> {
+            stub_step(self, session, spec)
+        }
+
+        fn claim_residual(
+            &self,
+            _session: &BatchedInferenceSession,
+            rows: usize,
+        ) -> candle::Result<CreepResidual> {
+            stub_residual(rows)
         }
 
         fn prune(&self) -> candle::Result<()> {
@@ -13143,9 +13235,23 @@ mod tests {
             _glue_inputs: &[Tensor],
             _layer_start: usize,
             _layer_end: usize,
-            _residual_in: Option<Tensor>,
+            _residual: Option<&mut CreepResidual>,
         ) -> candle::Result<WaveResult> {
             candle::bail!("wave forward failed")
+        }
+        fn forward_step(
+            &self,
+            session: &mut BatchedInferenceSession,
+            spec: StepSpec<'_>,
+        ) -> candle::Result<StepOutcome> {
+            stub_step(self, session, spec)
+        }
+        fn claim_residual(
+            &self,
+            _session: &BatchedInferenceSession,
+            rows: usize,
+        ) -> candle::Result<CreepResidual> {
+            stub_residual(rows)
         }
         fn prune(&self) -> candle::Result<()> {
             Ok(())
@@ -13188,7 +13294,7 @@ mod tests {
             glue_inputs: &[Tensor],
             layer_start: usize,
             layer_end: usize,
-            residual_in: Option<Tensor>,
+            residual: Option<&mut CreepResidual>,
         ) -> candle::Result<WaveResult> {
             self.0.forward_wave(
                 session,
@@ -13200,8 +13306,22 @@ mod tests {
                 glue_inputs,
                 layer_start,
                 layer_end,
-                residual_in,
+                residual,
             )
+        }
+        fn forward_step(
+            &self,
+            session: &mut BatchedInferenceSession,
+            spec: StepSpec<'_>,
+        ) -> candle::Result<StepOutcome> {
+            stub_step(self, session, spec)
+        }
+        fn claim_residual(
+            &self,
+            _session: &BatchedInferenceSession,
+            rows: usize,
+        ) -> candle::Result<CreepResidual> {
+            stub_residual(rows)
         }
         fn prune(&self) -> candle::Result<()> {
             Ok(())
@@ -13330,7 +13450,7 @@ mod tests {
             glue_inputs: &[Tensor],
             layer_start: usize,
             layer_end: usize,
-            residual_in: Option<Tensor>,
+            residual: Option<&mut CreepResidual>,
         ) -> candle::Result<WaveResult> {
             self.inner.forward_wave(
                 session,
@@ -13342,8 +13462,22 @@ mod tests {
                 glue_inputs,
                 layer_start,
                 layer_end,
-                residual_in,
+                residual,
             )
+        }
+        fn forward_step(
+            &self,
+            session: &mut BatchedInferenceSession,
+            spec: StepSpec<'_>,
+        ) -> candle::Result<StepOutcome> {
+            stub_step(self, session, spec)
+        }
+        fn claim_residual(
+            &self,
+            _session: &BatchedInferenceSession,
+            rows: usize,
+        ) -> candle::Result<CreepResidual> {
+            stub_residual(rows)
         }
         fn prune(&self) -> candle::Result<()> {
             Ok(())
@@ -13558,7 +13692,7 @@ mod tests {
             glue_inputs: &[Tensor],
             layer_start: usize,
             layer_end: usize,
-            residual_in: Option<Tensor>,
+            residual: Option<&mut CreepResidual>,
         ) -> candle::Result<WaveResult> {
             session.wave_adapter(prefill_seqs)?;
             if self.fail_with.is_some_and(|s| prefill_seqs.contains(&s)) {
@@ -13575,8 +13709,22 @@ mod tests {
                 glue_inputs,
                 layer_start,
                 layer_end,
-                residual_in,
+                residual,
             )
+        }
+        fn forward_step(
+            &self,
+            session: &mut BatchedInferenceSession,
+            spec: StepSpec<'_>,
+        ) -> candle::Result<StepOutcome> {
+            stub_step(self, session, spec)
+        }
+        fn claim_residual(
+            &self,
+            _session: &BatchedInferenceSession,
+            rows: usize,
+        ) -> candle::Result<CreepResidual> {
+            stub_residual(rows)
         }
         fn prune(&self) -> candle::Result<()> {
             Ok(())
@@ -14658,10 +14806,24 @@ mod tests {
                 f: &[Tensor],
                 g: usize,
                 h: usize,
-                i: Option<Tensor>,
+                i: Option<&mut CreepResidual>,
             ) -> candle::Result<candle_transformers::models::batched_inference::WaveResult>
             {
                 self.0.forward_wave(s, a, b, c, d, e, f, g, h, i)
+            }
+            fn forward_step(
+                &self,
+                session: &mut BatchedInferenceSession,
+                spec: StepSpec<'_>,
+            ) -> candle::Result<StepOutcome> {
+                stub_step(self, session, spec)
+            }
+            fn claim_residual(
+                &self,
+                _session: &BatchedInferenceSession,
+                rows: usize,
+            ) -> candle::Result<CreepResidual> {
+                stub_residual(rows)
             }
             fn prune(&self) -> candle::Result<()> {
                 Ok(())

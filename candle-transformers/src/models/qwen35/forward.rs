@@ -29,7 +29,7 @@
 //!   wrong mask.
 
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, Result, Tensor};
@@ -72,11 +72,15 @@ use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::residency_rows::residency_decode_rows;
+use crate::models::residual_rows::CreepResidual;
 use crate::models::rope_schedule::RungSelect;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_admit::admit_wave_kv;
-use crate::models::wave_buffers::wave_root;
-use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
+use crate::models::wave_buffers::{wave_empty_ticketed, wave_root, wave_root_ticketed};
+use crate::models::wave_driver::{
+    assemble_wave_contexts, drive_step, drive_wave, StepOutcome, StepSpec, SweepMode, WaveGroups,
+    WaveSweep,
+};
 use crate::models::wave_token_ids::device_token_ids;
 
 /// The hybrid as the scheduler drives it.
@@ -173,7 +177,7 @@ impl ManagedBatchedModel for HybridBatched {
         glue_inputs: &[Tensor],
         layer_start: usize,
         layer_end: usize,
-        residual_in: Option<Tensor>,
+        residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult> {
         session.expect_rope_select(self.rope().select())?;
         drive_wave(
@@ -187,8 +191,26 @@ impl ManagedBatchedModel for HybridBatched {
             glue_inputs,
             layer_start,
             layer_end,
-            residual_in,
+            residual,
         )
+    }
+
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome> {
+        session.expect_rope_select(self.rope().select())?;
+        drive_step(self, session, spec)
+    }
+
+    fn claim_residual(
+        &self,
+        session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual> {
+        let (width, dtype) = WaveSweep::residual_row(self, session)?;
+        CreepResidual::claim(WaveSweep::device(self), rows, width, dtype)
     }
 
     /// This checkpoint's own ladder, supplied at construction — see
@@ -666,6 +688,17 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        #[cfg(feature = "cuda")]
+        {
+            self.model().experts.as_ref().map(|c| c.stats_shared())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
         #[cfg(feature = "cuda")]
         {
@@ -813,6 +846,15 @@ impl WaveSweep for HybridBatched {
         <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
     }
 
+    /// The single-stream residual: `hidden` wide, in the wave's activation width.
+    fn residual_row(&self, session: &BatchedInferenceSession) -> Result<(usize, DType)> {
+        let dtype = session.activation_dtype();
+        Ok((
+            <Self as ManagedBatchedModel>::wave_geometry(self, dtype).hidden,
+            dtype,
+        ))
+    }
+
     fn kv_layer_range(&self, layer_start: usize, layer_end: usize) -> (usize, usize) {
         HybridBatched::kv_layer_range(self, layer_start, layer_end)
     }
@@ -837,7 +879,49 @@ impl WaveSweep for HybridBatched {
         wave: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
         let seqs = wave.seq_ids.to_vec();
+        let mode = wave.mode;
 
+        // A segment of a step skips everything up to the recurrent bracket: the
+        // step ran it — the tier hand-back, the boundary, the state claims — for
+        // every segment before it placed the tier they share
+        // (`docs/wave_step.md` §2.1), and a claim under that tier is refused.
+        if !matches!(mode, SweepMode::InStep(_)) {
+            self.prologue(session, &seqs)?;
+        }
+        // A segment being prepared prices itself and runs nothing, so it opens
+        // no recurrent wave and lifts no store.
+        if matches!(mode, SweepMode::Prepare) {
+            return sweep_layers(self, session, wave, &mut []);
+        }
+        self.begin_recurrent_wave(&seqs)?;
+        let mut stores = match self.take_recurrent(&seqs) {
+            Ok(s) => s,
+            Err(e) => {
+                // Nothing was lifted, so there is nothing to put back — but the
+                // wave IS open and must be closed or the next one is refused.
+                let _ = self.rollback_recurrent_wave(&seqs);
+                return Err(e);
+            }
+        };
+
+        let swept = {
+            let mut refs: Vec<&mut RecurrentStateStore> = stores.iter_mut().collect();
+            sweep_layers(self, session, wave, &mut refs)
+        };
+
+        self.put_recurrent(&seqs, stores)?;
+        match &swept {
+            Ok(_) => self.commit_recurrent_wave(&seqs)?,
+            Err(_) => self.rollback_recurrent_wave(&seqs)?,
+        }
+        swept
+    }
+}
+
+impl HybridBatched {
+    /// Everything a forward does before its recurrent bracket opens: hand back
+    /// the last tier, move the boundary, claim the state its sequences need.
+    fn prologue(&self, session: &BatchedInferenceSession, seqs: &[usize]) -> Result<()> {
         // Hand back the previous wave's transient tier, and let the elastic
         // boundary grow in the one gap it is legal in — every guard from that
         // wave is dropped and this one has opened none.
@@ -868,29 +952,7 @@ impl WaveSweep for HybridBatched {
             .iter()
             .map(|&s| session.sequence_offset(s).unwrap_or(0))
             .collect();
-        self.ensure_recurrent(&seqs, &offsets)?;
-        self.begin_recurrent_wave(&seqs)?;
-        let mut stores = match self.take_recurrent(&seqs) {
-            Ok(s) => s,
-            Err(e) => {
-                // Nothing was lifted, so there is nothing to put back — but the
-                // wave IS open and must be closed or the next one is refused.
-                let _ = self.rollback_recurrent_wave(&seqs);
-                return Err(e);
-            }
-        };
-
-        let swept = {
-            let mut refs: Vec<&mut RecurrentStateStore> = stores.iter_mut().collect();
-            sweep_layers(self, session, wave, &mut refs)
-        };
-
-        self.put_recurrent(&seqs, stores)?;
-        match &swept {
-            Ok(_) => self.commit_recurrent_wave(&seqs)?,
-            Err(_) => self.rollback_recurrent_wave(&seqs)?,
-        }
-        swept
+        self.ensure_recurrent(seqs, &offsets)
     }
 }
 
@@ -911,13 +973,15 @@ fn sweep_layers(
         layer_start,
         layer_end,
         x_in,
-        window,
+        mode,
         act_dtype,
         adapter,
     } = wave;
     if seq_ids.is_empty() {
         candle::bail!("qwen35 wave: empty batch");
     }
+    let preparing = matches!(mode, SweepMode::Prepare);
+    let in_step = matches!(mode, SweepMode::InStep(_));
     let q = model.model();
     // Resolved once for the sweep, not per layer: an unknown name fails here,
     // before any layer has run, rather than after the wave has half-decoded.
@@ -967,8 +1031,15 @@ fn sweep_layers(
     // ~20 ms at 128.
     let accept_in_place = session.accept_in_place();
     let g_meta = crate::models::profile::gpu_span("fwd:meta", model.device());
+    // A segment being prepared runs no layer, so it builds no header — but it
+    // claims the decode rows' write chunks the build would, here, before the
+    // step's span stands.
     #[cfg(feature = "cuda")]
-    let decode_headers = if n_decode > 0 {
+    if preparing {
+        session.ensure_decode_writes(&seq_ids[..n_decode])?;
+    }
+    #[cfg(feature = "cuda")]
+    let decode_headers = if n_decode > 0 && !preparing {
         let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
         DecodeHeaders::Decode { buf, stride }
     } else {
@@ -1006,14 +1077,21 @@ fn sweep_layers(
     // tier is placed against it. Over the **KV** range: three quarters of the
     // trunk range owns no cache at all, and the draft head's layer is one past
     // the end of it (see [`HybridBatched::kv_layer_range`]).
+    //
+    // A segment of a step was admitted when the step prepared it, before the
+    // tier its segments share was placed (`docs/wave_step.md` §2.1).
     let (kv_start, kv_end) = model.kv_layer_range(layer_start, layer_end);
     let head_kv = model.mtp_kv_layer().filter(|_| layer_end == num_layers);
-    admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
+    if !in_step {
+        admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
+    }
 
     // **Phase 2: price and reserve this wave's transient tier**, sized to this
-    // wave rather than to the widest one the engine can run.
+    // wave rather than to the widest one the engine can run. A segment being
+    // prepared returns its price for the step to place; a segment running in
+    // the step places nothing.
     #[cfg(feature = "cuda")]
-    if total_rows > 0 {
+    if total_rows > 0 && !in_step {
         if let Device::Cuda(d) = dev {
             let geometry = model.wave_geometry(embed_dtype);
             let plan = WavePlan::new(geometry);
@@ -1094,8 +1172,14 @@ fn sweep_layers(
                 plan.phase_bytes(LayerPhase::Ffn, width),
                 plan.phase_bytes(LayerPhase::Forward, width),
             ];
+            if preparing {
+                return Ok((WavePhase::Priced(per_phase), None));
+            }
             plan_wave_transient(&d.cuda_stream(), per_phase)?;
         }
+    }
+    if preparing {
+        return Ok((WavePhase::Priced([0; 3]), None));
     }
 
     // From here to the end of this function the forward owns the partition —
@@ -1112,14 +1196,19 @@ fn sweep_layers(
     // The forward's span, open from here to the head: the setup every layer
     // reads — the token ids and the ragged prefill tables — is laid on it
     // first, and the head's norm and logits are carved from it after the last
-    // layer. It is reset per *forward*, the lifetime all of them have.
+    // layer. It is reset per *forward*, the lifetime all of them have. A
+    // segment of a step carves from the step's span, which outlives it.
     #[cfg(feature = "cuda")]
-    let head_span = match dev {
-        Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
+    let head_span = match (dev, mode) {
+        (_, SweepMode::InStep(_)) => None,
+        (Device::Cuda(d), _) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
         _ => None,
     };
     #[cfg(feature = "cuda")]
-    let fwd_ticket = head_span.as_ref().map(|g| g.ticket());
+    let fwd_ticket = match mode {
+        SweepMode::InStep(ticket) => ticket,
+        _ => head_span.as_ref().map(|g| g.ticket()),
+    };
     #[cfg(not(feature = "cuda"))]
     let (head_span, fwd_ticket): (Option<WaveGuard>, Option<WaveTicket>) = (None, None);
 
@@ -1138,13 +1227,22 @@ fn sweep_layers(
     };
 
     // Combined residual: embed every row flat `[1, total, hidden]`, or resume a
-    // paused wave from its persisted stream.
+    // paused wave from the residual it was handed. Either way it is a buffer of
+    // this forward's own on the forward span (`WaveBuffer::ForwardResidual`):
+    // a resumed one is gathered into it in this forward's row order, leaving
+    // what it was gathered from as it was (`docs/wave_step.md` §3.1).
     let g_embed = crate::models::profile::gpu_span("fwd:embed", dev);
-    // A fresh residual is on the forward span (`WaveBuffer::ForwardResidual`);
-    // a window that stops short copies it off the span when it hands it on.
-    let fresh = x_in.is_none();
     let mut x = match x_in {
-        Some(resume) => resume,
+        Some(resume) => {
+            let buf = wave_empty_ticketed(
+                (1, total_rows, resume.width()),
+                embed_dtype,
+                dev,
+                fwd_ticket,
+            )?;
+            resume.gather_into(&buf)?;
+            TensorCat::from_cat_tensor(buf, 0)?
+        }
         None => TensorCat::from_cat_tensor(embed_rows(q, &ids, embed_dtype, fwd_ticket)?, 0)?,
     };
     g_embed.end();
@@ -1557,21 +1655,11 @@ fn sweep_layers(
         model.put_verify_stash(st)?;
     }
 
-    // A window that stops short hands its residual to a later forward, past
-    // this span's reset. A resumed one is already the caller's buffer and was
-    // added into in place; a fresh one is on the span, so it is copied into one
-    // of the session's held window buffers.
+    // A window that stops short hands its residual on as it stands, on the
+    // forward span, with the span's guard: the driver moves it to the next
+    // segment or the creep's arena while the guard still holds it.
     if layer_end < num_layers {
-        if !fresh {
-            return Ok((WavePhase::Residual(x), None));
-        }
-        let on_span = x.to_tensor();
-        let held = window.take(on_span.dims(), on_span.dtype(), on_span.device())?;
-        held.slice_set(&on_span, 0, 0)?;
-        return Ok((
-            WavePhase::Residual(TensorCat::from_cat_tensor(held, 0)?),
-            None,
-        ));
+        return Ok((WavePhase::Residual(x), head_span));
     }
 
     let xt = x.to_tensor();
@@ -1641,7 +1729,7 @@ fn sweep_layers(
             let acts = q.final_norm.forward_dynamic(
                 &pre_norm,
                 q.lm_head.int8mode(),
-                wave_root(head_span.as_ref()),
+                wave_root_ticketed(fwd_ticket),
             )?;
             q.lm_head
                 .forward_dynamic(acts.as_dynamic(), pre_norm.dtype())?
@@ -1674,9 +1762,8 @@ fn sweep_layers(
 /// the moment the dequantize on the next line has read them.
 ///
 /// The dequantized rows are the residual, written where `residual` names —
-/// the forward's span for a wave that reaches the head
-/// (`WaveBuffer::ForwardResidual`), an owned buffer for a window whose
-/// residual a later wave resumes.
+/// the forward's span (`WaveBuffer::ForwardResidual`), or an owned buffer when
+/// no forward span stands, as on the CPU device.
 fn embed_rows(
     model: &QuantModel,
     ids: &Tensor,

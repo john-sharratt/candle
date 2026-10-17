@@ -24,7 +24,8 @@ use candle_nn::kv_cache::{
 };
 use candle_transformers::models::batched_inference::PendingGlue;
 use candle_transformers::models::held_tensor::hold_row;
-use candle_transformers::models::window_residuals::WindowResiduals;
+use candle_transformers::models::residual_rows::{compact_creeps, CreepResidual};
+use candle_transformers::models::wave_driver::{StepCreep, StepRows, StepSpec};
 use std::collections::{HashMap, HashSet};
 
 /// Free KV regions kept in hand before [`Scheduler::vram_under_pressure_for`]
@@ -385,8 +386,8 @@ impl Scheduler {
     }
 
     /// Pack the span tenants that are not KV pools — the recurrent state store, the
-    /// QSA index pages and the provenance gallery — when one of them holds the
-    /// frontier over enough holes to be worth moving into
+    /// QSA index pages, the creeps' residuals and the provenance gallery — when one
+    /// of them holds the frontier over enough holes to be worth moving into
     /// ([`super::compaction_stall::MIN_FREEABLE_ARENAS`]).
     ///
     /// **Never in the follow-ups or relief.** Each is a batch of device copies of whole
@@ -411,6 +412,12 @@ impl Scheduler {
         /// than hundreds. The gallery's own ceiling is 512 MiB, or ~87k pages, so
         /// this is deliberately a fraction of the worst case.
         const MAX_GALLERY_MOVES: usize = 4096;
+
+        /// Creep residual blocks a single pass may move. A block is up to a
+        /// region of whole rows, so this is up to 256 MiB of copy — the same
+        /// class as the recurrent pass — and covers both halves of a creep of a
+        /// few thousand rows.
+        const MAX_CREEP_MOVES: usize = 16;
 
         // **Recurrent state first.** Its arenas are regions of the span like the KV
         // side's, and on a hybrid stack they are most of what stands above the holes —
@@ -445,6 +452,42 @@ impl Scheduler {
             Err(e) => tracing::error!(
                 target: "candle_conversation::scheduler::vram_relief",
                 "recurrent state compaction failed: {e}",
+            ),
+        }
+
+        // **A creep's arena stands for the whole of its sweep**, which beside a
+        // busy decode is many seconds — long enough for the KV side to free the
+        // ground under it and leave its blocks holding the frontier. Its blocks
+        // move like any tenant's: the one in flight and a paused one, which are
+        // every creep arena there is, between forwards (`docs/wave_step.md` §3).
+        let creeps = {
+            let _g = super::profile::span("compact:creep");
+            let held = self.wave_prefill_residual.iter_mut().chain(
+                self.paused_creep
+                    .iter_mut()
+                    .filter_map(|p| p.residual.as_mut()),
+            );
+            compact_creeps(held, MAX_CREEP_MOVES)
+        };
+        match creeps {
+            Ok(r) if r.planned > 0 => {
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::vram_relief",
+                    planned = r.planned,
+                    moved = r.moved,
+                    regions_before = r.regions_before,
+                    regions_after = r.regions_after,
+                    "creep residual compaction packed the creep arenas",
+                );
+                if r.regions_released() > 0 {
+                    let _g = super::profile::span("compact:reclaim_weights");
+                    self.model.reclaim_spare_ground();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(
+                target: "candle_conversation::scheduler::vram_relief",
+                "creep residual compaction failed: {e}",
             ),
         }
 
@@ -3057,39 +3100,6 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Splice the present residual parts along the token dim (1) in the given
-    /// caller order, skipping `None` parts. Returns `None` when all are absent,
-    /// and a lone part as it stands.
-    ///
-    /// Several parts are copied into one of the session's held window buffers
-    /// (`WindowResiduals`) rather than concatenated into a fresh tensor: this
-    /// runs between the segments of a co-batched wave that carries decode, and
-    /// an allocation here was one per segment.
-    fn cat_caller_residual(
-        window: &WindowResiduals,
-        parts: &[Option<&Tensor>],
-    ) -> candle::Result<Option<Tensor>> {
-        let present: Vec<&Tensor> = parts.iter().filter_map(|p| *p).collect();
-        let Some(first) = present.first() else {
-            return Ok(None);
-        };
-        if present.len() == 1 {
-            return Ok(Some((*first).clone()));
-        }
-        let mut dims = first.dims().to_vec();
-        dims[1] = present
-            .iter()
-            .map(|p| p.dim(1))
-            .sum::<candle::Result<usize>>()?;
-        let spliced = window.take(dims, first.dtype(), first.device())?;
-        let mut at = 0;
-        for p in present {
-            spliced.slice_set(p, 1, at)?;
-            at += p.dim(1)?;
-        }
-        Ok(Some(spliced))
-    }
-
     /// The unified continuous-fair-wave step (`docs/continuous_fair_waves.md`): ONE
     /// forward folding every class of work through the shared grouped GEMM so one
     /// expert load per layer serves them all — the whole point on the streaming box.
@@ -3103,11 +3113,11 @@ impl Scheduler {
     ///
     /// So the sweep splits into up to THREE segments — `[0, cursor)` and
     /// `[win_end, N)` carry only the full-sweep members, `[cursor, win_end)` adds
-    /// the creep. `forward_wave` returns the residual in CALLER order
-    /// `[decode | creep | glue]`, so the segment boundaries split it by contiguous
-    /// group: the creep is held WHOLE, the full-sweep members `[decode | glue]`
-    /// continue. At the head, per-sequence logits are `[decode | creep]` (glue
-    /// logits, if present, trail and are discarded): prefills promote, sections seal.
+    /// the creep — run as one step (`docs/wave_step.md`): one tier, one forward
+    /// span, the full-sweep members' residual handed between segments on it, and
+    /// the creep's held between steps in its arena. At the head, per-sequence
+    /// logits are `[decode | creep]` (glue logits, if present, trail and are
+    /// discarded): prefills promote, sections seal.
     ///
     /// With no creep group, all members are full-sweep: one `[0, N)` forward folding
     /// decode + a standalone section chunk + glue. The glue is a side effect only —
@@ -3188,10 +3198,6 @@ impl Scheduler {
         };
         let glue_pending: Option<&Vec<PendingGlue>> = glue.as_ref().map(|(_, _, p)| p);
         let has_glue = !glue_seqs.is_empty();
-        let glue_tok: usize = glue_inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(0))
-            .sum();
         // A "full-sweep" wave carries decode and/or glue across all N layers; it
         // drives segments 1 and 3. With neither, only the creep runs (seg 2).
         let has_fullsweep = n_dec > 0 || has_glue;
@@ -3275,10 +3281,7 @@ impl Scheduler {
                 .iter()
                 .map(|t| t.dims().get(1).copied().unwrap_or(0))
                 .sum();
-            let held = self
-                .wave_prefill_residual
-                .as_ref()
-                .map(|r| r.dims().get(1).copied().unwrap_or(0));
+            let held = self.wave_prefill_residual.as_ref().map(CreepResidual::rows);
             match held {
                 Some(held) if cursor > 0 && held != rows => {
                     tracing::error!(
@@ -3434,107 +3437,61 @@ impl Scheduler {
             return Ok(dec_logits);
         }
 
-        // Creep group present. Full-sweep members (decode + glue) ride all N layers;
-        // the creep rides only [cursor, win_end), its residual held WHOLE between
-        // waves. The residual crosses `forward_wave` in caller order
-        // `[decode | creep | glue]`, split by contiguous group at the boundaries.
+        // Creep group present: one step (`docs/wave_step.md`). The full-sweep
+        // members — decode, verify blocks, glue — cross every layer; the creep
+        // crosses `[cursor, win_end)`, resuming from its arena's committed rows
+        // and, when the window stops short, leaving its rows there for the next
+        // step. Verify blocks lead the prefill slot and the creep follows, so
+        // `[decode | verify]` is the contiguous head every segment shares and the
+        // caller reads its logits from.
         self.wave_cohort_advanced = true;
-        let creep_tok: usize = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(0))
-            .sum();
-
-        // Segment 1 — full-sweep members only over [0, cursor). Runs when there is
-        // any full-sweep member (decode or glue) and cursor > 0; the creep resumes
-        // from its held residual at `cursor`. Yields caller order `[decode | glue]`.
-        let seg1_res: Option<Tensor> = if cursor > 0 && (has_fullsweep || !verify_seqs.is_empty()) {
-            if let Some(p) = glue_pending {
-                self.session.set_pending_glue(p.clone());
-            }
-            let _g = super::profile::span("loop:wave:forward");
-            self.model
-                .forward_wave(
-                    &mut self.session,
-                    decode_seqs,
-                    decode_inputs,
-                    verify_seqs,
-                    verify_inputs,
-                    glue_seqs,
-                    glue_inputs,
-                    0,
-                    cursor,
-                    None,
-                )?
-                .into_residual()
-        } else {
-            None
-        };
-        // Split seg1's `[decode | verify | glue]` so the creep residual inserts
-        // between them for seg2's `[decode | verify | creep | glue]` order.
-        let (seg1_dec, seg1_glue): (Option<Tensor>, Option<Tensor>) = match &seg1_res {
-            Some(r) => {
-                let dec = if head_rows > 0 {
-                    Some(r.narrow(1, 0, head_rows)?)
-                } else {
-                    None
-                };
-                let g = if glue_tok > 0 {
-                    Some(r.narrow(1, head_rows, glue_tok)?)
-                } else {
-                    None
-                };
-                (dec, g)
-            }
-            None => (None, None),
-        };
-
-        // Segment 2 — full-sweep members + creep over [cursor, win_end). Input
-        // residual caller order `[decode | creep | glue]`; at cursor 0 all embed
-        // fresh (None).
-        let pf_res = self.wave_prefill_residual.take();
-        // A handle, not a copy: put back if this window fails mid-sweep.
-        let held_residual = pf_res.clone();
-        let seg2_in = Self::cat_caller_residual(
-            &self.session.window_residuals(),
-            &[seg1_dec.as_ref(), pf_res.as_ref(), seg1_glue.as_ref()],
-        )?;
+        let creep_tok = creep_rows;
         if let Some(p) = glue_pending {
             self.session.set_pending_glue(p.clone());
         }
-        // Time seg2 alone (the co-batch the creep actually rides) — seg1 is
-        // decode+glue over [0, cursor), which the creep did NOT ride, so charging
-        // its wall-clock to the prefill channel would understate the prefill rate.
-        let t_seg2 = Instant::now();
-        // Verify blocks lead the prefill slot, the creep follows: `[decode |
-        // verify]` then stays the contiguous head that every segment shares and
-        // that the caller reads its logits from.
-        let mid_seqs: Vec<usize> = verify_seqs.iter().chain(&seq_ids).copied().collect();
-        let mid_inputs: Vec<Tensor> = verify_inputs.iter().chain(&inputs).cloned().collect();
-        let _g_seg2 = super::profile::span("loop:wave:forward");
-        let seg2 = match self.model.forward_wave(
-            &mut self.session,
-            decode_seqs,
-            decode_inputs,
-            &mid_seqs,
-            &mid_inputs,
-            glue_seqs,
-            glue_inputs,
-            cursor,
-            win_end,
-            seg2_in,
-        ) {
+        let stepped = {
+            let _g = super::profile::span("loop:wave:forward");
+            self.model.forward_step(
+                &mut self.session,
+                StepSpec {
+                    decode: StepRows {
+                        seqs: decode_seqs,
+                        inputs: decode_inputs,
+                    },
+                    verify: StepRows {
+                        seqs: verify_seqs,
+                        inputs: verify_inputs,
+                    },
+                    glue: StepRows {
+                        seqs: glue_seqs,
+                        inputs: glue_inputs,
+                    },
+                    creep: Some(StepCreep {
+                        rows: StepRows {
+                            seqs: &seq_ids,
+                            inputs: &inputs,
+                        },
+                        cursor,
+                        win_end,
+                        residual: &mut self.wave_prefill_residual,
+                    }),
+                },
+            )
+        };
+        let stepped = match stepped {
             Ok(s) => {
                 self.wave_sweep_failures = 0;
                 s
             }
             Err(e) => {
-                // **Mid-sweep, a retryable failure retries the same window.** The
-                // forward's failure bracket rolled back what this window did, but
-                // `[0, cursor)` stands — so the group keeps its residual and its
-                // cursor rather than re-forming, which would run those layers'
-                // rows into their carried state again (`reset_wave_prefill`).
-                // Bounded: a window refused `MID_SWEEP_RETRIES` times in a row
-                // fails its members instead.
+                // **The creep's window failed, and a retryable failure retries
+                // the same window.** The forward's failure bracket rolled back
+                // what this window did, the arena's committed half is as the
+                // window found it, and `[0, cursor)` stands — so the group keeps
+                // its residual and its cursor rather than re-forming, which would
+                // run those layers' rows into their carried state again
+                // (`reset_wave_prefill`). Bounded: a window refused
+                // `MID_SWEEP_RETRIES` times in a row fails its members instead.
                 let retryable = is_device_oom(&e) || tier_refusal_shortfall(&e).is_some();
                 if cursor > 0 && retryable && self.wave_sweep_failures < MID_SWEEP_RETRIES {
                     self.wave_sweep_failures += 1;
@@ -3546,7 +3503,6 @@ impl Scheduler {
                         error = %e,
                         "creep window failed mid-sweep; holding the sweep to retry it"
                     );
-                    self.wave_prefill_residual = held_residual;
                     return Err(e);
                 }
                 self.wave_sweep_failures = 0;
@@ -3561,21 +3517,28 @@ impl Scheduler {
                 return Err(e);
             }
         };
-        // Closed here, not at end of scope. Left to drop naturally it would still be
-        // live when seg3's span opens below under the SAME name, so a paused wave
-        // (`win_end < n` with a full-sweep member) counted seg3's forward twice and
-        // inflated the call count — and it would also charge this span with the
-        // tallying, the residual narrowing and `complete_wave_group`, which is the
-        // opposite of what it is for.
-        _g_seg2.end();
+        // A segment that carried only the full-sweep rows failed before the
+        // creep's window ran: nothing of the creep moved, and the step's error is
+        // the caller's.
+        if !stepped.creep_advanced {
+            return match stepped.head {
+                Err(e) => Err(e),
+                Ok(_) => Err(candle::Error::Msg(
+                    "co-batch wave: the step ran without its creep window".into(),
+                )),
+            };
+        }
 
         // Record the co-batched creep throughput — prefill and section members are
-        // tallied into their own channels, sharing seg2's wall-clock (the forward
-        // they rode concurrently with decode) so the dashboard shows their CONCURRENT
-        // rate instead of reading zero. One record per wave; KV is summed now, before
-        // `complete_wave_group` advances the sequences at the head.
+        // tallied into their own channels, sharing the wall-clock of the segment
+        // the creep rode (concurrently with decode) so the dashboard shows their
+        // CONCURRENT rate instead of reading zero. The full-sweep segments around
+        // it, which the creep did not ride, are not charged to it: that would
+        // understate the prefill rate. One record per wave; KV is summed now,
+        // before `complete_wave_group` advances the sequences at the head.
+        let creep_us = stepped.creep_us;
         {
-            let ms = t_seg2.elapsed().as_millis() as u64;
+            let ms = creep_us / 1000;
             let (mut pf_seqs, mut pf_tok, mut pf_kv) = (0usize, 0usize, 0usize);
             let (mut sc_seqs, mut sc_tok, mut sc_kv) = (0usize, 0usize, 0usize);
             for (m, inp) in members.iter().zip(inputs.iter()) {
@@ -3607,12 +3570,8 @@ impl Scheduler {
             // The phase timeline's share of this sweep: one forward, split by rows
             // between the decode rows that rode it and the members above.
             let decode_rows = cobatched_decode_rows(decode_inputs, verify_inputs);
-            self.wave_stats.record_cobatched_split(
-                decode_rows,
-                pf_tok,
-                sc_tok,
-                t_seg2.elapsed().as_micros() as u64,
-            );
+            self.wave_stats
+                .record_cobatched_split(decode_rows, pf_tok, sc_tok, creep_us);
             // **Teach the planner what this machine actually did.** A forward is
             // `T = X/bw + W·c` — non-resident expert bytes over the bus, plus
             // compute for the rows — so one observation is one equation in two
@@ -3627,7 +3586,7 @@ impl Scheduler {
             // whole sweep, so a window's time is taken to the sweep it is part of.
             self.observe_prefill_forward(
                 pf_tok + sc_tok,
-                full_sweep_us(t_seg2.elapsed().as_micros() as u64, cursor, win_end, n),
+                full_sweep_us(creep_us, cursor, win_end, n),
             );
             // Every completed wave forward is OOM-free prefill throughput —
             // the progress signal the stall-grace gate and evidence reopen
@@ -3650,73 +3609,36 @@ impl Scheduler {
                 let _g = super::profile::span("loop:wave:reconcile_offsets");
                 self.reconcile_wave_offsets(glue_seqs)?;
             }
-            // Read in place behind the forward's guard — see `WaveLogits`. The
+            // Read in place behind the step's guard — see `WaveLogits`. The
             // creep's rows are consumed here; `complete_wave_group` copies the
             // one row a finished prefill keeps past this wave.
-            let logits = seg2.logits_on_span();
+            let head = stepped.head?;
+            let logits = head.logits_on_span();
             let d = head_rows.min(logits.len());
             let creep_end = (d + members.len()).min(logits.len());
             self.complete_wave_group(&members, &logits[d..creep_end]);
-            return Ok(WaveLogits::held_rows(seg2, logits[..d].to_vec()));
+            return Ok(WaveLogits::held_rows(head, logits[..d].to_vec()));
         }
 
-        // Paused: split seg2's `[decode | creep | glue]` residual. Hold the creep
-        // whole; continue the full-sweep members `[decode | glue]` into seg3.
-        let res = seg2
-            .into_residual()
-            .ok_or_else(|| candle::Error::Msg("co-batch wave: missing residual".into()))?;
-        let dec_part = if head_rows > 0 {
-            Some(res.narrow(1, 0, head_rows)?)
-        } else {
-            None
-        };
-        let creep_part = res.narrow(1, head_rows, creep_tok)?;
-        let glue_part = if glue_tok > 0 {
-            Some(res.narrow(1, head_rows + creep_tok, glue_tok)?)
-        } else {
-            None
-        };
-        self.wave_prefill_residual = Some(creep_part);
+        // The window stopped short: the creep's rows are in its arena, and it
+        // resumes at `win_end`.
         self.wave_prefill_cursor = win_end;
         self.wave_prefill_members = members;
         self.wave_prefill_rows = inputs
             .iter()
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
             .collect();
-
-        // Segment 3 — full-sweep members only over [win_end, N). Input caller order
-        // `[decode | verify | glue]`. Skipped when there is no full-sweep member
-        // (the creep paused at win_end, nothing else to sweep).
+        // The full-sweep members' last segment ran after the creep committed; its
+        // failure is the step's, with the creep already advanced.
+        let head = stepped.head?;
         if !has_fullsweep && verify_seqs.is_empty() {
             return Ok(WaveLogits::empty());
         }
-        let seg3_in = Self::cat_caller_residual(
-            &self.session.window_residuals(),
-            &[dec_part.as_ref(), glue_part.as_ref()],
-        )?;
-        if let Some(p) = glue_pending {
-            self.session.set_pending_glue(p.clone());
-        }
-        let _g_seg3 = super::profile::span("loop:wave:forward");
-        let seg3 = self.model.forward_wave(
-            &mut self.session,
-            decode_seqs,
-            decode_inputs,
-            verify_seqs,
-            verify_inputs,
-            glue_seqs,
-            glue_inputs,
-            win_end,
-            n,
-            seg3_in,
-        )?;
-        // Closed before the post-forward work, for the same reason as seg2's.
-        _g_seg3.end();
         if has_glue {
             let _g = super::profile::span("loop:wave:reconcile_offsets");
             self.reconcile_wave_offsets(glue_seqs)?;
         }
-        Ok(WaveLogits::held(seg3, head_rows))
+        Ok(WaveLogits::held(head, head_rows))
     }
 
     /// Handle a device-OOM from the ragged prefill forward: the batch was too
@@ -5430,12 +5352,43 @@ mod wave_give_up_tests {
 #[cfg(test)]
 mod creep_member_drop_tests {
     use candle::DType;
+    use candle_transformers::models::residual_rows::{copy_rows, RowCopy, SpanRows};
 
     use super::super::tests::make_test_scheduler;
     use super::super::*;
+    use super::CreepResidual;
 
     fn section(seq_id: usize, advance: usize) -> WaveMember {
         WaveMember::Section { seq_id, advance }
+    }
+
+    /// A creep arena of `rows` rows of width two on the host, holding
+    /// `0..2·rows` in order.
+    fn held(rows: usize) -> CreepResidual {
+        let mut c = CreepResidual::claim(&Device::Cpu, rows, 2, DType::F32).unwrap();
+        let values: Vec<f32> = (0..rows * 2).map(|v| v as f32).collect();
+        let src = Tensor::from_vec(values, (rows, 2), &Device::Cpu).unwrap();
+        let plan = [RowCopy {
+            src: 0,
+            dst: 0,
+            len: rows,
+        }];
+        copy_rows(&SpanRows::new(&src, 2).unwrap(), c.pending(), &plan).unwrap();
+        c.commit();
+        c
+    }
+
+    /// The values a creep arena holds, in caller order.
+    fn held_values(c: &CreepResidual) -> Vec<f32> {
+        c.committed()
+            .to_tensor()
+            .unwrap()
+            .narrow(0, 0, c.rows())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
     }
 
     /// **A member leaving mid-sweep takes only its own rows.** The survivors'
@@ -5447,16 +5400,14 @@ mod creep_member_drop_tests {
         sched.wave_prefill_members = vec![section(1, 2), section(2, 3), section(3, 1)];
         sched.wave_prefill_rows = vec![2, 3, 1];
         sched.wave_prefill_cursor = 7;
-        let rows: Vec<f32> = (0..12).map(|v| v as f32).collect();
-        sched.wave_prefill_residual =
-            Some(Tensor::from_vec(rows, (1, 6, 2), &Device::Cpu).unwrap());
+        sched.wave_prefill_residual = Some(held(6));
 
         sched.drop_wave_members(&[true, false, true]).unwrap();
 
         let res = sched.wave_prefill_residual.as_ref().expect("still held");
-        assert_eq!(res.dims(), &[1, 3, 2]);
+        assert_eq!(res.rows(), 3);
         assert_eq!(
-            res.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            held_values(res),
             vec![0., 1., 2., 3., 10., 11.],
             "member 1's two rows, then member 3's one"
         );
@@ -5477,8 +5428,7 @@ mod creep_member_drop_tests {
         sched.wave_prefill_members = vec![section(1, 2)];
         sched.wave_prefill_rows = vec![2];
         sched.wave_prefill_cursor = 7;
-        sched.wave_prefill_residual =
-            Some(Tensor::zeros((1, 2, 2), DType::F32, &Device::Cpu).unwrap());
+        sched.wave_prefill_residual = Some(held(2));
 
         sched.drop_wave_members(&[false]).unwrap();
 
@@ -5495,8 +5445,7 @@ mod creep_member_drop_tests {
         sched.wave_prefill_members = vec![section(1, 2), section(2, 2)];
         sched.wave_prefill_rows = vec![2, 2];
         sched.wave_prefill_cursor = 5;
-        sched.wave_prefill_residual =
-            Some(Tensor::zeros((1, 4, 2), DType::F32, &Device::Cpu).unwrap());
+        sched.wave_prefill_residual = Some(held(4));
 
         sched.purge_freed_slot_scheduling_state(SequenceId(1));
 
@@ -5507,10 +5456,8 @@ mod creep_member_drop_tests {
             .collect();
         assert_eq!(ids, vec![2]);
         assert_eq!(sched.wave_prefill_cursor, 5);
-        assert_eq!(
-            sched.wave_prefill_residual.as_ref().unwrap().dims(),
-            &[1, 2, 2]
-        );
+        let res = sched.wave_prefill_residual.as_ref().unwrap();
+        assert_eq!(held_values(res), vec![4., 5., 6., 7.], "member 2's rows");
     }
 
     /// **A paused creep resumes exactly where it stopped**: the same residual,
@@ -5521,8 +5468,7 @@ mod creep_member_drop_tests {
         sched.wave_prefill_members = vec![section(1, 2), section(2, 3)];
         sched.wave_prefill_rows = vec![2, 3];
         sched.wave_prefill_cursor = 9;
-        sched.wave_prefill_residual =
-            Some(Tensor::zeros((1, 5, 2), DType::F32, &Device::Cpu).unwrap());
+        sched.wave_prefill_residual = Some(held(5));
 
         sched.pause_creep();
         assert!(sched.wave_prefill_members.is_empty());
@@ -5544,8 +5490,9 @@ mod creep_member_drop_tests {
         assert_eq!(sched.wave_prefill_rows, vec![2, 3]);
         assert_eq!(sched.wave_prefill_cursor, 9);
         assert_eq!(
-            sched.wave_prefill_residual.as_ref().unwrap().dims(),
-            &[1, 5, 2]
+            held_values(sched.wave_prefill_residual.as_ref().unwrap()),
+            (0..10).map(|v| v as f32).collect::<Vec<_>>(),
+            "the same rows it paused with"
         );
         assert!(sched.paused_creep.is_none());
     }
@@ -5558,14 +5505,16 @@ mod creep_member_drop_tests {
         sched.wave_prefill_members = vec![section(1, 2), section(2, 2)];
         sched.wave_prefill_rows = vec![2, 2];
         sched.wave_prefill_cursor = 4;
-        sched.wave_prefill_residual =
-            Some(Tensor::zeros((1, 4, 2), DType::F32, &Device::Cpu).unwrap());
+        sched.wave_prefill_residual = Some(held(4));
         sched.pause_creep();
 
         sched.purge_freed_slot_scheduling_state(SequenceId(1));
         let paused = sched.paused_creep.as_ref().expect("one member left");
         assert_eq!(paused.rows, vec![2]);
-        assert_eq!(paused.residual.as_ref().unwrap().dims(), &[1, 2, 2]);
+        assert_eq!(
+            held_values(paused.residual.as_ref().unwrap()),
+            vec![4., 5., 6., 7.]
+        );
 
         sched.purge_freed_slot_scheduling_state(SequenceId(2));
         assert!(sched.paused_creep.is_none());

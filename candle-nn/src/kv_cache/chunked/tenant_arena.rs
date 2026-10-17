@@ -86,6 +86,9 @@ pub enum SlotTenant {
     Gallery,
     /// One page of a QSA index cache's block keys, or its open block.
     QsaIndex,
+    /// One block of whole rows of a creep's residual, held between the steps of
+    /// its sweep (`docs/wave_step.md` §3).
+    CreepResidual,
 }
 
 impl SlotTenant {
@@ -93,11 +96,12 @@ impl SlotTenant {
     /// ground. Exhaustive by construction — a new variant that is not added here
     /// goes missing from the accounting, and ground nothing can total is ground
     /// that goes missing.
-    pub const ALL: [SlotTenant; 4] = [
+    pub const ALL: [SlotTenant; 5] = [
         Self::RecurrentState,
         Self::RewindStash,
         Self::Gallery,
         Self::QsaIndex,
+        Self::CreepResidual,
     ];
 
     /// The tenant's name, for the arena window and for errors.
@@ -107,6 +111,7 @@ impl SlotTenant {
             Self::RewindStash => "a speculative rewind stash",
             Self::Gallery => "the provenance gallery",
             Self::QsaIndex => "a QSA index cache",
+            Self::CreepResidual => "a creep's residual",
         }
     }
 }
@@ -1110,15 +1115,7 @@ mod tests {
     #[test]
     fn every_tenant_is_named() {
         use std::collections::HashSet;
-        let labels: HashSet<_> = [
-            SlotTenant::RecurrentState,
-            SlotTenant::RewindStash,
-            SlotTenant::Gallery,
-            SlotTenant::QsaIndex,
-        ]
-        .into_iter()
-        .map(SlotTenant::label)
-        .collect();
-        assert_eq!(labels.len(), 4);
+        let labels: HashSet<_> = SlotTenant::ALL.into_iter().map(SlotTenant::label).collect();
+        assert_eq!(labels.len(), SlotTenant::ALL.len());
     }
 }

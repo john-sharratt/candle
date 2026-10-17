@@ -275,7 +275,7 @@ pub(crate) mod tests {
 
         let kinds = model.model().cfg.layer_kinds.clone();
         let n = kinds.len();
-        let mut residual: Option<Tensor> = None;
+        let mut residual = model.claim_residual(&session, prompt.len())?;
         let (mut attn_ms, mut delta_ms) = (0f64, 0f64);
         let (mut attn_n, mut delta_n) = (0usize, 0usize);
         for (li, kind) in kinds.iter().enumerate().take(n) {
@@ -291,9 +291,8 @@ pub(crate) mod tests {
                 &[],
                 li,
                 li + 1,
-                residual.take(),
+                Some(&mut residual),
             )?;
-            residual = step.residual.clone();
             drop(step);
             device.synchronize()?;
             let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -320,7 +319,7 @@ pub(crate) mod tests {
         // chunked scan, the paged decode kernel instead of the float fallback —
         // so its distribution has to be measured separately.
         let mut tok = 1000u32;
-        let mut residual: Option<Tensor> = None;
+        let mut residual = model.claim_residual(&session, 1)?;
         let (mut a_ms, mut d_ms) = (0f64, 0f64);
         for (li, kind) in kinds.iter().enumerate().take(n) {
             let ids = Tensor::from_vec(vec![tok], (1, 1), &device)?;
@@ -336,9 +335,8 @@ pub(crate) mod tests {
                 &[],
                 li,
                 li + 1,
-                residual.take(),
+                Some(&mut residual),
             )?;
-            residual = step.residual.clone();
             if let Some(l) = step.logits.as_ref() {
                 tok = l[0].flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
             }
