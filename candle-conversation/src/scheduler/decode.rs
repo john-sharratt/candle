@@ -2298,9 +2298,10 @@ impl Scheduler {
 
     /// A decode step whose transient tier the partition refused — the draft
     /// walk's or the verify forward's. **The turns keep their place.** A refusal
-    /// is placement, not computation: nothing was committed, and the next step
-    /// re-forwards the same last token (`DecodeState::mark_forwarded`'s benign
-    /// direction). Ending the turn instead threw away a reply mid-thought
+    /// is placement, not computation: nothing was committed — a segment that
+    /// ran before the refused one is taken back by the step bracket
+    /// (`decode_forward_cobatched`) — and the next step re-forwards the same
+    /// last token (`DecodeState::mark_forwarded`'s benign direction). Ending the turn instead threw away a reply mid-thought
     /// over ground that relief, a compaction or the weight side's between-wave
     /// concession hands back a step or two later — the weight side refuses to
     /// move only while a wave or an expert invocation is in flight. The step

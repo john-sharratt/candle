@@ -3626,6 +3626,10 @@ pub(crate) struct Scheduler {
     /// Consecutive failures of the creep's current mid-sweep window, retried in
     /// place up to `prefill::MID_SWEEP_RETRIES`.
     wave_sweep_failures: u32,
+    /// A wave step swept in segments, open on the model for its full-sweep
+    /// members (`ManagedBatchedModel::begin_step`): the trunk layers its
+    /// segments have committed so far. Closed by `decode_forward_cobatched`.
+    wave_step_open: Option<usize>,
     /// The prefill cohort may not advance on this wave step: it already did, or
     /// decode is still owed airtime for the last step that carried it
     /// ([`Self::creep_owed`]). Set per decode step, so the cohort advances its
@@ -3955,6 +3959,7 @@ impl Scheduler {
             wave_prefill_rows: Vec::new(),
             paused_creep: None,
             wave_sweep_failures: 0,
+            wave_step_open: None,
             wave_cohort_advanced: false,
             creep_owed: Duration::ZERO,
             decode_only_step: None,

@@ -237,6 +237,19 @@ pub struct Qwen4ExpBatched {
     /// paged attention kernel rotates from; the layout puts the head's
     /// non-rotary dims past them, where the kernels treat them as pass-through.
     pub(super) rope: RopeRungs,
+    /// The step open across a segmented sweep, if any — what its sequences
+    /// entered it with ([`ManagedBatchedModel::begin_step`]).
+    step: Mutex<Option<StepSnapshot>>,
+}
+
+/// What a step's sequences carried when it opened: everything outside the K/V
+/// and the recurrent stores (which keep their own step record) that a wave
+/// writes — the index, the PLE history and the head's seed.
+struct StepSnapshot {
+    seqs: Vec<usize>,
+    index: Vec<(usize, Vec<IndexSnapshot>)>,
+    ple: Vec<(usize, PleState)>,
+    seeds: Vec<(usize, Option<Tensor>)>,
 }
 
 /// The carried per-sequence state, and what persisting it costs.
@@ -1614,6 +1627,7 @@ impl Qwen4ExpBatched {
             index_rope,
             qsa_rows: AtomicU64::new(0),
             rope,
+            step: Mutex::new(None),
         })
     }
 
@@ -2599,6 +2613,134 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         let released = self.verify.write().ok().and_then(|mut g| g.take());
         if let Some(cap) = released {
             self.park_verify_stash(cap);
+        }
+    }
+
+    /// Snapshot what every sequence of `seqs` carries outside the K/V, and open
+    /// a step on its recurrent store. A sequence with no carried state yet —
+    /// one this step creates it for — is left out: nothing it entered with
+    /// could be restored, and it is no worse off than before the bracket.
+    fn begin_step(&self, seqs: &[usize]) -> Result<()> {
+        let poisoned = |what: &str| candle::Error::Msg(format!("qwen4exp: {what} lock poisoned"));
+        let mut step = self.step.lock().map_err(|_| poisoned("step"))?;
+        if step.is_some() {
+            candle::bail!("qwen4exp: begin_step with a step already open");
+        }
+        let index = self.index.read().map_err(|_| poisoned("index"))?;
+        let ple = self.ple.read().map_err(|_| poisoned("ple"))?;
+        let seeds = self.seeds.read().map_err(|_| poisoned("seed"))?;
+        let mut rec = self.recurrent.write().map_err(|_| poisoned("recurrent"))?;
+        let mut snap = StepSnapshot {
+            seqs: Vec::new(),
+            index: Vec::new(),
+            ple: Vec::new(),
+            seeds: Vec::new(),
+        };
+        let opened = seqs.iter().try_for_each(|&s| {
+            let (Some(caches), Some(p), true) = (index.get(&s), ple.get(&s), rec.contains_key(&s))
+            else {
+                return Ok(());
+            };
+            let idx = caches
+                .iter()
+                .map(IndexCache::snapshot)
+                .collect::<Result<Vec<_>>>()?;
+            rec.get_mut(&s).expect("checked above").begin_step()?;
+            snap.seqs.push(s);
+            snap.index.push((s, idx));
+            snap.ple.push((s, p.clone()));
+            snap.seeds.push((s, seeds.get(&s).cloned()));
+            Ok(())
+        });
+        if let Err(e) = opened {
+            // No step is open, so none of the stores opened so far may keep one.
+            for s in &snap.seqs {
+                if let Some(store) = rec.get_mut(s) {
+                    store.end_step();
+                }
+            }
+            return Err(e);
+        }
+        *step = Some(snap);
+        Ok(())
+    }
+
+    /// Keep the step, or put every sequence it covered back where the step
+    /// found it: K/V on the KV layers of trunk layers `[0, committed)`, the
+    /// recurrent stores by swapping back what the step's waves committed, and
+    /// the index, PLE history and seed from the snapshot. Every part is
+    /// attempted; the first failure is returned.
+    fn end_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        keep: bool,
+        committed: usize,
+    ) -> Result<()> {
+        let poisoned = |what: &str| candle::Error::Msg(format!("qwen4exp: {what} lock poisoned"));
+        let Some(snap) = self.step.lock().map_err(|_| poisoned("step"))?.take() else {
+            return Ok(());
+        };
+        let mut first_err: Option<candle::Error> = None;
+        let mut note = |r: Result<()>| {
+            if let Err(e) = r {
+                first_err.get_or_insert(e);
+            }
+        };
+        {
+            let mut rec = self.recurrent.write().map_err(|_| poisoned("recurrent"))?;
+            for s in &snap.seqs {
+                if let Some(store) = rec.get_mut(s) {
+                    if keep {
+                        store.end_step();
+                    } else {
+                        note(store.undo_step());
+                    }
+                }
+            }
+        }
+        if keep {
+            return Ok(());
+        }
+        let (kv_start, kv_end) = self.kv_layer_range(0, committed.min(self.model.cfg.num_layers));
+        note(crate::models::wave_admit::rollback_step_kv(
+            session, &snap.seqs, kv_start, kv_end,
+        ));
+        {
+            let mut idx = self.index.write().map_err(|_| poisoned("index"))?;
+            for (s, snaps) in &snap.index {
+                if let Some(caches) = idx.get_mut(s) {
+                    for (cache, sn) in caches.iter_mut().zip(snaps) {
+                        note(cache.restore(sn));
+                    }
+                }
+            }
+        }
+        {
+            let mut ple = self.ple.write().map_err(|_| poisoned("ple"))?;
+            for (s, st) in snap.ple {
+                ple.insert(s, st);
+            }
+        }
+        {
+            let mut seeds = self.seeds.write().map_err(|_| poisoned("seed"))?;
+            let mut spares = self.seed_spares.write().map_err(|_| poisoned("seed"))?;
+            for (s, seed) in snap.seeds {
+                // As the wave bracket's restore: the seed put back may already
+                // be the spare, which the next carry would then write.
+                spares.remove(&s);
+                match seed {
+                    Some(prev) => {
+                        seeds.insert(s, prev);
+                    }
+                    None => {
+                        seeds.remove(&s);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
