@@ -4462,6 +4462,19 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         Some(files) => {
             // Every document path is a mind path, relative to the mind's root.
             let dir: &Path = Path::new("");
+            // ── what the substrate already holds is not owed again ────────
+            //
+            // First, so everything below reads one ledger: the documents
+            // another member wrote — or this one, before its ledger was lost —
+            // are already in the substrate at a recorded version, and writing
+            // them again is how every document came to be held twice.
+            let seeded = mind_record::seed_ledger(&engine.lock().unwrap(), &rt.ledger);
+            if seeded > 0 {
+                tracing::info!(
+                    "mind: {seeded} document(s) already in the substrate, taken into the \
+                     ingest ledger"
+                );
+            }
             // ── what has left the record leaves memory ────────────────────
             //
             // Before anything is ingested: a document gone from disk is
@@ -4605,6 +4618,34 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                     Err(e) => tracing::warn!("life {who}: not run — {e:#}"),
                 }
                 rt.ledger.flush();
+            }
+
+            // ── what is read and never continued keeps no recurrent state ──
+            //
+            // After the documents and the lives, so everything they wrote this
+            // boot is marked. A store from before the mark existed kept a whole
+            // recurrent state (~112 MiB) as the tail of every document and
+            // dream — hundreds of gigabytes for a mind of a few thousand
+            // documents; this retires those tails, and compaction reclaims them.
+            {
+                // A document held twice keeps one copy — the duplicates' tails
+                // then go with their timelines rather than being retired one
+                // by one below.
+                let copies = mind_record::retire_duplicate_documents(&engine.lock().unwrap());
+                if copies > 0 {
+                    tracing::info!(
+                        copies,
+                        "retired the extra copies of documents written more than once"
+                    );
+                }
+                let retired = mind_record::retire_unresumed_snapshots(&engine.lock().unwrap());
+                if retired > 0 {
+                    tracing::info!(
+                        retired,
+                        "retired the recurrent snapshots of documents and dreams, which are \
+                         read and never continued"
+                    );
+                }
             }
 
             // ── what each bench draws on ───────────────────────────────────
@@ -5116,7 +5157,12 @@ async fn ingest_layer(
                         p.add_prefill_tokens(r.stats.turn_prefill_tokens as u64);
                         persist_signatures(&mut conv, &r, &mut events, addr);
                         if let Some(rel) = mind_record::rel(mind, &doc.path) {
-                            mind_record::mark(&engine.lock().unwrap(), timeline, &rel);
+                            mind_record::mark_version(
+                                &engine.lock().unwrap(),
+                                timeline,
+                                &rel,
+                                &doc.body,
+                            );
                         }
                         // **The seal is what earns the ledger entry.** Recorded here, at the
                         // one point the document is provably a turn in the substrate, so a
@@ -5330,7 +5376,7 @@ async fn run_life(
         // needs to reach an episode by *when* rather than only by what it said.
         let timeline = conv.timeline_id();
         if let Some(r) = &rel {
-            mind_record::mark(&engine.lock().unwrap(), timeline, r);
+            mind_record::mark_version(&engine.lock().unwrap(), timeline, r, &raw);
         }
         for (key, value) in [
             ("life.date", ep.date.as_str()),

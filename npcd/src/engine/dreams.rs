@@ -29,7 +29,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use candle_conversation::projection::{Builder, SelectionRule, SelectionState};
+use candle_conversation::projection::{Builder, SelectionRule, SelectionState, TimelineId};
 use candle_conversation::{ConversationEngine, SequenceConfig, TurnOptions};
 
 use crate::engine::mind::Projected;
@@ -464,6 +464,9 @@ pub async fn keep(
     let name = format!("npc-{npc_id}-dream-{}", timeline.raw());
     {
         let engine = engine.lock().unwrap();
+        // A kept dream is recalled, never continued: it keeps its turns and no
+        // recurrent snapshot — one whole recurrent state per dream otherwise.
+        engine.mark_timeline_unresumed(timeline);
         if let Err(e) = engine.set_conversation_conv_id(timeline, &name) {
             tracing::warn!("{name}: could not be named in the log — {e:?}");
         }
@@ -531,10 +534,46 @@ pub async fn keep(
         written.len(),
         started.elapsed()
     );
+    let forgotten = forget_oldest(&engine.lock().unwrap(), npc_id);
+    if forgotten > 0 {
+        tracing::info!("npc {npc_id}: {forgotten} oldest dream(s) forgotten — {KEEP_DREAMS} kept");
+    }
     Ok(Kept {
         timeline: timeline.raw(),
         passages: written,
     })
+}
+
+/// How many of a character's dreams are kept. A character dreams for as long as
+/// it lives, and every kept dream stays a conversation with its K/V on disk —
+/// two characters had kept about seven hundred each. Recall and the axis sample
+/// draw on the newest; the oldest beyond this are forgotten.
+pub const KEEP_DREAMS: usize = 64;
+
+/// Forget `npc_id`'s oldest dreams beyond [`KEEP_DREAMS`], oldest first by
+/// creation order. Answers how many.
+pub fn forget_oldest(engine: &ConversationEngine, npc_id: u64) -> usize {
+    let mut dreams: Vec<(u64, u64, TimelineId)> = engine
+        .find_conversations_by_metadata(META_OF, &npc_id.to_string())
+        .into_iter()
+        .filter_map(|t| {
+            let (_, order) = engine.timeline_group_and_order(t)?;
+            Some((order, t.raw(), t))
+        })
+        .collect();
+    if dreams.len() <= KEEP_DREAMS {
+        return 0;
+    }
+    dreams.sort();
+    let excess = dreams.len() - KEEP_DREAMS;
+    let mut forgotten = 0;
+    for (_, _, t) in dreams.into_iter().take(excess) {
+        match engine.tombstone_timeline(t) {
+            Ok(()) => forgotten += 1,
+            Err(e) => tracing::warn!("npc {npc_id}: an old dream was not forgotten — {e:?}"),
+        }
+    }
+    forgotten
 }
 
 /// A sample of the axes this character has already dreamt along, at most `n`.

@@ -1869,6 +1869,26 @@ pub struct SnapshotPayload {
 const SNAPSHOT_PAYLOAD_VERSION: u32 = 2;
 
 impl SnapshotPayload {
+    /// The tail of a timeline that keeps no recurrent state: no layers, no aux.
+    /// Written to supersede a full snapshot nothing will read again
+    /// (`Conversation::mark_timeline_unresumed`); read back as no snapshot.
+    pub fn retired(timeline_id: u64) -> Self {
+        Self {
+            timeline_id,
+            turn_index: 0,
+            schedule_hash: 0,
+            layers: Vec::new(),
+            aux: Vec::new(),
+        }
+    }
+
+    /// Whether this is a [`Self::retired`] tail. No model writes a snapshot
+    /// with neither layers nor aux — a model with no recurrent state writes
+    /// none at all — so the shape is unambiguous.
+    pub fn is_retired(&self) -> bool {
+        self.layers.is_empty() && self.aux.is_empty()
+    }
+
     /// The exact length [`Self::encode`] produces, counted from the fields
     /// without encoding anything — what the writer's byte cap charges a queued
     /// snapshot, and what the seal's snapshot-size counter adds.
