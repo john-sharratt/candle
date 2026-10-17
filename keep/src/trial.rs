@@ -18,6 +18,14 @@
 //! it within the limit, is stopped, the set-aside file put back, and the
 //! stable file started. The limit is the caller's; production passes ten
 //! minutes.
+//!
+//! **Receiving sync data restarts the limit.** A member catching up on what
+//! the group wrote while it was away prints a syncing line ([`is_syncing`])
+//! each time more arrives, and its catch-up is as long as the backlog, not the
+//! build — a build rolled back for being behind proves nothing about the
+//! build. So the limit runs from the newest such line: a catch-up that keeps
+//! receiving is waited out, and one that stalls is rolled back the limit after
+//! its last.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -27,7 +35,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cluster::upgrade::switch::PROOF;
+use cluster::upgrade::switch::{is_syncing, PROOF};
 
 use crate::place::{discard_previous, install, restore, set_aside};
 
@@ -40,7 +48,8 @@ pub enum Verdict {
     /// [`PROOF`] was read. The process may still be running, or it may have
     /// exited after the line.
     Proven,
-    /// The limit passed with no proof line.
+    /// The limit passed with no proof line, counted from the start or from
+    /// the newest syncing line.
     TimedOut,
     /// The process exited without the proof line.
     Died,
@@ -92,18 +101,22 @@ fn launch(exe: &Path, args: &[OsString], cwd: &Path, stderr: Stdio) -> io::Resul
 }
 
 /// Read `log` — `child`'s stderr — until [`PROOF`], the limit, or the
-/// process exiting. Lines read before that are logged.
+/// process exiting. Lines read before that are logged. The limit restarts at
+/// every syncing line ([`is_syncing`]).
 pub fn watch_proof(child: &mut Child, log: &Path, limit: Duration) -> Verdict {
-    let deadline = Instant::now() + limit;
+    let mut deadline = Instant::now() + limit;
     let mut at = 0u64;
     let mut partial = String::new();
     loop {
         // Read what is there before asking whether the process has exited, so
         // a line written just before the exit is still seen.
         let exited = matches!(child.try_wait(), Ok(Some(_)));
-        if let Some(found) = read_new_lines(log, &mut at, &mut partial) {
-            if found {
+        if let Some(seen) = read_new_lines(log, &mut at, &mut partial) {
+            if seen.proven {
                 return Verdict::Proven;
+            }
+            if seen.syncing {
+                deadline = Instant::now() + limit;
             }
         }
         if exited {
@@ -116,20 +129,29 @@ pub fn watch_proof(child: &mut Child, log: &Path, limit: Duration) -> Verdict {
     }
 }
 
-/// The complete lines `log` has gained since `at`, each logged; whether one
-/// was [`PROOF`]. `None` when the file cannot be read. A line still being
-/// written waits in `partial`.
-fn read_new_lines(log: &Path, at: &mut u64, partial: &mut String) -> Option<bool> {
+/// What the lines a read found said.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Seen {
+    /// One was [`PROOF`].
+    proven: bool,
+    /// One was a syncing line ([`is_syncing`]).
+    syncing: bool,
+}
+
+/// The complete lines `log` has gained since `at`, each logged, and what they
+/// said. `None` when the file cannot be read. A line still being written
+/// waits in `partial`.
+fn read_new_lines(log: &Path, at: &mut u64, partial: &mut String) -> Option<Seen> {
     let mut file = File::open(log).ok()?;
     file.seek(SeekFrom::Start(*at)).ok()?;
     let mut reader = BufReader::new(file);
-    let mut proven = false;
+    let mut seen = Seen::default();
     let mut line = String::new();
     loop {
         line.clear();
         let n = reader.read_line(&mut line).ok()?;
         if n == 0 {
-            return Some(proven);
+            return Some(seen);
         }
         *at += n as u64;
         partial.push_str(&line);
@@ -142,7 +164,10 @@ fn read_new_lines(log: &Path, at: &mut u64, partial: &mut String) -> Option<bool
             eprintln!("keep: trial: {done}");
         }
         if done == PROOF {
-            proven = true;
+            seen.proven = true;
+        }
+        if is_syncing(&done) {
+            seen.syncing = true;
         }
     }
 }

@@ -42,6 +42,7 @@ pub mod self_heal;
 pub mod server;
 pub mod starting;
 pub mod stopping;
+pub mod syncing;
 pub mod telemetry;
 pub mod tenant;
 pub mod ui;

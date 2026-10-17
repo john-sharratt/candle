@@ -15,6 +15,19 @@ use std::path::{Path, PathBuf};
 /// does not print it.
 pub const PROOF: &str = "INFO serving";
 
+/// The line, on stderr, each time the process receives more of what the group
+/// wrote while it was away — [`SYNCING`] alone, or followed by a space and what
+/// it has caught up on. A trial still catching up has not failed, it is behind:
+/// `keep` restarts its limit at every such line, so a catch-up that keeps
+/// receiving is waited out and one that stalls runs the limit down.
+pub const SYNCING: &str = "INFO syncing";
+
+/// Whether `line` is a [`SYNCING`] line.
+pub fn is_syncing(line: &str) -> bool {
+    line.strip_prefix(SYNCING)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+}
+
 /// `keep`'s switch. It binds this address and no other.
 pub const SWITCH_PORT: u16 = 8092;
 
@@ -76,6 +89,17 @@ mod tests {
     fn the_proof_line_is_the_whole_line() {
         assert_eq!(PROOF, "INFO serving");
         assert!(!PROOF.contains('\n'));
+    }
+
+    /// A syncing line is the marker alone or the marker and what it has
+    /// received; a word that merely begins with it, or the proof, is not.
+    #[test]
+    fn a_syncing_line_is_the_marker_and_what_follows_it() {
+        assert!(is_syncing("INFO syncing"));
+        assert!(is_syncing("INFO syncing zend 1200/5000 records"));
+        assert!(!is_syncing("INFO syncingly"));
+        assert!(!is_syncing("INFO serving"));
+        assert!(!is_syncing("WARN INFO syncing"));
     }
 
     #[test]
