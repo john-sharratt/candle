@@ -140,6 +140,28 @@ async fn a_refused_record_is_not_counted_as_caught_up() {
     assert!(b.store.value(b"a/0").is_none());
 }
 
+/// **A record that never travels is learned gone, never fetched.** Fetched,
+/// it would be refused, and fetched again every try of every catch-up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_that_never_travels_is_learned_gone() {
+    let gw = gateway("gw");
+    let a = member(&[&gw], 1, store(1), MemoryVotes::new(), true);
+    until("a ready", WITHIN, || a.ready()).await;
+    for k in 0..10u32 {
+        a.store.write(format!("a/{k}").as_bytes(), b"x");
+    }
+    let local_only = store(2);
+    local_only.set_local_only(0);
+    let b = member(&[&gw], 2, local_only, MemoryVotes::new(), true);
+    until("b learned every record gone", WITHIN, || {
+        b.ready() && (1..=10).all(|q| b.store.applied().contains(1, q))
+    })
+    .await;
+    let stats = b.app.replicator().unwrap().view().stats;
+    assert_eq!(stats.refused, 0, "nothing fetched to refuse: {stats:?}");
+    assert!(b.store.value(b"a/0").is_none());
+}
+
 /// A restarted member offers what it holds; a member lacking some of it
 /// catches up from it directly (§7.5). Here A holds records of an origin
 /// that never joins.

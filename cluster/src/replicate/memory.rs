@@ -176,6 +176,8 @@ pub struct MemoryStore {
     census: Mutex<Vec<u8>>,
     /// Origins whose records it refuses, set by the tests.
     refused_origins: Mutex<Vec<u64>>,
+    /// Record types it never takes from another member, set by the tests.
+    local_only: Mutex<Vec<u8>>,
 }
 
 impl MemoryStore {
@@ -196,7 +198,17 @@ impl MemoryStore {
             full: AtomicBool::new(false),
             census: Mutex::new(Vec::new()),
             refused_origins: Mutex::new(Vec::new()),
+            local_only: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Records of `record_type` never travel to this store, as a substrate's
+    /// local-only types do not. Every record it lists is of type `0`.
+    pub fn set_local_only(&self, record_type: u8) {
+        self.local_only
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(record_type);
     }
 
     /// Refuse every record of `origin` from now on, as a store refuses one it
@@ -439,6 +451,14 @@ impl Store for MemoryStore {
         for g in gone {
             s.applied.insert(origin, g.oseq);
         }
+    }
+
+    fn travels(&self, record_type: u8) -> bool {
+        !self
+            .local_only
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&record_type)
     }
 
     fn ticket(&self) -> u64 {

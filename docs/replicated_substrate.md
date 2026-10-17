@@ -2023,6 +2023,13 @@ member's own record past every `oseq` it issued — another member holding what 
 lost. The member's clock observes every record it applies or skips, so what it writes
 next ranks above it (`persistence/remote/`).
 
+**A type that never leaves its writer is never fetched either.** A catch-up's answerer
+lists such a record gone (`persistence/listing.rs`), and a requester counts any it is
+listed gone too (`Store::travels`, whatever the answerer runs): the requester marks the
+`oseq` applied, and its applied set has no hole there. Listed as a record, it was
+fetched, refused and fetched again on every try of every catch-up — a member joining
+`.5` on 2026-10-17 refused 164 of them and caught up on nothing.
+
 **Taking the substrate lock.** Apply takes the substrate write lock once per batch and
 never nests a read inside a held guard. Windows SRW locks deadlock on that
 (`docs/shared_model_host.md`, `projection/resolver.rs` `recover_turn_chunks`).

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use applied_set::AppliedSet;
 use candle_conversation::persistence::deleted::{DeletedEntry, DeletedKey, DeletedTimeline};
 use candle_conversation::persistence::identity::VersionStamp;
-use candle_conversation::persistence::record::decode_header;
+use candle_conversation::persistence::record::{decode_header, RecordType};
 use candle_conversation::persistence::remote::RemoteOutcome;
 use candle_conversation::projection::replication::CLUSTER_PREFIX;
 use candle_conversation::projection::Conversation;
@@ -251,6 +251,10 @@ impl Store for ConversationStore {
                 "what a catch-up learned is gone was not recorded: {e}"
             );
         }
+    }
+
+    fn travels(&self, record_type: u8) -> bool {
+        !RecordType::from_tag(record_type).is_local_only()
     }
 
     fn ticket(&self) -> u64 {

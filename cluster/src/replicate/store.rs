@@ -94,6 +94,12 @@ pub trait Store: Send + Sync + 'static {
     /// tombstone's deleted-set entry is applied before anything else.
     fn gone(&self, origin: u64, gone: &[Gone]);
 
+    /// Whether a record of type `record_type` (a listed header's tag) is one
+    /// this store takes from another member. One it would refuse on arrival
+    /// — it never leaves the member that wrote it — is not fetched: a
+    /// catch-up counts it gone (`receive.rs`).
+    fn travels(&self, record_type: u8) -> bool;
+
     /// A position in the store's write queue: every record handed to the
     /// writer before this call is at or below it.
     fn ticket(&self) -> u64;

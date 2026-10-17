@@ -14,7 +14,7 @@ use super::catchup::Purpose;
 use super::replicator::{Arrival, Phase, Replicator};
 use super::store::Applied;
 use crate::fragment::Whole;
-use crate::frame::{Done, Fetch, Frame, Have, Headers};
+use crate::frame::{Done, Fetch, Frame, Gone, Have, Headers};
 
 /// The most records, and bytes, applied in one batch.
 const BATCH_RECORDS: usize = 512;
@@ -128,7 +128,23 @@ impl Replicator {
     }
 
     /// A `HEADERS` of one of this member's catch-ups.
-    async fn headers(self: &Arc<Self>, c: usize, headers: Headers) {
+    ///
+    /// A listed record of a type this store never takes is counted gone, not
+    /// wanted: fetched, it is refused, and fetched again every try of every
+    /// catch-up — a member joining `.5` on 2026-10-17 refused 164 local-only
+    /// records (the model binding, the tokenizer, branch checkpoints) and caught
+    /// up on nothing. An answerer lists such records gone itself; this holds
+    /// whatever the answerer runs.
+    async fn headers(self: &Arc<Self>, c: usize, mut headers: Headers) {
+        let (travel, stay): (Vec<_>, Vec<_>) = headers
+            .records
+            .into_iter()
+            .partition(|r| self.store.travels(r.record_type));
+        headers.records = travel;
+        headers.gone.extend(stay.into_iter().map(|r| Gone {
+            oseq: r.oseq,
+            deleted_entry: None,
+        }));
         let store = self.store.clone();
         let Ok(applied) = tokio::task::spawn_blocking(move || store.applied()).await else {
             return;
