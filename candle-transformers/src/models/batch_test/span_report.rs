@@ -11,7 +11,7 @@
 //! times accumulates exactly the sort of gap that otherwise gets inferred away.
 
 use candle::Device;
-use candle_nn::kv_cache::{region_stats, REGION_BYTES};
+use candle_nn::kv_cache::{arena_census, region_stats, REGION_BYTES};
 
 use crate::models::expert_lre::PipelineStats;
 
@@ -67,6 +67,24 @@ pub fn print_span(title: &str, experts: Option<&PipelineStats>) {
         mib(rs.live.saturating_sub(rs.span_tenant) * REGION_BYTES),
         mib(rs.span_tenant * REGION_BYTES),
     );
+    // Who stands at the frontier: a span tenant whose top is the frontier, or —
+    // when none is — a KV arena.
+    if let Ok(device) = Device::new_cuda(0) {
+        for t in arena_census(&device).iter().filter(|t| t.regions > 0) {
+            println!(
+                "        {:<15} {:>4} regions, {:>7.1} MiB held, top {}{}",
+                t.tenant.label(),
+                t.regions,
+                mib(t.held_bytes),
+                t.top,
+                if t.top == rs.live_watermark {
+                    "  ← the frontier"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
     if rs.transient_bytes > 0 {
         println!(
             "    wave tier         {:>9.1} MiB   (placed now, ceiling {} regions)",

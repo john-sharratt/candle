@@ -30,6 +30,10 @@ pub mod side_compression;
 /// The whole-card VRAM decomposition off the span's accounting, printed at each
 /// config's decode end and at the end of the run.
 pub mod span_report;
+/// The scheduler's between-forwards packing, run by the gate between decode
+/// steps.
+#[cfg(feature = "cuda")]
+pub mod span_settle;
 /// The StoryRewrite comparison form: whitespace collapsed, gendered words
 /// neutralised at any word boundary.
 ///

@@ -514,11 +514,13 @@ struct RegionPool {
     /// no spare at all. Removing the seed exposed it, and a geometric grow step
     /// made it reachable within a few waves rather than dozens.
     transient_high_water: usize,
-    /// The tier the most recent forward placed, in bytes — **not** cleared on
-    /// release. The growth negotiation leaves this much free: the forward after a
-    /// prefill chunk is the next chunk, a little deeper, and its tier stands on the
-    /// same ground (see [`Occupancy::last_tier_bytes`]).
-    last_tier_bytes: usize,
+    /// The tiers the last [`RECENT_FORWARDS`] forwards placed, in bytes, as a ring
+    /// written at [`Self::recent_at`] — **not** cleared on release. The growth
+    /// negotiation leaves the widest of them free (see
+    /// [`Occupancy::recent_tier_bytes`]).
+    recent_tiers: [usize; RECENT_FORWARDS],
+    /// Where the next forward's tier is written in [`Self::recent_tiers`].
+    recent_at: usize,
     /// Whether prompts are waiting to be prefilled, as the scheduler last said
     /// ([`set_prompts_waiting`]).
     prompts_waiting: bool,
@@ -588,6 +590,20 @@ struct RegionPool {
 /// that sync per arena. A section-quantize drain claimed eighteen regions in one
 /// pass; at a region apiece that is eighteen full device syncs.
 const KV_BUY_STEP: usize = 8;
+
+/// Forwards whose tiers the growth negotiation remembers, leaving the widest free.
+///
+/// **A step, not a forward.** A speculative decode step is several forwards of
+/// unlike width — draft forwards a few regions wide, then the verify of every
+/// block, then the next step's drafts — so the last forward's tier is a draft's
+/// as often as not. Predicting the next forward from it handed the verify's ground
+/// to the weight side between two drafts, and the verify's placement then had to
+/// buy it back mid-step: on Flash-Next at ×8, once the span was packed after the
+/// prefill, a 912 MiB verify tier refused 256 MiB short with the weight zone 84
+/// regions fuller. Sixteen covers a step at the widest draft ladder with room for
+/// a segmented sweep's forwards; a prefill's chunks are each wider than the last,
+/// so the window's widest is still the next chunk's.
+const RECENT_FORWARDS: usize = 16;
 
 fn pools() -> &'static Mutex<HashMap<usize, RegionPool>> {
     static POOLS: OnceLock<Mutex<HashMap<usize, RegionPool>>> = OnceLock::new();
@@ -1108,7 +1124,8 @@ impl RegionPool {
             transient_base: None,
             transient_bytes: 0,
             transient_high_water: 0,
-            last_tier_bytes: 0,
+            recent_tiers: [0; RECENT_FORWARDS],
+            recent_at: 0,
             prompts_waiting: false,
             waiting_tier_bytes: 0,
             tier_peak: 0,
@@ -1248,6 +1265,11 @@ impl RegionPool {
             .filter(|Reverse(i)| *i < self.region_ceiling())
             .count();
         claimable(below, self.next, self.region_ceiling())
+    }
+
+    /// The widest tier of the last [`RECENT_FORWARDS`] forwards.
+    fn recent_tier_bytes(&self) -> usize {
+        self.recent_tiers.iter().copied().max().unwrap_or(0)
     }
 
     /// Regions that are unowned but sit above the ceiling, so cannot be claimed
@@ -1477,7 +1499,7 @@ impl RegionPool {
             free_above_live: self.total.saturating_sub(self.live_watermark()),
             tier_bytes: self.transient_bytes,
             tier_high_water: self.transient_high_water,
-            last_tier_bytes: self.last_tier_bytes,
+            recent_tier_bytes: self.recent_tier_bytes(),
             waiting_tier_bytes: self.waiting_tier_bytes,
         };
         match self.growth.spare(occ, slack, REGION_BYTES) {
@@ -2098,7 +2120,8 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
         // knows a tier of this size is about to want its ground back.
         pool.transient_high_water = pool.transient_high_water.max(len);
         pool.tier_peak = pool.tier_peak.max(len);
-        pool.last_tier_bytes = len;
+        pool.recent_tiers[pool.recent_at] = len;
+        pool.recent_at = (pool.recent_at + 1) % RECENT_FORWARDS;
         if pool.prompts_waiting {
             pool.waiting_tier_bytes = pool.waiting_tier_bytes.max(len);
         }
@@ -2154,23 +2177,23 @@ pub(crate) fn release_transient(stream: &std::sync::Arc<CudaStream>) {
     });
 }
 
-/// Forget the tier the most recent forward placed, so the growth negotiation
-/// stops keeping its ground free for a forward that is not coming.
+/// Forget the tiers the recent forwards placed, so the growth negotiation stops
+/// keeping their ground free for a forward that is not coming.
 ///
-/// The negotiation leaves the last forward's tier free because, between two
-/// forwards of a prefill, the next one is a little deeper and stands on the same
-/// ground. With nothing in flight that reasoning has nothing to apply to: the
-/// work is over, and a turn whose last forward was a 128K prefill chunk — a
-/// section ingest, which decodes nothing — would otherwise hold the weight side
-/// back by that whole tier for as long as the engine sat idle. The next forward
-/// prices and places its own tier, buying back what it needs.
+/// The negotiation leaves the recent forwards' widest tier free because the next
+/// forward is one of them again: the next chunk of a prefill, a little deeper, or
+/// the next verify of a decode. With nothing in flight that reasoning has nothing
+/// to apply to: the work is over, and a turn whose last forward was a 128K prefill
+/// chunk — a section ingest, which decodes nothing — would otherwise hold the
+/// weight side back by that whole tier for as long as the engine sat idle. The
+/// next forward prices and places its own tier, buying back what it needs.
 ///
 /// A placed tier is left alone: a caller that is wrong about being outside a
 /// forward changes nothing.
-pub fn forget_last_tier(stream: &std::sync::Arc<CudaStream>) {
+pub fn forget_recent_tiers(stream: &std::sync::Arc<CudaStream>) {
     let _ = with_pool(stream, |pool| {
         if pool.transient_base.is_none() {
-            pool.last_tier_bytes = 0;
+            pool.recent_tiers = [0; RECENT_FORWARDS];
         }
         Ok(())
     });
@@ -3497,30 +3520,63 @@ mod tests {
         }
     }
 
-    /// A settled device forgets the last forward's tier, so the growth
-    /// negotiation stops holding its ground free — and a tier still standing is
+    /// A settled device forgets the recent forwards' tiers, so the growth
+    /// negotiation stops holding their ground free — and a tier still standing is
     /// not forgotten under it.
     #[test]
-    fn a_settled_device_forgets_the_last_forwards_tier() -> Result<()> {
+    fn a_settled_device_forgets_the_recent_forwards_tiers() -> Result<()> {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
-        let last = || -> Result<usize> { with_pool(&s, |p| Ok(p.last_tier_bytes)) };
+        let recent = || -> Result<usize> { with_pool(&s, |p| Ok(p.recent_tier_bytes())) };
+        // The pool is process-wide: start from no remembered tier.
+        super::forget_recent_tiers(&s);
 
         place_transient(&s, 4 * REGION_BYTES)?;
-        super::forget_last_tier(&s);
+        super::forget_recent_tiers(&s);
         assert_eq!(
-            last()?,
+            recent()?,
             4 * REGION_BYTES,
             "a standing tier is not forgotten"
         );
         release_transient(&s);
         assert_eq!(
-            last()?,
+            recent()?,
             4 * REGION_BYTES,
             "the release keeps it for the next forward"
         );
-        super::forget_last_tier(&s);
-        assert_eq!(last()?, 0, "settled, nothing is coming");
+        super::forget_recent_tiers(&s);
+        assert_eq!(recent()?, 0, "settled, nothing is coming");
+        Ok(())
+    }
+
+    /// **A verify's tier outlives the drafts after it.** A decode step places
+    /// one wide verify tier and several narrow draft tiers; the negotiation must
+    /// keep the verify's ground free across the drafts, or the next verify buys
+    /// it back mid-step. It is forgotten only once a window's worth of forwards
+    /// has passed without it.
+    #[test]
+    fn a_wide_tier_is_kept_across_the_narrow_forwards_after_it() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let recent = || -> Result<usize> { with_pool(&s, |p| Ok(p.recent_tier_bytes())) };
+        let place = |regions: usize| -> Result<()> {
+            place_transient(&s, regions * REGION_BYTES)?;
+            release_transient(&s);
+            Ok(())
+        };
+        super::forget_recent_tiers(&s);
+        place(6)?;
+        for _ in 0..super::RECENT_FORWARDS - 1 {
+            place(1)?;
+            assert_eq!(recent()?, 6 * REGION_BYTES, "the verify's tier is kept");
+        }
+        place(1)?;
+        assert_eq!(
+            recent()?,
+            REGION_BYTES,
+            "a window of narrow forwards later, it is not"
+        );
+        super::forget_recent_tiers(&s);
         Ok(())
     }
 

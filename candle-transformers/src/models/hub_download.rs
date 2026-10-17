@@ -44,6 +44,16 @@ fn download_cache() -> PathBuf {
 }
 
 /// Where a download of `filename` of `repo` lands.
+/// Whether downloads are refused — see [`set_offline`].
+static OFFLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Refuse every download from now on (or allow them again): what is cached
+/// still loads, nothing new is fetched. The host turns it with its own network
+/// switch, which this crate cannot see.
+pub fn set_offline(offline: bool) {
+    OFFLINE.store(offline, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub fn download_path(repo: &Repo, filename: &str) -> PathBuf {
     download_cache()
         .join(repo.folder_name())
@@ -72,6 +82,11 @@ pub fn download(url: &str, dest: &Path) -> Result<PathBuf> {
     }
     if dest.exists() {
         return Ok(dest.to_path_buf());
+    }
+    if OFFLINE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(err(format!(
+            "downloading {url}: this machine is offline — only what the caches hold loads"
+        )));
     }
     let tmp = dest.with_extension("part");
 

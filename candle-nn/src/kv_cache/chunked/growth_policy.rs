@@ -199,8 +199,8 @@ pub struct Occupancy {
     pub free_above_live: usize,
     /// The transient tier's current footprint, bytes.
     pub tier_bytes: usize,
-    /// The tier the most recent forward stood, bytes — what the next forward's is
-    /// expected to need again, and so ground the negotiation leaves free.
+    /// The widest tier the recent forwards stood, bytes — what the next forward's
+    /// is expected to need again, and so ground the negotiation leaves free.
     ///
     /// **The next forward's tier, by its best predictor.** A prefill runs as a run
     /// of forwards a chunk apart, each tier a little wider than the last; the
@@ -209,13 +209,16 @@ pub struct Occupancy {
     /// bought it straight back. Measured on Flash-Next's 128K prefill: a compaction
     /// between forwards lowered the live count, the negotiation granted 1,631 slots,
     /// and the next placement conceded 1,877 — twice per turn, each a pair of
-    /// boundary moves. A decode's tier is a few regions, so once the prefill is done
-    /// the weight side grows back into everything the prefill's tier held.
-    pub last_tier_bytes: usize,
+    /// boundary moves. **Recent forwards, not the last one**, because a speculative
+    /// decode step alternates narrow draft forwards with a wide verify: read off the
+    /// last forward alone, a draft handed the verify's ground away. A decode's tiers
+    /// are a few regions to a verify's width, so once the prefill has left the
+    /// window the weight side grows back into everything its tier held.
+    pub recent_tier_bytes: usize,
     /// The widest tier stood since prompts began waiting, bytes — zero while none
     /// wait ([`super::region_pool::set_prompts_waiting`]).
     ///
-    /// **The next prefill's tier, while one is coming.** `last_tier_bytes` predicts
+    /// **The next prefill's tier, while one is coming.** `recent_tier_bytes` predicts
     /// the next forward from the last one, which holds within a prefill and fails
     /// between two: an engine ingesting runs one wide prefill forward, then a dozen
     /// decode forwards of a few regions each, then the next prefill. After the first
@@ -349,12 +352,12 @@ impl GrowthPolicy {
         // the tier need not be deducted since `ceiling_blocked` *is* the tier's
         // ground. It is, during a wave — and never at the one moment this runs.
         //
-        // **So the next forward's tier is deducted, by the last forward's**
-        // (`last_tier_bytes`). Deducting `transient_high_water` was tried and is
-        // worse: it is the widest tier the process ever stood (up to the full
+        // **So the next forward's tier is deducted, by the recent forwards'
+        // widest** (`recent_tier_bytes`). Deducting `transient_high_water` was tried
+        // and is worse: it is the widest tier the process ever stood (up to the full
         // reservation), not the next one's price, and on the 27B it cut applied
-        // grants from 17 to 4 and cost five layers of residency. The last tier is
-        // the next one's price within a prefill, and a few regions once decoding.
+        // grants from 17 to 4 and cost five layers of residency. The recent widest
+        // is the next one's price within a prefill, and a verify's once decoding.
         //
         // **And while prompts wait, the next prefill's tier** — the widest stood
         // since they began waiting ([`Occupancy::waiting_tier_bytes`]) — whichever
@@ -365,7 +368,7 @@ impl GrowthPolicy {
         // whichever is larger** — see [`FreeRegionTarget`]. Taking the KV side below
         // what its own relief frees to is taking ground relief will buy straight
         // back.
-        let next_tier = occ.last_tier_bytes.max(occ.waiting_tier_bytes);
+        let next_tier = occ.recent_tier_bytes.max(occ.waiting_tier_bytes);
         let keep =
             slack.max(occ.kv_target.relieved(occ.total)) + next_tier.div_ceil(region_bytes.max(1));
         let by_occupancy = occ.free_below_ceiling + occ.ceiling_blocked;
@@ -398,7 +401,7 @@ mod tests {
             ceiling_blocked: 0,
             free_above_live: free,
             tier_bytes: 0,
-            last_tier_bytes: 0,
+            recent_tier_bytes: 0,
             waiting_tier_bytes: 0,
             tier_high_water: 0,
         }
@@ -413,7 +416,7 @@ mod tests {
     fn the_next_prefills_tier_is_left_free_while_prompts_wait() {
         let mut p = GrowthPolicy::new();
         let prefill = Occupancy {
-            last_tier_bytes: 300 * R,
+            recent_tier_bytes: 300 * R,
             waiting_tier_bytes: 300 * R,
             ..steady(100, 400)
         };
@@ -424,14 +427,14 @@ mod tests {
         // still the prefill's ground stays where it is.
         for _ in 0..12 {
             let decode = Occupancy {
-                last_tier_bytes: 2 * R,
+                recent_tier_bytes: 2 * R,
                 ..prefill
             };
             assert_eq!(p.spare(decode, 32, R), Ok(400 - 300 - 32));
         }
         // The backlog is gone: the decode's tier is all that stays free.
         let drained = Occupancy {
-            last_tier_bytes: 2 * R,
+            recent_tier_bytes: 2 * R,
             waiting_tier_bytes: 0,
             ..prefill
         };
@@ -440,13 +443,13 @@ mod tests {
 
     /// **The prefill churn, closed.** Between two prefill forwards the first
     /// one's tier has been released, and its ground read as spare; the weight
-    /// side took it and the next placement bought it back. The last forward's
-    /// tier is left free, and only what lies beyond it is offered.
+    /// side took it and the next placement bought it back. The recent forwards'
+    /// widest tier is left free, and only what lies beyond it is offered.
     #[test]
-    fn the_last_forwards_tier_is_left_free() {
+    fn the_recent_forwards_tier_is_left_free() {
         let mut p = GrowthPolicy::new();
         let occ = Occupancy {
-            last_tier_bytes: 300 * R,
+            recent_tier_bytes: 300 * R,
             ..steady(100, 400)
         };
         let _ = p.spare(occ, 32, R);
@@ -454,7 +457,7 @@ mod tests {
         assert_eq!(p.spare(occ, 32, R), Ok(400 - 300 - 32));
         // A tier wider than the gap leaves nothing to take.
         let wide = Occupancy {
-            last_tier_bytes: 380 * R,
+            recent_tier_bytes: 380 * R,
             ..steady(100, 400)
         };
         assert_eq!(p.spare(wide, 32, R), Err(Refusal::Occupied));
@@ -543,7 +546,7 @@ mod tests {
             ceiling_blocked: 80,
             free_above_live: 100,
             tier_bytes: 0,
-            last_tier_bytes: 0,
+            recent_tier_bytes: 0,
             waiting_tier_bytes: 0,
             tier_high_water: 57 * R,
         };
@@ -578,7 +581,7 @@ mod tests {
             ceiling_blocked: 0,
             free_above_live: 587 - 199,
             tier_bytes: 0,
-            last_tier_bytes: 0,
+            recent_tier_bytes: 0,
             waiting_tier_bytes: 0,
             tier_high_water: 0,
         };
@@ -600,7 +603,7 @@ mod tests {
             ceiling_blocked: 0,
             free_above_live: 20,
             tier_bytes: 0,
-            last_tier_bytes: 0,
+            recent_tier_bytes: 0,
             waiting_tier_bytes: 0,
             tier_high_water: 0,
         };

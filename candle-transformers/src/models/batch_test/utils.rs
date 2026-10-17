@@ -26,6 +26,8 @@ use crate::models::batch_test::greedy::{greedy_token, live_vocab, token_ids};
 use crate::models::batch_test::host_ram_report::{print_host_ram, print_host_ram_line};
 use crate::models::batch_test::side_compression::{print_side_table, SideCompression};
 use crate::models::batch_test::span_report::print_span;
+#[cfg(feature = "cuda")]
+use crate::models::batch_test::span_settle::SpanSettler;
 use crate::models::batch_test::story_normalize::normalize_story;
 #[cfg(feature = "cuda")]
 use crate::models::batch_test::vram_wave_log::VramWaveLog;
@@ -2433,6 +2435,8 @@ impl TestParams {
         // One chooser for the run, so the buffer its picks land in is held
         // across steps rather than made per step.
         let mut chooser = GreedyChooser::new(live);
+        #[cfg(feature = "cuda")]
+        let mut settler = SpanSettler::default();
         let t_spec = std::time::Instant::now();
         // Wall time of each step. A step returns its emitted tokens to the host,
         // so it is complete when the call returns, and the first one is the
@@ -2495,6 +2499,18 @@ impl TestParams {
                 }
             }
             emitted += idxs.iter().map(|&i| runs[i].output.len()).sum::<usize>() - before;
+            // Between forwards, as a scheduler does on every wave: pack what the
+            // last forward left and let the weight side take it. The first decode
+            // step is the one that hands the prefill scratch back, so its holes
+            // appear here. Inside the step's clock, which is where a daemon pays.
+            #[cfg(feature = "cuda")]
+            if let Some(settled) = settler.settle(session, model)? {
+                if settled.frontier_after < settled.frontier_before
+                    || settled.weight_bytes_after > settled.weight_bytes_before
+                {
+                    println!("{}", settled.line());
+                }
+            }
             step_ms.push(t_step.elapsed().as_secs_f64() * 1e3);
         }
         let secs = t_spec.elapsed().as_secs_f64();

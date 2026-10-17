@@ -16,7 +16,7 @@
 //! them for as long as the passes took.
 
 use candle::Device;
-use candle_nn::kv_cache::{end_wave_transient, forget_last_tier};
+use candle_nn::kv_cache::{end_wave_transient, forget_recent_tiers};
 
 use super::compaction_stall::FrontierPass;
 use super::interleave::reseed_achievable_weight;
@@ -95,7 +95,7 @@ impl Scheduler {
         if let Device::Cuda(d) = self.session.device() {
             let stream = d.cuda_stream();
             end_wave_transient(&stream);
-            forget_last_tier(&stream);
+            forget_recent_tiers(&stream);
         }
         let mut arenas_released = self.session.release_empty_arenas().unwrap_or(0);
         // Lower the frontier as far as the tenants standing at it allow: each pass is

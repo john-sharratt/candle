@@ -325,6 +325,13 @@ async fn fetch(
     size_hint: Option<u64>,
     status: &Sender<String>,
 ) -> anyhow::Result<()> {
+    // Offline, the caches are all there is (`cluster::offline`).
+    if ::cluster::offline::is_offline() {
+        anyhow::bail!(
+            "{}",
+            ::cluster::offline::refused(&format!("downloading {url}"))
+        );
+    }
     let part = dest.with_extension("part");
     if part.exists() {
         tokio::fs::remove_file(&part).await.ok();
