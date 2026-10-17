@@ -61,6 +61,7 @@ use candle_nn::kv_cache::{
     rewrite_sealed, try_hold_chunk_locations, FormatCensus, QuantFormat, SealedSequence, Sweep,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::conversation::window_sealed_tokens;
@@ -3491,7 +3492,7 @@ impl Substrate {
         beta: f32,
         min_momentum: f32,
         limits: Limits,
-        max_admits: usize,
+        max_admits: NonZeroUsize,
     ) {
         let mut ws = self.working_sets.remove(&target).unwrap_or_default();
         ws.observe(fresh, beta, min_momentum, limits, max_admits, &|timeline| {
@@ -8169,7 +8170,7 @@ mod tests {
             0.2,
             100.0,
             ws_limits(1000),
-            usize::MAX,
+            NonZeroUsize::MAX,
         );
         assert_eq!(sub.working_set(target).unwrap().members().len(), 3);
         for r in &reads {

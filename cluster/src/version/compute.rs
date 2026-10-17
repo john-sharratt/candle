@@ -5,10 +5,23 @@
 //! - `count`: commits on `origin/main` that HEAD contains — the commit count of
 //!   `git merge-base HEAD origin/main`. A local commit does not move it.
 //! - `hash`: that merge base, short.
-//! - `local`: empty exactly at the merge base; otherwise the first 16 hex digits
-//!   of a SHA-256 over the commits HEAD has that `origin/main` does not, the
-//!   uncommitted diff, and every untracked file `git status` reports, by path
-//!   and contents.
+//! - `local`: empty when the **build's inputs** are exactly the merge base's;
+//!   otherwise the first 16 hex digits of a SHA-256 over how they differ — the
+//!   working tree's diff against the merge base, and every untracked input file,
+//!   by path and contents.
+//!
+//! **The inputs, not the checkout.** The build's inputs are the workspace's
+//! `Cargo.toml` and `Cargo.lock` and every workspace crate's directory
+//! ([`build_inputs`]). A file outside them — a doc, an editor's or a harness's
+//! lock file — cannot change the binary, so it cannot make a build local: a
+//! checkout whose only change was a tool's lock file used to report a local
+//! build at a clean commit.
+//!
+//! **The content, not the route to it.** The diff is taken against the merge
+//! base, not built from HEAD's commits, so the same sources on the same base
+//! are the same `local` however they were reached — committed locally, left
+//! uncommitted, or built again. Sources committed and pushed as they were built
+//! are a clean build at the new count.
 //!
 //! A tree with no git, or no `origin/main`, has no count to give: it is count
 //! 0, hash `none`, and a local build named by everything it can see.
@@ -55,26 +68,34 @@ pub fn compute(root: &Path) -> Version {
         None => (0, "none".into()),
     };
 
+    let inputs = build_inputs(root);
+    let scoped = |args: &[&str]| -> Option<Vec<u8>> {
+        let mut all: Vec<&str> = args.to_vec();
+        all.push("--");
+        all.extend(inputs.iter().map(String::as_str));
+        git(root, &all)
+    };
     let mut digest = Sha256::new();
     let mut beyond = false;
-    let ahead = if base.is_some() {
-        git(root, &["rev-list", "origin/main..HEAD"]).unwrap_or_default()
-    } else {
-        git(root, &["rev-list", "HEAD"]).unwrap_or_else(|| b"no git".to_vec())
+    // With no base there is nothing to diff against: the build is named by
+    // HEAD's history, as far as there is one.
+    let against = match &base {
+        Some(base) => base.clone(),
+        None => {
+            beyond = true;
+            digest.update(b"commits\0");
+            digest.update(git(root, &["rev-list", "HEAD"]).unwrap_or_else(|| b"no git".to_vec()));
+            "HEAD".to_string()
+        }
     };
-    if !ahead.is_empty() || base.is_none() {
-        beyond = true;
-        digest.update(b"commits\0");
-        digest.update(&ahead);
-    }
-    let diff = git(root, &["diff", "HEAD", "--binary"]).unwrap_or_default();
+    let diff = scoped(&["diff", &against, "--binary"]).unwrap_or_default();
     if !diff.is_empty() {
         beyond = true;
         digest.update(b"diff\0");
         digest.update(&diff);
     }
     let untracked =
-        git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
+        scoped(&["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
     for path in untracked.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         beyond = true;
         digest.update(b"untracked\0");
@@ -94,6 +115,35 @@ pub fn compute(root: &Path) -> Version {
         String::new()
     };
     Version { count, hash, local }
+}
+
+/// The workspace's crate directories, by name, in order: every directory at
+/// the root with a `Cargo.toml`, except `target/` and the hidden ones.
+fn crate_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut crates: Vec<PathBuf> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name != "target" && !name.starts_with('.') && p.join("Cargo.toml").is_file()
+        })
+        .collect();
+    crates.sort();
+    crates
+}
+
+/// What a build is made from, as git pathspecs relative to the root: the
+/// workspace's `Cargo.toml` and `Cargo.lock`, and every crate's directory.
+pub fn build_inputs(root: &Path) -> Vec<String> {
+    let mut inputs = vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()];
+    inputs.extend(
+        crate_dirs(root)
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_string)),
+    );
+    inputs
 }
 
 /// What the build script reruns on: git's HEAD, the refs HEAD and
@@ -130,19 +180,9 @@ pub fn rerun_paths(root: &Path) -> Vec<PathBuf> {
             paths.push(common.join(r));
         }
     }
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            name != "target" && !name.starts_with('.') && p.join("Cargo.toml").is_file()
-        })
-        .collect();
-    crates.sort();
     paths.push(root.join("Cargo.toml"));
-    for dir in crates {
+    paths.push(root.join("Cargo.lock"));
+    for dir in crate_dirs(root) {
         paths.push(dir.join("Cargo.toml"));
         paths.push(dir.join("src"));
         for ui in ["web", "content"] {

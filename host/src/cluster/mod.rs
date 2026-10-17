@@ -220,6 +220,24 @@ impl Cluster {
             .enable_all()
             .build()
             .map_err(|e| anyhow::anyhow!("could not start the cluster socket runtime: {e}"))?;
+        // A watchdog on that runtime: a reader it does not poll for 45 s closes
+        // both apps' sockets as "no frame from the gateway", and nothing else
+        // says the runtime was the one that stalled.
+        sockets.spawn(async {
+            const EVERY: Duration = Duration::from_millis(500);
+            let mut last = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(EVERY).await;
+                let late = last.elapsed().saturating_sub(EVERY);
+                if late >= Duration::from_secs(2) {
+                    tracing::warn!(
+                        late_ms = late.as_millis() as u64,
+                        "the cluster socket runtime was not polled on time"
+                    );
+                }
+                last = std::time::Instant::now();
+            }
+        });
         Ok(Arc::new(Cluster {
             targets,
             agent,
@@ -280,6 +298,11 @@ impl Cluster {
 
     pub fn build(&self) -> &BuildId {
         &self.build
+    }
+
+    /// This machine's name, as its `HELLO` gives it.
+    pub fn host(&self) -> &str {
+        &self.settings.host
     }
 
     /// The router gateway requests are served by, once the server built it.
@@ -621,7 +644,19 @@ impl Join {
         loop {
             progress(&r.catchups());
             let ready = r.caught_up() && r.phase() == Phase::Joined;
-            if ready || self.link.state() == Link::CutOff || cancelled() {
+            if ready || cancelled() {
+                return;
+            }
+            // Cut off before catching up: the load goes on detached, and the
+            // catch-up resumes once a gateway admits it again. Said, because
+            // the step reads done either way.
+            if self.link.state() == Link::CutOff {
+                let catchups = r.catchups();
+                tracing::warn!(
+                    behind = %view::catchup_detail(&catchups),
+                    "cut off before catching up — loading on detached; the catch-up resumes \
+                     once rejoined"
+                );
                 return;
             }
             sleep(CONNECTING_POLL);

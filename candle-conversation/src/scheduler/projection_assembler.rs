@@ -839,6 +839,22 @@ fn block_count_of(
         })
 }
 
+/// How many blocks of `parent_id` hold content — the count a record of where
+/// the slot stood after a piece keeps
+/// (`BatchedInferenceSession::sequence_content_block_count`): a glue gap
+/// leaves an empty writer chunk behind it, which the next piece fills.
+fn content_block_count_of(
+    ctx: &ApplyContext<'_>,
+    parent_id: SequenceId,
+) -> Result<usize, ConversationError> {
+    ctx.session
+        .sequence_content_block_count(parent_id.0)
+        .map_err(ConversationError::Model)?
+        .ok_or_else(|| {
+            ConversationError::Channel(format!("apply_segments: slot {} not in session", parent_id))
+        })
+}
+
 /// Build phase: snapshot the writer tail, truncate, then walk the segments —
 /// injecting the sealed prefix and collecting all glue as the new region with
 /// each column's TRUE logical position. Reserves the glue writer chunk but does
@@ -912,7 +928,9 @@ pub(super) fn apply_segments_build(
     // cut back to the end of that run — K/V, index and token log together — and
     // only the rest is walked. A projection whose selection moved at the end
     // costs the end, not the whole prefix (`super::piece_identity`).
+    let t_identities = std::time::Instant::now();
     let identities = {
+        let _g = profile::span("apply:identities");
         let read = ctx.conversation.read();
         let slot_timeline = ctx.slot_target.map(|t| t.timeline);
         let mut newest: HashMap<TimelineId, Option<TurnIndex>> = HashMap::new();
@@ -947,6 +965,7 @@ pub(super) fn apply_segments_build(
             },
         )
     };
+    let identities_us = t_identities.elapsed().as_micros() as u64;
     // A record is trusted only while the slot still reaches its end: anything
     // that cut the slot shorter since has taken the kept pieces with it.
     let slot_blocks = block_count_of(ctx, parent_id)?;
@@ -990,6 +1009,8 @@ pub(super) fn apply_segments_build(
         "apply_segments: kept prefix"
     );
     state.placed_pieces.truncate(keep);
+    let t_cut = std::time::Instant::now();
+    let cut_span = profile::span("apply:cut_to_kept");
     let mut prefix_h = DefaultHasher::new();
     match state.placed_pieces.last() {
         None => {
@@ -1025,6 +1046,11 @@ pub(super) fn apply_segments_build(
         }
     }
     walker.kept_pieces = keep;
+    cut_span.end();
+    let cut_us = t_cut.elapsed().as_micros() as u64;
+    // Per piece kind: microseconds walked and pieces walked.
+    let mut walk_us = [0u64; 3];
+    let mut walked = [0usize; 3];
     // ── Island-cache keying: a rolling hash over the CONTENT identity of every
     // piece the walk has placed so far. A glue island's K/V is a function of its
     // own tokens, its (backward-unbounded) attended prefix, and — when its
@@ -1067,8 +1093,15 @@ pub(super) fn apply_segments_build(
     check_drift(ctx, &walker, &|| "kept prefix".to_string());
     for i in keep..pieces.len() {
         let pos_before = walker.logical_pos;
+        let t_piece = std::time::Instant::now();
+        let kind = match &pieces[i] {
+            AssembledPiece::Section(_) => 0,
+            AssembledPiece::Turn { .. } | AssembledPiece::TurnHalf { .. } => 1,
+            AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) => 2,
+        };
         match &pieces[i] {
             AssembledPiece::Glue(tokens) => {
+                let _g = profile::span("apply:glue_island");
                 // Causal-only dialects (DeepSeek) drop the forward bridge — glue
                 // attends backward-unbounded only (§E), matching the paged-glue
                 // kernel's `fwd_ahead ≡ 0` contract.
@@ -1206,6 +1239,7 @@ pub(super) fn apply_segments_build(
                 prefix_h.write_u32(fwd);
             }
             AssembledPiece::Section(id) => {
+                let _g = profile::span("apply:inject_section");
                 let t = std::time::Instant::now();
                 inject_sealed_section(ctx, &mut walker, *id)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
@@ -1226,6 +1260,7 @@ pub(super) fn apply_segments_build(
                 role,
                 timeline,
             } => {
+                let _g = profile::span("apply:inject_turn");
                 let t = std::time::Instant::now();
                 inject_sealed_turn(ctx, &mut walker, *timeline, *group, *index, *role)?;
                 super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
@@ -1261,12 +1296,30 @@ pub(super) fn apply_segments_build(
         if !matches!(pieces[i], AssembledPiece::DeferredUser(_)) {
             state.placed_pieces.push(PlacedPiece {
                 identity: identities[i],
-                blocks_after: block_count_of(ctx, parent_id)?,
+                blocks_after: content_block_count_of(ctx, parent_id)?,
                 pos_after: walker.logical_pos,
                 prefix_h: prefix_h.clone(),
             });
         }
+        walk_us[kind] += t_piece.elapsed().as_micros() as u64;
+        walked[kind] += 1;
     }
+    // What the rebuild cost, by what it walked — a kept prefix is free, and every
+    // piece past it is re-injected.
+    tracing::debug!(
+        target: "candle_conversation::scheduler::reproject",
+        slot = parent_id.0,
+        identities_us,
+        cut_us,
+        sections_us = walk_us[0],
+        sections = walked[0],
+        turns_us = walk_us[1],
+        turns = walked[1],
+        glue_us = walk_us[2],
+        glue = walked[2],
+        kept = keep,
+        "apply split"
+    );
 
     // Convention assert: the slot's chunks were built in logical order (gaps
     // reserved in place), so the slot offset (Σ chunk usage) must equal the
@@ -1326,9 +1379,11 @@ pub(super) fn apply_segments_build(
     // (a stratified QSA selection ranks it in every window). Read from the
     // placement records before an incomplete assembly clears them.
     let prompt_end = prompt_end_of(&pieces, &state.placed_pieces);
+    let prompt_span = profile::span("apply:set_selection_prompt");
     ctx.model
         .set_selection_prompt(parent_id.0, prompt_end as usize)
         .map_err(ConversationError::Model)?;
+    prompt_span.end();
 
     let complete = walker.skipped_turns == 0 && walker.skipped_sections == 0;
     // A slot missing a piece its list names does not hold what the list
@@ -2820,6 +2875,7 @@ mod tests {
         GroupId, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId, WorkingSetShare,
     };
     use crate::working_set::Limits;
+    use std::num::NonZeroUsize;
 
     fn tl(raw: u64) -> TimelineId {
         TimelineId::from_raw(raw).expect("timeline id")
@@ -2891,7 +2947,7 @@ mod tests {
             0.2,
             100.0,
             limits,
-            usize::MAX,
+            NonZeroUsize::MAX,
         );
         let target = ProjectionTarget {
             layer,

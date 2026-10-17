@@ -1,11 +1,15 @@
 use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
+use super::creep_slice::next_layer_row_cost;
 use super::prefill::{VramPhase, LOAD_TARGET};
 use super::vram_bands::vram_bands;
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use candle::DeviceLocation;
-use candle_nn::kv_cache::{is_tier_refusal, region_stats, set_kv_free_target, span_partition};
+use candle_nn::kv_cache::{
+    is_tier_refusal, region_stats, set_kv_free_target, set_prompts_waiting, span_partition,
+};
+use std::process::exit;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
@@ -90,6 +94,10 @@ const MAX_DECODE_STEPS: usize = 256;
 /// stalls an agent loop rather than a status line.
 const CLEANUP_DEFER: Duration = Duration::from_millis(100);
 
+/// The process exit status when the engine can serve nothing again — the expert
+/// pipeline has exited. `EX_SOFTWARE`: an internal fault, not a usage error.
+const ENGINE_DEAD_EXIT: i32 = 70;
+
 /// Whether finished turns are cleaned up after this decode step: at once when one
 /// of them is `urgent` (it wrote a tool call), once nothing is left decoding, or
 /// once the earliest of them has waited [`CLEANUP_DEFER`].
@@ -105,24 +113,72 @@ fn cleanup_due(
     }
 }
 
-/// The decode time a quantum owes after a step that also carried the prefill
-/// creep, given that step's duration and the airtime ratio `R` the creep yielded
-/// to (the ratio of the decodes that outrank it): never less than a
-/// [`WAVE_SLICE`], and at least the step's own length over `R`.
+/// The decode-only airtime a step that also carried the prefill creep owes
+/// before the creep may ride again: the creep's share of the step — its length
+/// `step` less what a decode-only step takes now (`decode_only`) — times the
+/// airtime ratio `R` the creep yielded to (the ratio of the decodes that
+/// protect themselves from it — `prefill::throttle_ratio`). Decode gets `R`
+/// times the creep's airtime.
 ///
-/// **A co-batched step must not use up the slice it ran in.** The creep folds
-/// into a quantum's first step, and at `R = 1` (nothing outranks it — an ingest
-/// beside its own turns, or a second conversation beside the first) it takes
-/// every layer of an 8K-token chunk: 4.2 s at depth, past a 2 s slice, so the
-/// quantum returned after that one step and the next one co-batched again.
-/// Measured in zend: 24 of 135 steps carried the creep and took 100 s of a 120 s
-/// window — eight sessions decoding ~14% of the time where `R = 1` means equal
-/// airtime. Owing the step's length over `R` restores that ratio; a creep held
-/// back by an outranking decode is a few layers, its step is short, and the
-/// slice it gets is the one it always had.
-fn decode_owed_after_cobatched(step: Duration, ratio: u32) -> Duration {
-    WAVE_SLICE.max(step / ratio.max(1))
+/// **A co-batched step must not take decode's share of the device.** At `R = 1`
+/// (no decode protects itself from the creep — an ingest beside its own turns)
+/// a step carries every layer of an 8K-token
+/// chunk: 4.2 s at depth. Measured in zend, with the creep riding every step it
+/// could: 24 of 135 steps carried it and took 100 s of a 120 s window — eight
+/// sessions decoding ~14% of the time where `R = 1` means equal airtime.
+///
+/// **And the debt is paid in decode steps, not in quanta.** Paying it by letting
+/// the creep ride only a quantum's first step held a prefill to one advance per
+/// [`WAVE_SLICE`] whenever anything decoded: an 8K chunk that runs in 120 ms
+/// went once every 2 s, and a turn's tool result waited out the rest of another
+/// conversation's slice before its prefill moved — 2 s of nothing between the
+/// turns of a live dialogue, and an ingest of 30 workers finishing 0.7 folders a
+/// minute. Owed by the step, the creep rides again as soon as decode has had its
+/// share.
+///
+/// **The creep's share, not the step's length over `R`.** Owing `step / R`
+/// assumed the creep's `N / R` layers were a sliver of a step; at depth they are
+/// not. One layer of an eight-member ingest group at 300K positions cost ~40 ms
+/// beside a ~30 ms chat decode, and at `R = 64` it owed 1 ms — so it rode every
+/// step, and a `High` dialogue decoded 13–15 steps a second where it ran 33
+/// alone (`.5`, 2026-10-17). The share times `R` is what `R` says: beside a
+/// dialogue that ingest rides about once in 65 steps' worth of decode airtime,
+/// and at full speed once the dialogue stops decoding. With no decode-only step
+/// measured yet the whole step counts as the creep's, which errs toward decode.
+fn creep_owed_after(step: Duration, decode_only: Option<Duration>, ratio: u32) -> Duration {
+    let share = step.saturating_sub(decode_only.unwrap_or(Duration::ZERO));
+    share * ratio.max(1)
 }
+
+/// The airtime decode is owed after a step of length `step`: what a step that
+/// carried the creep or a section chunk owes (`creep_owed_after`), or what was
+/// owed less a step that did not.
+fn next_creep_owed(
+    owed: Duration,
+    step: Duration,
+    carried: bool,
+    decode_only: Option<Duration>,
+    ratio: u32,
+) -> Duration {
+    if carried {
+        creep_owed_after(step, decode_only, ratio)
+    } else {
+        owed.saturating_sub(step)
+    }
+}
+
+/// What a decode-only step takes now, after one more of length `step`: an
+/// exponential average weighting the newest by [`DECODE_ONLY_WEIGHT`], so it
+/// follows the decode width and depth within a few steps.
+fn next_decode_only(avg: Option<Duration>, step: Duration) -> Duration {
+    match avg {
+        None => step,
+        Some(a) => a.mul_f64(1.0 - DECODE_ONLY_WEIGHT) + step.mul_f64(DECODE_ONLY_WEIGHT),
+    }
+}
+
+/// The newest decode-only step's weight in [`next_decode_only`].
+const DECODE_ONLY_WEIGHT: f64 = 0.25;
 
 impl Scheduler {
     /// Number of currently-active decode sequences (including summary probes).
@@ -194,7 +250,7 @@ impl Scheduler {
         }
         self.wave_stats
             .add_phase(WavePhase::Reproject, t_reproj0.elapsed().as_millis() as u64);
-        let mut deadline = Instant::now() + WAVE_SLICE;
+        let deadline = Instant::now() + WAVE_SLICE;
         let mut steps = 0usize;
         // When this quantum first saw a finished turn it has not yet cleaned up —
         // the clock `CLEANUP_DEFER` runs on.
@@ -222,12 +278,25 @@ impl Scheduler {
             }
             {
                 let _g = profile::span("loop:decode:step");
+                // Every step is a wave: the creep and a section chunk ride it
+                // whenever decode has been paid what the last co-batched step
+                // owed it (`creep_owed_after`), so work admitted mid-quantum
+                // joins the next step rather than the next quantum. A `High`
+                // creep beside a `High` decode also waits out its token debt
+                // (`same_band_owed`).
+                let owed = !self.creep_owed.is_zero() || self.same_band_owed();
+                self.wave_cohort_advanced = owed;
+                self.wave_section_advanced = owed;
                 // Reset before the step so a step that runs no wave reads as
                 // decode-only, then filed by the shape the wave turned out to be.
                 self.wave_cobatched = false;
+                self.wave_step_token_paced = false;
+                self.wave_step_creep_layer_rows = 0;
+                let generated = self.decode_tokens_generated();
                 let t_step = Instant::now();
                 self.batch_decode_step();
                 let step = t_step.elapsed();
+                self.pay_same_band_debt(self.decode_tokens_generated().saturating_sub(generated));
                 profile::record(
                     if self.wave_cobatched {
                         "decode:cobatched:step"
@@ -236,11 +305,32 @@ impl Scheduler {
                     },
                     step,
                 );
-                // The creep's share of a co-batched step is prefill airtime, not
-                // the decode's — see `decode_owed_after_cobatched`.
-                if self.wave_cobatched {
-                    let owed = decode_owed_after_cobatched(step, self.wave_step_ratio);
-                    deadline = deadline.max(Instant::now() + owed);
+                // Glue rides every step it is due and is a decode row's own
+                // reprojection, not the creep: only the creep or a section chunk
+                // riding this step runs up the debt.
+                // A token-paced creep (`High` beside `High`) owes its debt in
+                // tokens, not airtime.
+                let carried = !owed
+                    && !self.wave_step_token_paced
+                    && (self.wave_cohort_advanced || self.wave_section_advanced);
+                self.creep_owed = next_creep_owed(
+                    self.creep_owed,
+                    step,
+                    carried,
+                    self.decode_only_step,
+                    self.wave_step_ratio,
+                );
+                if !self.wave_cobatched {
+                    self.decode_only_step = Some(next_decode_only(self.decode_only_step, step));
+                } else if let Some(decode_only) = self.decode_only_step {
+                    // What the creep that rode cost beside decode, so the next
+                    // slice fits a decode step's worth of it.
+                    self.creep_layer_row_cost = next_layer_row_cost(
+                        self.creep_layer_row_cost,
+                        step,
+                        decode_only,
+                        self.wave_step_creep_layer_rows,
+                    );
                 }
             }
             // Drain any continuous-re-projection swaps queued during the
@@ -273,9 +363,8 @@ impl Scheduler {
             // Take on conversations that queued WHILE this wave was executing,
             // under the same entry criteria the top-of-loop admission uses. The
             // newly-projected prefills land in `active_prefills` now and join the
-            // creep cohort the moment this quantum clips to the top and
-            // `form_wave_group` re-forms — so admission latency is bounded by
-            // WAVE_SLICE, not by the whole in-flight generation finishing.
+            // creep cohort the next time `form_wave_group` re-forms — at the
+            // next step the creep rides with no cohort in flight.
             let admitted = {
                 let _g = profile::span("loop:decode:mid_wave_admit");
                 self.mid_wave_admission()
@@ -500,6 +589,19 @@ impl Scheduler {
             if self.shutdown_requested {
                 break;
             }
+            // **An expert pipeline that has exited ends the process.** Neither its
+            // thread nor its stager is restarted, so every forward after it fails:
+            // the daemon kept answering every request, NPC and chat alike, with
+            // "expert stager died — channel closed" and served nothing until
+            // someone restarted it by hand. Exiting hands the restart to the
+            // supervisor (keep), which brings the engine back whole.
+            if self.model.expert_pipeline_dead() {
+                tracing::error!(
+                    "the expert pipeline has exited and cannot be restarted in place; \
+                     ending the process so its supervisor starts it again"
+                );
+                exit(ENGINE_DEAD_EXIT);
+            }
             // The top of the pass: a wave's wall-clock runs from here.
             let t_pass = Instant::now();
             // 1. Drain pending submissions (non-blocking). This synchronously
@@ -606,38 +708,17 @@ impl Scheduler {
                 self.wave_stats
                     .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
             }
-
-            // 2a. One turn of the normalization warm-up replay, when ingest-
-            // priority work may run (see `norm_warm`).
-            self.step_norm_warm();
-
-            // 2b. Everything with work is lower priority and paused behind a
-            // conversation still in its cooldown: wait for a request (which ends
-            // the wait at once) or the poll interval, then look again, rather
-            // than spinning through quanta that would run nothing.
-            if self.all_work_paused() {
-                tracing::trace!("every sequence with work is paused; waiting for a request");
-                let t_idle = Instant::now();
-                match self.rx.recv_timeout(super::priority_pause::PAUSED_POLL) {
-                    Ok(req) => {
-                        self.wave_stats
-                            .add_idle(t_idle.elapsed().as_millis() as u64);
-                        let t_req = Instant::now();
-                        let keep_going = self.handle_request(req);
-                        self.wave_stats
-                            .add_requests(t_req.elapsed().as_micros() as u64);
-                        if !keep_going {
-                            break;
-                        }
-                    }
-                    Err(flume::RecvTimeoutError::Timeout) => {
-                        self.wave_stats
-                            .add_idle(t_idle.elapsed().as_millis() as u64);
-                    }
-                    Err(flume::RecvTimeoutError::Disconnected) => break,
-                }
-                continue;
+            // **While prompts wait, their prefill's tier is spoken for.** Told
+            // before this pass issues a forward, so the growth negotiation after
+            // it leaves that ground standing through the decodes between two
+            // prefills, instead of handing it to the weight side and having the
+            // next prefill buy it back (`set_prompts_waiting`).
+            if let DeviceLocation::Cuda { gpu_id } = self.session.device().location() {
+                set_prompts_waiting(gpu_id, self.pending_prefill_tokens() > 0);
             }
+
+            // 2a. One turn of the normalization warm-up replay (see `norm_warm`).
+            self.step_norm_warm();
 
             // 3. If idle, block waiting for work. Deferred glue counts as work: the
             // unified wave step scatters it (`take_wave_glue`), so don't block while
@@ -738,11 +819,9 @@ impl Scheduler {
             // 4. Always run all quanta each iteration; order by current width.
             // Summary decodes are excluded from the flip count so they never
             // hold the loop in decode-first mode at the expense of prefills.
-            // Fresh per wave: the prefill cohort is advanced ONCE — folded into the
-            // first co-batched decode step if decode runs and the window is at a
-            // sweep boundary, else by the interleaved prefill pass. The guard is
-            // reset here (before both quanta) so its meaning is per-wave regardless
-            // of the width-ordered dispatch below.
+            // Fresh for this pass's prefill quantum, which advances the cohort
+            // when nothing decodes. The decode quantum sets the same guards per
+            // step, from the airtime decode is owed (`creep_owed_after`).
             self.wave_cohort_advanced = false;
             self.wave_section_advanced = false;
             // A width the partition refused holds only until ground frees.
@@ -1432,42 +1511,87 @@ mod cleanup_deferral_tests {
 
 #[cfg(test)]
 mod decode_airtime_tests {
-    use super::{decode_owed_after_cobatched, WAVE_SLICE};
+    use super::{creep_owed_after, next_creep_owed, next_decode_only};
     use std::time::Duration;
 
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// **The creep rides again once decode is paid, a step or two later.** At
+    /// `R = 1` a 120 ms co-batched step beside 40 ms decode-only steps owes its
+    /// 80 ms share; two decode-only steps pay it and the third may carry the
+    /// creep — where it used to wait for the next 2 s quantum.
+    #[test]
+    fn decode_only_steps_pay_the_debt_and_free_the_creep() {
+        let mut owed = next_creep_owed(Duration::ZERO, ms(120), true, Some(ms(40)), 1);
+        assert_eq!(owed, ms(80));
+        owed = next_creep_owed(owed, ms(40), false, Some(ms(40)), 1);
+        assert!(!owed.is_zero(), "still owed");
+        owed = next_creep_owed(owed, ms(40), false, Some(ms(40)), 1);
+        assert!(owed.is_zero(), "paid: the next step carries the creep");
+    }
+
+    /// **The measured case.** A ~30 ms dialogue decode carrying one layer of an
+    /// ingest group took 70 ms (`.5`, 2026-10-17). Behind that `High` decode
+    /// (`R = 64`) the 40 ms share owes 2.56 s of decode-only airtime: about 85
+    /// decode steps before the ingest rides again, not the next one.
+    #[test]
+    fn a_throttled_creep_owes_its_share_times_the_ratio() {
+        let owed = next_creep_owed(Duration::ZERO, ms(70), true, Some(ms(30)), 64);
+        assert_eq!(owed, ms(2_560));
+        let mut left = owed;
+        let mut steps = 0;
+        while !left.is_zero() {
+            left = next_creep_owed(left, ms(30), false, Some(ms(30)), 64);
+            steps += 1;
+        }
+        assert_eq!(steps, 86);
+    }
+
+    /// A step that carried the creep sets the debt to its own share rather than
+    /// adding to what was owed: it only rode because the last debt was paid.
+    #[test]
+    fn a_carrying_step_sets_the_debt_to_its_own_share() {
+        assert_eq!(
+            next_creep_owed(ms(500), ms(300), true, Some(ms(100)), 1),
+            ms(200)
+        );
+        assert_eq!(
+            next_creep_owed(ms(500), ms(300), true, Some(ms(100)), 16),
+            ms(3_200)
+        );
+    }
+
     /// The measured case: a 4.2 s co-batched step under a `Low` decode (R = 1)
-    /// owes the decode 4.2 s of its own — equal airtime — not the 2 s slice it
-    /// already spent.
+    /// owes the decode its own share — equal airtime.
     #[test]
-    fn an_unthrottled_creep_owes_the_decode_its_own_length() {
-        let step = Duration::from_millis(4_200);
-        assert_eq!(decode_owed_after_cobatched(step, 1), step);
+    fn an_unthrottled_creep_owes_the_decode_its_share() {
+        assert_eq!(creep_owed_after(ms(4_200), Some(ms(200)), 1), ms(4_000));
     }
 
-    /// A throttled creep's step is short, so the decode gets the slice it always
-    /// had — `High` and `Normal` waves are unchanged.
+    /// Before any decode-only step has been measured the whole step counts as
+    /// the creep's: the error is toward decode.
     #[test]
-    fn a_throttled_creep_leaves_the_slice_alone() {
-        assert_eq!(
-            decode_owed_after_cobatched(Duration::from_millis(150), 64),
-            WAVE_SLICE
-        );
-        assert_eq!(
-            decode_owed_after_cobatched(Duration::from_millis(600), 16),
-            WAVE_SLICE
-        );
+    fn with_no_decode_only_step_measured_the_whole_step_is_owed() {
+        assert_eq!(creep_owed_after(ms(70), None, 4), ms(280));
     }
 
-    /// A long step at a higher ratio owes its share, and a zero ratio reads as 1.
+    /// A step no longer than a decode-only one owes nothing — the creep cost
+    /// decode no airtime — and a zero ratio reads as 1.
     #[test]
-    fn the_share_scales_with_the_ratio() {
-        assert_eq!(
-            decode_owed_after_cobatched(Duration::from_millis(64_000), 16),
-            Duration::from_millis(4_000)
-        );
-        assert_eq!(
-            decode_owed_after_cobatched(Duration::from_millis(3_000), 0),
-            Duration::from_millis(3_000)
-        );
+    fn a_free_ride_owes_nothing_and_a_zero_ratio_reads_as_one() {
+        assert!(creep_owed_after(ms(25), Some(ms(30)), 64).is_zero());
+        assert_eq!(creep_owed_after(ms(3_000), Some(ms(1_000)), 0), ms(2_000));
+    }
+
+    /// The decode-only average starts at the first step and moves a quarter of
+    /// the way to each new one.
+    #[test]
+    fn the_decode_only_average_follows_the_steps() {
+        let a = next_decode_only(None, ms(40));
+        assert_eq!(a, ms(40));
+        let a = next_decode_only(Some(a), ms(80));
+        assert_eq!(a, ms(50));
     }
 }

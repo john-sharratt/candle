@@ -76,7 +76,7 @@ fn timeline() -> TimelineId {
 #[test]
 fn changes_survive_as_events() {
     let dir = tempfile::tempdir().unwrap();
-    let files = RepoFiles::overlay(workspace(dir.path()));
+    let files = RepoFiles::overlay(workspace(dir.path())).unwrap();
     let log = Memory::default();
     let mirror = Mutex::new(Mirror::of(BTreeMap::new()));
 
@@ -114,7 +114,7 @@ fn changes_survive_as_events() {
 #[test]
 fn an_unread_set_saves_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let files = RepoFiles::overlay(workspace(dir.path()));
+    let files = RepoFiles::overlay(workspace(dir.path())).unwrap();
     files
         .repo("a")
         .unwrap()

@@ -161,6 +161,15 @@ pub struct MeShare {
 pub struct TenantStatus {
     /// `"loading"` or `"ready"`.
     pub state: &'static str,
+    /// Whether this build has shown it works: every step that tests the binary
+    /// itself — the model loaded, the substrate opened, real forwards run — is
+    /// behind it. What may remain is work whose length is the data's, not the
+    /// build's: reading a workspace again after its ingest keys changed is an
+    /// hour of priming, and nothing about the binary is learned in it. The
+    /// process's proof line ([`crate::run`]) waits for this, not for `ready`.
+    /// A ready tenant is proven.
+    #[serde(skip)]
+    pub proven: bool,
     /// Its load, while it loads.
     pub loading: Option<LoadingView>,
     /// Its substrate's maintenance state, once its engine holds it open.
@@ -171,7 +180,7 @@ pub struct TenantStatus {
 }
 
 impl TenantStatus {
-    /// A tenant with nothing but its load to report.
+    /// A tenant with nothing but its load to report — proven once it is ready.
     pub fn of(loading: Option<LoadingView>) -> Self {
         Self {
             state: if loading.is_some() {
@@ -179,6 +188,7 @@ impl TenantStatus {
             } else {
                 "ready"
             },
+            proven: loading.is_none(),
             loading,
             maintenance: None,
             extra: Map::new(),

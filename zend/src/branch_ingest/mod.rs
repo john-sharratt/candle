@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::{ConversationEngine, Sequence};
-use zend_vfs::{Repo, Workspace};
+use zend_vfs::Workspace;
 
 use self::filter::IngestScope;
 use self::plan::{plan, Committed, Live};
@@ -259,15 +259,18 @@ fn units(
 /// Whether a folder is under git is read from the folder — a `.git` in it —
 /// never from a failure to open it: a git that cannot be spawned, a lock held
 /// for a moment, an ownership refusal all fail an open, and a repository
-/// read as not under git would have every unit it ever had tombstoned.
+/// read as not under git would have every unit it ever had tombstoned. A
+/// repository read from the substrate is always under git.
 pub(crate) fn record_branches(workspace: &Workspace) -> (Vec<RepoBranches>, Vec<String>) {
     let mut repos = Vec::new();
     let mut unreadable = Vec::new();
     for spec in workspace.repos() {
-        if is_upload_path(&spec.name) || !spec.dir.join(".git").exists() {
+        if is_upload_path(&spec.name) || !spec.is_git() {
             continue;
         }
-        let read = Repo::open(&spec.dir).and_then(|repo| RepoBranches::read(&spec.name, repo));
+        let read = spec
+            .open()
+            .and_then(|repo| RepoBranches::read(&spec.name, repo));
         match read {
             Ok(branches) => repos.push(branches),
             Err(e) => {

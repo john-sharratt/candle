@@ -652,6 +652,20 @@ impl ManagedBatchedModel for HybridBatched {
         }
     }
 
+    fn expert_pipeline_dead(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.model()
+                .experts
+                .as_ref()
+                .is_some_and(|c| c.pipeline_dead())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
         #[cfg(feature = "cuda")]
         {

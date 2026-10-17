@@ -715,10 +715,17 @@ entries carrying `dir: true`, a trailing `/`, and no `bytes`.
     {"path": "docs/", "dir": true},
     {"path": "src/", "dir": true}
   ],
-  "paging": {"page": 0, "pages": 1, "per_page": 50, "total": 3, "next_page": null},
+  "paging": {"page": 1, "pages": 1, "per_page": 50, "total": 3, "next_page": null},
   "total_bytes": 0
 }
 ```
+
+**Pages count from 1**, in every paged tool: `page` is required, page 1 is the
+first, `pages` is the last, and the last page's `next_page` is `null`. A request
+for page 0 is refused (`invalid_arguments`), the schema says `minimum: 1`, and the
+tool-call grammar never offers a leading `0` for it. Zero-based, the last of two
+pages read `page 1/2` — "page one of two" — and a model that had read a file whole
+reasoned its way to a missing page.
 
 **Implementation.** Union of the session layer with an `ignore`-driven walk of the working directory (the crate ripgrep uses, so `.gitignore`, `.ignore`, git's global excludes and hidden-file rules all apply), the session layer shadowing the workspace, sorted by path and paged at 50 entries. `modified: true` marks an entry the session has changed; it is omitted when false. `total_bytes` is the session layer's 10 MiB budget denominator — workspace files are read on demand and cost nothing against it.
 
@@ -758,11 +765,11 @@ Find files by **name or path** anywhere in the project, without knowing which di
     },
     "page": {
       "type": "integer",
-      "description": "Zero-based page of results. Defaults to 0.",
-      "default": 0
+      "description": "Page of results, from 1 — 1 to start.",
+      "minimum": 1
     }
   },
-  "required": ["query"]
+  "required": ["query", "page"]
 }
 ```
 
@@ -771,7 +778,7 @@ Find files by **name or path** anywhere in the project, without knowing which di
 ```json
 {
   "files": ["zend-tools/src/tools/web_search.rs", "zend-tools/src/tools/web_fetch.rs"],
-  "paging": {"page": 0, "pages": 1, "per_page": 60, "total": 2, "next_page": null}
+  "paging": {"page": 1, "pages": 1, "per_page": 60, "total": 2, "next_page": null}
 }
 ```
 
@@ -795,7 +802,7 @@ Find files by **name or path** anywhere in the project, without knowing which di
 
 Search the **contents** of every file in the project for a string or regular expression, returning matching lines with their paths and line numbers. Use for: finding where a function, type, constant or error message is defined or used; checking whether something exists in the codebase at all; tracing callers of an API; locating a config key, a magic string, or a TODO. Triggered by "where is X defined", "who calls", "find all uses of", "search the code for", "does the codebase contain", "grep for", "which file has", "find the string".
 
-**This is the tool for finding code by content**, and the line numbers it returns feed straight into `file_read`'s `start_line`.
+**This is the tool for finding code by content**, and the line numbers it returns feed straight into `file_read`: line N is on page `(N - 1) / 200 + 1`.
 
 **Parameters**
 
@@ -818,11 +825,11 @@ Search the **contents** of every file in the project for a string or regular exp
     },
     "page": {
       "type": "integer",
-      "description": "Zero-based page of results. Defaults to 0.",
-      "default": 0
+      "description": "Page of results, from 1 — 1 to start.",
+      "minimum": 1
     }
   },
-  "required": ["pattern"]
+  "required": ["pattern", "page"]
 }
 ```
 
@@ -833,7 +840,7 @@ Search the **contents** of every file in the project for a string or regular exp
   "matches": [
     {"path": "zend-tools/src/tools/web_search.rs", "line": 66, "text": "let Some(api_key) = ctx.secrets.tavily_api_key() else {"}
   ],
-  "paging": {"page": 0, "pages": 1, "per_page": 40, "total": 1, "next_page": null},
+  "paging": {"page": 1, "pages": 1, "per_page": 40, "total": 1, "next_page": null},
   "files_searched": 4127
 }
 ```
@@ -960,7 +967,7 @@ VFS tools cover editing only. Faking execution by letting the model produce the 
 
 - **One program, no shell.** `program` is the program (`npm`, `cargo`, `python`) and `args` its arguments, each passed as written — `npm test` is `program: "npm", args: ["test"]`, and a repository script runs through its interpreter (`node` with `["scripts/report.js"]`); no `&&`, pipes or redirects. `args` is required (`[]` for none), so the grammar cannot close the call before the arguments are decided. A whole command line sent as `program` is refused with the call it should have been — or, when it holds quotes, told to pass each argument apart, since splitting it at its spaces would keep the quotes; a git command line goes straight to the git refusal, unless it holds shell syntax, which is refused first. The daemon's allow-list (`zend/src/sandbox_programs.rs`) names the build, test and packaging toolchains and no shell; a program it does not list is refused with the list. git run directly is refused with a pointer to the git tools.
 - **The allow-list is not a sandbox.** It decides which programs start, not what they do: `python -c`, `node -e`, an `npm` script or an `npx` package run anything the daemon's rights allow, git and the network included, and the policy's argument checks see only the command line. The boundary is the mode: `run_command` needs `network` + `exec` + `disk_write`, which only Comprehensive grants, and only an admin may use Comprehensive.
-- **It waits.** The call returns when the program ends or is killed at its timeout (600 s by default, at most 1800) with everything it started. It returns the exit code, the files it changed (`edited` / `written` / `deleted`), and page 0 of the output.
+- **It waits.** The call returns when the program ends or is killed at its timeout (600 s by default, at most 1800) with everything it started. It returns the exit code, the files it changed (`edited` / `written` / `deleted`), and page 1 of the output.
 - **Output is paged.** 200 lines a page, colour codes stripped, over-long lines cut; `run_output` reads any page of a run by its `job` id, and a page past the end is the last.
 - **Refusals the model can act on:** `refused` (the policy), `behind` (the branch holds commits the conversation's files are not based on — `git_merge` first), `unpublished` (a merge fast-forwarded the conversation past its branch — `git_commit` with `from: all_changes` publishes it first), `merging` (a merge is being finished — commit it first), `no_branch` (the conversation is on no branch), `cannot_start` (not installed), `no_sandbox` (not a git repository), and `invalid_arguments` for a command line in `program` or shell syntax in `args` — an operator or redirect (`&&`, a pipe, `>out.txt`, `2>&1`), told to run one program per call, or a shell's escaped quote, told the argument as it should arrive.
 

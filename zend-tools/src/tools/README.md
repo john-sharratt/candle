@@ -52,7 +52,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 
 | Tool | File | Notes |
 |------|------|-------|
-| `run_command` | `run/command.rs` | One program, no shell, in the repository's sandbox on the conversation's branch; waits; returns exit code, changed files, output page 0. A command line in `program`, shell operators and redirects, and shell-escaped quotes are refused, each saying how to call it instead; a git command line goes to the git refusal. `Network` + `Exec` + `DiskWrite` |
+| `run_command` | `run/command.rs` | One program, no shell, in the repository's sandbox on the conversation's branch; waits; returns exit code, changed files, output page 1. A command line in `program`, shell operators and redirects, and shell-escaped quotes are refused, each saying how to call it instead; a git command line goes to the git refusal. `Network` + `Exec` + `DiskWrite` |
 | `run_output` | `run/output.rs` | Any page of a run's log by `job`; `Exec` |
 
 The sandboxes themselves — one per git repository, logs in the workspace's

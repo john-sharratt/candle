@@ -212,6 +212,20 @@ pub struct Occupancy {
     /// boundary moves. A decode's tier is a few regions, so once the prefill is done
     /// the weight side grows back into everything the prefill's tier held.
     pub last_tier_bytes: usize,
+    /// The widest tier stood since prompts began waiting, bytes — zero while none
+    /// wait ([`super::region_pool::set_prompts_waiting`]).
+    ///
+    /// **The next prefill's tier, while one is coming.** `last_tier_bytes` predicts
+    /// the next forward from the last one, which holds within a prefill and fails
+    /// between two: an engine ingesting runs one wide prefill forward, then a dozen
+    /// decode forwards of a few regions each, then the next prefill. After the first
+    /// decode the last tier reads tiny, the weight side grows back into the
+    /// prefill's ground, and the next prefill buys it straight back. Measured on
+    /// `.5` with a 53–77k-token backlog: ~2,000 expert slots conceded per prefill,
+    /// every 25–50 s, each in a 21–25 s wave whose decode forwards slowed to
+    /// 1.6–12 s. Prompts waiting is a statement about now, and the tier their
+    /// prefill stands is known — it stood a few forwards ago.
+    pub waiting_tier_bytes: usize,
     /// The widest tier this process has stood, bytes.
     ///
     /// The high-water rather than the live figure, because the live one is zero
@@ -342,12 +356,18 @@ impl GrowthPolicy {
         // grants from 17 to 4 and cost five layers of residency. The last tier is
         // the next one's price within a prefill, and a few regions once decoding.
         //
+        // **And while prompts wait, the next prefill's tier** — the widest stood
+        // since they began waiting ([`Occupancy::waiting_tier_bytes`]) — whichever
+        // of the two is wider. Between two prefills the last forward is a decode,
+        // and its few regions are not the next forward that needs ground.
+        //
         // **What stays free besides is the slack or the KV side's relief target,
         // whichever is larger** — see [`FreeRegionTarget`]. Taking the KV side below
         // what its own relief frees to is taking ground relief will buy straight
         // back.
-        let keep = slack.max(occ.kv_target.relieved(occ.total))
-            + occ.last_tier_bytes.div_ceil(region_bytes.max(1));
+        let next_tier = occ.last_tier_bytes.max(occ.waiting_tier_bytes);
+        let keep =
+            slack.max(occ.kv_target.relieved(occ.total)) + next_tier.div_ceil(region_bytes.max(1));
         let by_occupancy = occ.free_below_ceiling + occ.ceiling_blocked;
         if by_occupancy.saturating_sub(keep) == 0 {
             return Err(Refusal::Occupied);
@@ -379,8 +399,43 @@ mod tests {
             free_above_live: free,
             tier_bytes: 0,
             last_tier_bytes: 0,
+            waiting_tier_bytes: 0,
             tier_high_water: 0,
         }
+    }
+
+    /// **The churn between prefills, closed — as a trajectory.** An ingest runs a
+    /// wide prefill forward, then decode forwards of a few regions, then the next
+    /// prefill. While prompts wait, the decodes' small tiers do not hand the
+    /// prefill's ground to the weight side; once the backlog is gone, it is offered
+    /// back in full.
+    #[test]
+    fn the_next_prefills_tier_is_left_free_while_prompts_wait() {
+        let mut p = GrowthPolicy::new();
+        let prefill = Occupancy {
+            last_tier_bytes: 300 * R,
+            waiting_tier_bytes: 300 * R,
+            ..steady(100, 400)
+        };
+        let _ = p.spare(prefill, 32, R);
+        let _ = p.spare(prefill, 32, R);
+        assert_eq!(p.spare(prefill, 32, R), Ok(400 - 300 - 32));
+        // A dozen decodes between prefills: the last tier is a few regions, and
+        // still the prefill's ground stays where it is.
+        for _ in 0..12 {
+            let decode = Occupancy {
+                last_tier_bytes: 2 * R,
+                ..prefill
+            };
+            assert_eq!(p.spare(decode, 32, R), Ok(400 - 300 - 32));
+        }
+        // The backlog is gone: the decode's tier is all that stays free.
+        let drained = Occupancy {
+            last_tier_bytes: 2 * R,
+            waiting_tier_bytes: 0,
+            ..prefill
+        };
+        assert_eq!(p.spare(drained, 32, R), Ok(400 - 2 - 32));
     }
 
     /// **The prefill churn, closed.** Between two prefill forwards the first
@@ -489,6 +544,7 @@ mod tests {
             free_above_live: 100,
             tier_bytes: 0,
             last_tier_bytes: 0,
+            waiting_tier_bytes: 0,
             tier_high_water: 57 * R,
         };
         let _ = p.spare(occ, 32, R);
@@ -523,6 +579,7 @@ mod tests {
             free_above_live: 587 - 199,
             tier_bytes: 0,
             last_tier_bytes: 0,
+            waiting_tier_bytes: 0,
             tier_high_water: 0,
         };
         let _ = p.spare(occ, 32, R);
@@ -544,6 +601,7 @@ mod tests {
             free_above_live: 20,
             tier_bytes: 0,
             last_tier_bytes: 0,
+            waiting_tier_bytes: 0,
             tier_high_water: 0,
         };
         let _ = p.spare(occ, 32, R);

@@ -51,12 +51,12 @@ true size but fail to read with `unreadable`.
 
 ## `file_read` paging
 
-`path` and `page` are both required — there is no whole-file read. `page` is
-0-based and every page is [`PAGE_LINES`](../../../../zend-vfs/src/vfs.rs) lines
-(currently 200); a page past the end clamps to the last one rather than
-failing. The header reads `(page P of N, lines a-b of total)`, which names
-both the page just returned and the total page count, so the model reads it
-straight to know whether to keep going.
+`path` and `page` are both required — there is no whole-file read. `page`
+counts from 1 and every page is [`PAGE_LINES`](../../../../zend-vfs/src/vfs.rs)
+lines (currently 200); a page past the end clamps to the last one rather than
+failing, and page 0 is refused. The fence opens `page=P pages=N lines=L` and
+closes `end of <file> page P of N — next: page=P+1`, or `— the last page`, so
+the model reads straight off it whether and where to keep going.
 
 ## `file_edit` replacements
 

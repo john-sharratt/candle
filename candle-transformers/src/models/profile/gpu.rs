@@ -26,6 +26,8 @@ use candle::cuda_backend::CudaDevice;
 use std::cell::Cell;
 #[cfg(all(feature = "profile", feature = "cuda"))]
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(all(feature = "profile", feature = "cuda"))]
+use std::time::Duration;
 
 /// One forward in this many records its GPU spans — see
 /// [`set_gpu_span_period`]. Every forward until something says otherwise.
@@ -63,8 +65,14 @@ pub fn set_gpu_span_period(period: u32) {
 
 /// Mark the start of a forward on this thread: decides whether the spans it
 /// opens until the next forward are recorded ([`set_gpu_span_period`]).
+///
+/// A `bulk` forward — one carrying a prompt chunk — is recorded every time, at
+/// weight 1. Its span events are nothing against its length, and it is rare
+/// beside the decode steps the period thins: sampled one in eight, a chunk
+/// that held the device for 40 s went unrecorded while the sampled decode
+/// steps around it reported the window's GPU time as a few seconds.
 #[inline(always)]
-pub fn begin_gpu_span_forward() {
+pub fn begin_gpu_span_forward(bulk: bool) {
     #[cfg(all(feature = "profile", feature = "cuda"))]
     {
         let period = GPU_SPAN_PERIOD.load(Ordering::Relaxed).max(1);
@@ -73,7 +81,23 @@ pub fn begin_gpu_span_forward() {
             f.set(n);
             n
         });
-        SPAN_WEIGHT.with(|w| w.set(if n % period == 0 { period } else { 0 }));
+        SPAN_WEIGHT.with(|w| w.set(span_weight(bulk, n, period)));
+    }
+    #[cfg(not(all(feature = "profile", feature = "cuda")))]
+    let _ = bulk;
+}
+
+/// What the spans of forward `n` stand for at sampling `period`: a bulk
+/// forward itself alone; any other the `period` forwards its sample speaks for,
+/// or nothing when it falls outside the sample.
+#[cfg(all(feature = "profile", feature = "cuda"))]
+pub(super) fn span_weight(bulk: bool, n: u32, period: u32) -> u32 {
+    if bulk {
+        1
+    } else if n % period == 0 {
+        period
+    } else {
+        0
     }
 }
 
@@ -372,7 +396,7 @@ pub(super) fn pending_len_for_test() -> usize {
 
 #[cfg(all(feature = "profile", feature = "cuda"))]
 fn drain_inner(block: bool) {
-    let harvested: Vec<(&'static str, std::time::Duration, u32)> = gpu_pool::POOL.with(|p| {
+    let harvested: Vec<(&'static str, Duration, u32)> = gpu_pool::POOL.with(|p| {
         let mut p = p.borrow_mut();
         let mut out = Vec::new();
         let mut still_pending = Vec::with_capacity(p.pending.len());
@@ -389,13 +413,14 @@ fn drain_inner(block: bool) {
             }
             // A pair the driver cannot time is dropped rather than recorded as
             // zero: a silent zero would read as "this phase is free", which is
-            // the one wrong answer a profiler must not give.
+            // the one wrong answer a profiler must not give. A negative interval
+            // is the same case — the pair's events ran in two recorded segments
+            // and the stop's landed first — and converting it panicked the
+            // scheduler thread.
             if let Ok(ms) = entry.pair.start.elapsed_ms(&entry.pair.stop) {
-                out.push((
-                    entry.name,
-                    std::time::Duration::from_secs_f64(ms as f64 / 1e3),
-                    entry.weight,
-                ));
+                if let Ok(d) = Duration::try_from_secs_f64(ms as f64 / 1e3) {
+                    out.push((entry.name, d, entry.weight));
+                }
             }
             p.free.push(entry.pair);
         }

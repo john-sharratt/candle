@@ -9,6 +9,7 @@ use git2::{Reference, ReferenceType, Repository};
 
 use super::{failed, is_absent, oid_of, revision};
 use crate::error::GitError;
+use crate::odb::settings::Settings;
 use crate::read::head::Head;
 use crate::read::refs::{Branch, Upstream};
 use crate::read::remote_branches::RemoteBranch;
@@ -125,8 +126,20 @@ pub(crate) fn head(lib: &Repository) -> Result<Head, GitError> {
     }
 }
 
-/// Every local branch, with its upstream when one is configured.
-pub(crate) fn branches(lib: &Repository) -> Result<Vec<Branch>, GitError> {
+/// Where a repository keeps its branches' upstreams.
+pub(crate) enum Upstreams<'a> {
+    /// A checkout's config: `branch.<name>.remote` and `.merge`, mapped to a
+    /// tracking ref by the remote's fetch refspecs.
+    Config,
+    /// A repository read from the substrate's settings, in memory.
+    Held(&'a Settings),
+}
+
+/// Every local branch, with its upstream when one is set.
+pub(crate) fn branches(
+    lib: &Repository,
+    upstreams: Upstreams<'_>,
+) -> Result<Vec<Branch>, GitError> {
     let config = lib.config().map_err(|e| failed("config", e))?;
     let mut out = Vec::new();
     for reference in refs_with_prefix(lib, "refs/heads/")? {
@@ -135,15 +148,21 @@ pub(crate) fn branches(lib: &Repository) -> Result<Vec<Branch>, GitError> {
             .branch()
             .ok_or_else(|| GitError::malformed("libgit2", full.clone()))?;
         let oid = target_of(&reference)?;
-        let setting = |key: &str| {
-            config
-                .get_string(&format!("branch.{}.{key}", name.as_str()))
-                .ok()
-                .filter(|v| !v.is_empty())
+        let set = match &upstreams {
+            Upstreams::Config => {
+                let setting = |key: &str| {
+                    config
+                        .get_string(&format!("branch.{}.{key}", name.as_str()))
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                };
+                setting("remote").zip(setting("merge"))
+            }
+            Upstreams::Held(settings) => settings.upstream(name.as_str()).cloned(),
         };
-        let upstream = match (setting("remote"), setting("merge")) {
-            (Some(remote), Some(merge)) => Some(upstream_of(lib, &oid, &remote, &merge)?),
-            _ => None,
+        let upstream = match set {
+            Some((remote, merge)) => Some(upstream_of(lib, &upstreams, &oid, &remote, &merge)?),
+            None => None,
         };
         out.push(Branch {
             name,
@@ -163,6 +182,7 @@ pub(crate) fn branches(lib: &Repository) -> Result<Vec<Branch>, GitError> {
 /// tracking line at all.
 fn upstream_of(
     lib: &Repository,
+    upstreams: &Upstreams<'_>,
     local: &Oid,
     remote: &str,
     merge: &str,
@@ -172,6 +192,8 @@ fn upstream_of(
         .ok_or_else(|| GitError::malformed("for-each-ref", merge.to_string()))?;
     let tracking = if remote == "." {
         Some(merge.to_string())
+    } else if let Upstreams::Held(_) = upstreams {
+        Settings::tracking_of(remote, merge)
     } else {
         lib.find_remote(remote).ok().and_then(|r| {
             r.refspecs().find_map(|spec| {

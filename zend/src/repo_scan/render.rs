@@ -111,8 +111,8 @@ pub fn folder_anchor(repo: &str, inner: &str) -> String {
 /// what the model learns to write, so it is written here too.
 fn list_args(unit: &DirUnit) -> Vec<(&'static str, &str)> {
     match split(&unit.dir) {
-        (repo, "") => vec![("repo", repo), ("page", "0")],
-        (repo, inner) => vec![("repo", repo), ("path", inner), ("page", "0")],
+        (repo, "") => vec![("repo", repo), ("page", "1")],
+        (repo, inner) => vec![("repo", repo), ("path", inner), ("page", "1")],
     }
 }
 
@@ -222,7 +222,7 @@ mod tests {
             .filter(|e| e.path().is_dir())
             .map(|e| RepoSpec::named(&e.file_name().to_string_lossy()))
             .collect();
-        ToolContext::with_workspace(Workspace::new(d.path(), repos).unwrap())
+        ToolContext::with_workspace(Workspace::new(d.path(), repos).unwrap()).unwrap()
     }
 
     /// The envelope the chain tests render through. ChatML, so the assertions
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(root.dir, "a/");
         assert_eq!(
             render_list_call(&env(), root),
-            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"a\", \"page\": 0}}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"a\", \"page\": 1}}\n</tool_call>",
         );
         let listing = render_list_response(&ctx_for(&d), root).text();
         assert!(
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(
             call,
             "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"a\", \
-             \"path\": \"src\", \"page\": 0}}\n</tool_call>",
+             \"path\": \"src\", \"page\": 1}}\n</tool_call>",
         );
     }
 
@@ -410,7 +410,7 @@ mod tests {
         let env = ToolCallEnvelope::for_dialect(&Dialect::qwen35());
         assert_eq!(
             render_list_call(&env, &units[0]),
-            env.render("file_list", &[("repo", "a"), ("page", "0")]),
+            env.render("file_list", &[("repo", "a"), ("page", "1")]),
             "the listing call must be the dialect envelope's own rendering",
         );
         // And it is the CHECKPOINT's envelope, not a hardcoded family: ask the
@@ -418,7 +418,7 @@ mod tests {
         let lines = ToolCallEnvelope::for_dialect(&Dialect::llama3());
         assert_eq!(
             render_list_call(&lines, &units[0]),
-            lines.render("file_list", &[("repo", "a"), ("page", "0")]),
+            lines.render("file_list", &[("repo", "a"), ("page", "1")]),
         );
     }
 

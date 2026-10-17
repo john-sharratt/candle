@@ -210,7 +210,7 @@ impl Repo {
         if files.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let scratch = Scratch::new(self.git_dir());
+        let scratch = Scratch::new(self.git_dir()?);
         let index = scratch.index.as_os_str().to_owned();
         self.git("read-tree")
             .arg(rev.spec())

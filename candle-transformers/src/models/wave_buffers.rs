@@ -294,7 +294,7 @@ pub(crate) fn wave_from_vec_ticketed<D: CudaDType + candle::WithDType, S: Into<S
     let ptr = match wave_alloc(ticket, bytes, WAVE_ALIGN) {
         WaveCarve::Carved(ptr) => ptr,
         WaveCarve::Closed => return Tensor::from_vec(data, shape, device),
-        WaveCarve::Exhausted => return Err(exhausted(ticket, bytes)),
+        WaveCarve::Exhausted(span) => return Err(exhausted(ticket, bytes, span)),
     };
     // `ptr` addresses `bytes` the resolver just carved from the ticket's arena
     // and nothing else holds that range in this generation. The upload is
@@ -380,7 +380,7 @@ pub(crate) fn wave_empty_ticketed<S: Into<Shape>>(
     let ptr = match wave_alloc(ticket, bytes, WAVE_ALIGN) {
         WaveCarve::Carved(ptr) => ptr,
         WaveCarve::Closed => return Tensor::empty(shape, dtype, device),
-        WaveCarve::Exhausted => return Err(exhausted(ticket, bytes)),
+        WaveCarve::Exhausted(span) => return Err(exhausted(ticket, bytes, span)),
     };
     // SAFETY: `ptr` addresses `bytes` the resolver just carved from the ticket's
     // arena, and no other claimant holds that range within this generation. The

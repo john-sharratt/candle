@@ -1,5 +1,7 @@
 //! Pushing to remote branches and tags, each change guarded by a lease.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::classify::classify;
@@ -311,7 +313,9 @@ impl Repo {
             remote: Some(remote.clone()),
             rev: None,
         };
-        classify(self.dir(), &context, vec!["push".into()], status, stderr)
+        // Only a push this checkout made itself fails here, so it has a folder.
+        let dir = self.folder().map(Path::to_path_buf).unwrap_or_default();
+        classify(&dir, &context, vec!["push".into()], status, stderr)
     }
 }
 

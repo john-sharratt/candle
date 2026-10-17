@@ -123,7 +123,7 @@ fn keys_of(root: &Path) -> Vec<(String, String)> {
 /// half; what is asserted here is the turn shape that reaches the conversation
 /// before the first decode, which is where every rendering defect lives.
 fn record(root: &Path) -> RecordingTurnSink {
-    let ctx = ToolContext::with_workspace(workspace_of(root));
+    let ctx = ToolContext::with_workspace(workspace_of(root)).unwrap();
     let mut sink = RecordingTurnSink::new();
     // ChatML's envelope, matching this suite's existing JSON-shaped
     // expectations; `render::tests::tool_calls_follow_the_dialects_call_style`
@@ -178,9 +178,14 @@ fn each_directory_lists_once_and_then_summarises() {
     assert!(src[0]
         .0
         .starts_with("Summarize the `src/` folder in the `demo` repository"));
-    assert!(src[0].1.contains(
-        "{\"name\": \"file_list\", \"arguments\": {\"repo\": \"demo\", \"path\": \"src\"}}"
-    ));
+    assert!(
+        src[0].1.contains(
+            "{\"name\": \"file_list\", \"arguments\": {\"repo\": \"demo\", \"path\": \"src\", \
+             \"page\": 1}}"
+        ),
+        "{}",
+        src[0].1
+    );
     assert!(src[1].0.starts_with("<tool_response>{"), "the listing");
     assert!(src[1].1.is_empty(), "the folder summary is DECODED");
 }

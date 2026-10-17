@@ -387,6 +387,7 @@ mod tests {
     use candle::Device;
 
     use super::super::ple_bench::{gate_once, gate_waves, gate_waves_in};
+    use crate::models::gpu_test_lock::gpu_serial;
 
     /// The bench's admissible gap: reassociation of the norms' reductions.
     const GATE: f32 = 2e-5;
@@ -403,6 +404,7 @@ mod tests {
     /// one.
     #[test]
     fn the_fused_block_is_the_eager_chain() {
+        let _gpu = gpu_serial();
         let Ok(dev) = Device::new_cuda(0) else {
             return;
         };
@@ -425,6 +427,7 @@ mod tests {
     /// chain.
     #[test]
     fn the_history_alternates_between_two_buffers() {
+        let _gpu = gpu_serial();
         let Ok(dev) = Device::new_cuda(0) else {
             return;
         };
@@ -437,6 +440,7 @@ mod tests {
     /// chain — decode rows, a short segment and a long one, over three waves.
     #[test]
     fn the_int8_projection_stays_within_its_quantization() {
+        let _gpu = gpu_serial();
         let Ok(dev) = Device::new_cuda(0) else {
             return;
         };
@@ -450,6 +454,7 @@ mod tests {
     /// name; a float session takes the same projection.
     #[test]
     fn an_int8_projection_must_tile() {
+        let _gpu = gpu_serial();
         let Ok(dev) = Device::new_cuda(0) else {
             return;
         };

@@ -570,6 +570,7 @@ async fn a_cut_off_member_reaches_only_its_own_agent() {
         branch: Some("main".into()),
         have: Vec::new(),
         max_commits: None,
+        max_bytes: None,
     };
     let none = Agents::new(member.clone(), None).fetch(job.clone()).await;
     assert!(matches!(none, Err(AgentError::NoAgent(_))), "{none:?}");

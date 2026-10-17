@@ -36,7 +36,7 @@ fn file_write_unicode() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "uni.txt", "page": 0}),
+        json!({"repo": REPO, "path": "uni.txt", "page": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), content);
@@ -60,7 +60,7 @@ fn file_edit_not_found() {
 fn file_read_of_a_url_points_to_web_fetch() {
     let resp = harness::invoke(
         "file_read",
-        json!({"repo": REPO, "path": "https://docs.rs/serde/latest/serde/", "page": 0}),
+        json!({"repo": REPO, "path": "https://docs.rs/serde/latest/serde/", "page": 1}),
     );
     let detail = harness::expect_error(&resp, "invalid_arguments");
     assert!(
@@ -90,7 +90,7 @@ fn file_list_within_a_directory() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": "alpha", "page": 0}),
+        json!({"repo": REPO, "path": "alpha", "page": 1}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();
@@ -138,7 +138,7 @@ fn file_write_overwrite_created_false() {
     assert_eq!(r2["created"], false);
     let rd = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "ow.txt", "page": 0}),
+        json!({"repo": REPO, "path": "ow.txt", "page": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&rd), "v2");
@@ -159,7 +159,7 @@ fn file_edit_round_trip() {
     ));
     let rd = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "rt.txt", "page": 0}),
+        json!({"repo": REPO, "path": "rt.txt", "page": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&rd), "hello Rust");
@@ -175,7 +175,7 @@ fn file_write_read_roundtrip() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "hello.txt", "page": 0}),
+        json!({"repo": REPO, "path": "hello.txt", "page": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&resp), "hello world");
@@ -202,7 +202,7 @@ fn file_write_creates_vs_overwrites() {
 fn file_read_not_found() {
     let resp = harness::invoke(
         "file_read",
-        json!({"repo": REPO, "path": "nosuchfile.txt", "page": 0}),
+        json!({"repo": REPO, "path": "nosuchfile.txt", "page": 1}),
     );
     harness::expect_error(&resp, "not_found");
 }
@@ -226,7 +226,7 @@ fn file_edit_success() {
     assert_eq!(resp["matched"], "exact");
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "edit.txt", "page": 0}),
+        json!({"repo": REPO, "path": "edit.txt", "page": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), "foo qux baz");
@@ -278,7 +278,7 @@ fn file_edit_finds_text_quoted_at_the_wrong_indentation() {
     assert_eq!(resp["matched"], "indentation");
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "inv.js", "page": 0}),
+        json!({"repo": REPO, "path": "inv.js", "page": 1}),
         &ctx,
     ));
     assert_eq!(
@@ -311,7 +311,7 @@ fn file_edit_replaces_through_the_overlay_and_leaves_disk_untouched() {
     let patched = "fn main() {\n    let retries = 30;\n    run(retries);\n}\n";
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), patched.trim_end());
@@ -329,7 +329,7 @@ fn file_edit_replaces_through_the_overlay_and_leaves_disk_untouched() {
     assert_eq!(second["bytes"], 54);
     let reread = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&reread), patched.trim_end());
@@ -416,7 +416,7 @@ fn file_edit_already_applied_does_not_copy_the_file_up() {
 
     let listed = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "page": 0}),
+        json!({"repo": REPO, "page": 1}),
         &ctx,
     ));
     let entry = listed["entries"]
@@ -456,7 +456,7 @@ fn file_edit_writes_nothing_when_the_text_is_not_there() {
     assert!(detail.contains("line 2 of the file"), "{detail}");
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "all.txt", "page": 0}),
+        json!({"repo": REPO, "path": "all.txt", "page": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&read), before.trim_end());
@@ -496,7 +496,7 @@ fn file_list() {
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": REPO, "path": "a", "page": 0}),
+        json!({"repo": REPO, "path": "a", "page": 1}),
         &ctx,
     ));
     let entries = resp["entries"].as_array().unwrap();
@@ -513,7 +513,7 @@ fn file_list_root_is_empty_until_something_is_written() {
     for path in ["", "/"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path, "page": 0 }),
+            json!({ "repo": REPO, "path": path, "page": 1 }),
             &ctx,
         ));
         assert_eq!(
@@ -533,7 +533,7 @@ fn file_list_of_an_unwritten_directory_is_not_found() {
     for path in ["src", "candle-examples/"] {
         let resp = harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path, "page": 0 }),
+            json!({ "repo": REPO, "path": path, "page": 1 }),
             &ctx,
         );
         harness::expect_error(&resp, "not_found");
@@ -560,7 +560,7 @@ fn file_list_root_path_lists_one_level() {
     for path in ["/", ""] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path, "page": 0 }),
+            json!({ "repo": REPO, "path": path, "page": 1 }),
             &ctx,
         ));
         let entries = resp["entries"].as_array().unwrap();
@@ -596,7 +596,7 @@ fn leading_slash_and_dot_segments_normalise_to_the_same_entry() {
     for path in ["src", "src/", "/src", "./src", "src/../src"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path, "page": 0 }),
+            json!({ "repo": REPO, "path": path, "page": 1 }),
             &ctx,
         ));
         let entries = resp["entries"].as_array().unwrap();
@@ -606,7 +606,7 @@ fn leading_slash_and_dot_segments_normalise_to_the_same_entry() {
     // The same file resolves under either spelling.
     let bare = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 1}),
         &ctx,
     ));
     assert_eq!(excerpt_source(&bare), "fn main() {}");

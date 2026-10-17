@@ -18,3 +18,10 @@ serde_json   = { workspace = true }
 serde_yaml   = "0.9"
 sysinfo      = { version = "0.31", default-features = false, features = ["system"] }
 tokio        = { version = "1", features = ["rt-multi-thread"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

@@ -167,7 +167,7 @@ layers:
     window: 16000
     score_threshold: 0.0
     gather_scope: conversation
-    decode_priority: high
+    decode_priority: normal
     on_corrupt_turn: drop_turn
     budget:
       priority: 100
@@ -211,7 +211,7 @@ layers:
     window: 16000
     score_threshold: 0.0
     gather_scope: conversation
-    decode_priority: high
+    decode_priority: normal
     on_corrupt_turn: drop_turn
     budget:
       priority: 100
@@ -255,7 +255,7 @@ layers:
     window: 16000
     score_threshold: 0.0
     gather_scope: conversation
-    decode_priority: high
+    decode_priority: normal
     on_corrupt_turn: drop_turn
     budget:
       priority: 100

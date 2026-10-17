@@ -113,12 +113,18 @@ pub struct RepoPath {
 /// `code_reading` ingest's format. The header serves the model directly, in the
 /// text it is already reading, where a structured field beside a rendered
 /// string would have to be correlated with it.
+///
+/// **Pages are numbered from 1**, as a person numbers them, in everything the
+/// model writes and reads: page 1 is the first, `pages` is the last, and the
+/// last page's `next_page` is `null`. Zero-based, the last of two pages read
+/// "page 1/2" — page one of two, one more to come — and a model reasoning over
+/// it concluded a page was missing from a file it had read whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Paging {
-    /// Zero-based index of the page returned. Clamped into range, so asking past
-    /// the end yields the last page rather than an error or an empty result.
+    /// The page returned, from 1. Clamped into range, so asking past the end
+    /// yields the last page rather than an error or an empty result.
     pub page: u32,
-    /// Total number of pages available for this request.
+    /// Total number of pages available for this request — the last page.
     pub pages: u32,
     /// Items per page — the cap this tool applies.
     pub per_page: usize,
@@ -129,25 +135,31 @@ pub struct Paging {
 }
 
 impl Paging {
-    /// Describe page `requested` of `total` items at `per_page`. An out-of-range
-    /// request clamps to the last page: a model that over-shoots gets the tail of
-    /// the data rather than a silent empty list it would read as "nothing there".
+    /// Describe page `requested` (from 1) of `total` items at `per_page`. An
+    /// out-of-range request clamps into range: a model that over-shoots gets the
+    /// tail of the data rather than a silent empty list it would read as
+    /// "nothing there".
     pub fn of(total: usize, requested: u32, per_page: usize) -> Self {
         let per_page = per_page.max(1);
         let pages = total.div_ceil(per_page).max(1) as u32;
-        let page = requested.min(pages - 1);
+        let page = requested.clamp(1, pages);
         Paging {
             page,
             pages,
             per_page,
             total,
-            next_page: (page + 1 < pages).then_some(page + 1),
+            next_page: (page < pages).then_some(page + 1),
         }
     }
 
     /// Items to skip to reach this page.
     pub fn skipped(&self) -> usize {
-        self.page as usize * self.per_page
+        (self.page as usize - 1) * self.per_page
+    }
+
+    /// Whether this is the first page.
+    pub fn is_first(&self) -> bool {
+        self.page == 1
     }
 }
 

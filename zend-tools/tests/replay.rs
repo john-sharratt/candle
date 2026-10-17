@@ -33,7 +33,7 @@ fn a_file_edit_may_be_re_issued() {
 /// Reads change nothing, so a resumed turn simply reads again.
 #[test]
 fn a_read_may_be_re_issued() {
-    let args = serde_json::json!({ "repo": REPO, "path": "src/main.rs", "page": 0 });
+    let args = serde_json::json!({ "repo": REPO, "path": "src/main.rs", "page": 1 });
     assert_eq!(harness::replay("file_read", args), Replay::Safe);
 }
 

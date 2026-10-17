@@ -226,16 +226,59 @@ impl Hub {
         }
     }
 
-    /// Queue a catch-up frame for `node`, unless it would pass the cap.
+    /// Queue a catch-up frame for `node`, unless [`dropped_at_cap`].
     fn to_catchup(&self, app: &str, node: u64, frame: Frame) {
         let mut s = self.state();
         let Some(x) = s.sockets.get_mut(&(app.to_string(), node)) else {
             return;
         };
-        if x.handle.gauges().catchup() + frame.encoded_len() > CATCHUP_CAP {
+        if dropped_at_cap(&frame, x.handle.gauges().catchup()) {
             x.dropped += 1;
             return;
         }
         let _ = x.handle.catchup(frame);
+    }
+}
+
+/// Whether a catch-up frame is dropped, with `queued` bytes already on the
+/// member's catch-up lane: when it would pass [`CATCHUP_CAP`].
+///
+/// **A `DONE` is never dropped.** A dropped `HEADERS` or fetched record is
+/// repaired by the requester — it asks again from where it stands, and a fetch
+/// ending short of a record fetches it again — but a dropped `DONE` leaves its
+/// catch-up waiting until it goes quiet, 30 s on. It is a few bytes.
+fn dropped_at_cap(frame: &Frame, queued: usize) -> bool {
+    !matches!(frame, Frame::Done(_)) && queued + frame.encoded_len() > CATCHUP_CAP
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::Headers;
+
+    fn headers() -> Frame {
+        Frame::Headers(Headers {
+            request: 1,
+            reply_to: 7,
+            answerer: 3,
+            origin: 9,
+            from: 1,
+            to: 1,
+            gone: vec![],
+            records: vec![],
+        })
+    }
+
+    /// Past the cap a `HEADERS` is dropped and a `DONE` still goes.
+    #[test]
+    fn a_done_passes_the_cap_and_headers_do_not() {
+        let done = Frame::Done(Done {
+            request: 1,
+            reply_to: 7,
+        });
+        assert!(!dropped_at_cap(&headers(), 0));
+        assert!(dropped_at_cap(&headers(), CATCHUP_CAP));
+        assert!(!dropped_at_cap(&done, CATCHUP_CAP));
+        assert!(!dropped_at_cap(&done, usize::MAX / 2));
     }
 }

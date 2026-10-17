@@ -34,11 +34,13 @@ use http_body_util::BodyExt;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
-use zend_vfs::{FetchBundle, JobStatus, PushResult, RunOutcome};
+use zend_vfs::{FetchBundle, JobStatus, PushResult, RemoteRefs, RunOutcome};
 
 use crate::jobs::{JobError, Jobs};
 use crate::member::{capacity, node_in, APP};
-use crate::wire::{AgentJobs, FetchJob, JobView, LogChunk, PushJob, RunJob, Submit, Switching};
+use crate::wire::{
+    AgentJobs, FetchJob, JobView, ListJob, LogChunk, PushJob, RunJob, Submit, Switching,
+};
 
 /// How long each wait on a running job is held open.
 const WAIT: Duration = Duration::from_secs(25);
@@ -518,6 +520,39 @@ impl Agents {
         view.fetched
             .ok_or_else(|| AgentError::Transport("the fetch's answer carried nothing".into()))?
             .bundle()
+            .map_err(|e| AgentError::Transport(e.0))
+    }
+
+    /// What origin's refs point at now, read by an agent holding `job`'s
+    /// repository, fetching nothing.
+    pub async fn list(&self, job: ListJob) -> Result<RemoteRefs, AgentError> {
+        let view = if let Some(jobs) = self.local() {
+            jobs.submit(Submit::List(job)).await.map_err(refused)?
+        } else {
+            let body = serde_json::to_vec(&Submit::List(job.clone())).expect("a job serialises");
+            let (_, body) = self
+                .call(Call {
+                    method: Method::POST,
+                    path: "/v1/jobs".into(),
+                    body,
+                    to: None,
+                    lineage: None,
+                    repo: Some(&job.repo),
+                    toolchain: None,
+                    push: false,
+                })
+                .await?;
+            Self::view_of(&body)?
+        };
+        if let JobStatus::Failed { why } = &view.status {
+            return Err(AgentError::Refused {
+                status: 500,
+                why: why.clone(),
+            });
+        }
+        view.listed
+            .ok_or_else(|| AgentError::Transport("the listing's answer carried nothing".into()))?
+            .refs()
             .map_err(|e| AgentError::Transport(e.0))
     }
 }

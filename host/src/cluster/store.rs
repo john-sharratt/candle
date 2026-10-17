@@ -186,35 +186,28 @@ impl Store for ConversationStore {
     }
 
     fn list(&self, origin: u64, from: u64, to: u64) -> Listing {
-        match self.conversation.list_held(origin, from, to) {
-            Ok(held) => Listing {
-                records: held
-                    .records
-                    .into_iter()
-                    .map(|r| RecordHeader {
-                        oseq: r.oseq,
-                        record_type: r.record_type,
-                        stream_id: r.stream_id,
-                        chunk_index: r.chunk_index,
-                        len: r.len,
-                        digest: r.digest,
-                    })
-                    .collect(),
-                gone: held
-                    .gone
-                    .into_iter()
-                    .map(|(oseq, e)| Gone {
-                        oseq,
-                        deleted_entry: e.as_ref().map(encode_entry),
-                    })
-                    .collect(),
-            },
-            Err(e) => {
-                // Listing nothing claims nothing: the requester's catch-up
-                // leaves the range wanted.
-                tracing::error!(origin, from, to, "a catch-up's range is unreadable: {e}");
-                Listing::default()
-            }
+        let held = self.conversation.list_held(origin, from, to);
+        Listing {
+            records: held
+                .records
+                .into_iter()
+                .map(|r| RecordHeader {
+                    oseq: r.oseq,
+                    record_type: r.record_type,
+                    stream_id: r.stream_id,
+                    chunk_index: r.chunk_index,
+                    len: r.len,
+                    digest: r.digest,
+                })
+                .collect(),
+            gone: held
+                .gone
+                .into_iter()
+                .map(|(oseq, e)| Gone {
+                    oseq,
+                    deleted_entry: e.as_ref().map(encode_entry),
+                })
+                .collect(),
         }
     }
 

@@ -21,7 +21,7 @@ questions:
 - locate the definition in that commit without checking it out
 - which files matched that pattern in the previous revision
 category: Git
-description: '**Search what a COMMIT, BRANCH or TAG holds** — the committed content, not the files on disk. This is the tool for "search the committed files", "was this in the release branch", "did that tag still have it", "what did this look like before". Searches every file the revision tracks without checking it out, returning each matching file, line number and line, with a `count` of the total and `files_matched` distinct files. `pattern` is a POSIX extended regular expression, or a literal string when `fixed` is set; `ignore_case` matches without regard to case; `rev` chooses what to search and defaults to HEAD — the last commit, not the files on disk. Narrow with `paths`, and bound one file''s share with `max_per_file`. Binary files are skipped. **To search the working tree as it stands right now, uncommitted edits and untracked files included, use file_grep instead** — an untracked or since-edited file reads differently through the two. `page` is required, 40 matches a page: pass 0 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only.'
+description: '**Search what a COMMIT, BRANCH or TAG holds** — the committed content, not the files on disk. This is the tool for "search the committed files", "was this in the release branch", "did that tag still have it", "what did this look like before". Searches every file the revision tracks without checking it out, returning each matching file, line number and line, with a `count` of the total and `files_matched` distinct files. `pattern` is a POSIX extended regular expression, or a literal string when `fixed` is set; `ignore_case` matches without regard to case; `rev` chooses what to search and defaults to HEAD — the last commit, not the files on disk. Narrow with `paths`, and bound one file''s share with `max_per_file`. Binary files are skipped. **To search the working tree as it stands right now, uncommitted edits and untracked files included, use file_grep instead** — an untracked or since-edited file reads differently through the two. `page` is required and counts from 1, 40 matches a page: pass 1 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -66,9 +66,9 @@ parameters:
       minimum: 1.0
       type: integer
     page:
-      description: Zero-based page of matches, 40 a page. Required — pass 0 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
+      description: Page of matches, from 1, 40 a page. Required — pass 1 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
       format: uint32
-      minimum: 0.0
+      minimum: 1.0
       type: integer
     paths:
       description: Only search these repository-relative files or directories. Leave it out to search everything the revision tracks.

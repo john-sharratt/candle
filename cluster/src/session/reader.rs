@@ -38,6 +38,9 @@ pub async fn run<R: PipeRx>(
     let ended = loop {
         let message = match timeout(DEAD_AFTER, rx.recv()).await {
             Err(_) => {
+                // How many frames came before the silence tells a peer that
+                // never spoke from one that stopped.
+                tracing::warn!(frames = number, "no frame from the peer for 45 s: closing");
                 let close = Close::new(CloseCode::GoingAway, "no frame from the peer for 45 s");
                 let _ = commands.send(Command::Close(close));
                 break Ended::Dead;

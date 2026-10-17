@@ -58,6 +58,14 @@ pub enum GitError {
         status: Option<i32>,
         stderr: String,
     },
+    /// The packs a repository read from the substrate is held in could not be
+    /// read or written (`docs/substrate_git.md` §4).
+    #[error("the substrate's packs: {0}")]
+    Packs(String),
+    /// The `git` program was asked of a repository that has no folder for it
+    /// to run in: one read from the substrate.
+    #[error("git {command} has no folder to run in: the repository is read from the substrate")]
+    NoFolder { command: String },
 }
 
 impl GitError {

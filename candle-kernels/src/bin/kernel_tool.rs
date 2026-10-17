@@ -15,6 +15,8 @@
 #![allow(dead_code)]
 
 include!("../../build_utils.rs");
+// The build's source lint, here so its tests run (`cargo test --bin kernel_tool`).
+include!("../../build_lints.rs");
 
 use clap::{Parser, Subcommand};
 

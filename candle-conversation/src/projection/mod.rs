@@ -200,6 +200,7 @@
 
 pub mod adaptive;
 mod belief_files;
+mod belief_scan_split;
 mod builder;
 mod error;
 pub(crate) mod event;

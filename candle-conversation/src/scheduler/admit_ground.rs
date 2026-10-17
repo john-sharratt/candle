@@ -35,10 +35,9 @@
 //! reason [`admit::Ground::resident_weights`] gives: it moves under the fill's
 //! feet from places admission cannot see.
 
-use std::time::Instant;
-
 use super::admission::prefill_cost_bytes;
 use super::admit::{Budget, Cost, Ground, Headroom, Kind};
+use super::band::rank;
 use super::interleave;
 use super::{Scheduler, SequenceId, WaveMember};
 use crate::projection::DecodePriority;
@@ -276,7 +275,11 @@ impl Ground for AdmitPass<'_> {
         // Counted as work that can advance — prefills and sections alike, since
         // both are prefill rows in the same forwards — and a paused prefill
         // moves no row (`Scheduler::running_members`).
-        if self.sched.running_members() >= Scheduler::MAX_PREFILL_WIDTH {
+        // A prompt of a band the running members yield to is not held behind
+        // them: they are why the width is spent (`Ground::outranks_active`).
+        if self.sched.running_members() >= Scheduler::MAX_PREFILL_WIDTH
+            && !(kind == Kind::Prefill && self.sched.lower_band_active(prio))
+        {
             return None;
         }
         match kind {
@@ -296,6 +299,10 @@ impl Ground for AdmitPass<'_> {
         self.sched.set_rate_width(width);
         self.closed = true;
         true
+    }
+
+    fn outranks_active(&self, prio: DecodePriority) -> bool {
+        self.sched.lower_band_active(prio)
     }
 
     fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
@@ -404,17 +411,9 @@ impl AdmitPass<'_> {
         // The cursor is the pass's and this band's, so a band resumes where *it*
         // left off rather than where the previous band did, and nothing is
         // consumed by looking.
-        //
-        // **A turn paused behind higher-priority work is walked past too** — it
-        // waits in the queue, in order, until the work that outranks it has
-        // been idle for the cooldown (see `priority_pause`). Checked per turn,
-        // because the cursor walks the whole queue and only this band's turns
-        // are offered here.
         let band = band_index(prio);
-        let now = Instant::now();
         while let Some(w) = self.sched.prefill_queue.get(self.prefill_cursor[band]) {
-            let p = self.sched.decode_priority_or_high(w.sequence_id);
-            if p == prio && !self.sched.priority_pause.paused(p, now) {
+            if self.sched.decode_priority_or_high(w.sequence_id) == prio {
                 break;
             }
             self.prefill_cursor[band] += 1;
@@ -778,6 +777,27 @@ impl Scheduler {
     pub(super) fn decode_priority_or_high(&self, id: SequenceId) -> DecodePriority {
         self.decode_layer_priority(id)
             .unwrap_or(DecodePriority::High)
+    }
+
+    /// Whether a slot in flight — prefilling, ingesting a section, or decoding —
+    /// belongs to a band below `prio`. A section ingest is `Low`.
+    pub(super) fn lower_band_active(&self, prio: DecodePriority) -> bool {
+        let below = |p: DecodePriority| rank(p) < rank(prio);
+        let prefills = self
+            .active_prefills
+            .iter()
+            .filter(|p| p.error.is_none() && p.finished.is_none())
+            .any(|p| below(self.decode_priority_or_high(p.work.sequence_id)));
+        let sections = self
+            .active_section_ingests
+            .iter()
+            .any(|s| s.error.is_none() && below(DecodePriority::Low));
+        let decodes = self
+            .active_decodes
+            .iter()
+            .filter(|(_, s)| !s.finished)
+            .any(|(&id, _)| below(self.decode_priority_or_high(id)));
+        prefills || sections || decodes
     }
 }
 

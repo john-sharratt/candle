@@ -253,7 +253,7 @@ mod tests {
     }
 
     fn daemon(dir: &TempDir) -> (Arc<Runtime>, SharedSubstrate) {
-        let rt = Runtime::new(Mind::new(None), dir.path());
+        let rt = Runtime::new(Mind::new(None), dir.path()).unwrap();
         let s = shared(&dir.path().join("substrate"));
         rt.set_substrate(s.clone());
         (rt, s)
@@ -277,7 +277,7 @@ mod tests {
         rt.beat(&world);
         assert_eq!(rt.standing.written(WORLD), records_of(&world));
 
-        let again = Runtime::new(Mind::new(None), dir.path());
+        let again = Runtime::new(Mind::new(None), dir.path()).unwrap();
         again.set_substrate(s.clone());
         let hosted = again.host(WORLD, Path::new(ROOMS)).unwrap();
         again.hold_world(WORLD, true);

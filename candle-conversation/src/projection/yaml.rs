@@ -62,6 +62,7 @@
 //! variants.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 use candle_transformers::models::dialect::{Dialect, DialectTemplate};
 use serde::Deserialize;
@@ -803,6 +804,12 @@ fn parse_working_set(
     if yw.max_file_tokens == 0 {
         return Err(invalid("max_file_tokens must be > 0"));
     }
+    let max_admits = match yw.max_admits {
+        None => DEFAULT_MAX_SWAPS,
+        Some(n) => NonZeroUsize::new(n).ok_or_else(|| {
+            invalid("max_admits must be >= 1: a cap of 0 admits no conversation, ever")
+        })?,
+    };
     Ok(Some(WorkingSetConfig {
         budget_tokens: yw.budget_tokens,
         folder_tokens: yw.folder_tokens,
@@ -811,7 +818,7 @@ fn parse_working_set(
         max_file_tokens: yw.max_file_tokens,
         seeds: yw.seeds.clone(),
         release_on: yw.release_on.clone(),
-        max_admits: yw.max_admits.unwrap_or(DEFAULT_MAX_SWAPS),
+        max_admits,
     }))
 }
 
@@ -1123,7 +1130,17 @@ fn build(
                 budget_adaptive: parse_member_budget_adaptive(&yg.id, yg.budget_adaptive.as_ref())?,
                 locality: parse_locality(&yg.id, yg.locality.as_ref())?,
                 anchor: parse_anchor(&yg.id, yg.anchor.as_ref())?,
-                max_swaps: yg.max_swaps.unwrap_or(DEFAULT_MAX_SWAPS),
+                max_swaps: match yg.max_swaps {
+                    None => DEFAULT_MAX_SWAPS,
+                    Some(n) => {
+                        NonZeroUsize::new(n).ok_or_else(|| ConstructionError::InvalidPolicy {
+                            name: yg.id.clone(),
+                            reason: "max_swaps must be >= 1: a cap of 0 admits no conversation, \
+                                     ever"
+                                .to_string(),
+                        })?
+                    }
+                },
             });
         }
 

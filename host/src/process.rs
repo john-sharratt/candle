@@ -13,6 +13,7 @@ use std::panic::set_hook;
 use std::path::Path;
 use std::process::exit;
 use std::sync::Arc;
+use std::thread::current;
 
 use candle_conversation::relief_trace;
 use tokio::signal::ctrl_c;
@@ -22,19 +23,33 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-use crate::logs::{BusWriter, LogBus};
+use anyhow::anyhow;
+
+use crate::logs::LogBus;
 use web::log_file::{is_resuming, RotatingFileLog};
 
-/// Print a full backtrace on every panic — no `RUST_BACKTRACE` needed — with
+/// Report a full backtrace on every panic — no `RUST_BACKTRACE` needed — with
 /// the last CUDA kernel launched on the crashing thread and the relief trace.
 /// The kernel name is written into a thread-local breadcrumb before every
 /// kernel launch, so it is available here even though a CUDA error surfaces
 /// asynchronously at a later readback or synchronize.
+///
+/// **Logged as well as printed.** keep runs a stable daemon with stderr
+/// detached, so a panic that only reached stderr went nowhere: a scheduler
+/// thread that panicked left its callers hearing "scheduler has shut down"
+/// and the log saying nothing about why. The log file is the record that
+/// survives, and `/v1/logs` searches it.
 pub fn install_panic_hook() {
     set_hook(Box::new(|info| {
         let bt = Backtrace::force_capture();
         let kernel = candle::last_cuda_kernel_launch();
         let relief = relief_trace::dump();
+        let me = current();
+        let name = me.name().unwrap_or("<unnamed>");
+        tracing::error!(
+            thread = name,
+            "PANIC: {info}\nLast CUDA kernel: {kernel}\n{relief}\n\n{bt}"
+        );
         eprintln!(
             "\n=== PANIC ===\n{info}\nLast CUDA kernel: {kernel}\n{relief}\n\n{bt}\n=============\n"
         );
@@ -43,7 +58,12 @@ pub fn install_panic_hook() {
 
 /// The filter every sink shares, at `verbose` (0 info, 1 debug, 2+ trace).
 ///
-/// Every tenant's crate and the engine's at the chosen level. `candle_nn` sits
+/// Every tenant's crate, the engine's and the repositories' — the substrate's
+/// git stores, the object database, the agents that fetch for them — and the
+/// cluster's, at the chosen level. Without `cluster` a replication fault (a
+/// catch-up gone quiet and asked again, a refused record) was never written
+/// anywhere, and a member starved by its peers' catch-ups said nothing about
+/// why. `candle_nn` sits
 /// **one step below**, because its debug tier is not diagnostics: the KV
 /// cache's pools narrate every arena sweep and region claim, thousands of lines
 /// a second under load, which buries the events worth reading. Anything in
@@ -66,6 +86,11 @@ pub fn filter_directives(tenants: &[&str], verbose: u8) -> Vec<String> {
         "candle_conversation",
         "candle_transformers",
         "candle_core",
+        "substrate_git",
+        "zend_vfs",
+        "agent",
+        "cluster",
+        "cluster_dial",
     ] {
         d.push(format!("{krate}={level}"));
     }
@@ -73,9 +98,10 @@ pub fn filter_directives(tenants: &[&str], verbose: u8) -> Vec<String> {
     d
 }
 
-/// Install the one subscriber: the terminal, the bus `/ws/logs` serves, and a
-/// size-rotated file `<log_dir>/<log_name>`. One formatter feeds all three, so
-/// what an operator sees on screen and what the console shows cannot drift.
+/// Install the one subscriber: the terminal, and a size-rotated file
+/// `<log_dir>/<log_name>` that feeds the bus `/ws/logs` serves and `/v1/logs`
+/// searches. The file is the console's only record, so a file that cannot be
+/// opened fails the start rather than leaving the console silently empty.
 ///
 /// Returns whether this start resumes after a self-heal relaunch — read before
 /// the file sink consumes the marker that says so — so the caller can log the
@@ -97,27 +123,23 @@ pub fn init_logging(
     let stdout = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_filter(filter.clone());
-    let bus_writer = Arc::clone(bus);
-    let to_bus = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_target(true)
-        .with_writer(move || BusWriter::new(Arc::clone(&bus_writer)))
-        .with_filter(filter.clone());
 
     let resumed = is_resuming(log_dir);
-    // An unopenable file degrades to the terminal and the bus rather than
-    // failing the start; `Option<Layer>` is itself a `Layer`.
-    let to_file = RotatingFileLog::new(log_dir, log_name).map(|w| {
-        tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_target(true)
-            .with_writer(w)
-            .with_filter(filter)
-    });
+    let file = RotatingFileLog::new(log_dir, log_name).ok_or_else(|| {
+        anyhow!(
+            "the log file {} could not be opened",
+            log_dir.join(log_name).display()
+        )
+    })?;
+    bus.attach(&file);
+    let to_file = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(file)
+        .with_filter(filter);
 
     tracing_subscriber::registry()
         .with(stdout)
-        .with(to_bus)
         .with(to_file)
         .try_init()?;
     Ok(resumed)
@@ -187,6 +209,11 @@ mod tests {
                 "candle_conversation=info",
                 "candle_transformers=info",
                 "candle_core=info",
+                "substrate_git=info",
+                "zend_vfs=info",
+                "agent=info",
+                "cluster=info",
+                "cluster_dial=info",
                 "candle_nn=warn",
             ]
         );

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::GitError;
+use crate::library::refs::Upstreams;
 use crate::library::{config, history, refs};
 use crate::redact::redact_urls;
 use crate::runner::utf8;
@@ -280,7 +281,10 @@ impl Repo {
     /// Every local branch, with its upstream when one is configured.
     pub fn branches(&self) -> Result<Vec<Branch>, GitError> {
         if let Some(lib) = self.library() {
-            return refs::branches(&lib);
+            return match self.objects() {
+                Some(db) => refs::branches(&lib, Upstreams::Held(&db.settings())),
+                None => refs::branches(&lib, Upstreams::Config),
+            };
         }
         let out = self
             .git("for-each-ref")
@@ -293,6 +297,12 @@ impl Repo {
 
     /// Every configured remote.
     pub fn remotes(&self) -> Result<Vec<Remote>, GitError> {
+        // A repository read from the substrate holds its remotes in memory
+        // (`docs/substrate_git.md` §4.3).
+        if let Some(db) = self.objects() {
+            let held = db.settings().remotes().clone();
+            return remotes_from(held.into_iter().collect(), BTreeMap::new());
+        }
         if let Some(lib) = self.library() {
             return config::remotes(&lib);
         }

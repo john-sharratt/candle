@@ -26,3 +26,21 @@
 // A launcher that skipped its launch is the silent-loss case a recorded graph
 // cannot survive: the missing node would be missing from every replay. So the
 // status covers the launch itself, not only the table lookup.
+//
+// A failed launch also records WHICH CUDA call failed and with what error, on
+// this thread, read back by `qmm_last_launch_error` / `_site`
+// (`dispatcher.cu`). A bare QMM_LAUNCH_FAILED says nothing about the cause: a
+// launch inside a recorded wave can fail on its own refusal or report an
+// earlier one, and only the error and the call tell those apart.
+
+#include <cuda_runtime.h>
+
+extern thread_local cudaError_t qmm_launch_error;
+extern thread_local const char* qmm_launch_site;
+
+// Record `err` from the call at `site` and return QMM_LAUNCH_FAILED.
+static inline int qmm_launch_failed(cudaError_t err, const char* site) {
+    qmm_launch_error = err;
+    qmm_launch_site = site;
+    return QMM_LAUNCH_FAILED;
+}

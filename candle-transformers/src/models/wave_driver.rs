@@ -43,6 +43,7 @@ use super::residual_order::{caller_runs, reorder, Run};
 use super::tensor_cat::TensorCat;
 use super::window_residuals::WindowResiduals;
 use candle::quantized::pinned_staging::Generation;
+use candle_nn::kv_cache::PREFILL_KV_STAGE_MIN_Q_LEN;
 
 /// Everything the layer sweep needs that the driver assembled for it.
 ///
@@ -381,8 +382,12 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     {
         candle::bail!("forward_wave: input/seq length mismatch");
     }
-    // Whether this forward's GPU spans are sampled (`set_gpu_span_period`).
-    begin_gpu_span_forward();
+    // Whether this forward's GPU spans are sampled (`set_gpu_span_period`): a
+    // forward carrying a prompt chunk always is.
+    let bulk = prefill_inputs
+        .iter()
+        .any(|t| t.dims().last().copied().unwrap_or(0) >= PREFILL_KV_STAGE_MIN_Q_LEN);
+    begin_gpu_span_forward(bulk);
 
     // Bound a single forward's token count: a PURE prefill full sweep whose
     // total tokens exceed the budget is split into token-bounded sub-forwards

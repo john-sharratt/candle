@@ -46,24 +46,44 @@ use candle::{Device, Result};
 /// which happened can ignore the answer.
 ///
 /// A no-op off CUDA.
+///
+/// No runtime reserve: a plain model's held window residual is one `[rows,
+/// hidden]` block, which the governor's pool cushion covers. A model whose
+/// residual is wider says what it needs through [`open_for_load_sized`].
 pub fn open_for_load(device: &Device, content: &gguf_file::Content) -> Result<bool> {
-    open_for_load_sized(device, peak_load_pool_bytes(content.tensor_infos.values()))
+    open_for_load_sized(
+        device,
+        peak_load_pool_bytes(content.tensor_infos.values()),
+        0,
+    )
 }
 
 /// [`open_for_load`] with the pool headroom already computed — for a load that reads some of
 /// its tensors from outside `content` (see `qwen35::TensorOverrides::effective_infos`), whose
 /// largest source is therefore not the one `content`'s header names.
-pub fn open_for_load_sized(device: &Device, headroom: usize) -> Result<bool> {
+///
+/// `runtime_reserve` is device memory the model holds for as long as it runs, outside any
+/// forward. It widens the reservation's held ground, so it stands inside the span for good
+/// rather than being handed back at [`close_load`] like `headroom` — see
+/// `qwen4exp::loader::window_residual_reserve_bytes` for the one model that needs it.
+pub fn open_for_load_sized(
+    device: &Device,
+    headroom: usize,
+    runtime_reserve: usize,
+) -> Result<bool> {
     #[cfg(feature = "cuda")]
     {
         if matches!(device, Device::Cuda(_)) {
-            let claimed = candle_nn::kv_cache::ensure_reservation(device, headroom)?;
+            let claimed =
+                candle_nn::kv_cache::ensure_reservation(device, headroom, runtime_reserve)?;
             if claimed {
                 tracing::info!(
                     target: "candle_transformers::dense_span",
                     headroom_mib = headroom >> 20,
+                    runtime_reserve_mib = runtime_reserve >> 20,
                     "device reservation claimed before load; the largest source tensor and the \
-                     repack's bounded f32 band stay with the pool"
+                     repack's bounded f32 band stay with the pool, the runtime reserve is held \
+                     ground"
                 );
             } else {
                 tracing::info!(
@@ -76,7 +96,7 @@ pub fn open_for_load_sized(device: &Device, headroom: usize) -> Result<bool> {
         }
     }
     #[cfg(not(feature = "cuda"))]
-    let _ = headroom;
+    let _ = (headroom, runtime_reserve);
     let _ = device;
     Ok(false)
 }

@@ -16,6 +16,9 @@
 //!   bundle of their objects the member's `have` does not reach. A member
 //!   whose repository lives with an agent reads origin through it
 //!   (`docs/replicated_substrate.md` §10.3).
+//! - **`list`** — `{ repo }`: answer with what origin's refs point at now,
+//!   tags included, fetching nothing — `ls-remote` for a repository whose
+//!   remote lives with an agent (`docs/substrate_git.md` §9).
 //!
 //! Every answer is a [`JobView`]: where the job stands, and once it has
 //! ended, what it came to.
@@ -27,7 +30,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use zend_vfs::{
     BranchName, FetchBundle, JobStatus, Lease, Oid, PushAction, PushOutcome, PushResult, PushSpec,
-    PushTarget, RefName, RunOutcome, Snapshot,
+    PushTarget, RefName, RemoteRefs, RunOutcome, Snapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +39,7 @@ pub enum Submit {
     Run(RunJob),
     Push(PushJob),
     Fetch(FetchJob),
+    List(ListJob),
 }
 
 impl Submit {
@@ -44,7 +48,55 @@ impl Submit {
             Submit::Run(r) => &r.repo,
             Submit::Push(p) => &p.repo,
             Submit::Fetch(f) => &f.repo,
+            Submit::List(l) => &l.repo,
         }
+    }
+}
+
+/// What origin's refs point at now, fetching nothing: what a repository whose
+/// remote lives with an agent reads for `ls-remote` (`docs/substrate_git.md`
+/// §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListJob {
+    pub repo: String,
+}
+
+/// A listing's answer: the branch origin's `HEAD` names, and every ref under
+/// `refs/`, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    pub refs: BTreeMap<String, String>,
+}
+
+impl Listed {
+    pub fn of(r: &RemoteRefs) -> Listed {
+        Listed {
+            head: r.head_branch.as_ref().map(|b| b.as_str().to_string()),
+            refs: r
+                .refs
+                .iter()
+                .map(|(n, o)| (n.as_str().to_string(), o.to_string()))
+                .collect(),
+        }
+    }
+
+    pub fn refs(&self) -> Result<RemoteRefs, BadWire> {
+        let head_branch = self
+            .head
+            .as_deref()
+            .map(|b| BranchName::parse(b).map_err(|e| BadWire(format!("`{b}`: {e}"))))
+            .transpose()?;
+        let refs = self
+            .refs
+            .iter()
+            .map(|(n, o)| {
+                let name = RefName::parse(n).map_err(|e| BadWire(format!("`{n}`: {e}")))?;
+                Ok((name, oid(o)?))
+            })
+            .collect::<Result<_, BadWire>>()?;
+        Ok(RemoteRefs { head_branch, refs })
     }
 }
 
@@ -60,6 +112,12 @@ pub struct FetchJob {
     /// answer can carry (`docs/substrate_git.md` §5.1). Unbounded when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_commits: Option<u32>,
+    /// At most this many bytes of bundle in one answer: a slice that bundles
+    /// larger is cut again, half its commits each time, until it fits — a
+    /// member keeps each answer as one pack of a log whose records are
+    /// bounded. Unbounded when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
 }
 
 /// What origin holds for a fetch, and the objects the member lacks.
@@ -169,6 +227,9 @@ pub struct JobView {
     pub pushed: Vec<Pushed>,
     /// A fetch's answer, on the answer to its submit only.
     pub fetched: Option<Fetched>,
+    /// A listing's answer, on the answer to its submit only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed: Option<Listed>,
 }
 
 /// What a job does.
@@ -412,6 +473,7 @@ mod tests {
             outcome: None,
             pushed: Vec::new(),
             fetched: None,
+            listed: None,
         };
         let wire = serde_json::to_value(&view).unwrap();
         assert_eq!(
@@ -434,6 +496,7 @@ mod tests {
             branch: Some("main".into()),
             have: vec![A.into()],
             max_commits: None,
+            max_bytes: None,
         });
         assert_eq!(
             serde_json::to_value(&fetch).unwrap(),

@@ -143,6 +143,7 @@ struct SamplingMark {
     dry_span_len: i32,
     close_script_pos: Option<usize>,
     degenerate_run: u32,
+    degenerate: bool,
     rng_offset: u64,
 }
 
@@ -525,6 +526,14 @@ pub struct SequenceSamplingState {
     /// a broken forward, not of language; [`DEGENERATE_TOKEN_RUN`] bounds it.
     pub degenerate_run: u32,
 
+    /// The turn's run of token 0 reached [`DEGENERATE_TOKEN_RUN`] — sticky
+    /// until the turn ends, whatever is committed after it. The run itself
+    /// resets on the next other token, and the guard's own forced EOS is one:
+    /// a speculative step that commits the run's last token and that EOS
+    /// together leaves the run at 0 by the time the step is checked, and a
+    /// turn of `!` was sealed as an answer. The decode loop reads this.
+    pub degenerate: bool,
+
     /// Current RNG offset (for deterministic sampling across calls).
     pub rng_offset: u64,
 }
@@ -549,6 +558,7 @@ impl SequenceSamplingState {
             close_script_pos: None,
             close_would_continue: false,
             degenerate_run: 0,
+            degenerate: false,
             rng_offset: 0,
         }
     }
@@ -569,6 +579,9 @@ impl SequenceSamplingState {
         // row, so a run of it means the forward produced nothing usable.
         if token == 0 {
             self.degenerate_run += 1;
+            if self.degenerate_run >= DEGENERATE_TOKEN_RUN {
+                self.degenerate = true;
+            }
         } else {
             self.degenerate_run = 0;
         }
@@ -629,6 +642,8 @@ impl SequenceSamplingState {
         self.writing_call = false;
         self.close_script_pos = None;
         self.close_would_continue = false;
+        self.degenerate_run = 0;
+        self.degenerate = false;
         self.rng_offset = 0;
     }
 
@@ -689,6 +704,7 @@ impl SequenceSamplingState {
         self.close_script_pos = None;
         self.close_would_continue = false;
         self.degenerate_run = 0;
+        self.degenerate = false;
     }
 
     /// Advance RNG offset (called after each sampling).
@@ -762,6 +778,7 @@ impl SequenceSamplingState {
             dry_span_len: self.dry_span_len,
             close_script_pos: self.close_script_pos,
             degenerate_run: self.degenerate_run,
+            degenerate: self.degenerate,
             rng_offset: self.rng_offset,
         }
     }
@@ -787,6 +804,7 @@ impl SequenceSamplingState {
         self.dry_span_len = mark.dry_span_len;
         self.close_script_pos = mark.close_script_pos;
         self.degenerate_run = mark.degenerate_run;
+        self.degenerate = mark.degenerate;
         self.rng_offset = mark.rng_offset;
     }
 
@@ -2812,6 +2830,36 @@ mod tests {
         assert_eq!(st.degenerate_run, DEGENERATE_TOKEN_RUN);
         st.end_turn(0);
         assert_eq!(st.degenerate_run, 0);
+    }
+
+    /// **A turn that crossed the bar stays marked degenerate**, whatever is
+    /// committed after: the guard's forced EOS resets the run, and a
+    /// speculative step committing the run's last `!` and that EOS together
+    /// left a turn of `!` reading as healthy by the end of the step — sealed
+    /// as an answer in production. A draft rewound past the bar unmarks it;
+    /// the next turn starts unmarked.
+    #[test]
+    fn crossing_the_degenerate_bar_marks_the_turn_until_it_ends() {
+        let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
+        for _ in 0..DEGENERATE_TOKEN_RUN - 1 {
+            st.record_token(0, MAX_RECENT);
+        }
+        assert!(!st.degenerate, "below the bar");
+
+        let before = st.mark();
+        st.record_token(0, MAX_RECENT);
+        st.record_token(7, MAX_RECENT);
+        assert_eq!(st.degenerate_run, 0, "the EOS reset the run");
+        assert!(st.degenerate, "but the turn crossed the bar");
+
+        st.rewind(before, &[0, 7]);
+        assert!(!st.degenerate, "a rewound draft never crossed it");
+        assert_eq!(st.degenerate_run, DEGENERATE_TOKEN_RUN - 1);
+
+        st.record_token(0, MAX_RECENT);
+        assert!(st.degenerate);
+        st.end_turn(0);
+        assert!(!st.degenerate, "the next turn starts unmarked");
     }
 
     /// **The cross-turn penalty sees a window of turns, not the whole day.**

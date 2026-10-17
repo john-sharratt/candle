@@ -1,24 +1,28 @@
-//! File contents at any revision, from one long-running `cat-file --batch`.
+//! File contents at any revision.
 //!
-//! Starting a process per read costs milliseconds on Windows, so a reader
-//! keeps one `git cat-file --batch` per repository and feeds it requests
-//! over stdin, one per line. A request is a revision spec and a
-//! [`RepoPath`], and neither can hold a newline, so the line cannot be split. Reads are serialised by the reader's own lock; the child is
-//! restarted if it exits, and killed with its process tree when the reader
-//! is dropped.
+//! A checkout's are read from one long-running `cat-file --batch`; a
+//! repository read from the substrate's, through libgit2 over its database
+//! (`docs/substrate_git.md` §4.1).
+//!
+//! Starting a process per read costs milliseconds on Windows, so a checkout's
+//! reader keeps one `git cat-file --batch` per repository and feeds it
+//! requests over stdin, one per line. A request is a revision spec and a
+//! [`RepoPath`], and neither can hold a newline, so the line cannot be split.
+//! Reads are serialised by the reader's own lock; the child is restarted if it
+//! exits, and killed with its process tree when the reader is dropped.
 //!
 //! Two bounds keep one read from taking the daemon down with it:
 //!
 //! - **Size.** An object larger than [`MAX_BLOB_BYTES`] is refused from its
 //!   header, before any buffer is allocated for it; a multi-gigabyte blob
 //!   would otherwise be a multi-gigabyte allocation.
-//! - **Time.** Each read has a deadline. In a partial clone a read may fetch
-//!   from the network, and a fetch that stalls would otherwise hold the
-//!   reader's lock forever; a watchdog kills the child's process tree when
-//!   the deadline passes, and the read returns [`GitError::Timeout`].
+//! - **Time.** Each read of a checkout has a deadline. In a partial clone a
+//!   read may fetch from the network, and a fetch that stalls would otherwise
+//!   hold the reader's lock forever; a watchdog kills the child's process tree
+//!   when the deadline passes, and the read returns [`GitError::Timeout`].
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -26,12 +30,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use std::str;
+
+use git2::{ErrorCode, ObjectType};
+
 use crate::error::GitError;
 use crate::kill_tree::ProcessTree;
+use crate::library::{failed, is_absent, oid_of};
+use crate::odb::repository::repository;
+use crate::odb::ObjectDb;
 use crate::runner::{Invocation, NETWORK_TIMEOUT};
 use crate::sandbox::Priority;
 use crate::types::{Oid, RepoPath, Rev};
-use crate::Repo;
+use crate::{Place, Repo};
 
 /// The largest object a reader returns.
 pub const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
@@ -51,11 +62,25 @@ impl Drop for Batch {
     }
 }
 
+/// What a reader reads through.
+enum Source {
+    /// A checkout: one `cat-file --batch` child, started on the first read.
+    Batch {
+        dir: PathBuf,
+        batch: Mutex<Option<Batch>>,
+        args: &'static [&'static str],
+        deadline: Duration,
+    },
+    /// A repository read from the substrate: libgit2 over its database, made
+    /// on the first read, which reports any failure to make it.
+    Database {
+        db: ObjectDb,
+        lib: Mutex<Option<git2::Repository>>,
+    },
+}
+
 pub struct BlobReader {
-    dir: PathBuf,
-    batch: Mutex<Option<Batch>>,
-    args: &'static [&'static str],
-    deadline: Duration,
+    source: Source,
     max_bytes: u64,
 }
 
@@ -67,7 +92,7 @@ enum Header {
 }
 
 fn parse_header(line: &[u8], request: &str) -> Result<Header, GitError> {
-    let line = std::str::from_utf8(line)
+    let line = str::from_utf8(line)
         .map_err(|e| GitError::malformed("cat-file", e.to_string()))?
         .trim_end_matches('\n');
     if line == format!("{request} missing") || line == format!("{request} ambiguous") {
@@ -102,119 +127,179 @@ enum Reply {
     },
 }
 
-impl BlobReader {
-    fn start(&self) -> Result<Batch, GitError> {
-        let mut cmd = Invocation::new(&self.dir, "cat-file")
-            .args(self.args.iter().copied())
-            .command()?;
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = cmd.spawn()?;
-        let tree = Arc::new(ProcessTree::adopt(&child, Priority::Normal)?);
-        let stdin = child.stdin.take().expect("stdin is piped");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
-        Ok(Batch {
-            child,
-            stdin,
-            stdout,
-            tree,
+fn start(dir: &Path, args: &[&str]) -> Result<Batch, GitError> {
+    let mut cmd = Invocation::new(dir, "cat-file")
+        .args(args.iter().copied())
+        .command()?;
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn()?;
+    let tree = Arc::new(ProcessTree::adopt(&child, Priority::Normal)?);
+    let stdin = child.stdin.take().expect("stdin is piped");
+    let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    Ok(Batch {
+        child,
+        stdin,
+        stdout,
+        tree,
+    })
+}
+
+fn request(batch: &mut Batch, request: &str, max_bytes: u64) -> Result<Reply, std::io::Error> {
+    batch.stdin.write_all(request.as_bytes())?;
+    batch.stdin.write_all(b"\n")?;
+    batch.stdin.flush()?;
+    let mut line = Vec::new();
+    if batch.stdout.read_until(b'\n', &mut line)? == 0 {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    match parse_header(&line, request).map_err(std::io::Error::other)? {
+        Header::Missing => Ok(Reply::Missing),
+        Header::Found { size, .. } if size > max_bytes => Ok(Reply::TooLarge { size }),
+        Header::Found { oid, kind, size } => {
+            let mut body = vec![0; size as usize + 1];
+            batch.stdout.read_exact(&mut body)?;
+            body.pop(); // the newline after the contents
+            Ok(Reply::Found { oid, kind, body })
+        }
+    }
+}
+
+/// [`request`] under `deadline`: a watchdog kills the child's tree if the
+/// answer has not come by then, which unblocks the read.
+fn request_with_deadline(
+    batch: &mut Batch,
+    req: &str,
+    deadline: Duration,
+    max_bytes: u64,
+) -> Result<Reply, GitError> {
+    let (done, wait) = mpsc::channel::<()>();
+    let expired = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let tree = Arc::clone(&batch.tree);
+        let expired = Arc::clone(&expired);
+        thread::spawn(move || {
+            if let Err(RecvTimeoutError::Timeout) = wait.recv_timeout(deadline) {
+                expired.store(true, Ordering::SeqCst);
+                tree.kill();
+            }
         })
+    };
+    let reply = request(batch, req, max_bytes);
+    let _ = done.send(());
+    let _ = watchdog.join();
+    if expired.load(Ordering::SeqCst) {
+        return Err(GitError::Timeout {
+            args: vec!["cat-file".into(), "--batch".into(), req.to_string()],
+            after: deadline,
+        });
     }
+    reply.map_err(GitError::Io)
+}
 
-    fn request(batch: &mut Batch, request: &str, max_bytes: u64) -> Result<Reply, std::io::Error> {
-        batch.stdin.write_all(request.as_bytes())?;
-        batch.stdin.write_all(b"\n")?;
-        batch.stdin.flush()?;
-        let mut line = Vec::new();
-        if batch.stdout.read_until(b'\n', &mut line)? == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        match parse_header(&line, request).map_err(std::io::Error::other)? {
-            Header::Missing => Ok(Reply::Missing),
-            Header::Found { size, .. } if size > max_bytes => Ok(Reply::TooLarge { size }),
-            Header::Found { oid, kind, size } => {
-                let mut body = vec![0; size as usize + 1];
-                batch.stdout.read_exact(&mut body)?;
-                body.pop(); // the newline after the contents
-                Ok(Reply::Found { oid, kind, body })
-            }
-        }
+/// The kind libgit2 names an object of, as `cat-file` prints it.
+fn kind_name(kind: Option<ObjectType>) -> String {
+    match kind {
+        Some(ObjectType::Blob) => "blob",
+        Some(ObjectType::Tree) => "tree",
+        Some(ObjectType::Commit) => "commit",
+        Some(ObjectType::Tag) => "tag",
+        _ => "unknown",
     }
+    .to_string()
+}
 
-    /// [`Self::request`] under the deadline: a watchdog kills the child's
-    /// tree if the answer has not come by then, which unblocks the read.
-    fn request_with_deadline(&self, batch: &mut Batch, request: &str) -> Result<Reply, GitError> {
-        let (done, wait) = mpsc::channel::<()>();
-        let expired = Arc::new(AtomicBool::new(false));
-        let watchdog = {
-            let tree = Arc::clone(&batch.tree);
-            let expired = Arc::clone(&expired);
-            let deadline = self.deadline;
-            thread::spawn(move || {
-                if let Err(RecvTimeoutError::Timeout) = wait.recv_timeout(deadline) {
-                    expired.store(true, Ordering::SeqCst);
-                    tree.kill();
-                }
-            })
-        };
-        let reply = Self::request(batch, request, self.max_bytes);
-        let _ = done.send(());
-        let _ = watchdog.join();
-        if expired.load(Ordering::SeqCst) {
-            return Err(GitError::Timeout {
-                args: vec!["cat-file".into(), "--batch".into(), request.to_string()],
-                after: self.deadline,
-            });
-        }
-        reply.map_err(GitError::Io)
-    }
-
-    /// The object `request` names, which must be a `kind`: its id and
-    /// contents, or `None` when the repository holds no such object.
+impl BlobReader {
+    /// The object `request` names — a revision spec as `cat-file` takes one —
+    /// which must be a `kind`: its id and contents, or `None` when the
+    /// repository holds no such object.
     fn read_kind(&self, request: String, kind: &str) -> Result<Option<(Oid, Vec<u8>)>, GitError> {
-        let mut guard = self.batch.lock().unwrap_or_else(|e| e.into_inner());
-        // One restart: a child that exited since the last read is replaced.
-        for attempt in 0..2 {
-            if guard.is_none() {
-                *guard = Some(self.start()?);
+        match &self.source {
+            Source::Batch {
+                dir,
+                batch,
+                args,
+                deadline,
+            } => {
+                let mut guard = batch.lock().unwrap_or_else(|e| e.into_inner());
+                // One restart: a child that exited since the last read is
+                // replaced.
+                for attempt in 0..2 {
+                    if guard.is_none() {
+                        *guard = Some(start(dir, args)?);
+                    }
+                    let child = guard.as_mut().expect("started above");
+                    match request_with_deadline(child, &request, *deadline, self.max_bytes) {
+                        Ok(Reply::Missing) => return Ok(None),
+                        Ok(Reply::Found {
+                            oid,
+                            kind: found,
+                            body,
+                        }) if found == kind => return Ok(Some((oid, body))),
+                        Ok(Reply::Found { kind, .. }) => {
+                            return Err(GitError::NotABlob {
+                                object: request,
+                                kind,
+                            })
+                        }
+                        Ok(Reply::TooLarge { size }) => {
+                            // Its bytes are still in the pipe: start afresh
+                            // next read.
+                            *guard = None;
+                            return Err(GitError::BlobTooLarge {
+                                object: request,
+                                size,
+                                limit: self.max_bytes,
+                            });
+                        }
+                        Err(e @ GitError::Timeout { .. }) => {
+                            *guard = None;
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            *guard = None;
+                            if attempt == 1 {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                unreachable!("the loop returns on its second attempt")
             }
-            let batch = guard.as_mut().expect("started above");
-            match self.request_with_deadline(batch, &request) {
-                Ok(Reply::Missing) => return Ok(None),
-                Ok(Reply::Found {
-                    oid,
-                    kind: found,
-                    body,
-                }) if found == kind => return Ok(Some((oid, body))),
-                Ok(Reply::Found { kind, .. }) => {
+            Source::Database { db, lib } => {
+                let mut held = lib.lock().unwrap_or_else(|e| e.into_inner());
+                if held.is_none() {
+                    *held = Some(repository(db)?);
+                }
+                let lib = held.as_ref().expect("made above");
+                let object = match lib.revparse_single(&request) {
+                    Ok(object) => object,
+                    Err(e) if is_absent(&e) || e.code() == ErrorCode::Peel => return Ok(None),
+                    Err(e) => return Err(failed("revparse", e)),
+                };
+                let found = kind_name(object.kind());
+                if found != kind {
                     return Err(GitError::NotABlob {
                         object: request,
-                        kind,
-                    })
+                        kind: found,
+                    });
                 }
-                Ok(Reply::TooLarge { size }) => {
-                    // Its bytes are still in the pipe: start afresh next read.
-                    *guard = None;
+                let odb = lib.odb().map_err(|e| failed("odb", e))?;
+                let (size, _) = odb
+                    .read_header(object.id())
+                    .map_err(|e| failed("read_header", e))?;
+                if size as u64 > self.max_bytes {
                     return Err(GitError::BlobTooLarge {
                         object: request,
-                        size,
+                        size: size as u64,
                         limit: self.max_bytes,
                     });
                 }
-                Err(e @ GitError::Timeout { .. }) => {
-                    *guard = None;
-                    return Err(e);
-                }
-                Err(e) => {
-                    *guard = None;
-                    if attempt == 1 {
-                        return Err(e);
-                    }
-                }
+                let read = odb.read(object.id()).map_err(|e| failed("read", e))?;
+                Ok(Some((oid_of(object.id())?, read.data().to_vec())))
             }
         }
-        unreachable!("the loop returns on its second attempt")
     }
 
     /// The contents of `path` at `rev`, or `None` when `rev` holds no such
@@ -243,7 +328,7 @@ impl BlobReader {
         let tree = body
             .strip_prefix(b"tree ")
             .and_then(|rest| rest.split(|&b| b == b'\n').next())
-            .and_then(|id| std::str::from_utf8(id).ok())
+            .and_then(|id| str::from_utf8(id).ok())
             .ok_or_else(|| {
                 GitError::malformed("cat-file", format!("commit {commit} names no tree"))
             })?;
@@ -252,186 +337,28 @@ impl BlobReader {
 }
 
 impl Repo {
-    /// A reader for file contents in this repository. The child starts on
-    /// the first read. Each read may fetch from the network in a partial
-    /// clone, so the deadline is the network one.
+    /// A reader for file contents in this repository. A checkout's child
+    /// starts on the first read; each read may fetch from the network in a
+    /// partial clone, so the deadline is the network one.
     pub fn blobs(&self) -> BlobReader {
+        let source = match &self.place {
+            Place::Substrate(db) => Source::Database {
+                db: db.clone(),
+                lib: Mutex::new(None),
+            },
+            Place::Folder { dir, .. } => Source::Batch {
+                dir: dir.clone(),
+                batch: Mutex::new(None),
+                args: &["--batch"],
+                deadline: NETWORK_TIMEOUT,
+            },
+        };
         BlobReader {
-            dir: self.dir.clone(),
-            batch: Mutex::new(None),
-            args: &["--batch"],
-            deadline: NETWORK_TIMEOUT,
+            source,
             max_bytes: MAX_BLOB_BYTES,
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testing::TestRepo;
-    use crate::types::BranchName;
-
-    #[test]
-    fn headers_parse() {
-        assert_eq!(
-            parse_header(b"ce013625030ba8dba906f756967f9e9ca394464a blob 6\n", "x").unwrap(),
-            Header::Found {
-                oid: Oid::parse("ce013625030ba8dba906f756967f9e9ca394464a").unwrap(),
-                kind: "blob".into(),
-                size: 6
-            }
-        );
-        assert_eq!(
-            parse_header(b"HEAD:x missing\n", "HEAD:x").unwrap(),
-            Header::Missing
-        );
-        assert!(parse_header(b"garbage\n", "x").is_err());
-    }
-
-    #[test]
-    fn files_read_at_any_revision_byte_for_byte() {
-        let t = TestRepo::init();
-        let binary: Vec<u8> = (0..=255u8).chain(b"\r\n\0\n".iter().copied()).collect();
-        t.write("bin.dat", &binary);
-        t.write("dir with space/ünïcode.txt", b"first\n");
-        let first = t.commit_all("first");
-        t.git(&["branch", "old"]);
-        t.write("dir with space/ünïcode.txt", b"second\n");
-        t.commit_all("second");
-
-        let repo = t.repo();
-        let blobs = repo.blobs();
-        let path = RepoPath::parse("dir with space/ünïcode.txt").unwrap();
-        assert_eq!(
-            blobs.read_at(&Rev::Head, &path).unwrap().unwrap(),
-            b"second\n"
-        );
-        let old = Rev::Branch(BranchName::parse("old").unwrap());
-        assert_eq!(blobs.read_at(&old, &path).unwrap().unwrap(), b"first\n");
-        assert_eq!(
-            blobs.read_at(&Rev::Oid(first), &path).unwrap().unwrap(),
-            b"first\n"
-        );
-        assert_eq!(
-            blobs
-                .read_at(&Rev::Head, &RepoPath::parse("bin.dat").unwrap())
-                .unwrap()
-                .unwrap(),
-            binary
-        );
-        let hello = Oid::parse("ce013625030ba8dba906f756967f9e9ca394464a").unwrap();
-        assert_eq!(blobs.read_blob(&hello).unwrap(), None);
-    }
-
-    #[test]
-    fn a_missing_path_is_none_and_a_folder_is_not_a_blob() {
-        let t = TestRepo::init();
-        t.write("src/lib.rs", b"x\n");
-        t.commit_all("base");
-        let repo = t.repo();
-        let blobs = repo.blobs();
-        let missing = RepoPath::parse("nope.rs").unwrap();
-        assert_eq!(blobs.read_at(&Rev::Head, &missing).unwrap(), None);
-        let folder = RepoPath::parse("src").unwrap();
-        assert!(matches!(
-            blobs.read_at(&Rev::Head, &folder),
-            Err(GitError::NotABlob { .. })
-        ));
-        // The reader is still in step after an error.
-        let lib = RepoPath::parse("src/lib.rs").unwrap();
-        assert_eq!(blobs.read_at(&Rev::Head, &lib).unwrap().unwrap(), b"x\n");
-    }
-
-    /// **A revision resolves to its commit and that commit's tree** in one
-    /// request; nothing named, nothing found.
-    #[test]
-    fn a_revision_resolves_to_its_commit_and_tree() {
-        let t = TestRepo::init();
-        let repo = t.repo();
-        let blobs = repo.blobs();
-        assert_eq!(blobs.commit_of(&Rev::Head).unwrap(), None, "no commit yet");
-        t.write("a.txt", b"a\n");
-        let first = t.commit_all("first");
-        let main = Rev::Branch(BranchName::parse("main").unwrap());
-        let (commit, tree) = blobs.commit_of(&main).unwrap().unwrap();
-        assert_eq!(commit, first);
-        assert_eq!(tree.as_str(), t.git(&["rev-parse", "main^{tree}"]).trim());
-
-        t.write("a.txt", b"b\n");
-        let second = t.commit_all("second");
-        let (moved, _) = blobs.commit_of(&main).unwrap().unwrap();
-        assert_eq!(moved, second, "the same reader sees the branch move");
-
-        let none = Rev::Branch(BranchName::parse("nope").unwrap());
-        assert_eq!(blobs.commit_of(&none).unwrap(), None);
-    }
-
-    #[test]
-    fn a_dead_child_is_restarted() {
-        let t = TestRepo::init();
-        t.write("a.txt", b"a\n");
-        t.commit_all("base");
-        let repo = t.repo();
-        let blobs = repo.blobs();
-        let a = RepoPath::parse("a.txt").unwrap();
-        assert!(blobs.read_at(&Rev::Head, &a).unwrap().is_some());
-        {
-            let mut guard = blobs.batch.lock().unwrap();
-            let batch = guard.as_mut().unwrap();
-            batch.tree.kill();
-            let _ = batch.child.wait();
-        }
-        assert_eq!(blobs.read_at(&Rev::Head, &a).unwrap().unwrap(), b"a\n");
-    }
-
-    /// **An oversized object is refused from its header**, and the next read
-    /// — on a fresh child — still works.
-    #[test]
-    fn an_object_over_the_limit_is_refused_and_the_reader_recovers() {
-        let t = TestRepo::init();
-        t.write("big.txt", b"0123456789\n");
-        t.write("small.txt", b"ok\n");
-        t.commit_all("base");
-        let repo = t.repo();
-        let blobs = BlobReader {
-            max_bytes: 4,
-            ..repo.blobs()
-        };
-        match blobs.read_at(&Rev::Head, &RepoPath::parse("big.txt").unwrap()) {
-            Err(GitError::BlobTooLarge { size, limit, .. }) => assert_eq!((size, limit), (11, 4)),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(
-            blobs
-                .read_at(&Rev::Head, &RepoPath::parse("small.txt").unwrap())
-                .unwrap()
-                .unwrap(),
-            b"ok\n"
-        );
-    }
-
-    /// **A read that never answers times out**, killing the child. With
-    /// `--buffer`, `cat-file` holds its answers until its input ends, which
-    /// a reader never does — a stand-in for a lazy fetch that stalls.
-    #[test]
-    fn a_read_that_never_answers_times_out() {
-        let t = TestRepo::init();
-        t.write("a.txt", b"a\n");
-        t.commit_all("base");
-        let repo = t.repo();
-        let blobs = BlobReader {
-            args: &["--batch", "--buffer"],
-            deadline: Duration::from_millis(500),
-            ..repo.blobs()
-        };
-        let started = std::time::Instant::now();
-        let got = blobs.read_at(&Rev::Head, &RepoPath::parse("a.txt").unwrap());
-        assert!(matches!(got, Err(GitError::Timeout { .. })), "{got:?}");
-        assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(
-            blobs.batch.lock().unwrap().is_none(),
-            "the stuck child was dropped"
-        );
-    }
-}
+mod tests;

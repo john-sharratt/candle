@@ -65,7 +65,7 @@ fn file_read_refuses_the_daemons_secrets() {
     let dir = workspace();
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "secrets/tools.yaml", "page": 0}),
+        json!({"repo": REPO, "path": "secrets/tools.yaml", "page": 1}),
         &ctx(&dir),
     );
     let detail = harness::expect_error(&resp, "forbidden");
@@ -80,7 +80,7 @@ fn file_read_refuses_the_gateways_secrets() {
     let dir = workspace();
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "web/secrets/auth.yaml", "page": 0}),
+        json!({"repo": REPO, "path": "web/secrets/auth.yaml", "page": 1}),
         &ctx(&dir),
     );
     harness::expect_error(&resp, "forbidden");
@@ -107,7 +107,7 @@ fn no_spelling_of_the_path_gets_through() {
     ] {
         let resp = harness::invoke_with_ctx(
             "file_read",
-            json!({ "repo": REPO, "path": path, "page": 0 }),
+            json!({ "repo": REPO, "path": path, "page": 1 }),
             &c,
         );
         harness::expect_error(&resp, "forbidden");
@@ -125,7 +125,7 @@ fn file_grep_never_matches_inside_a_secrets_directory() {
     for pattern in ["tvly", "TESTKEY", "GOCSPX", "client_secret", "api_key", "."] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_grep",
-            json!({ "repo": REPO, "pattern": pattern, "page": 0 }),
+            json!({ "repo": REPO, "pattern": pattern, "page": 1 }),
             &c,
         ));
         let body = text(&resp);
@@ -149,7 +149,7 @@ fn file_search_never_lists_a_protected_path() {
     for query in ["tools.yaml", "auth.yaml", "secrets", "*.yaml"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_search",
-            json!({ "repo": REPO, "query": query, "page": 0 }),
+            json!({ "repo": REPO, "query": query, "page": 1 }),
             &c,
         ));
         assert!(
@@ -166,7 +166,7 @@ fn file_list_never_lists_a_protected_path() {
     for path in ["", "secrets", "web", "web/secrets"] {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_list",
-            json!({ "repo": REPO, "path": path, "page": 0 }),
+            json!({ "repo": REPO, "path": path, "page": 1 }),
             &c,
         ));
         assert!(
@@ -205,21 +205,21 @@ fn ordinary_files_still_read_and_search() {
 
     let read = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "src/main.rs", "page": 0}),
+        json!({"repo": REPO, "path": "src/main.rs", "page": 1}),
         &c,
     ));
     assert!(read.as_str().unwrap().contains("fn main()"));
 
     let found = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": REPO, "query": "main.rs", "page": 0}),
+        json!({"repo": REPO, "query": "main.rs", "page": 1}),
         &c,
     ));
     assert_eq!(found["repos"][0]["files"][0], "src/main.rs");
 
     let hit = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": REPO, "pattern": "println", "page": 0}),
+        json!({"repo": REPO, "pattern": "println", "page": 1}),
         &c,
     ));
     assert_eq!(hit["repos"][0]["matches"][0]["path"], "src/main.rs");
@@ -237,7 +237,7 @@ fn the_segment_matches_at_any_depth() {
     std::fs::write(root.join("a/b/secrets/c/deep.txt"), "buried").unwrap();
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": "a/b/secrets/c/deep.txt", "page": 0}),
+        json!({"repo": REPO, "path": "a/b/secrets/c/deep.txt", "page": 1}),
         &harness::workspace_ctx(dir.path()),
     );
     harness::expect_error(&resp, "forbidden");

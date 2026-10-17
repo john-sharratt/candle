@@ -147,11 +147,11 @@ mod tests {
         let u = folder_units("k", &tree, &read, &mut |_: &TreeFile| None).remove(0);
 
         let workspace = Workspace::new(d.path(), vec![RepoSpec::named("k")]).unwrap();
-        let ctx = ToolContext::with_workspace(workspace);
+        let ctx = ToolContext::with_workspace(workspace).unwrap();
         let shown = zend_tools::run(
             "file_list",
             "test",
-            &serde_json::json!({"repo": "k", "page": 0}),
+            &serde_json::json!({"repo": "k", "page": 1}),
             &ctx,
         );
         let listed_by_tool: Vec<String> = shown["entries"]

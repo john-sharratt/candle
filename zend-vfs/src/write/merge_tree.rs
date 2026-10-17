@@ -1,7 +1,11 @@
 //! Three-way merges computed in the object store, and commits made from a
 //! tree.
 //!
-//! The merge runs in a private index with plumbing every supported git has:
+//! Where libgit2 holds the repository — a checkout, or one read from the
+//! substrate — the merge is libgit2's `merge_trees` in this process, with no
+//! rename detection, and each conflict kept as ours when asked
+//! ([`merges`](crate::library::merges)). Otherwise it runs in a private index
+//! with plumbing every supported git has:
 //!
 //! 1. `read-tree -m -i --aggressive <base> <ours> <theirs>` settles every
 //!    path only one side changed, both sides changed identically, or either
@@ -19,11 +23,12 @@
 use std::collections::BTreeMap;
 
 use crate::error::GitError;
-use crate::library::objects;
+use crate::library::merge_file::merge_file;
+use crate::library::{merges, objects};
 use crate::runner::{utf8, Invocation};
 use crate::types::{FileMode, Oid, RepoPath, Signature};
 use crate::write::fast_import::normalize_message;
-use crate::write::scratch::{PrivateIndex, ScratchFile};
+use crate::write::scratch::PrivateIndex;
 use crate::Repo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,8 +109,10 @@ impl Repo {
         Ok(PartialMerge { tree, conflicts })
     }
 
-    /// The merge in a private index: the tree, unless paths conflict and
-    /// `keep_ours` is false; and the conflicting paths.
+    /// The merge: the tree, unless paths conflict and `keep_ours` is false;
+    /// and the conflicting paths. In this process when libgit2 holds the
+    /// repository — a checkout or one read from the substrate — and otherwise
+    /// in a private index.
     fn merge_in_index(
         &self,
         merge_base: &Oid,
@@ -114,7 +121,10 @@ impl Repo {
         keep_ours: bool,
     ) -> Result<(Option<Oid>, Vec<RepoPath>), GitError> {
         let _write = self.write_lock();
-        let index = PrivateIndex::new(self.git_dir());
+        if let Some(lib) = self.library() {
+            return merges::merge_trees(&lib, merge_base, ours, theirs, keep_ours);
+        }
+        let index = PrivateIndex::new(self.git_dir()?);
         let in_index = |inv: Invocation| inv.env("GIT_INDEX_FILE", &index.0);
 
         in_index(self.git("read-tree"))
@@ -184,44 +194,25 @@ impl Repo {
         Ok((Some(tree), conflicts))
     }
 
-    /// Merge three versions of a file line by line: the merged blob, or
-    /// `None` when the changes overlap or the content is binary.
+    /// Merge three versions of a file line by line, in this process: the
+    /// merged blob, or `None` when the changes overlap or the content is
+    /// binary. For a repository libgit2 cannot hold, whose blobs only `git`
+    /// reads and writes.
     fn merge_file(&self, base: &Oid, ours: &Oid, theirs: &Oid) -> Result<Option<Oid>, GitError> {
-        // A blob the library does not hold is one a partial clone has yet to
-        // fetch, which `git` does on demand.
         let blob = |oid: &Oid| {
-            if let Some(lib) = self.library() {
-                if let Some(bytes) = objects::blob_bytes(&lib, oid)? {
-                    return Ok(bytes);
-                }
-            }
             self.git("cat-file")
                 .args(["blob", "--end-of-options"])
                 .arg(oid.as_str())
                 .run_ok()
         };
-        let base_file = ScratchFile::new(self.git_dir(), "merge-base", &blob(base)?)?;
-        let ours_file = ScratchFile::new(self.git_dir(), "merge-ours", &blob(ours)?)?;
-        let theirs_file = ScratchFile::new(self.git_dir(), "merge-theirs", &blob(theirs)?)?;
-        // Exit 0: clean. Positive: the number of conflicts. Negative: an
-        // error, binary content among them. Only a clean merge is used.
-        let out = self
-            .git("merge-file")
-            .args(["-p", "--end-of-options"])
-            .arg(&ours_file.0)
-            .arg(&base_file.0)
-            .arg(&theirs_file.0)
-            .run()?;
-        if out.status != Some(0) {
+        let merged = merge_file(&blob(base)?, &blob(ours)?, &blob(theirs)?, None)?;
+        if !merged.clean {
             return Ok(None);
-        }
-        if let Some(lib) = self.library() {
-            return Ok(Some(objects::hash_raw(&lib, &out.stdout)?));
         }
         let oid = self
             .git("hash-object")
             .args(["-w", "--stdin", "--no-filters"])
-            .stdin(out.stdout)
+            .stdin(merged.bytes)
             .run_ok()?;
         Ok(Some(Oid::parse(utf8("hash-object", oid)?.trim())?))
     }

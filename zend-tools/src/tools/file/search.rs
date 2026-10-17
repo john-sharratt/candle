@@ -28,9 +28,11 @@ pub struct SearchRequest {
     /// each repository searched (e.g. `candle-nn/src/`). Omit to search whole
     /// repositories.
     pub prefix: Option<String>,
-    /// Zero-based page of results — 0 to start. When the response's
+    /// Page of results, from 1 — 1 to start. When the response's
     /// `paging.next_page` is set, pass it here for the following page.
     /// Required, as on every paged tool (see `file_list`'s `page`).
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: u32,
 }
 
@@ -70,7 +72,7 @@ impl Tool for FileSearch {
          \"where is\", \"find the file\", \"which file is\", \"locate\", \"is there a \
          file called\", \"what files are named\", \"show me all the .rs files\". \
          Returns the matching paths grouped by repo, shortest path first within \
-         each, paged: `page` is required — pass 0 to start, and the response's \
+         each, paged from 1: `page` is required — pass 1 to start, and the response's \
          `paging.next_page` for the next. THIS IS THE \
          TOOL FOR FINDING A FILE — do not guess directory names and call file_list \
          repeatedly; one file_search over the whole workspace replaces that entirely. Use file_grep to \

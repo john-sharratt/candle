@@ -73,6 +73,7 @@ pub fn releases(config: &WorkingSetConfig, tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
 
     use candle_conversation::models::Dialect;
     use candle_conversation::projection::Builder;
@@ -86,7 +87,7 @@ mod tests {
             max_file_tokens: 500,
             seeds: Vec::new(),
             release_on: release_on.iter().map(|s| s.to_string()).collect(),
-            max_admits: 2,
+            max_admits: NonZeroUsize::new(2).unwrap(),
         }
     }
 

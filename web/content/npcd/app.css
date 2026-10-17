@@ -535,27 +535,28 @@ table.t tr.click:hover td { background: var(--panel-2); }
 }
 .logs-list { font-size: .765rem; line-height: 1.85; }
 .log-row {
-  display: grid; grid-template-columns: 66px 54px 112px 1fr; gap: 12px;
+  display: grid; grid-template-columns: 66px 54px 84px 112px 1fr; gap: 12px;
   padding: 1px 16px; contain: layout paint style;
 }
 .log-row:hover { background: var(--panel-2); }
 .log-row .ts { color: var(--ink-ghost); }
 .log-row .lvl { font-weight: 700; font-size: .69rem; letter-spacing: .04em; }
 .log-row .tgt { color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-row .mbr { color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .log-row .msg { color: var(--ink-dim); white-space: pre-wrap; overflow-wrap: anywhere; }
 
-/* **A log line on a phone.** The four columns are 268 px of fixed track before
+/* **A log line on a phone.** The four columns are 364 px of fixed track before
  * the message starts, which is most of a 360 px screen — so the message was
  * crushed to nothing and the row scrolled sideways. Logs are read on a phone
  * more than anything else here (something is wrong, and you are not at a desk),
  * so this is the one grid that has to give.
  *
- * The stamp and level stay on one line as a header; the target and the message
+ * The stamp, level and member stay on one line as a header; the target and the message
  * go underneath at full width. Nothing is dropped — a log row that hid its
  * target would be unreadable in a different way. */
 @media (max-width: 559px) {
   .log-row {
-    grid-template-columns: auto auto 1fr;
+    grid-template-columns: auto auto 1fr;   /* stamp, level, member */
     gap: 2px 8px;
     padding-left: 12px; padding-right: 12px;
   }

@@ -11,6 +11,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 
 use super::CudaDevice;
 use crate::backend::BackendDevice;
+use crate::cuda_backend::graph::capture;
 use crate::Result;
 
 /// Bytes of distinct weight copies a rotation spans: past the RTX PRO 5000's 96 MiB L2 by enough
@@ -93,17 +94,12 @@ pub(crate) fn time_graph<T: Copy>(
     stream.synchronize().map_err(err("sync"))?;
     let eager_ms = t0.elapsed_ms(&t1).map_err(err("elapsed"))? as f64;
     let replays = ((TARGET_MS / eager_ms.max(1e-3)).ceil() as usize).clamp(2, 50);
-    // SAFETY: this test's stream, idle, not capturing; ended below.
-    unsafe {
-        result::stream::begin_capture(
-            cs,
-            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )
-        .map_err(err("begin capture"))?;
-    }
+    // SAFETY: this test's created stream, idle, not capturing; ended below.
+    unsafe { capture::begin(&stream)? };
     let issued: Result<()> = items.iter().try_for_each(|&it| launch(it, cs));
-    // SAFETY: the capture begun above, ended whatever the launches returned.
-    let graph = unsafe { result::stream::end_capture(cs) }.map_err(err("end capture"))?;
+    // SAFETY: the capture begun above on this thread, ended whatever the
+    // launches returned.
+    let graph = unsafe { capture::end(&stream)? };
     issued?;
     let mut exec: sys::CUgraphExec = std::ptr::null_mut();
     // SAFETY: a valid graph; default flags.

@@ -465,6 +465,13 @@ impl SharedSubstrate {
     pub fn blob(&self, sha256: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         self.persistence.lock().unwrap().blob(sha256)
     }
+
+    /// Whether a blob of `sha256` is held, without reading it: a pack of
+    /// 64 MiB is known to have arrived without being read
+    /// (`docs/substrate_git.md` §4.1).
+    pub fn has_blob(&self, sha256: &[u8; 32]) -> bool {
+        self.persistence.lock().unwrap().has_blob(sha256)
+    }
 }
 
 /// The persistence layer behind a substrate — owns the active redo log, the
@@ -750,8 +757,7 @@ fn observe_replica(
     let id = h.identity();
     if !id.is_none() {
         locations.insert(
-            id.origin,
-            id.oseq,
+            h,
             Located {
                 segment: entry.segment,
                 offset: entry.offset,
@@ -1766,8 +1772,7 @@ impl SubstratePersistence {
         if id.is_none() {
             return;
         }
-        self.locations
-            .insert(id.origin, id.oseq, Located { segment, offset });
+        self.locations.insert(h, Located { segment, offset });
         if id.origin != self.node() {
             if self.replica.applied.insert(id.origin, id.oseq) {
                 self.replica_dirty = true;

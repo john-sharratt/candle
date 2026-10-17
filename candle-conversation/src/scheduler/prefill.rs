@@ -4,12 +4,14 @@ use super::admission::{
 };
 use super::admit;
 use super::admit_ground::AdmitPass;
+use super::band::rank;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
+use super::creep_slice::time_bounded_layers;
 use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };
+use super::paused_creep::{drop_rows, PausedCreep};
 use super::phase_split::{cobatched_decode_rows, full_sweep_us, window_tokens};
-use super::priority_pause::rank;
 use super::section_pack;
 use super::wave_logits::WaveLogits;
 use super::*;
@@ -68,26 +70,80 @@ fn phase_target(phase: VramPhase) -> FreeRegionTarget {
 
 /// The decode-to-prefill airtime ratio `R` that work of priority `work` yields
 /// to, given the priorities of the decodes running beside it: the highest ratio
-/// among the decodes that **outrank** it, or 1 when none does.
+/// among the decodes that **outrank** it — and, for `High` work, among the
+/// `High` decodes too — or 1 when there are none.
 ///
-/// Only an outranking decode is protected. The throttle exists so background
-/// work runs underneath an interactive decode; a second conversation's prompt is
-/// not background to the first, and holding it to one layer a wave behind a
-/// `High` decode kept a 26-token prompt waiting 57 s for another conversation's
-/// whole tool round to finish.
+/// **A `High` decode protects itself from `High` work.** A creep that rode
+/// beside a same-band decode whole made that decode wait the full pass:
+/// measured on `.5`, 2026-10-16, a dialogue's decode step that took 17–19 ms
+/// alone took 3.2 s (profile build) whenever an npcd turn's chunk shared it.
+/// Beside one, a `High` creep keeps its chunk whole — each layer's experts are
+/// still loaded once for all its rows — and is paced by
+/// [`SAME_BAND_PREFILL_PER_DECODE`]. The ratio is re-read every wave, so the
+/// creep returns to full speed (`R = 1`) the wave the last such decode finishes.
 ///
-/// Outranking is by band alone ([`rank`]), whichever tenant the work belongs
-/// to: any tenant's dialogue decode holds back every tenant's ingest at its
-/// band's ratio, and two tenants' work in one band never holds back the other.
+/// Below `High`, latency matters less than throughput, so a `Normal` or `Low`
+/// creep is never held back by its own band — only by a decode that outranks it.
+///
+/// The band is all that counts ([`rank`]), whichever tenant the work belongs to.
 fn throttle_ratio(work: DecodePriority, decodes: impl IntoIterator<Item = DecodePriority>) -> u32 {
     decodes
         .into_iter()
-        .filter(|&d| rank(d) > rank(work))
+        .filter(|&d| protects_against(d, work))
         .map(|d| d.ratio())
         .max()
         .unwrap_or(1)
         .max(1)
 }
+
+/// Whether a decode of band `decode` holds back co-batched work of band `work`:
+/// it outranks it, or both are `High`.
+fn protects_against(decode: DecodePriority, work: DecodePriority) -> bool {
+    rank(decode) > rank(work) || (decode == DecodePriority::High && work == DecodePriority::High)
+}
+
+/// Prefill tokens a `High` creep advances per decode token that lands while a
+/// `High` decode runs beside it.
+///
+/// The mix the device runs best at: about 1.8k prefill tokens a second beside
+/// 200 decode tokens a second, aggregated over a handful of decoding sessions.
+/// Counted in tokens, not airtime, so it scales with the decode width on every
+/// machine: more sessions decoding buy the creep proportionally more rows.
+pub(super) const SAME_BAND_PREFILL_PER_DECODE: usize = 9;
+
+/// The creep debt, in token-layers (one row through one layer), that `landed`
+/// decode tokens pay off: [`SAME_BAND_PREFILL_PER_DECODE`] tokens through all
+/// `n` layers each.
+fn same_band_earned(landed: usize, n: usize) -> i64 {
+    (landed * SAME_BAND_PREFILL_PER_DECODE * n.max(1)) as i64
+}
+
+/// The same-band debt after a step that landed `landed` decode tokens. Paid
+/// down, it may go into credit, but never by more than the step earned: credit
+/// banked over steps the creep could not ride (it still owed airtime) would let
+/// it ride a whole sweep in one step, which is the stall the pacing exists to
+/// prevent.
+fn same_band_debt_after(debt: i64, landed: usize, n: usize) -> i64 {
+    let earned = same_band_earned(landed, n);
+    (debt - earned).max(-earned)
+}
+
+/// Layers a `High` creep of `rows` rows advances on a step it rides beside a
+/// `High` decode: as many as its credit (`-debt`) covers, at least one — the
+/// creep only rides once its debt is paid — and no more than `remaining`.
+///
+/// A short prompt's credit covers many layers, so it reaches its first token in
+/// a few steps; an 8K chunk's covers one layer every ~19 decode tokens.
+fn same_band_layers(debt: i64, rows: usize, remaining: usize) -> usize {
+    let credit = (-debt).max(0) as usize;
+    (credit / rows.max(1)).clamp(1, remaining.max(1))
+}
+
+/// Consecutive failures of one mid-sweep creep window that are retried in place
+/// before its members fail. A refusal is usually ground the next step finds —
+/// an expert concession, a tier released — and a window that keeps failing is
+/// not going to be placed by waiting.
+const MID_SWEEP_RETRIES: u32 = 4;
 
 /// Layers a creep advances per wave, out of `n`, at airtime ratio `ratio`:
 /// `ceil(n / ratio)`, never zero.
@@ -1115,10 +1171,8 @@ impl Scheduler {
         if self.prefill_queue.is_empty() && self.section_queue.is_empty() {
             return;
         }
-        // Every gate below reads the priority pause; judge against the present.
         // `in_flight` counts only work that can advance — prefills and section
         // ingests alike, see `running_members`.
-        self.observe_priorities();
         let in_flight = self.running_members();
         if in_flight >= Self::MAX_PREFILL_WIDTH {
             return;
@@ -1220,7 +1274,7 @@ impl Scheduler {
             // 518 — and the only way to find it was to notice that the pass which should
             // have logged never did. A path that quietly costs an order of magnitude is
             // the one path that must not be quiet.
-            if let Some(work) = self.pop_unpaused_head() {
+            if let Some(work) = self.pop_highest_band_head() {
                 tracing::debug!(
                     target: "candle_conversation::scheduler::throttle",
                     queued = self.prefill_queue.len(),
@@ -1329,13 +1383,10 @@ impl Scheduler {
     /// that forced it, because a head admitted this way was never judged and a
     /// reader has to be able to tell that from an admission that was.
     ///
-    /// The head is the first entry **not paused** by priority
-    /// ([`Self::priority_paused`]): a dialogue turn queued behind ingest is the
-    /// one forced in, and paused ingest is never forced past a pause the
-    /// running conversation holds. Nothing paused can deadlock the engine — the
-    /// work pausing it is running.
+    /// The head is the first entry of the **highest band** queued: a dialogue
+    /// turn queued behind ingest is the one forced in.
     fn force_queue_head(&mut self, why: &'static str) {
-        if let Some(work) = self.pop_unpaused_head() {
+        if let Some(work) = self.pop_highest_band_head() {
             tracing::debug!(
                 target: "candle_conversation::scheduler::throttle",
                 queued = self.prefill_queue.len() + 1,
@@ -1354,12 +1405,17 @@ impl Scheduler {
         }
     }
 
-    /// Remove and return the first queued prefill that is not paused by
-    /// priority, in queue order.
-    fn pop_unpaused_head(&mut self) -> Option<PrefillWork> {
-        self.observe_priorities();
-        let at = (0..self.prefill_queue.len())
-            .find(|&i| !self.priority_paused(self.prefill_queue[i].sequence_id))?;
+    /// Remove and return the first queued prefill of the highest band queued,
+    /// in queue order.
+    fn pop_highest_band_head(&mut self) -> Option<PrefillWork> {
+        let top = self
+            .prefill_queue
+            .iter()
+            .map(|w| rank(self.decode_priority_or_high(w.sequence_id)))
+            .max()?;
+        let at = (0..self.prefill_queue.len()).find(|&i| {
+            rank(self.decode_priority_or_high(self.prefill_queue[i].sequence_id)) == top
+        })?;
         self.prefill_queue.remove(at)
     }
 
@@ -1992,20 +2048,75 @@ impl Scheduler {
     }
 
     /// `R` for co-batched work of priority `work`: the decode-to-prefill airtime
-    /// ratio of the active foreground decodes that **outrank** it
-    /// (`docs/continuous_fair_waves.md` §3). The creep advances `ceil(N / R)`
+    /// ratio of the active foreground decodes that protect themselves from it
+    /// ([`throttle_ratio`], `docs/continuous_fair_waves.md` §3). The creep advances `ceil(N / R)`
     /// layers a wave, and the decode quantum owes decode that share of a
     /// co-batched step.
     ///
     /// Each decode counts at its target layer's `decode_priority`, `High`
-    /// where that does not resolve — the band [`Self::priority_paused`] gates
-    /// it in.
+    /// where that does not resolve.
     pub(super) fn airtime_ratio_over(&self, work: DecodePriority) -> u32 {
         throttle_ratio(
             work,
             self.foreground_decodes()
                 .map(|sid| self.decode_priority_or_high(sid)),
         )
+    }
+
+    /// Whether a creep of band `work` is paced by [`SAME_BAND_PREFILL_PER_DECODE`]:
+    /// it is `High` and a `High` foreground decode runs beside it.
+    pub(super) fn same_band_paced(&self, work: DecodePriority) -> bool {
+        work == DecodePriority::High
+            && self
+                .foreground_decodes()
+                .any(|sid| self.decode_priority_or_high(sid) == DecodePriority::High)
+    }
+
+    /// Whether the creep in flight is paced and still owes decode tokens before
+    /// it may ride again. A creep that is no longer paced — no `High` decode
+    /// beside it, or no creep at all — owes nothing, so its debt is dropped and
+    /// it runs at full speed from the next step.
+    pub(super) fn same_band_owed(&mut self) -> bool {
+        let band = self.creep_priority(&self.wave_prefill_members);
+        if self.wave_prefill_members.is_empty() || !self.same_band_paced(band) {
+            self.same_band_debt = 0;
+            return false;
+        }
+        self.same_band_debt > 0
+    }
+
+    /// Decode tokens generated so far across every active decode — read either
+    /// side of a step to count what it landed.
+    pub(super) fn decode_tokens_generated(&self) -> usize {
+        self.active_decodes
+            .values()
+            .map(|s| s.generated_tokens.len())
+            .sum()
+    }
+
+    /// Pay down the same-band debt with the `landed` decode tokens of a step.
+    pub(super) fn pay_same_band_debt(&mut self, landed: usize) {
+        let n = self.model.num_layers().max(1);
+        self.same_band_debt = same_band_debt_after(self.same_band_debt, landed, n);
+    }
+
+    /// Whether a prompt waiting outside the creep in flight outranks it while
+    /// the creep is throttled — the case where letting the creep finish first
+    /// holds the prompt back for `R` steps.
+    pub(super) fn creep_outranked_by_a_waiting_prompt(&self) -> bool {
+        let band = self.creep_priority(&self.wave_prefill_members);
+        if self.airtime_ratio_over(band) <= 1 {
+            return false;
+        }
+        self.active_prefills
+            .iter()
+            .filter(|p| p.error.is_none() && p.finished.is_none() && p.offset < p.work.tokens.len())
+            .filter(|p| {
+                let seq = p.work.sequence_id.0;
+                !self.wave_prefill_members.iter().any(|m| m.seq_id() == seq)
+                    && !self.paused_creep.as_ref().is_some_and(|c| c.holds(seq))
+            })
+            .any(|p| rank(self.decode_priority_or_high(p.work.sequence_id)) > rank(band))
     }
 
     /// The band a creep group runs at: its highest-ranked member's. A dialogue
@@ -2038,7 +2149,18 @@ impl Scheduler {
     /// Resolve the `decode_priority` of a decode slot's target layer, or `None`
     /// when the slot's target/timeline isn't resolvable (the caller then defaults
     /// to the protective `High`).
+    ///
+    /// A summary probe decodes on a scratch slot bound to the conversation it
+    /// compresses, so its target is that conversation's layer — the dialogue's,
+    /// `High`. It is background to that dialogue, so it runs at `Normal`.
     pub(super) fn decode_layer_priority(&self, sid: SequenceId) -> Option<DecodePriority> {
+        if self
+            .active_decodes
+            .get(&sid)
+            .is_some_and(|s| matches!(s.seal_action, SealAction::CompressionPass { .. }))
+        {
+            return Some(DecodePriority::Normal);
+        }
         let slot = self.owning_slot(sid);
         let target = self.slot_targets.get(&slot)?;
         let builder = self.timeline_projections.get(&target.timeline)?;
@@ -2056,6 +2178,15 @@ impl Scheduler {
         self.active_prefills
             .iter()
             .filter(|p| p.error.is_none() && p.offset < p.work.tokens.len())
+            .count()
+    }
+
+    /// In-flight prefills that can advance: not errored. What admission's
+    /// progress gates count.
+    pub(super) fn running_prefills(&self) -> usize {
+        self.active_prefills
+            .iter()
+            .filter(|p| p.error.is_none())
             .count()
     }
 
@@ -2217,18 +2348,165 @@ impl Scheduler {
 
     /// Clear the in-flight continuous-fair-wave prefill group (residual, cursor,
     /// members) so the next wave forms a fresh one.
+    ///
+    /// **Only between sweeps.** A creep mid-sweep has run layers `[0, cursor)`
+    /// for its members, and those layers' carried state — the QSA index, the
+    /// DeltaNet state, the PLE history — has taken its rows. Nothing rolls that
+    /// back, so a sweep restarted from layer 0 runs those rows into it a second
+    /// time: the index ends up ahead of the K/V it describes (measured on `.5`,
+    /// 2026-10-16: three section slots 2,545 tokens ahead after two restarts,
+    /// whose next append then needed a page inside the forward and failed the
+    /// wave), and the recurrent state has seen the prompt twice. A member that
+    /// must leave mid-sweep leaves through [`Self::drop_wave_members`].
     pub(super) fn reset_wave_prefill(&mut self) {
         self.wave_prefill_residual = None;
         self.wave_prefill_cursor = 0;
         self.wave_prefill_members.clear();
+        self.wave_prefill_rows.clear();
     }
 
-    /// Set of section-ingest `seq_id`s currently in flight in the wave group, so
-    /// the standalone section pass and a fresh group formation don't double-admit
-    /// a chunk that is already creeping (its offset isn't advanced until the head).
+    /// Take the members `keep` marks `false` out of the creep in flight,
+    /// keeping its sweep: their rows leave the held residual and the survivors
+    /// carry on from the layer they reached (`paused_creep::drop_rows`). With
+    /// no survivor the group is simply over.
+    pub(super) fn drop_wave_members(&mut self, keep: &[bool]) -> candle::Result<()> {
+        if !keep.iter().any(|&k| k) {
+            self.reset_wave_prefill();
+            return Ok(());
+        }
+        drop_rows(
+            &mut self.wave_prefill_residual,
+            &mut self.wave_prefill_members,
+            &mut self.wave_prefill_rows,
+            keep,
+        )
+    }
+
+    /// Take `seq` out of the paused creep, as [`Self::drop_wave_members`] does
+    /// for the one in flight. With no member left it is gone.
+    pub(super) fn drop_paused_member(&mut self, seq: usize) -> candle::Result<()> {
+        let Some(paused) = self.paused_creep.as_mut() else {
+            return Ok(());
+        };
+        let keep: Vec<bool> = paused.members.iter().map(|m| m.seq_id() != seq).collect();
+        if !keep.iter().any(|&k| k) {
+            self.paused_creep = None;
+            return Ok(());
+        }
+        drop_rows(
+            &mut paused.residual,
+            &mut paused.members,
+            &mut paused.rows,
+            &keep,
+        )
+    }
+
+    /// Set the creep in flight aside mid-sweep, so a higher band's prompt runs
+    /// first ([`PausedCreep`]).
+    fn pause_creep(&mut self) {
+        let band = self.creep_priority(&self.wave_prefill_members);
+        tracing::debug!(
+            target: "candle_conversation::scheduler::creep",
+            band = ?band,
+            cursor = self.wave_prefill_cursor,
+            members = self.wave_prefill_members.len(),
+            "creep paused for a higher band's prompt"
+        );
+        self.paused_creep = Some(PausedCreep {
+            residual: self.wave_prefill_residual.take(),
+            cursor: self.wave_prefill_cursor,
+            members: std::mem::take(&mut self.wave_prefill_members),
+            rows: std::mem::take(&mut self.wave_prefill_rows),
+            band,
+        });
+        self.reset_wave_prefill();
+        self.same_band_debt = 0;
+    }
+
+    /// Put the paused creep back in flight when no creep is and nothing above
+    /// its band is waiting. Returns whether it did.
+    fn resume_creep(&mut self) -> bool {
+        let Some(paused) = self.paused_creep.as_ref() else {
+            return false;
+        };
+        let above = self.active_prefills.iter().any(|p| {
+            p.error.is_none()
+                && p.finished.is_none()
+                && p.offset < p.work.tokens.len()
+                && !paused.holds(p.work.sequence_id.0)
+                && rank(self.decode_priority_or_high(p.work.sequence_id)) > rank(paused.band)
+        });
+        if above {
+            return false;
+        }
+        let Some(p) = self.paused_creep.take() else {
+            return false;
+        };
+        tracing::debug!(
+            target: "candle_conversation::scheduler::creep",
+            band = ?p.band,
+            cursor = p.cursor,
+            members = p.members.len(),
+            "paused creep resumed"
+        );
+        self.wave_prefill_residual = p.residual;
+        self.wave_prefill_cursor = p.cursor;
+        self.wave_prefill_members = p.members;
+        self.wave_prefill_rows = p.rows;
+        true
+    }
+
+    /// Fail every member of the paused creep and drop it — for a sweep that can
+    /// neither continue nor be replayed.
+    pub(super) fn fail_paused_creep(&mut self, why: &str) {
+        if let Some(p) = self.paused_creep.take() {
+            self.fail_members(p.members, why);
+        }
+    }
+
+    /// Fail every member of the creep in flight and end it — for a sweep that
+    /// can neither continue nor be replayed.
+    pub(super) fn fail_wave_members(&mut self, why: &str) {
+        let members = std::mem::take(&mut self.wave_prefill_members);
+        self.fail_members(members, why);
+        self.reset_wave_prefill();
+    }
+
+    /// Mark each of `members`' prefill or section ingest failed with `why`.
+    fn fail_members(&mut self, members: Vec<WaveMember>, why: &str) {
+        for m in members {
+            match m {
+                WaveMember::Prefill { seq_id, .. } => {
+                    if let Some(p) = self
+                        .active_prefills
+                        .iter_mut()
+                        .find(|p| p.work.sequence_id.0 == seq_id)
+                    {
+                        p.error = Some(ConversationError::Other(why.to_string()));
+                    }
+                }
+                WaveMember::Section { seq_id, .. } => {
+                    if let Some(s) = self
+                        .active_section_ingests
+                        .iter_mut()
+                        .find(|s| s.sequence_id.0 == seq_id)
+                    {
+                        s.error = Some(ConversationError::Other(why.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set of section-ingest `seq_id`s currently in flight in the wave group or
+    /// the paused one, so the standalone section pass and a fresh group
+    /// formation don't double-admit a chunk that is already creeping (its
+    /// offset isn't advanced until the head).
     pub(super) fn wave_group_section_seqs(&self) -> std::collections::HashSet<usize> {
+        let paused = self.paused_creep.iter().flat_map(|p| p.members.iter());
         self.wave_prefill_members
             .iter()
+            .chain(paused)
             .filter_map(|m| match m {
                 WaveMember::Section { seq_id, .. } => Some(*seq_id),
                 WaveMember::Prefill { .. } => None,
@@ -2278,14 +2556,45 @@ impl Scheduler {
             }
         }
         let mut members: Vec<WaveMember> = Vec::new();
-        // A prefill paused behind higher-priority work sits this group out and
-        // keeps its place — see `priority_pause`.
-        self.observe_priorities();
-        for p in &self.active_prefills {
+        // **The highest band leads the group.** The group's adapter is its
+        // first member's, so leading with a lower band could leave a waiting
+        // dialogue prompt out of the group re-formed to carry it
+        // (`creep_outranked_by_a_waiting_prompt`) — and that restart would then
+        // fire again every step, the creep never completing. Stable, so a band
+        // keeps its queue order.
+        // A paused creep's members are mid-sweep in their own group, so they
+        // join no other (`PausedCreep`).
+        let paused = self
+            .paused_creep
+            .as_ref()
+            .map(PausedCreep::seq_ids)
+            .unwrap_or_default();
+        let mut candidates: Vec<&ActivePrefill> = self
+            .active_prefills
+            .iter()
+            .filter(|p| !paused.contains(&p.work.sequence_id.0))
+            .collect();
+        candidates.sort_by_key(|p| {
+            std::cmp::Reverse(rank(self.decode_priority_or_high(p.work.sequence_id)))
+        });
+        // **A `High` group carries `High` prompts only.** Every row in a group
+        // rides every layer of its sweep, so a person's prompt beside eight
+        // characters' and ingest chunks waits for all of their rows — measured
+        // on `.5`, 2026-10-17, a 10-member, 8,190-row group creeping at one
+        // layer a step held a dialogue's first token ~24 s. Below `High`
+        // throughput matters more than latency, and the bands mix.
+        let lead = candidates
+            .first()
+            .map(|p| self.decode_priority_or_high(p.work.sequence_id));
+        let high_only = lead == Some(DecodePriority::High);
+        if high_only {
+            candidates.retain(|p| {
+                self.decode_priority_or_high(p.work.sequence_id) == DecodePriority::High
+            });
+        }
+        let include_sections = include_sections && !high_only;
+        for p in candidates {
             if p.error.is_some() || p.finished.is_some() || p.offset >= p.work.tokens.len() {
-                continue;
-            }
-            if self.priority_paused(p.work.sequence_id) {
                 continue;
             }
             // Every prompt that can advance is a candidate, each offering at
@@ -2368,7 +2677,10 @@ impl Scheduler {
         if include_sections && !members.is_empty() {
             for i in 0..self.active_section_ingests.len() {
                 let s = &self.active_section_ingests[i];
-                if s.error.is_some() || s.offset >= s.tokens.len() {
+                if s.error.is_some()
+                    || s.offset >= s.tokens.len()
+                    || paused.contains(&s.sequence_id.0)
+                {
                     continue;
                 }
                 if self.session.sequence_adapter(s.sequence_id.0) != group_adapter.as_deref() {
@@ -2390,6 +2702,32 @@ impl Scheduler {
                 used += advance;
             }
         }
+        if members.is_empty() {
+            self.wave_prefill_members = members;
+            return;
+        }
+        let band = self.creep_priority(&members);
+        // The decodes that set the ratio, by band — and how many count as
+        // `High` only because their layer did not resolve.
+        let mut decodes_by_band = [0usize; 3];
+        let mut unresolved = 0usize;
+        for sid in self.foreground_decodes() {
+            decodes_by_band[rank(self.decode_priority_or_high(sid))] += 1;
+            unresolved += usize::from(self.decode_layer_priority(sid).is_none());
+        }
+        tracing::debug!(
+            target: "candle_conversation::scheduler::creep",
+            band = ?band,
+            ratio = self.airtime_ratio_over(band),
+            budget,
+            members = members.len(),
+            tokens = used,
+            high_decodes = decodes_by_band[2],
+            normal_decodes = decodes_by_band[1],
+            low_decodes = decodes_by_band[0],
+            unresolved_decodes = unresolved,
+            "creep group formed"
+        );
         self.wave_prefill_members = members;
     }
 
@@ -2630,7 +2968,8 @@ impl Scheduler {
     /// `creep_rows` refused ([`Self::note_refused_width`]) — the same members at
     /// the same width would be refused again. On any other error, or a refusal
     /// of a group already at the least chunk, surface it on each member's backing
-    /// entry. Always resets the group.
+    /// entry. Always resets the group — so only for a failure in a sweep's first
+    /// window, before any layer has taken the group's rows into its state.
     fn fail_wave_group(
         &mut self,
         members: &[WaveMember],
@@ -2924,27 +3263,114 @@ impl Scheduler {
         // drives segments 1 and 3. With neither, only the creep runs (seg 2).
         let has_fullsweep = n_dec > 0 || has_glue;
 
-        // Not `let`: a residual/group mismatch below restarts the creep at layer 0
-        // in place (see the check after `creep_tok`), which moves both.
+        // Not `let`: pausing, resuming, or a creep whose members all left
+        // mid-sweep moves it.
         let mut cursor = self.wave_prefill_cursor;
+        // **A prompt that outranks the creep in flight pauses it.** A group
+        // only re-forms at its sweep boundary, and a throttled group takes `R`
+        // steps to reach it: an ingest group creeping one layer a step behind a
+        // cast's decodes held a dialogue's tool result back for all of them. It
+        // is set aside at the layer it reached ([`PausedCreep`]), the prompt's
+        // band runs, and it resumes there. It is never restarted — its finished
+        // layers hold its rows in their carried state (`reset_wave_prefill`) —
+        // and with a creep already paused, the one in flight finishes its
+        // remaining layers this step instead.
+        let mut finish_sweep = false;
 
         // Form/resume the creep group (dialogue prefills + section chunks) unless it
         // was already advanced this wave. A fresh group folds section chunks in to
         // co-batch the creep (`form_wave_group(true)`), unless the standalone
         // section pass already ran this wave (no decode present).
         let (members, seq_ids, inputs, prefill_gidxs) = if !self.wave_cohort_advanced {
+            if (cursor > 0 || self.wave_prefill_residual.is_some())
+                && self.creep_outranked_by_a_waiting_prompt()
+            {
+                if self.paused_creep.is_none() {
+                    self.pause_creep();
+                    cursor = 0;
+                } else {
+                    finish_sweep = true;
+                }
+            }
             if cursor == 0 && self.wave_prefill_residual.is_none() {
-                let _g = super::profile::span("loop:wave:form_group");
-                self.form_wave_group(!self.wave_section_advanced);
+                if self.resume_creep() {
+                    cursor = self.wave_prefill_cursor;
+                } else {
+                    let _g = super::profile::span("loop:wave:form_group");
+                    self.form_wave_group(!self.wave_section_advanced);
+                }
             }
             let _g = super::profile::span("loop:wave:build_inputs");
-            self.build_wave_group_inputs()
+            let built = self.build_wave_group_inputs();
+            // **A member that left mid-sweep takes its rows with it.**
+            // `build_wave_group_inputs` drops a member that errored or whose
+            // slot went, and the held residual still carries its rows. Taken
+            // out here, the survivors keep the layers they have run.
+            if cursor > 0 && built.0.len() != self.wave_prefill_members.len() {
+                let mut kept = built.0.iter().map(|m| m.seq_id()).peekable();
+                let keep: Vec<bool> = self
+                    .wave_prefill_members
+                    .iter()
+                    .map(|m| {
+                        let here = kept.peek() == Some(&m.seq_id());
+                        if here {
+                            kept.next();
+                        }
+                        here
+                    })
+                    .collect();
+                tracing::warn!(
+                    held = self.wave_prefill_members.len(),
+                    kept = built.0.len(),
+                    cursor,
+                    "creep members left mid-sweep; taking their rows out of the held residual"
+                );
+                self.drop_wave_members(&keep)?;
+                if self.wave_prefill_members.is_empty() {
+                    cursor = 0;
+                }
+            }
+            // **The held residual must be exactly the survivors' rows.** Paired
+            // with rows it does not hold, the remaining layers would attribute
+            // activations to the wrong members — which is what makes a sampler
+            // emit token 0 forever. Nothing can be replayed either (see
+            // `reset_wave_prefill`), so the creep's members fail, loudly, and
+            // this step runs without them. Not an assert: a panic on the
+            // scheduler thread takes the daemon with it.
+            let rows: usize = built
+                .2
+                .iter()
+                .map(|t| t.dims().get(1).copied().unwrap_or(0))
+                .sum();
+            let held = self
+                .wave_prefill_residual
+                .as_ref()
+                .map(|r| r.dims().get(1).copied().unwrap_or(0));
+            match held {
+                Some(held) if cursor > 0 && held != rows => {
+                    tracing::error!(
+                        held_residual_tokens = held,
+                        creep_tokens = rows,
+                        cursor,
+                        members = built.0.len(),
+                        "the creep's held residual does not match its members mid-sweep; \
+                         failing them rather than replaying layers they already ran"
+                    );
+                    self.fail_wave_members(
+                        "the prefill's creep lost track of its rows mid-sweep; retry the turn",
+                    );
+                    cursor = 0;
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                }
+                _ => built,
+            }
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
         self.wave_cobatched = has_glue || !seq_ids.is_empty();
 
-        // The creep yields only to the decodes that outrank it. Without a creep
+        // The creep yields to the decodes that protect themselves from it
+        // (`throttle_ratio`). Without a creep
         // the step co-batches glue and section chunks, which are background.
         let work = if seq_ids.is_empty() {
             DecodePriority::Low
@@ -2953,8 +3379,40 @@ impl Scheduler {
         };
         let ratio = self.airtime_ratio_over(work);
         self.wave_step_ratio = ratio;
-        let budget = creep_layer_budget(n, ratio);
-        let mut win_end = (cursor + budget).min(n);
+        let token_paced = !seq_ids.is_empty() && self.same_band_paced(work);
+        self.wave_step_token_paced = token_paced;
+        // A `High` creep beside a `High` decode is paced in tokens: it rides
+        // only once its debt is paid (`run`'s gate), and advances the layers its
+        // credit covers. Every other creep advances `ceil(N / R)` — and beside
+        // decode rows no more than a decode-only step's worth of them
+        // (`creep_slice`), so the share `R` sets is paid in steps, not seconds.
+        let creep_rows: usize = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(0))
+            .sum();
+        let budget = if finish_sweep {
+            n - cursor.min(n)
+        } else if token_paced {
+            let layers = same_band_layers(self.same_band_debt, creep_rows, n - cursor.min(n));
+            self.same_band_debt += (creep_rows * layers) as i64;
+            layers
+        } else if head_rows > 0 {
+            time_bounded_layers(
+                creep_layer_budget(n, ratio).min(n - cursor.min(n)),
+                creep_rows,
+                self.creep_layer_row_cost,
+                self.decode_only_step,
+            )
+        } else {
+            creep_layer_budget(n, ratio)
+        };
+        let win_end = (cursor + budget).min(n);
+        // What rode beside decode, for the next slice's cost estimate.
+        self.wave_step_creep_layer_rows = if head_rows > 0 && !seq_ids.is_empty() {
+            creep_rows * (win_end - cursor.min(win_end))
+        } else {
+            0
+        };
 
         // No creep group → one full-sweep [0, N) forward folding decode + a
         // standalone section chunk (if pending) + glue. All full-sweep, no residual
@@ -3061,54 +3519,6 @@ impl Scheduler {
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
             .sum();
 
-        // The held residual is a slice of a PREVIOUS wave's activations, sized by
-        // that wave's creep membership. `build_wave_group_inputs` rebuilds the
-        // group each wave and silently drops members that errored or completed, so
-        // a mid-creep drop leaves a residual wider than the tokens it is about to
-        // be paired with — the rows would then be attributed to the wrong members
-        // for the remaining layers, and wrong activations are exactly what makes
-        // the sampler emit token 0 forever.
-        //
-        // Recover rather than abort: the creep re-forms from layer 0 next wave.
-        // That is idempotent — a prefill member re-feeds its whole token block
-        // (`work.tokens[..]`, never a chunk) and its slot offset is only advanced
-        // at completion, so re-running `[0, cursor)` rewrites the same KV at the
-        // same positions. Deliberately NOT an assert: a hard assert on this path
-        // is what aborted the whole wave at 42553ca3 (see `reconcile_wave_offsets`),
-        // and a panic on the scheduler thread takes the daemon with it.
-        if cursor > 0 {
-            if let Some(res) = self.wave_prefill_residual.as_ref() {
-                let held = res.dims().get(1).copied().unwrap_or(0);
-                if held != creep_tok {
-                    tracing::error!(
-                        held_residual_tokens = held,
-                        creep_tokens = creep_tok,
-                        cursor,
-                        members = members.len(),
-                        "wave creep membership changed mid-sweep — the held residual \
-                         no longer matches the group. Restarting the creep from \
-                         layer 0; the affected prefill re-runs the layers it had \
-                         already done.",
-                    );
-                    // Restart IN PLACE rather than re-entering: the wave's deferred
-                    // glue was already drained by `take_wave_glue` above, so a
-                    // recursive call would find an empty queue and silently drop it.
-                    // Dropping the residual and rewinding the cursor gives the same
-                    // fresh start — the group already rebuilt this wave is the
-                    // consistent one, and seg1 is skipped once `cursor == 0`.
-                    //
-                    // Idempotent: a prefill member re-feeds its whole token block
-                    // (`work.tokens[..]`, never a chunk) and its slot offset only
-                    // advances at completion, so re-running `[0, cursor)` rewrites
-                    // the same K/V at the same positions.
-                    self.wave_prefill_residual = None;
-                    self.wave_prefill_cursor = 0;
-                    cursor = 0;
-                    win_end = budget.min(n);
-                }
-            }
-        }
-
         // Segment 1 — full-sweep members only over [0, cursor). Runs when there is
         // any full-sweep member (decode or glue) and cursor > 0; the creep resumes
         // from its held residual at `cursor`. Yields caller order `[decode | glue]`.
@@ -3157,6 +3567,8 @@ impl Scheduler {
         // residual caller order `[decode | creep | glue]`; at cursor 0 all embed
         // fresh (None).
         let pf_res = self.wave_prefill_residual.take();
+        // A handle, not a copy: put back if this window fails mid-sweep.
+        let held_residual = pf_res.clone();
         let seg2_in = Self::cat_caller_residual(
             &self.session.window_residuals(),
             &[seg1_dec.as_ref(), pf_res.as_ref(), seg1_glue.as_ref()],
@@ -3186,11 +3598,41 @@ impl Scheduler {
             win_end,
             seg2_in,
         ) {
-            Ok(s) => s,
+            Ok(s) => {
+                self.wave_sweep_failures = 0;
+                s
+            }
             Err(e) => {
-                // Drop the creep group cleanly (requeue scope prefills on OOM) so a
-                // fresh one forms next wave, then surface the error.
-                self.fail_wave_group(&members, &prefill_gidxs, creep_tok, &e);
+                // **Mid-sweep, a retryable failure retries the same window.** The
+                // forward's failure bracket rolled back what this window did, but
+                // `[0, cursor)` stands — so the group keeps its residual and its
+                // cursor rather than re-forming, which would run those layers'
+                // rows into their carried state again (`reset_wave_prefill`).
+                // Bounded: a window refused `MID_SWEEP_RETRIES` times in a row
+                // fails its members instead.
+                let retryable = is_device_oom(&e) || tier_refusal_shortfall(&e).is_some();
+                if cursor > 0 && retryable && self.wave_sweep_failures < MID_SWEEP_RETRIES {
+                    self.wave_sweep_failures += 1;
+                    tracing::warn!(
+                        cursor,
+                        win_end,
+                        rows = creep_tok,
+                        attempt = self.wave_sweep_failures,
+                        error = %e,
+                        "creep window failed mid-sweep; holding the sweep to retry it"
+                    );
+                    self.wave_prefill_residual = held_residual;
+                    return Err(e);
+                }
+                self.wave_sweep_failures = 0;
+                if cursor > 0 {
+                    // Nothing mid-sweep may be retried from layer 0.
+                    self.fail_wave_members(&format!("wave group forward failed mid-sweep: {e}"));
+                } else {
+                    // Drop the creep group cleanly (requeue scope prefills on OOM)
+                    // so a fresh one forms next wave, then surface the error.
+                    self.fail_wave_group(&members, &prefill_gidxs, creep_tok, &e);
+                }
                 return Err(e);
             }
         };
@@ -3312,6 +3754,10 @@ impl Scheduler {
         self.wave_prefill_residual = Some(creep_part);
         self.wave_prefill_cursor = win_end;
         self.wave_prefill_members = members;
+        self.wave_prefill_rows = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(0))
+            .collect();
 
         // Segment 3 — full-sweep members only over [win_end, N). Input caller order
         // `[decode | verify | glue]`. Skipped when there is no full-sweep member
@@ -5057,34 +5503,226 @@ mod wave_give_up_tests {
 }
 
 #[cfg(test)]
+mod creep_member_drop_tests {
+    use candle::DType;
+
+    use super::super::tests::make_test_scheduler;
+    use super::super::*;
+
+    fn section(seq_id: usize, advance: usize) -> WaveMember {
+        WaveMember::Section { seq_id, advance }
+    }
+
+    /// **A member leaving mid-sweep takes only its own rows.** The survivors'
+    /// rows stay, in order, and the sweep keeps its cursor — it is not
+    /// restarted, which would replay layers into state that already holds them.
+    #[test]
+    fn a_member_leaving_mid_sweep_takes_only_its_rows() {
+        let (mut sched, _tx) = make_test_scheduler();
+        sched.wave_prefill_members = vec![section(1, 2), section(2, 3), section(3, 1)];
+        sched.wave_prefill_rows = vec![2, 3, 1];
+        sched.wave_prefill_cursor = 7;
+        let rows: Vec<f32> = (0..12).map(|v| v as f32).collect();
+        sched.wave_prefill_residual =
+            Some(Tensor::from_vec(rows, (1, 6, 2), &Device::Cpu).unwrap());
+
+        sched.drop_wave_members(&[true, false, true]).unwrap();
+
+        let res = sched.wave_prefill_residual.as_ref().expect("still held");
+        assert_eq!(res.dims(), &[1, 3, 2]);
+        assert_eq!(
+            res.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![0., 1., 2., 3., 10., 11.],
+            "member 1's two rows, then member 3's one"
+        );
+        let ids: Vec<usize> = sched
+            .wave_prefill_members
+            .iter()
+            .map(|m| m.seq_id())
+            .collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(sched.wave_prefill_rows, vec![2, 1]);
+        assert_eq!(sched.wave_prefill_cursor, 7, "the sweep goes on");
+    }
+
+    /// With every member gone there is nothing to carry: the group is over.
+    #[test]
+    fn a_sweep_whose_members_all_leave_ends() {
+        let (mut sched, _tx) = make_test_scheduler();
+        sched.wave_prefill_members = vec![section(1, 2)];
+        sched.wave_prefill_rows = vec![2];
+        sched.wave_prefill_cursor = 7;
+        sched.wave_prefill_residual =
+            Some(Tensor::zeros((1, 2, 2), DType::F32, &Device::Cpu).unwrap());
+
+        sched.drop_wave_members(&[false]).unwrap();
+
+        assert!(sched.wave_prefill_residual.is_none());
+        assert!(sched.wave_prefill_members.is_empty());
+        assert_eq!(sched.wave_prefill_cursor, 0);
+    }
+
+    /// **Freeing a member's slot keeps the other members' sweep.** It used to
+    /// abandon the whole group, and the survivors re-ran their finished layers.
+    #[test]
+    fn freeing_a_members_slot_keeps_the_others_sweep() {
+        let (mut sched, _tx) = make_test_scheduler();
+        sched.wave_prefill_members = vec![section(1, 2), section(2, 2)];
+        sched.wave_prefill_rows = vec![2, 2];
+        sched.wave_prefill_cursor = 5;
+        sched.wave_prefill_residual =
+            Some(Tensor::zeros((1, 4, 2), DType::F32, &Device::Cpu).unwrap());
+
+        sched.purge_freed_slot_scheduling_state(SequenceId(1));
+
+        let ids: Vec<usize> = sched
+            .wave_prefill_members
+            .iter()
+            .map(|m| m.seq_id())
+            .collect();
+        assert_eq!(ids, vec![2]);
+        assert_eq!(sched.wave_prefill_cursor, 5);
+        assert_eq!(
+            sched.wave_prefill_residual.as_ref().unwrap().dims(),
+            &[1, 2, 2]
+        );
+    }
+
+    /// **A paused creep resumes exactly where it stopped**: the same residual,
+    /// layer, members and rows — and while paused nothing is in flight.
+    #[test]
+    fn a_paused_creep_resumes_where_it_stopped() {
+        let (mut sched, _tx) = make_test_scheduler();
+        sched.wave_prefill_members = vec![section(1, 2), section(2, 3)];
+        sched.wave_prefill_rows = vec![2, 3];
+        sched.wave_prefill_cursor = 9;
+        sched.wave_prefill_residual =
+            Some(Tensor::zeros((1, 5, 2), DType::F32, &Device::Cpu).unwrap());
+
+        sched.pause_creep();
+        assert!(sched.wave_prefill_members.is_empty());
+        assert_eq!(sched.wave_prefill_cursor, 0);
+        assert!(sched.wave_prefill_residual.is_none());
+        assert_eq!(
+            sched.wave_group_section_seqs(),
+            [1, 2].into_iter().collect(),
+            "a paused section is still in flight for the standalone pass"
+        );
+
+        assert!(sched.resume_creep(), "nothing waits above it");
+        let ids: Vec<usize> = sched
+            .wave_prefill_members
+            .iter()
+            .map(|m| m.seq_id())
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(sched.wave_prefill_rows, vec![2, 3]);
+        assert_eq!(sched.wave_prefill_cursor, 9);
+        assert_eq!(
+            sched.wave_prefill_residual.as_ref().unwrap().dims(),
+            &[1, 5, 2]
+        );
+        assert!(sched.paused_creep.is_none());
+    }
+
+    /// Freeing a paused member's slot takes it out of the paused creep, and
+    /// the last one leaving ends it.
+    #[test]
+    fn freeing_a_paused_member_takes_it_out_of_the_paused_creep() {
+        let (mut sched, _tx) = make_test_scheduler();
+        sched.wave_prefill_members = vec![section(1, 2), section(2, 2)];
+        sched.wave_prefill_rows = vec![2, 2];
+        sched.wave_prefill_cursor = 4;
+        sched.wave_prefill_residual =
+            Some(Tensor::zeros((1, 4, 2), DType::F32, &Device::Cpu).unwrap());
+        sched.pause_creep();
+
+        sched.purge_freed_slot_scheduling_state(SequenceId(1));
+        let paused = sched.paused_creep.as_ref().expect("one member left");
+        assert_eq!(paused.rows, vec![2]);
+        assert_eq!(paused.residual.as_ref().unwrap().dims(), &[1, 2, 2]);
+
+        sched.purge_freed_slot_scheduling_state(SequenceId(2));
+        assert!(sched.paused_creep.is_none());
+    }
+}
+
+#[cfg(test)]
 mod creep_throttle_tests {
-    use super::{creep_layer_budget, throttle_ratio};
+    use super::{
+        creep_layer_budget, same_band_debt_after, same_band_layers, throttle_ratio,
+        SAME_BAND_PREFILL_PER_DECODE,
+    };
     use crate::projection::DecodePriority::{High, Low, Normal};
 
-    /// Work yields only to a decode that outranks it, at that decode's ratio.
+    /// Work yields to a decode that outranks it, and `High` work to a `High`
+    /// decode too, at the highest such ratio; it runs whole beside none.
     #[test]
-    fn work_yields_only_to_an_outranking_decode() {
+    fn work_yields_to_an_outranking_decode_and_high_to_high() {
         assert_eq!(throttle_ratio(High, []), 1, "nothing decoding");
         assert_eq!(
             throttle_ratio(High, [High]),
-            1,
-            "a second conversation beside the first"
+            64,
+            "a second conversation's prompt beside the first's decode"
         );
-        assert_eq!(throttle_ratio(High, [High, Normal, Low]), 1);
+        assert_eq!(throttle_ratio(High, [High, Normal, Low]), 64);
+        assert_eq!(throttle_ratio(High, [Normal, Low]), 1, "outranks them all");
         assert_eq!(
             throttle_ratio(Low, [Low]),
             1,
             "an ingest beside its own turns"
         );
+        assert_eq!(
+            throttle_ratio(Normal, [Normal]),
+            1,
+            "below High, a band's own decodes never hold its work back"
+        );
         assert_eq!(throttle_ratio(Low, [High]), 64);
         assert_eq!(throttle_ratio(Low, [Normal]), 16);
-        assert_eq!(
-            throttle_ratio(Low, [Normal, High]),
-            64,
-            "the highest outranking ratio"
-        );
+        assert_eq!(throttle_ratio(Low, [Normal, High]), 64, "the highest ratio");
         assert_eq!(throttle_ratio(Normal, [High, Low]), 64);
         assert_eq!(throttle_ratio(Normal, [Normal, Low]), 1);
+    }
+
+    /// A decode token pays off `SAME_BAND_PREFILL_PER_DECODE` rows through all
+    /// `n` layers, and the debt goes into credit by at most one step's earnings.
+    #[test]
+    fn decode_tokens_pay_the_same_band_debt_and_bank_one_step_of_credit() {
+        let n = 48;
+        let per_token = (SAME_BAND_PREFILL_PER_DECODE * n) as i64;
+        assert_eq!(per_token, 432);
+        // One layer of an 8K chunk: 8192 token-layers, paid off by 19 tokens.
+        let mut debt = 8192;
+        for _ in 0..18 {
+            debt = same_band_debt_after(debt, 1, n);
+            assert!(debt > 0, "still owed: {debt}");
+        }
+        debt = same_band_debt_after(debt, 1, n);
+        assert_eq!(debt, 8192 - 19 * per_token);
+        assert!(debt <= 0);
+        // Credit never exceeds what the last step earned.
+        assert_eq!(same_band_debt_after(-100, 4, n), -4 * per_token);
+        assert_eq!(same_band_debt_after(-10_000, 1, n), -per_token);
+        assert_eq!(same_band_debt_after(0, 0, n), 0, "nothing landed");
+    }
+
+    /// A paced creep rides as many layers as its credit covers, at least one,
+    /// and never past the layers left in its sweep.
+    #[test]
+    fn a_paced_creep_rides_the_layers_its_credit_covers() {
+        assert_eq!(same_band_layers(0, 8192, 48), 1, "no credit: one layer");
+        assert_eq!(same_band_layers(-432, 8192, 48), 1);
+        assert_eq!(
+            same_band_layers(-432, 26, 48),
+            16,
+            "a short prompt covers 16 layers a decode token"
+        );
+        assert_eq!(
+            same_band_layers(-432, 26, 10),
+            10,
+            "capped at the sweep's end"
+        );
+        assert_eq!(same_band_layers(-432, 0, 48), 48, "zero rows read as one");
     }
 
     /// `ceil(n / R)` layers a wave, never zero.
@@ -5161,13 +5799,13 @@ layers:
             .insert(timeline, Arc::clone(builder));
     }
 
-    /// **A dialogue turn queued behind paused ingest is admitted.** The paused
-    /// ingest prefill moves no row, so it is not "in flight" for the
-    /// keep-one-alive rule: with admission closed until something settles, the
-    /// turn pausing it is the head that gets forced in. Counting the paused
-    /// prefill as in flight left the turn queued with nothing able to settle.
+    /// **A dialogue prompt's group is its own.** An ingest prefill queued
+    /// first waits for the next group: a `High` group carries `High` prompts
+    /// only, so the dialogue's first token does not wait on the ingest's rows.
+    /// The ingest still advances — it is not held out of the device, only out
+    /// of this group.
     #[test]
-    fn a_dialogue_turn_is_admitted_past_paused_ingest() {
+    fn a_dialogue_prompts_group_is_its_own() {
         let (mut sched, _tx) = make_test_scheduler();
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let ingest = SequenceId(sched.session.create_sequence().expect("create"));
@@ -5178,62 +5816,52 @@ layers:
             .active_prefills
             .push(dialogue_prefill(ingest, vec![1; 8]));
         sched
-            .prefill_queue
-            .push_back(dialogue_prefill(dialogue, vec![1; 8]).work);
-        sched.settled_since_admit = false;
+            .active_prefills
+            .push(dialogue_prefill(dialogue, vec![1; 8]));
 
-        sched.promote_new_prefills();
+        sched.form_wave_group(false);
 
-        assert!(
-            sched.priority_paused(ingest),
-            "the queued turn pauses ingest"
-        );
-        assert_eq!(
-            sched.running_prefills(),
-            1,
-            "only the dialogue turn can run"
-        );
-        assert!(
-            sched
-                .active_prefills
-                .iter()
-                .any(|p| p.work.sequence_id == dialogue),
-            "the dialogue turn was left queued behind paused ingest"
-        );
+        let members = sched.wave_prefill_members.clone();
+        let seqs: Vec<usize> = members.iter().map(|m| m.seq_id()).collect();
+        assert_eq!(seqs, vec![dialogue.0], "the dialogue alone");
+        assert_eq!(sched.creep_priority(&members), DecodePriority::High);
+        assert_eq!(sched.running_prefills(), 2, "both can advance");
     }
 
-    /// **A slot whose priority does not resolve pauses nobody.** It is gated as
-    /// `High` for itself, but it is not evidence that a conversation is running,
-    /// so ingest keeps its turn.
+    /// **The forced head is the highest band's.** With admission closed and
+    /// nothing in flight, a dialogue turn queued behind ingest is the one the
+    /// keep-one-alive rule forces in.
     #[test]
-    fn an_unresolvable_slot_does_not_pause_ingest() {
+    fn the_forced_head_is_the_highest_bands_first_turn() {
         let (mut sched, _tx) = make_test_scheduler();
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let ingest = SequenceId(sched.session.create_sequence().expect("create"));
-        let probe = SequenceId(sched.session.create_sequence().expect("create"));
+        let dialogue = SequenceId(sched.session.create_sequence().expect("create"));
         bind(&mut sched, &builder, ingest, "ingest", 1);
+        bind(&mut sched, &builder, dialogue, "dialogue", 2);
         sched
-            .active_prefills
-            .push(dialogue_prefill(ingest, vec![1; 8]));
+            .prefill_queue
+            .push_back(dialogue_prefill(ingest, vec![1; 8]).work);
         sched
-            .active_prefills
-            .push(dialogue_prefill(probe, vec![1; 8]));
+            .prefill_queue
+            .push_back(dialogue_prefill(dialogue, vec![1; 8]).work);
 
-        sched.observe_priorities();
+        let head = sched.pop_highest_band_head().expect("a head");
 
-        assert!(
-            !sched.priority_paused(probe),
-            "never paused: it counts as High"
+        assert_eq!(head.sequence_id, dialogue);
+        assert_eq!(
+            sched.prefill_queue.len(),
+            1,
+            "the ingest turn keeps its place"
         );
-        assert!(!sched.priority_paused(ingest), "and it pauses nothing");
+        assert_eq!(sched.prefill_queue[0].sequence_id, ingest);
     }
 
-    /// **A second conversation's prompt is not held back by the first's
-    /// decode.** Both are dialogue, so the creep carrying the new prompt runs
-    /// every layer in one wave; an ingest prompt beside the same decode still
-    /// creeps at the dialogue's ratio.
+    /// **A second conversation's prompt creeps beside the first's decode**, at
+    /// the dialogue's ratio, as an ingest prompt does — and runs every layer in
+    /// one wave again once that decode is gone.
     #[test]
-    fn a_dialogue_prompt_beside_a_dialogue_decode_is_not_throttled() {
+    fn a_dialogue_prompt_creeps_beside_a_dialogue_decode_until_it_clears() {
         let (mut sched, _tx) = make_test_scheduler();
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let decoding = SequenceId(sched.session.create_sequence().expect("create"));
@@ -5251,21 +5879,26 @@ layers:
         }];
         let work = sched.creep_priority(&creep);
         assert_eq!(work, DecodePriority::High);
-        assert_eq!(sched.airtime_ratio_over(work), 1);
+        assert_eq!(sched.airtime_ratio_over(work), 64);
 
-        let creep = [WaveMember::Prefill {
+        let ingest_creep = [WaveMember::Prefill {
             seq_id: ingest.0,
             advance: 26,
         }];
-        let work = sched.creep_priority(&creep);
-        assert_eq!(work, DecodePriority::Low);
-        assert_eq!(sched.airtime_ratio_over(work), 64);
+        let ingest_work = sched.creep_priority(&ingest_creep);
+        assert_eq!(ingest_work, DecodePriority::Low);
+        assert_eq!(sched.airtime_ratio_over(ingest_work), 64);
+
+        sched.active_decodes.remove(&decoding);
+        assert_eq!(sched.airtime_ratio_over(work), 1, "the decode cleared");
+        assert_eq!(sched.airtime_ratio_over(ingest_work), 1);
     }
 
     /// **Tenants are equal; the band decides.** npcd's live conversation
-    /// throttles and pauses zend's ingest exactly as zend's own would, and
-    /// zend's ingest never holds npcd's conversation back. Two tenants' ingests
-    /// run side by side.
+    /// throttles zend's ingest exactly as zend's own would — its creep yields
+    /// at the dialogue's ratio — and zend's ingest never holds npcd's
+    /// conversation back. Two tenants' ingests run side by side, and keep
+    /// running beside the conversation.
     #[test]
     fn a_second_tenants_dialogue_outranks_a_first_tenants_ingest() {
         let (mut sched, _tx) = make_test_scheduler();
@@ -5282,18 +5915,17 @@ layers:
         sched.slot_conversations.insert(npcd_dialogue, npcd());
         sched.slot_conversations.insert(npcd_ingest, npcd());
 
-        // Both tenants ingesting, nobody talking: neither pauses the other.
+        // Both tenants ingesting, nobody talking: both creep at full speed.
         sched
             .active_prefills
             .push(dialogue_prefill(zend_ingest, vec![1; 8]));
         sched
             .active_prefills
             .push(dialogue_prefill(npcd_ingest, vec![1; 8]));
-        sched.observe_priorities();
-        assert!(!sched.priority_paused(zend_ingest));
-        assert!(!sched.priority_paused(npcd_ingest));
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::Low), 1);
 
-        // npcd's conversation decodes: zend's ingest yields to it.
+        // npcd's conversation decodes: zend's ingest yields to it at the
+        // dialogue's ratio, and both ingests still advance beside it.
         let (state, _rx) = boundary_state();
         sched.active_decodes.insert(npcd_dialogue, state);
         let creep = [WaveMember::Prefill {
@@ -5303,10 +5935,102 @@ layers:
         let work = sched.creep_priority(&creep);
         assert_eq!(work, DecodePriority::Low);
         assert_eq!(sched.airtime_ratio_over(work), 64);
-        sched.observe_priorities();
-        assert!(sched.priority_paused(zend_ingest));
-        assert!(sched.priority_paused(npcd_ingest));
-        assert!(!sched.priority_paused(npcd_dialogue));
+        assert_eq!(sched.running_prefills(), 2, "neither ingest is held out");
+        sched.form_wave_group(false);
+        let seqs: Vec<usize> = sched
+            .wave_prefill_members
+            .iter()
+            .map(|m| m.seq_id())
+            .collect();
+        assert_eq!(seqs, vec![zend_ingest.0, npcd_ingest.0]);
+    }
+
+    /// **A dialogue prompt waiting behind a throttled ingest creep finishes
+    /// it.** The ingest group creeps at the cast's ratio (64); the prompt is
+    /// `High`, so the group runs its remaining layers at once and re-forms with
+    /// the prompt next step. A creep that is not throttled — or a waiting prompt
+    /// that does not outrank it — keeps its pace.
+    #[test]
+    fn a_waiting_dialogue_prompt_outranks_a_throttled_ingest_creep() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let cast = SequenceId(sched.session.create_sequence().expect("create"));
+        let ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let other_ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let prompt = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, cast, "dialogue", 1);
+        bind(&mut sched, &builder, ingest, "ingest", 2);
+        bind(&mut sched, &builder, other_ingest, "ingest", 3);
+        bind(&mut sched, &builder, prompt, "dialogue", 4);
+        sched
+            .active_prefills
+            .push(dialogue_prefill(ingest, vec![1; 8]));
+        sched.form_wave_group(false);
+        sched.wave_prefill_cursor = 5;
+
+        // No decode outranks the creep: it runs unthrottled and finishes.
+        sched
+            .active_prefills
+            .push(dialogue_prefill(prompt, vec![1; 8]));
+        assert!(!sched.creep_outranked_by_a_waiting_prompt());
+
+        // The cast decodes: the ingest creep is throttled, the prompt waits.
+        let (state, _rx) = boundary_state();
+        sched.active_decodes.insert(cast, state);
+        assert!(sched.creep_outranked_by_a_waiting_prompt());
+
+        // Another ingest prompt waiting does not outrank it.
+        sched.active_prefills.pop();
+        sched
+            .active_prefills
+            .push(dialogue_prefill(other_ingest, vec![1; 8]));
+        assert!(!sched.creep_outranked_by_a_waiting_prompt());
+    }
+
+    /// **The paused ingest creep waits out the dialogue prompt, and a `High`
+    /// group carries `High` prompts only.** The group formed beside the paused
+    /// creep holds the prompt and neither the paused member nor another
+    /// ingest's; the paused creep resumes only once the prompt has run.
+    #[test]
+    fn a_paused_creep_waits_out_the_prompt_that_outranked_it() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let other_ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let prompt = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, ingest, "ingest", 1);
+        bind(&mut sched, &builder, other_ingest, "ingest", 2);
+        bind(&mut sched, &builder, prompt, "dialogue", 3);
+        sched
+            .active_prefills
+            .push(dialogue_prefill(ingest, vec![1; 8]));
+        sched.form_wave_group(false);
+        sched.wave_prefill_cursor = 5;
+        sched.pause_creep();
+
+        sched
+            .active_prefills
+            .push(dialogue_prefill(other_ingest, vec![1; 8]));
+        sched
+            .active_prefills
+            .push(dialogue_prefill(prompt, vec![1; 8]));
+        assert!(!sched.resume_creep(), "the dialogue prompt is waiting");
+        sched.form_wave_group(false);
+        let seqs: Vec<usize> = sched
+            .wave_prefill_members
+            .iter()
+            .map(|m| m.seq_id())
+            .collect();
+        assert_eq!(seqs, vec![prompt.0], "the prompt alone");
+
+        // The prompt has run.
+        sched.reset_wave_prefill();
+        sched
+            .active_prefills
+            .retain(|p| p.work.sequence_id != prompt);
+        assert!(sched.resume_creep());
+        assert_eq!(sched.wave_prefill_cursor, 5);
+        assert_eq!(sched.wave_prefill_members[0].seq_id(), ingest.0);
     }
 
     /// A section chunk is background whatever slot carries it: alone it runs
@@ -5371,8 +6095,8 @@ layers:
     }
 
     /// A decode whose priority does not resolve (the titler, a summary probe)
-    /// is protected as `High` — the band it is gated in — so it holds ingest
-    /// back and yields nothing to a dialogue prompt.
+    /// is protected as `High` — the band it is gated in — so it holds back
+    /// ingest and a dialogue prompt alike.
     #[test]
     fn an_unresolvable_decode_counts_as_high() {
         let (mut sched, _tx) = make_test_scheduler();
@@ -5381,7 +6105,52 @@ layers:
         sched.active_decodes.insert(probe, state);
 
         assert_eq!(sched.airtime_ratio_over(DecodePriority::Low), 64);
-        assert_eq!(sched.airtime_ratio_over(DecodePriority::High), 1);
+        assert_eq!(sched.airtime_ratio_over(DecodePriority::High), 64);
+    }
+
+    /// **A summary probe decodes at `Normal`**, though its slot is bound to the
+    /// dialogue it compresses: it holds ingest back at `Normal`'s ratio and
+    /// never paces a dialogue prompt.
+    #[test]
+    fn a_summary_probe_decodes_at_normal() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let probe = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, probe, "dialogue", 1);
+        let (mut state, _rx) = boundary_state();
+        state.seal_action = SealAction::CompressionPass { job_id: 7 };
+        sched.active_decodes.insert(probe, state);
+
+        assert_eq!(sched.decode_priority_or_high(probe), DecodePriority::Normal);
+        assert!(!sched.same_band_paced(DecodePriority::High));
+    }
+
+    /// **A `High` creep is paced only beside a `High` decode**, and the debt
+    /// it ran up is dropped the moment that decode is gone — it runs at full
+    /// speed again.
+    #[test]
+    fn a_high_creep_is_paced_beside_a_high_decode_and_freed_when_it_clears() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let decoding = SequenceId(sched.session.create_sequence().expect("create"));
+        let prompt = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, decoding, "dialogue", 1);
+        bind(&mut sched, &builder, prompt, "dialogue", 2);
+        sched
+            .active_prefills
+            .push(dialogue_prefill(prompt, vec![1; 8]));
+        sched.form_wave_group(false);
+        let (state, _rx) = boundary_state();
+        sched.active_decodes.insert(decoding, state);
+
+        assert!(sched.same_band_paced(DecodePriority::High));
+        assert!(!sched.same_band_paced(DecodePriority::Low));
+        sched.same_band_debt = 500;
+        assert!(sched.same_band_owed());
+
+        sched.active_decodes.remove(&decoding);
+        assert!(!sched.same_band_owed(), "the decode cleared");
+        assert_eq!(sched.same_band_debt, 0);
     }
 
     /// A finished decode and a compression pass protect nothing: only a

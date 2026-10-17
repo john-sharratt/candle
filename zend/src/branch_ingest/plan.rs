@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use candle_conversation::persistence::identity::VersionStamp;
 use candle_conversation::projection::TimelineId;
 
+use super::keys::{key_version, KEY_VERSION};
+
 /// A unit on some branch: its key, and the path or folder it is of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Live<'a> {
@@ -51,9 +53,21 @@ pub struct Plan {
 /// before either sees the other's; both conversations arrive everywhere, and
 /// every member keeps the same one and tombstones the other, whatever order
 /// they arrived in.
+///
+/// **A conversation under a newer [`KEY_VERSION`] is not this member's to
+/// judge.** A peer upgraded first writes units this build cannot key, so none
+/// of them is ever in `retain`, and planned as this member's they would all be
+/// tombstoned — while the peer, planning the same layer, tombstones this
+/// member's older ones, and each re-ingests what the other just removed. Left
+/// alone, the newer units stand until this member upgrades and plans them as
+/// its own.
 pub fn plan(ingest: &[Live<'_>], retain: &HashSet<&str>, committed: &[Committed]) -> Plan {
+    let committed: Vec<&Committed> = committed
+        .iter()
+        .filter(|c| key_version(&c.key) <= KEY_VERSION)
+        .collect();
     let mut holder: HashMap<&str, &Committed> = HashMap::new();
-    for c in committed {
+    for &c in &committed {
         let lower =
             |held: &&Committed| (c.stamp, c.timeline.raw()) < (held.stamp, held.timeline.raw());
         if holder.get(c.key.as_str()).is_none_or(lower) {
@@ -214,6 +228,83 @@ mod tests {
         );
         assert!(p.queued.is_empty());
         assert_eq!(p.tombstone, [tl(2), tl(3)]);
+    }
+
+    /// **A key version tombstones every unit read under the old one** — each
+    /// once its replacement has committed, so no path is missing from the
+    /// layer while it is read again, and one past the depth bound at once,
+    /// since nothing re-reads it there. Old keys are the unversioned
+    /// `path@blob` form the layer held before `KEY_VERSION`.
+    #[test]
+    fn a_key_version_tombstones_every_unit_read_under_the_old_one() {
+        use super::super::keys::file_key;
+        use zend_vfs::Oid;
+        let blob = Oid::parse("ce013625030ba8dba906f756967f9e9ca394464a").unwrap();
+        let old_a = format!("r/a.rs@{blob}");
+        let old_b = format!("r/b.rs@{blob}");
+        let old_deep = format!("r/deep.rs@{blob}");
+        let new_a = file_key("r/a.rs", &blob);
+        let new_b = file_key("r/b.rs", &blob);
+        let new_deep = file_key("r/deep.rs", &blob);
+        assert_ne!(old_a, new_a, "the version is in the key");
+
+        let ingest = [live(&new_a, "r/a.rs"), live(&new_b, "r/b.rs")];
+        let retain: HashSet<&str> = [new_a.as_str(), new_b.as_str(), new_deep.as_str()].into();
+        let held = [
+            committed(1, &old_a, "r/a.rs"),
+            committed(2, &old_b, "r/b.rs"),
+            committed(3, &old_deep, "r/deep.rs"),
+        ];
+
+        // The first pass after the change: every unit within the bound is
+        // read again, its old conversation kept until the new one commits.
+        let first = plan(&ingest, &retain, &held);
+        assert_eq!(first.queued, [0, 1]);
+        assert_eq!(
+            first.tombstone,
+            [tl(3)],
+            "past the bound, nothing replaces it"
+        );
+
+        // Once both replacements have committed, both old conversations go.
+        let mut after = held[..2].to_vec();
+        after.push(committed(4, &new_a, "r/a.rs"));
+        after.push(committed(5, &new_b, "r/b.rs"));
+        let second = plan(&ingest, &retain, &after);
+        assert!(second.queued.is_empty());
+        assert_eq!(second.tombstone, [tl(1), tl(2)]);
+    }
+
+    /// **A unit under a newer key version is a peer's, and left alone** — not a
+    /// holder, never tombstoned — while one under an older version beside it is
+    /// replaced as usual. Two members on different versions would otherwise each
+    /// tombstone the other's units and re-ingest them, forever.
+    #[test]
+    fn a_unit_under_a_newer_key_version_is_left_alone() {
+        let newer = format!("v{}:r/a.rs@1", KEY_VERSION + 1);
+        let ours = format!("v{KEY_VERSION}:r/a.rs@1");
+        let p = unbounded(
+            &[live(&ours, "r/a.rs")],
+            &[
+                committed(1, &newer, "r/a.rs"),
+                committed(2, "r/a.rs@1", "r/a.rs"),
+            ],
+        );
+        // Ours is queued — the newer conversation does not hold its key — and
+        // the older one waits for it; the newer one is never tombstoned.
+        assert_eq!(p.queued, [0]);
+        assert!(p.tombstone.is_empty(), "{:?}", p.tombstone);
+
+        let after = unbounded(
+            &[live(&ours, "r/a.rs")],
+            &[
+                committed(1, &newer, "r/a.rs"),
+                committed(2, "r/a.rs@1", "r/a.rs"),
+                committed(3, &ours, "r/a.rs"),
+            ],
+        );
+        assert!(after.queued.is_empty());
+        assert_eq!(after.tombstone, [tl(2)], "only the older version goes");
     }
 
     #[test]

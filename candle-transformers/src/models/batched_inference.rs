@@ -1639,6 +1639,38 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
+    /// How many blocks of `seq_idx` hold content: on every layer, its block
+    /// count without the empty (0-token) writer chunks at its tail — the
+    /// fewest across layers. `None` when the slot is unallocated on every layer.
+    ///
+    /// **A record of where the slot stood after something was placed counts
+    /// this, never [`Self::sequence_block_count`].** An empty writer chunk at
+    /// the tail is where the *next* write lands — a glue gap's reservation
+    /// pushes one behind it, and [`Self::inject_sealed_at_tail`] trims it and
+    /// lands its first chunk at that very index. A count that included it then
+    /// ends inside whatever was placed next, and cutting the slot back to it
+    /// keeps that piece's first chunk: measured as a kept prefix whose slot
+    /// offset ran exactly one 32-token chunk past its logical position.
+    pub fn sequence_content_block_count(&self, seq_idx: usize) -> Result<Option<usize>> {
+        let mut fewest: Option<usize> = None;
+        for backing in &self.backings {
+            let Some(blocks) = backing.sequence_block_count(seq_idx) else {
+                continue;
+            };
+            let usage = backing.block_usage(seq_idx);
+            let Some(usage) = usage.get(..blocks) else {
+                candle::bail!(
+                    "sequence_content_block_count: seq {seq_idx} reports {blocks} block(s) but \
+                     its backing's block_usage is only {} wide",
+                    usage.len()
+                );
+            };
+            let held = usage.iter().rposition(|&u| u != 0).map_or(0, |i| i + 1);
+            fewest = Some(fewest.map_or(held, |f| f.min(held)));
+        }
+        Ok(fewest)
+    }
+
     /// Drop every layer's trailing empty (0-token) chunks from `seq_idx`, so
     /// each layer ends flush with the last token it actually holds.
     ///
@@ -5737,6 +5769,13 @@ pub trait ManagedBatchedModel {
         None
     }
 
+    /// Whether the expert cache's pipeline thread or stager has exited. Neither
+    /// is restarted, and every forward after it fails, so a model whose cache
+    /// reports this can serve nothing again.
+    fn expert_pipeline_dead(&self) -> bool {
+        false
+    }
+
     /// The expert cache's `(hits, misses)` tallies so far, unsettled
     /// (`ExpertCache::hit_counts`) — the per-step read, where
     /// [`Self::expert_stats`] waits for the pipeline thread to serve every
@@ -6038,6 +6077,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn expert_stats(&self) -> Option<PipelineStats> {
         self.model().expert_stats()
+    }
+
+    fn expert_pipeline_dead(&self) -> bool {
+        self.model().expert_pipeline_dead()
     }
 
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {

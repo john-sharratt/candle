@@ -112,21 +112,40 @@ The walk's output is a **corpus**: every distinct `code_reading` unit and every 
 
 ## 6. Content keys
 
+Every key carries a **version** (`KEY_VERSION`, `branch_ingest/keys.rs`, now 2):
+the version of what a unit's turns say beyond its content — the calls and
+responses rendered around it. A change to that rendering bumps it, which re-reads
+every unit: each new key is queued, the old conversation stays readable until its
+replacement commits, and the next pass tombstones it (§7.2); a unit past the depth
+bound, which nothing re-reads, is tombstoned at once. Version 2 is pages counted
+from 1 — `file_read`'s and `file_list`'s `page`, and the `page=1 pages=N` fence —
+so no zero-based call or fence is left in what a conversation is shown.
+
+Every key states its version as a `v<N>:` prefix — a key with none is version 1,
+the form before versions — and **a member judges only conversations at its own
+version or older**. One under a newer version was written by a peer upgraded
+first: this build cannot key it, so it is never retained, and planned as this
+member's it would be tombstoned — while the peer tombstones this member's older
+units, and each re-ingests what the other removed. A newer unit is therefore
+neither a holder nor tombstoned until this member upgrades and plans it as its own
+(`plan`).
+
 ### 6.1 A file
 
 ```
-<repo>/<path>@<blob id>
+v<version>:<repo>/<path>@<blob id>
 ```
 
-`candle/zend/src/main.rs@3f73f8722a390439c029daf7748a9ab24791a016`. The blob id is git's hash of the file's committed bytes, which are exactly what `file_read` returns: the store reads the blob and nothing converts it. The path is part of the key because the ingested conversation names it — in its opening request and in every `file_read` header — so the same bytes at another path are another conversation. (Measured on this repository: 22 branch tips hold 8,120 distinct path-and-blob pairs and 8,024 distinct blobs, so the path costs almost nothing.)
+`v2:candle/zend/src/main.rs@3f73f8722a390439c029daf7748a9ab24791a016`. The blob id is git's hash of the file's committed bytes, which are exactly what `file_read` returns: the store reads the blob and nothing converts it. The path is part of the key because the ingested conversation names it — in its opening request and in every `file_read` header — so the same bytes at another path are another conversation. (Measured on this repository: 22 branch tips hold 8,120 distinct path-and-blob pairs and 8,024 distinct blobs, so the path costs almost nothing.)
 
 The key is known from a tree listing alone. Deciding whether a file is ingested reads no file.
 
 ### 6.2 A folder
 
-A folder's turns show its listing (`file_list`'s first page, and how many entries the folder holds) and the manifest hint in its request (`(crate: candle-nn)`) — nothing else. The chain is one `file_list` round-trip and the summary; no file of the folder is read, so no file's content is part of what it shows (`repo_scan/render.rs` records why a README/module-doc read was removed). The listing is what `file_list` shows, not what the layer reads: every file and subfolder but hidden ones, a `LICENSE` or a `kernels/` folder as much as a `.rs` file. Its key is the SHA-256, in hex, of:
+A folder's key is `v<version>:` and then the hash below. A folder's turns show its listing (`file_list`'s first page, and how many entries the folder holds) and the manifest hint in its request (`(crate: candle-nn)`) — nothing else. The chain is one `file_list` round-trip and the summary; no file of the folder is read, so no file's content is part of what it shows (`repo_scan/render.rs` records why a README/module-doc read was removed). The listing is what `file_list` shows, not what the layer reads: every file and subfolder but hidden ones, a `LICENSE` or a `kernels/` folder as much as a `.rs` file. Its key is the SHA-256, in hex, of:
 
 ```
+v<version>\n        the key version, `v2`
 <dir>\n             workspace-relative, `candle/zend/src/`
 <total>\n           how many entries the listing holds
 <entry>\n           one per entry on the first page, workspace-relative, a folder ending in `/`, in the listing's order

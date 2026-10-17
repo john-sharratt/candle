@@ -1,6 +1,9 @@
-//! Searching file contents at a revision, without checking it out.
+//! Searching file contents at a revision, without checking it out: in this
+//! process where libgit2 holds the repository ([`grep`](crate::library::grep)),
+//! otherwise with `git grep`.
 
 use crate::error::GitError;
+use crate::library::grep as library_grep;
 use crate::types::{RepoPath, Rev};
 use crate::Repo;
 
@@ -73,6 +76,9 @@ impl Repo {
     /// Every line matching `query` in the files of `rev`. Binary files are
     /// skipped.
     pub fn grep(&self, rev: &Rev, query: &GrepQuery) -> Result<Vec<GrepHit>, GitError> {
+        if let Some(lib) = self.library() {
+            return library_grep::grep(&lib, rev, query);
+        }
         let spec = rev.spec();
         let mut inv = self.git("grep").args([
             "-z",
@@ -208,6 +214,44 @@ mod tests {
             ..GrepQuery::regex("pub fn")
         };
         assert_eq!(count(&limited), 1);
+    }
+
+    /// **The search in this process finds what `git grep` finds**, line for
+    /// line, across case, fixed strings, paths and limits.
+    #[test]
+    fn the_search_in_process_is_gits() {
+        let t = repo_with_branch();
+        t.write("deep/a b/notes.txt", b"alpha\r\nbeta\nALPHA alpha\n");
+        t.commit_all("deeper");
+        let held = t.repo();
+        let git = t.repo().without_library();
+        let queries = [
+            GrepQuery::regex("alpha"),
+            GrepQuery {
+                ignore_case: true,
+                ..GrepQuery::regex("alpha")
+            },
+            GrepQuery {
+                paths: vec![RepoPath::parse("deep").unwrap()],
+                ..GrepQuery::regex("a")
+            },
+            GrepQuery {
+                fixed: true,
+                ..GrepQuery::regex("fn alpha()")
+            },
+            GrepQuery {
+                max_per_file: Some(1),
+                ..GrepQuery::regex("[a-z]")
+            },
+            GrepQuery::regex("^beta$"),
+        ];
+        for q in &queries {
+            assert_eq!(
+                held.grep(&Rev::Head, q).unwrap(),
+                git.grep(&Rev::Head, q).unwrap(),
+                "{q:?}"
+            );
+        }
     }
 
     #[test]

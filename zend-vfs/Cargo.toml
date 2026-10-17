@@ -38,6 +38,13 @@ tracing = { workspace = true }
 # transports are left out: fetch, push and clone stay on the `git` program,
 # which carries the user's credentials and partial-clone promises.
 git2 = { version = "0.20", default-features = false }
+# The object database a repository read from the substrate is held in
+# (`docs/substrate_git.md` §4): libgit2 reads through our own object and ref
+# backends, plugged in through its C interface.
+libgit2-sys = "0.18"
+# A pack's entries are zlib streams, and its index records each entry's CRC-32.
+flate2 = "1"
+crc32fast = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

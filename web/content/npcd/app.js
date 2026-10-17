@@ -36,7 +36,7 @@ import { estateSwitcher } from '/common/lib/estate.js';
  *   /performance → GET  /v1/telemetry, /v1/memory   user
  *   /operations  → GET  /v1/pulse/operations        admin
  *   /substrate   → GET  /v1/substrate               admin
- *   /logs        → WS   /ws/logs                    admin
+ *   /logs        → WS   /ws/logs                    user
  */
 definePage({ path: '/', role: 'user', nav: { section: 'main', order: 10, label: 'My NPCs' },
   load: () => import('./pages/roster.js') });
@@ -101,8 +101,9 @@ definePage({ path: '/performance', role: 'user', nav: { section: 'main', order: 
   load: () => import('./pages/system.js') });
 definePage({ path: '/probe', role: 'user', nav: { section: 'main', order: 55, label: 'Probe' },
   load: () => import('./pages/probe.js') });
-// Carries every save's full path and the account ids — matches `/ws/logs`.
-definePage({ path: '/logs', role: 'admin', nav: { section: 'main', order: 70, label: 'Logs' },
+// Any signed-in caller, matching `/ws/logs`: the logs are how anyone running a
+// member sees what broke the cluster.
+definePage({ path: '/logs', role: 'user', nav: { section: 'main', order: 70, label: 'Logs' },
   load: () => import('./pages/logs.js') });
 // The same page as `/performance`, under an older address, so it belongs to the
 // same nav entry.

@@ -192,6 +192,7 @@ mod wave {
                 StreamItem::Prefill { .. }
                 | StreamItem::Think { .. }
                 | StreamItem::TurnEnd { .. } => {}
+                StreamItem::Error(e) => panic!("the turn failed: {e}"),
             }
         }
         (n, text)

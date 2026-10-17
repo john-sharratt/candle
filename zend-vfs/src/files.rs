@@ -31,7 +31,7 @@ use std::sync::{Arc, RwLock};
 use super::vfs::git_source::GitSource;
 use super::vfs::{Snapshot, VfsStore};
 use super::workspace::{Workspace, ALL_REPOS};
-use crate::{BranchName, Oid, Rev};
+use crate::{BranchName, GitError, Oid, Rev};
 
 /// Each git repository's source, by repository name.
 type Sources = BTreeMap<String, Arc<GitSource>>;
@@ -77,14 +77,19 @@ impl RepoFiles {
 
     /// An overlay store over each of `workspace`'s repositories: reads fall
     /// through to each one's branch — or, for a folder not under git, to the
-    /// folder — and writes stay in memory.
-    pub fn overlay(workspace: Workspace) -> Self {
-        let sources = workspace
-            .repos()
-            .iter()
-            .filter_map(|r| Some((r.name.clone(), GitSource::open(&r.dir).ok()?)))
-            .collect();
-        Self::over(workspace, Arc::new(sources))
+    /// folder — and writes stay in memory. Refused when a git repository
+    /// cannot be opened: read as a plain folder, or as nothing, it would show
+    /// every conversation files that are not its branch's.
+    pub fn overlay(workspace: Workspace) -> Result<Self, GitError> {
+        let mut sources = Sources::new();
+        for repo in workspace.repos().iter().filter(|r| r.is_git()) {
+            let source = repo
+                .open()
+                .and_then(GitSource::of)
+                .map_err(|e| GitError::invalid(format!("repository {}: {e}", repo.name)))?;
+            sources.insert(repo.name.clone(), source);
+        }
+        Ok(Self::over(workspace, Arc::new(sources)))
     }
 
     /// Overlay stores over `workspace`, reading through `sources`.
@@ -93,11 +98,14 @@ impl RepoFiles {
             .repos()
             .iter()
             .map(|r| {
-                let store = match sources.get(&r.name) {
-                    Some(source) => {
+                let store = match (sources.get(&r.name), r.folder()) {
+                    (Some(source), _) => {
                         VfsStore::on_branch(Arc::clone(source), source.default_rev().clone())
                     }
-                    None => VfsStore::with_root(&r.dir),
+                    (None, Some(dir)) => VfsStore::with_root(dir),
+                    // Every repository read from the substrate has a source:
+                    // `overlay` refuses one it cannot open.
+                    (None, None) => VfsStore::new(),
                 };
                 (r.name.clone(), Arc::new(store))
             })
@@ -293,7 +301,7 @@ mod tests {
     #[test]
     fn each_repository_resolves_against_its_own_folder() {
         let (dir, ws) = two_repos();
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         assert_eq!(
             files.repo("a").unwrap().root(),
             Some(dir.path().join("a").as_path())
@@ -319,7 +327,7 @@ mod tests {
     #[test]
     fn an_unlisted_repository_is_refused_with_the_listed_names() {
         let (_dir, ws) = two_repos();
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         let err = files.repo("c").err().unwrap();
         assert_eq!(
             err,
@@ -337,7 +345,7 @@ mod tests {
     #[test]
     fn stores_are_kept_in_manifest_order() {
         let (_dir, ws) = two_repos();
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         assert_eq!(files.names(), vec!["a", "b"]);
         assert_eq!(files.all().len(), 2);
     }
@@ -347,7 +355,7 @@ mod tests {
     #[test]
     fn one_repository_is_one_store() {
         let (_dir, ws) = two_repos();
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         files
             .repo("a")
             .unwrap()
@@ -366,7 +374,7 @@ mod tests {
     #[test]
     fn a_fresh_set_starts_without_the_others_changes() {
         let (_dir, ws) = two_repos();
-        let first = RepoFiles::overlay(ws);
+        let first = RepoFiles::overlay(ws).unwrap();
         first
             .repo("a")
             .unwrap()
@@ -409,7 +417,7 @@ mod tests {
     #[test]
     fn a_sets_changes_restore_into_a_fresh_set() {
         let (_dir, ws) = two_repos();
-        let first = RepoFiles::overlay(ws);
+        let first = RepoFiles::overlay(ws).unwrap();
         first
             .repo("a")
             .unwrap()
@@ -463,7 +471,7 @@ mod tests {
         )
         .unwrap();
 
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         let read = |files: &RepoFiles, repo: &str, path: &str| {
             files.repo(repo).unwrap().read(path).unwrap()
         };
@@ -515,7 +523,7 @@ mod tests {
             vec![RepoSpec::named(&repo), RepoSpec::named(&folder)],
         )
         .unwrap();
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
 
         let pinned = files.fresh_at(&repo, &first).expect("a git repository");
         let read = |files: &RepoFiles| files.repo(&repo).unwrap().read("a.txt").unwrap();
@@ -548,7 +556,7 @@ mod tests {
             vec![RepoSpec::named(&repo), RepoSpec::named(&folder)],
         )
         .unwrap();
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         let hello = Oid::parse("ce013625030ba8dba906f756967f9e9ca394464a").unwrap();
 
         let git = files.repo(&repo).unwrap();
@@ -587,7 +595,7 @@ mod tests {
         t.commit_all("first");
         let repo = t.path.file_name().unwrap().to_string_lossy().into_owned();
         let ws = Workspace::new(scratch(), vec![RepoSpec::named(&repo)]).unwrap();
-        let files = RepoFiles::overlay(ws);
+        let files = RepoFiles::overlay(ws).unwrap();
         let store = files.repo(&repo).unwrap();
 
         let first = store.peek_base().unwrap().unwrap();

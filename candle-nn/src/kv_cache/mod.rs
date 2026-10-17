@@ -110,7 +110,7 @@ pub use chunked::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     initial_weight_bytes, kv_spare_regions, set_ground_broker, set_kv_free_target,
-    set_weight_floor, span_end, weight_capacity_bytes, weight_floor_after,
+    set_prompts_waiting, set_weight_floor, span_end, weight_capacity_bytes, weight_floor_after,
 };
 /// Fixed-stride slot arenas, one set per span tenant — see `chunked::tenant_arena`.
 pub use chunked::{slot_stride, SlotTenant, SLOT_ALIGN};

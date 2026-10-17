@@ -75,7 +75,7 @@ pub fn materialize(
     branch: &BranchName,
     changes: &FileChanges,
 ) -> Result<(Ledger, Materialized), CheckoutError> {
-    let root = repo.dir().to_path_buf();
+    let root = repo.dir()?.to_path_buf();
     let (head, status) = repo.status_with_head()?;
     // On the branch, `HEAD`'s commit is the branch's; elsewhere it is read.
     let base = match &head {

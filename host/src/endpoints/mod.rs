@@ -9,6 +9,7 @@
 mod catalog;
 mod expert_split;
 mod format_mix;
+mod log_grep;
 mod logs;
 mod me;
 mod profile;
@@ -178,12 +179,21 @@ fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
             each(),
             get(catalog::substrate),
         )
-        // Every member's lines, on one socket.
+        // Every member's lines, on one socket. Any signed-in caller: the logs
+        // are how anyone running a member sees what broke the cluster.
         .route(
             "/ws/logs",
-            Role::Admin,
+            Role::User,
             Dispatch::Aggregate(Merge::Lines),
             get(logs::logs),
+        )
+        // Every member's log files searched, each member's matches beside the
+        // others'.
+        .route(
+            "/v1/logs",
+            Role::User,
+            Dispatch::Aggregate(Merge::Envelope),
+            get(log_grep::grep),
         )
 }
 
@@ -421,7 +431,8 @@ mod tests {
                 ("/v1/tools/calibrate", "admin"),
                 ("/v1/schema/layers", "user"),
                 ("/v1/substrate", "admin"),
-                ("/ws/logs", "admin"),
+                ("/ws/logs", "user"),
+                ("/v1/logs", "user"),
                 ("/v1/cluster/command/:name", "admin"),
                 ("/v1/cluster/command/job/:id", "admin"),
                 ("/v1/cluster/quorum", "admin"),

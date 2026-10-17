@@ -366,14 +366,15 @@ rebuild` — which the member shows on its loading page and in `/v1/status`.
   |---|---|---|
   | `count` | commits on `origin/main` that HEAD contains: `git rev-list --count $(git merge-base HEAD origin/main)` | a pushed commit is fetched and built. A local commit does not move it. |
   | `hash` | `git rev-parse --short` of that merge base | with `count` |
-  | `local` | empty for a build exactly at that merge base. Otherwise a digest of everything beyond it: the commits HEAD has that `origin/main` does not (`git rev-list origin/main..HEAD`), the uncommitted diff (`git diff HEAD`), and the untracked files `git status` reports | any local commit, edit or new file |
+  | `local` | empty when the build's **inputs** — the workspace `Cargo.toml` and `Cargo.lock` and every workspace crate's directory — are exactly the merge base's. Otherwise a digest of how they differ: the working tree's diff against the merge base (`git diff <base> -- <inputs>`) and the untracked input files. A file outside the inputs (a doc, a tool's lock file) cannot change the binary and does not make a build local; and the same sources on the same base give the same `local` however they were reached — committed locally, left uncommitted, or built again | an edit, local commit or new file among the inputs |
 
   The build script reruns on `.git/HEAD`, the refs `HEAD` and `origin/main` name,
-  `.git/packed-refs`, and every workspace crate's `src/`, `Cargo.toml` and the UI
-  directories, but not `target/`. So `local` is accurate to the build: a binary built
-  from edited sources always says so. `local` is the first 16 hex digits of a SHA-256
-  over the three inputs; a tree with no git or no `origin/main` is count 0, hash
-  `none`, and a local build (`cluster/src/version/compute.rs`).
+  `.git/packed-refs`, the workspace `Cargo.toml` and `Cargo.lock`, and every workspace
+  crate's `src/`, `Cargo.toml` and the UI directories, but not `target/`. So `local` is
+  accurate to the build: a binary built from edited sources always says so. `local` is
+  the first 16 hex digits of a SHA-256 over the input diff and the untracked input
+  files; a tree with no git or no `origin/main` is count 0, hash `none`, and a local
+  build named by HEAD's history as well (`cluster/src/version/compute.rs`).
 
   The version therefore changes with any edit in the workspace, and every crate that
   links `cluster` rebuilds with it. Nothing below the daemons may link it for that
@@ -712,25 +713,22 @@ build is certified (§3.8):
      it had been supervising and starts the staged file with the same arguments in
      the same working directory. The plan at `<data>/upgrade/watch.json` is the lease
      list the next process reads. `self_heal` relaunches the executable it is running
-     from, which is the stable file once `keep` has kept a trial.
+     from, which is the stable file: `keep` starts every trial from the stable path.
 4. **`keep` is the failsafe, and it is already running.** It is its own process. It
    does not certify, roll out, carry bytes, or choose a canary share. For `web` and
    `motherd` the last known-good executable is `keep/stable/<name>.exe`, started with
    the arguments in `keep`'s config:
    - **A process that is gone** is started again from that stable file.
-   - **A trial** is the staged path. `keep` reads its stderr for the line
-     `INFO serving`, which the process prints only after it is serving, not while it
-     is booting. The wait is at most 10 minutes.
-   - **No line in that time, or the process dying,** kills the trial and starts the
-     stable file again.
-   - **The line** makes the trial file the stable file. `keep` renames the trial
-     file onto the stable path when the platform allows it, and otherwise copies
-     the bytes and deletes the trial file once it is no longer locked. Which of
-     the two worked is recorded under `keep/state/`. The trial process is then
-     stopped and the stable file is started with the same arguments. That start
-     is not another trial. The process that stays up was started from the stable
-     path; a rename leaves a process on the path it was started from, and that
-     path is not the one the firewall allows.
+   - **A trial** runs from the stable path: the stable file is set aside, the
+     staged file copied onto its path and started there — the path the firewall
+     allows, and the one a self-relaunch starts. `keep` reads its stderr, written
+     to a file under `keep/state/`, for the line `INFO serving`, which the process
+     prints only after it is serving, not while it is booting. The wait is at most
+     10 minutes.
+   - **No line in that time, or the process dying,** kills the trial, puts the
+     set-aside file back and starts it.
+   - **The line** makes the trial the service: the set-aside file is deleted and
+     the trial process goes on running. A promotion does not restart it.
    - **Success for the member** is the new process. Once it is ready it writes
      `<data>/upgrade/ok`, prunes kept builds beyond *N*, and hands the leases back.
 
@@ -1438,14 +1436,15 @@ its sockets close, it is closed 4410, or it falls behind and stops being ready. 
 requests go to the configured upstream again. In-flight requests on the lost sockets
 fail as §5.6 says.
 
-**A loading member stands in for a down upstream.** While the app is dumb and its
-configured upstream is in its backoff window — its last attempt failed and none has
-succeeded since — a request goes to a member admitted and not yet ready, the lowest
-node first (`Registry::standing_by`), instead of the outage page. That member serves
-its own loading page and `/v1/status`, so a member replacing a retired upstream shows
-its load from the moment it joins. The status page names that state **loading** rather
-than dumb (`status::mode_name`): the app has a member, just none ready. The upstream's first failure is still answered with
-the outage page: that failure is how the gateway learns it is down.
+**While every member is loading, the gateway says it is restarting.** With members
+admitted and none ready, a request is answered by the gateway's own reconnecting page
+(`503` with `Retry-After`, `route::restarting`), which the consoles retry. It goes
+neither to the configured upstream, which is usually one of those members, nor to a
+loading member: either put that member's half-loaded startup card in front of players —
+measured 2026-10-16, with `.5` restarting and WhiteWorld stuck loading behind it,
+bot.tokera.com showed WhiteWorld's repository wait. The status page names that state
+**loading** rather than dumb (`status::mode_name`). The configured upstream serves
+only while no member is admitted at all.
 
 **The configured upstream gets nothing special in clustered mode.** It is often the
 same daemon as one of the members, for example zend on `.5`. While the app is
@@ -1713,6 +1712,12 @@ sit out for minutes, and a duel is over in a round or two however long the lease
 - A member that rendezvous stops naming for a key abandons its round for it, so it
   does not keep duelling the member that is named now. A lease it holds is unaffected;
   it runs out or is released.
+- **A lease asked for again while its round runs starts nothing.** The round retries
+  itself until it is held or a holder's promise stops it (`LeaseBusy`), so a second ask
+  could only replace it with a higher ballot. The import lease's load asked once a
+  second: each ask cancelled the member's own round before it could finish, and pushed
+  the ballot up under the holder's renewals, so nobody held `git/<repo>` long enough to
+  pull it and a joining member waited for good.
 
 ---
 
@@ -1789,8 +1794,10 @@ with no identity at all (every identity field zero).
   owes, and an answerer reads a fetched record, through this index. A location captured
   earlier would be stale. An `oseq` whose record maintenance dropped is gone, and its
   own origin knows it. An origin's `oseq`s are dense, so the index is a vector per
-  origin of one word per record: the segment and the record's offset in 4 KiB blocks,
-  the record's size read from its header when it is read.
+  origin of 48 bytes per record: one word for the segment and the record's offset in
+  4 KiB blocks, and beside it what a catch-up's headers list of the record (§7.2), so a
+  listing never reads the disk. The record's size is read from its header when it is
+  read.
 - **A substrate written before this design** has no origins. Its first writable open
   runs the full `compact()` once, stamping as it writes (`persistence/adoption.rs`):
   every record an origin writes takes this node's origin, a fresh `oseq`, the current
@@ -2422,7 +2429,52 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
    - Each range lists every record it holds, as
      `(oseq, type, stream_id, chunk_index, len, digest)`, about 40 bytes packed, never
      the payload. It also lists the `oseq`s in the range it knows are gone.
+   - `len` is the record as it travels, its header line and payload unpadded, with the
+     line's `crc` counted at its widest. A header-index digest carries every field of
+     the line but the `crc`, and the listing is read from memory (below), so `len` is
+     never under what travels and at most nine bytes over it.
    - The answer ends with `DONE`.
+   - **An answer is bounded** to 16 `HEADERS`, about 131,000 `oseq`s and 6 MiB
+     (`replicate/answer.rs`). The requester fetches what they list, and an admission
+     catch-up whose answer moved it on (a record it lacked is now held, or an `oseq`
+     learned gone) asks again, from where it then stands, before its socket is ready.
+     One that brings nothing has had everything its answerer covers. So a member far
+     behind catches up an answer at a time, fetching from the first.
+   - **An admission nobody answers does not hold the member.** One that goes quiet is
+     asked again; one that goes quiet twice (`tick::ADMISSION_QUIET_LIMIT`) is taken as
+     finished, and the member serves on what it holds — anything it lacks is a gap the
+     gap watch fetches once an origin announces it. On 2026-10-17 WhiteWorld's npcd,
+     ready at the gateway but with its sockets dropping every 45 s, was asked `.5`'s
+     admission again and again; `.5`'s npcd never finished loading and `keep` rolled
+     the build back after its ten minutes.
+     Unbounded, an answer to a member lacking 8 million records was a thousand frames,
+     about 360 MB, queued at once. That is far past what a gateway holds for one member
+     (16 MiB, after which it drops catch-up frames). A requester waiting on frames that
+     never come goes quiet and asks again, and each new answer queues behind old ones it
+     ignores. Measured on `.5`: 156 catch-ups answered in 20 minutes, none of them
+     recorded by whiteworld, which re-asked every 30 s and fetched nothing.
+   - **A gateway never drops a `DONE`.** A dropped `HEADERS` or fetched record is
+     repaired: the next answer lists from where the requester stands, and a fetch that
+     ends short fetches the record again. A dropped `DONE` would leave its catch-up
+     waiting until it went quiet.
+   - **One answer per requester.** A member far behind lacks everything, so an answer
+     lists the whole log, and its fetches run for minutes. A requester
+     asks again when its catch-up goes quiet (§7.1), and its gap watch asks again for as
+     long as the answerer keeps writing. So a newer `CATCHUP` from the same `reply_to`
+     cancels the answer before it, and an answer whose requester no gateway lists any
+     more is cancelled too. A cancelled answer stops before its next range and sends no
+     `DONE`. Without this, answers stacked by the dozen on `.5`, each re-listing the
+     same history, which was then read off disk: 70,000 4 KiB header reads a second, a
+     persistence lock nothing else could take, an engine that ran two forwards in
+     fourteen minutes, and a requester that never finished catching up.
+   - **A range is listed from memory.** The location index keeps, beside each record's
+     place, what the headers list of it (§6.2), so a listing is a walk over memory
+     under one short hold of the persistence lock. The hold, like a fetch's record
+     reads, is taken behind the lock's waiters: answering a peer is background work,
+     and the scheduler's and the leases' writes go first. Read off disk, 512 records
+     to a hold, the listing still kept the scheduler out 75–93 s at a time on `.5`
+     while whiteworld caught up: a lock released and re-taken at once is re-taken
+     before a waiter wakes.
 4. **Compare.** It decides what to fetch:
    - Every listed record it does not hold, and that none of its other catch-ups is
      already fetching, is wanted. It never compares by `digest`: a record keeps its
@@ -2474,7 +2526,8 @@ The headers for a million records are about 40 MB, which is cheap to send and to
 The records themselves are another matter. A member joining with an empty substrate
 fetches the whole log, which can be many gigabytes: that is the cost of D5. Headers
 first means it fetches each record once, and nothing it already holds.
-The headers' `len` gives the loading page an exact total to show progress against.
+The headers' `len` gives the loading page a total to show progress against, at most
+nine bytes a record over what travels (§7.2).
 
 ### 7.4 Backpressure
 
@@ -3426,7 +3479,13 @@ says why.
 ## 12. The gateway status page
 
 `GET /gateway` serves the page and `GET /gateway/status.json` its data. Both are on
-every host, merged ahead of site routing, and admin only. tokera.com's top bar links to
+every host, merged ahead of site routing, and admin only. The data also answers a
+caller presenting the **status key** as `Authorization: Bearer <key>`: a server-side
+secret, written by `web --new-status-key <path>` and named by the `cluster:` block's
+`status_key_file`, so a script or an operator at a shell reads how the cluster stands
+without a browser session (`web/src/cluster/status_key.rs`). It reads the status and
+nothing else: the page and every command still want an admin's session, and it is its
+own key, never the group key, so it admits no member. tokera.com's top bar links to
 it as **Cluster** beside the signed-in name, for an admin or a creator only:
 `/auth/me` carries the caller's `role`, and `common/lib/auth.js` offers the link where
 the page would not be refused. The gateway resolves roles from `host/roles.yaml` itself

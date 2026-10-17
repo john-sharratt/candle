@@ -30,6 +30,10 @@ host:
   cluster_name: tokera.com
   group_key: web/secrets/group.key
   agent: motherd/agent.yaml
+  # DEBUG for every tenant and engine crate (`candle_nn` at INFO): the
+  # per-reprojection timings and the scheduler's other per-event detail are
+  # logged there, and a slow conversation cannot be diagnosed without them.
+  verbose: 1
 
 # zend: the workspace folder holding `workspace.yaml`, and its `substrate/`. A
 # substrate is bound to the model that wrote it, so one written under another
@@ -41,8 +45,8 @@ zend:
 
 # npcd: its mind is the repository the agents hold as `battle-mind`, read from
 # the substrate at the commit the log names (docs/substrate_git.md §8) and
-# reached through the agents only. The substrate, the accounts and the mind's
-# object store (`git/battle-mind`) live in the data folder.
+# reached through the agents only. The substrate — the mind's packs among its
+# records — and the accounts live in the data folder.
 npcd:
   mind_repo: battle-mind
   data: ../npcd-data

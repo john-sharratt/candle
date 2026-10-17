@@ -37,7 +37,7 @@ fn two_repo_workspace() -> TempDir {
 
 fn ctx(dir: &TempDir) -> ToolContext {
     let ws = Workspace::new(dir.path(), vec![RepoSpec::named("a"), RepoSpec::named("b")]).unwrap();
-    ToolContext::with_workspace(ws)
+    ToolContext::with_workspace(ws).unwrap()
 }
 
 /// A grouped search result — `{"repos": [{"repo", <items>: [...]}]}` — as its
@@ -84,7 +84,7 @@ fn file_read_of_the_same_path_returns_each_repositorys_own_content() {
 
     let a = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "a", "path": "shared.txt", "page": 0}),
+        json!({"repo": "a", "path": "shared.txt", "page": 1}),
         &c,
     ));
     assert_eq!(excerpt_source(&a), "content from a");
@@ -92,7 +92,7 @@ fn file_read_of_the_same_path_returns_each_repositorys_own_content() {
 
     let b = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "b", "path": "shared.txt", "page": 0}),
+        json!({"repo": "b", "path": "shared.txt", "page": 1}),
         &c,
     ));
     assert_eq!(excerpt_source(&b), "content from b");
@@ -105,7 +105,7 @@ fn an_unknown_repo_names_every_repo_the_workspace_lists() {
     let c = ctx(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "c", "path": "shared.txt", "page": 0}),
+        json!({"repo": "c", "path": "shared.txt", "page": 1}),
         &c,
     );
     let detail = harness::expect_error(&resp, "unknown_repo");
@@ -122,7 +122,7 @@ fn parent_traversal_cannot_reach_a_sibling_repository() {
     let c = ctx(&dir);
     let resp = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "a", "path": "../b/only_b.txt", "page": 0}),
+        json!({"repo": "a", "path": "../b/only_b.txt", "page": 1}),
         &c,
     );
     harness::expect_error(&resp, "not_found");
@@ -137,7 +137,7 @@ fn file_list_lists_inside_one_repository() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
-        json!({"repo": "b", "page": 0}),
+        json!({"repo": "b", "page": 1}),
         &c,
     ));
     assert_eq!(resp["repo"], "b");
@@ -157,10 +157,10 @@ fn every_file_tool_refuses_a_call_without_a_repo() {
     let dir = two_repo_workspace();
     let c = ctx(&dir);
     for (tool, args) in [
-        ("file_list", json!({"page": 0})),
-        ("file_search", json!({"query": "shared.txt", "page": 0})),
-        ("file_grep", json!({"pattern": "marker", "page": 0})),
-        ("file_read", json!({"path": "shared.txt", "page": 0})),
+        ("file_list", json!({"page": 1})),
+        ("file_search", json!({"query": "shared.txt", "page": 1})),
+        ("file_grep", json!({"pattern": "marker", "page": 1})),
+        ("file_read", json!({"path": "shared.txt", "page": 1})),
     ] {
         let resp = harness::invoke_with_ctx(tool, args, &c);
         harness::expect_error(&resp, "invalid_arguments");
@@ -195,9 +195,9 @@ fn only_the_search_tools_take_all_repos() {
     for (tool, args) in [
         (
             "file_read",
-            json!({"repo": "*", "path": "shared.txt", "page": 0}),
+            json!({"repo": "*", "path": "shared.txt", "page": 1}),
         ),
-        ("file_list", json!({"repo": "*", "page": 0})),
+        ("file_list", json!({"repo": "*", "page": 1})),
     ] {
         let resp = harness::invoke_with_ctx(tool, args, &c);
         let detail = harness::expect_error(&resp, "unknown_repo");
@@ -215,7 +215,7 @@ fn file_search_of_all_repos_groups_the_hits_by_repo() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"query": "shared.txt", "repo": "*", "page": 0}),
+        json!({"query": "shared.txt", "repo": "*", "page": 1}),
         &c,
     ));
     let got: Vec<(&str, Vec<&str>)> = groups(&resp, "files")
@@ -231,7 +231,7 @@ fn file_search_with_a_repo_finds_only_that_repos_hits() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_search",
-        json!({"repo": "b", "query": "shared.txt", "page": 0}),
+        json!({"repo": "b", "query": "shared.txt", "page": 1}),
         &c,
     ));
     let got = groups(&resp, "files");
@@ -246,7 +246,7 @@ fn file_grep_of_all_repos_groups_the_hits_by_repo() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"pattern": "pub fn marker_", "repo": "*", "page": 0}),
+        json!({"pattern": "pub fn marker_", "repo": "*", "page": 1}),
         &c,
     ));
     let got: Vec<(&str, Vec<(&str, u64)>)> = groups(&resp, "matches")
@@ -289,7 +289,7 @@ fn a_workspace_grep_represents_every_repository_that_matches() {
     }
     let c = ctx(&dir);
     let mut repos = std::collections::BTreeSet::new();
-    let mut page = 0;
+    let mut page = 1;
     let truncated = loop {
         let resp = harness::expect_success(harness::invoke_with_ctx(
             "file_grep",
@@ -321,7 +321,7 @@ fn file_grep_with_a_repo_finds_only_that_repos_hits() {
     let c = ctx(&dir);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_grep",
-        json!({"repo": "b", "pattern": "pub fn marker_", "page": 0}),
+        json!({"repo": "b", "pattern": "pub fn marker_", "page": 1}),
         &c,
     ));
     let got = groups(&resp, "matches");
@@ -350,7 +350,7 @@ fn a_write_into_one_repo_is_not_visible_through_the_other_and_never_reaches_disk
     // Visible in `a`...
     let read_a = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "a", "path": "planted.txt", "page": 0}),
+        json!({"repo": "a", "path": "planted.txt", "page": 1}),
         &c,
     ));
     assert_eq!(excerpt_source(&read_a), "from a");
@@ -358,7 +358,7 @@ fn a_write_into_one_repo_is_not_visible_through_the_other_and_never_reaches_disk
     // ...absent in `b`.
     let read_b = harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": "b", "path": "planted.txt", "page": 0}),
+        json!({"repo": "b", "path": "planted.txt", "page": 1}),
         &c,
     );
     harness::expect_error(&read_b, "not_found");

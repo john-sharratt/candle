@@ -1,5 +1,6 @@
-//! [`Records`] over a daemon's substrate: packs as `Blob` records, entries as
-//! keyed custom objects. Both replicate like every other record.
+//! [`Records`] over a daemon's substrate: packs and their indexes as `Blob`
+//! records, entries as keyed custom objects. Both replicate like every other
+//! record.
 
 use candle_conversation::persistence::record::CustomObjectPayload;
 use candle_conversation::persistence::SharedSubstrate;
@@ -15,8 +16,16 @@ impl Records for SharedSubstrate {
         Ok(SharedSubstrate::blob(self, sha256)?)
     }
 
+    fn has_blob(&self, sha256: &[u8; 32]) -> bool {
+        SharedSubstrate::has_blob(self, sha256)
+    }
+
     fn put_object(&self, key: &str, value: serde_json::Value) -> anyhow::Result<()> {
         Ok(self.put_custom_object(CustomObjectPayload::new(key, value))?)
+    }
+
+    fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+        Ok(self.put_custom_object(CustomObjectPayload::ceased(key))?)
     }
 
     fn objects_under(&self, prefix: &str) -> Vec<(String, serde_json::Value)> {

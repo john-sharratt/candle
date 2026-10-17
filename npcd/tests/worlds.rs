@@ -219,7 +219,7 @@ async fn member(gw: &Gw, store: Store, world: &str, cast: &[u64]) -> Member {
     let replication = ConversationStore::new(conv, 0, || {})
         .replication()
         .unwrap();
-    let rt = Runtime::new(Mind::new(None), dir.path());
+    let rt = Runtime::new(Mind::new(None), dir.path()).unwrap();
     rt.set_substrate(shared.clone());
     rt.standing.set_clustered();
     let hosted = rt.host(world, Path::new(MAPS)).expect("the vault loads");

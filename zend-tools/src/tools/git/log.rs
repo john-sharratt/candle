@@ -51,8 +51,10 @@ pub struct LogRequest {
     #[serde(default)]
     #[schemars(with = "LineSpan")]
     pub lines: Option<LineSpan>,
-    /// Zero-based page of commits, 20 a page. Required — pass 0 for the
-    /// newest. A page past the end clamps to the last one.
+    /// Page of commits, from 1, 20 a page. Required — pass 1 for the newest.
+    /// A page past the end clamps to the last one.
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: u32,
 }
 
@@ -87,7 +89,7 @@ impl Tool for GitLog {
          of that one file's lines — who wrote them, not who last touched the file. Use \
          for \"what changed recently\", \
          \"when was this introduced\", or to get a commit id for git_show or git_commit; \
-         a commit's full message is git_show's. `page` is required — pass 0 for the \
+         a commit's full message is git_show's. `page` is required and counts from 1 — pass 1 for the \
          newest, and `paging.next_page` for the next. Reads only.";
 
     type Request = LogRequest;

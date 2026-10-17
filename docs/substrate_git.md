@@ -1,8 +1,10 @@
 # Git in the substrate: repositories replicate as packs
 
-**Status:** stages 1–3 are built (§11): the records, the derived store, the importer and
-adoption (`substrate-git/`), zend reading every repository from its store, and npcd's mind read from
-the substrate with `--mind-repo`. Stage 4 is not, and nothing has run end to end yet.
+**Status:** stages 1–4 are built (§11): the records, the importer and adoption
+(`substrate-git/`), the in-process object database every repository read from the
+substrate is held in (`zend-vfs/src/odb/`), zend reading every repository from it, and
+npcd's mind read from the substrate with `--mind-repo`. No folder and no `git` program is
+involved on a member. Nothing has run end to end across members yet (§12).
 **Scope:** where a member's git objects and refs come from. Today every zend member reads
 each workspace repository from its own checkout, and every npcd member reads its mind
 from a mirror it keeps under `--data`. This design moves both into the substrate: git's
@@ -100,9 +102,9 @@ content; battle-mind's are under 0.1 GB.
 | G2 | **Branches replicate as keyed objects** `git/ref/<repo>/<ref>`, naming the packs they need. A branch is applied only once those packs are held, and only forward unless `forced` (§3). | "Latest" becomes a point in the log, the same on every member, not each member's last fetch. |
 | G3 | **One member imports from `origin`**, holding the lease `git/<repo>`, fetching through an agent. Everyone else learns new commits by replication (§5). | One fetch per change for the whole group, instead of one per member. |
 | G4 | **Every member publishes its own pushes**, packs first, then the branch (§6). | A commit that lands on `origin` reaches every member through the log, not through each member's next fetch. |
-| G5 | **A member's object store is derived from its log**: a repository with an empty working tree at `<substrate>/git/<repo>`, filled only from the log's packs, whose record branches are the log's (§4). Stage 4 replaces it with an in-process object database (§11). | `Repo` sends writes and some reads to the `git` program, which needs a repository on disk (§1.1). Unlike today's checkouts and mirror, it has no other source, so it cannot diverge from the log. |
-| G6 | **Repositories are names, not folders.** A member reads each repository `workspace.yaml` names from its store and needs no checkout (§7). | Members stop needing per-machine clones. |
-| G7 | **npcd's mind is a repository like zend's.** npcd reads it through the same store, at a commit. A branch move replaces the file watcher's trigger, and the mirror is retired (§8). | One mechanism for both daemons. The schema, the corpus and an operation's base all come from one commit in the log. |
+| G5 | **A member's repository is an object database in process**, its packs the log's, its refs and settings in memory, its record branches the log's (§4). There is no folder, and libgit2 over the database answers everything `git` answered for a checkout. | Unlike a checkout or a mirror, it has no source but the log, so it cannot diverge from it; and nothing is written to disk twice — the log's packs are the repository. |
+| G6 | **Repositories are names, not folders.** A member reads each repository `workspace.yaml` names from its object database and needs no checkout (§7). | Members stop needing per-machine clones. |
+| G7 | **npcd's mind is a repository like zend's.** npcd reads it through the same database, at a commit. A branch move replaces the file watcher's trigger, and the mirror is retired (§8). | One mechanism for both daemons. The schema, the corpus and an operation's base all come from one commit in the log. |
 | G8 | **Standalone daemons use the same read path.** Without `--cluster`, the importer fetches through the agent in this process instead of the cluster's (§9). | One code path. |
 | G9 | **Packs are never collected in this design**, as `Blob` records are not. LFS content is not imported (§13). | git history is append-only by intent. Reachability collection and LFS are separable work. |
 
@@ -116,14 +118,20 @@ last writer wins by version stamp), held in RAM and replicated; a pack's bytes a
 
 | Key | Value |
 |---|---|
-| `git/pack/<repo>/<sha256>` | `PackEntry { checksum, objects }`: the `Blob` of that SHA-256 is a pack of `<repo>`, named by git as `pack-<checksum>.pack` |
+| `git/pack/<repo>/<sha256>` | `PackEntry { checksum, objects, index }`: the `Blob` of that SHA-256 is a pack of `<repo>`, and the `Blob` named by `index` is its git `.idx` (version 2) |
 | `git/ref/<repo>/refs/heads/<branch>` | `RefEntry { oid, needs, forced }`: where the branch points (`None` for deleted), the SHA-256s of the packs written with it, and whether it may replace a non-descendant |
+| `git/slice/<repo>/<oid>` | A commit an unfinished sliced fetch has taken (§5.1), so the next lease holder resumes from it |
 
-- **Packs.** `Repo::pack_objects(tips, known, 64 MiB)` packs what the tips reach beyond
-  the log's branches (`zend-vfs/src/remote/packs.rs`). At most 64 MiB, so a pack fits a
-  relocation stripe (`persistence/stripes.rs:14`) and replicates as 64 `EVENT` fragments
-  or fewer. candle's 1.3 GB adopts as about 21 packs. A blob already held is not written
-  twice.
+- **Packs.** At most 64 MiB, so a pack fits a relocation stripe
+  (`persistence/stripes.rs:14`) and replicates as 64 `EVENT` fragments or fewer. A pack
+  comes from one of three places: the objects a member made, packed when it publishes
+  (§4.4); a bundle an agent answers a fetch with, written as it is taken (§5.1); and a
+  folder repository adopted into the log (`adopt`, the tests' fixture). Every pack is
+  self-contained — no delta in it names a base outside it (§4.2). A blob already held is
+  not written twice.
+- **Indexes.** The pack's `.idx` is written beside it as its own `Blob`, so a member reads
+  where every object is without decoding a pack: about 28 bytes an object, 2 MB for
+  candle's 75,000.
 - **Entries replicate apart from their blobs.** A branch whose `needs` are not all held
   waits; a sync takes the pack once its blob arrives. A pack whose blob cannot be read or
   taken is reported by name (`Synced::failed`, the load's detail, the follower's warning)
@@ -139,25 +147,94 @@ last writer wins by version stamp), held in RAM and replicated; a pack's bytes a
 
 ---
 
-## 4. The derived object store
+## 4. The object database
 
-`<substrate>/git/<repo>` (`substrate-git/src/store.rs`) is a repository with an empty
-working tree, so `Repo` opens it unchanged:
+A repository read from the substrate is held in process and has no folder
+(`zend-vfs/src/odb/`). A `Repo` over it answers every question a `Repo` over a checkout
+does, through libgit2, and never starts the `git` program: `Invocation::command` refuses a
+repository with no folder, so a path not ported fails loudly instead of running against
+the wrong place. Commands that need files run on agents, which keep their own checkouts
+(`docs/replicated_substrate.md` §11).
 
-- `HEAD` names `refs/heads/substrate-store`, a branch never made, so nothing is checked out
-  and no branch the log moves is the current one.
+### 4.1 Reading objects
+
+- **The packs are the log's.** A `PackStore` (`substrate-git/src/pack_store.rs`, over the
+  records) lists the packs whose pack and index blobs have both arrived, reads either, and
+  writes a new pair. The database loads every index once, and a pack's bytes when an
+  object in it is first wanted.
+- **Pack bytes are kept** in memory within a budget, least recently read let go first
+  (`odb/packs.rs`; `DEFAULT_PACK_BUDGET`, 1 GiB, an argument of `ObjectDb::open`):
+  candle's 21 packs fit, and a pack let go is read again from the log.
+- **Decoding is ours** (`odb/pack/`): an entry's header, zlib (flate2), and git's delta
+  format — an offset delta's base in the same pack, a ref delta's by id — with the decoded
+  bases of recent chains cached.
+- **libgit2 reads through it.** A custom `git_odb_backend` (`odb/backend.rs`) answers
+  `read`, `read_header`, `read_prefix`, `exists`, `exists_prefix`, `refresh` and `foreach`
+  from the packs, so every algorithm libgit2 already runs in process — revision parsing,
+  history walks, merge bases, tree reads, blame, diffs, merges — runs over them unchanged.
+
+### 4.2 Taking a pack
+
+`ObjectDb::take_pack` indexes a pack's bytes in Rust (`odb/pack/indexer.rs`): every entry
+decoded, every delta resolved, every object hashed, and the `.idx` written exactly as
+`git index-pack` writes it. A ref delta whose base is not in the pack — a thin pack, which
+a bundle may be — has the base appended to the pack, whole, from what the database holds,
+and the header's count and the trailer rewritten (`git index-pack --fix-thin`'s rule), so
+no pack in the log depends on another.
+
+A pack larger than the log keeps (64 MiB) is never written: it is held in memory only
+while its objects are packed again in parts of about half the limit, each kept, and then
+let go (`odb/split.rs`). An answer from an agent that does not bound its bundles, or one
+commit larger than the bound, is kept that way.
+
+### 4.3 Refs and settings
+
+- **A custom `git_refdb_backend`** (`odb/refdb.rs`) holds the refs in memory, with
+  compare-and-swap locks for libgit2's transactions.
 - **The record is `origin`'s tracking refs**, `refs/remotes/origin/<branch>`, which is
   where zend reads a repository's branches when it has an origin
-  (`Repo::record_branches`). `Store::sync` takes each pack it lacks once its blob has
-  arrived (`git index-pack`), then moves each record branch whose packs are held, never
-  back to an ancestor unless `forced`.
-- **Two remotes, one URL.** `origin` is the record and where pushes go. `import` is where
-  the importer fetches. A fetch therefore never moves what zend reads before the log does.
-- Local branches are the member's own and never touched.
-- Deleting the folder loses nothing published: the next sync rebuilds it.
+  (`Repo::record_branches`). `Store::sync` refreshes the packs and then moves each record
+  branch whose packs are held, never back to an ancestor unless `forced`.
+- `HEAD` names `refs/heads/substrate-store`, a branch never made, so nothing is checked out
+  and no branch the log moves is the current one.
+- **Local refs** — the branch a landed push leaves, the layer's scratch refs, the
+  importer's `refs/remotes/import/*` — are the member's own, held in memory and gone at a
+  restart: everything they name is in the log or on `origin`.
+- **Settings** a checkout keeps in `.git/config` — its remotes and its branches'
+  upstreams — are held in memory beside the refs. `origin` and `import` are both
+  `agent:<repo>`. The identity commits are made under is the user's global git
+  configuration, read in process, as a checkout's falls back to it.
 
-Commands that need files run on agents, which keep their own checkouts
-(`docs/replicated_substrate.md` §11).
+### 4.4 Writing objects
+
+- **Pending objects.** What a member makes — blobs, trees, commits, tags — is written to
+  the database's own memory (`odb/pending.rs`), where libgit2 reads it back like any other
+  object. A blob is stored as it is given: a repository with no working tree has no
+  `.gitattributes` or `core.autocrlf` of its own to filter it through.
+- **Publishing packs them.** Before a member publishes a ref, `ObjectDb::flush` packs
+  every pending object (libgit2's packbuilder), takes the pack (§4.2) into the log, and
+  drops the pending objects it holds. The packs written since the last published ref are
+  that ref's `needs`.
+- **A bundle** for a push is cut in process: libgit2's packbuilder over the pushed tips,
+  hiding what `origin`'s tracking refs reach, behind git's bundle header. A bundle taken —
+  a fetch's answer — goes to the log as a pack at once (§4.2).
+
+### 4.5 What runs where
+
+| Operation | In a checkout | In the database |
+|---|---|---|
+| refs, revisions, ancestry, merge base, trees, blob reads | libgit2 | libgit2 |
+| history (`log`, a file's history across renames) | `git log` | libgit2 revwalk, git's path simplification and rename following |
+| `grep` at a revision | `git grep` | a walk of the revision's tree, each blob matched in process |
+| blame | `git blame` | libgit2 blame |
+| diffs and patches | `git diff-tree` | libgit2 diff, git's patch format |
+| commits, merges, cherry-picks, reverts, applied patches | `fast-import`, `read-tree`, `merge-file`, `apply` | libgit2 tree builder, `merge_trees`, `merge_file`, `apply_to_tree` |
+| tags | `mktag` | libgit2 tag objects |
+| bundles | `git bundle` | the packbuilder and §4.2 |
+| upstreams, remotes | `.git/config` | held in memory (§4.3) |
+
+A repository's object format is SHA-1: libgit2 holds no other, and a `sha256` repository is
+refused when it is first imported (§13).
 
 ---
 
@@ -181,7 +258,14 @@ A first pull of a long history comes through the agent in slices of 256 commits
 (`max_commits`). A slice is a prefix of the history, parents first, and its bundle is cut
 from every *head* of it — each commit of the slice no other commit of it descends from —
 so a slice across merges carries its whole budget. The member names those heads as held
-when it asks again, and keeps them under `refs/substrate-slices/` so a failed run resumes.
+when it asks again, and keeps them as `git/slice/<repo>/<oid>` records (§3) so a failed
+run resumes.
+
+Each answer becomes one pack in the log, at most 64 MiB, so an answer is bounded by bytes
+as well (`max_bytes`, half of that): a slice whose bundle is larger is cut again, half its
+commits each time, until it fits, leaving room for the bases a thin bundle is completed
+with (§4.2). A single commit whose objects do not fit is answered alone, as it is, and the
+member keeps it as several packs (§4.2).
 
 ### 5.2 Everyone else
 
@@ -227,15 +311,27 @@ publishing member moves onto its own push at once. Since the push was compare-an
 Built, with no setting and no checkout mode, in `zend/src/substrate_git.rs`.
 
 - **Manifest.** Unchanged: `workspace.yaml` names repositories. The manifest is read
-  without requiring the folders (`Workspace::manifest`), and each
-  repository's folder is its store (`Workspace::with_dir`). The name is unchanged, so every
-  tool argument, workspace-relative path and ingest key is too.
-- **Everything that opens `repo.dir`** — `GitSource` for the lower layer, branch ingest,
-  conversation branches, pushes through `AgentPush` — opens the store with no other
-  change.
+  without requiring the folders (`Workspace::manifest`), and each repository is marked
+  as read from the substrate (`Workspace::in_substrate`): it has no folder. The name is
+  unchanged, so every tool argument, workspace-relative path and ingest key is too.
+- **One database per repository.** The workspace is built at launch, before the
+  substrate opens, so a repository read from the substrate holds a slot every clone of
+  the workspace shares. The load opens each database and attaches it there
+  (`Workspace::attach`), so what the tools read and what the follower keeps with the log
+  are one database, whose refs are one set.
+- **Everything that opens a repository** — `GitSource` for the lower layer, branch
+  ingest, conversation branches, the git tools, pushes through `AgentPush` — opens it
+  through the workspace (`workspace::Repo::open`): a `Repo` over the database, fetching
+  through the agent. A repository that has not been attached yet refuses to open. No
+  sandbox is made for one: it has no folder, and its commands run on agents.
 - **Starting.** After the cluster join and catch-up, before anything reads a branch, each
   repository is brought up to the log once, pulled through an agent (§9) when the log
-  names no branch of it. Then a `substrate-git` thread ticks every 2 s until shutdown
+  names no branch of it. One the log names is not fetched at all (`Importer::settle`):
+  it is whole from the log, origin's newer commits are the follower's, and fetching
+  there made every restart wait on origin — 76 s for candle — with nothing to bring.
+  The repositories' rounds run side by side, the loading page has their packs held of
+  listed before the first round, and each logs `repository loaded` with its publish,
+  fetch and sync time. Then a `substrate-git` thread ticks every 2 s until shutdown
   stops and joins it, before the drain. A workspace naming no repository skips the step
   and needs no agent.
 - **Conversation bases.** A store has no local branch, so a conversation's base is the
@@ -243,8 +339,10 @@ Built, with no setting and no checkout mode, in `zend/src/substrate_git.rs`.
 - **The ingest worker** is woken by a record branch that moves, and once when it starts
   listening; `origin_watch` is removed.
 - **Commands** (`run_command`) already run on agents with the conversation's overlay.
-- **Not yet:** `HELLO.repos` still advertises each repository, now with the URL
-  `agent:<name>` on every member, so routing is unchanged among members.
+- **Advertising.** `HELLO.repos` still lists each repository, so routing is unchanged
+  among members. The advertisement goes out before the repositories load, so one read
+  from the substrate carries no origin URL: a member reaches origin only through agents,
+  which advertise their own.
 
 ---
 
@@ -254,7 +352,7 @@ Built, with no setting and no checkout mode, in `zend/src/substrate_git.rs`.
 
 Built in `npcd/src/mind/files.rs` and `npcd/src/mind_store.rs`.
 
-- **`MindFiles`** is the mind's files at one commit of its store, or in a plain folder.
+- **`MindFiles`** is the mind's files at one commit of its database, or in a plain folder.
   A commit's tree is indexed once with `ls_tree_all`, and each file's bytes are read in
   process on demand. It answers `read`, `bytes`, `is_file`, `is_dir`, `size`, `list`,
   `walk` and `not_a_document`. A link in a commit is never read as a document, as a
@@ -271,9 +369,13 @@ Built in `npcd/src/mind/files.rs` and `npcd/src/mind_store.rs`.
   that every API read goes through.
 - **Maps** load from the mind's `map/<id>/` files (`MapSet::load_texts`,
   `Hosted::load_mind`). A reshape of one is kept as the owner's draft in the mind.
-- **Operations' stores** read through the store's record: `GitSource` defaults to
-  `origin/main` (else `master`) when the checked-out branch has no commit, which is a
-  store's case, and `Merge` publishes on that branch through the agent.
+- **One database.** `Mind` holds the repository behind its files (`MindRepo`): a
+  folder, or the object database the tenant opened. The operations' stores
+  (`MindStores::for_mind`) and the follower (`Repos::over`) are given that same
+  database, so a branch the follower moves is the branch every store reads.
+- **Operations' stores** read through the database's record: `GitSource` defaults to
+  `origin/main` (else `master`) when the checked-out branch has no commit, which is the
+  database's case, and `Merge` publishes on that branch through the agent.
 - **The ingest ledger** is keyed by mind paths. A key an earlier build wrote as an
   absolute path under a mind folder is cut to its `layers/…` part when the ledger
   opens, so a mind that moved into the substrate retires nothing.
@@ -281,13 +383,17 @@ Built in `npcd/src/mind/files.rs` and `npcd/src/mind_store.rs`.
 ### 8.2 Startup and following
 
 - `--mind-repo <name>` (with `--cluster` and `--data`): the tenant opens the substrate
-  first, brings the store at `<data>/git/<name>` up to the local log, and reads the
-  schema and the registries from the branch's commit. A log that holds no such branch
-  yet starts the daemon on the bundled schema, with the mind pending.
+  first, opens the mind's object database over it and brings it up to the local log
+  (`mind_store::from_log`), and reads the schema and the registries from the branch's
+  commit. A log that holds no such branch yet starts the daemon on the bundled schema,
+  with the mind pending.
 - After the cluster join, `load_mind` (`engine/runtime.rs`) loads the repository whole
-  through `substrate_git::member::Repos`: pulled through an agent by the lease holder
-  when no member has. A mind that was pending restarts the process onto it, since the
-  schema and the grammar built from it are read once.
+  through `substrate_git::member::Repos`, over the mind's database: pulled through an
+  agent by the lease holder when no member has. A mind that was pending is taken in, in
+  process: the load rebuilds the projection, its policies and the minds over it, and the
+  tenant reads the worlds, personalities, libraries and feelings again
+  (`Runtime::read_again`). Nothing is written under the schema before then, so no restart
+  is needed — in motherd a restart takes zend down with it.
 - Then the repository is followed. When its branch moves, every reader moves to the
   new commit (`Mind::replace`), the worlds and personalities are read again
   (`MindStores::moved`), and the documents added, changed and removed are reported as
@@ -300,8 +406,8 @@ Built in `npcd/src/mind/files.rs` and `npcd/src/mind_store.rs`.
 ### 8.3 What went
 
 `npcd/src/mind_repo.rs` (the mirror at `<data>/mind/<name>`, its bring-up and its
-relaunch), and the checkout-based `follow` for a mind in the substrate: `MindStores`
-marked `read_from_substrate` checks nothing out.
+relaunch), the checkout-based `follow` for a mind in the substrate, and the store folder
+at `<data>/git/<name>`: nothing of the mind is on disk outside the substrate.
 
 ---
 
@@ -323,7 +429,7 @@ one; no daemon reads a checkout, a folder or `origin` of its own.
   beside the other members.
 
 So zend has no checkout mode: every repository `workspace.yaml` names is read from its
-store, and `origin_watch` is gone. npcd has no `--mind <folder>`: the mind is
+object database, and `origin_watch` is gone. npcd has no `--mind <folder>`: the mind is
 `--mind-repo <name>` or there is none, and the folder watcher, the checkout-based record
 follow (`record_follow`, `opstore/merge/follow.rs`) and direct folder writes in
 production are gone. `MindFiles::folder` and `Mind::new(Some(folder))` remain as test
@@ -338,18 +444,20 @@ fixtures only; nothing in a daemon builds one.
 | Before | After |
 |---|---|
 | A checkout per repository on every zend member | Nothing on the member; agents keep their own |
-| npcd's mirror, its 60 s follow, and its fetch-then-relaunch first start | Branches and packs in the log; a pending mind pulled once and restarted onto |
+| npcd's mirror, its 60 s follow, and its fetch-then-relaunch first start | Branches and packs in the log; a pending mind pulled once and taken in, in process |
 | Every member probing and fetching `origin` | One importer per repository, holding a lease, fetching every 15 s |
 | Members serving different mind tips for up to 60 s | One tip at each point in the log |
 | A schema that differs between members until each restarts | A restart driven by the branch move that changed it |
-| A first fetch of a long history as one agent answer | Slices of 256 commits (`max_commits`, §5.1) |
+| A first fetch of a long history as one agent answer | Slices of 256 commits and at most 32 MiB (`max_commits`, `max_bytes`, §5.1) |
+| A `git` program and a `.git` folder per repository on every member | An object database in process, over the log's packs (§4) |
 
 ### Adds
 
 - Pack and branch entries as keyed objects, pack bytes as `Blob` records — no new
   record type.
 - The importer and its lease; the `Repositories` load step in zend.
-- The derived store, until stage 4.
+- The object database (`zend-vfs/src/odb/`): pack decoding and indexing, libgit2 odb and
+  refdb backends, and in-process paths for history, grep, blame, diffs and writes.
 - About 1.7 GB of packs across the three repositories in every substrate, growing with
   history, and in a new member's catch-up.
 - Never-backwards branches, and the two-look force-push rule (§5.3).
@@ -360,13 +468,13 @@ fixtures only; nothing in a daemon builds one.
 
 | Stage | Contents | State |
 |---|---|---|
-| 1 | Pack and branch records; the derived store; the importer and its lease; adoption | Built: `substrate-git/` |
-| 2 | zend reads every repository from the derived store; repositories loaded whole while zend loads; `origin_watch` removed | Built: `zend/src/substrate_git.rs` |
+| 1 | Pack and branch records; the importer and its lease; adoption | Built: `substrate-git/` |
+| 2 | zend reads every repository from the substrate; repositories loaded whole while zend loads; `origin_watch` removed | Built: `zend/src/substrate_git.rs` |
 | 3 | npcd reads the mind at a commit through `MindFiles`; the mirror retired; the watcher's trigger a branch move | Built: `npcd/src/mind/files.rs`, `npcd/src/mind_store.rs` |
-| 4 | An in-process object database: the remaining `git` program writes and reads ported to libgit2 over packs read from the log, and the derived store deleted | Not started; optional |
+| 4 | The in-process object database: packs decoded and indexed in Rust, libgit2 over our odb and refdb backends, every `git` program read and write ported, the derived store on disk deleted, answers bounded by bytes | Built: `zend-vfs/src/odb/`, `zend-vfs/src/library/` |
 
-Not yet done: `HELLO.repos` still advertises repositories (§7), and runtime ingest of a
-changed mind document is the next start's, as it was for a watched folder (§8.2).
+Runtime ingest of a changed mind document is the next start's, as it was for a watched
+folder (§8.2).
 
 ---
 
@@ -382,14 +490,27 @@ Built:
 - **A real substrate** (`substrate-git/tests/member.rs`, feature `member`): a standalone
   checkout loads whole, and a second daemon with no checkout loads it from the log alone.
 - **Sliced fetches** (`zend-vfs/src/remote/fetch_bundle.rs`): a long history comes in
-  slices and the last moves the tracking ref to origin's commit.
+  slices and the last moves the tracking ref to origin's commit; a slice across a merge
+  carries its whole budget; a byte bound halves a slice until it fits, and a commit
+  larger than the bound is answered alone.
+- **The object database** (`zend-vfs/src/odb/`): entry headers, inflation and deltas;
+  an index byte for byte equal to `git index-pack`'s; a thin pack completed and accepted
+  by git; packs let go and read again within the budget; a pack whose index will not
+  read is reported and passed over; refs and transactions through libgit2; objects
+  written and read back; a flush split under the pack limit; a pack over the limit kept
+  as parts that fit; bundles cut and taken.
+- **Git-exact answers** (oracle tests beside each library path): history order on equal
+  timestamps, path simplification and `--follow`, grep's binary rule, blame, and diffs
+  with renames and type changes, each compared with the `git` program's own answer.
+- **The workspace** (`zend-vfs/src/workspace.rs`): a repository read from the substrate
+  has no folder, opens in every clone once attached, and is attached only once.
 - **npcd** (`npcd/src/mind/files.rs`, `npcd/src/mind_store.rs`,
   `npcd/src/engine/watcher.rs`): a folder and a commit read the same; a mind adopted
-  into the log reads with no checkout, its store holding no file; an absolute ledger key
+  into the log reads with no checkout, from a database naming it; an absolute ledger key
   becomes a mind path.
 
 Still to run: end to end on `.6` against `.5` — two members agreeing on a mind commit at
-one log point, a pending mind pulled and restarted onto, and a conversation's commits
+one log point, a pending mind pulled and taken in without a restart, and a conversation's commits
 read on another member.
 
 ---
@@ -405,8 +526,8 @@ read on another member.
 3. **Catch-up order.** A new member should take a repository's packs before its turns, so
    it can serve that repository's conversations first. Whether catch-up can be ordered by
    record type is a question for `docs/replicated_substrate.md` §7.
-4. **`sha256` repositories.** libgit2 cannot hold them (`zend-vfs/src/library/mod.rs`).
-   The derived store serves them through the `git` program, but stage 4 would not cover
-   them.
+4. **`sha256` repositories.** libgit2 cannot hold them (`zend-vfs/src/library/mod.rs`),
+   and the database's pack format is SHA-1's, so one cannot be read from the substrate. A
+   checkout of one is still served through the `git` program, on an agent.
 5. **Agents' own checkouts.** Agents still clone from `origin`. They could seed from the
    log instead, which would make the importer the only reader of `origin` at all.

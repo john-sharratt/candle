@@ -19,11 +19,17 @@
 //! A **self-heal restart** (`host::self_heal`) appends instead, so the fault
 //! and the recovery read as one run. [`RESTART_MARKER_NAME`] is dropped next to
 //! the log right before that relaunch; its presence here means "append".
+//!
+//! The file is also what a log reader reads back: a [`Tap`] is handed every
+//! write under the file's lock, and [`RotatingFileLog::tail`] reads the file's
+//! end under the same lock — so a reader that subscribes to the tap inside
+//! `tail` sees each line exactly once, from the file or from the tap.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::iter::once;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -63,6 +69,54 @@ fn open_appending(path: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
+/// What every write to the log is handed to, under the file's lock.
+pub type Tap = Box<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Every file of the log at `base` that exists, oldest first: the archives
+/// from `.N` down to `.1`, then the active file.
+fn files_of(base: &Path) -> Vec<PathBuf> {
+    (1..=MAX_ARCHIVES)
+        .rev()
+        .map(|n| archive_path(base, n))
+        .chain(once(base.to_path_buf()))
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// The last `max` bytes of the log at `base`, across archives, starting at a
+/// line: a line the window cut is dropped rather than shown in part.
+fn read_tail(base: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let mut parts = Vec::new();
+    let mut left = max;
+    let mut cut = false;
+    for path in files_of(base).into_iter().rev() {
+        if left == 0 {
+            break;
+        }
+        let mut f = File::open(&path)?;
+        let len = f.metadata()?.len();
+        let take = len.min(left);
+        f.seek(SeekFrom::Start(len - take))?;
+        let mut buf = vec![0u8; take as usize];
+        f.read_exact(&mut buf)?;
+        left -= take;
+        parts.push(buf);
+        if take < len {
+            cut = true;
+            break;
+        }
+    }
+    parts.reverse();
+    let mut out = parts.concat();
+    if cut {
+        match out.iter().position(|b| *b == b'\n') {
+            Some(nl) => drop(out.drain(..=nl)),
+            None => out.clear(),
+        }
+    }
+    Ok(out)
+}
+
 struct Inner {
     /// Active log file (`None` only transiently mid-rotation).
     file: Option<File>,
@@ -70,6 +124,8 @@ struct Inner {
     written: u64,
     /// Path of the active file (`<dir>/<name>`).
     base: PathBuf,
+    /// Handed each write once it is in the file. The gateway's log has none.
+    tap: Option<Tap>,
 }
 
 impl Inner {
@@ -102,6 +158,9 @@ impl Inner {
         if let Some(f) = self.file.as_mut() {
             f.write_all(buf)?;
             self.written += buf.len() as u64;
+        }
+        if let Some(tap) = &self.tap {
+            tap(buf);
         }
         Ok(())
     }
@@ -150,6 +209,7 @@ impl RotatingFileLog {
             file: Some(file),
             written,
             base,
+            tap: None,
         };
         if !resuming && inner.written > 0 {
             if let Err(e) = inner.rotate() {
@@ -161,6 +221,35 @@ impl RotatingFileLog {
             }
         }
         Some(Self(Arc::new(Mutex::new(inner))))
+    }
+
+    fn inner(&self) -> MutexGuard<'_, Inner> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Hand every write from here on to `tap`, under the file's lock.
+    pub fn set_tap(&self, tap: Tap) {
+        self.inner().tap = Some(tap);
+    }
+
+    /// The log's last `max` bytes, from whole lines, with `at` called under the
+    /// file's lock first: nothing is written between `at` and the read, so
+    /// whatever `at` subscribes to starts exactly where the bytes end.
+    pub fn tail<R>(&self, max: u64, at: impl FnOnce() -> R) -> io::Result<(Vec<u8>, R)> {
+        let mut inner = self.inner();
+        if let Some(f) = inner.file.as_mut() {
+            f.flush()?;
+        }
+        let r = at();
+        let bytes = read_tail(&inner.base, max)?;
+        Ok((bytes, r))
+    }
+
+    /// Every file of the log, oldest first: the archives from `.N` down, then
+    /// the active file.
+    pub fn files(&self) -> Vec<PathBuf> {
+        let base = self.inner().base.clone();
+        files_of(&base)
     }
 }
 
@@ -314,6 +403,80 @@ mod tests {
         assert!(archive_path(&base, 1).exists());
         assert_eq!(read(&base), "first line after full\n");
         drop(w);
+    }
+
+    /// The tap is handed each write, and by then the write is in the file.
+    #[test]
+    fn the_tap_sees_each_write_once_it_is_in_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(NAME);
+        let mut log = RotatingFileLog::new(tmp.path(), NAME).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let (s, b) = (Arc::clone(&seen), base.clone());
+        log.set_tap(Box::new(move |buf| {
+            let on_disk = String::from_utf8(fs::read(&b).unwrap()).unwrap();
+            s.lock()
+                .unwrap()
+                .push((String::from_utf8(buf.to_vec()).unwrap(), on_disk));
+        }));
+        log.write_all(b"one\n").unwrap();
+        log.write_all(b"two\n").unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("one\n".to_string(), "one\n".to_string()),
+                ("two\n".to_string(), "one\ntwo\n".to_string()),
+            ]
+        );
+    }
+
+    /// The tail is whole lines: a window that cuts a line drops it, and one
+    /// wider than the active file reaches back into `.1`.
+    #[test]
+    fn the_tail_is_whole_lines_and_reaches_into_the_archive() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(NAME);
+        fs::write(&base, b"aa\nbb\n").unwrap();
+        let mut log = RotatingFileLog::new(tmp.path(), NAME).unwrap();
+        log.write_all(b"cc\ndd\n").unwrap();
+
+        let (all, _) = log.tail(1 << 20, || ()).unwrap();
+        assert_eq!(all, b"aa\nbb\ncc\ndd\n");
+        // Eight bytes back is "b\ncc\ndd\n" — two bytes into `.1`, mid-line.
+        let (cut, _) = log.tail(8, || ()).unwrap();
+        assert_eq!(cut, b"cc\ndd\n");
+        // Six bytes back is the active file exactly.
+        let (exact, _) = log.tail(6, || ()).unwrap();
+        assert_eq!(exact, b"cc\ndd\n");
+        // A window inside one line holds no whole line.
+        let (none, _) = log.tail(2, || ()).unwrap();
+        assert_eq!(none, b"");
+    }
+
+    /// `at` runs under the lock, before the read: what it returns is the
+    /// caller's, and a write cannot land between it and the bytes.
+    #[test]
+    fn the_tail_runs_its_callback_and_returns_what_it_made() {
+        let tmp = TempDir::new().unwrap();
+        let mut log = RotatingFileLog::new(tmp.path(), NAME).unwrap();
+        log.write_all(b"x\n").unwrap();
+        let (bytes, made) = log.tail(1 << 20, || 41 + 1).unwrap();
+        assert_eq!(bytes, b"x\n");
+        assert_eq!(made, 42);
+    }
+
+    /// The files come oldest first, ending with the active one.
+    #[test]
+    fn the_files_are_listed_oldest_first() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(NAME);
+        fs::write(&base, b"older\n").unwrap();
+        fs::write(archive_path(&base, 1), b"oldest\n").unwrap();
+        let log = RotatingFileLog::new(tmp.path(), NAME).unwrap();
+        assert_eq!(
+            log.files(),
+            [archive_path(&base, 2), archive_path(&base, 1), base]
+        );
     }
 
     /// A resumed log's `written` must reflect the real on-disk size, or

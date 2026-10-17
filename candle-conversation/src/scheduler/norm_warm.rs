@@ -9,10 +9,10 @@
 //! every restart. Here each probe is the paged GPU launch the reprojection
 //! uses, over the same resident pages.
 //!
-//! The replay is background work, so it runs at ingest priority: one probe per
-//! loop iteration, and none while a higher-priority conversation holds the
-//! device or is in its cooldown ([`super::priority_pause`]). A live turn never
-//! waits on it.
+//! The replay is background work, so it is paced by the loop rather than by the
+//! decode step: one probe per loop iteration, which a decode quantum bounds to
+//! one per `WAVE_SLICE`. A live turn waits on at most one probe a quantum while
+//! a warm-up drains, and the warm-up drains whatever else is running.
 //!
 //! The ingest layers' per-file warm-up ([`crate::IngestWarmer`]) arrives here
 //! as slices and waits in the same backlog, under the same rule. Served the
@@ -26,11 +26,9 @@ use std::time::{Duration, Instant};
 
 use flume::Sender;
 
-use super::priority_pause::PAUSED_POLL;
 use super::Scheduler;
 use crate::projection::{
-    Builder, Conversation, DecodePriority, GroupId, LayerId, ProjectionTarget, Schema, TimelineId,
-    WarmProbe,
+    Builder, Conversation, GroupId, LayerId, ProjectionTarget, Schema, TimelineId, WarmProbe,
 };
 
 /// One replayed turn waiting to be scored, with what scoring it needs.
@@ -68,19 +66,12 @@ pub(super) struct NormWarm {
 impl Scheduler {
     /// How long an otherwise idle loop may wait for a request before it owes
     /// the warm-up its next turn: `None` with nothing queued (block as usual),
-    /// zero when a turn can run now, and [`PAUSED_POLL`] while ingest-priority
-    /// work is paused — so a paused replay neither spins nor delays a request.
-    ///
-    /// The next job runs at ingest priority, `Low`, whichever tenant's
-    /// substrate it warms.
+    /// zero while anything is.
     pub(super) fn norm_warm_wait(&self) -> Option<Duration> {
         if self.norm_warm.backlog.is_empty() && self.norm_warm.ingest.is_empty() {
             return None;
         }
-        let paused = self
-            .priority_pause
-            .paused(DecodePriority::Low, Instant::now());
-        Some(if paused { PAUSED_POLL } else { Duration::ZERO })
+        Some(Duration::ZERO)
     }
 
     /// Queue the dialogue warm-up replay when it is armed — see
@@ -105,8 +96,8 @@ impl Scheduler {
         }));
     }
 
-    /// Queue one ingest warm-up slice; [`Self::step_norm_warm`] scores it when
-    /// ingest-priority work may run.
+    /// Queue one ingest warm-up slice; [`Self::step_norm_warm`] scores it on a
+    /// later loop iteration.
     pub(super) fn queue_ingest_warm_slice(&mut self, job: IngestSliceJob) {
         self.norm_warm.ingest.push_back(job);
     }
@@ -126,13 +117,9 @@ impl Scheduler {
         }
     }
 
-    /// Score one queued replay turn — or, with none left, one ingest slice —
-    /// unless ingest-priority work is paused right now. Returns whether one was
-    /// scored.
+    /// Score one queued replay turn — or, with none left, one ingest slice.
+    /// Returns whether one was scored.
     pub(super) fn step_norm_warm(&mut self) -> bool {
-        if self.norm_warm_wait() != Some(Duration::ZERO) {
-            return false;
-        }
         let Some(job) = self.norm_warm.backlog.pop_front() else {
             let Some(slice) = self.norm_warm.ingest.pop_front() else {
                 return false;
@@ -184,19 +171,17 @@ impl Scheduler {
 mod tests {
     use super::super::test_substrate::{open, record_turns, YAML};
     use super::super::tests::make_test_scheduler;
-    use super::{IngestSliceJob, PAUSED_POLL};
-    use crate::projection::{Builder, DecodePriority};
+    use super::IngestSliceJob;
+    use crate::projection::Builder;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    /// **The replay queues once per arming, and is scored only in the gaps a
-    /// dialogue leaves.** Two dialogue turns and one tool exemplar: the replay
-    /// is the two untagged turns. While a higher-priority conversation holds
-    /// the device the loop may wait the pause poll and scores nothing; once it
-    /// has gone, each step scores one turn, and the drained backlog stops
-    /// shortening the idle wait. A re-arm queues the replay again.
+    /// **The replay queues once per arming, and each step scores one turn.**
+    /// Two dialogue turns and one tool exemplar: the replay is the two untagged
+    /// turns. Each step scores one, and the drained backlog stops shortening
+    /// the idle wait. A re-arm queues the replay again.
     #[test]
-    fn the_warm_replay_waits_behind_a_dialogue_and_drains_after_it() {
+    fn the_warm_replay_scores_a_turn_a_step_until_drained() {
         let dir = tempfile::tempdir().unwrap();
         let conv = open(dir.path());
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
@@ -225,14 +210,6 @@ mod tests {
             "an armed replay is taken once"
         );
 
-        sched
-            .priority_pause
-            .observe(DecodePriority::High, Instant::now());
-        assert_eq!(sched.norm_warm_wait(), Some(PAUSED_POLL));
-        assert!(!sched.step_norm_warm(), "a dialogue holds the device");
-        assert_eq!(sched.norm_warm.backlog.len(), 2);
-
-        sched.priority_pause = Default::default();
         assert_eq!(sched.norm_warm_wait(), Some(Duration::ZERO));
         assert!(sched.step_norm_warm());
         assert_eq!(sched.norm_warm.backlog.len(), 1);
@@ -245,13 +222,12 @@ mod tests {
         assert_eq!(sched.norm_warm.backlog.len(), 2, "a re-arm queues it again");
     }
 
-    /// **An ingest warm-up slice is answered in the gaps a dialogue leaves, not
-    /// when it arrives.** While a higher-priority conversation holds the device
-    /// the slice waits and its warmer hears nothing; once it has gone the next
-    /// step answers it — here `None`, a scheduler with no arena — and the
-    /// backlog stops shortening the idle wait.
+    /// **An ingest warm-up slice is answered on a later step, not when it
+    /// arrives.** Its warmer hears nothing until the step answers it — here
+    /// `None`, a scheduler with no arena — and the backlog then stops
+    /// shortening the idle wait.
     #[test]
-    fn an_ingest_warm_slice_waits_behind_a_dialogue() {
+    fn an_ingest_warm_slice_is_answered_on_the_next_step() {
         let dir = tempfile::tempdir().unwrap();
         let conv = open(dir.path());
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
@@ -267,15 +243,8 @@ mod tests {
             response_tx: reply_tx,
         });
         assert_eq!(sched.norm_warm_wait(), Some(Duration::ZERO));
-
-        sched
-            .priority_pause
-            .observe(DecodePriority::High, Instant::now());
-        assert_eq!(sched.norm_warm_wait(), Some(PAUSED_POLL));
-        assert!(!sched.step_norm_warm(), "a dialogue holds the device");
         assert!(reply_rx.try_recv().is_err(), "the warmer is still waiting");
 
-        sched.priority_pause = Default::default();
         assert!(sched.step_norm_warm());
         assert_eq!(
             reply_rx.try_recv().unwrap(),

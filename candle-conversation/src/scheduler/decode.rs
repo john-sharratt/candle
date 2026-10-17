@@ -1,6 +1,6 @@
+use super::band::rank;
 use super::block_guard::BlockGuard;
 use super::named_tool::steer_to_named_tool;
-use super::priority_pause::rank;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{locate_rows, SpecChooser};
 use super::wave_retry::{Next, WaveRetry};
@@ -517,7 +517,7 @@ impl Scheduler {
                 .sample_batch(&stacked, &mut state_refs, &config_refs)
         };
         for (id, state) in state_ids.into_iter().zip(states) {
-            if state.degenerate_run == DEGENERATE_TOKEN_RUN {
+            if state.degenerate {
                 self.fail_degenerate(id);
             }
             self.sampling_states.insert(id, state);
@@ -610,18 +610,13 @@ impl Scheduler {
             "decode row selection",
         );
 
-        // ── Interactive-decode priority ──────────────────────────────────────
-        // Lower-priority decodes sit out while higher-priority work is running
-        // and for a cooldown after it (`priority_pause`), so an ingest co-batch
-        // never widens the dialogue's forward and never takes the device in the
-        // gap between its tool rounds. A paused decode stays active and resumes
-        // where it stopped — pure scheduling. Among what remains, the highest
-        // priority leads, so the adapter rule below keeps the dialogue's.
-        // `decode_priority_or_high` treats an unresolvable slot as `High`, so a
-        // real decode is never wrongly paused. Tenants are equal: the band alone
-        // ranks.
-        self.observe_priorities();
-        seq_ids.retain(|&id| !self.priority_paused(id));
+        // ── Every band's decode rides the step ──────────────────────────────
+        // Decode is width-bound — the step's expert loads amortize across its
+        // rows — so an ingest row beside a dialogue's costs the dialogue little
+        // and is the ingest's whole progress. Bands share the step; none sits
+        // out (`band`). The highest band leads, so the adapter rule below keeps
+        // the dialogue's. `decode_priority_or_high` treats an unresolvable slot
+        // as `High`. Tenants are equal: the band alone ranks.
         seq_ids.sort_by_key(|&id| std::cmp::Reverse(rank(self.decode_priority_or_high(id))));
 
         // ── One adapter per wave ─────────────────────────────────────────────
@@ -648,17 +643,17 @@ impl Scheduler {
 
         if seq_ids.is_empty() {
             // Every active decode is excluded this wave — deferred-glue-pending,
-            // or paused behind higher-priority work (`priority_pause`) — so there
-            // is no decode row to run. But the work those rows would have carried
-            // must still move: `run_prefill_until_budget` is gated behind
-            // `decode_width() == 0`, which these excluded-but-live slots hold
-            // `> 0`, so the prefill cohort, section chunks and deferred glue ride
-            // ONLY the decode sweep. Without this, neither path advances them: a
-            // hard deadlock — 0 forwards, the queue standing still. Measured with
-            // the pause: ingest decodes paused, the dialogue's next-round prefill
-            // (1,856 tokens) never advanced, and the turn hung until killed.
-            // Drive a decode-less wave, exactly as `run_prefill_until_budget`
-            // would, whenever any of the three has work.
+            // or its next token already sampled by a stencil injection, or held
+            // back by the adapter rule — so there is no decode row to run. But
+            // the work those rows would have carried must still move:
+            // `run_prefill_until_budget` is gated behind `decode_width() == 0`,
+            // which these excluded-but-live slots hold `> 0`, so the prefill
+            // cohort, section chunks and deferred glue ride ONLY the decode
+            // sweep. Without this, neither path advances them: a hard deadlock —
+            // 0 forwards, the queue standing still, a dialogue's next-round
+            // prefill (1,856 tokens) never advancing. Drive a decode-less wave,
+            // exactly as `run_prefill_until_budget` would, whenever any of the
+            // three has work.
             if !self.deferred_glue_fires.is_empty()
                 || self.prefill_width() > 0
                 || self.section_ingest_width() > 0
@@ -1147,7 +1142,13 @@ impl Scheduler {
             // these vocabularies and ordinary prose contains it, so triggering
             // on a single one reports healthy turns as faults — measured, 16
             // such reports in a clean ingest. A RUN of them is the signal.
-            if state.degenerate_run == DEGENERATE_TOKEN_RUN {
+            //
+            // Read from the sticky flag, never the run's length: a speculative
+            // step commits several tokens, and one that commits the run's last
+            // `!` and the guard's forced EOS together has reset the run by
+            // now. Checking the length let exactly such a turn seal as an
+            // answer of eight `!`.
+            if state.degenerate {
                 self.fail_degenerate(id);
             }
             self.sampling_states.insert(id, state);
@@ -1297,11 +1298,24 @@ impl Scheduler {
         // earlier arrangement truncated to `kept` here and tried to correct to
         // `committed` afterwards, which could not work for that reason and left
         // rejected tokens in the KV whenever the per-token path stopped early.
-        let targets: Vec<(usize, usize)> = seq_ids_raw
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| (s, poss[i] + committed[i]))
-            .collect();
+        //
+        // **A row that committed nothing is not rolled back with the others.**
+        // Every live row commits at least its first token, so zero means the
+        // sequence had already stopped — a degenerate row, a sink that closed —
+        // and the model refuses a rewind to zero rows. Asked anyway, that one
+        // refusal failed every decode in the step: on 2026-10-17 one
+        // conversation's NaN state took another's turn down with it. It fails
+        // alone instead, so its turn is discarded rather than sealed over a
+        // block the K/V still holds.
+        let (stopped, targets) = rollback_targets(&seq_ids_raw, &poss, &committed);
+        for &i in &stopped {
+            if let Some(state) = self.active_decodes.get_mut(&seq_ids[i]) {
+                state.fail(ConversationError::Channel(
+                    "the sequence stopped inside a speculative step before committing a token"
+                        .to_string(),
+                ));
+            }
+        }
         // Every read of the wave's rows is done; the rollback may run the next
         // forward, which reclaims their span.
         drop(captured);
@@ -2175,6 +2189,9 @@ impl Scheduler {
                         view_id = view_id.0, err = %e,
                         "reprojection prepare failed; aborting decode for this view"
                     );
+                    // A failure before prepare took the turn's state leaves it
+                    // here to fail; one after has told the turn already
+                    // (`reproject_abandon.rs`).
                     if let Some(state) = self.active_decodes.get_mut(&view_id) {
                         state.fail(e);
                     }
@@ -2314,6 +2331,10 @@ impl Scheduler {
     /// [`DEGENERATE_TOKEN_RUN`] tokens: say whether its carried recurrent state is to blame, then fail
     /// the turn so what it decoded over those logits is never sealed.
     fn fail_degenerate(&mut self, id: SequenceId) {
+        // Once per turn: the flag stays set on every step after the bar.
+        if self.active_decodes.get(&id).is_none_or(|s| s.faulted) {
+            return;
+        }
         describe_recurrent_state(self.model.as_ref(), id);
         if let Some(state) = self.active_decodes.get_mut(&id) {
             state.fail(ConversationError::Channel(format!(
@@ -2333,6 +2354,26 @@ impl Scheduler {
             }
         }
     }
+}
+
+/// Split a speculative step's rows for the rollback: the positions (into
+/// `seqs`) of the rows that committed nothing, which are not rolled back, and
+/// `(sequence, position after its committed tokens)` for every other row.
+fn rollback_targets(
+    seqs: &[usize],
+    poss: &[usize],
+    committed: &[usize],
+) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let mut stopped = Vec::new();
+    let mut targets = Vec::with_capacity(seqs.len());
+    for (i, &seq) in seqs.iter().enumerate() {
+        if committed[i] == 0 {
+            stopped.push(i);
+        } else {
+            targets.push((seq, poss[i] + committed[i]));
+        }
+    }
+    (stopped, targets)
 }
 
 /// Report whether a sequence's persistent recurrent state is finite, per layer.
@@ -2407,5 +2448,22 @@ fn describe_recurrent_state(model: &(dyn ManagedBatchedModel + Send), seq: Seque
             "degenerate decode: recurrent state is entirely FINITE — the fault is in \
              this wave's activations, not in carried state"
         ),
+    }
+}
+
+#[cfg(test)]
+mod rollback_target_tests {
+    use super::rollback_targets;
+
+    /// A row that committed nothing stays out of the rollback; the others
+    /// roll back to just past what they committed.
+    #[test]
+    fn a_row_that_committed_nothing_is_left_out_of_the_rollback() {
+        let (stopped, targets) = rollback_targets(&[21, 26, 30], &[100, 200, 300], &[3, 0, 1]);
+        assert_eq!(stopped, vec![1]);
+        assert_eq!(targets, vec![(21, 103), (30, 301)]);
+        let (stopped, targets) = rollback_targets(&[5], &[10], &[2]);
+        assert!(stopped.is_empty());
+        assert_eq!(targets, vec![(5, 12)]);
     }
 }

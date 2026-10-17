@@ -31,9 +31,9 @@ parameters:
       minLength: 1
       type: string
     page:
-      description: Which page of the output, 0-based; a page past the end is the last. Required.
+      description: Which page of the output, from 1; a page past the end is the last. Required.
       format: uint
-      minimum: 0.0
+      minimum: 1.0
       type: integer
   required:
   - repo

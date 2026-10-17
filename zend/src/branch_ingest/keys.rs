@@ -32,17 +32,41 @@ pub const BRANCHES_KEY: &str = "branches";
 /// readings of one path apart where a branch list would not.
 pub const COMMIT_KEY: &str = "commit";
 
+/// The version of what an ingested unit's turns say beyond its content — the
+/// calls and responses rendered around it. Part of every key, so a change to
+/// that rendering re-reads every unit: each one's new key is queued, its old
+/// conversation stays readable until the replacement commits, and the next pass
+/// tombstones it (`plan`).
+///
+/// 2: pages count from 1 — `file_read`'s and `file_list`'s `page`, and the
+/// `page=1 pages=N` fence. A unit read under 1 holds zero-based calls and
+/// fences, and nothing the conversation is shown should teach those.
+///
+/// Every key states its version as a `v<N>:` prefix ([`key_version`]), so a
+/// member can tell a unit read under a NEWER version — a peer's, upgraded before
+/// it — from one it should replace, and leaves it alone.
+pub const KEY_VERSION: u32 = 2;
+
+/// The version a key was written under: its `v<N>:` prefix, and 1 for a key
+/// with none — the form every key had before versions.
+pub fn key_version(key: &str) -> u32 {
+    key.strip_prefix('v')
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(n, _)| n.parse().ok())
+        .unwrap_or(1)
+}
+
 /// [`BRANCHES_KEY`]'s value for `names`.
 pub fn branches_value(names: &[String]) -> String {
     names.join(",")
 }
 
-/// A file's key: its workspace-relative path and its blob id —
-/// `candle/zend/src/main.rs@3f73f872…`. The path is in it because the
+/// A file's key: the [`KEY_VERSION`], its workspace-relative path and its blob
+/// id — `v2:candle/zend/src/main.rs@3f73f872…`. The path is in it because the
 /// ingested conversation names the path; the blob id is git's hash of the
 /// bytes `file_read` returns.
 pub fn file_key(path: &str, blob: &Oid) -> String {
-    format!("{path}@{blob}")
+    format!("v{KEY_VERSION}:{path}@{blob}")
 }
 
 /// What a folder's listing turn shows: how many entries the folder holds,
@@ -54,8 +78,9 @@ pub struct Listing<'a> {
     pub page: &'a [String],
 }
 
-/// A folder's key: SHA-256, in hex, over the folder (workspace-relative,
-/// `candle/zend/src/`, or `.` for the workspace), its [`Listing`], and the
+/// A folder's key: `v<N>:` and then SHA-256, in hex, over the [`KEY_VERSION`],
+/// the folder (workspace-relative, `candle/zend/src/`, or `.` for the
+/// workspace), its [`Listing`], and the
 /// manifest hint its request shows — everything its turns show but the sizes
 /// the listing prints beside each file, which move with every edit of a file
 /// the folder only names.
@@ -69,6 +94,7 @@ pub struct Listing<'a> {
 /// listings across its branches.
 pub fn dir_key(dir: &str, listing: &Listing<'_>, hint: Option<&ModuleHint>) -> String {
     let mut h = Sha256::new();
+    h.update(format!("v{KEY_VERSION}\n").as_bytes());
     h.update(dir.as_bytes());
     h.update(b"\n");
     h.update(listing.total.to_string().as_bytes());
@@ -81,7 +107,7 @@ pub fn dir_key(dir: &str, listing: &Listing<'_>, hint: Option<&ModuleHint>) -> S
         h.update(b"\0hint\0");
         h.update(hint.render().as_bytes());
     }
-    let mut out = String::with_capacity(64);
+    let mut out = format!("v{KEY_VERSION}:");
     for b in h.finalize() {
         let _ = write!(out, "{b:02x}");
     }
@@ -113,7 +139,7 @@ mod tests {
     fn a_file_key_is_its_path_and_blob() {
         assert_eq!(
             file_key("candle/zend/src/main.rs", &oid(A)),
-            "candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+            "v2:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 
@@ -129,14 +155,42 @@ mod tests {
         };
         assert_eq!(
             dir_key("r/a/", &listing, None),
-            "b7b7753a12c14492a0ff6e2f48638351766fdaa2ba4336eaa42cd14d8c4f146a"
+            "v2:717794e220eb93b6dd9585eca5034757489450c3b49532f42057f23df22e749c"
         );
         let hint = ModuleHint::CargoPackage {
             name: "demo".into(),
         };
         assert_eq!(
             dir_key("r/a/", &listing, Some(&hint)),
-            "76de6507dbd2ffaec073b92ea3734d95c90bdbf8778ee1952081a80b6d53f1eb"
+            "v2:8fea126301149e52c287e26a280d4e7681799142cabd277541b19c1c7c0be435"
+        );
+    }
+
+    /// Every key states the version it was written under, and a key from
+    /// before versions reads as 1.
+    #[test]
+    fn a_keys_version_is_read_from_its_prefix() {
+        let listing = Listing {
+            total: 0,
+            page: &[],
+        };
+        assert_eq!(key_version(&file_key("r/a.rs", &oid(A))), KEY_VERSION);
+        assert_eq!(key_version(&dir_key("r/", &listing, None)), KEY_VERSION);
+        assert_eq!(
+            key_version(&format!("r/a.rs@{A}")),
+            1,
+            "a file key before versions"
+        );
+        assert_eq!(
+            key_version("b7b7753a12c14492a0ff6e2f48638351766fdaa2ba4336eaa42cd14d8c4f146a"),
+            1,
+            "a folder key before versions"
+        );
+        assert_eq!(key_version("v3:r/a.rs@x"), 3);
+        assert_eq!(
+            key_version("vendor/a.rs@x"),
+            1,
+            "a path starting with v is not a version"
         );
     }
 

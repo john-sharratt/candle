@@ -1,12 +1,9 @@
-//! Scratch files the write operations need: a private index, and the three
-//! versions of a file `merge-file` merges.
+//! The scratch file the write operations need: a private index.
 //!
-//! Both live in the repository's own git folder, never a shared temp folder
-//! where another user could create the path first, and each is deleted when
+//! It lives in the repository's own git folder, never a shared temp folder
+//! where another user could create the path first, and is deleted when
 //! dropped.
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,29 +39,6 @@ impl Drop for PrivateIndex {
     }
 }
 
-/// A file holding `bytes`, created exclusively — it fails rather than
-/// open a path something else already made.
-pub(crate) struct ScratchFile(pub(crate) PathBuf);
-
-impl ScratchFile {
-    pub(crate) fn new(git_dir: &Path, tag: &str, bytes: &[u8]) -> std::io::Result<Self> {
-        let path = unique(git_dir, tag);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        let scratch = Self(path);
-        file.write_all(bytes)?;
-        Ok(scratch)
-    }
-}
-
-impl Drop for ScratchFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,15 +63,5 @@ mod tests {
         drop(index);
         assert!(!path.exists());
         assert!(!PathBuf::from(lock).exists());
-    }
-
-    #[test]
-    fn a_scratch_file_holds_its_bytes_and_is_removed_on_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = ScratchFile::new(dir.path(), "t", b"bytes").unwrap();
-        let path = f.0.clone();
-        assert_eq!(std::fs::read(&path).unwrap(), b"bytes");
-        drop(f);
-        assert!(!path.exists());
     }
 }

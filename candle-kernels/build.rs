@@ -5,10 +5,12 @@
 // binary can reuse the same code.
 
 include!("build_utils.rs");
+include!("build_lints.rs");
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_utils.rs");
+    println!("cargo:rerun-if-changed=build_lints.rs");
 
     // Register all .cu and .cuh files in src/ for cargo:rerun-if-changed.
     // SHA256-based caching determines which actually need recompilation.
@@ -36,6 +38,7 @@ fn main() -> Result<()> {
     }
 
     register_source_files(Path::new("src"))?;
+    forbid_device_wide_calls(Path::new("src"))?;
 
     // ================================================================
     // Build directory setup

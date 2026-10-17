@@ -98,7 +98,9 @@ pub(crate) struct Output {
 
 /// One git command, built up and then run.
 pub(crate) struct Invocation {
-    dir: PathBuf,
+    /// The folder git runs in; `None` for a repository read from the
+    /// substrate, which has none, and which [`Invocation::command`] refuses.
+    dir: Option<PathBuf>,
     config: Vec<(String, String)>,
     subcommand: String,
     args: Vec<OsString>,
@@ -110,8 +112,14 @@ pub(crate) struct Invocation {
 
 impl Invocation {
     pub(crate) fn new(dir: &Path, subcommand: &str) -> Self {
+        Self::in_folder(Some(dir), subcommand)
+    }
+
+    /// An invocation in `dir`, or in no folder at all: one that fails as
+    /// it is started, naming the command, rather than running elsewhere.
+    pub(crate) fn in_folder(dir: Option<&Path>, subcommand: &str) -> Self {
         Self {
-            dir: dir.to_path_buf(),
+            dir: dir.map(Path::to_path_buf),
             config: Vec::new(),
             subcommand: subcommand.to_string(),
             args: Vec::new(),
@@ -201,8 +209,11 @@ impl Invocation {
 
     /// The configured command, not yet started.
     pub(crate) fn command(&self) -> Result<Command, GitError> {
+        let dir = self.dir.as_ref().ok_or_else(|| GitError::NoFolder {
+            command: self.subcommand.clone(),
+        })?;
         let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(&self.dir);
+        cmd.arg("-C").arg(dir);
         let mut overrides: Vec<(String, String)> = vec![
             ("core.hooksPath".into(), NO_HOOKS.into()),
             // Empty, not `false`: before 2.36 this setting named a hook to
@@ -349,7 +360,8 @@ impl Invocation {
 
     /// Run, accepting the listed exit codes and classifying any other.
     pub(crate) fn run_accepting(self, ok: &[i32]) -> Result<Output, GitError> {
-        let dir = self.dir.clone();
+        // `run` refuses an invocation with no folder before this is read.
+        let dir = self.dir.clone().unwrap_or_default();
         let context = self.context.clone();
         let args = self.arg_strings();
         let output = self.run()?;

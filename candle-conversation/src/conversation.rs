@@ -1894,13 +1894,28 @@ impl Sequence {
         // GUI jump.  `flume::Selector` lets us pick up the
         // next ready receiver instead, firing `on_section_done`
         // progressively as sections actually complete.
+        //
+        // **The wait looks at the ingest-cancel latch every 100 ms.** A whole
+        // tool catalog is minutes of prefill, and a load blocked here past a
+        // process stop kept the process alive — drained from its cluster, never
+        // exiting. A stop abandons the stragglers to the scheduler's teardown
+        // (`drain_and_free`) and the collection ends `IngestCancelled`; what
+        // sealed before it stands, and the next load restores it.
+        let poll = std::time::Duration::from_millis(100);
         while !pending.is_empty() {
+            if self.substrate.ingest_cancelled() {
+                self.drain_and_free(&mut pending);
+                return Err(ConversationError::IngestCancelled);
+            }
             let mut selector = flume::Selector::new();
             for (i, (_, _, _, rx)) in pending.iter().enumerate() {
                 selector = selector.recv(rx, move |r| (i, r));
             }
-            // `wait` consumes the selector, so its borrow of `pending` ends here.
-            let (idx, r) = selector.wait();
+            // `wait_timeout` consumes the selector, so its borrow of `pending`
+            // ends here.
+            let Ok((idx, r)) = selector.wait_timeout(poll) else {
+                continue;
+            };
             let settled = r
                 .map_err(|_| ConversationError::SchedulerGone)
                 .and_then(|seal| seal);

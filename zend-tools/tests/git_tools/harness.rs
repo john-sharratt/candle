@@ -334,7 +334,7 @@ impl GitWorkspace {
     /// A context over this workspace, under `grants`.
     pub fn ctx(&self, grants: Grants) -> ToolContext {
         let ws = Workspace::new(self.dir.path(), vec![RepoSpec::named("app")]).unwrap();
-        ToolContext::with_workspace(ws).granting(grants)
+        ToolContext::with_workspace(ws).unwrap().granting(grants)
     }
 
     /// A context that may run the writers — Comprehensive's grants.
@@ -365,6 +365,7 @@ impl GitWorkspace {
                 .unwrap();
         Conversation {
             ctx: ToolContext::with_workspace(ws)
+                .unwrap()
                 .granting(Grants::ALL)
                 .with_executor(Arc::new(sandboxes)),
         }
@@ -449,7 +450,7 @@ impl Conversation {
     }
 
     pub fn status(&self) -> Value {
-        self.call("git_status", json!({"repo": "app", "page": 0}))
+        self.call("git_status", json!({"repo": "app", "page": 1}))
     }
 }
 

@@ -113,7 +113,7 @@ pub fn preserve(
     writes: &[String],
     target: Option<&Oid>,
 ) -> Result<Preserved, CheckoutError> {
-    let lock = CheckoutLock::take(repo.git_dir())?;
+    let lock = CheckoutLock::take(repo.git_dir()?)?;
     refuse_mid_operation(&repo)?;
     recover_locked(&repo)?;
     let (branch, commit) = match repo.head()? {
@@ -128,7 +128,7 @@ pub fn preserve(
         }
     };
     let landing = aside::landing(&repo, writes, target)?;
-    let place = Place::new(repo.git_dir());
+    let place = Place::new(repo.git_dir()?);
     let mut journal = Journal {
         why: why.to_string(),
         phase: Phase::Capturing,
@@ -191,7 +191,7 @@ pub fn preserve(
 /// a run that crashed, or whose restore failed. An error means something is
 /// still set aside, and names where.
 pub fn recover(repo: &Arc<Repo>) -> Result<(), CheckoutError> {
-    let _lock = CheckoutLock::take(repo.git_dir())?;
+    let _lock = CheckoutLock::take(repo.git_dir()?)?;
     refuse_mid_operation(repo)?;
     recover_locked(repo)
 }
@@ -199,9 +199,10 @@ pub fn recover(repo: &Arc<Repo>) -> Result<(), CheckoutError> {
 /// A checkout part way through an operation of git's is its owner's to
 /// finish: refused, nothing touched.
 fn refuse_mid_operation(repo: &Repo) -> Result<(), CheckoutError> {
+    let git_dir = repo.git_dir()?;
     match OPERATIONS
         .iter()
-        .find(|(marker, _)| repo.git_dir().join(marker).exists())
+        .find(|(marker, _)| git_dir.join(marker).exists())
     {
         Some((_, what)) => Err(GitError::invalid(format!(
             "the checkout is part way through {what}; nothing was touched — finish or abort \
@@ -215,7 +216,7 @@ fn refuse_mid_operation(repo: &Repo) -> Result<(), CheckoutError> {
 /// [`recover`], with the checkout's lock held: every preservation on disk
 /// is one a run that is gone left behind.
 fn recover_locked(repo: &Arc<Repo>) -> Result<(), CheckoutError> {
-    for place in Place::left_in(repo.git_dir())? {
+    for place in Place::left_in(repo.git_dir()?)? {
         let journal = place.load()?;
         let mut left = Preserved {
             repo: Arc::clone(repo),
@@ -407,7 +408,7 @@ impl Preserved {
     /// writes through a link standing where a folder was, outside the
     /// repository if that is where it points.
     fn unlink_the_run(&self, kept: &Ignored) -> Result<(), CheckoutError> {
-        let root = self.repo.dir();
+        let root = self.repo.dir()?;
         for rel in raw::untracked(&self.repo)? {
             if !kept.covers(rel.strip_suffix(b"/").unwrap_or(&rel)) {
                 raw::remove_link(root, &rel)?;
@@ -422,7 +423,7 @@ impl Preserved {
     /// Every untracked file the run left, and every link, gone — never
     /// followed — except what was ignored when the state was set aside.
     fn clear_the_run(&self, kept: &Ignored) -> Result<(), CheckoutError> {
-        let root = self.repo.dir();
+        let root = self.repo.dir()?;
         for rel in raw::untracked(&self.repo)? {
             raw::remove_untracked(root, &rel, kept)?;
         }
@@ -633,7 +634,7 @@ impl Drop for Preserved {
 
 /// `.git/info/exclude` as it stands; `None` when there is none.
 fn read_exclude(repo: &Repo) -> Result<Option<Vec<u8>>, CheckoutError> {
-    let path = repo.git_dir().join("info").join("exclude");
+    let path = repo.git_dir()?.join("info").join("exclude");
     match std::fs::read(&path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -645,7 +646,7 @@ fn read_exclude(repo: &Repo) -> Result<Option<Vec<u8>>, CheckoutError> {
 /// untracked files are removed under are the checkout's own, whatever the
 /// run did to them.
 fn write_exclude(repo: &Repo, bytes: Option<&[u8]>) -> Result<(), CheckoutError> {
-    let path = repo.git_dir().join("info").join("exclude");
+    let path = repo.git_dir()?.join("info").join("exclude");
     let fail = |e| CheckoutError::io("info/exclude", e);
     match bytes {
         Some(bytes) => {

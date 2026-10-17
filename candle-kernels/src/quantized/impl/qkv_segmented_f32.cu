@@ -315,8 +315,9 @@ extern "C" int run_qkv_segmented_matmul(
     void* args[] = {(void*)&s0,      (void*)&s1,         (void*)&s2,       (void*)&num_segs,
                     (void*)&act,      (void*)&dst,        (void*)&ncols_x,  (void*)&total_batch,
                     (void*)&y_stride, (void*)&dst_stride, (void*)&sum_norm};
-    if (cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream) != cudaSuccess) {
-        return QMM_LAUNCH_FAILED;
+    if (const cudaError_t e = cudaLaunchKernel(kfn, grid, block, args, 0, (cudaStream_t)stream);
+        e != cudaSuccess) {
+        return qmm_launch_failed(e, "qkv segmented: launch");
     }
     return QMM_OK;
 }

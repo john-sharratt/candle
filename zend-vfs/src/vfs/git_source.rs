@@ -41,7 +41,7 @@ pub struct GitSource {
 impl fmt::Debug for GitSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GitSource")
-            .field("dir", &self.repo.dir())
+            .field("repo", &self.repo)
             .field("default", &self.default)
             .finish()
     }
@@ -65,14 +65,19 @@ fn record_default(repo: &Repo) -> Result<Option<Rev>, GitError> {
 impl GitSource {
     /// The repository whose top level is `dir`.
     pub fn open(dir: &Path) -> Result<Arc<Self>, GitError> {
-        let repo = Repo::open(dir)?;
+        Self::of(Repo::open(dir)?)
+    }
+
+    /// `repo`'s branches: a checkout's, or a repository read from the
+    /// substrate.
+    pub fn of(repo: Repo) -> Result<Arc<Self>, GitError> {
         let default = match repo.head()?.branch() {
             Some(branch) if repo.ref_target(&branch.to_ref())?.is_some() => {
                 Rev::Branch(branch.clone())
             }
-            // A branch with no commit checked out — a store derived from a
-            // substrate, which checks nothing out (`docs/substrate_git.md`
-            // §4): what it reads is the record's `main`, else `master`.
+            // A branch with no commit checked out — a repository read from
+            // the substrate, which checks nothing out (`docs/substrate_git.md`
+            // §4.3): what it reads is the record's `main`, else `master`.
             Some(branch) => record_default(&repo)?.unwrap_or_else(|| Rev::Branch(branch.clone())),
             None => Rev::Head,
         };
@@ -85,9 +90,9 @@ impl GitSource {
         }))
     }
 
-    /// The repository's folder.
-    pub fn dir(&self) -> &Path {
-        self.repo.dir()
+    /// The repository's folder; `None` for one read from the substrate.
+    pub fn folder(&self) -> Option<&Path> {
+        self.repo.folder()
     }
 
     /// What a store over this repository reads when it is given no branch.

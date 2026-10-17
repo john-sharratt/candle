@@ -57,7 +57,7 @@
 //! runs of resident layers between them, and therefore the most time to hide the
 //! transfers that replace them.
 
-use candle::cuda_backend::graph::try_without_recording;
+use candle::cuda_backend::graph::{try_without_recording, Quiet};
 use candle::Result;
 use candle_nn::kv_cache::{
     kv_spare_regions, set_weight_floor, span_end, wave_is_live, REGION_BYTES,
@@ -116,13 +116,13 @@ const MIN_GROWTH_LAYERS: usize = 2;
 /// A handover in either direction changes who owns an address. Slot transfers
 /// run on the cache's own copy stream, which a compute-stream synchronize does
 /// not cover, so this synchronizes the **context** — the same thing
-/// `ExpertCache::quiesce_before_handover` does and for the same reason.
-fn quiesce(device: &candle::CudaDevice) -> Result<()> {
+/// `ExpertCache::quiesce_before_handover` does and for the same reason, and
+/// like it only with the record gate held (`quiet`).
+fn quiesce(quiet: &Quiet, device: &candle::CudaDevice) -> Result<()> {
     let stream = device.cuda_stream();
-    let ctx = stream.context();
-    ctx.bind_to_thread().map_err(candle::Error::wrap)?;
-    ctx.synchronize().map_err(candle::Error::wrap)?;
-    Ok(())
+    quiet
+        .synchronize_context(stream.context())
+        .map_err(candle::Error::wrap)
 }
 
 /// Give the KV side `regions` more regions by surrendering layer ground.
@@ -145,10 +145,11 @@ pub fn concede_kv_ground<T, A: SlotAssembler<T>>(
     cache: &mut LayerCache<T, A>,
     regions: usize,
 ) -> Result<u64> {
-    try_without_recording(|| concede_kv_ground_now(cache, regions)).unwrap_or(Ok(0))
+    try_without_recording(|quiet| concede_kv_ground_now(quiet, cache, regions)).unwrap_or(Ok(0))
 }
 
 fn concede_kv_ground_now<T, A: SlotAssembler<T>>(
+    quiet: &Quiet,
     cache: &mut LayerCache<T, A>,
     regions: usize,
 ) -> Result<u64> {
@@ -198,7 +199,7 @@ fn concede_kv_ground_now<T, A: SlotAssembler<T>>(
         return Ok(0);
     }
 
-    quiesce(&device)?;
+    quiesce(quiet, &device)?;
 
     // **The floor moves first, and the tenants follow it.**
     //
@@ -249,10 +250,13 @@ fn concede_kv_ground_now<T, A: SlotAssembler<T>>(
 /// Like [`concede_kv_ground`], refused while a wave records: it reclaims
 /// nothing and the next quiet moment asks again.
 pub fn reclaim_spare_ground<T, A: SlotAssembler<T>>(cache: &mut LayerCache<T, A>) -> Result<u64> {
-    try_without_recording(|| reclaim_spare_ground_now(cache)).unwrap_or(Ok(0))
+    try_without_recording(|quiet| reclaim_spare_ground_now(quiet, cache)).unwrap_or(Ok(0))
 }
 
-fn reclaim_spare_ground_now<T, A: SlotAssembler<T>>(cache: &mut LayerCache<T, A>) -> Result<u64> {
+fn reclaim_spare_ground_now<T, A: SlotAssembler<T>>(
+    quiet: &Quiet,
+    cache: &mut LayerCache<T, A>,
+) -> Result<u64> {
     growth_note(0);
     let before = cache.residency().homed();
     let num_layers = cache.residency().num_layers();
@@ -324,7 +328,7 @@ fn reclaim_spare_ground_now<T, A: SlotAssembler<T>>(cache: &mut LayerCache<T, A>
     }
     growth_note(5);
 
-    quiesce(&device)?;
+    quiesce(quiet, &device)?;
     set_weight_floor(&stream, plan.floor)?;
     // **The layers this brings in are the ones most recently given up**, because
     // the resident set is a prefix of the protection order at every budget. So

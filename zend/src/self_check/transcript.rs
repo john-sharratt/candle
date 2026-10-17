@@ -104,7 +104,7 @@ mod tests {
                 "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\"}}\n</tool_call>",
             ),
             turn(
-                "<tool_response>\n```rust file=r/a.rs page=0/1\n1 fn main() {}\n```\n</tool_response>",
+                "<tool_response>\n```rust file=r/a.rs page=1 pages=1\n1 fn main() {}\n```\n</tool_response>",
                 "**Purpose:** `a.rs` is the entry point.",
             ),
         ]);
@@ -115,7 +115,7 @@ mod tests {
              ASSISTANT: [tool call] {\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\"}}\n\
              \n\
              [turn 2]\n\
-             TOOL RESULT: ```rust file=r/a.rs page=0/1 1 fn main() {} ```\n\
+             TOOL RESULT: ```rust file=r/a.rs page=1 pages=1 1 fn main() {} ```\n\
              ASSISTANT: **Purpose:** `a.rs` is the entry point.\n"
         );
     }

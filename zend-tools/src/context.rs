@@ -41,7 +41,7 @@ use std::sync::Arc;
 use crate::executor::Executor;
 use crate::grants::{Capability, Grants, NotPermitted};
 use crate::state::{CredentialStore, HashStateStore, NotesStore, Secrets, SessionRegistry};
-use zend_vfs::{here, Push, RepoFiles, Workspace};
+use zend_vfs::{here, GitError, Push, RepoFiles, Workspace};
 
 /// Read-only handle bundle passed by the runner into each tool invocation.
 /// All stores are wrapped in `Arc` so cloning the context is cheap.
@@ -74,9 +74,10 @@ impl ToolContext {
 
     /// Construct a context whose file stores overlay `workspace`'s
     /// repositories: `file_*` reads fall through to real project files, writes
-    /// and edits stay in memory. Grants nothing.
-    pub fn with_workspace(workspace: Workspace) -> Self {
-        Self::build(RepoFiles::overlay(workspace))
+    /// and edits stay in memory. Grants nothing. Refused when a git
+    /// repository of it cannot be opened.
+    pub fn with_workspace(workspace: Workspace) -> Result<Self, GitError> {
+        Ok(Self::build(RepoFiles::overlay(workspace)?))
     }
 
     fn build(files: RepoFiles) -> Self {

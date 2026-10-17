@@ -21,7 +21,7 @@ questions:
 - enumerate the refs under refs/remotes
 - do we have a branch named after that ticket
 category: Git
-description: '**The one way to ask what branches, tags or remotes a repository has, and how many.** Never read `.git/` to find out — its refs are a database, not a list (loose refs, packed refs and symbolic refs together), and hand-parsing it gives confidently wrong counts; the tools refuse that folder anyway. `kind` picks which: `branches` gives the local branches with the commit each points at, which one is checked out, and how far ahead or behind its upstream each is — so "do I have unpushed commits" and "am I up to date with origin" are answered here; `tags` gives the tags with the commit each finally points at and whether it is annotated or lightweight; `remotes` gives the configured remotes and their URLs, with any credentials redacted — so "where does this push to" and "what is the url of origin" are answered here, never from a README or a guess; `remote_branches` gives the remote-tracking branches as of the last fetch, along with their remotes'' URLs. A `count` comes back with every listing, so "how many branches are there" is READ off the number rather than counted from the entries. Use for "what branches exist", "am I up to date with origin", "do I have unpushed commits", "what versions have been released", "where does this push to". Contacts no server — it reads what this repository already knows, so run git_fetch first if the remote may have moved. `page` is required, 40 refs a page: pass 0 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only.'
+description: '**The one way to ask what branches, tags or remotes a repository has, and how many.** Never read `.git/` to find out — its refs are a database, not a list (loose refs, packed refs and symbolic refs together), and hand-parsing it gives confidently wrong counts; the tools refuse that folder anyway. `kind` picks which: `branches` gives the local branches with the commit each points at, which one is checked out, and how far ahead or behind its upstream each is — so "do I have unpushed commits" and "am I up to date with origin" are answered here; `tags` gives the tags with the commit each finally points at and whether it is annotated or lightweight; `remotes` gives the configured remotes and their URLs, with any credentials redacted — so "where does this push to" and "what is the url of origin" are answered here, never from a README or a guess; `remote_branches` gives the remote-tracking branches as of the last fetch, along with their remotes'' URLs. A `count` comes back with every listing, so "how many branches are there" is READ off the number rather than counted from the entries. Use for "what branches exist", "am I up to date with origin", "do I have unpushed commits", "what versions have been released", "where does this push to". Contacts no server — it reads what this repository already knows, so run git_fetch first if the remote may have moved. `page` is required and counts from 1, 40 refs a page: pass 1 to start, then the reply''s `paging.next_page` for the next; a page past the end returns the last one rather than nothing. Reads only.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -40,9 +40,9 @@ parameters:
       - $ref: '#/definitions/RefKind'
       description: Which refs to list. Required.
     page:
-      description: Zero-based page, 40 refs a page. Required — pass 0 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
+      description: Page of refs, from 1, 40 a page. Required — pass 1 to start. Pass the reply's `paging.next_page` back here for the following page; a page past the end returns the last one.
       format: uint32
-      minimum: 0.0
+      minimum: 1.0
       type: integer
     repo:
       description: The repository to read. Required.

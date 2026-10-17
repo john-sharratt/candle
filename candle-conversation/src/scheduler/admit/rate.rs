@@ -1080,6 +1080,41 @@ impl WaveRate {
         }
     }
 
+    /// Offer a prefill that **outranks work the engine is already running** — a
+    /// band above some active slot's. Only the row cap is judged.
+    ///
+    /// The floors defend the residency the running work decodes at, and the gain
+    /// rules defend the wave's rate. Neither is a reason to hold back a band the
+    /// running work yields to: the lower band's slots are what took that
+    /// residency, and they keep it until they finish. Measured on `.5`,
+    /// 2026-10-17: with fourteen ingest and character slots in flight, a dialogue's
+    /// two-row continuation was refused at the decode floor on every pass
+    /// (`resident_after` 21.5 GiB against a 25.3 GiB floor) — the person waited
+    /// for background work to drain before their tool result was even admitted.
+    /// The residency it spends is paid back by the throttle, which yields the
+    /// lower bands' creep to this band's decode.
+    ///
+    /// A refusal on the cap does **not** latch [`Self::is_full`]: the forward's
+    /// rows are spent, not the turn's chance, and the caller re-offers it as a
+    /// join — or latches the wave itself ([`Self::latch_full`]) when it cannot.
+    pub fn try_outranking(&mut self, tokens: usize, weights_after: u64) -> Admit {
+        if self.full {
+            return Admit::Refused(Refusal::Full);
+        }
+        let tokens_after = self.tokens.saturating_add(tokens);
+        if self.admitted_any && tokens_after > self.max_tokens {
+            return Admit::Refused(Refusal::Cap {
+                max_tokens: self.max_tokens,
+            });
+        }
+        self.admitted_any = true;
+        self.resident_now = weights_after;
+        self.tokens = tokens_after;
+        Admit::Admitted {
+            projected: self.rate(tokens_after, weights_after),
+        }
+    }
+
     /// Whether the decode a prefill is going to become could be carried at
     /// `resident` — asked **while judging that prefill**, so the turn is priced
     /// by both models at the one moment a refusal is still cheap.
@@ -1692,6 +1727,39 @@ mod tests {
             matches!(p.try_join(6 * GIB), Admit::Refused(Refusal::Full)),
             "a refused join latches the wave like any refusal"
         );
+    }
+
+    /// **A band the running work yields to is admitted under both floors, and
+    /// stopped only by the row cap.** The wave already carries rows, so the head
+    /// waiver is spent; a join of the same turn at the same residency is refused
+    /// at the floor, and the outranking offer is not.
+    #[test]
+    fn an_outranking_prefill_passes_the_floors_and_stops_at_the_cap() {
+        let floor = 4 * GIB;
+        let mut p = planner(LINK_4090_MOBILE);
+        p.reset(8 * GIB, floor, floor, CAP, DECODE_CAP);
+        let _ = offer(&mut p, prefill(CAP - 2), 0);
+        let mut joined = p.clone();
+        assert!(matches!(
+            joined.try_join(floor - GIB),
+            Admit::Refused(Refusal::Floor { .. })
+        ));
+
+        assert!(matches!(
+            p.try_outranking(2, floor - GIB),
+            Admit::Admitted { .. }
+        ));
+        assert_eq!(p.tokens(), CAP, "its rows join the wave's");
+        assert_eq!(p.resident_now(), floor - GIB);
+        assert!(matches!(
+            p.try_outranking(1, floor - GIB),
+            Admit::Refused(Refusal::Cap { max_tokens }) if max_tokens == CAP
+        ));
+        assert!(
+            matches!(p.try_outranking(0, floor - GIB), Admit::Admitted { .. }),
+            "the cap leaves the wave open for the same turn as a join"
+        );
+        assert_eq!(p.tokens(), CAP, "a join adds no rows");
     }
 
     /// **A latched wave must not decide a promotion.** `try_admit` refuses

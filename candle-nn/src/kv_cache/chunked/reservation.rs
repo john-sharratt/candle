@@ -69,6 +69,7 @@ use candle::cuda_backend::cudarc::driver::sys::{
     CUmemAllocationType_enum, CUmemLocationType_enum, CUmemLocation_st, CUresult,
 };
 use candle::cuda_backend::cudarc::driver::{CudaContext, CudaStream};
+use candle::cuda_backend::graph::without_recording;
 use candle::Result;
 
 /// A contiguous virtual address span, backed by however much physical memory
@@ -399,9 +400,15 @@ impl Reservation {
     /// refusal, and dropping the span. Neither is per-granule and neither is on
     /// a forward. Errors are swallowed on purpose — this runs from `Drop`, and a
     /// context already faulted has a real failure being reported elsewhere.
+    ///
+    /// **Through the record gate, waiting.** A context-wide synchronise
+    /// invalidates any capture in flight, so it waits for none to be recording.
+    /// Waiting is safe here because every caller runs where no wave can be
+    /// recording or waiting on a lock this thread holds: the span is mapped at
+    /// creation and when the load's headroom is reclaimed, both before the
+    /// first forward, and dropped at the end of the process.
     fn fence(&self) {
-        let _ = self.context.bind_to_thread();
-        let _ = self.context.synchronize();
+        let _ = without_recording(|quiet| quiet.synchronize_context(&self.context));
     }
 
     /// Unmap and release a granule that failed part-way through mapping.

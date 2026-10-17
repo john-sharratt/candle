@@ -1,27 +1,27 @@
 //! The daemon's own log lines, as a bus the console can read.
 //!
-//! What `/ws/logs` streams: the same lines `tracing` writes to the terminal,
-//! tapped on the way out.
+//! What `/ws/logs` streams and `/v1/logs` searches: the lines the log file
+//! holds, tapped as they are written to it.
 //!
-//! # Why a writer rather than a `Layer`
+//! # Fed by the file, not beside it
 //!
-//! A `tracing_subscriber::Layer` would see events *before* formatting and would
-//! have to render them itself — a second formatter, guaranteed to drift from
-//! the one on stderr, so the console and the terminal would disagree about what
-//! the daemon said. Tapping the writer means there is exactly one formatter and
-//! both readers see its output. The cost is that the structured fields are
-//! already flattened into text and have to be picked apart again, which
-//! [`parse`] does, tolerantly.
+//! The bus is the log file's tap (`web::log_file`): every write the
+//! file takes is handed here under the file's lock, split into lines and
+//! broadcast. There is exactly one formatter and one record of what the
+//! daemon said — the file — and the console reads that record rather than a
+//! copy of it. The cost is that the structured fields are already flattened
+//! into text and have to be picked apart again, which [`parse`] does,
+//! tolerantly.
 //!
-//! # Replay, and why the ring is here rather than in the socket
+//! # Replay, from the file
 //!
 //! A console that connects to a live stream and shows nothing until the next
 //! event looks broken — and a quiet process is exactly when you go looking at
-//! the logs. So the bus keeps the last [`RING`] lines and hands them over on
-//! connect, on the same socket as the tail. Every line carries a [`LogLine::seq`]:
-//! the reader subscribes first, replays the ring, and skips whatever the
-//! subscription then delivers that the replay already covered — so a line is
-//! neither lost in the gap between the two nor shown twice.
+//! the logs. So a reader starts with the file's last lines and then follows
+//! the stream. The bus keeps no lines of its own: the replay is read back
+//! from disk ([`LogBus::replay`]), and the subscription is taken under the
+//! file's lock in the same moment, so a line is in the replay or the stream —
+//! never both, never neither.
 //!
 //! # One bus for every tenant
 //!
@@ -29,17 +29,14 @@
 //! line names the tenant it came from ([`LogLine::tenant`]), read off the
 //! target's crate. Engine lines name none: the engine is every tenant's.
 
-use std::collections::VecDeque;
-use std::io::{Result as IoResult, Write};
+use std::path::PathBuf;
+use std::str::from_utf8;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
 use tokio::sync::broadcast;
-
-/// Lines kept for replay. Enough to see what happened just before you looked,
-/// not a log store — that is what the terminal and the log file are for.
-const RING: usize = 500;
+use web::log_file::RotatingFileLog;
 
 /// Broadcast depth. Generous because a slow console must not cost the *daemon*
 /// anything: when it overflows, the reader is told it lagged rather than the
@@ -60,23 +57,25 @@ pub struct LogLine {
     /// The tenant the line came from — `zend`, `npcd` — or empty for the
     /// engine and the host, which belong to every tenant.
     pub tenant: String,
-    /// Position on the bus, strictly increasing — what lets a reader that
-    /// replays the ring and then tails the stream skip what it has already
-    /// shown.
+    /// Position on the bus, strictly increasing across the live stream; zero
+    /// for a line replayed from the file, which the bus never carried.
     pub seq: u64,
 }
 
-const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+pub const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
 
 pub struct LogBus {
     tx: broadcast::Sender<LogLine>,
-    /// Guarded together with the next sequence number, so ring order and
-    /// `seq` order are one order.
-    ring: Mutex<(VecDeque<LogLine>, u64)>,
+    next: AtomicU64,
     /// The tenants a line's target can name.
     tenants: Vec<&'static str>,
     /// Lines a slow reader missed, process-wide — reported in the stream.
     dropped: AtomicU64,
+    /// Bytes the file took since its last newline. Only the file's tap writes
+    /// here, under the file's lock.
+    partial: Mutex<String>,
+    /// The file feeding the bus, once [`Self::attach`] has run.
+    file: OnceLock<RotatingFileLog>,
 }
 
 impl LogBus {
@@ -85,24 +84,79 @@ impl LogBus {
         let (tx, _) = broadcast::channel(CHANNEL);
         Arc::new(Self {
             tx,
-            ring: Mutex::new((VecDeque::with_capacity(RING), 1)),
+            next: AtomicU64::new(1),
             tenants: tenants.to_vec(),
             dropped: AtomicU64::new(0),
+            partial: Mutex::new(String::new()),
+            file: OnceLock::new(),
         })
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<LogLine> {
-        self.tx.subscribe()
+    /// Feed the bus from `file`: every line written to it is a line here, and
+    /// a reader's replay is read back from it. The tap holds the bus weakly,
+    /// so the file outliving it costs nothing.
+    pub fn attach(self: &Arc<Self>, file: &RotatingFileLog) {
+        let bus = Arc::downgrade(self);
+        file.set_tap(Box::new(move |bytes| {
+            if let Some(bus) = bus.upgrade() {
+                bus.take(bytes);
+            }
+        }));
+        let _ = self.file.set(file.clone());
     }
 
-    /// The most recent lines, oldest first.
-    pub fn recent(&self) -> Vec<LogLine> {
-        self.ring.lock().unwrap().0.iter().cloned().collect()
+    /// A reader's start: a subscription, and the lines among the file's last
+    /// `max_bytes` — split at the moment the subscription was taken, so each
+    /// line is in exactly one of the two.
+    pub fn replay(&self, max_bytes: u64) -> (broadcast::Receiver<LogLine>, Vec<LogLine>) {
+        let Some(file) = self.file.get() else {
+            return (self.tx.subscribe(), Vec::new());
+        };
+        match file.tail(max_bytes, || self.tx.subscribe()) {
+            Ok((bytes, rx)) => (rx, self.lines(&bytes)),
+            // Said in the stream rather than swallowed: an empty pane with no
+            // reason reads as a silent daemon.
+            Err(e) => (
+                self.tx.subscribe(),
+                vec![LogLine {
+                    ts: String::new(),
+                    level: "WARN".to_owned(),
+                    target: "host::logs".to_owned(),
+                    msg: format!("the log file could not be read back: {e}"),
+                    tenant: String::new(),
+                    seq: 0,
+                }],
+            ),
+        }
+    }
+
+    /// Every file of the log, oldest first; none before [`Self::attach`].
+    pub fn files(&self) -> Vec<PathBuf> {
+        self.file
+            .get()
+            .map(RotatingFileLog::files)
+            .unwrap_or_default()
+    }
+
+    /// One formatted line as the bus carries it: taken apart, its tenant named.
+    pub fn line(&self, text: &str) -> LogLine {
+        let mut line = parse(text);
+        line.tenant = self.tenant_of(&line.target);
+        line
     }
 
     /// Note that a reader fell `n` lines behind.
     pub fn note_dropped(&self, n: u64) {
         self.dropped.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Every non-blank line in `bytes`, in order.
+    fn lines(&self, bytes: &[u8]) -> Vec<LogLine> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| self.line(l))
+            .collect()
     }
 
     /// The tenant a target names, or empty: its crate, or one of the crates
@@ -121,96 +175,30 @@ impl LogBus {
             .unwrap_or_default()
     }
 
+    /// What the file took. Nothing guarantees one write is one line, so bytes
+    /// accumulate and only a newline completes a line — treating each write as
+    /// a line would shred one split across writes into meaningless fragments.
+    /// Non-UTF-8 is discarded rather than escaped: the formatter writes a
+    /// `String`, so it cannot happen, and a lossy conversion would put mojibake
+    /// on the console under a name that reads as a real log line.
+    fn take(&self, bytes: &[u8]) {
+        let Ok(s) = from_utf8(bytes) else {
+            return;
+        };
+        let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+        partial.push_str(s);
+        while let Some(nl) = partial.find('\n') {
+            let text: String = partial.drain(..=nl).collect();
+            if !text.trim().is_empty() {
+                self.push(self.line(&text));
+            }
+        }
+    }
+
     fn push(&self, mut line: LogLine) {
-        line.tenant = self.tenant_of(&line.target);
-        {
-            let mut g = self.ring.lock().unwrap();
-            let (ring, next) = &mut *g;
-            line.seq = *next;
-            *next += 1;
-            if ring.len() >= RING {
-                ring.pop_front();
-            }
-            ring.push_back(line.clone());
-            // Sent under the lock, so the stream's order is the ring's.
-            // Nobody listening is the normal case — the console is usually
-            // closed.
-            let _ = self.tx.send(line);
-        }
-    }
-}
-
-/// Plugs into `tracing_subscriber::fmt::layer().with_writer(..)`.
-///
-/// # It buffers, because `Write` is a byte stream
-///
-/// Nothing guarantees that one `write` call is one line. `write_fmt` — what
-/// every `write!`/`writeln!` expands to — issues a separate call per fragment
-/// of the format string, so `writeln!(w, "line {i}")` arrives as three. Treating
-/// each call as a line would shred that into three log entries, two of them
-/// meaningless.
-///
-/// The fmt layer as it stands renders into a `String` and writes it in one go,
-/// so this would have worked by luck. Luck is not a contract, and the failure
-/// mode — silently mangled log lines — is one nobody would think to look for.
-/// So bytes accumulate here and only a newline completes a line.
-pub struct BusWriter {
-    bus: Arc<LogBus>,
-    /// Bytes seen since the last newline. A writer is made per event and
-    /// dropped after it, so this is normally empty by the time it dies — and
-    /// when it is not, `Drop` still delivers what it holds.
-    partial: String,
-}
-
-impl BusWriter {
-    pub fn new(bus: Arc<LogBus>) -> Self {
-        Self {
-            bus,
-            partial: String::new(),
-        }
-    }
-
-    /// Emit whatever is buffered as a final line, complete or not. A line
-    /// without its newline is still something the daemon said.
-    fn finish(&mut self) {
-        if !self.partial.trim().is_empty() {
-            let line = std::mem::take(&mut self.partial);
-            self.bus.push(parse(&line));
-        }
-        self.partial.clear();
-    }
-}
-
-impl Write for BusWriter {
-    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        // Non-UTF-8 is discarded rather than escaped: the fmt layer produces a
-        // formatted `String`, so this cannot happen, and a lossy conversion
-        // would put mojibake on the console under a name that reads as a real
-        // log line.
-        if let Ok(s) = std::str::from_utf8(buf) {
-            self.partial.push_str(s);
-            while let Some(nl) = self.partial.find('\n') {
-                let line: String = self.partial.drain(..=nl).collect();
-                // A line that is only whitespace is formatting, not content.
-                if !line.trim().is_empty() {
-                    self.bus.push(parse(&line));
-                }
-            }
-        }
-        // Always the full length: refusing bytes would make `tracing` retry a
-        // line the daemon has already printed.
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> IoResult<()> {
-        self.finish();
-        Ok(())
-    }
-}
-
-impl Drop for BusWriter {
-    fn drop(&mut self) {
-        self.finish();
+        line.seq = self.next.fetch_add(1, Ordering::Relaxed);
+        // Nobody listening is the normal case — the console is usually closed.
+        let _ = self.tx.send(line);
     }
 }
 
@@ -305,7 +293,19 @@ fn strip_ansi(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use tempfile::TempDir;
+
     use super::*;
+
+    /// A bus fed by a log file in `dir`, as `init_logging` wires it.
+    fn attached(dir: &TempDir, tenants: &[&'static str]) -> (Arc<LogBus>, RotatingFileLog) {
+        let bus = LogBus::new(tenants);
+        let file = RotatingFileLog::new(dir.path(), "test.log").unwrap();
+        bus.attach(&file);
+        (bus, file)
+    }
 
     #[test]
     fn a_formatted_line_comes_apart_into_its_fields() {
@@ -356,104 +356,118 @@ mod tests {
         assert_eq!(l.msg, "a bare line with no shape at all");
     }
 
+    /// **The replay is the file's, and the stream starts where it ends.** A
+    /// line written before the reader arrived is replayed and not streamed;
+    /// one written after is streamed and not replayed.
+    #[tokio::test]
+    async fn the_replay_is_read_from_the_file_and_the_stream_follows_it() {
+        let dir = TempDir::new().unwrap();
+        let (bus, mut file) = attached(&dir, &["zend"]);
+        writeln!(file, "2026-01-01T00:00:01.0Z  INFO zend::a: before").unwrap();
+
+        let (mut rx, replay) = bus.replay(1 << 20);
+        writeln!(file, "2026-01-01T00:00:02.0Z  WARN zend::a: after").unwrap();
+
+        let replayed: Vec<(&str, &str, u64)> = replay
+            .iter()
+            .map(|l| (l.msg.as_str(), l.tenant.as_str(), l.seq))
+            .collect();
+        assert_eq!(replayed, [("before", "zend", 0)]);
+        let streamed = rx.recv().await.unwrap();
+        assert_eq!(
+            (streamed.msg.as_str(), streamed.level.as_str()),
+            ("after", "WARN")
+        );
+        assert!(rx.try_recv().is_err(), "nothing else streamed");
+    }
+
+    /// The replay is bounded by bytes, taken from the end, in whole lines.
     #[test]
-    fn the_ring_replays_the_most_recent_lines_oldest_first() {
-        let bus = LogBus::new(&["npcd"]);
-        let mut w = BusWriter::new(bus.clone());
-        for i in 0..(RING + 10) {
-            writeln!(w, "2026-08-28T06:35:04.1Z  INFO t: line {i}").unwrap();
+    fn the_replay_is_the_files_last_lines() {
+        let dir = TempDir::new().unwrap();
+        let (bus, mut file) = attached(&dir, &["npcd"]);
+        for i in 0..100 {
+            writeln!(file, "2026-08-28T06:35:04.1Z  INFO npcd: line {i:03}").unwrap();
         }
-        let recent = bus.recent();
-        assert_eq!(recent.len(), RING);
-        assert_eq!(recent[0].msg, format!("line {}", 10));
-        assert_eq!(recent[RING - 1].msg, format!("line {}", RING + 9));
+        // Each line is 44 bytes: 100 bytes back cuts into the third from last,
+        // which is dropped, and holds the last two whole.
+        let (_rx, replay) = bus.replay(100);
+        let msgs: Vec<&str> = replay.iter().map(|l| l.msg.as_str()).collect();
+        assert_eq!(msgs, ["line 098", "line 099"]);
     }
 
     /// The converse, and the one that actually bit: a line may arrive across
-    /// several `write` calls. `write_fmt` splits on the format string's
-    /// fragments, so this is what `writeln!(w, "line {i}")` really does.
-    #[test]
-    fn a_line_split_across_writes_is_reassembled() {
-        let bus = LogBus::new(&["npcd"]);
-        let mut w = BusWriter::new(bus.clone());
-        w.write_all(b"2026-01-01T00:00:01.0Z  INFO npcd: line ")
+    /// several writes. `write_fmt` splits on the format string's fragments, so
+    /// this is what `writeln!(w, "line {i}")` really does.
+    #[tokio::test]
+    async fn a_line_split_across_writes_is_reassembled() {
+        let dir = TempDir::new().unwrap();
+        let (bus, mut file) = attached(&dir, &["npcd"]);
+        let (mut rx, _) = bus.replay(0);
+        file.write_all(b"2026-01-01T00:00:01.0Z  INFO npcd: line ")
             .unwrap();
-        w.write_all(b"41").unwrap();
+        file.write_all(b"41").unwrap();
         // Nothing yet — no newline has arrived, so the line is not finished.
-        assert!(bus.recent().is_empty());
-        w.write_all(b"\n").unwrap();
+        assert!(rx.try_recv().is_err());
+        file.write_all(b"\n").unwrap();
 
-        let r = bus.recent();
-        assert_eq!(r.len(), 1, "one line, not one per write call");
-        assert_eq!(r[0].msg, "line 41");
-        assert_eq!(r[0].target, "npcd");
-    }
-
-    /// A writer dropped mid-line still delivers what it had. Losing the last
-    /// thing a daemon said is losing the one line most likely to explain why it
-    /// stopped saying anything.
-    #[test]
-    fn an_unterminated_line_survives_the_writers_death() {
-        let bus = LogBus::new(&["npcd"]);
-        {
-            let mut w = BusWriter::new(bus.clone());
-            w.write_all(b"2026-01-01T00:00:01.0Z ERROR npcd: cut off mid-")
-                .unwrap();
-        }
-        let r = bus.recent();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].level, "ERROR");
-        assert_eq!(r[0].msg, "cut off mid-");
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.msg, "line 41");
+        assert_eq!(got.target, "npcd");
+        assert!(rx.try_recv().is_err(), "one line, not one per write call");
     }
 
     /// A line names its tenant by its target's crate, and the engine's lines
     /// name none; sequence numbers count up across all of them.
-    #[test]
-    fn lines_name_their_tenant_and_count_up() {
-        let bus = LogBus::new(&["zend", "npcd"]);
-        let mut w = BusWriter::new(bus.clone());
-        writeln!(w, "2026-01-01T00:00:01.0Z  INFO zend::session: a").unwrap();
-        writeln!(w, "2026-01-01T00:00:01.0Z  INFO npcd::api: b").unwrap();
+    #[tokio::test]
+    async fn lines_name_their_tenant_and_count_up() {
+        let dir = TempDir::new().unwrap();
+        let (bus, mut file) = attached(&dir, &["zend", "npcd"]);
+        let (mut rx, _) = bus.replay(0);
+        writeln!(file, "2026-01-01T00:00:01.0Z  INFO zend::session: a").unwrap();
+        writeln!(file, "2026-01-01T00:00:01.0Z  INFO npcd::api: b").unwrap();
         writeln!(
-            w,
+            file,
             "2026-01-01T00:00:01.0Z  INFO candle_conversation::scheduler: c"
         )
         .unwrap();
-        writeln!(w, "2026-01-01T00:00:01.0Z  INFO zend_tools::fs: d").unwrap();
-        writeln!(w, "2026-01-01T00:00:01.0Z  INFO zendish::x: e").unwrap();
-        let r = bus.recent();
-        let got: Vec<(&str, u64)> = r.iter().map(|l| (l.tenant.as_str(), l.seq)).collect();
+        writeln!(file, "2026-01-01T00:00:01.0Z  INFO zend_tools::fs: d").unwrap();
+        writeln!(file, "2026-01-01T00:00:01.0Z  INFO zendish::x: e").unwrap();
+        let mut got = Vec::new();
+        for _ in 0..5 {
+            let l = rx.recv().await.unwrap();
+            got.push((l.tenant, l.seq));
+        }
+        let got: Vec<(&str, u64)> = got.iter().map(|(t, s)| (t.as_str(), *s)).collect();
         assert_eq!(
             got,
             vec![("zend", 1), ("npcd", 2), ("", 3), ("zend", 4), ("", 5)]
         );
     }
 
-    /// One `write` may carry several lines, and each is its own event.
-    #[test]
-    fn a_multi_line_write_becomes_multiple_lines() {
-        let bus = LogBus::new(&["npcd"]);
-        let mut w = BusWriter::new(bus.clone());
-        w.write_all(b"2026-01-01T00:00:01.0Z  INFO a: one\n2026-01-01T00:00:02.0Z  WARN b: two\n")
-            .unwrap();
-        let r = bus.recent();
-        assert_eq!(r.len(), 2);
-        assert_eq!((r[0].level.as_str(), r[0].msg.as_str()), ("INFO", "one"));
-        assert_eq!((r[1].level.as_str(), r[1].msg.as_str()), ("WARN", "two"));
+    /// One write may carry several lines, and each is its own event.
+    #[tokio::test]
+    async fn a_multi_line_write_becomes_multiple_lines() {
+        let dir = TempDir::new().unwrap();
+        let (bus, mut file) = attached(&dir, &["npcd"]);
+        let (mut rx, _) = bus.replay(0);
+        file.write_all(
+            b"2026-01-01T00:00:01.0Z  INFO a: one\n2026-01-01T00:00:02.0Z  WARN b: two\n",
+        )
+        .unwrap();
+        let one = rx.recv().await.unwrap();
+        let two = rx.recv().await.unwrap();
+        assert_eq!((one.level.as_str(), one.msg.as_str()), ("INFO", "one"));
+        assert_eq!((two.level.as_str(), two.msg.as_str()), ("WARN", "two"));
     }
 
-    /// A subscriber taken before the write sees it; the ring keeps it too, so a
-    /// console that connects a moment later still gets it.
-    #[tokio::test]
-    async fn a_line_reaches_both_the_stream_and_the_replay() {
-        let bus = LogBus::new(&["npcd"]);
-        let mut rx = bus.subscribe();
-        let mut w = BusWriter::new(bus.clone());
-        writeln!(w, "2026-01-01T00:00:01.0Z  WARN npcd: careful").unwrap();
-
-        let got = rx.recv().await.unwrap();
-        assert_eq!(got.level, "WARN");
-        assert_eq!(got.msg, "careful");
-        assert_eq!(bus.recent().last().unwrap().msg, "careful");
+    /// A bus with no file has nothing to replay and no files to search: it
+    /// keeps no record of its own.
+    #[test]
+    fn an_unattached_bus_replays_nothing() {
+        let bus = LogBus::new(&["zend"]);
+        let (_rx, replay) = bus.replay(1 << 20);
+        assert!(replay.is_empty());
+        assert!(bus.files().is_empty());
     }
 }

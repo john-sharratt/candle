@@ -2,6 +2,7 @@
 //! turns, in the order they entered (`docs/zend_working_set.md` §4.3).
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 use crate::projection::{TimelineId, WorkingSetShare};
 
@@ -280,9 +281,10 @@ impl WorkingSet {
         beta: f32,
         min_momentum: f32,
         limits: Limits,
-        max_admits: usize,
+        max_admits: NonZeroUsize,
         candidate: &dyn Fn(TimelineId) -> Option<Candidate>,
     ) {
+        let max_admits = max_admits.get();
         let locked: Vec<TimelineId> = self.pinned();
         let keep = 1.0 - beta;
         for (timeline, m) in self.momentum.iter_mut() {
@@ -476,7 +478,7 @@ mod tests {
 
     fn observe(ws: &mut WorkingSet, fresh: &[(u64, f32)], budget: usize) {
         let fresh: HashMap<TimelineId, f32> = fresh.iter().map(|&(r, s)| (tl(r), s)).collect();
-        ws.observe(&fresh, 0.2, 100.0, limits(budget), usize::MAX, &info);
+        ws.observe(&fresh, 0.2, 100.0, limits(budget), NonZeroUsize::MAX, &info);
     }
 
     /// **Locks enter just before the insertion point**: the oldest lock stays
@@ -655,7 +657,7 @@ mod tests {
             max_file_tokens: 1_000,
         };
         let fresh: HashMap<TimelineId, f32> = HashMap::from([(tl(50), 900.0), (tl(1), 200.0)]);
-        ws.observe(&fresh, 0.2, 100.0, lim, usize::MAX, &info);
+        ws.observe(&fresh, 0.2, 100.0, lim, NonZeroUsize::MAX, &info);
         assert_eq!(order(&ws), vec![50, 1]);
         ws.lock(tl(51), cand(51), lim).unwrap();
         assert_eq!(
@@ -678,7 +680,7 @@ mod tests {
             0.2,
             100.0,
             limits(1_000),
-            usize::MAX,
+            NonZeroUsize::MAX,
             &gone,
         );
         assert_eq!(order(&ws), vec![2]);
@@ -695,14 +697,15 @@ mod tests {
             (tl(3), 700.0),
             (tl(4), 600.0),
         ]);
-        ws.observe(&fresh, 0.2, 100.0, limits(1_000), 2, &info);
+        let two = NonZeroUsize::new(2).unwrap();
+        ws.observe(&fresh, 0.2, 100.0, limits(1_000), two, &info);
         assert_eq!(order(&ws), vec![1, 2]);
         assert_eq!(
             ws.momentum_of(tl(4)),
             Some(600.0),
             "a waiting file keeps its momentum"
         );
-        ws.observe(&HashMap::new(), 0.2, 100.0, limits(1_000), 2, &info);
+        ws.observe(&HashMap::new(), 0.2, 100.0, limits(1_000), two, &info);
         assert_eq!(order(&ws), vec![1, 2, 3, 4]);
     }
 

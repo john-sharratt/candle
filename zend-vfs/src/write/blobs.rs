@@ -1,6 +1,7 @@
 //! Storing file contents as blobs, through the repository's own filters.
 
 use crate::error::GitError;
+use crate::library::objects;
 use crate::runner::utf8;
 use crate::types::{FileMode, Oid, RepoPath};
 use crate::Repo;
@@ -29,6 +30,15 @@ impl Repo {
         content: Vec<u8>,
         mode: FileMode,
     ) -> Result<Oid, GitError> {
+        // A repository read from the substrate has no working tree, and so no
+        // `.gitattributes` or `core.autocrlf` of its own: its blob is the
+        // content as given (`docs/substrate_git.md` §4.4).
+        if self.objects().is_some() {
+            let lib = self
+                .library()
+                .expect("a repository in the substrate is held in process");
+            return objects::hash_raw(&lib, &content);
+        }
         let filters = if mode == FileMode::Symlink {
             "--no-filters".to_string()
         } else {

@@ -81,7 +81,7 @@ fn policy() -> CommandPolicy {
 fn store(ws: &Workspace) -> Arc<VfsStore> {
     let main = BranchName::parse("main").unwrap();
     Arc::new(VfsStore::on_branch(
-        GitSource::open(&ws.repo("app").unwrap().dir).unwrap(),
+        GitSource::open(ws.repo("app").unwrap().folder().unwrap()).unwrap(),
         Rev::Branch(main),
     ))
 }
@@ -150,14 +150,19 @@ fn a_job_runs_records_what_it_wrote_and_pages_its_output() {
     let written = files.read("out.txt").unwrap().unwrap();
     assert_eq!(written.trim_end(), "made");
     assert!(
-        !ws.repo("app").unwrap().dir.join("out.txt").exists(),
+        !ws.repo("app")
+            .unwrap()
+            .folder()
+            .unwrap()
+            .join("out.txt")
+            .exists(),
         "the folder is put back"
     );
 
-    let (info, page) = boxes.output("app", &ran.job, 0).unwrap();
+    let (info, page) = boxes.output("app", &ran.job, 1).unwrap();
     assert_eq!(info.log, ran.log);
     assert_eq!(page.text.trim_end(), "first\nsecond");
-    assert_eq!((page.page, page.pages, page.total_lines), (0, 1, 2));
+    assert_eq!((page.page, page.pages, page.total_lines), (1, 1, 2));
 }
 
 /// **A refused command is the policy's answer**, and it never runs.

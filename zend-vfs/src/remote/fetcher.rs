@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use crate::error::GitError;
 use crate::remote::fetch::{FetchSpec, RefUpdate};
+use crate::remote::ls_remote::RemoteRefs;
 use crate::types::RemoteName;
 use crate::Repo;
 
-/// What makes a repository's fetches.
+/// What makes a repository's fetches, and reads what its remote holds.
 pub trait Fetch: Send + Sync {
     /// Fetch `spec` from `remote` into `repo`'s remote-tracking refs, as
     /// [`Repo::fetch_here`] does, and report what changed.
@@ -23,6 +24,10 @@ pub trait Fetch: Send + Sync {
         remote: &RemoteName,
         spec: &FetchSpec,
     ) -> Result<Vec<RefUpdate>, GitError>;
+
+    /// What `remote`'s refs point at now, fetching nothing, as
+    /// [`Repo::ls_remote_here`] reads them.
+    fn list(&self, repo: &Repo, remote: &RemoteName) -> Result<RemoteRefs, GitError>;
 }
 
 /// Fetching from this checkout's remote, over this machine's network and
@@ -37,6 +42,10 @@ impl Fetch for FetchHere {
         spec: &FetchSpec,
     ) -> Result<Vec<RefUpdate>, GitError> {
         repo.fetch_here(remote, spec)
+    }
+
+    fn list(&self, repo: &Repo, remote: &RemoteName) -> Result<RemoteRefs, GitError> {
+        repo.ls_remote_here(remote)
     }
 }
 

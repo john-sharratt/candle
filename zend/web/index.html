@@ -805,25 +805,23 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     }
     // The call's own page, shown even before a response has come back —
     // `file_read`'s `page` is a required argument, so it is always present.
-    // The wire value is zero-based (page 0 is the top of the file); shown
-    // as one-based here, matching file_list's `paging.page + 1` below —
-    // "page 0" reads as a computer's off-by-one to a human, not the top.
+    // Pages count from 1 on the wire, so it is shown as it stands.
     let detail = '';
-    if (name === 'file_read' && typeof args.page === 'number') detail = 'page ' + (args.page + 1);
+    if (name === 'file_read' && typeof args.page === 'number') detail = 'page ' + args.page;
     // file_read's opening fence, once the response lands:
-    // "```rust file=repo/path page=1/5 lines=1420", or "lines=0" alone for an
-    // empty file — richer than the call alone. The page is shown one-based, and
-    // the line range it covers is derived from the fixed 200-line page stride.
-    const fence = resp && /^\s*```\S* file=\S+(?: page=(\d+)\/(\d+))? lines=(\d+)\n/.exec(resp.raw);
+    // "```rust file=repo/path page=2 pages=5 lines=1420", or "lines=0" alone
+    // for an empty file — richer than the call alone. The line range a page
+    // covers is derived from the fixed 200-line page stride.
+    const fence = resp && /^\s*```\S* file=\S+(?: page=(\d+) pages=(\d+))? lines=(\d+)\n/.exec(resp.raw);
     if (fence && fence[1] === undefined) detail = 'empty';
     else if (fence) {
       const page = Number(fence[1]), total = Number(fence[3]);
-      const first = page * 200 + 1, last = Math.min((page + 1) * 200, total);
-      detail = 'page ' + (page + 1) + ' of ' + fence[2] + ', lines ' + first + '-' + last + ' of ' + total;
+      const first = (page - 1) * 200 + 1, last = Math.min(page * 200, total);
+      detail = 'page ' + page + ' of ' + fence[2] + ', lines ' + first + '-' + last + ' of ' + total;
     }
     else if (resp && resp.obj && resp.obj.paging && typeof resp.obj.paging.total === 'number') {
       const p = resp.obj.paging;
-      detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + (p.page + 1) + '/' + p.pages : '');
+      detail = p.total + (p.total === 1 ? ' file' : ' files') + (p.pages > 1 ? ' · page ' + p.page + '/' + p.pages : '');
     }
     return { repo, subject, detail };
   }
@@ -1270,7 +1268,29 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // message and its streaming reply: adopted, it wiped both from the view and
   // left the stream writing into the previous turn until the next hydrate.
   // `send` and `startStream` retire every snapshot in flight (`retireHydrates`).
-  function hydrateConv(id, first) {
+  // The exchange a turn that failed left on screen: the question and the
+  // bubble after it, error and all — what `hydrateConv` keeps when the stored
+  // conversation does not hold it.
+  function failedExchange(id) {
+    const conv = S.conversations.find((c) => c.id === id);
+    if (!conv) return null;
+    const h = conv.history;
+    let q = h.length - 1;
+    while (q >= 0 && h[q].role !== 'user') q--;
+    if (q < 0) return null;
+    return h.slice(q).map((m) => Object.assign({}, m, { streaming: false }));
+  }
+  // `stored`, with `failed` on the end when the stored conversation does not
+  // already end with its question: a turn the engine discarded was never
+  // stored, and its question and error are the only record of it.
+  function withFailedExchange(stored, failed) {
+    if (!failed || !failed.length) return stored;
+    let last = stored.length - 1;
+    while (last >= 0 && stored[last].role !== 'user') last--;
+    if (last >= 0 && stored[last].content === failed[0].content) return stored;
+    return stored.concat(failed);
+  }
+  function hydrateConv(id, first, failed) {
     if (first) { S.hydrating[id] = true; delete S.loadError[id]; }
     const gen = (S.hydrateGen[id] || 0) + 1;
     S.hydrateGen[id] = gen;
@@ -1278,7 +1298,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       delete S.hydrating[id];
       const cur = S.conversations.find((c) => c.id === id);
       if (S.hydrateGen[id] !== gen || (cur && cur.streaming)) { render(); return; }
-      const patch = { history: full.history || [] };
+      const patch = { history: withFailedExchange(full.history || [], failed) };
       if (full.title != null) patch.title = full.title;
       if (full.turn_count != null) patch.turn_count = full.turn_count;
       // Recovered upload events hydrate the files pane (and the inline
@@ -1489,6 +1509,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // Set with `failed` when the daemon had the turn: it is still running, or
     // finished and stored, so the page reconnects instead of stopping.
     let reattach = false;
+    // The turn itself failed (`onTurnError`), and the stream carried on to its
+    // end. A turn the engine discards — a fault it will not seal — is not in
+    // the stored conversation at all, so the reload after it must keep the
+    // question and the error rather than draw the conversation without them.
+    let turnFailed = false;
     // Every handler below answers for THIS stream only. A cancelled stream
     // still reports its end, and the adapter reports a finished one twice
     // (`[DONE]`, then the closed reader): each would otherwise clear the next
@@ -1546,6 +1571,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       // brings both back: this is not `failed`, and offers no retry — the
       // question is already stored.
       onTurnError: (msg) => {
+        turnFailed = true;
         patchStream(convId, (m) => { m.error = msg; m.status = ''; m.prefill = null; });
         addLog(API.mkLog('ERROR', 'zend::session', 'conv_id=' + convId + ' turn failed: ' + msg));
       },
@@ -1583,7 +1609,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
         // structure (real turns + full projection timeline). The daemon commits
         // every turn's events before sending Done, so the fetch sees them.
         S.loaded[convId] = true;
-        hydrateConv(convId);
+        hydrateConv(convId, false, turnFailed ? failedExchange(convId) : null);
         addLog(API.mkLog('INFO', 'zend::http', 'POST /v1/chat/completions conv_id=' + convId + ' 200 stream=done'));
       },
     });
@@ -3806,9 +3832,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // seeds synchronously, the live adapter fetches GET /v1/conversations. Either
   // way we pick an active conversation (prefer hydrated, else first) + hydrate.
   //
-  // The log stream is an admin's (`/ws/logs`), so the boot screen's log panel
-  // opens it only for one — see `loadAccess` — rather than retrying a refused
-  // socket for the life of the page.
+  // The log stream (`/ws/logs`) is any signed-in caller's, so the boot screen's
+  // log panel opens it only once one is known — see `loadAccess` — rather than
+  // retrying a refused socket for the life of the page.
 
   // `prefetched` is a list request already in flight (the first load asks for
   // it alongside the status); without one, or if it failed, ask now.
@@ -3868,7 +3894,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   const ADMIN_ROLES = { admin: 1, creator: 1 };
   function loadAccess() {
     Promise.resolve(API.getMe()).then((me) => {
-      if (me && ADMIN_ROLES[me.role] && !logUnsub) {
+      if (me && me.role !== 'unauthenticated' && !logUnsub) {
         logUnsub = API.subscribeLogs((line) => addLog(line));
       }
       if (me && ADMIN_ROLES[me.role] && !ACCESS.admin) {

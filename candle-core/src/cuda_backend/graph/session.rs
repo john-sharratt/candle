@@ -1,5 +1,6 @@
 //! One open capture on its own stream — the driver-level tests' recorder.
 
+use super::capture;
 use super::{CaptureStream, ComputeStream, GraphError, GraphExec};
 use crate::cuda_backend::WrapErr;
 use crate::Result;
@@ -18,18 +19,12 @@ pub struct CaptureSession<'s> {
 }
 
 impl<'s> CaptureSession<'s> {
-    /// Start recording on `cap`, in `ThreadLocal` mode.
+    /// Start recording on `cap`, in `ThreadLocal` mode, counted into the record
+    /// gate like every capture.
     pub fn begin(cap: &'s mut CaptureStream) -> Result<Self> {
-        cap.stream.context().bind_to_thread().w()?;
-        // SAFETY: a stream this value owns, not already capturing — a session
-        // holds it by `&mut`, so no second one can be open on it.
-        unsafe {
-            result::stream::begin_capture(
-                cap.stream.cu_stream(),
-                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )
-            .w()?;
-        }
+        // SAFETY: a created stream this value owns, not already capturing — a
+        // session holds it by `&mut`, so no second one can be open on it.
+        unsafe { capture::begin(&cap.stream)? };
         Ok(Self { cap, open: true })
     }
 
@@ -84,7 +79,7 @@ impl<'s> CaptureSession<'s> {
     fn end(&self) -> Result<sys::CUgraph> {
         self.cap.stream.context().bind_to_thread().w()?;
         // SAFETY: this session began the capture on this stream.
-        unsafe { result::stream::end_capture(self.cap.stream.cu_stream()).w() }
+        unsafe { capture::end(&self.cap.stream) }
     }
 }
 

@@ -13,12 +13,12 @@ use std::sync::Arc;
 
 use tokio::runtime::Handle;
 use zend_vfs::{
-    Fetch, FetchSpec, GitError, Oid, RefName, RefOp, RefTransaction, RefUpdate, RemoteName, Repo,
-    ORIGIN,
+    Fetch, FetchSpec, GitError, Oid, RefName, RefOp, RefTransaction, RefUpdate, RemoteName,
+    RemoteRefs, Repo, MAX_PACK_BYTES, ORIGIN,
 };
 
 use crate::client::Agents;
-use crate::wire::FetchJob;
+use crate::wire::{FetchJob, ListJob};
 
 /// One repository's fetches, made by an agent.
 pub struct AgentFetch {
@@ -88,6 +88,7 @@ impl Fetch for AgentFetch {
                 },
                 have: have.clone(),
                 max_commits: Some(SLICE),
+                max_bytes: Some(SLICE_BYTES),
             };
             let agents = self.agents.clone();
             let (tx, rx) = mpsc::channel();
@@ -129,6 +130,20 @@ impl Fetch for AgentFetch {
             repo.update_refs(&txn)?;
         }
     }
+
+    fn list(&self, _repo: &Repo, remote: &RemoteName) -> Result<RemoteRefs, GitError> {
+        let agents = self.agents.clone();
+        let job = ListJob {
+            repo: self.repo.clone(),
+        };
+        let (tx, rx) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let _ = tx.send(agents.list(job).await);
+        });
+        rx.recv()
+            .map_err(|_| failed(remote, "the listing's job was dropped".into()))?
+            .map_err(|e| failed(remote, e.to_string()))
+    }
 }
 
 /// Where a sliced fetch keeps the commits its slices took, one ref per commit,
@@ -154,3 +169,9 @@ fn drop_slices(repo: &Repo, slices: &[(RefName, Oid)]) {
 /// The most commits one answer carries. A first fetch of candle's history —
 /// 6,500 commits, 1.3 GB packed — comes in about 26 answers of this.
 const SLICE: u32 = 256;
+
+/// The largest bundle one answer carries. A repository read from the
+/// substrate keeps each answer as one pack, and a pack is at most
+/// [`MAX_PACK_BYTES`]; half that leaves room for the bases a thin pack is
+/// completed with when it is indexed.
+const SLICE_BYTES: u64 = (MAX_PACK_BYTES / 2) as u64;

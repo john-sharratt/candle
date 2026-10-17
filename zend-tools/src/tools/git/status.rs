@@ -30,8 +30,10 @@ pub struct StatusRequest {
     /// The repository to inspect. Required.
     #[validate(length(min = 1))]
     pub repo: String,
-    /// Zero-based page of changed paths, 80 a page. Required — pass 0 to
-    /// start. A page past the end clamps to the last one.
+    /// Page of changed paths, from 1, 80 a page. Required — pass 1 to start.
+    /// A page past the end clamps to the last one.
+    #[validate(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub page: u32,
 }
 
@@ -94,7 +96,7 @@ impl Tool for GitStatus {
          behind origin's copy the local branch is, with totals so \"how many\" needs no \
          counting. Use for \"what have I changed\", \"is this clean\", \"what branch am I \
          on\", \"am I up to date\", \"what is still in conflict\", or to see what a commit \
-         of your changes would hold. `page` is required — pass 0 to start, and \
+         of your changes would hold. `page` is required and counts from 1 — pass 1 to start, and \
          `paging.next_page` for the next. Reads only.";
 
     type Request = StatusRequest;

@@ -21,6 +21,7 @@ mod page_io;
 mod pages;
 mod probe_rows;
 mod scan;
+pub mod scan_split;
 
 pub use pages::{page_u64, pages_for, transpose_to_pages, PAGE_TOKENS};
 pub use scan::{PagedSegment, PagedWindow};

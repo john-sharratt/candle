@@ -405,7 +405,7 @@ mod tests {
 
     /// [`daemon`] for any world, with the body standing at `at`.
     fn daemon_at(world_id: &str, at: Where, npc_id: u64) -> (Arc<Runtime>, Arc<Tokens>) {
-        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
+        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
         rt.host(world_id, Path::new(ROOMS))
             .expect("the world loads");
         rt.hold_world(world_id, true);

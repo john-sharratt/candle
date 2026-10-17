@@ -19,6 +19,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use super::ids::{TimelineId, TurnKey};
 
@@ -26,7 +27,13 @@ use super::ids::{TimelineId, TurnKey};
 /// `max_swaps`. Two keeps a cadence reprojection's rebuild small while a topic
 /// that moved still lands within a couple of reprojections — a few seconds of
 /// decode.
-pub const DEFAULT_MAX_SWAPS: usize = 2;
+///
+/// **A cap is never zero, by type.** A cap of zero admits nothing, ever: every
+/// newcomer is held back on every reprojection, the selection freezes on what
+/// the turn opened with, and a conversation the question needs never arrives.
+/// The unit is a whole conversation, so the smallest cap still brings one in
+/// whole.
+pub const DEFAULT_MAX_SWAPS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 /// What [`cap_new_members`] changed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -50,8 +57,9 @@ pub fn cap_new_members(
     selected: &mut [bool],
     prior: &[bool],
     score: &[f32],
-    cap: usize,
+    cap: NonZeroUsize,
 ) -> SwapCap {
+    let cap = cap.get();
     let mut was: BTreeSet<TimelineId> = BTreeSet::new();
     let mut now: BTreeMap<TimelineId, f32> = BTreeMap::new();
     let mut best: BTreeMap<TimelineId, f32> = BTreeMap::new();
@@ -108,9 +116,14 @@ fn best_first(score: &BTreeMap<TimelineId, f32>, a: &TimelineId, b: &TimelineId)
 mod tests {
     use super::{cap_new_members, SwapCap};
     use crate::projection::{TimelineId, TurnIndex, TurnKey};
+    use std::num::NonZeroUsize;
 
     fn key(tl: u64, idx: u32) -> TurnKey {
         TurnKey::new(TimelineId::from_raw(tl).unwrap(), TurnIndex(idx))
+    }
+
+    fn cap(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
     }
 
     /// Files 1 and 2 were selected; the fresh pick drops both and brings in
@@ -132,9 +145,9 @@ mod tests {
         let prior = [true, true, false, false, false, false, false, false];
         let score = [300.0, 400.0, 500.0, 500.0, 450.0, 450.0, 900.0, 900.0];
         let mut selected = [false, false, true, true, true, true, true, true];
-        let cap = cap_new_members(&keys, &mut selected, &prior, &score, 1);
+        let capped = cap_new_members(&keys, &mut selected, &prior, &score, cap(1));
         assert_eq!(
-            cap,
+            capped,
             SwapCap {
                 held_back: 2,
                 kept: 2
@@ -154,9 +167,9 @@ mod tests {
         let prior = [true, false, false, false, false];
         let score = [100.0, 100.0, 700.0, 600.0, 500.0];
         let mut selected = [false, false, true, true, true];
-        let cap = cap_new_members(&keys, &mut selected, &prior, &score, 1);
+        let capped = cap_new_members(&keys, &mut selected, &prior, &score, cap(1));
         assert_eq!(
-            cap,
+            capped,
             SwapCap {
                 held_back: 2,
                 kept: 1
@@ -173,15 +186,36 @@ mod tests {
         let score = [1.0, 2.0, 3.0];
 
         let mut within = [false, true, true];
-        let none = cap_new_members(&keys, &mut within, &[true, false, false], &score, 2);
+        let none = cap_new_members(&keys, &mut within, &[true, false, false], &score, cap(2));
         assert_eq!((none, within), (SwapCap::default(), [false, true, true]));
 
         let mut opening = [true, true, true];
-        let none = cap_new_members(&keys, &mut opening, &[false; 3], &score, 0);
+        let none = cap_new_members(&keys, &mut opening, &[false; 3], &score, cap(1));
         assert_eq!((none, opening), (SwapCap::default(), [true, true, true]));
 
         let mut same = [true, true, false];
-        let none = cap_new_members(&keys, &mut same, &[true, true, false], &score, 0);
+        let none = cap_new_members(&keys, &mut same, &[true, true, false], &score, cap(1));
         assert_eq!((none, same), (SwapCap::default(), [true, true, false]));
+    }
+
+    /// **The smallest cap still brings one conversation in, whole.** Every
+    /// newcomer outscored by another is held back, and the strongest arrives
+    /// with all of its turns.
+    #[test]
+    fn the_smallest_cap_admits_one_whole_conversation() {
+        let keys = [
+            key(1, 0),
+            key(3, 0),
+            key(3, 1),
+            key(3, 2),
+            key(4, 0),
+            key(4, 1),
+        ];
+        let prior = [true, false, false, false, false, false];
+        let score = [100.0, 800.0, 800.0, 800.0, 600.0, 600.0];
+        let mut selected = [false, true, true, true, true, true];
+        let capped = cap_new_members(&keys, &mut selected, &prior, &score, cap(1));
+        assert_eq!(capped.held_back, 1, "one newcomer waits");
+        assert_eq!(selected, [true, true, true, true, false, false]);
     }
 }

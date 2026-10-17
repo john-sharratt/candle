@@ -272,17 +272,17 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 /// inside it separately, the two arguments the call it asks for takes.
 pub(crate) fn opening_prompt(key: &str, lines: usize) -> String {
     let (repo, path) = split(key);
+    // Pages count from 1, as `file_read`'s do: the last is `pages`.
     let pages = lines.div_ceil(PAGE_LINES as usize).max(1);
-    let last = pages - 1;
     // A reply holds at most `MAX_TOOL_CALLS_PER_TURN` calls — the tool grammar
     // ends the turn after that many — so a longer file is asked for in replies
     // of that size rather than told to fit in one.
     let batching = if pages <= MAX_TOOL_CALLS_PER_TURN {
-        format!("issue all {pages} in the SAME reply, one per page from page 0 to page {last}")
+        format!("issue all {pages} in the SAME reply, one per page from page 1 to page {pages}")
     } else {
         format!(
             "issue them {MAX_TOOL_CALLS_PER_TURN} to a reply — the most one reply can \
-             hold — in page order from page 0 to page {last}, putting as many as fit \
+             hold — in page order from page 1 to page {pages}, putting as many as fit \
              in the SAME reply each time"
         )
     };
@@ -1156,7 +1156,7 @@ mod tests {
         };
         assert_eq!(
             job.key(),
-            "candle/src/lib.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+            "v2:candle/src/lib.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 
@@ -1192,7 +1192,7 @@ mod tests {
     /// budget cut it off mid-word, with no `file_read` call emitted, no coupling,
     /// no second turn and no summary. The arithmetic belongs in the prompt.
     ///
-    /// Pages are 200 lines and 0-based, so the boundaries are pinned as text.
+    /// Pages are 200 lines and count from 1, so the boundaries are pinned as text.
     #[test]
     fn opening_prompt_states_the_length_and_the_call_count() {
         assert_eq!(
@@ -1205,24 +1205,24 @@ mod tests {
             one.contains(
                 "The file is 200 lines long and each call returns one 200-line page, \
                  so it takes exactly 1 file_read call(s): issue all 1 in the SAME \
-                 reply, one per page from page 0 to page 0,"
+                 reply, one per page from page 1 to page 1,"
             ),
             "{one:?}",
         );
-        // One line over: two calls, pages 0 and 1.
+        // One line over: two calls, pages 1 and 2.
         let two = opening_prompt("candle/src/mid.rs", 201);
         assert!(
             two.contains(
                 "The file is 201 lines long and each call returns one 200-line page, \
                  so it takes exactly 2 file_read call(s): issue all 2 in the SAME \
-                 reply, one per page from page 0 to page 1,"
+                 reply, one per page from page 1 to page 2,"
             ),
             "{two:?}",
         );
         // An empty file still asks for one call rather than zero.
         let empty = opening_prompt("candle/src/empty.rs", 0);
         assert!(
-            empty.contains("exactly 1 file_read call(s)") && empty.contains("page 0 to page 0,"),
+            empty.contains("exactly 1 file_read call(s)") && empty.contains("page 1 to page 1,"),
             "never zero calls: {empty:?}",
         );
     }
@@ -1288,7 +1288,7 @@ mod tests {
         assert!(!long.contains("issue all 10"), "{long:?}");
         let short = opening_prompt("candle/src/small.rs", 300);
         assert!(
-            short.contains("issue all 2 in the SAME reply, one per page from page 0 to page 1"),
+            short.contains("issue all 2 in the SAME reply, one per page from page 1 to page 2"),
             "{short:?}"
         );
     }

@@ -128,7 +128,13 @@ fn a_mind_with_no_folder_writes_in_the_authored_folder() {
     save(&author, "world", WORLDS, "ardh", &json!({"name": "Ardh"})).unwrap();
     assert!(dir.path().join("worlds/ardh.yaml").is_file());
 
-    let pending = crate::mind::Mind::pending(dir.path());
+    let sub = dir.path().join("substrate");
+    std::fs::create_dir(&sub).unwrap();
+    let mut substrate = Substrate::new();
+    let persistence = SubstratePersistence::open_in_with_substrate(&sub, &mut substrate).unwrap();
+    let shared = SharedSubstrate::new(substrate, persistence);
+    let db = substrate_git::open_db(Arc::new(shared), "mind").unwrap();
+    let pending = crate::mind::Mind::pending(db);
     let author = Author::open(&pending, dir.path(), None, "ab");
     let refused = author.commit(&[("worlds/hess.yaml".into(), Some("name: Hess\n".into()))]);
     assert!(refused.is_err());

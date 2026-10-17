@@ -360,7 +360,7 @@ pub fn into_arena(src: &Tensor, device: &Device) -> candle::Result<Tensor> {
     let ptr = match wave_alloc(ticket, bytes, 256) {
         WaveCarve::Carved(ptr) => ptr,
         WaveCarve::Closed => return Ok(src.clone()),
-        WaveCarve::Exhausted => return Err(exhausted(ticket, bytes)),
+        WaveCarve::Exhausted(span) => return Err(exhausted(ticket, bytes, span)),
     };
     // SAFETY: the range was just carved from the open generation, which outlives
     // this tensor — the caller drops it before the generation rewinds — and

@@ -1,7 +1,7 @@
 //! Writing a repository's new objects, then the refs that name them
-//! (`docs/substrate_git.md` §6.1).
+//! (`docs/substrate_git.md` §4.4, §6).
 //!
-//! Objects first: every object a ref reaches that the log's refs do not is
+//! Objects first: every object a ref reaches that the log does not hold is
 //! packed and written before the ref is, so no member ever holds a ref whose
 //! commit it cannot read — and a ref that replicates ahead of its packs waits
 //! for them in [`crate::Store::sync`].
@@ -9,7 +9,7 @@
 use anyhow::Context;
 use zend_vfs::{object_count, pack_checksum, Oid, RefName, Repo, Rev};
 
-use crate::records::{Log, PackEntry, Records, RefEntry};
+use crate::records::{Log, Records, RefEntry};
 use crate::MAX_PACK;
 
 /// What [`publish`] wrote.
@@ -65,27 +65,39 @@ pub fn publish(
         return Ok(published);
     }
 
-    let tips: Vec<Oid> = moving.iter().filter_map(|(_, oid)| oid.clone()).collect();
-    let mut known = Vec::new();
     let mut needs: Vec<String> = Vec::new();
-    for entry in held.values() {
-        let Some(oid) = entry.oid.as_deref() else {
-            continue;
-        };
-        known.push(Oid::parse(oid)?);
+    match source.objects() {
+        // A repository read from the substrate: what it made is packed and
+        // kept, and every pack kept since the last publish — a fetch's
+        // bundles among them — is what these refs need
+        // (`docs/substrate_git.md` §4.4).
+        Some(db) => {
+            db.flush().with_context(|| format!("packing {repo}"))?;
+            needs = db.take_unannounced();
+            published.packs = needs.len();
+        }
+        // A checkout adopted into the log: what the tips reach beyond the
+        // log's branches, packed by git with its index. Each pack is written
+        // and let go before the next is read: a first publish of a whole
+        // history is never in memory at once.
+        None => {
+            let tips: Vec<Oid> = moving.iter().filter_map(|(_, oid)| oid.clone()).collect();
+            let mut known = Vec::new();
+            for entry in held.values() {
+                if let Some(oid) = entry.oid.as_deref() {
+                    known.push(Oid::parse(oid)?);
+                }
+            }
+            published.packs = source
+                .pack_objects(&tips, &known, MAX_PACK, |pack, index| {
+                    let checksum = pack_checksum(&pack).context("a pack with no trailer")?;
+                    let objects = object_count(&pack);
+                    needs.push(log.put_pack(pack, index, &checksum, objects)?);
+                    Ok::<(), anyhow::Error>(())
+                })
+                .with_context(|| format!("packing {repo}"))?;
+        }
     }
-    // Each pack is written and let go before the next is read: a first
-    // publish of a whole history is never in memory at once.
-    published.packs = source
-        .pack_objects(&tips, &known, MAX_PACK, |pack| {
-            let entry = PackEntry {
-                checksum: pack_checksum(&pack).context("a pack with no trailer")?,
-                objects: object_count(&pack),
-            };
-            needs.push(log.put_pack(pack, &entry)?);
-            Ok::<(), anyhow::Error>(())
-        })
-        .with_context(|| format!("packing {repo}"))?;
 
     // Packing took a while, and the log is last writer wins: a ref another
     // member moved meanwhile is replaced only by a descendant of where it

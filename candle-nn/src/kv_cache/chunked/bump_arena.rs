@@ -52,7 +52,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{current, ThreadId};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
-use candle::cuda_backend::wave_provenance::{WaveCarve, WaveTicket};
+use candle::cuda_backend::wave_provenance::{SpanState, WaveCarve, WaveTicket};
 use candle::Result;
 
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
@@ -1119,7 +1119,7 @@ fn stage_in(
     let ptr = match wave_alloc(ticket, bytes, 256) {
         WaveCarve::Carved(ptr) => ptr,
         WaveCarve::Closed => return Ok(x.clone()),
-        WaveCarve::Exhausted => return Err(exhausted(ticket, bytes)),
+        WaveCarve::Exhausted(span) => return Err(exhausted(ticket, bytes, span)),
     };
     let dev = candle::Device::Cuda(cuda.clone());
     // SAFETY: the range was carved from the generation open above, which the
@@ -1995,7 +1995,16 @@ fn stream_of(domain: &WaveDomain) -> Arc<CudaStream> {
 /// is [`WaveCarve::Exhausted`], which the caller turns into an error — a buffer
 /// the wave plan did not price, named where it was asked for.
 fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCarve {
-    let carve = |c: Option<u64>| c.map_or(WaveCarve::Exhausted, WaveCarve::Carved);
+    // A refusal says where the span stood, read under the same guard as the
+    // carve it refused.
+    let carve = |guard: &mut Inner, name: &'static str| match bump_locked(guard, name, bytes, align)
+    {
+        Some(ptr) => WaveCarve::Carved(ptr),
+        None => WaveCarve::Exhausted(SpanState {
+            cursor: guard.cursor,
+            capacity: guard.capacity,
+        }),
+    };
     // A guest ticket names no phase, so it is answered from the guest registry
     // rather than the wave domain's three arenas. Checked first because it is
     // the cheaper lookup and because `arenas.get(3)` would otherwise decide it
@@ -2034,7 +2043,7 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCar
             if !epoch_ok || guard.live == 0 {
                 return WaveCarve::Closed;
             }
-            return carve(bump_locked(&mut guard, name, bytes, align));
+            return carve(&mut guard, name);
         }
     }
     let Ok(map) = wave_domains().lock() else {
@@ -2062,7 +2071,7 @@ fn resolve_wave_alloc(ticket: WaveTicket, bytes: usize, align: usize) -> WaveCar
     if guard.epoch != ticket.epoch || guard.live == 0 {
         return WaveCarve::Closed;
     }
-    carve(bump_locked(&mut guard, name, bytes, align))
+    carve(&mut guard, name)
 }
 
 /// Whether any wave generation is open on `ordinal`.

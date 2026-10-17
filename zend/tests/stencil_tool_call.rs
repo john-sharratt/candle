@@ -555,7 +555,10 @@ fn minimal_value(p: &Param) -> String {
     }
     match p.ty {
         ParamType::String => "\"\"".into(),
-        ParamType::Integer | ParamType::Number => "0".into(),
+        // The smallest value the schema admits: a one-based page has no 0.
+        ParamType::Integer | ParamType::Number => {
+            format!("{}", p.minimum.unwrap_or(0.0).max(0.0) as i64)
+        }
         ParamType::Boolean => "false".into(),
         // A guided array holds at least its `minItems` elements, which the
         // tree separates as `, `.
@@ -804,7 +807,7 @@ fn hallucinated_parameter_is_masked() {
 #[test]
 fn file_read_always_drives_repo_path_and_page() {
     let (tree, vocab) = build_tree();
-    for page in [0, 3] {
+    for page in [1, 3, 10] {
         let target = format!(
             "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"repo\": \"candle\", \
              \"path\": \"a.rs\", \"page\": {page}}}}}\n</tool_call><|im_end|>"
@@ -819,13 +822,28 @@ fn file_read_always_drives_repo_path_and_page() {
     }
 }
 
+/// **Page 0 cannot be decoded.** Pages count from 1 and the catalog's schema
+/// says `minimum: 1`, so the grammar never offers the `0` that would begin it —
+/// the model cannot write a zero-based page however it was taught.
+#[test]
+fn file_read_cannot_be_driven_at_page_zero() {
+    let (tree, vocab) = build_tree();
+    let target = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"repo\": \"candle\", \
+                  \"path\": \"a.rs\", \"page\": 0}}\n</tool_call><|im_end|>";
+    let err = drive(tree, target, &vocab).unwrap_err();
+    assert!(
+        matches!(err, DriveErr::MaskRejected { byte: b'0', .. }),
+        "got {err:?}"
+    );
+}
+
 /// **A repository the workspace does not list cannot be decoded** — the enum
 /// is a choice between the listed names, so `app` is masked at its first byte.
 #[test]
 fn a_repo_outside_the_workspace_is_masked() {
     let (tree, vocab) = build_tree();
     let target = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"repo\": \"app\", \
-                  \"path\": \"a.rs\", \"page\": 0}}\n</tool_call>";
+                  \"path\": \"a.rs\", \"page\": 1}}\n</tool_call>";
     let err = drive(tree, target, &vocab).unwrap_err();
     assert!(
         matches!(err, DriveErr::MaskRejected { byte: b'a', .. }),
@@ -838,7 +856,7 @@ fn a_repo_outside_the_workspace_is_masked() {
 fn file_read_rejects_a_call_missing_repo() {
     let (tree, vocab) = build_tree();
     let target = "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"a.rs\", \
-                  \"page\": 0}}\n</tool_call>";
+                  \"page\": 1}}\n</tool_call>";
     let err = drive(tree, target, &vocab).unwrap_err();
     assert!(
         matches!(
@@ -1130,8 +1148,10 @@ fn escaped_token_bails_and_terminates() {
 #[test]
 fn an_empty_string_argument_drives() {
     let (tree, vocab) = build_tree();
+    // Required properties first, as the catalog compiles them: `page`, then
+    // the optional `path`.
     let target = "<tool_call>\n{\"name\": \"file_list\", \"arguments\": {\"repo\": \"candle\", \
-                  \"path\": \"\"}}\n</tool_call><|im_end|>";
+                  \"page\": 1, \"path\": \"\"}}\n</tool_call><|im_end|>";
     let out = drive(Arc::clone(&tree), target, &vocab)
         .unwrap_or_else(|e| panic!("an empty path must drive, got {e:?}"));
     let parsed: serde_json::Value = serde_json::from_str(json_body(&out)).unwrap();
@@ -1175,7 +1195,7 @@ fn each_call_level_adds_one_catalog_of_grammar() {
 fn read_call(path: &str) -> String {
     format!(
         "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"repo\": \"candle\", \
-         \"path\": \"{path}\", \"page\": 0}}}}\n</tool_call>"
+         \"path\": \"{path}\", \"page\": 1}}}}\n</tool_call>"
     )
 }
 
@@ -1495,16 +1515,18 @@ fn a_repo_enum_then_a_path_drives_the_live_grammar() {
     let tree = Arc::new(compile(&spec, &vocab).unwrap());
     let mut failures = Vec::new();
     for call in [
-        r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "path": "crates", "page": 0}}"#,
-        r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "page": 0}}"#,
-        r#"{"name": "file_list", "arguments": {"repo": "mind", "path": "personalities", "page": 1}}"#,
+        // Required properties first, as the catalog compiles them: `page`,
+        // then the optional `path` or `prefix`.
+        r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "page": 1, "path": "crates"}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "battle-cities", "page": 1}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "mind", "page": 1, "path": "personalities"}}"#,
         // `*` before the required page: `file_list` names one repository, so
         // the all-repositories value is a search's.
-        r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "*", "page": 0}}"#,
-        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "*", "page": 0}}"#,
-        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "candle", "prefix": "zend/", "page": 0}}"#,
-        r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "battle-cities", "page": 0}}"#,
-        r#"{"name": "file_read", "arguments": {"repo": "battle-cities", "path": "crates/client/src/main.rs", "page": 0}}"#,
+        r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "*", "page": 1}}"#,
+        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "*", "page": 1}}"#,
+        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "candle", "page": 1, "prefix": "zend/"}}"#,
+        r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "battle-cities", "page": 1}}"#,
+        r#"{"name": "file_read", "arguments": {"repo": "battle-cities", "path": "crates/client/src/main.rs", "page": 1}}"#,
     ] {
         let target = format!("{MARKER}\n{call}\n</tool_call>{TURN_CLOSE}");
         if let Err(e) = drive_natural_strict(Arc::clone(&tree), &tok, &target) {
@@ -1537,12 +1559,15 @@ fn live_tree() -> (Arc<StencilTree>, tokenizers::Tokenizer) {
 fn natural_calls_drive_the_live_grammar() {
     let (tree, tok) = live_tree();
     let calls = [
-        r#"{"name": "file_list", "arguments": {"repo": "candle", "path": "", "page": 0}}"#,
-        r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "*", "page": 0}}"#,
-        r#"{"name": "file_list", "arguments": {"repo": "candle", "path": "zend/src", "page": 0}}"#,
-        r#"{"name": "file_read", "arguments": {"repo": "candle", "path": "src/main.rs", "page": 0}}"#,
-        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "*", "prefix": "zend/", "page": 0}}"#,
-        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "candle", "prefix": "zend/", "page": 0}}"#,
+        // Required properties first, as the catalog compiles them: `page`,
+        // then the optional `path` or `prefix`. `file_read`'s `path` is
+        // required, so it keeps its place before `page`.
+        r#"{"name": "file_list", "arguments": {"repo": "candle", "page": 1, "path": ""}}"#,
+        r#"{"name": "file_search", "arguments": {"query": "main.rs", "repo": "*", "page": 1}}"#,
+        r#"{"name": "file_list", "arguments": {"repo": "candle", "page": 1, "path": "zend/src"}}"#,
+        r#"{"name": "file_read", "arguments": {"repo": "candle", "path": "src/main.rs", "page": 1}}"#,
+        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "*", "page": 1, "prefix": "zend/"}}"#,
+        r#"{"name": "file_grep", "arguments": {"pattern": "fn main", "repo": "candle", "page": 1, "prefix": "zend/"}}"#,
         r#"{"name": "calculator", "arguments": {"expression": "2 + 2"}}"#,
     ];
     let mut failures = Vec::new();
@@ -1558,7 +1583,7 @@ fn natural_calls_drive_the_live_grammar() {
         .map(|p| {
             format!(
                 "{MARKER}\n{{\"name\": \"file_read\", \"arguments\": {{\"repo\": \"candle\", \
-                 \"path\": \"{p}\", \"page\": 0}}}}\n</tool_call>"
+                 \"path\": \"{p}\", \"page\": 1}}}}\n</tool_call>"
             )
         })
         .collect::<Vec<_>>()
@@ -1632,7 +1657,7 @@ fn the_natural_drive_rejects_both_live_failures() {
         .map(|p| {
             format!(
                 "{MARKER}\n{{\"name\": \"file_read\", \"arguments\": {{\"repo\": \"candle\", \
-                 \"path\": \"{p}\", \"page\": 0}}}}\n</tool_call>"
+                 \"path\": \"{p}\", \"page\": 1}}}}\n</tool_call>"
             )
         })
         .collect::<Vec<_>>()

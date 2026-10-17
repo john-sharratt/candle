@@ -40,6 +40,11 @@ impl SubstratePersistence {
         Ok((&blob.sha256 == sha256).then_some(blob.bytes))
     }
 
+    /// Whether a blob of `sha256` is held, without reading it.
+    pub fn has_blob(&self, sha256: &[u8; 32]) -> bool {
+        self.blob_index.get(BlobKey::of(sha256)).is_some()
+    }
+
     /// Where every blob is.
     pub fn blob_index(&self) -> &BlobIndex {
         &self.blob_index

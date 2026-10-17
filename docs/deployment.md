@@ -53,8 +53,8 @@ repository is readable by the model.
 - **The cluster.** motherd's zend and npcd tenants join the gateway's cluster
   (`docs/replicated_substrate.md`): the gateway routes each name to a joined, ready
   member of its app over the member's socket, and to the route's `upstream` only while
-  the app has no member (dumb mode). While that upstream is down, a member still loading
-  stands in for it, so the name shows the member's loading page rather than an outage.
+  the app has no member (dumb mode). While every admitted member is still loading, the
+  gateway answers with its own reconnecting page, which the consoles retry.
   npcd on `.6` was stopped on 2026-10-12: `bot.tokera.com` is motherd's npcd alone until
   `.6` is rebuilt onto this framework and joins.
 - **cf-ddns** keeps the Cloudflare A records at the public IP, so a router reboot that
@@ -189,7 +189,9 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
   `upstream:`. The gateway serves a name from the app's ready members while it has any,
   and from the upstream while it has none.
 - **The status page** is `/gateway` on the gateway, its data `/gateway/status.json`
-  (both an admin's): each app's mode,
+  (both an admin's; the data also answers `Authorization: Bearer <key>` with the key
+  `web --new-status-key web/secrets/status.key` writes, named as the `cluster:` block's
+  `status_key_file`): each app's mode,
   members, lag and claims, the build floor, and the gateway's peers.
 
 ### keep
@@ -198,19 +200,27 @@ The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` blo
 `motherd` are the files `keep/stable/web.exe` and `keep/stable/motherd.exe`. On startup
 `keep` runs those files with the arguments in `keep/keep.yaml`. A switch is one POST to
 `127.0.0.1:8092` whose body is the path of a staged executable (`keep/stage/`). `keep`
-starts that trial and reads its stderr until the line `INFO serving` or the 10 minute
-limit. Those trial lines are logged. A process started from the stable path — at
-startup, after the proof line, and on rollback — has stdout and stderr detached:
-`keep` holds no handles on them, does not read or write them, and does not append
-them to the supervisor log. The process is kept only when it prints `INFO serving`,
-which `web` and `motherd` print once they are serving and not during boot. No such line
-within 10 minutes, or the process dying, stops the trial and starts the stable file
-again. A kept trial is renamed onto the stable path, or copied there when a running
-executable cannot be renamed, and that child is then stopped and started again from
-the stable path, detached. Windows firewall allows a program by the path it was started from,
-and a rename does not change that path, so the process left running has to be
-`keep/stable/web.exe` or `keep/stable/motherd.exe`. The restart is the stable file
-with the same arguments, not another trial. It does not certify, roll out, or store binary bytes, and
+stops the running process, moves the stable file aside (`<name>.exe.prev`), copies the
+staged file onto the stable path and starts it there. Windows firewall allows a
+program by the path it was started from, and a self-heal relaunch starts the path it
+is running from, so the trial runs from `keep/stable/web.exe` or
+`keep/stable/motherd.exe` from its first moment; the staged file is only copied and
+stays free for the next deploy. Its stderr goes to `keep/state/<name>.trial.log`,
+read until the line `INFO serving` or the 10 minute limit; those lines are logged. A
+file, not a pipe, so the process can go on writing to it after the proof, and after
+`keep` itself restarts, with nothing draining it. `web` prints the line once it is
+serving; `motherd` once every tenant has *proven* the build (`TenantStatus::proven`):
+zend once section calibration is behind it — the model loaded, the substrate opened,
+real forwards run — not once it is ready. What follows calibration, priming above all,
+is as long as there is to read: after the ingest keys change it re-reads every
+repository's anchors, an hour that tests nothing the forwards before it did not, and a
+trial that waited for it ran out of time and rolled a working build back. **The line makes the trial the service: the
+set-aside file is deleted and the process goes on running — a promotion does not
+restart it.** No such line within 10 minutes, or the process dying, stops the trial,
+puts the set-aside file back and starts it. A process `keep` starts at startup or on
+rollback has stdout and stderr detached. A set-aside file exists only while a trial
+is unproven, so a `keep` that starts and finds one stops whatever runs and puts it
+back. It does not certify, roll out, or store binary bytes, and
 it does no canary math. It also joins the gateway as the app `keep`, so `/gateway` lists
 it beside zend and npcd; that socket declares no routes and takes no rollout. Its state
 is `keep/state/`.
@@ -221,10 +231,15 @@ after any exit. The scheduled task **`\keep`** runs that supervisor — boot tri
 as `johna`, restart count 999, no time limit, normal priority (cf-ddns's below-normal
 priority class would be inherited by `motherd`). So a reboot brings `keep` back, and
 `keep` brings back `web` and `motherd`, with nobody logged on. Registering the task
-needs an elevated session. Log: `C:\Users\johna\AppData\Local\keep\keep.log`.
-The supervisor redirects keep's output with `cmd /c "… >> log 2>&1"`, never through a
-PowerShell pipe: `web` and `motherd` inherit keep's handles, and a pipe they hold open
-kept the loop waiting after keep exited, so keep was never restarted. Its
+needs an elevated session. Log: `C:\Users\johna\AppData\Local\keep\keep-<start>.log`,
+a new file for every start with the newest five kept, and the supervisor's own lines in
+`supervise.err.log` beside it. `web` and `motherd` inherit keep's handles and hold them
+for as long as they run, which shapes both halves of the loop. keep is started with
+`Process.Start` — no window, no pipe — and its output redirected by `cmd /c "… >> log
+2>&1"`: run as a native command, cmd's output was a pipe to the script that the
+services held open after keep exited, and the loop never restarted it. And every start
+writes a file of its own: a log reused across starts is still open in the services, and
+the next start's `cmd` cannot open it — keep then exits 1 on every attempt. Its
 processes run in the task's logon session, so their start time and path read empty from
 an interactive session; match them by name. A rollout does not swap `keep`.
 

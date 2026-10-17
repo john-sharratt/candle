@@ -41,7 +41,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use candle_conversation::persistence::SharedSubstrate;
 use store_events::Mirror;
 use tokio::sync::watch;
+use zend_vfs::workspace::Repo as WorkspaceRepo;
 use zend_vfs::{fetch_here, here, Fetch, Push, RepoFiles, RepoSpec, Rev, VfsStore, Workspace};
+
+use crate::mind::MindRepo;
 
 use self::log::Substrate;
 use self::merge::Merge;
@@ -78,14 +81,37 @@ impl MindStores {
         let mind = mind.and_then(|root| {
             let name = root.file_name()?.to_string_lossy().into_owned();
             let parent = root.parent()?;
-            match Workspace::new(parent, vec![RepoSpec::named(&name)]) {
-                Ok(ws) => Some((RepoFiles::overlay(ws), name)),
+            let files = Workspace::new(parent, vec![RepoSpec::named(&name)])
+                .map_err(|e| e.to_string())
+                .and_then(|ws| RepoFiles::overlay(ws).map_err(|e| e.to_string()));
+            match files {
+                Ok(files) => Some((files, name)),
                 Err(e) => {
                     tracing::warn!("the mind folder cannot hold stores: {e}");
                     None
                 }
             }
         });
+        Self::over(mind)
+    }
+
+    /// The stores over the mind `repo` holds: a folder, or a repository read
+    /// from the substrate — whose stores read its database, shared with
+    /// everything else that holds it. `data` is the daemon's data folder,
+    /// which a repository with no folder of its own is placed under.
+    pub fn for_mind(repo: Option<&MindRepo>, data: &Path) -> anyhow::Result<Arc<MindStores>> {
+        let db = match repo {
+            None => return Ok(Self::new(None)),
+            Some(MindRepo::Folder(root)) => return Ok(Self::new(Some(root))),
+            Some(MindRepo::Substrate(db)) => db,
+        };
+        let name = db.name().to_string();
+        let ws = Workspace::new(data, vec![RepoSpec::named(&name)])?.in_substrate(&name)?;
+        ws.attach(&name, db.clone(), fetch_here())?;
+        Ok(Self::over(Some((RepoFiles::overlay(ws)?, name))))
+    }
+
+    fn over(mind: Option<(RepoFiles, String)>) -> Arc<MindStores> {
         Arc::new(MindStores {
             mind,
             shared: OnceLock::new(),
@@ -133,10 +159,10 @@ impl MindStores {
         owner: &Owner,
         merge: impl FnOnce(&Merge<'_>) -> T,
     ) -> Option<Result<T, String>> {
-        let dir = self.mind_dir()?.to_path_buf();
+        let repo = self.mind_repo()?.clone();
         let (pusher, fetcher) = (self.pusher(), self.fetcher());
         self.change(owner, |store| {
-            Merge::open(&dir, store, pusher, fetcher).map(|m| merge(&m))
+            Merge::open(&repo, store, pusher, fetcher).map(|m| merge(&m))
         })
     }
 
@@ -165,10 +191,15 @@ impl MindStores {
         self.mind.as_ref().map(|(_, name)| name.as_str())
     }
 
-    /// The mind repository's folder.
-    pub fn mind_dir(&self) -> Option<&Path> {
+    /// The mind repository.
+    fn mind_repo(&self) -> Option<&WorkspaceRepo> {
         let (files, name) = self.mind.as_ref()?;
-        files.workspace()?.repo(name).map(|r| r.dir.as_path())
+        files.workspace()?.repo(name)
+    }
+
+    /// The mind repository's folder; `None` for one read from the substrate.
+    pub fn mind_dir(&self) -> Option<&Path> {
+        self.mind_repo()?.folder()
     }
 
     /// Whether the mind folder is a git repository, which is what gives a

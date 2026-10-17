@@ -21,6 +21,10 @@
 //! `models/quantized_qwen38_moe.rs`, named beside its `_moe` siblings —
 //! `quantized_qwen38.rs` is the *other* Qwen3.8, the 27B dense.
 
+/// The attention output's capture: the stored K/V audited and the launch
+/// rerun, in the pass that went non-finite.
+#[cfg(feature = "tensor-assert")]
+mod attn_capture;
 #[cfg(feature = "cuda")]
 pub mod batched_attention;
 pub mod capture_rows;

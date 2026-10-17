@@ -56,8 +56,17 @@ impl Conversation {
     /// Record `(origin, oseq)` as it travels — its header line and payload,
     /// unpadded — from wherever maintenance moved it, or `None` when this
     /// member does not hold it.
+    ///
+    /// Read behind the waiters, as [`Self::list_held`] lists: every caller is
+    /// replication — this member's own sends and the records a peer's catch-up
+    /// fetches — and a fetch reads one record off disk after another, so
+    /// foreground holds would keep the scheduler out for the whole fetch.
     pub fn read_event(&self, origin: u64, oseq: u64) -> Option<Vec<u8>> {
-        let read = self.persistence.lock().unwrap().read_event(origin, oseq);
+        let read = self
+            .persistence
+            .lock_behind_waiters()
+            .unwrap()
+            .read_event(origin, oseq);
         let mut bytes = match read {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return None,
@@ -77,8 +86,17 @@ impl Conversation {
 
     /// What this member holds of `origin`'s `from..=to`, a range it covers
     /// completely; an `oseq` gone with an expired tombstone carries its entry.
-    pub fn list_held(&self, origin: u64, from: u64, to: u64) -> PersistenceResult<HeldRange> {
-        let listing = self.persistence.lock().unwrap().list(origin, from, to)?;
+    ///
+    /// Listed from memory (`persistence::listing`) under one short hold of the
+    /// persistence lock, taken behind the waiters (`lock_behind_waiters`):
+    /// answering a peer is background work, and the scheduler's writes go
+    /// first.
+    pub fn list_held(&self, origin: u64, from: u64, to: u64) -> HeldRange {
+        let listing = self
+            .persistence
+            .lock_behind_waiters()
+            .unwrap()
+            .list(origin, from, to);
         let view = self.read();
         let in_range = |e: &DeletedEntry| e.origin() == origin && (from..=to).contains(&e.oseq());
         let entries: Vec<DeletedEntry> = view
@@ -87,14 +105,14 @@ impl Conversation {
             .chain(view.deleted_keys().map(DeletedEntry::Key))
             .filter(in_range)
             .collect();
-        Ok(HeldRange {
+        HeldRange {
             records: listing.records,
             gone: listing
                 .gone
                 .into_iter()
                 .map(|oseq| (oseq, entries.iter().copied().find(|e| e.oseq() == oseq)))
                 .collect(),
-        })
+        }
     }
 
     /// `oseq`s of `origin` a catch-up learned are gone. A deleted-set entry

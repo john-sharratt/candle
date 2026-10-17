@@ -212,7 +212,7 @@ mod tests {
     }
 
     fn daemon() -> (Arc<Runtime>, Arc<Tokens>) {
-        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
+        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
         rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
         rt.hold_world(WORLD, true);
         let tokens = Arc::new(Tokens::load(tmp()).expect("a fresh token store"));

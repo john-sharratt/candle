@@ -48,7 +48,7 @@ fn tmp() -> std::path::PathBuf {
 /// A daemon hosting the vault, held still, with the effector device installed —
 /// the token store and the `local` router the fast path drives.
 fn daemon() -> (Arc<Runtime>, Arc<Tokens>) {
-    let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
+    let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
     rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
     rt.hold_world(WORLD, true);
 

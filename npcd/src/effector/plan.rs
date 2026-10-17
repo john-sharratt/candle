@@ -389,7 +389,7 @@ mod tests {
     /// A runtime with a token store and a seeded, cast-installed character — the
     /// cast Arc is handed back so a test can read the record after a write.
     fn daemon(npc_id: u64) -> (Arc<Runtime>, Arc<Tokens>, Arc<AsyncRwLock<Npcs>>) {
-        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir());
+        let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
         let tokens = Arc::new(Tokens::load(tmp()).expect("a fresh token store"));
         rt.set_tokens(tokens.clone());
         let mut npcs = Npcs::load(&tmp()).expect("a fresh cast");

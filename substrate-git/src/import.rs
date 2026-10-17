@@ -41,6 +41,40 @@ pub struct Imported {
     pub forced: Published,
     /// What the sync after them did.
     pub synced: Synced,
+    /// How long each part of the round took.
+    pub took: Took,
+}
+
+/// A round's time, by part: what a slow load is spent on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Took {
+    /// Publishing this member's pushes.
+    pub publish: Duration,
+    /// Fetching `origin` and publishing what moved; zero when this member did
+    /// not fetch.
+    pub fetch: Duration,
+    /// Syncing the store up to the log.
+    pub sync: Duration,
+}
+
+impl Took {
+    /// Both rounds' time, part by part.
+    pub fn add(&mut self, other: &Took) {
+        self.publish += other.publish;
+        self.fetch += other.fetch;
+        self.sync += other.sync;
+    }
+}
+
+/// Whether a round fetches `origin`, when this member holds the lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fetching {
+    /// Once [`Importer::fetching_every`] has passed since the last.
+    IfDue,
+    /// Whether due or not.
+    Now,
+    /// Not at all.
+    Never,
 }
 
 /// The importer of one repository.
@@ -71,30 +105,56 @@ impl Importer {
         self
     }
 
+    /// The member last found holding `repo`'s import lease, when another
+    /// does.
+    pub fn holder(&self, repo: &str) -> Option<u64> {
+        self.lease.holder(&import_lease(repo))
+    }
+
     /// One round: publish this member's pushes, import if holding the lease
     /// and a fetch is due, sync.
     pub fn tick(&self, store: &Store, records: &dyn Records) -> anyhow::Result<Imported> {
-        self.round(store, records, false)
+        self.round(store, records, Fetching::IfDue)
     }
 
     /// [`Self::tick`], fetching now if holding the lease, due or not: a
-    /// member's first load of a repository.
+    /// member's first load of a repository the log names no branch of.
     pub fn pull(&self, store: &Store, records: &dyn Records) -> anyhow::Result<Imported> {
-        self.round(store, records, true)
+        self.round(store, records, Fetching::Now)
     }
 
-    fn round(&self, store: &Store, records: &dyn Records, now: bool) -> anyhow::Result<Imported> {
+    /// [`Self::tick`] with no fetch: this member's pushes published and the
+    /// store synced to the log. A load of a repository the log already names
+    /// is whole from the log alone; origin's newer commits are the follower's
+    /// to bring in, and a fetch here only made the load wait on origin.
+    pub fn settle(&self, store: &Store, records: &dyn Records) -> anyhow::Result<Imported> {
+        self.round(store, records, Fetching::Never)
+    }
+
+    fn round(
+        &self,
+        store: &Store,
+        records: &dyn Records,
+        fetching: Fetching,
+    ) -> anyhow::Result<Imported> {
         let mut out = Imported::default();
         let repo = store.repo();
-        let due = now || {
-            let last = *self.last_fetch.lock().unwrap();
-            last.is_none_or(|at| at.elapsed() >= self.fetch_every)
+        let due = match fetching {
+            Fetching::Now => true,
+            Fetching::Never => false,
+            Fetching::IfDue => {
+                let last = *self.last_fetch.lock().unwrap();
+                last.is_none_or(|at| at.elapsed() >= self.fetch_every)
+            }
         };
 
+        let started = Instant::now();
         let log = log_branches(records, store.name())?;
         let pushed = ahead_of(store, &log, &store.record()?)?;
         out.pushed = publish(records, store.name(), repo, &pushed, false)?;
+        out.took.publish = started.elapsed();
 
+        let started = Instant::now();
         let fetched = if due && self.lease.hold(&import_lease(store.name())) {
             *self.last_fetch.lock().unwrap() = Some(Instant::now());
             match repo.fetch(&RemoteName::parse(IMPORT)?, &FetchSpec::AllBranches) {
@@ -145,8 +205,13 @@ impl Importer {
         } else if fetched.is_none() && due {
             self.suspect.lock().unwrap().clear();
         }
+        if fetched.is_some() {
+            out.took.fetch = started.elapsed();
+        }
 
+        let started = Instant::now();
         out.synced = store.sync(records)?;
+        out.took.sync = started.elapsed();
         Ok(out)
     }
 }

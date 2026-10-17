@@ -45,12 +45,19 @@ pub fn catchup_progress(catchups: &[CatchupView]) -> (u64, u64) {
 
 /// The `catchup` step's detail: per catch-up, records and bytes fetched
 /// against the total the headers listed, records skipped as already held, and
-/// which member is answering.
+/// which member is answering. One no member has answered says so: "0 of 0
+/// records" read as a catch-up with nothing left to do.
 pub fn catchup_detail(catchups: &[CatchupView]) -> String {
+    if catchups.is_empty() {
+        return "waiting to be asked for what this member lacks".into();
+    }
     catchups
         .iter()
         .map(|c| {
             let p = &c.progress;
+            if p.answerer.is_none() && p.wanted == 0 {
+                return "asked — no member has answered yet".to_string();
+            }
             let mut line = format!(
                 "{} of {} records, {} of {} MiB",
                 p.fetched,
@@ -183,6 +190,26 @@ mod tests {
             "30 of 120 records, 16 of 64 MiB, 7 already held, from 00000000000000ab"
         );
         assert_eq!(catchup_progress(&[c.clone(), c]), (60, 240));
+    }
+
+    /// **A catch-up nobody has answered is not one with nothing to do.** Its
+    /// "0 of 0 records" read as finished on a member whose every catch-up was
+    /// going unanswered.
+    #[test]
+    fn an_unanswered_catch_up_says_so() {
+        let c = CatchupView {
+            cluster: 0,
+            purpose: Purpose::Admission,
+            progress: Progress::default(),
+        };
+        assert_eq!(
+            catchup_detail(from_ref(&c)),
+            "asked — no member has answered yet"
+        );
+        assert_eq!(
+            catchup_detail(&[]),
+            "waiting to be asked for what this member lacks"
+        );
     }
 
     #[test]

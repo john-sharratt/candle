@@ -16,6 +16,7 @@ pub use maintenance_op::MaintenanceOp;
 use maintenance_op::Pass;
 
 use super::belief_files::{assemble_file_scans, scan_file_scans};
+use super::belief_scan_split::GROUP_SCAN_SPLIT;
 use super::ids::{
     process_timeline_allocator, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId,
     TurnIndex, TurnKey,
@@ -53,7 +54,7 @@ use crate::persistence::{
     PersistenceLock, Result as PersistenceResult, SharedSubstrate, SubstratePersistence,
 };
 use crate::projection::adaptive::{attention_mass, LEVEL_PRIOR_T_REF};
-use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
+use crate::provenance::gallery_arena::{scan_split, PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
     decode_wide_sigs_for_scoring, score_slots_fused, score_slots_grouped, score_slots_weighted,
@@ -1350,8 +1351,9 @@ impl Conversation {
             // Where one collection's scan time went — assembling its gallery
             // (host, walks the substrate's streams), scoring it (the arena
             // launches), and normalizing — the collection-side counterpart of
-            // the per-group `belief group scan` line.
-            tracing::trace!(
+            // the per-group `belief group scan` line. Debug, not trace: a scan
+            // visits one or two collections, so this is a line or two a scan.
+            tracing::debug!(
                 target: "candle_conversation::provenance",
                 collection = %coll.name,
                 windows = windows.len(),
@@ -1474,12 +1476,17 @@ impl Conversation {
             return (scores, candidates);
         }
         // Collections (the tool catalog) live in the shared system prompt.
+        scan_split::take();
         let t_coll = Instant::now();
+        let coll_span = profile::span("beliefs:collections");
         scores =
             self.score_belief_collections(&schema.system_prompt, probe, probe_q, observe, arena);
+        coll_span.end();
         let coll_us = t_coll.elapsed().as_micros() as u64;
         // Belief-driven turn groups live across every layer.
         let t_groups = Instant::now();
+        let _groups_span = profile::span("beliefs:groups");
+        GROUP_SCAN_SPLIT.take();
         for layer in &schema.layers {
             candidates.extend(self.score_belief_groups(
                 layer,
@@ -1492,13 +1499,34 @@ impl Conversation {
             ));
         }
         // Phase split for the reproject `scan_ms`: which side of the scan the
-        // time went to (the collection scan vs the per-layer group scans), so a
-        // silent GPU→CPU fallback or a growing probe shows up attributably.
-        tracing::trace!(
+        // time went to (the collection scan vs the per-layer group scans), and
+        // within the groups which phase — so a silent GPU→CPU fallback, a
+        // growing probe or a group walk that grew with the corpus shows up
+        // attributably. One line per scan.
+        let groups = GROUP_SCAN_SPLIT.take();
+        let arena = scan_split::take();
+        tracing::debug!(
             target: "candle_conversation::provenance",
             probe_windows = probe.len(),
             collections_us = coll_us,
             groups_us = t_groups.elapsed().as_micros() as u64,
+            groups_scanned = groups.scanned,
+            group_windows = groups.windows,
+            group_turns = groups.turns,
+            select_us = groups.select_us,
+            assemble_us = groups.assemble_us,
+            score_us = groups.score_us,
+            normalize_us = groups.normalize_us,
+            arena_scans = arena.scans,
+            arena_launches = arena.launches,
+            arena_segments = arena.segments,
+            arena_fresh_tokens = arena.fresh_tokens,
+            arena_index_us = arena.index_us,
+            arena_upload_us = arena.upload_us,
+            arena_kernel_us = arena.kernel_us,
+            arena_readback_us = arena.readback_us,
+            arena_rows_us = arena.rows_us,
+            arena_tally_us = arena.tally_us,
             "belief scan phase split"
         );
         (scores, candidates)
@@ -2487,6 +2515,7 @@ impl Conversation {
             // `belief scan phase split` line above already carries the per-scan
             // totals that answer "did a phase grow". Raise the target to trace
             // when the question is which *group* grew.
+            let normalize_us = t_normalize.elapsed().as_micros() as u64;
             tracing::trace!(
                 target: "candle_conversation::provenance",
                 layer = %layer.name,
@@ -2498,9 +2527,20 @@ impl Conversation {
                 select_us,
                 assemble_us,
                 score_us,
-                normalize_us = t_normalize.elapsed().as_micros() as u64,
+                normalize_us,
                 "belief group scan"
             );
+            GROUP_SCAN_SPLIT.set({
+                let mut s = GROUP_SCAN_SPLIT.get();
+                s.scanned += 1;
+                s.windows += n_windows as u64;
+                s.turns += turns_walked as u64;
+                s.select_us += select_us;
+                s.assemble_us += assemble_us;
+                s.score_us += score_us;
+                s.normalize_us += normalize_us;
+                s
+            });
             per_group.push((group.id, cands));
         }
         per_group

@@ -1,14 +1,12 @@
 //! Three versions of one text merged line by line, overlaps kept between
-//! conflict markers — what `git merge` leaves in a working tree's file.
+//! conflict markers — what `git merge` leaves in a working tree's file. The
+//! merge is git's own xdiff merge, run in this process
+//! ([`merge_file`](crate::library::merge_file)).
 
 use crate::error::GitError;
+use crate::library::merge_file::{conflicts_in, merge_file, Labels};
 use crate::runner::utf8;
-use crate::write::scratch::ScratchFile;
 use crate::Repo;
-
-/// The largest conflict count `merge-file` reports; any exit status above it
-/// is an error.
-const MAX_REPORTED_CONFLICTS: i32 = 127;
 
 /// A merged text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,39 +37,23 @@ impl Repo {
         theirs: &str,
         labels: MergeLabels<'_>,
     ) -> Result<MergedText, GitError> {
-        let base_file = ScratchFile::new(self.git_dir(), "merge-base", base.as_bytes())?;
-        let ours_file = ScratchFile::new(self.git_dir(), "merge-ours", ours.as_bytes())?;
-        let theirs_file = ScratchFile::new(self.git_dir(), "merge-theirs", theirs.as_bytes())?;
-        let out = self
-            .git("merge-file")
-            .args([
-                "-p",
-                "-L",
-                labels.ours,
-                "-L",
-                labels.base,
-                "-L",
-                labels.theirs,
-            ])
-            .arg("--end-of-options")
-            .arg(&ours_file.0)
-            .arg(&base_file.0)
-            .arg(&theirs_file.0)
-            .run()?;
-        // Exit 0: clean. 1–127: that many conflicts, capped. Anything else:
-        // an error.
-        let conflicts = match out.status {
-            Some(n) if (0..=MAX_REPORTED_CONFLICTS).contains(&n) => n as usize,
-            status => {
-                return Err(GitError::Unclassified {
-                    args: vec!["merge-file".to_string()],
-                    status,
-                    stderr: out.stderr,
-                })
-            }
+        let merged = merge_file(
+            base.as_bytes(),
+            ours.as_bytes(),
+            theirs.as_bytes(),
+            Some(Labels {
+                ours: labels.ours,
+                base: labels.base,
+                theirs: labels.theirs,
+            }),
+        )?;
+        let conflicts = if merged.clean {
+            0
+        } else {
+            conflicts_in(&merged.bytes).max(1)
         };
         Ok(MergedText {
-            text: utf8("merge-file", out.stdout)?,
+            text: utf8("merge-file", merged.bytes)?,
             conflicts,
         })
     }
@@ -79,7 +61,11 @@ impl Repo {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::odb::memory_store::MemoryStore;
+    use crate::odb::{ObjectDb, PackStore, DEFAULT_PACK_BUDGET};
     use crate::testing::TestRepo;
 
     const LABELS: MergeLabels<'static> = MergeLabels {
@@ -136,16 +122,17 @@ mod tests {
         );
     }
 
-    /// No scratch file outlives the merge.
+    /// **A repository read from the substrate merges text the same**, with no
+    /// folder and no `git` program.
     #[test]
-    fn scratch_files_are_removed() {
-        let t = TestRepo::init();
-        t.repo().merge_text("a\n", "b\n", "c\n", LABELS).unwrap();
-        let left = std::fs::read_dir(t.path.join(".git"))
+    fn a_repository_in_the_substrate_merges_the_same() {
+        let store: Arc<dyn PackStore> = Arc::new(MemoryStore::default());
+        let db = ObjectDb::open("r", store, DEFAULT_PACK_BUDGET).unwrap();
+        let merged = Repo::in_substrate(&db)
             .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("zen-"))
-            .count();
-        assert_eq!(left, 0);
+            .merge_text("a\nb\nc\n", "a\nmine\nc\n", "a\ntheirs\nc\n", LABELS)
+            .unwrap();
+        assert_eq!(merged.conflicts, 1);
+        assert!(merged.text.contains("<<<<<<< yours\nmine\n"));
     }
 }

@@ -58,21 +58,25 @@ fn scale_sub(dev: &CudaDevice) -> Result<CudaFunction> {
 /// executables naming a function that no longer existed, and the next fold
 /// into one of them crashed the driver.
 fn compile(dev: &CudaDevice, name: &'static str, src: &str) -> Result<CudaFunction> {
-    // One compile at a time: the toolkit-side assembly writes its files under
-    // the kernel's name, so tests compiling it at once overwrite each other's.
     static LOADED: Mutex<Vec<(&'static str, CudaFunction)>> = Mutex::new(Vec::new());
-    let mut loaded = LOADED.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((_, f)) = loaded.iter().find(|(n, _)| *n == name) {
-        return Ok(f.clone());
-    }
-    let ptx = cudarc::nvrtc::compile_ptx(src).map_err(crate::Error::wrap)?;
-    // Assembled toolkit-side: a driver older than the toolkit refuses to JIT
-    // its PTX, and these tests are about streams, not about that.
-    let module = match dev.cuda_context().load_module(ptx.clone()) {
-        Ok(m) => m,
-        Err(_) => dev.load_module_via_ptxas(name, &ptx)?,
+    let cached = |loaded: &Vec<(&'static str, CudaFunction)>| {
+        loaded
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, f)| f.clone())
     };
+    if let Some(f) = cached(&LOADED.lock().unwrap_or_else(|p| p.into_inner())) {
+        return Ok(f);
+    }
+    // Loaded with the cache unlocked: the load waits for every recording to
+    // end (`load_ptx`), and a test that is recording may be reading the cache.
+    let ptx = cudarc::nvrtc::compile_ptx(src).map_err(crate::Error::wrap)?;
+    let module = dev.load_ptx(name, &ptx)?;
     let f = module.load_function(name).w()?;
+    let mut loaded = LOADED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(first) = cached(&loaded) {
+        return Ok(first);
+    }
     loaded.push((name, f.clone()));
     Ok(f)
 }
@@ -599,19 +603,13 @@ fn exec_update_cost_by_change() -> Result<()> {
 
     // One capture of NODES launches; node `i`'s `add` is `adds[i]`.
     let capture = |adds: &[f32], y: &mut CudaSlice<f32>| -> Result<sys::CUgraph> {
-        // SAFETY: a stream this test owns, not capturing.
-        unsafe {
-            result::stream::begin_capture(
-                stream.cu_stream(),
-                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )
-            .w()?;
-        }
+        // SAFETY: a created stream this test owns, not capturing.
+        unsafe { super::capture::begin(&stream)? };
         for &add in adds {
             launch(&f, &stream, &x, y, 1.0, add)?;
         }
-        // SAFETY: the capture begun above.
-        unsafe { result::stream::end_capture(stream.cu_stream()).w() }
+        // SAFETY: the capture begun above, on this thread.
+        unsafe { super::capture::end(&stream) }
     };
     let base: Vec<f32> = vec![0.0; NODES];
     let template = capture(&base, &mut y)?;
@@ -738,6 +736,125 @@ fn null_stream_calls_during_capture() -> Result<()> {
         println!(
             "{name}: call {:?} | capture {:?}",
             outcome.as_ref().map_err(|e| e.to_string()),
+            finished.as_ref().map(|_| ()).map_err(|e| e.to_string())
+        );
+        null.synchronize().w()?;
+    }
+    Ok(())
+}
+
+/// What ANOTHER thread's calls do to a capture open on this one: each probe
+/// runs on a second thread, start to finish, while the capture records. Prints
+/// each call's outcome and whether the capture survived it — the facts the
+/// record gate's list of refused operations (`device_wide`, `build_lints.rs`,
+/// `clippy.toml`) rests on.
+#[test]
+#[ignore = "probe: cargo test -p candle-core --features cuda --release graph::tests::other_threads_calls_during_capture -- --ignored --nocapture --test-threads=1"]
+fn other_threads_calls_during_capture() -> Result<()> {
+    use cudarc::driver::{result, sys};
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let f = scale_add(&dev)?;
+    let null = dev.cuda_stream();
+    let x = dev.memcpy_stod(&ramp(1.0))?;
+    let compute = ComputeStream::of(&dev);
+    let mut cap = CaptureStream::new(&dev)?;
+    type Probe = Box<dyn Fn(&CudaDevice) -> Result<()> + Send + Sync>;
+    let probes: Vec<(&str, Probe)> = vec![
+        (
+            "null stream synchronize",
+            Box::new(|d| d.cuda_stream().synchronize().w()),
+        ),
+        (
+            "memcpy_dtov",
+            Box::new(|d| d.memcpy_dtov(&d.memcpy_stod(&[1f32; 16])?).map(|_| ())),
+        ),
+        (
+            "pool alloc + free",
+            Box::new(|d| unsafe { d.alloc::<f32>(1 << 20) }.map(drop)),
+        ),
+        (
+            "cuMemAlloc + cuMemFree",
+            Box::new(|d| unsafe {
+                d.cuda_stream().context().bind_to_thread().w()?;
+                let p = result::malloc_sync(1 << 20).w()?;
+                result::free_sync(p).w()
+            }),
+        ),
+        (
+            "cuMemHostAlloc + cuMemFreeHost",
+            Box::new(|d| unsafe {
+                d.cuda_stream().context().bind_to_thread().w()?;
+                let mut p = std::ptr::null_mut();
+                sys::cuMemHostAlloc(&mut p, 1 << 20, 0).result().w()?;
+                sys::cuMemFreeHost(p).result().w()
+            }),
+        ),
+        (
+            "kernel launch on the null stream",
+            Box::new(move |d| {
+                let mut y = d.alloc_zeros::<f32>(N)?;
+                let g = scale_add(d)?;
+                let x = d.memcpy_stod(&ramp(1.0))?;
+                launch(&g, &d.cuda_stream(), &x, &mut y, 1.0, 0.0)
+            }),
+        ),
+        (
+            "stream create + destroy",
+            Box::new(|d| d.cuda_context().new_stream().w().map(drop)),
+        ),
+        (
+            "device handle (its own cuBLAS + curand)",
+            Box::new(|_| CudaDevice::new(0).map(drop)),
+        ),
+        (
+            "cuBLAS handle (ungated)",
+            #[allow(clippy::disallowed_methods)]
+            Box::new(|d| {
+                cudarc::cublas::CudaBlas::new(d.cuda_stream())
+                    .map(drop)
+                    .map_err(crate::Error::wrap)
+            }),
+        ),
+        (
+            "curand generator",
+            Box::new(|d| {
+                cudarc::curand::CudaRng::new(0, d.cuda_stream())
+                    .map(drop)
+                    .map_err(crate::Error::wrap)
+            }),
+        ),
+        // The two the gate exists for, made raw here to show what it prevents.
+        (
+            "context synchronize (ungated)",
+            #[allow(clippy::disallowed_methods)]
+            Box::new(|d| d.cuda_context().synchronize().w()),
+        ),
+        (
+            "module load (ungated)",
+            #[allow(clippy::disallowed_methods)]
+            Box::new(|d| {
+                let ptx = cudarc::nvrtc::compile_ptx(
+                    "extern \"C\" __global__ void probe_k(float* p) { p[0] = 1.0f; }",
+                )
+                .map_err(crate::Error::wrap)?;
+                d.cuda_context().load_module(ptx).w().map(drop)
+            }),
+        ),
+    ];
+    for (name, probe) in &probes {
+        let mut y = dev.alloc_zeros::<f32>(N)?;
+        let s = CaptureSession::begin(&mut cap)?;
+        launch(&f, s.stream(), &x, &mut y, 1.0, 0.0)?;
+        let other = dev.clone();
+        let outcome = std::thread::scope(|sc| {
+            sc.spawn(|| probe(&other).map_err(|e| e.to_string()))
+                .join()
+                .expect("the probe thread")
+        });
+        let finished = s.finish(&compute, 1);
+        println!(
+            "{name}: call {outcome:?} | capture {:?}",
             finished.as_ref().map(|_| ()).map_err(|e| e.to_string())
         );
         null.synchronize().w()?;
@@ -1609,19 +1726,13 @@ fn device_bytes_per_executable() -> Result<()> {
         Ok(free as u64)
     };
     for nodes in [1usize, 100, 400, 800] {
-        // SAFETY: a stream this test owns, not capturing.
-        unsafe {
-            result::stream::begin_capture(
-                stream.cu_stream(),
-                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )
-            .w()?;
-        }
+        // SAFETY: a created stream this test owns, not capturing.
+        unsafe { super::capture::begin(&stream)? };
         for i in 0..nodes {
             launch(&f, &stream, &x, &mut y, 1.0, i as f32)?;
         }
-        // SAFETY: the capture begun above.
-        let template = unsafe { result::stream::end_capture(stream.cu_stream()).w()? };
+        // SAFETY: the capture begun above, on this thread.
+        let template = unsafe { super::capture::end(&stream)? };
         let before = free_now()?;
         let mut execs = Vec::with_capacity(EXECS);
         for _ in 0..EXECS {

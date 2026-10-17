@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
+use super::answering::Answering;
 use super::catchup::{Progress, Purpose, Requester};
 use super::fault::Fault;
 use super::lease::{LeaseEvent, Term, EVENTS_KEPT};
@@ -88,10 +89,16 @@ pub(super) struct State {
     pub sockets: Vec<Option<SessionHandle>>,
     /// Per socket: its admission catch-up has finished.
     pub ready: Vec<bool>,
+    /// Per socket: how many times its admission catch-up has gone unanswered
+    /// since the socket was admitted (`tick::ADMISSION_QUIET_LIMIT`).
+    pub admission_quiet: Vec<u32>,
     pub members: Vec<Option<Members>>,
     pub rr: usize,
     pub next_request: u64,
     pub catchups: BTreeMap<u64, Requester>,
+    /// The catch-up answers this member is running for others, one per
+    /// requester.
+    pub answering: Answering,
     /// Each catch-up's last word from its answerer.
     pub heard: HashMap<u64, Instant>,
     /// Which catch-up each outstanding fetch belongs to.
@@ -181,7 +188,10 @@ pub struct ReplicationView {
     pub unsent: usize,
     pub in_flight: usize,
     pub catchups: Vec<CatchupView>,
-    #[serde(flatten)]
+    /// Catch-up answers running for other members, one per requester.
+    pub answering: usize,
+    /// The counters, under their own key: flattened, `stats.catchups` (a
+    /// count) overwrote the `catchups` list above.
     pub stats: Stats,
 }
 
@@ -269,6 +279,7 @@ impl Replicator {
                 fresh: BTreeMap::new(),
                 sockets: vec![None; clusters],
                 ready: vec![false; clusters],
+                admission_quiet: vec![0; clusters],
                 members: vec![None; clusters],
                 rr: 0,
                 // A process's requests number from a random base: answers to a
@@ -276,6 +287,7 @@ impl Replicator {
                 // never match one of this process's.
                 next_request: (rand::random::<u32>() as u64) << 32,
                 catchups: BTreeMap::new(),
+                answering: Answering::default(),
                 heard: HashMap::new(),
                 fetches: HashMap::new(),
                 claimed: HashSet::new(),
@@ -375,6 +387,7 @@ impl Replicator {
             let mut s = self.state();
             s.sockets[c] = Some(handle);
             s.ready[c] = false;
+            s.admission_quiet[c] = 0;
             s.ack_dirty = true;
             if s.phase == Phase::CutOff && s.retry_rejoin.is_none() {
                 s.phase = Phase::Rejoining;
@@ -446,7 +459,19 @@ impl Replicator {
                 self.state().outbox.receipt(c as u32, r.through);
                 self.receipts.notify_waiters();
             }
-            Frame::Members(m) => self.state().members[c] = Some(m),
+            Frame::Members(m) => {
+                let mut s = self.state();
+                s.members[c] = Some(m);
+                // An answer for a member no gateway lists any more has nobody
+                // to read it.
+                let listed: HashSet<u64> = s
+                    .members
+                    .iter()
+                    .flatten()
+                    .flat_map(|m| m.members.iter().map(|x| x.node))
+                    .collect();
+                s.answering.retain(|r| listed.contains(&r));
+            }
             Frame::Headers(headers) => {
                 let _ = self.arrivals.send(Arrival::Headers { c, headers });
             }
@@ -517,6 +542,7 @@ impl Replicator {
                     progress: r.progress().clone(),
                 })
                 .collect(),
+            answering: s.answering.len(),
             stats: s.stats.clone(),
         }
     }

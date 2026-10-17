@@ -1221,8 +1221,16 @@ impl Builder {
     /// for this same text: a section that already exists is reused by id
     /// without its text being compared, so a fixed id would hand this
     /// conversation whichever prompt had sealed there first.
+    ///
+    /// Its one layer is a dialogue, so it decodes at `High`.
     pub fn for_plain_prompt(system_prompt_text: &str, frame: SectionId) -> Self {
-        Self::synthetic_single_section(system_prompt_text, LayerId::new(1), GroupId::new(1), frame)
+        Self::synthetic_single_section(
+            system_prompt_text,
+            LayerId::new(1),
+            GroupId::new(1),
+            frame,
+            DecodePriority::High,
+        )
     }
 
     /// Same as [`Self::for_plain_prompt`] but takes the layer and group ids
@@ -1232,17 +1240,23 @@ impl Builder {
     /// entering its projection. The frame is `frame`, for the same reason as
     /// there.
     ///
+    /// The caller names the band it decodes at: an engine-internal conversation
+    /// may be a person's (a client's passthrough dialogue) or background to one
+    /// (the titler), and only the caller knows which.
+    ///
     /// [`Reserved`]: super::Reserved
     pub fn for_plain_prompt_reserved(
         system_prompt_text: &str,
         kind: Reserved,
         frame: SectionId,
+        decode_priority: DecodePriority,
     ) -> Self {
         Self::synthetic_single_section(
             system_prompt_text,
             LayerId::reserved(kind),
             GroupId::reserved(kind),
             frame,
+            decode_priority,
         )
     }
 
@@ -1258,31 +1272,35 @@ impl Builder {
     /// u32 allows). The partition keeps every section id clear of the user
     /// schema's low `1..n` ids, the tool ids allocated above them, and the
     /// reserved band — however much the user schema grows — since the substrate
-    /// keys section state globally by id.
+    /// keys section state globally by id. The caller names the band it decodes
+    /// at, as for [`Self::for_plain_prompt_reserved`].
     ///
     /// [`Reserved`]: super::Reserved
     pub fn for_reserved_corpus(
         system_prompt_text: &str,
         kind: Reserved,
         section_base: u32,
+        decode_priority: DecodePriority,
     ) -> Self {
         Self::synthetic_single_section(
             system_prompt_text,
             LayerId::reserved(kind),
             GroupId::reserved(kind),
             SectionId::new(section_base),
+            decode_priority,
         )
     }
 
     /// Shared body of [`Self::for_plain_prompt`] /
     /// [`Self::for_plain_prompt_reserved`] — a single-layer / single-group
     /// schema with one `"frame"` section in the system prompt, using
-    /// caller-supplied ids.
+    /// caller-supplied ids, decoding at `decode_priority`.
     fn synthetic_single_section(
         system_prompt_text: &str,
         layer_id: LayerId,
         group_id: GroupId,
         section_id: SectionId,
+        decode_priority: DecodePriority,
     ) -> Self {
         // Id for the summary's answer framing section (never emitted; sealed
         // lazily only if this conversation is summarised), the one beside the
@@ -1387,9 +1405,7 @@ impl Builder {
                 gathered: true,
                 // The only layer, so the bottom of its own stack.
                 rank: 0,
-                // This synthetic fallback layer IS the dialogue layer, so it takes
-                // the interactive decode priority the production dialogue layer does.
-                decode_priority: DecodePriority::High,
+                decode_priority,
                 on_corrupt_turn: CorruptTurnPolicy::DropTurn,
                 ingest_unit: None,
                 in_tool_rounds: true,

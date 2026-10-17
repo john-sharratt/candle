@@ -3734,3 +3734,273 @@ fn bench_prefill_cost_vs_depth() -> Result<()> {
     );
     Ok(())
 }
+
+/// **A bulk launch shared by many sequences.** The engine's ingest groups put
+/// eight members of about a thousand rows each into one forward, every one deep
+/// enough to be staged and to carry, where [`bench_prefill_production_shape`]
+/// times one member of 8K rows. Same rows, same budget, same depth per member:
+/// the columns differ only in how the rows are split across sequences.
+#[test]
+#[ignore = "microbenchmark; run with: cargo test --release --features cuda \
+            -p candle-transformers --test qsa_kernel_tests \
+            bench_prefill_many_members -- --ignored --nocapture"]
+fn bench_prefill_many_members() -> Result<()> {
+    use std::time::Instant;
+
+    let _guard = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let g = FLASH_NEXT;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    const HISTORY: usize = 65_536;
+    const ROWS: usize = 8192;
+    const TOP_K: usize = 2048;
+    const WARM: usize = 1;
+    const ITERS: usize = 3;
+    const MEMBERS: usize = 8;
+
+    // Every member's history in its own slot of one backing, built the way
+    // `build_history_slot` builds slot 0: each row reads only its tail block.
+    let blocks = MEMBERS * ((HISTORY + ROWS) / CHUNK_SIZE + 2);
+    let backing = ChunkedKvBacking::new(4, g.n_kv_head, g.head_dim, DType::BF16, &device, blocks)?;
+    let mut caches: Vec<KvCache> = Vec::with_capacity(MEMBERS);
+    let (k_hist, v_hist) = make_kv_at(g, 0, HISTORY, 0x9004, &none_alt(HISTORY), &device)?;
+    let q_hist = Tensor::zeros((HISTORY, g.n_head, g.head_dim), DType::BF16, &device)?;
+    let tail_only: Vec<Vec<u32>> = (0..HISTORY)
+        .map(|t| budget_row(t + 1, RATIO, 0).0)
+        .collect();
+    let tail_only = selection(&tail_only, &device)?;
+    for slot in 0..MEMBERS {
+        let mut cache = KvCache::new(2, 64);
+        cache.force_dtype(DType::BF16);
+        cache.set_chunked_backing(&backing, slot, None)?;
+        backing.ensure_for_batch_entries(&[(slot, 0)], HISTORY)?;
+        let generation = stager.begin_generation();
+        {
+            let mut arr: [&mut KvCache; 1] = [&mut cache];
+            let _ = paged_prefill_batched(
+                None,
+                &mut arr[..],
+                &[0],
+                &q_hist,
+                &k_hist,
+                &v_hist,
+                1,
+                &[HISTORY],
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                None,
+                &rope,
+                false,
+                &generation,
+                &std::cell::RefCell::new(None),
+                Some(&tail_only),
+            )?;
+        }
+        cache.set_current_seq_len(HISTORY)?;
+        caches.push(cache);
+    }
+
+    // The same 8K rows, one member of them or split evenly across all.
+    let mut time_split = |members: usize| -> Result<f64> {
+        let q_len = ROWS / members;
+        let (q, k, v) = make_qkv_at(g, HISTORY, q_len, 0x9004, &[], &device)?;
+        let rep = |t: &Tensor| -> Result<Tensor> { Tensor::cat(&vec![t.clone(); members], 0) };
+        let (q, k, v) = (rep(&q)?, rep(&k)?, rep(&v)?);
+        let rows: Vec<Vec<u32>> = (0..members)
+            .flat_map(|_| (0..q_len).map(|t| budget_row(HISTORY + t + 1, TOP_K, t & 1).0))
+            .collect();
+        let sel = selection(&rows, &device)?;
+        let offsets = vec![HISTORY; members];
+        let q_lens = vec![q_len; members];
+        let launch = |caches: &mut [KvCache]| -> Result<()> {
+            for slot in 0..members {
+                backing.truncate_sequence_to_tokens(slot, HISTORY)?;
+                backing.ensure_for_batch_entries(&[(slot, HISTORY)], q_len)?;
+            }
+            let generation = stager.begin_generation();
+            let mut arr: Vec<&mut KvCache> = caches[..members].iter_mut().collect();
+            paged_prefill_batched(
+                None,
+                &mut arr[..],
+                &offsets,
+                &q,
+                &k,
+                &v,
+                members,
+                &q_lens,
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                None,
+                &rope,
+                false,
+                &generation,
+                &std::cell::RefCell::new(None),
+                Some(&sel),
+            )?;
+            Ok(())
+        };
+        for _ in 0..WARM {
+            launch(&mut caches)?;
+        }
+        device.synchronize()?;
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            launch(&mut caches)?;
+        }
+        device.synchronize()?;
+        Ok(t0.elapsed().as_secs_f64() * 1000.0 / ITERS as f64)
+    };
+    let one = time_split(1)?;
+    let two = time_split(2)?;
+    let eight = time_split(MEMBERS)?;
+    println!(
+        "\n  history {HISTORY} per member, {ROWS} rows, budget {TOP_K}\n  \
+         1 member {one:.1} ms   2 members {two:.1} ms   {MEMBERS} members {eight:.1} ms"
+    );
+    Ok(())
+}
+
+/// **The prefill launch the engine actually issues at depth.**
+///
+/// [`bench_prefill_cost_vs_depth`] times a 2K chunk over a BF16 history held in
+/// one piece. A production bulk chunk differs on three axes at once: it is the
+/// engine's 8K width, the history behind it is sealed through the compression
+/// policy, and a projected context is assembled from placed pieces — each its
+/// own index page ending in a short block, so selected blocks sit off the
+/// four-position grid the pre-stage copies in quads. Each column changes one
+/// axis from its left neighbour, so a cost that appears only in production
+/// lands in the column that introduced it.
+#[test]
+#[ignore = "microbenchmark; run with: cargo test --release --features cuda \
+            -p candle-transformers --test qsa_kernel_tests \
+            bench_prefill_production_shape -- --ignored --nocapture"]
+fn bench_prefill_production_shape() -> Result<()> {
+    use std::time::Instant;
+
+    let _guard = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let g = FLASH_NEXT;
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    const Q_LEN: usize = 8192;
+    const TOP_K: usize = 2048;
+    // 36 whole blocks and a short one of 2 cells, as a placed file read leaves.
+    const PIECE: usize = 146;
+    const SEAL_LEVEL: u8 = 5;
+    const WARM: usize = 1;
+    const ITERS: usize = 3;
+    // A whole number of pieces at the harness's depth ceiling.
+    let history = (131_072 / PIECE) * PIECE;
+
+    let (backing, mut cache) = build_history_slot(
+        g,
+        history,
+        0x9003,
+        &none_alt(history),
+        &rope,
+        &stager,
+        &device,
+    )?;
+    let (q, k, v) = make_qkv_at(g, history, Q_LEN, 0x9003, &[], &device)?;
+    let flat_rows: Vec<Vec<u32>> = (0..Q_LEN)
+        .map(|t| budget_row(history + t + 1, TOP_K, t & 1).0)
+        .collect();
+    let flat_sel = selection(&flat_rows, &device)?;
+    let layout = piece_layout(history, PIECE);
+    let paged_rows: Vec<Vec<u32>> = (0..Q_LEN)
+        .map(|t| paged_budget_row(&layout, history + t + 1, TOP_K, t & 1))
+        .collect();
+    let paged_sel = paged_selection(&layout, &paged_rows, &device)?;
+
+    let time_it = |cache: &mut KvCache, slot: usize, s: &QsaSelection| -> Result<f64> {
+        let mut launch = || -> Result<()> {
+            backing.truncate_sequence_to_tokens(slot, history)?;
+            backing.ensure_for_batch_entries(&[(slot, history)], Q_LEN)?;
+            let generation = stager.begin_generation();
+            let mut caches_arr: [&mut KvCache; 1] = [&mut *cache];
+            paged_prefill_batched(
+                None,
+                &mut caches_arr[..],
+                &[history],
+                &q,
+                &k,
+                &v,
+                1,
+                &[Q_LEN],
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                None,
+                &rope,
+                false,
+                &generation,
+                &std::cell::RefCell::new(None),
+                Some(s),
+            )?;
+            Ok(())
+        };
+        for _ in 0..WARM {
+            launch()?;
+        }
+        device.synchronize()?;
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            launch()?;
+        }
+        device.synchronize()?;
+        Ok(t0.elapsed().as_secs_f64() * 1000.0 / ITERS as f64)
+    };
+    // Stratified selection at production depth ranks one budget per window, so
+    // a row attends `windows × budget`: four windows' worth at ~500K.
+    const STRATA_WINDOWS: usize = 4;
+    let strata_rows: Vec<Vec<u32>> = (0..Q_LEN)
+        .map(|t| paged_budget_row(&layout, history + t + 1, TOP_K * STRATA_WINDOWS, t & 1))
+        .collect();
+    let strata_sel = paged_selection(&layout, &strata_rows, &device)?;
+
+    let bf16_flat = time_it(&mut cache, 0, &flat_sel)?;
+    let bf16_paged = time_it(&mut cache, 0, &paged_sel)?;
+    let (mut sealed, formats) = seal_history(&backing, history, SEAL_LEVEL, 1, &device)?;
+    let sealed_flat = time_it(&mut sealed, 1, &flat_sel)?;
+    let sealed_paged = time_it(&mut sealed, 1, &paged_sel)?;
+    let sealed_strata = time_it(&mut sealed, 1, &strata_sel)?;
+    println!(
+        "\n  history {history}, chunk {Q_LEN}, budget {TOP_K}, piece {PIECE}, sealed C{SEAL_LEVEL} \
+         ({formats:?})\n  bf16 flat {bf16_flat:.1} ms   bf16 paged {bf16_paged:.1} ms   \
+         sealed flat {sealed_flat:.1} ms   sealed paged {sealed_paged:.1} ms   \
+         sealed paged ×{STRATA_WINDOWS} windows {sealed_strata:.1} ms"
+    );
+    // **Index pages at production granularity.** A projected context closes an
+    // index page at every reasoning boundary and break token, so a page can be a
+    // few tokens long: every one of them ends in a short block, and every block
+    // after it starts off the four-position grid the pre-stage copies in quads.
+    // Each divides the history (146 · 897), so the sealed slot serves every one.
+    for piece in [39usize, 13, 3] {
+        let layout = piece_layout(history, piece);
+        let rows: Vec<Vec<u32>> = (0..Q_LEN)
+            .map(|t| paged_budget_row(&layout, history + t + 1, TOP_K * STRATA_WINDOWS, t & 1))
+            .collect();
+        let sel = paged_selection(&layout, &rows, &device)?;
+        let ms = time_it(&mut sealed, 1, &sel)?;
+        println!(
+            "  piece {piece:>3}: {} pages, sealed ×{STRATA_WINDOWS} windows {ms:.1} ms",
+            layout.len()
+        );
+    }
+    Ok(())
+}

@@ -35,7 +35,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::projection::{Builder, GroupId, LayerId, Reserved, SectionId};
+use candle_conversation::projection::{
+    Builder, DecodePriority, GroupId, LayerId, Reserved, SectionId,
+};
 use candle_conversation::stencil::{
     compile_action_loop, compile_think_tree, compile_tool_call_tree, StencilTree,
     StencilTreeBuilder, ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec,
@@ -408,7 +410,9 @@ const CLOSED: &str = "prose:closed";
 /// Tagged with something no turn carries, it admits none of them, and a job
 /// reads its own system prompt and question and nothing else.
 fn prose_projection(system: &str, frame: SectionId) -> anyhow::Result<(Builder, LayerId, GroupId)> {
-    let mut builder = Builder::for_plain_prompt_reserved(system, Reserved::Prose, frame);
+    // npcd's band, as its characters' turns: below zend's dialogue.
+    let mut builder =
+        Builder::for_plain_prompt_reserved(system, Reserved::Prose, frame, DecodePriority::Normal);
     builder
         .set_group_tags(PROSE_GROUP, vec![CLOSED.to_string()])
         .map_err(|e| anyhow::anyhow!("closing the prose group: {e}"))?;

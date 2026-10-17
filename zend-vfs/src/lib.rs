@@ -53,6 +53,7 @@ pub mod file_delta;
 pub mod files;
 mod kill_tree;
 mod library;
+pub mod odb;
 pub mod origin;
 mod read;
 mod redact;
@@ -82,6 +83,10 @@ pub use error::GitError;
 pub use file_changes::FileChanges;
 pub use file_delta::{FileDelta, FileTimes, Splice, TimedDelta};
 pub use files::{RepoFiles, UnknownRepo};
+pub use odb::{
+    KeptPack, ObjectDb, PackId, PackStore, Refreshed, DEFAULT_PACK_BUDGET, KEPT_REFS,
+    MAX_PACK_BYTES, STORE_HEAD,
+};
 pub use origin::{Followed, Published, Pulled, ORIGIN};
 pub use read::blame::{BlameLine, LineRange};
 pub use read::blob_reader::BlobReader;
@@ -120,7 +125,9 @@ pub use types::{
 pub use vfs::git_source::GitSource;
 pub use vfs::{has_markers, Base, FileState, SavedBase, SavedChain, Snapshot, VfsError, VfsStore};
 pub use work::{merge_into, Committing, Landed, Merged, NotCommitted};
-pub use workspace::{RepoSpec, Workspace, WorkspaceError, ALL_REPOS, MANIFEST_FILE};
+pub use workspace::{
+    Attached, RepoPlace, RepoSpec, Workspace, WorkspaceError, ALL_REPOS, MANIFEST_FILE,
+};
 pub use worktrees::{Worktree, WorktreeCheckout};
 pub use write::apply::ApplyOutcome;
 pub use write::merge_text::{MergeLabels, MergedText};
@@ -138,11 +145,7 @@ use runner::{utf8, Invocation};
 /// process never race; correctness across processes rests on the
 /// compare-and-swap every ref update carries, not on the lock.
 pub struct Repo {
-    dir: PathBuf,
-    /// This working tree's own git folder (`.git`, or `.git/worktrees/<n>`
-    /// for a linked worktree): private to the repository's owner, so the
-    /// layer's scratch files go here rather than in a shared temp folder.
-    git_dir: PathBuf,
+    place: Place,
     format: ObjectFormat,
     write: Mutex<()>,
     /// The repository held in this process, which answers what its own files
@@ -155,12 +158,26 @@ pub struct Repo {
     fetcher: Arc<dyn Fetch>,
 }
 
+/// Where a repository is.
+enum Place {
+    /// A working tree on disk: its top level, and its own git folder (`.git`,
+    /// or `.git/worktrees/<n>` for a linked worktree) — private to its owner,
+    /// so the layer's scratch files go there rather than in a shared temp
+    /// folder.
+    Folder { dir: PathBuf, git_dir: PathBuf },
+    /// A repository read from the substrate: no folder, every question
+    /// answered by libgit2 over the database (`docs/substrate_git.md` §4).
+    Substrate(ObjectDb),
+}
+
 impl fmt::Debug for Repo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Repo")
-            .field("dir", &self.dir)
-            .field("format", &self.format)
-            .finish()
+        let mut s = f.debug_struct("Repo");
+        match &self.place {
+            Place::Folder { dir, .. } => s.field("dir", dir),
+            Place::Substrate(db) => s.field("substrate", &db.name()),
+        };
+        s.field("format", &self.format).finish()
     }
 }
 
@@ -229,14 +246,48 @@ impl Repo {
             }
         };
         Ok(Self {
-            dir: dir.to_path_buf(),
-            git_dir,
+            place: Place::Folder {
+                dir: dir.to_path_buf(),
+                git_dir,
+            },
             format,
             write: Mutex::new(()),
             library: None,
             pusher: here(),
             fetcher: fetch_here(),
         })
+    }
+
+    /// The repository `db` holds, read from the substrate: no folder, and no
+    /// `git` program (`docs/substrate_git.md` §4). Its pushes and fetches go
+    /// where [`Self::pushing_through`] and [`Self::fetching_through`] say.
+    pub fn in_substrate(db: &ObjectDb) -> Result<Self, GitError> {
+        Ok(Self {
+            library: Some(Mutex::new(odb::repository::repository(db)?)),
+            place: Place::Substrate(db.clone()),
+            format: ObjectFormat::Sha1,
+            write: Mutex::new(()),
+            pusher: here(),
+            fetcher: fetch_here(),
+        })
+    }
+
+    /// The object database a repository read from the substrate is held in;
+    /// `None` for a folder.
+    pub fn objects(&self) -> Option<&ObjectDb> {
+        match &self.place {
+            Place::Substrate(db) => Some(db),
+            Place::Folder { .. } => None,
+        }
+    }
+
+    /// The working tree's top level; `None` for a repository read from the
+    /// substrate, which has no folder.
+    pub fn folder(&self) -> Option<&Path> {
+        match &self.place {
+            Place::Folder { dir, .. } => Some(dir),
+            Place::Substrate(_) => None,
+        }
     }
 
     /// This repository with its pushes made by `pusher`.
@@ -251,14 +302,22 @@ impl Repo {
         self
     }
 
-    /// This working tree's own git folder.
-    pub(crate) fn git_dir(&self) -> &Path {
-        &self.git_dir
+    /// This working tree's own git folder; refused for a repository with none.
+    pub(crate) fn git_dir(&self) -> Result<&Path, GitError> {
+        match &self.place {
+            Place::Folder { git_dir, .. } => Ok(git_dir),
+            Place::Substrate(_) => Err(GitError::NoFolder {
+                command: "its git folder".to_string(),
+            }),
+        }
     }
 
-    /// The working tree's top level.
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// The working tree's top level; refused for a repository read from the
+    /// substrate, for what needs files on disk — a checkout, a sandbox.
+    pub fn dir(&self) -> Result<&Path, GitError> {
+        self.folder().ok_or_else(|| GitError::NoFolder {
+            command: "its working tree".to_string(),
+        })
     }
 
     /// The hash the repository's object ids use.
@@ -268,7 +327,7 @@ impl Repo {
 
     /// A git invocation in this repository.
     pub(crate) fn git(&self, subcommand: &str) -> Invocation {
-        Invocation::new(&self.dir, subcommand)
+        Invocation::in_folder(self.folder(), subcommand)
     }
 
     /// The write lock. Poisoning is ignored: the lock guards no data, only
@@ -340,9 +399,9 @@ mod tests {
         let t = TestRepo::init();
         let first = Repo::open(&t.path).unwrap();
         let second = Repo::open(&t.path).unwrap();
-        assert_eq!(first.dir(), second.dir());
-        assert_eq!(first.git_dir(), second.git_dir());
-        assert!(first.git_dir().ends_with(".git"), "{:?}", first.git_dir());
+        assert_eq!(first.folder(), second.folder());
+        assert_eq!(first.git_dir().unwrap(), second.git_dir().unwrap());
+        assert!(first.git_dir().unwrap().ends_with(".git"));
         assert_eq!(second.format(), ObjectFormat::Sha1);
     }
 

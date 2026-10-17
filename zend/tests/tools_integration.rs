@@ -407,6 +407,7 @@ mod tool_scenarios {
                 StreamItem::Prefill { .. }
                 | StreamItem::Think { .. }
                 | StreamItem::TurnEnd { .. } => {}
+                StreamItem::Error(e) => panic!("the turn failed: {e}"),
             }
         }
         eprintln!("\n\n[FINAL RESPONSE]\n{response}");

@@ -1,6 +1,7 @@
 //! Creating and deleting tags.
 
 use crate::error::GitError;
+use crate::library::objects;
 use crate::runner::utf8;
 use crate::types::{Oid, Signature, TagName};
 use crate::write::fast_import::normalize_message;
@@ -39,9 +40,18 @@ impl Repo {
         annotation: Option<&TagAnnotation>,
     ) -> Result<Oid, GitError> {
         let _write = self.write_lock();
-        let value = match annotation {
-            None => target.clone(),
-            Some(annotation) => {
+        // The library's lock is let go when the value is made: the ref
+        // transaction below takes it again.
+        let value = match (annotation, self.library()) {
+            (None, _) => target.clone(),
+            (Some(annotation), Some(lib)) => objects::tag_object(
+                &lib,
+                target,
+                name,
+                &annotation.tagger,
+                &normalize_message(&annotation.message),
+            )?,
+            (Some(annotation), None) => {
                 let kind = self
                     .git("cat-file")
                     .args(["-t", "--end-of-options"])

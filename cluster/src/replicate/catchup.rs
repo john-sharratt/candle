@@ -84,6 +84,8 @@ pub struct Requester {
     outstanding: u64,
     tries: HashMap<(u64, u64), u8>,
     progress: Progress,
+    /// `oseq`s the answer listed as gone.
+    gone_learned: u64,
 }
 
 impl Requester {
@@ -100,6 +102,7 @@ impl Requester {
             outstanding: 0,
             tries: HashMap::new(),
             progress: Progress::default(),
+            gone_learned: 0,
         }
     }
 
@@ -129,6 +132,7 @@ impl Requester {
                 len: r.len as u64,
             });
         }
+        self.gone_learned += h.gone.len() as u64;
         (h.gone, wanted)
     }
 
@@ -228,6 +232,17 @@ impl Requester {
     /// The answer is in and nothing is outstanding.
     pub fn finished(&self) -> bool {
         self.headers_done && self.wanted.is_empty() && self.fetching.is_empty()
+    }
+
+    /// A finished admission catch-up whose answer moved this member on — a
+    /// record it lacked is now held, or an `oseq` learned gone — asks again
+    /// before the socket is ready: an answer is bounded (`answer.rs`), so one
+    /// that brought anything may have stopped short. One that brought nothing
+    /// was the whole of what its answerer covers.
+    pub fn asks_again(&self) -> bool {
+        self.purpose == Purpose::Admission
+            && self.finished()
+            && (self.progress.wanted > self.progress.left || self.gone_learned > 0)
     }
 
     pub fn progress(&self) -> &Progress {
@@ -374,11 +389,66 @@ mod tests {
         assert_eq!(r.progress().left, 1);
     }
 
-    /// An answer that lists nothing finishes at its `DONE`.
+    /// An answer that lists nothing finishes at its `DONE`, and an admission
+    /// asks no more of it.
     #[test]
     fn an_empty_answer_finishes_at_once() {
         let mut r = Requester::new(1, 0, Purpose::Admission, 7);
         assert!(r.headers_done(counter()).is_empty());
         assert!(r.finished());
+        assert!(!r.asks_again());
+    }
+
+    /// An admission whose answer brought a record, or taught an `oseq` gone,
+    /// asks again once it finishes — and not before.
+    #[test]
+    fn an_admission_that_moved_on_asks_again() {
+        let mut fetched = Requester::new(1, 0, Purpose::Admission, 7);
+        fetched.headers(listing(3, 9, 1, 1, &[10]), |_, _| false);
+        let f = fetched.headers_done(counter());
+        assert!(!fetched.asks_again(), "still fetching");
+        fetched.fetch_done(f[0].request, |_, _| true, counter());
+        assert!(fetched.asks_again());
+
+        let mut gone = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut h = listing(3, 9, 1, 4, &[]);
+        h.gone = vec![Gone {
+            oseq: 4,
+            deleted_entry: None,
+        }];
+        gone.headers(h, |_, _| false);
+        gone.headers_done(counter());
+        assert!(gone.asks_again());
+    }
+
+    /// Nothing moved on — every record held already, or left undeliverable —
+    /// and the admission is done. Other purposes never ask again: the gap
+    /// watch and the periodic catch-up come round on their own.
+    #[test]
+    fn an_admission_that_moved_nothing_is_done() {
+        let mut held = Requester::new(1, 0, Purpose::Admission, 7);
+        held.headers(listing(3, 9, 1, 2, &[10, 10]), |_, _| true);
+        held.headers_done(counter());
+        assert!(held.finished());
+        assert!(!held.asks_again());
+
+        let mut left = Requester::new(1, 0, Purpose::Admission, 7);
+        left.headers(listing(3, 9, 1, 1, &[10]), |_, _| false);
+        let mut f = left.headers_done(counter());
+        for _ in 0..FETCH_TRIES {
+            f = left.fetch_done(f[0].request, |_, _| false, counter()).0;
+            if f.is_empty() {
+                break;
+            }
+        }
+        assert!(left.finished());
+        assert!(!left.asks_again());
+
+        let mut gap = Requester::new(1, 0, Purpose::Gap(9), 7);
+        gap.headers(listing(3, 9, 1, 1, &[10]), |_, _| false);
+        let f = gap.headers_done(counter());
+        gap.fetch_done(f[0].request, |_, _| true, counter());
+        assert!(gap.finished());
+        assert!(!gap.asks_again());
     }
 }

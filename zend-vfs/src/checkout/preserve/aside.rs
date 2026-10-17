@@ -130,7 +130,7 @@ pub(super) fn set_aside(
     journal: &mut Journal,
     paths: &[String],
 ) -> Result<(), CheckoutError> {
-    let root = repo.dir();
+    let root = repo.dir()?;
     let ignored = ignored(repo, paths)?;
     // Shortest first: a folder on the way is dealt with before what is in it.
     let mut ordered: Vec<&String> = paths.iter().collect();
@@ -176,7 +176,7 @@ pub(super) fn put_back(
     journal: &mut Journal,
     clear_vacant: bool,
 ) -> Result<(), CheckoutError> {
-    let root = repo.dir();
+    let root = repo.dir()?;
     let mut gone = Vec::new();
     if clear_vacant {
         let held = held_at_head(repo, journal.vacant.iter())?;
@@ -213,7 +213,7 @@ pub(super) fn taken_homes(
     let mut taken = Vec::new();
     for path in &journal.moved {
         let kept = std::fs::symlink_metadata(place.kept(path)).is_ok();
-        let (_, found) = target::inspect(repo.dir(), path)?;
+        let (_, found) = target::inspect(repo.dir()?, path)?;
         if kept && found != Found::Absent {
             taken.push(path.clone());
         }

@@ -40,6 +40,19 @@ conversations per reprojection, without the selection churning.
 For the **working set** (`WorkingSet::observe`), at most `max_admits` newcomers
 enter per reprojection. The rest keep their momentum and enter later.
 
+**A cap is never zero.** Both are `NonZeroUsize`, and the YAML loader refuses a
+`0`: a cap of zero admits nothing, ever, and the selection freezes on what the
+turn opened with. The smallest cap still brings one conversation in, whole.
+
+**What is admitted arrives whole.** The cap bounds how many conversations enter
+at once, never how much of one. After the elevate, a conversation (other than
+the slot's own dialogue) any of whose projected turns did not come up hot is
+withdrawn from that projection entirely and arrives whole on a later one
+(`scheduler/whole_conversations.rs`) — a partial lift would otherwise place a
+call without its response, or half an exchange, around the gap. A rebuild that
+withdrew one does not record its selection's identity, so the next reprojection
+of the same selection still brings it.
+
 ## Not capped
 
 - **The opening projection of a turn** (position 0). A new question reselects

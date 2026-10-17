@@ -83,10 +83,7 @@ pub fn drain(device: &Device) -> Result<Vec<Finding>> {
     let Device::Cuda(dev) = device else {
         return Ok(Vec::new());
     };
-    let stream = dev.cuda_stream();
-    stream
-        .synchronize()
-        .map_err(|e| crate::Error::Msg(format!("tensor_assert: drain fence: {e}")))?;
+    super::fence(dev, "drain")?;
     let raw = slots::with_slots(dev, |sl| sl.read(dev))?;
     let claimed = names::claimed();
 

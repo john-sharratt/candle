@@ -37,8 +37,8 @@ use zend_vfs::{
 use crate::checkouts::{Checkout, Checkouts};
 use crate::switch::Switch;
 use crate::wire::{
-    decode_bundle, AgentJobs, FetchJob, Fetched, JobKind, JobLine, JobView, LogChunk, PushJob,
-    Pushed, RunJob, Submit,
+    decode_bundle, AgentJobs, FetchJob, Fetched, JobKind, JobLine, JobView, ListJob, Listed,
+    LogChunk, PushJob, Pushed, RunJob, Submit,
 };
 
 /// Jobs kept after they end.
@@ -242,7 +242,35 @@ impl Jobs {
             Submit::Run(run) => self.run(run).await,
             Submit::Push(push) => self.push(push).await,
             Submit::Fetch(fetch) => self.fetch_for(fetch).await,
+            Submit::List(list) => self.list_for(list).await,
         }
+    }
+
+    /// What origin's refs point at now, read from the checkout's origin and
+    /// fetching nothing. A listing changes nothing, so it is not kept.
+    async fn list_for(self: &Arc<Self>, list: ListJob) -> Result<JobView, JobError> {
+        self.checkout(&list.repo)?;
+        let jobs = Arc::clone(self);
+        let repo = list.repo.clone();
+        let listed = spawn_blocking(move || {
+            let c = jobs.checkout(&repo)?;
+            c.repo()
+                .ls_remote_here(&origin())
+                .map_err(|e| JobError::Bad(format!("listing `{repo}`'s origin: {e}")))
+        })
+        .await
+        .map_err(|e| JobError::Bad(e.to_string()))??;
+        Ok(JobView {
+            id: JobId::random().to_string(),
+            repo: list.repo,
+            status: JobStatus::Exited { code: Some(0) },
+            lines: 0,
+            bytes: 0,
+            outcome: None,
+            pushed: Vec::new(),
+            fetched: None,
+            listed: Some(Listed::of(&listed)),
+        })
     }
 
     /// Fetch origin, and answer with what it holds for the job's branch — or
@@ -276,10 +304,13 @@ impl Jobs {
         let repo = fetch.repo.clone();
         let held = have.clone();
         let max_commits = fetch.max_commits.map(|n| n as usize);
+        let max_bytes = fetch
+            .max_bytes
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
         let found = spawn_blocking(move || {
             let c = jobs.checkout(&repo)?;
             c.repo()
-                .bundle_for_fetch_sliced(&origin(), &spec, &held, max_commits)
+                .bundle_for_fetch_sliced(&origin(), &spec, &held, max_commits, max_bytes)
                 .map_err(|e| JobError::Bad(format!("bundling `{repo}`: {e}")))
         })
         .await
@@ -296,6 +327,7 @@ impl Jobs {
                     outcome: None,
                     pushed: Vec::new(),
                     fetched: Some(Fetched::of(&f)),
+                    listed: None,
                 })
             }
             Ok(f) => (JobStatus::Exited { code: Some(0) }, Some(Fetched::of(&f))),
@@ -502,6 +534,7 @@ impl Jobs {
                 outcome: None,
                 pushed: pushed.clone(),
                 fetched: None,
+                listed: None,
             },
             Kind::Fetch { status } => JobView {
                 id: id.to_string(),
@@ -512,6 +545,7 @@ impl Jobs {
                 outcome: None,
                 pushed: Vec::new(),
                 fetched: None,
+                listed: None,
             },
             Kind::Run { outcome, .. } => {
                 let info = JobId::parse(id)
@@ -526,6 +560,7 @@ impl Jobs {
                     outcome: outcome.clone(),
                     pushed: Vec::new(),
                     fetched: None,
+                    listed: None,
                 }
             }
         })
@@ -686,6 +721,7 @@ mod tests {
             branch: Some("main".into()),
             have: Vec::new(),
             max_commits: None,
+            max_bytes: None,
         };
         assert_eq!(fetch_command(&one), ["git", "fetch", "origin", "main"]);
         let all = FetchJob {

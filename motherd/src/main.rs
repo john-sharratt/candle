@@ -25,7 +25,7 @@
 //!
 //! Paths resolve against the working directory — the repository root, which
 //! every daemon runs from — so from `D:\prog\candle` that is zend's workspace
-//! `D:\prog` and npcd's data `D:\prog\npcd-data`. `--config` defaults to
+//! `D:\prog` and npcd's data folder `D:\prog\npcd-data`. `--config` defaults to
 //! `motherd.yaml` in the working directory; the shipped example is
 //! `motherd/motherd.yaml` (blackworld's), and `motherd/motherd.laptop.yaml` is
 //! the laptop's.

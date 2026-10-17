@@ -126,7 +126,7 @@
             ]) },
             { role: 'user', content: J([
               '<tool_response>[1/2 file_list]',
-              '{"entries":["conversations.rs","mod.rs"],"paging":{"page":0,"pages":1,"total":2}}</tool_response>',
+              '{"entries":["conversations.rs","mod.rs"],"paging":{"page":1,"pages":1,"total":2}}</tool_response>',
               '<tool_response>[2/2 file_list]',
               '{"error":"not_found","detail":"no such folder: zend/src/nope"}</tool_response>',
             ]) },
@@ -536,6 +536,20 @@
     // `live` — until the answer joins it.
     daemonTurn(conv, text, opts, client) {
       const id = String(conv.id);
+      // A test sets `window.__ZEND_MOCK_DISCARDED_TURN__` to an error to make
+      // the next turn one the engine discards: it fails, the stream carries
+      // the error and ends, and nothing of it is stored — not even the
+      // question.
+      const discarded = window.__ZEND_MOCK_DISCARDED_TURN__;
+      if (discarded) {
+        window.__ZEND_MOCK_DISCARDED_TURN__ = null;
+        this.storedConv(id, text);
+        const t = setTimeout(() => {
+          if (client.onTurnError) client.onTurnError(discarded);
+          client.onDone();
+        }, 34);
+        return { cancel: () => clearTimeout(t) };
+      }
       const stored = this.storedConv(id, text);
       stored.history = stored.history.concat([{ role: 'user', content: text }]);
       const turn = { frames: [], clients: [client], content: '', done: false };
@@ -623,21 +637,26 @@
         handlers.onProjection(this.mkProjEvent(conv, 'answer')); // decode-end event (final t/s)
         handlers.onDone();
       });
+      // Every tool round's results are read in before the answer, as the
+      // daemon does, with `prefill` progress along the way.
+      const prefillThen = (total, then) => {
+        const steps = 8;
+        let step = 0;
+        const tick = () => {
+          if (handlers.onPrefill) handlers.onPrefill({ done: Math.round((total * step) / steps), total });
+          if (step >= steps) { then(); return; }
+          step += 1;
+          later(160, tick);
+        };
+        tick();
+      };
       const toolRound = () => {
         const path = 'crates/substrate/src/redo.rs';
         streamText('<tool_call>{"name":"read_file","arguments":{"path":"' + path + '"}}</tool_call>\n\n', () => {
           if (handlers.onTool) handlers.onTool({ phase: 'running', tools: ['read_file'] });
           later(250, () => {
             if (handlers.onTool) handlers.onTool({ phase: 'done', tools: ['read_file'], results: [{ path, content: this._fileContent[1] || '' }], tokens: [2140] });
-            const total = 18432, steps = 8;
-            let step = 0;
-            const tick = () => {
-              if (handlers.onPrefill) handlers.onPrefill({ done: Math.round((total * step) / steps), total });
-              if (step >= steps) { answer(); return; }
-              step += 1;
-              later(160, tick);
-            };
-            tick();
+            prefillThen(18432, answer);
           });
         });
       };
@@ -662,7 +681,7 @@
           if (handlers.onTool) handlers.onTool({ phase: 'running', tools: ['write'] });
           later(250, () => {
             if (handlers.onTool) handlers.onTool({ phase: 'done', tools: ['write'], results: [{ path, bytes: body.length }], tokens: [24] });
-            answer();
+            prefillThen(6144, answer);
           });
         });
       };

@@ -6,7 +6,8 @@
 //! the model never gets. The chain's own record decides: each call turn's
 //! `file_read` pages, paired in order with the `<tool_response>` blocks of the
 //! turn after it, count when the response carries no `error`. The chain is
-//! complete when those pages cover `0 .. ceil(lines / PAGE_LINES)`.
+//! complete when those pages cover `1 ..= ceil(lines / PAGE_LINES)` — pages
+//! count from 1, as `file_read`'s request does.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -45,10 +46,10 @@ impl Coverage {
     }
 }
 
-/// Whether `pages` covers every page of a `lines`-line file.
+/// Whether `pages` (from 1) covers every page of a `lines`-line file.
 pub fn covers(pages: &BTreeSet<u32>, lines: usize) -> bool {
     let needed = lines.div_ceil(PAGE_LINES as usize) as u32;
-    (0..needed).all(|p| pages.contains(&p))
+    (1..=needed).all(|p| pages.contains(&p))
 }
 
 /// The `file_read` pages a chain served without an error. `turns` are the
@@ -138,19 +139,19 @@ mod tests {
         format!("<tool_response>{body}</tool_response>\n")
     }
 
-    const PAGE: &str =
-        "\n```rust file=candle/a.rs page=1/2 lines=350\n…\n```\nend of candle/a.rs page 1/2\n";
+    const PAGE: &str = "\n```rust file=candle/a.rs page=1 pages=2 lines=350\n…\n```\n\
+                        end of candle/a.rs page 1 of 2 — next: page=2\n";
 
     /// Two call turns answered in turn, then the summary: both pages count.
     #[test]
     fn a_chain_that_read_every_page_is_complete() {
         let turns = vec![
-            ("Read a.rs".to_string(), call(0)),
-            (response(PAGE), call(1)),
+            ("Read a.rs".to_string(), call(1)),
+            (response(PAGE), call(2)),
             (response(PAGE), "It defines A.".to_string()),
         ];
         let pages = read_pages(&turns);
-        assert_eq!(pages, BTreeSet::from([0, 1]));
+        assert_eq!(pages, BTreeSet::from([1, 2]));
         assert!(covers(&pages, 350));
     }
 
@@ -158,42 +159,49 @@ mod tests {
     #[test]
     fn a_missing_page_or_an_error_is_not_complete() {
         let skipped = vec![
-            ("Read a.rs".to_string(), call(0)),
+            ("Read a.rs".to_string(), call(1)),
             (response(PAGE), "It defines A.".to_string()),
         ];
         assert!(!covers(&read_pages(&skipped), 350));
 
         let failed = vec![
-            ("Read a.rs".to_string(), call(0)),
-            (response(PAGE), call(1)),
+            ("Read a.rs".to_string(), call(1)),
+            (response(PAGE), call(2)),
             (
                 response(r#"{"error":"not_found","detail":"x"}"#),
                 "It defines A.".to_string(),
             ),
         ];
-        assert_eq!(read_pages(&failed), BTreeSet::from([0]));
+        assert_eq!(read_pages(&failed), BTreeSet::from([1]));
         assert!(!covers(&read_pages(&failed), 350));
+    }
+
+    /// **A chain read zero-based is not complete**: pages 0 and 1 of a two-page
+    /// file are the first page and a past-the-end clamp, never the whole file.
+    #[test]
+    fn a_zero_based_chain_is_not_complete() {
+        assert!(!covers(&BTreeSet::from([0, 1]), 350));
     }
 
     /// A multi-call round's labels are stripped before the error test, and the
     /// responses pair with the calls in order.
     #[test]
     fn labelled_responses_pair_with_calls_in_order() {
-        let calls = format!("{}\n{}", call(0), call(1));
+        let calls = format!("{}\n{}", call(1), call(2));
         let user = format!(
             "{}{}",
             response(&format!("[1/2 file_read]\n{PAGE}")),
             response("[2/2 file_read]\n{\"error\":\"bad_page\"}"),
         );
         let turns = vec![("Read a.rs".to_string(), calls), (user, "…".to_string())];
-        assert_eq!(read_pages(&turns), BTreeSet::from([0]));
+        assert_eq!(read_pages(&turns), BTreeSet::from([1]));
     }
 
     /// Page counts are exact at the boundary: 200 lines is one page, 201 two,
     /// and an empty file needs none.
     #[test]
     fn the_page_count_is_exact_at_the_boundary() {
-        let first = BTreeSet::from([0]);
+        let first = BTreeSet::from([1]);
         assert!(covers(&first, 200));
         assert!(!covers(&first, 201));
         assert!(covers(&BTreeSet::new(), 0));

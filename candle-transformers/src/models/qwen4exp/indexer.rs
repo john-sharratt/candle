@@ -38,6 +38,7 @@
 
 use candle::{DType, Device, Result, Tensor};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -67,7 +68,10 @@ use candle_kernels::simple::f32_rows_matmul::F32_ROWS_MATMUL_MAX_ROWS;
 #[cfg(feature = "cuda")]
 use candle_kernels::simple::qsa_topk::{qsa_topk_split_parts, SPLIT_KEYS};
 use candle_kernels::simple::qsa_topk::{MAX_ENTRIES, MAX_KEEP};
-use candle_nn::kv_cache::{arena_regions, plan_slot_moves, relocate_tensor, ArenaSlot, SlotTenant};
+use candle_nn::kv_cache::{
+    arena_regions, plan_slot_moves, relocate_tensor, ArenaSlot, SlotTenant,
+    PREFILL_KV_STAGE_MIN_Q_LEN,
+};
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
 #[cfg(feature = "cuda")]
@@ -2338,6 +2342,45 @@ pub fn widest_candidates(
         .max(1)
 }
 
+/// The wave's spans, by index, cut into the runs that are scored together: a run
+/// of prompt chunks (at least [`PREFILL_KV_STAGE_MIN_Q_LEN`] rows each) or a run
+/// of narrow spans — decode rows and verify windows. Each run's score buffer is
+/// as wide as its own deepest row ([`select_layer`], `select_bytes`).
+///
+/// **One width for the whole wave priced every row at the deepest one's.** A
+/// decode row of a deep dialogue riding beside an ingest chunk made the chunk's
+/// thousands of rows as wide as the dialogue's candidates: measured on `.5`,
+/// 2026-10-17, an 8,202-row wave carved its score buffer at 78,939 columns —
+/// 2.6 GB on every attention layer's phase, bought from the expert zone — where
+/// the chunk's own rows ranked under 16K. Runs are contiguous in the wave's
+/// packed order, so each one's rows are a row range of the selection table.
+pub fn score_runs(spans: &[SeqSpan]) -> Vec<Range<usize>> {
+    let bulk = |s: &SeqSpan| s.len >= PREFILL_KV_STAGE_MIN_Q_LEN;
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    for (i, s) in spans.iter().enumerate() {
+        match runs.last_mut() {
+            Some(r) if bulk(&spans[r.start]) == bulk(s) => r.end = i + 1,
+            _ => runs.push(i..i + 1),
+        }
+    }
+    runs
+}
+
+/// A bulk selection's shape, which is what its scoring and top-k cost follow:
+/// the rows scored, the candidate blocks the widest row ranks, and the page
+/// layout the attention walks through.
+fn log_bulk_selection(rows: usize, widest: usize, pages: usize) {
+    if rows >= PREFILL_KV_STAGE_MIN_Q_LEN {
+        tracing::debug!(
+            target: "candle_transformers::prefill_launch",
+            rows,
+            widest_candidates = widest,
+            pages,
+            "bulk qsa selection",
+        );
+    }
+}
+
 /// Whether a layer at this depth selects at all.
 ///
 /// Below the budget every visible cell is attended, so the indexer would
@@ -2516,61 +2559,78 @@ pub fn select_layer(
     append_wave(&mut work, &k_all, indexer, compress_ratio, eps)?;
 
     if let (Some(table), Some(q_all)) = (table.as_mut(), q_all.as_ref()) {
-        // A row's own candidate count still bounds its scan, so the columns a
-        // narrower span leaves untouched are never read — which is why the
-        // buffer is allocated uninitialised (hot-path invariant 6).
-        let scores = wave_empty_ticketed((total_rows, widest), DType::F32, device, ticket)?;
-        let mut cand: Vec<u32> = vec![0; total_rows];
-        let mut tail: Vec<u32> = vec![1; total_rows];
-        let mut prompt: Vec<u32> = vec![0; total_rows];
-        for (span, &rung) in spans.iter().zip(&span_rungs) {
-            let cache = idx_map
-                .get(&span.seq)
-                .and_then(|c| c.get(kv))
-                .ok_or_else(|| {
-                    candle::Error::Msg(format!("seq {} has no index cache", span.seq))
-                })?;
-            // Name the cache, not just the shortfall. A sequence holds one cache
-            // per KV layer and they are not interchangeable: the trunk's are
-            // appended by every wave, while the MTP draft head's — the slot at
-            // `n_attention_layers()` — is appended only by the draft walks it
-            // runs. A shortfall reported without its layer reads as one bug in
-            // the index when it is two different populations of the same array.
-            let span_cand = cache
-                .score_rows(
-                    &q_all.narrow(0, span.start, span.len)?,
-                    &positions[span.start..span.start + span.len],
-                    idx_cfg,
-                    compress_ratio,
-                    rope,
-                    rung,
-                    &scores,
-                    widest,
-                    span.start,
-                    ticket,
-                )
-                .map_err(|e| candle::Error::Msg(format!("kv layer {kv}, seq {}: {e}", span.seq)))?;
-            cand[span.start..span.start + span.len].copy_from_slice(&span_cand);
-            for (r, &p) in positions[span.start..span.start + span.len]
-                .iter()
-                .enumerate()
-            {
-                tail[span.start + r] = cache.tail_len(p, compress_ratio);
+        // Scored and ranked a run at a time (`score_runs`), each run's buffer as
+        // wide as its own deepest row. A row's own candidate count still bounds
+        // its scan, so the columns a narrower span leaves untouched are never
+        // read — which is why each buffer is allocated uninitialised (hot-path
+        // invariant 6).
+        for run in score_runs(spans) {
+            let run_spans = &spans[run.clone()];
+            let base = run_spans[0].start;
+            let rows = run_spans.iter().map(|s| s.len).sum::<usize>();
+            let run_widest = widest_candidates(
+                run_spans,
+                &offsets[run.clone()],
+                idx_map,
+                kv,
+                compress_ratio,
+            );
+            let scores = wave_empty_ticketed((rows, run_widest), DType::F32, device, ticket)?;
+            let mut cand: Vec<u32> = vec![0; rows];
+            let mut tail: Vec<u32> = vec![1; rows];
+            let mut prompt: Vec<u32> = vec![0; rows];
+            for (span, &rung) in run_spans.iter().zip(&span_rungs[run.clone()]) {
+                let cache = idx_map
+                    .get(&span.seq)
+                    .and_then(|c| c.get(kv))
+                    .ok_or_else(|| {
+                        candle::Error::Msg(format!("seq {} has no index cache", span.seq))
+                    })?;
+                let at = span.start - base;
+                // Name the cache, not just the shortfall. A sequence holds one
+                // cache per KV layer and they are not interchangeable: the
+                // trunk's are appended by every wave, while the MTP draft head's
+                // — the slot at `n_attention_layers()` — is appended only by the
+                // draft walks it runs. A shortfall reported without its layer
+                // reads as one bug in the index when it is two different
+                // populations of the same array.
+                let span_cand = cache
+                    .score_rows(
+                        &q_all.narrow(0, span.start, span.len)?,
+                        &positions[span.start..span.start + span.len],
+                        idx_cfg,
+                        compress_ratio,
+                        rope,
+                        rung,
+                        &scores,
+                        run_widest,
+                        at,
+                        ticket,
+                    )
+                    .map_err(|e| {
+                        candle::Error::Msg(format!("kv layer {kv}, seq {}: {e}", span.seq))
+                    })?;
+                cand[at..at + span.len].copy_from_slice(&span_cand);
+                for (r, &p) in positions[span.start..span.start + span.len]
+                    .iter()
+                    .enumerate()
+                {
+                    tail[at + r] = cache.tail_len(p, compress_ratio);
+                }
+                prompt[at..at + span.len].fill(cache.prompt_blocks(compress_ratio) as u32);
             }
-            prompt[span.start..span.start + span.len]
-                .fill(cache.prompt_blocks(compress_ratio) as u32);
+            expect_dense(&scores, "qsa selection scores")?;
+            table.fill_rows(
+                &scores,
+                &cand,
+                &positions[base..base + rows],
+                &tail,
+                &prompt,
+                compress_ratio,
+                idx_cfg.top_k,
+                base,
+            )?;
         }
-        expect_dense(&scores, "qsa selection scores")?;
-        table.fill_rows(
-            &scores,
-            &cand,
-            &positions,
-            &tail,
-            &prompt,
-            compress_ratio,
-            idx_cfg.top_k,
-            0,
-        )?;
     }
     // The page layout the attention kernels walk, built only when some sequence
     // in this wave holds an injected prefix. Every other wave passes null and
@@ -2584,6 +2644,7 @@ pub fn select_layer(
             .is_some_and(|c| c.has_pages())
     });
     if !needs_pages {
+        log_bulk_selection(total_rows, widest, 0);
         return Ok(Some(sel));
     }
     let mut pages: Vec<u32> = Vec::new();
@@ -2604,6 +2665,7 @@ pub fn select_layer(
         }
     }
     let n_pages = pages.len() / 2;
+    log_bulk_selection(total_rows, widest, n_pages);
     let pages_t = wave_from_vec_ticketed(pages, (n_pages, 2), device, ticket)?;
     let win_t = wave_from_vec_ticketed(win, (total_rows, 2), device, ticket)?;
     Ok(Some(sel.with_pages(pages_t, win_t)?))
@@ -2612,6 +2674,7 @@ pub fn select_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::gpu_test_lock::gpu_serial;
     use crate::models::qwen35::attention::RopeTables;
     use crate::models::qwen4exp::qsa::{qsa_selection_mask, IndexState};
     use crate::models::qwen4exp::qsa_select::{
@@ -3680,6 +3743,7 @@ mod tests {
     /// with the block input on the phase as the forward puts it.
     #[test]
     fn the_selection_bound_covers_what_a_layer_carves() -> Result<()> {
+        let _gpu = gpu_serial();
         let Some(device) = cuda() else { return Ok(()) };
         let Device::Cuda(cd) = &device else {
             return Ok(());
@@ -3701,6 +3765,108 @@ mod tests {
 
         let hidden = rig.w.q_proj.dim(1)?;
         let h = Tensor::from_vec(lcg(rows * hidden, 0x77, 1.0), (rows, hidden), &device)?;
+        let wave = begin_wave(&cd.cuda_stream(), LayerPhase::Attention)?;
+        let ticket = Some(wave.ticket());
+        let h_wave = wave_empty_ticketed((rows, hidden), DType::F32, &device, ticket)?;
+        h_wave.slice_set(&h, 0, 0)?;
+        let before = wave.alloc(1, CARVE_ALIGN)?.ptr;
+        let sel = select_layer(
+            0,
+            rig.ratio,
+            &rig.w,
+            &rig.rope,
+            &h_wave,
+            &spans,
+            &offsets,
+            &mut idx_map,
+            None,
+            rows,
+            &rig.cfg,
+            rig.eps,
+            &device,
+            &AtomicU64::new(0),
+            ticket,
+        )?;
+        assert!(sel.is_some(), "the selection engaged");
+        drop(sel);
+        let after = wave.alloc(1, CARVE_ALIGN)?.ptr;
+        let carved = (after - before) as usize - CARVE_ALIGN;
+        assert!(
+            carved <= bound,
+            "select_layer carved {carved} B against a stated bound of {bound} B"
+        );
+        Ok(())
+    }
+
+    /// Runs follow the spans' packed order: a bulk span joins the bulk spans
+    /// around it and a narrow one the narrow ones, and every span is in
+    /// exactly one run.
+    #[test]
+    fn spans_are_scored_in_runs_of_bulk_and_narrow() {
+        let span = |start: usize, len: usize| SeqSpan {
+            seq: start,
+            start,
+            len,
+        };
+        let bulk = PREFILL_KV_STAGE_MIN_Q_LEN;
+        let spans = [
+            span(0, 1),
+            span(1, 5),
+            span(6, bulk),
+            span(6 + bulk, 2 * bulk),
+            span(6 + 3 * bulk, 1),
+        ];
+        assert_eq!(score_runs(&spans), vec![0..2, 2..4, 4..5]);
+        assert_eq!(score_runs(&spans[..1]), vec![0..1]);
+        assert!(score_runs(&[]).is_empty());
+    }
+
+    /// **A deep decode row does not widen a bulk chunk's score buffer.** The
+    /// bound still covers what the layer carves, and it is the bulk rows at
+    /// their own width plus the decode row at its — under the one-width figure
+    /// that priced every row at the deepest row's candidates.
+    #[test]
+    fn a_deep_narrow_row_does_not_widen_a_bulk_runs_scores() -> Result<()> {
+        let _gpu = gpu_serial();
+        let Some(device) = cuda() else { return Ok(()) };
+        let Device::Cuda(cd) = &device else {
+            return Ok(());
+        };
+        let (deep_past, bulk_past) = (4096usize, 96usize);
+        let rig = Rig::new(device.clone(), deep_past + 1)?;
+        let bulk_rows = PREFILL_KV_STAGE_MIN_Q_LEN;
+        let mut deep = rig.build(deep_past)?;
+        deep.ensure_capacity(deep_past + 1, rig.ratio)?;
+        let mut shallow = rig.build(bulk_past)?;
+        shallow.ensure_capacity(bulk_past + bulk_rows, rig.ratio)?;
+        let mut idx_map: HashMap<usize, Vec<IndexCache>> = HashMap::new();
+        idx_map.insert(1, vec![deep]);
+        idx_map.insert(2, vec![shallow]);
+        let spans = [
+            SeqSpan {
+                seq: 1,
+                start: 0,
+                len: 1,
+            },
+            SeqSpan {
+                seq: 2,
+                start: 1,
+                len: bulk_rows,
+            },
+        ];
+        let offsets = [deep_past, bulk_past];
+        let rows = 1 + bulk_rows;
+        let bound = select_layer_bytes(0, rig.ratio, &spans, &offsets, &idx_map, &rig.cfg)?;
+        let widest = widest_candidates(&spans, &offsets, &idx_map, 0, rig.ratio);
+        let one_width = rows * widest * 4;
+        let bulk_width = widest_candidates(&spans[1..], &offsets[1..], &idx_map, 0, rig.ratio);
+        assert!(
+            bulk_rows * bulk_width * 4 + widest * 4 < one_width,
+            "the bulk run is narrower than the deep row: {bulk_width} against {widest}"
+        );
+
+        let hidden = rig.w.q_proj.dim(1)?;
+        let h = Tensor::from_vec(lcg(rows * hidden, 0x78, 1.0), (rows, hidden), &device)?;
         let wave = begin_wave(&cd.cuda_stream(), LayerPhase::Attention)?;
         let ticket = Some(wave.ticket());
         let h_wave = wave_empty_ticketed((rows, hidden), DType::F32, &device, ticket)?;

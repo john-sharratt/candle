@@ -153,6 +153,11 @@ fn the_unreachable_reason_is_readable() {
         json!("The gateway answered 502.")
     );
     assert_eq!(
+        reason(json!("Error"), json!("GET /v1/status -> 503")),
+        json!("Zend is restarting — back in a moment."),
+        "every member still loading"
+    );
+    assert_eq!(
         reason(
             json!("Error"),
             json!("/v1/status did not answer within 8s.")

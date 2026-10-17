@@ -1,38 +1,30 @@
-//! The object store a member derives from its log (`docs/substrate_git.md` §4).
+//! The object database a member reads one repository through
+//! (`docs/substrate_git.md` §4): no folder, its objects the log's packs, its
+//! refs in memory.
 //!
-//! One repository per name under a root — `<substrate>/git/<repo>` — with an
-//! empty working tree, since nothing reads its folder: a conversation reads a
-//! branch's tree, and commands run on agents. Its packs are the log's packs.
-//!
-//! The log's branches are the store's **record**: `origin`'s tracking refs,
+//! The log's branches are the database's **record**: `origin`'s tracking refs,
 //! `refs/remotes/origin/<branch>`, which is where zend reads a repository's
 //! branches when it has an origin (`zend_vfs::Repo::record_branches`). A sync
 //! never moves a tracking ref back to an ancestor of what it holds unless the
 //! log says `forced`, so a member's own push — which moves its tracking ref as
 //! it lands — is never rewound before it is published ([`crate::Importer`]).
 //! A tip on another line is taken: the log reached it through a forced write
-//! this store missed. Local branches are the member's own and never touched.
+//! this member missed. Local branches are the member's own and never touched.
 //!
-//! Deleting the store loses nothing a member has published: the next sync
-//! rebuilds it from the log.
+//! Nothing a member holds here is lost at a restart: its refs are rebuilt
+//! from the log by the next sync.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use zend_vfs::{
-    BranchName, Fetch, Oid, RefName, RefOp, RefTransaction, RemoteName, RemoteUrl, Repo, Rev,
-    UrlKind,
+    fetch_here, Fetch, ObjectDb, Oid, RefName, RefOp, RefTransaction, RemoteName, RemoteUrl, Repo,
+    Rev, UrlKind, DEFAULT_PACK_BUDGET,
 };
 
+use crate::pack_store::LogPacks;
 use crate::records::{Log, Records};
-
-/// What the store's HEAD names: a branch never made, so nothing is checked out
-/// and no branch the log moves is the current one.
-const STORE_HEAD: &str = "refs/heads/substrate-store";
 
 /// Where the record's branches are: `origin`'s tracking refs.
 pub(crate) const TRACKING: &str = "refs/remotes/origin/";
@@ -40,85 +32,91 @@ pub(crate) const TRACKING: &str = "refs/remotes/origin/";
 /// The remote the importer fetches into.
 pub(crate) const IMPORT: &str = "import";
 
-/// One repository's derived object store.
+/// The object database of repository `name`, its packs read from `records`.
+pub fn open_db(records: Arc<dyn Records>, name: &str) -> anyhow::Result<ObjectDb> {
+    Log::new(records.as_ref(), name)?;
+    let packs = Arc::new(LogPacks::new(records, name));
+    ObjectDb::open(name, packs, DEFAULT_PACK_BUDGET)
+        .with_context(|| format!("the object database of {name}"))
+}
+
+/// One repository's object database.
 pub struct Store {
     name: String,
-    dir: PathBuf,
+    db: ObjectDb,
     repo: Repo,
+    /// What makes the repository's fetches.
+    fetcher: Arc<dyn Fetch>,
 }
 
 /// What a sync did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Synced {
-    /// Packs taken into the store.
+    /// Packs taken into the database.
     pub taken: usize,
-    /// Packs the log names whose blob has not arrived.
+    /// Packs the log names whose blobs have not all arrived.
     pub waiting: usize,
-    /// Packs whose blob arrived but could not be read or taken, by SHA-256,
-    /// with why. Every branch waits while one is, as for a pack not arrived.
+    /// Packs whose blobs arrived but whose index could not be read, by
+    /// SHA-256, with why. Every branch waits while one is, as for a pack not
+    /// arrived.
     pub failed: Vec<(String, String)>,
-    /// Packs the log names that the store holds, and how many it names.
+    /// Packs the log names that the database holds, and how many it names.
     pub held: usize,
     pub listed: usize,
-    /// Branches the log names that the store does not yet hold where the log
-    /// does: their packs have not all arrived.
+    /// Branches the log names that the database does not yet hold where the
+    /// log does: their packs have not all arrived.
     pub behind: usize,
     /// Record refs set or deleted, with where they point now.
     pub moved: Vec<(RefName, Option<Oid>)>,
 }
 
 impl Store {
-    /// The store for `name` under `root`, made empty when absent. Its `origin`
-    /// is `agent:<name>` until [`Self::with_origin`] says otherwise.
-    pub fn open(root: &Path, name: &str) -> anyhow::Result<Self> {
-        let dir = root.join(name);
-        if !dir.join(".git").is_dir() {
-            fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
-            Repo::init(&dir, &BranchName::parse("main")?)
-                .with_context(|| format!("the object store at {}", dir.display()))?;
-        }
-        // Nothing is checked out here, so HEAD names a ref of the store's own,
-        // never a branch.
-        let pointed = Command::new("git")
-            .current_dir(&dir)
-            .args(["symbolic-ref", "HEAD", STORE_HEAD])
-            .output()
-            .with_context(|| format!("pointing HEAD in {}", dir.display()))?;
-        if !pointed.status.success() {
-            bail!(
-                "pointing HEAD in {}: {}",
-                dir.display(),
-                String::from_utf8_lossy(&pointed.stderr).trim()
-            );
-        }
-        let repo =
-            Repo::open(&dir).with_context(|| format!("the object store at {}", dir.display()))?;
+    /// Repository `name`, read from `records`. Its `origin` is `agent:<name>`
+    /// until [`Self::with_origin`] says otherwise.
+    pub fn open(records: Arc<dyn Records>, name: &str) -> anyhow::Result<Self> {
+        Self::over(open_db(records, name)?)
+    }
+
+    /// The repository `db` holds — a database [`open_db`] opened, shared with
+    /// whatever else holds it. Its `origin` is `agent:<name>` until
+    /// [`Self::with_origin`] says otherwise.
+    pub fn over(db: ObjectDb) -> anyhow::Result<Self> {
+        let name = db.name().to_string();
+        let repo = Repo::in_substrate(&db)?;
         let store = Self {
-            name: name.to_string(),
-            dir,
+            name: name.clone(),
+            db,
             repo,
+            fetcher: fetch_here(),
         };
-        store.set_origin(&RemoteUrl::parse(&format!("agent:{name}"))?, false)?;
+        store.set_origin(&RemoteUrl::parse(&format!("agent:{name}"))?)?;
         Ok(store)
     }
 
     /// This store fetching from `url` as `origin`, through `fetcher`.
     pub fn with_origin(mut self, url: &RemoteUrl, fetcher: Arc<dyn Fetch>) -> anyhow::Result<Self> {
-        self.set_origin(url, true)?;
-        self.repo = self.repo.fetching_through(fetcher);
+        self.set_origin(url)?;
+        self.repo = Repo::in_substrate(&self.db)?.fetching_through(Arc::clone(&fetcher));
+        self.fetcher = fetcher;
         Ok(self)
+    }
+
+    /// What makes the repository's fetches: for another handle on the same
+    /// database to fetch as this one does.
+    pub fn fetcher(&self) -> Arc<dyn Fetch> {
+        Arc::clone(&self.fetcher)
     }
 
     /// Point `origin` — the record, and where pushes go — and `import` — what
     /// the importer fetches into — at `url`.
-    fn set_origin(&self, url: &RemoteUrl, replace: bool) -> anyhow::Result<()> {
+    fn set_origin(&self, url: &RemoteUrl) -> anyhow::Result<()> {
         let remotes = self.repo.remotes()?;
         for name in ["origin", IMPORT] {
             let name = RemoteName::parse(name)?;
-            if !remotes.iter().any(|r| r.name == name) {
-                self.repo.add_remote(&name, url)?;
-            } else if replace {
+            if remotes.iter().any(|r| r.name == name) {
                 self.repo.set_remote_url(&name, url, UrlKind::Fetch)?;
+            } else {
+                self.repo.add_remote(&name, url)?;
             }
         }
         Ok(())
@@ -136,17 +134,17 @@ impl Store {
         &self.name
     }
 
-    /// Where the store is.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// The store as a repository: read branches, build commits, bundle a push.
     pub fn repo(&self) -> &Repo {
         &self.repo
     }
 
-    /// The record's branches as the store holds them, by their name in the
+    /// The database the repository is held in.
+    pub fn objects(&self) -> &ObjectDb {
+        &self.db
+    }
+
+    /// The record's branches as the database holds them, by their name in the
     /// log (`refs/heads/<branch>`).
     pub fn record(&self) -> anyhow::Result<BTreeMap<RefName, Oid>> {
         self.branches_under(TRACKING)
@@ -163,41 +161,38 @@ impl Store {
         Ok(out)
     }
 
-    /// Bring the store up to `records`: take every pack it lacks whose blob has
+    /// Packs the log names that the database holds, and how many it names —
+    /// read, with nothing taken in and no ref moved: what a load can say
+    /// before its first round has run.
+    pub fn pack_counts(&self, records: &dyn Records) -> anyhow::Result<(usize, usize)> {
+        let listed = Log::new(records, &self.name)?.packs()?;
+        let held: BTreeSet<String> = self.db.held_packs().into_iter().collect();
+        let n_held = listed.keys().filter(|sha| held.contains(*sha)).count();
+        Ok((n_held, listed.len()))
+    }
+
+    /// Bring the database up to `records`: take every pack whose blobs have
     /// arrived, then, once every pack the log lists is here, move every record
     /// branch whose own `needs` are too — never back to an ancestor unless
     /// forced.
     pub fn sync(&self, records: &dyn Records) -> anyhow::Result<Synced> {
         let log = Log::new(records, &self.name)?;
-        let mut synced = Synced::default();
-        let mut held = BTreeSet::new();
-        for (sha, entry) in log.packs()? {
-            if self.pack_path(&entry.checksum).is_file() {
-                held.insert(sha);
-                continue;
-            }
-            // One pack that cannot be read or taken is reported and passed
-            // over, never the sync's failure: every other pack is still
-            // taken, and the next sync tries it again.
-            let taken = log.pack_bytes(&sha).and_then(|bytes| match bytes {
-                Some(bytes) => {
-                    self.repo.take_pack(&bytes)?;
-                    Ok(true)
-                }
-                None => Ok(false),
-            });
-            match taken {
-                Ok(true) => {
-                    synced.taken += 1;
-                    held.insert(sha);
-                }
-                Ok(false) => synced.waiting += 1,
-                Err(e) => synced.failed.push((sha, format!("{e:#}"))),
+        let refreshed = self.db.refresh()?;
+        let held: BTreeSet<String> = self.db.held_packs().into_iter().collect();
+        let mut synced = Synced {
+            taken: refreshed.added,
+            failed: refreshed.failed,
+            ..Synced::default()
+        };
+        for sha in log.packs()?.keys() {
+            synced.listed += 1;
+            if held.contains(sha) {
+                synced.held += 1;
+            } else if !synced.failed.iter().any(|(f, _)| f == sha) {
+                synced.waiting += 1;
             }
         }
 
-        synced.held = held.len();
-        synced.listed = synced.held + synced.waiting + synced.failed.len();
         let current = self.record()?;
         let mut txn = RefTransaction::new();
         for (name, entry) in log.refs()? {
@@ -205,10 +200,9 @@ impl Store {
                 continue;
             };
             // Every pack the log lists, not only the ref's own `needs`: a ref
-            // published before `needs` named every pack it reaches through
-            // (`crate::publish`) lists only its newest, and its parents may
-            // be in any other. A tracking ref never names a commit whose
-            // history the store cannot read whole.
+            // names only the packs written with it, and its parents may be in
+            // any other. A tracking ref never names a commit whose history the
+            // database cannot read whole.
             if synced.listed > synced.held || !entry.needs.iter().all(|sha| held.contains(sha)) {
                 synced.behind += 1;
                 continue;
@@ -232,7 +226,7 @@ impl Store {
                     // Never back to an ancestor of what the record holds,
                     // unless forced: that is the log behind this member's own
                     // push, or a stale write. A tip on another line is taken —
-                    // the log moved there through a forced write this store
+                    // the log moved there through a forced write this member
                     // missed, and `forced` belongs to that one entry, not to
                     // the commits written on top of it since.
                     let backward = self
@@ -264,13 +258,5 @@ impl Store {
             self.repo.update_refs(&txn)?;
         }
         Ok(synced)
-    }
-
-    fn pack_path(&self, checksum: &str) -> PathBuf {
-        self.dir
-            .join(".git")
-            .join("objects")
-            .join("pack")
-            .join(format!("pack-{checksum}.pack"))
     }
 }

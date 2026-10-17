@@ -26,7 +26,7 @@ questions:
 - show me every place that constructs a ToolContext
 category: Files
 mandatory: true
-description: 'Search the CONTENTS of every file in the workspace **as it stands on disk right now** — uncommitted edits and untracked files included — for a string or regular expression, and return the matching lines grouped by repo, each with its file path and line number. **If the question is about what a COMMIT, BRANCH or TAG holds ("search the committed files", "was this in the release branch", "did that tag still have it"), stop and use git_grep instead** — an untracked or since-edited file reads differently through the two, so answering a committed-content question from the working tree is confidently wrong. `repo` is required: name one repository when you know which one holds the code, or pass `*` to search them all. Use for: finding where a function, type, constant or error message is defined or used; checking whether something exists in the codebase at all; tracing the callers of an API; locating a config key, a magic string, or a leftover TODO. Takes a regex in Rust regex syntax (`^pub fn `, `Error::\w+`, `foo|bar`) — a plain string matches itself — plus an optional path prefix to narrow the search and an optional ignore_case. Returns the matches grouped by repo — path, line number and the matching line — paged (`page` is required: pass 0 to start, and the response''s `paging.next_page` for the next page), along with files_searched so that an empty result is unambiguous: scanning four thousand files and finding nothing reads differently from a prefix that matched nothing to scan. Capped at twenty hits per file so one generated file cannot hide every other file that matched; `truncated` says when a cap was reached. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it before guessing directory names with file_list. The line number it returns divided by 200, rounded down, is the page to pass file_read to see it in context. Use file_search to find a file by its NAME rather than its contents, and git_grep for what a commit, branch or tag holds rather than what is on disk.'
+description: 'Search the CONTENTS of every file in the workspace **as it stands on disk right now** — uncommitted edits and untracked files included — for a string or regular expression, and return the matching lines grouped by repo, each with its file path and line number. **If the question is about what a COMMIT, BRANCH or TAG holds ("search the committed files", "was this in the release branch", "did that tag still have it"), stop and use git_grep instead** — an untracked or since-edited file reads differently through the two, so answering a committed-content question from the working tree is confidently wrong. `repo` is required: name one repository when you know which one holds the code, or pass `*` to search them all. Use for: finding where a function, type, constant or error message is defined or used; checking whether something exists in the codebase at all; tracing the callers of an API; locating a config key, a magic string, or a leftover TODO. Takes a regex in Rust regex syntax (`^pub fn `, `Error::\w+`, `foo|bar`) — a plain string matches itself — plus an optional path prefix to narrow the search and an optional ignore_case. Returns the matches grouped by repo — path, line number and the matching line — paged from 1 (`page` is required: pass 1 to start, and the response''s `paging.next_page` for the next page), along with files_searched so that an empty result is unambiguous: scanning four thousand files and finding nothing reads differently from a prefix that matched nothing to scan. Capped at twenty hits per file so one generated file cannot hide every other file that matched; `truncated` says when a cap was reached. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it before guessing directory names with file_list. The line number it returns divided by 200, rounded down, is the page to pass file_read to see it in context. Use file_search to find a file by its NAME rather than its contents, and git_grep for what a commit, branch or tag holds rather than what is on disk.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
@@ -51,9 +51,9 @@ parameters:
       - boolean
       - 'null'
     page:
-      description: Zero-based page of results to return — 0 to start. When the response's `paging.next_page` is set, pass it here to read the following page. Required.
+      description: Page of results to return, from 1 — 1 to start. When the response's `paging.next_page` is set, pass it here to read the following page. Required.
       format: uint32
-      minimum: 0.0
+      minimum: 1.0
       type: integer
   required:
   - pattern
@@ -72,7 +72,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "forward_wave", "repo": "candle", "page": 0}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "forward_wave", "repo": "candle", "page": 1}}
   </tool_call><|projection|>
 - |-
   are there any TODO or FIXME comments left<|im_end|>
@@ -84,7 +84,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "TODO|FIXME", "repo": "*", "page": 0}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "TODO|FIXME", "repo": "*", "page": 1}}
   </tool_call><|projection|>
 - |-
   who calls elevate_to_hot<|im_end|>
@@ -96,7 +96,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "elevate_to_hot\\(", "repo": "candle", "page": 0}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "elevate_to_hot\\(", "repo": "candle", "page": 1}}
   </tool_call><|projection|>
 - |-
   find the public functions in zend-tools<|im_end|>
@@ -108,7 +108,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "^pub fn ", "repo": "candle", "prefix": "zend-tools/src/", "page": 0}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "^pub fn ", "repo": "candle", "prefix": "zend-tools/src/", "page": 1}}
   </tool_call><|projection|>
 - |-
   the log says connection refused, find where that message comes from<|im_end|>
@@ -120,7 +120,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "connection refused", "repo": "*", "ignore_case": true, "page": 0}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "connection refused", "repo": "*", "ignore_case": true, "page": 1}}
   </tool_call><|projection|>
 - |-
   does anything still use the old KvFormat enum<|im_end|>
@@ -132,7 +132,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "KvFormat", "repo": "candle", "page": 0}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "KvFormat", "repo": "candle", "page": 1}}
   </tool_call><|projection|>
 - |-
   which file reads the tavily api key<|im_end|>
@@ -144,7 +144,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "tavily_api_key", "repo": "*", "page": 0}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "tavily_api_key", "repo": "*", "page": 1}}
   </tool_call><|projection|>
 - |-
   show me every place that constructs a ToolContext<|im_end|>
@@ -156,5 +156,5 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_grep", "arguments": {"pattern": "ToolContext::", "repo": "candle", "page": 0}}
+  <|projection|>{"name": "file_grep", "arguments": {"pattern": "ToolContext::", "repo": "candle", "page": 1}}
   </tool_call><|projection|>

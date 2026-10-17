@@ -1039,6 +1039,10 @@ impl ManagedBatchedModel for BatchedEngine {
         Some(self.engine.experts().expert_stats())
     }
 
+    fn expert_pipeline_dead(&self) -> bool {
+        self.engine.experts().pipeline_dead()
+    }
+
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
         Some(self.engine.experts().hit_counts())
     }

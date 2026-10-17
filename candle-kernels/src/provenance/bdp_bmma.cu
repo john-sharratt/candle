@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "bdp_chunk.cuh"
 #include "bdp_vote.cuh"
 #include "../grow_scratch.cuh"
 
@@ -470,12 +471,18 @@ extern "C" int run_bmma_bdp_scan(
     // else's failure and report it as ours — a launch that never actually
     // failed then looks like a BMMA rejection.
     (void)cudaGetLastError();
-    const size_t nc = (size_t)n_probe_tokens * n_groups * n_cases;
+
+    // The probe tokens run in chunks sized to `BDP_SCRATCH_BYTES` — see
+    // `bdp_probe_chunk`. The accumulators are per (probe, group, case) and the
+    // outputs per (probe, group, segment), both contiguous in the probe, so a
+    // chunk is the same scan over a prefix-offset slice of each.
+    const int chunk = bdp_probe_chunk(n_groups, n_cases);
+    const size_t nc = (size_t)chunk * n_groups * n_cases;
 
     // The three accumulators, carved from one grow-only scratch the launcher
-    // keeps (`grow_scratch.cuh`): every launch zeroes what it uses before the
+    // keeps (`grow_scratch.cuh`): every chunk zeroes what it uses before the
     // accumulate, and launches on the scan's one stream run in order, so the
-    // next launch's zeroing lands after this one's finalize has read them.
+    // next chunk's zeroing lands after this one's finalize has read them.
     static void *s_block = nullptr;
     static size_t s_cap = 0;
     const size_t max_bytes = (nc * sizeof(unsigned int) + 255) & ~(size_t)255;
@@ -493,32 +500,35 @@ extern "C" int run_bmma_bdp_scan(
         d_sum = (unsigned long long *)((char *)s_block + max_bytes);
         d_sq = (unsigned long long *)((char *)s_block + max_bytes + acc_bytes);
     }
-    if (err == cudaSuccess) {
+    for (int q0 = 0; err == cudaSuccess && q0 < n_probe_tokens; q0 += chunk) {
+        const int nq = (n_probe_tokens - q0) < chunk ? (n_probe_tokens - q0) : chunk;
+        const size_t ncq = (size_t)nq * n_groups * n_cases;
+        const size_t out_at = (size_t)q0 * n_groups * n_segments;
         stage = BDP_BMMA_STAGE_MEMSET;
-        err = cudaMemsetAsync(d_max, 0, nc * sizeof(unsigned int), s);
-    }
-    if (err == cudaSuccess) {
-        err = cudaMemsetAsync(d_sum, 0, nc * sizeof(unsigned long long), s);
-    }
-    if (err == cudaSuccess) {
-        err = cudaMemsetAsync(d_sq, 0, nc * sizeof(unsigned long long), s);
-    }
-    if (err == cudaSuccess) {
-        stage = BDP_BMMA_STAGE_ACCUM;
-        const dim3 grid((n_tokens + BMMA_TC - 1) / BMMA_TC, n_groups);
-        bdp_bmma_accum_kernel<<<grid, 256, 0, s>>>(
-            gallery_case, probe_words, page_ptr, pos_map, n_tokens,
-            n_probe_tokens, n_groups, n_cases, wpt, d_max, d_sum, d_sq);
-        err = cudaGetLastError();
-    }
-    if (err == cudaSuccess) {
-        stage = BDP_BMMA_STAGE_FINALIZE;
-        const int total = n_probe_tokens * n_groups * n_segments;
-        const int blocks = (total + 255) / 256;
-        bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
-            d_max, d_sum, d_sq, seg_tok_start, seg_case_start, n_probe_tokens,
-            n_groups, n_segments, n_cases, out_case, out_vote);
-        err = cudaGetLastError();
+        err = cudaMemsetAsync(d_max, 0, ncq * sizeof(unsigned int), s);
+        if (err == cudaSuccess) {
+            err = cudaMemsetAsync(d_sum, 0, ncq * sizeof(unsigned long long), s);
+        }
+        if (err == cudaSuccess) {
+            err = cudaMemsetAsync(d_sq, 0, ncq * sizeof(unsigned long long), s);
+        }
+        if (err == cudaSuccess) {
+            stage = BDP_BMMA_STAGE_ACCUM;
+            const dim3 grid((n_tokens + BMMA_TC - 1) / BMMA_TC, n_groups);
+            bdp_bmma_accum_kernel<<<grid, 256, 0, s>>>(
+                gallery_case, probe_words + (size_t)q0 * wpt, page_ptr, pos_map, n_tokens,
+                nq, n_groups, n_cases, wpt, d_max, d_sum, d_sq);
+            err = cudaGetLastError();
+        }
+        if (err == cudaSuccess) {
+            stage = BDP_BMMA_STAGE_FINALIZE;
+            const int total = nq * n_groups * n_segments;
+            const int blocks = (total + 255) / 256;
+            bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
+                d_max, d_sum, d_sq, seg_tok_start, seg_case_start, nq,
+                n_groups, n_segments, n_cases, out_case + out_at, out_vote + out_at);
+            err = cudaGetLastError();
+        }
     }
     return (err == cudaSuccess) ? 0 : -(stage * 1000 + (int)err);
 }

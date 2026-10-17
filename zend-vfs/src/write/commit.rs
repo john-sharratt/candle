@@ -6,9 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::changeset::{Change, ChangeSet};
 use crate::error::GitError;
+use crate::library::objects;
 use crate::read::tree::ObjectKind;
 use crate::types::{FileMode, Oid, RefName, RepoPath, Rev, Signature};
-use crate::write::fast_import::{CommitStream, FileOp};
+use crate::write::fast_import::{normalize_message, CommitStream, FileOp};
 use crate::write::ref_txn::{RefOp, RefTransaction};
 use crate::Repo;
 
@@ -35,8 +36,10 @@ impl Repo {
     ///
     /// 1. Each written file becomes a blob through the repository's filters
     ///    ([`Repo::write_blob`]), taking the base's mode when none is given.
-    /// 2. One `fast-import` run writes the tree and commit onto a scratch ref.
-    /// 3. The commit id is read back and the scratch ref deleted.
+    /// 2. Where libgit2 holds the repository, the base's tree is updated with
+    ///    the changes and the commit written over it, in this process.
+    /// 3. Otherwise one `fast-import` run writes the tree and commit onto a
+    ///    scratch ref, the commit id is read back, and the ref deleted.
     ///
     /// Given the same base, changes, message and signatures, the commit id is
     /// always the same.
@@ -86,6 +89,29 @@ impl Repo {
                 }
                 Change::Delete => ops.push(FileOp::Delete { path: path.clone() }),
             }
+        }
+
+        // In this process where libgit2 holds the repository: the base's tree
+        // with the changes written into it, and the commit over that. The
+        // blobs were written above, before the library is taken: its lock is
+        // not re-entrant.
+        if let Some(lib) = self.library() {
+            let edits: Vec<(&RepoPath, Option<(FileMode, &Oid)>)> = ops
+                .iter()
+                .map(|op| match op {
+                    FileOp::Modify { mode, oid, path } => (path, Some((*mode, oid))),
+                    FileOp::Delete { path } => (path, None),
+                })
+                .collect();
+            let tree = objects::tree_with(&lib, base, &edits)?;
+            return objects::commit_tree(
+                &lib,
+                &tree,
+                &[base],
+                &normalize_message(message),
+                author,
+                committer,
+            );
         }
 
         let target = scratch_ref();

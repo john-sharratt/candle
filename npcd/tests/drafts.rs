@@ -98,7 +98,7 @@ fn rig(record: bool) -> Rig {
     let npcs = Npcs::load(&data).unwrap();
     let accounts = Accounts::open(npcs.substrate(), &data.join("accounts")).unwrap();
     let (images, _) = Images::open(npcs.substrate(), &data.join("images")).unwrap();
-    let rt = Runtime::new(Mind::new(Some(mind.clone())), &data);
+    let rt = Runtime::new(Mind::new(Some(mind.clone())), &data).unwrap();
     rt.set_substrate(npcs.substrate());
     let state = Authored::new(
         Registry::load("world", mind.join("worlds")).unwrap(),

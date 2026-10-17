@@ -2,11 +2,14 @@
 //! built from a list of entries, commits made from a tree, and the index's
 //! entries.
 
-use git2::{Commit, Index, IndexEntry, IndexTime, Repository, Time};
+use std::path::Path;
+
+use git2::build::TreeUpdateBuilder;
+use git2::{Commit, FileMode as LibMode, Index, IndexEntry, IndexTime, Repository, Time};
 
 use super::{failed, is_absent, oid_of};
 use crate::error::GitError;
-use crate::types::{FileMode, Oid, Signature};
+use crate::types::{FileMode, Oid, RepoPath, Signature, TagName};
 
 /// The extended index flag marking an entry added with `--intent-to-add`.
 const INTENT_TO_ADD: u16 = 1 << 13;
@@ -128,6 +131,49 @@ pub(crate) fn index_listing(lib: &Repository) -> Result<Vec<Indexed>, GitError> 
         .collect()
 }
 
+/// libgit2's name for `mode`.
+fn lib_mode(mode: FileMode) -> LibMode {
+    match mode {
+        FileMode::Regular => LibMode::Blob,
+        FileMode::Executable => LibMode::BlobExecutable,
+        FileMode::Symlink => LibMode::Link,
+        FileMode::Tree => LibMode::Tree,
+        FileMode::Submodule => LibMode::Commit,
+    }
+}
+
+/// The tree `base` with each change applied: a path set to a mode and blob,
+/// or — `None` — removed. A removal of a path `base` does not hold changes
+/// nothing, as a fast-import `D` of it does.
+pub(crate) fn tree_with(
+    lib: &Repository,
+    base: &Oid,
+    changes: &[(&RepoPath, Option<(FileMode, &Oid)>)],
+) -> Result<Oid, GitError> {
+    let baseline = lib
+        .find_object(lib_id(base)?, None)
+        .and_then(|object| object.peel_to_tree())
+        .map_err(|e| failed("peel_to_tree", e))?;
+    let mut update = TreeUpdateBuilder::new();
+    for (path, change) in changes {
+        match change {
+            Some((mode, id)) => {
+                update.upsert(path.as_str(), lib_id(id)?, lib_mode(*mode));
+            }
+            None => {
+                if baseline.get_path(Path::new(path.as_str())).is_ok() {
+                    update.remove(path.as_str());
+                }
+            }
+        }
+    }
+    oid_of(
+        update
+            .create_updated(lib, &baseline)
+            .map_err(|e| failed("tree_create_updated", e))?,
+    )
+}
+
 fn signed(who: &Signature) -> Result<git2::Signature<'static>, GitError> {
     git2::Signature::new(
         who.name(),
@@ -135,6 +181,24 @@ fn signed(who: &Signature) -> Result<git2::Signature<'static>, GitError> {
         &Time::new(who.when.seconds, who.when.offset_minutes),
     )
     .map_err(|e| failed("signature", e))
+}
+
+/// An annotated tag object naming `target` as `name`, written; its id. No ref
+/// is made — the caller's transaction makes it.
+pub(crate) fn tag_object(
+    lib: &Repository,
+    target: &Oid,
+    name: &TagName,
+    tagger: &Signature,
+    message: &str,
+) -> Result<Oid, GitError> {
+    let object = lib
+        .find_object(lib_id(target)?, None)
+        .map_err(|e| failed("find_object", e))?;
+    oid_of(
+        lib.tag_annotation_create(name.as_str(), &object, &signed(tagger)?, message)
+            .map_err(|e| failed("tag_annotation_create", e))?,
+    )
 }
 
 /// A commit of `tree` over `parents`, in order, with `message` as it stands.
