@@ -85,6 +85,14 @@ impl ExecLibrary {
         self.slots.get(&key).is_some_and(|s| !s.execs().is_empty())
     }
 
+    /// Every `(topology, shape)` an executable holds now — what a trial judges.
+    pub(super) fn held_keys(&self) -> Vec<Key> {
+        self.slots
+            .iter()
+            .flat_map(|(&k, s)| s.execs().iter().map(move |e| (k, e.shape())))
+            .collect()
+    }
+
     /// Whether an executable holds exactly `(topology, shape)` — what a
     /// segment needs to replay without reshaping anything.
     pub(super) fn holds_shape(&self, (key, shape): Key) -> bool {

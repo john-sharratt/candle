@@ -110,9 +110,13 @@ executables per 2 s window on `.5` (2026-10-17) to admit shapes that were evicte
 1. **Learn.** Segments record and the library admits what it folds into its fixed budget. The
    learn ends at the first admission that does not fit, or after `LEARN_IDLE_WAVES` (32) waves
    with no admission.
-2. **Trial**, for `TRIAL_WAVES` (64) waves. Each shape the learn admitted alternates graphed
-   and eager every time a segment predicts it, timed on the device from the segment's start to
-   its end — host lateness included, which is what a graph removes. A shape hit in fewer than
+2. **Trial**, for `TRIAL_WAVES` (64) waves. It judges every shape the library **holds**
+   unproven when it begins — not the keys the learn admitted: the learn folds a one-off shape
+   over another executable, which then holds the one-off's shape, so judged by admitted key a
+   trial on `.5` (2026-10-17) banned all 1,065 of them as rarely hit and left 681 executables
+   held and never judged. A later learn never folds a one-off over a proven executable. Each
+   shape on trial alternates graphed and eager every time a segment predicts it, timed on the
+   device from the segment's start to its end — host lateness included, which is what a graph removes. A shape hit in fewer than
    one trial wave in `MIN_HIT_DIVISOR` (8), or whose graphed median is not at least 5 % below
    its eager median, is **banned**: dropped, and never admitted again. A tie is banned too — a
    kept shape pays for its recording every wave. The rest are proven and never trialled again.

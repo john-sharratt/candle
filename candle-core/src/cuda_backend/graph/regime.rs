@@ -105,8 +105,12 @@ struct Tally {
 enum Judged {
     /// Kept; its graphed median over its eager one.
     Proven(f64),
-    /// Hit too rarely, or too rarely timed, to judge.
+    /// Hit in fewer than one trial wave in [`MIN_HIT_DIVISOR`].
     Rare,
+    /// Hit enough, but its timings did not arrive in time to judge — reported
+    /// apart from [`Self::Rare`] because it says the trial failed to measure,
+    /// not that the shape failed to recur.
+    Untimed,
     /// Hit enough, not faster enough; the same ratio.
     Slower(f64),
 }
@@ -114,10 +118,11 @@ enum Judged {
 impl Tally {
     /// What this candidate earned over a trial of `waves`.
     fn judge(&self, waves: u64) -> Judged {
-        let hit_enough = self.hits * MIN_HIT_DIVISOR >= waves;
-        let timed = self.graph.len() >= MIN_SAMPLES && self.eager.len() >= MIN_SAMPLES;
-        if !(hit_enough && timed) {
+        if self.hits * MIN_HIT_DIVISOR < waves {
             return Judged::Rare;
+        }
+        if self.graph.len() < MIN_SAMPLES || self.eager.len() < MIN_SAMPLES {
+            return Judged::Untimed;
         }
         let eager = median(&self.eager).as_secs_f64();
         let ratio = if eager > 0.0 {
@@ -153,10 +158,13 @@ pub(crate) enum Transition {
     },
     Trialled {
         waves: u64,
+        /// What the trial judged: every shape the library held unproven.
+        judged: usize,
         proven: usize,
         /// The median, over the shapes it proved, of graphed time over eager.
         proven_ratio: Option<f64>,
         rare: usize,
+        untimed: usize,
         slower: usize,
         next: Phase,
     },
@@ -175,7 +183,16 @@ pub(crate) struct Regime {
     began: Option<u64>,
     /// The wave the trial ends at.
     trial_until: u64,
-    /// Admitted since the last trial: what the next trial judges.
+    /// Shapes the current learn has admitted — whether it has anything to
+    /// trial, and what its summary reports.
+    admitted: usize,
+    /// What the trial judges: every shape the library held, unproven, when it
+    /// began ([`Self::begin_trial`]) — not the keys the learn admitted. A learn
+    /// folds a one-off shape over another executable, which then holds the
+    /// one-off's shape; judged by its admitted key, that executable was never
+    /// hit, and its real shape was never judged at all. On `.5` (2026-10-17)
+    /// every one of 1,065 admitted keys was banned as rarely hit and 681
+    /// executables were left held, untrialled.
     candidates: HashMap<Key, Tally>,
     proven: HashSet<Key>,
     banned: HashSet<Key>,
@@ -198,17 +215,41 @@ impl Regime {
         self.banned.contains(&key)
     }
 
+    /// Whether `key` was proven: a later learn must not reshape its executable
+    /// into another shape.
+    pub(crate) fn proven(&self, key: Key) -> bool {
+        self.proven.contains(&key)
+    }
+
     /// Shapes banned, and proven, so far.
     pub(crate) fn counts(&self) -> (usize, usize) {
         (self.banned.len(), self.proven.len())
     }
 
-    /// The learn admitted `key` in wave `wave`: a candidate for the next trial.
-    pub(crate) fn admitted(&mut self, key: Key, wave: u64) {
+    /// The learn admitted a shape in wave `wave`.
+    pub(crate) fn admitted(&mut self, wave: u64) {
         if self.admits() {
-            self.candidates.entry(key).or_default();
+            self.admitted += 1;
             self.last_admit = Some(wave);
         }
+    }
+
+    /// A trial has begun: judge every shape in `held` — what the library holds
+    /// now — that is not already proven. Returns how many. With none to judge,
+    /// there is nothing a trial could prove, and the library locks.
+    pub(crate) fn begin_trial(&mut self, held: impl IntoIterator<Item = Key>) -> usize {
+        if self.phase != Phase::Trial {
+            return 0;
+        }
+        self.candidates = held
+            .into_iter()
+            .filter(|k| !self.proven.contains(k) && !self.banned.contains(k))
+            .map(|k| (k, Tally::default()))
+            .collect();
+        if self.candidates.is_empty() {
+            self.phase = Phase::Lock;
+        }
+        self.candidates.len()
     }
 
     /// An admission in wave `wave` did not fit the budget: the learn is over.
@@ -224,7 +265,7 @@ impl Regime {
     }
 
     fn end_learn(&mut self, wave: u64, ended: LearnEnd) {
-        let next = if self.candidates.is_empty() {
+        let next = if self.admitted == 0 {
             Phase::Lock
         } else {
             self.trial_until = wave + TRIAL_WAVES;
@@ -232,10 +273,12 @@ impl Regime {
         };
         self.transitions.push(Transition::Learned {
             waves: wave.saturating_sub(self.began.unwrap_or(wave)),
-            admitted: self.candidates.len(),
+            admitted: self.admitted,
             ended,
             next,
         });
+        self.admitted = 0;
+        self.candidates.clear();
         self.phase = next;
         self.began = Some(wave);
     }
@@ -261,17 +304,18 @@ impl Regime {
     fn verdict(&mut self, wave: u64) -> Vec<Key> {
         let mut banned = Vec::new();
         let mut ratios = Vec::new();
-        let (mut rare, mut slower) = (0, 0);
+        let judged = self.candidates.len();
+        let (mut rare, mut untimed, mut slower) = (0, 0, 0);
         for (key, tally) in self.candidates.drain() {
-            let judged = tally.judge(TRIAL_WAVES);
-            if let Judged::Proven(r) = judged {
-                self.proven.insert(key);
-                ratios.push(r);
-                continue;
-            }
-            match judged {
+            match tally.judge(TRIAL_WAVES) {
+                Judged::Proven(r) => {
+                    self.proven.insert(key);
+                    ratios.push(r);
+                    continue;
+                }
                 Judged::Rare => rare += 1,
-                _ => slower += 1,
+                Judged::Untimed => untimed += 1,
+                Judged::Slower(_) => slower += 1,
             }
             self.banned.insert(key);
             banned.push(key);
@@ -285,9 +329,11 @@ impl Regime {
         ratios.sort_by(f64::total_cmp);
         self.transitions.push(Transition::Trialled {
             waves: wave.saturating_sub(self.began.unwrap_or(wave)),
+            judged,
             proven: ratios.len(),
             proven_ratio: ratios.get(ratios.len() / 2).copied(),
             rare,
+            untimed,
             slower,
             next,
         });
@@ -357,6 +403,16 @@ mod tests {
     const A: Key = (1, 10);
     const B: Key = (2, 20);
 
+    /// A learn that admitted one shape for each of `held`, ended full at
+    /// `wave`, and handed its trial what the library holds — `held`.
+    fn learned(r: &mut Regime, wave: u64, held: &[Key]) -> usize {
+        for _ in held {
+            r.admitted(wave);
+        }
+        r.full(wave);
+        r.begin_trial(held.iter().copied())
+    }
+
     /// Run a whole trial from wave `start`: every listed key is hit every wave
     /// and its runs take `graph` or `eager`. Returns the verdict's bans.
     fn trial(r: &mut Regime, start: u64, keys: &[(Key, Duration, Duration)]) -> Vec<Key> {
@@ -372,26 +428,56 @@ mod tests {
     }
 
     /// **The learn admits until the budget refuses**, and the trial then
-    /// judges what it admitted.
+    /// judges what the library holds.
     #[test]
     fn a_full_budget_ends_the_learn_and_starts_a_trial() {
         let mut r = Regime::default();
         assert_eq!(r.phase(), Phase::Learn);
         assert!(r.admits());
-        r.admitted(A, 3);
+        r.admitted(3);
         r.full(4);
         assert_eq!(r.phase(), Phase::Trial);
         assert!(!r.admits(), "a trial admits nothing");
+        assert_eq!(r.begin_trial([A]), 1);
         assert!(r.timed(A));
-        assert!(!r.timed(B), "only what the learn admitted is on trial");
+        assert!(!r.timed(B), "only what the library holds is on trial");
         assert_eq!(r.mode_for(B), Mode::Graph);
+    }
+
+    /// **The trial judges what is held, not what was admitted**: an
+    /// executable a one-off reshaped holds the one-off's shape, and that is
+    /// the shape judged. Proven and banned shapes are not judged again, and a
+    /// trial with nothing left to judge locks at once.
+    #[test]
+    fn the_trial_judges_the_shapes_the_library_holds() {
+        let mut r = Regime::default();
+        r.admitted(1);
+        r.full(2);
+        let reshaped: Key = (1, 99);
+        assert_eq!(r.begin_trial([reshaped]), 1);
+        assert!(
+            r.timed(reshaped) && !r.timed(A),
+            "the held shape, not the admitted one"
+        );
+
+        let mut r = Regime::default();
+        learned(&mut r, 2, &[A, B]);
+        trial(&mut r, 2, &[(A, us(50), us(100)), (B, us(100), us(100))]);
+        r.admitted(200);
+        r.full(201);
+        assert_eq!(
+            r.begin_trial([A, B]),
+            0,
+            "A proven, B banned: nothing to judge"
+        );
+        assert_eq!(r.phase(), Phase::Lock);
     }
 
     /// A learn whose traffic has shown every shape ends on its own.
     #[test]
     fn a_quiet_learn_ends_after_its_idle_waves() {
         let mut r = Regime::default();
-        r.admitted(A, 10);
+        r.admitted(10);
         r.wave_begins(10 + LEARN_IDLE_WAVES - 1);
         assert_eq!(r.phase(), Phase::Learn);
         r.wave_begins(10 + LEARN_IDLE_WAVES);
@@ -424,8 +510,7 @@ mod tests {
     #[test]
     fn a_candidate_alternates_its_modes() {
         let mut r = Regime::default();
-        r.admitted(A, 1);
-        r.full(2);
+        learned(&mut r, 2, &[A]);
         let mut modes = Vec::new();
         for _ in 0..4 {
             let m = r.mode_for(A);
@@ -440,8 +525,7 @@ mod tests {
     #[test]
     fn a_candidate_alternates_before_its_timings_arrive() {
         let mut r = Regime::default();
-        r.admitted(A, 1);
-        r.full(2);
+        learned(&mut r, 2, &[A]);
         let modes: Vec<Mode> = (0..4).map(|_| r.mode_for(A)).collect();
         assert_eq!(modes, [Mode::Graph, Mode::Eager, Mode::Graph, Mode::Eager]);
     }
@@ -453,8 +537,8 @@ mod tests {
     fn each_phase_that_ends_leaves_its_summary() {
         let mut r = Regime::default();
         r.wave_begins(100);
-        r.admitted(A, 110);
-        r.admitted(B, 120);
+        r.admitted(110);
+        r.admitted(120);
         r.full(130);
         assert_eq!(
             r.take_transitions(),
@@ -465,14 +549,28 @@ mod tests {
                 next: Phase::Trial,
             }]
         );
-        trial(&mut r, 130, &[(A, us(50), us(100)), (B, us(100), us(90))]);
+        const C: Key = (3, 30);
+        const D: Key = (4, 40);
+        r.begin_trial([A, B, C, D]);
+        // C is hit every wave but never timed; D is never hit.
+        for wave in 130..130 + TRIAL_WAVES {
+            r.wave_begins(wave);
+            for (key, graph, eager) in [(A, us(50), us(100)), (B, us(100), us(90))] {
+                let mode = r.mode_for(key);
+                r.sample(key, mode, if mode == Mode::Graph { graph } else { eager });
+            }
+            r.mode_for(C);
+        }
+        r.wave_begins(130 + TRIAL_WAVES);
         assert_eq!(
             r.take_transitions(),
             vec![Transition::Trialled {
                 waves: TRIAL_WAVES,
+                judged: 4,
                 proven: 1,
                 proven_ratio: Some(0.5),
-                rare: 0,
+                rare: 1,
+                untimed: 1,
                 slower: 1,
                 next: Phase::Learn,
             }]
@@ -496,9 +594,7 @@ mod tests {
     #[test]
     fn the_verdict_keeps_what_is_faster_and_bans_what_is_not() {
         let mut r = Regime::default();
-        r.admitted(A, 1);
-        r.admitted(B, 1);
-        r.full(2);
+        learned(&mut r, 2, &[A, B]);
         let bans = trial(&mut r, 2, &[(A, us(80), us(100)), (B, us(100), us(100))]);
         assert_eq!(bans, vec![B], "a tie is not kept");
         assert!(r.banned(B) && !r.banned(A));
@@ -511,8 +607,7 @@ mod tests {
     #[test]
     fn a_graph_barely_faster_is_banned() {
         let mut r = Regime::default();
-        r.admitted(A, 1);
-        r.full(2);
+        learned(&mut r, 2, &[A]);
         assert_eq!(trial(&mut r, 2, &[(A, us(97), us(100))]), vec![A]);
     }
 
@@ -521,8 +616,7 @@ mod tests {
     #[test]
     fn a_rarely_hit_candidate_is_banned() {
         let mut r = Regime::default();
-        r.admitted(A, 1);
-        r.full(2);
+        learned(&mut r, 2, &[A]);
         let hits_needed = TRIAL_WAVES / MIN_HIT_DIVISOR;
         for i in 0..hits_needed - 1 {
             let m = r.mode_for(A);
@@ -537,12 +631,12 @@ mod tests {
     #[test]
     fn a_trial_that_proves_nothing_locks() {
         let mut r = Regime::default();
-        r.admitted(A, 1);
-        r.full(2);
+        learned(&mut r, 2, &[A]);
         trial(&mut r, 2, &[(A, us(100), us(90))]);
         assert_eq!(r.phase(), Phase::Lock);
-        r.admitted(B, 600);
+        r.admitted(600);
         r.full(601);
+        assert_eq!(r.begin_trial([B]), 0, "a locked library begins no trial");
         assert!(!r.admits() && !r.timed(B));
         assert!(r.wave_begins(1 << 40).is_empty());
         assert_eq!(r.phase(), Phase::Lock, "locked for good");
@@ -553,13 +647,12 @@ mod tests {
     #[test]
     fn learn_and_trial_repeat_until_no_candidate_is_worth_keeping() {
         let mut r = Regime::default();
-        r.admitted(A, 1);
-        r.full(2);
+        learned(&mut r, 2, &[A]);
         trial(&mut r, 2, &[(A, us(50), us(100))]);
         assert_eq!(r.phase(), Phase::Learn);
+        assert!(r.proven(A));
         let next = 2 + TRIAL_WAVES + 1;
-        r.admitted(B, next);
-        r.full(next + 1);
+        assert_eq!(learned(&mut r, next + 1, &[A, B]), 1, "A is proven already");
         assert!(r.timed(B) && !r.timed(A));
         assert_eq!(trial(&mut r, next + 1, &[(B, us(100), us(100))]), vec![B]);
         assert_eq!(r.phase(), Phase::Lock);

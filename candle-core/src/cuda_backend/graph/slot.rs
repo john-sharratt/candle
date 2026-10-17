@@ -66,9 +66,10 @@ pub(super) struct ExecSlot {
 impl ExecSlot {
     /// Fold `template` into the executable holding its shape. Failing that,
     /// with [`Admit::Keep`]: give a recurring shape a new executable, or fold a
-    /// one-off into the first executable that accepts it, most recently used
-    /// first, or instantiate it and keep it. With [`Admit::Never`]: instantiate
-    /// it for this launch alone.
+    /// one-off into the first executable that accepts it — most recently used
+    /// first, never one whose shape is `protected` (proven by a trial) — or
+    /// instantiate it and keep it. With [`Admit::Never`]: instantiate it for
+    /// this launch alone.
     ///
     /// Returns the executable to launch when it is not kept (`Some`, the
     /// [`Folded::Transient`] case) — otherwise it is [`Self::front`] — how it
@@ -81,6 +82,7 @@ impl ExecSlot {
         on: &ComputeStream,
         nodes: usize,
         admit: Admit,
+        protected: impl Fn(u64) -> bool,
     ) -> Result<(Option<GraphExec>, Folded, Option<Refusal>)> {
         let keep = admit == Admit::Keep;
         let Audited {
@@ -100,6 +102,9 @@ impl ExecSlot {
         }
         if outcome.is_none() && keep && !recurring {
             for i in 0..self.execs.len() {
+                if protected(self.execs[i].shape()) {
+                    continue;
+                }
                 if self.execs[i].try_fold(&template, on, nodes, shape)? {
                     outcome = Some((i, Folded::Reshaped));
                     break;

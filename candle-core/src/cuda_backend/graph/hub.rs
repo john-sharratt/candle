@@ -322,11 +322,12 @@ fn begin(capture: &Arc<CudaStream>) -> Result<()> {
     unsafe { capture::begin(capture) }
 }
 
-/// Log every library phase that has ended (`regime`), at wave `wave`, with what
-/// the library holds once it has.
-fn log_transitions(st: &mut HubState, wave: u64) {
+/// Act on every library phase that has ended (`regime`), at wave `wave`: a
+/// learn that hands over to a trial begins it on what the library holds —
+/// which is why every path that may end a learn calls this at once — and each
+/// is logged with what the library then holds.
+fn act_on_transitions(st: &mut HubState, wave: u64) {
     for t in st.regime.take_transitions() {
-        let (execs, nodes, bytes) = st.library.held();
         let (banned_total, proven_total) = st.regime.counts();
         let budget_mib = st.library.budget() >> 20;
         match t {
@@ -335,55 +336,70 @@ fn log_transitions(st: &mut HubState, wave: u64) {
                 admitted,
                 ended,
                 next,
-            } => tracing::info!(
-                target: "candle_core::graph",
-                wave,
-                waves,
-                admitted,
-                ended = match ended {
-                    LearnEnd::Full => "budget full",
-                    LearnEnd::Quiet => "no new shape",
-                },
-                next = next.name(),
-                execs_held = execs,
-                nodes_held = nodes,
-                held_mib = bytes >> 20,
-                budget_mib,
-                "graph library: learn ended — {admitted} shape(s) admitted in {waves} wave(s), {}",
-                match next {
-                    Phase::Trial => "trialling them graphed against eager",
-                    _ => "nothing to trial: locked",
-                }
-            ),
+            } => {
+                let judging = st.regime.begin_trial(st.library.held_keys());
+                let (execs, nodes, bytes) = st.library.held();
+                tracing::info!(
+                    target: "candle_core::graph",
+                    wave,
+                    waves,
+                    admitted,
+                    judging,
+                    ended = match ended {
+                        LearnEnd::Full => "budget full",
+                        LearnEnd::Quiet => "no new shape",
+                    },
+                    next = st.regime.phase().name(),
+                    execs_held = execs,
+                    nodes_held = nodes,
+                    held_mib = bytes >> 20,
+                    budget_mib,
+                    "graph library: learn ended — {admitted} shape(s) admitted in {waves} wave(s), {}",
+                    match (next, judging) {
+                        (Phase::Trial, n) if n > 0 =>
+                            format!("trialling the {n} shape(s) held unproven, graphed against eager"),
+                        _ => "nothing to trial: locked".to_string(),
+                    }
+                );
+            }
             Transition::Trialled {
                 waves,
+                judged,
                 proven,
                 proven_ratio,
                 rare,
+                untimed,
                 slower,
                 next,
-            } => tracing::info!(
-                target: "candle_core::graph",
-                wave,
-                waves,
-                proven,
-                graphed_over_eager = proven_ratio.map(|r| format!("{r:.2}")).unwrap_or_default(),
-                banned_rare = rare,
-                banned_slower = slower,
-                next = next.name(),
-                banned_total,
-                proven_total,
-                execs_held = execs,
-                nodes_held = nodes,
-                held_mib = bytes >> 20,
-                budget_mib,
-                "graph library: trial ended — {proven} proven, {} banned ({rare} rarely hit, {slower} not faster), {}",
-                rare + slower,
-                match next {
-                    Phase::Learn => "learning again into the ground the bans freed",
-                    _ => "nothing new worth keeping: locked",
-                }
-            ),
+            } => {
+                let (execs, nodes, bytes) = st.library.held();
+                tracing::info!(
+                    target: "candle_core::graph",
+                    wave,
+                    waves,
+                    judged,
+                    proven,
+                    graphed_over_eager =
+                        proven_ratio.map(|r| format!("{r:.2}")).unwrap_or_default(),
+                    banned_rare = rare,
+                    banned_untimed = untimed,
+                    banned_slower = slower,
+                    next = next.name(),
+                    banned_total,
+                    proven_total,
+                    execs_held = execs,
+                    nodes_held = nodes,
+                    held_mib = bytes >> 20,
+                    budget_mib,
+                    "graph library: trial ended — of {judged} judged, {proven} proven, {} banned \
+                     ({rare} rarely hit, {untimed} never timed, {slower} not faster), {}",
+                    rare + untimed + slower,
+                    match next {
+                        Phase::Learn => "learning again into the ground the bans freed",
+                        _ => "nothing new worth keeping: locked",
+                    }
+                );
+            }
         }
     }
 }
@@ -516,7 +532,7 @@ impl CaptureHub {
                 library.ban(key);
             }
         }
-        log_transitions(&mut st, now);
+        act_on_transitions(&mut st, now);
         st.wave = Some(Wave {
             owner: std::thread::current().id(),
             serial: st.stats.waves,
@@ -649,10 +665,14 @@ impl CaptureHub {
         } else {
             Admit::Never
         };
+        // A proven executable keeps the shape its trial proved: a one-off is
+        // never folded over it.
+        let regime = &st.regime;
+        let protected = |s| regime.proven((key, s));
         let (transient, folded, refusal) = match st
             .library
             .slot(key)
-            .fold(template, audited, &on, nodes, admit)
+            .fold(template, audited, &on, nodes, admit, protected)
         {
             Ok(done) => done,
             Err(e) => {
@@ -740,10 +760,10 @@ impl CaptureHub {
                 st.stats.instantiated_us += fold_us;
                 // Launched above, so a refusal may destroy it at once.
                 if st.library.admitted(key) {
-                    st.regime.admitted((key, shape), serial);
+                    st.regime.admitted(serial);
                 } else {
                     st.regime.full(serial);
-                    log_transitions(st, serial);
+                    act_on_transitions(st, serial);
                 }
             }
             Folded::Transient => {
