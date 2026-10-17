@@ -25,17 +25,17 @@ use super::engine::{
     wave_kv_range,
 };
 use super::quantized_weights::QuantModel;
-use super::spec::{replay_accepted_prefixes, ReplayLayer, StashSpan, VerifyStash};
 use crate::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ModelCoreProperties, ProvenanceLayerIndices,
 };
-use crate::models::delta_net::DeltaNetConstants;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::KvLayerMap;
 use crate::models::delta_net::LayerKind;
 use crate::models::delta_net::RecurrentStateStore;
 use crate::models::delta_net::StagedSnapshot;
-use crate::models::delta_net::{compact_stores, RecurrentCompaction};
+use crate::models::delta_net::{
+    commit_stores, compact_stores, fold_stores, RecurrentCompaction, TIMELINE_ROWS,
+};
 use crate::models::draft_ladder::DraftLadder;
 use crate::models::lora::Adapter;
 use crate::models::rope_schedule::{RopeRungs, RopeSchedule};
@@ -103,16 +103,19 @@ pub struct HybridBatched {
     /// [`Self::verify_blocks`](crate::models::batched_inference::ManagedBatchedModel::verify_blocks)
     /// and cleared on the way out, error or not.
     verify_rows: Mutex<Vec<usize>>,
-    /// Per-sequence recurrence operands of the block currently in flight, so a
-    /// partial accept can replay the prefix it kept. See [`super::spec`].
-    verify_stash: Mutex<Option<VerifyStash>>,
+    /// The **armed verify cohort**: each sequence whose block this step verifies,
+    /// and the block's length. Their DeltaNet layers stay pending past the
+    /// forward's commit — every other short span folds there — until the
+    /// reconcile folds the rows the accept kept ([`super::spec`]), or an abort
+    /// discards them.
+    armed: Mutex<HashMap<usize, usize>>,
     /// Sequences whose scored rows this wave must also hand back as
     /// **post-final-norm hiddens** — the MTP head's seed. Set for the duration
     /// of one forward, alongside `verify_rows`.
     hidden_seqs: Mutex<Vec<usize>>,
     /// Per-sequence buffers the sweep writes those hiddens into, `[rows, hidden]`
-    /// in the wave's activation dtype. Sized before the forward opens, for the
-    /// same reason the verify stash is.
+    /// in the wave's activation dtype. Sized before the forward opens: the arena
+    /// refuses a device allocation from inside a wave.
     verify_hidden: Mutex<HashMap<usize, Tensor>>,
     /// How many rows of each buffer the last armed wave actually filled.
     ///
@@ -172,7 +175,7 @@ impl HybridBatched {
             recurrent: Mutex::new(HashMap::new()),
             staged: Mutex::new(HashMap::new()),
             verify_rows: Mutex::new(Vec::new()),
-            verify_stash: Mutex::new(None),
+            armed: Mutex::new(HashMap::new()),
             hidden_seqs: Mutex::new(Vec::new()),
             verify_hidden: Mutex::new(HashMap::new()),
             capture_rows: Mutex::new(HashMap::new()),
@@ -268,130 +271,109 @@ impl HybridBatched {
         Ok(())
     }
 
-    /// Lay out this step's verify cohort: size the shared stash buffers for the
-    /// cohort's total rows and record each sequence's span of them.
+    /// Arm this step's verify cohort — `(sequence, block length)` — replacing
+    /// whatever the last step armed. Their DeltaNet layers stay pending past the
+    /// forward's commit until [`Self::fold_armed`] or [`Self::disarm_verify`].
     ///
-    /// **Called before the forward opens**, never inside it: the stash is
-    /// device memory and a wave's storage is claimed up front, so an allocation
-    /// from inside the sweep is refused by the arena. Buffers are reused across
-    /// steps and only reallocated when a wider cohort arrives.
-    pub fn begin_verify_stash(&self, blocks: &[(usize, usize)]) -> Result<()> {
-        let total: usize = blocks.iter().map(|&(_, len)| len).sum();
-        let mut slot = self
-            .verify_stash
-            .lock()
-            .map_err(|_| candle::Error::Msg("qwen35: verify_stash lock poisoned".into()))?;
-        // An empty cohort stashes nothing, so it needs no buffers: building a
-        // zero-row stash for it was one allocator call per recurrent operand,
-        // every step that drafted nothing. Buffers already held are kept, with
-        // no spans.
-        if total == 0 {
-            return match slot.as_mut() {
-                Some(s) => s.begin(blocks),
-                None => Ok(()),
-            };
+    /// **A block is at most [`TIMELINE_ROWS`] rows**, refused here rather than
+    /// run: a longer span writes the prefill scratch, which cannot keep only a
+    /// prefix, so it could never be partially accepted.
+    pub fn arm_verify(&self, blocks: &[(usize, usize)]) -> Result<()> {
+        if let Some(&(seq, len)) = blocks.iter().find(|&&(_, len)| len > TIMELINE_ROWS) {
+            candle::bail!(
+                "qwen35 verify: sequence {seq}'s {len}-row block is deeper than the \
+                 {TIMELINE_ROWS}-row timeline — at most {} drafts a block",
+                TIMELINE_ROWS - 1
+            );
         }
-        let grow = match slot.as_ref() {
-            Some(s) => s.capacity()? < total,
-            None => true,
-        };
-        if grow {
-            // **Release the old stash before claiming the new one.** Both are
-            // carved from the reservation now, not the driver, so building the
-            // replacement in place would hold two cohorts' regions at once at
-            // exactly the moment the wider one is hardest to satisfy — ~302 MiB
-            // asked for while ~241 MiB is still held, at 20 contexts and budget
-            // 4 on the 27B. Dropping first costs nothing: `grow` has already
-            // decided these buffers are too small to keep, and `begin` below
-            // rebuilds every span.
-            drop(slot.take());
-            *slot = Some(VerifyStash::new(
-                &self.model.cfg.layer_kinds,
-                &self.model.cfg.delta_net,
-                total,
-                &self.model.device,
-            )?);
-        }
-        slot.as_mut().expect("just ensured").begin(blocks)
-    }
-
-    /// What a rewind of the armed cohort will **stage** — `(rows, spans)` — or
-    /// `None` when no cohort is armed.
-    ///
-    /// The forward prices this into its Attention span, because the forward is
-    /// what creates the obligation: `replay_accepted_prefixes` carves the conv,
-    /// the scan and the span table per recurrent layer off that span at accept
-    /// time, and `WaveWidth::replay` is what prices them. A width built with
-    /// `staged_rows: 0` prices that chain at exactly zero — correct for a wave
-    /// that owes no replay, and short by the whole chain for one that does.
-    ///
-    /// **Rows are the stash's CAPACITY, not this cohort's total.** The buffers
-    /// only ever grow, and the replay's kernels run over the stash's full row
-    /// count — so a cohort narrower than the high-water mark still carves the
-    /// high-water mark, and pricing the cohort would under-reserve by the
-    /// difference.
-    ///
-    /// **Spans are the ones still outstanding.** The verify forward reads this
-    /// right after `begin`, when they are the whole cohort — the count the replay
-    /// later sizes its stacks from (`VerifyStash::cohort_spans`), after the rewinds
-    /// have removed theirs. A forward read after those removals prices no replay,
-    /// which is right: it owes none.
-    pub fn verify_stash_width(&self) -> Result<Option<(usize, usize)>> {
-        let slot = self
-            .verify_stash
-            .lock()
-            .map_err(|_| candle::Error::Msg("qwen35: verify_stash lock poisoned".into()))?;
-        match slot.as_ref() {
-            Some(s) => Ok(Some((s.capacity()?, s.spans.len()))),
-            None => Ok(None),
-        }
-    }
-
-    /// Take the cohort stash for the sweep or the replay. Taking rather than
-    /// borrowing: a stash span is good for exactly one rewind, and a second use
-    /// would replay from a state two waves old — the taker removes the spans it
-    /// consumed before putting the buffers back.
-    pub fn take_verify_stash(&self) -> Result<Option<VerifyStash>> {
-        Ok(self
-            .verify_stash
-            .lock()
-            .map_err(|_| candle::Error::Msg("qwen35: verify_stash lock poisoned".into()))?
-            .take())
-    }
-
-    /// Return the cohort stash — buffers always, spans as the taker left them.
-    pub fn put_verify_stash(&self, stash: VerifyStash) -> Result<()> {
-        *self
-            .verify_stash
-            .lock()
-            .map_err(|_| candle::Error::Msg("qwen35: verify_stash lock poisoned".into()))? =
-            Some(stash);
+        *self.armed_map()? = blocks.iter().copied().collect();
         Ok(())
     }
 
-    /// Drop the stash spans of `seqs` without replaying — for a verify forward
-    /// that failed, whose spans would otherwise rewind a wave that never
-    /// committed. The buffers stay for reuse.
-    pub fn drop_verify_stashes(&self, seqs: &[usize]) {
-        if let Ok(mut slot) = self.verify_stash.lock() {
-            if let Some(st) = slot.as_mut() {
-                for s in seqs {
-                    st.remove(*s);
-                }
-                // **A stash with no spans left is holding ground for nobody.**
-                // The buffers are meant to outlive a span — they are kept across
-                // steps and reallocated only for a wider cohort — but not to
-                // outlive every span. They are carved from the reservation, so
-                // once the last sequence goes they pin regions the weight side
-                // could be using, for the life of the process, and no arena
-                // sweep can see them because they are not KV. Measured on the
-                // 27B: one region left behind by every config, on top of the
-                // twenty the recurrent stores held.
-                if st.is_unused() {
-                    *slot = None;
-                }
+    /// The armed cohort, locked.
+    fn armed_map(&self) -> Result<MutexGuard<'_, HashMap<usize, usize>>> {
+        self.armed
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: armed cohort lock poisoned".into()))
+    }
+
+    /// Whether `seq` is in the armed cohort, and its block's length.
+    pub fn armed_block(&self, seq: usize) -> Result<Option<usize>> {
+        Ok(self.armed_map()?.get(&seq).copied())
+    }
+
+    /// Take `seqs` out of the armed cohort and drop their pending timelines: the
+    /// step that armed them ends without keeping any of their rows, so their
+    /// state stands exactly as the step found it.
+    pub fn disarm_verify(&self, seqs: &[usize]) -> Result<()> {
+        // Released before the map is taken: `release_recurrent` locks the two the
+        // other way round.
+        {
+            let mut armed = self.armed_map()?;
+            for seq in seqs {
+                armed.remove(seq);
             }
         }
+        let mut map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        for seq in seqs {
+            if let Some(store) = map.get_mut(seq) {
+                store.discard_pending();
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold the armed sequences' kept rows — `(sequence, rows kept)` — and take
+    /// them out of the cohort: the reconcile's whole DeltaNet half, ONE fold
+    /// launch over every sequence and recurrent layer.
+    ///
+    /// A sequence keeping every row of its block folds them all; one keeping
+    /// none drops its timelines. Every job must name an armed sequence and keep
+    /// at most its block's rows.
+    pub fn fold_armed(&self, jobs: &[(usize, usize)]) -> Result<()> {
+        let mut armed = self.armed_map()?;
+        for &(seq, kept) in jobs {
+            let len = armed.get(&seq).copied().ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "qwen35 verify: a fold for sequence {seq}, which is not in the armed cohort"
+                ))
+            })?;
+            if kept > len {
+                candle::bail!(
+                    "qwen35 verify: sequence {seq} keeps {kept} rows of a {len}-row block"
+                );
+            }
+        }
+        // Out of the cohort before the fold runs: whether it succeeds or not,
+        // these rows are consumed — a failed fold's must not survive to be
+        // folded by a later step.
+        for &(seq, _) in jobs {
+            armed.remove(&seq);
+        }
+        drop(armed);
+        let mut map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        let mut stores: HashMap<usize, &mut RecurrentStateStore> = map
+            .iter_mut()
+            .filter(|(seq, _)| jobs.iter().any(|&(s, _)| s == **seq))
+            .map(|(seq, st)| (*seq, st))
+            .collect();
+        let mut folds: Vec<(&mut RecurrentStateStore, Option<usize>)> =
+            Vec::with_capacity(jobs.len());
+        for &(seq, kept) in jobs {
+            let store = stores.remove(&seq).ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "qwen35 verify: armed sequence {seq} has no recurrent state to fold"
+                ))
+            })?;
+            folds.push((store, Some(kept)));
+        }
+        fold_stores(&mut folds)
     }
 
     /// The lineage's RoPE rungs, which every paged kernel rotates from.
@@ -474,19 +456,30 @@ impl HybridBatched {
     /// Missed, this is close to invisible. The cache is empty so attention is
     /// correct, the shapes all match, nothing errors — the model simply
     /// answers as though it remembers a conversation the prompt never had.
-    pub fn ensure_recurrent(&self, seqs: &[usize], offsets: &[usize]) -> Result<()> {
-        if seqs.len() != offsets.len() {
+    ///
+    /// A sequence whose span this forward is longer than [`TIMELINE_ROWS`] —
+    /// a prefill chunk — also gets its prefill scratch here, between forwards,
+    /// where the claim is legal: the span writes its advanced state there and
+    /// the commit exchanges it in.
+    pub fn ensure_recurrent(
+        &self,
+        seqs: &[usize],
+        offsets: &[usize],
+        q_lens: &[usize],
+    ) -> Result<()> {
+        if seqs.len() != offsets.len() || seqs.len() != q_lens.len() {
             candle::bail!(
-                "ensure_recurrent: {} sequences against {} offsets",
+                "ensure_recurrent: {} sequences against {} offsets and {} span lengths",
                 seqs.len(),
-                offsets.len()
+                offsets.len(),
+                q_lens.len()
             );
         }
         let mut map = self
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
-        for (&seq, &offset) in seqs.iter().zip(offsets) {
+        for ((&seq, &offset), &q_len) in seqs.iter().zip(offsets).zip(q_lens) {
             // A snapshot held for this sequence becomes its store before the
             // wave reads it. Built seeded, so the offset-0 rule below keeps it.
             if let Entry::Vacant(slot) = map.entry(seq) {
@@ -520,6 +513,9 @@ impl HybridBatched {
                     }
                 }
             }
+            if q_len > TIMELINE_ROWS {
+                map.get_mut(&seq).expect("ensured above").ensure_scratch()?;
+            }
         }
         Ok(())
     }
@@ -536,9 +532,9 @@ impl HybridBatched {
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
         map.remove(&seq);
         self.staged_map()?.remove(&seq);
-        // A stash names a rewind point inside the state that just went away,
-        // and the draft head's history belongs to the same sequence.
-        self.drop_verify_stashes(&[seq]);
+        // An armed block names rows of the state that just went away, and the
+        // draft head's history belongs to the same sequence.
+        self.armed_map()?.remove(&seq);
         self.release_draft(seq);
         Ok(())
     }
@@ -583,13 +579,17 @@ impl HybridBatched {
     /// process holds by a count of what is merely in flight, so it climbs with
     /// the number of *idle* conversations.
     ///
+    /// **A sequence arrives prefilling**, so the price is its store and its
+    /// prefill scratch — one more slot per DeltaNet layer, held until the
+    /// sequence decodes (`docs/deltanet_timeline.md` §7). A decoding sequence
+    /// holds [`RecurrentStateStore::reserved_bytes_for`] alone.
+    ///
     /// This takes no lock, which is the other half of its value here —
     /// admission asks on the scheduler thread while forwards hold the map.
     pub fn recurrent_store_bytes(&self) -> usize {
-        RecurrentStateStore::reserved_bytes_for(
-            &self.model.cfg.layer_kinds,
-            &self.model.cfg.delta_net,
-        )
+        let (kinds, dims) = (&self.model.cfg.layer_kinds, &self.model.cfg.delta_net);
+        RecurrentStateStore::reserved_bytes_for(kinds, dims)
+            + RecurrentStateStore::scratch_bytes_for(kinds, dims)
     }
 
     /// The turn loop carves a child slot per turn and decodes on it, borrowing
@@ -666,12 +666,16 @@ impl HybridBatched {
     /// `None` when the sequence carries no state — a slot that has never run a
     /// wave has nothing worth persisting, and writing a zero snapshot would be
     /// worse than writing none: resume would install it and report success.
+    ///
+    /// A snapshot is taken at a turn's seal, which ends any prefill the
+    /// sequence was in, so its prefill scratch goes back here: the next long
+    /// span claims it again.
     pub fn export_recurrent(&self, seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
-        let map = self
+        let mut map = self
             .recurrent
             .lock()
             .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
-        let Some(store) = map.get(&seq) else {
+        let Some(store) = map.get_mut(&seq) else {
             // A held snapshot is this sequence's state as surely as a store
             // would be: read it back as it stands, without building one.
             return Ok(self
@@ -683,6 +687,7 @@ impl HybridBatched {
         // reaching that error means the ordering broke, not that the caller
         // needs a retry.
         let layers = store.export()?;
+        store.release_scratch();
         Ok(Some((store.schedule_hash(), layers)))
     }
 
@@ -797,21 +802,39 @@ impl HybridBatched {
             .len())
     }
 
-    /// Open a wave over `seqs`' recurrent state, stashing each entry state so
-    /// a failed wave can be rolled back.
+    /// Open a wave over `seqs`' recurrent state.
     ///
-    /// The wave-atomicity contract: the mixer advances state in place as it
-    /// runs, so "did not commit" is not the same as "did not happen". Every
-    /// wave that begins must either commit or roll back.
+    /// The wave-atomicity contract: a wave writes timelines and the prefill
+    /// scratch, never a live state, so every wave that begins must either commit
+    /// or roll back and a rolled-back one leaves no trace.
     pub fn begin_recurrent_wave(&self, seqs: &[usize]) -> Result<()> {
         self.for_each_store(seqs, |s| s.begin_wave())
     }
 
+    /// Close the wave over `seqs` ([`commit_stores`]): fold every short span it
+    /// ran for a sequence outside the armed cohort — all of its rows, in ONE
+    /// launch over every such sequence and layer — then commit. The armed
+    /// cohort's layers stay pending for the reconcile, which alone knows how many
+    /// rows each keeps. On an error nothing is committed and the caller rolls the
+    /// wave back.
     pub fn commit_recurrent_wave(&self, seqs: &[usize]) -> Result<()> {
-        self.for_each_store(seqs, |s| {
-            s.commit_wave();
-            Ok(())
-        })
+        let armed: Vec<usize> = self.armed_map()?.keys().copied().collect();
+        let mut map = self
+            .recurrent
+            .lock()
+            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
+        if let Some(seq) = seqs.iter().find(|s| !map.contains_key(s)) {
+            candle::bail!(
+                "qwen35: sequence {seq} has no recurrent state — \
+                 `ensure_recurrent` was not called for this wave"
+            );
+        }
+        let mut stores: Vec<(&mut RecurrentStateStore, bool)> = map
+            .iter_mut()
+            .filter(|(seq, _)| seqs.contains(seq))
+            .map(|(seq, store)| (store, !armed.contains(seq)))
+            .collect();
+        commit_stores(&mut stores)
     }
 
     pub fn rollback_recurrent_wave(&self, seqs: &[usize]) -> Result<()> {
@@ -876,66 +899,17 @@ impl HybridBatched {
         if !self.has_drafter() {
             return 0;
         }
-        // **Bounded by what its own rewind machinery costs.**
-        //
-        // A verify block of `k` proposals makes each sequence stash `k + 1` rows
-        // of post-projection operands for every DeltaNet layer, because a
-        // recurrence cannot be truncated and has to be replayed (`super::spec`).
-        // So the stash is `width × (k + 1)` rows, and the ladder alone prices
-        // only the *throughput* side of `k` — it has no term for the memory the
-        // rewind needs.
-        //
-        // Measured on the 27B at 20 contexts: 60.4 MiB of stash at budget 0
-        // against 301.8 MiB at budget 4. Widening the ladder to reach width 20
-        // therefore took a config that fit and made it not fit, and the failure
-        // arrived as a device OOM rather than as a refusal — the stash is
-        // allocated between forwards, where nothing is left to concede to.
-        //
-        // Clamping here rather than refusing later is what lets the ladder ask
-        // for depth at *any* width: a narrow cohort still gets the full budget,
-        // and a wide one gets the deepest budget its stash can afford instead of
-        // the whole wave failing. Speculation is lossless, so a shallower budget
-        // costs throughput and never a token.
-        self.draft
-            .budget(width)
-            .min(self.affordable_draft_budget(width))
+        // Bounded by the timeline: a block of `k` drafts verifies `k + 1` rows,
+        // and a block deeper than the timeline is refused (`arm_verify`). The
+        // rewind costs no memory a deeper block would add to — each DeltaNet
+        // layer's timeline is a fixed part of its slot — so depth is otherwise
+        // the ladder's alone.
+        self.draft.budget(width).min(TIMELINE_ROWS - 1)
     }
 
     /// The drafted-token cost this checkpoint's ladder carries.
     pub fn draft_token_cost_for(&self) -> f32 {
         self.draft.token_cost()
-    }
-
-    /// The deepest budget whose rewind stash the KV side can currently hold.
-    ///
-    /// `usize::MAX` when the question does not arise — no reservation to measure
-    /// (a CPU device or a test), or a model with no recurrent layers to stash.
-    /// The caller `min`s with the ladder, so an unmeasurable bound never *raises*
-    /// a budget.
-    fn affordable_draft_budget(&self, width: usize) -> usize {
-        let dims = &self.model.cfg.delta_net;
-        let layers = self
-            .model
-            .cfg
-            .layer_kinds
-            .iter()
-            .filter(|k| **k == LayerKind::DeltaNet)
-            .count();
-        // The four operands `SpanOperands` holds, per row, per DeltaNet layer.
-        let per_row = (dims.conv_dim() + dims.value_dim() + 2 * dims.n_v_heads)
-            * std::mem::size_of::<f32>()
-            * layers;
-        if per_row == 0 || width == 0 {
-            return usize::MAX;
-        }
-        let Some(budget) = candle_nn::kv_cache::vram_budget_available(&self.model.device) else {
-            return usize::MAX;
-        };
-        // Half of what is claimable, not all of it: the stash is one tenant among
-        // several and a wave that spends every free region on its own rewind
-        // buffer has nothing left to decode into.
-        let rows = (budget / 2) / per_row;
-        (rows / width).saturating_sub(1)
     }
 
     /// The KV layer the draft head writes, past every trunk attention layer.
@@ -962,9 +936,8 @@ impl HybridBatched {
 
     /// Name them for the next forward, and size the buffers it will write.
     ///
-    /// **Sized here, before the forward opens** — same rule as the verify
-    /// stash: a wave's storage is claimed up front and the arena refuses a
-    /// device allocation from inside the sweep.
+    /// **Sized here, before the forward opens**: a wave's storage is claimed up
+    /// front and the arena refuses a device allocation from inside the sweep.
     ///
     /// `act_dtype` is the wave's activation dtype, and the buffers are
     /// allocated in it rather than in F32. Everything on both sides of these
@@ -1234,88 +1207,6 @@ impl HybridBatched {
         }
     }
 
-    /// Re-advance `seq`'s recurrent state over the first `kept` tokens of the
-    /// block it just verified — the speculative rewind ([`super::spec`]).
-    ///
-    /// Runs against the store in place: the replay is a handful of small
-    /// launches per recurrent layer, nothing like the whole-wave `&mut` a
-    /// sweep needs, so there is no reason to lift the store out.
-    /// Replay every job's accepted prefix — the whole cohort's recurrent
-    /// rewinds in one batched launch pair per DeltaNet layer.
-    ///
-    /// `jobs` pairs each stash span with how many of its rows the accept kept.
-    /// They must ascend by stash row, which they do when taken in the order the
-    /// stash recorded them.
-    pub fn replay_recurrent(&self, stash: &VerifyStash, jobs: &[(StashSpan, usize)]) -> Result<()> {
-        if jobs.is_empty() {
-            return Ok(());
-        }
-        let mut map = self
-            .recurrent
-            .lock()
-            .map_err(|_| candle::Error::Msg("qwen35: recurrent state lock poisoned".into()))?;
-        // One pass over the map collects a distinct `&mut` per job's store —
-        // the borrows are disjoint because the sequences are.
-        let mut stores: HashMap<usize, &mut RecurrentStateStore> = map
-            .iter_mut()
-            .filter(|(seq, _)| jobs.iter().any(|(sp, _)| sp.seq == **seq))
-            .map(|(seq, st)| (*seq, st))
-            .collect();
-        let mut full: Vec<(StashSpan, usize, &mut RecurrentStateStore)> =
-            Vec::with_capacity(jobs.len());
-        for &(span, kept) in jobs {
-            let store = stores.remove(&span.seq).ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "qwen35: sequence {} has no recurrent state — \
-                     `ensure_recurrent` was not called for this wave",
-                    span.seq
-                ))
-            })?;
-            full.push((span, kept, store));
-        }
-        // The **residues**, not the layers. The replay runs at accept time,
-        // well after the sweep that captured the stash, so on a streamed
-        // checkpoint the layer's image may long since have been evicted — and
-        // `ensure`ing it would pull ~240 MB over PCIe to read four small
-        // constants that never left VRAM. The residue holds exactly those four.
-        let recurrent: Vec<usize> = match full.first() {
-            Some((_, _, store)) => store.recurrent_layer_indices().collect(),
-            None => return Ok(()),
-        };
-        let mut residues = Vec::with_capacity(recurrent.len());
-        for &li in &recurrent {
-            residues.push((li, self.model.layers.residue(li)?));
-        }
-        let layers: Vec<ReplayLayer<'_>> = residues
-            .iter()
-            .map(|(li, r)| {
-                let w = r.delta_net().map_err(|_| {
-                    candle::Error::Msg(format!(
-                        "qwen35 verify replay: layer {li} carries recurrent state but is \
-                         not DeltaNet"
-                    ))
-                })?;
-                Ok(ReplayLayer {
-                    layer_index: *li,
-                    consts: DeltaNetConstants {
-                        dt_bias: &w.dt_bias,
-                        a: &w.a,
-                        conv: &w.conv,
-                        norm: &w.norm,
-                    },
-                })
-            })
-            .collect::<Result<_>>()?;
-        replay_accepted_prefixes(
-            &layers,
-            &self.model.cfg.delta_net,
-            self.model.cfg.rms_norm_eps,
-            &self.model.device,
-            stash,
-            &mut full,
-        )
-    }
-
     fn for_each_store(
         &self,
         seqs: &[usize],
@@ -1582,20 +1473,26 @@ mod tests {
         }
     }
 
-    /// A wave writes the buffer it is NOT reading, so the entry state is intact
-    /// whether the wave commits or fails — and a commit installs the wave's
-    /// output.
+    /// A long span writes the prefill scratch, NOT the state it reads, so the
+    /// entry state is intact whether the wave commits or fails — and a commit
+    /// installs the wave's output.
     #[test]
     fn recurrent_state_rolls_back_to_the_entry_value() -> Result<()> {
+        use crate::models::delta_net::SpanWrite;
         let c = cfg();
         let dev = Device::Cpu;
         let mut store = RecurrentStateStore::new(&c.layer_kinds, &c.delta_net, &dev)?;
+        store.ensure_scratch()?;
         // Layer 0 is DeltaNet under the 3:1 schedule.
         let entry = store.layer_state(0)?.s.copy()?;
 
-        // The form the mixer uses: read `live`, write the other buffer.
+        // The form the mixer uses for a prefill span: read `live`, write the
+        // scratch.
         let advance = |store: &mut RecurrentStateStore| -> Result<()> {
-            let (live, out) = store.layer_state_pair_mut(0)?;
+            let (live, write) = store.layer_span_mut(0, TIMELINE_ROWS + 1)?;
+            let SpanWrite::State(out) = write else {
+                candle::bail!("a long span writes the scratch");
+            };
             let bump = Tensor::full(3f32, live.s.shape(), &dev)?;
             out.s.slice_set(&live.s.add(&bump)?, 0, 0)?;
             Ok(())

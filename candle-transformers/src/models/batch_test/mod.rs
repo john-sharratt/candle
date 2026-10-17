@@ -60,6 +60,10 @@ pub mod test_helpers;
 /// could not be given them, and the two figures would have to be compared across two
 /// outputs that do not measure the same machine.
 pub mod utils;
+/// The card wave by wave — the performance page's bands — written to a CSV
+/// under `target/` as a batched gate runs.
+#[cfg(feature = "cuda")]
+pub mod vram_wave_log;
 /// The YaRN gates run on the models whose rungs they back.
 #[cfg(test)]
 mod yarn_gate_models;

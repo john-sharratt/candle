@@ -72,6 +72,7 @@ pub mod cuda_backend;
 mod custom_op;
 mod device;
 pub mod direct_io;
+pub mod direct_write;
 pub mod display;
 mod dtype;
 pub mod dummy_cuda_backend;

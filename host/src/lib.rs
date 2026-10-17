@@ -19,6 +19,7 @@
 //! | [`access`] | the estate's role table and `--local-signin` |
 //! | [`ui`] | UIs from disk, `/common/`, the on-disk build id |
 //! | [`model`] | the one model every tenant runs |
+//! | [`expert_split`] | the CPU expert split's settings, applied before the engine loads |
 //! | [`build_info`] | `--build-info`, and what every binary does first |
 //! | [`logs`], [`telemetry`], [`loading`] | what the process says about itself |
 //! | [`process`], [`ctrl_c`], [`self_heal`] | process-wide concerns (the log file is `web::log_file`, which the gateway writes too) |
@@ -32,6 +33,7 @@ pub mod commands;
 pub mod ctrl_c;
 pub mod download;
 pub mod endpoints;
+pub mod expert_split;
 pub mod guard;
 pub mod loading;
 pub mod logs;

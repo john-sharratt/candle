@@ -3,10 +3,12 @@
 //! The parity oracle is the sequential reference in
 //! `candle-transformers/src/models/delta_net/mix.rs`; these kernels
 //! implement the same recurrence with F32 state math (the state is a running
-//! sum — half precision drifts over a long decode). The decode step fuses
-//! decay, the delta-rule correction, the in-place state update, and the
-//! post-update read into one launch per token; the conv step advances the
-//! carried causal-conv tail in place.
+//! sum — half precision drifts over a long decode). A span of at most
+//! [`DELTA_NET_TIMELINE_ROWS`] rows — a decode row, a verify block, a short
+//! prompt — reads its state and writes a **timeline** of the generators its
+//! tokens add (`docs/deltanet_timeline.md`); [`run_delta_net_fold_f32`] applies
+//! the rows a step keeps. A longer span runs the conv + scan pair and writes
+//! its advanced state to a separate buffer.
 
 use core::ffi::c_void;
 
@@ -19,18 +21,18 @@ pub const DELTA_NET_PREFILL_CHUNK: usize = 64;
 /// Other widths take the tensor-op fallback in `delta_chunked`.
 pub const DELTA_NET_PREFILL_DIM: usize = 128;
 
-/// Pointers per layer in a prefill launch's layer table, in the kernels'
-/// `DnLayerOps` order: conv input, conv weights, alpha, beta_lin, dt_bias, a.
-pub const DELTA_NET_LAYER_OPS: usize = 6;
-
-/// The most `(layer, span)` pairs one prefill launch covers — the grid's
-/// z extent. The launchers refuse a stack past it.
-pub const DELTA_NET_MAX_LAYER_SPANS: usize = 65_535;
+/// The most spans one prefill launch covers — the grid's z extent. The
+/// launchers refuse a table past it.
+pub const DELTA_NET_MAX_SPANS: usize = 65_535;
 
 /// The longest span [`run_delta_net_short_span_f32`] takes: a speculative
 /// verify block (the drafts plus the accepted token) with room to spare. The
 /// kernel's per-row buffers are sized by it (`DNS_ROWS`).
 pub const DELTA_NET_SHORT_SPAN_ROWS: usize = 8;
+
+/// Rows a timeline holds (`DNT_ROWS`) — every span the short-span kernel runs
+/// keeps one, so the two are one number.
+pub const DELTA_NET_TIMELINE_ROWS: usize = DELTA_NET_SHORT_SPAN_ROWS;
 
 /// The causal-conv width the short-span kernel is compiled for (`DNS_KW`).
 pub const DELTA_NET_SHORT_SPAN_CONV: usize = 4;
@@ -49,12 +51,16 @@ extern "C" {
     /// tok_stride]` is the conv output (Q|K normed columns leading, V
     /// trailing); `alpha`/`beta_lin [T_wave, n_v_heads]` raw gate
     /// projections; `o [T_wave, n_v_heads·d_v]`. Gates computed in-kernel;
-    /// GQA broadcast by index; q scaled on load. `d_k`/`d_v` capped at 256
-    /// (shared-memory staging); the launcher silently no-ops beyond that —
-    /// callers validate dims at model load.
+    /// GQA broadcast by index; q scaled on load.
+    ///
+    /// The state is read and never written: the token's generators go to row 0
+    /// of each sequence's timeline (`timelines`, f32 pointers as i64), for
+    /// [`run_delta_net_fold_f32`]. `d_k == d_v == 128` and `tok_stride ==
+    /// (2·h_k + h_v)·128`; returns 1 with nothing written otherwise, 0 when
+    /// launched.
     pub fn run_delta_net_decode_step_f32(
         states: *const i64,
-        states_out: *const i64,
+        timelines: *const i64,
         conved: *const f32,
         rows: *const u32,
         alpha: *const f32,
@@ -70,22 +76,23 @@ extern "C" {
         tok_stride: i32,
         q_scale: f32,
         stream: *mut c_void,
-    );
+    ) -> i32;
 
     /// One causal depthwise-conv token step per decode sequence, batched over
     /// the wave, with the SiLU + Q|K-norm epilogue: each sequence's output
     /// row of `y [T_wave, channels]` is the post-activation operand row the
     /// decode step reads. `x [T_wave, channels]` (the wave's raw QKV rows),
-    /// `tails`/`tails_out [n_decode]` device f32 pointers to each sequence's
-    /// entering and advanced `[channels, kwidth−1]` tails (raw values, shifted
-    /// left with this token appended), `rows [n_decode]` wave rows.
-    /// `qk_channels` (= `2·h_k·128`, a multiple of 256) bounds the l2-normed
-    /// columns; `eps` is the norm's root floor.
+    /// `tails [n_decode]` device f32 pointers to each sequence's entering
+    /// `[channels, kwidth−1]` tail (read only), `timelines [n_decode]` each
+    /// sequence's timeline, whose row 0 receives the token's raw input,
+    /// `rows [n_decode]` wave rows. `qk_channels` (= `2·h_k·128`, a multiple
+    /// of 256) bounds the l2-normed columns; `eps` is the norm's root floor.
+    /// Returns 1 with nothing written for a refused shape, 0 when launched.
     pub fn run_delta_net_conv_decode_f32(
         x: *const f32,
         kernel: *const f32,
         tails: *const i64,
-        tails_out: *const i64,
+        timelines: *const i64,
         rows: *const u32,
         y: *mut f32,
         n_decode: i32,
@@ -94,7 +101,25 @@ extern "C" {
         qk_channels: i32,
         eps: f32,
         stream: *mut c_void,
-    );
+    ) -> i32;
+
+    /// Apply the first `m[i]` rows of entry `i`'s timeline to its state and
+    /// conv tail, in place, for every entry in one launch: grid
+    /// `(n_v_heads, 128/32, n)`. `table [4, n]` i64 holds each entry's conv
+    /// tail, state and timeline (f32 pointers), then its row count `m[i]` in
+    /// `1..=DELTA_NET_TIMELINE_ROWS` — one upload for the whole fold. The state
+    /// update is the scan's state phase over those rows, bit for bit; the tail
+    /// becomes the last `kwidth−1` of `[tail | x[0..m)]`. Returns 1 with
+    /// nothing written for a refused shape, 0 when launched.
+    pub fn run_delta_net_fold_f32(
+        table: *const i64,
+        n: i32,
+        n_v_heads: i32,
+        n_k_heads: i32,
+        channels: i32,
+        kwidth: i32,
+        stream: *mut c_void,
+    ) -> i32;
 
     /// Write the per-matrix address arrays `cublas<t>trsmBatched` reads:
     /// `a_ptrs[i] = a_base + i·a_stride`, `b_ptrs[i] = b_base + i·b_stride`,
@@ -115,24 +140,17 @@ extern "C" {
     );
 
     /// Token-parallel causal conv over a whole prefill segment, with the
-    /// SiLU + Q|K-norm epilogue: `y` IS the operand buffer the scan kernels
-    /// read q/k/v from through strides. `x [t_len, channels]` token-major,
-    /// `kernel [channels, kwidth]`, `tail [channels, kwidth−1]` (entering
-    /// tail, read-only), `y [t_len, channels]`,
-    /// `tail_out [channels, kwidth−1]` (the advanced RAW tail; a separate
-    /// buffer because blocks computing the first `kwidth−1` outputs read the
-    /// entering tail concurrently). `qk_channels`/`eps` as in the conv step.
-    /// `kwidth` is at most [`DELTA_NET_PREFILL_CONV_MAX`]; a wider kernel, like
-    /// every other refused shape, returns `1` with nothing written (`0` when
-    /// launched).
-    ///
-    /// **The layer stack.** With `layers` non-null, the launch replays
-    /// `n_layers` recurrent layers at once: `layers` is a device table of
-    /// [`DELTA_NET_LAYER_OPS`] pointers per layer (conv input, conv weights,
-    /// alpha, beta_lin, dt_bias, a — the last four read by the intra pass), and
-    /// `y_wave [n_layers, t_wave, channels]` / `ptrs [n_layers, 4, n_spans]` are
-    /// stacked by layer; `x_wave`/`kernel` are then ignored. Null `layers` with
-    /// `n_layers == 1` is the single-layer launch every forward makes.
+    /// SiLU + Q|K-norm epilogue, for every span of a wave in one launch: `y` IS
+    /// the operand buffer the scan kernels read q/k/v from through strides.
+    /// `x_wave [T_wave, channels]` token-major, `kernel [channels, kwidth]`,
+    /// `y_wave [T_wave, channels]`; `ptrs [4, n_spans]` each span's entering
+    /// tail (read-only), advanced tail, entering state and advanced state, and
+    /// `spans [2, n_spans]` its first row and length. The advanced RAW tail is a
+    /// separate buffer because blocks computing the first `kwidth−1` outputs
+    /// read the entering tail concurrently. `qk_channels`/`eps` as in the conv
+    /// step. `kwidth` is at most [`DELTA_NET_PREFILL_CONV_MAX`] and `n_spans` at
+    /// most [`DELTA_NET_MAX_SPANS`]; a refused shape returns `1` with nothing
+    /// written (`0` when launched).
     pub fn run_delta_net_conv_prefill_f32(
         x_wave: *const f32,
         kernel: *const f32,
@@ -140,9 +158,6 @@ extern "C" {
         ptrs: *const i64,
         spans: *const u32,
         n_spans: i32,
-        layers: *const i64,
-        n_layers: i32,
-        t_wave: i32,
         max_len: i32,
         channels: i32,
         kwidth: i32,
@@ -163,10 +178,6 @@ extern "C" {
     /// `kq [n_v_heads, t_len, DELTA_NET_PREFILL_CHUNK]` (rows valid for
     /// `s ≤ t` only) and `g_cs [n_v_heads, t_len]`. The q/k rows are read four
     /// floats at a time, so `qk_wave` must be 16-byte aligned.
-    ///
-    /// With `layers` non-null (see [`run_delta_net_conv_prefill_f32`]) the
-    /// gate projections and constants come from the table, and the conv output
-    /// (`t_tran` rows a layer) and every transient are stacked by layer.
     pub fn run_delta_net_prefill_intra_f32(
         qk_wave: *const f32,
         v_wave: *const f32,
@@ -180,8 +191,6 @@ extern "C" {
         g_cs: *mut f32,
         spans: *const u32,
         n_spans: i32,
-        layers: *const i64,
-        n_layers: i32,
         max_len: i32,
         t_tran: i32,
         n_v_heads: i32,
@@ -195,17 +204,14 @@ extern "C" {
     /// with the state tile resident in shared memory, computes the fused output
     /// (inter-chunk read of the pre-update state + intra-chunk reads of the
     /// chunk's own writes) directly into the span's rows of the whole-wave
-    /// output `o [.., n_v_heads·128]`, and updates `state [n_v_heads, 128,
-    /// 128]` in place in the stored orientation. `qk`/`tok_stride` as in the
-    /// intra kernel.
+    /// output `o [.., n_v_heads·128]`, and writes each span's advanced state
+    /// `[n_v_heads, 128, 128]` in the stored orientation to its state-out
+    /// (`ptrs` as in [`run_delta_net_conv_prefill_f32`]), leaving the entering
+    /// state as it was. `qk`/`tok_stride` as in the intra kernel.
     ///
     /// The pass reads `qk`, `u`, `w`, `kq` and every span's states four floats
     /// at a time, so each of those bases must be 16-byte aligned (`tok_stride`
     /// is a multiple of 128, which keeps every row aligned with its base).
-    ///
-    /// With `layers` non-null every buffer is stacked by layer — the conv
-    /// output, the transients, `o` (`t_tran` rows a layer) and `ptrs` — and the
-    /// table itself is not read: this pass touches only what the launch carved.
     pub fn run_delta_net_prefill_state_f32(
         qk_wave: *const f32,
         u: *const f32,
@@ -216,8 +222,6 @@ extern "C" {
         ptrs: *const i64,
         spans: *const u32,
         n_spans: i32,
-        layers: *const i64,
-        n_layers: i32,
         t_tran: i32,
         n_v_heads: i32,
         n_k_heads: i32,
@@ -226,22 +230,24 @@ extern "C" {
         stream: *mut c_void,
     );
 
-    /// The whole prefill scan — conv, intra-chunk solve and state pass — in
-    /// one launch, for spans of at most [`DELTA_NET_SHORT_SPAN_ROWS`] rows:
-    /// grid `(n_v_heads, 128/32, n_spans)`, each block convolving the q/k/v
-    /// rows it reads itself and keeping every intermediate on chip. Writes
-    /// exactly what the three-launch path writes into `o`, the advanced states
-    /// and the advanced conv tails — the same bits — and no conv-output rows.
+    /// The conv, the intra-chunk solve and the state pass's reads of the
+    /// prefill scan in one launch, for spans of at most
+    /// [`DELTA_NET_SHORT_SPAN_ROWS`] rows: grid `(n_v_heads, 128/32, n_spans)`,
+    /// each block convolving the q/k/v rows it reads itself and keeping every
+    /// intermediate on chip. Writes exactly what the three-launch path writes
+    /// into `o` — the same bits — and each span's timeline rows (G, k, v_new
+    /// and the raw conv input per row); it writes neither state nor conv tail,
+    /// and no conv-output rows.
     ///
     /// `x_wave [T_wave, channels]` is the raw QKV projection (token-major),
     /// `kernel [channels, DELTA_NET_SHORT_SPAN_CONV]`; `alpha`/`blin
-    /// [T_wave, n_v_heads]` raw; `o_wave [T_wave, n_v_heads·128]`; `ptrs`/
-    /// `spans` the span table of [`run_delta_net_conv_prefill_f32`] (entering
-    /// and advanced conv tails must be separate buffers; the states may be
-    /// one). `max_len` is the table's longest span. Returns 0 when launched,
-    /// 1 when the shape is refused and nothing was written: `max_len` outside
-    /// `1..=DELTA_NET_SHORT_SPAN_ROWS`, `kwidth` other than
-    /// [`DELTA_NET_SHORT_SPAN_CONV`], or `channels` not `(2·h_k + h_v)·128`.
+    /// [T_wave, n_v_heads]` raw; `o_wave [T_wave, n_v_heads·128]`; `ptrs
+    /// [3, n_spans]` each span's conv tail, state and timeline, `spans
+    /// [2, n_spans]` its first row and length. `max_len` is the table's longest
+    /// span. Returns 0 when launched, 1 when the shape is refused and nothing
+    /// was written: `max_len` outside `1..=DELTA_NET_SHORT_SPAN_ROWS`, `kwidth`
+    /// other than [`DELTA_NET_SHORT_SPAN_CONV`], or `channels` not
+    /// `(2·h_k + h_v)·128`.
     pub fn run_delta_net_short_span_f32(
         x_wave: *const f32,
         kernel: *const f32,

@@ -40,10 +40,119 @@ pub fn rel(mind: &Path, path: &Path) -> Option<String> {
 }
 
 /// Mark `timeline` as written from the mind document at `rel`.
+///
+/// A document's conversation is read, never continued, so it is also marked
+/// as never resumed: it keeps its turns and no recurrent snapshot.
 pub fn mark(engine: &ConversationEngine, timeline: TimelineId, rel: &str) {
+    engine.mark_timeline_unresumed(timeline);
     if let Err(e) = engine.set_conversation_metadata(timeline, META_PATH, rel) {
         tracing::warn!("{rel}: not marked as its document's — {e:?}");
     }
+}
+
+/// The metadata key a document's conversation records its content hash under —
+/// the ledger's hash ([`crate::engine::watcher::hash`]) of the text it was
+/// written from.
+pub const META_HASH: &str = "mind.sha";
+
+/// [`mark`], recording also the content hash of `body` — what lets another
+/// member, or this one with its ledger lost, tell the document is already in
+/// the substrate ([`seed_ledger`]).
+pub fn mark_version(engine: &ConversationEngine, timeline: TimelineId, rel: &str, body: &str) {
+    mark(engine, timeline, rel);
+    let digest = crate::engine::watcher::hash(body);
+    if let Err(e) = engine.set_conversation_metadata(timeline, META_HASH, &digest) {
+        tracing::warn!("{rel}: content hash not recorded — {e:?}");
+    }
+}
+
+/// Give the ingest ledger every document the substrate already holds at a
+/// recorded version, so a document written by another member — or by this one
+/// before its ledger was lost — is not written again. Answers how many.
+pub fn seed_ledger(engine: &ConversationEngine, ledger: &crate::engine::watcher::Ledger) -> usize {
+    let hashes: std::collections::HashMap<TimelineId, String> = engine
+        .conversations_with_metadata_key(META_HASH)
+        .into_iter()
+        .collect();
+    let held = engine
+        .conversations_with_metadata_key(META_PATH)
+        .into_iter()
+        .filter_map(|(t, rel)| hashes.get(&t).map(|h| (rel, h.clone())));
+    ledger.adopt_held(held)
+}
+
+/// Retire every copy but one of each layer document that is in the substrate
+/// more than once. Answers how many copies were retired.
+///
+/// A layer document becomes exactly one conversation in its group, so two live
+/// ones with the same mind path in the same group are the same document written
+/// twice — by two members that each found it missing from their own ledger.
+/// The copy kept is the first created, the lower timeline id breaking a tie: a
+/// rule every member applies to the same records the same way, so members
+/// retiring at once retire the same copies. A life event's path names several
+/// conversations by design and is left alone.
+pub fn retire_duplicate_documents(engine: &ConversationEngine) -> usize {
+    use std::collections::HashMap;
+    let mut copies: HashMap<(String, u32), Vec<(u64, u64, TimelineId)>> = HashMap::new();
+    for (timeline, rel) in engine.conversations_with_metadata_key(META_PATH) {
+        if life_event(&rel).is_some() {
+            continue;
+        }
+        let Some((group, order)) = engine.timeline_group_and_order(timeline) else {
+            continue;
+        };
+        copies
+            .entry((rel, group.raw()))
+            .or_default()
+            .push((order, timeline.raw(), timeline));
+    }
+    let mut retired = 0;
+    for ((rel, _), mut found) in copies {
+        if found.len() < 2 {
+            continue;
+        }
+        found.sort();
+        for (_, _, t) in found.into_iter().skip(1) {
+            match engine.tombstone_timeline(t) {
+                Ok(()) => retired += 1,
+                Err(e) => tracing::warn!("{rel}: a duplicate copy was not retired — {e:?}"),
+            }
+        }
+    }
+    retired
+}
+
+/// Smallest snapshot taken to be a kept state rather than a retired tail —
+/// which encodes in a few dozen bytes.
+const KEPT_SNAPSHOT_BYTES: u64 = 4096;
+
+/// Retire the recurrent snapshots of every conversation that is read and never
+/// continued — a mind document's, a kept dream's — and mark them so none is
+/// written again. Answers how many tails were retired.
+///
+/// For a store written before the mark existed, where every such conversation
+/// kept a whole recurrent state as its tail, and for marks lost to a restart.
+/// A tail already retired costs a lookup.
+pub fn retire_unresumed_snapshots(engine: &ConversationEngine) -> usize {
+    let mut seen: HashSet<TimelineId> = HashSet::new();
+    let mut retired = 0;
+    for key in [META_PATH, crate::engine::dreams::META_OF] {
+        for (timeline, _) in engine.conversations_with_metadata_key(key) {
+            if !seen.insert(timeline) {
+                continue;
+            }
+            let kept = engine
+                .recurrent_snapshot_bytes(timeline)
+                .is_some_and(|b| b >= KEPT_SNAPSHOT_BYTES);
+            if kept {
+                engine.mark_timeline_unresumed(timeline);
+                retired += 1;
+            } else {
+                engine.note_timeline_unresumed(timeline);
+            }
+        }
+    }
+    retired
 }
 
 /// Retire every conversation the document at `rel` became. Answers how many.

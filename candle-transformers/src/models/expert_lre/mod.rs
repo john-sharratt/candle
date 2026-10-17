@@ -26,8 +26,9 @@
 //!
 //! ## Eviction policy
 //!
-//! Eviction is a **retarget** — every expert has a copy in the pack, and the
-//! warm tier is immutable — so it moves no bytes. A promotion takes a free
+//! Eviction is a **retarget** — every expert has a copy in the pack, and a host
+//! copy stays where it is when its expert is promoted — so it moves no bytes.
+//! A promotion takes a free
 //! slot, else the best victim [`cache::ExpertCacheInner::rank_victims`] offers
 //! that the reclaim rule lets go now: a row with no invocation in flight.
 //!
@@ -129,6 +130,7 @@
 //! | `blend`        | one prediction list from votes, Markov and recency, ranked by learned cells |
 //! | `fault`        | the word a launch reports a lost cold expert in, and the forward's error |
 //! | `belady`, `routing_trace`, `replay` | the residency references and the offline policy replay |
+//! | `cpu_pool`     | the host CPU's pool for routed experts (`docs/cpu_expert_compute.md`) |
 //! | [`handle`]     | `ExpertCache` public API |
 
 /// The pad pins read-ahead holds for the pad-backed experts it lists.
@@ -142,7 +144,13 @@ mod blend;
 #[cfg(feature = "cuda")]
 mod boundary;
 mod cache;
+#[cfg(feature = "cuda")]
+mod cold_wait;
 pub(crate) mod compute;
+/// The host CPU's pool for routed experts: the kernel, the pool, its service
+/// thread and the rings it shares with the device.
+#[cfg(feature = "cuda")]
+pub mod cpu_pool;
 #[cfg(feature = "cuda")]
 mod dispatch;
 #[cfg(test)]
@@ -205,6 +213,9 @@ mod regret;
 mod replay;
 #[cfg(feature = "cuda")]
 mod residency;
+/// The pinned resident set: re-chosen between waves from decode's host
+/// accesses.
+mod resident;
 /// The routing the pipeline thread served, kept for the residency ceiling.
 mod routing_trace;
 /// The expert section of a model pack: built from a checkpoint, opened at load.

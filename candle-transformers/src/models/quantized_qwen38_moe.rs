@@ -398,11 +398,12 @@ pub fn oracle_from_gguf_path(
 /// (the 3.5 sibling needed a retune for precisely that).
 ///
 /// **The ×16 rung is gated on VRAM.** What bounds width here is per-session
-/// state, not the checkpoint: 36 GDN layers carry 256 MiB of recurrent state
-/// a sequence (both halves of the store), so sixteen want 4 GiB before any
+/// state, not the checkpoint: 36 GDN layers carry 144 MiB of recurrent state a
+/// decoding sequence and 288 MiB while it prefills (its state, timeline and
+/// prefill scratch), so sixteen prefilling together want 4.5 GiB before any
 /// K/V or the 3.3 GiB tier a sixteen-wide decode stands. On the 16 GB card the
-/// dense trunk plus an expert zone on its floor leave 221 regions against the
-/// 275 that needs — measured, and refused by the weight side on its floor.
+/// dense trunk plus an expert zone on its floor leave 221 regions — measured —
+/// against the 288 their state alone needs.
 /// Twenty-four GiB is the smallest card in the fleet with that room; below it
 /// the rung is skipped and says so, because a narrower run is still a green
 /// run and silence would let reduced coverage read as a pass.
@@ -1363,6 +1364,7 @@ mod tests {
         for k in [0usize, 1, 2, 3, 4, 5, 8, 12, 16, 24, 32, 40, 47, 48] {
             let mut session = model.create_batched_session(BatchedConfig::default())?;
             let seq = session.create_sequence()?;
+            let mut residual = model.claim_residual(&session, ids.len())?;
             let step = model.forward_wave(
                 &mut session,
                 &[],
@@ -1373,12 +1375,10 @@ mod tests {
                 &[],
                 0,
                 k.min(n_layers),
-                None,
+                Some(&mut residual),
             )?;
             if k < n_layers {
-                let r = step
-                    .into_residual()
-                    .ok_or_else(|| candle::Error::Msg("expected a residual".into()))?;
+                let r = residual.committed().to_tensor()?;
                 let m = r
                     .abs()?
                     .flatten_all()?
@@ -1424,13 +1424,9 @@ mod tests {
     /// drafter and the target have stopped agreeing, and only the rung itself
     /// shows that.
     ///
-    /// The 32-context row is the width limit, and it is here rather than in the
-    /// plain gate because it is where the rewind stash is priced: the stash is
-    /// `width × (budget + 1)` rows across all 36 DeltaNet layers, so 32 is the
-    /// width at which `affordable_draft_budget` is expected to start clamping
-    /// the ladder's depth. A row that runs and reports a *shallower* effective
-    /// budget there is the clamp working; a row that OOMs is the clamp priced
-    /// wrong.
+    /// The 32-context row is past the ladder's last bracket, so it decodes
+    /// plain: it is here to show the width at which speculation stops, beside
+    /// the rows that speculate.
     fn speculative_ladder() -> Vec<TestConfig> {
         use crate::models::batched_inference::InferenceMode;
 
@@ -1555,8 +1551,7 @@ mod tests {
         // which asks the model at each config's width — production behaviour,
         // and the whole point of this table. Pinning a budget would measure a
         // configuration nothing runs, and would hide the one thing the wide
-        // rows exist to show: `affordable_draft_budget` clamping the depth a
-        // 32-wide cohort can stash for.
+        // rows exist to show: where the ladder stops speculating.
         let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
             .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
             .with_suppress_thinking(true)
@@ -2313,6 +2308,45 @@ mod tests {
             Ok(m)
         };
         params.run(configs, load)
+    }
+
+    /// **Eight sequences whose prefill does not fit one wave.** The gate's ×8
+    /// row alone: on a 16 GiB card its 4,160 prompt rows are sliced into
+    /// several passes, so every sequence's prefill is a chain of long spans at
+    /// rising offsets — each reading the state the last one installed through
+    /// the prefill scratch's exchange — and decode starts from the end of that
+    /// chain. On a wider card the row runs whole and checks the same output.
+    #[test]
+    #[ignore = "loads this card's engine artifact and needs a GPU. Run with: \
+                cargo test --release --features cuda -p candle-transformers --lib \
+                quantized_qwen38_moe::tests::test_eight_wide_sliced_prefill \
+                -- --ignored --nocapture --test-threads=1"]
+    fn test_eight_wide_sliced_prefill() -> Result<()> {
+        use crate::models::batch_test::utils::TestParams;
+        use crate::models::batched_inference::InferenceMode;
+        use crate::models::dialect::Dialect;
+        use crate::models::qwen4exp::{Qwen4ExpBatched, Qwen4ExpGpu};
+        use candle::quantized::Int8Mode;
+
+        let pack = engine()?;
+        let device = Device::new_cuda(0)?;
+        let int8mode = Int8Mode::auto(&device);
+        let params = TestParams::new(256, &tokenizer_json()?, Dialect::qwen35())
+            .map_err(|e| candle::Error::Msg(format!("TestParams: {e}")))?
+            .with_suppress_thinking(true)
+            .with_int8mode(int8mode)
+            .with_timeout_secs(3600);
+        let configs = vec![TestConfig {
+            mode: InferenceMode::BF16,
+            use_batched: true,
+            num_contexts: 8,
+            num_repeats: 1,
+            test_mode: Some(TestMode::StoryRewrite),
+        }];
+        params.run(configs, || {
+            let gpu = Qwen4ExpGpu::load(&pack, &device)?;
+            Qwen4ExpBatched::new(gpu)
+        })
     }
 
     /// **Single-session decode, alone.** The gate's one-context row — same task,

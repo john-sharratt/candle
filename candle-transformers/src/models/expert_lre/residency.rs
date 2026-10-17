@@ -8,8 +8,9 @@
 //! The lock is never held across a CUDA call or a pack read.
 //!
 //! **The entry is a pure function of the places**: the VRAM slot if there is
-//! one, else the pad slot, else a pinned warm slot, else 0. A pageable warm slot
-//! is not device-readable, so an expert held only there is cold (the stager
+//! one, else the pad slot, else 0. Every pinned host copy is a pad slot —
+//! resident or churn (`resident`) — and the warm tier's slots are pageable,
+//! not device-readable, so an expert held only there is cold (the stager
 //! stages it into the pad with a `memcpy`).
 //!
 //! Whether a change is *allowed* now — an entry going to 0 needs a quiet row, a
@@ -26,8 +27,8 @@ pub(crate) struct Place {
     pub(crate) vram: Option<(usize, u64)>,
     /// Pad slot and its host address (device-readable at the same address).
     pub(crate) pad: Option<(usize, u64)>,
-    /// Warm-tier slot, with its address when it is pinned.
-    pub(crate) warm: Option<(usize, Option<u64>)>,
+    /// Pageable warm-tier slot.
+    pub(crate) warm: Option<usize>,
     /// Promotion copies reading the pad slot right now. A pinned pad slot is
     /// never evicted.
     pub(crate) pins: u32,
@@ -42,8 +43,6 @@ pub(crate) struct Place {
 /// eviction here would publish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fallback {
-    /// Its pinned warm slot.
-    Warm,
     /// Its pad slot, pinned against the stager for the life of the offer.
     Pad,
     /// Nowhere device-readable: entries 0, and the next launch that routes it
@@ -58,23 +57,15 @@ impl Place {
             b
         } else if let Some((_, b)) = self.pad {
             b
-        } else if let Some((_, Some(b))) = self.warm {
-            b
         } else {
             0
         }
     }
 
     /// The pinned host copy the device reads the expert from once its VRAM
-    /// slot is claimed, and whether it is the pad's.
-    pub(crate) fn pinned_source(&self) -> Option<(u64, bool)> {
-        if let Some((_, b)) = self.pad {
-            Some((b, true))
-        } else if let Some((_, Some(b))) = self.warm {
-            Some((b, false))
-        } else {
-            None
-        }
+    /// slot is claimed: its pad slot's.
+    pub(crate) fn pinned_source(&self) -> Option<u64> {
+        self.pad.map(|(_, b)| b)
     }
 }
 
@@ -142,22 +133,17 @@ impl Residency {
         self.change(row, expert, |p| p.pad = pad)
     }
 
-    /// Record the expert's warm slot — at startup, once; the warm tier is
-    /// immutable.
-    pub(crate) fn set_warm(
-        &mut self,
-        row: usize,
-        expert: usize,
-        warm: Option<(usize, Option<u64>)>,
-    ) {
+    /// Record the expert's pageable warm slot — at startup, once. It never
+    /// changes the entry: the device cannot read it.
+    pub(crate) fn set_warm(&mut self, row: usize, expert: usize, warm: Option<usize>) {
         let i = self.at(row, expert);
         self.places[i].warm = warm;
     }
 
     /// The entries (gate, up, down) a VRAM-resident expert falls back to when
     /// the device evicts it — exactly what an eviction here would publish: its
-    /// pad slot's, else its pinned warm slot's, else 0 — and which that is, or
-    /// `None` when it is not in VRAM.
+    /// pad slot's, else 0 — and which that is, or `None` when it is not in
+    /// VRAM.
     ///
     /// The caller holds the fallback for as long as the offer stands: a pad
     /// slot pinned (`pin_pad`), since the stager owns pad eviction and must not
@@ -172,17 +158,13 @@ impl Residency {
         let p = self.place(row, expert);
         p.vram?;
         Some(match p.pinned_source() {
-            Some((base, from_pad)) => (
+            Some(base) => (
                 [
                     base + self.table.offset(Proj::Gate, row),
                     base + self.table.offset(Proj::Up, row),
                     base + self.table.offset(Proj::Down, row),
                 ],
-                if from_pad {
-                    Fallback::Pad
-                } else {
-                    Fallback::Warm
-                },
+                Fallback::Pad,
             ),
             None => ([0; 3], Fallback::Cold),
         })
@@ -240,24 +222,18 @@ mod tests {
     use super::*;
 
     /// A lazy victim's fallback is exactly the entry eviction would publish —
-    /// its pad slot over its pinned warm slot, plus the row's projection
-    /// offsets, else 0 — and only an expert in VRAM is one.
+    /// its pad slot, plus the row's projection offsets, else 0 — and only an
+    /// expert in VRAM is one.
     #[test]
     fn a_lazy_victim_falls_back_to_what_eviction_publishes() {
         let (mut r, t) = residency();
-        let (warm, pad) = (0x7100_0000u64, 0x9000_0000u64);
-        r.set_warm(1, 2, Some((9, Some(warm))));
+        let pad = 0x9000_0000u64;
+        r.set_pad(1, 2, Some((3, pad)));
         assert_eq!(r.displaced_entries(1, 2), None, "not in VRAM");
         r.set_vram(1, 2, Some((40, 0xa000_0000)));
         assert_eq!(
             r.displaced_entries(1, 2),
-            Some(([warm, warm + 0x100, warm + 0x300], Fallback::Warm))
-        );
-        r.set_pad(1, 2, Some((3, pad)));
-        assert_eq!(
-            r.displaced_entries(1, 2),
             Some(([pad, pad + 0x100, pad + 0x300], Fallback::Pad)),
-            "the pad copy is nearer"
         );
         r.set_vram(1, 2, None);
         assert_eq!(
@@ -266,7 +242,7 @@ mod tests {
             "what the device writes, eviction publishes"
         );
 
-        r.set_warm(0, 1, Some((4, None)));
+        r.set_warm(0, 1, Some(4));
         r.set_vram(0, 1, Some((41, 0xa100_0000)));
         assert_eq!(
             r.displaced_entries(0, 1),
@@ -299,33 +275,28 @@ mod tests {
     }
 
     /// Every row of the design's transition table (§0.4), with the entry each
-    /// leaves behind: VRAM over pad over pinned warm over 0.
+    /// leaves behind: VRAM over pad over 0.
     #[test]
     fn the_entry_follows_the_nearest_copy() {
         let (mut r, t) = residency();
-        let pinned_warm = 0x7100_0000u64;
-        r.set_warm(1, 2, Some((9, Some(pinned_warm))));
+        let resident = 0x7100_0000u64;
+        r.set_pad(1, 2, Some((1030, resident)));
         r.publish_all();
-        assert_eq!(t.entry(Proj::Gate, 1, 2), pinned_warm, "warm only");
-        assert_eq!(t.entry(Proj::Down, 1, 2), pinned_warm + 0x300);
+        assert_eq!(t.entry(Proj::Gate, 1, 2), resident, "a resident pad slot");
+        assert_eq!(t.entry(Proj::Down, 1, 2), resident + 0x300);
 
         // Promotion lands: VRAM.
         assert_eq!(
             r.set_vram(1, 2, Some((40, 0xa000_0000))),
-            (pinned_warm, 0xa000_0000)
+            (resident, 0xa000_0000)
         );
         assert_eq!(t.entry(Proj::Up, 1, 2), 0xa000_0100);
-        // The stager publishes a pad copy: the entry stays VRAM.
-        assert_eq!(
-            r.set_pad(1, 2, Some((3, 0x9000_0000))),
-            (0xa000_0000, 0xa000_0000)
-        );
-        assert_eq!(t.entry(Proj::Gate, 1, 2), 0xa000_0000);
         // VRAM eviction falls back to the pad.
-        assert_eq!(r.set_vram(1, 2, None), (0xa000_0000, 0x9000_0000));
-        // Pad eviction falls back to the pinned warm slot.
-        assert_eq!(r.set_pad(1, 2, None), (0x9000_0000, pinned_warm));
-        assert_eq!(t.entry(Proj::Gate, 1, 2), pinned_warm);
+        assert_eq!(r.set_vram(1, 2, None), (0xa000_0000, resident));
+        assert_eq!(t.entry(Proj::Gate, 1, 2), resident);
+        // Pad eviction leaves it cold.
+        assert_eq!(r.set_pad(1, 2, None), (resident, 0));
+        assert_eq!(t.entry(Proj::Gate, 1, 2), 0);
     }
 
     /// A pageable warm slot is not device-readable: an expert held only there
@@ -333,7 +304,7 @@ mod tests {
     #[test]
     fn a_pageable_warm_copy_is_cold() {
         let (mut r, t) = residency();
-        r.set_warm(0, 1, Some((70, None)));
+        r.set_warm(0, 1, Some(70));
         r.publish_all();
         assert_eq!(t.entry(Proj::Gate, 0, 1), 0);
         r.set_pad(0, 1, Some((0, 0x9000_0000)));
@@ -344,14 +315,15 @@ mod tests {
         }
     }
 
-    /// A promotion's pin is counted, and the copy source prefers the pad.
+    /// A promotion's pin is counted, and the copy source is the pad slot — a
+    /// pageable warm slot is none.
     #[test]
-    fn pins_count_and_the_pad_is_the_preferred_source() {
+    fn pins_count_and_the_pad_is_the_source() {
         let (mut r, _) = residency();
-        r.set_warm(1, 0, Some((5, Some(0x7100_0000))));
-        assert_eq!(r.place(1, 0).pinned_source(), Some((0x7100_0000, false)));
+        r.set_warm(1, 0, Some(5));
+        assert_eq!(r.place(1, 0).pinned_source(), None);
         r.set_pad(1, 0, Some((2, 0x9000_0000)));
-        assert_eq!(r.place(1, 0).pinned_source(), Some((0x9000_0000, true)));
+        assert_eq!(r.place(1, 0).pinned_source(), Some(0x9000_0000));
         r.pin_pad(1, 0, 1);
         r.pin_pad(1, 0, 1);
         assert_eq!(r.place(1, 0).pins, 2);

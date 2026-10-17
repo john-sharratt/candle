@@ -36,7 +36,7 @@
 //! let logits = batched.forward_batch(&mut contexts)?;
 //! ```
 
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 #[cfg(not(feature = "cuda"))]
 use candle::wave_provenance::WaveTicket;
@@ -69,11 +69,11 @@ use super::rope_schedule::{RopeRungs, RopeSchedule};
 use super::rope_tables::CisPrecomputations;
 use super::tensor_cat::TensorCat;
 use super::wave_admit::admit_wave_kv;
-use super::wave_driver::{assemble_wave_contexts, WaveGroups};
+use super::wave_driver::{assemble_wave_contexts, SweepMode, WaveGroups};
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::profile::{pipeline_record, profile_now};
-use crate::models::wave_buffers::wave_root;
+use crate::models::wave_buffers::{wave_empty_ticketed, wave_root, wave_root_ticketed};
 use crate::models::wave_token_ids::device_token_ids;
 use crate::quantized_nn::RmsNorm;
 use candle_nn::Embedding;
@@ -88,18 +88,21 @@ pub type WaveGuard = candle_nn::kv_cache::WaveGeneration;
 #[cfg(not(feature = "cuda"))]
 pub type WaveGuard = ();
 
-/// Outcome of a re-entrant [`BatchedInference::forward_batch_layers`] call.
+/// Outcome of one sweep over a contiguous layer range.
 ///
-/// A wave runs a contiguous layer range. If it stopped short of the final layer
-/// it yields the inter-layer residual stream to persist and resume; if it reached
-/// the last layer it ran the head and yields per-sequence logits.
+/// Stopped short of the final layer it yields the inter-layer residual stream,
+/// still on its forward span; reached the last layer it ran the head and yields
+/// per-sequence logits; a segment being prepared for a step yields its price.
 pub enum WavePhase {
-    /// Layers `[start, end)` ran with `end < num_layers`; the residual stream is
-    /// handed back to be persisted and fed as `x_in` on the next wave.
+    /// Layers `[start, end)` ran with `end < num_layers`; the residual stream, on
+    /// the forward span, for the driver to move where it goes next.
     Residual(TensorCat),
     /// The range reached the final layer; the head ran. One logits row per input
     /// sequence, packed as the current forward's `TensorCat`.
     Logits(TensorCat),
+    /// [`SweepMode::Prepare`]: the segment's per-phase transient price —
+    /// attention, FFN, forward span — with nothing placed and nothing swept.
+    Priced([usize; 3]),
 }
 
 /// Driver-used VRAM right now (`total − free` from `cuMemGetInfo`), in bytes;
@@ -366,6 +369,12 @@ pub trait BatchedModelCore {
     /// `ManagedBatchedModel::expert_pipeline_dead`.
     fn expert_pipeline_dead(&self) -> bool {
         false
+    }
+
+    /// The expert pipeline counters' shared home, for a reader on another
+    /// thread that reads gauges while forwards run (`ExpertCache::stats_shared`).
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        None
     }
 
     /// The expert cache's `(hits, misses)` tallies so far, unsettled
@@ -717,13 +726,15 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             layer_start,
             layer_end,
             x_in,
-            window,
+            mode,
             act_dtype: _,
             adapter,
         } = wave;
         if seq_ids.is_empty() {
             candle::bail!("forward_wave: empty batch");
         }
+        let preparing = matches!(mode, SweepMode::Prepare);
+        let in_step = matches!(mode, SweepMode::InStep(_));
         // Read before the contexts borrow the session: whether the caller's
         // accept walk will select on this wave's head span.
         #[cfg(feature = "cuda")]
@@ -769,9 +780,15 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // additionally translates the staged per-token scatter descriptors.
         // The uniform stack's arena state does not move before the layer loop
         // reads it, so building here — before phase 0 — matches the order the
-        // wave driver used when it built these.
+        // wave driver used when it built these. A segment being prepared runs no
+        // layer, so it builds none — but it claims the decode rows' write chunks
+        // the build would, here, before the step's span stands.
         #[cfg(feature = "cuda")]
-        let decode_headers = if n_decode > 0 {
+        if preparing {
+            session.ensure_decode_writes(&seq_ids[..n_decode])?;
+        }
+        #[cfg(feature = "cuda")]
+        let decode_headers = if n_decode > 0 && !preparing {
             let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
             DecodeHeaders::Decode { buf, stride }
         } else {
@@ -807,9 +824,13 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // that has already finished. Invisible while every wave succeeds, fatal
         // the moment one fails: the failed wave's tier stands, every retry's
         // admit is refused by it, and the engine spins.
+        //
+        // A segment of a step skips this and the admit below: the step ran both
+        // for every segment before it placed the tier its segments share
+        // (`docs/wave_step.md` §2.1), and its forward span is live.
         let t_reclaim = profile_now();
         #[cfg(feature = "cuda")]
-        if let Device::Cuda(d) = self.model.device() {
+        if let (Device::Cuda(d), false) = (self.model.device(), in_step) {
             end_wave_transient(&d.cuda_stream());
             // **And the boundary's growing direction, in the one gap it is legal
             // in.** Every guard from the previous forward is dropped and this
@@ -875,7 +896,9 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // were made by the caller when it built the position map; this covers
         // the multi-token rows.
         let t_admit = profile_now();
-        admit_wave_kv(contexts, n_decode, n_prefill, layer_start, layer_end)?;
+        if !in_step {
+            admit_wave_kv(contexts, n_decode, n_prefill, layer_start, layer_end)?;
+        }
         pipeline_record("wave:admit", t_admit);
 
         // **Phase 2: price and reserve this wave's transient tier.**
@@ -891,11 +914,15 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // out inside the reservation on every phase but never chooses its
         // address, which is what keeps layer *N*'s extents and layer *N+1*'s at
         // the same offsets (§13b).
+        //
+        // A segment of a step prices itself and returns: the step places one tier
+        // for all of its segments. A segment running inside the step places
+        // nothing — the step's tier stands under it.
         let t_plan = profile_now();
         #[cfg(feature = "cuda")]
         {
             let rows = n_decode + pre_rows + glue_rows;
-            if rows > 0 {
+            if rows > 0 && !in_step {
                 if let Device::Cuda(d) = self.model.device() {
                     let geometry = self.model.wave_geometry(embed_dtype);
                     let plan = WavePlan::new(geometry);
@@ -920,8 +947,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                         // Every prefill and glue sequence: the ragged tables
                         // hold an entry for each, whatever its length.
                         prefill_spans: n_prefill + n_glue,
-                        staged_rows: 0,
-                        staged_spans: 0,
                         // The caller's accept walk selects on the head's span
                         // only when it reads the logits there.
                         accept_rows: if accept_in_place { scored_rows } else { 0 },
@@ -954,11 +979,17 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                     // in turn waits on before it reads the frontier. The
                     // compressor keeps running through the forward — it fills
                     // arenas that already exist, which moves nothing.
+                    if preparing {
+                        return Ok((WavePhase::Priced(per_phase), None));
+                    }
                     plan_wave_transient(&d.cuda_stream(), per_phase)?;
                 }
             }
         }
         pipeline_record("wave:plan", t_plan);
+        if preparing {
+            return Ok((WavePhase::Priced([0; 3]), None));
+        }
 
         // **From here to the end of this function, the forward owns the
         // partition.**
@@ -988,14 +1019,19 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // The forward's span, open from here to the head: the wave's token ids
         // are laid on it before the embedding reads them, and the head's norm
         // and logits are carved from it after the last layer. It is reset per
-        // *forward* — the lifetime all three actually have.
+        // *forward* — the lifetime all three actually have. A segment of a step
+        // carves from the step's span instead, which outlives its segments.
         #[cfg(feature = "cuda")]
-        let head_span = match self.model.device() {
-            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
+        let head_span = match (self.model.device(), mode) {
+            (_, SweepMode::InStep(_)) => None,
+            (Device::Cuda(d), _) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
             _ => None,
         };
         #[cfg(feature = "cuda")]
-        let fwd_ticket = head_span.as_ref().map(|g| g.ticket());
+        let fwd_ticket = match mode {
+            SweepMode::InStep(ticket) => ticket,
+            _ => head_span.as_ref().map(|g| g.ticket()),
+        };
         #[cfg(not(feature = "cuda"))]
         let (head_span, fwd_ticket): (Option<WaveGuard>, Option<WaveTicket>) = (None, None);
 
@@ -1019,8 +1055,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         let glue_headers = DecodeHeaders::Prefill(glue_meta);
 
         // Combined residual: embed every row flat `[1, total, hidden]`, or resume
-        // a paused wave from its persisted stream.
-        let fresh = x_in.is_none();
+        // a paused wave from the residual it was handed.
         let t_embed = profile_now();
         let mut x = match x_in {
             None => {
@@ -1029,8 +1064,8 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 // device (`WaveBuffer::RowTokenIds`). The resident table's gather
                 // inherits the ids' arena, so the residual it produces lands
                 // there too (`WaveBuffer::ForwardResidual`), and every layer adds
-                // into it in place. A window that stops short copies it off the
-                // span when it hands it on (below).
+                // into it in place. A window that stops short hands it on from
+                // there (below).
                 let inputs: Vec<&Tensor> = contexts.iter().map(|c| c.input_ids).collect();
                 let ids = device_token_ids(&inputs, self.model.device(), fwd_ticket)?;
                 let xt = ids.reshape((1, ids.elem_count()))?;
@@ -1084,7 +1119,18 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 // table because `forward_as_dtype` does.
                 TensorCat::from_cat_tensor(embedded, 0)?
             }
-            Some(resume) => resume,
+            // The residual this forward resumes is gathered into a buffer of its
+            // own on the forward span (`WaveBuffer::ForwardResidual`), in this
+            // forward's row order: every layer adds into it in place, and what
+            // it was gathered from is left as it was, so a failed forward can be
+            // retried from the same input (`docs/wave_step.md` §3.1).
+            Some(resume) => {
+                let total = n_decode + pre_rows + glue_rows;
+                let buf =
+                    wave_empty_ticketed((1, total, resume.width()), embed_dtype, dev, fwd_ticket)?;
+                resume.gather_into(&buf)?;
+                TensorCat::from_cat_tensor(buf, 0)?
+            }
         };
         pipeline_record("wave:embed", t_embed);
 
@@ -1195,21 +1241,11 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             dev.flush_launches()?;
         }
 
-        // A window that stops short hands its residual to a later forward, past
-        // this span's reset. A resumed one is already the caller's buffer and
-        // was added into in place; a fresh one is on the span, so it is copied
-        // into one of the session's held window buffers.
+        // A window that stops short hands its residual on as it stands, on the
+        // forward span, with the span's guard: the driver moves it to the next
+        // segment or the creep's arena while the guard still holds it.
         if layer_end < num_layers {
-            if !fresh {
-                return Ok((WavePhase::Residual(x), None));
-            }
-            let on_span = x.to_tensor();
-            let held = window.take(on_span.dims(), on_span.dtype(), on_span.device())?;
-            held.slice_set(&on_span, 0, 0)?;
-            return Ok((
-                WavePhase::Residual(TensorCat::from_cat_tensor(held, 0)?),
-                None,
-            ));
+            return Ok((WavePhase::Residual(x), head_span));
         }
 
         // Head over the rows that need logits: every decode row (one token each,
@@ -1252,7 +1288,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 let acts = self.model.final_norm().forward_dynamic(
                     &pre_norm,
                     proj.int8mode(),
-                    wave_root(head_span.as_ref()),
+                    wave_root_ticketed(fwd_ticket),
                 )?;
                 proj.forward_dynamic(acts.as_dynamic(), pre_norm.dtype())?
             }

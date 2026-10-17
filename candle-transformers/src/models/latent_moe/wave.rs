@@ -14,7 +14,7 @@
 //! clears everything.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 use candle::quantized::pinned_staging::Generation;
 use candle::{DType, Device, Result, Tensor};
@@ -26,8 +26,11 @@ use crate::models::batched_inference::{
 use crate::models::batched_model::{WaveGuard, WavePhase};
 use crate::models::head_rows::select_head_rows;
 use crate::models::kv_cache_utils::SequenceContext;
+use crate::models::residual_rows::CreepResidual;
 use crate::models::tensor_cat::TensorCat;
-use crate::models::wave_driver::{drive_wave, WaveGroups, WaveSweep};
+use crate::models::wave_driver::{
+    drive_step, drive_wave, StepOutcome, StepSpec, SweepMode, WaveGroups, WaveSweep,
+};
 use candle_nn::kv_cache::ModelGeometry;
 use candle_nn::kv_cache::CHUNK_SIZE;
 
@@ -1043,6 +1046,10 @@ impl ManagedBatchedModel for BatchedEngine {
         self.engine.experts().pipeline_dead()
     }
 
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        Some(self.engine.experts().stats_shared())
+    }
+
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
         Some(self.engine.experts().hit_counts())
     }
@@ -1089,7 +1096,7 @@ impl ManagedBatchedModel for BatchedEngine {
         glue_inputs: &[Tensor],
         layer_start: usize,
         layer_end: usize,
-        residual_in: Option<Tensor>,
+        residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult> {
         drive_wave(
             self,
@@ -1102,8 +1109,25 @@ impl ManagedBatchedModel for BatchedEngine {
             glue_inputs,
             layer_start,
             layer_end,
-            residual_in,
+            residual,
         )
+    }
+
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome> {
+        drive_step(self, session, spec)
+    }
+
+    fn claim_residual(
+        &self,
+        session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual> {
+        let (width, dtype) = WaveSweep::residual_row(self, session)?;
+        CreepResidual::claim(WaveSweep::device(self), rows, width, dtype)
     }
 
     /// Batched speculative verify: every sequence's `[committed, drafts…]`
@@ -1289,6 +1313,13 @@ impl WaveSweep for BatchedEngine {
         <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
     }
 
+    /// The mHC stream: `hc_mult` copies of `dim`, in F32 — what the embedding
+    /// expands into and every layer's post-mix writes.
+    fn residual_row(&self, _session: &BatchedInferenceSession) -> Result<(usize, DType)> {
+        let cfg = self.engine.cfg();
+        Ok((cfg.hc_mult * cfg.dim, DType::F32))
+    }
+
     /// No reconciliation: this model's session offsets are ABSOLUTE while
     /// `sequence_backing_tokens` counts the RESIDENT chunks of the sliding
     /// window ring — once the ring has slid, the default's `offset == backing`
@@ -1349,6 +1380,14 @@ impl WaveSweep for BatchedEngine {
         session: &mut BatchedInferenceSession,
         wave: WaveGroups<'_>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
+        // A segment being prepared for a step: the boundary move, and nothing
+        // priced — this engine keeps no buffer on the transient tier, so the
+        // step places none for it. Its claims happen inside its own sweep, as
+        // they do for a forward on its own.
+        if matches!(wave.mode, SweepMode::Prepare) {
+            self.engine.experts().reclaim_spare_ground();
+            return Ok((WavePhase::Priced([0; 3]), None));
+        }
         let snaps = self.capture_corpus_state(wave.seq_ids)?;
         match self.sweep_wave_inner(session, wave) {
             Ok(v) => Ok(v),
@@ -1383,7 +1422,7 @@ impl BatchedEngine {
             layer_start,
             layer_end,
             x_in,
-            window: _,
+            mode,
             act_dtype: _,
             adapter,
         } = wave;
@@ -1396,7 +1435,6 @@ impl BatchedEngine {
                  `{name}` cannot be applied"
             );
         }
-        let residual_in: Option<Tensor> = x_in.map(|tc| tc.to_tensor());
         // The KV↔expert boundary's GROWING direction, in the one gap it is
         // legal in: between forwards, before this wave opens any state. Spare
         // KV regions above the KV side's recent high-water go back to the
@@ -1404,8 +1442,11 @@ impl BatchedEngine {
         // only ever moves toward KV (`request_kv_ground` buys on the spot) and
         // expert residency ratchets down across a long run. The shrink
         // direction needs no call here: a KV claim that runs out buys its
-        // ground itself. Mirrors the blanket `BatchedModel` wave's phase 0.
-        self.engine.experts().reclaim_spare_ground();
+        // ground itself. Mirrors the blanket `BatchedModel` wave's phase 0. A
+        // segment of a step had it when the step prepared it.
+        if !matches!(mode, SweepMode::InStep(_)) {
+            self.engine.experts().reclaim_spare_ground();
+        }
         let e = &self.engine;
         let cfg = e.cfg();
         let n_layers = self.engine.layer_count();
@@ -1658,10 +1699,14 @@ impl BatchedEngine {
         let total_rows: usize = decode_seqs.len()
             + prefill_lens.iter().sum::<usize>()
             + glue_lens.iter().sum::<usize>();
-        let mut h = match residual_in {
-            Some(r) => {
-                // Persisted as [1, rows, hc·dim]; restore the mHC axes.
-                r.reshape((1, total_rows, cfg.hc_mult, cfg.dim))?
+        let mut h = match x_in {
+            Some(resume) => {
+                // Gathered into a stream of this wave's own, in its row order,
+                // leaving what it was gathered from as it was; then the mHC axes.
+                let buf =
+                    Tensor::empty((total_rows, resume.width()), DType::F32, e.engine_device())?;
+                resume.gather_into(&buf)?;
+                buf.reshape((1, total_rows, cfg.hc_mult, cfg.dim))?
             }
             None => {
                 let mut flat_ids: Vec<u32> = decode_ids.clone();
@@ -4458,9 +4503,9 @@ mod tests {
         let mut res_a: Vec<Vec<Tensor>> = vec![Vec::with_capacity(n); n_layers];
         for &t in &ids {
             let tt = Tensor::from_vec(vec![t], (1, 1), &Device::Cpu)?;
-            let mut resid: Option<Tensor> = None;
+            let mut resid = model.claim_residual(&session, 1)?;
             for l in 0..n_layers {
-                let step = model.forward_wave(
+                model.forward_wave(
                     &mut session,
                     &[seq_a],
                     std::slice::from_ref(&tt),
@@ -4470,16 +4515,12 @@ mod tests {
                     &[],
                     l,
                     l + 1,
-                    resid.take(),
+                    Some(&mut resid),
                 )?;
-                match step.into_residual() {
-                    Some(r) => {
-                        res_a[l].push(r.clone());
-                        resid = Some(r);
-                    }
-                    None => {
-                        // final layer returns logits; no residual to store
-                    }
+                // The final layer runs the head; every other hands its residual
+                // on through the arena.
+                if l + 1 < n_layers {
+                    res_a[l].push(resid.committed().to_tensor()?.unsqueeze(0)?);
                 }
             }
             session.advance_sequence(seq_a, 1)?;
@@ -4488,9 +4529,9 @@ mod tests {
         // B: batched prefill, layer-segmented; res_b[l] = [1, n, hc*dim].
         let pt = Tensor::from_vec(ids.clone(), (1, n), &Device::Cpu)?;
         let mut res_b: Vec<Tensor> = Vec::with_capacity(n_layers);
-        let mut resid: Option<Tensor> = None;
+        let mut resid = model.claim_residual(&session, n)?;
         for l in 0..n_layers {
-            let step = model.forward_wave(
+            model.forward_wave(
                 &mut session,
                 &[],
                 &[],
@@ -4500,11 +4541,10 @@ mod tests {
                 &[],
                 l,
                 l + 1,
-                resid.take(),
+                Some(&mut resid),
             )?;
-            if let Some(r) = step.into_residual() {
-                res_b.push(r.clone());
-                resid = Some(r);
+            if l + 1 < n_layers {
+                res_b.push(resid.committed().to_tensor()?.unsqueeze(0)?);
             }
         }
         session.advance_sequence(seq_b, n)?;

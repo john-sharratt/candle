@@ -3,8 +3,8 @@
 // See `simple/moe_bucketize.cu` for the authoritative contract: outputs,
 // stability guarantees, and the padding conventions. All array arguments are
 // device pointers on `stream`; every output/scratch buffer is sized to the
-// `n_tokens × k` launch bound; `header` is `i32[5]` and `token_starts` is
-// `i32[n_tokens + 1]`.
+// `n_tokens × k` launch bound; `header` is `i32[HEADER_WORDS]` and
+// `token_starts` is `i32[n_tokens + 1]`.
 
 use std::ffi::c_void;
 
@@ -36,6 +36,77 @@ pub const AHEAD_CHUNKS: usize = 16;
 /// Set in a promotion log entry's expert field for a read-ahead claim,
 /// mirrored from `AHEAD_FLAG`.
 pub const AHEAD_FLAG: u32 = 0x4000;
+/// Set with [`AHEAD_FLAG`] for a claim that promotes an expert the previous
+/// launch's CPU pool served (the carry), mirrored from `CARRY_FLAG`.
+pub const CARRY_FLAG: u32 = 0x2000;
+
+/// Words in the device header: `{n_active, total_valid, num_tiles, remote
+/// experts, remote tiles, CPU rows, CPU experts, CPU input rows}`.
+pub const HEADER_WORDS: usize = 8;
+
+/// Routed counts the CPU split's cost tables cover, mirrored from `CPU_MAX_N`
+/// in `moe_bucketize_cpu.cuh`.
+pub const CPU_MAX_N: usize = 32;
+/// The summary bit a CPU-class expert carries, mirrored from `SUMMARY_CPU_BIT`;
+/// the routed count is the 28 bits below it.
+pub const SUMMARY_CPU_BIT: u32 = 28;
+/// The summary word's count field.
+pub const SUMMARY_COUNT_MASK: u32 = (1 << SUMMARY_CPU_BIT) - 1;
+/// Bytes of one CPU work slot, mirrored from `CPU_WORK_SLOT_BYTES`: a 16-byte
+/// header, then `MAX_EXPERTS` 40-byte expert entries.
+pub const CPU_WORK_SLOT_BYTES: usize = 16 + MAX_EXPERTS * 40;
+/// `u32` words of the carry, mirrored from `CPU_CARRY_WORDS`: `{seq, n}`, then
+/// `AHEAD_MAX` `(row, expert)` pairs.
+pub const CPU_CARRY_WORDS: usize = 2 + 2 * AHEAD_MAX;
+
+/// [`CpuSplit::promote`], mirrored from `CPU_PROMOTE_*`: which experts the CPU
+/// pool served the next launch copies into VRAM behind it — none, the cold
+/// ones, or every one.
+pub const CPU_PROMOTE_NONE: u32 = 0;
+pub const CPU_PROMOTE_COLD: u32 = 1;
+pub const CPU_PROMOTE_ALL: u32 = 2;
+
+/// The CPU split's costs, by value in the launch parameters
+/// (`moe_bucketize_cpu.cuh` documents each). `cap_rows == 0` turns the CPU
+/// class off.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuSplit {
+    pub cap_rows: u32,
+    pub max_n: u32,
+    pub copy_ns: f32,
+    pub read_shared_ns: f32,
+    pub read_alone_ns: f32,
+    pub handoff_ns: f32,
+    pub row_ns: f32,
+    pub min_gain_ns: f32,
+    pub explore_ns: f32,
+    pub promote: u32,
+    /// Most CPU experts a launch takes: what the pool's performance cores
+    /// carry alone. The rest of its misses stay on the GPU.
+    pub max_experts: u32,
+    pub cpu_n_ns: [f32; CPU_MAX_N + 1],
+    pub gpu_n_ns: [f32; CPU_MAX_N + 1],
+}
+
+impl CpuSplit {
+    /// The CPU class off.
+    pub const OFF: Self = Self {
+        cap_rows: 0,
+        max_n: 0,
+        copy_ns: 0.0,
+        read_shared_ns: 0.0,
+        read_alone_ns: 0.0,
+        handoff_ns: 0.0,
+        row_ns: 0.0,
+        min_gain_ns: 0.0,
+        explore_ns: 0.0,
+        promote: CPU_PROMOTE_NONE,
+        max_experts: 0,
+        cpu_n_ns: [0.0; CPU_MAX_N + 1],
+        gpu_n_ns: [0.0; CPU_MAX_N + 1],
+    };
+}
 
 /// [`run_moe_bucketize`] launched the kernel.
 pub const BUCKETIZE_LAUNCHED: i32 = 0;
@@ -150,6 +221,45 @@ extern "C" {
         row_layout: *const c_void,
         ahead_items: *mut c_void,
         ahead_done: *mut c_void,
+        // Non-zero: read the predictions ahead. Zero with `ahead_items` set:
+        // the items carry only the CPU pool's promotions.
+        ahead_predict: i32,
+        // The CPU class: the split's costs (host pointer, copied into the
+        // launch; null = off), this invocation's mapped work slot
+        // (`CPU_WORK_SLOT_BYTES`), the device `u32[n_tokens · k]` ring row →
+        // expert-grouped row map, and the device `u32[CPU_CARRY_WORDS]` carry
+        // (null = nothing promoted behind the pool). With the class on,
+        // `gate_row` and `cpu_dst_row` are required.
+        cpu: *const CpuSplit,
+        cpu_work: *mut c_void,
+        cpu_dst_row: *mut c_void,
+        cpu_carry: *mut c_void,
+        // The CPU experts' inputs, each distinct token once: the device
+        // `u32[n_tokens]` scratch, the device `u32[cap]` input row → token,
+        // and the mapped `u32[1 + cap]` input-row count, then ring row →
+        // input row. Null `cpu_input_map` writes none.
+        cpu_tok_first: *mut c_void,
+        cpu_in_tok: *mut c_void,
+        cpu_input_map: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    /// The Rust struct is the CUDA struct byte for byte.
+    #[test]
+    fn cpu_split_layout() {
+        assert_eq!(size_of::<CpuSplit>(), 11 * 4 + 2 * (CPU_MAX_N + 1) * 4);
+        assert_eq!(offset_of!(CpuSplit, copy_ns), 8);
+        assert_eq!(offset_of!(CpuSplit, min_gain_ns), 28);
+        assert_eq!(offset_of!(CpuSplit, explore_ns), 32);
+        assert_eq!(offset_of!(CpuSplit, promote), 36);
+        assert_eq!(offset_of!(CpuSplit, max_experts), 40);
+        assert_eq!(offset_of!(CpuSplit, cpu_n_ns), 44);
+        assert_eq!(offset_of!(CpuSplit, gpu_n_ns), 44 + (CPU_MAX_N + 1) * 4);
+    }
 }

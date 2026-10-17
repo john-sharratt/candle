@@ -34,8 +34,9 @@ use super::held_ledger::{HeldLedger, HeldSite};
 #[cfg(feature = "cuda")]
 const REFUSAL_REPORT_SITES: usize = 8;
 
-/// Bytes of the span kept as held ground for the buffers every model holds — a
-/// model's runtime reserve widens it further (`region_pool::held_bytes`).
+/// Bytes of the span kept as held ground for the buffers every model holds. No
+/// model widens it: a window's residual lives on the step's forward span or a
+/// creep's arena (`docs/wave_step.md`).
 ///
 /// Sized from what the serving loop holds this way on Flash-Next under a
 /// conversation and an ingest (`.5`, 2026-10-17): the launchers' kernel scratch

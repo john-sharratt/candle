@@ -262,7 +262,8 @@ pub const QWEN35_35B_A3B_DRAFT: DraftLadder = DraftLadder::new(LINEAGE_START, LI
 /// each reject one early proposal at depth 3 and 4 alike, and a 10-token run
 /// has three steps to amortise it in; a reply long enough for the per-sequence
 /// depth choice to learn from its acceptance is the stock column. Width 8 is
-/// Flash-Next's measured stash limit at budget 4, kept rather than extended.
+/// the widest budget-4 cohort measured on Flash-Next's shape, kept rather than
+/// extended.
 pub const QWEN36_35B_A3B_DRAFT: DraftLadder =
     DraftLadder::new(QWEN36_35B_A3B_BRACKETS, LINEAGE_TOKEN_COST);
 const QWEN36_35B_A3B_BRACKETS: &[(usize, usize)] = &[(8, 4), (16, 2)];
@@ -315,19 +316,11 @@ const QWEN36_35B_A3B_BRACKETS: &[(usize, usize)] = &[(8, 4), (16, 2)];
 /// 10 and 20 contexts, and only 1 and 4 carry speculative points. If a wide rung
 /// regresses, this bracket is the first thing to pull back in.
 // **Width 16, not the 32 that was asked for — and this is a parked decision,
-// not a rejection.** Measured on the 16 GB card by direct control experiment:
-// at (32, 4) the gate's C8×20 config takes `CUDA_ERROR_OUT_OF_MEMORY`; at
-// (16, 4), with nothing else in the tree different, it passes 20/20. The cause
-// is the rewind stash, which is `contexts × (budget + 1)` rows across every
-// DeltaNet layer — 60.4 MiB at budget 0 against 301.8 MiB at budget 4, at 20
-// contexts.
-//
-// `HybridBatched::affordable_draft_budget` exists to make (32, 4) safe by
-// lowering the *depth* when a cohort is too wide to stash, so speculation
-// degrades instead of the wave failing. It does not yet bind: the budget it
-// reads reports ~1.4 GiB claimable where the device then refuses, so the clamp
-// permits a depth that does not fit. Until that disagreement is understood,
-// this row stays at the width that is measured to work.
+// not a rejection.** (16, 4) is the widest row measured to pass the gate on the
+// 16 GB card. The memory a wider cohort's rewind once needed is gone — a verify
+// block now costs each DeltaNet layer only its timeline, a fixed part of the
+// state's own slot (`docs/deltanet_timeline.md`) — so widening is a measurement
+// of throughput at 32, not of whether the rewind fits.
 const QWEN38_27B_BRACKETS: &[(usize, usize)] = &[(16, 4)];
 /// The lineage's chosen cost, unmeasured here as there.
 pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS, LINEAGE_TOKEN_COST);
@@ -352,31 +345,12 @@ pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS, 
 /// context both the trunk and the head are reading. So the bracket sits at the
 /// deepest measured point rather than at an inferred optimum.
 ///
-/// **The width limit is the rewind stash, and it was measured by hitting it.**
-///
-/// What a width has to survive is not throughput but the stash:
-/// `width × (budget + 1)` rows across all 36 DeltaNet layers, allocated
-/// *between* forwards, where nothing is left to concede to — so the failure is
-/// a device OOM rather than a refusal.
-///
-/// Measured on the 72 GB card by `test_speculative_ladder`, in stash rows:
-///
-/// | width | budget | rows | outcome |
-/// |---|---|---|---|
-/// | 1 | 4 | 5 | ✓ 4.90 accepted/step |
-/// | 4 | 4 | 20 | ✓ 4.90 |
-/// | 8 | 4 | 40 | ✓ 4.72 per sequence |
-/// | 16 | 4 | 80 | **CUDA_ERROR_OUT_OF_MEMORY** |
-///
-/// So budget 4 is carried to width 8 and no further. The second bracket is the
-/// lineage's own, which the sibling rows back.
-///
-/// **`affordable_draft_budget` did not save the width-16 row**, and this is the
-/// same disagreement the 27B row below records: the budget it reads reports
-/// claimable bytes the device then refuses, so the clamp permits a depth that
-/// does not fit. It is kept because it binds correctly when the reservation is
-/// genuinely small, but it must not be treated as a licence to widen a bracket
-/// past what has been run — which is exactly the mistake this table replaced.
+/// **Budget 4 is carried to width 8, the widest it has been measured at** by
+/// `test_speculative_ladder` on the 72 GB card: 4.90 accepted/step at widths 1
+/// and 4, 4.72 per sequence at 8. The second bracket is the lineage's own, which
+/// the sibling rows back. A verify block's rewind costs each DeltaNet layer
+/// only its fixed timeline (`docs/deltanet_timeline.md`), so a wider row is a
+/// throughput question to measure, not a memory one.
 ///
 /// **These are ceilings, not the depth a sequence drafts at.** Each sequence
 /// drafts the depth that buys it the most tokens per second at its own
@@ -386,23 +360,21 @@ pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS, 
 /// tokens the walk throws away.
 ///
 /// **One sequence alone drafts up to 4, like a wave of eight.** Deeper pays
-/// only on text the head can copy. Measured on the 72 GB card (one load, three
-/// warm runs, 2026-10-06), each depth drafted on every step:
+/// only on text the head can copy, and no ceiling may pass 7: a block is the
+/// drafts plus the row they follow, and it must fit each DeltaNet layer's
+/// 8-row timeline to be partially acceptable (`docs/deltanet_timeline.md`).
+/// Measured on the 72 GB card (one load, three warm runs, 2026-10-06), each
+/// depth drafted on every step, free continuation:
 ///
 /// | task | depth | accepted / step | ms / step | t/s |
 /// |---|---|---:|---:|---:|
-/// | rewrite (`profile_single_session_decode`) | 8 | 7.50 | 26.7 | 279 |
-/// | | 12 | 11.09 | 33.4 | 330 |
-/// | | 16 | 12.75 | 38.9 | 327 |
 /// | essay (`profile_single_session_essay`) | 1 | 1.68 | 20.7 | 81 |
 /// | | 2 | 2.22 | 22.9 | 97 |
 /// | | 3 | 2.12 | 25.4 | 84 |
 ///
-/// and under the depth rule (2026-10-07), ceiling 4 against 12: rewrite 4.90
-/// accepted / step at 236 t/s against 9.44 at 315, essay 2.14 at 88 against
-/// ~2.2 at 92. A ceiling of 12 buys its third only on a near-verbatim rewrite;
-/// on free continuation the rule settles near 2 under either ceiling, so the
-/// one-session rate is quoted at the depth real text drafts at.
+/// and under the depth rule (2026-10-07) at ceiling 4: rewrite 4.90 accepted /
+/// step at 236 t/s, essay 2.14 at 88. On free continuation the rule settles
+/// near 2, so the one-session rate is quoted at the depth real text drafts at.
 ///
 /// **A one-session ceiling of 5 loses** (Strata's benchmark, 2026-10-07): 3.0–3.45
 /// accepted / step against ~3.07 at 4, for ~2 ms more per step — 143.2 / 140.1 /
@@ -415,8 +387,7 @@ pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS, 
 /// (rewrite, essay) t/s under an earlier form of the depth rule whose unreached
 /// positions aged three times as fast: 0.085 → (313, 83), 0.125 → (324, 88),
 /// 0.15 → (313, 87), 0.2 → (290, 96) — run-to-run spread on the essay is a few
-/// per cent, as each run writes a slightly different essay. Under the rule as
-/// it stands, 0.125 → (316, 92) at a ceiling of 12.
+/// per cent, as each run writes a slightly different essay.
 const QWEN38_FLASH_NEXT_BRACKETS: &[(usize, usize)] = &[(8, 4), (16, 2)];
 pub const QWEN38_FLASH_NEXT_DRAFT: DraftLadder =
     DraftLadder::new(QWEN38_FLASH_NEXT_BRACKETS, 0.125);
@@ -441,6 +412,31 @@ mod tests {
         ] {
             if let Err(e) = ladder.check() {
                 panic!("{name} ladder is malformed: {e}");
+            }
+        }
+    }
+
+    /// **No shipped ladder drafts past the DeltaNet timeline.** A block is the
+    /// drafts plus the row they follow, and every block-forming path refuses
+    /// one deeper than `TIMELINE_ROWS` rows — so a ladder asking for more would
+    /// fail its own steps rather than draft shallower.
+    #[test]
+    fn no_shipped_ladder_drafts_past_the_timeline() {
+        use crate::models::delta_net::TIMELINE_ROWS;
+        for (name, ladder) in [
+            ("9B", QWEN35_9B_DRAFT),
+            ("0.8B", QWEN35_0_8B_DRAFT),
+            ("35B-A3B", QWEN35_35B_A3B_DRAFT),
+            ("3.6-35B-A3B", QWEN36_35B_A3B_DRAFT),
+            ("27B", QWEN38_27B_DRAFT),
+            ("Flash-Next", QWEN38_FLASH_NEXT_DRAFT),
+        ] {
+            for width in 1..=64 {
+                assert!(
+                    ladder.budget(width) < TIMELINE_ROWS,
+                    "{name} drafts {} at width {width}",
+                    ladder.budget(width)
+                );
             }
         }
     }
@@ -488,9 +484,9 @@ mod tests {
     #[test]
     fn only_the_27b_carries_its_own_depth() {
         assert_eq!(QWEN38_27B_DRAFT.budget(16), 4, "the 27B's own depth");
-        // The width is parked at 16 pending the stash-affordability work — see
-        // the const's own note. Pinned so re-widening is a deliberate edit here
-        // rather than a number that drifts.
+        // The width is parked at 16, the widest measured — see the const's own
+        // note. Pinned so re-widening is a deliberate edit here rather than a
+        // number that drifts.
         assert_eq!(QWEN38_27B_DRAFT.budget(17), 0, "parked at width 16");
         for (name, ladder) in [
             ("9B", QWEN35_9B_DRAFT),

@@ -27,6 +27,11 @@
 //! overwritten before both host threads have read it — a check against two
 //! counters, never against the driver or the GPU.
 
+use super::cold_wait::ColdWait;
+use super::cpu_pool::backoff::{Backoff, INTER_LAYER_SPINS, LOW_POWER_CYCLES};
+use super::cpu_pool::cold::{ColdSource, PagedImages};
+use super::cpu_pool::params::shared;
+use super::cpu_pool::service::CpuService;
 use super::fault::FaultWord;
 use super::flush_schedule::{SegmentFill, MAX_UNFLUSHED_INVOCATIONS};
 use super::live_table::{LiveTable, Proj};
@@ -41,6 +46,7 @@ use super::transition::HOPS;
 use super::types::{LookAhead, PipelineMessage, RoutedLayer};
 use super::votes::VoteRing;
 use crate::models::batched_inference::MAX_PREFILL_TOKENS;
+use crate::models::operand_guard::expect_dtype;
 use crate::models::profile::{gpu_span, profile_now};
 use crate::models::wave_buffers::{wave_empty, wave_root};
 use candle::cuda_backend::CudaDevice;
@@ -48,17 +54,24 @@ use candle::cuda_backend::CudaDevice;
 use candle::quantized::cuda::STALL_WORDS;
 use candle::quantized::cuda::{
     fused_deterministic_scatter, fused_moe_gather_q8a128, grouped_int8_n_sub,
-    grouped_qmatmul_dev_q8a128, moe_bucketize, moe_predict_votes, silu_mul_q8a128, BucketizeLive,
-    MoeBucketizeWorkspace, MoeLive, OwnerCheck, Q8a128Operand, ReadAhead,
+    grouped_qmatmul_dev_q8a128, moe_bucketize, moe_predict_votes, silu_mul_q8a128, BucketizeCpu,
+    BucketizeLive, MoeBucketizeWorkspace, MoeLive, OwnerCheck, Q8a128Operand, ReadAhead,
 };
 use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::SumScale;
 use candle::{DType, Device, LiveTensor, Result};
-use candle_kernels::simple::moe_bucketize::{AHEAD_ITEM_WORDS, AHEAD_MAX};
+use candle_kernels::simple::moe_bucketize::{
+    CpuSplit, AHEAD_ITEM_WORDS, AHEAD_MAX, CPU_CARRY_WORDS, CPU_PROMOTE_NONE,
+};
+use candle_kernels::simple::moe_cpu_export::{run_moe_cpu_export, EXPORT_MAX_BLOCKS, EXPORT_WARPS};
 use candle_nn::kv_cache::WaveGeneration;
 use cudarc::driver::{sys, CudaSlice, DevicePtr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ffi::c_void;
+use std::ptr::{null_mut, read_volatile, write_bytes, write_volatile};
+use std::slice;
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Routing summaries in flight between the forward thread and the host threads.
 /// Invocation `seq` writes slot `seq % SUMMARY_RING`; the forward thread does
@@ -154,7 +167,7 @@ unsafe impl Sync for SummaryRing {}
 impl SummaryRing {
     pub(crate) fn new(n_experts: usize) -> Result<Self> {
         let len = SUMMARY_RING * (n_experts + 1);
-        let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut raw: *mut c_void = null_mut();
         // SAFETY: a page-locked, device-mapped allocation, freed in `drop`.
         let r = unsafe { sys::cuMemHostAlloc(&mut raw, len * 4, sys::CU_MEMHOSTALLOC_DEVICEMAP) };
         if r != sys::CUresult::CUDA_SUCCESS {
@@ -172,7 +185,7 @@ impl SummaryRing {
         }
         // SAFETY: `len` u32s just allocated. Zero is never a sequence word, so
         // no slot reads as written before its first bucketize.
-        unsafe { std::ptr::write_bytes(raw as *mut u32, 0, len) };
+        unsafe { write_bytes(raw as *mut u32, 0, len) };
         Ok(Self {
             dev_base,
             host: raw as *mut u32,
@@ -197,6 +210,13 @@ impl SummaryRing {
         unsafe { self.host.add(slot * self.stride()) }
     }
 
+    /// `slot`'s sequence word, which bucketize stores last: the line a waiter
+    /// for the slot `umwait`s on. Live as long as the ring.
+    pub(crate) fn word_ptr(&self, slot: usize) -> *const u32 {
+        // SAFETY: the word follows the slot's `n_experts` counts, inside it.
+        unsafe { self.host_slot_ptr(slot).add(self.n_experts) }
+    }
+
     /// Whether bucketize has written `slot` for sequence word `word`.
     ///
     /// The word is the last thing bucketize stores, behind a system fence, so
@@ -205,41 +225,46 @@ impl SummaryRing {
     /// completed. That is the whole signal: no event and no copy.
     pub(crate) fn ready(&self, slot: usize, word: u32) -> bool {
         // SAFETY: the word is inside the mapped ring; the device writes it.
-        let ready =
-            unsafe { std::ptr::read_volatile(self.host_slot_ptr(slot).add(self.n_experts)) }
-                == word;
+        let ready = unsafe { read_volatile(self.word_ptr(slot)) } == word;
         if ready {
-            std::sync::atomic::fence(Ordering::Acquire);
+            fence(Ordering::Acquire);
         }
         ready
     }
 
-    /// Wait for [`Self::ready`], calling `idle` every [`WAIT_IDLE_EVERY`] polls
-    /// — the waiter's chance to do work that must not wait for this word. A
-    /// word that never arrives means the device faulted or the forward
-    /// thread's chain died; that is reported rather than waited out.
+    /// Wait for [`Self::ready`] — hot spins, then `umwait` on the sequence
+    /// word's line, which the device's store wakes (`cpu_pool::backoff`) —
+    /// calling `idle` every [`WAIT_IDLE_EVERY`] polls while hot and after
+    /// every low-power wait: the waiter's chance to do work that must not wait
+    /// for this word. A word that never arrives means the device faulted or the
+    /// forward thread's chain died; that is reported rather than waited out.
     pub(crate) fn wait(
         &self,
         slot: usize,
         word: u32,
         mut idle: impl FnMut() -> Result<()>,
     ) -> Result<()> {
-        let start = std::time::Instant::now();
-        let mut spins = 0u32;
+        let start = Instant::now();
+        let p = self.word_ptr(slot);
+        let mut backoff = Backoff::new(INTER_LAYER_SPINS);
+        let mut polls = 0u32;
         while !self.ready(slot, word) {
-            spins += 1;
-            if spins.is_multiple_of(WAIT_IDLE_EVERY) {
+            polls += 1;
+            if backoff.cooled() || polls.is_multiple_of(WAIT_IDLE_EVERY) {
                 idle()?;
-            }
-            if spins < 1024 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
                 if start.elapsed() > SUMMARY_DEADLINE {
                     candle::bail!(
                         "expert pipeline: routing summary for slot {slot} never arrived — the \
                          device stopped before this layer's bucketize"
                     );
+                }
+            }
+            // SAFETY: the mapped ring, live while `self` is; the device writes
+            // the word.
+            unsafe {
+                let seen = read_volatile(p);
+                if seen != word {
+                    backoff.wait_u32(p, seen, LOW_POWER_CYCLES);
                 }
             }
         }
@@ -254,7 +279,7 @@ impl SummaryRing {
     /// [`Self::ready`] must have returned true for this invocation, and the
     /// caller must not have released the slot to the forward thread yet.
     pub(crate) unsafe fn read(&self, slot: usize) -> &[u32] {
-        std::slice::from_raw_parts(self.host_slot_ptr(slot), self.n_experts)
+        slice::from_raw_parts(self.host_slot_ptr(slot), self.n_experts)
     }
 }
 
@@ -267,7 +292,7 @@ const WAIT_IDLE_EVERY: u32 = 64;
 /// the device is not going to produce one. Far above any layer's compute — a
 /// worker gives a cold expert up after [`SPIN_LIMIT_NS`] — so it fires only on
 /// a dead device.
-const SUMMARY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const SUMMARY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The sequence word bucketize stores for invocation `seq`: never zero, which
 /// is what a fresh slot holds.
@@ -280,7 +305,7 @@ impl Drop for SummaryRing {
         // SAFETY: allocated by `cuMemHostAlloc` in `new`; the threads that read
         // it are joined before the cache drops.
         unsafe {
-            sys::cuMemFreeHost(self.host as *mut std::ffi::c_void);
+            sys::cuMemFreeHost(self.host as *mut c_void);
         }
     }
 }
@@ -306,7 +331,7 @@ unsafe impl Sync for AbortWord {}
 
 impl AbortWord {
     pub(crate) fn new() -> Result<Self> {
-        let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut raw: *mut c_void = null_mut();
         // SAFETY: a page-locked, device-mapped allocation, freed in `drop`.
         let r = unsafe { sys::cuMemHostAlloc(&mut raw, 4, sys::CU_MEMHOSTALLOC_DEVICEMAP) };
         if r != sys::CUresult::CUDA_SUCCESS {
@@ -323,7 +348,7 @@ impl AbortWord {
             candle::bail!("expert cache: abort word has no device address: {r:?}");
         }
         // SAFETY: four bytes just allocated.
-        unsafe { std::ptr::write_volatile(raw as *mut u32, 0) };
+        unsafe { write_volatile(raw as *mut u32, 0) };
         Ok(Self {
             host: raw as *mut u32,
             dev,
@@ -338,13 +363,13 @@ impl AbortWord {
     /// End every wait, now and later. Idempotent.
     pub(crate) fn raise(&self) {
         // SAFETY: the mapped word this struct owns.
-        unsafe { std::ptr::write_volatile(self.host, 1) };
-        std::sync::atomic::fence(Ordering::SeqCst);
+        unsafe { write_volatile(self.host, 1) };
+        fence(Ordering::SeqCst);
     }
 
     pub(crate) fn is_raised(&self) -> bool {
         // SAFETY: the mapped word this struct owns.
-        unsafe { std::ptr::read_volatile(self.host) != 0 }
+        unsafe { read_volatile(self.host) != 0 }
     }
 }
 
@@ -353,7 +378,7 @@ impl Drop for AbortWord {
         // SAFETY: allocated by `cuMemHostAlloc` in `new`; every reader is
         // joined or synchronized before the cache drops.
         unsafe {
-            sys::cuMemFreeHost(self.host as *mut std::ffi::c_void);
+            sys::cuMemFreeHost(self.host as *mut c_void);
         }
     }
 }
@@ -476,12 +501,90 @@ pub(crate) struct Dispatch {
     /// (`read_ahead_gate`). Off, bucketize is not given `ahead` and the caller
     /// passes no look-ahead routers.
     pub(crate) read_ahead: Arc<ReadAheadGate>,
+    /// The CPU class, or `None` where it cannot run (no pool started).
+    cpu: Option<CpuPath>,
+    /// What the gate launches' workers waited for cold experts (`cold_wait`).
+    pub(crate) cold_wait: ColdWait,
     /// Profile build only: per-row worker counters `[rows × STALL_WORDS]` (see
     /// `kernel.cuh`, "A live expert table").
     #[cfg(feature = "profile")]
     pub(crate) stall: CudaSlice<u64>,
     #[cfg(feature = "profile")]
     device: CudaDevice,
+}
+
+/// The CPU class's device side for one dispatch (`docs/cpu_expert_compute.md`
+/// §5.1–§5.5): the pool's service, which owns the mapped rings, and the two
+/// device buffers bucketize, the export kernel and the down launch's CPU item
+/// share. One set serves every layer: each invocation's use ends — the down
+/// launch has pulled its results — before the next invocation's bucketize
+/// writes them, in stream order.
+pub(crate) struct CpuPath {
+    pub(crate) service: CpuService,
+    /// The warm tier's pageable copies, which the pool computes from directly.
+    paged: Arc<PagedImages>,
+    /// `u32[2 · MAX_PREFILL_TOKENS · k]`: ring row → expert-grouped row.
+    dst_row: CudaSlice<u32>,
+    /// The export kernel's finished-block count, zero between launches.
+    blocks_done: CudaSlice<u32>,
+    /// `u32[CPU_CARRY_WORDS]`: the CPU experts one launch hands the next to
+    /// promote behind the pool (`moe_bucketize_cpu.cuh`, THE CARRY). Zeroed:
+    /// sequence word 0 names no launch, so the first launch finds nothing.
+    carry: CudaSlice<u32>,
+    /// The inputs (`moe_bucketize_cpu.cuh`, THE INPUTS): `u32[n_tokens]`
+    /// scratch, and `u32[cap_rows]` input row → token, which the export reads.
+    tok_first: CudaSlice<u32>,
+    in_tok: CudaSlice<u32>,
+    /// Exploration (§5.3.2): the pool's served count when last seen to move,
+    /// and the invocations since.
+    explore: Mutex<Quiet>,
+}
+
+#[derive(Default)]
+struct Quiet {
+    served: u64,
+    invocations: u32,
+}
+
+impl CpuPath {
+    pub(crate) fn new(
+        device: &CudaDevice,
+        service: CpuService,
+        paged: Arc<PagedImages>,
+        k: usize,
+    ) -> Result<Self> {
+        let cap_rows = service.rings().cap_rows;
+        Ok(Self {
+            paged,
+            // SAFETY (all three): bucketize writes every word a reader reads —
+            // `tok_first` it sets for every token before it reads one.
+            dst_row: unsafe { device.alloc::<u32>(2 * MAX_PREFILL_TOKENS * k)? },
+            tok_first: unsafe { device.alloc::<u32>(2 * MAX_PREFILL_TOKENS)? },
+            in_tok: unsafe { device.alloc::<u32>(cap_rows.max(1))? },
+            service,
+            blocks_done: device.memcpy_stod(&[0u32])?,
+            carry: device.memcpy_stod(&[0u32; CPU_CARRY_WORDS])?,
+            explore: Mutex::new(Quiet::default()),
+        })
+    }
+
+    /// Whether this invocation explores: the pool has served nothing for
+    /// `period` invocations. Exploring restarts the count.
+    fn explores(&self, period: u32) -> bool {
+        let mut q = self.explore.lock().unwrap_or_else(|e| e.into_inner());
+        let served = self.service.served();
+        if served != q.served {
+            q.served = served;
+            q.invocations = 0;
+            return false;
+        }
+        q.invocations += 1;
+        if period == 0 || q.invocations < period {
+            return false;
+        }
+        q.invocations = 0;
+        true
+    }
 }
 
 /// Read-ahead's device buffers ([`Dispatch::ahead`]).
@@ -545,6 +648,7 @@ impl Dispatch {
         k: usize,
         promo: Option<Arc<PromotionRing>>,
         owner: OwnerTags,
+        cpu: Option<CpuPath>,
     ) -> Result<Self> {
         if image_bytes.len() != table.n_rows() {
             candle::bail!(
@@ -582,12 +686,25 @@ impl Dispatch {
         let scratch = unsafe { device.alloc::<u8>(WORKERS_PREFILL * slot_bytes)? };
         #[cfg(feature = "profile")]
         let stall = device.memcpy_stod(&vec![0u64; table.n_rows() * STALL_WORDS])?;
+        let fault = Arc::new(FaultWord::new()?);
+        // The pool waits on a cold expert's publish where a GPU worker would,
+        // and gives it up through the same words (§5.4).
+        if let Some(c) = &cpu {
+            c.service.attach_cold(ColdSource {
+                table: table.clone(),
+                abort: abort.clone(),
+                fault: fault.clone(),
+                pinned,
+                paged: c.paged.clone(),
+                spin_limit: Duration::from_nanos(SPIN_LIMIT_NS),
+            });
+        }
         Ok(Self {
             table,
             ring,
             votes,
             abort,
-            fault: Arc::new(FaultWord::new()?),
+            fault,
             clock,
             pass: Arc::new(Mutex::new(PassState {
                 pass: 0,
@@ -612,6 +729,8 @@ impl Dispatch {
             owner,
             ahead,
             read_ahead,
+            cpu,
+            cold_wait: ColdWait::new()?,
             #[cfg(feature = "profile")]
             stall,
             #[cfg(feature = "profile")]
@@ -674,19 +793,20 @@ impl Dispatch {
         // Host time the forward thread spends here is the GPU's, not its own:
         // the readers consume a slot only once the device has written it.
         let t = profile_now();
-        let mut spins = 0u32;
-        while self.served.load(Ordering::Acquire) < need
-            || self.staged.load(Ordering::Acquire) < need
-        {
+        let mut backoff = Backoff::new(INTER_LAYER_SPINS);
+        loop {
+            // Whichever reader is behind: its counter's line is the one to
+            // watch.
+            let behind = [&self.served, &self.staged]
+                .into_iter()
+                .map(|c| (c, c.load(Ordering::Acquire)))
+                .find(|&(_, at)| at < need);
+            let Some((counter, at)) = behind else { break };
             if self.abort.is_raised() {
                 candle::bail!("expert pipeline or stager died — the layer cannot be served");
             }
-            spins += 1;
-            if spins < 1024 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
+            // SAFETY: the dispatch's own counter, live while it is.
+            unsafe { backoff.wait_u64(counter.as_ptr(), at, LOW_POWER_CYCLES) };
         }
         crate::models::profile::pipeline_record("moe:hold_ring", t);
         Ok(())
@@ -765,6 +885,11 @@ impl Dispatch {
         // A faulted forward not yet failed: nothing is launched on top of it,
         // and refusing before the reservation leaves the protocol untouched.
         self.fault.check()?;
+        // The pool parks between steps; this layer's doorbell may be moments
+        // away.
+        if let Some(c) = &self.cpu {
+            c.service.wake();
+        }
         let (seq, pass) = self.begin_invocation(row)?;
         let ticket = seq + 1;
         let slot = (seq % SUMMARY_RING as u64) as usize;
@@ -844,6 +969,9 @@ impl Dispatch {
             candle::bail!("expert dispatch: expected a CUDA device")
         };
         let Reserved { seq, slot, row } = reserved;
+        // The invocation's ticket: bucketize's started word, and the CPU
+        // class's doorbell and `done` value.
+        let ticket = seq + 1;
         let (num_tokens, k) = indices.dims2()?;
         let hidden_dim = acts.cols;
         let table = &*self.table;
@@ -876,18 +1004,43 @@ impl Dispatch {
         let remote = self.remote.device_ptr(&compute).0;
         let counters = self.counters.device_ptr(&compute).0;
         let remote_dst = self.remote_dst.device_ptr(&compute).0;
-        // Without read-ahead the walk runs only for a launch with remote
-        // experts to claim for, and reads none of the ring's listings.
+        // The CPU class for this invocation: the process's split, by value
+        // (`cpu_pool::params`). Off — a zero cap — the layer is all-GPU. The
+        // cap is a live knob, but the rings were sized at load: past their
+        // rows, bucketize would publish results the ring cannot hold.
+        let cpu = self.cpu.as_ref().and_then(|c| {
+            let (mut split, knobs) = shared()
+                .lock()
+                .map(|p| (p.split(), p.knobs))
+                .unwrap_or((CpuSplit::OFF, Default::default()));
+            let tight = knobs.wait_tight_ns;
+            split.cap_rows = split.cap_rows.min(c.service.rings().cap_rows as u32);
+            if split.cap_rows > 0 && c.explores(knobs.explore_period) {
+                split.explore_ns = knobs.explore_ns;
+            }
+            (split.cap_rows > 0).then(|| {
+                c.service
+                    .set_sum_by_amax(acts.sum_scale == SumScale::ByAmax);
+                (c, split, tight)
+            })
+        });
+        // The item buffers go to bucketize while the predictions are read
+        // ahead, and while the CPU pool's experts are promoted behind it —
+        // the carry's copies are items too. Without either the walk runs only
+        // for a launch with remote experts to claim for, and reads none of
+        // the ring's listings.
         let reads_ahead = self.read_ahead.pays();
+        let carries = cpu.is_some_and(|(_, split, _)| split.promote != CPU_PROMOTE_NONE);
         let ahead = self
             .ahead
             .as_ref()
-            .filter(|_| reads_ahead)
+            .filter(|_| reads_ahead || carries)
             .map(|a| ReadAhead {
                 row_layout: a.row_layout.device_ptr(&compute).0,
                 rows: table.n_rows() as i32,
                 items: a.items.device_ptr(&compute).0,
                 done: a.done.device_ptr(&compute).0,
+                predict: reads_ahead,
             });
         // The next rows' votes, ahead of bucketize: its summary word is the
         // store the pipeline thread waits on, so the votes are in its slot by
@@ -938,6 +1091,18 @@ impl Dispatch {
                 // layer's link window goes to the vetted experts predicted for
                 // the rows after the next, copied by the gate launch's workers.
                 ahead,
+                // The CPU class: bucketize picks the misses the pool takes
+                // and publishes them to the work slot, and hands the next
+                // launch the ones it promotes behind the pool.
+                cpu: cpu.map(|(c, split, _)| BucketizeCpu {
+                    split,
+                    work: c.service.rings().work.dev(),
+                    dst_row: c.dst_row.device_ptr(&compute).0,
+                    carry: c.carry.device_ptr(&compute).0,
+                    tok_first: c.tok_first.device_ptr(&compute).0,
+                    in_tok: c.in_tok.device_ptr(&compute).0,
+                    input_map: c.service.rings().inputs.dev(),
+                }),
             }),
             decode,
         )?;
@@ -970,6 +1135,24 @@ impl Dispatch {
             ahead: ahead.filter(|_| proj == Proj::Gate).map_or(0, |a| a.items),
             ahead_done: ahead.filter(|_| proj == Proj::Gate).map_or(0, |a| a.done),
             spin_limit_ns: SPIN_LIMIT_NS,
+            // The down launch's CPU items pull the pool's results into the
+            // rows bucketize left the CPU experts.
+            cpu_done: cpu
+                .filter(|_| proj == Proj::Down)
+                .map_or(0, |(c, _, _)| c.service.rings().done.dev()),
+            cpu_seq: ticket,
+            cpu_rows: cpu.map_or(0, |(c, _, _)| c.service.rings().results.dev()),
+            cpu_dst_row: cpu.map_or(0, |(c, _, _)| c.dst_row.device_ptr(&compute).0),
+            cpu_alive: cpu.map_or(0, |(c, _, _)| c.service.rings().alive.dev()),
+            cpu_tight_ns: cpu.map_or(0, |(_, _, t)| t),
+            cpu_wait: cpu.map_or(0, |(c, _, _)| c.service.rings().wait.dev()),
+            // The gate launch is where a cold expert's wait happens; the up
+            // and down launches find it published.
+            cold_wait: if proj == Proj::Gate {
+                self.cold_wait.dev()
+            } else {
+                0
+            },
             workers: workers_for(num_tokens) as i32,
             row: row as i32,
         };
@@ -982,6 +1165,46 @@ impl Dispatch {
             acts.with_device_ptr(cuda_dev, |p| unsafe {
                 checkpoint_q8a128(nm, p, r, c, n, cuda_dev)
             })?;
+        }
+        // The CPU experts' inputs out to the pool's ring — each distinct token
+        // bucketize chose, once, straight from the MoE input — then its
+        // doorbell, ahead of the gather: the pool computes while the GPU runs
+        // the layer's own experts. A layer with no CPU expert exports, fences
+        // and rings nothing.
+        if let Some((c, _, _)) = cpu {
+            let g = gpu_span("moe:cpu_export", &device);
+            let rings = c.service.rings();
+            let tiles = hidden_dim / 128;
+            let rows = num_tokens.min(rings.cap_rows);
+            let hp = ws.header.device_ptr(&compute).0;
+            let ip = c.in_tok.device_ptr(&compute).0;
+            let bp = c.blocks_done.device_ptr(&compute).0;
+            let status = acts.with_device_ptr(cuda_dev, |src| {
+                // SAFETY: every address is a live allocation on this device or
+                // mapped for it, sized for `rows` rows; the stream is the
+                // forward's.
+                Ok(unsafe {
+                    run_moe_cpu_export(
+                        src as *const c_void,
+                        tiles as i32,
+                        ip as *const c_void,
+                        hp as *const c_void,
+                        rings.rows.dev() as *mut c_void,
+                        rings.cap_rows as u32,
+                        rings.doorbell.dev() as *mut c_void,
+                        ticket,
+                        bp as *mut c_void,
+                        (rows * tiles)
+                            .div_ceil(EXPORT_WARPS)
+                            .clamp(1, EXPORT_MAX_BLOCKS) as i32,
+                        compute.cu_stream() as *mut c_void,
+                    )
+                })
+            })?;
+            if status != 0 {
+                candle::bail!("expert dispatch: the CPU export launch failed ({status})");
+            }
+            g.end();
         }
         let g = gpu_span("moe:gather", &device);
         let stacked = fused_moe_gather_q8a128(&acts, &ws.tok_ids, a_ub, cuda_dev, wave_root(wave))?;
@@ -1091,6 +1314,11 @@ impl Dispatch {
             cuda_dev,
         )?;
         g.end();
+        // The CPU items write the pool's F32 rows straight into this output;
+        // an output of any other type would leave those rows unwritten.
+        if cpu.is_some() {
+            expect_dtype(&down_out, DType::F32, "moe down (CPU result rows)")?;
+        }
         #[cfg(feature = "tensor-assert")]
         crate::models::nan_capture::checkpoint(
             candle::tensor_assert::site("moe.down_out.L", row),
@@ -1144,7 +1372,7 @@ mod tests {
     /// Store `word` where bucketize stores a slot's sequence word.
     fn write_word(ring: &SummaryRing, slot: usize, word: u32) {
         // SAFETY: the word is inside the mapped ring, after the slot's counts.
-        unsafe { std::ptr::write_volatile(ring.host_slot_ptr(slot).add(ring.n_experts), word) };
+        unsafe { write_volatile(ring.host_slot_ptr(slot).add(ring.n_experts), word) };
     }
 
     /// The waiter's idle work runs every `WAIT_IDLE_EVERY` polls while the word

@@ -36,9 +36,7 @@ use candle::{Device, Result, Tensor};
 use super::config::Qwen4ExpConfig;
 use super::hyper::ko::HcWeightsKo;
 use super::hyper::HcWeights;
-use super::loader::{
-    load_headroom_bytes, offloaded_bytes, open_cached_ple, window_residual_reserve_bytes,
-};
+use super::loader::{load_headroom_bytes, offloaded_bytes, open_cached_ple};
 use super::model::PleSource;
 use super::mtp::{MtpDense, MtpHead};
 use super::ple::PleWeights;
@@ -159,11 +157,7 @@ impl Qwen4ExpGpu {
         // carved into its dense block and the span is sized from the whole card
         // rather than from what a lazily-created span found free mid-load; the
         // headroom it concedes to the pool is returned at `close_load` below.
-        dense_span::open_for_load_sized(
-            device,
-            load_headroom_bytes(content),
-            window_residual_reserve_bytes(&cfg),
-        )?;
+        dense_span::open_for_load_sized(device, load_headroom_bytes(content))?;
 
         let f32t = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
@@ -461,6 +455,13 @@ impl Qwen4ExpGpu {
         if let Some(report) = progress {
             report(LoadPhase::Weights, n_blocks, n_blocks);
         }
+        // The PLE table reads through direct-I/O handles of its own
+        // (`DiskPleFetch`); the GGUF reader — a buffered handle on the pack —
+        // closes here, before the expert cache fills its warm tier from the
+        // same file. The pack's own mapping (`ModelPack::mmap`) stays open
+        // through the fill; nothing reads it after load.
+        let ple_table = open_cached_ple(&gguf, &cfg, device)?;
+        drop(gguf);
         let experts = build_expert_cache_for(
             &pack,
             cfg.moe.n_experts,
@@ -520,12 +521,6 @@ impl Qwen4ExpGpu {
                 Some(dense.with_block(block))
             }
         };
-
-        // The PLE table reads through direct-I/O handles of its own; the GGUF
-        // reader — a buffered handle on the pack — closes here, so nothing holds
-        // a cached view of the file the expert stager reads (`DiskPleFetch`).
-        let ple_table = open_cached_ple(&gguf, &cfg, device)?;
-        drop(gguf);
 
         Ok(Self {
             cfg,

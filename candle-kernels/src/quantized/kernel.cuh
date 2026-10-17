@@ -1712,9 +1712,27 @@ __device__ __forceinline__ uint4 moe_live_ld16(const uint8_t* p) {
     return v;
 }
 
+// 16 bytes of host memory the host REWRITES in place — the CPU pool's result
+// ring, the same addresses every layer. `.cv` treats any cached copy of the
+// line as stale and fetches it again: `.cg` may be served from an L2 line the
+// previous layer's pull left behind, which nothing between two launches of one
+// graph invalidates, and returns the previous layer's results.
+__device__ __forceinline__ uint4 moe_live_ld16_cv(const uint8_t* p) {
+    uint4 v;
+    asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
 // Every poll is a PCIe read, and a launch can have every worker waiting: back
 // off to tens of microseconds so the polls never compete with the copies.
 #define MOE_LIVE_MAX_SLEEP_NS 32768u
+
+// Result rows one CPU item of the down launch pulls (`api.rs`'s
+// `MOE_LIVE_CPU_ROWS`), and the expert its fault names: the pool's results
+// never landed.
+#define MOE_LIVE_CPU_ROWS 16
+#define MOE_FAULT_CPU_EXPERT 0xffffull
 
 // 16-byte loads each worker thread keeps in flight in a slice copy. Eight measured
 // level with four on Flash-Next decode (RTX 4090 Laptop, 32 workers): with that
@@ -1776,6 +1794,51 @@ __device__ __forceinline__ unsigned long long moe_live_source(
     }
     *src = p;
     return moe_live_now() - t0;
+}
+
+// Thread 0 of a worker: waits for the host pool's results — its mapped `done`
+// word reading `live.cpu_seq` (`moe_bucketize_cpu.cuh`). Polls tightly for
+// `cpu_tight_ns` — the pool's predicted finish, when a result is due — and
+// backs off past it, where a late pool is waiting on something slow. A wait
+// that ends without the results — the abort word, the spin limit, another
+// fault, or the pool's liveness word dropped — claims the fault word naming
+// MOE_FAULT_CPU_EXPERT and returns false. A wait that ends with the results
+// raises `cpu_wait` to its length: the device's lateness on the pool.
+__device__ __forceinline__ bool moe_live_cpu_wait(const MoeLive& live)
+{
+    if (moe_live_load(reinterpret_cast<const uint64_t*>(live.cpu_done)) == live.cpu_seq) {
+        return true;
+    }
+    const unsigned long long t0 = moe_live_now();
+    unsigned int ns = 32;
+    for (;;) {
+        const unsigned int aborted = *reinterpret_cast<const volatile unsigned int*>(live.abort);
+        const unsigned int alive = *reinterpret_cast<const volatile unsigned int*>(live.cpu_alive);
+        const unsigned long long waited = moe_live_now() - t0;
+        if (aborted != 0u || alive == 0u || waited > live.spin_limit_ns || moe_live_faulted(live)) {
+            const unsigned long long us = waited / 1000ull;
+            const unsigned long long code =
+                (aborted != 0u ? MOE_FAULT_ABORTED : 0ull) |
+                ((unsigned long long)(live.row & 0x7fff) << MOE_FAULT_ROW_SHIFT) |
+                (MOE_FAULT_CPU_EXPERT << MOE_FAULT_EXPERT_SHIFT) |
+                (us < 0xffffffffull ? us : 0xffffffffull);
+            atomicCAS(live.fault, 0ull, code);
+            __threadfence_system();
+            return false;
+        }
+        if (waited > live.cpu_tight_ns) {
+#if __CUDA_ARCH__ >= 700
+            __nanosleep(ns);
+#endif
+            ns = ns < MOE_LIVE_MAX_SLEEP_NS ? ns * 2u : MOE_LIVE_MAX_SLEEP_NS;
+        }
+        if (moe_live_load(reinterpret_cast<const uint64_t*>(live.cpu_done)) == live.cpu_seq) {
+            if (live.cpu_wait != nullptr) {
+                atomicMax(live.cpu_wait, moe_live_now() - t0);
+            }
+            return true;
+        }
+    }
 }
 
 namespace grouped_tc {
@@ -2938,8 +3001,14 @@ static __device__ void moe_live_worker(
     const int row_tiles = nrows_x / N_TILE;
     const int units = (ncols_x / K_TILE) * UNITS_PER_PIECE;
     const int n_items = live.header[3] * row_tiles;
-    // The launch's own items, then the read-ahead pieces.
-    const int n_all = n_items + (live.ahead != nullptr ? (int)live.ahead[0] * AHEAD_CHUNKS : 0);
+    // The CPU class's result rows (the down launch only): MOE_LIVE_CPU_ROWS a
+    // CPU item, after the launch's own items so a worker waiting on the pool
+    // never delays a remote expert's copy.
+    const int cpu_rows = live.cpu_done != nullptr ? live.header[5] : 0;
+    const int n_cpu = (cpu_rows + MOE_LIVE_CPU_ROWS - 1) / MOE_LIVE_CPU_ROWS;
+    // The launch's own items, the CPU items, then the read-ahead pieces.
+    const int n_all = n_items + n_cpu +
+                      (live.ahead != nullptr ? (int)live.ahead[0] * AHEAD_CHUNKS : 0);
     uint8_t* slot = live.scratch + (size_t)worker * live.slot_bytes;
     if (live.stall != nullptr && worker == 0 && tid == 0) {
         atomicAdd(&live.stall[4], 1ull);
@@ -2953,10 +3022,56 @@ static __device__ void moe_live_worker(
         if (it >= n_all) {
             return;
         }
-        if (it >= n_items) {
+        if (it >= n_items + n_cpu) {
             // Read-ahead pieces never wait on a cold expert, so a fault does not
             // touch them: each publishes an expert its own copy completes.
-            moe_live_ahead_piece(live, (it - n_items) / AHEAD_CHUNKS, (it - n_items) % AHEAD_CHUNKS, tid);
+            const int p = it - n_items - n_cpu;
+            moe_live_ahead_piece(live, p / AHEAD_CHUNKS, p % AHEAD_CHUNKS, tid);
+            continue;
+        }
+        if (it >= n_items) {
+            // A CPU item: wait for the pool, then copy its result rows into the
+            // rows bucketize left the CPU experts. The scatter reads them there
+            // exactly as it reads a GPU-computed row.
+            if constexpr (std::is_same_v<output_t, float>) {
+                // `s_src` carries the outcome: the bm128 instantiation sits at
+                // the 48 KB static shared-memory cap, so this adds no word.
+                if (tid == 0) {
+                    s_src = moe_live_cpu_wait(live) ? 1ull : 0ull;
+                }
+                __syncthreads();
+                if (s_src == 0ull) {
+                    continue;
+                }
+                const int c = it - n_items;
+                const int r0 = c * MOE_LIVE_CPU_ROWS;
+                const int r1 = min(cpu_rows, r0 + MOE_LIVE_CPU_ROWS);
+                const int units = nrows_x / 4;  // 16-byte units in one row
+                const int total = (r1 - r0) * units;
+                for (int b = tid; b < total; b += NUM_THREADS * MOE_LIVE_LOADS) {
+                    uint4 v[MOE_LIVE_LOADS];
+                    int at[MOE_LIVE_LOADS];
+                    #pragma unroll
+                    for (int u = 0; u < MOE_LIVE_LOADS; ++u) {
+                        at[u] = b + u * NUM_THREADS;
+                        if (at[u] < total) {
+                            const int rr = r0 + at[u] / units;
+                            const int o = at[u] - (rr - r0) * units;
+                            v[u] = moe_live_ld16_cv(reinterpret_cast<const uint8_t*>(
+                                live.cpu_rows + (size_t)rr * nrows_x + (size_t)o * 4));
+                        }
+                    }
+                    #pragma unroll
+                    for (int u = 0; u < MOE_LIVE_LOADS; ++u) {
+                        if (at[u] < total) {
+                            const int rr = r0 + at[u] / units;
+                            const int o = at[u] - (rr - r0) * units;
+                            const size_t row = live.cpu_dst_row[rr];
+                            *reinterpret_cast<uint4*>(dst + row * (size_t)dst_stride + (size_t)o * 4) = v[u];
+                        }
+                    }
+                }
+            }
             continue;
         }
         const int r = it / row_tiles;
@@ -3020,6 +3135,10 @@ static __device__ void moe_live_worker(
         // The slot's stores are visible to the block's own `cp.async.cg` reads
         // (both through L2) once every thread has passed this barrier.
         __syncthreads();
+        if (live.cold_wait != nullptr && tid == 0 && j == 0 && live.remote[4 * r + 3] != 0) {
+            atomicAdd(&live.cold_wait[0], waited);
+            atomicAdd(&live.cold_wait[1], 1ull);
+        }
         if (live.stall != nullptr && tid == 0) {
             atomicAdd(&live.stall[0], waited);
             atomicAdd(&live.stall[1], 1ull);

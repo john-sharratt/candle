@@ -16,7 +16,7 @@
 // The decode step reads the mixer's own buffers through strides — no GQA
 // repeat, no per-span copies, no separate q/k/v tensors (the same contract as
 // the prefill scan in delta_net_prefill_kernel.cuh):
-//   state : [h_v, d_v, d_k]  updated in place
+//   state : [h_v, d_v, d_k]  read, never written
 //   qk    : one token's row of the l2-normed Q|K stack, [2*h_k, d_k];
 //           V head h reads K head h % h_k, q scaled by q_scale on load
 //   v     : one token's V columns of the conv output, [h_v, d_v]
@@ -24,19 +24,27 @@
 //   dt_bias, a      : [h_v] constants
 //   o     : one token's row of the wave output, [h_v, d_v]
 //
+// **A decode row is a one-row timeline** (delta_net_timeline.cuh). The step
+// writes its token's generators — G[0] = g, k, v_new[0] = err — and leaves S
+// as it found it; the fold applies the row once the step keeps it, and the
+// conv step writes the row's raw input (x[0]). The update `o` reads is
+// computed in registers as the fold computes it at m = 1 — the decayed key
+// k·e^{g−g}, the rank-1 term as one rounded FMA from zero, the store as one
+// rounded FMA — so the state `o` is read from is the state the fold stores.
+//
 // One block per (V head, sequence); warps stripe the d_v state rows and the
 // lanes of a warp stripe one row. k and q are staged in shared memory once per
-// block. d_k and d_v are runtime arguments bounded by DELTA_NET_MAX_HEAD_DIM
-// (shared-memory budget: 2 * 256 * 4 B = 2 KB); d_k is a multiple of 4, so a
-// row is whole float4s.
+// block. The timeline is laid out for DN_HEAD_DIM-wide heads, so d_k and d_v
+// are DN_HEAD_DIM; a row is whole float4s.
 //
 // Concrete (non-template) kernels: this header is compiled by the single
 // translation unit delta_net_api_f32.cu; `static` keeps the definitions
 // TU-local so a second includer cannot collide at link time.
 
 #include "delta_net_common.cuh"
+#include "delta_net_timeline.cuh"
 
-#define DELTA_NET_MAX_HEAD_DIM 256
+#define DELTA_NET_MAX_HEAD_DIM DN_HEAD_DIM
 
 namespace delta_net {
 
@@ -56,8 +64,8 @@ __device__ __forceinline__ float dn_warp_sum(float x) {
 // the table one host upload per FORWARD builds (never per layer: a mid-sweep
 // upload would serialise the launch pipeline).
 static __global__ void delta_net_decode_step_f32_kernel(
-        const long long*     __restrict__ states,     // [n_decode] entering f32* as i64
-        const long long*     __restrict__ states_out, // [n_decode] advanced f32* as i64
+        const long long*     __restrict__ states,    // [n_decode] f32* as i64, read only
+        const long long*     __restrict__ timelines, // [n_decode] f32* as i64
         const float*         __restrict__ conved, // [T_wave, tok_stride]
         const unsigned int*  __restrict__ rows,   // [n_decode] wave rows
         const float*         __restrict__ alpha,  // [T_wave, n_v_heads] raw
@@ -76,7 +84,7 @@ static __global__ void delta_net_decode_step_f32_kernel(
     const int kh = h % n_k_heads;
     const int row = (int)rows[seq];
     const float* state_in = (const float*)states[seq];
-    float* state_out = (float*)states_out[seq];
+    const DnTimeline tl = dn_timeline((float*)timelines[seq], n_v_heads, n_k_heads, tok_stride);
     const float* qk = conved + (size_t)row * tok_stride;
     const float* v = qk + ((size_t)tok_stride - (size_t)n_v_heads * d_v);
     const float* gates_a = alpha + (size_t)row * n_v_heads;
@@ -85,6 +93,10 @@ static __global__ void delta_net_decode_step_f32_kernel(
 
     __shared__ __align__(16) float sh_k[DELTA_NET_MAX_HEAD_DIM];
     __shared__ __align__(16) float sh_q[DELTA_NET_MAX_HEAD_DIM];
+    // Each state row's err and output, gathered so the block writes both as
+    // whole coalesced rows rather than one lane-0 store per row each.
+    __shared__ __align__(16) float sh_err[DELTA_NET_MAX_HEAD_DIM];
+    __shared__ __align__(16) float sh_out[DELTA_NET_MAX_HEAD_DIM];
 
     for (int j = threadIdx.x; j < d_k; j += blockDim.x) {
         sh_q[j] = qk[(size_t)kh * d_k + j] * q_scale;
@@ -92,25 +104,27 @@ static __global__ void delta_net_decode_step_f32_kernel(
     }
     __syncthreads();
 
-    const float g     = a_neg[h] * dn_softplus(gates_a[h] + dt_bias[h]);
+    const float g     = dn_decay_gate(a_neg[h], gates_a[h], dt_bias[h]);
     const float decay = expf(g);
     const float b     = dn_sigmoid(gates_b[h]);
+    // e^{G[m−1] − G[t]} at m = 1, t = 0, as the fold computes it.
+    const float e0    = expf(g - g);
 
-    // The entering state is read from `state_in`, the advanced state written to
-    // `state_out` — the wave points the latter at the slot's OTHER buffer. Every
-    // element of the row is written below, so the destination needs no
-    // initialisation and carries nothing forward from whatever it last held.
-    // That is what lets a failed wave roll back by simply not swapping the two
-    // buffers, instead of copying the entering state aside before every wave.
-    // The two may also be the same pointer (the reference path passes one buffer
-    // twice): a row is read whole into registers before any of it is written,
-    // so in-place stays correct.
+    // The row's generators, into the timeline: G and — once per K head, by the
+    // group's first V head — k. err goes per state row below.
+    if (threadIdx.x == 0) tl.g[h] = g;
+    if (h < n_k_heads) {
+        for (int j = threadIdx.x; j < d_k; j += blockDim.x) tl.k[(size_t)h * d_k + j] = sh_k[j];
+    }
+
+    // The entering state is read and never written: the token's contribution
+    // lands in the timeline, and the fold applies it once the step keeps the
+    // row. A failed wave therefore leaves the state exactly as it entered.
     //
     // A warp per row: lane l holds elements 4l..4l+3 of each 128-wide chunk, so
-    // the warp reads the row as one coalesced float4 sweep, keeps it in
-    // registers through the prediction, the update and the output read, and
-    // writes the advanced row back once — one read and one write of the state.
-    // A chunk past d_k is dead for every lane at once when d_k is a multiple of
+    // the warp reads the row as one coalesced float4 sweep and keeps it in
+    // registers through the prediction, the update and the output read. A
+    // chunk past d_k is dead for every lane at once when d_k is a multiple of
     // 128, and its registers are written on both paths.
     const int lane = (int)threadIdx.x & 31;
     const int n_warps = (int)blockDim.x >> 5;
@@ -119,7 +133,6 @@ static __global__ void delta_net_decode_step_f32_kernel(
     for (int i = (int)threadIdx.x >> 5; i < d_v; i += n_warps) {
         const float4* srow_in =
             reinterpret_cast<const float4*>(state_in + ((size_t)h * d_v + i) * d_k);
-        float4* srow_out = reinterpret_cast<float4*>(state_out + ((size_t)h * d_v + i) * d_k);
         float4 s[DN_ROW_CHUNKS];
         // Decayed prediction the state makes for k.
         float pred = 0.f;
@@ -139,7 +152,9 @@ static __global__ void delta_net_decode_step_f32_kernel(
         }
         pred = dn_warp_sum(pred);
         const float err = b * (v[(size_t)h * d_v + i] - pred);
-        // Update the row and read the output with the post-update state.
+        if (lane == 0) sh_err[i] = err;
+        // The updated row, as the fold will store it, and the output read
+        // against it.
         float out = 0.f;
         #pragma unroll
         for (int c = 0; c < DN_ROW_CHUNKS; ++c) {
@@ -148,11 +163,10 @@ static __global__ void delta_net_decode_step_f32_kernel(
                 const float4 kk = k4[j4];
                 const float4 qq = q4[j4];
                 float4 sn;
-                sn.x = s[c].x * decay + err * kk.x;
-                sn.y = s[c].y * decay + err * kk.y;
-                sn.z = s[c].z * decay + err * kk.z;
-                sn.w = s[c].w * decay + err * kk.w;
-                srow_out[j4] = sn;
+                sn.x = dn_state_update(s[c].x, decay, dn_rank1_acc(err, dn_decayed_key(kk.x, e0), 0.f));
+                sn.y = dn_state_update(s[c].y, decay, dn_rank1_acc(err, dn_decayed_key(kk.y, e0), 0.f));
+                sn.z = dn_state_update(s[c].z, decay, dn_rank1_acc(err, dn_decayed_key(kk.z, e0), 0.f));
+                sn.w = dn_state_update(s[c].w, decay, dn_rank1_acc(err, dn_decayed_key(kk.w, e0), 0.f));
                 out += sn.x * qq.x;
                 out += sn.y * qq.y;
                 out += sn.z * qq.z;
@@ -160,23 +174,27 @@ static __global__ void delta_net_decode_step_f32_kernel(
             }
         }
         out = dn_warp_sum(out);
-        if (lane == 0) orow[(size_t)h * d_v + i] = out;
+        if (lane == 0) sh_out[i] = out;
+    }
+    // Every warp leaves the row loop (its trip count depends only on the warp),
+    // so the barrier is reached by the whole block.
+    __syncthreads();
+    for (int i = threadIdx.x; i < d_v; i += blockDim.x) {
+        tl.v[(size_t)h * d_v + i] = sh_err[i];
+        orow[(size_t)h * d_v + i] = sh_out[i];
     }
 }
 
 // Causal depthwise conv, one token step per decode sequence, batched over
-// the wave: grid ((channels+255)/256, n_decode). The entering and advanced
-// tails are separate allocations named by two pointer tables — the wave writes
-// the buffer it is not reading, so a failed wave leaves the entering tail
-// intact and `commit_wave` installs the advance with a host pointer swap. The
-// SiLU + Q|K-norm epilogue makes the output row the same operand-buffer
-// contract as the prefill conv.
+// the wave: grid ((channels+255)/256, n_decode). The tail is read and never
+// written: the token's RAW input goes to row 0 of the sequence's timeline
+// (x[0]), and the fold shifts it into the tail once the step keeps the row —
+// so a failed wave leaves the tail as it entered. The SiLU + Q|K-norm epilogue
+// makes the output row the same operand-buffer contract as the prefill conv.
 //   x         : [T_wave, channels]   the wave's pre-conv fused QKV rows
 //   kernel    : [channels, kwidth]
 //   tails     : [n_decode] device f32* to the entering [channels, kwidth-1]
-//   tails_out : [n_decode] device f32* to the advanced [channels, kwidth-1]
-//               (the entering tail shifted left with the RAW x appended — the
-//               conv window wants pre-activation values)
+//   timelines : [n_decode] device f32* to each sequence's timeline
 //   rows      : [n_decode] each sequence's row in x/y
 //   y         : [T_wave, channels]   y = epilogue(sum_j kern[c,j]*window[j])
 // window = [tail | x] so the output sees inputs t-K+1 ..= t.
@@ -184,7 +202,7 @@ static __global__ void delta_net_conv_decode_f32_kernel(
         const float*        __restrict__ x,
         const float*        __restrict__ kernel,
         const long long*    __restrict__ tails,
-        const long long*    __restrict__ tails_out,
+        const long long*    __restrict__ timelines,
         const unsigned int* __restrict__ rows,
         float*              __restrict__ y,
         int channels,
@@ -199,7 +217,6 @@ static __global__ void delta_net_conv_decode_f32_kernel(
 
     const int tcols = kwidth - 1;
     const float* trow_in = ((const float*)tails[seq]) + (size_t)c * tcols;
-    float* trow_out = ((float*)tails_out[seq]) + (size_t)c * tcols;
     const float xv = x[(size_t)row * channels + c];
     const float* krow = kernel + (size_t)c * kwidth;
 
@@ -210,13 +227,10 @@ static __global__ void delta_net_conv_decode_f32_kernel(
     y[(size_t)row * channels + c] =
         dn_silu_norm_epilogue(acc, c, qk_channels, eps, (int)threadIdx.x, red);
 
-    // Shift the tail left and append this token.
-    for (int j = 0; j + 1 < tcols; ++j) {
-        trow_out[j] = trow_in[j + 1];
-    }
-    if (tcols > 0) {
-        trow_out[tcols - 1] = xv;
-    }
+    // The raw input, as the fold will shift it into the tail.
+    const int h_k = qk_channels / (2 * DN_HEAD_DIM);
+    const int h_v = (channels - qk_channels) / DN_HEAD_DIM;
+    dn_timeline((float*)timelines[seq], h_v, h_k, channels).x[c] = xv;
 }
 
 // Address arrays for cuBLAS's batched triangular solve.
@@ -240,9 +254,11 @@ static __global__ void delta_net_batch_ptrs_kernel(
     b_ptrs[i] = b_base + (long long)i * b_stride;
 }
 
-static inline void launch_decode_step_f32(
+// 0 when launched, 1 when the shape is refused (nothing written): a head
+// width other than the timeline's, or a geometry that is not [Q|K|V].
+static inline int launch_decode_step_f32(
         const long long* states,
-        const long long* states_out,
+        const long long* timelines,
         const float* conved,
         const unsigned int* rows,
         const float* alpha,
@@ -258,21 +274,23 @@ static inline void launch_decode_step_f32(
         int tok_stride,
         float q_scale,
         cudaStream_t stream) {
-    if (n_decode <= 0 || n_v_heads <= 0 || n_k_heads <= 0 || d_k <= 0 || d_v <= 0) return;
-    if (d_k > DELTA_NET_MAX_HEAD_DIM || d_v > DELTA_NET_MAX_HEAD_DIM) return;
-    if (d_k % 4 != 0) return;
+    if (n_decode <= 0 || n_v_heads <= 0 || n_k_heads <= 0) return 1;
+    if (d_k != DN_HEAD_DIM || d_v != DN_HEAD_DIM) return 1;
+    if (tok_stride != (2 * n_k_heads + n_v_heads) * DN_HEAD_DIM) return 1;
     const int threads = 128;
     dim3 grid(n_v_heads, n_decode);
     delta_net_decode_step_f32_kernel<<<grid, threads, 0, stream>>>(
-        states, states_out, conved, rows, alpha, beta_lin, dt_bias, a_neg, o,
+        states, timelines, conved, rows, alpha, beta_lin, dt_bias, a_neg, o,
         d_k, d_v, n_v_heads, n_k_heads, tok_stride, q_scale);
+    return 0;
 }
 
-static inline void launch_conv_decode_f32(
+// 0 when launched, 1 when the shape is refused (nothing written).
+static inline int launch_conv_decode_f32(
         const float* x,
         const float* kernel,
         const long long* tails,
-        const long long* tails_out,
+        const long long* timelines,
         const unsigned int* rows,
         float* y,
         int n_decode,
@@ -281,13 +299,16 @@ static inline void launch_conv_decode_f32(
         int qk_channels,
         float eps,
         cudaStream_t stream) {
-    if (n_decode <= 0 || channels <= 0 || kwidth <= 1) return;
+    if (n_decode <= 0 || channels <= 0 || kwidth <= 1) return 1;
     // Whole head groups per block — see dn_silu_norm_epilogue.
-    if (qk_channels < 0 || qk_channels > channels || qk_channels % 256 != 0) return;
+    if (qk_channels < 0 || qk_channels > channels || qk_channels % 256 != 0) return 1;
+    // The timeline's x field sits behind fields laid out for DN_HEAD_DIM heads.
+    if ((channels - qk_channels) % DN_HEAD_DIM != 0) return 1;
     const int threads = 256;
     dim3 grid((channels + threads - 1) / threads, n_decode);
     delta_net_conv_decode_f32_kernel<<<grid, threads, 0, stream>>>(
-        x, kernel, tails, tails_out, rows, y, channels, kwidth, qk_channels, eps);
+        x, kernel, tails, timelines, rows, y, channels, kwidth, qk_channels, eps);
+    return 0;
 }
 
 static inline void launch_batch_ptrs(

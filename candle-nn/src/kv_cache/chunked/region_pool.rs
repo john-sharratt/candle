@@ -114,40 +114,21 @@ const MAX_WAVE_TRANSIENT_BYTES: usize = super::wave_spans::WAVE_ATTN_BYTES
     + super::wave_spans::WAVE_FFN_BYTES
     + super::wave_spans::WAVE_FORWARD_BYTES;
 
-/// The fixed block at the far **left** of the span, for a model that holds no
-/// runtime reserve: the held ground ([`HELD_GROUND_BYTES`]) first, then the
-/// persistence thread's staging. A model's runtime reserve widens the held
-/// ground and with it this block ([`persist_bytes`]).
+/// The fixed block at the far **left** of the span: the held ground
+/// ([`HELD_GROUND_BYTES`]) first, then the persistence thread's staging.
 ///
 /// Fixed for the process lifetime and out of both frontiers' way. Putting it
 /// left rather than letting it float is what lets the weight boundary move
 /// without ever having to reason about a copy stream that is not synchronised
 /// to the wave — and what lets a held buffer be taken mid-forward, where a
 /// region claim would be refused.
-const PERSIST_SPAN_BYTES: usize = HELD_GROUND_BYTES + MIGRATION_STAGING_CAP_BYTES;
-
-/// The held ground for a model whose runtime reserve is `runtime_reserve`: the
-/// buffers every model holds ([`HELD_GROUND_BYTES`]) plus that reserve, rounded
-/// to whole regions so the fixed block stays region-aligned.
 ///
-/// **The reserve stands inside the span, on held ground.** It used to be left
-/// outside it, as CUDA-pool room — the window residuals a wide-residual model
-/// hands from one forward to the next. Outside, they were memory the span did
-/// not count and WDDM could demote; and the pool they came from kept every
-/// width they had ever been, so its footprint only rose. Measured on `.5`,
-/// 2026-10-17: the pool reached 5.5 GiB under one conversation and an ingest,
-/// the card's residency budget ran out, and WDDM paged the process to host RAM
-/// — decode stalled 5–10 s every 10–15 s. Held ground is pinned span memory the
-/// driver may not migrate, and it is in the plan.
-fn held_bytes(runtime_reserve: usize) -> usize {
-    HELD_GROUND_BYTES + runtime_reserve.next_multiple_of(REGION_BYTES)
-}
-
-/// The fixed left block for a model whose runtime reserve is `runtime_reserve`:
-/// its held ground, then the persistence staging.
-fn persist_bytes(runtime_reserve: usize) -> usize {
-    held_bytes(runtime_reserve) + MIGRATION_STAGING_CAP_BYTES
-}
+/// **No model widens it.** The residual a window hands from one forward to the
+/// next lives on the step's forward span or a creep's arena, sized to the rows
+/// in flight and held only while they are (`docs/wave_step.md`); held here, it
+/// would be priced at the widest forward the scheduler can send and stand on
+/// every card for the life of the process.
+const PERSIST_SPAN_BYTES: usize = HELD_GROUND_BYTES + MIGRATION_STAGING_CAP_BYTES;
 
 /// The smallest span that can run a forward whose fixed block is `persist`
 /// bytes: that block plus one wave's transient tier, with nothing left for KV.
@@ -382,6 +363,9 @@ pub struct RegionStats {
     /// memory report because a `0` here would read as "the card was empty
     /// before us" and license a subtraction that silently did nothing.
     pub pre_reservation_in_use_bytes: Option<u64>,
+    /// Transient tiers placed since the pool was made — one per forward, so a
+    /// reader polling it sees each wave go by.
+    pub tiers_placed: u64,
 }
 
 struct RegionPool {
@@ -547,13 +531,15 @@ struct RegionPool {
     /// wave's activation ground, which a reading taken between forwards would
     /// otherwise always see as zero.
     tier_peak: usize,
+    /// Tiers placed since the pool was made — one per forward: the clock a
+    /// per-wave reading of the span is taken against.
+    tiers_placed: u64,
     /// Bytes of the fixed left block carved so far: the held ground, then the
     /// persistence staging.
     persist_carved: usize,
-    /// The whole fixed left block — [`persist_bytes`] of the model's runtime
-    /// reserve.
+    /// The whole fixed left block — [`PERSIST_SPAN_BYTES`].
     persist_bytes: usize,
-    /// The held ground at its base — [`held_bytes`] of the same reserve.
+    /// The held ground at its base — [`HELD_GROUND_BYTES`].
     held_bytes: usize,
     /// Fresh regions claimed while a wave's transient tier was placed.
     ///
@@ -909,15 +895,9 @@ impl RegionPool {
     /// in tensor size. It is bounded, not zero: `peak_load_pool_bytes` carries
     /// the `2 × REPACK_BAND_BYTES` term, and dropping it OOMs the first large
     /// repack.
-    ///
-    /// `runtime_reserve` is device memory the model holds for as long as it
-    /// runs, outside any forward — a wide-residual model's window residuals. It
-    /// widens the held ground ([`held_bytes`]), so it is inside the span and in
-    /// the plan rather than CUDA-pool room left beside it.
     fn create_with_headroom(
         stream: &std::sync::Arc<CudaStream>,
         load_headroom: usize,
-        runtime_reserve: usize,
     ) -> Result<Self> {
         let ordinal = stream.context().ordinal();
         // Read before the claim: mapping granules consumes headroom, so asking
@@ -950,8 +930,8 @@ impl RegionPool {
             .bind_to_thread()
             .map_err(|e| candle::Error::Msg(format!("reservation: bind: {e}")))?;
         let graph_reserve = graph_budget_bytes()? as usize;
-        let held_bytes = held_bytes(runtime_reserve);
-        let persist_bytes = persist_bytes(runtime_reserve);
+        let held_bytes = HELD_GROUND_BYTES;
+        let persist_bytes = PERSIST_SPAN_BYTES;
         let span_minimum = span_minimum_bytes(persist_bytes);
         let target = span_target(ordinal, graph_reserve)?;
         let measured = candle::vram::get(ordinal).is_some();
@@ -1132,6 +1112,7 @@ impl RegionPool {
             prompts_waiting: false,
             waiting_tier_bytes: 0,
             tier_peak: 0,
+            tiers_placed: 0,
             persist_carved: held_bytes,
             persist_bytes,
             held_bytes,
@@ -1573,8 +1554,7 @@ fn with_pool<R>(
         // No headroom on the lazy path: reaching here means nothing called
         // `ensure_reservation`, so no model is loading and there is no repack
         // peak to leave room for. That is every test, and the CPU-device paths.
-        // No runtime reserve either, for the same reason: no model said it needs one.
-        Entry::Vacant(v) => v.insert(RegionPool::create_with_headroom(stream, 0, 0)?),
+        Entry::Vacant(v) => v.insert(RegionPool::create_with_headroom(stream, 0)?),
     };
     f(pool)
 }
@@ -2118,6 +2098,7 @@ fn try_place(stream: &std::sync::Arc<CudaStream>, bytes: usize) -> Result<Placed
         if pool.prompts_waiting {
             pool.waiting_tier_bytes = pool.waiting_tier_bytes.max(len);
         }
+        pool.tiers_placed += 1;
         Ok(Placed::At(base))
     })
 }
@@ -2343,15 +2324,7 @@ pub fn dense_bytes(stream: &std::sync::Arc<CudaStream>) -> Result<usize> {
 /// Failing instead would turn "this is the second model in the process" — every
 /// multi-model test binary — into a load failure, and swallowing it silently
 /// would leave a reader unable to explain why `dense_bytes` was zero.
-///
-/// `runtime_reserve` is device memory the model holds for as long as it runs,
-/// outside any forward; it widens the held ground inside the span
-/// ([`RegionPool::create_with_headroom`]).
-pub fn ensure_reservation(
-    device: &candle::Device,
-    load_headroom: usize,
-    runtime_reserve: usize,
-) -> Result<bool> {
+pub fn ensure_reservation(device: &candle::Device, load_headroom: usize) -> Result<bool> {
     let candle::Device::Cuda(cuda) = device else {
         candle::bail!("ensure_reservation: the reservation is a CUDA allocation");
     };
@@ -2381,11 +2354,7 @@ pub fn ensure_reservation(
     match map.entry(ordinal) {
         Entry::Occupied(_) => Ok(false),
         Entry::Vacant(v) => {
-            v.insert(RegionPool::create_with_headroom(
-                &stream,
-                load_headroom,
-                runtime_reserve,
-            )?);
+            v.insert(RegionPool::create_with_headroom(&stream, load_headroom)?);
             Ok(true)
         }
     }
@@ -3159,6 +3128,7 @@ pub fn region_stats(ordinal: usize) -> Option<RegionStats> {
         reserved_bytes: pool.reservation.reserved_bytes(),
         granularity: pool.reservation.granularity(),
         pre_reservation_in_use_bytes: pool.pre_reservation_in_use,
+        tiers_placed: pool.tiers_placed,
     })
 }
 
@@ -3178,7 +3148,7 @@ pub struct SpanPartition {
     /// Regions held by KV arenas.
     pub kv: usize,
     /// Regions held by span tenants — recurrent state, the provenance
-    /// gallery, index caches, rewind stashes.
+    /// gallery, index caches, creep residuals.
     pub tenants: usize,
     /// The largest wave transient tier placed since the last reading: the
     /// activations of the widest forward. It stands on regions nobody holds, so
@@ -3330,45 +3300,6 @@ mod partition_tests {
         assert_eq!((p.kv, p.transient, p.regions_free), (4 * R, 2 * R, 0));
         assert_eq!(p.sum(), span);
     }
-
-    /// **A runtime reserve widens the held ground and costs regions, nothing
-    /// else.** The persistence staging keeps its size, the bands still sum to
-    /// the span, and the regions given up are exactly the reserve's.
-    #[test]
-    fn a_runtime_reserve_is_held_ground_inside_the_span() {
-        let reserve = 1760 * 1024 * 1024;
-        let held = super::held_bytes(reserve);
-        let persist = super::persist_bytes(reserve);
-        assert_eq!(held, HELD_GROUND_BYTES + 110 * R);
-        assert_eq!(persist - held, PERSIST_SPAN_BYTES - HELD_GROUND_BYTES);
-        let span = persist + 40 * R;
-        let p = partition(persist, held, span, 0, span, 4, 0, 0);
-        assert_eq!(p.held_ground, held);
-        assert_eq!(p.persist_staging, PERSIST_SPAN_BYTES - HELD_GROUND_BYTES);
-        assert_eq!(p.kv + p.regions_free, 40 * R);
-        assert_eq!(p.sum(), span);
-        let without = partition(
-            PERSIST_SPAN_BYTES,
-            HELD_GROUND_BYTES,
-            span,
-            0,
-            span,
-            4,
-            0,
-            0,
-        );
-        assert_eq!(
-            (without.kv + without.regions_free) - (p.kv + p.regions_free),
-            110 * R
-        );
-    }
-
-    #[test]
-    fn a_reserve_of_a_part_region_takes_a_whole_one() {
-        assert_eq!(super::held_bytes(1), HELD_GROUND_BYTES + R);
-        assert_eq!(super::held_bytes(0), HELD_GROUND_BYTES);
-        assert_eq!(super::persist_bytes(0), PERSIST_SPAN_BYTES);
-    }
 }
 
 #[cfg(test)]
@@ -3380,7 +3311,7 @@ mod tests {
     use candle::{Device, Result};
     use std::sync::Arc;
 
-    /// The layout of a span whose fixed block holds no runtime reserve.
+    /// The layout of a span with the fixed block every span has.
     fn rest_layout(base: u64, span: usize, dense: usize, floor: u64) -> Layout {
         layout_span(base, PERSIST_SPAN_BYTES, span, dense, floor)
     }

@@ -100,7 +100,7 @@ impl ManagedBatchedModel for ChainDrafter {
         _glue_inputs: &[Tensor],
         _layer_start: usize,
         _layer_end: usize,
-        _residual_in: Option<Tensor>,
+        _residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult> {
         self.forwards.fetch_add(1, Ordering::Relaxed);
         let mut rows = Vec::new();
@@ -120,10 +120,23 @@ impl ManagedBatchedModel for ChainDrafter {
                 rows.push(self.row_after(last)?);
             }
         }
-        Ok(WaveResult::owned(WaveStep {
-            residual: None,
-            logits: Some(rows),
-        }))
+        Ok(WaveResult::owned(WaveStep { logits: Some(rows) }))
+    }
+
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome> {
+        stub_step(self, session, spec)
+    }
+
+    fn claim_residual(
+        &self,
+        _session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual> {
+        stub_residual(rows)
     }
 
     fn draft_budget(&self, _width: usize) -> usize {

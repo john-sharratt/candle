@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub use super::vram_bands::VramBands;
+pub use candle_nn::kv_cache::VramBands;
 
 // ── Projection tracker ───────────────────────────────────────────────────────
 // What projection lifted into VRAM for a working set, by name: each unit

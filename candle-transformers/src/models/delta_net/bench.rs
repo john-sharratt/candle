@@ -23,7 +23,9 @@
 
 use candle::{Device, Result, Tensor};
 
-use super::mix::{delta_net_mix, delta_net_mix_spans, DeltaNetProjections, DeltaNetSeq};
+use super::mix::{
+    delta_net_mix, delta_net_mix_spans, solo_write, DeltaNetProjections, DeltaNetSeq,
+};
 use super::types::{DeltaNetDims, ZGate};
 use super::{DeltaNetConstants, DeltaNetState};
 
@@ -182,13 +184,12 @@ fn correctness_gate(
             norm: &norm,
         };
         let mut st = DeltaNetState::zeros(dims, dev)?;
-        let out = st.solo_out()?;
+        let write = solo_write(&st, gate_tokens, dims)?;
         let mut seqs = [DeltaNetSeq {
             start: 0,
             len: gate_tokens,
             state: &mut st,
-            out,
-            stash: None,
+            write,
         }];
         delta_net_mix_spans(
             &p_gpu.view(),
@@ -265,20 +266,19 @@ pub fn run_delta_net_kernels(dev: &Device, cfg: DeltaNetBenchCfg) -> Result<()> 
     );
 
     let once = |states: &mut Vec<DeltaNetState>| -> Result<()> {
-        let mut outs = Vec::with_capacity(states.len());
-        for st in states.iter_mut() {
-            outs.push(st.solo_out()?);
+        let mut writes = Vec::with_capacity(states.len());
+        for st in states.iter() {
+            writes.push(solo_write(st, per_seq, &dims)?);
         }
         let mut seqs: Vec<DeltaNetSeq<'_>> = states
             .iter_mut()
-            .zip(outs)
+            .zip(writes)
             .enumerate()
-            .map(|(i, (state, out))| DeltaNetSeq {
+            .map(|(i, (state, write))| DeltaNetSeq {
                 start: i * per_seq,
                 len: per_seq,
                 state,
-                out,
-                stash: None,
+                write,
             })
             .collect();
         let _ = delta_net_mix_spans(

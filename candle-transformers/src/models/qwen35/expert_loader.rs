@@ -46,10 +46,13 @@ pub fn build_expert_cache(
         device,
         // The qwen35 loader carries no progress hook of its own.
         None,
-        // Its embedding is copied into pinned host memory at load, and every
-        // other tensor of the mapping is paged on demand — none of it is served
-        // by a cache of the model's own.
-        0,
+        // Nothing in the mapping is read from the host after load: a routed
+        // checkpoint keeps every dense tensor resident on the card, placed
+        // before this cache is built (`load_quantized_model`), and the
+        // embedding is copied into its own pinned allocation. Counted as live
+        // weight, the whole GGUF part would be reserved as page cache out of
+        // the warm tier's RAM.
+        pack.gguf_len(),
     )
 }
 

@@ -1,18 +1,19 @@
-//! The warm tier: a static, stratified, immutable mirror of part of the pack.
+//! The warm tier's startup fill: a stratified subset of the pack, drawn once.
 //!
 //! ```text
 //! cold    the repacked pack file        authoritative, holds every expert
-//! warm    pinned host RAM (this file)   static, immutable, a stratified subset
+//! warm    host RAM (this file's pool)   a stratified subset, drawn at startup
 //! hot     VRAM                          dynamic cache, eviction = drop
 //! ```
 //!
-//! The pool is filled **once**, at startup, and never changes: no eviction
-//! policy, no ranking, no background filler, no free list. That is not a
-//! simplification of a richer design — it is what licenses the rule that makes
-//! the rest of the cache simple. Because no other expert can ever claim a slot,
-//! a promoted expert's slot is not worth reclaiming, so its host copy is never
-//! surrendered and an eviction from VRAM lands it back on RAM by doing nothing.
-//! A warm tier with an eviction policy could not make that promise.
+//! The draw is made **once**, at startup, with no ranking and no background
+//! filler; this file chooses the set every forward starts from, not the steady
+//! state. Past the fill the pinned part is the pad's resident region (`pad`,
+//! `resident`): the stager relabels it between passes from decode's own
+//! misses, and a resident it demotes to churn may be overwritten by a cold
+//! read. The pageable part stays as filled. Promoting a host copy into VRAM
+//! copies it and leaves it in place, so an eviction from VRAM lands an expert
+//! whose slot still holds it back on that copy by doing nothing.
 //!
 //! # Why a random subset, and why stratified
 //!
@@ -31,8 +32,7 @@
 //! for one; and the wave is sequential, so lucky layers cannot compensate —
 //! layer *N+1* cannot start until layer *N*'s experts land, and the sweep runs
 //! at its worst stage rather than its mean. Stratifying drives that variance to
-//! zero for the same fill, the same immutability and one different line in the
-//! sampler.
+//! zero for the same fill and one different line in the sampler.
 
 #[cfg(feature = "cuda")]
 use super::page_pressure::{press, PAGE_PRESSURE_BYTES};
@@ -118,15 +118,14 @@ pub(crate) fn layer_geometries(
 /// The two fields are independent facts over an always-present base, not a
 /// choice between three places. An expert can be in VRAM and RAM at once, and
 /// usually is: promoting a warm expert *copies* its bytes to the device rather
-/// than moving them, because the warm tier is immutable and would not reuse the
-/// vacated slot anyway.
+/// than moving them, and leaves its host copy where it is.
 ///
 /// # Why a product and not a sum
 ///
 /// The sum — `Vram { slot, ram_backed } | Ram { slot } | Disk` — carries exactly
 /// the same four states and exactly the same semantics. The product is preferred
-/// because `ram` is an **immutable per-expert fact** decided at startup, and the
-/// sum makes every VRAM transition rewrite it. Five sites construct a VRAM
+/// because `ram` is a **per-expert fact of the startup fill**, never rewritten,
+/// and the sum makes every VRAM transition rewrite it. Five sites construct a VRAM
 /// residency (startup fill, demand miss, prefetch, hint, relocation); under the
 /// sum each must restate `ram_backed` correctly, and the compiler would force
 /// them to supply *a* value but not the *right* one. A relocation between VRAM
@@ -166,8 +165,9 @@ pub(crate) struct ExpertResidency {
 ///
 /// A global draw gives per-layer residency `~ Binomial`, so across 48 layers the
 /// unluckiest lands far below the mean. That matters more here than for an
-/// ordinary cache: the fill is immutable, so an unlucky layer is slow on *every*
-/// forward for the process lifetime; and the wave is sequential, so lucky layers
+/// ordinary cache: every forward starts from the fill, and the resident set moves
+/// from it only within per-layer bands (`resident::Bands`), so an unlucky layer
+/// stays slow; and the wave is sequential, so lucky layers
 /// cannot compensate — layer *N+1* cannot start until layer *N*'s experts land.
 /// Each pass therefore hands slots out one per layer at a time, so no layer is
 /// ever more than one ahead of another that still has candidates.
@@ -262,9 +262,10 @@ pub(crate) fn stratified_membership(
 /// memory, so that a worker waits for the stager to read it, and can give it
 /// up (`fault`). Never when every expert fits in VRAM; and never when the warm
 /// tier's `members` — at most one slot per expert of the `evictable` set
-/// ([`stratified_membership`]), filled once at startup and never repurposed —
-/// cover that whole set with no slot `paged`: an expert evicted from VRAM is
-/// then always read from pinned memory.
+/// ([`stratified_membership`]) — cover that whole set with no slot `paged`:
+/// every evictable expert then holds a resident pad slot, none is ever read
+/// from the pack, so no churn copy arises to displace a resident, and an
+/// expert evicted from VRAM is always read from pinned memory.
 #[cfg(feature = "cuda")]
 pub(crate) fn can_go_cold(
     all_resident: bool,
@@ -316,8 +317,11 @@ impl SplitMix64 {
 ///
 /// # Thread safety
 ///
-/// Owned exclusively by the pipeline thread (`&mut self` access). No interior
-/// mutability, no atomics.
+/// Filled through `&mut self` before it is shared, then read through `&self`
+/// (`slot_ref`, `range`) by every thread that holds it. Past that, the only
+/// writes to its slots are the stager's, through raw slot addresses under the
+/// pad's slot protocol (`pad`, `stager`): a slot is written only while its
+/// label makes it the stager's, never while a reader may hold its address.
 #[cfg(feature = "cuda")]
 pub(crate) struct WarmPool {
     /// Base pointer from `cuMemAllocHost`.
@@ -653,19 +657,17 @@ impl Drop for WarmPool {
     }
 }
 
-// SAFETY: The pinned memory is allocated via cuMemAllocHost which returns
-// a host-accessible pointer valid for any thread.  The pool is exclusively
-// owned by the pipeline thread (no shared access).
+// SAFETY: the pinned memory is allocated via cuMemAllocHost, which returns a
+// host-accessible pointer valid on any thread, and the pool owns it alone.
 #[cfg(feature = "cuda")]
 unsafe impl Send for WarmPool {}
 
-// SAFETY: after the startup fill the pool is immutable by design (this file's
-// module doc: "static, immutable, a stratified subset") — the mutating
-// accessors (`slot_mut`, `span_mut`) are only reachable through `&mut self`,
-// and the pool is shared read-only via `Arc` (which makes `&mut` unreachable)
-// between the host threads that read it (the pipeline thread and the stager)
-// and, through the warm-slot addresses, the expert kernels. Concurrent `slot_ref`
-// reads of stable pinned memory are race-free.
+// SAFETY: the safe accessors that mutate (`slot_mut`, `span_mut`) take `&mut
+// self`, which a shared pool (`Arc`) makes unreachable; through `&self` the
+// pool only hands out addresses and reads. The writes made after the fill go
+// through raw slot addresses under the pad's slot protocol (`pad`, `stager`),
+// which writes a slot only while no reader holds its address — not through
+// any reference this impl shares.
 #[cfg(feature = "cuda")]
 unsafe impl Sync for WarmPool {}
 

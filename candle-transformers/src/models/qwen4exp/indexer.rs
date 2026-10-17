@@ -2512,7 +2512,7 @@ pub fn select_layer(
     // (`super::spec`). `k_all` is on the layer's arena, which the phase reset
     // reclaims, and the rewind reads the keys after the wave — so they are
     // copied into the cohort's kept-row buffer for this layer, at the
-    // sequence's stash row.
+    // sequence's capture row.
     if let Some(c) = capture {
         let SpecCapture { seqs, rows, .. } = c;
         let keys_buf = rows.qsa.get(kv).ok_or_else(|| {

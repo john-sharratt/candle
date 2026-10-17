@@ -49,7 +49,7 @@ pub struct GovernorConfig {
     /// where the driver refused the balloon, which is what makes `capacity_c`
     /// 14,592 rather than 16,376.)
     pub scratch_margin: u64,
-    /// **The one number the card holds back**, in bytes (default 512 MiB).
+    /// **The one number the card holds back**, in bytes (default 256 MiB).
     ///
     /// `C = min(headroom, total − this)`, on the balloon's growth loop and on
     /// the fast path that skips it alike ([`super::balloon::capacity_target`]).
@@ -154,7 +154,12 @@ const DEFAULT_SCRATCH_MARGIN_MB: u64 = 512;
 /// a cap on every path (see `balloon::capacity_target`'s `headroom` cap). A
 /// fixed number cannot stand in for the budget: 5 GiB was measured right on
 /// the 73 GiB card and would take a third of a 16 GiB one.
-const DEFAULT_CAPACITY_RESERVE_MB: u64 = 512;
+///
+/// 256 MiB, the floor of that WDDM margin as well as the whole margin
+/// everywhere else. It stands beside the graph library's budget (256 MiB on
+/// the 16 GiB laptop) and a 512 MiB pool cushion, which already cover what a
+/// full batched sweep there draws outside the span.
+const DEFAULT_CAPACITY_RESERVE_MB: u64 = 256;
 const DEFAULT_BALLOON_CHUNK_MB: u64 = 256;
 /// One VMM allocation granule on every device this runs on. `Reservation`
 /// queries the real value at run time; the balloon cannot, because it runs

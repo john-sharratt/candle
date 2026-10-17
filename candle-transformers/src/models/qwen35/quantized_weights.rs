@@ -1667,7 +1667,7 @@ where
         None => dense_span::peak_load_pool_bytes(content.tensor_infos.values()),
     };
     // A plain `[rows, hidden]` residual, which the pool cushion covers: no runtime reserve.
-    dense_span::open_for_load_sized(device, headroom, 0)?;
+    dense_span::open_for_load_sized(device, headroom)?;
 
     // A routed checkpoint's layers stay resident however the caller asked — see
     // this function's header. Resolved here, where the config is known, so the

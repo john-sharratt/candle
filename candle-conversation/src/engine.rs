@@ -1428,6 +1428,44 @@ impl ConversationEngine {
         self.conversation.mark_timeline_transient(timeline);
     }
 
+    /// Mark `timeline` as kept but never resumed: its turns stay — sealed,
+    /// persisted, projectable — but it keeps no recurrent snapshot, and the one
+    /// it already has is retired. For content that is read and never extended:
+    /// a document ingested as a conversation, a kept dream. A snapshot is a
+    /// whole recurrent state per conversation (~112 MiB on Flash-Next) whatever
+    /// the conversation's length. See
+    /// [`crate::projection::Conversation::mark_timeline_unresumed`].
+    ///
+    /// In-memory as a mark, durable as the retirement: a caller marks its
+    /// timelines again after a restart (they then write nothing new), and a
+    /// fork of such a timeline starts from its nearest ancestor that kept one.
+    pub fn mark_timeline_unresumed(&self, timeline: TimelineId) {
+        self.conversation.mark_timeline_unresumed(timeline);
+    }
+
+    /// [`Self::mark_timeline_unresumed`] without the retiring write, for a
+    /// timeline whose tail is known to be retired already (or absent): later
+    /// seals write no snapshot, and nothing is appended now.
+    pub fn note_timeline_unresumed(&self, timeline: TimelineId) {
+        self.conversation.note_timeline_unresumed(timeline);
+    }
+
+    /// The group `timeline` belongs to, and its creation-order rank
+    /// ([`crate::substrate::TimelineEntry::order`]) — `None` for a timeline
+    /// this substrate does not hold.
+    pub fn timeline_group_and_order(&self, timeline: TimelineId) -> Option<(GroupId, u64)> {
+        self.conversation
+            .read()
+            .timeline_entry(timeline)
+            .map(|e| (e.group, e.order))
+    }
+
+    /// Bytes of the recurrent snapshot `timeline` keeps, if any — a retired
+    /// tail reads as a few dozen. Read from the index, not the record.
+    pub fn recurrent_snapshot_bytes(&self, timeline: TimelineId) -> Option<u64> {
+        self.conversation.recurrent_snapshot_bytes(timeline)
+    }
+
     /// Whether `timeline` is archived. Unlike [`Self::known_conversations`]
     /// — which omits internal conversations that never set a `conv_id` — this
     /// reads the flag directly, so it works for reserved/utility timelines too.

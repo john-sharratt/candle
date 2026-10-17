@@ -370,7 +370,7 @@ tenants, all legitimate, none of them ever leaked:
 |---|---|---|
 | `Gallery` | `provenance/gallery_arena/storage.rs` | the **ingested corpus** |
 | `RecurrentState` | `delta_net/state_store.rs` | concurrent sequences |
-| `VerifyStash` | `qwen35/spec.rs` | concurrent sequences × draft budget |
+| `VerifyStash` | `qwen35/spec.rs` (since replaced by each state slot's fixed timeline, `docs/deltanet_timeline.md`) | concurrent sequences × draft budget |
 
 All three exist only on DeltaNet-lineage models, which is why this never
 appeared on a non-DeltaNet target — and why the throughput law may not carry

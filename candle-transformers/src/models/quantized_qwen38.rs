@@ -490,7 +490,7 @@ mod tests {
         // The same widening the 3.6 gate carries, and for the same reason: what
         // bounds concurrency at C10 is per-session state, not the checkpoint.
         // DeltaNet holds `n_v_heads × head_dim × head_dim` in F32 per recurrent
-        // layer per sequence, doubled for the live/backup ping-pong, and C10 KV
+        // layer per sequence, with its conv tail and timeline, and C10 KV
         // adds only a couple of MiB on top. Widening here measures the engine's
         // concurrency; widening a lower rung would measure KV bytes and so
         // measure the card instead.

@@ -401,7 +401,12 @@ impl Engine {
             progress: None,
             int8mode,
             mapped_bytes: pack.gguf_len(),
-            offloaded_bytes: 0,
+            // Nothing in the mapping is read from the host after load: every
+            // dense tensor above is resident on the card, and the embedding is
+            // a dequantized host tensor of its own. Counted as live weight, the
+            // whole GGUF part would be reserved as page cache out of the warm
+            // tier's RAM.
+            offloaded_bytes: pack.gguf_len(),
         })?);
         #[cfg(feature = "cuda")]
         {

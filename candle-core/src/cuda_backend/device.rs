@@ -331,30 +331,32 @@ impl CudaDevice {
     /// While this thread records a wave capture, the bytes are staged in the
     /// wave's ring and their copy is recorded into the segment, so the upload
     /// does not end it. In a segment that runs eagerly the copy goes straight
-    /// onto the compute stream, behind the launches already issued — ending
-    /// the segment there would cut the wave where a recorded one is not cut,
-    /// and every segment after it would hold different layers. Otherwise — or
-    /// when the ring is full — the copy is queued on the compute stream behind
-    /// everything issued before it; the driver has staged pageable bytes before
-    /// it returns, so `src` may go.
+    /// onto the **launch stream** — the capture stream an eager segment runs on
+    /// — behind the launches already issued and ahead of the ones that read
+    /// it; ending the segment there would cut the wave where a recorded one is
+    /// not cut, and every segment after it would hold different layers.
+    /// Queued on the compute stream instead, it would be unordered against the
+    /// segment's own launches. Otherwise — or when the ring is full — the copy
+    /// is queued on the compute stream behind everything issued before it. The
+    /// driver has staged pageable bytes before it returns, so `src` may go.
     #[track_caller]
     pub fn upload_raw(&self, dst: u64, src: &[u8]) -> Result<()> {
         if src.is_empty() || self.record_upload(dst, src) {
             return Ok(());
         }
-        let _eager = if self.capture.eager_segment_here() {
-            None
+        let (stream, _eager) = if self.capture.eager_segment_here() {
+            (self.cuda_stream(), None)
         } else {
-            self.pause_capture()?
+            (self.stream.clone(), self.pause_capture()?)
         };
         // SAFETY: the caller's `dst` holds `src.len()` bytes; queued on the
-        // compute stream.
+        // stream the launches that read it are on.
         unsafe {
             cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                 dst,
                 src.as_ptr() as *const std::ffi::c_void,
                 src.len(),
-                self.stream.cu_stream(),
+                stream.cu_stream(),
             )
             .result()
             .w()
@@ -477,21 +479,20 @@ impl CudaDevice {
                 }
             }
         }
-        // The copy below is issued on the compute stream itself, not recorded,
-        // so a segment still holding a read of the scratch must be launched
-        // ahead of it. A segment that runs eagerly holds none: its launches
-        // are already on the stream, and ending it here would cut the wave
-        // where a recorded one is not cut (see [`Self::upload_raw`]).
-        let _eager = if self.capture.eager_segment_here() {
-            None
+        // The copy below is issued eagerly, not recorded, so a segment still
+        // holding a read of the scratch must be launched ahead of it. A segment
+        // that runs eagerly holds none: the copy goes on its launch stream —
+        // the capture stream, where `f`'s launches go too — and ending it here
+        // would cut the wave where a recorded one is not cut (see
+        // [`Self::upload_raw`]).
+        let (stream, _eager) = if self.capture.eager_segment_here() {
+            (self.cuda_stream(), None)
         } else {
-            self.pause_capture()?
+            (self.stream.clone(), self.pause_capture()?)
         };
         self.with_staging(bytes, |buf| {
             if bytes > 0 {
-                self.stream
-                    .memcpy_htod(src, &mut buf.slice_mut(..bytes))
-                    .w()?;
+                stream.memcpy_htod(src, &mut buf.slice_mut(..bytes)).w()?;
             }
             let (ptr, _guard) = buf.device_ptr(&self.stream);
             f(ptr)

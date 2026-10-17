@@ -281,12 +281,18 @@ as part of the live MoE dispatch, which also removed the routing readback.
    transfer with no compute and keeps the embed table off VRAM. The MoE expert routing is
    **not** read back: `bucketize` writes a routing summary into a mapped pinned ring, the
    expert-cache host threads read it asynchronously, and nothing on the device waits for
-   them to (`docs/moe_live_dispatch_design.md`). Everything else — comp-idx assembly,
-   select remaps, gather indices — stays on the GPU.
+   them to (`docs/moe_live_dispatch_design.md`). A second sanctioned transfer is the CPU
+   expert class (`docs/cpu_expert_compute.md`): the q8a128 rows of the assignments the
+   device gave the host pool go out to mapped host memory, and the pool's result rows
+   come back the same way. No host CUDA call reads or waits on either; the device waits
+   only for results it handed out work for, through a mapped word. Everything else —
+   comp-idx assembly, select remaps, gather indices — stays on the GPU.
 
 4. **Run as much as possible on the GPU.** No host-side compute that a kernel can do:
    no host counting-sort, no host set-union/dedup/remap, no host embedding gather. Host
-   code issues launches; it does not compute over per-token data.
+   code issues launches; it does not compute over per-token data. One exception: the CPU
+   expert pool computes the experts the device assigned to it in `moe_bucketize`, which
+   is where the split is decided.
 
 5. **Everything in prefill and decode runs fully batched.** One launch over all slots /
    all sessions, not a per-seq or per-token loop. Decode already batches select, gather,
@@ -354,6 +360,7 @@ of them.
 | prefill | `kernel_attention.rs:621` `g.to_vec1::<u32>()` | per-token GID readback (out-of-regime recall) | violation (deep-prompt fallback) — keep on GPU |
 | decode | `wave.rs:995-1046` `idx_flat` host build + `from_vec` | comp-idx assembly | build comp-idx on-device from the batched select's offsets |
 | both | `gallery.rs` `gather_corpus` spilled arm `to_device(Cpu)` | warm-tier re-heat | **NEEDED** (tiering) — keep |
+| MoE | `moe_cpu_export` + the down launch's CPU items | CPU-class rows out, result rows back, through mapped memory | **SANCTIONED** — the CPU expert class (`docs/cpu_expert_compute.md` §4); no host call waits on either |
 
 ---
 
@@ -364,6 +371,7 @@ of them.
 | MoE | `engine.rs` | counting-sort + `assignments` built on host then re-uploaded | **FIXED** — GPU `moe_bucketize` over the live expert table (`ExpertCache::forward_routed`); the host sort and the readback it rode on are both gone |
 | prefill | `wave.rs:1227-1267` (Host-select) | `union.sort/dedup` + `remap` HashMap + `idx_flat` host build + `from_vec` | extend `batched_causal_select_device` to the out-of-regime/HCA/SWA arms |
 | both | `wave.rs:377` `embed_rows` | `from_vec(Cpu)` + `index_select(Cpu)` | **SANCTIONED** — this is an index + host→device transfer, not compute; the embed table stays CPU-resident to save VRAM |
+| MoE | `expert_lre/cpu_pool` | the pool computes the experts bucketize assigned it | **SANCTIONED** — the split is decided on the device; the host computes only what it was handed (`docs/cpu_expert_compute.md` §4) |
 
 ---
 

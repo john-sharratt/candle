@@ -95,6 +95,7 @@ fn cold_launch(row: i32, spin_limit_ns: u64, release: impl FnOnce(*mut u32)) -> 
         ticket: 0,
         owner: OwnerCheck::default(),
         ahead: None,
+        cpu: None,
     };
     drop((_g1, _g2, _g3, _g4, _g5, _g6));
     moe_bucketize(
@@ -120,6 +121,14 @@ fn cold_launch(row: i32, spin_limit_ns: u64, release: impl FnOnce(*mut u32)) -> 
         ahead: 0,
         ahead_done: 0,
         spin_limit_ns,
+        cpu_done: 0,
+        cpu_seq: 0,
+        cpu_rows: 0,
+        cpu_dst_row: 0,
+        cpu_alive: 0,
+        cpu_tight_ns: 0,
+        cpu_wait: 0,
+        cold_wait: 0,
         workers: 8,
         row,
     };

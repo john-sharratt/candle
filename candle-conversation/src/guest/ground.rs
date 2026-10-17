@@ -35,7 +35,7 @@
 //! the drain has no restore step: there is no second mechanism to get wrong.
 
 use candle::Device;
-use candle_nn::kv_cache::{span_region_refusal, SpanClaims, SpanRegion};
+use candle_nn::kv_cache::{runs_from, span_region_refusal, RegionRun, SpanClaims, SpanRegion};
 
 /// One placed allocation: where it is and how much room it has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,23 +45,6 @@ pub struct Placement {
     pub len: usize,
 }
 
-/// A stretch of ground that really is contiguous.
-///
-/// Regions are ~16 MiB and a model's tensors are not: a Llama's embedding table
-/// is 323 MB in one piece, and every projection is several regions. So the
-/// allocator's unit cannot be the region — it has to be the **run**: a maximal
-/// stretch of claimed regions whose addresses are consecutive, inside which an
-/// allocation may span freely because there is no other tenant between them.
-///
-/// The KV side hands regions back in whatever order its free list holds them,
-/// so a claim is a *set* of addresses, not a range. Coalescing them into runs
-/// is what turns that set into somewhere a 323 MB tensor can live.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Run {
-    pub base: u64,
-    pub bytes: usize,
-}
-
 /// The placement arithmetic, over region base addresses alone.
 ///
 /// Split from [`GuestGround`] because it is the part with the invariant in it
@@ -69,9 +52,15 @@ pub struct Run {
 /// cross a run boundary, refuse rather than split, take the runs in address
 /// order — is a rule about addresses, and a test that needs a GPU to check an
 /// address is a test nobody runs.
+///
+/// Regions are ~16 MiB and a model's tensors are not: a Llama's embedding table
+/// is 323 MB in one piece, and every projection is several regions. So the unit
+/// placed into is the **run** ([`RegionRun`]): a maximal stretch of claimed
+/// regions whose addresses are consecutive, inside which an allocation may span
+/// freely because there is no other tenant between them.
 #[derive(Clone, Debug)]
 pub struct Bump {
-    runs: Vec<Run>,
+    runs: Vec<RegionRun>,
     /// The run placements are being cut from.
     run: usize,
     /// Bytes handed out of that run so far.
@@ -80,33 +69,6 @@ pub struct Bump {
     /// read until the drain ends: there is nothing to free individually, and a
     /// free list would be machinery for an event that never happens.
     offset: usize,
-}
-
-/// Coalesce claimed region bases into contiguous runs.
-///
-/// Sorted first, because the claim order is the free list's order and says
-/// nothing about adjacency — two regions claimed one after another may sit at
-/// either end of the span. Sorting is what makes "is the next one adjacent?"
-/// answerable at all.
-pub fn runs_from(mut bases: Vec<u64>, region_bytes: usize) -> Vec<Run> {
-    bases.sort_unstable();
-    bases.dedup();
-    let mut runs: Vec<Run> = Vec::new();
-    for base in bases {
-        match runs.last_mut() {
-            Some(r) if r.base + r.bytes as u64 == base => r.bytes += region_bytes,
-            _ => runs.push(Run {
-                base,
-                bytes: region_bytes,
-            }),
-        }
-    }
-    // Widest first. A model's largest tensor is placed first in practice, but
-    // ordering the runs means it does not have to be: the biggest ask meets the
-    // biggest stretch either way, and a load that would have failed on a
-    // fragmented claim succeeds on the same regions.
-    runs.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.base.cmp(&b.base)));
-    runs
 }
 
 impl Bump {
@@ -133,7 +95,7 @@ impl Bump {
         self.runs.iter().map(|r| r.bytes).max().unwrap_or(0)
     }
 
-    pub fn runs(&self) -> &[Run] {
+    pub fn runs(&self) -> &[RegionRun] {
         &self.runs
     }
 
@@ -295,7 +257,7 @@ impl GuestGround {
     /// it read-only once its weights are written, most usefully, so that a write
     /// landing here from anywhere else names itself at the FFI boundary instead
     /// of surfacing later as attention reading a weight.
-    pub fn runs(&self) -> &[Run] {
+    pub fn runs(&self) -> &[RegionRun] {
         self.bump.runs()
     }
 
@@ -410,29 +372,6 @@ mod tests {
     /// never promised one.
     fn scattered() -> Bump {
         Bump::new(vec![0x4000, 0x1000, 0x5000], 0x1000)
-    }
-
-    /// **The whole reason runs exist.** A model's tensors are far bigger than a
-    /// region — a Llama's embedding table is 323 MB in one piece — so an
-    /// allocator whose unit is the region cannot host any model at all. It
-    /// refused that table on the first real load, correctly and uselessly.
-    #[test]
-    fn adjacent_regions_coalesce_into_one_stretch() {
-        let runs = runs_from(vec![0x4000, 0x1000, 0x5000], 0x1000);
-        assert_eq!(
-            runs,
-            vec![
-                Run {
-                    base: 0x4000,
-                    bytes: 0x2000
-                },
-                Run {
-                    base: 0x1000,
-                    bytes: 0x1000
-                },
-            ],
-            "adjacent regions were not joined, so nothing larger than one can be placed"
-        );
     }
 
     /// An allocation spanning two *adjacent* regions is served, because there is
@@ -591,20 +530,6 @@ mod tests {
         // 0x200 placed.
         b.place(0x200, 1).unwrap();
         assert_eq!(b.free(), 0x1000 - 0x200);
-    }
-
-    /// A duplicate base would coalesce into a run twice as long as the ground
-    /// really is, and the second half of every allocation in it would land
-    /// outside the claim.
-    #[test]
-    fn a_repeated_base_does_not_invent_ground() {
-        assert_eq!(
-            runs_from(vec![0x4000, 0x4000], 0x1000),
-            vec![Run {
-                base: 0x4000,
-                bytes: 0x1000
-            }]
-        );
     }
 
     #[test]

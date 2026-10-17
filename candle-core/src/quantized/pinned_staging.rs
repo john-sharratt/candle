@@ -767,6 +767,9 @@ impl PinnedStagerInner {
             .unwrap_or_else(|| dev.compute_stream());
         let src = buf.as_slice();
         let mut _eager = None;
+        // The stream the copy is queued on: `stream`, unless an eager segment's
+        // launch stream (below).
+        let mut copy_on = stream.clone();
         let at = match self.resident.carve(buf.len()) {
             Carve::At(offset) => {
                 let slab = self
@@ -774,18 +777,22 @@ impl PinnedStagerInner {
                     .last()
                     .expect("a carve At names a held slab");
                 let at = slab.device_ptr(&stream).0 + offset as u64;
-                // **On the compute stream, a carve into a held slab cuts
-                // nothing.** Recording, the bytes are staged through the
+                // **On the forward's own streams, a carve into a held slab
+                // cuts nothing.** Recording, the bytes are staged through the
                 // wave's ring and their copy recorded ahead of the launches
-                // that read them; in a segment that runs eagerly, the copy
-                // below lands behind the launches already issued. Pausing in
-                // either cut the wave where the same wave without this copy
-                // is not cut, and every segment after it held other layers.
+                // that read them; in a segment that runs eagerly, the copy is
+                // queued on its launch stream — the capture stream the
+                // segment's launches are on — behind the launches already
+                // issued. Pausing in either cut the wave where the same wave
+                // without this copy is not cut, and every segment after it
+                // held other layers.
                 if self.explicit_stream.is_none() {
                     if dev.record_upload(at, src) {
                         return Ok(at);
                     }
-                    if !dev.eager_segment_here() {
+                    if dev.eager_segment_here() {
+                        copy_on = dev.cuda_stream();
+                    } else {
                         _eager = dev.pause_capture()?;
                     }
                 } else {
@@ -814,7 +821,7 @@ impl PinnedStagerInner {
                     at,
                     src.as_ptr() as *const std::ffi::c_void,
                     src.len(),
-                    stream.cu_stream(),
+                    copy_on.cu_stream(),
                 )
             }
             .result()

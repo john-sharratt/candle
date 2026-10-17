@@ -83,6 +83,7 @@ fn a_vram_entry_on_another_experts_slot_traps() -> Result<()> {
             slots: n_experts as u32,
         },
         ahead: None,
+        cpu: None,
     };
     moe_bucketize(
         &t,

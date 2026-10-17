@@ -27,7 +27,8 @@
 //! every daemon runs from — so from `D:\prog\candle` that is zend's workspace
 //! `D:\prog` and npcd's data folder `D:\prog\npcd-data`. `--config` defaults to
 //! `motherd.yaml` in the working directory; the shipped example is
-//! `motherd/motherd.yaml`.
+//! `motherd/motherd.yaml` (blackworld's), and `motherd/motherd.laptop.yaml` is
+//! the laptop's.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,7 +58,7 @@ struct Cli {
 }
 
 /// `motherd.yaml`.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
     host: HostArgs,
@@ -140,6 +141,24 @@ mod tests {
         assert!(c.host.group_key.is_some() && c.host.agent.is_some());
         assert_eq!(c.npcd.mind_repo.as_deref(), Some("battle-mind"));
         assert!(c.npcd.data.is_some());
+    }
+
+    /// The laptop's file is blackworld's with its own address and agent: the
+    /// same cluster and tenants, so a member started there joins the same way.
+    #[test]
+    fn the_laptop_configuration_parses() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let laptop = Config::load(&dir.join("motherd.laptop.yaml")).unwrap();
+        let shipped = Config::load(&dir.join("motherd.yaml")).unwrap();
+        assert_eq!(laptop.host.host, "192.168.0.237");
+        assert_eq!(
+            laptop.host.agent.as_deref(),
+            Some(Path::new("motherd/agent.laptop.yaml"))
+        );
+        assert_eq!(laptop.host.clusters, shipped.host.clusters);
+        assert_eq!(laptop.host.cluster_name, shipped.host.cluster_name);
+        assert_eq!(laptop.zend, shipped.zend);
+        assert_eq!(laptop.npcd, shipped.npcd);
     }
 
     /// A key no section knows is refused, naming the file — a misspelt

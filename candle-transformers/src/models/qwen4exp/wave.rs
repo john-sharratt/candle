@@ -74,15 +74,14 @@ use crate::models::batched_layer::{
 use crate::models::batched_model::{WaveGuard, WavePhase};
 #[cfg(feature = "cuda")]
 use crate::models::delta_net::cuda::build_wave_table;
-use crate::models::delta_net::StashSlot;
 use crate::models::delta_net::{
-    compact_stores, quantized_delta_net_layer_forward_spans, seq_spans, DeltaNetSeq,
-    ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore, SeqSpan,
-    StagedSnapshot, ZGate,
+    commit_stores, compact_stores, end_steps, quantized_delta_net_layer_forward_spans, seq_spans,
+    DeltaNetSeq, ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore, SeqSpan,
+    StagedSnapshot, ZGate, TIMELINE_ROWS,
 };
 use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
 use crate::models::expert_lre::{
-    WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
+    PipelineStats, WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
 };
 use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
@@ -94,8 +93,9 @@ use crate::models::profile::{pipeline_record, profile_now, span, ProfileSnapshot
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
-use crate::models::qwen35::spec::{compact_verify_stash, split_block_rows, VerifyStash};
+use crate::models::qwen35::spec::split_block_rows;
 use crate::models::residency_rows::residency_decode_rows;
+use crate::models::residual_rows::{CreepResidual, ResidualIn};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
 use crate::models::selection_strata::StrataTokens;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
@@ -104,9 +104,11 @@ use super::rope::flash_next_schedule;
 use crate::models::tensor_cat::TensorCat;
 use crate::models::verify_wave::{upload_plan_rows, VerifyPlan};
 use crate::models::wave_admit::admit_wave_kv;
-use crate::models::wave_driver::{assemble_wave_contexts, drive_wave, WaveGroups, WaveSweep};
+use crate::models::wave_driver::{
+    assemble_wave_contexts, drive_step, drive_wave, StepOutcome, StepSpec, SweepMode, WaveGroups,
+    WaveSweep,
+};
 use crate::models::wave_token_ids::host_token_ids;
-use crate::models::window_residuals::WindowResiduals;
 
 /// Seal `c`'s live tail into a **position-free** record: its completed rows and
 /// its open block, read back to the host.
@@ -178,9 +180,9 @@ pub struct Qwen4ExpBatched {
     /// The draft walk's two carried-residual buffers, sized for the widest
     /// cohort drafted so far. See [`Self::draft_carry`].
     pub(super) draft_carry: Mutex<Option<(Tensor, Tensor)>>,
-    /// The rewind stash and the kept rows between speculative steps, sized for
-    /// the widest cohort verified so far. See [`Self::verify_stash_for`].
-    pub(super) verify_stash: Mutex<Option<(VerifyStash, CaptureRows)>>,
+    /// The capture's kept-row buffers between speculative steps, sized for the
+    /// widest cohort verified so far. See [`Self::capture_rows_for`].
+    pub(super) parked_rows: Mutex<Option<CaptureRows>>,
     /// Sequences whose carried state was put there **deliberately** — by a view
     /// carve or by a resume — and which must therefore survive exactly one
     /// `offset == 0` reset in [`Self::ensure_seq_state`].
@@ -1275,12 +1277,16 @@ impl Qwen4ExpBatched {
     /// auxiliary blob ([`Self::export_aux_state`]) and the QSA index is rebuilt
     /// rather than stored — see this impl block's header for why the three
     /// classes are treated differently.
+    ///
+    /// A snapshot is taken at a turn's seal, which ends any prefill the
+    /// sequence was in, so its prefill scratch goes back here: the next long
+    /// span claims it again.
     pub fn export_recurrent(&self, seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
-        let map = self
+        let mut map = self
             .recurrent
-            .read()
+            .write()
             .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
-        let Some(store) = map.get(&seq) else {
+        let Some(store) = map.get_mut(&seq) else {
             // A held snapshot is this sequence's state as surely as a store
             // would be: read it back as it stands, without building one.
             let staged = self
@@ -1294,6 +1300,7 @@ impl Qwen4ExpBatched {
         // `export` refuses mid-wave itself; the seal runs outside the wave, so
         // reaching that error means the ordering broke.
         let layers = store.export()?;
+        store.release_scratch();
         Ok(Some((store.schedule_hash(), layers)))
     }
 
@@ -1514,18 +1521,9 @@ impl Qwen4ExpBatched {
     }
 
     /// Compact every arena the carried state lives in: each sequence's GDN state
-    /// ([`compact_stores`]), each QSA index cache ([`compact_index_caches`]), and
-    /// the speculative rewind stash ([`compact_verify_stash`]). The report sums all
-    /// three. Between forwards; the locks are held for the pass, which is what
-    /// keeps a wave from opening on a store, a cache or a stash mid-move.
-    ///
-    /// The stash's regions are counted into the recurrent-state figure rather than
-    /// its own, matching `RecurrentStateStore::arena_reserved_bytes` — it is the
-    /// buffer set that exists to rewind that state, and splitting the two across
-    /// reports would leave neither total reconcilable. They are read here rather
-    /// than inside `compact_stores`, because a `regions_released` that omitted the
-    /// stash would leave `reclaim_spare_ground` unrun on exactly the passes that
-    /// freed stash ground.
+    /// ([`compact_stores`]) and each QSA index cache ([`compact_index_caches`]).
+    /// The report sums both. Between forwards; the locks are held for the pass,
+    /// which is what keeps a wave from opening on a store or a cache mid-move.
     pub fn compact_recurrent(&self, max_moves: usize) -> Result<RecurrentCompaction> {
         let mut map = self
             .recurrent
@@ -1548,48 +1546,22 @@ impl Qwen4ExpBatched {
             &self.model.device,
             max_moves,
         )?;
-        // The stash is armed inside a verify's capture or parked between steps —
-        // the same buffers either way, and both are on this thread between
-        // forwards, where a move cannot race a capture or a replay.
-        let stash_before = arena_regions(&self.model.device, SlotTenant::RewindStash);
-        let stash = {
-            let mut g = self
-                .verify
-                .write()
-                .map_err(|_| candle::Error::Msg("verify lock poisoned".into()))?;
-            let mut parked = self
-                .verify_stash
-                .lock()
-                .map_err(|_| candle::Error::Msg("verify stash lock poisoned".into()))?;
-            let target = match g.as_mut() {
-                Some(cap) => Some(&mut cap.delta),
-                None => parked.as_mut().map(|(delta, _)| delta),
-            };
-            match target {
-                Some(delta) => compact_verify_stash(
-                    delta,
-                    &self.model.cfg.delta_net,
-                    &self.model.device,
-                    max_moves,
-                )?,
-                None => (0, 0),
-            }
-        };
-        let stash_after = arena_regions(&self.model.device, SlotTenant::RewindStash);
         Ok(RecurrentCompaction {
-            planned: gdn.planned + qsa.planned + stash.0,
-            moved: gdn.moved + qsa.moved + stash.1,
-            regions_before: gdn.regions_before + qsa.regions_before + stash_before,
-            regions_after: gdn.regions_after + qsa.regions_after + stash_after,
+            planned: gdn.planned + qsa.planned,
+            moved: gdn.moved + qsa.moved,
+            regions_before: gdn.regions_before + qsa.regions_before,
+            regions_after: gdn.regions_after + qsa.regions_after,
         })
     }
 
     /// What admitting **one** more sequence costs in carried state.
     ///
-    /// The GDN store alone, priced from the geometry
+    /// The GDN store, priced from the geometry
     /// ([`RecurrentStateStore::reserved_bytes_for`]) — every store this model
     /// builds has the same shape, so the config answers for all of them, and it
-    /// answers before the first one exists, which is when admission asks.
+    /// answers before the first one exists, which is when admission asks — and,
+    /// because a sequence arrives prefilling, its prefill scratch: one more slot
+    /// per DeltaNet layer, held until it decodes (`docs/deltanet_timeline.md` §7).
     ///
     /// **The index caches are deliberately not in it.** They are the other half
     /// of [`Self::recurrent_reserved_bytes`], but their key pages grow with the
@@ -1601,6 +1573,7 @@ impl Qwen4ExpBatched {
     pub fn recurrent_store_bytes(&self) -> usize {
         let cfg = &self.model.cfg;
         RecurrentStateStore::reserved_bytes_for(&cfg.layer_kinds, &cfg.delta_net)
+            + RecurrentStateStore::scratch_bytes_for(&cfg.layer_kinds, &cfg.delta_net)
     }
 
     pub fn new(model: Qwen4ExpGpu) -> Result<Self> {
@@ -1615,7 +1588,7 @@ impl Qwen4ExpBatched {
             seeds: RwLock::new(SeedStore::new()),
             seed_spares: RwLock::new(SeedStore::new()),
             draft_carry: Mutex::new(None),
-            verify_stash: Mutex::new(None),
+            parked_rows: Mutex::new(None),
             seeded: RwLock::new(HashSet::new()),
             pristine: RwLock::new(HashSet::new()),
             staged: RwLock::new(HashMap::new()),
@@ -1824,6 +1797,12 @@ impl Qwen4ExpBatched {
                         &self.model.device,
                     )?);
                 }
+            }
+            // A prefill span — longer than the timeline — writes its advanced
+            // state into the prefill scratch, claimed here with the other claims,
+            // before the tier stands; the commit exchanges it in.
+            if tokens - offset > TIMELINE_ROWS {
+                rec.get_mut(&seq).expect("ensured above").ensure_scratch()?;
             }
         }
         {
@@ -2438,22 +2417,11 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         if self.model.mtp.is_none() {
             return 0;
         }
-        // **Bounded by what its own rewind machinery costs**, not only by the
-        // ladder. A block of `k` proposals makes each sequence stash `k + 1`
-        // rows of post-projection operands for every DeltaNet layer, and this
-        // stack has 36 of them — so the stash is `width × (k + 1) × 36` rows,
-        // and the ladder prices only the throughput side of `k`.
-        //
-        // Clamping rather than refusing is what lets the ladder ask for depth
-        // at any width: a narrow cohort still gets the full budget, a wide one
-        // gets the deepest budget its stash can afford, and the wave does not
-        // fail. The stash is allocated between forwards, where nothing is left
-        // to concede to, so the alternative failure is a device OOM rather than
-        // a refusal. Speculation is lossless, so a shallower budget costs
-        // throughput and never a token.
-        QWEN38_FLASH_NEXT_DRAFT
-            .budget(width)
-            .min(self.affordable_draft_budget(width))
+        // Bounded by the timeline: a block of `k` drafts verifies `k + 1` rows,
+        // and a block deeper than each DeltaNet layer's timeline is refused
+        // (`begin_verify`). The rewind costs no memory a deeper block adds to,
+        // so depth is otherwise the ladder's alone.
+        QWEN38_FLASH_NEXT_DRAFT.budget(width).min(TIMELINE_ROWS - 1)
     }
 
     /// The checkpoint's measured drafted-token cost — see its ladder.
@@ -2477,9 +2445,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     ///
     /// The claim is about [`Self::truncate_sequences`]: that it restores all
     /// three recurrences exactly for the targets it accepts. It is not a claim
-    /// that every offset is rewindable — a replay covers the block it stashed
-    /// operands for and nothing else, and `truncate_sequences` refuses an
-    /// uncovered target itself, at the one place that knows.
+    /// that every offset is rewindable — a fold covers the block whose timeline
+    /// the verify wave wrote and nothing else, and `truncate_sequences` refuses
+    /// an uncovered target itself, at the one place that knows.
     fn can_rewind_speculative_block(&self) -> bool {
         true
     }
@@ -2521,11 +2489,23 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         }
         // A one-token block is a decode step; the driver routes those to
         // `plain` and never here. Refused rather than folded, because the
-        // stash's `len` would then disagree with the block.
+        // capture's `len` would then disagree with the block.
         if let Some(b) = blocks.iter().find(|b| b.len() < 2) {
             candle::bail!(
                 "qwen4exp verify: a {}-token block is a plain decode step, not a verify",
                 b.len()
+            );
+        }
+        // A block deeper than the DeltaNet timeline would run as a prefill span,
+        // which writes a whole advanced state and cannot keep only a prefix of
+        // it — so it could never be partially accepted. Refused where it is
+        // formed, never run.
+        if let Some(b) = blocks.iter().find(|b| b.len() > TIMELINE_ROWS) {
+            candle::bail!(
+                "qwen4exp verify: a {}-row block is deeper than the {TIMELINE_ROWS}-row \
+                 timeline — at most {} drafts a block",
+                b.len(),
+                TIMELINE_ROWS - 1
             );
         }
         // The model's device, not the host: these rows are cat'd with whatever
@@ -2534,28 +2514,29 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         let tokens: Vec<u32> = plain.iter().map(|&(_, t)| t).collect();
         let (dinputs, pinputs) = upload_plan_rows(&tokens, blocks)?;
 
-        // **Size the stash before the forward opens.** A wave's storage is
-        // claimed by `admit_wave_kv` and the transient tier placed against that
-        // claim, so the arena refuses a device allocation from inside the
-        // forward — which is what a stash allocated as the sweep reached each
-        // layer would be.
+        // **Size the capture's rows before the forward opens.** A wave's storage
+        // is claimed by `admit_wave_kv` and the transient tier placed against
+        // that claim, so the arena refuses a device allocation from inside the
+        // forward — which is what rows allocated as the sweep reached each layer
+        // would be.
         let cohort: Vec<(usize, usize)> = seqs
             .iter()
             .enumerate()
             .map(|(i, &s)| (s, blocks[i].len()))
             .collect();
         // A capture still armed from a step that never reached its rewind is
-        // released first, so its stash is the one this step reuses.
+        // released first — its timelines discarded, its rows the ones this step
+        // reuses.
         let stale = self
             .verify
             .write()
             .map_err(|_| candle::Error::Msg("verify lock poisoned".into()))?
             .take();
         if let Some(old) = stale {
-            self.park_verify_stash(old);
+            self.release_capture(old)?;
         }
         let rows: usize = cohort.iter().map(|&(_, n)| n).sum();
-        let cap = SpecCapture::new(&cohort, self.verify_stash_for(rows)?)?;
+        let cap = SpecCapture::new(&cohort, self.capture_rows_for(rows)?)?;
         let mut tokens: Vec<(usize, Vec<u32>)> = Vec::with_capacity(seqs.len());
         for (i, &s) in seqs.iter().enumerate() {
             tokens.push((s, blocks[i].clone()));
@@ -2605,14 +2586,17 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         split_block_rows(&logits, plain.len(), &lens)
     }
 
-    /// The wave rolled its own state back, so the capture names a rewind point
-    /// that no longer exists — left in place, a later truncate would replay
-    /// from it.
+    /// The step keeps none of its blocks: the capture goes, and with it every
+    /// armed sequence's pending timelines — each sequence's GDN state stands
+    /// exactly as the step entered it. Left in place, a later truncate would
+    /// fold rows nothing kept.
     fn abort_verify(&self, seqs: &[usize]) {
         let _ = seqs;
         let released = self.verify.write().ok().and_then(|mut g| g.take());
         if let Some(cap) = released {
-            self.park_verify_stash(cap);
+            if let Err(e) = self.release_capture(cap) {
+                tracing::error!("qwen4exp abort_verify: {e}");
+            }
         }
     }
 
@@ -2654,20 +2638,23 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         });
         if let Err(e) = opened {
             // No step is open, so none of the stores opened so far may keep one.
-            for s in &snap.seqs {
-                if let Some(store) = rec.get_mut(s) {
-                    store.end_step();
-                }
-            }
+            // No wave of the step ran, so none is owed a fold.
+            let mut opened: Vec<&mut RecurrentStateStore> = rec
+                .iter_mut()
+                .filter(|(s, _)| snap.seqs.contains(s))
+                .map(|(_, store)| store)
+                .collect();
+            end_steps(&mut opened)?;
             return Err(e);
         }
         *step = Some(snap);
         Ok(())
     }
 
-    /// Keep the step, or put every sequence it covered back where the step
+    /// Keep the step — folding, in one launch, the rows its commits owed the
+    /// recurrent stores — or put every sequence it covered back where the step
     /// found it: K/V on the KV layers of trunk layers `[0, committed)`, the
-    /// recurrent stores by swapping back what the step's waves committed, and
+    /// recurrent stores by dropping the rows the step's waves left pending, and
     /// the index, PLE history and seed from the snapshot. Every part is
     /// attempted; the first failure is returned.
     fn end_step(
@@ -2688,18 +2675,17 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         };
         {
             let mut rec = self.recurrent.write().map_err(|_| poisoned("recurrent"))?;
-            for s in &snap.seqs {
-                if let Some(store) = rec.get_mut(s) {
-                    if keep {
-                        store.end_step();
-                    } else {
-                        note(store.undo_step());
-                    }
-                }
+            let mut stores: Vec<&mut RecurrentStateStore> = rec
+                .iter_mut()
+                .filter(|(s, _)| snap.seqs.contains(s))
+                .map(|(_, store)| store)
+                .collect();
+            if keep {
+                return end_steps(&mut stores);
             }
-        }
-        if keep {
-            return Ok(());
+            for store in stores {
+                note(store.undo_step());
+            }
         }
         let (kv_start, kv_end) = self.kv_layer_range(0, committed.min(self.model.cfg.num_layers));
         note(crate::models::wave_admit::rollback_step_kv(
@@ -2866,13 +2852,11 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         }
         if let Ok(mut m) = self.recurrent.write() {
             m.remove(&seq);
-            // **The parked rewind stash goes with the last sequence.** It is
-            // kept across steps for the next verify, and carved from the
-            // reservation — so with nobody left to verify it would pin its
-            // regions for the life of the process, where no arena sweep can
-            // see them because they are not KV.
+            // **The parked capture rows go with the last sequence.** They are
+            // kept across steps for the next verify — so with nobody left to
+            // verify they would be held for the life of the process.
             if m.is_empty() {
-                if let Ok(mut parked) = self.verify_stash.lock() {
+                if let Ok(mut parked) = self.parked_rows.lock() {
                     *parked = None;
                 }
             }
@@ -2901,12 +2885,16 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Ok(())
     }
 
-    fn expert_stats(&self) -> Option<crate::models::expert_lre::PipelineStats> {
+    fn expert_stats(&self) -> Option<PipelineStats> {
         Some(self.model.experts.expert_stats())
     }
 
     fn expert_pipeline_dead(&self) -> bool {
         self.model.experts.pipeline_dead()
+    }
+
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        Some(self.model.experts.stats_shared())
     }
 
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
@@ -2974,7 +2962,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         glue_inputs: &[Tensor],
         layer_start: usize,
         layer_end: usize,
-        residual_in: Option<Tensor>,
+        residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult> {
         session.expect_rope_select(self.rope.select())?;
         drive_wave(
@@ -2988,8 +2976,26 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             glue_inputs,
             layer_start,
             layer_end,
-            residual_in,
+            residual,
         )
+    }
+
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome> {
+        session.expect_rope_select(self.rope.select())?;
+        drive_step(self, session, spec)
+    }
+
+    fn claim_residual(
+        &self,
+        session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual> {
+        let (width, dtype) = WaveSweep::residual_row(self, session)?;
+        CreepResidual::claim(&self.model.device, rows, width, dtype)
     }
 }
 
@@ -3008,6 +3014,12 @@ impl WaveSweep for Qwen4ExpBatched {
 
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
         <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
+    }
+
+    /// The Gated Residual's wide stream: `hc` streams of `hidden`, in F32.
+    fn residual_row(&self, _session: &BatchedInferenceSession) -> Result<(usize, DType)> {
+        let cfg = &self.model.cfg;
+        Ok((cfg.hc.count * cfg.hidden_size, DType::F32))
     }
 
     /// Caches are indexed by KV layer: three quarters of the trunk owns no
@@ -3053,13 +3065,15 @@ impl WaveSweep for Qwen4ExpBatched {
             layer_start,
             layer_end,
             x_in,
-            window,
+            mode,
             act_dtype: _,
             adapter,
         } = wave;
         if seq_ids.is_empty() {
             candle::bail!("qwen4exp wave: empty batch");
         }
+        let preparing = matches!(mode, SweepMode::Prepare);
+        let in_step = matches!(mode, SweepMode::InStep(_));
         let accept_in_place = session.accept_in_place();
         // Flash-Next runs its layers under the Gated Residual, which carries no
         // adapter plumbing, so `project_qkv_gated` is called with an empty
@@ -3097,8 +3111,13 @@ impl WaveSweep for Qwen4ExpBatched {
         // the wave that placed it. It also has to precede `ensure_seq_state`
         // below, which claims span regions for any store it creates — and a
         // claim under a standing tier is refused outright.
+        //
+        // A segment of a step skips this, the boundary move, the admit and the
+        // state claims below: the step ran all four for every segment before it
+        // placed the tier they share, and its forward span is live
+        // (`docs/wave_step.md` §2.1).
         #[cfg(feature = "cuda")]
-        if let Device::Cuda(d) = &m.device {
+        if let (Device::Cuda(d), false) = (&m.device, in_step) {
             end_wave_transient(&d.cuda_stream());
         }
         pipeline_record("q4e:pre:end_tier", t_pre);
@@ -3116,7 +3135,9 @@ impl WaveSweep for Qwen4ExpBatched {
         // blanket `BatchedModel` wave's phase 0; Flash-Next runs its own engine
         // rather than `BatchedModelCore`, so it does not inherit either.
         let t_pre = profile_now();
-        m.experts.reclaim_spare_ground();
+        if !in_step {
+            m.experts.reclaim_spare_ground();
+        }
         pipeline_record("q4e:pre:reclaim", t_pre);
 
         let n_glue = seq_ids.len() - n_decode - n_prefill;
@@ -3146,8 +3167,14 @@ impl WaveSweep for Qwen4ExpBatched {
         // session's STREAM layers — the draft head's layer is stepped by the
         // head's own pass, and `build_decode_metadata` scopes itself to the
         // stream for exactly that reason.
+        // A segment being prepared runs no layer, so it builds no header — but
+        // it claims the decode rows' write chunks the build would, here, before
+        // the step's span stands.
         let t_pre = profile_now();
-        let decode_headers = if n_decode > 0 {
+        if preparing {
+            session.ensure_decode_writes(&seq_ids[..n_decode])?;
+        }
+        let decode_headers = if n_decode > 0 && !preparing {
             let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
             DecodeHeaders::Decode { buf, stride }
         } else {
@@ -3169,7 +3196,9 @@ impl WaveSweep for Qwen4ExpBatched {
         // Admit: claim every KV chunk this wave writes, over the KV range.
         let t_pre = profile_now();
         let (kv_start, kv_end) = self.kv_layer_range(layer_start, layer_end);
-        admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
+        if !in_step {
+            admit_wave_kv(contexts, n_decode, n_prefill, kv_start, kv_end)?;
+        }
         pipeline_record("q4e:pre:admit", t_pre);
 
         // ── Carried state: ensure (reset at offset 0), open the GDN wave,
@@ -3198,8 +3227,10 @@ impl WaveSweep for Qwen4ExpBatched {
         // moves the frontier under a tier already standing on it (hot-path
         // invariant 7).
         let t_pre = profile_now();
-        for ((&seq, &off), &q) in seq_ids.iter().zip(&offsets).zip(&q_lens) {
-            self.ensure_seq_state(seq, off, off + q, layer_start)?;
+        if !in_step {
+            for ((&seq, &off), &q) in seq_ids.iter().zip(&offsets).zip(&q_lens) {
+                self.ensure_seq_state(seq, off, off + q, layer_start)?;
+            }
         }
         pipeline_record("q4e:pre:ensure_state", t_pre);
 
@@ -3209,9 +3240,12 @@ impl WaveSweep for Qwen4ExpBatched {
         // it, and before `begin_forward` below, because the placement may buy
         // ground from the weight side and `set_weight_floor` refuses while a
         // forward is open.
+        //
+        // A segment being prepared returns its price for the step to place; a
+        // segment running in the step places nothing — the step's tier stands.
         let t_pre = profile_now();
         #[cfg(feature = "cuda")]
-        if total_rows > 0 {
+        if total_rows > 0 && !in_step {
             if let Device::Cuda(d) = &m.device {
                 let geometry = self.wave_geometry(tier_act_dtype);
                 let plan = WavePlan::new(geometry);
@@ -3237,22 +3271,6 @@ impl WaveSweep for Qwen4ExpBatched {
                     .ok()
                     .and_then(|g| g.as_ref().map(|c| c.seqs.keys().copied().collect()))
                     .unwrap_or_default();
-                // **The rewind this wave may owe.** `replay_accepted_prefixes`
-                // — the same one the hybrid runs — carves its conv, scan and
-                // span table off THIS Attention span at accept time, and these
-                // two units are what price that chain. Left at zero it prices to
-                // nothing and the span is short by the whole chain. Rows are the
-                // stash's CAPACITY, not this cohort's total: the buffers only
-                // grow and the replay's kernels run over every stash row.
-                let staged: Option<(usize, usize)> = self
-                    .verify
-                    .read()
-                    .ok()
-                    .and_then(|g| {
-                        g.as_ref()
-                            .map(|c| c.delta.capacity().map(|rows| (rows, c.delta.spans.len())))
-                    })
-                    .transpose()?;
                 let scored_prefill: usize = pre_q
                     .iter()
                     .enumerate()
@@ -3276,8 +3294,6 @@ impl WaveSweep for Qwen4ExpBatched {
                     // A one-row prefill group takes the decode kernels, so it
                     // carves no span-table entry and, alone, no scan transient.
                     prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
-                    staged_rows: staged.map_or(0, |(rows, _)| rows),
-                    staged_spans: staged.map_or(0, |(_, spans)| spans),
                     // The caller's accept walk selects on the head's span only
                     // when it reads the logits there.
                     accept_rows: if accept_in_place { scored_rows } else { 0 },
@@ -3305,6 +3321,9 @@ impl WaveSweep for Qwen4ExpBatched {
                     plan.phase_bytes(LayerPhase::Ffn, width),
                     plan.phase_bytes(LayerPhase::Forward, width),
                 ];
+                if preparing {
+                    return Ok((WavePhase::Priced(per_phase), None));
+                }
                 // The refusal names the partition; the wave it was refused for
                 // is what says which of the wave's parts to look at.
                 plan_wave_transient(&d.cuda_stream(), per_phase).map_err(|e| {
@@ -3313,6 +3332,9 @@ impl WaveSweep for Qwen4ExpBatched {
             }
         }
         pipeline_record("q4e:pre:plan_tier", t_pre);
+        if preparing {
+            return Ok((WavePhase::Priced([0; 3]), None));
+        }
 
         // From here the forward owns the span partition: the tier is placed and
         // must not move under it.
@@ -3331,13 +3353,18 @@ impl WaveSweep for Qwen4ExpBatched {
         // `WAVE_FORWARD_BYTES` describes. Its ticket travels instead of the
         // guard, because the builders are deep in the sweep and a `Copy`
         // coordinate reaches them without changing any signature's lifetime.
+        // A segment of a step carves from the step's span, which outlives it.
         #[cfg(feature = "cuda")]
-        let fwd_span = match &m.device {
-            Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
+        let fwd_span = match (&m.device, mode) {
+            (_, SweepMode::InStep(_)) => None,
+            (Device::Cuda(d), _) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
             _ => None,
         };
         #[cfg(feature = "cuda")]
-        let fwd_ticket = fwd_span.as_ref().map(|g| g.ticket());
+        let fwd_ticket = match mode {
+            SweepMode::InStep(ticket) => ticket,
+            _ => fwd_span.as_ref().map(|g| g.ticket()),
+        };
         #[cfg(not(feature = "cuda"))]
         let fwd_ticket: Option<candle::cuda_backend::wave_provenance::WaveTicket> = None;
 
@@ -3424,7 +3451,6 @@ impl WaveSweep for Qwen4ExpBatched {
             (total_rows, pre_rows),
             (layer_start, layer_end),
             x_in,
-            window,
             (decode_headers, prefill_headers),
             generation,
             eps,
@@ -3436,29 +3462,55 @@ impl WaveSweep for Qwen4ExpBatched {
         // Close the wave: commit on success, rewind everything on failure. A
         // rollback that itself fails leaves the sequence's state unaccounted
         // — report both, exactly as the driver's KV rollback does.
-        {
+        //
+        // The close folds every short span a sequence outside the armed verify
+        // cohort ran — all of its rows, in ONE launch over every such sequence
+        // and layer — then commits (`commit_stores`). The armed cohort's layers
+        // stay pending for the rewind, which alone knows how many rows each
+        // keeps. A close that fails commits nothing, so the wave is failed and
+        // rolled back like any other, carried state and all.
+        let swept = {
+            let armed: Vec<usize> = self
+                .verify
+                .read()
+                .map_err(|_| candle::Error::Msg("verify lock poisoned".into()))?
+                .as_ref()
+                .map(|c| c.seqs.keys().copied().collect())
+                .unwrap_or_default();
             let mut rec = self
                 .recurrent
                 .write()
                 .map_err(|_| candle::Error::Msg("recurrent lock poisoned".into()))?;
-            for &s in seq_ids {
-                if let Some(store) = rec.get_mut(&s) {
-                    if swept.is_ok() {
-                        store.commit_wave();
-                    } else if let Err(rb) = store.rollback_wave() {
-                        let e = swept
-                            .as_ref()
-                            .err()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "unknown".into());
+            let closed = match &swept {
+                Ok(_) => {
+                    let mut stores: Vec<(&mut RecurrentStateStore, bool)> = rec
+                        .iter_mut()
+                        .filter(|(s, _)| seq_ids.contains(s))
+                        .map(|(s, store)| (store, !armed.contains(s)))
+                        .collect();
+                    commit_stores(&mut stores)
+                }
+                Err(_) => Ok(()),
+            };
+            let swept = match closed {
+                Ok(()) => swept,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = &swept {
+                for (s, store) in rec.iter_mut() {
+                    if !seq_ids.contains(s) {
+                        continue;
+                    }
+                    if let Err(rb) = store.rollback_wave() {
                         candle::bail!(
-                            "wave failed ({e}) and sequence {s}'s recurrent rollback \
-                             also failed ({rb})"
+                            "wave failed ({e}) and sequence {s}'s recurrent rollback also \
+                             failed ({rb})"
                         );
                     }
                 }
             }
-        }
+            swept
+        };
         if swept.is_err() {
             let mut ple = self
                 .ple
@@ -3541,15 +3593,10 @@ impl WaveSweep for Qwen4ExpBatched {
         // head GEMM run on its ticket), so a wave that reached the head hands
         // the span's guard back with them: `WaveResult` keeps the span alive
         // while the caller reads, instead of the head copying the `[R, vocab]`
-        // block off it first.
+        // block off it first. A window that stopped short hands its residual
+        // back on the same span, and the guard goes with it for the same reason.
         #[cfg(feature = "cuda")]
-        let swept = swept.map(|(phase, guard)| {
-            if matches!(phase, WavePhase::Logits(_)) {
-                (phase, guard.or(fwd_span))
-            } else {
-                (phase, guard)
-            }
-        });
+        let swept = swept.map(|(phase, guard)| (phase, guard.or(fwd_span)));
         swept
     }
 }
@@ -3629,8 +3676,7 @@ impl Qwen4ExpBatched {
         offs: (&[usize], &[usize], &[usize], &[usize]),
         rows: (usize, usize),
         range: (usize, usize),
-        x_in: Option<TensorCat>,
-        window: &WindowResiduals,
+        x_in: Option<ResidualIn<'_>>,
         headers: (DecodeHeaders, DecodeHeaders),
         generation: &candle::quantized::pinned_staging::Generation,
         eps: f64,
@@ -3662,22 +3708,15 @@ impl Qwen4ExpBatched {
         // One launch fills both: the fresh residual is the embedding repeated
         // across the `hc` streams, written by the gather itself, and the head
         // reads the bare rows. Both are fully written (invariant 6), and both
-        // are on the forward span whenever the sweep reaches the head
-        // (`WaveBuffer::HyperResidual`, `WaveBuffer::HeadRowEmbeds`) — see the
-        // residual below for the window that does not.
+        // are on the forward span (`WaveBuffer::HyperResidual`,
+        // `WaveBuffer::HeadRowEmbeds`).
         let fresh = x_in.is_none();
         let reaches_head = layer_end == num_layers;
         let head_embeds = reaches_head && m.mtp.is_some();
         let res_dims = (total_rows, hc, n_embd);
-        // The residual's home: the forward span for a sweep that reaches the
-        // head, a held window buffer for one that hands it on.
-        let residual_buffer = || -> Result<Tensor> {
-            if reaches_head {
-                wave_empty_ticketed(res_dims, DType::F32, dev, fwd_ticket)
-            } else {
-                window.take(res_dims, DType::F32, dev)
-            }
-        };
+        // The residual's home, fresh or resumed: the forward span, which
+        // outlives every layer phase of the sweep.
+        let residual_buffer = || wave_empty_ticketed(res_dims, DType::F32, dev, fwd_ticket);
         let entry = if fresh {
             Some(residual_buffer()?)
         } else {
@@ -3717,24 +3756,21 @@ impl Qwen4ExpBatched {
         // **One buffer for the whole forward, updated in place.** `hc_combine`
         // adds each block's scatter into `res` where it stands, so the wide
         // `[rows, hc, hidden]` stream is this one buffer, not one per combine.
-        // It crosses every layer phase's reset, so a sweep that reaches the
-        // head carves it from the forward span, which outlives them all. A
-        // window that stops short hands it back as `WavePhase::Residual` for
-        // the next wave to resume from — past this span's reset — so there it
-        // is one of the session's held window buffers.
+        // It crosses every layer phase's reset, so it is carved from the
+        // forward span, which outlives them all. A window that stops short
+        // hands it back as `WavePhase::Residual`, still on the span, and the
+        // driver moves it on (`docs/wave_step.md`).
         //
-        // **A resumed residual is copied first.** `x_in` is the caller's tensor:
-        // the residual a previous window handed back to be persisted, which the
-        // driver passes through without a copy. Combining into it in place would
-        // rewrite the persisted state under its owner — and a wave that fails
-        // part-way would leave it advanced by the layers that did run. One copy
-        // per resumed forward is the price; the fresh path writes its gathered
-        // rows straight into a buffer it owns.
+        // **A resumed residual is gathered in, never combined into where it
+        // lies.** What `x_in` names is the caller's: a creep's committed half,
+        // the last segment's rows. Combining into it would rewrite it under its
+        // owner, and a wave that failed part-way would leave it advanced by the
+        // layers that did run. The gather lands the rows in this forward's own
+        // buffer in its row order, which is the copy a resume costs.
         let mut res = match x_in {
-            Some(t) => {
-                let src = t.to_tensor().reshape(res_dims)?;
+            Some(resume) => {
                 let dst = residual_buffer()?;
-                dst.slice_set(&src, 0, 0)?;
+                resume.gather_into(&dst)?;
                 dst
             }
             None => entry.expect("allocated whenever the residual is fresh"),
@@ -3818,11 +3854,11 @@ impl Qwen4ExpBatched {
         let cap_map: &mut Option<SpecCapture> = &mut verify_guard;
 
         // The decode pointer table for the whole sweep — every DeltaNet layer's
-        // state and tail addresses for every decode sequence, ONE host upload
-        // here, before the first layer's launches, where the queue is still
-        // empty. Each DeltaNet layer takes its slice, so no layer uploads a
+        // tail, state and timeline addresses for every decode sequence, ONE host
+        // upload here, before the first layer's launches, where the queue is
+        // still empty. Each DeltaNet layer takes its slice, so no layer uploads a
         // table of its own behind the launches already queued. Valid for this
-        // forward only: `commit_wave` exchanges the halves after the sweep.
+        // forward only: compaction may move a slot between forwards.
         #[cfg(feature = "cuda")]
         let dn_table = {
             let at: HashMap<usize, usize> =
@@ -3937,7 +3973,7 @@ impl Qwen4ExpBatched {
                 // Every sequence's rows in one pass — one table gather, the
                 // injection and the conv over the whole wave, the residual
                 // updated in place of a per-sequence concatenation. A verifying
-                // span stashes the rows it appends to the conv history; every
+                // span captures the rows it appends to the conv history; every
                 // other span captures nothing.
                 let at: HashMap<usize, usize> =
                     spans.iter().enumerate().map(|(i, s)| (s.seq, i)).collect();
@@ -3985,7 +4021,7 @@ impl Qwen4ExpBatched {
                 drop(ple_spans);
                 // Kept before the phase closes: the captured rows are views on
                 // it, copied into the cohort's kept-row buffer at each
-                // sequence's stash row.
+                // sequence's capture row.
                 if let Some(c) = cap_map.as_mut() {
                     let SpecCapture {
                         seqs, rows: kept, ..
@@ -4054,14 +4090,6 @@ impl Qwen4ExpBatched {
             // its own rows of the residual.
             let y: Option<LiveTensor<'_>> = match &layer.mix {
                 GpuLayerMix::DeltaNet(w) => {
-                    // This layer's ordinal among the recurrent layers — the
-                    // axis the stash is indexed on, and the same order
-                    // `recurrent_layer_indices` yields, because both walk the
-                    // trunk forwards.
-                    let ord = cfg.layer_kinds[..li]
-                        .iter()
-                        .filter(|k| matches!(k, LayerKind::DeltaNet))
-                        .count();
                     let mut seqs: Vec<DeltaNetSeq<'_>> = Vec::with_capacity(spans.len());
                     for span in &spans {
                         let store =
@@ -4070,22 +4098,16 @@ impl Qwen4ExpBatched {
                         // driver refuses duplicates), so the mutable borrows
                         // are disjoint.
                         let store = unsafe { &mut *store };
-                        let (state, out) = store.layer_state_pair_mut(li)?;
-                        // A verifying span stashes this layer's post-projection
-                        // operands so the accepted prefix can be replayed
-                        // (`super::spec`); every other span stashes nothing.
-                        let stash = cap_map.as_ref().and_then(|c| {
-                            c.delta.span_of(span.seq).map(|s| StashSlot {
-                                ops: &c.delta.layers[ord],
-                                row: s.row,
-                            })
-                        });
+                        // The live state the span reads, and where its work
+                        // lands: the layer's timeline for a short span — a
+                        // verify block's included, which the rewind folds — or
+                        // the prefill scratch for a long one.
+                        let (state, write) = store.layer_span_mut(li, span.len)?;
                         seqs.push(DeltaNetSeq {
                             start: span.start,
                             len: span.len,
                             state,
-                            out,
-                            stash,
+                            write,
                         });
                     }
                     let acts = match h_q8 {
@@ -4123,13 +4145,6 @@ impl Qwen4ExpBatched {
                         None,
                     )?;
                     drop(seqs);
-                    // Allocated is not written: a sweep split into layer windows
-                    // fills only its own ordinals, and a replay from a
-                    // half-written stash advances some layers and not others.
-                    // Recorded here, where the layer has actually run.
-                    if let Some(c) = cap_map.as_mut() {
-                        c.delta.filled[ord] = true;
-                    }
                     Some(mixed)
                 }
                 GpuLayerMix::Attention {

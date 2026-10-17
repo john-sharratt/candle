@@ -174,6 +174,11 @@ pub use candle_transformers::generation::Sampling;
 pub use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
 };
+/// The CPU expert split's knobs and measured costs, for a daemon's config and
+/// its admin route (`docs/cpu_expert_compute.md` §5.3.1).
+pub use candle_transformers::models::expert_lre::cpu_pool::params as expert_split;
+/// Layers the CPU expert pool has served in this process.
+pub use candle_transformers::models::expert_lre::cpu_pool::service::served_total as expert_split_served;
 /// The last forward's walk through the routed layers, for a daemon's telemetry
 /// page — recorded by the expert pipeline thread, read here with no engine lock.
 pub use candle_transformers::models::expert_lre::layer_trace;

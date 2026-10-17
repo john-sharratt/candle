@@ -1,13 +1,13 @@
 use super::admission::{admit_quantum, budget_notches, evidence_ticks_for, ThrottleReason};
 use super::creep_slice::next_layer_row_cost;
 use super::prefill::{VramPhase, LOAD_TARGET};
-use super::vram_bands::vram_bands;
 use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use candle::DeviceLocation;
 use candle_nn::kv_cache::{
     is_tier_refusal, region_stats, set_kv_free_target, set_prompts_waiting, span_partition,
+    vram_bands,
 };
 use std::process::exit;
 use std::sync::atomic::AtomicU64;

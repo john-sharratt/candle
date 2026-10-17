@@ -36,6 +36,9 @@
 // Set in a promotion log entry's expert field for a read-ahead claim; the
 // expert is the low bits, the row the target row, not the launch's.
 #define AHEAD_FLAG 0x4000u
+// Set with AHEAD_FLAG for a claim that promotes an expert the previous launch's
+// CPU pool served (`promotion_walk`'s carry) rather than a predicted one.
+#define CARRY_FLAG 0x2000u
 
 // Bytes of piece `c` of an item of `bytes`: each piece a whole number of
 // 16-byte units, the last piece whatever remains.

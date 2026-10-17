@@ -14,11 +14,22 @@
 //! The handle's fixed workspace is made with it: without one, cuBLAS allocates
 //! its workspace on the stream per call, which a wave capture records as a
 //! graph allocation and refuses; with one, a GEMM is kernels only.
+//!
+//! **A thread's handles are destroyed by a live thread, not by their own as it
+//! ends.** A thread's locals are dropped as it exits, which on Windows runs
+//! beside the CUDA driver's own teardown of that thread: a driver call made
+//! there fails with `CUDA_ERROR_NOT_INITIALIZED`, and cudarc records a failure
+//! in a `Drop` on the context, where the next `bind_to_thread` on any thread
+//! returns it. A test whose thread had run a GEMM left exactly that behind, and
+//! the next test failed to make its device handle. So an ending thread moves
+//! its handles to [`ORPHANS`], and the next thread to make a handle destroys
+//! them.
 
 use std::cell::RefCell;
+use std::mem::take;
 use std::ops::Deref;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaStream, DevicePtrMut};
@@ -49,12 +60,40 @@ impl ThreadBlas {
 
 impl Drop for ThreadBlas {
     fn drop(&mut self) {
-        // Destroying synchronises like creating does; the thread is ending, so
-        // waiting for a recording elsewhere to finish costs nothing it needs.
+        // Destroying synchronises like creating does, so it waits for any
+        // recording to end — on a thread making its own first handle, which
+        // waits for the same thing anyway.
         if let Some(blas) = self.blas.take() {
             let _ = without_recording(|quiet| quiet.destroy_blas(blas));
         }
     }
+}
+
+/// Handles whose threads have ended, for the next thread that makes a handle
+/// to destroy — see the module documentation.
+static ORPHANS: Mutex<Vec<ThreadBlas>> = Mutex::new(Vec::new());
+
+/// This thread's handles, by context. Dropped as the thread ends, it hands each
+/// to [`ORPHANS`] instead of destroying it.
+struct Handles(Vec<(usize, Rc<ThreadBlas>)>);
+
+impl Drop for Handles {
+    fn drop(&mut self) {
+        let mut orphans = ORPHANS.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, held) in take(&mut self.0) {
+            // A `BlasHandle` is not `Send` and lives on this thread's stack, so
+            // by the time its locals go, the list holds the last reference.
+            if let Ok(blas) = Rc::try_unwrap(held) {
+                orphans.push(blas);
+            }
+        }
+    }
+}
+
+/// Destroy every handle an ended thread left, from this live one.
+fn destroy_orphans() {
+    let orphans = take(&mut *ORPHANS.lock().unwrap_or_else(|p| p.into_inner()));
+    drop(orphans);
 }
 
 /// This thread's handle, borrowed. Not `Send`: it is this thread's alone.
@@ -78,13 +117,13 @@ impl Deref for BlasHandle {
 
 thread_local! {
     /// This thread's handles, by context.
-    static HANDLES: RefCell<Vec<(usize, Rc<ThreadBlas>)>> = const { RefCell::new(Vec::new()) };
+    static HANDLES: RefCell<Handles> = const { RefCell::new(Handles(Vec::new())) };
 }
 
 /// Whether this thread already holds a handle on `stream`'s context.
 pub(crate) fn has_handle(stream: &Arc<CudaStream>) -> bool {
     let key = Arc::as_ptr(stream.context()) as usize;
-    HANDLES.with(|h| h.borrow().iter().any(|(k, _)| *k == key))
+    HANDLES.with(|h| h.borrow().0.iter().any(|(k, _)| *k == key))
 }
 
 /// This thread's handle on `stream`'s context, made on first use.
@@ -96,12 +135,14 @@ pub(crate) fn handle_for(stream: &Arc<CudaStream>) -> Result<BlasHandle> {
     let key = Arc::as_ptr(stream.context()) as usize;
     if let Some(found) = HANDLES.with(|h| {
         h.borrow()
+            .0
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, t)| t.clone())
     }) {
         return Ok(BlasHandle(found));
     }
+    destroy_orphans();
     let blas = without_recording(|quiet| quiet.create_blas(stream))?.w()?;
     // SAFETY: cuBLAS writes its workspace before reading it.
     let mut workspace = unsafe { Held::<u8>::alloc_on(stream, BLAS_WORKSPACE_BYTES) }?;
@@ -124,6 +165,38 @@ pub(crate) fn handle_for(stream: &Arc<CudaStream>) -> Result<BlasHandle> {
         blas: Some(blas),
         workspace,
     });
-    HANDLES.with(|h| h.borrow_mut().push((key, made.clone())));
+    HANDLES.with(|h| h.borrow_mut().0.push((key, made.clone())));
     Ok(BlasHandle(made))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendDevice;
+    use crate::cuda_backend::CudaDevice;
+    use std::thread;
+
+    /// **A thread that made a handle and ended leaves no error on the
+    /// context**, and the next thread to make one destroys it. Destroyed by the
+    /// ending thread itself, its workspace's free failed inside the driver's
+    /// thread teardown and was recorded on the context, and the next
+    /// `bind_to_thread` anywhere — a device handle made for the next test —
+    /// failed with `CUDA_ERROR_NOT_INITIALIZED`.
+    #[test]
+    fn an_ended_threads_handle_leaves_the_context_clean() -> Result<()> {
+        let dev = CudaDevice::new(0)?;
+        let stream = dev.compute_stream();
+        let theirs = stream.clone();
+        thread::spawn(move || handle_for(&theirs).map(|_| ()))
+            .join()
+            .expect("the handle's thread panicked")?;
+        stream.context().check_err().w()?;
+        CudaDevice::new(0)?;
+        // A thread making its first handle destroys what the ended one left.
+        thread::spawn(move || handle_for(&stream).map(|_| ()))
+            .join()
+            .expect("the second thread panicked")?;
+        dev.compute_stream().context().check_err().w()?;
+        Ok(())
+    }
 }

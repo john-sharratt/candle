@@ -39,7 +39,9 @@ struct DecodeRanges {
 #define PROMO_SKIP 0xFFFFu
 
 // The parameter list both kernels take, so the launcher hands either the same
-// arguments. Documented at `moe_bucketize_kernel` in `moe_bucketize.cu`.
+// arguments. Documented at `moe_bucketize_kernel` in `moe_bucketize.cu`; the
+// CPU class's two (`cpu`, `cpu_out`) are defined in `moe_bucketize_cpu.cuh`,
+// which every kernel this macro expands in includes.
 #define MOE_BUCKETIZE_KERNEL_PARAMS                                                           \
     const uint32_t* __restrict__ topk_ids, const int n_tokens, const int k,                   \
     const int n_experts, const int tile_w, uint32_t* __restrict__ tok_ids,                    \
@@ -61,7 +63,8 @@ struct DecodeRanges {
     uint64_t* started_rows, const uint64_t ticket, const uint32_t* ahead_window,              \
     const uint32_t* ahead_depth, const uint32_t* ahead_n, const uint32_t* ahead_list,         \
     const uint64_t* ahead_src, const uint32_t ahead_cap, const int32_t rows,                  \
-    const uint64_t* row_layout, uint64_t* ahead_items, uint32_t* ahead_done
+    const uint64_t* row_layout, uint64_t* ahead_items, uint32_t* ahead_done,                  \
+    const int ahead_predict, const CpuSplit cpu, const CpuOut cpu_out
 
 // The tile order's rank of each class: pinned, then cold, then VRAM.
 __device__ __forceinline__ int class_rank(uint8_t cls) {

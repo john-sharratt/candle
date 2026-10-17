@@ -12,8 +12,9 @@
 //!    victims are ranked by [`ExpertCacheInner::rank_victims`] in one scan,
 //!    scored at the row the pipeline is serving, and a claim — a demand miss
 //!    or a read-ahead copy — takes the next one. Eviction is a retarget (the
-//!    cold pack holds every expert; the warm tier is immutable), so there is no
-//!    copy to hide and nothing to do ahead of time.
+//!    cold pack holds every expert; a promotion copies a host copy and leaves
+//!    it in place), so there is no copy to hide and nothing to do ahead of
+//!    time.
 //! 2. **Behind the wave first, fading** — each resident's frequency is scaled
 //!    by how far behind the wave its layer lies ([`behind_protection`]): L−1
 //!    by [`FADE_FLOOR`], each layer further back a little more, wrapping round
@@ -52,13 +53,13 @@
 //! experts decode keeps coming back to.
 
 use super::regret::class_index;
+use super::resident::HostBacked;
 #[cfg(feature = "tensor-assert")]
 use super::slot_owners::SlotOwners;
 use super::types::ExpertSlot;
 use candle_nn::kv_cache::WeightZone;
 use std::cmp::Ordering;
 use std::collections::HashMap;
-#[cfg(feature = "tensor-assert")]
 use std::sync::Arc;
 
 /// Number of early MoE layers whose experts are never evicted.
@@ -369,13 +370,11 @@ pub struct ExpertCacheInner {
     /// nowhere to reload from. The zone's floor ([`minimum_resident_slots`]) is
     /// what guarantees the cache can always afford it.
     pub(crate) pinned_layers: usize,
-    /// Flat `layer * experts_per_layer + expert` → does a warm (pinned host)
-    /// copy of this expert exist?
-    ///
-    /// Written once when the warm tier is filled and never again — the tier is
-    /// immutable, which is what lets the eviction policy treat this as a
-    /// property of the expert rather than something to re-check.
-    pub(crate) warm_backed: Vec<bool>,
+    /// Per `(layer, expert)`: does a host copy hold it that a reload needs no
+    /// pack read for — a resident pinned slot or a pageable warm copy
+    /// (`resident::HostBacked`)? Shared with the stager, which labels the
+    /// pinned slots: written at the startup fill and at pass boundaries.
+    pub(crate) warm_backed: Arc<HostBacked>,
     /// Flat `layer * experts_per_layer + expert` → did this expert's row route
     /// it on the row's last visit? Rewritten per row as each is served
     /// ([`Self::mark_visit`]); the recency half of [`EVICTION_PASSES`].
@@ -409,7 +408,7 @@ impl ExpertCacheInner {
             num_moe_layers,
             experts_per_layer,
             pinned_layers: pinned_layer_count(num_moe_layers),
-            warm_backed: vec![false; num_moe_layers * experts_per_layer],
+            warm_backed: Arc::new(HostBacked::new(num_moe_layers, experts_per_layer)),
             hit_last: vec![false; num_moe_layers * experts_per_layer],
             passes: EVICTION_PASSES,
             #[cfg(feature = "tensor-assert")]
@@ -437,16 +436,13 @@ impl ExpertCacheInner {
         }
     }
 
-    /// Record which experts the warm tier holds, once its fill is decided.
-    ///
-    /// Called before the first forward and never again.
+    /// Record which experts the warm tier holds — each a resident pinned slot
+    /// or a pageable copy — once the startup fill is decided; the stager keeps
+    /// it current from then on.
     pub(crate) fn set_warm_backed(&mut self, membership: &[(usize, usize)]) {
-        self.warm_backed.iter_mut().for_each(|b| *b = false);
+        self.warm_backed.clear();
         for &(layer, expert) in membership {
-            let idx = layer * self.experts_per_layer + expert;
-            if idx < self.warm_backed.len() {
-                self.warm_backed[idx] = true;
-            }
+            self.warm_backed.set(layer, expert, true);
         }
     }
 
@@ -493,8 +489,7 @@ impl ExpertCacheInner {
     /// [`ReloadTier`] for why eviction passes split by tier.
     #[inline]
     fn reload_tier(&self, layer: usize, expert: usize) -> ReloadTier {
-        let idx = layer * self.experts_per_layer + expert;
-        if self.warm_backed.get(idx).copied().unwrap_or(false) {
+        if self.warm_backed.get(layer, expert) {
             ReloadTier::Warm
         } else {
             ReloadTier::Nvme

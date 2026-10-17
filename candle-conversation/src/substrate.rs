@@ -425,6 +425,10 @@ pub struct Substrate {
     /// qualifies. In-memory only — the flag is re-derived on load, never a
     /// redo-log marker.
     transient_timelines: HashSet<TimelineId>,
+    /// Timelines that keep their KV but are **never resumed**, so they keep no
+    /// recurrent snapshot — see [`Self::mark_timeline_unresumed`]. In-memory
+    /// only: what made the mark durable is the empty snapshot written with it.
+    unresumed_timelines: HashSet<TimelineId>,
     /// Timelines whose turns are **splice sources** — code_read scope forks,
     /// whose sealed turns `adopt_turn` re-records onto the file timeline by
     /// reference. Residences are flagged [`SequenceResidence::splice_source`];
@@ -5452,6 +5456,28 @@ impl Substrate {
     /// which skips such a timeline entirely.
     pub fn is_timeline_transient(&self, timeline: TimelineId) -> bool {
         self.transient_timelines.contains(&timeline)
+    }
+
+    /// Mark `timeline` as **never resumed**: its turns are kept — sealed,
+    /// cold-persisted, projectable — but no slot will ever continue it, so it
+    /// keeps no recurrent snapshot. The weaker sibling of
+    /// [`Self::mark_timeline_transient`], for content that is read and never
+    /// extended: a document ingested as a conversation, a kept dream.
+    ///
+    /// A snapshot is a whole recurrent state, fixed-size per sequence whatever
+    /// its token count — ~112 MiB on Flash-Next — and the single-tail rule keeps
+    /// one per live conversation forever. A store of thousands of one-turn
+    /// documents therefore held hundreds of gigabytes of state nothing would
+    /// ever read. In-memory; `Conversation::mark_timeline_unresumed` writes the
+    /// empty snapshot that retires a tail already on disk.
+    pub fn mark_timeline_unresumed(&mut self, timeline: TimelineId) {
+        self.unresumed_timelines.insert(timeline);
+    }
+
+    /// Whether `timeline` keeps no recurrent snapshot — see
+    /// [`Self::mark_timeline_unresumed`].
+    pub fn is_timeline_unresumed(&self, timeline: TimelineId) -> bool {
+        self.unresumed_timelines.contains(&timeline)
     }
 
     /// Mark `timeline` as a **splice source**: its turns keep their hot copy

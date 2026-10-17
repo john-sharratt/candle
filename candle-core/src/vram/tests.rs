@@ -22,7 +22,7 @@ const MIB: u64 = 1024 * 1024;
 fn test_config() -> GovernorConfig {
     GovernorConfig {
         scratch_margin: GIB,
-        capacity_reserve: 512 * MIB,
+        capacity_reserve: 256 * MIB,
         balloon_chunk: 256 * MIB,
         balloon_min_chunk: 2 * MIB,
     }
@@ -225,9 +225,9 @@ fn balloon_stops_at_the_residency_budget_when_the_driver_never_refuses() -> Resu
     let mut alloc = FakeBalloonAllocator::new(vram.clone(), total);
     let probe = vram.probe_as(super::ProbeKind::Dxgi);
     let c = super::balloon::balloon_measure(&probe, &mut alloc, &cfg)?;
-    // The claim stops at budget − wobble margin (budget/16, ≤ 1 GiB, ≥ the
+    // The claim stops at budget − wobble margin (budget/32, ≤ 512 MiB, ≥ the
     // reserve), never at total − reserve.
-    let margin = (budget / 16).max(cfg.capacity_reserve);
+    let margin = (budget / 32).max(cfg.capacity_reserve);
     let cap = budget - margin;
     assert!(c <= cap, "claim {c} ran past budget − margin ({cap})");
     assert!(
@@ -237,27 +237,27 @@ fn balloon_stops_at_the_residency_budget_when_the_driver_never_refuses() -> Resu
     Ok(())
 }
 
-/// On a large card the WDDM margin is capped: a sixteenth of a 71,977 MiB
-/// budget (the measured dev-box one) would leave 4,498 MiB unclaimed; the cap
-/// leaves 1 GiB. On a 16 GiB card the sixteenth (896 MiB) is under the cap and
-/// stands.
+/// On a large card the WDDM margin is capped: a thirty-second of a 71,977 MiB
+/// budget (the measured dev-box one) would leave 2,249 MiB unclaimed; the cap
+/// leaves 512 MiB. On a 14 GiB budget the thirty-second (448 MiB) is under the
+/// cap and stands; on a 4 GiB one it is under the reserve, which stands instead.
 #[test]
-fn the_wddm_margin_is_capped_at_one_gib() {
+fn the_wddm_margin_is_capped_at_half_a_gib() {
     let cfg = test_config();
     let reading = |headroom: u64| {
         super::reading::VramReading::new(headroom, 73_045 * MIB, super::ProbeKind::Dxgi)
     };
     assert_eq!(
         super::balloon::wobble_margin(&reading(71_977 * MIB), &cfg),
-        GIB
+        512 * MIB
     );
     assert_eq!(
         super::balloon::wobble_margin(&reading(14 * GIB), &cfg),
-        14 * GIB / 16
+        448 * MIB
     );
     assert_eq!(
         super::balloon::wobble_margin(&reading(4 * GIB), &cfg),
-        cfg.capacity_reserve
+        256 * MIB
     );
 }
 

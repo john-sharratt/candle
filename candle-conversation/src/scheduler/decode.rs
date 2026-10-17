@@ -517,8 +517,10 @@ impl Scheduler {
                 .sample_batch(&stacked, &mut state_refs, &config_refs)
         };
         for (id, state) in state_ids.into_iter().zip(states) {
-            if state.degenerate {
-                self.fail_degenerate(id);
+            // A plain step's forward has committed and folded every row it ran,
+            // so the state is settled and can be described at once.
+            if state.degenerate && self.fail_degenerate(id) {
+                describe_recurrent_state(self.model.as_ref(), id);
             }
             self.sampling_states.insert(id, state);
         }
@@ -852,9 +854,9 @@ impl Scheduler {
                 return;
             }
             Err(e) => {
-                // It may have armed some of what it arms before failing, and a
-                // stash or a capture left standing outlives the step it belongs
-                // to — the next rewind would replay from it.
+                // It may have armed some of what it arms before failing, and an
+                // armed block or a capture left standing outlives the step it
+                // belongs to — the next rewind would fold from it.
                 self.model.abort_verify(&spec_seqs);
                 self.fail_all_decodes(&seq_ids, &format!("verify setup failed: {e}"));
                 return;
@@ -964,6 +966,7 @@ impl Scheduler {
                     match plain_rows.get(p) {
                         Some(r) => rows_of[i] = vec![r.clone()],
                         None => {
+                            self.model.abort_verify(&spec_seqs);
                             self.fail_all_decodes(&seq_ids, "verify returned too few plain rows");
                             return;
                         }
@@ -975,6 +978,7 @@ impl Scheduler {
                 match spec_rows.get(k) {
                     Some(r) if r.len() == blocks[i].len() => rows_of[i] = r.clone(),
                     _ => {
+                        self.model.abort_verify(&spec_seqs);
                         self.fail_all_decodes(
                             &seq_ids,
                             "verify returned the wrong number of rows for a block",
@@ -1125,6 +1129,11 @@ impl Scheduler {
         // The row each token was drawn from, for the health checks, taken before
         // the states go back.
         let captured: Vec<Vec<Tensor>> = chooser.rows().to_vec();
+        // Sequences whose turn the guard bar fails this step, described once the
+        // rollback has settled: until then a verifying sequence's recurrent state
+        // still has this step's rows pending, and reading it would describe a
+        // state the step has not finished deciding.
+        let mut degenerate: Vec<SequenceId> = Vec::new();
         for (id, state) in state_ids.into_iter().zip(chooser.into_states()) {
             // A sequence that has just started emitting token 0 gets its
             // recurrent state described, once.
@@ -1148,8 +1157,8 @@ impl Scheduler {
             // `!` and the guard's forced EOS together has reset the run by
             // now. Checking the length let exactly such a turn seal as an
             // answer of eight `!`.
-            if state.degenerate {
-                self.fail_degenerate(id);
+            if state.degenerate && self.fail_degenerate(id) {
+                degenerate.push(id);
             }
             self.sampling_states.insert(id, state);
         }
@@ -1291,9 +1300,9 @@ impl Scheduler {
         // `kept`: the per-token path can stop a sequence short of what the walk
         // accepted, and those tokens must come off too.
         //
-        // One call, not two. A rewind consumes the verifying sequence's span
-        // from the shared stash — a span is good for exactly one step — so a
-        // second `truncate_sequences` in the same step finds no rewind point and
+        // One call, not two. A rewind consumes the verifying sequence's armed
+        // block — it is good for exactly one step — so a second
+        // `truncate_sequences` in the same step finds no rewind point and
         // refuses, taking every other sequence's rollback down with it. The
         // earlier arrangement truncated to `kept` here and tried to correct to
         // `committed` afterwards, which could not work for that reason and left
@@ -1323,10 +1332,23 @@ impl Scheduler {
         drop(held);
         let rollback_span = profile::span("decode:rollback");
         if let Err(e) = self.model.truncate_sequences(&mut self.session, &targets) {
+            // Every verifying sequence's recurrent rows go with the step: none of
+            // them is kept, so none may stay pending into the next one.
+            self.model.abort_verify(&spec_seqs);
             self.fail_all_decodes(&seq_ids, &format!("speculative rollback failed: {e}"));
             return;
         }
+        // The rows that committed nothing keep none of their block either, so
+        // their recurrent rows are dropped — the state stands as the step
+        // entered it, and the turn is already failed.
+        if !stopped.is_empty() {
+            let stopped_seqs: Vec<usize> = stopped.iter().map(|&i| seq_ids_raw[i]).collect();
+            self.model.abort_verify(&stopped_seqs);
+        }
         rollback_span.end();
+        for id in degenerate {
+            describe_recurrent_state(self.model.as_ref(), id);
+        }
         // The healed prefixes, now that each sequence's KV ends at its last
         // committed position — the only place they belong.
         let heal_span = profile::span("decode:heal");
@@ -2329,14 +2351,15 @@ impl Scheduler {
     }
 
     /// A sequence whose forward has produced unusable logits for a run of
-    /// [`DEGENERATE_TOKEN_RUN`] tokens: say whether its carried recurrent state is to blame, then fail
-    /// the turn so what it decoded over those logits is never sealed.
-    fn fail_degenerate(&mut self, id: SequenceId) {
+    /// [`DEGENERATE_TOKEN_RUN`] tokens: fail the turn so what it decoded over
+    /// those logits is never sealed. Answers whether it failed it now — the
+    /// caller then says whether its carried recurrent state is to blame
+    /// ([`describe_recurrent_state`]), once the step has settled that state.
+    fn fail_degenerate(&mut self, id: SequenceId) -> bool {
         // Once per turn: the flag stays set on every step after the bar.
         if self.active_decodes.get(&id).is_none_or(|s| s.faulted) {
-            return;
+            return false;
         }
-        describe_recurrent_state(self.model.as_ref(), id);
         if let Some(state) = self.active_decodes.get_mut(&id) {
             state.fail(ConversationError::Channel(format!(
                 "degenerate decode: the forward produced unusable logits for {} tokens \
@@ -2344,6 +2367,7 @@ impl Scheduler {
                 DEGENERATE_TOKEN_RUN
             )));
         }
+        true
     }
 
     /// Fail every listed decode: each caller gets the error, and what each turn

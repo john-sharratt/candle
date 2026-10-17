@@ -22,10 +22,11 @@
 //! arbitrary:
 //!
 //! - **Decode is already exhaustive.** `ensure_for_batch_entries_all` runs once
-//!   per decode step, over every layer's backing, before the forward is entered
-//!   at all. It was hoisted for an unrelated reason — 48 lock acquisitions per
-//!   token in a steady state where the answer is "nothing to allocate" — but it
-//!   is exactly this phase, and nothing here needs to repeat it.
+//!   per decode step, over every layer's backing, before the forward's tier is
+//!   placed — in the header build of a whole forward, and in each segment's
+//!   prepare pass under a step (`ensure_decode_writes`). It is batched over the
+//!   layers so a steady state, where the answer is "nothing to allocate", takes
+//!   no write guard; it is exactly this phase, and nothing here repeats it.
 //! - **Glue claims nothing.** A glue row reprojects tokens that are already
 //!   resident; `glue_write_slice` and `glue_write_in_blk` name slots that exist.
 //!   It still needs the truncation below, because it shares the multi-token

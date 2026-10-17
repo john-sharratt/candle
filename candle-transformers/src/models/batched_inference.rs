@@ -29,14 +29,15 @@ use super::expert_lre::ProfileSnapshot;
 use super::expert_lre::WeightPlanning;
 use crate::models::delta_net::ExportedLayerState;
 use crate::models::delta_net::RecurrentCompaction;
+use crate::models::delta_net::TIMELINE_ROWS;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::layer_parallel;
 use crate::models::piece_key::PieceKey;
+use crate::models::residual_rows::CreepResidual;
 use crate::models::rope_schedule::RungSelect;
 use crate::models::sealed_injection::{reconcile_sealed_prefix, SealedInjection};
 use crate::models::selection_strata::StrataTokens;
 use crate::models::slot_header::{SlotHeaderHost, SLOT_HEADER_BYTES};
-use crate::models::window_residuals::WindowResiduals;
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
@@ -51,21 +52,23 @@ use candle_nn::kv_cache::{
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cuda")]
 use super::batched_layer::GlueMeta;
-use super::batched_model::{BatchedInference, BatchedModelCore, WaveGuard, WavePhase};
+use super::batched_model::{
+    activation_dtype, BatchedInference, BatchedModelCore, WaveGuard, WavePhase,
+};
 use super::held_tensor::held_empty;
 #[cfg(feature = "cuda")]
 use super::wave_buffers::wave_from_vec_ticketed;
-use super::wave_driver::{drive_wave, WaveGroups, WaveSweep};
+use super::wave_driver::{drive_step, drive_wave, StepOutcome, StepSpec, WaveGroups, WaveSweep};
 #[cfg(feature = "cuda")]
 use crate::models::profile::{gpu_span, pipeline_record_duration, span};
 use crate::models::speculative_choice::{
     all_rows, AcceptWalk, SpeculativeStep, TokenChooser, TypicalAcceptance,
 };
-use crate::models::verify_wave::{issue_verify_wave, upload_plan_rows, VerifyPlan, WaveCoBatch};
+use crate::models::verify_wave::{issue_verify_wave, upload_plan_rows, VerifyPlan};
 #[cfg(feature = "cuda")]
 use candle::wave_provenance::WaveTicket;
 
@@ -660,9 +663,6 @@ pub struct BatchedInferenceSession {
     accept_in_place: bool,
     /// The draft walk's token buffer — see [`Self::walk_tokens`].
     walk_tokens: Option<Tensor>,
-    /// The residuals layer windows hand on to each other — see
-    /// [`Self::window_residuals`].
-    window_residuals: Arc<WindowResiduals>,
 }
 
 /// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
@@ -744,7 +744,6 @@ impl BatchedInferenceSession {
             rope: RungSelect::unbounded(),
             accept_in_place: false,
             walk_tokens: None,
-            window_residuals: Arc::default(),
         })
     }
 
@@ -855,7 +854,6 @@ impl BatchedInferenceSession {
             rope: RungSelect::unbounded(),
             accept_in_place: false,
             walk_tokens: None,
-            window_residuals: Arc::default(),
         }
     }
 
@@ -902,15 +900,6 @@ impl BatchedInferenceSession {
         }
         let buf = self.walk_tokens.as_ref().expect("sized above");
         buf.narrow(0, 0, want)?.reshape((rows, n))
-    }
-
-    /// The pool of residuals that layer windows hand on to each other — a
-    /// window that stops short of the head writes its residual into one, the
-    /// driver reorders through them, and a caller that splices residual parts
-    /// for the next window composes into one. Shared, so a caller can hold it
-    /// across a forward that borrows the session.
-    pub fn window_residuals(&self) -> Arc<WindowResiduals> {
-        self.window_residuals.clone()
     }
 
     /// Get the configuration used for this session.
@@ -1119,6 +1108,36 @@ impl BatchedInferenceSession {
             .first()
             .expect("begin_stager_generation: no backings")
             .begin_stager_generation_required()
+    }
+
+    /// Claim the write chunk each decode row's next token lands in, over the
+    /// stream's layers — the allocation [`Self::build_decode_metadata`] makes
+    /// before it describes the rows, which can create an arena.
+    ///
+    /// A step's prepare pass runs it, so the claim lands between forwards,
+    /// before the step's tier and forward span stand; the build inside the step
+    /// then finds nothing left to allocate (`docs/wave_step.md` §2.1).
+    #[cfg(feature = "cuda")]
+    pub fn ensure_decode_writes(&self, seq_indices: &[usize]) -> Result<()> {
+        if seq_indices.is_empty() {
+            return Ok(());
+        }
+        let entries: Vec<(usize, usize)> = seq_indices
+            .iter()
+            .map(|&seq_idx| {
+                let offset = self
+                    .sequences
+                    .get(seq_idx)
+                    .and_then(|s| s.as_ref())
+                    .map_or(0, |s| s.offset);
+                (seq_idx, offset)
+            })
+            .collect();
+        ChunkedKvBacking::ensure_for_batch_entries_all(
+            &self.backings[0..self.stream_layers],
+            &entries,
+            1,
+        )
     }
 
     /// Build decode kernel metadata for ALL layers from scratch.
@@ -4093,15 +4112,12 @@ pub struct ModelCoreProperties {
     pub carries_recurrent_state: bool,
 }
 
-/// Result of a re-entrant [`ManagedBatchedModel::forward_batched_layers`] wave.
+/// Result of a wave forward.
 ///
-/// Exactly one of the two fields is populated: `residual` when the wave paused
-/// before the last layer (the packed inter-layer stream to persist and feed back
-/// next wave), or `logits` when it ran the head (one row per input sequence).
+/// `logits` when it ran the head (one row per scored input sequence), `None`
+/// when it stopped short — whose residual went to the caller's
+/// [`CreepResidual`] — or carried only glue rows, which score nothing.
 pub struct WaveStep {
-    /// Packed residual stream to persist + resume, when the range stopped short
-    /// of the final layer.
-    pub residual: Option<Tensor>,
     /// Per-sequence logits (in `seq_indices` order), when the range reached the head.
     pub logits: Option<Vec<Tensor>>,
 }
@@ -4199,21 +4215,6 @@ impl WaveResult {
             start += n;
         }
         Ok(out)
-    }
-
-    /// Take the residual stream, which is pool-backed and outlives the span.
-    ///
-    /// Deliberately available by value where the logits are not: a paused wave's
-    /// residual is persisted and resumed on a *later* forward, so it cannot live
-    /// on a span that resets at the end of this one — and does not.
-    pub fn into_residual(mut self) -> Option<Tensor> {
-        self.step.residual.take()
-    }
-
-    /// [`Self::into_residual`] without giving up the result — for a caller that
-    /// takes the residual and still reads the logits through the guard.
-    pub fn take_residual(&mut self) -> Option<Tensor> {
-        self.step.residual.take()
     }
 
     /// The scored rows as views on the head's span, for reading **while this
@@ -4493,9 +4494,13 @@ pub trait ManagedBatchedModel {
     /// (`docs/continuous_fair_waves.md`). Glue rows are staged on the session via
     /// `set_pending_glue` before the call, as for a plain glue forward.
     ///
-    /// Returns a [`WaveStep`]: `residual` (persist + resume) when the range stops
-    /// short of the head, else `logits` for the **decode + prefill** rows only
-    /// (in `decode_seqs ++ prefill_seqs` order — glue rows carry no logits).
+    /// Returns a [`WaveStep`] carrying `logits` for the **decode + prefill** rows
+    /// only (in `decode_seqs ++ prefill_seqs` order — glue rows carry no
+    /// logits) when the range reaches the head, and none when it stops short.
+    ///
+    /// A range starting past layer 0 resumes from `residual`'s committed rows; a
+    /// range stopping short of the head writes its residual there and commits it
+    /// (`docs/wave_step.md` §3.2). [`Self::claim_residual`] sizes one.
     #[allow(clippy::too_many_arguments)]
     fn forward_wave(
         &self,
@@ -4508,8 +4513,26 @@ pub trait ManagedBatchedModel {
         glue_inputs: &[Tensor],
         layer_start: usize,
         layer_end: usize,
-        residual_in: Option<Tensor>,
+        residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult>;
+
+    /// One co-batched step: rows that cross every layer, and a creep that
+    /// crosses its window, in one forward span with one tier
+    /// (`docs/wave_step.md` §2).
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome>;
+
+    /// Room for `rows` rows of this model's residual stream, held between
+    /// forwards — for a sweep paused and resumed by layer range. Between
+    /// forwards, as every span claim is.
+    fn claim_residual(
+        &self,
+        session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual>;
 
     // ── Speculative decoding (model-agnostic hook) ──────────────────────────────
     //
@@ -4697,18 +4720,18 @@ pub trait ManagedBatchedModel {
     /// Carrying recurrent state means there is something outside the session's KV to
     /// snapshot; for as long as no model could rewind such a state, one declaration
     /// served for both questions and the speculative entry point refused on it. The
-    /// hybrid's verify replay separates them. It still carries state — nothing else
-    /// records the tokens that built `S` — and it can now rewind *inside a block it
-    /// just verified*, by replaying the mixer over the accepted prefix from the
-    /// ping-pong entering state the wave left untouched (`qwen35::spec`).
+    /// hybrid's timeline separates them. It still carries state — nothing else
+    /// records the tokens that built `S` — and it can rewind *inside a block it
+    /// just verified*: the block never wrote `S`, only its timeline, and the fold
+    /// applies the accepted prefix of it (`qwen35::spec`).
     ///
     /// Default: a model carrying recurrent state cannot rewind, which keeps every
-    /// model that has not implemented a replay refused exactly as before.
+    /// model that has not implemented a rewind refused.
     ///
     /// Overriding to `true` is a claim about [`Self::truncate_sequences`], not about
     /// the state: that it restores the recurrence exactly for the targets it accepts.
-    /// It is not a claim that every offset is rewindable — a replay covers the block
-    /// it stashed operands for and nothing else, so `truncate_sequences` is what
+    /// It is not a claim that every offset is rewindable — a fold covers the block
+    /// the verify wave wrote and nothing else, so `truncate_sequences` is what
     /// refuses a target with no rewind point, at the one place that knows.
     fn can_rewind_speculative_block(&self) -> bool {
         !self.carries_recurrent_state()
@@ -4736,8 +4759,8 @@ pub trait ManagedBatchedModel {
     /// [`Self::can_rewind_speculative_block`] at its default `false` and is
     /// refused at the entry point, so it never arrives here — the guard is the
     /// declaration, not a bail inside an override raised after the driver has
-    /// committed. A model that *can* rewind, but only within a block it stashed
-    /// operands for, accepts here and refuses the uncovered offsets itself.
+    /// committed. A model that *can* rewind, but only within a block it just
+    /// verified, accepts here and refuses the uncovered offsets itself.
     fn truncate_sequence(
         &self,
         session: &mut BatchedInferenceSession,
@@ -4760,9 +4783,9 @@ pub trait ManagedBatchedModel {
     /// The whole step's rollbacks in one call — `(seq, tokens)` per sequence.
     /// Default: [`Self::truncate_sequence`] per target, which is correct for
     /// any model. A model whose rollback does real per-sequence work overrides
-    /// this to batch it — the qwen35 lineage's recurrent replay runs one
-    /// launch pair per DeltaNet layer for the whole cohort here, against one
-    /// per layer PER SEQUENCE through the per-target default.
+    /// this to batch it — the qwen35 lineage's recurrent fold runs one launch
+    /// for the whole cohort and every DeltaNet layer here, against one per
+    /// sequence through the per-target default.
     fn truncate_sequences(
         &self,
         session: &mut BatchedInferenceSession,
@@ -5139,10 +5162,11 @@ pub trait ManagedBatchedModel {
     /// overrides this and [`Self::end_verify`] together.
     ///
     /// **Split from the wave on purpose.** The setup here is real work with real
-    /// ordering constraints — the `qwen35` lineage sizes every verifying
-    /// sequence's rewind stash before the forward opens, because the arena
-    /// refuses a device allocation from inside a wave, and arms the MTP seed
-    /// capture over both cohorts; DeepSeek snapshots the streaming
+    /// ordering constraints — the `qwen35` lineage arms its verify cohort, whose
+    /// DeltaNet rows the forward's commit then leaves pending for the rewind,
+    /// and the MTP seed capture over both cohorts, sized before the forward
+    /// opens because the arena refuses a device allocation from inside a wave;
+    /// DeepSeek snapshots the streaming
     /// compressor/gallery state its blocks are about to absorb. None of it wants
     /// to know what else is riding the wave, and the caller that *does* know —
     /// the scheduler, folding these rows into the continuous-fair wave — cannot
@@ -5229,11 +5253,14 @@ pub trait ManagedBatchedModel {
         Ok((logits, Vec::new()))
     }
 
-    /// Release whatever [`Self::begin_verify`] armed, after a wave that failed.
+    /// Release whatever [`Self::begin_verify`] armed for `seqs`, on any exit
+    /// that keeps none of their blocks — a wave that failed, a readback or an
+    /// accept walk that failed, a rollback that failed, or a row that committed
+    /// nothing.
     ///
-    /// The wave rolled its own state back, so a stash or snapshot taken before
-    /// it names a rewind point that no longer exists — left in place, a later
-    /// truncate would replay from it.
+    /// Left in place, a snapshot taken before the wave names a rewind point
+    /// that no longer exists, and a recurrent model's verify rows stay pending
+    /// into the next step — a later truncate would rewind or fold from them.
     fn abort_verify(&self, seqs: &[usize]) {
         let _ = seqs;
     }
@@ -5281,7 +5308,17 @@ pub trait ManagedBatchedModel {
         // The standalone shape: one wave carrying nothing but this step's own
         // rows. The scheduler does not come through here — it runs the same
         // three phases around its own co-batched wave.
-        if let Some(plan) = self.begin_verify(session, plain, seqs, blocks, budget)? {
+        // Every exit below that keeps no block ends what `begin_verify` armed:
+        // a recurrent model's verify rows stay pending until the rewind folds
+        // them or this discards them.
+        let planned = match self.begin_verify(session, plain, seqs, blocks, budget) {
+            Ok(p) => p,
+            Err(e) => {
+                self.abort_verify(seqs);
+                return Err(e);
+            }
+        };
+        if let Some(plan) = planned {
             let issued = issue_verify_wave(
                 self,
                 session,
@@ -5289,7 +5326,6 @@ pub trait ManagedBatchedModel {
                 &plan.decode_inputs,
                 &plan.verify_seqs,
                 &plan.verify_inputs,
-                &WaveCoBatch::standalone(),
                 layer_end,
             );
             return match issued {
@@ -5303,7 +5339,13 @@ pub trait ManagedBatchedModel {
                         );
                     }
                     let (plain_rows, block_rows) =
-                        self.end_verify(session, plain, seqs, blocks, out.logits)?;
+                        match self.end_verify(session, plain, seqs, blocks, out.logits) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                self.abort_verify(seqs);
+                                return Err(e);
+                            }
+                        };
                     Ok(VerifiedRows {
                         plain: plain_rows,
                         blocks: block_rows,
@@ -5467,13 +5509,12 @@ pub trait ManagedBatchedModel {
         // tokens the K/V no longer holds.
         //
         // The question is whether the model can REWIND, not whether it carries
-        // recurrent state — the hybrid does both. Its verify replay re-runs the
-        // mixer over the accepted prefix from the entering state the wave's
-        // ping-pong left intact, which reconstructs exactly the state those
-        // tokens alone would have produced (`qwen35::spec`,
-        // `docs/deltanet_state_persistence.md` §5.4). Which offsets are
-        // rewindable is a property of the stashed block, so `truncate_sequences`
-        // is what refuses one it has no rewind point for.
+        // recurrent state — the hybrid does both. Its verify block never writes
+        // `S`, only each DeltaNet layer's timeline, and the fold applies the
+        // accepted prefix of it — exactly the state those tokens alone would
+        // have produced (`qwen35::spec`, `docs/deltanet_timeline.md`). Which
+        // offsets are rewindable is a property of the verified block, so
+        // `truncate_sequences` is what refuses one it has no rewind point for.
         //
         // And only a step that would actually DRAFT needs the rewind: at a zero
         // draft budget every sequence takes a plain decode wave below and
@@ -5495,6 +5536,19 @@ pub trait ManagedBatchedModel {
                  — as the qwen35 lineage's replay does — declares \
                  `can_rewind_speculative_block`; without that, run it without a \
                  drafter."
+            );
+        }
+        // **A recurrent model's block must fit its timeline.** Each DeltaNet
+        // layer keeps a verify block's rows in a fixed `TIMELINE_ROWS`-row
+        // timeline; a deeper block would run as a prefill span, which writes a
+        // whole advanced state and can never be partially accepted. Refused
+        // here, before anything is drafted.
+        if self.carries_recurrent_state() && max_draft >= TIMELINE_ROWS {
+            candle::bail!(
+                "speculative_decode_step_batch: {max_draft} drafts make a {}-row block, deeper \
+                 than the {TIMELINE_ROWS}-row DeltaNet timeline — at most {} drafts a block",
+                max_draft + 1,
+                TIMELINE_ROWS - 1
             );
         }
         // Draft per sequence. A sequence whose drafter proposes NOTHING (no
@@ -5583,6 +5637,13 @@ pub trait ManagedBatchedModel {
         } = verified?;
         pipeline_record_duration("spec:verify", t_verify.elapsed(), 1);
         g_fwd.end();
+        // Every exit between here and the rollback keeps none of the blocks,
+        // so it ends what the verify armed: a recurrent model's verify rows
+        // would otherwise stay pending into the next step.
+        let abort = |e: candle::Error| {
+            self.abort_verify(&spec_seqs);
+            e
+        };
         // The row gather between the forward and the accept walk, and the
         // `row_of` bookkeeping. Spanned because it is the only part of the step
         // that is neither `spec:verify` nor `spec:walk`.
@@ -5601,7 +5662,8 @@ pub trait ManagedBatchedModel {
             .map(|&i| plain_logits[i].as_ref().expect("filled above"))
             .chain(spec_logits.iter().flatten())
             .map(|t| t.flatten_all()?.unsqueeze(0))
-            .collect::<Result<_>>()?;
+            .collect::<Result<_>>()
+            .map_err(abort)?;
         let mut row_of: Vec<(usize, usize)> = vec![(0, 0); seqs.len()];
         for (k, &i) in plain.iter().enumerate() {
             row_of[i] = (k, 1);
@@ -5617,12 +5679,12 @@ pub trait ManagedBatchedModel {
         // some other sequence's row instead of failing.
         for (i, &(_, n_rows)) in row_of.iter().enumerate() {
             if n_rows != blocks[i].len() {
-                candle::bail!(
+                return Err(abort(candle::Error::Msg(format!(
                     "speculative_decode_step_batch: sequence {} verified {n_rows} rows for a \
                      {}-token block",
                     seqs[i],
                     blocks[i].len()
-                );
+                ))));
             }
         }
 
@@ -5650,9 +5712,13 @@ pub trait ManagedBatchedModel {
         let ahead = if chooser.stateless() {
             let all = match Tensor::cat_view(&rows, 0) {
                 Some(all) => all,
-                None => Tensor::cat(&rows, 0)?,
+                None => Tensor::cat(&rows, 0).map_err(abort)?,
             };
-            Some(chooser.choose(&all, &all_rows(&blocks, &row_of))?)
+            Some(
+                chooser
+                    .choose(&all, &all_rows(&blocks, &row_of))
+                    .map_err(abort)?,
+            )
         } else {
             None
         };
@@ -5679,12 +5745,13 @@ pub trait ManagedBatchedModel {
                         .collect();
                     let block = match Tensor::cat_view(&picked, 0) {
                         Some(block) => block,
-                        None => Tensor::cat(&picked, 0)?,
+                        None => Tensor::cat(&picked, 0).map_err(abort)?,
                     };
-                    chooser.choose(&block, &walked)?
+                    chooser.choose(&block, &walked).map_err(abort)?
                 }
             };
-            walk.commit(&tokens, |i, token| (emits[i])(token))?;
+            walk.commit(&tokens, |i, token| (emits[i])(token))
+                .map_err(abort)?;
         }
         let (next, kept) = walk.finish();
         // The walk is bounded by the draft budget and the rollback is not, so
@@ -5693,8 +5760,8 @@ pub trait ManagedBatchedModel {
         // span over both reads as "accept got slower with depth" and hides which.
         pipeline_record_duration("spec:walk", t_accept.elapsed(), 1);
         // Every view on the head's span, then the wave that holds it: the
-        // rollback below may open waves of its own (the recurrent replay), and
-        // the span is reclaimed only once nothing names it.
+        // rollback below may open waves of its own (the recurrent fold), and the
+        // span is reclaimed only once nothing names it.
         drop(rows);
         drop(plain_logits);
         drop(spec_logits);
@@ -5705,10 +5772,11 @@ pub trait ManagedBatchedModel {
             .map(|(i, &seq)| (seq, poss[i] + kept[i]))
             .collect();
         // ONE rollback call for the step: every sequence's target at once, so a
-        // model whose rollback does real work (the recurrent replay) batches it
-        // across the cohort instead of paying it per sequence.
+        // model whose rollback does real work (the recurrent fold) batches it
+        // across the cohort instead of paying it per sequence. A rollback that
+        // fails keeps none of the blocks.
         let t_rollback = std::time::Instant::now();
-        self.truncate_sequences(session, &targets)?;
+        self.truncate_sequences(session, &targets).map_err(abort)?;
         pipeline_record_duration("spec:rollback", t_rollback.elapsed(), 1);
         pipeline_record_duration("spec:accept", t_accept.elapsed(), 1);
         Ok(SpeculativeStep {
@@ -5805,6 +5873,12 @@ pub trait ManagedBatchedModel {
     /// reports this can serve nothing again.
     fn expert_pipeline_dead(&self) -> bool {
         false
+    }
+
+    /// The expert pipeline counters' shared home, for a reader on another
+    /// thread that reads gauges while forwards run (`ExpertCache::stats_shared`).
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        None
     }
 
     /// The expert cache's `(hits, misses)` tallies so far, unsettled
@@ -6085,7 +6159,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         glue_inputs: &[Tensor],
         layer_start: usize,
         layer_end: usize,
-        residual_in: Option<Tensor>,
+        residual: Option<&mut CreepResidual>,
     ) -> Result<WaveResult> {
         session.expect_rope_select(self.rope().select())?;
         drive_wave(
@@ -6099,9 +6173,28 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             glue_inputs,
             layer_start,
             layer_end,
-            residual_in,
+            residual,
         )
     }
+
+    fn forward_step(
+        &self,
+        session: &mut BatchedInferenceSession,
+        spec: StepSpec<'_>,
+    ) -> Result<StepOutcome> {
+        session.expect_rope_select(self.rope().select())?;
+        drive_step(self, session, spec)
+    }
+
+    fn claim_residual(
+        &self,
+        session: &BatchedInferenceSession,
+        rows: usize,
+    ) -> Result<CreepResidual> {
+        let (width, dtype) = WaveSweep::residual_row(self, session)?;
+        CreepResidual::claim(WaveSweep::device(self), rows, width, dtype)
+    }
+
     fn prune(&self) -> Result<()> {
         self.model().prune()
     }
@@ -6112,6 +6205,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 
     fn expert_pipeline_dead(&self) -> bool {
         self.model().expert_pipeline_dead()
+    }
+
+    fn expert_stats_shared(&self) -> Option<Arc<Mutex<PipelineStats>>> {
+        self.model().expert_stats_shared()
     }
 
     fn expert_hit_counts(&self) -> Option<(usize, usize)> {
@@ -6286,6 +6383,13 @@ impl<M: BatchedModelCore> WaveSweep for BatchedInference<M> {
 
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
         <Self as ManagedBatchedModel>::prefill_width_cap(self, act_dtype)
+    }
+
+    /// The single-stream residual: `hidden` wide, in the width the sweep embeds
+    /// in — the activation width of the live KV's dtype.
+    fn residual_row(&self, session: &BatchedInferenceSession) -> Result<(usize, DType)> {
+        let dtype = activation_dtype(session.kv_live_dtype());
+        Ok((self.model().wave_geometry(dtype).hidden, dtype))
     }
 
     fn sweep(

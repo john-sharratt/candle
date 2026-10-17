@@ -1000,6 +1000,51 @@ mod tests {
         assert_eq!(reloaded.recurrent_snapshot_loc(failed), fresh);
     }
 
+    /// **A retired tail supersedes the state before it, now and on reload.** A
+    /// timeline that is never resumed retires its snapshot by writing an empty
+    /// one under the same stream: the index then names the empty record, so the
+    /// whole state behind it is dead to maintenance, and a reload agrees.
+    #[test]
+    fn a_retired_snapshot_supersedes_the_state_before_it_now_and_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let stream_id = StreamId(0xF00D_0090);
+        let mut substrate = Substrate::new();
+        let p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+        let substrate = Arc::new(RwLock::new(substrate));
+        let persistence = Arc::new(PersistenceLock::new(p));
+        let writer = SubstrateWriter::spawn(substrate.clone(), persistence.clone());
+        let mut full = snapshot_at(0);
+        full.aux = vec![9u8; 1 << 16];
+        writer.enqueue(WriteJob::Snapshot {
+            stream_id,
+            payload: full,
+        });
+        writer.enqueue(WriteJob::Snapshot {
+            stream_id,
+            payload: SnapshotPayload::retired(7),
+        });
+        writer.shutdown();
+        drop(writer);
+
+        let tail = substrate
+            .read()
+            .unwrap()
+            .recurrent_snapshot_loc(stream_id)
+            .expect("the retired tail is indexed");
+        assert!(tail.payload_len < 4096, "the tail is the empty record");
+        let bytes = persistence
+            .lock()
+            .unwrap()
+            .read_record_payload(&tail)
+            .unwrap();
+        assert!(SnapshotPayload::decode(&bytes).unwrap().is_retired());
+        drop(persistence);
+
+        let mut reloaded = Substrate::new();
+        let _p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut reloaded).unwrap();
+        assert_eq!(reloaded.recurrent_snapshot_loc(stream_id), Some(tail));
+    }
+
     /// **A read-only writer drops every job and touches no file.** Metadata,
     /// tokens and a bulk snapshot are all dropped before they take a queue
     /// slot, no location is registered for a record that was never written,

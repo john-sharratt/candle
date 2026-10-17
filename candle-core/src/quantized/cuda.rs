@@ -7582,9 +7582,10 @@ pub struct MoeBucketizeWorkspace {
     /// Per-token scatter segment boundaries, `[n_tokens + 1]`.
     pub token_starts: CudaSlice<i32>,
     /// Device header `{n_active, total_valid, num_tiles, remote experts,
-    /// remote tiles}`. The live grouped GEMM's blocks read the last two; the
-    /// host never reads it — the pipeline launches at the `n_tokens × k` upper
-    /// bound.
+    /// remote tiles, CPU rows, CPU experts, _}`. The live grouped GEMM's blocks
+    /// read the remote words, and the CPU export and the down launch's CPU item
+    /// the CPU rows; the host never reads it — the pipeline launches at the
+    /// `n_tokens × k` upper bound.
     pub header: CudaSlice<i32>,
     inv: CudaSlice<u32>,
     scan: CudaSlice<i32>,
@@ -7606,7 +7607,9 @@ impl MoeBucketizeWorkspace {
             perm: unsafe { device.alloc::<u32>(cap_assign)? },
             rw_ids: unsafe { device.alloc::<u32>(cap_assign)? },
             token_starts: unsafe { device.alloc::<i32>(cap_starts)? },
-            header: unsafe { device.alloc::<i32>(5)? },
+            header: unsafe {
+                device.alloc::<i32>(candle_kernels::simple::moe_bucketize::HEADER_WORDS)?
+            },
             inv: unsafe { device.alloc::<u32>(cap_assign)? },
             scan: unsafe { device.alloc::<i32>(cap_assign)? },
         })
@@ -7700,6 +7703,12 @@ pub fn moe_bucketize(
     let owner = live.map_or(OwnerCheck::default(), |l| l.owner);
     if owner.owners != 0 && (owner.slot_bytes == 0 || live.is_none_or(|l| l.gate_row == 0)) {
         crate::bail!("moe_bucketize: the owner check needs a slot size and a live table");
+    }
+    let cpu = live.and_then(|l| l.cpu);
+    if cpu.is_some_and(|c| {
+        c.split.cap_rows != 0 && (c.dst_row == 0 || live.is_none_or(|l| l.gate_row == 0))
+    }) {
+        crate::bail!("moe_bucketize: the CPU class needs a ring-row map and a live table");
     }
     let ahead = live.and_then(|l| l.ahead);
     if let (Some(a), Some(l)) = (ahead, live) {
@@ -7816,6 +7825,15 @@ pub fn moe_bucketize(
             ahead.map_or(0, |a| a.row_layout) as *const std::ffi::c_void,
             ahead.map_or(0, |a| a.items) as *mut std::ffi::c_void,
             ahead.map_or(0, |a| a.done) as *mut std::ffi::c_void,
+            ahead.map_or(0, |a| i32::from(a.predict)),
+            cpu.as_ref()
+                .map_or(std::ptr::null(), |c| &c.split as *const _),
+            cpu.map_or(0, |c| c.work) as *mut std::ffi::c_void,
+            cpu.map_or(0, |c| c.dst_row) as *mut std::ffi::c_void,
+            cpu.map_or(0, |c| c.carry) as *mut std::ffi::c_void,
+            cpu.map_or(0, |c| c.tok_first) as *mut std::ffi::c_void,
+            cpu.map_or(0, |c| c.in_tok) as *mut std::ffi::c_void,
+            cpu.map_or(0, |c| c.input_map) as *mut std::ffi::c_void,
             stream.cu_stream() as *mut std::ffi::c_void,
         )
     };
@@ -7875,6 +7893,29 @@ pub struct BucketizeLive {
     /// Read-ahead into the promotion ring ([`ReadAhead`]), or `None`. Requires
     /// `promo`.
     pub ahead: Option<ReadAhead>,
+    /// The CPU class ([`BucketizeCpu`]), or `None`.
+    pub cpu: Option<BucketizeCpu>,
+}
+
+/// The CPU class for one [`moe_bucketize`] (`moe_bucketize_cpu.cuh`): the
+/// split's measured costs, and where the chosen experts are published.
+#[derive(Debug, Clone, Copy)]
+pub struct BucketizeCpu {
+    pub split: candle_kernels::simple::moe_bucketize::CpuSplit,
+    /// This invocation's work slot (mapped, `CPU_WORK_SLOT_BYTES`).
+    pub work: u64,
+    /// Device `u32[n_tokens · k]`: ring row → expert-grouped row.
+    pub dst_row: u64,
+    /// Device `u32[CPU_CARRY_WORDS]`, or 0: the CPU experts one launch hands
+    /// the next to promote behind the pool (`split.promote`).
+    pub carry: u64,
+    /// The inputs, each distinct token once (`moe_bucketize_cpu.cuh`,
+    /// `cpu_inputs`): device `u32[n_tokens]` scratch, device `u32[cap]` input
+    /// row → token, and the mapped `u32[1 + cap]` input-row count then ring
+    /// row → input row. `input_map` 0 writes none.
+    pub tok_first: u64,
+    pub in_tok: u64,
+    pub input_map: u64,
 }
 
 /// The device buffers [`moe_bucketize`]'s read-ahead walk writes and the gate
@@ -7892,6 +7933,9 @@ pub struct ReadAhead {
     pub items: u64,
     /// `u32[AHEAD_MAX]`: pieces of each item copied so far, zeroed per item.
     pub done: u64,
+    /// Whether the predictions are read ahead. Without it the items carry only
+    /// the CPU pool's promotions ([`BucketizeCpu::carry`]).
+    pub predict: bool,
 }
 
 /// Where [`moe_bucketize`] checks every VRAM entry it snapshots against the

@@ -88,6 +88,9 @@ mod palette_layout;
 pub mod prefill_kv_stage;
 #[cfg(feature = "cuda")]
 pub(crate) mod region_pool;
+/// Claimed regions coalesced into contiguous runs. Pure address arithmetic,
+/// outside the `cuda` gate so it is tested anywhere.
+pub mod region_runs;
 #[cfg(feature = "tensor-assert")]
 mod release_watch;
 #[cfg(feature = "cuda")]
@@ -104,13 +107,17 @@ pub(crate) mod slot_upload_batch;
 /// Where the tier may stand and what the KV side may reach. Pure arithmetic, and
 /// outside the `cuda` gate so it can be exercised on any machine.
 pub mod span_geometry;
-/// Fixed-stride slot arenas, dedicated per span tenant: recurrent state, rewind
-/// stashes, gallery pages, QSA index pages. The bookkeeping is host arithmetic and
+/// Fixed-stride slot arenas, dedicated per span tenant: recurrent state, gallery
+/// pages, QSA index pages, creep residuals. The bookkeeping is host arithmetic and
 /// tested anywhere; the pool that claims regions is CUDA-only.
 pub mod tenant_arena;
 /// The chunked cache's core types: sealed sequences and chunks, and their
 /// per-chunk metadata.
 mod types;
+/// The whole card cut by what holds each byte, once per wave — the bands the
+/// performance page stacks and the batched gates log.
+#[cfg(feature = "cuda")]
+mod vram_bands;
 // Instrumentation for the bump arenas' high-water marks: its only caller is
 // `bump_arena`, so it shares that module's gating.
 #[cfg(feature = "cuda")]
@@ -211,6 +218,7 @@ pub use region_pool::{
     span_partition, span_region_refusal, spare_tally, weight_capacity_bytes, weight_floor_after,
     RegionStats, SpanClaims, SpanLayout, SpanPartition, SpanRegion, REGION_BYTES,
 };
+pub use region_runs::{runs_from, RegionRun};
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;
 #[cfg(feature = "cuda")]
@@ -219,6 +227,8 @@ pub use tenant_arena::{
     relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
 };
 pub use tenant_arena::{slot_stride, SlotTenant, SLOT_ALIGN};
+#[cfg(feature = "cuda")]
+pub use vram_bands::{vram_bands, VramBands};
 pub use wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};
 // Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
 // Defined in both configurations — `None` when there is no CUDA device to

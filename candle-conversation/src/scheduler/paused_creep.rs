@@ -11,14 +11,16 @@
 
 use std::collections::HashSet;
 
-use candle::{Result, Tensor};
+use candle::Result;
+use candle_transformers::models::residual_rows::CreepResidual;
 
 use super::WaveMember;
 use crate::projection::DecodePriority;
 
 /// A creep group mid-sweep, set aside.
 pub(super) struct PausedCreep {
-    pub residual: Option<Tensor>,
+    /// Its arena, holding the rows it reached — kept as it stands.
+    pub residual: Option<CreepResidual>,
     pub cursor: usize,
     pub members: Vec<WaveMember>,
     pub rows: Vec<usize>,
@@ -65,12 +67,12 @@ pub(super) fn kept_row_ranges(rows: &[usize], keep: &[bool]) -> Result<Vec<(usiz
 /// Take the members `keep` marks `false` out of a held creep — its residual,
 /// its members and their rows — leaving the survivors' rows in order.
 ///
-/// The one copy here, the survivors' rows gathered into a residual of their
-/// own, is an exception to hot-path invariant 2 that pays for itself: it runs
-/// only when a member errors or its slot is freed mid-sweep, and the
-/// alternative is replaying every survivor's finished layers.
+/// The one copy here, the survivors' rows moved into the arena's other half
+/// ([`CreepResidual::retain`]), runs only when a member errors or its slot is
+/// freed mid-sweep, and the alternative is replaying every survivor's finished
+/// layers. With no survivor rows the arena goes.
 pub(super) fn drop_rows(
-    residual: &mut Option<Tensor>,
+    residual: &mut Option<CreepResidual>,
     members: &mut Vec<WaveMember>,
     rows: &mut Vec<usize>,
     keep: &[bool],
@@ -78,15 +80,11 @@ pub(super) fn drop_rows(
     if keep.iter().all(|&k| k) {
         return Ok(());
     }
-    if let Some(res) = residual.take() {
-        let ranges = kept_row_ranges(rows, keep)?;
-        if !ranges.is_empty() {
-            let pieces = ranges
-                .iter()
-                .map(|&(start, len)| res.narrow(1, start, len))
-                .collect::<Result<Vec<_>>>()?;
-            *residual = Some(Tensor::cat(&pieces, 1)?);
-        }
+    let ranges = kept_row_ranges(rows, keep)?;
+    match residual.as_mut() {
+        Some(r) if !ranges.is_empty() => r.retain(&ranges)?,
+        Some(_) => *residual = None,
+        None => {}
     }
     let mut k = keep.iter();
     members.retain(|_| *k.next().unwrap_or(&false));
@@ -97,7 +95,8 @@ pub(super) fn drop_rows(
 
 #[cfg(test)]
 mod tests {
-    use candle::{Device, Tensor};
+    use candle::{DType, Device, Tensor};
+    use candle_transformers::models::residual_rows::{copy_rows, CreepResidual, RowCopy, SpanRows};
 
     use super::{drop_rows, kept_row_ranges};
     use crate::scheduler::WaveMember;
@@ -121,18 +120,37 @@ mod tests {
         assert!(kept_row_ranges(&[3, 2], &[true]).is_err());
     }
 
+    /// A creep arena of six rows of width two, holding `0..12` in order.
+    fn held_creep() -> CreepResidual {
+        let mut c = CreepResidual::claim(&Device::Cpu, 6, 2, DType::F32).unwrap();
+        let values: Vec<f32> = (0..12).map(|v| v as f32).collect();
+        let src = Tensor::from_vec(values, (6, 2), &Device::Cpu).unwrap();
+        let plan = [RowCopy {
+            src: 0,
+            dst: 0,
+            len: 6,
+        }];
+        copy_rows(&SpanRows::new(&src, 2).unwrap(), c.pending(), &plan).unwrap();
+        c.commit();
+        c
+    }
+
     /// Dropping a member takes exactly its rows, and the others keep theirs in
     /// order.
     #[test]
     fn dropping_a_member_takes_exactly_its_rows() {
-        let values: Vec<f32> = (0..12).map(|v| v as f32).collect();
-        let mut residual = Some(Tensor::from_vec(values, (1, 6, 2), &Device::Cpu).unwrap());
+        let mut residual = Some(held_creep());
         let section = |seq_id| WaveMember::Section { seq_id, advance: 1 };
         let mut members = vec![section(1), section(2), section(3)];
         let mut rows = vec![2, 3, 1];
         drop_rows(&mut residual, &mut members, &mut rows, &[true, false, true]).unwrap();
+        let held = residual.unwrap();
+        assert_eq!(held.rows(), 3);
         assert_eq!(
-            residual
+            held.committed()
+                .to_tensor()
+                .unwrap()
+                .narrow(0, 0, 3)
                 .unwrap()
                 .flatten_all()
                 .unwrap()
@@ -143,5 +161,17 @@ mod tests {
         let ids: Vec<usize> = members.iter().map(|m| m.seq_id()).collect();
         assert_eq!(ids, vec![1, 3]);
         assert_eq!(rows, vec![2, 1]);
+    }
+
+    /// Dropping every member's rows gives the arena back.
+    #[test]
+    fn dropping_every_row_gives_the_arena_back() {
+        let mut residual = Some(held_creep());
+        let section = |seq_id| WaveMember::Section { seq_id, advance: 1 };
+        let mut members = vec![section(1), section(2)];
+        let mut rows = vec![2, 4];
+        drop_rows(&mut residual, &mut members, &mut rows, &[false, false]).unwrap();
+        assert!(residual.is_none());
+        assert!(members.is_empty());
     }
 }

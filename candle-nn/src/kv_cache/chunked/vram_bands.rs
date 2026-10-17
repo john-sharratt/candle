@@ -1,14 +1,13 @@
 //! The whole card, cut by what holds each byte, once per wave — what the
-//! performance page stacks over time.
+//! performance page stacks over time, and what the batched gates log per wave.
 //!
 //! Every band is a measurement, and together they are the card: driver free,
 //! what was on the card before the span was reserved, the CUDA pool outside the
-//! span, the span's own partition (`candle_nn::kv_cache::SpanPartition`), and
-//! whatever is left, named `unaccounted` and signed. A chart that only shows
-//! some of them cannot say where the rest went; this one adds up to the card's
-//! total at every wave.
+//! span, the span's own partition ([`SpanPartition`]), and whatever is left,
+//! named `unaccounted` and signed. A chart that only shows some of them cannot
+//! say where the rest went; this one adds up to the card's total at every wave.
 
-use candle_nn::kv_cache::SpanPartition;
+use super::region_pool::SpanPartition;
 
 /// One wave's card, in MiB.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -30,7 +29,8 @@ pub struct VramBands {
     pub expert_free: f64,
     /// KV arenas.
     pub kv: f64,
-    /// Span tenants: recurrent state, the provenance gallery, index caches.
+    /// Span tenants: recurrent state (timelines and prefill scratch included),
+    /// the provenance gallery, index caches, creep residuals.
     pub state: f64,
     /// The widest forward's activations since the last wave.
     pub transient: f64,

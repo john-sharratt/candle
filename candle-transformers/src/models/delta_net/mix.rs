@@ -41,8 +41,6 @@
 #[cfg(feature = "cuda")]
 use std::cmp::Reverse;
 use std::collections::HashMap;
-#[cfg(feature = "cuda")]
-use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "cuda")]
@@ -54,19 +52,12 @@ use candle::wave_provenance::WaveTicket;
 use candle::LeaseAnchor;
 use candle::{DType, Device, DeviceLocation, LiveTensor, Result, Tensor};
 #[cfg(feature = "cuda")]
-use candle_kernels::delta_net::{DELTA_NET_SHORT_SPAN_CONV, DELTA_NET_SHORT_SPAN_ROWS};
-#[cfg(feature = "cuda")]
-use candle_kernels::simple::rows_scatter::ROWS_SCATTER_INLINE_MAX;
-#[cfg(feature = "cuda")]
-use candle_nn::kv_cache::{relocate_tensor, ArenaSlot};
+use candle_kernels::delta_net::DELTA_NET_SHORT_SPAN_CONV;
 
-#[cfg(feature = "cuda")]
-use crate::models::latent_moe::scatter::{rows_scatter_inline, RowRun};
 #[cfg(feature = "cuda")]
 use crate::models::wave_buffers::upload_into;
 
-#[cfg(feature = "cuda")]
-use super::replay_stack::{delta_net_replay_stack, ReplaySpan, ReplayStates, StackedLayer};
+use super::timeline::{fold_by_ops, TimelineLayout, TIMELINE_ROWS};
 use super::types::{DeltaNetDims, ZGate};
 
 /// The carried per-sequence state of one DeltaNet layer.
@@ -218,11 +209,8 @@ impl DeltaNetState {
         })
     }
 
-    /// Handles onto both buffers, as the half a wave WRITES.
-    ///
-    /// A `DeltaNetState` is the pair of allocations; which of a slot's two is
-    /// the read half and which the write half is the store's business, and this
-    /// is how it names the one it is handing out to be written.
+    /// Handles onto both buffers, as the buffers a long span WRITES — the
+    /// prefill scratch the store hands it, which `commit_wave` exchanges in.
     pub fn write_half(&self) -> DeltaNetOut {
         DeltaNetOut {
             s: self.s.clone(),
@@ -261,12 +249,12 @@ impl DeltaNetState {
     /// memset per layer (~2 MB × 30 layers ≈ 63 MiB per fork) on the exact
     /// bytes the next wave overwrites, and forks run ~3× per turn.
     ///
-    /// Sound for BOTH halves under the current ping-pong: [`commit_wave`]
-    /// installs `s` and the conv tail together because the wave's kernels write
-    /// both into the backup half (the conv kernels take the entering and
-    /// advanced tails as two pointers). [`Self::zeros`] remains the constructor
-    /// for a state that is genuinely read at zero — a sequence-start value —
-    /// and [`Self::solo_out`] keeps its zeroed scratch tail deliberately.
+    /// Sound for the prefill scratch: [`commit_wave`] installs `s` and the conv
+    /// tail together because a long span's kernels write both into it (the conv
+    /// kernels take the entering and advanced tails as two pointers).
+    /// [`Self::zeros`] remains the constructor for a state that is genuinely
+    /// read at zero — a sequence-start value — and [`Self::solo_out`] keeps its
+    /// zeroed scratch tail deliberately.
     ///
     /// [`commit_wave`]: super::state_store::RecurrentStateStore::commit_wave
     pub fn uninit(dims: &DeltaNetDims, dev: &Device) -> Result<Self> {
@@ -281,13 +269,13 @@ impl DeltaNetState {
     }
 }
 
-/// Where a wave WRITES one sequence's advanced state for a layer: the store's
-/// other half, which `commit_wave` swaps in.
+/// Where a long span WRITES one sequence's advanced state for a layer: the
+/// store's prefill scratch, which `commit_wave` exchanges in.
 ///
 /// Both buffers are handles rather than borrows, because the reference paths
 /// have a single state and name the same tensors here and in the
 /// [`DeltaNetState`] they read — and the kernels take addresses either way.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeltaNetOut {
     /// `[n_v_heads, d_v, d_k]`, F32 — the advanced `S`.
     pub s: Tensor,
@@ -448,92 +436,158 @@ pub fn delta_chunked<'w>(
             mask_width = c;
         }
         let (mask_incl, mask_strict) = masks.as_ref().expect("built above");
-
-        // Inclusive log-decay cumsum and the exp variants used everywhere.
-        let g_cs = gc.cumsum(1)?; // [H, c]
-        let g_exp = g_cs.exp()?; // e^{G[i]}
-        let g_last = g_cs.narrow(1, c - 1, 1)?; // [H, 1]
-        let g_last_exp = g_last.exp()?;
-        let g_diff_exp = g_last.broadcast_sub(&g_cs)?.exp()?; // e^{G_last − G[i]}
-
-        let bc3 = bc.unsqueeze(2)?; // [H, c, 1]
-        let k_b = kc.broadcast_mul(&bc3)?;
-        let v_b = vc.broadcast_mul(&bc3)?;
-
-        // Decay mask D[i][j] = exp(G[i] − G[j]), lower incl. diagonal.
-        //
-        // **The clamp is load-bearing, not defensive.** `G` is a cumulative sum
-        // of log-decays and every `g` is negative, so `G` decreases: for the
-        // `j ≤ i` half this exponent is ≤ 0 and `exp` is a contraction. The
-        // upper half is the mirror image — `G[i] − G[j]` grows *positive* with
-        // the distance — and although the mask discards it, the mask is applied
-        // to the result. `exp` runs first, overflows to `+inf` once the gap
-        // passes ~88 in f32, and `inf × 0` is `NaN`, which then propagates
-        // through `unit_lower_inverse` into every later token.
-        //
-        // It is depth- and content-dependent, so short probes miss it entirely:
-        // random activations over 40 tokens stay finite, while real prompt
-        // embeddings poisoned the row at token 23 of one prompt and 27 of
-        // another. Clamping the exponent at 0 leaves the kept half untouched
-        // (it is already ≤ 0) and makes the discarded half `exp(0) = 1` before
-        // the mask zeroes it.
-        let gi = g_cs.unsqueeze(2)?; // [H, c, 1]
-        let gj = g_cs.unsqueeze(1)?; // [H, 1, c]
-        let decay = gi
-            .broadcast_sub(&gj)?
-            .minimum(0f64)?
-            .exp()?
-            .broadcast_mul(&mask_incl.unsqueeze(0)?)?; // [H, c, c]
-
-        // A[i][j] = (βk[i]·k[j]) D[i][j], strictly lower.
-        let a = k_b
-            .matmul(&kc.transpose(1, 2)?)?
-            .mul(&decay)?
-            .broadcast_mul(&mask_strict.unsqueeze(0)?)?;
-
-        // Pseudo-values and the cumulative-decay key read: `u = T(βv)` and
-        // `kcd = T(βk ⊙ e^G)` with `T = (I + A)⁻¹`.
-        //
-        // **Solved, not inverted.** Both share the left side `I + A`, so they
-        // are one triangular solve with the two right-hand sides side by side —
-        // and a solve never forms `T`. The alternative, and what the reference
-        // below still does, is a recursive block inversion costing `log₂ c`
-        // levels of a handful of launches each: about eighty serially dependent
-        // ops per chunk, which measured as the single largest op-count item in
-        // prefill. `cublasStrsmBatched` is one launch and is backward-stable.
-        let kg_scaled = k_b.broadcast_mul(&g_exp.unsqueeze(2)?)?;
-        let (u, kcd) = solve_pseudo_values(&a, &v_b, &kg_scaled, d_v, d_k)?;
-
-        // Chunk-local writes: what each token adds beyond the entering state.
-        // `Sᵀ` as a view of the buffer — re-taken each chunk because the buffer
-        // advanced, and free because a transpose is a layout, not a copy.
-        let s_fla = state.transpose(1, 2)?.contiguous()?;
-        let v_new = u.sub(&kcd.matmul(&s_fla)?)?; // [H, c, d_v]
-
-        // Output: inter-chunk read of the entering state + intra-chunk reads
-        // of this chunk's own writes (inclusive diagonal — the token sees its
-        // own update, matching the sequential rule's post-update read).
-        let q_g = qc.broadcast_mul(&g_exp.unsqueeze(2)?)?;
-        let inter = q_g.matmul(&s_fla)?; // [H, c, d_v]
-        let kq = qc.matmul(&kc.transpose(1, 2)?)?.mul(&decay)?; // q[i]·k[j] D[i][j], j ≤ i
-        let intra = kq.matmul(&v_new)?;
-        let o = inter.add(&intra)?; // [H, c, d_v]
-        outs.push(o.transpose(0, 1)?.contiguous()?); // [c, H, d_v]
+        let rows = chunk_rows(state, &qc, &kc, &vc, &gc, &bc, mask_incl, mask_strict)?;
+        outs.push(rows.o.transpose(0, 1)?.contiguous()?); // [c, H, d_v]
 
         // State carry, in place and in the stored orientation:
         //   S ← e^{G[c−1]}·S + V_newᵀ (K ⊙ e^{G[c−1]−G})
+        let g_last = rows.g_cs.narrow(1, c - 1, 1)?; // [H, 1]
+        let g_diff_exp = g_last.broadcast_sub(&rows.g_cs)?.exp()?; // e^{G_last − G[i]}
         let kg = kc.broadcast_mul(&g_diff_exp.unsqueeze(2)?)?; // [H, c, d_k]
-        let decay_full = g_last_exp
+        let decay_full = g_last
+            .exp()?
             .unsqueeze(2)?
             .broadcast_as((h, d_v, d_k))?
             .contiguous()?;
         state.mul_mut(&decay_full)?;
-        state.add_mut(&v_new.transpose(1, 2)?.contiguous()?.matmul(&kg)?)?;
+        state.add_mut(&rows.v_new.transpose(1, 2)?.contiguous()?.matmul(&kg)?)?;
 
         start += c;
     }
 
     LiveTensor::cat(&outs, 0) // [T, H, d_v]
+}
+
+/// One chunk's row quantities against its entering state, which is read and
+/// not advanced: the output, the inclusive log-decay scan `G` and the
+/// chunk-local writes `v_new` — what [`delta_chunked`] carries the state with,
+/// and what a short span keeps as its timeline instead.
+struct ChunkRows<'w> {
+    /// `[H, c, d_v]`.
+    o: LiveTensor<'w>,
+    /// `[H, c]`.
+    g_cs: LiveTensor<'w>,
+    /// `[H, c, d_v]`.
+    v_new: LiveTensor<'w>,
+}
+
+/// [`ChunkRows`] for one head-major chunk: `qc`/`kc` `[H, c, d_k]`, `vc`
+/// `[H, c, d_v]`, `gc`/`bc` `[H, c]`, against `state` `[H, d_v, d_k]`.
+#[allow(clippy::too_many_arguments)]
+fn chunk_rows<'w>(
+    state: &Tensor,
+    qc: &LiveTensor<'w>,
+    kc: &LiveTensor<'w>,
+    vc: &LiveTensor<'w>,
+    gc: &LiveTensor<'w>,
+    bc: &LiveTensor<'w>,
+    mask_incl: &Tensor,
+    mask_strict: &Tensor,
+) -> Result<ChunkRows<'w>> {
+    let d_k = qc.dim(2)?;
+    let d_v = vc.dim(2)?;
+    // Inclusive log-decay cumsum and its exp.
+    let g_cs = gc.cumsum(1)?; // [H, c]
+    let g_exp = g_cs.exp()?; // e^{G[i]}
+
+    let bc3 = bc.unsqueeze(2)?; // [H, c, 1]
+    let k_b = kc.broadcast_mul(&bc3)?;
+    let v_b = vc.broadcast_mul(&bc3)?;
+
+    // Decay mask D[i][j] = exp(G[i] − G[j]), lower incl. diagonal.
+    //
+    // **The clamp is load-bearing, not defensive.** `G` is a cumulative sum
+    // of log-decays and every `g` is negative, so `G` decreases: for the
+    // `j ≤ i` half this exponent is ≤ 0 and `exp` is a contraction. The
+    // upper half is the mirror image — `G[i] − G[j]` grows *positive* with
+    // the distance — and although the mask discards it, the mask is applied
+    // to the result. `exp` runs first, overflows to `+inf` once the gap
+    // passes ~88 in f32, and `inf × 0` is `NaN`, which then propagates
+    // through `unit_lower_inverse` into every later token.
+    //
+    // It is depth- and content-dependent, so short probes miss it entirely:
+    // random activations over 40 tokens stay finite, while real prompt
+    // embeddings poisoned the row at token 23 of one prompt and 27 of
+    // another. Clamping the exponent at 0 leaves the kept half untouched
+    // (it is already ≤ 0) and makes the discarded half `exp(0) = 1` before
+    // the mask zeroes it.
+    let gi = g_cs.unsqueeze(2)?; // [H, c, 1]
+    let gj = g_cs.unsqueeze(1)?; // [H, 1, c]
+    let decay = gi
+        .broadcast_sub(&gj)?
+        .minimum(0f64)?
+        .exp()?
+        .broadcast_mul(&mask_incl.unsqueeze(0)?)?; // [H, c, c]
+
+    // A[i][j] = (βk[i]·k[j]) D[i][j], strictly lower.
+    let a = k_b
+        .matmul(&kc.transpose(1, 2)?)?
+        .mul(&decay)?
+        .broadcast_mul(&mask_strict.unsqueeze(0)?)?;
+
+    // Pseudo-values and the cumulative-decay key read: `u = T(βv)` and
+    // `kcd = T(βk ⊙ e^G)` with `T = (I + A)⁻¹`.
+    //
+    // **Solved, not inverted.** Both share the left side `I + A`, so they
+    // are one triangular solve with the two right-hand sides side by side —
+    // and a solve never forms `T`. The alternative, and what the reference
+    // below still does, is a recursive block inversion costing `log₂ c`
+    // levels of a handful of launches each: about eighty serially dependent
+    // ops per chunk, which measured as the single largest op-count item in
+    // prefill. `cublasStrsmBatched` is one launch and is backward-stable.
+    let kg_scaled = k_b.broadcast_mul(&g_exp.unsqueeze(2)?)?;
+    let (u, kcd) = solve_pseudo_values(&a, &v_b, &kg_scaled, d_v, d_k)?;
+
+    // Chunk-local writes: what each token adds beyond the entering state.
+    // `Sᵀ` as a view of the buffer — free, because a transpose is a layout,
+    // not a copy.
+    let s_fla = state.transpose(1, 2)?.contiguous()?;
+    let v_new = u.sub(&kcd.matmul(&s_fla)?)?; // [H, c, d_v]
+
+    // Output: inter-chunk read of the entering state + intra-chunk reads
+    // of this chunk's own writes (inclusive diagonal — the token sees its
+    // own update, matching the sequential rule's post-update read).
+    let q_g = qc.broadcast_mul(&g_exp.unsqueeze(2)?)?;
+    let inter = q_g.matmul(&s_fla)?; // [H, c, d_v]
+    let kq = qc.matmul(&kc.transpose(1, 2)?)?.mul(&decay)?; // q[i]·k[j] D[i][j], j ≤ i
+    let intra = kq.matmul(&v_new)?;
+    let o = inter.add(&intra)?; // [H, c, d_v]
+    Ok(ChunkRows { o, g_cs, v_new })
+}
+
+/// A short span's mixer rows against `state`, which is read and not advanced:
+/// its output `[T, H, d_v]`, and its `G` `[T, H]` and `v_new` `[T, H, d_v]` for
+/// the timeline. One chunk — a short span is at most [`TIMELINE_ROWS`] rows.
+/// Shapes as in [`delta_chunked`].
+fn delta_span_rows<'w>(
+    state: &Tensor,
+    q: &LiveTensor<'w>,
+    k: &LiveTensor<'w>,
+    v: &LiveTensor<'w>,
+    g_log: &LiveTensor<'w>,
+    beta: &LiveTensor<'w>,
+) -> Result<(LiveTensor<'w>, LiveTensor<'w>, LiveTensor<'w>)> {
+    let t = q.dim(0)?;
+    if t == 0 || t > TIMELINE_ROWS {
+        candle::bail!("delta_span_rows: a short span is 1..={TIMELINE_ROWS} rows, got {t}");
+    }
+    let dev = q.device();
+    let head_major = |x: &LiveTensor<'w>| x.transpose(0, 1)?.contiguous();
+    let rows = chunk_rows(
+        state,
+        &head_major(q)?,
+        &head_major(k)?,
+        &head_major(v)?,
+        &head_major(g_log)?,
+        &head_major(beta)?,
+        &lower_tri_mask(t, false, dev)?,
+        &lower_tri_mask(t, true, dev)?,
+    )?;
+    Ok((
+        rows.o.transpose(0, 1)?.contiguous()?,
+        rows.g_cs.transpose(0, 1)?.contiguous()?,
+        rows.v_new.transpose(0, 1)?.contiguous()?,
+    ))
 }
 
 /// `u = T·v_b` and `kcd = T·kg` for `T = (I + A)⁻¹`, `A` strictly lower.
@@ -597,14 +651,14 @@ fn solve_pseudo_values<'w>(
 const MAX_DISPATCH_CONDS: usize = 12;
 
 /// `[path][0]` is the fused count; `[path][i + 1]` counts rejections by
-/// condition `i`. Two paths, so two rows.
+/// condition `i`. One path, so one row.
 #[cfg(feature = "cuda")]
-static DISPATCH_TALLY: [[std::sync::atomic::AtomicU64; MAX_DISPATCH_CONDS + 1]; 2] =
-    [const { [const { std::sync::atomic::AtomicU64::new(0) }; MAX_DISPATCH_CONDS + 1] }; 2];
+static DISPATCH_TALLY: [[std::sync::atomic::AtomicU64; MAX_DISPATCH_CONDS + 1]; 1] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; MAX_DISPATCH_CONDS + 1] }; 1];
 
 /// The paths, in `DISPATCH_TALLY` row order.
 #[cfg(feature = "cuda")]
-const DISPATCH_PATHS: [&str; 2] = ["dn:mix", "dn:replay"];
+const DISPATCH_PATHS: [&str; 1] = ["dn:mix"];
 
 #[cfg(feature = "cuda")]
 fn dispatch_verdict(row: usize, conds: &[(&'static str, &dyn Fn() -> bool)]) -> bool {
@@ -620,30 +674,19 @@ fn dispatch_verdict(row: usize, conds: &[(&'static str, &dyn Fn() -> bool)]) -> 
 /// most-frequent first. Zero rows are omitted.
 #[cfg(feature = "cuda")]
 pub fn dispatch_tally() -> Vec<(&'static str, &'static str, u64)> {
-    let names: [&[&str]; 2] = [
-        &[
-            "device",
-            "head_dim",
-            "qkv:f32",
-            "alpha:f32",
-            "beta:f32",
-            "z:f32",
-            "dt_bias:f32",
-            "a:f32",
-            "norm:f32",
-            "state:cuda",
-        ],
-        &[
-            "device",
-            "head_dim",
-            "qkv:f32",
-            "alpha:f32",
-            "beta:f32",
-            "dt_bias:f32",
-            "a:f32",
-            "state:cuda",
-        ],
-    ];
+    let names: [&[&str]; 1] = [&[
+        "device",
+        "head_dim",
+        "qkv:f32",
+        "alpha:f32",
+        "beta:f32",
+        "z:f32",
+        "dt_bias:f32",
+        "a:f32",
+        "norm:f32",
+        "state:cuda",
+        "short:conv",
+    ]];
     let mut v = Vec::new();
     for (row, path) in DISPATCH_PATHS.iter().enumerate() {
         for (slot, cell) in DISPATCH_TALLY[row].iter().enumerate() {
@@ -947,312 +990,104 @@ pub struct DeltaNetSeq<'a> {
     /// How many rows it contributes.
     pub len: usize,
     /// The recurrent state this sequence enters the wave with. Read, never
-    /// written.
+    /// written: a short span's contribution lands in its timeline and a long
+    /// span's advanced state in [`SpanWrite::State`].
     pub state: &'a mut DeltaNetState,
-    /// Where the advance lands — both carried buffers of the store's other
-    /// half, which `commit_wave` swaps in.
-    pub out: DeltaNetOut,
-    /// This DeltaNet layer's slot for the span's recurrence operands, so a
-    /// **shorter prefix** of the span can be re-run later.
-    ///
-    /// `None` on every ordinary wave — the copy exists only where something
-    /// will need to rewind. Speculative verify is that something: it advances
-    /// the state over a whole draft block and then learns how much of the block
-    /// the model actually accepted, and `S` is a running sum with no suffix to
-    /// remove. Replaying the accepted prefix from the wave's *entering* state
-    /// (which the store's ping-pong still holds) is the rewind, and these are
-    /// what it replays.
-    ///
-    /// The buffers are **already allocated** — the caller sizes them before the
-    /// forward opens. Allocating them here would be a device allocation from
-    /// inside the forward that owns the partition, which the arena refuses:
-    /// a wave's storage is claimed by `admit_wave_kv` before the forward opens
-    /// and the transient tier is placed against that claim.
-    pub stash: Option<StashSlot<'a>>,
+    /// Where the span's work lands.
+    pub write: SpanWrite,
 }
 
-/// Where one span's operands land in the cohort's shared stash buffers.
-///
-/// Every verifying span of a wave stashes into the SAME [`SpanOperands`] — one
-/// allocation per layer for the whole cohort, each span owning the `len` rows
-/// at its `row` — because the replay that consumes them advances every
-/// sequence's state in one batched launch per layer, and a batched launch reads
-/// spans of one buffer, not a buffer per sequence. Shared references suffice:
-/// the spans' row ranges are disjoint by construction.
-#[derive(Clone, Copy)]
-pub struct StashSlot<'a> {
-    pub ops: &'a SpanOperands,
-    /// First row of this span in the shared buffers.
-    pub row: usize,
+/// Where a span's work lands — chosen by its length, never by its purpose
+/// (`docs/deltanet_timeline.md` §7). A clone is another handle on the same
+/// buffers.
+#[derive(Debug, Clone)]
+pub enum SpanWrite {
+    /// A span of at most [`TIMELINE_ROWS`] rows: its timeline, a
+    /// [`TimelineLayout`] buffer the span writes one row per token into. The
+    /// state and the conv tail are read and left as they are; the fold applies
+    /// the rows the step keeps.
+    Timeline(Tensor),
+    /// A longer span: the buffers its advanced state and conv tail are written
+    /// to — the store's prefill scratch, which `commit_wave` exchanges with
+    /// the live state.
+    State(DeltaNetOut),
 }
 
-/// One span's stash capture: `len` rows of the wave's projections from wave row
-/// `start` into `ops` at row `dst_row`.
-#[derive(Clone, Copy)]
-pub struct StashCapture<'a> {
-    pub ops: &'a SpanOperands,
-    pub start: usize,
-    pub dst_row: usize,
-    pub len: usize,
-}
-
-/// Spans adjacent in BOTH the wave and the same stash, merged into single
-/// runs, in order. A verify wave packs its verifying spans back to back and
-/// the stash assigns their rows in the same order, so a whole cohort usually
-/// merges to one run per stash.
-pub(crate) fn coalesce_captures<'a>(spans: &[StashCapture<'a>]) -> Vec<StashCapture<'a>> {
-    let mut merged: Vec<StashCapture<'a>> = Vec::with_capacity(spans.len());
-    for s in spans {
-        if let Some(last) = merged.last_mut() {
-            if std::ptr::eq(last.ops, s.ops)
-                && last.start + last.len == s.start
-                && last.dst_row + last.len == s.dst_row
-            {
-                last.len += s.len;
-                continue;
-            }
+impl SpanWrite {
+    pub fn timeline(&self) -> Option<&Tensor> {
+        match self {
+            Self::Timeline(t) => Some(t),
+            Self::State(_) => None,
         }
-        merged.push(*s);
     }
-    merged
+
+    pub fn state(&self) -> Option<&DeltaNetOut> {
+        match self {
+            Self::Timeline(_) => None,
+            Self::State(o) => Some(o),
+        }
+    }
 }
 
-/// Every verifying span's operand capture for one layer.
-///
-/// On the device the copies are row-scatter launches over coalesced runs —
-/// four runs per merged span, up to the kernel's inline capacity per launch,
-/// with nothing staged — where copying span by span cost four `slice_set`
-/// launches per span per DeltaNet layer (hot-path invariants 2 and 5). On the
-/// host each merged run is a plain copy.
-pub fn capture_spans(p: &DeltaNetProjections<'_>, spans: &[StashCapture<'_>]) -> Result<()> {
-    for s in spans {
-        let cap = s.ops.capacity()?;
-        if s.len == 0 || s.dst_row + s.len > cap {
+/// Check that every span's write fits its length: a timeline for a span of at
+/// most [`TIMELINE_ROWS`] rows, a state for a longer one.
+fn check_span_writes(seqs: &[DeltaNetSeq<'_>]) -> Result<()> {
+    for (i, s) in seqs.iter().enumerate() {
+        let short = s.len <= TIMELINE_ROWS;
+        if short != s.write.timeline().is_some() {
             candle::bail!(
-                "capture_spans: rows {}+{} into a {cap}-row stash",
-                s.dst_row,
-                s.len
+                "delta_net_mix_spans: span {i} of {} rows was handed a {} — a span of at \
+                 most {TIMELINE_ROWS} rows writes a timeline, a longer one a state",
+                s.len,
+                if short { "state" } else { "timeline" }
             );
-        }
-    }
-    let merged = coalesce_captures(spans);
-    #[cfg(feature = "cuda")]
-    if matches!(p.qkv.device(), Device::Cuda(_)) {
-        let mut runs: Vec<RowRun<'_>> = Vec::with_capacity(merged.len() * 4);
-        for m in &merged {
-            for (dst, src) in m.ops.pairs(p) {
-                runs.push(RowRun::new(src.narrow(0, m.start, m.len)?, dst, m.dst_row));
-            }
-        }
-        for batch in runs.chunks(ROWS_SCATTER_INLINE_MAX) {
-            rows_scatter_inline(batch)?;
-        }
-        return Ok(());
-    }
-    for m in &merged {
-        for (dst, src) in m.ops.pairs(p) {
-            dst.narrow(0, m.dst_row, m.len)?
-                .slice_set(&src.narrow(0, m.start, m.len)?, 0, 0)?;
         }
     }
     Ok(())
 }
 
-/// One DeltaNet layer's recurrence operands for one span, held in buffers that
-/// outlive the wave arena.
-///
-/// Post-projection deliberately. Re-running the projections would give the same
-/// numbers only if the GEMM's reduction order were independent of the row count
-/// — true today, and not a property worth resting a rewind on. These four are
-/// the mixer's whole input: everything downstream of them is per-token
-/// arithmetic that depends on the token's own row and the tokens before it, so
-/// a replay over the first `m` rows is bit-identical to what the wave computed
-/// for those rows.
-///
-/// Sized to the widest block the caller will verify and reused across steps.
-#[derive(Debug)]
-pub struct SpanOperands {
-    /// `[cap, conv_dim]` F32 — the fused Q|K|V projection, raw (pre-conv).
-    pub qkv: Tensor,
-    /// `[cap, value_dim]` F32 — the output gate, pre-SiLU.
-    pub z: Tensor,
-    /// `[cap, n_v_heads]` F32 — the raw `ssm_beta` projection.
-    pub beta_lin: Tensor,
-    /// `[cap, n_v_heads]` F32 — the raw `ssm_alpha` projection.
-    pub alpha_lin: Tensor,
+/// The write for a single span over **one** carried state, outside any store —
+/// the single-span entry points and the reference tests, which have no wave to
+/// roll back. A short span writes a timeline of its own, which
+/// [`finish_solo`] folds whole; a longer one writes `s` in place and its conv
+/// tail to a scratch buffer [`finish_solo`] copies back.
+pub fn solo_write(state: &DeltaNetState, len: usize, dims: &DeltaNetDims) -> Result<SpanWrite> {
+    if len <= TIMELINE_ROWS {
+        Ok(SpanWrite::Timeline(
+            TimelineLayout::of(dims).alloc(state.s.device())?,
+        ))
+    } else {
+        Ok(SpanWrite::State(state.solo_out()?))
+    }
 }
 
-impl SpanOperands {
-    /// Buffers for a block of up to `cap` rows. **Allocate outside a forward**
-    /// — see [`DeltaNetSeq::stash`].
-    ///
-    /// Driver memory, for a caller with no reservation to carve from — a CPU
-    /// device, or a unit test. Production takes [`Self::in_slots`]; see there
-    /// for why the difference matters.
-    pub fn zeros(dims: &DeltaNetDims, cap: usize, dev: &Device) -> Result<Self> {
-        let [qkv, z, beta_lin, alpha_lin] =
-            Self::widths(dims).map(|cols| Tensor::zeros((cap, cols), DType::F32, dev));
-        Ok(Self {
-            qkv: qkv?,
-            z: z?,
-            beta_lin: beta_lin?,
-            alpha_lin: alpha_lin?,
-        })
+/// Land a [`solo_write`] span's work in its state: fold every row of a
+/// timeline, or take the advanced conv tail back from its scratch buffer.
+pub fn finish_solo(
+    state: &mut DeltaNetState,
+    write: &SpanWrite,
+    len: usize,
+    dims: &DeltaNetDims,
+) -> Result<()> {
+    match write {
+        SpanWrite::Timeline(tl) => fold_one(state, tl, len, dims),
+        SpanWrite::State(out) => state.absorb_solo(out),
     }
+}
 
-    /// Columns of each operand, in field order: `qkv`, `z`, `beta_lin`, `alpha_lin`.
-    /// Each buffer is `[cap, width]` F32.
-    pub fn widths(dims: &DeltaNetDims) -> [usize; 4] {
-        [
-            dims.conv_dim(),
-            dims.value_dim(),
-            dims.n_v_heads,
-            dims.n_v_heads,
-        ]
-    }
-
-    /// [`Self::zeros`], in **rewind-stash arena slots** of the reservation rather
-    /// than driver memory — one slot per operand, in [`Self::widths`] order, each
-    /// zeroed and viewed as an anchored tensor so no view of it outlives the slot.
-    ///
-    /// The stash is long-lived per-cohort state: it must outlive the wave (that
-    /// is what it is *for*), so it cannot come from the wave arena, and until
-    /// this existed it came from `Tensor::zeros` — i.e. the gap outside the
-    /// reservation, which nothing accounts for.
-    ///
-    /// **That gap is small and the stash is not.** Its size is
-    /// `cap × (2·key_dim + value_dim + 2·n_v_heads) × 4` per DeltaNet layer, and
-    /// `cap` is `contexts × (draft_budget + 1)` — so it scales with both the
-    /// cohort and the ladder. Measured on the 27B at 20 contexts: **60.4 MiB at
-    /// budget 0 against 301.8 MiB at budget 4**, into ~258 MiB of card outside a
-    /// 13,840 MiB span. Widening the draft ladder to reach width 20 walked
-    /// straight through it, and the failure surfaced as
-    /// `CUDA_ERROR_OUT_OF_MEMORY` on an unrelated event sync — a *sticky*
-    /// context error reported by innocent code, with the real allocation named
-    /// only in the backtrace.
-    ///
-    /// Inside the reservation it is visible to the partition instead of
-    /// competing with it: the region claim is counted, and a claim that runs
-    /// short asks the weight side to concede layers rather than failing the
-    /// device. In an arena of its own tenant, so its slots are counted and packed
-    /// apart from the recurrent state it exists to rewind; its stride follows the
-    /// verify cap, which is why each width is a pool of its own.
-    ///
-    /// **Zeroed, unlike a wave buffer.** The replay hands the mixer the whole
-    /// `cap`-row buffer while only the captured spans were filled, so these are
-    /// zeros read before being written — hot-path invariant 6's exemption.
+/// Fold the first `m` rows of `tl` into `state` — the fold kernel on a CUDA
+/// device at the kernels' head width, the tensor-op fold elsewhere.
+pub fn fold_one(
+    state: &mut DeltaNetState,
+    tl: &Tensor,
+    m: usize,
+    dims: &DeltaNetDims,
+) -> Result<()> {
     #[cfg(feature = "cuda")]
-    pub fn in_slots(
-        dims: &DeltaNetDims,
-        cap: usize,
-        dev: &Device,
-        slots: [Arc<ArenaSlot>; 4],
-    ) -> Result<Self> {
-        let mut out = Vec::with_capacity(4);
-        for (slot, cols) in slots.iter().zip(Self::widths(dims)) {
-            slot.zero(cap * cols * DType::F32.size_in_bytes(), dev)?;
-            out.push(slot.tensor(0, DType::F32, (cap, cols), dev)?);
-        }
-        let [qkv, z, beta_lin, alpha_lin]: [Tensor; 4] =
-            out.try_into().expect("four operands, four slots");
-        Ok(Self {
-            qkv,
-            z,
-            beta_lin,
-            alpha_lin,
-        })
+    if state.s.device().is_cuda() && super::cuda::fold_runs_fused(dims) {
+        return super::cuda::delta_net_fold_states(&[(&*state, tl, m)], dims);
     }
-
-    /// How many rows these buffers hold.
-    pub fn capacity(&self) -> Result<usize> {
-        self.qkv.dim(0)
-    }
-
-    /// Move any of the four buffers whose slot is a planned source onto its
-    /// destination — see [`relocate_tensor`]. Answers how many moved.
-    ///
-    /// Each buffer is its own slot, so a pass may move one, some or none of them;
-    /// the set that moves is whatever the walk chose, and the four stay
-    /// independently addressable either way.
-    #[cfg(feature = "cuda")]
-    pub fn relocate(&mut self, moves: &mut HashMap<u64, ArenaSlot>) -> Result<usize> {
-        let mut moved = 0usize;
-        for t in [
-            &mut self.qkv,
-            &mut self.z,
-            &mut self.beta_lin,
-            &mut self.alpha_lin,
-        ] {
-            moved += usize::from(relocate_tensor(t, moves)?);
-        }
-        Ok(moved)
-    }
-
-    /// Copy `len` rows of `p`, starting at wave row `start`, into these buffers
-    /// at row `dst_row` — the one-span case of [`capture_spans`].
-    pub fn capture(
-        &self,
-        p: &DeltaNetProjections<'_>,
-        start: usize,
-        dst_row: usize,
-        len: usize,
-    ) -> Result<()> {
-        capture_spans(
-            p,
-            &[StashCapture {
-                ops: self,
-                start,
-                dst_row,
-                len,
-            }],
-        )
-    }
-
-    /// The four `(destination, source)` operand pairs, in a fixed order.
-    fn pairs<'a, 'w>(
-        &'a self,
-        p: &'a DeltaNetProjections<'w>,
-    ) -> [(&'a Tensor, &'a LiveTensor<'w>); 4] {
-        [
-            (&self.qkv, &p.qkv),
-            (&self.z, &p.z),
-            (&self.beta_lin, &p.beta_lin),
-            (&self.alpha_lin, &p.alpha_lin),
-        ]
-    }
-
-    /// `len` rows of each operand starting at `row`, as the projections a
-    /// mixer call takes.
-    pub fn rows(&self, row: usize, len: usize) -> Result<DeltaNetProjections<'static>> {
-        let cap = self.capacity()?;
-        if len == 0 || row + len > cap {
-            candle::bail!("SpanOperands::rows: rows {row}+{len} of a {cap}-row stash");
-        }
-        let cut = |t: &Tensor| -> Result<Tensor> {
-            if row == 0 && len == cap {
-                Ok(t.clone())
-            } else {
-                t.narrow(0, row, len)?.contiguous()
-            }
-        };
-        Ok(DeltaNetProjections {
-            qkv: cut(&self.qkv)?,
-            z: cut(&self.z)?,
-            beta_lin: cut(&self.beta_lin)?,
-            alpha_lin: cut(&self.alpha_lin)?,
-        })
-    }
-
-    /// The whole buffers as one projections view — what the batched replay
-    /// hands the kernels, with each span naming its own rows.
-    pub fn all_rows(&self) -> DeltaNetProjections<'static> {
-        DeltaNetProjections {
-            qkv: self.qkv.clone(),
-            z: self.z.clone(),
-            beta_lin: self.beta_lin.clone(),
-            alpha_lin: self.alpha_lin.clone(),
-        }
-    }
+    fold_by_ops(state, tl, m, dims)
 }
 
 /// Where one sequence's rows sit in the wave's packed activation buffer.
@@ -1295,36 +1130,39 @@ pub fn seq_spans(seqs: &[usize], q_lens: &[usize]) -> Result<Vec<SeqSpan>> {
 }
 
 /// One layer's slice of the decode pointer table: device arrays of each
-/// decode sequence's conv-tail and state base pointers (`ptrs [2, n_decode]`
-/// I64 — row 0 tails, row 1 states) plus each sequence's row in the wave
-/// tensors (`rows [n_decode]` U32).
+/// decode sequence's conv-tail, state and timeline base pointers
+/// (`ptrs [3, n_decode]` I64) plus each sequence's row in the wave tensors
+/// (`rows [n_decode]` U32).
 ///
 /// Decode states live in per-session allocations, so batching the decode
 /// conv and recurrence into one launch each needs their addresses on the
 /// device. The wave driver builds the whole forward's table in ONE host
 /// upload before the layer sweep ([`super::cuda::build_wave_table`]) — never
 /// per layer, where the upload's stream sync would serialise the launch
-/// pipeline — and each layer receives its slice. State pointers are stable
-/// within the forward — the store holds the buffers and their anchors keep the
-/// slots held — but not across one: `commit_wave` exchanges each layer's halves
-/// after the sweep, so a table is never kept past the forward that built it.
-/// `'w` because a slice of [`super::cuda::DeltaNetWaveTable`] borrows it, and
-/// that table lives on the forward-phase span — so this must not outlive the
-/// generation whose reset reclaims it. A per-layer table built standalone is
-/// `'static`, which this still admits.
+/// pipeline — and each layer receives its slice. Pointers are stable within the
+/// forward — the store holds the buffers and their anchors keep the slots held
+/// — but not across one: compaction moves slots between forwards, so a table
+/// is never kept past the forward that built it. `'w` because a slice of
+/// [`super::cuda::DeltaNetWaveTable`] borrows it, and that table lives on the
+/// forward-phase span — so this must not outlive the generation whose reset
+/// reclaims it. A per-layer table built standalone is `'static`, which this
+/// still admits.
 pub struct DeltaNetLayerTable<'w> {
-    /// `[4, n_decode]` I64 device tensor (or a view of the wave table): conv
-    /// tail in, conv tail out, state in, state out.
+    /// `[3, n_decode]` I64 device tensor (or a view of the wave table): conv
+    /// tail, state, timeline.
     pub ptrs: LiveTensor<'w>,
     /// `[n_decode]` U32 wave rows.
     pub rows: LiveTensor<'w>,
 }
 
-/// The same table for the wave's **multi-row** spans — prefilling sequences and
-/// speculative verify blocks.
+/// The same table for the wave's **multi-row** spans, in one of two forms by
+/// length: a short table (`[3, n]` — conv tail, state, timeline) for spans of at
+/// most [`TIMELINE_ROWS`] rows, which the short-span kernel runs, and a long
+/// table (`[4, n]` — conv tail in, conv tail out, state in, state out) for the
+/// prefill spans the conv + scan pair runs.
 ///
 /// A span differs from a decode row only in occupying `len` consecutive rows
-/// instead of one, so it needs the same four pointers plus that extent. With
+/// instead of one, so it needs the same pointers plus that extent. With
 /// them on the device, every span in the wave runs in one launch per kernel
 /// rather than one launch per span (hot-path invariant 5) — which is what the
 /// decode rows next door have always done.
@@ -1342,9 +1180,7 @@ pub struct DeltaNetLayerTable<'w> {
 /// `LiveTensor<'static>`, and a `'static` handle onto recycled arena memory is
 /// the use-after-reset the lifetimes exist to prevent.
 pub struct DeltaNetSpanTable<'w> {
-    /// `[4, n]` I64: conv tail in, conv tail out, state in, state out — the
-    /// same row order as [`DeltaNetLayerTable::ptrs`], so one builder serves
-    /// both.
+    /// `[3, n]` I64 for a short table, `[4, n]` for a long one.
     pub ptrs: LiveTensor<'w>,
     /// `[2, n]` U32: first row in the packed wave buffer, then row count.
     pub spans: LiveTensor<'w>,
@@ -1409,12 +1245,12 @@ fn conv_silu_spans<'w>(
     let mut parts: Vec<LiveTensor<'w>> = Vec::with_capacity(seqs.len());
     for s in seqs.iter_mut() {
         let xs = x_cm.narrow(1, s.start, s.len)?.contiguous()?;
-        parts.push(conv_advance(
-            &xs,
-            kernel,
-            &s.state.conv_tail,
-            &s.out.conv_tail,
-        )?);
+        parts.push(match &s.write {
+            SpanWrite::State(out) => conv_advance(&xs, kernel, &s.state.conv_tail, &out.conv_tail)?,
+            // A short span leaves the tail as it is: its raw rows go to the
+            // timeline, and the fold shifts in the ones the step keeps.
+            SpanWrite::Timeline(_) => causal_conv1d(&xs, kernel, &s.state.conv_tail)?.0,
+        });
     }
     // `cat`, not a preallocated buffer written span by span. The two are the
     // same work for several sequences, and **not** the same for one: `cat` of a
@@ -1437,24 +1273,25 @@ fn conv_fused_spans<'w>(
     qk_channels: usize,
     eps: f32,
     table: Option<&DeltaNetLayerTable>,
-    spans: Option<&DeltaNetSpanTable>,
+    long: Option<&DeltaNetSpanTable>,
 ) -> Result<LiveTensor<'w>> {
     let (t, channels) = qkv.dims2()?;
     // Every row a kernel reads is written exactly once — by the batched decode
-    // conv or by a prefill span's conv — so the buffer is allocated
-    // uninitialised (hot-path invariant 6), in `qkv`'s arena. Spans the
-    // short-span scan takes (`spans` is `None` for them) convolve inside that
-    // kernel, which reads none of these rows, so theirs stay unwritten.
+    // conv or by a long span's conv — so the buffer is allocated uninitialised
+    // (hot-path invariant 6), in `qkv`'s arena. Short spans convolve inside
+    // the short-span kernel, which reads none of these rows, so theirs stay
+    // unwritten.
     let conved = qkv.empty_beside((t, channels), DType::F32)?;
     if let Some(tbl) = table {
         // All decode spans in one launch: tails via the pointer table, rows
-        // scattered into the shared buffer, each tail shifted in place.
+        // scattered into the shared buffer, each row's raw input into its
+        // timeline.
         super::cuda::delta_net_conv_decode(qkv, kernel, tbl, &conved, qk_channels, eps)?;
     }
-    if let Some(sp) = spans {
-        // Every multi-row span in ONE launch, token-parallel over the widest of
+    if let Some(sp) = long {
+        // Every long span in ONE launch, token-parallel over the widest of
         // them, each writing its own rows of the shared buffer. The advanced
-        // tails land in the wave's write buffers — separate allocations from the
+        // tails land in the prefill scratch — separate allocations from the
         // entering ones, which the kernel's readers of the first `kwidth−1`
         // outputs are still reading concurrently — so there is nothing to copy
         // back.
@@ -1492,20 +1329,19 @@ pub fn delta_net_mix<'w>(
     zgate: ZGate,
 ) -> Result<LiveTensor<'w>> {
     let (t, _) = p.qkv.dims2()?;
-    // One carried state, so the write half shares `s` and scratches the conv
-    // tail: this single-span entry point has no wave to roll back.
-    let out = state.solo_out()?;
+    // One carried state and no wave to roll back: a short span's timeline is
+    // folded whole, a long span writes `s` in place.
+    let write = solo_write(state, t, dims)?;
     let mut one = [DeltaNetSeq {
         start: 0,
         len: t,
         state,
-        out,
-        stash: None,
+        write,
     }];
     // The single-sequence reference path, off the sweep: no phase is open.
     let mixed = delta_net_mix_spans(p, c, dims, &mut one, rms_eps, None, zgate, None)?;
     let [seq] = one;
-    seq.state.absorb_solo(&seq.out)?;
+    finish_solo(seq.state, &seq.write, t, dims)?;
     Ok(mixed)
 }
 
@@ -1552,6 +1388,7 @@ pub fn delta_net_mix_spans<'w>(
     // assumed: the caller derives these from the wave's own packing, and this is
     // the one place that can see both.
     check_span_tiling(seqs, t)?;
+    check_span_writes(seqs)?;
     #[cfg(feature = "cuda")]
     let d = dims.head_dim;
 
@@ -1598,6 +1435,7 @@ pub fn delta_net_mix_spans_q8<'w>(
 ) -> Result<MixOut<'w>> {
     let (t, _) = p.qkv.dims2()?;
     check_span_tiling(seqs, t)?;
+    check_span_writes(seqs)?;
     let d = dims.head_dim;
     match fused_mix(p, c, dims, seqs, rms_eps, table, ticket)? {
         Some(o) if d == 128 => Ok(MixOut::Q8(super::cuda::delta_net_norm_gate_q8(
@@ -1662,19 +1500,22 @@ fn fused_mix<'w>(
     let key_dim = dims.key_dim();
 
     // The fused path: everything from the conv to the output projection in
-    // three launches over the prefill spans (one when they are all
-    // verify-width), two over the decode spans, plus one epilogue launch over
-    // the whole wave. The conv kernels' SiLU + Q|K-norm
-    // epilogue makes their output THE operand buffer — q, k and v are strided
-    // views of it, the GQA broadcast is an index (`kh = h % h_k`), the read
-    // scale is applied on load, the gates are computed in-kernel, and each
-    // span writes its own rows of one shared output. So the split/norm
-    // launches and their full-width copy, the repeat/scale materialisations,
-    // the per-span operand copies, the output concatenation, and the
-    // epilogue's three full-width intermediates do not exist here. The
-    // tensor-op path (`mix_spans_by_ops`) is the same arithmetic (the kernels
-    // are parity-locked to it) and serves CPU, reference dtypes, and any other
-    // head geometry.
+    // one launch over the short spans, three over the long ones, two over the
+    // decode spans, plus one epilogue launch over the whole wave. The conv
+    // kernels' SiLU + Q|K-norm epilogue makes their output THE operand buffer —
+    // q, k and v are strided views of it, the GQA broadcast is an index
+    // (`kh = h % h_k`), the read scale is applied on load, the gates are
+    // computed in-kernel, and each span writes its own rows of one shared
+    // output. So the split/norm launches and their full-width copy, the
+    // repeat/scale materialisations, the per-span operand copies, the output
+    // concatenation, and the epilogue's three full-width intermediates do not
+    // exist here. The tensor-op path (`mix_spans_by_ops`) is the same
+    // arithmetic (the kernels are parity-locked to it) and serves CPU,
+    // reference dtypes, and any other head geometry.
+    //
+    // A short multi-row span has one kernel, the short-span scan, compiled for
+    // one conv width; a wave carrying such a span at another width runs by
+    // ops whole.
     let fused_ok = dispatch_verdict(
         0,
         &[
@@ -1690,73 +1531,69 @@ fn fused_mix<'w>(
             ("state:cuda", &|| {
                 seqs.iter().all(|s| s.state.s.device().is_cuda())
             }),
+            ("short:conv", &|| {
+                dims.conv_kernel == DELTA_NET_SHORT_SPAN_CONV
+                    || !seqs.iter().any(|s| s.len > 1 && s.len <= TIMELINE_ROWS)
+            }),
         ],
     );
     if !fused_ok {
         return Ok(None);
     }
-    {
-        // The decode spans run as ONE conv launch and ONE step launch however
-        // many sessions the wave carries, through the pointer table. The hot
-        // path receives the table from the wave driver (built once per
-        // forward); the reference path and unit tests, which call in without
-        // one, build a per-layer table here — same kernels, same arithmetic,
-        // the upload merely happens closer to the launch.
-        let local = match table {
-            Some(_) => None,
-            None if seqs.iter().any(|s| s.len == 1) => {
-                Some(super::cuda::build_layer_table(seqs, ticket)?)
-            }
-            None => None,
-        };
-        let table = table.or(local.as_ref());
-        // The multi-row spans get the same treatment, built here because unlike
-        // the decode table their extents are a property of THIS wave's packing
-        // rather than of the sequences, so there is nothing for the driver to
-        // hoist out of the layer sweep.
-        let spans = super::cuda::build_span_table(seqs, qkv)?;
-        // A verify wave's spans are a few rows each, and at that width the
-        // conv, the intra-chunk solve and the state pass are three latency-bound
-        // launches chained through global memory. One launch does all three
-        // on chip — same bits — whenever every multi-row span fits it; a wave
-        // carrying a longer span (bulk prefill) takes the conv + scan pair.
-        let short = spans
-            .as_ref()
-            .is_some_and(|sp| sp.max_len <= DELTA_NET_SHORT_SPAN_ROWS)
-            && dims.conv_kernel == DELTA_NET_SHORT_SPAN_CONV;
+    // The decode spans run as ONE conv launch and ONE step launch however
+    // many sessions the wave carries, through the pointer table. The hot path
+    // receives the table from the wave driver (built once per forward); the
+    // reference path and unit tests, which call in without one, build a
+    // per-layer table here — same kernels, same arithmetic, the upload merely
+    // happens closer to the launch.
+    let local = match table {
+        Some(_) => None,
+        None if seqs.iter().any(|s| s.len == 1) => {
+            Some(super::cuda::build_layer_table(seqs, ticket)?)
+        }
+        None => None,
+    };
+    let table = table.or(local.as_ref());
+    // The multi-row spans get the same treatment, built here because unlike the
+    // decode table their extents are a property of THIS wave's packing rather
+    // than of the sequences, so there is nothing for the driver to hoist out of
+    // the layer sweep. Split by length: a short span — a verify block, a short
+    // prompt — runs the short-span scan into its timeline, one launch doing the
+    // conv, the intra-chunk solve and the state pass's reads on chip; a long
+    // span runs the conv + scan pair into the prefill scratch. A wave carrying
+    // both launches both.
+    let (short, long) = super::cuda::build_span_tables(seqs, qkv)?;
 
-        let conved = conv_fused_spans(
-            qkv,
-            w.conv,
-            2 * key_dim,
-            rms_eps as f32,
-            table,
-            if short { None } else { spans.as_ref() },
-        )?;
-        let o = conved.empty_beside((t, dims.value_dim()), DType::F32)?;
-        let fused = super::cuda::DeltaNetFused {
-            conved: &conved,
-            alpha: &p.alpha_lin,
-            blin: &p.beta_lin,
-            dt_bias: c.dt_bias,
-            a: c.a,
-            o: &o,
-            // See the read-scale comment on the fallback below: this is
-            // load-bearing through the epilogue's epsilon floor.
-            q_scale: (1.0 / (d as f64).sqrt()) as f32,
-        };
-        if let Some(tbl) = table {
-            super::cuda::delta_net_decode_batch(&fused, tbl)?;
-        }
-        match spans.as_ref() {
-            Some(sp) if short => {
-                super::cuda::delta_net_short_span_scan(&fused, qkv, w.conv, sp, rms_eps as f32)?
-            }
-            Some(sp) => super::cuda::delta_net_prefill_scan(&fused, sp)?,
-            None => {}
-        }
-        Ok(Some(o))
+    let conved = conv_fused_spans(
+        qkv,
+        w.conv,
+        2 * key_dim,
+        rms_eps as f32,
+        table,
+        long.as_ref(),
+    )?;
+    let o = conved.empty_beside((t, dims.value_dim()), DType::F32)?;
+    let fused = super::cuda::DeltaNetFused {
+        conved: &conved,
+        alpha: &p.alpha_lin,
+        blin: &p.beta_lin,
+        dt_bias: c.dt_bias,
+        a: c.a,
+        o: &o,
+        // See the read-scale comment on the fallback below: this is
+        // load-bearing through the epilogue's epsilon floor.
+        q_scale: (1.0 / (d as f64).sqrt()) as f32,
+    };
+    if let Some(tbl) = table {
+        super::cuda::delta_net_decode_batch(&fused, tbl)?;
     }
+    if let Some(sp) = short.as_ref() {
+        super::cuda::delta_net_short_span_scan(&fused, qkv, w.conv, sp, rms_eps as f32)?;
+    }
+    if let Some(sp) = long.as_ref() {
+        super::cuda::delta_net_prefill_scan(&fused, sp)?;
+    }
+    Ok(Some(o))
 }
 
 /// The mixer as tensor ops — the arithmetic the fused kernels are
@@ -1850,6 +1687,7 @@ fn mix_spans_by_ops<'w>(
     // Per sequence, because `S` is: this is the other place a row depends on
     // the rows before it *within its own sequence*. Each call reads its slice of
     // the five operands and writes its slice of one shared output.
+    let lay = TimelineLayout::of(dims);
     let mut o_parts: Vec<LiveTensor<'w>> = Vec::with_capacity(seqs.len());
     for s in seqs.iter_mut() {
         // Free when the span is the whole buffer: a row range of a contiguous
@@ -1857,29 +1695,43 @@ fn mix_spans_by_ops<'w>(
         let rows = |x: &LiveTensor<'w>| -> Result<LiveTensor<'w>> {
             x.narrow(0, s.start, s.len)?.contiguous()
         };
-        o_parts.push(delta_chunked(
-            &mut s.state.s,
-            &rows(&q)?,
-            &rows(&k)?,
-            &rows(&v)?,
-            &rows(&g_log)?,
-            &rows(&beta)?,
-            DELTA_CHUNK,
-        )?);
-        // This path advances `s` IN PLACE, but the caller has already told the
-        // store the layer advanced, and `commit_wave` installs `out.s` — so the
-        // advance has to reach it or the swap would discard the wave's work and
-        // reinstate a two-waves-old state, silently. Mirroring here keeps the
-        // fallback's in-place arithmetic (which the parity oracle is written
-        // against) and still honours the store's contract; the fused path,
-        // which is what production runs, writes `out.s` directly and copies
-        // nothing.
-        //
-        // Nothing to mirror when the two are one buffer: the single-span entry
-        // points and the reference tests share `s` between the halves, and
-        // `slice_set` refuses a source that shares its destination's storage.
-        if !s.out.s.same_storage(&s.state.s) {
-            s.out.s.slice_set(&s.state.s, 0, 0)?;
+        match &s.write {
+            // A short span reads the state and writes its timeline: the rows'
+            // `G` and `v_new` against the entering state, the per-K-head key
+            // (normed, unscaled) and the raw conv input — what the kernels
+            // write, by the same algebra.
+            SpanWrite::Timeline(tl) => {
+                let (o, g_cs, v_new) = delta_span_rows(
+                    &s.state.s,
+                    &rows(&q)?,
+                    &rows(&k)?,
+                    &rows(&v)?,
+                    &rows(&g_log)?,
+                    &rows(&beta)?,
+                )?;
+                let k_heads = qk.narrow(1, h_k, h_k)?.narrow(0, s.start, s.len)?;
+                lay.write_rows(tl, &g_cs, &k_heads, &v_new, &rows(qkv)?)?;
+                o_parts.push(o);
+            }
+            // A long span advances into its write buffers — the prefill
+            // scratch, which `commit_wave` exchanges in — and leaves the live
+            // state as it entered. On the single-span entry points the two are
+            // one buffer, and the advance is in place.
+            SpanWrite::State(out) => {
+                if !out.s.same_storage(&s.state.s) {
+                    out.s.slice_set(&s.state.s, 0, 0)?;
+                }
+                let mut advanced = out.s.clone();
+                o_parts.push(delta_chunked(
+                    &mut advanced,
+                    &rows(&q)?,
+                    &rows(&k)?,
+                    &rows(&v)?,
+                    &rows(&g_log)?,
+                    &rows(&beta)?,
+                    DELTA_CHUNK,
+                )?);
+            }
         }
     }
     let o = LiveTensor::cat(&o_parts, 0)?;
@@ -1893,138 +1745,6 @@ fn mix_spans_by_ops<'w>(
     };
     let gated = rms_norm_per_head(&o, w.norm, rms_eps)?.mul(&z_gate)?;
     gated.reshape((t, dims.value_dim()))
-}
-
-/// Advance every span's carried state over its rows of `p` — states only, no
-/// output activations.
-///
-/// This is the speculative replay's form of the mixer. A rewind re-runs the
-/// accepted prefix of each verifying sequence from the state the block was
-/// entered with, and only the advanced state is wanted: the accepted tokens'
-/// logits were already produced by the wave, so the output path — the per-head
-/// norm, the z-gate, the very buffers they'd write — is work with no reader.
-///
-/// Two contract differences from [`delta_net_mix_spans`], both because the
-/// activations are discarded:
-///
-/// * **Spans need not tile `p`.** Each names its own `start`/`len` rows of the
-///   cohort's shared stash buffers, and an accept that kept fewer rows than its
-///   block leaves a gap the kernels never touch. The tiling rule over there
-///   protects an output buffer reconstructed span by span; there is no output
-///   here to protect. Spans must still be disjoint and ascending — that much is
-///   what keeps one sequence's rows out of another's recurrence.
-/// * **No decode split.** Every span replays as a prefill span whatever its
-///   length: the wave that stashed these operands ran them as prefill rows, and
-///   the replay must retrace that path, not the decode kernels' — same
-///   arithmetic, but bit-identity to the wave is the property a rewind rests on.
-///
-/// The fused CUDA path is the same two kernels the wave ran (conv + scan,
-/// batched over all spans through the span table); everywhere else each span
-/// takes one [`delta_net_mix_spans`] call over its own rows, which is the
-/// reference the kernels are parity-locked to.
-///
-/// `conved` is the fused path's `[T, conv_dim]` F32 conv output, and the
-/// **provenance root** of the replay: `p` is read in place from the rewind
-/// stash, which the sequence owns across waves and so names no arena, and the
-/// scan's output and the span table are placed beside `conved` instead. A
-/// caller replaying on a wave carves it there; the reference path convolves
-/// each span itself and never reads it.
-pub fn delta_net_advance_spans(
-    p: &DeltaNetProjections<'_>,
-    c: &DeltaNetConstants<'_>,
-    dims: &DeltaNetDims,
-    seqs: &mut [DeltaNetSeq<'_>],
-    rms_eps: f64,
-    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] conved: &LiveTensor<'_>,
-) -> Result<()> {
-    if seqs.is_empty() {
-        return Ok(());
-    }
-    let (t, _) = p.qkv.dims2()?;
-    let mut cursor = 0usize;
-    for (i, s) in seqs.iter().enumerate() {
-        if s.start < cursor || s.len == 0 {
-            candle::bail!(
-                "delta_net_advance_spans: span {i} at {}+{} overlaps the one before it \
-                 (ends at {cursor}) — spans must be disjoint and ascending",
-                s.start,
-                s.len
-            );
-        }
-        cursor = s.start + s.len;
-    }
-    if cursor > t {
-        candle::bail!("delta_net_advance_spans: spans reach row {cursor} of a {t}-row buffer");
-    }
-
-    // Bound under the same cfg as its only two uses below — the kernel's
-    // geometry check and the query scale. Without cuda there is no CUDA path to
-    // take, so the binding would be dead rather than merely unread.
-    #[cfg(feature = "cuda")]
-    let d = dims.head_dim;
-    #[cfg(feature = "cuda")]
-    let replay_ok = dispatch_verdict(
-        1,
-        &[
-            ("device", &|| p.qkv.device().is_cuda()),
-            ("head_dim", &|| d == super::cuda::DELTA_NET_PREFILL_DIM),
-            ("qkv:f32", &|| p.qkv.dtype() == DType::F32),
-            ("alpha:f32", &|| p.alpha_lin.dtype() == DType::F32),
-            ("beta:f32", &|| p.beta_lin.dtype() == DType::F32),
-            ("dt_bias:f32", &|| c.dt_bias.dtype() == DType::F32),
-            ("a:f32", &|| c.a.dtype() == DType::F32),
-            ("state:cuda", &|| {
-                seqs.iter().all(|s| s.state.s.device().is_cuda())
-            }),
-        ],
-    );
-    // A one-layer stack: the replay's one CUDA implementation, which the
-    // speculative rewind runs over every recurrent layer at once. Its tables
-    // and transients land beside `conved`, where the caller carved the conv
-    // (`WaveBuffer::Replay*`); the conv writes every row of every span and the
-    // scan reads only those, so `conved` arrives uninitialised (invariant 6).
-    #[cfg(feature = "cuda")]
-    if replay_ok {
-        let states = seqs
-            .iter()
-            .map(|s| ReplayStates::of(s.state, &s.out, dims))
-            .collect::<Result<Vec<_>>>()?;
-        let spans: Vec<ReplaySpan> = seqs
-            .iter()
-            .map(|s| ReplaySpan {
-                start: s.start,
-                len: s.len,
-            })
-            .collect();
-        let layer = StackedLayer { p, c, states };
-        return delta_net_replay_stack(&[layer], &spans, dims, rms_eps as f32, conved);
-    }
-
-    // Reference path: each span through the full mixer over its own rows,
-    // outputs discarded. Identical to running the spans one at a time, which is
-    // exactly what it does.
-    for s in seqs.iter_mut() {
-        let view = DeltaNetProjections {
-            qkv: p.qkv.narrow(0, s.start, s.len)?.contiguous()?,
-            z: p.z.narrow(0, s.start, s.len)?.contiguous()?,
-            beta_lin: p.beta_lin.narrow(0, s.start, s.len)?.contiguous()?,
-            alpha_lin: p.alpha_lin.narrow(0, s.start, s.len)?.contiguous()?,
-        };
-        let mut one = [DeltaNetSeq {
-            start: 0,
-            len: s.len,
-            state: &mut *s.state,
-            out: DeltaNetOut {
-                s: s.out.s.clone(),
-                conv_tail: s.out.conv_tail.clone(),
-            },
-            stash: None,
-        }];
-        // The activations — and with them the z-gate — are discarded; only the
-        // advanced state is wanted, so the gate kind cannot matter here.
-        let _ = delta_net_mix_spans(&view, c, dims, &mut one, rms_eps, None, ZGate::Silu, None)?;
-    }
-    Ok(())
 }
 
 /// One DeltaNet layer over a `[T, hidden]` segment (single sequence), from a
@@ -2382,105 +2102,6 @@ mod tests {
         (dt_bias, a, conv, norm)
     }
 
-    /// Spans merge only when they are adjacent in the wave AND in the same
-    /// stash; a gap on either side, or a different stash, starts a new run.
-    #[test]
-    fn adjacent_captures_coalesce_and_nothing_else_does() {
-        let dims = span_dims();
-        let a = SpanOperands::zeros(&dims, 16, &Device::Cpu).unwrap();
-        let b = SpanOperands::zeros(&dims, 16, &Device::Cpu).unwrap();
-        let cap = |ops, start, dst_row, len| StashCapture {
-            ops,
-            start,
-            dst_row,
-            len,
-        };
-        let merged = coalesce_captures(&[
-            cap(&a, 0, 0, 3),
-            cap(&a, 3, 3, 2),   // adjacent in both → merges
-            cap(&a, 6, 5, 2),   // wave gap → new run
-            cap(&a, 8, 8, 1),   // stash gap → new run
-            cap(&b, 9, 9, 1),   // other stash → new run
-            cap(&b, 10, 10, 4), // adjacent in both → merges
-        ]);
-        let shape: Vec<(usize, usize, usize, bool)> = merged
-            .iter()
-            .map(|m| (m.start, m.dst_row, m.len, std::ptr::eq(m.ops, &a)))
-            .collect();
-        assert_eq!(
-            shape,
-            vec![
-                (0, 0, 5, true),
-                (6, 5, 2, true),
-                (8, 8, 1, true),
-                (9, 9, 5, false)
-            ]
-        );
-    }
-
-    /// Every span of a cohort lands at its own stash rows, exactly, and rows no
-    /// span names stay as they were.
-    fn cohort_capture_lands_exactly(dev: &Device) {
-        let dims = span_dims();
-        let p = span_projections(12, &dims, dev);
-        let stash = SpanOperands::zeros(&dims, 10, dev).unwrap();
-        // Two adjacent spans (merge), then one placed after a stash gap.
-        let spans = [
-            StashCapture {
-                ops: &stash,
-                start: 1,
-                dst_row: 0,
-                len: 3,
-            },
-            StashCapture {
-                ops: &stash,
-                start: 4,
-                dst_row: 3,
-                len: 2,
-            },
-            StashCapture {
-                ops: &stash,
-                start: 8,
-                dst_row: 7,
-                len: 3,
-            },
-        ];
-        capture_spans(&p, &spans).unwrap();
-        for (dst, src) in stash.pairs(&p) {
-            let got = dst
-                .to_device(&Device::Cpu)
-                .unwrap()
-                .to_vec2::<f32>()
-                .unwrap();
-            let src = src
-                .to_device(&Device::Cpu)
-                .unwrap()
-                .to_vec2::<f32>()
-                .unwrap();
-            let width = src[0].len();
-            let mut want = vec![vec![0f32; width]; 10];
-            for s in &spans {
-                for r in 0..s.len {
-                    want[s.dst_row + r] = src[s.start + r].clone();
-                }
-            }
-            assert_eq!(got, want);
-        }
-    }
-
-    #[test]
-    fn a_cohort_capture_lands_exactly_on_the_host() {
-        cohort_capture_lands_exactly(&dev());
-    }
-
-    /// The device path (coalesced row-scatter launches) places the same bytes
-    /// the host copies do.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn a_cohort_capture_lands_exactly_on_the_device() {
-        cohort_capture_lands_exactly(&Device::new_cuda(0).unwrap());
-    }
-
     /// **Batching several sequences into one call must equal running each
     /// alone.**
     ///
@@ -2493,12 +2114,13 @@ mod tests {
     /// conversation into another, and the symptom is a plausible wrong answer
     /// rather than a crash.
     ///
-    /// Two sequences of *different* lengths, so an off-by-one cannot alias.
+    /// Two sequences of *different* lengths, so an off-by-one cannot alias —
+    /// one long enough to write a state, one short enough to write a timeline.
     #[test]
     fn spans_equal_running_each_sequence_alone() {
         let dev = dev();
         let dims = span_dims();
-        let (len_a, len_b) = (5usize, 3usize);
+        let (len_a, len_b) = (TIMELINE_ROWS + 3, 3usize);
         let total = len_a + len_b;
         let eps = 1e-6;
 
@@ -2532,27 +2154,26 @@ mod tests {
         let mut st_a = DeltaNetState::zeros(&dims, &dev).unwrap();
         let mut st_b = DeltaNetState::zeros(&dims, &dev).unwrap();
         let got = {
-            let (out_a, out_b) = (st_a.solo_out().unwrap(), st_b.solo_out().unwrap());
+            let write_a = solo_write(&st_a, len_a, &dims).unwrap();
+            let write_b = solo_write(&st_b, len_b, &dims).unwrap();
             let mut seqs = [
                 DeltaNetSeq {
                     start: 0,
                     len: len_a,
                     state: &mut st_a,
-                    out: out_a,
-                    stash: None,
+                    write: write_a,
                 },
                 DeltaNetSeq {
                     start: len_a,
                     len: len_b,
                     state: &mut st_b,
-                    out: out_b,
-                    stash: None,
+                    write: write_b,
                 },
             ];
             let mixed = delta_net_mix_spans(&p, &c, &dims, &mut seqs, eps, None, ZGate::Silu, None)
                 .unwrap();
             for s in seqs.iter_mut() {
-                s.state.absorb_solo(&s.out).unwrap();
+                finish_solo(s.state, &s.write, s.len, &dims).unwrap();
             }
             mixed
         };
@@ -2586,24 +2207,25 @@ mod tests {
         assert!(cross > 1e-6, "the two sequences ended in identical state");
     }
 
-    /// **Replaying a block's first `m` rows from the entering state equals
-    /// having only ever run those `m` rows.**
+    /// **Folding the first `m` rows of a block's timeline equals having only
+    /// ever run those `m` rows.**
     ///
     /// This is the property speculative decode rests on, and it is the reason
     /// the hybrid can rewind at all: `S` is a running sum with no suffix to
-    /// subtract, so a partial accept is undone by going *forward* from the
-    /// state the block was entered with — which the store's ping-pong keeps
-    /// for free — over the operands the wave stashed.
+    /// subtract, so a partial accept is a choice of how many of the block's
+    /// rows to fold into the state the block entered with — which nothing
+    /// wrote, because a short span writes only its timeline.
     ///
     /// The oracle is a clean run of the same `m` rows into a fresh copy of the
     /// entering state. If the two disagree, a rejected draft has left its mark
     /// on the recurrence, and the model would answer as though it had read
-    /// tokens the KV no longer holds.
+    /// tokens the KV no longer holds. Run for every `m`, so the prefix
+    /// stability of `G`, the solve and `v_new` is held at every row.
     #[test]
-    fn replaying_a_prefix_equals_running_only_that_prefix() {
+    fn folding_a_prefix_equals_running_only_that_prefix() {
         let dev = dev();
         let dims = span_dims();
-        let (block, kept) = (5usize, 2usize);
+        let block = 6usize;
         let p = span_projections(block, &dims, &dev);
         let (dt_bias, a, conv, norm) = span_constants(&dims, &dev);
         let c = DeltaNetConstants {
@@ -2613,57 +2235,38 @@ mod tests {
             norm: &norm,
         };
 
-        // A non-trivial entering state, so a replay that silently started from
+        // A non-trivial entering state, so a fold that silently started from
         // zeros could not pass.
         let entering = DeltaNetState {
             s: lcg_tensor(&[dims.n_v_heads, dims.head_dim, dims.head_dim], 77, &dev),
             conv_tail: lcg_tensor(&[dims.conv_dim(), dims.conv_kernel - 1], 78, &dev),
         };
 
-        // The wave: the whole block, reading `entering` and writing `advanced`,
-        // stashing its operands on the way through.
+        // The wave: the whole block, reading `entering` and writing a timeline.
         let mut read = entering.snapshot().unwrap();
-        let advanced = DeltaNetState::zeros(&dims, &dev).unwrap();
-        // Sized ahead of the mixer, as the engine sizes it ahead of the wave.
-        let stash = SpanOperands::zeros(&dims, block, &dev).unwrap();
+        let tl = TimelineLayout::of(&dims).alloc(&dev).unwrap();
         {
             let mut seqs = [DeltaNetSeq {
                 start: 0,
                 len: block,
                 state: &mut read,
-                out: advanced.write_half(),
-                stash: Some(StashSlot {
-                    ops: &stash,
-                    row: 0,
-                }),
+                write: SpanWrite::Timeline(tl.clone()),
             }];
-            // The mixer itself does not fill the stash — the quantized layer
-            // driver does, right after the projections — so stand in for it
-            // with the same capture it would have made.
-            let slot = seqs[0].stash.as_ref().unwrap();
-            slot.ops.capture(&p, 0, slot.row, block).unwrap();
             delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
         }
+        assert_close(
+            &read.s,
+            &entering.s,
+            0.0,
+            "a short span left its state as it was",
+        );
 
-        // The replay: `kept` rows, from the entering state, into a fresh half.
-        let mut replay_read = entering.snapshot().unwrap();
-        let replayed = DeltaNetState::zeros(&dims, &dev).unwrap();
-        {
-            let pr = stash.rows(0, kept).unwrap();
-            let mut seqs = [DeltaNetSeq {
-                start: 0,
-                len: kept,
-                state: &mut replay_read,
-                out: replayed.write_half(),
-                stash: None,
-            }];
-            delta_net_mix_spans(&pr, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
-        }
+        for kept in 1..=block {
+            let mut folded = entering.snapshot().unwrap();
+            fold_by_ops(&mut folded, &tl, kept, &dims).unwrap();
 
-        // The oracle: the same `kept` rows, nothing else, same entering state.
-        let mut want_read = entering.snapshot().unwrap();
-        let want = DeltaNetState::zeros(&dims, &dev).unwrap();
-        {
+            // The oracle: the same `kept` rows, nothing else, same entering state.
+            let mut want = entering.snapshot().unwrap();
             let po = DeltaNetProjections {
                 qkv: p.qkv.narrow(0, 0, kept).unwrap().contiguous().unwrap(),
                 z: p.z.narrow(0, 0, kept).unwrap().contiguous().unwrap(),
@@ -2675,28 +2278,26 @@ mod tests {
                     .contiguous()
                     .unwrap(),
             };
-            let mut seqs = [DeltaNetSeq {
-                start: 0,
-                len: kept,
-                state: &mut want_read,
-                out: want.write_half(),
-                stash: None,
-            }];
-            delta_net_mix_spans(&po, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).unwrap();
+            delta_net_mix(&po, &c, &dims, &mut want, 1e-6, ZGate::Silu).unwrap();
+
+            assert_close(&folded.s, &want.s, 1e-5, &format!("state folded at {kept}"));
+            assert_close(
+                &folded.conv_tail,
+                &want.conv_tail,
+                0.0,
+                &format!("conv tail folded at {kept}"),
+            );
         }
 
-        assert_close(&replayed.s, &want.s, 1e-6, "replayed state");
-        assert_close(
-            &replayed.conv_tail,
-            &want.conv_tail,
-            1e-6,
-            "replayed conv tail",
-        );
-        // And the block really did advance further than the prefix, so the
-        // assertions above are not comparing a rewind to a no-op.
-        let gap = advanced
+        // And the whole block really does advance further than a prefix, so
+        // the assertions above are not comparing a rewind to a no-op.
+        let mut whole = entering.snapshot().unwrap();
+        fold_by_ops(&mut whole, &tl, block, &dims).unwrap();
+        let mut one = entering.snapshot().unwrap();
+        fold_by_ops(&mut one, &tl, 1, &dims).unwrap();
+        let gap = whole
             .s
-            .sub(&want.s)
+            .sub(&one.s)
             .unwrap()
             .abs()
             .unwrap()
@@ -2708,29 +2309,17 @@ mod tests {
             .unwrap();
         assert!(
             gap > 1e-5,
-            "the {block}-row block ended in the same state as its {kept}-row \
-             prefix — the fixture cannot tell a rewind from a no-op"
+            "the {block}-row block ended in the same state as its first row — the \
+             fixture cannot tell a rewind from a no-op"
         );
     }
 
-    /// **A cohort's replays batched must equal each replayed alone.**
-    ///
-    /// The batched rewind advances several sequences' states over their own
-    /// spans of ONE shared operand buffer, with gaps where an accept kept fewer
-    /// rows than its block — the layout [`delta_net_advance_spans`] exists for.
-    /// Each state must come out exactly as a lone [`delta_net_mix_spans`] call
-    /// over just its rows would leave it, gaps ignored, no sequence reading
-    /// another's rows.
+    /// A span's write must fit its length — a short span handed a state, or a
+    /// long one a timeline, is refused before anything runs.
     #[test]
-    fn batched_state_advance_equals_each_span_alone() {
+    fn a_span_write_that_does_not_fit_its_length_is_refused() {
         let dev = dev();
         let dims = span_dims();
-        // (block len, kept): a short accept, a FULL accept span sitting between
-        // two rewinding ones (its rows are a gap the kernels must skip), and a
-        // one-row accept.
-        let blocks = [(5usize, 2usize), (3, 3), (4, 1)];
-        let total: usize = blocks.iter().map(|b| b.0).sum();
-        let p = span_projections(total, &dims, &dev);
         let (dt_bias, a, conv, norm) = span_constants(&dims, &dev);
         let c = DeltaNetConstants {
             dt_bias: &dt_bias,
@@ -2738,125 +2327,30 @@ mod tests {
             conv: &conv,
             norm: &norm,
         };
+        let mut st = DeltaNetState::zeros(&dims, &dev).unwrap();
+        let short = span_projections(3, &dims, &dev);
+        let out = st.solo_out().unwrap();
+        let mut seqs = [DeltaNetSeq {
+            start: 0,
+            len: 3,
+            state: &mut st,
+            write: SpanWrite::State(out),
+        }];
+        let err = delta_net_mix_spans(&short, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("timeline"), "{err}");
 
-        // Distinct entering states per sequence, so crossed rows cannot agree
-        // by coincidence.
-        let enterings: Vec<DeltaNetState> = (0..blocks.len())
-            .map(|i| DeltaNetState {
-                s: lcg_tensor(
-                    &[dims.n_v_heads, dims.head_dim, dims.head_dim],
-                    200 + i as u64,
-                    &dev,
-                ),
-                conv_tail: lcg_tensor(
-                    &[dims.conv_dim(), dims.conv_kernel - 1],
-                    300 + i as u64,
-                    &dev,
-                ),
-            })
-            .collect();
-        let starts: Vec<usize> = blocks
-            .iter()
-            .scan(0usize, |acc, &(len, _)| {
-                let s = *acc;
-                *acc += len;
-                Some(s)
-            })
-            .collect();
-
-        // Batched: only the rewinding spans (kept < len), over the shared
-        // buffer with the full-accept span's rows left as a gap.
-        let mut batched_reads: Vec<DeltaNetState> =
-            enterings.iter().map(|e| e.snapshot().unwrap()).collect();
-        let batched_outs: Vec<DeltaNetState> = (0..blocks.len())
-            .map(|_| DeltaNetState::zeros(&dims, &dev).unwrap())
-            .collect();
-        {
-            let mut seqs: Vec<DeltaNetSeq<'_>> = Vec::new();
-            for (i, st) in batched_reads.iter_mut().enumerate() {
-                let (len, kept) = blocks[i];
-                if kept < len {
-                    seqs.push(DeltaNetSeq {
-                        start: starts[i],
-                        len: kept,
-                        state: st,
-                        out: batched_outs[i].write_half(),
-                        stash: None,
-                    });
-                }
-            }
-            let conved = Tensor::empty((total, dims.conv_dim()), DType::F32, &dev).unwrap();
-            delta_net_advance_spans(&p, &c, &dims, &mut seqs, 1e-6, &conved).unwrap();
-        }
-
-        // Alone: each rewinding span through the ordinary mixer over its rows.
-        for (i, entering) in enterings.iter().enumerate() {
-            let (len, kept) = blocks[i];
-            if kept == len {
-                continue;
-            }
-            let view = DeltaNetProjections {
-                qkv: p
-                    .qkv
-                    .narrow(0, starts[i], kept)
-                    .unwrap()
-                    .contiguous()
-                    .unwrap(),
-                z: p.z
-                    .narrow(0, starts[i], kept)
-                    .unwrap()
-                    .contiguous()
-                    .unwrap(),
-                beta_lin: p
-                    .beta_lin
-                    .narrow(0, starts[i], kept)
-                    .unwrap()
-                    .contiguous()
-                    .unwrap(),
-                alpha_lin: p
-                    .alpha_lin
-                    .narrow(0, starts[i], kept)
-                    .unwrap()
-                    .contiguous()
-                    .unwrap(),
-            };
-            let mut read = entering.snapshot().unwrap();
-            let want = DeltaNetState::zeros(&dims, &dev).unwrap();
-            let mut one = [DeltaNetSeq {
-                start: 0,
-                len: kept,
-                state: &mut read,
-                out: want.write_half(),
-                stash: None,
-            }];
-            let _ = delta_net_mix_spans(&view, &c, &dims, &mut one, 1e-6, None, ZGate::Silu, None)
-                .unwrap();
-
-            let got_s = batched_outs[i].write_half().s;
-            let got_t = batched_outs[i].write_half().conv_tail;
-            let d = |x: &Tensor, y: &Tensor| -> f32 {
-                (x - y)
-                    .unwrap()
-                    .abs()
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .max(0)
-                    .unwrap()
-                    .to_scalar::<f32>()
-                    .unwrap()
-            };
-            assert_eq!(
-                d(&got_s, &want.write_half().s),
-                0.0,
-                "sequence {i}'s batched S differs from its lone replay"
-            );
-            assert_eq!(
-                d(&got_t, &want.write_half().conv_tail),
-                0.0,
-                "sequence {i}'s batched conv tail differs from its lone replay"
-            );
-        }
+        let long = span_projections(TIMELINE_ROWS + 1, &dims, &dev);
+        let tl = TimelineLayout::of(&dims).alloc(&dev).unwrap();
+        let mut seqs = [DeltaNetSeq {
+            start: 0,
+            len: TIMELINE_ROWS + 1,
+            state: &mut st,
+            write: SpanWrite::Timeline(tl),
+        }];
+        let err = delta_net_mix_spans(&long, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("state"), "{err}");
     }
 
     /// Spans that do not tile the buffer must be refused, not silently mixed.
@@ -2882,21 +2376,20 @@ mod tests {
         let mut st_b = DeltaNetState::zeros(&dims, &dev).unwrap();
 
         let run = |spans: [(usize, usize); 2], sa: &mut DeltaNetState, sb: &mut DeltaNetState| {
-            let (out_a, out_b) = (sa.solo_out().unwrap(), sb.solo_out().unwrap());
+            let write_a = solo_write(sa, spans[0].1, &dims).unwrap();
+            let write_b = solo_write(sb, spans[1].1, &dims).unwrap();
             let mut seqs = [
                 DeltaNetSeq {
                     start: spans[0].0,
                     len: spans[0].1,
                     state: sa,
-                    out: out_a,
-                    stash: None,
+                    write: write_a,
                 },
                 DeltaNetSeq {
                     start: spans[1].0,
                     len: spans[1].1,
                     state: sb,
-                    out: out_b,
-                    stash: None,
+                    write: write_b,
                 },
             ];
             delta_net_mix_spans(&p, &c, &dims, &mut seqs, 1e-6, None, ZGate::Silu, None).map(|_| ())

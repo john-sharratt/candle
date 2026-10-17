@@ -217,7 +217,9 @@ pub(crate) mod repack_fingerprint;
 /// the wave forwards, are CUDA-only.
 #[cfg(feature = "cuda")]
 pub(crate) mod residency_rows;
-pub mod residual_order;
+/// Where a residual lives between forwards: the step's buffers and the creep's
+/// arena (`docs/wave_step.md`).
+pub mod residual_rows;
 pub mod rope_schedule;
 pub mod rope_tables;
 pub mod rotary_layout;
@@ -275,7 +277,6 @@ pub mod wave_driver;
 #[cfg(feature = "cuda")]
 pub mod wave_token_ids;
 pub mod whisper;
-pub mod window_residuals;
 pub mod with_tracing;
 pub mod wuerstchen;
 pub mod xlm_roberta;

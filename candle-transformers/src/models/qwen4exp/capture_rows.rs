@@ -5,8 +5,8 @@
 //! Each is computed on the wave's own arena and read after the wave, by the
 //! rewind at accept time, so it has to be copied off the arena. It is copied
 //! into these buffers rather than into a fresh owned tensor per span per
-//! layer: they are laid out like the rewind stash — one row per verify row of
-//! the cohort, each sequence at its stash row — sized for the widest cohort
+//! layer: one row per verify row of the cohort, each sequence's block at its
+//! capture row (`SpecCapture::new` packs them in wave order) — sized for the widest cohort
 //! verified so far and reused across steps, so a verify wave allocates nothing
 //! to keep them.
 
@@ -36,8 +36,8 @@ pub struct CaptureWidths {
 
 impl CaptureRows {
     /// Buffers for `cap` verify rows, on held ground. **Allocate outside a
-    /// forward**, as the rewind stash is: the copies into them run inside the
-    /// sweep.
+    /// forward**: the copies into them run inside the sweep, where the arena
+    /// refuses an allocation.
     pub fn new(cap: usize, w: CaptureWidths, device: &Device) -> Result<Self> {
         Ok(Self {
             head: held_empty((cap, w.hc, w.n_embd), DType::F32, device)?,
@@ -54,7 +54,7 @@ impl CaptureRows {
     }
 
     /// Copy `src`'s rows into rows `[row, row + src.dim(0))` of `dst` and
-    /// return that view — what the stash keeps in place of an owned copy.
+    /// return that view — what the capture keeps in place of an owned copy.
     pub fn keep(dst: &Tensor, row: usize, src: &Tensor) -> Result<Tensor> {
         let rows = src.dim(0)?;
         if row + rows > dst.dim(0)? {
@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_span_is_its_rows_at_its_stash_row() -> Result<()> {
+    fn a_kept_span_is_its_rows_at_its_capture_row() -> Result<()> {
         let dev = Device::Cpu;
         let rows = CaptureRows::new(5, widths(), &dev)?;
         let src = Tensor::arange(0f32, 8.0, &dev)?.reshape((2, 4))?;

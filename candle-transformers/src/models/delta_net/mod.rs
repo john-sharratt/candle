@@ -22,17 +22,16 @@ pub mod mix;
 /// scatter is a kernel wrapper, so it shares that module's gate.
 #[cfg(feature = "cuda")]
 pub mod quantized;
-#[cfg(feature = "cuda")]
-pub mod replay_stack;
 pub mod state_store;
+pub mod timeline;
 pub mod types;
 
 pub use kv_layout::KvLayerMap;
 pub use mix::{
-    causal_conv1d, delta_net_advance_spans, delta_net_layer_forward, delta_net_mix,
-    delta_net_mix_spans, delta_recurrence, delta_step, l2_norm, seq_spans, DeltaNetConstants,
+    causal_conv1d, delta_net_layer_forward, delta_net_mix, delta_net_mix_spans, delta_recurrence,
+    delta_step, finish_solo, fold_one, l2_norm, seq_spans, solo_write, DeltaNetConstants,
     DeltaNetLayerTable, DeltaNetOut, DeltaNetProjections, DeltaNetSeq, DeltaNetSpanTable,
-    DeltaNetState, DeltaNetWeights, SeqSpan, SpanOperands, StashSlot,
+    DeltaNetState, DeltaNetWeights, SeqSpan, SpanWrite,
 };
 #[cfg(feature = "cuda")]
 pub use quantized::{
@@ -40,7 +39,8 @@ pub use quantized::{
     QuantDeltaNetWeights,
 };
 pub use state_store::{
-    compact_stores, release_seal_readback, ExportedLayerState, RecurrentCompaction,
-    RecurrentStateStore, StagedSnapshot,
+    commit_stores, compact_stores, end_steps, fold_stores, release_seal_readback,
+    ExportedLayerState, RecurrentCompaction, RecurrentStateStore, StagedSnapshot,
 };
+pub use timeline::{fold_by_ops, TimelineLayout, TIMELINE_ROWS};
 pub use types::{DeltaNetDims, LayerKind, ZGate};

@@ -7,6 +7,7 @@
 //! `/v1/tools`, which are open on purpose (see each route).
 
 mod catalog;
+mod expert_split;
 mod format_mix;
 mod log_grep;
 mod logs;
@@ -135,6 +136,14 @@ fn shared_table(roles: Roles) -> Api<Arc<Shared>> {
         // Reading resets the counters, so two calls bracket a window — an
         // operator's, which a reader passing by must not be able to wipe.
         .route("/v1/profile", Role::Admin, each(), get(profile::profile))
+        // Tuning the CPU expert split moves where every member's experts are
+        // computed. Each member answers with its own measured costs.
+        .route(
+            "/v1/expert_split",
+            Role::Admin,
+            each(),
+            post(expert_split::expert_split),
+        )
         // The chat page is open to everyone, and it reads the catalog to show
         // what a tool call left out and the defaults it took. The catalog
         // describes what the tools take, nothing anybody has stored.
@@ -417,6 +426,7 @@ mod tests {
                 ("/v1/projections", "user"),
                 ("/v1/layers", "user"),
                 ("/v1/profile", "admin"),
+                ("/v1/expert_split", "admin"),
                 ("/v1/tools", "unauthenticated"),
                 ("/v1/tools/calibrate", "admin"),
                 ("/v1/schema/layers", "user"),

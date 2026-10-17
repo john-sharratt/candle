@@ -38,8 +38,10 @@
 
 use super::cache::PREFILL_HIT_SCORE;
 use super::pinned::WarmPool;
+use super::warm_tier::WarmTier;
 use candle::Result;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 /// One pad slot's state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +58,9 @@ pub(crate) struct PadBook {
     slots: Vec<PadSlot>,
     /// Per slot: staged ahead, and its row not yet begun.
     fresh: Vec<bool>,
+    /// Per slot: resident (`resident`) — never a victim; its label changes
+    /// only at a pass boundary.
+    resident: Vec<bool>,
     free: Vec<usize>,
     scores: Vec<f32>,
     n_experts: usize,
@@ -72,15 +77,51 @@ pub(crate) enum Fresh {
 }
 
 impl PadBook {
-    pub(crate) fn new(n_slots: usize, rows: usize, n_experts: usize) -> Self {
+    /// `n_slots` slots, of which `residents` — `(slot, row, expert)`, the
+    /// startup fill's — already hold their experts, resident; every other slot
+    /// is free.
+    pub(crate) fn new(
+        n_slots: usize,
+        rows: usize,
+        n_experts: usize,
+        residents: &[(usize, usize, usize)],
+    ) -> Self {
+        let mut slots = vec![PadSlot::Free; n_slots];
+        let mut resident = vec![false; n_slots];
+        for &(slot, row, expert) in residents {
+            slots[slot] = PadSlot::Held(row, expert);
+            resident[slot] = true;
+        }
         Self {
-            slots: vec![PadSlot::Free; n_slots],
+            // Popped from the back: the lowest free slot first.
+            free: (0..n_slots).rev().filter(|&s| !resident[s]).collect(),
+            slots,
             fresh: vec![false; n_slots],
-            // Popped from the back: slot 0 first.
-            free: (0..n_slots).rev().collect(),
+            resident,
             scores: vec![0.0; rows * n_experts],
             n_experts,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_resident(&self, slot: usize) -> bool {
+        self.resident[slot]
+    }
+
+    /// Relabel `slot` — at a pass boundary only (`resident`).
+    pub(crate) fn set_resident(&mut self, slot: usize, resident: bool) {
+        self.resident[slot] = resident;
+    }
+
+    /// The held slots, `(slot, row, expert, resident)`.
+    pub(crate) fn held(&self) -> impl Iterator<Item = (usize, usize, usize, bool)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| match *s {
+                PadSlot::Held(row, expert) => Some((slot, row, expert, self.resident[slot])),
+                _ => None,
+            })
     }
 
     pub(crate) fn state(&self, slot: usize) -> PadSlot {
@@ -160,10 +201,11 @@ impl PadBook {
         self.scores[row * self.n_experts + expert]
     }
 
-    /// Up to `count` held slots to evict, best first. `admit(row, expert)`
-    /// returns `None` for a slot that may not go, else whether its expert is
-    /// also in VRAM — those go first, then the slots that are not fresh, then
-    /// the lowest score. `fresh` says whether a fresh slot may go at all.
+    /// Up to `count` held churn slots to evict, best first — a resident slot
+    /// never goes. `admit(row, expert)` returns `None` for a slot that may not
+    /// go, else whether its expert is also in VRAM — those go first, then the
+    /// slots that are not fresh, then the lowest score. `fresh` says whether a
+    /// fresh slot may go at all.
     pub(crate) fn victims(
         &self,
         count: usize,
@@ -175,7 +217,7 @@ impl PadBook {
             .iter()
             .enumerate()
             .filter_map(|(slot, s)| match *s {
-                PadSlot::Held(row, expert) => {
+                PadSlot::Held(row, expert) if !self.resident[slot] => {
                     let is_fresh = self.fresh[slot];
                     if is_fresh && fresh == Fresh::Spare {
                         return None;
@@ -195,10 +237,17 @@ impl PadBook {
     }
 }
 
-/// The pad's memory.
+/// The pad's memory: its own churn block, then the resident region — the warm
+/// tier's pinned block, appended once the startup fill has written it.
 pub(crate) struct Pad {
     pool: WarmPool,
     stride: usize,
+    /// The resident region, `(base, slots)`: slots `pool.num_slots()..` of the
+    /// pad.
+    resident: (u64, usize),
+    /// The warm tier the resident region lies in, held so the region lives as
+    /// long as the pad does.
+    warm: Option<Arc<WarmTier>>,
 }
 
 impl Pad {
@@ -214,11 +263,41 @@ impl Pad {
                 pool.num_slots()
             );
         }
-        Ok(Self { pool, stride })
+        Ok(Self {
+            pool,
+            stride,
+            resident: (0, 0),
+            warm: None,
+        })
+    }
+
+    /// Append the warm tier's pinned block, which the startup fill has
+    /// written, as the resident region — its slots `stride` apart, as the
+    /// pad's own are. Once, before the stager takes the pad.
+    pub(crate) fn attach_resident(&mut self, warm: Arc<WarmTier>) {
+        assert!(
+            self.warm.is_none(),
+            "expert pad: resident region attached twice"
+        );
+        let (lo, hi) = warm.pinned_range();
+        let slots = warm.pinned_slots();
+        assert_eq!(
+            hi - lo,
+            (slots * self.stride) as u64,
+            "expert pad: the warm tier's pinned slots are not the pad's {} B stride",
+            self.stride
+        );
+        self.resident = (lo, slots);
+        self.warm = Some(warm);
+    }
+
+    /// The churn block's slots: `0..churn_slots()`.
+    pub(crate) fn churn_slots(&self) -> usize {
+        self.pool.num_slots()
     }
 
     pub(crate) fn num_slots(&self) -> usize {
-        self.pool.num_slots()
+        self.pool.num_slots() + self.resident.1
     }
 
     pub(crate) fn stride(&self) -> usize {
@@ -227,9 +306,21 @@ impl Pad {
 
     /// Slot `i`'s address, host and device alike.
     pub(crate) fn slot_addr(&self, i: usize) -> u64 {
-        self.pool.slot_addr(i)
+        match i.checked_sub(self.pool.num_slots()) {
+            None => self.pool.slot_addr(i),
+            Some(r) => {
+                assert!(
+                    r < self.resident.1,
+                    "expert pad: slot {i} is past the pad's {} slots",
+                    self.num_slots()
+                );
+                self.resident.0 + (r * self.stride) as u64
+            }
+        }
     }
 
+    /// The churn block's addresses, `[lo, hi)`; the resident region's are the
+    /// warm tier's pinned range.
     pub(crate) fn range(&self) -> (u64, u64) {
         self.pool.range()
     }
@@ -255,7 +346,7 @@ mod tests {
     /// slot taken again as a victim reloads in place.
     #[test]
     fn a_slot_cycles_through_its_states() {
-        let mut b = PadBook::new(3, 2, 4);
+        let mut b = PadBook::new(3, 2, 4, &[]);
         assert_eq!(b.take_free(), Some(0));
         b.start_load(0, 1, 3, false);
         assert_eq!(b.state(0), PadSlot::Loading(1, 3));
@@ -272,7 +363,7 @@ mod tests {
     /// score, then the lowest score; loading and refused slots never.
     #[test]
     fn victims_prefer_vram_backed_then_the_coldest() {
-        let mut b = PadBook::new(5, 2, 4);
+        let mut b = PadBook::new(5, 2, 4, &[]);
         for (slot, (row, e)) in [(1, 0), (1, 1), (1, 2), (0, 3), (0, 0)]
             .into_iter()
             .enumerate()
@@ -309,7 +400,7 @@ mod tests {
     /// clears it too.
     #[test]
     fn a_fresh_slot_is_spared_until_its_row_is_settled() {
-        let mut b = PadBook::new(4, 3, 4);
+        let mut b = PadBook::new(4, 3, 4, &[]);
         // Slots 0 and 1 staged ahead for row 2, slot 2 an old demand copy of
         // row 0 with a score, slot 3 an unscored demand copy of row 1.
         for (slot, (row, e, ahead)) in [(2, 0, true), (2, 1, true), (0, 1, false), (1, 3, false)]
@@ -347,10 +438,35 @@ mod tests {
         assert!(!b.is_fresh(3), "a demand load is not fresh");
     }
 
+    /// The startup fill's residents hold their slots, off the free list and
+    /// never a victim; relabelled churn, one becomes a victim like any other,
+    /// and a churn slot relabelled resident stops being one.
+    #[test]
+    fn residents_are_never_victims_until_relabelled() {
+        let mut b = PadBook::new(4, 2, 4, &[(2, 1, 0), (3, 1, 1)]);
+        assert_eq!(b.state(2), PadSlot::Held(1, 0));
+        assert!(b.is_resident(2) && b.is_resident(3) && !b.is_resident(0));
+        assert_eq!(b.take_free(), Some(0));
+        b.start_load(0, 0, 3, false);
+        b.landed(0);
+        assert_eq!(b.take_free(), Some(1));
+        assert_eq!(b.take_free(), None, "residents are off the free list");
+        assert_eq!(b.victims(4, Fresh::Spare, |_, _| Some(false)), vec![0]);
+        b.set_resident(3, false);
+        b.set_resident(0, true);
+        assert_eq!(b.victims(4, Fresh::Spare, |_, _| Some(false)), vec![3]);
+        let mut held: Vec<_> = b.held().collect();
+        held.sort_unstable();
+        assert_eq!(
+            held,
+            vec![(0, 0, 3, true), (2, 1, 0, true), (3, 1, 1, false)]
+        );
+    }
+
     /// A row's scored experts, highest first, ties by expert, floored and capped.
     #[test]
     fn top_scored_ranks_a_rows_experts_above_the_floor() {
-        let mut b = PadBook::new(1, 2, 5);
+        let mut b = PadBook::new(1, 2, 5, &[]);
         b.credit(1, 3, true);
         b.credit(1, 3, true); // 2.0
         b.credit(1, 0, true); // 1.0

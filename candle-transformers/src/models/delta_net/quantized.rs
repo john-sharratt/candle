@@ -27,8 +27,8 @@ use crate::models::quantized_matmul::QMatMul;
 use crate::models::stacked_proj::project_grouped;
 
 use super::mix::{
-    capture_spans, delta_net_mix_spans, delta_net_mix_spans_q8, DeltaNetConstants,
-    DeltaNetLayerTable, DeltaNetProjections, DeltaNetSeq, DeltaNetState, MixOut, StashCapture,
+    delta_net_mix_spans, delta_net_mix_spans_q8, finish_solo, solo_write, DeltaNetConstants,
+    DeltaNetLayerTable, DeltaNetProjections, DeltaNetSeq, DeltaNetState, MixOut,
 };
 use super::types::{DeltaNetDims, ZGate};
 
@@ -102,16 +102,16 @@ pub fn quantized_delta_net_layer_forward<'w>(
     zgate: ZGate,
 ) -> Result<LiveTensor<'w>> {
     let t = x.dim(0)?;
-    // One carried state, as in the float single-span path: `s` is read and
-    // written in place, the conv tail lands in a scratch buffer that is folded
-    // back below. There is no wave to roll back here.
-    let out = state.solo_out()?;
+    // One carried state, as in the float single-span path: a short span's
+    // timeline is folded whole below, a long span writes `s` in place and its
+    // conv tail to a scratch buffer taken back below. There is no wave to roll
+    // back here.
+    let write = solo_write(state, t, dims)?;
     let mut one = [DeltaNetSeq {
         start: 0,
         len: t,
         state,
-        out,
-        stash: None,
+        write,
     }];
     // The single-sequence convenience path, used off the sweep, so no phase is
     // open for its projections to root on.
@@ -128,7 +128,7 @@ pub fn quantized_delta_net_layer_forward<'w>(
         None,
     )?;
     let [seq] = one;
-    seq.state.absorb_solo(&seq.out)?;
+    finish_solo(seq.state, &seq.write, t, dims)?;
     Ok(mixed)
 }
 
@@ -204,24 +204,6 @@ pub fn quantized_delta_net_layer_forward_spans<'w>(
         alpha_lin: take.next().expect("four parts requested"),
     };
     g_proj.end();
-    // A span that will have to rewind keeps this layer's operands, copied out
-    // of the wave arena that is reclaimed at the end of the forward — every
-    // such span in one batched capture. The destination is already allocated —
-    // see `DeltaNetSeq::stash`.
-    let captures: Vec<StashCapture<'_>> = seqs
-        .iter()
-        .filter_map(|s| {
-            s.stash.as_ref().map(|slot| StashCapture {
-                ops: slot.ops,
-                start: s.start,
-                dst_row: slot.row,
-                len: s.len,
-            })
-        })
-        .collect();
-    if !captures.is_empty() {
-        capture_spans(&p, &captures)?;
-    }
     let c = DeltaNetConstants {
         dt_bias: &w.dt_bias,
         a: &w.a,

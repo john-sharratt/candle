@@ -275,7 +275,7 @@ pub(crate) mod tests {
 
         let kinds = model.model().cfg.layer_kinds.clone();
         let n = kinds.len();
-        let mut residual: Option<Tensor> = None;
+        let mut residual = model.claim_residual(&session, prompt.len())?;
         let (mut attn_ms, mut delta_ms) = (0f64, 0f64);
         let (mut attn_n, mut delta_n) = (0usize, 0usize);
         for (li, kind) in kinds.iter().enumerate().take(n) {
@@ -291,9 +291,8 @@ pub(crate) mod tests {
                 &[],
                 li,
                 li + 1,
-                residual.take(),
+                Some(&mut residual),
             )?;
-            residual = step.residual.clone();
             drop(step);
             device.synchronize()?;
             let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -320,7 +319,7 @@ pub(crate) mod tests {
         // chunked scan, the paged decode kernel instead of the float fallback —
         // so its distribution has to be measured separately.
         let mut tok = 1000u32;
-        let mut residual: Option<Tensor> = None;
+        let mut residual = model.claim_residual(&session, 1)?;
         let (mut a_ms, mut d_ms) = (0f64, 0f64);
         for (li, kind) in kinds.iter().enumerate().take(n) {
             let ids = Tensor::from_vec(vec![tok], (1, 1), &device)?;
@@ -336,9 +335,8 @@ pub(crate) mod tests {
                 &[],
                 li,
                 li + 1,
-                residual.take(),
+                Some(&mut residual),
             )?;
-            residual = step.residual.clone();
             if let Some(l) = step.logits.as_ref() {
                 tok = l[0].flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
             }
@@ -848,8 +846,8 @@ pub(crate) mod tests {
     ///
     /// It measured flat (242.6 / 257.1 / 262.8 tok/s at 64 / 128 / 256 tokens,
     /// width 10), which is what pointed at DeltaNet: 30 recurrent layers each
-    /// holding a `32 × 128 × 128` F32 state per sequence, doubled for the
-    /// live/backup ping-pong, is 120 MiB per session and is untouched by KV
+    /// holding a `32 × 128 × 128` F32 state per sequence, with its conv tail and
+    /// timeline, is ~80 MiB per decoding session and is untouched by KV
     /// compression.
     ///
     /// **Each length is its own `params.run` and therefore its own model load**,
@@ -983,9 +981,10 @@ pub(crate) mod tests {
     cold_point!(cold_w20_b1, 20, 1);
     cold_point!(cold_w20_b2, 20, 2);
     // **Width 32 needs a card this lineage's dev machines do not have.** Thirty
-    // recurrent layers holding a `32 × 128 × 128` F32 state per sequence, doubled
-    // for the live/backup ping-pong, is ~120 MiB per session and compression
-    // cannot touch it — so 32 sessions is ~3.8 GiB of DeltaNet state before any
+    // recurrent layers holding a `32 × 128 × 128` F32 state per sequence, with
+    // its conv tail and timeline, is ~80 MiB per decoding session — twice that
+    // while it prefills — and compression cannot touch it, so 32 sessions
+    // prefilling together is ~5 GiB of DeltaNet state before any
     // KV, and admission refuses on the 16 GB and 24 GB boxes. They are kept, and
     // `#[ignore]`d like every other point here, because they are the instrument
     // for the 72 GB Blackwell: the answer they carry is whether the turn at 16
