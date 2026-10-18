@@ -1,0 +1,17 @@
+[package]
+name = "coop"
+version.workspace = true
+edition.workspace = true
+description = "Cooperative admission for a zend cluster: each member's forward cost fitted from its own wave log, and a cluster simulator that compares placement policies on it."
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "coop-lab"
+path = "src/lab.rs"
+
+[dependencies]
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }

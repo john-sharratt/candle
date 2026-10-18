@@ -5,6 +5,7 @@ members = [
     "candle-conversation",
     "cluster",
     "cluster-dial",
+    "coop",
     "candle-core",
     "embed-watch",
     "zend",
