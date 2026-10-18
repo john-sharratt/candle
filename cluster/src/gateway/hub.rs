@@ -448,6 +448,7 @@ impl Hub {
                 lagging: false,
                 syncing,
                 in_flight: 0,
+                handed: 0,
             });
         }
         let local = if hello.build.is_local() {

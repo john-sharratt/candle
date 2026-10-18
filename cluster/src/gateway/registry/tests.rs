@@ -37,6 +37,7 @@ fn member(node: u64, session: u64) -> MemberView {
         lagging: false,
         syncing: false,
         in_flight: 0,
+        handed: 0,
     }
 }
 
@@ -315,6 +316,40 @@ fn an_aggregate_reaches_every_ready_member() {
         r.pick("zend", &Dispatch::Aggregate(Merge::Envelope), None, None),
         Pick::All(vec![1, 3])
     );
+}
+
+/// **A job picked for an agent counts as handed to it until its next
+/// `CAPACITY`**, which reports it running and clears the count.
+#[test]
+fn a_picked_job_is_handed_until_the_next_capacity() {
+    let mut r = Registry::new();
+    for node in [1, 2] {
+        let mut m = member(node, node);
+        m.app = "agent".into();
+        m.repos = vec![RepoAd {
+            name: "candle".into(),
+            origin: "o".into(),
+            push: false,
+        }];
+        r.join(m);
+        r.capacity("agent", node, capacity(MemberState::Ready, 0, true, 1));
+    }
+    let need = Need {
+        repo: "candle".into(),
+        toolchain: None,
+        push: false,
+    };
+    assert_eq!(r.pick_agent("agent", None, &need, false), Choice::Run(1));
+    assert_eq!(r.member("agent", 1).map(|m| m.handed), Some(1));
+    assert_eq!(
+        r.pick_agent("agent", None, &need, false),
+        Choice::Run(2),
+        "node 1's one slot was handed out"
+    );
+    assert_eq!(r.pick_agent("agent", None, &need, false), Choice::Wait);
+    r.capacity("agent", 1, capacity(MemberState::Ready, 0, true, 1));
+    assert_eq!(r.member("agent", 1).map(|m| m.handed), Some(0));
+    assert_eq!(r.pick_agent("agent", None, &need, false), Choice::Run(1));
 }
 
 /// A node's older session leaving does not remove its newer one.

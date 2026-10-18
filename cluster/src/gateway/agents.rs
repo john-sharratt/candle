@@ -75,15 +75,21 @@ fn fits(agent: &MemberView, need: &Need) -> bool {
     holds && has
 }
 
+/// A free slot the jobs handed to it since its last `CAPACITY` have not
+/// already taken.
 fn free(agent: &MemberView) -> bool {
-    agent.capacity.as_ref().is_some_and(|c| c.slots_free > 0)
-}
-
-fn idle_cores(agent: &MemberView) -> i64 {
     agent
         .capacity
         .as_ref()
-        .map_or(i64::MIN, |c| c.idle_cores_milli())
+        .is_some_and(|c| c.slots_free > agent.handed)
+}
+
+/// Its idle cores, less one for each job handed to it since its last
+/// `CAPACITY`, which that report does not yet show running.
+fn idle_cores(agent: &MemberView) -> i64 {
+    agent.capacity.as_ref().map_or(i64::MIN, |c| {
+        c.idle_cores_milli() - 1_000 * i64::from(agent.handed)
+    })
 }
 
 fn dedicated(agent: &MemberView) -> bool {
@@ -164,6 +170,7 @@ mod tests {
             lagging: false,
             syncing: false,
             in_flight: 0,
+            handed: 0,
         }
     }
 
@@ -218,6 +225,26 @@ mod tests {
         );
         // 6000, 5500, 6000 idle: 4 and 5 tie, the lower node wins.
         assert_eq!(choose(&[&a, &b, &c], None, &cargo(), false), Choice::Run(4));
+    }
+
+    /// **Jobs handed since an agent's last `CAPACITY` count against it**: a
+    /// slot one of them took is not free, and each takes a core off its idle
+    /// ones — so a burst spreads instead of all reading the same report.
+    #[test]
+    fn jobs_handed_since_the_last_report_count_against_an_agent() {
+        let mut a = agent(1, 8, 0, 1);
+        let b = agent(2, 8, 0, 1);
+        assert_eq!(choose(&[&a, &b], None, &cargo(), false), Choice::Run(1));
+        a.handed = 1;
+        assert_eq!(
+            choose(&[&a, &b], None, &cargo(), false),
+            Choice::Run(2),
+            "a's one slot is taken"
+        );
+        let (mut c, d) = (agent(3, 8, 0, 4), agent(4, 8, 2_500, 4));
+        c.handed = 3;
+        // c: 8000 − 3000 = 5000 idle; d: 8000 − 2500 = 5500.
+        assert_eq!(choose(&[&c, &d], None, &cargo(), false), Choice::Run(4));
     }
 
     /// Only agents holding the repository, the push right when it pushes, and

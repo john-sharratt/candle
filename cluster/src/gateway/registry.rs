@@ -44,6 +44,12 @@ pub struct MemberView {
     /// (§5.3): counted at the pick, so a burst sees its own earlier picks
     /// before the member's next `CAPACITY` reports them.
     pub in_flight: u32,
+    /// Jobs handed to it, an agent, since its last `CAPACITY` (§11.3): a job
+    /// is started and then read back, so it holds no request open to count,
+    /// and the next `CAPACITY` reports it running. Until then the choice
+    /// counts it, so a burst of jobs is spread instead of all reading the
+    /// same free slot.
+    pub handed: u32,
 }
 
 /// How many of an origin's latest writes a member may still lack and count
@@ -146,6 +152,8 @@ impl Registry {
             a.epoch += 1;
         }
         m.capacity = Some(capacity);
+        // What it was handed is in what it reports now.
+        m.handed = 0;
         changed
     }
 
@@ -382,9 +390,10 @@ impl Registry {
 
     /// Which agent of `app` runs a job of `lineage` needing `need` (§11.3): the
     /// lineage's holder while it has a free slot, and after `waited` the best
-    /// idle agent.
+    /// idle agent. The agent chosen is counted as handed the job until its
+    /// next `CAPACITY`.
     pub fn pick_agent(
-        &self,
+        &mut self,
         app: &str,
         lineage: Option<&str>,
         need: &Need,
@@ -395,7 +404,13 @@ impl Registry {
                 .get(app)
                 .and_then(|a| a.claims.holder(k.as_bytes()))
         });
-        choose(&self.ready(app), holder, need, waited)
+        let choice = choose(&self.ready(app), holder, need, waited);
+        if let Choice::Run(node) = choice {
+            if let Some(m) = self.app(app).members.get_mut(&node) {
+                m.handed += 1;
+            }
+        }
+        choice
     }
 
     /// Where a request with `dispatch` goes. `key` is its sticky or owner key;
