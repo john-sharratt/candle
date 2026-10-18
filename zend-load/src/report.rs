@@ -138,6 +138,7 @@ mod tests {
             total: s(10),
             longest_silence: s(silence),
             text_chunks: 50,
+            tools: Vec::new(),
         }
     }
 

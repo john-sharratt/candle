@@ -40,6 +40,8 @@ pub struct Sample {
     pub longest_silence: Duration,
     /// Chunks that carried text: about one per generated token.
     pub text_chunks: usize,
+    /// The tools the turn ran, in the order it started them.
+    pub tools: Vec<String>,
 }
 
 impl Sample {
@@ -56,6 +58,7 @@ impl Sample {
         let mut outcome = Outcome::Cut;
         let mut last = Duration::ZERO;
         let mut longest = Duration::ZERO;
+        let mut tools = Vec::new();
         for (at, item) in events {
             longest = longest.max(at.saturating_sub(last));
             last = *at;
@@ -64,6 +67,7 @@ impl Sample {
                 first_text.get_or_insert(*at);
             }
             match item {
+                Item::Tools(names) => tools.extend(names.iter().cloned()),
                 Item::Failed(m) => outcome = Outcome::Failed(m.clone()),
                 Item::Done if outcome == Outcome::Cut => outcome = Outcome::Answered,
                 _ => {}
@@ -79,6 +83,7 @@ impl Sample {
             total: ended,
             longest_silence: longest,
             text_chunks,
+            tools,
         }
     }
 
@@ -94,6 +99,7 @@ impl Sample {
             total: ended,
             longest_silence: ended,
             text_chunks: 0,
+            tools: Vec::new(),
         }
     }
 }
@@ -105,7 +111,7 @@ impl fmt::Display for Sample {
             .map_or("-".to_string(), |d| format!("{:.1}s", d.as_secs_f64()));
         write!(
             f,
-            "client {} turn {} on {}: {:?}, first text {first}, longest silence {:.1}s, total {:.1}s, {} text chunks",
+            "client {} turn {} on {}: {:?}, first text {first}, longest silence {:.1}s, total {:.1}s, {} text chunks, tools [{}]",
             self.client,
             self.turn,
             self.member,
@@ -113,6 +119,7 @@ impl fmt::Display for Sample {
             self.longest_silence.as_secs_f64(),
             self.total.as_secs_f64(),
             self.text_chunks,
+            self.tools.join(" "),
         )
     }
 }
@@ -138,6 +145,7 @@ mod tests {
     fn a_stream_is_measured_from_its_arrivals() {
         let events = vec![
             (ms(400), Item::Progress("prefill".into())),
+            (ms(1_000), Item::Tools(vec!["file_read".into()])),
             (ms(2_400), Item::Progress("prefill".into())),
             (ms(2_500), text("", 4)),
             (ms(2_550), text("", 0)),
@@ -147,8 +155,9 @@ mod tests {
         let s = Sample::of("light", "BlackWorld", &events, ms(2_620));
         assert_eq!(s.outcome, Outcome::Answered);
         assert_eq!(s.first_text, Some(ms(2_500)));
-        assert_eq!(s.longest_silence, ms(2_000));
+        assert_eq!(s.longest_silence, ms(1_400));
         assert_eq!(s.text_chunks, 2);
+        assert_eq!(s.tools, vec!["file_read".to_string()]);
         assert_eq!(s.total, ms(2_620));
     }
 

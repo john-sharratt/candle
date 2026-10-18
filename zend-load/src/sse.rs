@@ -13,6 +13,8 @@ pub enum Item {
     Text { content: String, reasoning: usize },
     /// A progress event the client shows: its name.
     Progress(String),
+    /// Tools the turn started running, by name.
+    Tools(Vec<String>),
     /// The turn failed, with the engine's message.
     Failed(String),
     /// The stream is complete.
@@ -57,6 +59,7 @@ impl Parser {
         }
         match event.as_deref() {
             Some("turn_error") => Some(Item::Failed(message(&data))),
+            Some("tool") => Some(tools(&data)),
             Some(name) => Some(Item::Progress(name.to_string())),
             None if data == "[DONE]" => Some(Item::Done),
             None => Some(text(&data)),
@@ -79,6 +82,25 @@ impl Item {
     pub fn has_text(&self) -> bool {
         matches!(self, Item::Text { content, reasoning } if !content.is_empty() || *reasoning > 0)
     }
+}
+
+/// A `tool` event: the tools it starts when its phase is `running`; a `done`
+/// event names the same tools again and starts none.
+fn tools(data: &str) -> Item {
+    let v = serde_json::from_str::<Value>(data).unwrap_or(Value::Null);
+    if v["phase"] != "running" {
+        return Item::Progress("tool".into());
+    }
+    Item::Tools(
+        v["tools"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
 }
 
 fn message(data: &str) -> String {
@@ -119,6 +141,24 @@ mod tests {
                 },
                 Item::Failed("pool stalled".into()),
                 Item::Done,
+            ]
+        );
+    }
+
+    /// A running `tool` event names the tools it starts; its `done` twin is
+    /// only progress.
+    #[test]
+    fn a_running_tool_event_names_its_tools() {
+        let mut p = Parser::default();
+        let got = p.push(
+            b"event: tool\ndata: {\"phase\":\"running\",\"tools\":[\"file_read\",\"file_edit\"]}\n\n\
+              event: tool\ndata: {\"phase\":\"done\",\"tools\":[\"file_read\"],\"results\":[]}\n\n",
+        );
+        assert_eq!(
+            got,
+            vec![
+                Item::Tools(vec!["file_read".into(), "file_edit".into()]),
+                Item::Progress("tool".into()),
             ]
         );
     }

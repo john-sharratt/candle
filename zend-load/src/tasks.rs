@@ -16,9 +16,20 @@ pub enum Task {
     Write,
 }
 
-/// The battle-cities crates a write task edits, one per client in turn.
-const CRATES: [&str; 9] = [
-    "math", "quadtree", "chat", "conf", "dmo", "llm", "lore", "recall", "sim",
+/// The battle-cities files a write task edits, one per client in turn — each
+/// declares a public function, so the edit asked for has a place to go. A
+/// crate's `lib.rs` often declares none (`math`'s is one `pub mod`), and asked
+/// to document "its first public function" the model rightly made no edit.
+const FILES: [&str; 9] = [
+    "crates/sim/src/server/throttle.rs",
+    "crates/sim/src/server/aes_key.rs",
+    "crates/sim/src/server/session.rs",
+    "crates/sim/src/model/zenling/damage.rs",
+    "crates/sim/src/model/zenling/patrol.rs",
+    "crates/sim/src/model/zenling/extrapolate.rs",
+    "crates/sim/src/model/world/what_in_region.rs",
+    "crates/sim/src/shared_state.rs",
+    "crates/sim/src/server/subscriber_reply.rs",
 ];
 
 /// What every write turn is told, so nothing it does leaves the overlay.
@@ -143,12 +154,11 @@ impl Task {
             }
             Task::Write => {
                 let conv_id = format!("{run}-w{client}");
-                let krate = CRATES[client % CRATES.len()];
+                let file = FILES[client % FILES.len()];
                 let ask = if turn == 0 {
                     format!(
-                        "In battle-cities, open crates/{krate}/src/lib.rs and add a one-line \
-                         doc comment above its first public function saying what it does. \
-                         {WRITE_RULES}"
+                        "In battle-cities, open {file} and add a one-line doc comment above \
+                         its first public function saying what it does. {WRITE_RULES}"
                     )
                 } else {
                     format!(
@@ -212,7 +222,7 @@ mod tests {
         let (first, conv) = Task::Write.body("zl-2", 1, 0, &[], 2048);
         assert_eq!(conv, "zl-2-w1");
         let ask = first["messages"][0]["content"].as_str().unwrap();
-        assert!(ask.contains("battle-cities, open crates/quadtree/src/lib.rs"));
+        assert!(ask.contains("battle-cities, open crates/sim/src/server/aes_key.rs"));
         assert!(!ask.contains("candle"));
         assert!(ask.ends_with(WRITE_RULES));
         let (next, _) = Task::Write.body("zl-2", 1, 1, &[], 2048);
