@@ -1424,12 +1424,13 @@ other clusters carry on.
 
 ### 5.7 Dumb mode and clustered mode
 
-The gateway keeps its configured upstreams. Each app is in one of two modes, on each
+The gateway keeps its configured upstreams. Each app is in one of three modes, on each
 gateway independently:
 
 | Mode | When | Routes to |
 |---|---|---|
-| **Dumb** | the app has no ready member on this gateway | the route's configured `upstream` URL, exactly as today (§1.1): one fixed daemon, passive backoff, IP-trusted identity headers |
+| **Dumb** | the app has no member admitted on this gateway | the route's configured `upstream` URL, exactly as today (§1.1): one fixed daemon, passive backoff, IP-trusted identity headers |
+| **Loading** | members are admitted and none is ready | the member that joined first, as below |
 | **Clustered** | the app has at least one ready member here (§7.2) | members only, by each route's dispatch (§5.2); the configured URL is ignored |
 
 ```yaml
@@ -1447,15 +1448,18 @@ its sockets close, it is closed 4410, or it falls behind and stops being ready. 
 requests go to the configured upstream again. In-flight requests on the lost sockets
 fail as §5.6 says.
 
-**While every member is loading, the gateway says it is restarting.** With members
-admitted and none ready, a request is answered by the gateway's own reconnecting page
-(`503` with `Retry-After`, `route::restarting`), which the consoles retry. It goes
-neither to the configured upstream, which is usually one of those members, nor to a
-loading member: either put that member's half-loaded startup card in front of players —
-measured 2026-10-16, with `.5` restarting and WhiteWorld stuck loading behind it,
-bot.tokera.com showed WhiteWorld's repository wait. The status page names that state
-**loading** rather than dumb (`status::mode_name`). The configured upstream serves
-only while no member is admitted at all.
+**While every member is loading, the first of them to join answers.** With members
+admitted and none ready, every request for the app goes to the member that joined
+this gateway first — the lowest admission session among those not ready
+(`Registry::standing_by`) — and that member serves it itself. Its loading page shows
+where the app's page would, and its own endpoints answer what the app's pages read
+while it is down: `/v1/telemetry` and the other performance readings, `/v1/agents`.
+The gateway's reconnecting page (`503` with `Retry-After`, `route::restarting`) is
+the answer only when no admitted member is left to take a request. One member is
+chosen, not each in turn, so a page and the calls it makes all see the same startup:
+a reader watches one member's progress rather than cards from several. The status
+page names that state **loading** rather than dumb (`status::mode_name`). The
+configured upstream serves only while no member is admitted at all.
 
 **The configured upstream gets nothing special in clustered mode.** It is often the
 same daemon as one of the members, for example zend on `.5`. While the app is

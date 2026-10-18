@@ -249,16 +249,18 @@ impl Registry {
         })
     }
 
-    /// A member of the app admitted here and not ready — loading, catching up,
-    /// upgrading — the lowest node first. While the app is dumb and its
-    /// configured upstream does not answer, this member's own loading page
-    /// stands in for it (§5.7).
+    /// The member of the app that joined this gateway first — the lowest
+    /// admission session — among those admitted and not ready: loading,
+    /// catching up, upgrading. While no member is ready, every request for the
+    /// app goes to it (§5.7), so its loading page and its own endpoints — the
+    /// performance and agents pages read them — stand in for the app.
     pub fn standing_by(&self, app: &str) -> Option<u64> {
         self.apps
             .get(app)?
             .members
             .values()
-            .find(|m| !m.ready())
+            .filter(|m| !m.ready())
+            .min_by_key(|m| m.session)
             .map(|m| m.node)
     }
 
