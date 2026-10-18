@@ -49,7 +49,7 @@ impl EngineRoom for Scheduler {
         // The same ladder ordinary KV pressure walks. `VramPhase::Load` is the
         // right setpoint: a guest drain is a load — it is about to put a
         // checkpoint on the card — not a decode step trying not to stall.
-        self.relieve_vram_pressure("guest", VramPhase::Load);
+        self.relieve_vram_pressure("guest", VramPhase::Load, super::prefill::ReliefNeed::Now);
         self.free_region_bytes().saturating_sub(before)
     }
 

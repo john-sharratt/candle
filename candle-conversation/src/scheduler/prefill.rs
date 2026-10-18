@@ -247,63 +247,17 @@ fn ingest_hot_window() -> usize {
 /// a wedged persistence thread; it is not the expected path.
 const VRAM_OFFLOAD_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The pool a refused tier packs: its shape now, and the two passes. The
-/// [`Scheduler`] is one; a test stands a modelled pool in its place.
-pub(super) trait TierPool {
-    /// The pools' shape and the KV side's top region, read fresh.
-    fn shape(&self) -> Option<(PoolShape, Option<usize>)>;
-    /// Whether the stall gate holds `pass` over `shape`.
-    fn stalled(&self, pass: FrontierPass, shape: PoolShape) -> bool;
-    /// Run `pass`, started from `shape`.
-    fn run(&mut self, pass: FrontierPass, shape: PoolShape);
-}
-
-/// [`Scheduler::pack_for_refused_tier`]'s order: the KV pools packed for
-/// ground wherever they lie, then — over the shape that left — the span tenant
-/// on top moved into the holes below it. The tier stands at the frontier, so
-/// holes are no room for it until the second pass brings the frontier down.
-pub(super) fn pack_for_tier(pool: &mut impl TierPool) {
-    if let Some((shape, top)) = pool.shape() {
-        if shape.ground_pass(top) == Some(FrontierPass::Kv)
-            && !pool.stalled(FrontierPass::Kv, shape)
-        {
-            pool.run(FrontierPass::Kv, shape);
-        }
-    }
-    if let Some((shape, top)) = pool.shape() {
-        if shape.frontier_pass(top) == Some(FrontierPass::SpanTenants)
-            && !pool.stalled(FrontierPass::SpanTenants, shape)
-        {
-            pool.run(FrontierPass::SpanTenants, shape);
-        }
-    }
-}
-
-impl TierPool for Scheduler {
-    fn shape(&self) -> Option<(PoolShape, Option<usize>)> {
-        let stats = self.session.kv_region_stats()?;
-        Some((
-            PoolShape {
-                live: stats.live,
-                frontier: stats.live_watermark,
-                sparse: self.session.kv_sparse_arenas(),
-            },
-            self.session.kv_top_rank(),
-        ))
-    }
-
-    fn stalled(&self, pass: FrontierPass, shape: PoolShape) -> bool {
-        self.kv_compaction_stall.holds(pass, shape)
-    }
-
-    fn run(&mut self, pass: FrontierPass, shape: PoolShape) {
-        match pass {
-            FrontierPass::Kv => {
-                self.pack_until_settled(PackGoal::Ground);
-            }
-            FrontierPass::SpanTenants => self.pack_span_tenants_judged(shape),
-        }
-    }
+/// Whether relief's caller needs the ground before it can go on
+/// ([`Scheduler::relieve_vram_pressure`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReliefNeed {
+    /// It cannot proceed without it: KV loaded before attention reads it
+    /// (elevate), a probe or guest that runs now. Relief may wait, bounded,
+    /// for the persistence thread to make turns warm and evictable.
+    Now,
+    /// It waits a pass when the ground is not there: admission, a section
+    /// ingest, a decode's growth. Relief never holds the loop for it.
+    Paced,
 }
 
 /// What a KV pack is for, which decides when one is worth running.
@@ -669,15 +623,6 @@ impl Scheduler {
         settle_passes(|| self.pack_kv_pools(goal))
     }
 
-    /// Lower the frontier for a tier the partition just refused: the KV pools
-    /// packed for ground, then the span tenant on top moved into the holes. The
-    /// tier stands at the frontier, so holes below it are no room until a pass
-    /// brings the frontier down to them. Each pass's own gate decides whether it
-    /// runs, and a pass the stall gate holds is not repeated.
-    pub(super) fn pack_for_refused_tier(&mut self) {
-        pack_for_tier(self);
-    }
-
     /// One KV compaction pass if the pools are fragmented enough to be worth it, then
     /// the weight side's reclaim — what [`Self::compact_kv_if_fragmented`] paces and
     /// relief runs directly. The span tenants are not packed here; see
@@ -985,7 +930,12 @@ impl Scheduler {
     /// Returns `true` if pressure is **still** on afterwards — the caller's
     /// signal to narrow the admission window, which is §3.8's third and last
     /// response. `whence` tags the log line with the calling gate.
-    pub(super) fn relieve_vram_pressure(&mut self, whence: &str, phase: VramPhase) -> bool {
+    pub(super) fn relieve_vram_pressure(
+        &mut self,
+        whence: &str,
+        phase: VramPhase,
+        need: ReliefNeed,
+    ) -> bool {
         let t = std::time::Instant::now();
         let Some(want) = self.relief_shortfall_bytes(phase) else {
             return false;
@@ -1079,10 +1029,23 @@ impl Scheduler {
                 // answered once that much is warm and evictable.
                 let short = want.saturating_sub(evicted.bytes);
                 let t_flush = std::time::Instant::now();
-                flushed = super::timed_wait(|| {
-                    self.persist_triggers
-                        .flush_at_least(short, VRAM_OFFLOAD_FLUSH_TIMEOUT)
-                });
+                // **Only a caller that cannot proceed without the ground waits
+                // for it.** The wait holds the loop, and every stream with it:
+                // on blackworld (2026-10-18) a promote's relief spent 1,277 ms
+                // in this flush, admission backpressure that a pass later would
+                // have answered by itself. A paced caller wakes the persistence
+                // thread and goes on; the warm copies land behind it, and the
+                // backlog falling wakes the loop.
+                flushed = match need {
+                    ReliefNeed::Now => super::timed_wait(|| {
+                        self.persist_triggers
+                            .flush_at_least(short, VRAM_OFFLOAD_FLUSH_TIMEOUT)
+                    }),
+                    ReliefNeed::Paced => {
+                        self.persist_triggers.fire();
+                        false
+                    }
+                };
                 flush_ms = t_flush.elapsed().as_millis() as u64;
                 let t_evict = std::time::Instant::now();
                 let more = self.evict_cold_tail(want.saturating_sub(evicted.bytes));
@@ -1325,7 +1288,7 @@ impl Scheduler {
         // doesn't clear it, leave the rest queued this pass.
         if in_flight > 0
             && self.vram_under_pressure()
-            && self.relieve_vram_pressure("promote", VramPhase::Load)
+            && self.relieve_vram_pressure("promote", VramPhase::Load, ReliefNeed::Paced)
         {
             // Pressure survived eviction — stop piling on this pass (the
             // `in_flight > 0` guard keeps ≥1 in flight). The budget halves
@@ -1730,7 +1693,7 @@ impl Scheduler {
             self.prefill_queue.push_front(work);
             return;
         }
-        self.relieve_vram_pressure("claim", VramPhase::Load);
+        self.relieve_vram_pressure("claim", VramPhase::Load, ReliefNeed::Paced);
         let Err(refused) = self.begin_admitted(work) else {
             return;
         };
@@ -1755,7 +1718,7 @@ impl Scheduler {
             self.section_queue.push_front(s);
             return false;
         }
-        self.relieve_vram_pressure("claim", VramPhase::Load);
+        self.relieve_vram_pressure("claim", VramPhase::Load, ReliefNeed::Paced);
         let Err(refused) = self.begin_section(s) else {
             return true;
         };
@@ -3187,11 +3150,15 @@ impl Scheduler {
             // Every member keeps its place and its progress; the same group
             // re-forms on the next wave — after a full span, once turns
             // finishing and the KV side's relief have given ground back.
-        } else if tier_refusal_shortfall(err)
-            .is_some_and(|short| self.note_refused_width(creep_rows, short))
-        {
+        } else if let Some(short) = tier_refusal_shortfall(err) {
             // Every member keeps its place and its progress; the group re-forms
-            // narrower on the next wave.
+            // narrower on the next wave — or, already at the least chunk, at the
+            // same width once ground is back. **A refusal at the least width is a
+            // full span, not a bad turn**, and is waited out like one: failed, it
+            // ended passthrough turns on whiteworld (2026-10-18) with the zone at
+            // its floor and every region live, ground that finishing turns and
+            // relief hand back moments later.
+            self.note_refused_width(creep_rows, short);
         } else {
             let msg = format!("wave group forward failed: {err}");
             for m in members {
@@ -3638,7 +3605,7 @@ impl Scheduler {
         if seq_ids.is_empty() {
             let section = if !self.wave_cohort_advanced && !self.wave_section_advanced {
                 if self.vram_under_pressure() {
-                    self.relieve_vram_pressure("section", VramPhase::Load);
+                    self.relieve_vram_pressure("section", VramPhase::Load, ReliefNeed::Paced);
                 }
                 let _g = super::profile::span("loop:wave:build_section");
                 self.build_section_batch()
@@ -3827,16 +3794,6 @@ impl Scheduler {
                         error = %e,
                         "creep window failed mid-sweep; holding the sweep to retry it"
                     );
-                    // **A refused tier is retried over packed ground**, not the
-                    // ground that refused it. The retries come milliseconds
-                    // apart, inside the wave loop's compaction interval, so
-                    // without this nothing between them could make room: on the
-                    // RTX 3090 (2026-10-18) the zone at its static floor, a creep
-                    // three regions short at the frontier with eight holes below
-                    // it, four retries in 25 ms, and its file ingests failed.
-                    if tier_refusal_shortfall(&e).is_some() {
-                        self.pack_for_refused_tier();
-                    }
                     return Err(e);
                 }
                 self.wave_sweep_failures = 0;
@@ -6471,116 +6428,5 @@ mod prefill_think_tests {
             OPEN,
             None
         ));
-    }
-}
-
-#[cfg(test)]
-mod refused_tier_pack_tests {
-    use super::super::admit::pass_budget::frontier_tier_ground;
-    use super::super::compaction_stall::{FrontierPass, PoolShape, MIN_FREEABLE_ARENAS};
-    use super::{pack_for_tier, TierPool};
-
-    const REGION: usize = 16 << 20;
-
-    /// A pool whose passes do what the real ones are for: the KV pass empties
-    /// the sparse arenas into holes, and the span tenants' pass moves the tenant
-    /// on top down into the holes below it.
-    struct Modelled {
-        total: usize,
-        shape: PoolShape,
-        kv_top: Option<usize>,
-        ran: Vec<FrontierPass>,
-    }
-
-    impl TierPool for Modelled {
-        fn shape(&self) -> Option<(PoolShape, Option<usize>)> {
-            Some((self.shape, self.kv_top))
-        }
-        fn stalled(&self, _pass: FrontierPass, _shape: PoolShape) -> bool {
-            false
-        }
-        fn run(&mut self, pass: FrontierPass, _shape: PoolShape) {
-            self.ran.push(pass);
-            match pass {
-                FrontierPass::Kv => {
-                    self.shape.live -= self.shape.sparse;
-                    self.shape.sparse = 0;
-                }
-                FrontierPass::SpanTenants => self.shape.frontier = self.shape.live,
-            }
-        }
-    }
-
-    impl Modelled {
-        fn tier_ground(&self) -> usize {
-            frontier_tier_ground(self.total, self.shape.frontier, 0, REGION)
-        }
-    }
-
-    /// **The refused tier's retry stands on lowered ground.** The RTX 3090 at
-    /// 08:51 (2026-10-18): 827 regions below the weight floor, the frontier at
-    /// 721 over 713 live — eight holes — a span tenant on top, the weight side
-    /// at its static floor, and a 109-region tier three regions short. The
-    /// tenants' pass brings the frontier down onto the live regions, and the
-    /// tier fits.
-    #[test]
-    fn a_refused_tier_is_retried_over_a_lowered_frontier() {
-        let tier = 109 * REGION;
-        let mut pool = Modelled {
-            total: 827,
-            shape: PoolShape {
-                live: 713,
-                frontier: 721,
-                sparse: 0,
-            },
-            kv_top: Some(700),
-            ran: Vec::new(),
-        };
-        assert_eq!(pool.shape.holes(), MIN_FREEABLE_ARENAS);
-        assert!(
-            pool.tier_ground() < tier,
-            "refused: 106 regions at the frontier"
-        );
-        pack_for_tier(&mut pool);
-        assert_eq!(pool.ran, vec![FrontierPass::SpanTenants]);
-        assert_eq!(pool.shape.frontier, 713);
-        assert!(pool.tier_ground() >= tier, "114 regions: the retry fits");
-    }
-
-    /// **Sparse KV arenas under the tenant are packed first**, and the holes
-    /// they leave are what the tenants' pass then moves into.
-    #[test]
-    fn sparse_kv_arenas_under_a_tenant_are_packed_before_it_moves() {
-        let mut pool = Modelled {
-            total: 827,
-            shape: PoolShape {
-                live: 720,
-                frontier: 721,
-                sparse: 9,
-            },
-            kv_top: Some(700),
-            ran: Vec::new(),
-        };
-        pack_for_tier(&mut pool);
-        assert_eq!(pool.ran, vec![FrontierPass::Kv, FrontierPass::SpanTenants]);
-        assert_eq!(pool.shape.frontier, 711);
-    }
-
-    /// **With nothing to pack, nothing runs**: one hole and no sparse arena is
-    /// not worth a pass's copies, and the retry meets the same ground.
-    #[test]
-    fn a_packed_pool_runs_no_pass() {
-        let mut pool = Modelled {
-            total: 827,
-            shape: PoolShape {
-                live: 720,
-                frontier: 721,
-                sparse: 0,
-            },
-            kv_top: Some(720),
-            ran: Vec::new(),
-        };
-        pack_for_tier(&mut pool);
-        assert!(pool.ran.is_empty());
     }
 }

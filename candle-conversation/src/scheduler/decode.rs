@@ -2373,11 +2373,6 @@ impl Scheduler {
                         "{what} did not run; the turns keep their place and it runs again: {err}"
                     );
                 }
-                // The next attempt comes inside the compaction interval: make
-                // the room it needs now (`pack_for_refused_tier`).
-                if candle_nn::kv_cache::tier_refusal_shortfall(err).is_some() {
-                    self.pack_for_refused_tier();
-                }
             }
             Next::GiveUp { attempts } => {
                 tracing::error!(attempts, "{what} failed on every attempt: {err}");

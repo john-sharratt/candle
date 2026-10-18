@@ -244,7 +244,7 @@ impl PipelineState {
         // **Refuse before touching anything**, exactly as the growth path does:
         // a retraction refused half-way once left the zone believing it was
         // smaller while experts were still live past the new capacity.
-        if target.max(self.inner.zone.retraction_capacity()) >= before {
+        if target.max(self.inner.zone.min_capacity()) >= before {
             tracing::info!(
                 target: "candle_transformers::expert_lre",
                 wanted = delta,
