@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::setup::Setup;
 use crate::frame::{Artifact, BuildArtifacts, BuildId};
-use crate::upgrade::artifacts::{artifact_of, Offered};
+use crate::upgrade::artifacts::{artifact_of, Offered, Probe};
 use crate::upgrade::kept::{builds_dir, list};
 use crate::upgrade::parts::Parts;
 use crate::upgrade::sum::{hex, unhex};
@@ -142,8 +142,10 @@ pub fn kept(setup: &Setup) -> Vec<Item> {
     items
 }
 
-/// Every verified download under `parts`.
-pub fn verified(parts: &Parts) -> Vec<Item> {
+/// Every verified download under `parts`, with the build `probe` reads off
+/// it: an install opens what that says, so a download found again after a
+/// restart carries it exactly as one verified in this process does.
+pub fn verified(parts: &Parts, probe: &dyn Probe) -> Vec<Item> {
     let Ok(dirs) = fs::read_dir(parts.root()) else {
         return Vec::new();
     };
@@ -158,12 +160,13 @@ pub fn verified(parts: &Parts) -> Vec<Item> {
         for a in offer.artifacts() {
             let path = parts.verified(&offer.build, &a);
             if path.is_file() {
+                let info = probe.build_info(&path);
                 items.push(Item {
                     build: offer.build.clone(),
                     artifact: a,
                     from: HeldAs::Verified,
                     path,
-                    info: None,
+                    info,
                 });
             }
         }
@@ -213,6 +216,8 @@ pub fn grouped(items: &[Item]) -> Vec<BuildArtifacts> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::Path;
 
     use tempfile::TempDir;
 
@@ -286,7 +291,18 @@ mod tests {
         assert_eq!(items[0].from, HeldAs::Kept);
     }
 
-    /// A verified download is known again after a restart, by its offer.
+    /// Answers every probe with build 13.
+    struct Thirteen;
+
+    impl Probe for Thirteen {
+        fn build_info(&self, _exe: &Path) -> Option<BuildInfo> {
+            Some(info(13))
+        }
+    }
+
+    /// A verified download is known again after a restart, by its offer, and
+    /// with the build its binary reports: without it the install has nothing
+    /// to check what the build opens against, and never starts.
     #[test]
     fn a_verified_download_is_found_by_its_offer() {
         let t = TempDir::new().unwrap();
@@ -302,10 +318,14 @@ mod tests {
             artifacts: vec![a.clone()],
         };
         OfferFile::write(&parts, &b).unwrap();
-        assert!(verified(&parts).is_empty(), "nothing verified yet");
+        assert!(
+            verified(&parts, &Thirteen).is_empty(),
+            "nothing verified yet"
+        );
         fs::write(parts.verified(&b.build, &a), b"ok").unwrap();
-        let items = verified(&parts);
+        let items = verified(&parts, &Thirteen);
         assert_eq!(items.len(), 1);
         assert_eq!((items[0].from, &items[0].artifact), (HeldAs::Verified, &a));
+        assert_eq!(items[0].info, Some(info(13)));
     }
 }

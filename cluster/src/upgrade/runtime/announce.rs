@@ -17,13 +17,14 @@ impl Upgrader {
     pub(super) async fn scan(&self) {
         let setup = self.setup.clone();
         let parts = self.parts.clone();
+        let probe = self.probe.clone();
         let (items, kept_now) = tokio::task::spawn_blocking(move || {
             let mut items = running(&setup).unwrap_or_else(|e| {
                 tracing::error!("the running build's artifacts are unreadable: {e}");
                 Vec::new()
             });
             items.extend(kept(&setup));
-            items.extend(verified(&parts));
+            items.extend(verified(&parts, probe.as_ref()));
             (items, kept_lines(&setup.exe))
         })
         .await
