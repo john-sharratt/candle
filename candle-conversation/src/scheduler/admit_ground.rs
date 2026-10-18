@@ -536,6 +536,26 @@ impl Ground for AdmitPass<'_> {
         self.sched.lower_band_active(prio)
     }
 
+    /// Every waiting prompt — queued work and pending submissions, of every
+    /// band — counted `1 + age` with its age **in sweeps**, the time one
+    /// prefill cohort takes as measured: a prompt that has waited a whole sweep
+    /// counts twice, two sweeps three times. In sweeps rather than seconds so
+    /// the weight follows how long this engine takes to serve a prompt, not a
+    /// constant to re-derive per card; before a sweep has been measured each
+    /// prompt counts once. At least one: the offer itself is waiting.
+    fn prefill_weight(&self, _prio: DecodePriority) -> f64 {
+        let sweep = self.sched.sweep_forecast.sweep_secs().filter(|s| *s > 0.0);
+        let weight =
+            |at: std::time::Instant| 1.0 + sweep.map_or(0.0, |s| at.elapsed().as_secs_f64() / s);
+        let queued = self.sched.prefill_queue.iter().map(|w| w.submitted_at);
+        let pending = self
+            .sched
+            .pending_submits
+            .iter()
+            .map(|p| p.work.submitted_at);
+        queued.chain(pending).map(weight).sum::<f64>().max(1.0)
+    }
+
     fn admit(&mut self, kind: Kind, prio: DecodePriority, cost: Cost) -> bool {
         match kind {
             Kind::Prefill => self.admit_prefill(prio, cost),
@@ -878,7 +898,7 @@ impl Scheduler {
             zone,
             zone_min: interleave::optimal_weight_bytes().unwrap_or(0),
             zone_max: interleave::achievable_weight_now().unwrap_or(u64::MAX),
-            zone_min_prefill: interleave::prefill_weight_bytes().unwrap_or(0),
+            zone_min_prefill: self.expert_zone_min_bytes(),
         };
         Headroom {
             // **The spendable ground is one subtraction: how far residency
@@ -896,6 +916,26 @@ impl Scheduler {
             free_kv: zone.saturating_sub(room.floor().saturating_add(tier_reserve)),
             ..room
         }
+    }
+
+    /// The smallest weight zone the expert cache can serve a forward from —
+    /// its pinned set, a worst-case working layer and one slot for the load
+    /// that triggered an eviction (`minimum_resident_slots`), as the cache
+    /// publishes it. Zero for a dense stack: no expert residency to defend.
+    ///
+    /// **The prefill floor, derived rather than set.** It was a quarter of the
+    /// achievable residency plus a fixed 512 MiB margin — a fraction tuned on
+    /// one ingest, the same on every card and every load, and on the 3090 with
+    /// two dozen conversations' state resident a line the zone could not stand
+    /// above. What a prefill must never cross is the point where the cache can
+    /// no longer serve, and the cache knows that point exactly: under it every
+    /// slot can be pinned and no promotion lands. Above it, spending weight for
+    /// rows is the trade the rate model judges.
+    pub(super) fn expert_zone_min_bytes(&self) -> u64 {
+        self.model
+            .expert_stats_shared()
+            .and_then(|s| s.lock().ok().map(|s| s.zone_min_bytes as u64))
+            .unwrap_or(0)
     }
 
     /// Tier bytes a forward worth running needs, held back from admission.
@@ -994,8 +1034,8 @@ impl Scheduler {
         let mut wave = WaveDraft::default();
         let mut held = Vec::with_capacity(self.wave_prefill_members.len());
         for m in &self.wave_prefill_members {
-            let (WaveMember::Prefill { seq_id, advance }
-            | WaveMember::Section { seq_id, advance }) = m;
+            let (WaveMember::Prefill { seq_id, advance } | WaveMember::Section { seq_id, advance }) =
+                m;
             wave.held_rows += *advance;
             wave.held_advances.push(*advance);
             wave.held_depths
@@ -1006,7 +1046,12 @@ impl Scheduler {
             .active_prefills
             .iter()
             .filter(|p| p.error.is_none() && p.finished.is_none())
-            .map(|p| (p.work.sequence_id, p.work.tokens.len().saturating_sub(p.offset)));
+            .map(|p| {
+                (
+                    p.work.sequence_id,
+                    p.work.tokens.len().saturating_sub(p.offset),
+                )
+            });
         let sections = self
             .active_section_ingests
             .iter()
@@ -1041,8 +1086,7 @@ impl Scheduler {
         let total = wave
             .held_rows
             .saturating_add(wave.joining.iter().map(|&(r, _)| r).sum::<usize>());
-        let ceiling =
-            self.prefill_group_budget_at(total, self.composition_target_at(wave.width));
+        let ceiling = self.prefill_group_budget_at(total, self.composition_target_at(wave.width));
         let mut out = Composed {
             rows: wave.held_rows,
             seqs: wave.held_advances.len() + wave.joining.len(),
@@ -1053,7 +1097,8 @@ impl Scheduler {
             let rows = remaining.min(ceiling.saturating_sub(out.rows));
             if rows > 0 {
                 out.advances.push(rows);
-                out.depths.push(deepest_chunk_offset(depth, remaining, rows));
+                out.depths
+                    .push(deepest_chunk_offset(depth, remaining, rows));
                 out.rows += rows;
             }
         }

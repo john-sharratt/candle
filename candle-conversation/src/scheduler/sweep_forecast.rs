@@ -102,6 +102,11 @@ impl SweepForecast {
         self.sweep_started = None;
     }
 
+    /// A sweep's measured duration, in seconds — `None` until one has run.
+    pub(super) fn sweep_secs(&self) -> Option<f64> {
+        self.sweep_secs
+    }
+
     /// KV rows the decodes will add over one sweep, as measured so far: zero
     /// until both the rate and a sweep's duration have been observed.
     pub(super) fn withheld_rows(&self) -> usize {

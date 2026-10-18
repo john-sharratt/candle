@@ -16290,7 +16290,7 @@ mod tests {
             budget.prefill_floor,
             room.prefill_floor()
                 .saturating_add(sched.min_forward_tier_bytes()),
-            "the prefill floor is its own hold, the margin and a forward's tier",
+            "the prefill floor is the cache's minimum and a forward's tier",
         );
     }
 

@@ -1041,6 +1041,125 @@ impl WaveRate {
         }
     }
 
+    /// Offer a prefill of `tokens` rows **whose turn goes on to decode**, judged
+    /// on the trade the whole wave makes: the prefill throughput it earns
+    /// against the decode throughput it costs every running decode by the
+    /// residency it dislodges.
+    ///
+    /// **One trade, not two vetoes.** It used to be asked the prefill question
+    /// (`judge_prefill`) and the decode question (`decode_would_carry`) apart,
+    /// and refused if either rate fell at all — so a prefill that slowed the
+    /// decodes by a fraction of a percent was refused however much it earned.
+    ///
+    /// **Each phase is weighed as a share of its own rate, by the work waiting
+    /// on it.** The two rates are not comparable as tokens a second — a
+    /// prefill forward runs thousands, a decode tens — so summing them lets any
+    /// prefill gain drown any decode loss. The trade instead is
+    ///
+    /// `prefill_weight × ΔP / P_cap  ≥  decode_weight × (−ΔD) / D`
+    ///
+    /// with `P_cap` the prefill rate of a forward at the wave's whole width at
+    /// the residency found, and `D` the running decodes' rate at it.
+    /// `prefill_weight` is the prompts waiting, each counted more the longer it
+    /// has waited (`Ground::prefill_weight`); `decode_weight` is the decodes
+    /// running. So many decodes and few prompts make a dislodge dear and the
+    /// prompts wait; many prompts and few decodes make the rows worth the
+    /// weights, and the weights go; in between the cheap prefills co-batch and
+    /// the balance follows the queues. The decode the turn becomes counts on
+    /// the decode side, so a turn whose decode pays for itself is not refused
+    /// for slowing the others by less.
+    ///
+    /// The prefill floor still binds — under it the cache cannot serve a forward
+    /// — and the row cap and the head waiver are `try_widen`'s. The decode is
+    /// not committed: it rides a later wave and is charged there. While the
+    /// decode model is unlearned its side is left out, for
+    /// `decode_would_carry`'s reason, and the prefill gain alone decides.
+    pub fn try_widen_trading(
+        &mut self,
+        tokens: usize,
+        weights_before: u64,
+        weights_after: u64,
+        prefill_weight: f64,
+        decode_weight: f64,
+    ) -> Admit {
+        if self.full {
+            return Admit::Refused(Refusal::Full);
+        }
+        let first = !self.admitted_any;
+        let tokens_after = self.tokens.saturating_add(tokens);
+        if !first {
+            if tokens_after > self.max_tokens {
+                return Admit::Refused(Refusal::Cap {
+                    max_tokens: self.max_tokens,
+                });
+            }
+            if weights_after < self.prefill_floor {
+                self.full = true;
+                return Admit::Refused(Refusal::Floor {
+                    resident_after: weights_after,
+                    floor: self.prefill_floor,
+                });
+            }
+        }
+        let prefill_now = self.rate(self.tokens, weights_before);
+        let prefill_with = self.rate(tokens_after, weights_after);
+        let projected = prefill_with;
+        if !first {
+            let p_cap = self.rate(self.max_tokens.max(tokens_after), weights_before);
+            let prefill_gain = if p_cap > 0.0 {
+                (prefill_with - prefill_now) / p_cap
+            } else {
+                0.0
+            };
+            let decode_learned = self.decode_samples >= Self::MIN_DECODE_SAMPLES;
+            let decode_now = self.decode_rate(self.decodes, self.routed_per_layer, weights_before);
+            let decode_change = if decode_learned && self.decodes > 0 && decode_now > 0.0 {
+                let decode_with = self.decode_rate(
+                    self.decodes + 1,
+                    self.routed_per_layer
+                        .saturating_add(self.experts_per_decode(0)),
+                    weights_after,
+                );
+                (decode_with - decode_now) / decode_now
+            } else {
+                0.0
+            };
+            let net = prefill_weight * prefill_gain + decode_weight * decode_change;
+            // Every trade's terms, so a run shows where the formula was wrong
+            // against what the forwards that followed measured.
+            tracing::debug!(
+                target: "candle_conversation::scheduler::admission",
+                tokens,
+                prefill_weight,
+                decode_weight,
+                prefill_gain,
+                decode_change,
+                net,
+                resident_before_mib = weights_before >> 20,
+                resident_after_mib = weights_after >> 20,
+                "prefill traded against decode",
+            );
+            // Any net gain pays: each side is already a share of its own rate,
+            // weighted by the work waiting on it.
+            if net <= 1e-12 {
+                // Unlatched, as `try_widen`'s rate refusals are: the forward's
+                // rows stop paying, and the turn is re-offered as a join.
+                return Admit::Refused(if net < 0.0 {
+                    Refusal::Worse {
+                        before: prefill_now,
+                        after: prefill_with,
+                    }
+                } else {
+                    Refusal::Saturated { gain: net }
+                });
+            }
+        }
+        self.admitted_any = true;
+        self.resident_now = weights_after;
+        self.tokens = tokens_after;
+        Admit::Admitted { projected }
+    }
+
     /// End the wave on a refusal the caller could not turn into a join — what
     /// [`Self::try_admit`] does on every refusal. Every later offer is refused
     /// as [`Refusal::Full`].
@@ -1161,20 +1280,16 @@ impl WaveRate {
     /// yet run the decode forwards the estimate is learned from, and the engine
     /// would never leave the window it is refusing on.
     ///
-    /// **The floor refuses the offer that crosses it, not every offer once it
-    /// is crossed.** It defends the residency the decodes run at against an
-    /// admission that would spend it. When committed work already holds
-    /// residency under it — the running turns' state, the cohort's tier — no
-    /// refusal brings those weights back; refusing only keeps another decode
-    /// out of the batch that shares the expert streaming, which is what makes
-    /// streamed experts affordable at all. Measured on the 3090 scratch daemon
-    /// (2026-10-18, zend-load heavy-decode, 24 `High` clients): residency 3–4.5
-    /// GiB against a 7.4 GiB decode floor and a 9–20% expert hit rate, 911
-    /// offers refused on it in eleven minutes, first text p50 160 s where the
-    /// same rung ran at 10.9 s. Under the floor the question is the marginal
-    /// one the model already asks — does the wave decode faster with this turn
-    /// in it, at the residency the turn leaves, than without it at the
-    /// residency it found — and the prefill floor still bounds what fits.
+    /// **No decode floor: the marginal decode rate decides.** A fixed fraction
+    /// of achievable residency stood here, first as a wall and then as a line
+    /// the crossing offer could not pass. It refused turns the decodes could
+    /// carry: measured on the 3090 scratch daemon (2026-10-18, 24 `High`
+    /// clients), residency 3–4.5 GiB against a 7.4 GiB floor, 911 offers
+    /// refused in eleven minutes and first text p50 160 s where the same rung
+    /// had run at 10.9 s. The question that line stood in for is the one this
+    /// asks — does the wave decode faster with this turn in it, at the
+    /// residency the turn leaves, than without it at the residency it found —
+    /// and the prefill floor still bounds what fits.
     pub fn decode_would_carry(
         &self,
         draft: usize,
@@ -1187,12 +1302,6 @@ impl WaveRate {
         let projected = self.decode_rate(self.decodes + 1, routed_after, resident_after);
         if self.decode_samples < Self::MIN_DECODE_SAMPLES {
             return Ok(projected);
-        }
-        if resident_before >= self.decode_floor && resident_after < self.decode_floor {
-            return Err(Refusal::Floor {
-                resident_after,
-                floor: self.decode_floor,
-            });
         }
         // Against the wave's decodes as they stand: if adding the decode this
         // turn becomes would not pay for itself — the wave without it at the
@@ -1390,12 +1499,14 @@ impl WaveRate {
                     max_decodes: self.max_decodes,
                 });
             }
-            // The offer that crosses the floor, as in `decode_would_carry`: once
-            // committed work holds residency under it, the gain below decides.
-            if before >= self.decode_floor && after < self.decode_floor {
+            // The line every admission respects: under the prefill floor the
+            // expert cache can no longer serve a forward. Above it, whether a
+            // decode pays at the residency it leaves is the gain's question —
+            // there is no separate decode floor.
+            if after < self.prefill_floor {
                 return Err(Refusal::Floor {
                     resident_after: after,
-                    floor: self.decode_floor,
+                    floor: self.prefill_floor,
                 });
             }
         }
@@ -1884,26 +1995,6 @@ mod tests {
         ));
     }
 
-    /// **The prefill of a turn that will decode is asked the decode question
-    /// too, and refused on it.** The whole defect this closes: a prefill's copy
-    /// is paid per forward, so `judge_prefill` amortises it and keeps admitting
-    /// down to the floor, while the decode that turn becomes pays per layer
-    /// against `1 - hit(resident)`. Judged by the prefill model alone, the cheap
-    /// phase spends the residency the expensive one is about to need.
-    #[test]
-    fn a_decode_that_could_not_be_carried_refuses_its_prefill() {
-        let mut p = planner_judging(20e-3);
-        // The floor is the wave's, so the question has to be asked of a wave.
-        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
-        // Residency under the floor: the decode side cannot stand there.
-        assert!(matches!(
-            p.decode_would_carry(0, RESIDENT_RUN15, FLOOR_16GB - 1),
-            Err(Refusal::Floor { .. })
-        ));
-        // And where it can, the same question answers yes.
-        assert!(p.decode_would_carry(0, RESIDENT_RUN15, RESIDENT_RUN15).is_ok());
-    }
-
     /// **Under the floor already, the floor is not what refuses.** Committed
     /// work holds residency there, and refusing the turn returns no weight; the
     /// marginal question decides instead — here, with no decode in the wave to
@@ -1947,7 +2038,8 @@ mod tests {
         p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(p.decode_samples() < WaveRate::MIN_DECODE_SAMPLES);
         assert!(
-            p.decode_would_carry(0, RESIDENT_RUN15, FLOOR_16GB - 1).is_ok(),
+            p.decode_would_carry(0, RESIDENT_RUN15, FLOOR_16GB - 1)
+                .is_ok(),
             "while unlearned the decode question cannot refuse"
         );
     }
@@ -1978,20 +2070,17 @@ mod tests {
         }
     }
 
-    /// **A prefill may spend weights a decode may not.**
+    /// **No decode floor: between the old floors both kinds land.**
     ///
-    /// The two floors are the whole point of the split: a prefill's expert copy is
-    /// once per forward and amortises over its rows, so bytes buy rows at a good
-    /// rate; a decode's copy is charged per layer per step against
-    /// `1 − hit(resident)`, so the same byte is paid again on every step after. One
-    /// floor for both had to be the decode's, and that is what starved prefill
-    /// width — `interleave::HOLD`'s note records a run refusing 384 prefills over
-    /// 13.5 minutes for want of one store's ground.
-    ///
-    /// Ground that sits between the floors: a prefill lands on it, a decode is
-    /// refused on it and names the decode floor.
+    /// A decode floor above the prefill's used to refuse a decode on ground a
+    /// prefill could take, as a fixed fraction of achievable residency standing
+    /// in for the question the decode model answers — whether the wave decodes
+    /// faster with it at the residency it leaves. Ground above the prefill
+    /// floor, where the cache can still serve, now takes a decode whose rate
+    /// climbs, and under the prefill floor a decode is refused on it as a
+    /// prefill is.
     #[test]
-    fn ground_between_the_floors_takes_a_prefill_and_refuses_a_decode() {
+    fn ground_above_the_prefill_floor_takes_a_prefill_and_a_decode() {
         let prefill_floor = FLOOR_16GB / 2;
         let between = FLOOR_16GB - MIB;
 
@@ -2002,18 +2091,22 @@ mod tests {
         let _ = offer(&mut p, prefill(1), 0);
         match offer_at(&mut p, prefill(1), RESIDENT_RUN15, between) {
             Admit::Admitted { .. } => {}
-            other => panic!("a prefill may stand between the floors, got {other:?}"),
+            other => panic!("a prefill may stand above its floor, got {other:?}"),
         }
 
         let mut d = planner_judging(20e-3);
         d.reset(RESIDENT_RUN15, prefill_floor, FLOOR_16GB, CAP, DECODE_CAP);
         let _ = offer(&mut d, decode(0), 0);
         match offer_at(&mut d, decode(0), RESIDENT_RUN15, between) {
+            Admit::Admitted { .. } => {}
+            other => panic!("a decode that pays may stand above the prefill floor, got {other:?}"),
+        }
+        match offer_at(&mut d, decode(0), between, prefill_floor - 1) {
             Admit::Refused(Refusal::Floor { floor, .. }) => assert_eq!(
-                floor, FLOOR_16GB,
-                "a decode is refused on the DECODE floor, not the prefill one",
+                floor, prefill_floor,
+                "under it, a decode is refused on the prefill floor",
             ),
-            other => panic!("a decode may not stand between the floors, got {other:?}"),
+            other => panic!("a decode may not go under the prefill floor, got {other:?}"),
         }
     }
 

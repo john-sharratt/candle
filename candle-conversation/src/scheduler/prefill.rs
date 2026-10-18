@@ -2875,7 +2875,11 @@ impl Scheduler {
                 let holes = self.session.kv_region_stats().map_or(0, |s| {
                     s.live_watermark.saturating_sub(s.live) * candle_nn::kv_cache::REGION_BYTES
                 });
-                fitted_rows(rows, (tier as usize).saturating_add(claims.saturating_sub(holes)), g)
+                fitted_rows(
+                    rows,
+                    (tier as usize).saturating_add(claims.saturating_sub(holes)),
+                    g,
+                )
             });
             let Some(target) = [fitted_rows(rows, need, ground), at_frontier]
                 .into_iter()
