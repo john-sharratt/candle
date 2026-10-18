@@ -1,8 +1,9 @@
 //! Where a request for a clustered app goes (§5.2): the dispatch its route
 //! declares in the members' table, its key, the member the hub picks, and the
 //! answer — forwarded to one member, combined from all, handed back to go to
-//! the configured upstream when no member is admitted, or the gateway's
-//! "reconnecting" page while every admitted member is still loading.
+//! the configured upstream when no member is admitted, or — while every
+//! admitted member is still loading — forwarded whole to the one that joined
+//! first, whose loading page and own endpoints stand in for the app.
 //!
 //! Every request a member answers is a sample for certifying a candidate
 //! (§3.8): while one certifies it takes its share of the traffic, and a share
@@ -111,35 +112,38 @@ fn addressed(req: &Request, ctx: &Context<'_>) -> Result<Option<u64>, Box<Proble
 /// How long a page waits before asking again while every member is loading.
 const LOADING_RETRY: Duration = Duration::from_secs(3);
 
-/// The answer while every member of `app` admitted here is still loading: the
-/// gateway's own "reconnecting" page, which the consoles retry. Not the
-/// configured upstream — it is usually one of those members — and not a
-/// loading member standing in: either put that member's half-loaded startup
-/// card in front of players (measured 2026-10-16: .5 restarting, WhiteWorld
-/// stuck loading behind it, and bot.tokera.com showing WhiteWorld's
-/// repository wait).
+/// The gateway's own "reconnecting" page, which the consoles retry: the answer
+/// when `app` is admitted here yet has no member to send a request to — every
+/// one gone between the check and the pick.
 pub fn restarting(app: &str, want_html: bool) -> Response {
     errors::respond(
-        Problem::backing_off("Restarting — back in a moment.", LOADING_RETRY)
-            .because(format!("every {app} member admitted here is still loading")),
+        Problem::backing_off("Restarting — back in a moment.", LOADING_RETRY).because(format!(
+            "no {app} member admitted here can take the request"
+        )),
         want_html,
     )
 }
 
 /// No member of `app` is ready: its configured upstream when none is admitted
-/// (§5.7), [`restarting`] when some are and all are loading.
-fn none_ready(gateway: &Gateway, app: &str, ctx: &Context<'_>, req: Request) -> Routed {
+/// (§5.7); otherwise the member that joined first, still loading, answers it —
+/// its loading page, and its own endpoints, which the performance and agents
+/// pages read while the app is down. [`restarting`] only when no admitted member
+/// is left to stand by.
+async fn none_ready(gateway: &Arc<Gateway>, app: &str, ctx: &Context<'_>, req: Request) -> Routed {
     if !gateway.hub.admitted(app) {
         return Routed::Dumb(req);
     }
-    Routed::Answered(restarting(app, ctx.want_html))
+    match gateway.hub.standing_by(app) {
+        Some(node) => Routed::Answered(forward(gateway, app, node, ctx, req).await),
+        None => Routed::Answered(restarting(app, ctx.want_html)),
+    }
 }
 
 /// Route `req` for `app`, clustered on this gateway.
 pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Request) -> Routed {
     let hub = &gateway.hub;
     let Some(table) = hub.table(app) else {
-        return none_ready(gateway, app, &ctx, req);
+        return none_ready(gateway, app, &ctx, req).await;
     };
     match addressed(&req, &ctx) {
         Err(p) => return Routed::Answered(errors::respond(*p, ctx.want_html)),
@@ -212,7 +216,7 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
 
     let pin = pinned(&req, app);
     match hub.pick(app, &dispatch, key.as_deref(), pin) {
-        Pick::Configured => none_ready(gateway, app, &ctx, req),
+        Pick::Configured => none_ready(gateway, app, &ctx, req).await,
         Pick::Member(node) => {
             hub.traffic.request(Class::of(&dispatch));
             let to_candidate = match mirror {

@@ -665,15 +665,14 @@ async fn handle(
                         roles: &app.cfg.roles,
                         from_member: origin.as_ref().map(|o| o.node),
                     };
-                    if gw.hub.clustered(cluster_app) {
+                    // Clustered, or members admitted and all still loading — the
+                    // first of them to join then answers (§5.7). Only with no
+                    // member admitted does the configured upstream serve.
+                    if gw.hub.admitted(cluster_app) {
                         match route::route(gw, cluster_app, ctx(), req).await {
                             Routed::Answered(res) => return res,
                             Routed::Dumb(back) => req = back,
                         }
-                    } else if gw.hub.admitted(cluster_app) {
-                        // Members, all still loading: the gateway's reconnecting
-                        // page, never one of them half-loaded (§5.7).
-                        return route::restarting(cluster_app, want_html);
                     }
                     gw.hub.traffic.request(Class::Configured);
                 }

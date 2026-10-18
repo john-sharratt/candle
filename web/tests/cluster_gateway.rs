@@ -416,24 +416,33 @@ async fn the_mode_follows_the_ready_members() {
     assert_eq!(fetch(gw, "/v1/where").await.json()["by"], "dumb");
 }
 
-/// **While every member is loading, the gateway says it is restarting**
-/// (§5.7): neither the configured upstream — usually one of those members —
-/// nor a loading member answers, so nobody is shown a half-loaded member's
-/// startup page. With no member admitted the upstream serves again, and a
-/// route without `cluster:` always goes to it.
+/// **While every member is loading, the first of them to join answers**
+/// (§5.7): not the configured upstream — usually one of those members — and
+/// not each loading member in turn, but the one admitted first, so its loading
+/// page and its own endpoints stand in for the app. Joined first is not the
+/// lowest node: 5 joins before 1, and 5 answers. With no member admitted the
+/// upstream serves again, and a route without `cluster:` always goes to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn while_every_member_loads_the_gateway_says_it_is_restarting() {
+async fn while_every_member_loads_the_first_to_join_answers() {
     let dumb = spawn(dumb_daemon()).await;
     let (gw, hub) = gateway(dumb).await;
-    let m = joined(gw, 1, 100, false);
-    until("admitted", || hub.admitted("zend")).await;
+    let first = joined(gw, 5, 100, false);
+    until("the first admitted", || hub.admitted("zend")).await;
+    let second = joined(gw, 1, 100, false);
+    until("both admitted", || hub.status(0).members.len() == 2).await;
     assert!(!hub.clustered("zend"), "loading, so not clustered");
 
-    let r = fetch(gw, "/v1/where").await;
-    assert_eq!(r.status, 503, "restarting, not the upstream or the member");
+    for _ in 0..4 {
+        assert_eq!(
+            fetch(gw, "/v1/where").await.json()["by"],
+            "member-5",
+            "every request goes to the member that joined first"
+        );
+    }
     assert_eq!(fetch(gw, "/plain/x").await.json()["by"], "dumb");
 
-    m.leave();
+    first.leave();
+    second.leave();
     until("gone", || !hub.admitted("zend")).await;
     assert_eq!(
         fetch(gw, "/v1/where").await.json()["by"],

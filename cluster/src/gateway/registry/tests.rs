@@ -168,17 +168,22 @@ fn the_mode_follows_ready_members() {
 fn a_loading_member_stands_by() {
     let mut r = Registry::new();
     assert_eq!(r.standing_by("npcd"), None);
+    // The first to join stands by, whatever its node: 7 was admitted before 3.
     r.join(member(7, 1));
-    r.join(member(3, 1));
-    assert_eq!(r.standing_by("zend"), Some(3));
+    r.join(member(3, 2));
+    assert_eq!(r.standing_by("zend"), Some(7));
     assert_eq!(
         r.standing_by("npcd"),
         None,
         "another app's member is not this one's"
     );
-    r.capacity("zend", 3, capacity(MemberState::Ready, 1, true, 1));
-    assert_eq!(r.standing_by("zend"), Some(7));
     r.capacity("zend", 7, capacity(MemberState::Ready, 1, true, 1));
+    assert_eq!(
+        r.standing_by("zend"),
+        Some(3),
+        "the first is ready: the next joined stands by"
+    );
+    r.capacity("zend", 3, capacity(MemberState::Ready, 1, true, 1));
     assert_eq!(r.standing_by("zend"), None);
 }
 
