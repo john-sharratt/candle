@@ -171,6 +171,7 @@ mod tests {
             syncing: false,
             in_flight: 0,
             handed: 0,
+            closing: false,
         }
     }
 

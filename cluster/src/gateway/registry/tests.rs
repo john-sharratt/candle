@@ -38,7 +38,32 @@ fn member(node: u64, session: u64) -> MemberView {
         syncing: false,
         in_flight: 0,
         handed: 0,
+        closing: false,
     }
+}
+
+/// A member whose session has ended is routed nothing, even as a canary or
+/// when it would rank best — but only that session: a newer session of the
+/// same node is left alone (§5.3).
+#[test]
+fn a_closing_member_is_routed_nothing() {
+    let mut r = three();
+    r.closing("zend", 2, 99);
+    let picks: Vec<Pick> = (0..6)
+        .map(|_| r.pick("zend", &Dispatch::Any, None, None))
+        .collect();
+    assert!(picks.contains(&Pick::Member(2)), "another session's end");
+    r.closing("zend", 2, 2);
+    for _ in 0..6 {
+        assert_ne!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(2));
+        assert_ne!(r.pick("zend", &Dispatch::Best, None, None), Pick::Member(2));
+        assert_ne!(
+            r.pick_canary("zend", &Dispatch::Best, None, None, 2, &mut || true),
+            Pick::Member(2),
+            "a closing canary is no canary"
+        );
+    }
+    assert!(r.clustered("zend"));
 }
 
 /// A lagging member is routed nothing and never answers a catch-up, though it

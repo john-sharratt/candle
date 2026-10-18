@@ -449,6 +449,7 @@ impl Hub {
                 syncing,
                 in_flight: 0,
                 handed: 0,
+                closing: false,
             });
         }
         let local = if hello.build.is_local() {
@@ -1097,8 +1098,18 @@ impl Hub {
     ) -> Picked {
         let mut s = self.state();
         let State {
-            registry, upgrades, ..
+            registry,
+            upgrades,
+            sockets,
+            ..
         } = &mut *s;
+        // A session that has ended is still listed until its socket's cleanup
+        // leaves, and no stream opens to it in between: route it nothing.
+        for ((a, node), socket) in sockets.iter() {
+            if a == app && socket.handle.is_gone() {
+                registry.closing(app, *node, socket.session);
+            }
+        }
         let pick = match upgrades.canary(app) {
             Some(candidate) => {
                 registry.pick_canary(app, dispatch, key, pinned, candidate, &mut || {

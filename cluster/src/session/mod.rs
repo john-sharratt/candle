@@ -107,6 +107,12 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Whether the session has ended: nothing sent on it is delivered, and
+    /// [`Self::open`] fails.
+    pub fn is_gone(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     /// Open a virtual connection towards `target`.
     pub fn open(&self, target: &str) -> Result<VirtualConn, SessionGone> {
         let id = self.next_stream.fetch_add(2, Ordering::Relaxed);

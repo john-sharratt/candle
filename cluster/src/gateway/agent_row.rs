@@ -126,6 +126,7 @@ mod tests {
             syncing: false,
             in_flight: 0,
             handed: 0,
+            closing: false,
         };
         assert_eq!(
             serde_json::to_value(AgentRow::of(&agent, 1_700_000_000_000)).unwrap(),

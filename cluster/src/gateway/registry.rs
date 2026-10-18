@@ -50,6 +50,11 @@ pub struct MemberView {
     /// counts it, so a burst of jobs is spread instead of all reading the
     /// same free slot.
     pub handed: u32,
+    /// Its session has ended and the socket's cleanup has not yet run its
+    /// leave: no stream can open to it, so it is routed nothing. A request
+    /// picked for it in that window was answered `503` while another member
+    /// stood ready.
+    pub closing: bool,
 }
 
 /// How many of an origin's latest writes a member may still lack and count
@@ -67,10 +72,10 @@ impl MemberView {
         self.state() == MemberState::Ready
     }
 
-    /// Ready, not lagging and not still syncing: a request may be routed to
-    /// it.
+    /// Ready, not lagging, not still syncing and not closing: a request may be
+    /// routed to it.
     pub fn routable(&self) -> bool {
-        self.ready() && !self.lagging && !self.syncing
+        self.ready() && !self.lagging && !self.syncing && !self.closing
     }
 
     pub fn info(&self) -> MemberInfo {
@@ -139,6 +144,19 @@ impl Registry {
             return true;
         }
         false
+    }
+
+    /// `node`'s session `session` has ended: route it nothing until its leave.
+    /// A newer session of the same node is left alone.
+    pub fn closing(&mut self, app: &str, node: u64, session: u64) {
+        if let Some(m) = self
+            .apps
+            .get_mut(app)
+            .and_then(|a| a.members.get_mut(&node))
+            .filter(|m| m.session == session)
+        {
+            m.closing = true;
+        }
     }
 
     /// `node`'s `CAPACITY`; whether its state changed, which `MEMBERS` reports.
@@ -336,7 +354,7 @@ impl Registry {
         // the app answering nothing.
         a.members
             .values()
-            .filter(|m| m.ready() && !m.lagging && Some(m.node) != except)
+            .filter(|m| m.ready() && !m.lagging && !m.closing && Some(m.node) != except)
             .collect()
     }
 
