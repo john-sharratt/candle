@@ -33,6 +33,7 @@ use axum::response::Response;
 use cluster::dispatch::{extract, Dispatch, Extracted, KeySource, Merge, Mirror, BODY_LIMIT};
 use cluster::gateway::{Class, Pick, NODE_HEADER};
 
+use super::load::carry;
 use super::mirror::{mirrored, sampled, Route};
 use super::{aggregate, merge_ws, Gateway};
 use crate::auth::{cookie, Identity, Role, Roles};
@@ -215,7 +216,8 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
     }
 
     let pin = pinned(&req, app);
-    match hub.pick(app, &dispatch, key.as_deref(), pin) {
+    let picked = hub.pick(app, &dispatch, key.as_deref(), pin);
+    match picked.pick {
         Pick::Configured => none_ready(gateway, app, &ctx, req).await,
         Pick::Member(node) => {
             hub.traffic.request(Class::of(&dispatch));
@@ -223,10 +225,11 @@ pub async fn route(gateway: &Arc<Gateway>, app: &str, ctx: Context<'_>, req: Req
                 Mirror::None => None,
                 _ => hub.mirror_to(app, node),
             };
-            Routed::Answered(match to_candidate {
+            let res = match to_candidate {
                 Some(candidate) => mirrored(gateway, app, node, candidate, sample, &ctx, req).await,
                 None => sampled(gateway, app, node, sample, &ctx, req).await,
-            })
+            };
+            Routed::Answered(carry(res, picked.load))
         }
         Pick::Pinned(node) => {
             hub.traffic.request(Class::Ui);

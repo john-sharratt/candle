@@ -167,7 +167,7 @@ async fn members_join_route_and_carry_streams() {
     .await;
     assert!(!hub.clustered("zend"));
     assert_eq!(
-        hub.pick("zend", &Dispatch::Any, None, None),
+        hub.pick("zend", &Dispatch::Any, None, None).pick,
         Pick::Configured
     );
 
@@ -177,22 +177,42 @@ async fn members_join_route_and_carry_streams() {
     assert_eq!(hub.table("zend"), Some(routes()));
     // Only A is ready: every class goes to it.
     assert_eq!(
-        hub.pick("zend", &Dispatch::Best, None, None),
+        hub.pick("zend", &Dispatch::Best, None, None).pick,
         Pick::Member(1)
     );
     b.ready.store(true, Ordering::SeqCst);
     b.app.capacity_changed();
     // B has the higher power.
     until("B ready", || {
-        hub.pick("zend", &Dispatch::Best, None, None) == Pick::Member(2)
+        hub.pick("zend", &Dispatch::Best, None, None).pick == Pick::Member(2)
     })
     .await;
+    // A request B is answering halves its share, 102 / 2 against A's 101:
+    // the next goes to A, and to B again once B's answer is done.
+    let held = hub.pick("zend", &Dispatch::Best, None, None);
+    assert_eq!(held.pick, Pick::Member(2));
+    assert!(held.load.is_some(), "a Best request is work for its member");
+    assert_eq!(
+        hub.pick("zend", &Dispatch::Best, None, None).pick,
+        Pick::Member(1)
+    );
+    assert!(
+        hub.pick("zend", &Dispatch::Any, None, None).load.is_none(),
+        "an Any request is not counted"
+    );
+    drop(held);
+    assert_eq!(
+        hub.pick("zend", &Dispatch::Best, None, None).pick,
+        Pick::Member(2)
+    );
 
     // A claims a conversation; the gateway routes it there, and B, told of
     // the claim, refuses to serve it.
     assert!(matches!(a.app.claim(b"c-1"), Check::Took(_)));
     until("the claim routed", || {
-        hub.pick("zend", &Dispatch::sticky_path("id"), Some("c-1"), None) == Pick::Member(1)
+        hub.pick("zend", &Dispatch::sticky_path("id"), Some("c-1"), None)
+            .pick
+            == Pick::Member(1)
     })
     .await;
     until("B told", || b.app.claim(b"c-1") == Check::Held(1)).await;
@@ -265,8 +285,10 @@ async fn members_join_route_and_carry_streams() {
     assert!(hub.clustered("zend"));
 }
 
-/// A gateway shutting down closes its members `1001`; each records why and
-/// dials again (§3.4).
+/// A gateway shutting down closes its members `1001`; each counts the ended
+/// attempt and dials again (§3.4). The close is logged, not kept: once the
+/// member is admitted again its view describes the new socket, which nothing
+/// has closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gateway_going_away_closes_1001_and_the_member_redials() {
     let hub = Hub::new(key(), "gw-test");
@@ -274,16 +296,19 @@ async fn a_gateway_going_away_closes_1001_and_the_member_redials() {
     let a = member(&hub, 1, build(10), model(1), &up_tx);
     until("joined", || hub.member("zend", 1).is_some()).await;
     let first = hub.member("zend", 1).unwrap().session;
+    let attempts = a.app.clusters()[0].attempts;
     hub.close_all("the gateway is shutting down");
     until("rejoined on a new session", || {
         hub.member("zend", 1).is_some_and(|m| m.session != first)
     })
     .await;
-    let close = a.app.clusters()[0].last_close.clone().unwrap_or_default();
+    until("admitted again", || a.app.clusters()[0].state == "admitted").await;
+    let view = &a.app.clusters()[0];
     assert!(
-        close.starts_with("1001: the gateway is shutting down"),
-        "{close}"
+        view.attempts > attempts,
+        "the ended socket counts an attempt"
     );
+    assert_eq!(view.last_close, None, "the new socket was not closed");
 }
 
 /// A dropped socket fails every stream riding it: the gateway's reads end in

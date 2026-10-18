@@ -163,6 +163,7 @@ mod tests {
             high_water: 0,
             lagging: false,
             syncing: false,
+            in_flight: 0,
         }
     }
 

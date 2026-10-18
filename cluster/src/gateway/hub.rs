@@ -52,6 +52,7 @@ use super::admission::{Admission, Admitted};
 use super::agent_row::AgentRow;
 use super::agents::{Choice, Need};
 use super::coord_log::changes;
+use super::load::{Load, Picked};
 use super::log::{CoordLog, Entry};
 use super::paxos_log::paxos_step;
 use super::registry::{MemberView, Pick, Registry};
@@ -446,6 +447,7 @@ impl Hub {
                 high_water: 0,
                 lagging: false,
                 syncing,
+                in_flight: 0,
             });
         }
         let local = if hello.build.is_local() {
@@ -1081,26 +1083,40 @@ impl Hub {
     }
 
     /// Where a request goes (§5.2): while a candidate certifies, its share
-    /// of the live traffic goes to it (§3.8).
+    /// of the live traffic goes to it (§3.8). A request that is work for the
+    /// member it reaches is counted against it until the returned
+    /// [`Load`] drops — in the same hold of the state as the pick, so two
+    /// picks at once each see the other (§5.3).
     pub fn pick(
-        &self,
+        self: &Arc<Self>,
         app: &str,
         dispatch: &Dispatch,
         key: Option<&str>,
         pinned: Option<u64>,
-    ) -> Pick {
+    ) -> Picked {
         let mut s = self.state();
         let State {
             registry, upgrades, ..
         } = &mut *s;
-        match upgrades.canary(app) {
+        let pick = match upgrades.canary(app) {
             Some(candidate) => {
                 registry.pick_canary(app, dispatch, key, pinned, candidate, &mut || {
                     upgrades.take_share(app)
                 })
             }
             None => registry.pick(app, dispatch, key, pinned),
-        }
+        };
+        let work = matches!(
+            dispatch,
+            Dispatch::Best | Dispatch::Sticky(_) | Dispatch::Owner(_)
+        );
+        let load = match pick {
+            Pick::Member(node) if work => registry
+                .begin(app, node)
+                .map(|session| Load::new(Arc::clone(self), app, node, session)),
+            _ => None,
+        };
+        Picked { pick, load }
     }
 
     /// Which agent of `app` runs a job (§11.3).

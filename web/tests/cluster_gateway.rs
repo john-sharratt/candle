@@ -452,7 +452,7 @@ async fn while_every_member_loads_the_first_to_join_answers() {
 }
 
 /// **Dispatch, claims and pinning** (§5.2–§5.4): `Best` takes the most
-/// powerful idle member; a sticky key stays with the member that claimed it;
+/// powerful member; a sticky key stays with the member that claimed it;
 /// a body key is read from the buffered body; a page's UI requests stay on one
 /// member through its cookie, which API requests ignore; the cookie and the
 /// session token never reach a member; `x-tokera-node` is an admin's.
@@ -688,6 +688,76 @@ async fn a_dropped_socket_fails_what_rides_it() {
     assert!(failures.failed_before_head >= 1);
     assert!(failures.aborted_mid_body >= 1);
     assert!(failures.tunnels_closed >= 1);
+}
+
+/// Open `/v1/stream` through the gateway and read its first chunk; the body is
+/// still streaming when this returns. Dropping the returned connection task
+/// closes the client's socket.
+async fn open_stream(gw: SocketAddr) -> (Incoming, tokio::task::JoinHandle<()>) {
+    let stream = TcpStream::connect(gw).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let conn = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let res = sender
+        .send_request(
+            Request::get("/v1/stream")
+                .header("host", "code.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let mut body = res.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(&first[..], b"first chunk");
+    (body, conn)
+}
+
+fn in_flight(hub: &Hub, node: &str) -> u32 {
+    hub.status(0)
+        .members
+        .iter()
+        .find(|m| m.node == node)
+        .map_or(0, |m| m.in_flight)
+}
+
+/// **`Best` divides power by the requests in flight** (§5.3), counted from the
+/// pick until the answer's last byte: two streams still answering on the
+/// 300-power member leave it 100 a request, level with the idle 100, so the
+/// next request goes to the other; once the clients go away the streams end,
+/// and the stronger member takes new work again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn best_spreads_by_the_requests_in_flight() {
+    let dumb = spawn(dumb_daemon()).await;
+    let (gw, hub) = gateway(dumb).await;
+    let a = member(gw, 1, 100);
+    let b = member(gw, 2, 300);
+    until("both ready", || both_ready(&hub)).await;
+    const B: &str = "0000000000000002";
+
+    assert_eq!(fetch(gw, "/v1/where").await.json()["by"], "member-2");
+    let first = open_stream(gw).await;
+    let second = open_stream(gw).await;
+    assert_eq!(in_flight(&hub, B), 2, "both streams are still answering");
+    assert_eq!(
+        fetch(gw, "/v1/where").await.json()["by"],
+        "member-1",
+        "300 / 3 against 100 / 1: level, and the lower node takes it"
+    );
+    assert_eq!(in_flight(&hub, "0000000000000001"), 0, "that answer ended");
+
+    for (body, conn) in [first, second] {
+        drop(body);
+        conn.abort();
+    }
+    until("the streams ended", || in_flight(&hub, B) == 0).await;
+    assert_eq!(fetch(gw, "/v1/where").await.json()["by"], "member-2");
+    a.leave();
+    b.leave();
 }
 
 /// **A key held through another cluster** (§5.4): the member reached answers

@@ -10,6 +10,7 @@ mod claims;
 mod coord_log;
 mod drain;
 mod hub;
+mod load;
 mod log;
 mod paxos_log;
 mod registry;
@@ -33,6 +34,7 @@ pub use drain::DRAIN_WAIT;
 pub use hub::{
     rolls_out, Hub, MemberStream, APPS, CATCHUP_CAP, KEEP, LAG_CAP, MEMBERS_EVERY, REFUSALS_KEPT,
 };
+pub use load::{Load, Picked};
 pub use log::{CoordLog, Entry};
 pub use paxos_log::paxos_step;
 pub use registry::{MemberView, Pick, Registry};

@@ -5,7 +5,7 @@
 //! An app is **clustered** on this gateway while it has a ready member, and
 //! **dumb** otherwise: its routes then go to their configured upstream (§5.7).
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap};
 
 use applied_set::AppliedSet;
@@ -40,6 +40,10 @@ pub struct MemberView {
     /// — the gateway's judgement, not the member's. Unlike lagging, it is sent
     /// live events throughout, so it catches up rather than chasing them.
     pub syncing: bool,
+    /// Requests this gateway has handed it and it has not finished answering
+    /// (§5.3): counted at the pick, so a burst sees its own earlier picks
+    /// before the member's next `CAPACITY` reports them.
+    pub in_flight: u32,
 }
 
 /// How many of an origin's latest writes a member may still lack and count
@@ -219,6 +223,26 @@ impl Registry {
         changed
     }
 
+    /// A request handed to `node`: one more in flight there. Returns the
+    /// member's session, which [`Self::end`] names, or `None` for a node not
+    /// admitted.
+    pub fn begin(&mut self, app: &str, node: u64) -> Option<u64> {
+        let m = self.app(app).members.get_mut(&node)?;
+        m.in_flight += 1;
+        Some(m.session)
+    }
+
+    /// A request [`Self::begin`] counted against `node`'s `session` is
+    /// answered. A session since replaced counted its own requests, so the
+    /// newer one's count is left alone.
+    pub fn end(&mut self, app: &str, node: u64, session: u64) {
+        if let Some(m) = self.app(app).members.get_mut(&node) {
+            if m.session == session {
+                m.in_flight = m.in_flight.saturating_sub(1);
+            }
+        }
+    }
+
     pub fn claims(&mut self, app: &str) -> &mut Claims {
         &mut self.app(app).claims
     }
@@ -326,25 +350,19 @@ impl Registry {
         Some(pick)
     }
 
-    /// The highest-power idle ready member; with none idle, the one with the
-    /// most free slots (§5.3).
+    /// The ready member with the most power to spare per request (§5.3):
+    /// `power / (1 + in_flight)`, among those with room — idle, or with more
+    /// free slots than it has requests in flight — or among them all when none
+    /// has. Of equal shares, an idle member; then the lowest node.
     fn best(&self, app: &str) -> Option<u64> {
         self.best_but(app, None)
     }
 
     fn best_but(&self, app: &str, except: Option<u64>) -> Option<u64> {
         let ready = self.ready_but(app, except);
-        let cap = |m: &&MemberView| m.capacity.clone().expect("a ready member sent capacity");
-        ready
-            .iter()
-            .filter(|m| cap(m).idle)
-            .max_by_key(|m| (cap(m).power, Reverse(m.node)))
-            .or_else(|| {
-                ready
-                    .iter()
-                    .max_by_key(|m| (cap(m).slots_free, Reverse(m.node)))
-            })
-            .map(|m| m.node)
+        let roomy: Vec<&MemberView> = ready.iter().copied().filter(|m| has_room(m)).collect();
+        let pool = if roomy.is_empty() { ready } else { roomy };
+        pool.into_iter().max_by(|a, b| rank(a, b)).map(|m| m.node)
     }
 
     fn round_robin(&mut self, app: &str) -> Option<u64> {
@@ -483,6 +501,30 @@ impl Registry {
         };
         Pick::Member(baseline.unwrap_or(canary))
     }
+}
+
+fn capacity_of(m: &MemberView) -> &Capacity {
+    m.capacity.as_ref().expect("a ready member sent capacity")
+}
+
+/// Whether `m` can take another request: idle, or with a free slot its
+/// requests in flight have not already spoken for.
+fn has_room(m: &MemberView) -> bool {
+    let c = capacity_of(m);
+    c.idle || c.slots_free > m.in_flight
+}
+
+/// `a` against `b` for [`Registry::best`]: the larger share of power per
+/// request — `power / (1 + in_flight)`, compared cross-multiplied so no share
+/// rounds — then idle over busy, then the lower node.
+fn rank(a: &MemberView, b: &MemberView) -> Ordering {
+    let (ca, cb) = (capacity_of(a), capacity_of(b));
+    let share_a = u64::from(ca.power) * (1 + u64::from(b.in_flight));
+    let share_b = u64::from(cb.power) * (1 + u64::from(a.in_flight));
+    share_a
+        .cmp(&share_b)
+        .then(ca.idle.cmp(&cb.idle))
+        .then(Reverse(a.node).cmp(&Reverse(b.node)))
 }
 
 #[cfg(test)]

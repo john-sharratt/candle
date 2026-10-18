@@ -36,6 +36,7 @@ fn member(node: u64, session: u64) -> MemberView {
         high_water: 0,
         lagging: false,
         syncing: false,
+        in_flight: 0,
     }
 }
 
@@ -65,7 +66,8 @@ fn a_lagging_member_is_routed_nothing() {
 #[test]
 fn a_candidate_takes_its_share_and_no_more() {
     let mut r = three();
-    // Node 3 is the candidate: idle, power 200; node 1 is the idle baseline.
+    // Node 3 is the candidate: idle, power 200; node 2, power 300, is the
+    // baseline `Best` picks with the candidate left out.
     let mut yes = || true;
     let mut no = || false;
     assert_eq!(
@@ -74,7 +76,7 @@ fn a_candidate_takes_its_share_and_no_more() {
     );
     assert_eq!(
         r.pick_canary("zend", &Dispatch::Best, None, None, 3, &mut no),
-        Pick::Member(1)
+        Pick::Member(2)
     );
     for _ in 0..4 {
         assert_ne!(
@@ -126,7 +128,8 @@ fn the_answerer_is_another_member_round_robin() {
     assert_eq!(alone.answerer("zend", 1), None);
 }
 
-/// Three ready members: power 100 (idle), 300 (busy), 200 (idle).
+/// Three ready members: power 100 (idle, 2 slots), 300 (busy, 5 slots), 200
+/// (idle, 1 slot).
 fn three() -> Registry {
     let mut r = Registry::new();
     for (node, power, idle, slots) in [(1, 100, true, 2), (2, 300, false, 5), (3, 200, true, 1)] {
@@ -187,16 +190,60 @@ fn a_loading_member_stands_by() {
     assert_eq!(r.standing_by("zend"), None);
 }
 
+fn best(r: &mut Registry) -> Pick {
+    r.pick("zend", &Dispatch::Best, None, None)
+}
+
+/// **`Best` divides each member's power by its requests in flight** (§5.3):
+/// the most powerful takes new work until its share per request falls below
+/// another's, busy or not — a member's own background work does not count. A
+/// member out of room is passed over while another has room; an equal share
+/// goes to an idle member, then the lowest node.
 #[test]
-fn best_takes_the_highest_idle_power_else_the_most_free_slots() {
+fn best_takes_the_largest_share_of_power_per_request() {
     let mut r = three();
-    assert_eq!(r.pick("zend", &Dispatch::Best, None, None), Pick::Member(3));
-    r.capacity("zend", 1, capacity(MemberState::Ready, 100, false, 2));
+    // Shares 100, 300, 200: the busy 300 still has five free slots.
+    assert_eq!(best(&mut r), Pick::Member(2));
+    let first = r.begin("zend", 2).expect("admitted");
+    // 100, 300/2 = 150, 200.
+    assert_eq!(best(&mut r), Pick::Member(3));
+    r.begin("zend", 3);
+    // 100, 150, 200/2 = 100.
+    assert_eq!(best(&mut r), Pick::Member(2));
+    r.begin("zend", 2);
+    r.begin("zend", 2);
+    // 100, 300/4 = 75, 100: two idle members tie, and the lower node takes it.
+    assert_eq!(best(&mut r), Pick::Member(1));
+    // Node 1 busy with no free slot has no room; node 3, idle, still has.
+    r.capacity("zend", 1, capacity(MemberState::Ready, 100, false, 0));
+    assert_eq!(best(&mut r), Pick::Member(3));
+    // With nobody left with room, the largest share of all takes it: node 2
+    // has three requests on five slots, so it has room until it holds five.
     r.capacity("zend", 3, capacity(MemberState::Ready, 200, false, 1));
-    assert_eq!(r.pick("zend", &Dispatch::Best, None, None), Pick::Member(2));
+    assert_eq!(best(&mut r), Pick::Member(2), "the only one with room");
+    r.begin("zend", 2);
+    r.begin("zend", 2);
+    assert_eq!(
+        r.member("zend", 2).map(|m| m.in_flight),
+        Some(5),
+        "five begun on node 2"
+    );
+    // No room anywhere: 100/1, 300/6 = 50, 200/2 = 100 — tied, lower node.
+    assert_eq!(best(&mut r), Pick::Member(1));
+
+    // An answer ends its request; one from a session since replaced leaves
+    // the newer session's count alone.
+    r.end("zend", 2, first);
+    assert_eq!(r.member("zend", 2).map(|m| m.in_flight), Some(4));
+    r.join(member(2, 9));
+    r.capacity("zend", 2, capacity(MemberState::Ready, 300, false, 5));
+    r.begin("zend", 2);
+    r.end("zend", 2, first);
+    assert_eq!(r.member("zend", 2).map(|m| m.in_flight), Some(1));
+
     // A member in fault mode or upgrading is not ready, and takes nothing.
     r.capacity("zend", 2, capacity(MemberState::Fault, 300, true, 9));
-    assert_eq!(r.pick("zend", &Dispatch::Best, None, None), Pick::Member(1));
+    assert_ne!(best(&mut r), Pick::Member(2));
 }
 
 #[test]
@@ -228,14 +275,14 @@ fn a_sticky_key_follows_its_claim() {
     );
     assert_eq!(
         r.pick("zend", &sticky(), Some("c-2"), None),
-        Pick::Member(3)
+        Pick::Member(2)
     );
     r.claims("zend").claim(b"c-3", Epoch { ms: 1, node: 9 });
     assert_eq!(
         r.pick("zend", &sticky(), Some("c-3"), None),
-        Pick::Member(3)
+        Pick::Member(2)
     );
-    assert_eq!(r.pick("zend", &sticky(), None, None), Pick::Member(3));
+    assert_eq!(r.pick("zend", &sticky(), None, None), Pick::Member(2));
 }
 
 /// A page's files come from one member: a new page is pinned round robin, and

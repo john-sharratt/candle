@@ -25,6 +25,7 @@ pub mod aggregate;
 pub mod codec;
 pub mod endpoint;
 pub mod jobs;
+pub mod load;
 pub mod merge_ws;
 pub mod mirror;
 pub mod page;

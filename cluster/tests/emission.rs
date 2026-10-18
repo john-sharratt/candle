@@ -4,6 +4,7 @@
 
 mod support;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,8 +90,10 @@ async fn other_events_go_round_robin() {
 
 /// A member that stops reading its socket becomes lagging once its lane
 /// passes the cap: no further live event is queued for it and no request is
-/// routed to it; its socket stays open; once it drains it catches up through
-/// `high_water` and is ready again.
+/// routed to it; its socket stays open. Once its lane drains it takes live
+/// events again and syncs — **while the origin is still writing**, which a
+/// lagging member, chasing writes it is not sent, could never catch up with —
+/// and is routed again once in sync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_member_lags_and_comes_back() {
     let gw = gateway("gw");
@@ -111,7 +114,7 @@ async fn a_slow_member_lags_and_comes_back() {
     .await;
     for _ in 0..4 {
         assert_ne!(
-            gw.pick(APP, &Dispatch::Any, None, None),
+            gw.pick(APP, &Dispatch::Any, None, None).pick,
             Pick::Member(2),
             "no request routed to a lagging member"
         );
@@ -124,9 +127,32 @@ async fn a_slow_member_lags_and_comes_back() {
         .unwrap();
     assert!(row.queues.skipped > 0);
 
+    // The origin keeps writing throughout the recovery, as an ingesting
+    // member does.
+    let writing = Arc::new(AtomicBool::new(true));
+    let writer = tokio::spawn({
+        let store = a.store.clone();
+        let writing = writing.clone();
+        async move {
+            let mut k = 0u64;
+            while writing.load(Ordering::SeqCst) {
+                store.write(format!("trickle/{k}").as_bytes(), b"t");
+                k += 1;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    });
     slow.pause(0, false);
-    until("caught up and no longer lagging", WITHIN + GAP_WAIT, || {
-        gw.member(APP, 2).is_some_and(|m| !m.lagging) && converged(&[&a.store, &slow.store])
+    until(
+        "routed again while the origin writes",
+        WITHIN + GAP_WAIT,
+        || gw.member(APP, 2).is_some_and(|m| m.routable()),
+    )
+    .await;
+    writing.store(false, Ordering::SeqCst);
+    writer.await.unwrap();
+    until("converged", WITHIN + GAP_WAIT, || {
+        converged(&[&a.store, &slow.store])
     })
     .await;
     assert_eq!(

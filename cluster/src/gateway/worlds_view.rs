@@ -194,6 +194,7 @@ mod tests {
             power: None,
             idle: None,
             slots_free: None,
+            in_flight: 0,
             state,
             session: 1,
             connected_ms: 0,

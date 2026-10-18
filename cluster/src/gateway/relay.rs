@@ -122,7 +122,17 @@ impl Hub {
     }
 
     /// `node`'s socket's timer: a `RECEIPT` owed for 100 ms, and the end of
-    /// its lagging once its lane has drained and it has caught up.
+    /// its lagging once its lane has drained.
+    ///
+    /// **A drained lane ends the lagging; being in sync ends the syncing.** A
+    /// lagging member is sent no live event, so the writes it lacks reach it
+    /// only by catch-up — which trails any origin still writing. Waiting for its
+    /// `ACK`s to reach that origin's `high_water` before sending it live events
+    /// again waited for ever: WhiteWorld's zend, lagging behind `.5`'s ingest,
+    /// was routed nothing for as long as `.5` ingested (2026-10-18). Drained, it
+    /// takes live events again and is syncing: routed no request until its
+    /// `ACK`s are in sync with the members serving, judged with
+    /// [`super::registry::SYNC_SLACK`] like any member joining beside them.
     pub(super) fn receipt_tick(&self, app: &str, node: u64) {
         let (receipt, recovered, synced) = {
             let mut guard = self.state();
@@ -137,18 +147,10 @@ impl Hub {
             let drained = x.handle.gauges().live() == 0;
             let acks = x.acks.clone();
             let lagging = s.registry.member(app, node).is_some_and(|m| m.lagging);
-            let caught_up = s
-                .registry
-                .members(app)
-                .iter()
-                .filter(|m| m.node != node && m.high_water > 0)
-                .all(|m| {
-                    acks.iter()
-                        .any(|(origin, through)| *origin == m.node && *through >= m.high_water)
-                });
-            let recovered = lagging && drained && caught_up;
+            let recovered = lagging && drained;
             if recovered {
                 s.registry.set_lagging(app, node, false);
+                s.registry.set_syncing(app, node, true);
             }
             // Synced: its own `ACK`s cover every other origin this gateway has
             // heard, members away included — judged here, not by the member,
@@ -178,7 +180,11 @@ impl Hub {
             let _ = handle.control(Frame::Receipt(Receipt { through }));
         }
         if recovered {
-            self.note(app, hex(node), "caught up: no longer lagging".into());
+            self.note(
+                app,
+                hex(node),
+                "lane drained: no longer lagging, syncing until in sync".into(),
+            );
         }
         if synced {
             self.note(

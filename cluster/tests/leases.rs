@@ -254,13 +254,13 @@ async fn the_holders_claim_routes_the_world() {
     let owner = Dispatch::Owner(KeySource::Path("wid".into()));
     a.app.hold(b"w1");
     until("routed to a", WITHIN, || {
-        gw.pick(APP, &owner, Some("w1"), None) == Pick::Member(1)
+        gw.pick(APP, &owner, Some("w1"), None).pick == Pick::Member(1)
     })
     .await;
     a.app.let_go(b"w1", 7);
     b.app.hold(b"w1");
     until("routed to b", WITHIN, || {
-        gw.pick(APP, &owner, Some("w1"), None) == Pick::Member(2)
+        gw.pick(APP, &owner, Some("w1"), None).pick == Pick::Member(2)
     })
     .await;
 }

@@ -1136,9 +1136,16 @@ Each member has an outbound queue per lane.
     finish rather than fail. Each stream's own flow control bounds them (§4.2).
 
   The member sees the gap through `high_water` and catches up (§7.1), at its link's
-  pace. When it has drained the lane and its catch-up is done, it is ready again and
-  receives live events once more. Closing the socket would instead fail every exchange
-  on it (§5.6), for a member that is only slow.
+  pace. **Once it has drained the lane it receives live events again and is
+  syncing** — the state of a member admitted beside one already serving: sent live
+  events throughout, routed no request until its `ACK`s cover what the members serving
+  have applied of every origin, within 64 records (`SYNC_SLACK`), as the gateway judges
+  from those `ACK`s. Waiting instead for its
+  catch-up to reach every origin's `high_water` before sending it live events waits
+  for ever while any origin keeps writing — the catch-up trails the writes it is not
+  sent — and so it did: WhiteWorld's zend, lagging behind `.5`'s ingest, was routed
+  nothing for as long as `.5` ingested (2026-10-18). Closing the socket would instead
+  fail every exchange on it (§5.6), for a member that is only slow.
 - **The catch-up lane is capped at 128 MiB per member.** The requester sets the pace: it
   keeps no more than 64 MiB of fetched records outstanding (§7.2), so an answer stays
   under the cap. A catch-up moves one window per round trip — the answerer's reads, the
@@ -1214,7 +1221,7 @@ matches request paths against it with the same matcher axum uses (`matchit`).
 
 | Dispatch | Picks |
 |---|---|
-| `Best` | the highest-power member with idle capacity (§5.3) |
+| `Best` | the member with the most power per request in flight (§5.3) |
 | `Sticky(key)` | the member holding `key`'s affinity; a key with none goes `Best` and takes it (§5.4) |
 | `Owner(key)` | the member holding the lease for `key`: the world's authority for a world, the NPC-lease holder for a character (§9.6) |
 | `Aggregate(merge)` | every admitted, ready member; responses combined (§5.5) |
@@ -1288,8 +1295,21 @@ Routes by group (the full table is in each crate's `declared`):
 - **`idle`**: the scheduler can admit now — a free slot and a prefill backlog under its
   budget (`slots`, `budget`, `used` in the wave rows, `host/src/endpoints/waves.rs:43-70`).
 
-`Best` picks the highest `power` among idle, ready members; when none is idle, the one
-with the most free slots. Agents rank by idle cores (§11.3).
+The gateway adds what no `CAPACITY` can say in time: **`in_flight`**, the requests it
+has handed each member and the member is still answering. A request routed `Best`,
+sticky or owner is counted at the pick — in the same hold of the registry, so two picks
+at once each see the other — and until the last byte of its answer: a chat streams for
+as long as it decodes. An upgraded connection is a session, not a request, and is not
+counted.
+
+`Best` picks the ready member with the most power to spare per request,
+`power / (1 + in_flight)`, among those with room — idle, or with more free slots than
+requests in flight — and among them all when none has room. Of equal shares an idle
+member wins, then the lowest node. A member's own background work — ingest, a
+calibration pass — is not a request and does not count: the dialogue a request serves
+decodes at `High` priority, 64 shares to background work's one (`DecodePriority`). So the strongest member takes new conversations until its share per
+request falls to another's, and a burst spreads over the members as it arrives rather
+than all reading the same second-old `CAPACITY`. Agents rank by idle cores (§11.3).
 
 ### 5.4 Affinity is a claim the member holds
 
@@ -3981,7 +4001,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | dispatch | the route table and requests yield the expected member for each class; the `x-tokera-node` override is admin-only; the `Body` key reads ≤ 8 MiB |
 | modes | a route with `cluster:` and no ready member goes to its configured URL; the first ready member switches it; requests in flight to the URL finish there; the last member leaving reverts it; a route without `cluster:` never switches |
 | claims | a new key is claimed by the member that serves it; the claim is announced on every cluster; a gateway lacking the holder answers `409` then `503`; the idle release carries `through`; the catch-up hold releases at `through`; of two simultaneous first claims the higher epoch keeps the key |
-| lagging | an ordered lane past its cap makes the member lagging: no further live events are queued for it and none of its queued stream frames are dropped; no new request is routed to it; it catches up through `high_water` and becomes ready again; its socket is never closed for being slow |
+| lagging | an ordered lane past its cap makes the member lagging: no further live events are queued for it and none of its queued stream frames are dropped; no new request is routed to it; once its lane drains it takes live events again and syncs, routed again once in sync — an origin still writing included; its socket is never closed for being slow |
 | socket drop | an exchange with no response head yet gets a `503`; a body in progress is aborted rather than ended; a tunnelled WebSocket closes `1011`; nothing is replayed on another member |
 | emission | a request's events leave on the request's socket; other events go round robin across sockets, one whole event at a time; with every socket down events stay *unsent*, never queued in memory |
 | retransmit | events in flight on a socket that drops, and only those past its last `RECEIPT`, go back to unsent and leave again in `oseq` order on the next socket admitted; nothing is re-sent that a `RECEIPT` covered |

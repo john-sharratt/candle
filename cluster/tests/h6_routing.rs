@@ -44,17 +44,23 @@ impl Model {
             .collect()
     }
 
+    /// Nothing is in flight here — the registry is asked directly, never
+    /// through a hub — so each share of power is the whole power: among the
+    /// members with room (idle, or a free slot), or all when none has, the
+    /// highest power; of equals, an idle one; then the lowest node.
     fn best(&self) -> Option<u64> {
         let ready = self.ready();
-        let mut idle: Vec<&(u64, Cap)> = ready.iter().filter(|(_, c)| c.idle).collect();
-        if !idle.is_empty() {
-            // The highest power; of equals, the lowest node.
-            idle.sort_by_key(|(n, c)| (Reverse(c.power), *n));
-            return Some(idle[0].0);
-        }
-        let mut all: Vec<&(u64, Cap)> = ready.iter().collect();
-        all.sort_by_key(|(n, c)| (Reverse(c.slots), *n));
-        all.first().map(|(n, _)| *n)
+        let roomy: Vec<&(u64, Cap)> = ready
+            .iter()
+            .filter(|(_, c)| c.idle || c.slots > 0)
+            .collect();
+        let mut pool = if roomy.is_empty() {
+            ready.iter().collect()
+        } else {
+            roomy
+        };
+        pool.sort_by_key(|(n, c)| (Reverse(c.power), Reverse(c.idle), *n));
+        pool.first().map(|(n, _)| *n)
     }
 
     fn rr(&mut self) -> Option<u64> {
@@ -115,6 +121,7 @@ fn view(node: u64, session: u64) -> MemberView {
         high_water: 0,
         lagging: false,
         syncing: false,
+        in_flight: 0,
     }
 }
 

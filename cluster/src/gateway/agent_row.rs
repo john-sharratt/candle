@@ -124,6 +124,7 @@ mod tests {
             high_water: 0,
             lagging: false,
             syncing: false,
+            in_flight: 0,
         };
         assert_eq!(
             serde_json::to_value(AgentRow::of(&agent, 1_700_000_000_000)).unwrap(),
