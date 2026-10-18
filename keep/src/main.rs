@@ -13,6 +13,13 @@
 //! never restarts it. No line, or the process dying, stops the trial, puts the
 //! set-aside file back and starts it.
 //!
+//! `POST /accept`, with the same body, takes the new executable as the service
+//! with no trial: the service is stopped, the new bytes installed on the stable
+//! path — the file they replace kept as `<name>.last` for a rollback by hand —
+//! and started. Nothing waits on a proof line and nothing is rolled back: for a
+//! build that cannot prove itself inside the trial's ten minutes, such as a
+//! first start on a fresh substrate.
+//!
 //! `POST /restart/<service>` stops that service and starts its stable file
 //! again — no trial, since the binary is the one already kept. `POST
 //! /stop/<service>` stops it and holds it down until `POST /start/<service>`
@@ -36,7 +43,7 @@ use std::thread;
 use std::time::Duration;
 
 use cluster::upgrade::switch::SWITCH_ADDR;
-use place::{previous_of, restore, same_file};
+use place::{accept, previous_of, restore, same_file};
 use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use trial::{spawn_detached, switch_to, Ended, Running};
@@ -90,6 +97,12 @@ struct Slot {
 enum Req {
     /// Run `path` as a trial on the stable path (`POST /`, the path as body).
     Switch {
+        path: PathBuf,
+        reply: Sender<Answer>,
+    },
+    /// Install `path` on the stable path and start it, with no trial
+    /// (`POST /accept`, the path as body).
+    Accept {
         path: PathBuf,
         reply: Sender<Answer>,
     },
@@ -219,6 +232,10 @@ fn supervise(svc: Service, rx: Receiver<Req>) {
                 held = false;
                 live = apply(&svc, live, &path, reply);
             }
+            Ok(Req::Accept { path, reply }) => {
+                held = false;
+                live = accept_build(&svc, live, &path, reply);
+            }
             Ok(Req::Restart { reply }) => {
                 held = false;
                 live = restart(&svc, live, reply);
@@ -318,6 +335,46 @@ fn restart(svc: &Service, live: Option<Live>, reply: Sender<Answer>) -> Option<L
             status: 500,
             reason: "Internal Server Error",
             body: "stopped, and the stable file did not start\n".to_string(),
+        },
+    };
+    eprintln!("keep: {} {}", svc.name, answer.body.trim());
+    let _ = reply.send(answer);
+    started
+}
+
+/// Stop the service, install `path` on the stable path and start it: no
+/// trial. A failed install leaves the stable file as it was and starts that.
+fn accept_build(
+    svc: &Service,
+    live: Option<Live>,
+    path: &Path,
+    reply: Sender<Answer>,
+) -> Option<Live> {
+    if let Some(mut live) = live {
+        stop(&mut live);
+    }
+    // One found by name is the service too, whoever started it: its image
+    // holds the stable file open.
+    if let Some(found) = find(&svc.file) {
+        stop(&mut Live::Adopted(found.pid));
+    }
+    let installed = accept(path, &svc.stable);
+    let started = ensure(svc);
+    let answer = match (&installed, &started) {
+        (Ok(()), Some(_)) => Answer {
+            status: 200,
+            reason: "OK",
+            body: "accepted\n".to_string(),
+        },
+        (Ok(()), None) => Answer {
+            status: 500,
+            reason: "Internal Server Error",
+            body: "accepted, and the new stable file did not start\n".to_string(),
+        },
+        (Err(e), _) => Answer {
+            status: 409,
+            reason: "Conflict",
+            body: format!("not accepted: {e}\nthe stable file is unchanged\n"),
         },
     };
     eprintln!("keep: {} {}", svc.name, answer.body.trim());
@@ -477,7 +534,8 @@ fn kill_pid(pid: u32) {
 fn handle(mut stream: TcpStream, slots: &[Slot]) {
     let answer = match read_request(&mut stream) {
         Ok((target, body)) => match route(&target) {
-            Route::Switch => dispatch(body.trim(), slots),
+            Route::Switch => dispatch(body.trim(), slots, Hand::Trial),
+            Route::Accept => dispatch(body.trim(), slots, Hand::Accept),
             Route::Service(action, name) => service_request(action, name, slots),
             Route::Exit => {
                 let _ = write_answer(
@@ -496,8 +554,8 @@ fn handle(mut stream: TcpStream, slots: &[Slot]) {
             Route::Unknown => Answer {
                 status: 404,
                 reason: "Not Found",
-                body: "POST / with an executable's path, POST /restart|stop|start/<service>, \
-                       or POST /exit\n"
+                body: "POST / or /accept with an executable's path, \
+                       POST /restart|stop|start/<service>, or POST /exit\n"
                     .into(),
             },
         },
@@ -515,6 +573,8 @@ fn handle(mut stream: TcpStream, slots: &[Slot]) {
 enum Route<'a> {
     /// `/`: switch to the executable the body names.
     Switch,
+    /// `/accept`: take the executable the body names, with no trial.
+    Accept,
     /// `/<action>/<service>`.
     Service(Action, &'a str),
     /// `/exit`: keep itself exits, for its supervisor to start it again.
@@ -533,6 +593,9 @@ enum Action {
 fn route(target: &str) -> Route<'_> {
     if target == "/" {
         return Route::Switch;
+    }
+    if target == "/accept" {
+        return Route::Accept;
     }
     if target == "/exit" {
         return Route::Exit;
@@ -579,7 +642,14 @@ fn service_request(action: Action, name: &str, slots: &[Slot]) -> Answer {
     })
 }
 
-fn dispatch(body: &str, slots: &[Slot]) -> Answer {
+/// How a new executable is taken: proven by a trial, or accepted as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hand {
+    Trial,
+    Accept,
+}
+
+fn dispatch(body: &str, slots: &[Slot], hand: Hand) -> Answer {
     if body.is_empty() {
         return Answer {
             status: 400,
@@ -617,7 +687,11 @@ fn dispatch(body: &str, slots: &[Slot]) -> Answer {
         };
     }
     let (tx, rx) = mpsc::channel();
-    if slot.tx.send(Req::Switch { path, reply: tx }).is_err() {
+    let req = match hand {
+        Hand::Trial => Req::Switch { path, reply: tx },
+        Hand::Accept => Req::Accept { path, reply: tx },
+    };
+    if slot.tx.send(req).is_err() {
         return Answer {
             status: 409,
             reason: "Conflict",
@@ -742,6 +816,8 @@ mod tests {
     #[test]
     fn a_target_routes_to_its_request() {
         assert_eq!(route("/"), Route::Switch);
+        assert_eq!(route("/accept"), Route::Accept);
+        assert_eq!(route("/accept/motherd"), Route::Unknown);
         assert_eq!(
             route("/restart/motherd"),
             Route::Service(Action::Restart, "motherd")
