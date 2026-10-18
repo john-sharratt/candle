@@ -507,6 +507,19 @@ impl Admit {
     }
 }
 
+/// The trades [`WaveRate::try_widen_trading`] judged over a window — what the
+/// scheduler's summary line reports, so a run shows how the balance between
+/// prefill and decode moved and what the formula weighed each time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TradeWindow {
+    pub judged: u64,
+    pub admitted: u64,
+    pub prefill_weight: f64,
+    pub decode_weight: f64,
+    pub prefill_gain: f64,
+    pub decode_change: f64,
+}
+
 /// The wave throughput planner: the two models, the learned rates, and the
 /// budget of the wave being composed.
 #[derive(Clone, Debug)]
@@ -526,6 +539,9 @@ pub struct WaveRate {
     alpha: f64,
     /// Relative rate gain below which an admission is refused as saturated.
     min_gain: f64,
+    /// The trades judged since the summary last read them — see
+    /// [`TradeWindow`].
+    trades: TradeWindow,
     /// Prefill forwards folded into the copy rate so far.
     samples: u64,
     /// Decode forwards folded into the layer time so far.
@@ -647,6 +663,7 @@ impl WaveRate {
             layer_secs: 1.0 / (decode.initial_tok_per_s * geometry.moe_layers as f64),
             alpha: Self::DEFAULT_ALPHA,
             min_gain: Self::DEFAULT_MIN_GAIN,
+            trades: TradeWindow::default(),
             samples: 0,
             decode_samples: 0,
             hit_samples: 0,
@@ -1125,6 +1142,12 @@ impl WaveRate {
                 0.0
             };
             let net = prefill_weight * prefill_gain + decode_weight * decode_change;
+            self.trades.judged += 1;
+            self.trades.admitted += u64::from(net > 1e-12);
+            self.trades.prefill_weight += prefill_weight;
+            self.trades.decode_weight += decode_weight;
+            self.trades.prefill_gain += prefill_gain;
+            self.trades.decode_change += decode_change;
             // Every trade's terms, so a run shows where the formula was wrong
             // against what the forwards that followed measured.
             tracing::debug!(
@@ -1158,6 +1181,11 @@ impl WaveRate {
         self.resident_now = weights_after;
         self.tokens = tokens_after;
         Admit::Admitted { projected }
+    }
+
+    /// The trades judged since the last call, and a fresh window.
+    pub fn take_trades(&mut self) -> TradeWindow {
+        std::mem::take(&mut self.trades)
     }
 
     /// End the wave on a refusal the caller could not turn into a join — what

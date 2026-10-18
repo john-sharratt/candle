@@ -2615,6 +2615,7 @@ impl WaveStats {
         slots: (u32, u32, u32, u32),
         experts: Option<(usize, usize, usize, usize)>,
         graphs: Option<CaptureStats>,
+        trades: Option<admit::rate::TradeWindow>,
     ) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
@@ -2706,8 +2707,27 @@ impl WaveStats {
             _ => String::new(),
         };
         self.graphs_prev = graphs;
+        // This window's prefill-against-decode trades: how many turns were
+        // judged on the trade and admitted, the mean weights each side carried,
+        // and the mean shares of its own rate each side moved by — the figures
+        // the formula is tuned from (`WaveRate::try_widen_trading`).
+        let trades_str = match trades {
+            Some(t) if t.judged > 0 => {
+                let n = t.judged as f64;
+                format!(
+                    " | trades n={} ok={} pw={:.1} dw={:.1} dP={:.4} dD={:.4}",
+                    t.judged,
+                    t.admitted,
+                    t.prefill_weight / n,
+                    t.decode_weight / n,
+                    t.prefill_gain / n,
+                    t.decode_change / n,
+                )
+            }
+            _ => String::new(),
+        };
         tracing::info!(
-            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}",
+            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}{trades_str}",
             elapsed.as_secs_f64()
         );
         // Phase breakdown: where the wall-clock went on the scheduler thread.
