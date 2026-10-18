@@ -1,4 +1,5 @@
-//! Reading records from **sealed** segments without the persistence mutex.
+//! Reading **durable** records — any in a sealed segment, and those below the
+//! active segment's last commit — without the persistence mutex.
 //!
 //! Every read through [`super::SubstratePersistence`] takes its mutex, and
 //! background maintenance holds that mutex across its relocation I/O — the
@@ -18,11 +19,19 @@
 //! segments are sealed can open one read-only and read a record out of it
 //! concurrently with anything the persistence thread is doing.
 //!
+//! The active segment's **committed prefix** needs none either: a commit
+//! fsyncs everything below the logical end, and the file only grows, so a
+//! record wholly below it is as final as a sealed one. What lies past it may
+//! still be staged in RAM, so it is declined and left to the locked path. A
+//! record written moments ago — the recurrent snapshot a turn's seal just
+//! enqueued, which the next admission reads back — is readable here as soon
+//! as the commit that covered it returns.
+//!
 //! What the reader needs to know that is otherwise behind the mutex is which
-//! segment is active: the active one still has records staged in RAM that may
-//! not be on disk, so it is declined and left to the locked path. The log
-//! publishes its active id into [`ActiveSegment`] after every seal, and ids only
-//! ever grow, so `segment < active` is a sealed segment that is already durable.
+//! segment is active and how far it is committed. The log publishes both into
+//! [`ActiveSegment`] — the id after every seal, the end after every commit —
+//! and ids only ever grow, so `segment < active` is a sealed segment that is
+//! already durable.
 //!
 //! **Two races, both closed by construction.** An unlink by maintenance cannot
 //! pull a file out from under an open read: Rust opens every file here with
@@ -52,27 +61,75 @@ use super::{PersistenceError, Result};
 use candle::direct_io::AlignedScratch;
 use candle::direct_write::{Access, UnbufferedFile};
 
-/// The active segment's id, published by the log and read without a lock.
+/// The active segment's id and how much of it is durable, published by the log
+/// and read without a lock.
 ///
-/// Written with `Release` after the previous active is sealed — flushed,
-/// fsynced, truncated, and its write handle dropped — and read with `Acquire`,
-/// so a reader that sees the new id also sees the sealed file complete.
+/// The id is written with `Release` after the previous active is sealed —
+/// flushed, fsynced, truncated, and its write handle dropped — and read with
+/// `Acquire`, so a reader that sees the new id also sees the sealed file
+/// complete.
+///
+/// The durable prefix is the active's logical end as of its last successful
+/// commit: everything below it was fsynced and, the file being append-only,
+/// is never written again. It is published as a segment and an end, the end
+/// stored first, and read segment, end, segment: a reader accepts the end
+/// only when both segment reads agree on the segment it wants. An end
+/// belonging to a later segment is stored after that segment's id, so a
+/// reader that sees it sees the later id too and declines; a fresh active
+/// starts at an end of 0, which accepts nothing.
 #[derive(Debug, Clone)]
-pub struct ActiveSegment(Arc<AtomicU64>);
+pub struct ActiveSegment(Arc<Published>);
+
+#[derive(Debug)]
+struct Published {
+    active: AtomicU64,
+    committed_segment: AtomicU64,
+    committed_end: AtomicU64,
+}
 
 impl ActiveSegment {
-    pub(super) fn new(id: SegmentId) -> ActiveSegment {
-        ActiveSegment(Arc::new(AtomicU64::new(id.raw())))
+    /// `id` is the active, durable through `committed_end` — what a recovery
+    /// walk found on disk, or nothing yet for a new segment.
+    pub(super) fn new(id: SegmentId, committed_end: u64) -> ActiveSegment {
+        ActiveSegment(Arc::new(Published {
+            active: AtomicU64::new(id.raw()),
+            committed_segment: AtomicU64::new(id.raw()),
+            committed_end: AtomicU64::new(committed_end),
+        }))
     }
 
     /// Publish the new active id. Call only once the previous active is sealed.
+    /// The new active has nothing durable yet.
     pub(super) fn publish(&self, id: SegmentId) {
-        self.0.store(id.raw(), Ordering::Release);
+        self.0.committed_end.store(0, Ordering::Release);
+        self.0.committed_segment.store(id.raw(), Ordering::Release);
+        self.0.active.store(id.raw(), Ordering::Release);
+    }
+
+    /// Publish that the active `id` is durable through `end`. Call only after
+    /// a commit that fsynced it.
+    pub(super) fn committed(&self, id: SegmentId, end: u64) {
+        self.0.committed_end.store(end, Ordering::Release);
+        self.0.committed_segment.store(id.raw(), Ordering::Release);
     }
 
     /// Whether `segment` is sealed as of the latest publish.
     pub fn is_sealed(&self, segment: SegmentId) -> bool {
-        segment.raw() < self.0.load(Ordering::Acquire)
+        segment.raw() < self.0.active.load(Ordering::Acquire)
+    }
+
+    /// Whether the record at `loc` is durable and will never be written again:
+    /// in a sealed segment, or wholly inside the active's committed prefix.
+    pub fn is_durable(&self, loc: &RecordLoc) -> bool {
+        if self.is_sealed(loc.segment) {
+            return true;
+        }
+        let before = self.0.committed_segment.load(Ordering::Acquire);
+        let end = self.0.committed_end.load(Ordering::Acquire);
+        let after = self.0.committed_segment.load(Ordering::Acquire);
+        before == after
+            && before == loc.segment.raw()
+            && loc.offset.saturating_add(loc.record_size) <= end
     }
 }
 
@@ -89,9 +146,15 @@ impl SealedReader {
         SealedReader { dir, active }
     }
 
-    /// The payload of the record at `loc`, or `None` when `loc` is in the
-    /// active segment — whose records may still be staged in RAM, and which
-    /// only the locked path can read.
+    /// Whether the record at `loc` is durable — readable here, and never to
+    /// change — as of the latest publish ([`ActiveSegment::is_durable`]).
+    pub fn is_durable(&self, loc: &RecordLoc) -> bool {
+        self.active.is_durable(loc)
+    }
+
+    /// The payload of the record at `loc`, or `None` when `loc` is not yet
+    /// durable — past the active segment's last commit, where it may still be
+    /// staged in RAM and only the locked path can read it.
     ///
     /// One read-only unbuffered open and one read of the record's whole
     /// sectors — the page cache keeps nothing of it, as it keeps nothing of
@@ -101,7 +164,7 @@ impl SealedReader {
     /// record read uses. It also leaves the log's own handle pool untouched:
     /// the pool is `&mut` state behind the mutex this exists to avoid.
     pub fn read_record_payload(&self, loc: &RecordLoc) -> Option<Result<Vec<u8>>> {
-        if !self.active.is_sealed(loc.segment) {
+        if !self.active.is_durable(loc) {
             return None;
         }
         Some(self.read_sealed(loc))
@@ -234,39 +297,109 @@ mod tests {
         assert_eq!(payload, b"sealed and immutable");
     }
 
-    /// The active segment is declined, never read: its records may still be
-    /// staged in RAM, and only the log holding them can see them.
-    #[test]
-    fn the_active_segment_is_declined() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut log = open(dir.path());
-        let loc = write(&mut log, 1, b"still active");
-        assert!(log.sealed_reader().read_record_payload(&loc).is_none());
+    /// Stage one record into the active segment without committing it.
+    fn stage(log: &mut SegmentedLog, stream_id: u64, payload: &[u8]) -> RecordLoc {
+        let bytes = record(stream_id, payload);
+        let (segment, offset) = log.stage(&bytes);
+        RecordLoc {
+            segment,
+            offset,
+            payload_len: payload.len() as u64,
+            record_size: bytes.len() as u64,
+        }
     }
 
-    /// **A reader taken before a seal sees it after.** A conversation takes its
-    /// reader once, at construction, so the seal has to reach readers that
-    /// already exist — through the published active id they share — or a
-    /// long-lived handle would decline every segment sealed since it opened.
+    /// **The active segment is read through its last commit, and declined
+    /// past it.** A staged record may exist only in RAM, so it is declined;
+    /// once a commit has fsynced it, it reads here like a sealed one — the
+    /// record a seal wrote moments ago, without the log's lock.
     #[test]
-    fn a_reader_taken_earlier_sees_later_seals() {
+    fn the_active_is_read_through_its_last_commit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut log = open(dir.path());
         let reader = log.sealed_reader();
-        let loc = write(&mut log, 3, b"sealed after the reader was taken");
+        let loc = stage(&mut log, 1, b"staged, then committed");
+        assert!(!reader.is_durable(&loc));
         assert!(
             reader.read_record_payload(&loc).is_none(),
-            "still the active segment when first asked"
+            "a staged record is declined"
         );
+        log.commit().expect("commit");
+        assert!(reader.is_durable(&loc));
+        assert_eq!(
+            reader
+                .read_record_payload(&loc)
+                .expect("committed")
+                .expect("read"),
+            b"staged, then committed"
+        );
+        // A later record past the commit is declined while the earlier one
+        // still reads.
+        let next = stage(&mut log, 2, b"not committed yet");
+        assert!(reader.read_record_payload(&next).is_none());
+        assert!(reader.is_durable(&loc));
+    }
+
+    /// **A reader taken earlier sees later commits and seals.** A conversation
+    /// takes its reader once, at construction, so both have to reach readers
+    /// that already exist — through the published state they share — or a
+    /// long-lived handle would decline everything written since it opened. A
+    /// rotation leaves the new active with nothing durable, and the old one
+    /// sealed.
+    #[test]
+    fn a_reader_taken_earlier_sees_later_commits_and_seals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = open(dir.path());
+        let reader = log.sealed_reader();
+        let loc = stage(&mut log, 3, b"written after the reader was taken");
+        assert!(reader.read_record_payload(&loc).is_none(), "staged");
+        log.commit().expect("commit");
         log.seal_and_rotate().expect("seal");
         let payload = reader
             .read_record_payload(&loc)
             .expect("sealed now")
             .expect("read");
-        assert_eq!(payload, b"sealed after the reader was taken");
-        // And the new active is declined in turn.
-        let next = write(&mut log, 4, b"the new active");
+        assert_eq!(payload, b"written after the reader was taken");
+        let next = stage(&mut log, 4, b"the new active");
         assert!(reader.read_record_payload(&next).is_none());
+        log.commit().expect("commit");
+        assert_eq!(
+            reader
+                .read_record_payload(&next)
+                .expect("committed")
+                .expect("read"),
+            b"the new active"
+        );
+    }
+
+    /// **A durable end is never taken for the wrong segment.** The published
+    /// end is the active's; a location in a different, unsealed segment id at
+    /// an offset below it is declined, and a fresh active starts with nothing
+    /// durable.
+    #[test]
+    fn a_durable_end_belongs_to_its_own_segment() {
+        let active = ActiveSegment::new(SegmentId(5), 4096);
+        let at = |segment: u64, offset: u64| RecordLoc {
+            segment: SegmentId(segment),
+            offset,
+            payload_len: 8,
+            record_size: 64,
+        };
+        assert!(active.is_durable(&at(5, 1024)));
+        assert!(!active.is_durable(&at(5, 4096 - 63)), "past the end");
+        assert!(active.is_durable(&at(4, 1 << 30)), "sealed");
+        assert!(!active.is_durable(&at(6, 0)), "not the committed segment");
+        active.publish(SegmentId(6));
+        assert!(
+            !active.is_durable(&at(6, 0)),
+            "a fresh active holds nothing"
+        );
+        assert!(
+            active.is_durable(&at(5, 1 << 30)),
+            "the old active is sealed"
+        );
+        active.committed(SegmentId(6), 128);
+        assert!(active.is_durable(&at(6, 64)));
     }
 
     /// A segment maintenance unlinked is a failed read, not a panic and not an

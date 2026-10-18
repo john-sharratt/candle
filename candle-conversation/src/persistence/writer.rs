@@ -40,6 +40,7 @@ use super::identity::{RecordIdentity, Stamped};
 use super::manifest::RecordLoc;
 use super::record::{BranchCheckpointPayload, RecordType, SectionGeneration, SnapshotPayload};
 use super::resume::{self, TurnChunkGrid};
+use super::written_snapshots::{WrittenSnapshot, WrittenSnapshots};
 use super::{PersistenceError, PersistenceLock, Result};
 use crate::persistence::streams::StreamId;
 use crate::substrate::{ResidenceIndex, Substrate, TurnMark};
@@ -301,6 +302,9 @@ pub struct SubstrateWriter {
     /// The persistence handle was opened read-only: no thread runs, and
     /// [`Self::enqueue`] drops every job.
     read_only: bool,
+    /// Every recurrent snapshot this writer appended, for the state's owner to
+    /// release once the record is durable ([`WrittenSnapshots`]).
+    written_snapshots: Arc<WrittenSnapshots>,
 }
 
 impl SubstrateWriter {
@@ -321,6 +325,7 @@ impl SubstrateWriter {
             .unwrap_or_else(|e| e.into_inner())
             .is_read_only();
         let progress = Arc::new(Progress::default());
+        let written_snapshots = Arc::new(WrittenSnapshots::default());
         if read_only {
             return Self {
                 tx,
@@ -328,13 +333,15 @@ impl SubstrateWriter {
                 progress,
                 handle: Mutex::new(None),
                 read_only,
+                written_snapshots,
             };
         }
         let bp = backpressure.clone();
         let written = progress.clone();
+        let snapshots = written_snapshots.clone();
         let handle = std::thread::Builder::new()
             .name("substrate-writer".into())
-            .spawn(move || writer_loop(rx, substrate, persistence, bp, written))
+            .spawn(move || writer_loop(rx, substrate, persistence, bp, written, snapshots))
             .expect("spawn substrate-writer thread");
         Self {
             tx,
@@ -342,7 +349,14 @@ impl SubstrateWriter {
             progress,
             handle: Mutex::new(Some(handle)),
             read_only,
+            written_snapshots,
         }
+    }
+
+    /// The recurrent snapshots this writer has appended — see
+    /// [`WrittenSnapshots`].
+    pub fn written_snapshots(&self) -> &WrittenSnapshots {
+        &self.written_snapshots
     }
 
     /// A position in the queue: every job enqueued before this call is at or
@@ -428,10 +442,11 @@ fn writer_loop(
     persistence: Arc<PersistenceLock>,
     bp: Arc<Backpressure>,
     progress: Arc<Progress>,
+    snapshots: Arc<WrittenSnapshots>,
 ) {
     while let Ok((first, first_bytes)) = rx.recv() {
         let t_process = std::time::Instant::now();
-        let mut ack = process_one(first, &substrate, &persistence);
+        let mut ack = process_one(first, &substrate, &persistence, &snapshots);
         bp.release(first_bytes);
         progress.wrote_one();
         let mut n = 1;
@@ -439,7 +454,7 @@ fn writer_loop(
         while ack.is_none() && n < MAX_BATCH {
             match rx.try_recv() {
                 Ok((job, bytes)) => {
-                    ack = process_one(job, &substrate, &persistence);
+                    ack = process_one(job, &substrate, &persistence, &snapshots);
                     bp.release(bytes);
                     progress.wrote_one();
                     n += 1;
@@ -478,6 +493,7 @@ fn process_one(
     job: WriteJob,
     substrate: &Arc<RwLock<Substrate>>,
     persistence: &Arc<PersistenceLock>,
+    snapshots: &WrittenSnapshots,
 ) -> Option<Sender<()>> {
     match job {
         WriteJob::Shutdown(ack) => return Some(ack),
@@ -670,10 +686,20 @@ fn process_one(
             // payload's parts: the state blobs go from the conversation's own
             // buffers to the file with no intermediate copy.
             match append_snapshot(persistence, stream_id, &payload) {
-                Ok(loc) => substrate
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .apply_snapshot_loc(stream_id, loc.value, loc.id),
+                Ok(loc) => {
+                    substrate
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .apply_snapshot_loc(stream_id, loc.value, loc.id);
+                    // A retired tail carries no state to stand in for any.
+                    if !payload.is_retired() {
+                        snapshots.push(WrittenSnapshot {
+                            timeline: payload.timeline_id,
+                            turn_index: payload.turn_index,
+                            loc: loc.value,
+                        });
+                    }
+                }
                 Err(e) => retract_failed_snapshot(substrate, persistence, stream_id, &e),
             }
         }

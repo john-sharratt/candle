@@ -87,6 +87,7 @@ pub mod vfs;
 pub mod walker;
 pub mod writer;
 pub mod writer_lock;
+pub mod written_snapshots;
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};

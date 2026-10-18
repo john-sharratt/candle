@@ -4639,8 +4639,8 @@ impl Conversation {
         // a store that keeps compacting under the read.
         for _ in 0..SEALED_READ_ATTEMPTS {
             let Some(read) = self.sealed.read_record_payload(&loc) else {
-                // In the active segment, where records may still be staged in
-                // RAM: only the locked read can see them.
+                // Past the active segment's last commit, where records may
+                // still be staged in RAM: only the locked read can see them.
                 break;
             };
             match read {
@@ -4682,6 +4682,21 @@ impl Conversation {
                 }
             }
         }
+    }
+
+    /// Every recurrent snapshot whose record became durable since the last
+    /// call, as `(timeline, turn index)` — the cue for a slot holding exactly
+    /// that state to release it, since [`Self::read_recurrent_snapshot`] now
+    /// reads the record back without the persistence lock. Lock-free: it waits
+    /// on neither the writer, the persistence lock nor the substrate. A
+    /// snapshot appended but not yet committed is reported by a later call.
+    pub fn drain_durable_snapshots(&self) -> Vec<(TimelineId, u32)> {
+        self.writer
+            .written_snapshots()
+            .take_durable(|loc| self.sealed.is_durable(loc))
+            .into_iter()
+            .filter_map(|(raw, turn)| Some((TimelineId::from_raw(raw)?, turn)))
+            .collect()
     }
 
     /// The timeline's snapshot location if the index now names a different one
@@ -6118,19 +6133,72 @@ mod recurrent_snapshot_read_tests {
         assert_eq!(got.timeline_id, timeline.raw());
     }
 
-    /// A snapshot still in the active segment is read through the locked path,
-    /// exactly as before: its record may be staged in RAM, which only the log
-    /// holding it can see.
+    /// **A committed snapshot still in the active segment reads while the
+    /// persistence mutex is held, too.** The snapshot a seal just wrote is the
+    /// one the next admission reads back, and it is nearly always still in the
+    /// active segment: once committed it is as final as a sealed record, so
+    /// the read takes no lock.
     #[test]
-    fn a_snapshot_in_the_active_segment_is_still_read() {
+    fn a_committed_active_snapshot_reads_while_persistence_is_held() {
         let conv = Conversation::ephemeral();
         let timeline = TimelineId::for_test(42);
         store(&conv, timeline, 5, false);
-        let got = conv
-            .read_recurrent_snapshot(timeline)
+
+        let held = conv.persistence.clone();
+        let _compaction = held.lock().expect("hold persistence");
+        let reader = conv.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(reader.read_recurrent_snapshot(timeline));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the active read finished while persistence was held")
             .expect("readable")
             .expect("present");
+        worker.join().expect("worker");
         assert_eq!(got.turn_index, 5);
+    }
+
+    /// **The writer reports a snapshot once its record is durable, once.** A
+    /// slot holding the state of a sealed turn may release it when this says
+    /// so, because the read above then serves the record without a lock. The
+    /// report is the timeline and turn the snapshot was taken at; a second
+    /// drain has nothing new.
+    #[test]
+    fn a_written_snapshot_is_reported_once_it_is_durable() {
+        let conv = Conversation::ephemeral();
+        let timeline = TimelineId::for_test(44);
+        conv.enqueue_recurrent_snapshot(timeline, payload(timeline, 6));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let reported = loop {
+            let got = conv.drain_durable_snapshots();
+            if !got.is_empty() {
+                break got;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never reported the snapshot durable"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(reported, vec![(timeline, 6)]);
+        assert!(conv.drain_durable_snapshots().is_empty(), "reported once");
+
+        let held = conv.persistence.clone();
+        let _compaction = held.lock().expect("hold persistence");
+        let reader = conv.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(reader.read_recurrent_snapshot(timeline));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a reported snapshot reads without the lock")
+            .expect("readable")
+            .expect("present");
+        worker.join().expect("worker");
+        assert_eq!(got.turn_index, 6);
     }
 
     /// **An index naming a segment that is gone is still an error.** The

@@ -443,7 +443,8 @@ impl SegmentedLog {
         let segments = SegmentedLog {
             dir: dir.to_path_buf(),
             active_id,
-            active_published: ActiveSegment::new(active_id),
+            // What recovery walked is on disk; nothing past it is written here.
+            active_published: ActiveSegment::new(active_id, active.write_offset()),
             active,
             sealed,
             pool: SealedPool::held(held),
@@ -524,7 +525,9 @@ impl SegmentedLog {
         let segments = SegmentedLog {
             dir: dir.to_path_buf(),
             active_id,
-            active_published: ActiveSegment::new(active_id),
+            // Durable through the end recovery walked to, which a torn tail was
+            // truncated back to; a fresh segment holds no record yet.
+            active_published: ActiveSegment::new(active_id, active.write_offset()),
             active,
             sealed,
             pool: SealedPool::new(OPEN_SEALED_SEGMENTS),
@@ -601,7 +604,12 @@ impl SegmentedLog {
 
     /// Flush + fsync the active segment.
     pub fn commit(&mut self) -> Result<()> {
-        self.active.commit()
+        self.active.commit()?;
+        // Everything below the logical end is fsynced now, and the file only
+        // grows: readers may take it without this log ([`SealedReader`]).
+        self.active_published
+            .committed(self.active_id, self.active.write_offset());
+        Ok(())
     }
 
     /// Publish the active segment's newest `HeaderIndex` chain head.
