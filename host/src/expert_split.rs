@@ -10,14 +10,22 @@ use serde::Deserialize;
 
 use candle_conversation::expert_split::{shared, Knobs, Promote};
 
-/// The split's settings. Defaults are the engine's: off, and neutral knobs.
+/// The split's settings. Defaults are the engine's: on, and neutral knobs.
 #[derive(Args, Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExpertSplitArgs {
     /// Compute some routed experts on the host CPU: the pinned misses the
     /// device judges cheaper there than over the link. The pool calibrates
-    /// at load, and the split stays all-GPU until it has.
-    #[arg(long = "expert-split", id = "expert_split_enabled")]
+    /// at load, and the split stays all-GPU until it has. On by default;
+    /// `--expert-split false` (`enabled: false`) keeps every expert on the GPU.
+    #[arg(
+        long = "expert-split",
+        id = "expert_split_enabled",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true"
+    )]
     pub enabled: bool,
 
     /// Most CPU assignments one layer may take. 0 keeps every expert on the
@@ -83,7 +91,7 @@ impl Default for ExpertSplitArgs {
     fn default() -> Self {
         let k = Knobs::default();
         Self {
-            enabled: false,
+            enabled: true,
             max_cpu_assignments: k.max_cpu_assignments,
             cpu_scale: k.cpu_scale,
             gpu_scale: k.gpu_scale,
@@ -141,7 +149,7 @@ mod tests {
     }
 
     /// The flags and the YAML read the same settings, and both default to the
-    /// engine's own knobs, off.
+    /// engine's own knobs, on; either turns it off.
     #[test]
     fn flags_and_yaml_agree_and_default_to_the_engines_knobs() {
         let flags = Cli::try_parse_from([
@@ -172,8 +180,14 @@ mod tests {
 
         let none = Cli::try_parse_from(["x"]).unwrap().split;
         assert_eq!(none, ExpertSplitArgs::default());
-        assert!(!none.enabled);
+        assert!(none.enabled);
         assert_eq!(none.knobs(), Knobs::default());
+        let off = Cli::try_parse_from(["x", "--expert-split", "false"]).unwrap().split;
+        assert!(!off.enabled);
+        assert_eq!(
+            off,
+            serde_yaml::from_str::<ExpertSplitArgs>("enabled: false\n").unwrap()
+        );
         assert_eq!(
             serde_yaml::from_str::<ExpertSplitArgs>("{}").unwrap(),
             ExpertSplitArgs::default()

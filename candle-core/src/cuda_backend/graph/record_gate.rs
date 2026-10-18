@@ -46,6 +46,7 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::panic::Location;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -250,6 +251,7 @@ pub(crate) fn lease_begins() -> bool {
     let site = Location::caller();
     let started = Instant::now();
     let mut st = lock();
+    let waited = lease_waits(&st);
     while lease_waits(&st) {
         let (next, _) = CHANGED
             .wait_timeout(st, Duration::from_millis(100))
@@ -265,7 +267,56 @@ pub(crate) fn lease_begins() -> bool {
     }
     st.leases += 1;
     LEASES_HERE.with(|l| l.set(l.get() + 1));
+    drop(st);
+    if waited {
+        note_lease_wait(site, started.elapsed());
+    }
     true
+}
+
+/// Leases that found a segment recording and waited for it, in all: how many,
+/// and for how long. A thread issuing device work off the forward thread — the
+/// expert pipeline, persistence — pays this wait on its own path, which no
+/// segment count shows.
+static LEASE_WAITS: AtomicU64 = AtomicU64::new(0);
+static LEASE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+/// The same, per call site, kept only for leases that waited.
+static LEASE_WAIT_SITES: Mutex<Vec<(&'static Location<'static>, u64, u64)>> =
+    Mutex::new(Vec::new());
+
+fn note_lease_wait(site: &'static Location<'static>, waited: Duration) {
+    let ns = waited.as_nanos() as u64;
+    LEASE_WAITS.fetch_add(1, Ordering::Relaxed);
+    LEASE_WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+    let mut sites = LEASE_WAIT_SITES.lock().unwrap_or_else(|p| p.into_inner());
+    match sites.iter_mut().find(|(s, _, _)| *s == site) {
+        Some((_, n, total)) => {
+            *n += 1;
+            *total += ns;
+        }
+        None => sites.push((site, 1, ns)),
+    }
+}
+
+/// Leases that waited for a recording segment since start, and their wait in
+/// all, in µs.
+pub fn lease_wait_total() -> (u64, u64) {
+    (
+        LEASE_WAITS.load(Ordering::Relaxed),
+        LEASE_WAIT_NS.load(Ordering::Relaxed) / 1_000,
+    )
+}
+
+/// Per call site, since start: `(site, leases that waited, µs waited)`, the
+/// longest total first.
+pub fn lease_wait_sites() -> Vec<(String, u64, u64)> {
+    let sites = LEASE_WAIT_SITES.lock().unwrap_or_else(|p| p.into_inner());
+    let mut out: Vec<_> = sites
+        .iter()
+        .map(|(s, n, ns)| (s.to_string(), *n, ns / 1_000))
+        .collect();
+    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out
 }
 
 /// Return a lease [`lease_begins`] counted.

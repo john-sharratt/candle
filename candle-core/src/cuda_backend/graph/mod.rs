@@ -57,7 +57,9 @@ pub use error::GraphError;
 pub use exec::GraphExec;
 pub(crate) use hub::CaptureHub;
 pub use hub::{CaptureStats, Paused, WaveCapture};
-pub use record_gate::{try_without_recording, without_recording, Quiet};
+pub use record_gate::{
+    lease_wait_sites, lease_wait_total, try_without_recording, without_recording, Quiet,
+};
 pub use regime::Phase as GraphPhase;
 #[cfg(test)]
 use session::CaptureSession;

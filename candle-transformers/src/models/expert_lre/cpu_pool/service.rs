@@ -98,6 +98,77 @@ pub fn served_ns() -> u64 {
     SERVED_NS.load(Ordering::Relaxed)
 }
 
+/// Where the service is, for a device that gave up waiting on it to name —
+/// process-wide, like the counters above, so every pool in the process writes
+/// it: the phase in the top byte, the last doorbell it took in the low word.
+static STATE: AtomicU64 = AtomicU64::new(0);
+/// The last layer the service refused or gave up — the reason in the top
+/// byte, its doorbell in the low word — and how many it has.
+static LAST_REFUSAL: AtomicU64 = AtomicU64::new(0);
+static REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+const PHASES: [&str; 8] = [
+    "not started",
+    "calibrating",
+    "waiting for a doorbell",
+    "reading the work slot",
+    "computing",
+    "serving cold experts",
+    "publishing",
+    "stopped",
+];
+const PHASE_CALIBRATING: u64 = 1;
+const PHASE_WAITING: u64 = 2;
+const PHASE_PARSING: u64 = 3;
+const PHASE_COMPUTING: u64 = 4;
+const PHASE_COLD: u64 = 5;
+const PHASE_PUBLISHING: u64 = 6;
+const PHASE_STOPPED: u64 = 7;
+
+const REASONS: [&str; 7] = [
+    "none",
+    "the work slot never named its invocation",
+    "work for a row outside the table (the service stopped)",
+    "a ring row named an input row past the inputs",
+    "cold experts with no live table",
+    "a cold expert was given up or published to device memory",
+    "a pinned expert named memory outside the pinned ranges",
+];
+const REFUSED_STALE: u64 = 1;
+const REFUSED_ROW: u64 = 2;
+const REFUSED_INPUT: u64 = 3;
+const REFUSED_NO_TABLE: u64 = 4;
+const REFUSED_COLD: u64 = 5;
+const REFUSED_PINNED: u64 = 6;
+
+fn set_phase(phase: u64, seq: u64) {
+    STATE.store((phase << 56) | (seq & 0xffff_ffff), Ordering::Relaxed);
+}
+
+fn note_refusal(reason: u64, seq: u64) {
+    LAST_REFUSAL.store((reason << 56) | (seq & 0xffff_ffff), Ordering::Relaxed);
+    REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The service's state in words: its phase and last doorbell, and its last
+/// refusal. What a device that gave up on the pool reports beside its error.
+pub fn state_line() -> String {
+    let s = STATE.load(Ordering::Relaxed);
+    let r = LAST_REFUSAL.load(Ordering::Relaxed);
+    fn name(t: &[&'static str], v: u64) -> &'static str {
+        t.get((v >> 56) as usize).copied().unwrap_or("?")
+    }
+    format!(
+        "service {} (last doorbell {}); {} layers refused, the last {} ({}); {} served",
+        name(&PHASES, s),
+        s & 0xffff_ffff,
+        REFUSALS.load(Ordering::Relaxed),
+        r & 0xffff_ffff,
+        name(&REASONS, r),
+        SERVED_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
 /// The buffer the pool's DRAM read rate is measured over at load: far past
 /// any last-level cache, small enough not to matter to the host's RAM.
 const CALIBRATION_BYTES: usize = 512 << 20;
@@ -208,6 +279,7 @@ impl CpuService {
                     thread::park_timeout(Duration::from_millis(100));
                 }
                 if enabled {
+                    set_phase(PHASE_CALIBRATING, 0);
                     if let Some(shape) = ctx.shapes.first() {
                         // The cores inference runs on: the performance cores'.
                         let mut sets = vec![caller];
@@ -324,6 +396,8 @@ struct AliveGuard<'a>(&'a CpuRings);
 impl Drop for AliveGuard<'_> {
     fn drop(&mut self) {
         self.0.set_alive(false);
+        let seq = STATE.load(Ordering::Relaxed) & 0xffff_ffff;
+        set_phase(PHASE_STOPPED, seq);
     }
 }
 
@@ -337,6 +411,7 @@ fn serve(ctx: &Ctx, pool: &Pool, isa: Isa) {
     let mut last_sample: Option<Instant> = None;
     let mut last_cold_wait = 0u64;
     loop {
+        set_phase(PHASE_WAITING, last);
         let Some(seq) = wait_doorbell(ctx, last) else {
             return;
         };
@@ -344,6 +419,7 @@ fn serve(ctx: &Ctx, pool: &Pool, isa: Isa) {
         // the reads below may be ordered ahead of seeing it.
         fence(Ordering::Acquire);
         last = seq;
+        set_phase(PHASE_PARSING, seq);
         let t0 = Instant::now();
         // The previous served layer's: its down launch finished before this
         // doorbell's export ran.
@@ -364,6 +440,7 @@ fn serve(ctx: &Ctx, pool: &Pool, isa: Isa) {
                 h = rings.header();
             }
             if h.seq != want {
+                note_refusal(REFUSED_STALE, seq);
                 warn!(
                     doorbell = seq,
                     slot = h.seq,
@@ -374,6 +451,7 @@ fn serve(ctx: &Ctx, pool: &Pool, isa: Isa) {
             }
         }
         let Some(&shape) = ctx.shapes.get(h.row as usize) else {
+            note_refusal(REFUSED_ROW, seq);
             warn!(
                 "cpu expert service: work for row {} outside the table",
                 h.row
@@ -385,6 +463,7 @@ fn serve(ctx: &Ctx, pool: &Pool, isa: Isa) {
         let n_rows = (h.n_rows as usize).min(rings.cap_rows);
         let (n_in, in_row) = rings.input_map(n_rows);
         if in_row.iter().any(|&r| r >= n_in) {
+            note_refusal(REFUSED_INPUT, seq);
             warn!(
                 row = h.row,
                 n_in,
@@ -431,14 +510,47 @@ fn serve(ctx: &Ctx, pool: &Pool, isa: Isa) {
             .into_iter()
             .map(|w| (w, [w.gate, w.up, w.down]))
             .collect();
+        // Every projection of a pinned expert must be host memory: the pool
+        // reads it in place, and a device address is an access violation, not
+        // an error. Bucketize classes an expert pinned only when all three are
+        // (`snapshot_expert`); this refuses the layer if one ever is not.
+        if let Some(src) = ctx.cold.get() {
+            if let Some((w, a)) = ready
+                .iter()
+                .find(|(_, a)| a.iter().any(|&x| !src.host_readable(x)))
+            {
+                note_refusal(REFUSED_PINNED, seq);
+                warn!(
+                    row = h.row,
+                    expert = w.expert,
+                    gate = format_args!("{:#x}", a[0]),
+                    up = format_args!("{:#x}", a[1]),
+                    down = format_args!("{:#x}", a[2]),
+                    "cpu expert service: a pinned expert names memory outside the pinned ranges — \
+                     the layer is refused"
+                );
+                continue;
+            }
+        }
+        set_phase(PHASE_COMPUTING, seq);
         if !ready.is_empty() {
             run(&ready);
         }
         let mut cold_wait = Duration::ZERO;
+        if n_cold > 0 {
+            set_phase(PHASE_COLD, seq);
+        }
         let served = n_cold == 0
             || match ctx.cold.get() {
-                Some(src) => serve_cold(src, h.row as usize, cold, &mut run, &mut cold_wait),
+                Some(src) => {
+                    let ok = serve_cold(src, h.row as usize, cold, &mut run, &mut cold_wait);
+                    if !ok {
+                        note_refusal(REFUSED_COLD, seq);
+                    }
+                    ok
+                }
                 None => {
+                    note_refusal(REFUSED_NO_TABLE, seq);
                     warn!(
                         row = h.row,
                         "cpu expert service: handed cold experts with no live table to wait \
@@ -448,6 +560,7 @@ fn serve(ctx: &Ctx, pool: &Pool, isa: Isa) {
                 }
             };
         let t_computed = Instant::now();
+        set_phase(PHASE_PUBLISHING, seq);
         if served {
             rings.publish_done(seq);
         }

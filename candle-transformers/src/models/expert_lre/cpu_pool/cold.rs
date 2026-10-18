@@ -125,7 +125,7 @@ impl ColdSource {
         }
     }
 
-    fn host_readable(&self, addr: u64) -> bool {
+    pub(crate) fn host_readable(&self, addr: u64) -> bool {
         self.pinned.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
     }
 

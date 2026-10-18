@@ -2046,6 +2046,10 @@ impl TestParams {
             Device::Cuda(dev) => Some(dev.capture_stats()),
             _ => None,
         };
+        #[cfg(feature = "cuda")]
+        let leases_before = crate::models::batch_test::graph_report::LeaseWaits::now();
+        #[cfg(feature = "cuda")]
+        let cpu_before = crate::models::batch_test::graph_report::CpuServed::now();
         // ONE generate path for every gate and every model. A model with a
         // drafter speculates; a model without one proposes nothing and the
         // driver degrades to a token-per-step decode, which is what the
@@ -2068,6 +2072,10 @@ impl TestParams {
         if let (Some(before), Device::Cuda(dev)) = (graphs_before, &self.device) {
             print_graph_line(&before, &dev.capture_stats());
         }
+        #[cfg(feature = "cuda")]
+        leases_before.print_since();
+        #[cfg(feature = "cuda")]
+        cpu_before.print_since();
         // **The clock stops here, before the reporting below** — the same rule the
         // prefill clock keeps. `ProcessRam::capture` walks every page of the address
         // space (~17M on Flash-Next's 54 GB mapping), and inside the window it was

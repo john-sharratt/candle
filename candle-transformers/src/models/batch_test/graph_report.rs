@@ -2,6 +2,8 @@
 
 use candle::cuda_backend::graph::CaptureStats;
 
+use crate::models::expert_lre::cpu_pool::stats::{stats as pool_stats, ClassStats};
+
 /// The difference `after - before`, as the gate prints it: forwards, how
 /// finely each was cut into graph launches, how big those were, how many
 /// segments were folded into their executable in place, and the host time each
@@ -41,6 +43,145 @@ pub(crate) fn graph_line(before: &CaptureStats, after: &CaptureStats) -> String 
 
 pub(crate) fn print_graph_line(before: &CaptureStats, after: &CaptureStats) {
     println!("{}", graph_line(before, after));
+}
+
+/// What the CPU expert pool served (`expert_lre::cpu_pool`), as of one moment.
+pub(crate) struct CpuServed {
+    layers: u64,
+    experts: u64,
+    rows: u64,
+    ns: u64,
+    phases: [ClassStats; 2],
+}
+
+impl CpuServed {
+    pub(crate) fn now() -> Self {
+        use crate::models::expert_lre::cpu_pool::service as s;
+        Self {
+            layers: s::served_total(),
+            experts: s::served_experts(),
+            rows: s::served_rows(),
+            ns: s::served_ns(),
+            phases: pool_stats(),
+        }
+    }
+
+    /// One class's phases since `before`, per layer and per expert (µs).
+    fn phase_line(name: &str, now: &ClassStats, before: &ClassStats) {
+        let c = now.since(before);
+        if c.layers == 0 {
+            return;
+        }
+        let per = |ns: u64, n: u64| {
+            if n == 0 {
+                0.0
+            } else {
+                ns as f64 / n as f64 / 1e3
+            }
+        };
+        println!(
+            "    {name}: {} layers, {:.1} experts/layer, {:.1} rows/layer · µs a layer: parse {:.1}, \
+             compute {:.1}, cold wait {:.1}, publish {:.1}, device wait {:.1} · compute µs an expert \
+             {:.1} · runs {:.2}/layer, {:.1} participants, join {:.1} µs, occupancy {:.0}%",
+            c.layers,
+            c.experts as f64 / c.layers as f64,
+            c.rows as f64 / c.layers as f64,
+            per(c.parse_ns, c.layers),
+            per(c.compute_ns, c.layers),
+            per(c.cold_wait_ns, c.layers),
+            per(c.publish_ns, c.layers),
+            per(c.device_wait_ns, c.layers),
+            per(c.compute_ns, c.experts),
+            c.runs as f64 / c.layers as f64,
+            if c.runs == 0 { 0.0 } else { c.participants as f64 / c.runs as f64 },
+            per(c.join_ns, c.runs),
+            if c.in_job_ns == 0 { 0.0 } else { 100.0 * c.work_ns as f64 / c.in_job_ns as f64 },
+        );
+    }
+
+    /// Print what the pool served since `self`, and whether it is calibrated.
+    pub(crate) fn print_since(&self) {
+        let after = Self::now();
+        let p = *crate::models::expert_lre::cpu_pool::params::shared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let layers = after.layers - self.layers;
+        let ms = (after.ns - self.ns) as f64 / 1e6;
+        println!(
+            "  cpu experts: {} · {layers} layers served, {} experts, {} rows, {ms:.1} ms pool time ({:.1} µs a layer)",
+            match (p.enabled, p.measured.is_some()) {
+                (false, _) => "off",
+                (true, false) => "on, not yet calibrated",
+                (true, true) => "on, calibrated",
+            },
+            after.experts - self.experts,
+            after.rows - self.rows,
+            if layers == 0 { 0.0 } else { ms * 1e3 / layers as f64 },
+        );
+        Self::phase_line("decode-sized", &after.phases[0], &self.phases[0]);
+        Self::phase_line("prompt-sized", &after.phases[1], &self.phases[1]);
+        let s = p.split();
+        println!(
+            "    split: cut n≤{} · cpu µs n1/n2/n4 {:.0}/{:.0}/{:.0} · gpu µs n1 {:.0} · copy µs {:.0} · \
+             handoff µs {:.0} · read µs {:.0} · max experts {} · cap rows {}",
+            s.max_n,
+            s.cpu_n_ns[1] / 1e3,
+            s.cpu_n_ns[2] / 1e3,
+            s.cpu_n_ns[4] / 1e3,
+            s.gpu_n_ns[1] / 1e3,
+            s.copy_ns / 1e3,
+            s.handoff_ns / 1e3,
+            s.read_shared_ns / 1e3,
+            s.max_experts,
+            s.cap_rows,
+        );
+    }
+}
+
+/// Stream leases that waited for another thread's recording segment
+/// (`record_gate`), as of one moment: the wait threads off the forward pay,
+/// which the graph line does not show.
+pub(crate) struct LeaseWaits {
+    total: (u64, u64),
+    sites: Vec<(String, u64, u64)>,
+}
+
+impl LeaseWaits {
+    pub(crate) fn now() -> Self {
+        Self {
+            total: candle::cuda_backend::graph::lease_wait_total(),
+            sites: candle::cuda_backend::graph::lease_wait_sites(),
+        }
+    }
+
+    /// Print what waited since `self`, the busiest sites first.
+    pub(crate) fn print_since(&self) {
+        let after = Self::now();
+        let n = after.total.0 - self.total.0;
+        let us = after.total.1 - self.total.1;
+        println!(
+            "  lease waits: {n} leases waited {:.1} ms in all ({:.1} µs each)",
+            us as f64 / 1_000.0,
+            if n == 0 { 0.0 } else { us as f64 / n as f64 },
+        );
+        let mut sites: Vec<(String, u64, u64)> = after
+            .sites
+            .into_iter()
+            .map(|(site, n, us)| {
+                let (n0, us0) = self
+                    .sites
+                    .iter()
+                    .find(|(s, _, _)| *s == site)
+                    .map_or((0, 0), |(_, n, us)| (*n, *us));
+                (site, n - n0, us - us0)
+            })
+            .filter(|(_, n, _)| *n > 0)
+            .collect();
+        sites.sort_by(|a, b| b.2.cmp(&a.2));
+        for (site, n, us) in sites.iter().take(8) {
+            println!("    {:>9.1} ms over {n:>6} at {site}", *us as f64 / 1_000.0);
+        }
+    }
 }
 
 #[cfg(test)]
