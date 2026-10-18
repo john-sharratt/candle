@@ -99,6 +99,12 @@ pub use chunked::{
     expect_kv_range_in, freeze_dense, reclaim_load_headroom, span_layout, span_region_refusal,
     SpanClaims, SpanLayout, SpanRegion,
 };
+/// The weight side of the reservation. Pure arithmetic, so it is available
+/// whether or not the crate was built with a GPU backend.
+pub use chunked::{
+    defended_weight_bytes, set_defended_weight_bytes, RetractPlan, WeightZone, WeightZoneStats,
+    INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
+};
 #[cfg(feature = "cuda")]
 pub use chunked::{
     empty_sweep_stats, forget_recent_tiers, held_ground_sites, held_ground_stats,
@@ -116,11 +122,6 @@ pub use chunked::{
 pub use chunked::{runs_from, RegionRun};
 /// Fixed-stride slot arenas, one set per span tenant — see `chunked::tenant_arena`.
 pub use chunked::{slot_stride, SlotTenant, SLOT_ALIGN};
-/// The weight side of the reservation. Pure arithmetic, so it is available
-/// whether or not the crate was built with a GPU backend.
-pub use chunked::{
-    RetractPlan, WeightZone, WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
-};
 /// The wave arena's phase spans. Measurements, so they are available whether or
 /// not the crate was built with a GPU backend.
 pub use chunked::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES, WAVE_SPAN_BYTES};

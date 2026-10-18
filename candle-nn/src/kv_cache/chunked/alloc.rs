@@ -223,6 +223,21 @@ impl ChunkedKvBacking {
     }
 }
 
+/// Most arenas one refused pass may owe a class: a mis-sized demand cannot
+/// owe the whole span.
+#[cfg(feature = "cuda")]
+const MAX_OWED_PER_CLASS: usize = 64;
+
+/// Arenas of `per`-slot capacity a class needing `slots` slots, with `free`
+/// slots free and `owed` arenas already owed, is owed more — the shortfall in
+/// whole arenas, less what is already owed, capped (`owe_capacity`).
+#[cfg(feature = "cuda")]
+fn more_arenas_owed(slots: usize, free: usize, per: usize, owed: usize) -> usize {
+    let short = slots.saturating_sub(free);
+    let arenas = short.div_ceil(per.max(1)).min(MAX_OWED_PER_CLASS);
+    arenas.saturating_sub(owed)
+}
+
 impl BackingInner {
     /// Where this backing's *hot* tier is: the device it was built on.
     ///
@@ -331,7 +346,7 @@ impl BackingInner {
     /// other failure here means "there is no ground". They call for opposite
     /// responses, so no path may fold one into the other.
     #[cfg(feature = "cuda")]
-    fn is_wave_deferral(e: &candle::Error) -> bool {
+    pub(super) fn is_wave_deferral(e: &candle::Error) -> bool {
         e.to_string().contains(KV_ARENA_MID_WAVE)
     }
 
@@ -345,6 +360,41 @@ impl BackingInner {
     fn note_deferred_arena(&self, key: ArenaKey) {
         if let Ok(mut pending) = self.deferred_arenas.lock() {
             if !pending.contains(&key) {
+                pending.push(key);
+            }
+        }
+    }
+
+    /// **Owe what a refused pass will need, not one arena of each class it
+    /// asked for.** `demand` is `(class, slots)` for the work the pass has yet
+    /// to place; each class is owed the arenas its free slots fall short of,
+    /// so the gap between forwards creates them all and the retry only fills.
+    ///
+    /// One arena a class was owed before. A hot→warm demotion group needs many
+    /// regions of one class — a few hundred MB of a size class is twenty
+    /// arenas — so each arena cost a full round trip: refused mid-wave, owed,
+    /// created in the gap, retried, refused again at the next. On `.5`
+    /// (2026-10-18, sustained load) the sixteen retries a pass gets could not
+    /// keep pace with decode KV growth, demotion fell behind, and the span
+    /// ended 100% hot with every turn failing.
+    ///
+    /// Free slots are counted, not runs, so a class whose free slots are
+    /// scattered can still be refused once more; the retry covers that.
+    /// Capped per class, so a mis-sized demand cannot owe the whole span.
+    #[cfg(feature = "cuda")]
+    pub(super) fn owe_capacity(&self, demand: &[(ArenaKey, usize)]) {
+        let Ok(mut pending) = self.deferred_arenas.lock() else {
+            return;
+        };
+        for &(key, slots) in demand {
+            let free: usize = self
+                .pool
+                .pool_arena_load(key)
+                .iter()
+                .map(|&(_, capacity, live)| capacity.saturating_sub(live))
+                .sum();
+            let owed = pending.iter().filter(|k| **k == key).count();
+            for _ in 0..more_arenas_owed(slots, free, key.chunks(), owed) {
                 pending.push(key);
             }
         }
@@ -2403,5 +2453,28 @@ impl ChunkedKvBacking {
             appended_tokens(state.sequences[batch_idx].as_ref(), offset, add)
         };
         self.ensure_for_batch_entries(&[(batch_idx, offset)], appended)
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod owe_tests {
+    use super::{more_arenas_owed, MAX_OWED_PER_CLASS};
+
+    /// A class short of slots is owed the arenas that cover the shortfall,
+    /// once: owing again adds only what is not owed yet, a class with room is
+    /// owed nothing, and no demand owes past the cap.
+    #[test]
+    fn a_class_is_owed_the_arenas_its_shortfall_needs() {
+        // 300 slots wanted, 20 free, 16 a region: 280 short is 18 arenas.
+        assert_eq!(more_arenas_owed(300, 20, 16, 0), 18);
+        assert_eq!(more_arenas_owed(300, 20, 16, 18), 0, "already owed");
+        assert_eq!(more_arenas_owed(300, 20, 16, 5), 13, "only the rest");
+        assert_eq!(more_arenas_owed(10, 20, 16, 0), 0, "room enough");
+        assert_eq!(more_arenas_owed(1 << 30, 0, 16, 0), MAX_OWED_PER_CLASS);
+        assert_eq!(
+            more_arenas_owed(5, 0, 0, 0),
+            5,
+            "a zero capacity reads as one"
+        );
     }
 }
