@@ -52,9 +52,14 @@ pub enum LoadStep {
     /// (§7.2, §7.6), and taking a generation for what it wrote cut off.
     /// Skipped standalone and when no cluster was reached.
     CatchUp,
+    /// A repository the log names no branch of yet pulled from `origin`
+    /// through an agent, by the member holding its lease — this one, or another
+    /// it waits for (`docs/substrate_git.md` §5). A fresh substrate pulls every
+    /// repository in full: candle alone is twenty packs and over a minute.
+    /// Skipped when the log already names every repository.
+    PullingRepositories,
     /// Every repository the workspace names brought up to the log: its packs
-    /// taken into its store, pulled through an agent first when no member has
-    /// (`docs/substrate_git.md` §5). Skipped when the workspace names none.
+    /// taken into its store. Skipped when the workspace names none.
     Repositories,
     Sections,
     CalibratingSections,
@@ -92,6 +97,7 @@ impl LoadStep {
         LoadStep::Compacting,
         LoadStep::Connecting,
         LoadStep::CatchUp,
+        LoadStep::PullingRepositories,
         LoadStep::Repositories,
         LoadStep::Sections,
         LoadStep::CalibratingSections,
@@ -117,6 +123,7 @@ impl LoadStep {
             | LoadStep::Compacting
             | LoadStep::Connecting
             | LoadStep::CatchUp
+            | LoadStep::PullingRepositories
             | LoadStep::Repositories
             | LoadStep::Sections
             | LoadStep::CalibratingSections => false,
@@ -137,6 +144,7 @@ impl LoadStep {
             LoadStep::Compacting => "compacting",
             LoadStep::Connecting => "connecting",
             LoadStep::CatchUp => "catchup",
+            LoadStep::PullingRepositories => "pulling_repositories",
             LoadStep::Repositories => "repositories",
             LoadStep::Sections => "sections",
             LoadStep::CalibratingSections => "calibrating_sections",
@@ -157,6 +165,7 @@ impl LoadStep {
             LoadStep::Compacting => "Compacting substrate",
             LoadStep::Connecting => "Connecting to the cluster",
             LoadStep::CatchUp => "Catching up",
+            LoadStep::PullingRepositories => "Pulling repositories",
             LoadStep::Repositories => "Loading repositories",
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
@@ -188,6 +197,7 @@ impl LoadStep {
             LoadStep::Compacting => "",
             LoadStep::Connecting => "clusters",
             LoadStep::CatchUp => "records",
+            LoadStep::PullingRepositories => "repositories",
             LoadStep::Repositories => "packs",
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
@@ -547,6 +557,7 @@ mod tests {
                 LoadStep::Compacting,
                 LoadStep::Connecting,
                 LoadStep::CatchUp,
+                LoadStep::PullingRepositories,
                 LoadStep::Repositories
             ]
         );
@@ -676,6 +687,7 @@ mod tests {
                 "compacting",
                 "connecting",
                 "catchup",
+                "pulling_repositories",
                 "repositories",
                 "sections",
                 "calibrating_sections",

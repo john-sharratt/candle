@@ -7,13 +7,15 @@
 //! reached only through an agent — the cluster's, or the one in this process
 //! (`docs/substrate_git.md` §9).
 //!
-//! Every repository is loaded whole during the [`LoadStep::Repositories`] step
-//! — pulled through an agent first when no member has — and then followed
+//! Every repository is loaded whole during the [`LoadStep::PullingRepositories`]
+//! and [`LoadStep::Repositories`] steps — pulled through an agent first when no
+//! member has, then its packs taken in — and then followed
 //! ([`substrate_git::member::Repos`]) until [`Repositories::stop`]. The load
 //! attaches each database to the workspace, so what the tools read and what
 //! is kept with the log are one database. A record branch that moves wakes
 //! the ingest worker.
 
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -153,13 +155,27 @@ pub fn load(
             .ok_or_else(|| anyhow::anyhow!("no store was opened for {name}"))?;
         workspace.attach(name, store.objects().clone(), store.fetcher())?;
     }
-    progress.set_step(LoadStep::Repositories);
+    // Pulling while any repository is still being pulled from origin, or waits
+    // for its first pull — the log names none of its packs yet — counted in
+    // repositories; then the packs taken in, counted in packs. Once past the
+    // pull the step does not go back to it: a late pull reads in the detail.
+    let pulled = Cell::new(false);
     repos.load(&cancelled, &|state: &[Loading]| {
-        let held: usize = state.iter().map(|l| l.held).sum();
-        let listed: usize = state.iter().map(|l| l.listed).sum();
-        progress.set_step_progress(held as u64, listed as u64);
+        let awaiting_pull = |l: &Loading| !l.whole && (l.pulling || l.listed == 0);
+        if !pulled.get() && state.iter().any(awaiting_pull) {
+            progress.set_step(LoadStep::PullingRepositories);
+            let done = state.iter().filter(|l| !awaiting_pull(l)).count();
+            progress.set_step_progress(done as u64, state.len() as u64);
+        } else {
+            pulled.set(true);
+            progress.set_step(LoadStep::Repositories);
+            let held: usize = state.iter().map(|l| l.held).sum();
+            let listed: usize = state.iter().map(|l| l.listed).sum();
+            progress.set_step_progress(held as u64, listed as u64);
+        }
         status.send(detail(state)).ok();
     })?;
+    progress.set_step(LoadStep::Repositories);
     status.send(String::new()).ok();
     let stop = Arc::new(AtomicBool::new(false));
     let (exited_tx, exited) = mpsc::channel::<()>();
@@ -187,6 +203,7 @@ fn detail(state: &[Loading]) -> String {
         .iter()
         .filter(|l| !l.whole)
         .map(|l| match &l.error {
+            _ if l.pulling => format!("{}: pulling from origin", l.repo),
             Some(e) => format!("{}: {e}", l.repo),
             None if l.busy && l.listed == 0 => format!("{}: pulling from origin", l.repo),
             None if l.busy => format!(
