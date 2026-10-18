@@ -344,6 +344,7 @@ impl CognitiveTask for SummarizationTask {
                 Ok(evt @ TurnEvent::Token(_))
                 | Ok(evt @ TurnEvent::Prefill(_))
                 | Ok(evt @ TurnEvent::PrefillProgress { .. })
+                | Ok(evt @ TurnEvent::PrefillQueued { .. })
                 | Ok(evt @ TurnEvent::HealthWarning(_)) => {
                     if let Some(ref tx) = self.event_observer {
                         let _ = tx.send(evt);

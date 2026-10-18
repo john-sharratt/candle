@@ -721,6 +721,11 @@ impl Scheduler {
             // 2a. One turn of the normalization warm-up replay (see `norm_warm`).
             self.step_norm_warm();
 
+            // 2b. A turn whose prefill stands still is told what it waits
+            // behind, so its caller can show it rather than look hung
+            // (`prefill_wait`).
+            self.report_prefill_waits();
+
             // 3. If idle, block waiting for work. Deferred glue counts as work: the
             // unified wave step scatters it (`take_wave_glue`), so don't block while
             // any is pending or it would never be consumed.

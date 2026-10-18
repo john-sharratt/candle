@@ -118,6 +118,20 @@ const HIGH_BESIDE_HIGH_RATIO: u32 = 2;
 /// not going to be placed by waiting.
 const MID_SWEEP_RETRIES: u32 = 4;
 
+/// The rows a cohort of `rows` that needs `need` bytes of tier and KV shrinks
+/// to, to fit `ground`: scaled by the shortfall and a margin for the staircase
+/// a tier's regions make — or `None` when it already fits, or is one chunk and
+/// can shrink no further. Always fewer rows than it had, never under a chunk.
+fn fitted_rows(rows: usize, need: usize, ground: usize) -> Option<usize> {
+    /// Under the scaled width, for the staircase a tier's regions make.
+    const FIT_MARGIN: f64 = 0.97;
+    if need <= ground || rows <= CHUNK_SIZE {
+        return None;
+    }
+    let scaled = (rows as f64 * ground as f64 / need as f64 * FIT_MARGIN) as usize;
+    Some(scaled.clamp(CHUNK_SIZE, rows - 1))
+}
+
 /// The longest a decode-less creep step runs: what a prompt arriving while
 /// nothing decodes waits, at most, before the creep yields to it at the step's
 /// end. Short against a whole 8K-row sweep at depth (~2.6 s), long against the
@@ -2690,6 +2704,15 @@ impl Scheduler {
             self.wave_prefill_members = members;
             return;
         }
+        self.fit_cohort_to_ground(&mut members);
+        let used: usize = members
+            .iter()
+            .map(|m| match m {
+                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
+                    *advance
+                }
+            })
+            .sum();
         let band = self.creep_priority(&members);
         // The decodes that set the ratio, by band — and how many count as
         // `High` only because their layer did not resolve.
@@ -2714,6 +2737,81 @@ impl Scheduler {
         );
         self.sweep_forecast.sweep_formed(std::time::Instant::now());
         self.wave_prefill_members = members;
+    }
+
+    /// **Fit a cohort to the tier its windows will place**, not to the width
+    /// cap's estimate of it.
+    ///
+    /// The cap prices a one-sequence tier with none of the terms that follow
+    /// depth — the attention launch's KV-stage carve and the sparse
+    /// selection's carve over every candidate block — and a cohort's every
+    /// full-attention window pays both. Above the weight floor the slack hid
+    /// it; at the floor, on the RTX 3090 (2026-10-18), an 8,192-row cohort the
+    /// cap admitted was refused at its first full-attention layer by 16–240 MB,
+    /// every five seconds. So the cohort is priced through `wave_tier_bytes` —
+    /// the function the tier is placed from — over its members' real rows and
+    /// depths, with its KV, against the ground less what the decodes will take
+    /// over the sweep (`sweep_forecast`), and its shares shrink until it fits.
+    /// Never below one chunk: a cohort that cannot fit one is the partition's
+    /// refusal to answer, which narrows the next.
+    fn fit_cohort_to_ground(&self, members: &mut Vec<WaveMember>) {
+        /// Shrinks one fit may make; each scales by the shortfall, so a few do.
+        const FIT_PASSES: usize = 6;
+        let dtype = self.session.activation_dtype();
+        let Some(ground) = self.model.prefill_ground_bytes() else {
+            return;
+        };
+        let kv_row = self.model.kv_bytes_per_row(dtype).unwrap_or(0);
+        let ground = ground.saturating_sub(self.sweep_forecast.withheld_bytes(kv_row));
+        let advance = |m: &WaveMember| match m {
+            WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => *advance,
+        };
+        for _ in 0..FIT_PASSES {
+            let q_lens: Vec<usize> = members.iter().map(advance).collect();
+            let offsets: Vec<usize> = members
+                .iter()
+                .map(|m| self.session.sequence_offset(m.seq_id()).unwrap_or(0))
+                .collect();
+            let rows: usize = q_lens.iter().sum();
+            let Some(tier) =
+                self.model
+                    .wave_tier_bytes(rows, members.len(), &q_lens, &offsets, dtype)
+            else {
+                return;
+            };
+            let need = (tier as usize).saturating_add(rows.saturating_mul(kv_row));
+            let Some(target) = fitted_rows(rows, need, ground) else {
+                return;
+            };
+            tracing::debug!(
+                target: "candle_conversation::scheduler::creep",
+                rows,
+                target,
+                need_mib = need >> 20,
+                ground_mib = ground >> 20,
+                "creep cohort narrowed to the tier its windows will place"
+            );
+            let shares = super::admission::share_within(&q_lens, target, CHUNK_SIZE);
+            let before = std::mem::take(members);
+            for (m, share) in before.into_iter().zip(shares) {
+                if share == 0 {
+                    continue;
+                }
+                members.push(match m {
+                    WaveMember::Prefill { seq_id, .. } => WaveMember::Prefill {
+                        seq_id,
+                        advance: share,
+                    },
+                    WaveMember::Section { seq_id, .. } => WaveMember::Section {
+                        seq_id,
+                        advance: share,
+                    },
+                });
+            }
+            if members.is_empty() {
+                return;
+            }
+        }
     }
 
     /// Resume the held wave group: rebuild each member's `(seq_id, input tensor)`
@@ -3616,7 +3714,17 @@ impl Scheduler {
                 }
                 self.wave_sweep_failures = 0;
                 if cursor > 0 {
-                    // Nothing mid-sweep may be retried from layer 0.
+                    // **The width this window was refused is the next group's
+                    // too, unless it is told.** The members fail — nothing
+                    // mid-sweep may be retried from layer 0 — but the group
+                    // that forms next is composed against the same cap, so
+                    // without the refusal noted it formed at the same width and
+                    // failed at the same window: on the RTX 3090 (2026-10-18)
+                    // an 8,192-row cohort every five seconds, each failing its
+                    // file ingests at the first full-attention layer.
+                    if let Some(short) = tier_refusal_shortfall(&e) {
+                        self.note_refused_width(creep_tok, short);
+                    }
                     self.fail_wave_members(&format!("wave group forward failed mid-sweep: {e}"));
                 } else {
                     // Drop the creep group cleanly (requeue scope prefills on OOM)
@@ -5684,6 +5792,30 @@ mod creep_throttle_tests {
         assert_eq!(creep_layer_budget(48, 64), 1);
         assert_eq!(creep_layer_budget(1, 64), 1);
         assert_eq!(creep_layer_budget(48, 0), 48, "a zero ratio reads as 1");
+    }
+
+    /// A cohort that does not fit its ground shrinks by the shortfall, with a
+    /// margin, to fewer rows and never under a chunk; one that fits, or is a
+    /// chunk already, is left alone. The measured case: 8,192 rows needing
+    /// 7,264 + 200 MiB against 7,000 MiB of ground.
+    #[test]
+    fn a_cohort_shrinks_by_its_shortfall_to_fit() {
+        use super::{fitted_rows, CHUNK_SIZE};
+        let mib = 1usize << 20;
+        assert_eq!(fitted_rows(8_192, 7_000 * mib, 7_000 * mib), None, "fits");
+        let rows = fitted_rows(8_192, 7_464 * mib, 7_000 * mib).expect("shrinks");
+        assert!((CHUNK_SIZE..8_192).contains(&rows));
+        assert_eq!(rows, (8_192.0 * 7_000.0 / 7_464.0 * 0.97) as usize);
+        assert_eq!(
+            fitted_rows(CHUNK_SIZE, 9_000 * mib, mib),
+            None,
+            "a chunk is the floor"
+        );
+        assert_eq!(
+            fitted_rows(CHUNK_SIZE + 1, 9_000 * mib, mib),
+            Some(CHUNK_SIZE),
+            "never under a chunk"
+        );
     }
 
     /// **A decode-less step is a slice, not the sweep.** The measured case: an

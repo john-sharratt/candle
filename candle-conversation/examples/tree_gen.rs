@@ -1077,6 +1077,7 @@ fn stream_response(
     for event in handle.stream() {
         match event {
             TurnEvent::Prefill(_) => {}
+            TurnEvent::PrefillQueued { .. } => {}
             TurnEvent::PrefillProgress {
                 tokens_done,
                 tokens_total,

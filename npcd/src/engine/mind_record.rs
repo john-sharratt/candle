@@ -93,7 +93,10 @@ pub fn seed_ledger(engine: &ConversationEngine, ledger: &crate::engine::watcher:
 /// conversations by design and is left alone.
 pub fn retire_duplicate_documents(engine: &ConversationEngine) -> usize {
     use std::collections::HashMap;
-    let mut copies: HashMap<(String, u32), Vec<(u64, u64, TimelineId)>> = HashMap::new();
+    /// A document's copies, by (mind path, group): each one's creation order,
+    /// raw timeline id and timeline.
+    type Copies = HashMap<(String, u32), Vec<(u64, u64, TimelineId)>>;
+    let mut copies: Copies = HashMap::new();
     for (timeline, rel) in engine.conversations_with_metadata_key(META_PATH) {
         if life_event(&rel).is_some() {
             continue;

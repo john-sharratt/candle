@@ -209,6 +209,21 @@ pub enum TurnEvent {
         tokens_total: usize,
     },
 
+    /// The turn's prefill is waiting: it has made no progress for
+    /// `waiting_ms`, and this much work stands ahead of it. Sent once a second
+    /// while it waits, so a caller can say why nothing is happening rather than
+    /// look hung (`scheduler::prefill_wait`).
+    PrefillQueued {
+        /// Prompt tokens the scheduler will run before this turn's next row:
+        /// the creep cohort in flight and the waiting work of at least this
+        /// turn's band that came before it.
+        ahead_tokens: usize,
+        /// Turns and ingests among that work.
+        ahead_turns: usize,
+        /// Since the turn last made progress, or since it was queued.
+        waiting_ms: u64,
+    },
+
     /// A raw token ID (streamed during generation).
     ///
     /// The caller is responsible for decoding tokens into text using a
