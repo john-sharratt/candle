@@ -20,6 +20,7 @@ use candle_nn::kv_cache::{end_wave_transient, forget_recent_tiers, settle_held_g
 
 use super::compaction_stall::FrontierPass;
 use super::interleave::reseed_achievable_weight;
+use super::prefill::PackGoal;
 use super::Scheduler;
 
 /// The partition as [`Scheduler::settle_device`] left it.
@@ -106,10 +107,12 @@ impl Scheduler {
         // whichever tenant holds the frontier now, until none could move it — the
         // gate's own answer, which a pass that made no progress closes behind it.
         for _ in 0..MAX_FRONTIER_PASSES {
-            match self.frontier_pass() {
+            match self.ground_pass() {
                 None => break,
                 Some((shape, FrontierPass::SpanTenants)) => self.pack_span_tenants_judged(shape),
-                Some((_, FrontierPass::Kv)) => arenas_released += self.pack_until_settled(),
+                Some((_, FrontierPass::Kv)) => {
+                    arenas_released += self.pack_until_settled(PackGoal::Ground)
+                }
             }
         }
         let weight_now = |s: &Self| s.session.kv_region_stats().map_or(0, |r| r.weight_bytes);

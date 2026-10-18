@@ -74,6 +74,26 @@ impl PoolShape {
             (self.holes() >= MIN_FREEABLE_ARENAS).then_some(FrontierPass::SpanTenants)
         }
     }
+
+    /// The pass that recovers free regions, wherever they lie: the KV pass whenever
+    /// its pools hold [`MIN_FREEABLE_ARENAS`] arenas a pack would empty, else
+    /// [`Self::frontier_pass`].
+    ///
+    /// **Relief is short of regions, not of frontier.** An arena a pack empties is a
+    /// free region below a span tenant as much as at the top, and the next claim
+    /// takes the lowest one — but the frontier gate runs no KV pass under a tenant,
+    /// so relief there packed nothing and went straight to the weight side.
+    /// Measured on blackworld (2026-10-18): recurrent state at the frontier, 201
+    /// freeable arenas in the 4 and 8 KiB classes, and relief conceding expert
+    /// ground every few seconds with `arenas_packed=0`. The holes such a pass opens
+    /// are also what the span tenants' pass then moves the top tenant down into.
+    pub fn ground_pass(&self, kv_top: Option<usize>) -> Option<FrontierPass> {
+        if self.live > 0 && self.sparse >= MIN_FREEABLE_ARENAS {
+            Some(FrontierPass::Kv)
+        } else {
+            self.frontier_pass(kv_top)
+        }
+    }
 }
 
 /// The pass that last failed to improve its ground, and the shape it started
@@ -176,6 +196,46 @@ mod tests {
             index_on_top.frontier_pass(None),
             Some(FrontierPass::SpanTenants)
         );
+    }
+
+    /// **Relief packs the KV pools under a span tenant**, where the frontier gate
+    /// does not: what it is short of is free regions, and an emptied arena is one
+    /// wherever it lies. Blackworld's shape: recurrent state on top, 201 freeable
+    /// arenas beneath it, and relief conceding expert ground with nothing packed.
+    #[test]
+    fn relief_packs_the_kv_pools_under_a_span_tenant() {
+        let recurrent_on_top = PoolShape {
+            live: 1_990,
+            frontier: 2_080,
+            sparse: 201,
+        };
+        assert_eq!(
+            recurrent_on_top.frontier_pass(Some(1_500)),
+            Some(FrontierPass::SpanTenants)
+        );
+        assert_eq!(
+            recurrent_on_top.ground_pass(Some(1_500)),
+            Some(FrontierPass::Kv)
+        );
+        // Too little to empty: the frontier's own answer.
+        let packed = PoolShape {
+            live: 167,
+            frontier: 167,
+            sparse: 7,
+        };
+        assert_eq!(packed.ground_pass(Some(162)), None);
+        assert_eq!(
+            SHAPE.ground_pass(Some(702)),
+            Some(FrontierPass::Kv),
+            "nine sparse arenas"
+        );
+        // Nothing live, nothing to pack.
+        let empty = PoolShape {
+            live: 0,
+            frontier: 0,
+            sparse: 9,
+        };
+        assert_eq!(empty.ground_pass(None), None);
     }
 
     /// A span tenant over a single hole is not worth its copies: moving it would

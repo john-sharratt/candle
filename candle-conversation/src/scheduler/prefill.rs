@@ -247,6 +247,26 @@ fn ingest_hot_window() -> usize {
 /// a wedged persistence thread; it is not the expected path.
 const VRAM_OFFLOAD_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What a KV pack is for, which decides when one is worth running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PackGoal {
+    /// Lower the frontier: the wave loop's pass, run only with a KV arena on top
+    /// ([`Scheduler::frontier_pass`]).
+    Frontier,
+    /// Recover free regions wherever they lie: relief and the settle, which pack
+    /// under a span tenant too ([`Scheduler::ground_pass`]).
+    Ground,
+}
+
+impl PackGoal {
+    fn pass(self, sched: &Scheduler) -> Option<(PoolShape, FrontierPass)> {
+        match self {
+            Self::Frontier => sched.frontier_pass(),
+            Self::Ground => sched.ground_pass(),
+        }
+    }
+}
+
 /// What one KV compaction pass did: the arenas it emptied and handed back, and whether
 /// its budget stopped it with work left.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -333,7 +353,7 @@ impl Scheduler {
                 self.pack_span_tenants_judged(shape);
                 0
             }
-            Some((_, FrontierPass::Kv)) => self.pack_until_settled(),
+            Some((_, FrontierPass::Kv)) => self.pack_until_settled(PackGoal::Frontier),
         }
     }
 
@@ -369,13 +389,31 @@ impl Scheduler {
     /// it; if no KV pass is coming, that promise has to be withdrawn or hot→warm defers
     /// for a pass that never runs.
     pub(super) fn frontier_pass(&self) -> Option<(PoolShape, FrontierPass)> {
+        self.pass_by(PoolShape::frontier_pass)
+    }
+
+    /// [`Self::frontier_pass`], for a caller short of free regions rather than of
+    /// frontier — relief and the settle — which packs the KV pools under a span
+    /// tenant too ([`PoolShape::ground_pass`]).
+    ///
+    /// A KV pack the stall gate holds falls back to the frontier's pass, so the
+    /// span tenants still move into the holes the last one opened.
+    pub(super) fn ground_pass(&self) -> Option<(PoolShape, FrontierPass)> {
+        self.pass_by(PoolShape::ground_pass)
+            .or_else(|| self.frontier_pass())
+    }
+
+    fn pass_by(
+        &self,
+        choose: impl Fn(&PoolShape, Option<usize>) -> Option<FrontierPass>,
+    ) -> Option<(PoolShape, FrontierPass)> {
         let pass = self.session.kv_region_stats().and_then(|stats| {
             let shape = PoolShape {
                 live: stats.live,
                 frontier: stats.live_watermark,
                 sparse: self.session.kv_sparse_arenas(),
             };
-            let pass = shape.frontier_pass(self.session.kv_top_rank())?;
+            let pass = choose(&shape, self.session.kv_top_rank())?;
             (!self.kv_compaction_stall.holds(pass, shape)).then_some((shape, pass))
         });
         if !matches!(pass, Some((_, FrontierPass::Kv))) {
@@ -568,8 +606,8 @@ impl Scheduler {
     /// next forward and the publish after it: worst sustained efficiency read 66–75%
     /// with every pass reporting `plan_capped` and none clipped by the clock. See
     /// [`settle_passes`] for why the loop ends.
-    pub(super) fn pack_until_settled(&mut self) -> usize {
-        settle_passes(|| self.pack_kv_pools())
+    pub(super) fn pack_until_settled(&mut self, goal: PackGoal) -> usize {
+        settle_passes(|| self.pack_kv_pools(goal))
     }
 
     /// One KV compaction pass if the pools are fragmented enough to be worth it, then
@@ -581,7 +619,7 @@ impl Scheduler {
     /// `None` when it was turned away by a holder of the partition or of chunk
     /// locations (a forward, a hot→warm migrate group, a cold-writer free), which is
     /// the one answer that changes by asking again shortly.
-    pub(super) fn pack_kv_pools(&mut self) -> Option<PackPass> {
+    pub(super) fn pack_kv_pools(&mut self, goal: PackGoal) -> Option<PackPass> {
         /// Wall-clock a single pass may spend **planning and claiming**. A budget
         /// rather than a move cap: the ladder spans 320 B to 16 KiB, so the same
         /// "one move" is fifty times the bandwidth at one rung and a count cannot
@@ -603,7 +641,7 @@ impl Scheduler {
         /// what has to be matched, and clipping every pass means it never is.
         const BUDGET: std::time::Duration = std::time::Duration::from_millis(80);
 
-        let Some((shape, FrontierPass::Kv)) = self.frontier_pass() else {
+        let Some((shape, FrontierPass::Kv)) = goal.pass(self) else {
             return Some(PackPass::default());
         };
 
@@ -958,7 +996,7 @@ impl Scheduler {
         let (mut pack_ms, mut evict_ms, mut flush_ms) = (0u64, 0u64, 0u64);
         let t_stage = std::time::Instant::now();
         if self.vram_under_pressure_for(phase) {
-            packed = self.pack_until_settled();
+            packed = self.pack_until_settled(PackGoal::Ground);
         }
 
         pack_ms += t_stage.elapsed().as_millis() as u64;
@@ -995,7 +1033,7 @@ impl Scheduler {
         // residency with `arenas_packed=0`. Whenever eviction ran, for the reason the
         // first pack runs whenever compression did.
         if evicted.count > 0 || self.vram_under_pressure_for(phase) {
-            packed += self.pack_until_settled();
+            packed += self.pack_until_settled(PackGoal::Ground);
         }
         pack_ms += t_stage.elapsed().as_millis() as u64;
 
