@@ -178,7 +178,10 @@ roles_file: "../host/roles.yaml"
 #
 # and copied to every member (`--group-key`, `group_key:` in motherd.yaml).
 # `floor_grace_minutes` and `canary_share` tune certification (§3.8); `peers`
-# names the other gateways answering these names (§13.4) — none yet.
+# names the other gateways answering these names (§13.4) — none yet. The grace
+# is one minute: a build is judged on a minute of canary traffic — enough to
+# catch one that cannot serve — and rolls out as soon as it passes, so a fix
+# reaches every member in minutes rather than half an hour.
 #
 # `status_key_file` lets a caller read `/gateway/status.json` without a browser
 # session, presenting the file's contents as `Authorization: Bearer <key>`
@@ -189,6 +192,7 @@ cluster:
   group_key_file: "secrets/group.key"
   status_key_file: "secrets/status.key"
   name: "blackworld"
+  floor_grace_minutes: 1
 
 sites:
   # ── tokera.com ──────────────────────────────────────────────────────────
