@@ -54,7 +54,7 @@ use std::thread::{current, ThreadId};
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::cuda_backend::wave_provenance::{SpanState, WaveCarve, WaveTicket};
 use candle::cuda_backend::{
-    close_scratch_scope, install_scope_carve, open_scratch_scope, scratch_reserve,
+    close_scratch_scope, install_scope_carve, open_scratch_scope, scratch_reserve, StreamLease,
 };
 use candle::Result;
 
@@ -1345,8 +1345,19 @@ fn with_wave_domain<R>(
 /// Permission to create KV arenas, held for as long as the creation takes.
 ///
 /// Dropping it lets a forward that is waiting to place its tier proceed.
+///
+/// **It holds the stream lease it was entered with, for as long as it is
+/// open.** A forward that wants the partition waits for every window to close,
+/// and creating an arena under the window issues on the stream. With the lease
+/// taken only to enter and let go at once, a segment could start recording
+/// while the window stood, then wait on it for its tier — while the window's
+/// thread, wanting the stream to claim its slab, waited on the recording. Both
+/// persistence threads hit that on `.5` twice in one evening, each a 30 s stall
+/// ending in a lease panic (2026-10-18). A lease held keeps a new recording from
+/// starting; the recording thread runs that wave's segments as issued instead.
 pub struct ArenaWindow {
     ordinal: usize,
+    _lease: StreamLease,
 }
 
 impl Drop for ArenaWindow {
@@ -1438,7 +1449,8 @@ impl Drop for ArenaWindow {
 ///
 /// `&'static str`, so no call site can pay for a `format!` on the success path
 /// that every wave takes.
-pub fn enter_arena_window(stream: &Arc<CudaStream>, tenant: &'static str) -> Result<ArenaWindow> {
+pub fn enter_arena_window(lease: StreamLease, tenant: &'static str) -> Result<ArenaWindow> {
+    let stream: &Arc<CudaStream> = &lease;
     let (ordinal, had_tier) = {
         let mut map = lock_domains();
         let (ordinal, domain) = domain_entry(&mut map, stream);
@@ -1501,7 +1513,10 @@ pub fn enter_arena_window(stream: &Arc<CudaStream>, tenant: &'static str) -> Res
     if had_tier {
         release_transient(stream);
     }
-    Ok(ArenaWindow { ordinal })
+    Ok(ArenaWindow {
+        ordinal,
+        _lease: lease,
+    })
 }
 
 /// Marker every mid-wave arena refusal carries, so a caller that has a retry can
@@ -2692,6 +2707,11 @@ mod wave_tests {
         }
     }
 
+    /// A lease for a window, on the device [`stream`] found.
+    fn lease() -> candle::cuda_backend::StreamLease {
+        stream().expect("the device the test's stream came from")
+    }
+
     /// **An arena cannot be created while a wave is open — and the caller is
     /// told so rather than parked.**
     ///
@@ -2715,10 +2735,9 @@ mod wave_tests {
         // From another thread, so this is the ordinary sealing case rather than
         // the forward's own thread.
         let (tx, rx) = mpsc::channel();
-        let s2 = s.clone();
         std::thread::spawn(move || {
             let _ = tx.send(
-                enter_arena_window(&s2, "a test tenant")
+                enter_arena_window(lease(), "a test tenant")
                     .err()
                     .map(|e| e.to_string()),
             );
@@ -2737,7 +2756,56 @@ mod wave_tests {
 
         // Once the wave is over the same request succeeds.
         drop(guard);
-        drop(enter_arena_window(&s, "a test tenant")?);
+        drop(enter_arena_window(lease(), "a test tenant")?);
+        Ok(())
+    }
+
+    /// **An open window keeps a recording from starting on another thread.**
+    /// The window holds its stream lease for as long as it stands, so a wave
+    /// opened beside it runs its segment as issued; once it closes, the same
+    /// wave records. Entered and let go at once, the lease let a segment start
+    /// recording under a standing window, wait on the window for its tier, and
+    /// hold the window's thread on the recording — a deadlock that stalled both
+    /// persistence threads on `.5` for 30 s at a time.
+    #[test]
+    fn an_open_window_keeps_a_recording_from_starting() -> Result<()> {
+        use std::sync::mpsc;
+
+        let _serial = serial();
+        let Ok(Device::Cuda(dev)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let (opened, window_open) = mpsc::channel();
+        let (close, closing) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || -> Result<()> {
+            let window = enter_arena_window(lease(), "a test tenant")?;
+            opened.send(()).expect("the test is listening");
+            let _ = closing.recv();
+            drop(window);
+            Ok(())
+        });
+        window_open
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the window opened");
+
+        let wave = dev.begin_wave_capture()?;
+        dev.record_launches()?;
+        assert_eq!(
+            dev.recording_segment(),
+            None,
+            "a segment began recording while another thread's window stood"
+        );
+        drop(wave);
+
+        close.send(()).expect("the holder is waiting");
+        holder.join().expect("the holder panicked")?;
+        let wave = dev.begin_wave_capture()?;
+        dev.record_launches()?;
+        assert!(
+            dev.recording_segment().is_some(),
+            "with the window closed the wave records"
+        );
+        drop(wave);
         Ok(())
     }
 
@@ -2754,7 +2822,7 @@ mod wave_tests {
         let _serial = serial();
         let Some(s) = stream() else { return Ok(()) };
         let open = begin_forward(&s);
-        let err = enter_arena_window(&s, "a test tenant")
+        let err = enter_arena_window(lease(), "a test tenant")
             .err()
             .expect("the forward's own thread must be refused")
             .to_string();
@@ -2774,7 +2842,7 @@ mod wave_tests {
         );
         drop(open);
         // And once the forward is over, the same thread is an ordinary caller.
-        drop(enter_arena_window(&s, "a test tenant")?);
+        drop(enter_arena_window(lease(), "a test tenant")?);
         Ok(())
     }
 
@@ -2803,7 +2871,7 @@ mod wave_tests {
         assert!(placed > 0, "the forward should have left a tier standing");
 
         // The window opens anyway, and the ground comes back with it.
-        let window = enter_arena_window(&s, "a test tenant")?;
+        let window = enter_arena_window(lease(), "a test tenant")?;
         assert_eq!(
             super::super::region_pool::region_stats(ordinal)
                 .map(|r| r.transient_bytes)
@@ -2833,7 +2901,7 @@ mod wave_tests {
             let _open = begin_forward(&s);
             plan_wave_transient(&s, wide)?;
         }
-        drop(enter_arena_window(&s, "a test tenant")?);
+        drop(enter_arena_window(lease(), "a test tenant")?);
         let tier = |ordinal| {
             super::super::region_pool::region_stats(ordinal)
                 .map(|r| r.transient_bytes)
@@ -2883,7 +2951,7 @@ mod wave_tests {
         // the forward's plan and records the walk's width beside it.
         let walk = [2 << 20, 2 << 20, 2 << 20];
         let covering = cover_wave_transient(&s, walk)?;
-        drop(enter_arena_window(&s, "a test tenant")?);
+        drop(enter_arena_window(lease(), "a test tenant")?);
         assert_eq!(tier(ordinal), 0, "the window handed the tier back");
         let guard = begin_wave(&s, LayerPhase::Attention)?;
         let placed = tier(ordinal);
@@ -2899,7 +2967,7 @@ mod wave_tests {
             let _open = begin_forward(&s);
             plan_wave_transient(&s, wide)?;
         }
-        drop(enter_arena_window(&s, "a test tenant")?);
+        drop(enter_arena_window(lease(), "a test tenant")?);
         let guard = begin_wave(&s, LayerPhase::Attention)?;
         let placed = tier(ordinal);
         assert!(

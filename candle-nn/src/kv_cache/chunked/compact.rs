@@ -651,7 +651,6 @@ impl super::backing::ChunkedKvBacking {
         let candle::Device::Cuda(cuda) = self.device() else {
             return Err(CompactionRefused::NoDevice);
         };
-        let stream = cuda.cuda_stream();
 
         // **Nothing off-thread may be holding a chunk address.** The arena window
         // below excludes forwards, which run on this thread; it says nothing about the
@@ -665,7 +664,8 @@ impl super::backing::ChunkedKvBacking {
             .ok_or(CompactionRefused::MigrateInFlight)?;
 
         // One window for the whole pass — see the module note on 199,888 refusals.
-        let _window = super::bump_arena::enter_arena_window(&stream, "a KV compaction")
+        // It holds the stream's lease for the pass with it.
+        let _window = super::bump_arena::enter_arena_window(cuda.cuda_stream(), "a KV compaction")
             .map_err(|_| CompactionRefused::WaveInFlight)?;
 
         // **Quiesce the whole device before reading anything, not just before

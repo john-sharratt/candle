@@ -3014,11 +3014,10 @@ pub fn claim_span_region(
     let candle::Device::Cuda(cuda) = device else {
         candle::bail!("claim_span_region: the reservation is a CUDA allocation");
     };
-    let stream = cuda.cuda_stream();
     // Held across the claim, so a forward cannot open between the gate and the
     // frontier moving.
-    let _window = super::bump_arena::enter_arena_window(&stream, tenant)?;
-    Ok(claim_region(&stream)?.map(SpanRegion::adopt))
+    let _window = super::bump_arena::enter_arena_window(cuda.cuda_stream(), tenant)?;
+    Ok(claim_region(&cuda.cuda_stream())?.map(SpanRegion::adopt))
 }
 
 /// An open arena window, for a tenant claiming SEVERAL regions at once.
@@ -3047,7 +3046,7 @@ impl SpanClaims {
         let candle::Device::Cuda(cuda) = device else {
             candle::bail!("SpanClaims: the reservation is a CUDA allocation");
         };
-        let _window = super::bump_arena::enter_arena_window(&cuda.cuda_stream(), tenant)?;
+        let _window = super::bump_arena::enter_arena_window(cuda.cuda_stream(), tenant)?;
         Ok(Self {
             device: cuda.clone(),
             _window,
