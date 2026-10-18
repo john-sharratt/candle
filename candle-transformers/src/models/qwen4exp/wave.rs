@@ -1614,8 +1614,17 @@ impl Qwen4ExpBatched {
             .write()
             .map_err(|_| candle::Error::Msg("index lock poisoned".into()))?;
         let mut caches: Vec<&mut IndexCache> = idx.values_mut().flatten().collect();
+        let retired: Vec<Arc<ResidentPage>> = self
+            .retired
+            .read()
+            .map_err(|_| candle::Error::Msg("qwen4exp: retired lock poisoned".into()))?
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
         let qsa = compact_index_caches(
             &mut caches,
+            &retired,
             self.model.cfg.indexer.head_dim,
             &self.model.device,
             max_moves,

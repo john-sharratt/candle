@@ -2253,6 +2253,7 @@ pub fn append_wave(
 /// is safe and shows as `moved` short of `planned`.
 pub fn compact_index_caches(
     caches: &mut [&mut IndexCache],
+    retired: &[Arc<ResidentPage>],
     head_dim: usize,
     device: &Device,
     max_moves: usize,
@@ -2276,6 +2277,11 @@ pub fn compact_index_caches(
             moves.into_iter().map(|m| (m.src, m.dst)).collect();
         for cache in caches.iter_mut() {
             moved += cache.relocate(&mut by_source)?;
+        }
+        // Pages a reset dropped are held for the rebuild by nothing a cache
+        // reaches; left out, their slots kept every arena they sat in from emptying.
+        for page in retired {
+            moved += page.relocate(&mut by_source)?;
         }
         // Destinations whose source nothing here held go back to their arenas.
         drop(by_source);
@@ -2759,8 +2765,13 @@ mod tests {
         let mut p_fork = p.fork()?;
         drop(hole);
 
-        let report =
-            compact_index_caches(&mut [&mut a, &mut c, &mut p, &mut p_fork], d, &device, 0)?;
+        let report = compact_index_caches(
+            &mut [&mut a, &mut c, &mut p, &mut p_fork],
+            &[],
+            d,
+            &device,
+            0,
+        )?;
         assert!(report.moved <= report.planned);
         for (cache, keys, open) in [(&a, &a_keys, &a_open), (&c, &c_keys, &c_open)] {
             assert_eq!(&cache.live_rows_host()?, keys);
