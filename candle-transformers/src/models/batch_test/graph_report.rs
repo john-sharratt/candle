@@ -1,5 +1,7 @@
 //! The gate's one-line summary of what the wave chains did across a decode.
 
+use std::cmp::Reverse;
+
 use candle::cuda_backend::graph::CaptureStats;
 
 use crate::models::expert_lre::cpu_pool::stats::{stats as pool_stats, ClassStats};
@@ -177,7 +179,7 @@ impl LeaseWaits {
             })
             .filter(|(_, n, _)| *n > 0)
             .collect();
-        sites.sort_by(|a, b| b.2.cmp(&a.2));
+        sites.sort_by_key(|s| Reverse(s.2));
         for (site, n, us) in sites.iter().take(8) {
             println!("    {:>9.1} ms over {n:>6} at {site}", *us as f64 / 1_000.0);
         }

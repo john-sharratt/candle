@@ -182,7 +182,9 @@ mod tests {
         assert_eq!(none, ExpertSplitArgs::default());
         assert!(none.enabled);
         assert_eq!(none.knobs(), Knobs::default());
-        let off = Cli::try_parse_from(["x", "--expert-split", "false"]).unwrap().split;
+        let off = Cli::try_parse_from(["x", "--expert-split", "false"])
+            .unwrap()
+            .split;
         assert!(!off.enabled);
         assert_eq!(
             off,

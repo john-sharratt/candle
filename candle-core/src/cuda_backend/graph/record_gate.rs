@@ -44,6 +44,7 @@
 //! holder blocked on a lock the recording thread holds cannot stall it.
 
 use std::cell::Cell;
+use std::cmp::Reverse;
 use std::marker::PhantomData;
 use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -315,7 +316,7 @@ pub fn lease_wait_sites() -> Vec<(String, u64, u64)> {
         .iter()
         .map(|(s, n, ns)| (s.to_string(), *n, ns / 1_000))
         .collect();
-    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out.sort_by_key(|s| Reverse(s.2));
     out
 }
 
