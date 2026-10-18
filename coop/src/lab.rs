@@ -22,7 +22,7 @@ use coop::sample::{Channel, Sample};
 use coop::sim::engine::{simulate, Outage};
 use coop::sim::link::Link;
 use coop::sim::model::MemberModel;
-use coop::sim::policy::{Concentrate, ConcentrateProxy, EarliestFinish, Policy, Today};
+use coop::sim::policy::{Concentrate, EarliestFinish, Policy, Today};
 use coop::sim::report::Report;
 use coop::sim::workload::{generate, Conversation, Kind};
 use coop::wave_log::parse;
@@ -73,12 +73,7 @@ fn policies() -> Vec<Box<dyn Policy>> {
     vec![
         Box::new(Today),
         Box::new(Concentrate { floor_hit: 0.9 }),
-        Box::new(ConcentrateProxy {
-            concentrate: Concentrate { floor_hit: 0.9 },
-            min_prefill: 4_000,
-            max_backlog: 16_000,
-        }),
-        Box::new(EarliestFinish { margin: 0.25 }),
+        Box::new(EarliestFinish),
     ]
 }
 
@@ -135,7 +130,7 @@ fn sim(n: usize, spread: f64, seed: u64) {
 
 fn print_header() {
     println!(
-        "  {:<30} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6} {:>9} {:>6} {:>4}",
+        "  {:<30} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6} {:>9} {:>6} {:>4} {:>5}",
         "policy",
         "tok/s",
         "first50",
@@ -146,7 +141,8 @@ fn print_header() {
         "jain",
         "turns B/W",
         "linkGB",
-        "rst"
+        "rst",
+        "moves"
     );
 }
 
@@ -158,7 +154,7 @@ fn print_row(r: &Report) {
         .collect::<Vec<_>>()
         .join("/");
     println!(
-        "  {:<30} {:>7.0} {:>7.1}s {:>7.1}s {:>7.2}s {:>7.2}s {:>8.1} {:>6.3} {:>9} {:>6.1} {:>4}",
+        "  {:<30} {:>7.0} {:>7.1}s {:>7.1}s {:>7.2}s {:>7.2}s {:>8.1} {:>6.3} {:>9} {:>6.1} {:>4} {:>5}",
         r.policy,
         r.tokens_per_s,
         r.first_token_p50,
@@ -169,7 +165,8 @@ fn print_row(r: &Report) {
         r.fairness,
         split,
         r.link_gb,
-        r.restarted
+        r.restarted,
+        r.moves
     );
 }
 

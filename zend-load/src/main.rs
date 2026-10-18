@@ -8,11 +8,18 @@
 //!
 //! ```text
 //! zend-load --levels light,medium,heavy --tasks decode,read
+//! zend-load --gateway http://192.168.0.6:8081 --patterns heavy-read,blend,shift
 //! ```
+//!
+//! `--patterns` runs named, fixed mixes ([`pattern`]) in place of the ladder,
+//! each part's row printed and then the pattern's as a whole. `--gateway` may
+//! name one member's own listener as well as the gateway, so the same pattern
+//! measures a member alone and the cluster.
 
 mod cleanup;
 mod client;
 mod ladder;
+mod pattern;
 mod report;
 mod run;
 mod sample;
@@ -27,8 +34,10 @@ use clap::Parser;
 
 use client::Target;
 use ladder::rung;
+use pattern::{pattern, run_pattern};
 use report::Row;
 use tasks::{run_mark, Task};
+use tokio::time::Instant;
 
 #[derive(Parser)]
 #[command(about = "Load ladder for a zend cluster, through its gateway")]
@@ -46,6 +55,10 @@ struct Args {
     /// code), write (zen-code editing battle-cities in its overlay).
     #[arg(long, value_delimiter = ',', default_value = "decode,read,write")]
     tasks: Vec<String>,
+    /// Named patterns to run in place of the ladder: heavy-decode,
+    /// heavy-read, blend, shift.
+    #[arg(long, value_delimiter = ',')]
+    patterns: Vec<String>,
     /// The longest one turn may take before it counts as cut.
     #[arg(long, default_value_t = 900)]
     turn_limit_s: u64,
@@ -87,6 +100,49 @@ async fn main() -> Result<()> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let limit = Duration::from_secs(args.turn_limit_s);
     let mut rows = Vec::new();
+    if !args.patterns.is_empty() {
+        let mut patterns = Vec::new();
+        for name in &args.patterns {
+            match pattern(name) {
+                Some(p) => patterns.push(p),
+                None => bail!("no pattern `{name}`: heavy-decode, heavy-read, blend or shift"),
+            }
+        }
+        for p in &patterns {
+            println!("running pattern {} ...", p.name);
+            let started = Instant::now();
+            let parts = run_pattern(Arc::clone(&target), p, &format!("zl{stamp}"), limit).await;
+            let wall = started.elapsed();
+            let mut all = Vec::new();
+            for (scenario, run_name, ran) in &parts {
+                if args.samples {
+                    for s in &ran.samples {
+                        println!("  {s}");
+                    }
+                }
+                let row = Row::of(&scenario.name, &ran.samples, ran.wall);
+                println!("{row}");
+                rows.push(row);
+                all.extend(ran.samples.iter().cloned());
+                if !args.keep {
+                    let mark = format!("{} ", run_mark(run_name));
+                    let (gone, kept) =
+                        cleanup::delete_run(&target, &base, &ran.conversations, &mark).await;
+                    println!("  cleanup: {gone} conversations deleted, {kept} refused");
+                }
+            }
+            if parts.len() > 1 {
+                let row = Row::of(&p.name, &all, wall);
+                println!("{row}");
+                rows.push(row);
+            }
+        }
+        println!("\nsummary");
+        for row in &rows {
+            println!("{row}");
+        }
+        return Ok(());
+    }
     for scenario in &scenarios {
         let run_name = format!("zl{stamp}-{}", scenario.name);
         println!(

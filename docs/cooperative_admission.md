@@ -70,56 +70,47 @@ What crosses it when a turn's work moves:
 
 - its new KV — on the order of 12 KB a token (12 full-attention layers),
   ~24 MB for a 2K-token prompt, ~0.2 s;
-- its recurrent snapshot — the GDN store, ~150 MB, **~1.4 s**.
+- its recurrent snapshot — 36 DeltaNet layers × 48 value heads × 128 × 128 at
+  f32, **113 MB**, about 1 s.
 
-Both replicate anyway: every sealed turn's records go to every member. What a
-move costs is the wait for them to have arrived, so a move at a turn boundary
-after the user's own pause costs nothing, and a move in the middle of a turn
-costs a snapshot crossing.
+Both replicate anyway: every sealed turn's records go to every member. So a
+turn placed on another member costs nothing the substrate was not already
+sending, provided that member already holds the turn before it (§2.2).
 
 ## 2. Mechanisms
 
-### 2.1 Declared role and capacity
+### 2.1 Advertised load figures
 
-Each member says in `CAPACITY`, as it runs, what it is best used for and how
-much more it can take:
+Each member says in `CAPACITY`, as it runs, what more work would cost it, from
+its own measurements (§1):
 
-- **role** — `decode`, `prefill` or `mixed`, chosen by the member from its
-  own measurements (§1): the card with the resident weights takes `decode`
-  when another member can take prefill; a card alone is `mixed`;
-- **capacity** — tokens per second it can still add on that role at its
-  current residency, from its own fitted curve.
+- **decode-heavy and prefill-heavy** — how loaded it is on each: the rows it is
+  decoding and the prompt tokens it has queued;
+- **the marginal value of one more of each** — what one more decoding turn,
+  and one more prompt, would do to its own throughput at its current
+  residency, from its own fitted curve.
 
-The gateway places by these alone. It models nothing of a member's insides;
-the member that knows its card is the one that says what the card can do.
+The gateway compares these numbers and nothing else. It models nothing of a
+member's insides; the member that knows its card is the one that says what
+the card can do.
 
-### 2.2 Lease transfer at a turn boundary
+### 2.2 A lease per turn, placed among the replicated
 
-A conversation lives on the member holding its claim (§5.4 of
-`replicated_substrate.md`). Moving it is the claim's existing release with
-`through`: the next request goes to another member, which serves once it has
-applied the old holder's writes. A transfer carries a **stay** mark — the
-conversation is not moved again at its next admission — so a conversation
-moves at most once per two turns and never oscillates.
+A conversation's lease (its claim, §5.4 of `replicated_substrate.md`) is held
+for **one turn**: its prefill and its decode, the time its state has to be on
+a card. At the turn's boundary, once the turn is durable, the lease is
+released with `through`, and the next turn is placed afresh.
 
-### 2.3 Proxied prefill
+- **Only members that hold the conversation through its latest turn are
+  candidates.** A member that has not yet confirmed replication up to the turn
+  just ended is skipped, never waited on. Placement therefore never stalls a
+  turn on the link, and a move costs nothing the substrate was not already
+  sending.
+- Among the candidates, the turn goes by §2.1's figures.
+- A turn runs where it is placed, start to finish: no part of it is sent to
+  another member mid-turn.
 
-The holder keeps the lease and asks another member to run a turn's prefill.
-
-- The executor admits it only once it holds every unit the turn's selection
-  names: it has applied the holder's writes through the `oseq` the request
-  states. Until then it is not admitted, and the holder may run it itself.
-- The holder admits the decode only once the executor's KV chunks and
-  recurrent snapshot have replicated back.
-- **No recursion.** A proxied request carries the mark; a member receiving one
-  runs it or refuses it and never proxies it on. One hop, always.
-
-It pays when the prefill saved outweighs the snapshot's crossing (~1.4 s): a
-long prompt — a first turn, a large tool result, a reprojection — on a member
-whose card is busy decoding. A follow-up turn's prefill is a few dozen tokens
-and is never proxied.
-
-### 2.4 Fairness
+### 2.3 Fairness
 
 Every policy is judged on per-conversation slowdown (the turn's time against
 the same turn alone on an idle cluster): its p95 and its Jain index across
@@ -127,51 +118,53 @@ conversations, and the longest any turn waited for admission. A policy that
 raises throughput by starving the conversations it does not concentrate is
 rejected.
 
-### 2.5 Failure
+### 2.4 Failure
 
-A member dropping hands its claims back (§12.4); its conversations are placed
-again as new. A proxied prefill whose executor drops is run by the holder,
-which never gave up the lease. A transfer whose target drops before it served
-leaves the claim free, and the next request is placed as new.
+A member dropping hands its claims back (§12.4). A turn running on it starts
+again, placed among the members that hold its conversation through the turn
+before. A conversation whose only up-to-date copy was on the dropped member
+waits for nothing: its next turn is placed among the members that hold it
+through the latest turn they have, which is the last turn that member
+replicated before it went.
 
 ## 3. Experiments
 
-The simulator replays a workload — conversations with turns of prompt and
-output lengths drawn from the zend-load rungs and from production — against
-members whose step time is their measured curve, with the link above, under:
+The simulator (`coop/src/sim/`) replays a workload — conversations whose
+turns are prefill-then-decode segments, sized from the zend-load rungs —
+against members whose step time is their measured curve. Each turn's end
+replicates its state to every other member over the link above, FIFO, and a
+member becomes a candidate for that conversation once its copy has arrived
+(§2.2). The policies:
 
-1. **today** — sticky, new conversations `Best` by `power / (1 + in_flight)`;
-2. **declared roles** (§2.1);
-3. **declared roles + lease transfer** (§2.2);
-4. **declared roles + proxied prefill** (§2.3).
-
-5. **earliest declared finish** — each member declares what this turn would
-   cost it now (its prefill backlog plus this prompt at its prefill rate, then
-   the reply at the step time one more row gives it); the turn goes to the
-   soonest, and a running conversation moves at a turn boundary only when the
-   other member is better by 25%, then stays a turn. It is §2.1's capacity
-   figure used as the only guide.
+1. **today** — sticky; a new conversation goes `Best` by
+   `power / (1 + in_flight)`;
+2. **concentrate decodes** — every turn on the strong card while it reports
+   room (rows under its maximum, decode hit rate above 0.9), otherwise `Best`;
+3. **earliest advertised finish** — each candidate advertises what this turn
+   would cost it now (its prefill backlog plus this prompt at its prefill
+   rate, then the reply at the step time one more row gives it), and the turn
+   goes to the soonest. §2.1's figures used as the only guide.
 
 Reported per policy: aggregate t/s, first-token p50/p95, longest stall, Jain
-index, and the same with one member dropping mid-run.
+index, turns per member, lease moves, and the same with one member dropping
+mid-run.
 
-### 3.1 First results (`coop-lab sim`, 24 conversations, seed 1)
+### 3.1 Results (`coop-lab sim`, 24 conversations, seed 1)
 
 BlackWorld as measured; **WhiteWorld assumed** from its gate figures (decode
 slope 3.2× BlackWorld's, prefill half its rate, a 9 GB expert zone) until its
 wave log is fitted, so every WhiteWorld-dependent figure below moves when it is.
 
-| scenario | policy | t/s | first token p95 | Jain | turns BW/WW |
-|---|---|---|---|---|---|
-| chat | today | 141 | 1.8 s | 0.942 | 60/12 |
-| chat | concentrate | 160 | 2.7 s | 0.997 | 72/0 |
-| chat | earliest finish | **161** | 2.5 s | **0.997** | 71/1 |
-| read | today | 85 | **6.8 s** | 0.995 | 40/8 |
-| read | concentrate | 81 | 9.8 s | 0.997 | 48/0 |
-| read | proxied prefill | 83 | 9.8 s | 0.973 | 48/0 |
-| read | earliest finish | **87** | 8.7 s | 0.989 | 44/4 |
-| chat + read | today | 94 | 3.0 s | 0.969 | 50/10 |
-| chat + read | earliest finish | **106** | 5.0 s | **0.990** | 59/1 |
+| scenario | policy | t/s | first token p95 | Jain | turns BW/WW | moves |
+|---|---|---|---|---|---|---|
+| chat | today | 141 | 1.8 s | 0.942 | 60/12 | 0 |
+| chat | concentrate | 160 | 2.7 s | 0.997 | 72/0 | 0 |
+| chat | earliest finish | **161** | 2.5 s | **0.997** | 71/1 | 1 |
+| read | today | 85 | **6.8 s** | 0.995 | 40/8 | 0 |
+| read | concentrate | 81 | 9.8 s | 0.997 | 48/0 | 0 |
+| read | earliest finish | **86** | 8.7 s | 0.992 | 45/3 | 3 |
+| chat + read | today | 94 | 3.0 s | 0.969 | 50/10 | 0 |
+| chat + read | earliest finish | **106** | 5.0 s | **0.990** | 59/1 | 1 |
 
 With WhiteWorld dropping at 30 s, today's first-token p95 rises to 22–28 s
 (its turns restart); earliest finish stays at 2.7–9.0 s.
@@ -181,12 +174,9 @@ What it says so far:
 - **Concentrating decodes beats today's power split** by 13% on chat and
   evens the slowdown (Jain 0.94 → 1.00): today's split sends a sixth of the
   conversations to the card that serves them several times slower.
-- **Proxied prefill to the assumed WhiteWorld hurts** on reads (gap p95
-  96 s): its prefill at a 9 GB zone is slow, and the queue it builds waits on
-  the snapshot crossing. Whether it pays depends on WhiteWorld's real prefill
-  rate, which is the next measurement.
-- **Earliest declared finish is the best single policy** on every mix but
+- **Earliest advertised finish is the best single policy** on every mix but
   read's first-token tail, and it is the simplest to build: each member
-  computes its own figure and the gateway compares numbers.
+  computes its own figure and the gateway compares numbers. It moves a lease
+  at most three times a run, and only to a member already holding the state.
 - Every result assumes the member's own scheduler forms full-width prefills;
   production forwards average ~200 tokens (§1), which no placement fixes.

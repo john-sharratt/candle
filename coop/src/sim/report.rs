@@ -42,6 +42,9 @@ pub struct Report {
     pub per_member: Vec<usize>,
     pub link_gb: f64,
     pub restarted: usize,
+    /// Turns whose lease went to a different member than the conversation's
+    /// previous turn ran on.
+    pub moves: usize,
 }
 
 /// The `q` quantile of `xs`, nearest rank.
@@ -100,6 +103,12 @@ impl Report {
         for r in records {
             per_member[r.member] += 1;
         }
+        let mut ordered: Vec<&TurnRecord> = records.iter().collect();
+        ordered.sort_by_key(|r| (r.conversation, r.turn));
+        let moves = ordered
+            .windows(2)
+            .filter(|w| w[0].conversation == w[1].conversation && w[0].member != w[1].member)
+            .count();
         Report {
             policy,
             turns: records.len(),
@@ -113,6 +122,7 @@ impl Report {
             per_member,
             link_gb: link_bytes / 1e9,
             restarted: records.iter().filter(|r| r.restarted).count(),
+            moves,
         }
     }
 }
@@ -168,5 +178,15 @@ mod tests {
         assert!((r.fairness - 0.9).abs() < 1e-12);
         assert_eq!(r.per_member, vec![1, 1]);
         assert_eq!(r.link_gb, 2.0);
+        assert_eq!(r.moves, 0, "two conversations, one turn each");
+    }
+
+    /// A conversation whose second turn ran elsewhere moved once.
+    #[test]
+    fn a_turn_elsewhere_is_a_move() {
+        let mut second = turn(0, 1, 5.0, 9.0);
+        second.turn = 1;
+        let r = Report::of("p", &[turn(0, 0, 0.0, 4.0), second], 2, 0.0, 0.0);
+        assert_eq!(r.moves, 1);
     }
 }
