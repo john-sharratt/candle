@@ -70,6 +70,24 @@ pub fn ceiling_regions(
     (usable / REGION_BYTES).min(total)
 }
 
+/// The regions a **durable** claim may reach, of `total`, while the weight zone
+/// holds `zone_bytes` against the `defended` residency: all but the band the zone
+/// is still owed, which it grows back into.
+///
+/// **Ground a transient bought past the defence must come back.** A wave's tier
+/// may concede the zone past its defended residency (`TransientPurchase`), and
+/// its ground is free again when the forward ends — but free to anyone, and a
+/// durable claim took it before the weight side grew back: an arena placed there
+/// holds it for its life. Measured on the RTX 3090 (2026-10-18): the zone at
+/// 3.2 GB against 6.7 GB defended, the defence worn down one concession at a
+/// time. Capping durable claims below the owed band keeps that ground the
+/// weight side's to retake; a claim that needs it meets a full span and waits,
+/// as a claim past the defence always should.
+pub fn defended_ceiling(total: usize, zone_bytes: usize, defended: usize) -> usize {
+    let owed = defended.saturating_sub(zone_bytes).div_ceil(REGION_BYTES);
+    total.saturating_sub(owed)
+}
+
 /// Whether `[base, base + len)` is ground the tier may stand on, or the bytes by
 /// which it is not.
 ///
@@ -217,5 +235,34 @@ mod tests {
         assert_eq!(claimable(0, 100, 40), 0);
         assert_eq!(claimable(7, 100, 40), 7, "the free list is still claimable");
         assert_eq!(claimable(0, 40, 100), 60);
+    }
+
+    /// **Durable claims stop short of the band the weight zone is owed.** The
+    /// 3090's shape (2026-10-18): 827 regions below the floor, the zone at
+    /// 3.2 GB against 6.7 GB defended — 3.5 GB, 224 regions, it was owed and
+    /// could not retake because arenas had taken that ground.
+    #[test]
+    fn durable_claims_stop_short_of_the_owed_band() {
+        const GB: usize = 1_000_000_000;
+        let owed = (67 * GB / 10 - 32 * GB / 10).div_ceil(REGION_BYTES);
+        assert_eq!(
+            defended_ceiling(827, 32 * GB / 10, 67 * GB / 10),
+            827 - owed
+        );
+        assert_eq!(
+            defended_ceiling(827, 32 * GB / 10, 0),
+            827,
+            "nothing defended"
+        );
+        assert_eq!(
+            defended_ceiling(827, 7 * GB, 67 * GB / 10),
+            827,
+            "a zone at its defence is owed nothing"
+        );
+        assert_eq!(
+            defended_ceiling(10, 0, usize::MAX / 2),
+            0,
+            "never below zero"
+        );
     }
 }

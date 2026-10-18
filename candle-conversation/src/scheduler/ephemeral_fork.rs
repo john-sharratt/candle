@@ -34,7 +34,7 @@ pub(super) struct ParkedFork {
 impl Scheduler {
     /// Whether a turn is in flight on `parent`: a view carved from it is alive.
     fn turn_in_flight(&self, parent: SequenceId) -> bool {
-        self.turn_views.values().any(|v| v.parent_id == parent)
+        self.turn_views.values().any(|v| v.parent_id == parent) || self.owes_view(parent)
     }
 
     /// Answer a fork request now, or park it until the turn on `parent` ends.

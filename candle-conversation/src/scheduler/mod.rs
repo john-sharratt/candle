@@ -59,6 +59,7 @@ pub(crate) mod projection_assembler;
 mod projection_identity;
 pub mod relief_trace;
 mod reproject_abandon;
+mod reproject_owed;
 mod run;
 mod sample;
 mod seal_scan;
@@ -3601,6 +3602,9 @@ pub(crate) struct Scheduler {
     /// Ephemeral-fork requests whose parent had a turn in flight when they
     /// arrived, answered at the turn boundary. See [`ephemeral_fork`].
     parked_forks: Vec<ephemeral_fork::ParkedFork>,
+    /// Reprojected turns waiting for the ground to carve their new view
+    /// ([`reproject_owed`]).
+    owed_views: Vec<reproject_owed::OwedView>,
 
     /// Continuous-fair-wave prefill cohort (`docs/continuous_fair_waves.md`): the
     /// in-flight prefill batch's inter-layer residual, held between steps in its
@@ -3961,6 +3965,7 @@ impl Scheduler {
             deferred_glue_fires: Vec::new(),
             stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
+            owed_views: Vec::new(),
             wave_prefill_residual: None,
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
@@ -10064,7 +10069,7 @@ impl Scheduler {
     /// wave would make no progress and the wave's members must be failed
     /// instead of retried.
     pub(super) fn note_refused_width(&mut self, rows: usize, short: usize) -> bool {
-        let ground = self.model.prefill_ground_bytes().unwrap_or(0);
+        let ground = self.frontier_tier_bytes().unwrap_or(0);
         match RefusedWidth::after(rows, ground, short, CHUNK_SIZE) {
             Some(w) => {
                 tracing::warn!(
@@ -10085,14 +10090,30 @@ impl Scheduler {
     /// by what the refused tier was short — see [`RefusedWidth::lapsed`].
     pub(super) fn settle_refused_width(&mut self) {
         if let Some(w) = self.refused_width {
-            if self
-                .model
-                .prefill_ground_bytes()
-                .is_none_or(|g| w.lapsed(g))
-            {
+            if self.frontier_tier_bytes().is_none_or(|g| w.lapsed(g)) {
                 self.refused_width = None;
             }
         }
+    }
+
+    /// The ground a wave's tier can stand on: the regions between the arena
+    /// frontier and the weight floor, and what the weight side would concede
+    /// past it.
+    ///
+    /// **Not [`ManagedBatchedModel::prefill_ground_bytes`]**, which counts every
+    /// free region — holes below the frontier too. Those are KV ground, never a
+    /// tier's: the tier stands at the frontier. A refused width recorded and
+    /// lapsed against them lapsed with the tier no closer to fitting. Measured on
+    /// the RTX 3090 (2026-10-18): 3,450 rows refused, 2,588 refused, then 3,450
+    /// composed again, 4,210 times over 27 s, with 114 holes below the frontier.
+    pub(super) fn frontier_tier_bytes(&self) -> Option<usize> {
+        let stats = self.session.kv_region_stats()?;
+        Some(admit::pass_budget::frontier_tier_ground(
+            stats.total,
+            stats.live_watermark,
+            self.model.reclaimable_kv_bytes(),
+            candle_nn::kv_cache::REGION_BYTES,
+        ))
     }
 
     fn pass_budget_under(&self, target: usize) -> usize {
@@ -12080,57 +12101,44 @@ impl Scheduler {
         inject_span.end();
         let inject_ms = t_inject.elapsed().as_millis() as u64;
 
-        // Carve a fresh view from the rebuilt parent.  Empty
-        // `effective_ranges` means "borrow every chunk".
+        // Carve a fresh view from the rebuilt parent, borrowing every chunk, and
+        // re-bind the turn to it. The active turn's content starts where the new
+        // prefix ends — `cleanup_finished`'s seal extracts
+        // `parent[turn_start_parent_blocks..end]` to produce the substrate turn
+        // entry, so the anchor excludes the freshly-injected sections / turns
+        // and includes the tail. A fork the span refuses for ground parks the
+        // turn whole until a later pass can carve it (`reproject_owed`).
         let parent_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
-        let effective_ranges: Vec<BlockRange> = if parent_block_count == 0 {
-            Vec::new()
-        } else {
-            vec![BlockRange::new(0, parent_block_count)]
-        };
         let t_view = Instant::now();
         let view_span = profile::span("reproject:create_view");
-        let (new_view_id, new_borrowed) = or_abandon!(
-            self,
+        let carved = self.carve_owed_view(reproject_owed::OwedView {
             view_id,
             parent_id,
             decode_state,
-            false,
-            self.create_view(parent_id, &effective_ranges)
-        );
+            sampling_state,
+            turn_start_parent_blocks: new_prefix_block_count,
+            question_tokens,
+            applied_identity,
+            since: Instant::now(),
+        })?;
         view_span.end();
         let view_ms = t_view.elapsed().as_millis() as u64;
-        // Diagnostic log: the new view's slot index may have been
-        // recycled from the freed old view's slot; drop any stale
-        // entry under the new id before decode resumes.
-        self.slot_tokens.remove(&new_view_id);
-        self.turn_views.insert(
-            new_view_id,
-            ViewState {
-                parent_id,
-                original_borrowed: new_borrowed,
-                // The active turn's content starts where the new
-                // prefix ends — `cleanup_finished`'s seal extracts
-                // `parent[turn_start_parent_blocks..end]` to produce
-                // the substrate turn entry, so this anchor must
-                // exclude the freshly-injected sections / turns and
-                // include the tail.
-                turn_start_parent_blocks: new_prefix_block_count,
-                question_tokens,
-                applied_identity,
-                state_forked: true,
-            },
-        );
-
-        // Re-bind DecodeState and sampling state to the new view id.
-        // `create_view` already seeded a fresh sampling state from
-        // parent for the new view; replace it with the live one
-        // carried across from the old view so DRY history and
-        // per-turn counters survive.
-        self.active_decodes.insert(new_view_id, decode_state);
-        if let Some(state) = sampling_state {
-            self.sampling_states.insert(new_view_id, state);
-        }
+        let new_view_id = match carved {
+            Ok(new_view_id) => new_view_id,
+            Err(owed) => {
+                tracing::info!(
+                    target: "candle_conversation::scheduler::reproject",
+                    view_id = view_id.0,
+                    "reprojected turn waits for ground to carve its view"
+                );
+                self.owed_views.push(owed);
+                return Ok(view_id);
+            }
+        };
+        let new_borrowed = self
+            .turn_views
+            .get(&new_view_id)
+            .map_or(BlockCount(0), |v| v.original_borrowed);
         // True end-to-end wall-clock of the whole reproject (prepare → wave →
         // complete), so the phase fields below — which are individually disjoint
         // but separated by the shared glue wave — can be read against a real
@@ -15986,6 +15994,7 @@ mod tests {
     mod faulted_turn;
     mod refused_decode_tier;
     mod reproject_abandoned;
+    mod reproject_owed;
     mod speculation_exits;
     mod speculation_in_a_grammar;
 

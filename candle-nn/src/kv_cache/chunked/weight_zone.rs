@@ -61,46 +61,60 @@ pub fn defended_weight_bytes() -> usize {
     DEFENDED_WEIGHT_BYTES.load(Ordering::Relaxed)
 }
 
-/// Tier purchases in progress ([`TierPurchase`]).
-static TIER_PURCHASES: AtomicUsize = AtomicUsize::new(0);
+/// Transient purchases in progress ([`TransientPurchase`]).
+static TRANSIENT_PURCHASES: AtomicUsize = AtomicUsize::new(0);
 
-/// **A transient tier buys past the defence; a durable claim does not.**
+/// **Ground a forward holds only briefly buys past the defence; a durable claim
+/// does not.**
 ///
 /// The defence is against KV that stays: a claim past it holds the zone down
-/// for as long as its arena lives. A wave's tier is gone when its forward ends
-/// and the weight side grows back into what it frees, so conceding to it costs
-/// a few promotions — while refusing it mid-sweep fails a creep cohort whose
-/// width can no longer change. Measured on the 3090 (2026-10-18): the zone at
-/// its 3,419-slot defence, a 3,537-row creep three regions short at its fourth
-/// window, four retries in 4 ms with nothing to change, 21 file ingests failed.
-/// Pricing still reads the defended floor ([`WeightZone::min_capacity`]), so a
-/// cohort is fitted as if the defence held and only the forecast's error
-/// reaches into it.
+/// for as long as its arena lives. A wave's tier is gone when its forward ends,
+/// and a recurrent store's prefill scratch when its sequence next runs with no
+/// long span, and the weight side grows back into what they free — so conceding
+/// to them costs a few promotions, while refusing them fails turns that did
+/// nothing wrong. Measured on the 3090 (2026-10-18): the zone at its 3,419-slot
+/// defence, a 3,537-row creep three regions short at its fourth window, four
+/// retries in 4 ms with nothing to change, 21 file ingests failed; and later a
+/// write turn's closing tail failed claiming its 36-slot scratch with the zone
+/// 381 slots above its static floor. Pricing still reads the defended floor
+/// ([`WeightZone::min_capacity`]), so a cohort is fitted as if the defence held
+/// and only the forecast's error reaches into it.
 ///
-/// Held across one placement's purchases. Process-wide, as the defence is: the
+/// Held across one claim's purchases. Process-wide, as the defence is: the
 /// concession runs on the pipeline thread, not the buyer's.
-pub(crate) struct TierPurchase(());
+pub struct TransientPurchase(());
 
-impl TierPurchase {
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    pub(crate) fn begin() -> Self {
-        TIER_PURCHASES.fetch_add(1, Ordering::AcqRel);
+impl TransientPurchase {
+    pub fn begin() -> Self {
+        TRANSIENT_PURCHASES.fetch_add(1, Ordering::AcqRel);
         Self(())
     }
 }
 
-impl Drop for TierPurchase {
+impl Drop for TransientPurchase {
     fn drop(&mut self) {
-        TIER_PURCHASES.fetch_sub(1, Ordering::AcqRel);
+        TRANSIENT_PURCHASES.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-/// The defence a retraction honours now: none while a tier is buying.
+/// Whether a [`TransientPurchase`] is held anywhere in the process.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn transient_purchase_open() -> bool {
+    TRANSIENT_PURCHASES.load(Ordering::Acquire) > 0
+}
+
+/// The defence a retraction honours now: none while transient ground is buying.
 fn retraction_defence() -> usize {
-    if TIER_PURCHASES.load(Ordering::Acquire) > 0 {
+    defence_during(transient_purchase_open(), defended_weight_bytes())
+}
+
+/// The `defended` residency a retraction honours, with or without a transient
+/// purchase `open`.
+fn defence_during(open: bool, defended: usize) -> usize {
+    if open {
         0
     } else {
-        defended_weight_bytes()
+        defended
     }
 }
 
@@ -355,7 +369,7 @@ impl WeightZone {
     }
 
     /// The floor a retraction may go to now: [`Self::min_capacity`], less the
-    /// defence while a transient tier is buying ([`TierPurchase`]). Pricing
+    /// defence while transient ground is buying ([`TransientPurchase`]). Pricing
     /// reads [`Self::min_capacity`]; only a retraction reads this.
     pub fn retraction_capacity(&self) -> usize {
         retraction_floor(
@@ -708,6 +722,27 @@ mod tests {
             2_000,
             "never past the zone's limit"
         );
+    }
+
+    /// **Transient ground buys down to the static floor; nothing else does.**
+    /// The 3090's shape at 08:18 (2026-10-18): a 1,537-slot static floor, the
+    /// defence at 1,918 slots of 1.99 MB, and a write turn's 36-slot prefill
+    /// scratch refused there with 381 slots between the two.
+    #[test]
+    fn a_transient_purchase_retracts_past_the_defence_to_the_static_floor() {
+        let slot = 1_990_000;
+        let defended = 1_918 * slot;
+        let floor =
+            |open| retraction_floor(1_537, defence_during(open, defended), slot, 25_088, 4_000);
+        assert_eq!(floor(false), 1_918, "a durable claim meets the defence");
+        assert_eq!(
+            floor(true),
+            1_537,
+            "transient ground reaches the static floor"
+        );
+        let held = TransientPurchase::begin();
+        assert!(transient_purchase_open(), "open while it is held");
+        drop(held);
     }
 
     const SLOT: usize = 3 * 1024 * 1024;

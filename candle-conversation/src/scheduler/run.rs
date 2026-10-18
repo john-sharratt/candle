@@ -726,6 +726,10 @@ impl Scheduler {
             // (`prefill_wait`).
             self.report_prefill_waits();
 
+            // 2c. A reprojected turn the span could not carve a view for is
+            // tried again (`reproject_owed`).
+            self.retry_owed_views();
+
             // 3. If idle, block waiting for work. Deferred glue counts as work: the
             // unified wave step scatters it (`take_wave_glue`), so don't block while
             // any is pending or it would never be consumed.
@@ -756,8 +760,16 @@ impl Scheduler {
                 // isn't mislabeled as Blocked in the GUI.
                 let t_idle = Instant::now();
                 // A queued warm-up is work too: wait only as long as it allows,
-                // then go round to score its next replayed turn.
-                let req = if let Some(wait) = self.norm_warm_wait() {
+                // then go round to score its next replayed turn. So is a turn
+                // owed its view: the settle above is what may have freed its
+                // ground, and nothing else will wake the loop to carve it.
+                let owed_wait =
+                    (!self.owed_views.is_empty()).then_some(super::reproject_owed::OWED_VIEW_RETRY);
+                let wait = match (self.norm_warm_wait(), owed_wait) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                let req = if let Some(wait) = wait {
                     match self.rx.recv_timeout(wait) {
                         Ok(req) => req,
                         Err(flume::RecvTimeoutError::Timeout) => {

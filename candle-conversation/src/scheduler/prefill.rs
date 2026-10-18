@@ -610,6 +610,18 @@ impl Scheduler {
         settle_passes(|| self.pack_kv_pools(goal))
     }
 
+    /// Lower the frontier for a tier the partition just refused: the KV pools
+    /// packed for ground, then the span tenant on top moved into the holes. The
+    /// tier stands at the frontier, so holes below it are no room until a pass
+    /// brings the frontier down to them. Each pass's own gate decides whether it
+    /// runs, and a pass the stall gate holds is not repeated.
+    pub(super) fn pack_for_refused_tier(&mut self) {
+        self.pack_until_settled(PackGoal::Ground);
+        if let Some((shape, FrontierPass::SpanTenants)) = self.frontier_pass() {
+            self.pack_span_tenants_judged(shape);
+        }
+    }
+
     /// One KV compaction pass if the pools are fragmented enough to be worth it, then
     /// the weight side's reclaim — what [`Self::compact_kv_if_fragmented`] paces and
     /// relief runs directly. The span tenants are not packed here; see
@@ -2818,7 +2830,16 @@ impl Scheduler {
                 return;
             };
             let need = (tier as usize).saturating_add(rows.saturating_mul(kv_row));
-            let Some(target) = fitted_rows(rows, need, ground) else {
+            // The KV the cohort writes may fill holes below the frontier; its
+            // tier may not, so the tier alone fits the frontier's ground too.
+            let at_frontier = self
+                .frontier_tier_bytes()
+                .and_then(|g| fitted_rows(rows, tier as usize, g));
+            let Some(target) = [fitted_rows(rows, need, ground), at_frontier]
+                .into_iter()
+                .flatten()
+                .min()
+            else {
                 return;
             };
             tracing::debug!(
@@ -3750,6 +3771,16 @@ impl Scheduler {
                         error = %e,
                         "creep window failed mid-sweep; holding the sweep to retry it"
                     );
+                    // **A refused tier is retried over packed ground**, not the
+                    // ground that refused it. The retries come milliseconds
+                    // apart, inside the wave loop's compaction interval, so
+                    // without this nothing between them could make room: on the
+                    // RTX 3090 (2026-10-18) the zone at its static floor, a creep
+                    // three regions short at the frontier with 114 holes below
+                    // it, four retries in 25 ms, and its file ingests failed.
+                    if tier_refusal_shortfall(&e).is_some() {
+                        self.pack_for_refused_tier();
+                    }
                     return Err(e);
                 }
                 self.wave_sweep_failures = 0;
