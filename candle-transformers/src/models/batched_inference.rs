@@ -5479,6 +5479,9 @@ pub trait ManagedBatchedModel {
         // the per-sequence block clones. Spanned so the step's CPU time is
         // covered end to end — `spec:setup` + `spec:verify` + `spec:gather` +
         // `spec:accept` should now sum to the step.
+        // The whole step — draft, verify, accept, rollback and every gap between
+        // them — as one range, so a trace can take exactly one step's kernels.
+        let _step = span("spec:step");
         let t_setup = std::time::Instant::now();
         if seqs.len() != committed.len()
             || seqs.len() != emits.len()

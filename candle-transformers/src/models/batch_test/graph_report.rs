@@ -19,12 +19,17 @@ pub(crate) fn graph_line(before: &CaptureStats, after: &CaptureStats) -> String 
     let recording_us = after.recording_us - before.recording_us;
     let eager = after.eager_segments - before.eager_segments;
     let leased = after.leased_eager - before.leased_eager;
+    let banned = after.banned - before.banned;
+    let benched = after.benched - before.benched;
+    let reopened = after.reopened - before.reopened;
+    let (phase, held) = (after.phase.name(), after.execs_held);
     let per = |n: u64, d: u64| if d == 0 { 0.0 } else { n as f64 / d as f64 };
     format!(
         "  graphs: {waves} waves, {:.1} segments/wave, {:.1} launches/segment, \
          {updated} updated in place ({reshaped} reshaped), {instantiated} instantiated; \
          fold µs each: in place {:.1}, reshaped {:.1}, instantiated {:.1}; \
-         recording µs/segment {:.1}; {eager} run as issued ({leased} behind a lease)",
+         recording µs/segment {:.1}; {eager} run as issued ({leased} behind a lease); \
+         library {phase}, {held} held, {banned} banned, {benched} benched, {reopened} reopened",
         per(segments, waves),
         per(nodes, segments),
         per(in_place_us, updated - reshaped),
@@ -79,7 +84,8 @@ mod tests {
             "  graphs: 4 waves, 41.0 segments/wave, 25.0 launches/segment, \
              162 updated in place (7 reshaped), 2 instantiated; \
              fold µs each: in place 50.0, reshaped 500.0, instantiated 500.0; \
-             recording µs/segment 100.0; 7 run as issued (3 behind a lease)"
+             recording µs/segment 100.0; 7 run as issued (3 behind a lease); \
+             library learn, 0 held, 0 banned, 0 benched, 0 reopened"
         );
     }
 
@@ -91,7 +97,8 @@ mod tests {
             "  graphs: 0 waves, 0.0 segments/wave, 0.0 launches/segment, \
              0 updated in place (0 reshaped), 0 instantiated; \
              fold µs each: in place 0.0, reshaped 0.0, instantiated 0.0; \
-             recording µs/segment 0.0; 0 run as issued (0 behind a lease)"
+             recording µs/segment 0.0; 0 run as issued (0 behind a lease); \
+             library learn, 0 held, 0 banned, 0 benched, 0 reopened"
         );
     }
 }
