@@ -856,8 +856,11 @@ argument but `app` and `build` is optional.
   pushed first;
 - the source does not hold `build`, or is not connected;
 - no quorum is reachable, because the rollout is decided by Paxos (below);
-- `parallel` is more than the ready members minus the quorum, so Paxos stays available
-  while members restart (§5.9).
+- `parallel` is more than the ready members can lose and still make the quorum, so
+  Paxos stays available while members restart (§5.9). The seats are counted as Paxos
+  counts them: a gateway's tie-break vote fills the empty seat of a group of two, so
+  such a group rolls out one member at a time — without it, a two-member group could
+  never be rolled out by hand at all, not even back to an older build in an emergency.
 
 **The gateway answers with a plan before anything moves:**
 

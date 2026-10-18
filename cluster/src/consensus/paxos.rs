@@ -134,7 +134,7 @@ enum Phase {
 /// seat of a group of two, and no other group: a quorum of two is also three
 /// members' majority, and one member plus a gateway must not decide there
 /// while the other two decide on their own.
-fn seats(quorum: usize, tiebreak_counts: bool, members: usize, tiebreaks: usize) -> usize {
+pub fn seats(quorum: usize, tiebreak_counts: bool, members: usize, tiebreaks: usize) -> usize {
     let extra = usize::from(tiebreak_counts && quorum == 2 && members >= 1 && tiebreaks >= 1);
     members + extra
 }

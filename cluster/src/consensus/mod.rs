@@ -24,6 +24,6 @@ pub mod votes;
 
 pub use acceptor::DECIDED;
 pub use clock::Millis;
-pub use paxos::{Config, KeyStatus, Out, Paxos, HOLDER_MARGIN};
+pub use paxos::{seats, Config, KeyStatus, Out, Paxos, HOLDER_MARGIN};
 pub use quorum::{Change, MaxMembers};
 pub use value::{Value, MAX_DECISION};

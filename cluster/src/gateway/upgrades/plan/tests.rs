@@ -127,6 +127,7 @@ fn a_downgrade_is_planned_member_by_member() {
         &members,
         Some(&b(12)),
         3,
+        false,
         &[b12.clone(), b13.clone(), b10.clone()],
         7,
     )
@@ -192,7 +193,7 @@ fn a_downgrade_across_a_new_record_type_is_stranded() {
             upgrade: Some(&other),
         },
     ];
-    let p = plan(&ask("10-h10"), &members, Some(&b(12)), 1, &[], 0).unwrap();
+    let p = plan(&ask("10-h10"), &members, Some(&b(12)), 1, false, &[], 0).unwrap();
     assert!(p.targets.is_empty());
     assert_eq!(p.stranded.len(), 2);
     assert!(p.stranded[0]
@@ -240,22 +241,24 @@ fn a_rollout_is_refused_outright_when_it_cannot_run() {
         },
     ];
     assert_eq!(
-        plan(&ask("10-h10"), &members, Some(&b(12)), 3, &[], 0).unwrap_err(),
+        plan(&ask("10-h10"), &members, Some(&b(12)), 3, false, &[], 0).unwrap_err(),
         "no quorum: 2 members ready, 3 needed to decide the rollout"
     );
     let wide = Ask {
         parallel: 2,
         ..ask("10-h10")
     };
-    assert!(plan(&wide, &members, Some(&b(12)), 1, &[], 0)
+    assert!(plan(&wide, &members, Some(&b(12)), 1, false, &[], 0)
         .unwrap_err()
-        .starts_with("parallel 2 is more than the 2 ready members less the quorum of 1"));
+        .starts_with(
+            "parallel 2 is more than the 2 ready members can spare and keep the quorum of 1"
+        ));
     let from2 = Ask {
         from: Some(2),
         ..ask("10-h10")
     };
     assert_eq!(
-        plan(&from2, &members, Some(&b(12)), 1, &[], 0).unwrap_err(),
+        plan(&from2, &members, Some(&b(12)), 1, false, &[], 0).unwrap_err(),
         "m2 does not hold 10-h10"
     );
     let from9 = Ask {
@@ -263,13 +266,72 @@ fn a_rollout_is_refused_outright_when_it_cannot_run() {
         ..ask("10-h10")
     };
     assert_eq!(
-        plan(&from9, &members, Some(&b(12)), 1, &[], 0).unwrap_err(),
+        plan(&from9, &members, Some(&b(12)), 1, false, &[], 0).unwrap_err(),
         "member 0000000000000009 is not connected"
     );
-    assert!(plan(&ask("10-h10"), &members, Some(&b(12)), 1, &[], 0)
-        .unwrap_err()
-        .contains("is a local build"));
-    assert!(plan(&ask("ten"), &members, None, 1, &[], 0)
+    assert!(
+        plan(&ask("10-h10"), &members, Some(&b(12)), 1, false, &[], 0)
+            .unwrap_err()
+            .contains("is a local build")
+    );
+    assert!(plan(&ask("ten"), &members, None, 1, false, &[], 0)
         .unwrap_err()
         .contains("is not a build"));
+}
+
+/// **A group of two with a gateway tie-break can roll out, one member at a
+/// time** (§5.9). The gateway's vote fills the seat of the member restarting,
+/// as consensus counts it, so the plan gets past its availability checks —
+/// here to the source's own refusal, a local build — where without the
+/// tie-break it is refused for having no member to spare. Two at once is still
+/// refused, and so is any step once only one member is ready.
+#[test]
+fn a_two_member_group_rolls_one_at_a_time_on_the_tiebreak() {
+    let b12 = b(12);
+    let local = BuildId {
+        local: "abcd".into(),
+        ..b(10)
+    };
+    let holder = view(
+        "linux-x86_64",
+        &[1],
+        vec![hold("10-h10", "zend", "linux-x86_64", "running", &[1])],
+    );
+    let empty = view("linux-x86_64", &[1], vec![]);
+    let pair = |second_ready: bool| {
+        [
+            Member {
+                node: 1,
+                host: "m1",
+                build: &local,
+                ready: true,
+                upgrade: Some(&holder),
+            },
+            Member {
+                node: 2,
+                host: "m2",
+                build: &b12,
+                ready: second_ready,
+                upgrade: Some(&empty),
+            },
+        ]
+    };
+    let both = pair(true);
+    assert!(plan(&ask("10-h10"), &both, Some(&b(12)), 2, false, &[], 0)
+        .unwrap_err()
+        .contains("can spare"));
+    assert!(plan(&ask("10-h10"), &both, Some(&b(12)), 2, true, &[], 0)
+        .unwrap_err()
+        .contains("is a local build"));
+    let wide = Ask {
+        parallel: 2,
+        ..ask("10-h10")
+    };
+    assert!(plan(&wide, &both, Some(&b(12)), 2, true, &[], 0)
+        .unwrap_err()
+        .contains("can spare"));
+    let one = pair(false);
+    assert!(plan(&ask("10-h10"), &one, Some(&b(12)), 2, true, &[], 0)
+        .unwrap_err()
+        .contains("can spare"));
 }

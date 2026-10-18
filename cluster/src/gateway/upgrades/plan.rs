@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 
+use crate::consensus::seats;
 use crate::coord::UpgradeView;
 use crate::frame::BuildId;
 use crate::upgrade::compat::{check, Needs};
@@ -80,11 +81,19 @@ fn hex(node: u64) -> String {
 
 /// The plan for `ask` over `members`, against the app's `floor`, `quorum`,
 /// and the builds the app runs or was certifying (`seen`); or why not.
+///
+/// `tiebreak` is whether a gateway votes as the tie-break (§5.9). Its seat is
+/// counted exactly as consensus counts it ([`seats`]): it fills the empty seat
+/// of a group of two, so such a group still decides — and a rollout can
+/// restart one member at a time — with one member away. Not counting it made
+/// every forced rollout of a two-member group impossible, an emergency
+/// downgrade among them.
 pub fn plan(
     ask: &Ask,
     members: &[Member<'_>],
     floor: Option<&BuildId>,
     quorum: usize,
+    tiebreak: bool,
     seen: &[BuildId],
     at_ms: u64,
 ) -> Result<Plan, String> {
@@ -97,16 +106,23 @@ pub fn plan(
     };
     let name = build_name(&build);
     let ready = members.iter().filter(|m| m.ready).count();
-    if ready < quorum {
+    let voting = |members: usize| seats(quorum, tiebreak, members, usize::from(tiebreak));
+    if voting(ready) < quorum {
         return Err(format!(
             "no quorum: {ready} members ready, {quorum} needed to decide the rollout"
         ));
     }
+    // The members a step may take down at once, while those left — and the
+    // tie-break's seat — still make the quorum.
     let parallel = ask.parallel.max(1);
-    if parallel as usize > ready - quorum {
+    let spare = (0..=ready)
+        .rev()
+        .find(|down| voting(ready - down) >= quorum)
+        .unwrap_or(0);
+    if parallel as usize > spare {
         return Err(format!(
-            "parallel {parallel} is more than the {ready} ready members less the quorum of \
-             {quorum}: consensus must stay available while members restart"
+            "parallel {parallel} is more than the {ready} ready members can spare and keep \
+             the quorum of {quorum}: consensus must stay available while members restart"
         ));
     }
     // The source: the member named, or the first that holds the build.

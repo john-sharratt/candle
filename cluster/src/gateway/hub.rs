@@ -962,7 +962,20 @@ impl Hub {
                 upgrade: view.as_ref(),
             })
             .collect();
-        plan(ask, &members, floor.as_ref(), quorum, &seen, now_ms())
+        let tiebreak = self
+            .tiebreak
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        plan(
+            ask,
+            &members,
+            floor.as_ref(),
+            quorum,
+            tiebreak,
+            &seen,
+            now_ms(),
+        )
     }
 
     /// `cancel-floor` (§12.4): discard `app`'s pending floor.
