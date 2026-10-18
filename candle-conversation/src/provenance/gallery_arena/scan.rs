@@ -1373,9 +1373,14 @@ mod tests {
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
-        // Several turns of differing length, so the runs are ragged.
-        let turns: Vec<Vec<WideQSig>> = (0..5u64)
-            .map(|t| (0..(14 + t * 9)).map(|k| sig((t << 32) + k)).collect())
+        // Enough 64-page turns to fill an arena and spill into the next, so the
+        // pass has an arena it can empty (`plan_slot_moves` moves nothing it
+        // cannot empty an arena with).
+        let per_arena = candle_nn::kv_cache::REGION_BYTES
+            / candle_nn::kv_cache::slot_stride(arena.page_bytes as usize);
+        let turn_tokens = (64 * super::super::PAGE_TOKENS) as u64;
+        let turns: Vec<Vec<WideQSig>> = (0..(per_arena / 64 + 3) as u64)
+            .map(|t| (0..turn_tokens).map(|k| sig((t << 32) + k)).collect())
             .collect();
         let windows: Vec<PagedWindow<'_>> = turns
             .iter()
@@ -1399,11 +1404,12 @@ mod tests {
             .scan_weighted(&segments, &[probe.as_slice()], &[])
             .unwrap();
 
-        // Scatter: drop two turns from the middle of the corpus, leaving holes
-        // under live pages, then pack. `scan_weighted` unpinned on its way out, so
-        // every survivor is movable.
-        arena.drop_turn(turn_stream_id(41, 0));
-        arena.drop_turn(turn_stream_id(43, 0));
+        // Scatter: drop the first arena's first turns, leaving more holes under
+        // live pages than the second arena holds, then pack. `scan_weighted`
+        // unpinned on its way out, so every survivor is movable.
+        for i in 0..4u64 {
+            arena.drop_turn(turn_stream_id(40 + i, 0));
+        }
         let report = arena.compact(0).unwrap();
         assert!(report.moved > 0, "nothing moved, so nothing is proven");
 
