@@ -1090,6 +1090,7 @@ impl InferenceState {
         cluster: Option<Join>,
         status_tx: watch::Sender<String>,
         progress: Arc<LoadProgress>,
+        loading_substrate: Arc<RwLock<Option<Conversation>>>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         // The workspace folder: where the substrate, the schema override and a
         // mind's section folders live. Repositories are reached through
@@ -1457,6 +1458,9 @@ impl InferenceState {
             elapsed_ms = t_reload_wait.elapsed().as_millis() as u64,
             "load timing: substrate reload overhang (redo-log replay past the weight load)",
         );
+        // Replayed: the substrate views can read it from here, while the rest of
+        // the load runs (`ZendSession::substrate_for_views`).
+        *loading_substrate.write().unwrap() = Some(engine.conversation());
 
         // Reclaim is normally fully background: the segmented log's
         // persistence-thread maintenance pass drops / compacts / combines
@@ -5160,6 +5164,10 @@ pub struct ZendSession {
     started_at_ms: u64,
     /// Populated in the background after construction; None until model loads.
     inference: Arc<RwLock<Option<Arc<InferenceState>>>>,
+    /// The substrate, published by the load once its redo log has replayed —
+    /// long before the engine is: what the substrate views read while zend is
+    /// still loading (`substrate_for_views`).
+    loading_substrate: Arc<RwLock<Option<Conversation>>>,
     /// Handle to the `zend-loader` thread. [`Self::shutdown`] joins it so an
     /// in-progress load has broken its ingest and drained the engine (on the
     /// loader thread, which owns it) before the process exits.
@@ -5315,6 +5323,7 @@ impl ZendSession {
             .unwrap_or(0);
         Self {
             inference: Arc::new(RwLock::new(None)),
+            loading_substrate: Arc::new(RwLock::new(None)),
             config,
             projection_builder,
             ready_tx,
@@ -5564,14 +5573,30 @@ impl ZendSession {
         ))
     }
 
+    /// What the substrate views read: the substrate, the titler's timeline they
+    /// leave out, and the target layer — the loaded engine's, or while zend is
+    /// still loading the substrate the load published once its redo log
+    /// replayed, with no titler or target layer built yet. `None` before the
+    /// replay has finished.
+    fn substrate_for_views(&self) -> Option<(Conversation, Option<TimelineId>, String)> {
+        if let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) {
+            let target_layer = state.base_conv.lock().unwrap().target_layer_name();
+            // Clone the handle out, dropping the engine lock at once.
+            let conv = state.engine.lock().unwrap().conversation();
+            return Some((conv, Some(state.titler_timeline), target_layer));
+        }
+        let conv = self.loading_substrate.read().unwrap().clone()?;
+        Some((conv, None, String::new()))
+    }
+
     /// `GET /v1/substrate` — a structural snapshot of the live substrate for the
     /// viewer: on-disk size, live counts, and the projection hierarchy (layers →
     /// conversations). Reads the shared `Substrate` through a cloned
     /// `Conversation` handle (engine lock released immediately, only the
     /// substrate read guard held for the walk), never a rebuild from the log.
-    /// `None` until the model is loaded.
+    /// Answers while zend is still loading, once its substrate has replayed.
     pub fn substrate_overview(&self) -> Option<SubstrateOverview> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let (conv, titler, target_layer) = self.substrate_for_views()?;
 
         // Projection schema — the builder parsed once at session construction, no
         // lock held (and no per-request re-parse).
@@ -5580,14 +5605,6 @@ impl ZendSession {
         // On-disk footprint (fs stat, no lock).
         let (segments, total_bytes) = self.substrate_segment_files();
 
-        let titler = state.titler_timeline;
-        let target_layer = {
-            let base = state.base_conv.lock().unwrap();
-            base.target_layer_name()
-        };
-
-        // Clone the handle out (drop the engine lock), then read the substrate.
-        let conv = { state.engine.lock().unwrap().conversation() };
         let dead_ratio = conv.dead_ratio();
         let read = conv.read();
         let s = &*read;
@@ -5668,10 +5685,9 @@ impl ZendSession {
     }
 
     /// `GET /v1/substrate/zend/layer/{name}` — the conversations (timelines) that
-    /// target one layer. Fetched when the layer card expands. `None` when the
-    /// model isn't loaded or the layer name is unknown.
+    /// target one layer. Fetched when the layer card expands. `None` before the
+    /// substrate has replayed or when the layer name is unknown.
     pub fn substrate_layer(&self, name: &str) -> Option<LayerConversations> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let schema = self.projection_builder.schema();
         // Resolve the layer's groups before touching the substrate.
         let groups = schema
@@ -5679,8 +5695,7 @@ impl ZendSession {
             .iter()
             .find(|l| l.name == name)
             .map(|l| l.groups.clone())?;
-        let titler = state.titler_timeline;
-        let conv = { state.engine.lock().unwrap().conversation() };
+        let (conv, titler, _) = self.substrate_for_views()?;
         let read = conv.read();
         Some(LayerConversations {
             conversations: layer_conv_views(&read, &groups, titler),
@@ -5693,13 +5708,8 @@ impl ZendSession {
     /// itself loads from `substrate_tools`). Fetched when the system-prompt card
     /// expands.
     pub fn substrate_system_prompt(&self) -> Option<SystemPromptView> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let schema = self.projection_builder.schema();
-        let target_layer = {
-            let base = state.base_conv.lock().unwrap();
-            base.target_layer_name()
-        };
-        let conv = { state.engine.lock().unwrap().conversation() };
+        let (conv, _, target_layer) = self.substrate_for_views()?;
         let read = conv.read();
         let s = &*read;
 
@@ -5732,9 +5742,9 @@ impl ZendSession {
     /// dialogue layer's `tools` collection. Sourced from the bundled tool
     /// definitions (`src/prompts/tools/`, embedded); the schema YAML declares the
     /// collection empty and tools install at daemon start. Fetched when the tools
-    /// collection expands. Needs only the model to be loaded.
+    /// collection expands. The bundled definitions alone: it answers while zend
+    /// is still loading.
     pub fn substrate_tools(&self) -> Option<ToolsView> {
-        let _state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         Some(ToolsView {
             tools: crate::tool_def::all()
                 .iter()
@@ -5749,15 +5759,14 @@ impl ZendSession {
     }
 
     /// `GET /v1/substrate/zend/timeline/{tl}` — one conversation's full summary forest,
-    /// every turn decoded. `tl` is the raw timeline id. `None` when the model
-    /// isn't loaded or no such timeline exists.
+    /// every turn decoded. `tl` is the raw timeline id. `None` before the
+    /// substrate has replayed or when no such timeline exists.
     pub fn substrate_timeline(&self, tl_raw: u64) -> Option<TimelineDetail> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let tl = projection::TimelineId::from_raw(tl_raw)?;
 
         let schema = self.projection_builder.schema();
 
-        let conv = { state.engine.lock().unwrap().conversation() };
+        let (conv, _, _) = self.substrate_for_views()?;
         let read = conv.read();
         let s = &*read;
 
@@ -6639,6 +6648,7 @@ impl ZendSession {
 
     pub fn start_loading(self: &Arc<Self>) {
         let slot = Arc::clone(&self.inference);
+        let loading_substrate = Arc::clone(&self.loading_substrate);
         let proj_builder = self.projection_builder.clone();
         let ready_tx = self.ready_tx.clone();
         let status_tx = self.status_tx.clone();
@@ -6770,6 +6780,7 @@ impl ZendSession {
                     cluster,
                     status_tx.clone(),
                     load_progress_for_blocking,
+                    loading_substrate,
                 ) {
                     Ok(Some(state)) => {
                         *slot.write().unwrap() = Some(Arc::clone(&state));
@@ -7302,11 +7313,15 @@ fn clean_title(raw: &str) -> String {
 /// `(conversation count, total tokens)` across the non-empty, non-tombstoned,
 /// non-titler timelines targeting a layer's groups — the cheap headline numbers
 /// the overview shows without materializing the conversation list.
-fn layer_totals(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -> (usize, usize) {
+fn layer_totals(
+    s: &Substrate,
+    groups: &[GroupSchema],
+    titler: Option<TimelineId>,
+) -> (usize, usize) {
     groups
         .iter()
         .flat_map(|g| s.timelines_for_group(g.id))
-        .filter(|tl| *tl != titler && !s.is_tombstoned(*tl) && s.turn_count(*tl) > 0)
+        .filter(|tl| Some(*tl) != titler && !s.is_tombstoned(*tl) && s.turn_count(*tl) > 0)
         .fold((0, 0), |(n, tok), tl| {
             (n + 1, tok + s.timeline_token_total(tl))
         })
@@ -7317,11 +7332,15 @@ fn layer_totals(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -> (u
 /// content layers (repo_map, code_reading, the analysis layers) surface their
 /// timelines too; `known_conversations()` would return only the conv_id-bearing
 /// dialogue conversations and leave a populated layer reading empty.
-fn layer_conv_views(s: &Substrate, groups: &[GroupSchema], titler: TimelineId) -> Vec<ConvView> {
+fn layer_conv_views(
+    s: &Substrate,
+    groups: &[GroupSchema],
+    titler: Option<TimelineId>,
+) -> Vec<ConvView> {
     let mut conversations: Vec<ConvView> = Vec::new();
     for g in groups {
         for tl in s.timelines_for_group(g.id) {
-            if tl == titler || s.is_tombstoned(tl) || s.turn_count(tl) == 0 {
+            if Some(tl) == titler || s.is_tombstoned(tl) || s.turn_count(tl) == 0 {
                 continue;
             }
             // Title precedence: the sidebar label, then the conv_id, then the

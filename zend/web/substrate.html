@@ -620,9 +620,10 @@ async function refresh(){
     // The overview is intentionally light (storage + counts + layer metadata);
     // conversations, sections and the tool catalog load per-expansion. So this
     // poll stays cheap and never loads the whole substrate up front. It is
-    // zend's line in the host's overview of every attached substrate — `null`
-    // until zend's engine holds it open, which reads as the model loading.
-    // Through a clustered gateway, a member's that holds it.
+    // zend's line in the host's overview of every attached substrate — there as
+    // soon as zend's load has replayed its redo log, long before the engine is
+    // ready, and `null` only before that. Through a clustered gateway, a
+    // member's that holds it — while every member loads, the first to join.
     const d = MOCK ? mockOverview() : await Promise.all([
       getJSON('/v1/substrate'), import('/common/lib/aggregate.js'),
     ]).then(([body, aggregate])=>{

@@ -17,6 +17,7 @@
 //! the log does.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +86,9 @@ pub struct Importer {
     /// How often the lease holder fetches; every tick when zero.
     fetch_every: Duration,
     last_fetch: Mutex<Option<Instant>>,
+    /// Set while this member, holding the lease, is fetching `origin` — what a
+    /// load reports as the repository being pulled while the round still runs.
+    fetching: AtomicBool,
 }
 
 impl Importer {
@@ -94,7 +98,13 @@ impl Importer {
             suspect: Mutex::new(HashMap::new()),
             fetch_every: Duration::ZERO,
             last_fetch: Mutex::new(None),
+            fetching: AtomicBool::new(false),
         }
+    }
+
+    /// Whether this member is fetching `origin` now, holding the lease.
+    pub fn fetching(&self) -> bool {
+        self.fetching.load(Ordering::Relaxed)
     }
 
     /// This importer fetching at most every `every` — each fetch is a job on
@@ -157,7 +167,10 @@ impl Importer {
         let started = Instant::now();
         let fetched = if due && self.lease.hold(&import_lease(store.name())) {
             *self.last_fetch.lock().unwrap() = Some(Instant::now());
-            match repo.fetch(&RemoteName::parse(IMPORT)?, &FetchSpec::AllBranches) {
+            self.fetching.store(true, Ordering::Relaxed);
+            let result = repo.fetch(&RemoteName::parse(IMPORT)?, &FetchSpec::AllBranches);
+            self.fetching.store(false, Ordering::Relaxed);
+            match result {
                 Ok(_) => Some(true),
                 // An agent or origin out of reach: what is held is still
                 // published and synced, and the next tick tries again.

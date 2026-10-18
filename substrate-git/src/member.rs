@@ -171,7 +171,14 @@ pub struct Loading {
     pub error: Option<String>,
     /// Whether a round is running on it now.
     pub busy: bool,
+    /// Whether this member, holding its lease, is fetching it from `origin`
+    /// now — read while the round runs, so a pull reads as itself and not as
+    /// the wait for the lease that came before it.
+    pub pulling: bool,
 }
+
+/// How often a load reports while its rounds run, so a pull in progress shows.
+const REPORT_EVERY: Duration = Duration::from_millis(500);
 
 type OnChange = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -284,8 +291,33 @@ impl Repos {
                     });
                 }
                 drop(tx);
-                for (i, ended) in rx {
-                    let (loading, t) = ended?;
+                loop {
+                    let (i, ended) = match rx.recv_timeout(REPORT_EVERY) {
+                        Ok(got) => got,
+                        // Rounds still running: whether each is fetching now.
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let mut changed = false;
+                            for (l, (_, importer)) in state.iter_mut().zip(&self.inner.repos) {
+                                let pulling = l.busy && importer.fetching();
+                                if pulling != l.pulling {
+                                    l.pulling = pulling;
+                                    if pulling {
+                                        // The lease is held now: what the last
+                                        // round said about waiting for it is over.
+                                        l.error = None;
+                                    }
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                report(&state);
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    let (mut loading, t) = ended?;
+                    loading.pulling = false;
                     took[i].0 += 1;
                     took[i].1.add(&t);
                     if loading.whole {
