@@ -4563,13 +4563,26 @@ impl Substrate {
     /// Record the location of a snapshot stream's recurrent-state record `id`
     /// — the greatest stamp is the stream's tail. The location it replaces was
     /// credited dead by the accounting layer when this one appended.
-    pub fn apply_snapshot_loc(&mut self, stream_id: StreamId, loc: RecordLoc, id: RecordIdentity) {
+    ///
+    /// Whether the record became the tail: `false` when the stream is retired
+    /// (its timeline tombstoned or distilled) or a record that outranks it is
+    /// already held. Only a record that became the tail is what
+    /// [`Self::recurrent_snapshot_loc`] serves, so only that one may stand in
+    /// for state a slot drops.
+    pub fn apply_snapshot_loc(
+        &mut self,
+        stream_id: StreamId,
+        loc: RecordLoc,
+        id: RecordIdentity,
+    ) -> bool {
         if self.retired_snapshots.contains(&stream_id) {
-            return;
+            return false;
         }
         if take(self.snapshot_ids.entry(stream_id).or_default(), id) {
             self.recurrent_snapshots.insert(stream_id, loc);
+            return true;
         }
+        false
     }
 
     /// A snapshot retraction, record `id`: when it outranks the stream's tail
@@ -4607,7 +4620,16 @@ impl Substrate {
     /// goes, and no snapshot of it is installed again, whenever it arrives.
     fn retire_snapshot_stream(&mut self, timeline: TimelineId) {
         let stream_id = snapshot_stream_id(timeline.raw());
-        self.retired_snapshots.insert(stream_id);
+        if self.retired_snapshots.insert(stream_id) {
+            // Named, so a slot that later finds its record gone can be traced
+            // to what retired it from the log alone.
+            tracing::info!(
+                target: "candle_conversation::substrate::snapshots",
+                timeline = timeline.raw(),
+                had_tail = self.recurrent_snapshots.contains_key(&stream_id),
+                "recurrent snapshot stream retired"
+            );
+        }
         self.drop_snapshot_loc(stream_id);
     }
 

@@ -687,12 +687,15 @@ fn process_one(
             // buffers to the file with no intermediate copy.
             match append_snapshot(persistence, stream_id, &payload) {
                 Ok(loc) => {
-                    substrate
+                    let tail = substrate
                         .write()
                         .unwrap_or_else(|e| e.into_inner())
                         .apply_snapshot_loc(stream_id, loc.value, loc.id);
-                    // A retired tail carries no state to stand in for any.
-                    if !payload.is_retired() {
+                    // Reported only when it became the stream's tail — what a
+                    // read of the timeline's snapshot then serves. One the index
+                    // declined (the stream retired, or a newer record held)
+                    // stands in for nothing, and a retired tail carries no state.
+                    if tail && !payload.is_retired() {
                         snapshots.push(WrittenSnapshot {
                             timeline: payload.timeline_id,
                             turn_index: payload.turn_index,

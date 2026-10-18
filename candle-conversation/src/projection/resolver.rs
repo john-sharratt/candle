@@ -6160,6 +6160,37 @@ mod recurrent_snapshot_read_tests {
         assert_eq!(got.turn_index, 5);
     }
 
+    /// **Only a snapshot the index took is reported.** One written for a
+    /// timeline already tombstoned is declined by the index — its stream is
+    /// retired, so a read of the timeline's snapshot finds nothing — and a slot
+    /// told it was durable would drop state its record cannot give back. The
+    /// live timeline's snapshot, written beside it, is reported.
+    #[test]
+    fn a_snapshot_the_index_declined_is_not_reported() {
+        let conv = Conversation::ephemeral();
+        let retired = TimelineId::for_test(45);
+        let live = TimelineId::for_test(46);
+        conv.tombstone_timeline(retired).expect("tombstone");
+        conv.enqueue_recurrent_snapshot(retired, payload(retired, 2));
+        conv.enqueue_recurrent_snapshot(live, payload(live, 3));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut reported = Vec::new();
+        while !reported.contains(&(live, 3)) {
+            reported.extend(conv.drain_durable_snapshots());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never reported the live snapshot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            reported,
+            vec![(live, 3)],
+            "the retired one is never reported"
+        );
+        assert!(conv.read_recurrent_snapshot(retired).unwrap().is_none());
+    }
+
     /// **The writer reports a snapshot once its record is durable, once.** A
     /// slot holding the state of a sealed turn may release it when this says
     /// so, because the read above then serves the record without a lock. The
