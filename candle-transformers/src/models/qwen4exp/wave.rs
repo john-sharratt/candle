@@ -218,6 +218,11 @@ pub struct Qwen4ExpBatched {
     /// snapshot, a claim or a wave on it builds its store — so a slot that has
     /// not run a turn holds host bytes it shares, not a store of its own.
     pub(super) staged: RwLock<HashMap<usize, StagedSnapshot>>,
+    /// Sequences whose store was dropped once their last seal was durable
+    /// ([`Self::park_recurrent`]). Their state is the record's until it is
+    /// staged back; a want of it before then is refused rather than met with a
+    /// sequence-start store, which would read fluently and remember nothing.
+    pub(super) parked: RwLock<HashSet<usize>>,
     /// Armed only while a speculative block is in flight: what the verify wave
     /// must capture so a partial accept can be rewound ([`super::spec`]).
     /// `None` on every plain decode, which is what keeps the capture sites a
@@ -434,6 +439,7 @@ impl Qwen4ExpBatched {
     /// one holding the index but a zero PLE would inject an n-gram embedding
     /// computed from a window it never saw. Both read as a plausible answer.
     pub fn fork_recurrent(&self, parent: usize, child: usize) -> Result<()> {
+        self.refuse_parked(parent)?;
         // The child's state is the parent's from here, not sequence-start.
         self.clear_pristine(child);
         // **Each carried class is forked on its own terms.** They are populated
@@ -1100,6 +1106,7 @@ impl Qwen4ExpBatched {
     /// and the first wave keeps it. A store a fork already copied is left alone,
     /// and a snapshot held for the sequence becomes its store here.
     pub fn claim_carried_state(&self, seq: usize) -> Result<()> {
+        self.refuse_parked(seq)?;
         self.install_staged(seq)?;
         let cfg = &self.model.cfg;
         let hc_dim = cfg.hc.count * cfg.hidden_size;
@@ -1181,6 +1188,7 @@ impl Qwen4ExpBatched {
     /// what it holds now is what the parent's state becomes. The child's
     /// entries are gone afterwards and the parent's previous ones are dropped.
     pub fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
+        self.refuse_parked(child)?;
         // A view claimed its state at admission and never ran a wave: what it
         // holds is sequence-start zeros, not a continuation, and moving it would
         // wipe the parent's. It goes; the parent keeps what it had — the same
@@ -1219,6 +1227,7 @@ impl Qwen4ExpBatched {
             .write()
             .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
             .insert(parent, store);
+        self.unpark(parent);
         // The parent's state is the view's continuation now, so a snapshot it
         // was still holding describes a point it has moved past.
         self.staged
@@ -1282,6 +1291,7 @@ impl Qwen4ExpBatched {
     /// sequence was in, so its prefill scratch goes back here: the next long
     /// span claims it again.
     pub fn export_recurrent(&self, seq: usize) -> Result<Option<(u64, Vec<ExportedLayerState>)>> {
+        self.refuse_parked(seq)?;
         let mut map = self
             .recurrent
             .write()
@@ -1318,6 +1328,7 @@ impl Qwen4ExpBatched {
         // A restored state is the record's, not sequence-start, and it
         // supersedes any snapshot held back for this sequence.
         self.clear_pristine(seq);
+        self.unpark(seq);
         self.staged
             .write()
             .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
@@ -1361,6 +1372,7 @@ impl Qwen4ExpBatched {
             return self.restore_recurrent(seq, schedule_hash, &layers);
         }
         self.clear_pristine(seq);
+        self.unpark(seq);
         self.staged
             .write()
             .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
@@ -1372,6 +1384,67 @@ impl Qwen4ExpBatched {
                 },
             );
         self.mark_seeded(seq)
+    }
+
+    /// Drop `seq`'s GDN store: its last seal's snapshot is durable and the
+    /// sequence is out of every forward, so the store's device ground is idle
+    /// ground. The PLE history, seeds and QSA index stay — they are small, or
+    /// rebuilt from pages, and none of them is what holds the span.
+    ///
+    /// An idle conversation keeps its slot for minutes, and its store with it:
+    /// on blackworld (2026-10-18) 155 recurrent regions, 2.37 GB, held mostly
+    /// by conversations no forward was running.
+    pub fn park_recurrent(&self, seq: usize) -> Result<bool> {
+        {
+            let mut map = self
+                .recurrent
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?;
+            match map.get(&seq) {
+                Some(store) if !store.wave_open() => {
+                    map.remove(&seq);
+                }
+                _ => return Ok(false),
+            }
+        }
+        self.clear_pristine(seq);
+        self.parked
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: parked lock poisoned".into()))?
+            .insert(seq);
+        Ok(true)
+    }
+
+    /// Whether `seq`'s state is parked in its record.
+    pub fn recurrent_parked(&self, seq: usize) -> bool {
+        self.parked.read().is_ok_and(|p| p.contains(&seq))
+    }
+
+    /// Refuse a want of `seq`'s state while it is parked and nothing has been
+    /// staged back for it.
+    fn refuse_parked(&self, seq: usize) -> Result<()> {
+        if self.recurrent_parked(seq) && !self.has_recurrent(seq)? {
+            let staged = self
+                .staged
+                .read()
+                .map_err(|_| candle::Error::Msg("qwen4exp: staged lock poisoned".into()))?
+                .contains_key(&seq);
+            if !staged {
+                candle::bail!(
+                    "{}: sequence {seq} must be restored from its record before its state \
+                     is read",
+                    crate::models::batched_inference::RECURRENT_PARKED_MARKER
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `seq`'s state is written from elsewhere: no longer the record's alone.
+    fn unpark(&self, seq: usize) {
+        if let Ok(mut p) = self.parked.write() {
+            p.remove(&seq);
+        }
     }
 
     /// Build `seq`'s store from the snapshot held for it, if one is held. A
@@ -1393,6 +1466,7 @@ impl Qwen4ExpBatched {
                     .write()
                     .map_err(|_| candle::Error::Msg("qwen4exp: recurrent lock poisoned".into()))?
                     .insert(seq, store);
+                self.unpark(seq);
                 Ok(())
             }
             Err(e) => {
@@ -1592,6 +1666,7 @@ impl Qwen4ExpBatched {
             seeded: RwLock::new(HashSet::new()),
             pristine: RwLock::new(HashSet::new()),
             staged: RwLock::new(HashMap::new()),
+            parked: RwLock::new(HashSet::new()),
             verify: RwLock::new(None),
             ple: RwLock::new(HashMap::new()),
             index: RwLock::new(HashMap::new()),
@@ -1641,6 +1716,7 @@ impl Qwen4ExpBatched {
         // A wave run on a sequence whose snapshot is still held — one no claim
         // reached, such as a projection's own prefill on its slot — builds the
         // store from the snapshot before anything reads it.
+        self.refuse_parked(seq)?;
         self.install_staged(seq)?;
         let cfg = &self.model.cfg;
         let hc_dim = cfg.hc.count * cfg.hidden_size;
@@ -2284,6 +2360,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.has_recurrent(seq).unwrap_or(false)
     }
 
+    fn park_recurrent(&self, seq: usize) -> Result<bool> {
+        Qwen4ExpBatched::park_recurrent(self, seq)
+    }
+
+    fn recurrent_parked(&self, seq: usize) -> bool {
+        Qwen4ExpBatched::recurrent_parked(self, seq)
+    }
+
     fn claim_carried_state(&self, seq: usize) -> Result<()> {
         Qwen4ExpBatched::claim_carried_state(self, seq)
     }
@@ -2839,6 +2923,9 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     }
 
     fn prune(&self) -> Result<()> {
+        if let Ok(mut m) = self.parked.write() {
+            m.clear();
+        }
         if let Ok(mut m) = self.recurrent.write() {
             m.clear();
         }
@@ -2873,6 +2960,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     /// reads healthy.
     fn release_sequence(&self, seq: usize) -> Result<()> {
         self.clear_pristine(seq);
+        self.unpark(seq);
         if let Ok(mut m) = self.staged.write() {
             m.remove(&seq);
         }

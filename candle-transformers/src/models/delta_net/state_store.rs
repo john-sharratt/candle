@@ -756,6 +756,12 @@ impl RecurrentStateStore {
         self.hash
     }
 
+    /// Whether a wave has this store open: its state is mid-forward, and
+    /// nothing may take it away.
+    pub fn wave_open(&self) -> bool {
+        self.open
+    }
+
     pub fn dims(&self) -> &DeltaNetDims {
         &self.dims
     }
