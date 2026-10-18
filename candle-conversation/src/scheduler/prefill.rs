@@ -23,6 +23,7 @@ use candle_nn::kv_cache::{
     end_wave_transient, is_device_oom, tier_refusal_shortfall, FreeRegionTarget,
 };
 use candle_transformers::models::batched_inference::PendingGlue;
+use candle_transformers::models::expert_lre::is_expert_stall;
 use candle_transformers::models::held_tensor::hold_row;
 use candle_transformers::models::residual_rows::{compact_creeps, CreepResidual};
 use candle_transformers::models::wave_driver::{StepCreep, StepRows, StepSpec};
@@ -2911,20 +2912,23 @@ impl Scheduler {
     /// member rebuilt the same batch and failed it the same way, forever: the
     /// stuck Qwen3.8-Flash-Next calibration was this, about 1,500 refused
     /// placements a second. A refused tier narrows the next batch while there
-    /// is anything left to narrow ([`Self::note_refused_width`]). A device OOM
-    /// leaves the sections as they are, to be retried on the next wave exactly
-    /// as [`Self::fail_wave_group`] retries its section members — the two paths
-    /// carry the same sections, so they answer the same error the same way, and
-    /// a one-off OOM costs a retry rather than every section in the batch. Any
-    /// other error, or a refusal of the least chunk, fails the batch's sections
-    /// so they answer their callers and give their slots back.
+    /// is anything left to narrow ([`Self::note_refused_width`]). A device OOM,
+    /// or an expert stall — a cold expert whose pack read ran past the workers'
+    /// wait ([`is_expert_stall`]) — leaves the sections as they are, to be
+    /// retried on the next wave exactly as [`Self::fail_wave_group`] retries its
+    /// section members: the two paths carry the same sections, so they answer
+    /// the same error the same way, and a one-off costs a retry rather than
+    /// every section in the batch. A stall failed them outright, and one slow
+    /// pack read under disk contention failed zend's load with them. Any other
+    /// error, or a refusal of the least chunk, fails the batch's sections so
+    /// they answer their callers and give their slots back.
     pub(super) fn fail_section_batch(
         &mut self,
         group_idxs: &[usize],
         advances: &[usize],
         err: &candle::Error,
     ) {
-        if group_idxs.is_empty() || is_device_oom(err) {
+        if group_idxs.is_empty() || is_device_oom(err) || is_expert_stall(err) {
             return;
         }
         let rows: usize = advances.iter().sum();
@@ -2939,7 +2943,10 @@ impl Scheduler {
 
     /// Route a wave-group forward failure. On device-OOM, requeue the prefill
     /// members' scope prefills ([`Self::handle_prefill_oom`]) — section members and
-    /// dialogue turns just retry next wave once the group is dropped. On a refused
+    /// dialogue turns just retry next wave once the group is dropped. On an
+    /// expert stall ([`is_expert_stall`]) every member keeps its place and
+    /// retries next wave: nothing was short, so there is nothing to requeue or
+    /// narrow. On a refused
     /// tier, every member retries in a group composed narrower than the
     /// `creep_rows` refused ([`Self::note_refused_width`]) — the same members at
     /// the same width would be refused again. On any other error, or a refusal
@@ -2955,6 +2962,9 @@ impl Scheduler {
     ) {
         if is_device_oom(err) {
             self.handle_prefill_oom(prefill_gidxs, err);
+        } else if is_expert_stall(err) {
+            // Every member keeps its place and its progress; the same group
+            // re-forms on the next wave.
         } else if tier_refusal_shortfall(err)
             .is_some_and(|short| self.note_refused_width(creep_rows, short))
         {
@@ -3567,7 +3577,9 @@ impl Scheduler {
                 // run those layers' rows into their carried state again
                 // (`reset_wave_prefill`). Bounded: a window refused
                 // `MID_SWEEP_RETRIES` times in a row fails its members instead.
-                let retryable = is_device_oom(&e) || tier_refusal_shortfall(&e).is_some();
+                let retryable = is_device_oom(&e)
+                    || tier_refusal_shortfall(&e).is_some()
+                    || is_expert_stall(&e);
                 if cursor > 0 && retryable && self.wave_sweep_failures < MID_SWEEP_RETRIES {
                     self.wave_sweep_failures += 1;
                     tracing::warn!(

@@ -9,7 +9,7 @@ use crate::batched_sampler::DEGENERATE_TOKEN_RUN;
 use crate::recorded_reply::{departure, replayed_step};
 use crate::stats::streams_committed;
 use candle_nn::kv_cache::is_tier_refusal;
-use candle_transformers::models::expert_lre::{PipelineStats, ProfileSnapshot};
+use candle_transformers::models::expert_lre::{is_expert_stall, PipelineStats, ProfileSnapshot};
 use candle_transformers::models::held_tensor::hold_rows;
 use candle_transformers::models::speculative_choice::AcceptWalk;
 
@@ -782,8 +782,8 @@ impl Scheduler {
             budget,
         ) {
             Ok(d) => d,
-            Err(e) if is_tier_refusal(&e) => {
-                self.refused_step(&seq_ids, "decode draft", &e);
+            Err(e) if is_tier_refusal(&e) || is_expert_stall(&e) => {
+                self.retry_step(&seq_ids, "decode draft", &e);
                 return;
             }
             Err(e) => {
@@ -881,8 +881,8 @@ impl Scheduler {
             Ok(l) => l,
             Err(e) => {
                 self.model.abort_verify(&spec_seqs);
-                if is_tier_refusal(&e) {
-                    self.refused_step(&seq_ids, "decode forward", &e);
+                if is_tier_refusal(&e) || is_expert_stall(&e) {
+                    self.retry_step(&seq_ids, "decode forward", &e);
                 } else {
                     self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
                 }
@@ -890,8 +890,8 @@ impl Scheduler {
             }
         };
         forward_span.end();
-        if let Some(refusals) = self.decode_retry.succeeded() {
-            tracing::info!(refusals, "decode step ran after its tier was refused");
+        if let Some(failures) = self.decode_retry.succeeded() {
+            tracing::info!(failures, "decode step ran after failing to run");
         }
         let fwd_elapsed = t_fwd.elapsed();
         // The step's two halves by the wave's shape, so a pure decode step is
@@ -2318,33 +2318,37 @@ impl Scheduler {
         }
     }
 
-    /// A decode step whose transient tier the partition refused — the draft
-    /// walk's or the verify forward's. **The turns keep their place.** A refusal
-    /// is placement, not computation: nothing was committed — a segment that
-    /// ran before the refused one is taken back by the step bracket
-    /// (`decode_forward_cobatched`) — and the next step re-forwards the same
-    /// last token (`DecodeState::mark_forwarded`'s benign direction). Ending the turn instead threw away a reply mid-thought
-    /// over ground that relief, a compaction or the weight side's between-wave
-    /// concession hands back a step or two later — the weight side refuses to
-    /// move only while a wave or an expert invocation is in flight. The step
-    /// waits out the backoff ([`WaveRetry`]) and runs again; a run of refusals
-    /// long enough to give up fails the turns with the error.
-    fn refused_step(&mut self, seq_ids: &[SequenceId], what: &str, err: &candle::Error) {
+    /// A decode step that did not run but may on the next attempt — the draft
+    /// walk's or the verify forward's: its transient tier was refused, or the
+    /// device gave a cold expert up on a stalled pack read ([`is_expert_stall`]).
+    /// **The turns keep their place.** Either way nothing was committed — a
+    /// segment that ran before the failed one is taken back by the step bracket
+    /// (`decode_forward_cobatched`), and a faulted segment is rolled back as a
+    /// failed sweep — and the next step re-forwards the same last token
+    /// (`DecodeState::mark_forwarded`'s benign direction). Ending the turn
+    /// instead threw away a reply mid-thought over ground that relief, a
+    /// compaction or the weight side's between-wave concession hands back a step
+    /// or two later — the weight side refuses to move only while a wave or an
+    /// expert invocation is in flight — or over one slow read, which the next
+    /// attempt waits for afresh. The step waits out the backoff ([`WaveRetry`])
+    /// and runs again; a run of failures long enough to give up fails the turns
+    /// with the error.
+    fn retry_step(&mut self, seq_ids: &[SequenceId], what: &str, err: &candle::Error) {
         match self.decode_retry.failed() {
             Next::Retry { wait, attempt } => {
                 if WaveRetry::logs(attempt) {
                     tracing::warn!(
                         attempt,
                         wait_us = wait.as_micros() as u64,
-                        "{what} refused its tier; the turns wait for ground: {err}"
+                        "{what} did not run; the turns keep their place and it runs again: {err}"
                     );
                 }
             }
             Next::GiveUp { attempts } => {
-                tracing::error!(attempts, "{what} refused its tier on every attempt: {err}");
+                tracing::error!(attempts, "{what} failed on every attempt: {err}");
                 self.fail_all_decodes(
                     seq_ids,
-                    &format!("{what} could not place its tier in {attempts} attempts: {err}"),
+                    &format!("{what} could not run in {attempts} attempts: {err}"),
                 );
             }
         }

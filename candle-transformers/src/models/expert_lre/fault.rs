@@ -8,7 +8,9 @@
 //! wait that sees it gives its expert up at once (`kernel.cuh`, "A live expert
 //! table"). The forward's results are then garbage, so the host reads the word
 //! once the forward has synchronised and fails it (`ExpertCache::take_fault`);
-//! the wave driver rolls the wave back and the context stays usable.
+//! the wave driver rolls the wave back and the context stays usable. A wait
+//! that ran out is a stall ([`EXPERT_STALL_MARKER`]), and the scheduler runs
+//! the same work again; one that ended on the abort word fails it.
 //!
 //! While the word is set nothing builds on the faulted forward: the dispatch
 //! refuses every launch ([`FaultWord::check`]) — so a caller that never takes
@@ -68,8 +70,15 @@ impl ExpertFault {
         self.expert as u64 == MOE_FAULT_CPU_EXPERT
     }
 
-    /// The forward's error.
+    /// The forward's error. A wait that ran out carries [`EXPERT_STALL_MARKER`]:
+    /// the forward may simply run again. One that ended on the abort word does
+    /// not — a dead stager or pipeline thread answers no retry.
     pub(crate) fn error(self) -> Error {
+        let outcome = if self.aborted {
+            "the forward's results are discarded"
+        } else {
+            EXPERT_STALL_MARKER
+        };
         if self.is_cpu() {
             let why = if self.aborted {
                 "the expert stager or pipeline thread died"
@@ -78,7 +87,7 @@ impl ExpertFault {
             };
             return Error::Msg(format!(
                 "expert forward failed: MoE row {}'s CPU experts were given up after {:.1} ms \
-                 ({why}); the forward's results are discarded",
+                 ({why}); {outcome}",
                 self.row,
                 self.waited_us as f64 / 1e3
             ));
@@ -90,12 +99,26 @@ impl ExpertFault {
         };
         Error::Msg(format!(
             "expert forward failed: cold expert {} of MoE row {} was given up after {:.1} ms \
-             ({why}); the forward's results are discarded",
+             ({why}); {outcome}",
             self.expert,
             self.row,
             self.waited_us as f64 / 1e3
         ))
     }
+}
+
+/// Ends the error of a forward the device gave part of up because a wait ran
+/// out — a cold expert its pack read published late, the CPU pool answering
+/// late — rather than because a thread died. The forward was discarded whole
+/// and rolled back, the context is usable, and the next attempt waits afresh,
+/// so the scheduler runs the same work again ([`is_expert_stall`]) instead of
+/// failing it: a pack read that stalls for a second under disk contention
+/// otherwise failed zend's load, and in a decode, every turn in the step.
+pub const EXPERT_STALL_MARKER: &str = "the forward is discarded and may run again";
+
+/// Whether `err` is a forward given up on a stall — see [`EXPERT_STALL_MARKER`].
+pub fn is_expert_stall(err: &Error) -> bool {
+    err.to_string().contains(EXPERT_STALL_MARKER)
 }
 
 /// The mapped fault word.
@@ -235,9 +258,28 @@ mod tests {
         assert_eq!(
             timed_out.error().to_string(),
             "expert forward failed: cold expert 9 of MoE row 5 was given up after 1.5 ms (the \
-             stager did not publish it in time — a pack read stalled); the forward's results are \
-             discarded"
+             stager did not publish it in time — a pack read stalled); the forward is discarded \
+             and may run again"
         );
+    }
+
+    /// **A wait that ran out is a stall the scheduler retries; one that ended
+    /// on the abort word is not** — a dead stager answers no retry.
+    #[test]
+    fn a_timed_out_wait_is_a_stall_and_an_aborted_one_is_not() {
+        let timed_out = ExpertFault::decode((5u64 << 48) | (9u64 << 32) | 1_500).unwrap();
+        assert!(is_expert_stall(&timed_out.error()));
+        let cpu = ExpertFault::decode((7u64 << 48) | (MOE_FAULT_CPU_EXPERT << 32) | 2_500).unwrap();
+        assert!(is_expert_stall(&cpu.error()));
+        let aborted =
+            ExpertFault::decode(MOE_FAULT_ABORTED | (5u64 << 48) | (9u64 << 32) | 7).unwrap();
+        assert!(!is_expert_stall(&aborted.error()));
+        assert_eq!(
+            aborted.error().to_string(),
+            "expert forward failed: cold expert 9 of MoE row 5 was given up after 0.0 ms (the \
+             expert stager or pipeline thread died); the forward's results are discarded"
+        );
+        assert!(!is_expert_stall(&Error::Msg("out of memory".into())));
     }
 
     /// The CPU item's claim names the pool, not a cold expert: expert
@@ -249,7 +291,7 @@ mod tests {
         assert_eq!(
             f.error().to_string(),
             "expert forward failed: MoE row 7's CPU experts were given up after 2.5 ms (the pool \
-             stopped or did not answer in time); the forward's results are discarded"
+             stopped or did not answer in time); the forward is discarded and may run again"
         );
         assert!(!ExpertFault::decode((7u64 << 48) | (9u64 << 32) | 1)
             .unwrap()

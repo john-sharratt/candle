@@ -1097,7 +1097,9 @@ Host side (`candle-transformers`, host-only, raw expected values):
     `candle-core/tests/moe_live_abort.rs`: an aborted wait and a wait past the
     spin limit each claim the fault word (abort bit, row, expert, wait — raw
     bits) and leave the next synchronise and later work running;
-    `expert_lre::fault` decodes the word into the forward's error.
+    `expert_lre::fault` decodes the word into the forward's error, and
+    `a_timed_out_wait_is_a_stall_and_an_aborted_one_is_not` that an overrun's
+    error is the stall the scheduler retries and an abort's is not.
 12. **Router look-ahead votes** — `votes::ranked` (most votes first, ties by
     expert, zero votes left out), and `qkv_segmented_refuses_a_fourth_segment`:
     a stacked launch that does not split K takes at most three weights.
@@ -1390,7 +1392,11 @@ __syncthreads(); weights = s_w;
 - **The fault word is the error path** (§0.12). An abort or an overrun gives
   the expert up and claims the word; the host fails the forward once it has
   synchronised, before any token computed from the layer is returned, and the
-  context survives. §8.
+  context survives. §8. An overrun is a stall, not a lost forward: its error
+  carries `expert_lre::EXPERT_STALL_MARKER`, and the scheduler keeps the work in
+  place and runs it again — a section, a prefill and a decode step alike, as it
+  does a refused tier, and a reprojection's gap-fill forward in place, a few
+  times. Only an abort (a dead stager or pipeline thread) fails the work.
 
 ### 4.3 Why tile order changes nothing numerically
 

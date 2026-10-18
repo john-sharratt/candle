@@ -3654,8 +3654,8 @@ pub(crate) struct Scheduler {
     /// Consecutive failures of the decode-less wave step and the wait owed
     /// before the next — see `wave_retry`.
     wave_retry: wave_retry::WaveRetry,
-    /// Consecutive decode steps whose tier the partition refused, and the wait
-    /// owed before the next — see `decode::refused_step`.
+    /// Consecutive decode steps that did not run — a refused tier, an expert
+    /// stall — and the wait owed before the next; see `decode::retry_step`.
     decode_retry: wave_retry::WaveRetry,
     /// The last wave step carried rows other than decode and verify — a prefill
     /// creep, a section chunk or glue — so the profile can tell an 8-session
