@@ -6,8 +6,8 @@ use super::*;
 use candle::wave_provenance::{publish_wave_declines, DeclineSnapshot};
 use candle::DeviceLocation;
 use candle_nn::kv_cache::{
-    is_tier_refusal, region_stats, set_kv_free_target, set_prompts_waiting, span_partition,
-    vram_bands,
+    is_span_full, is_tier_refusal, region_stats, set_kv_free_target, set_prompts_waiting,
+    span_partition, vram_bands,
 };
 use std::process::exit;
 use std::sync::atomic::AtomicU64;
@@ -482,7 +482,7 @@ impl Scheduler {
             // composed narrower, or a wave already at the least chunk fails its
             // members — so it is a warning here, not a fault, and not a failure
             // the retry counts toward giving up.
-            Err(e) if is_tier_refusal(&e) => {
+            Err(e) if is_tier_refusal(&e) || is_span_full(&e) => {
                 tracing::warn!("decode-less wave step refused its tier: {e}");
             }
             Err(e) => match self.wave_retry.failed() {

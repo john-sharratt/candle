@@ -8,7 +8,7 @@ use super::*;
 use crate::batched_sampler::DEGENERATE_TOKEN_RUN;
 use crate::recorded_reply::{departure, replayed_step};
 use crate::stats::streams_committed;
-use candle_nn::kv_cache::is_tier_refusal;
+use candle_nn::kv_cache::{is_span_full, is_tier_refusal};
 use candle_transformers::models::expert_lre::{is_expert_stall, PipelineStats, ProfileSnapshot};
 use candle_transformers::models::held_tensor::hold_rows;
 use candle_transformers::models::speculative_choice::AcceptWalk;
@@ -793,7 +793,7 @@ impl Scheduler {
             budget,
         ) {
             Ok(d) => d,
-            Err(e) if is_tier_refusal(&e) || is_expert_stall(&e) => {
+            Err(e) if is_tier_refusal(&e) || is_span_full(&e) || is_expert_stall(&e) => {
                 self.retry_step(&seq_ids, "decode draft", &e);
                 return;
             }
@@ -892,7 +892,7 @@ impl Scheduler {
             Ok(l) => l,
             Err(e) => {
                 self.model.abort_verify(&spec_seqs);
-                if is_tier_refusal(&e) || is_expert_stall(&e) {
+                if is_tier_refusal(&e) || is_span_full(&e) || is_expert_stall(&e) {
                     self.retry_step(&seq_ids, "decode forward", &e);
                 } else {
                     self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
@@ -2216,6 +2216,25 @@ impl Scheduler {
             match self.reproject_view_prepare(view_id) {
                 Ok(Some(inflight)) => inflights.push(inflight),
                 Ok(None) => {}
+                // **Refused ground before the turn's state moved: skip, not
+                // fail.** A reprojection is a refresh of a view the turn is
+                // still decoding on, and nothing of that view has changed yet,
+                // so the turn decodes on and a later trigger tries again —
+                // where failing it ended a live turn because the span was full
+                // that moment (`.5`, 2026-10-18).
+                Err(e)
+                    if self
+                        .active_decodes
+                        .get(&view_id)
+                        .is_some_and(|s| !s.finished)
+                        && is_ground_refusal(&e) =>
+                {
+                    tracing::warn!(
+                        target: "candle_conversation::scheduler::reproject",
+                        view_id = view_id.0, err = %e,
+                        "reprojection skipped: no ground for it now; the turn decodes on its view"
+                    );
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "candle_conversation::scheduler::reproject",
@@ -2396,6 +2415,17 @@ impl Scheduler {
     }
 }
 
+/// Whether `e` is the device having no room for the work right now — a refused
+/// tier, a full span, the KV budget — rather than a fault: ground that comes
+/// back as turns finish and the KV side relieves.
+fn is_ground_refusal(e: &ConversationError) -> bool {
+    use candle_nn::kv_cache::{KV_DEVICE_OOM_MARKER, SPAN_FULL_MARKER, TIER_REFUSED_MARKER};
+    let s = e.to_string();
+    [SPAN_FULL_MARKER, TIER_REFUSED_MARKER, KV_DEVICE_OOM_MARKER]
+        .iter()
+        .any(|m| s.contains(m))
+}
+
 /// Split a speculative step's rows for the rollback: the positions (into
 /// `seqs`) of the rows that committed nothing, which are not rolled back, and
 /// `(sequence, position after its committed tokens)` for every other row.
@@ -2488,6 +2518,36 @@ fn describe_recurrent_state(model: &(dyn ManagedBatchedModel + Send), seq: Seque
             "degenerate decode: recurrent state is entirely FINITE — the fault is in \
              this wave's activations, not in carried state"
         ),
+    }
+}
+
+#[cfg(test)]
+mod ground_refusal_tests {
+    use super::is_ground_refusal;
+    use crate::error::ConversationError;
+
+    /// The device having no room now — a full span, a refused tier, the KV
+    /// budget — is told apart from a fault, so a reprojection it refused is
+    /// skipped and its turn decodes on, where any fault still fails it.
+    #[test]
+    fn no_room_now_is_told_apart_from_a_fault() {
+        let model = |s: &str| ConversationError::Model(candle::Error::Msg(s.to_string()));
+        assert!(is_ground_refusal(&model(
+            "slot arena: no region for recurrent state after 20 of 36 slots of 3859968 B — no \
+             tier stands, so the span is genuinely full — the weight side is at its own floor"
+        )));
+        assert!(is_ground_refusal(&model(
+            "wave too wide for the partition: short by 16777216 B"
+        )));
+        assert!(is_ground_refusal(&model(
+            "kv-cache GPU VRAM budget exceeded"
+        )));
+        assert!(!is_ground_refusal(&model(
+            "the index disagrees with the K/V it describes"
+        )));
+        assert!(!is_ground_refusal(&ConversationError::Channel(
+            "closed".into()
+        )));
     }
 }
 
