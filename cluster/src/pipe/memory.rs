@@ -3,17 +3,18 @@
 //! wait, as a socket's send buffer does.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-use super::{Message, PipeClosed, PipeRx, PipeTx};
+use super::{Drain, Message, PipeClosed, PipeRx, PipeTx};
 
 /// One direction of the pipe.
 struct Direction {
     queue: Mutex<VecDeque<Message>>,
-    bytes: AtomicUsize,
+    /// The bytes queued and not yet received.
+    bytes: Drain,
     cap: usize,
     /// The receiving half has something to read, or the pipe closed.
     readable: Notify,
@@ -26,7 +27,7 @@ impl Direction {
     fn new(cap: usize) -> Arc<Self> {
         Arc::new(Self {
             queue: Mutex::new(VecDeque::new()),
-            bytes: AtomicUsize::new(0),
+            bytes: Drain::new(),
             cap,
             readable: Notify::new(),
             writable: Notify::new(),
@@ -88,10 +89,10 @@ impl PipeTx for MemoryTx {
             if self.dir.closed.load(Ordering::SeqCst) {
                 return Err(PipeClosed);
             }
-            let held = self.dir.bytes.load(Ordering::SeqCst);
+            let held = self.dir.bytes.unsent();
             if held == 0 || held + len <= self.dir.cap {
                 let close = matches!(message, Message::Close(_));
-                self.dir.bytes.fetch_add(len, Ordering::SeqCst);
+                self.dir.bytes.add(len);
                 self.dir.queue.lock().unwrap().push_back(message);
                 self.dir.readable.notify_one();
                 if close {
@@ -106,8 +107,8 @@ impl PipeTx for MemoryTx {
         }
     }
 
-    fn unsent_bytes(&self) -> usize {
-        self.dir.bytes.load(Ordering::SeqCst)
+    fn drain(&self) -> &Drain {
+        &self.dir.bytes
     }
 }
 
@@ -122,7 +123,7 @@ impl PipeRx for MemoryRx {
         loop {
             let notified = self.dir.readable.notified();
             if let Some(m) = self.dir.queue.lock().unwrap().pop_front() {
-                self.dir.bytes.fetch_sub(m.len(), Ordering::SeqCst);
+                self.dir.bytes.sub(m.len());
                 self.dir.writable.notify_one();
                 return Some(m);
             }

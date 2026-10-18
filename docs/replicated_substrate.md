@@ -2586,6 +2586,11 @@ A catch-up uses only spare capacity:
   make it many frames for the gateway to relay first, so it is kept to what keeps a
   link busy and no more: under catch-up of 100 k small records, H4 measures the live
   p99 against it (§14.2).
+- The writer waits for the socket to drain under that mark on the pipe's own count —
+  woken by the fall itself (`pipe::drain`), never on a timer. Polled every 1 ms, the
+  wait took a timer tick — ~15.6 ms on Windows — so about one 1 MiB mark went out per
+  tick on each hop, ~64 MB/s at best, and a member joining `.5` caught up 35 GB at
+  30–43 MB/s (2026-10-18).
 
 A joining member on a slow link therefore catches up behind the live traffic, not in
 front of it.

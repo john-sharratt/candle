@@ -16,7 +16,7 @@ use cluster::frame::{Admit, BuildId, Done, Frame, Hello, Kind, ModelId, RepoAd};
 use cluster::gateway::Hub;
 use cluster::handshake::{admit, join, GroupKey, HandshakeError, PROTO};
 use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
-use cluster::pipe::{Message, PipeClosed, PipeRx, PipeTx};
+use cluster::pipe::{Drain, Message, PipeClosed, PipeRx, PipeTx};
 
 const HANDSHAKES: usize = 500;
 const BUDGET: Duration = Duration::from_secs(2);
@@ -34,8 +34,8 @@ impl PipeTx for Tap {
         self.inner.send(message).await
     }
 
-    fn unsent_bytes(&self) -> usize {
-        self.inner.unsent_bytes()
+    fn drain(&self) -> &Drain {
+        self.inner.drain()
     }
 }
 

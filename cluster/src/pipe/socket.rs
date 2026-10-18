@@ -7,14 +7,12 @@
 //! transport has taken it. That count gates the catch-up lane (§4.2).
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::mpsc;
 
-use super::{Message, PipeClosed, PipeRx, PipeTx};
+use super::{Drain, Message, PipeClosed, PipeRx, PipeTx};
 use crate::close::Close;
 
 /// What a socket's message is, as a pipe reads it.
@@ -38,7 +36,7 @@ const PUMP_DEPTH: usize = 64;
 
 pub struct SocketTx {
     tx: mpsc::Sender<Message>,
-    unsent: Arc<AtomicUsize>,
+    unsent: Drain,
 }
 
 pub struct SocketRx<S, C> {
@@ -55,7 +53,7 @@ where
 {
     let (sink, stream) = socket.split();
     let (tx, rx) = mpsc::channel(PUMP_DEPTH);
-    let unsent = Arc::new(AtomicUsize::new(0));
+    let unsent = Drain::new();
     tokio::spawn(pump::<C, S, E>(sink, rx, unsent.clone()));
     (
         SocketTx { tx, unsent },
@@ -69,7 +67,7 @@ where
 async fn pump<C, S, E>(
     mut sink: SplitSink<S, C::Message>,
     mut rx: mpsc::Receiver<Message>,
-    unsent: Arc<AtomicUsize>,
+    unsent: Drain,
 ) where
     C: Codec,
     S: Sink<C::Message, Error = E> + Stream<Item = Result<C::Message, E>> + Send + Unpin + 'static,
@@ -81,7 +79,7 @@ async fn pump<C, S, E>(
             Message::Close(close) => (C::close(&close), true),
         };
         let sent = sink.send(wire).await;
-        unsent.fetch_sub(len, Ordering::SeqCst);
+        unsent.sub(len);
         if sent.is_err() || last {
             break;
         }
@@ -92,16 +90,16 @@ async fn pump<C, S, E>(
 impl PipeTx for SocketTx {
     async fn send(&mut self, message: Message) -> Result<(), PipeClosed> {
         let len = message.len();
-        self.unsent.fetch_add(len, Ordering::SeqCst);
+        self.unsent.add(len);
         if self.tx.send(message).await.is_err() {
-            self.unsent.fetch_sub(len, Ordering::SeqCst);
+            self.unsent.sub(len);
             return Err(PipeClosed);
         }
         Ok(())
     }
 
-    fn unsent_bytes(&self) -> usize {
-        self.unsent.load(Ordering::SeqCst)
+    fn drain(&self) -> &Drain {
+        &self.unsent
     }
 }
 

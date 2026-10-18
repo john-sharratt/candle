@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use cluster::frame::{Frame, Kind, Receipt};
 use cluster::pipe::memory::{pair, MemoryTx};
-use cluster::pipe::{Message, PipeClosed, PipeTx};
+use cluster::pipe::{Drain, Message, PipeClosed, PipeTx};
 use cluster::session::{start, Incoming, Role};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -39,8 +39,8 @@ impl PipeTx for Tap {
         self.inner.send(message).await
     }
 
-    fn unsent_bytes(&self) -> usize {
-        self.inner.unsent_bytes()
+    fn drain(&self) -> &Drain {
+        self.inner.drain()
     }
 }
 

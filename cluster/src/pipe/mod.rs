@@ -8,11 +8,14 @@
 //! messages a [`socket::Codec`] maps — [`tungstenite::Tungstenite`] for a
 //! member's dialled socket.
 
+pub mod drain;
 pub mod memory;
 pub mod socket;
 pub mod tungstenite;
 
 use std::future::Future;
+
+pub use drain::Drain;
 
 use crate::close::Close;
 
@@ -45,8 +48,13 @@ pub trait PipeTx: Send + 'static {
     /// Hand one message to the transport, waiting while it is full.
     fn send(&mut self, message: Message) -> impl Future<Output = Result<(), PipeClosed>> + Send;
 
-    /// Bytes handed to the transport that the peer has not taken yet.
-    fn unsent_bytes(&self) -> usize;
+    /// Bytes handed to the transport that the peer has not taken yet, and a
+    /// wake when that falls.
+    fn drain(&self) -> &Drain;
+
+    fn unsent_bytes(&self) -> usize {
+        self.drain().unsent()
+    }
 }
 
 pub trait PipeRx: Send + 'static {

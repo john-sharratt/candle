@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::time::{interval_at, sleep, Instant, MissedTickBehavior};
+use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
 use super::command::Command;
 use super::gauge::Gauges;
-use super::lanes::Lanes;
+use super::lanes::{Lanes, CATCHUP_LOW_WATER};
 use crate::close::Close;
 use crate::delivery::FrameCounter;
 use crate::frame::Frame;
@@ -21,10 +21,6 @@ pub const PING_EVERY: Duration = Duration::from_secs(15);
 
 /// A hand-off to the send pump this slow is logged.
 const SLOW_HANDOFF: Duration = Duration::from_secs(5);
-
-/// How often a writer with only catch-up frames waiting looks again at the
-/// socket's unsent bytes.
-const DRAIN_POLL: Duration = Duration::from_millis(1);
 
 enum Outcome {
     Queued,
@@ -63,6 +59,9 @@ pub async fn run<T: PipeTx>(
 ) {
     let mut lanes = Lanes::new();
     let mut counter = FrameCounter::default();
+    // Catch-up frames wait for the socket to drain under its low-water mark,
+    // and are woken by the fall itself (`pipe::drain`).
+    let drain = tx.drain().clone();
     let mut ping = interval_at(Instant::now() + PING_EVERY, PING_EVERY);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -121,7 +120,53 @@ pub async fn run<T: PipeTx>(
                 }
             },
             _ = ping.tick() => lanes.control(Frame::Ping(rand::random())),
-            _ = sleep(DRAIN_POLL), if lanes.catchup_waiting() => {}
+            _ = drain.below(CATCHUP_LOW_WATER), if lanes.catchup_waiting() => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use crate::frame::Data;
+    use crate::pipe::memory::pair;
+    use crate::pipe::PipeRx;
+    use crate::session::gauge::Lane;
+
+    /// **Catch-up goes at the reader's pace, not a timer's.** 64 MiB of
+    /// catch-up frames, each the size of the low-water mark, cross a pipe that
+    /// holds two of them: each waits only for the reader to take the one ahead.
+    /// Woken by a 1 ms poll instead, each waited a timer tick — ~15.6 ms on
+    /// Windows, over a second for these.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catchup_frames_go_as_fast_as_the_reader_takes_them() {
+        const FRAMES: usize = 64;
+        let (a, mut b) = pair(2 * CATCHUP_LOW_WATER + 64);
+        let (commands, rx) = unbounded_channel();
+        let gauges = Arc::new(Gauges::default());
+        for _ in 0..FRAMES {
+            gauges.queued(Lane::CatchUp, CATCHUP_LOW_WATER);
+            commands
+                .send(Command::CatchUp(Frame::Data(Data {
+                    stream: 1,
+                    bytes: vec![0; CATCHUP_LOW_WATER],
+                })))
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let writer = tokio::spawn(run(a.tx, rx, gauges));
+        for _ in 0..FRAMES {
+            b.rx.recv().await.expect("a frame");
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(400),
+            "{FRAMES} MiB of catch-up took {took:?}"
+        );
+        drop(commands);
+        writer.await.unwrap();
     }
 }
