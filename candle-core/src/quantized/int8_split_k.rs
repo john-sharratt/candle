@@ -60,9 +60,13 @@ const K_TILE: usize = 128;
 /// Tuned with the KO projection bench (`gr_hyper_bench ko`) on the RTX PRO 5000 (110 SMs).
 pub const SPLIT_TARGET_BLOCKS_PER_SM: usize = 4;
 
-/// The widest wave a launch splits at: two token tiles. A decode wave of one to a few rows per
-/// sequence, and a narrow verify, sit under it; wider launches fill the card unsplit.
-pub const MAX_SPLIT_ROWS: usize = 32;
+/// The widest wave a launch splits at: six token tiles. A wide output fills the card unsplit
+/// well before this — the `2·base` guard turns it away — so what reaches it is a narrow output,
+/// which does not: the hyper-connection `down` (N = 416, K = 10,240) is 13 output tiles at any M.
+/// Unsplit it runs at 147 GB/s, 30.8 µs at every width; the rule's split took 17.9 µs at 33
+/// rows, 20.6 at 48 (a ×16 verify), 24.7 at 64, 27.8 at 80 and 30.1 at 96, and lost at 112 —
+/// 34.5 µs, its depth down to five slices (`gr_hyper_bench ko`, RTX PRO 5000).
+pub const MAX_SPLIT_ROWS: usize = 96;
 
 /// F32 partials the per-stream scratch holds: 16 MiB.
 pub const SPLIT_SCRATCH_PARTIALS: usize = 1 << 22;
@@ -341,7 +345,10 @@ mod tests {
 
     #[test]
     fn prefill_widths_never_split() {
-        assert_eq!(q8a128_dense_k_splits(33, 416, 10_240, SM), 1);
+        assert_eq!(
+            q8a128_dense_k_splits(MAX_SPLIT_ROWS + 1, 416, 10_240, SM),
+            1
+        );
         assert_eq!(q8a128_dense_k_splits(512, 416, 10_240, SM), 1);
         assert_eq!(q8a128_dense_k_splits(2048, 10_240, 384, SM), 1);
     }
@@ -456,6 +463,15 @@ mod tests {
         assert_eq!(
             q8a128_dense_plan(32, 416, 10_240, SM, true, Q8),
             DensePlan::SplitK(16)
+        );
+        // A ×16 verify's 48 rows still leave the narrow `down` 13 output tiles wide.
+        assert_eq!(
+            q8a128_dense_plan(48, 416, 10_240, SM, true, Q8),
+            DensePlan::SplitK(12)
+        );
+        assert_eq!(
+            q8a128_dense_plan(MAX_SPLIT_ROWS + 1, 416, 10_240, SM, true, Q8),
+            DensePlan::Unsplit
         );
     }
 

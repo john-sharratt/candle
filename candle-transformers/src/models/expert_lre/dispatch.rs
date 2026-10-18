@@ -862,11 +862,20 @@ impl Dispatch {
                 "expert dispatch: look-ahead parts must cover hops 1..=n once each, n ≤ {HOPS}"
             );
         }
+        // The forward thread's host time in each part, on its own span: what an
+        // invocation costs the host to issue, apart from the device time
+        // `q4e:moe_routed:*` measures.
+        let t = profile_now();
         let reserved = self.before(tx, stager, row, num_tokens, voted_hops)?;
+        crate::models::profile::pipeline_record("moe:host:before", t);
+        let t = profile_now();
         let ys = self.record(
             reserved, acts, weights, indices, decode, out_dtype, wave, look_ahead,
         )?;
+        crate::models::profile::pipeline_record("moe:host:record", t);
+        let t = profile_now();
         self.after(cuda_dev)?;
+        crate::models::profile::pipeline_record("moe:host:after", t);
         Ok(ys)
     }
 
