@@ -667,6 +667,7 @@ fn stream_turn(
                     io::stdout().flush().ok();
                 }
             }
+            TurnEvent::PrefillQueued { .. } => {}
             TurnEvent::PrefillProgress {
                 tokens_done,
                 tokens_total,

@@ -4029,6 +4029,9 @@ fn run_inference_stream(
             // substrate never holds half a turn the client's socket decided the
             // length of.
             let mut listener_gone = false;
+            // The last "waiting for the GPU" status sent, so a wait reported
+            // every second reaches the client only when its text changes.
+            let mut last_queued: Option<String> = None;
 
             // Scoped so the stream's borrow of `handle` ends with the loop —
             // `finish_turn` consumes the handle below.
@@ -4200,6 +4203,21 @@ fn run_inference_stream(
                             };
                             if tx.send(Ok(progress)).await.is_err() {
                                 listener_gone = true;
+                            }
+                        }
+                        // The prefill is waiting on the GPU: say so, and for how
+                        // long, instead of a silent stream.
+                        TurnEvent::PrefillQueued {
+                            ahead_tokens,
+                            ahead_turns,
+                            waiting_ms,
+                        } => {
+                            let status = queued_status(ahead_tokens, ahead_turns, waiting_ms);
+                            if last_queued.as_deref() != Some(status.as_str()) {
+                                last_queued = Some(status.clone());
+                                if tx.send(Ok(StreamItem::Status(status))).await.is_err() {
+                                    listener_gone = true;
+                                }
                             }
                         }
                         _ => {}
@@ -7419,6 +7437,23 @@ fn layer_conv_views(
     conversations
 }
 
+/// The status a waiting prefill shows (`TurnEvent::PrefillQueued`): what it
+/// waits behind and for how long, in whole seconds, so the text changes once a
+/// second at most — "Waiting for the GPU — 2 turns (18K tokens) ahead, 4 s".
+fn queued_status(ahead_tokens: usize, ahead_turns: usize, waiting_ms: u64) -> String {
+    let secs = waiting_ms / 1000;
+    if ahead_turns == 0 {
+        return format!("Waiting for the GPU — {secs} s");
+    }
+    let tokens = if ahead_tokens >= 1000 {
+        format!("{}K", ahead_tokens / 1000)
+    } else {
+        ahead_tokens.to_string()
+    };
+    let turns = if ahead_turns == 1 { "turn" } else { "turns" };
+    format!("Waiting for the GPU — {ahead_turns} {turns} ({tokens} tokens) ahead, {secs} s")
+}
+
 /// One-line description of a group's selection rule, for the substrate viewer.
 fn fmt_selection(rule: &SelectionRule) -> String {
     match rule {
@@ -7516,6 +7551,26 @@ fn pre_collection_prelude(builder: &Builder) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod queued_status_tests {
+    use super::queued_status;
+
+    /// What a waiting prefill shows: whole seconds, tokens in K past a
+    /// thousand, the ahead part only when something is ahead.
+    #[test]
+    fn a_wait_reads_as_what_is_ahead_and_how_long() {
+        assert_eq!(
+            queued_status(18_400, 2, 4_900),
+            "Waiting for the GPU — 2 turns (18K tokens) ahead, 4 s"
+        );
+        assert_eq!(
+            queued_status(512, 1, 1_000),
+            "Waiting for the GPU — 1 turn (512 tokens) ahead, 1 s"
+        );
+        assert_eq!(queued_status(0, 0, 3_200), "Waiting for the GPU — 3 s");
+    }
 }
 
 #[cfg(test)]

@@ -53,6 +53,7 @@ pub mod phase_ring;
 mod phase_split;
 mod piece_identity;
 mod prefill;
+mod prefill_wait;
 pub(crate) mod profile;
 pub(crate) mod projection_assembler;
 mod projection_identity;
@@ -3630,6 +3631,9 @@ pub(crate) struct Scheduler {
     /// The KV the decodes will add over a creep cohort's sweep, which its
     /// width is priced against at formation (`sweep_forecast`).
     sweep_forecast: sweep_forecast::SweepForecast,
+    /// When each waiting turn last moved and was last told so
+    /// (`prefill_wait`).
+    prefill_waits: prefill_wait::PrefillWaits,
     /// A wave step swept in segments, open on the model for its full-sweep
     /// members (`ManagedBatchedModel::begin_step`): the trunk layers its
     /// segments have committed so far. Closed by `decode_forward_cobatched`.
@@ -3964,6 +3968,7 @@ impl Scheduler {
             paused_creep: None,
             wave_sweep_failures: 0,
             sweep_forecast: sweep_forecast::SweepForecast::default(),
+            prefill_waits: prefill_wait::PrefillWaits::default(),
             wave_step_open: None,
             wave_cohort_advanced: false,
             creep_owed: Duration::ZERO,
