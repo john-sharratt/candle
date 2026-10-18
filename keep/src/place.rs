@@ -36,6 +36,24 @@ pub fn previous_of(stable: &Path) -> PathBuf {
     beside(stable, ".prev")
 }
 
+/// Where an accepted build leaves the stable file it replaced, for a rollback
+/// by hand. Not [`previous_of`]: that file's presence means a trial was cut
+/// short, and a keep starting beside one would roll the accepted build back.
+pub fn last_of(stable: &Path) -> PathBuf {
+    beside(stable, ".last")
+}
+
+/// Accept `new` as the stable file with no trial: the stable file it replaces
+/// is copied to [`last_of`], and `new`'s bytes installed. The process the
+/// stable file was started from has been stopped, though its image may stay
+/// locked a moment.
+pub fn accept(new: &Path, stable: &Path) -> io::Result<()> {
+    if stable.exists() {
+        retrying(|| fs::copy(stable, last_of(stable)).map(|_| ()))?;
+    }
+    retrying(|| install(new, stable))
+}
+
 /// Move the stable file aside, for a trial to run from its path. Nothing to
 /// set aside — no stable file yet — is not an error. The process it was
 /// started from has been stopped, so it is not locked.
@@ -165,6 +183,31 @@ mod tests {
 
         assert_eq!(fs::read(&stable).unwrap(), b"old");
         assert!(!previous_of(&stable).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **An accepted build is the stable file at once**, the one it replaced
+    /// kept as `.last` — never `.prev`, which reads as a trial cut short.
+    #[test]
+    fn an_accepted_build_replaces_the_stable_file_and_keeps_the_last() {
+        let dir = scratch();
+        let staged = dir.join("staged.exe");
+        let stable = dir.join("svc.exe");
+        fs::write(&staged, b"new").unwrap();
+        fs::write(&stable, b"old").unwrap();
+
+        accept(&staged, &stable).unwrap();
+
+        assert_eq!(fs::read(&stable).unwrap(), b"new");
+        assert_eq!(fs::read(last_of(&stable)).unwrap(), b"old");
+        assert!(!previous_of(&stable).exists());
+        assert!(!beside(&stable, ".next").exists());
+
+        // A first accept, with no stable file yet, keeps nothing as the last.
+        let fresh = dir.join("fresh.exe");
+        accept(&staged, &fresh).unwrap();
+        assert_eq!(fs::read(&fresh).unwrap(), b"new");
+        assert!(!last_of(&fresh).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
