@@ -370,7 +370,11 @@ mod tests {
         );
         assert!(fail.reason.starts_with("GET /v1/route/0: its p95"));
         assert!(fail.reason.ends_with('…'));
-        assert_eq!(fail.figures.len(), 3, "summaries fit once the reason is cut");
+        assert_eq!(
+            fail.figures.len(),
+            3,
+            "summaries fit once the reason is cut"
+        );
         assert_eq!(fail.figures[0], "fail: 0 pass, 0 gap, 40 fail");
     }
 
