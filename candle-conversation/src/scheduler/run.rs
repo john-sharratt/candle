@@ -770,6 +770,7 @@ impl Scheduler {
             if self.active_decodes.is_empty()
                 && self.active_prefills.is_empty()
                 && self.prefill_queue.is_empty()
+                && self.pending_submits.is_empty()
                 && self.section_queue.is_empty()
                 && self.active_section_ingests.is_empty()
                 && self.deferred_glue_fires.is_empty()

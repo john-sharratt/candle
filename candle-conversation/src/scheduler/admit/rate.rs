@@ -1081,7 +1081,8 @@ impl WaveRate {
     }
 
     /// Offer a prefill that **outranks work the engine is already running** — a
-    /// band above some active slot's. Only the row cap is judged.
+    /// band above some active slot's. The row cap and the prefill floor are
+    /// judged; the decode floor and the gain rules are not.
     ///
     /// The floors defend the residency the running work decodes at, and the gain
     /// rules defend the wave's rate. Neither is a reason to hold back a band the
@@ -1094,12 +1095,33 @@ impl WaveRate {
     /// The residency it spends is paid back by the throttle, which yields the
     /// lower bands' creep to this band's decode.
     ///
+    /// **The prefill floor is not the lower band's, and it still binds.** What
+    /// the case above was held at is the *decode* floor — the residency the
+    /// running work decodes at, which the lower band spent and the throttle hands
+    /// back. The prefill floor is a different line: below it the wave already
+    /// committed and one useful forward no longer fit beside the weights at all,
+    /// and [`Self::try_join`] and [`Self::try_widen`] hold it for every other
+    /// admission. Judging only the cap let the outranking band break itself:
+    /// measured on the 3090 scratch daemon (2026-10-18, zend-load heavy-read),
+    /// eight `High` turns admitted outranking calibration work took residency
+    /// from 4,318 MiB to 0 against a 3,913 MiB prefill floor, and their own
+    /// cohort's sweep then found its 1.71 GB window tier one region short —
+    /// 22 of 26 turns lost after 260 s each.
+    ///
     /// A refusal on the cap does **not** latch [`Self::is_full`]: the forward's
     /// rows are spent, not the turn's chance, and the caller re-offers it as a
     /// join — or latches the wave itself ([`Self::latch_full`]) when it cannot.
+    /// A refusal on the floor latches, as it does for every admission.
     pub fn try_outranking(&mut self, tokens: usize, weights_after: u64) -> Admit {
         if self.full {
             return Admit::Refused(Refusal::Full);
+        }
+        if self.admitted_any && weights_after < self.prefill_floor {
+            self.full = true;
+            return Admit::Refused(Refusal::Floor {
+                resident_after: weights_after,
+                floor: self.prefill_floor,
+            });
         }
         let tokens_after = self.tokens.saturating_add(tokens);
         if self.admitted_any && tokens_after > self.max_tokens {
@@ -1138,27 +1160,49 @@ impl WaveRate {
     /// on a seed measured 26x optimistic would turn away prefills that have not
     /// yet run the decode forwards the estimate is learned from, and the engine
     /// would never leave the window it is refusing on.
-    pub fn decode_would_carry(&self, draft: usize, resident: u64) -> Result<f64, Refusal> {
+    ///
+    /// **The floor refuses the offer that crosses it, not every offer once it
+    /// is crossed.** It defends the residency the decodes run at against an
+    /// admission that would spend it. When committed work already holds
+    /// residency under it — the running turns' state, the cohort's tier — no
+    /// refusal brings those weights back; refusing only keeps another decode
+    /// out of the batch that shares the expert streaming, which is what makes
+    /// streamed experts affordable at all. Measured on the 3090 scratch daemon
+    /// (2026-10-18, zend-load heavy-decode, 24 `High` clients): residency 3–4.5
+    /// GiB against a 7.4 GiB decode floor and a 9–20% expert hit rate, 911
+    /// offers refused on it in eleven minutes, first text p50 160 s where the
+    /// same rung ran at 10.9 s. Under the floor the question is the marginal
+    /// one the model already asks — does the wave decode faster with this turn
+    /// in it, at the residency the turn leaves, than without it at the
+    /// residency it found — and the prefill floor still bounds what fits.
+    pub fn decode_would_carry(
+        &self,
+        draft: usize,
+        resident_before: u64,
+        resident_after: u64,
+    ) -> Result<f64, Refusal> {
         let routed_after = self
             .routed_per_layer
             .saturating_add(self.experts_per_decode(draft));
-        let projected = self.decode_rate(self.decodes + 1, routed_after, resident);
+        let projected = self.decode_rate(self.decodes + 1, routed_after, resident_after);
         if self.decode_samples < Self::MIN_DECODE_SAMPLES {
             return Ok(projected);
         }
-        if resident < self.decode_floor {
+        if resident_before >= self.decode_floor && resident_after < self.decode_floor {
             return Err(Refusal::Floor {
-                resident_after: resident,
+                resident_after,
                 floor: self.decode_floor,
             });
         }
         // Against the wave's decodes as they stand: if adding the decode this
-        // turn becomes would not pay for itself at this residency, the prefill
-        // that creates it should not be admitted either. With no decode in the
-        // wave yet there is nothing to compare against and the turn is carried —
-        // the same head rule the rest of the model keeps.
+        // turn becomes would not pay for itself — the wave without it at the
+        // residency it found, against the wave with it at the residency it
+        // leaves — the prefill that creates it should not be admitted either.
+        // With no decode in the wave yet there is nothing to compare against
+        // and the turn is carried — the same head rule the rest of the model
+        // keeps.
         if self.decodes > 0 {
-            let current = self.decode_rate(self.decodes, self.routed_per_layer, resident);
+            let current = self.decode_rate(self.decodes, self.routed_per_layer, resident_before);
             Self::judge_gain(current, projected, self.min_gain)?;
         }
         Ok(projected)
@@ -1346,7 +1390,9 @@ impl WaveRate {
                     max_decodes: self.max_decodes,
                 });
             }
-            if after < self.decode_floor {
+            // The offer that crosses the floor, as in `decode_would_carry`: once
+            // committed work holds residency under it, the gain below decides.
+            if before >= self.decode_floor && after < self.decode_floor {
                 return Err(Refusal::Floor {
                     resident_after: after,
                     floor: self.decode_floor,
@@ -1729,37 +1775,43 @@ mod tests {
         );
     }
 
-    /// **A band the running work yields to is admitted under both floors, and
-    /// stopped only by the row cap.** The wave already carries rows, so the head
-    /// waiver is spent; a join of the same turn at the same residency is refused
-    /// at the floor, and the outranking offer is not.
+    /// **A band the running work yields to is admitted under the decode floor,
+    /// and stopped by the row cap and the prefill floor.** The wave already
+    /// carries rows, so the head waiver is spent. The decode floor is the
+    /// residency the lower band spent; the prefill floor is the line below
+    /// which the committed wave no longer fits, and nobody may cross it.
     #[test]
-    fn an_outranking_prefill_passes_the_floors_and_stops_at_the_cap() {
-        let floor = 4 * GIB;
+    fn an_outranking_prefill_passes_the_decode_floor_and_stops_at_the_prefill_floor() {
+        let (prefill_floor, decode_floor) = (2 * GIB, 4 * GIB);
+        let between = 3 * GIB;
         let mut p = planner(LINK_4090_MOBILE);
-        p.reset(8 * GIB, floor, floor, CAP, DECODE_CAP);
+        p.reset(8 * GIB, prefill_floor, decode_floor, CAP, DECODE_CAP);
         let _ = offer(&mut p, prefill(CAP - 2), 0);
-        let mut joined = p.clone();
-        assert!(matches!(
-            joined.try_join(floor - GIB),
-            Admit::Refused(Refusal::Floor { .. })
-        ));
 
         assert!(matches!(
-            p.try_outranking(2, floor - GIB),
+            p.try_outranking(2, between),
             Admit::Admitted { .. }
         ));
         assert_eq!(p.tokens(), CAP, "its rows join the wave's");
-        assert_eq!(p.resident_now(), floor - GIB);
+        assert_eq!(p.resident_now(), between);
         assert!(matches!(
-            p.try_outranking(1, floor - GIB),
+            p.try_outranking(1, between),
             Admit::Refused(Refusal::Cap { max_tokens }) if max_tokens == CAP
         ));
         assert!(
-            matches!(p.try_outranking(0, floor - GIB), Admit::Admitted { .. }),
+            matches!(p.try_outranking(0, between), Admit::Admitted { .. }),
             "the cap leaves the wave open for the same turn as a join"
         );
         assert_eq!(p.tokens(), CAP, "a join adds no rows");
+
+        assert!(matches!(
+            p.try_outranking(0, prefill_floor - GIB),
+            Admit::Refused(Refusal::Floor { floor, .. }) if floor == prefill_floor
+        ));
+        assert!(
+            matches!(p.try_outranking(0, between), Admit::Refused(Refusal::Full)),
+            "a floor refusal latches, as it does for every admission"
+        );
     }
 
     /// **A latched wave must not decide a promotion.** `try_admit` refuses
@@ -1845,11 +1897,26 @@ mod tests {
         p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         // Residency under the floor: the decode side cannot stand there.
         assert!(matches!(
-            p.decode_would_carry(0, FLOOR_16GB - 1),
+            p.decode_would_carry(0, RESIDENT_RUN15, FLOOR_16GB - 1),
             Err(Refusal::Floor { .. })
         ));
         // And where it can, the same question answers yes.
-        assert!(p.decode_would_carry(0, RESIDENT_RUN15).is_ok());
+        assert!(p.decode_would_carry(0, RESIDENT_RUN15, RESIDENT_RUN15).is_ok());
+    }
+
+    /// **Under the floor already, the floor is not what refuses.** Committed
+    /// work holds residency there, and refusing the turn returns no weight; the
+    /// marginal question decides instead — here, with no decode in the wave to
+    /// compare against, the head rule carries it.
+    #[test]
+    fn a_floor_already_crossed_leaves_the_decode_to_the_gain() {
+        let mut p = planner_judging(20e-3);
+        p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
+        let under = FLOOR_16GB - GIB;
+        assert!(
+            p.decode_would_carry(0, under, under - GIB / 4).is_ok(),
+            "the turn did not cross the floor, so the floor does not refuse it"
+        );
     }
 
     /// **The question commits nothing.** The decode rides a later wave and buys
@@ -1862,8 +1929,8 @@ mod tests {
         let decodes = p.decodes();
         let resident = p.resident_now();
         for _ in 0..4 {
-            let _ = p.decode_would_carry(0, RESIDENT_RUN15);
-            let _ = p.decode_would_carry(0, FLOOR_16GB - 1);
+            let _ = p.decode_would_carry(0, RESIDENT_RUN15, RESIDENT_RUN15);
+            let _ = p.decode_would_carry(0, RESIDENT_RUN15, FLOOR_16GB - 1);
         }
         assert_eq!(p.decodes(), decodes, "no decode was counted in");
         assert_eq!(p.resident_now(), resident, "no residency was spent");
@@ -1880,7 +1947,7 @@ mod tests {
         p.reset(RESIDENT_RUN15, FLOOR_16GB, FLOOR_16GB, CAP, DECODE_CAP);
         assert!(p.decode_samples() < WaveRate::MIN_DECODE_SAMPLES);
         assert!(
-            p.decode_would_carry(0, FLOOR_16GB - 1).is_ok(),
+            p.decode_would_carry(0, RESIDENT_RUN15, FLOOR_16GB - 1).is_ok(),
             "while unlearned the decode question cannot refuse"
         );
     }

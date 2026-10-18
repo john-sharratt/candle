@@ -86,6 +86,44 @@ fn deepest_chunk_offset(depth: usize, turn: usize, rows: usize) -> usize {
     depth + turn.saturating_sub(rows)
 }
 
+/// The prefill cohort a pass is composing: the held creep group, whose
+/// advances are fixed, then every member that will join it — admitted on an
+/// earlier pass or by this one — with its remaining rows and depth.
+///
+/// **An offer is charged what it adds to the forward the cohort will run, not
+/// what it would cost alone.** The tier is superlinear in spans and its launch
+/// carve follows each member's depth, so N admissions priced as N one-sequence
+/// waves understate the wave they compose — measured on the 3090 scratch
+/// daemon, calibration passes admitting 32 cases against ~2 GiB of priced tier
+/// whose forward then placed 4.48 GB and found no ground in 1,024 attempts.
+///
+/// **Composed when priced, the way the group is formed** ([`Scheduler::compose`]):
+/// a member's rows are not fixed when it is admitted, because a turn that
+/// joined a spent forward still rides the cohort's windows once the group
+/// absorbs it. Pricing that join at no rows charged a cohort of 6,254 rows
+/// that ran at 8,066.
+#[derive(Clone, Default)]
+pub(super) struct WaveDraft {
+    held_rows: usize,
+    held_advances: Vec<usize>,
+    held_depths: Vec<usize>,
+    /// `(remaining, depth)` of each member not in the held group.
+    joining: Vec<(usize, usize)>,
+    /// The width the rate model chose for the cohort, which its forwards are
+    /// composed at — `None` when no choice stands. A pass that widens clears
+    /// it, one that closes sets it; the draft follows, so each offer is priced
+    /// at the width its own admission leaves.
+    width: Option<usize>,
+}
+
+/// A [`WaveDraft`] composed into the forward it will run.
+pub(super) struct Composed {
+    pub(super) rows: usize,
+    seqs: usize,
+    advances: Vec<usize>,
+    depths: Vec<usize>,
+}
+
 /// A priority's slot in the per-band cursors. Three bands, in the order
 /// `admit::order::BANDS` offers them.
 fn band_index(prio: DecodePriority) -> usize {
@@ -127,10 +165,31 @@ pub(super) struct AdmitPass<'a> {
     /// Rows this pass has admitted, so each offer is sized to the room that is
     /// still free rather than to the whole of [`Self::chunk_rows`]. See `peek`.
     rows_taken: usize,
-    /// The tier the wave already in flight reserves — see
-    /// [`Scheduler::standing_tier_bytes`]. Read once: it describes committed
-    /// work, so it cannot move under the pass.
+    /// The ground the wave already in flight reserves — its tier and its
+    /// decodes' growth over a sweep, see [`Scheduler::standing_ground_bytes`].
+    /// Read once: it describes committed work, so it cannot move under the
+    /// pass.
     standing_tier: usize,
+    /// The rows the cohort stood at when the pass opened. Read once, like the
+    /// tier: what this pass admits joins the cohort as it goes, and is counted
+    /// in [`Self::rows_taken`] instead.
+    standing_rows: usize,
+    /// The forward this pass is composing, and its tier — what each offer's
+    /// tier is priced against. See [`WaveDraft`].
+    wave: WaveDraft,
+    wave_tier: u64,
+    /// The rows [`Self::wave`] composes to — what an offer widens it from.
+    wave_rows: usize,
+    /// The member the offer [`Ground::peek`] last answered would add to
+    /// [`Self::wave`]: its remaining rows and depth.
+    offered: Option<(usize, usize)>,
+    /// Whether that offer was sized to the floor, so its admission closes the
+    /// forward at its width — see `offer_tier`.
+    narrowed: bool,
+    /// Hole ground this pass has credited to admitted claims that have not yet
+    /// landed — so two offers are not both told the same hole is theirs. See
+    /// `admit::Cost::hole_credit`.
+    holes_spoken: u64,
     /// How far down `prefill_queue` this pass has offered, **per priority
     /// band**.
     ///
@@ -139,6 +198,12 @@ pub(super) struct AdmitPass<'a> {
     /// the `Low` band would start from wherever `High` had walked to and skip
     /// every `Low` candidate ahead of it.
     prefill_cursor: [usize; 3],
+    /// Per band, the next pending submission to offer ([`Scheduler::pending_submits`]),
+    /// scanned once the band's queued work is spent.
+    submit_cursor: [usize; 3],
+    /// Whether the offer [`Ground::peek`] last answered is a pending submission,
+    /// which [`Ground::admit`] then materialises before it begins.
+    offering_submit: bool,
     /// Whether this pass admitted prefill rows, and whether it closed them on
     /// the rate — what [`Self::conclude`] reads to replace the cohort's width.
     widened: bool,
@@ -153,7 +218,23 @@ impl<'a> AdmitPass<'a> {
         // Offered against the ceiling, not the width the last pass chose: a
         // pass that finds wider rows paying widens the cohort's forwards.
         let chunk_rows = sched.prefill_pass_ceiling();
-        let standing_tier = sched.standing_tier_bytes();
+        let wave = sched.standing_wave();
+        let composed = sched.compose(&wave);
+        let wave_tier = sched.composed_tier(&composed);
+        // Net of what the running decodes will claim over a sweep: see
+        // `Scheduler::standing_ground_bytes`.
+        let growth = sched.decode_growth_bytes();
+        let standing_tier = (wave_tier as usize).saturating_add(growth);
+        tracing::debug!(
+            target: "candle_conversation::scheduler::admission",
+            standing_tier_mib = wave_tier >> 20,
+            decode_growth_mib = growth >> 20,
+            residency_mib = residency_now(standing_tier) >> 20,
+            holes_mib = interleave::stranded_hole_bytes() >> 20,
+            standing_rows = composed.rows,
+            members = composed.seqs,
+            "admission pass opened",
+        );
         let headroom = sched.admit_headroom(standing_tier);
         let budget = sched.admit_budget_terms(&headroom, chunk_rows);
         Self {
@@ -166,7 +247,16 @@ impl<'a> AdmitPass<'a> {
             rows_taken: 0,
             chunk_rows,
             standing_tier,
+            standing_rows: composed.rows,
+            wave_rows: composed.rows,
+            wave,
+            wave_tier,
+            offered: None,
+            narrowed: false,
+            holes_spoken: 0,
             prefill_cursor: [0; 3],
+            submit_cursor: [0; 3],
+            offering_submit: false,
             widened: false,
             closed: false,
         }
@@ -183,47 +273,175 @@ impl<'a> AdmitPass<'a> {
         }
     }
 
-    /// The tier the **deepest** chunk of a `turn`-token prefill from sequence
-    /// `seq` needs, fed `rows` at a time, or zero when the model cannot price
-    /// one.
+    /// What [`Self::wave`] gains by taking `member` (its remaining rows and
+    /// depth) with its forwards composed at `width`: the tier, and the rows
+    /// the composed forward widens by. Zero when the model cannot price one.
     ///
-    /// The deepest, not the first: the terms that follow depth — the
-    /// pre-stage up to its key-chunk bound, and on a sparse-selection model
-    /// the scoring over every candidate block the deepest row can see — grow
-    /// as the turn advances, so a 128K turn's last chunk costs a tier its first
-    /// does not. A full-width chunk ending at the turn's last token bounds
-    /// every chunk the turn will run: none is wider, and none reaches deeper.
-    fn tier_for(&self, rows: usize, turn: usize, seq: SequenceId) -> u64 {
-        let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
-        let deepest = deepest_chunk_offset(depth, turn, rows);
-        self.sched
-            .model
-            .wave_tier_bytes(
-                rows,
-                1,
-                &[rows],
-                &[deepest],
-                self.sched.session.activation_dtype(),
-            )
-            .unwrap_or(0)
+    /// A member that adds no row is not free: the span tables hold an entry
+    /// per span, and pricing it at zero lets a forward widen to the sequence
+    /// cap on a tier admission never charged.
+    fn added(&self, member: (usize, usize), width: Option<usize>) -> (u64, usize) {
+        let mut with = self.wave.clone();
+        with.joining.push(member);
+        with.width = width;
+        let composed = self.sched.compose(&with);
+        (
+            self.sched
+                .composed_tier(&composed)
+                .saturating_sub(self.wave_tier),
+            composed.rows.saturating_sub(self.wave_rows),
+        )
     }
 
-    /// The tier a **join** adds: the forward's rows stay where they are, and it
-    /// carries one sequence more. The tier is superlinear in sequences — the span
-    /// tables hold an entry per span — so a join is not free even though it adds
-    /// no row, and pricing it at zero lets a forward widen to the sequence cap on
-    /// a tier admission never charged. It stages nothing: it brings no rows
-    /// into this forward, and the forwards that give it rows price it standing.
-    fn join_tier(&self, rows: usize) -> u64 {
-        let dtype = self.sched.session.activation_dtype();
-        let seqs = self.sched.running_prefills();
-        let tier = |n: usize| {
-            self.sched
-                .model
-                .wave_tier_bytes(rows, n, &[], &[], dtype)
-                .unwrap_or(0)
-        };
-        tier(seqs + 1).saturating_sub(tier(seqs))
+    /// An offer of `turn` tokens at `depth` whose claim (its K/V and store) is
+    /// `claim` bytes, given `room` rows free in the forward: the rows it earns
+    /// there, the tier it adds and the creep residual it owes. Records the
+    /// member, for the admit that follows.
+    ///
+    /// Staged at its **deepest** chunk, not its first: the terms that follow
+    /// depth — the pre-stage up to its key-chunk bound, and on a
+    /// sparse-selection model the scoring over every candidate block the
+    /// deepest row can see — grow as the turn advances, so a 128K turn's last
+    /// chunk costs a tier its first does not. A full-width chunk ending at the
+    /// turn's last token bounds every chunk the turn will run.
+    ///
+    /// The residual is sized by the cohort's composed rows, so it is owed for
+    /// the rows the offer widens the composition by — a join the group
+    /// absorbs owes it as surely as a turn with rows in this forward.
+    ///
+    /// **Priced at the width its own admission leaves.** An offer with rows
+    /// widens the forward, and a pass that widens clears the rate model's
+    /// width (`conclude`), so the group then composes at the deployment's
+    /// target; a join leaves the width as it stands.
+    ///
+    /// **Sized to the floor when it cannot fit whole.** A turn whose rows would
+    /// take residency under the prefill floor is offered the widest rows that
+    /// still clear it — never fewer than the least advance — and the pass
+    /// closes at that width when it is admitted (`take_offered`), so the group
+    /// composes there and the turn advances by that much a forward. Offered
+    /// whole, it is refused on every pass: measured on the 3090 scratch daemon
+    /// (2026-10-18), a 4,325-row `High` tool-result prefill priced at a
+    /// 4,992 MiB tier against 954 MiB of room, refused for minutes while the
+    /// person waited, 22 turns cut at the client's deadline.
+    fn offer_tier(
+        &mut self,
+        room: usize,
+        turn: usize,
+        depth: usize,
+        claim: u64,
+    ) -> (usize, u64, u64) {
+        let member = (turn, depth);
+        self.offered = Some(member);
+        self.narrowed = false;
+        let rows = turn.min(room);
+        if rows == 0 {
+            let (tier, widened) = self.added(member, self.wave.width);
+            return (0, tier, self.residual_for(widened));
+        }
+        let (tier, widened) = self.added(member, None);
+        let residual = self.residual_for(widened);
+        let spendable = self
+            .resident_weights()
+            .saturating_sub(self.budget.prefill_floor);
+        if self.dislodges(claim, residual, tier) <= spendable {
+            return (rows, tier, residual);
+        }
+        // Chunk-aligned rows, bisected: the tier and the residual both grow
+        // with the rows, so the rows that fit are a prefix.
+        let least = PREFILL_MIN_ADVANCE.min(rows).div_ceil(CHUNK_SIZE);
+        let (mut lo, mut hi) = (least, rows.div_ceil(CHUNK_SIZE) - 1);
+        let mut fit = None;
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let r = (mid * CHUNK_SIZE).min(rows);
+            let width = self.standing_rows + self.rows_taken + r;
+            let (tier, widened) = self.added(member, Some(width));
+            let residual = self.residual_for(widened);
+            if self.dislodges(claim, residual, tier) <= spendable {
+                fit = Some((r, tier, residual));
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        match fit {
+            Some(narrow) => {
+                self.narrowed = true;
+                narrow
+            }
+            // Not even the least advance fits: the whole offer is the honest
+            // price, and the floor refuses it.
+            None => (rows, tier, residual),
+        }
+    }
+
+    /// What an offer claiming `claim` with this residual and tier dislodges,
+    /// its hole credit taken — the figure the floor is judged on.
+    fn dislodges(&self, claim: u64, residual: u64, tier: u64) -> u64 {
+        self.credited(Cost {
+            kv: claim,
+            residual,
+            activations: tier,
+            ..Default::default()
+        })
+        .dislodged_bytes()
+    }
+
+    /// The offer [`Self::offer_tier`] priced was admitted: it is a member of
+    /// the cohort the next offer is priced against, at the width its
+    /// admission leaves — closed where it was sized to the floor, cleared
+    /// where it widened the forward.
+    fn take_offered(&mut self, rows: usize) {
+        if let Some(member) = self.offered.take() {
+            self.wave.joining.push(member);
+        }
+        if self.narrowed {
+            self.narrowed = false;
+            self.close_rows();
+            return;
+        }
+        if rows > 0 && !self.closed {
+            self.wave.width = None;
+        }
+        self.recompose();
+    }
+
+    /// Re-read [`Self::wave`]'s composed tier and rows after it changed.
+    fn recompose(&mut self) {
+        let composed = self.sched.compose(&self.wave);
+        self.wave_tier = self.sched.composed_tier(&composed);
+        self.wave_rows = composed.rows;
+    }
+
+    /// `cost` with the part of its claim that lands in holes credited: the
+    /// holes stranded below the frontier now, less those this pass has
+    /// already promised to claims still to land.
+    fn credited(&self, cost: Cost) -> Cost {
+        let free = interleave::stranded_hole_bytes().saturating_sub(self.holes_spoken);
+        Cost {
+            hole_credit: cost.claimed_bytes().min(free),
+            ..cost
+        }
+    }
+
+    /// An admission credited `credit` of hole ground, and its carve has since
+    /// filled `stranded_before` less what stands now: the rest is still owed.
+    fn settle_holes(&mut self, stranded_before: u64, credit: u64) {
+        let landed = stranded_before.saturating_sub(interleave::stranded_hole_bytes());
+        self.holes_spoken = self
+            .holes_spoken
+            .saturating_add(credit)
+            .saturating_sub(landed);
+    }
+
+    /// The creep residual `rows` more rows hold: the hidden state a sweep keeps
+    /// between windows is sized by the cohort's rows and claimed when the
+    /// cohort forms, so each offer owes its own rows' share. Linear in rows,
+    /// so the shares a pass admits sum to what the cohort claims.
+    fn residual_for(&self, rows: usize) -> u64 {
+        self.sched
+            .model
+            .creep_residual_bytes(&self.sched.session, rows) as u64
     }
 }
 
@@ -261,8 +479,19 @@ impl Ground for AdmitPass<'_> {
         residency_now(self.standing_tier).saturating_sub(self.committed)
     }
 
+    /// Rows the next wave already carries before admission adds anything: the
+    /// held creep group, which rides that wave whole, and the admitted members
+    /// that will join it ([`Scheduler::standing_wave`]).
+    ///
+    /// **Charged to the wave before any offer is judged**, for two reasons. The
+    /// offers behind it are then priced against the forward that will actually
+    /// run rather than an empty one — a cohort already in flight is most of the
+    /// copy those offers would otherwise look like they were amortising alone.
+    /// And it denies the head waiver: the model carries its first offer
+    /// unconditionally so a slot too large to ever fit cannot block the queue
+    /// forever, and a wave already carrying a cohort is not that case.
     fn standing_rows(&self) -> usize {
-        self.sched.standing_rows()
+        self.standing_rows
     }
 
     fn peek(&mut self, kind: Kind, prio: DecodePriority) -> Option<Cost> {
@@ -294,10 +523,12 @@ impl Ground for AdmitPass<'_> {
     /// offer has no room and comes back as a join, and the forwards the cohort
     /// shares are composed at this width (`Scheduler::rate_width`).
     fn close_rows(&mut self) -> bool {
-        let width = self.sched.standing_rows().saturating_add(self.rows_taken);
+        let width = self.standing_rows.saturating_add(self.rows_taken);
         self.chunk_rows = width.max(CHUNK_SIZE);
         self.sched.set_rate_width(width);
         self.closed = true;
+        self.wave.width = Some(width);
+        self.recompose();
         true
     }
 
@@ -321,27 +552,12 @@ impl AdmitPass<'_> {
     fn room(&self) -> Option<usize> {
         let room = self
             .chunk_rows
-            .saturating_sub(self.sched.standing_rows().saturating_add(self.rows_taken));
+            .saturating_sub(self.standing_rows.saturating_add(self.rows_taken));
         let members = self.sched.prefill_width() + self.sched.section_ingest_width();
         if room == 0 && (members + 1).saturating_mul(CHUNK_SIZE) > self.chunk_rows {
             return None;
         }
         Some(room)
-    }
-
-    /// The tier an offer of `turn` tokens from `seq` adds to the forward,
-    /// given `room` rows free in it.
-    fn offer_tier(&self, room: usize, turn: usize, seq: SequenceId) -> (usize, u64) {
-        let rows = turn.min(room);
-        // A join widens the forward by a sequence rather than by rows, and pays
-        // for that; an offer with rows pays for its rows.
-        let rows_in_forward = self.chunk_rows.saturating_sub(room);
-        let activations = if rows == 0 {
-            self.join_tier(rows_in_forward)
-        } else {
-            self.tier_for(rows, turn, seq)
-        };
-        (rows, activations)
     }
 
     /// The section band's next candidate: the head of the section queue,
@@ -359,14 +575,19 @@ impl AdmitPass<'_> {
             self.recurrent
         };
         let room = self.room()?;
-        let (rows, activations) = self.offer_tier(room, turn, seq);
-        Some(Cost {
-            kv: prefill_cost_bytes(turn, self.per_block),
+        let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
+        let kv = prefill_cost_bytes(turn, self.per_block);
+        let (rows, activations, residual) =
+            self.offer_tier(room, turn, depth, kv.saturating_add(recurrent));
+        Some(self.credited(Cost {
+            kv,
             recurrent,
+            residual,
+            hole_credit: 0,
             activations,
             rows,
             decodes_after: false,
-        })
+        }))
     }
 
     /// Admit the section queue's head, priced at `cost`, and start it — its
@@ -377,6 +598,7 @@ impl AdmitPass<'_> {
             return false;
         };
         let before = residency_now(self.standing_tier);
+        let stranded = interleave::stranded_hole_bytes();
         if let Err(refused) = self.sched.begin_section(section) {
             let (section, why) = *refused;
             tracing::debug!(
@@ -387,6 +609,8 @@ impl AdmitPass<'_> {
             return false;
         }
         self.rows_taken = self.rows_taken.saturating_add(cost.rows);
+        self.take_offered(cost.rows);
+        self.settle_holes(stranded, cost.hole_credit);
         self.widened |= cost.rows > 0;
         // See `admit_prefill`: what the section dislodges as it runs is carried
         // so the offers behind it face the wave as it now stands, less what the
@@ -418,7 +642,11 @@ impl AdmitPass<'_> {
             }
             self.prefill_cursor[band] += 1;
         }
-        let w = self.sched.prefill_queue.get(self.prefill_cursor[band])?;
+        // The band's queued work first; then the submissions behind it.
+        let Some(w) = self.sched.prefill_queue.get(self.prefill_cursor[band]) else {
+            return self.peek_submit(prio);
+        };
+        self.offering_submit = false;
         // **Offer what is LEFT of the wave's rows, not the whole cap.**
         //
         // Clipping to `chunk_rows` made every offer the size of the entire budget,
@@ -464,22 +692,106 @@ impl AdmitPass<'_> {
             self.sched.uncarved_case(w).is_none() && self.sched.model.has_recurrent_state(seq.0);
         let recurrent = if holds_store { 0 } else { self.recurrent };
         let room = self.room()?;
-        let (rows, activations) = self.offer_tier(room, turn, seq);
-        Some(Cost {
+        let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
+        let kv = prefill_cost_bytes(turn, self.per_block);
+        let (rows, activations, residual) =
+            self.offer_tier(room, turn, depth, kv.saturating_add(recurrent));
+        Some(self.credited(Cost {
             // The whole turn's K/V, not this chunk's: admitting the turn commits
             // the engine to feeding all of it, and a cost that priced only the
             // first chunk would admit a queue of turns whose tails cannot fit.
-            kv: prefill_cost_bytes(turn, self.per_block),
+            kv,
             recurrent,
+            residual,
+            hole_credit: 0,
             activations,
             rows,
             // The turn decodes when this prefill finishes, which is what puts
             // the decode model's judgement in play beside the prefill one.
             decodes_after: true,
-        })
+        }))
+    }
+
+    /// The band's next pending submission, priced as the turn it will become
+    /// **plus the lift its projection puts on the device**
+    /// ([`super::submit_admit`]) — the selected history brought hot and its
+    /// index pages placed, ground the weight side loses exactly as the turn's
+    /// own K/V. Its view is carved at admission, so it holds no store yet, and
+    /// its tier is priced at the depth its projection will give it.
+    fn peek_submit(&mut self, prio: DecodePriority) -> Option<Cost> {
+        let band = band_index(prio);
+        while let Some(p) = self.sched.pending_submits.get(self.submit_cursor[band]) {
+            if self.sched.decode_priority_or_high(p.parent()) == prio {
+                break;
+            }
+            self.submit_cursor[band] += 1;
+        }
+        let p = self.sched.pending_submits.get(self.submit_cursor[band])?;
+        let (turn, depth, lift) = (p.work.tokens.len(), p.depth, p.lift);
+        let room = self.room()?;
+        let kv = prefill_cost_bytes(turn, self.per_block).saturating_add(lift);
+        let (rows, activations, residual) =
+            self.offer_tier(room, turn, depth, kv.saturating_add(self.recurrent));
+        self.offering_submit = true;
+        Some(self.credited(Cost {
+            kv,
+            recurrent: self.recurrent,
+            residual,
+            hole_credit: 0,
+            activations,
+            rows,
+            decodes_after: true,
+        }))
+    }
+
+    /// Admit the pending submission [`Self::peek_submit`] offered: put its
+    /// projection on the device and begin it. A turn whose begin the allocators
+    /// refuse stays queued as carved work, as an admitted case does.
+    fn admit_submit(&mut self, prio: DecodePriority, cost: Cost) -> bool {
+        let band = band_index(prio);
+        let at = self.submit_cursor[band];
+        let Some(pending) = self.sched.pending_submits.remove(at) else {
+            return false;
+        };
+        for (i, c) in self.submit_cursor.iter_mut().enumerate() {
+            if i != band && *c > at {
+                *c -= 1;
+            }
+        }
+        let before = residency_now(self.standing_tier);
+        let stranded = interleave::stranded_hole_bytes();
+        let begun = match self.sched.materialise_submit(pending) {
+            Some(work) => match self.sched.begin_admitted(work) {
+                Ok(()) => true,
+                Err(refused) => {
+                    let (work, why) = *refused;
+                    tracing::debug!(
+                        target: "candle_conversation::scheduler::throttle",
+                        "admitted submission could not begin — it waits as carved work: {why}",
+                    );
+                    self.sched.prefill_queue.push_front(work);
+                    false
+                }
+            },
+            // Its caller has the error, or it went to a turn group whose cases
+            // are offered on their own.
+            None => true,
+        };
+        self.rows_taken = self.rows_taken.saturating_add(cost.rows);
+        self.take_offered(cost.rows);
+        self.settle_holes(stranded, cost.hole_credit);
+        self.widened |= cost.rows > 0;
+        let carved = before.saturating_sub(residency_now(self.standing_tier));
+        self.committed = self
+            .committed
+            .saturating_add(cost.dislodged_bytes().saturating_sub(carved));
+        begun
     }
 
     fn admit_prefill(&mut self, prio: DecodePriority, cost: Cost) -> bool {
+        if self.offering_submit {
+            return self.admit_submit(prio, cost);
+        }
         let band = band_index(prio);
         let at = self.prefill_cursor[band];
         let Some(work) = self.sched.prefill_queue.remove(at) else {
@@ -491,6 +803,7 @@ impl AdmitPass<'_> {
         // it stood and ends the band, as any refusal after the model's yes does:
         // the ground is genuinely gone, and the case waits for the next pass.
         let before = residency_now(self.standing_tier);
+        let stranded = interleave::stranded_hole_bytes();
         if let Err(refused) = self.sched.begin_admitted(work) {
             let (work, why) = *refused;
             tracing::debug!(
@@ -503,6 +816,8 @@ impl AdmitPass<'_> {
         // Spend the rows this offer took, so the next offer in this pass is sized
         // to what is left — see `peek`.
         self.rows_taken = self.rows_taken.saturating_add(cost.rows);
+        self.take_offered(cost.rows);
+        self.settle_holes(stranded, cost.hole_credit);
         self.widened |= cost.rows > 0;
         // **Nothing is purchased here, and that is not an omission.**
         //
@@ -606,6 +921,18 @@ impl Scheduler {
             .unwrap_or(0)
     }
 
+    /// Whether spending `bytes` more of the weight side's residency leaves it at
+    /// or above the decode floor admission defends — the same line
+    /// [`Self::admit_budget_terms`] gives the rate model, read now. What a
+    /// mid-decode rebuild is judged by: it adds no rows, so the only question is
+    /// whether the decodes it would slow can still be carried.
+    pub(super) fn decode_floor_holds_after(&self, bytes: u64) -> bool {
+        let standing = self.standing_ground_bytes();
+        let room = self.admit_headroom(standing);
+        let floor = room.floor().saturating_add(self.min_forward_tier_bytes());
+        residency_now(standing).saturating_sub(bytes) >= floor
+    }
+
     /// The tier the wave already in flight reserves — the held creep group,
     /// its members' pre-stage at each one's own depth included.
     ///
@@ -614,27 +941,137 @@ impl Scheduler {
     /// `Cost::dislodged_bytes`, so between them the wave's tier is counted
     /// exactly once.
     pub(super) fn standing_tier_bytes(&self) -> usize {
-        let rows = self.standing_rows();
-        let seqs = self.wave_prefill_members.len().max(1);
-        let (advances, depths): (Vec<usize>, Vec<usize>) = self
-            .wave_prefill_members
+        self.composed_tier(&self.compose(&self.standing_wave())) as usize
+    }
+
+    /// Ground the standing wave holds against the weight side: its tier, and
+    /// the K/V its running decodes will claim before a sweep's windows are
+    /// done ([`super::sweep_forecast`]), in whole regions as the claims take
+    /// it. What every residency reading is net of.
+    ///
+    /// **The decodes' growth is committed ground, not headroom.** A sweep's
+    /// tier is placed per window on the ground left then, and the decodes
+    /// beside it keep claiming as they generate; admission that spends to the
+    /// floor's edge leaves the later windows that much short. Measured on the
+    /// 3090 scratch daemon (2026-10-18): floor-sized offers took residency to
+    /// within 27 MiB of the prefill floor, and the sweep's last window found
+    /// its 5.0 GB tier two regions short — ten decodes' claims over its 30 s.
+    /// The group budget already withholds this forecast; admission now reads
+    /// the same one.
+    pub(super) fn standing_ground_bytes(&self) -> usize {
+        self.standing_tier_bytes()
+            .saturating_add(self.decode_growth_bytes())
+    }
+
+    /// The K/V the running decodes will claim over one sweep, in whole regions
+    /// — see [`Self::standing_ground_bytes`].
+    pub(super) fn decode_growth_bytes(&self) -> usize {
+        let growth = self
+            .model
+            .kv_bytes_per_row(self.session.activation_dtype())
+            .map_or(0, |row| self.sweep_forecast.withheld_bytes(row));
+        let region = candle_nn::kv_cache::REGION_BYTES;
+        growth.div_ceil(region).saturating_mul(region)
+    }
+
+    /// The cohort the next forwards carry as a [`WaveDraft`]: the held creep
+    /// group at each member's advance and depth, then **every prefill and
+    /// section admitted that has not joined it yet**.
+    ///
+    /// Those are the next group's members as surely as the held ones —
+    /// `share_within` carries every prefill in flight — and an earlier pass
+    /// charged their tier against the draft it composed. Starting the next pass
+    /// from the held group alone forgets that charge: measured on the 3090
+    /// scratch daemon (2026-10-18), five passes in two seconds each read
+    /// ~9.3 GiB, admitted three turns down to ~4.6 GiB and stopped — sixteen
+    /// turns whose cohort then formed at 8,192 rows on a 6.9 GB tier, and its
+    /// sweep failed two to four regions short with every member lost.
+    ///
+    /// Each takes rows from what the ceiling has left, staged at its deepest
+    /// chunk, exactly as its admission's offer was priced; past the ceiling
+    /// it joins, adding a sequence and no rows.
+    pub(super) fn standing_wave(&self) -> WaveDraft {
+        let mut wave = WaveDraft::default();
+        let mut held = Vec::with_capacity(self.wave_prefill_members.len());
+        for m in &self.wave_prefill_members {
+            let (WaveMember::Prefill { seq_id, advance }
+            | WaveMember::Section { seq_id, advance }) = m;
+            wave.held_rows += *advance;
+            wave.held_advances.push(*advance);
+            wave.held_depths
+                .push(self.session.sequence_offset(*seq_id).unwrap_or(0));
+            held.push(*seq_id);
+        }
+        let prefills = self
+            .active_prefills
             .iter()
-            .map(|m| match m {
-                WaveMember::Prefill { seq_id, advance }
-                | WaveMember::Section { seq_id, advance } => {
-                    (*advance, self.session.sequence_offset(*seq_id).unwrap_or(0))
-                }
-            })
-            .unzip();
+            .filter(|p| p.error.is_none() && p.finished.is_none())
+            .map(|p| (p.work.sequence_id, p.work.tokens.len().saturating_sub(p.offset)));
+        let sections = self
+            .active_section_ingests
+            .iter()
+            .filter(|s| s.error.is_none())
+            .map(|s| (s.sequence_id, s.tokens.len().saturating_sub(s.offset)));
+        for (seq, remaining) in prefills.chain(sections) {
+            if remaining > 0 && !held.contains(&seq.0) {
+                let depth = self.session.sequence_offset(seq.0).unwrap_or(0);
+                wave.joining.push((remaining, depth));
+            }
+        }
+        wave.width = self.rate_width.map(|w| w.rows);
+        wave
+    }
+
+    /// `wave` composed the way the group forms: the held group at its fixed
+    /// advances, then each joining member taking rows from what the ceiling
+    /// has left, staged at its deepest chunk; past the ceiling it rides as a
+    /// sequence with no rows.
+    ///
+    /// **The ceiling is the width the group will be composed at** — the group
+    /// budget at the draft's width, the rule `prefill_group_budget` forms the
+    /// group by — not the pass ceiling an offer is sized against. The group
+    /// budget absorbs a total that passes the model's cap by no more than its
+    /// slack, so a cohort can form wider than any ceiling an offer saw:
+    /// measured on the 3090 scratch daemon (2026-10-18), a sweep at 8,066 rows
+    /// whose last window's 7.26 GB tier was nine regions short. The stretch
+    /// fires exactly when the model's cap binds, which is when ground is short.
+    /// And a narrower width the pass closes at binds the other way: a member
+    /// clipped to it is priced at the rows it will actually run.
+    pub(super) fn compose(&self, wave: &WaveDraft) -> Composed {
+        let total = wave
+            .held_rows
+            .saturating_add(wave.joining.iter().map(|&(r, _)| r).sum::<usize>());
+        let ceiling =
+            self.prefill_group_budget_at(total, self.composition_target_at(wave.width));
+        let mut out = Composed {
+            rows: wave.held_rows,
+            seqs: wave.held_advances.len() + wave.joining.len(),
+            advances: wave.held_advances.clone(),
+            depths: wave.held_depths.clone(),
+        };
+        for &(remaining, depth) in &wave.joining {
+            let rows = remaining.min(ceiling.saturating_sub(out.rows));
+            if rows > 0 {
+                out.advances.push(rows);
+                out.depths.push(deepest_chunk_offset(depth, remaining, rows));
+                out.rows += rows;
+            }
+        }
+        out
+    }
+
+    /// The tier a forward composed as `wave` places — the same planner the
+    /// placement reads.
+    pub(super) fn composed_tier(&self, wave: &Composed) -> u64 {
         self.model
             .wave_tier_bytes(
-                rows,
-                seqs,
-                &advances,
-                &depths,
+                wave.rows,
+                wave.seqs.max(1),
+                &wave.advances,
+                &wave.depths,
                 self.session.activation_dtype(),
             )
-            .unwrap_or(0) as usize
+            .unwrap_or(0)
     }
 
     /// The wave's opening terms, from the same settled reading as the headroom.
@@ -701,7 +1138,7 @@ impl Scheduler {
         // amortised across forwards that *ran*, not across forwards wide enough to teach
         // the copy rate.
         self.wave_forwards += 1;
-        let resident = residency_now(self.standing_tier_bytes());
+        let resident = residency_now(self.standing_ground_bytes());
         if let Some(rate) = self.wave_rate.as_mut() {
             rate.observe_prefill(rows, resident, us as f64 / 1e6);
         }
@@ -720,7 +1157,7 @@ impl Scheduler {
         // Same reason as the prefill funnel: the loop's overhead is shared by every
         // forward a wave ran, of either kind.
         self.wave_forwards += 1;
-        let resident = residency_now(self.standing_tier_bytes());
+        let resident = residency_now(self.standing_ground_bytes());
         if let Some(rate) = self.wave_rate.as_mut() {
             rate.observe_decode(decodes, 0, resident, us as f64 / 1e6);
         }
@@ -766,7 +1203,7 @@ impl Scheduler {
             return;
         }
         let hit = hits as f64 / routed as f64;
-        let resident = residency_now(self.standing_tier_bytes());
+        let resident = residency_now(self.standing_ground_bytes());
         if let Some(rate) = self.wave_rate.as_mut() {
             rate.observe_hit_rate(hit, resident);
         }

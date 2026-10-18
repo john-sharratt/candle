@@ -103,6 +103,7 @@ impl Scheduler {
                 .active_section_ingests
                 .iter()
                 .any(|s| s.sequence_id == slot)
+            && !self.pending_submits.iter().any(|p| p.parent() == slot)
             && !self.fork_waits_on(slot)
     }
 

@@ -687,7 +687,7 @@ impl Scheduler {
             prefill_width: self.prefill_width(),
             section_width: self.section_ingest_width(),
             decode_width: self.decode_width(),
-            queued_prefills: self.prefill_queue.len(),
+            queued_prefills: self.prefill_queue.len() + self.pending_submits.len(),
         };
 
         // ── Experts ─────────────────────────────────────────────────────────

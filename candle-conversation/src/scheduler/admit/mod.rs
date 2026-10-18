@@ -473,7 +473,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                         // The decode that follows steps one row at a time; a
                         // drafted turn is wider, and would only be refused more
                         // readily than this asks for.
-                        match rate.decode_would_carry(0, after) {
+                        match rate.decode_would_carry(0, before, after) {
                             Ok(_) => true,
                             Err(r) => {
                                 out.note(r);
@@ -522,6 +522,24 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
             };
             if !allowed {
                 break;
+            }
+            if kind != Kind::Decode {
+                // The refusal's twin: a pass that admits more than its readings
+                // allow is read from these, not from the pass total.
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::admission",
+                    kind = ?kind,
+                    prio = ?prio,
+                    outranking = ground.outranks_active(prio),
+                    rows = cost.rows,
+                    tier_mib = cost.activations >> 20,
+                    dislodged_mib = cost.dislodged_bytes() >> 20,
+                    hole_credit_mib = cost.hole_credit >> 20,
+                    resident_before_mib = before >> 20,
+                    resident_after_mib = after >> 20,
+                    prefill_floor_mib = budget.prefill_floor >> 20,
+                    "offer admitted",
+                );
             }
             if !ground.admit(kind, prio, cost) {
                 // The allocators refused after the model said yes. The ground
@@ -611,6 +629,8 @@ mod tests {
         rows_closed: bool,
         /// The band of the slots already running, when one is set.
         running_band: Option<DecodePriority>,
+        /// The prefill floor, when a case needs it apart from the decode floor.
+        prefill_floor: u64,
     }
 
     impl Fake {
@@ -634,6 +654,7 @@ mod tests {
                 closes_rows: false,
                 rows_closed: false,
                 running_band: None,
+                prefill_floor: FLOOR,
             }
         }
         fn queue(&mut self, kind: Kind) -> &mut Vec<u64> {
@@ -679,7 +700,7 @@ mod tests {
                 // model's gain arithmetic and its caps, not about the prefill /
                 // decode split, and giving them the same number keeps each
                 // assertion meaning exactly what it meant before the split.
-                prefill_floor: FLOOR,
+                prefill_floor: self.prefill_floor,
                 decode_floor: FLOOR,
                 max_rows: 8_192,
                 max_decodes: 64,
@@ -738,10 +759,12 @@ mod tests {
         }
     }
 
-    /// **A dialogue turn is not held behind the background work it outranks.**
-    /// Residency already stands under the floor — the running `Low` slots spent
-    /// it — so a `Low` turn is refused there, while a `High` one is admitted
-    /// past it.
+    /// **A dialogue turn is not held behind the background work it outranks —
+    /// down to the prefill floor, and no further.** Residency already stands
+    /// under the decode floor — the running `Low` slots spent it — so a `Low`
+    /// turn is refused there, while a `High` one is admitted past it. Under the
+    /// prefill floor the committed wave no longer fits, and the `High` turn
+    /// waits as well: admitted there, it breaks its own cohort's sweep.
     #[test]
     fn a_turn_outranking_the_running_slots_is_admitted_under_the_floor() {
         let under = FLOOR - 4 * REGION;
@@ -756,9 +779,18 @@ mod tests {
         high.active = 14;
         high.running_band = Some(DecodePriority::Low);
         high.prefill_prio = DecodePriority::High;
+        high.prefill_floor = FLOOR - 8 * REGION;
         let got = fill_once(&mut high);
         assert_eq!(got.prefills, 1, "the band they yield to is admitted");
         assert!(!got.stopped_on_weights);
+
+        let mut broke = Fake::new(Vec::new(), vec![REGION], under);
+        broke.active = 14;
+        broke.running_band = Some(DecodePriority::Low);
+        broke.prefill_prio = DecodePriority::High;
+        let got = fill_once(&mut broke);
+        assert_eq!(got.prefills, 0, "under the prefill floor it waits too");
+        assert!(got.stopped_on_weights);
 
         let mut peer = Fake::new(Vec::new(), vec![REGION], under);
         peer.active = 14;

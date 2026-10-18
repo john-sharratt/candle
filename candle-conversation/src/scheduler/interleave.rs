@@ -73,15 +73,34 @@ pub(super) fn weight_zone_bytes() -> Option<u64> {
 ///
 /// Pass `0` where there is no wave in flight — the idle reseed, the reports —
 /// and the constant binds as it always did.
+///
+/// **Measured to the arena frontier, not the live count.** A free region below
+/// the frontier is a hole: the next claim takes it (the free list recycles
+/// lowest-first), but neither the weight side nor the tier can — the tier stands
+/// above every live arena, and the zone grows only from the floor down to it.
+/// Counted as weight ground, holes let admission hold a residency the weights
+/// could not reach: measured on the 3090 scratch daemon mid-sweep, 346 holes
+/// (5.8 GB) read as residency while the zone sat on its hard floor, and a
+/// 7.37 GB window tier found 7.06 GB above the frontier. Holes are credited to
+/// the claims that will land in them instead — see [`stranded_hole_bytes`].
 pub(super) fn effective_weight_zone_bytes(standing_tier: usize) -> Option<u64> {
     let r = stats()?;
     Some(achievable_weight_bytes(
         r.total,
-        r.live,
+        r.live_watermark.max(r.live),
         r.weight_bytes,
         REGION_BYTES,
         reserve_for(standing_tier),
     ))
+}
+
+/// Free ground stranded below the arena frontier: what the next claims take
+/// before any of them moves the frontier, and so the part of a claim that
+/// dislodges no weight.
+pub(super) fn stranded_hole_bytes() -> u64 {
+    stats().map_or(0, |r| {
+        (r.live_watermark.saturating_sub(r.live) * REGION_BYTES) as u64
+    })
 }
 
 /// The floor's reserve, raised by whatever a standing tier needs beyond the

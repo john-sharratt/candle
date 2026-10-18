@@ -38,6 +38,18 @@ pub(crate) struct Cost {
     pub kv: u64,
     /// The per-sequence model state, or zero when it is already resident.
     pub recurrent: u64,
+    /// The creep residual its rows hold between the windows of a sweep: the
+    /// hidden state of every row, in two halves, for as long as the sweep
+    /// runs. Claimed when the cohort forms and held to its end, so it is
+    /// ground like the K/V, not a per-forward tier — on blackworld (2026-10-18)
+    /// 0.9 GB of it stood beside a cohort admission had never charged for it.
+    pub residual: u64,
+    /// Of the claim, the bytes that land in holes below the arena frontier —
+    /// regions the free list hands out first, which neither the weight side nor
+    /// the tier can stand on. They cost the weight side nothing, so
+    /// [`Self::dislodged_bytes`] leaves them out; the allocator still claims
+    /// them, so [`Self::claimed_bytes`] does not.
+    pub hole_credit: u64,
     /// The wave transient tier this admission's rows would need.
     pub activations: u64,
     /// Rows this admission puts in the forward — the prefill chunk that rides
@@ -77,6 +89,7 @@ impl Cost {
     pub(crate) fn total(&self) -> u64 {
         self.kv
             .saturating_add(self.recurrent)
+            .saturating_add(self.residual)
             .saturating_add(self.activations)
     }
 
@@ -96,6 +109,7 @@ impl Cost {
         let region = REGION_BYTES as u64;
         self.kv
             .saturating_add(self.recurrent)
+            .saturating_add(self.residual)
             .div_ceil(region)
             .saturating_mul(region)
     }
@@ -126,7 +140,9 @@ impl Cost {
     /// to each admission's slice of it. Rounding here would charge a region per
     /// admission for ground the wave takes once.
     pub(crate) fn dislodged_bytes(&self) -> u64 {
-        self.claimed_bytes().saturating_add(self.activations)
+        self.claimed_bytes()
+            .saturating_sub(self.hole_credit)
+            .saturating_add(self.activations)
     }
 }
 
@@ -208,6 +224,8 @@ mod tests {
         let c = Cost {
             kv: 10,
             recurrent: 200,
+            residual: 0,
+            hole_credit: 0,
             activations: 3_000,
             rows: 128,
             decodes_after: false,
@@ -227,6 +245,8 @@ mod tests {
         let c = Cost {
             kv: region + 1,
             recurrent: 0,
+            residual: 0,
+            hole_credit: 0,
             activations: 64 * region,
             rows: 128,
             decodes_after: false,
@@ -258,6 +278,8 @@ mod tests {
         let step = Cost {
             kv: 0,
             recurrent: 0,
+            residual: 0,
+            hole_credit: 0,
             activations: 3 * region,
             rows: 8,
             decodes_after: false,
@@ -268,6 +290,8 @@ mod tests {
             Cost {
                 kv: region,
                 recurrent: region,
+                residual: 0,
+                hole_credit: 0,
                 ..Default::default()
             }
             .claimed_bytes(),
@@ -283,10 +307,28 @@ mod tests {
         let step = Cost {
             kv: 0,
             recurrent: 0,
+            residual: 0,
+            hole_credit: 0,
             activations: 128 << 20,
             rows: 3,
             decodes_after: false,
         };
         assert_eq!(step.claimed_bytes(), 0);
+    }
+
+    /// A claim that lands in holes below the frontier is still claimed, but
+    /// the weight side loses only the part past them — and the tier, which
+    /// can never stand in a hole, in full.
+    #[test]
+    fn hole_ground_is_claimed_but_dislodges_no_weight() {
+        let region = REGION_BYTES as u64;
+        let c = Cost {
+            kv: 5 * region,
+            hole_credit: 3 * region,
+            activations: 4 * region,
+            ..Default::default()
+        };
+        assert_eq!(c.claimed_bytes(), 5 * region);
+        assert_eq!(c.dislodged_bytes(), 2 * region + 4 * region);
     }
 }
