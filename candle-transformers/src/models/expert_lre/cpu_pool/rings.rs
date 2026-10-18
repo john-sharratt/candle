@@ -220,6 +220,12 @@ impl CpuRings {
         unsafe { ptr::read_volatile(self.doorbell.host() as *const u64) }
     }
 
+    /// The last `done` the service published.
+    pub fn done(&self) -> u64 {
+        // SAFETY: the mapped done word.
+        unsafe { ptr::read_volatile(self.done.host() as *const u64) }
+    }
+
     pub fn doorbell_ptr(&self) -> *const u64 {
         self.doorbell.host() as *const u64
     }

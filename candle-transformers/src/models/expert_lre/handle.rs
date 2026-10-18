@@ -1156,6 +1156,20 @@ impl ExpertCache {
             let _ = response_rx.recv();
         }
         self.dispatch.fault.clear();
+        if fault.is_cpu() {
+            // What the pool was doing when the device gave up on it.
+            let words = self
+                .dispatch
+                .cpu_words()
+                .map_or(String::new(), |(bell, done)| {
+                    format!("; doorbell {bell}, done {done}")
+                });
+            return Err(candle::Error::Msg(format!(
+                "{}; pool: {}{words}",
+                fault.error(),
+                super::cpu_pool::service::state_line()
+            )));
+        }
         Err(fault.error())
     }
 
