@@ -635,6 +635,15 @@ pub(crate) struct WorkerCounters {
 }
 
 impl Dispatch {
+    /// The CPU pool's doorbell and `done` words as the host reads them now:
+    /// a doorbell ahead of `done` and of the service's last is a layer the
+    /// service never took.
+    pub(crate) fn cpu_words(&self) -> Option<(u64, u64)> {
+        self.cpu
+            .as_ref()
+            .map(|c| (c.service.rings().doorbell(), c.service.rings().done()))
+    }
+
     /// `slot_bytes` is the largest 32-row tile slice of any projection — one
     /// worker's scratch slot. `image_bytes` is each row's slot image size —
     /// what a read-ahead copies; with the promotion ring, read-ahead is on.

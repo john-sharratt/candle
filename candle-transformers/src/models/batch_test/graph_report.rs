@@ -2,6 +2,8 @@
 
 use candle::cuda_backend::graph::CaptureStats;
 
+use crate::models::expert_lre::cpu_pool::stats::{stats as pool_stats, ClassStats};
+
 /// The difference `after - before`, as the gate prints it: forwards, how
 /// finely each was cut into graph launches, how big those were, how many
 /// segments were folded into their executable in place, and the host time each
@@ -49,6 +51,7 @@ pub(crate) struct CpuServed {
     experts: u64,
     rows: u64,
     ns: u64,
+    phases: [ClassStats; 2],
 }
 
 impl CpuServed {
@@ -59,7 +62,41 @@ impl CpuServed {
             experts: s::served_experts(),
             rows: s::served_rows(),
             ns: s::served_ns(),
+            phases: pool_stats(),
         }
+    }
+
+    /// One class's phases since `before`, per layer and per expert (µs).
+    fn phase_line(name: &str, now: &ClassStats, before: &ClassStats) {
+        let c = now.since(before);
+        if c.layers == 0 {
+            return;
+        }
+        let per = |ns: u64, n: u64| {
+            if n == 0 {
+                0.0
+            } else {
+                ns as f64 / n as f64 / 1e3
+            }
+        };
+        println!(
+            "    {name}: {} layers, {:.1} experts/layer, {:.1} rows/layer · µs a layer: parse {:.1}, \
+             compute {:.1}, cold wait {:.1}, publish {:.1}, device wait {:.1} · compute µs an expert \
+             {:.1} · runs {:.2}/layer, {:.1} participants, join {:.1} µs, occupancy {:.0}%",
+            c.layers,
+            c.experts as f64 / c.layers as f64,
+            c.rows as f64 / c.layers as f64,
+            per(c.parse_ns, c.layers),
+            per(c.compute_ns, c.layers),
+            per(c.cold_wait_ns, c.layers),
+            per(c.publish_ns, c.layers),
+            per(c.device_wait_ns, c.layers),
+            per(c.compute_ns, c.experts),
+            c.runs as f64 / c.layers as f64,
+            if c.runs == 0 { 0.0 } else { c.participants as f64 / c.runs as f64 },
+            per(c.join_ns, c.runs),
+            if c.in_job_ns == 0 { 0.0 } else { 100.0 * c.work_ns as f64 / c.in_job_ns as f64 },
+        );
     }
 
     /// Print what the pool served since `self`, and whether it is calibrated.
@@ -81,6 +118,8 @@ impl CpuServed {
             after.rows - self.rows,
             if layers == 0 { 0.0 } else { ms * 1e3 / layers as f64 },
         );
+        Self::phase_line("decode-sized", &after.phases[0], &self.phases[0]);
+        Self::phase_line("prompt-sized", &after.phases[1], &self.phases[1]);
         let s = p.split();
         println!(
             "    split: cut n≤{} · cpu µs n1/n2/n4 {:.0}/{:.0}/{:.0} · gpu µs n1 {:.0} · copy µs {:.0} · \
