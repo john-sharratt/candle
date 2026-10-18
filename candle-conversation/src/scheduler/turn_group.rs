@@ -358,6 +358,7 @@ impl Scheduler {
                 question_tokens: 0,
                 applied_identity: None,
                 state_forked: true,
+                holds_parent_state: false,
             },
         );
         self.turn_groups

@@ -2423,7 +2423,7 @@ impl Scheduler {
 /// Whether `e` is the device having no room for the work right now — a refused
 /// tier, a full span, the KV budget — rather than a fault: ground that comes
 /// back as turns finish and the KV side relieves.
-pub(super) fn is_ground_refusal(e: &ConversationError) -> bool {
+fn is_ground_refusal(e: &ConversationError) -> bool {
     use candle_nn::kv_cache::{KV_DEVICE_OOM_MARKER, SPAN_FULL_MARKER, TIER_REFUSED_MARKER};
     let s = e.to_string();
     [SPAN_FULL_MARKER, TIER_REFUSED_MARKER, KV_DEVICE_OOM_MARKER]

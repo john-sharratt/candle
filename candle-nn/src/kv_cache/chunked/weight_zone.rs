@@ -98,7 +98,6 @@ impl Drop for TransientPurchase {
 }
 
 /// Whether a [`TransientPurchase`] is held anywhere in the process.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn transient_purchase_open() -> bool {
     TRANSIENT_PURCHASES.load(Ordering::Acquire) > 0
 }

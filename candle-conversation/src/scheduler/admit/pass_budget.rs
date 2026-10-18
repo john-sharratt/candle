@@ -398,29 +398,30 @@ mod tests {
     }
 
     /// **A refused width holds while only holes below the frontier free.** The
-    /// 27 s spin on the RTX 3090 (2026-10-18): 827 regions below the floor, the
-    /// frontier at 713, a 3,450-row tier 128 MiB short. Counted as every free
-    /// region, the ground grew by the 114 holes a pass freed below the frontier,
-    /// the narrowing lapsed, and 3,450 was composed again — 4,210 times. Counted
-    /// at the frontier, it holds until the frontier itself comes down.
+    /// RTX 3090 (2026-10-18): 827 regions below the weight floor, the frontier
+    /// at 721 over 713 live, a 3,450-row tier 128 MiB short. Counted as every
+    /// free region, eight regions freed below the frontier read as the shortfall
+    /// returned, the narrowing lapsed, and 3,450 was composed again — 4,210
+    /// times in 27 s. Counted at the frontier, it holds until the frontier
+    /// itself comes down, or the weight side can concede the difference.
     #[test]
     fn a_refused_width_holds_while_only_holes_below_the_frontier_free() {
         const REGION: usize = 16 << 20;
         let short = 128 << 20;
-        let at_refusal = frontier_tier_ground(827, 713, 0, REGION);
+        let at_refusal = frontier_tier_ground(827, 721, 0, REGION);
         let w = RefusedWidth::after(3_450, at_refusal, short, CHUNK_SIZE).expect("narrowable");
         assert_eq!(w.rows, 2_588);
         assert!(
-            !w.lapsed(frontier_tier_ground(827, 713, 0, REGION)),
+            !w.lapsed(frontier_tier_ground(827, 721, 0, REGION)),
             "holes freed below the frontier are no ground for the tier"
         );
         // The same moment counted as every free region: the cycle.
-        let anywhere = |holes: usize| (827 - 713 + holes) * REGION;
+        let anywhere = |holes: usize| (827 - 721 + holes) * REGION;
         let counted_anywhere =
-            RefusedWidth::after(3_450, anywhere(0), short, CHUNK_SIZE).expect("narrowable");
-        assert!(counted_anywhere.lapsed(anywhere(114)));
+            RefusedWidth::after(3_450, anywhere(8), short, CHUNK_SIZE).expect("narrowable");
+        assert!(counted_anywhere.lapsed(anywhere(16)));
         // The frontier down by the shortfall's eight regions: now it fits.
-        assert!(w.lapsed(frontier_tier_ground(827, 705, 0, REGION)));
-        assert!(w.lapsed(frontier_tier_ground(827, 713, short, REGION)));
+        assert!(w.lapsed(frontier_tier_ground(827, 713, 0, REGION)));
+        assert!(w.lapsed(frontier_tier_ground(827, 721, short, REGION)));
     }
 }

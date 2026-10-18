@@ -247,6 +247,65 @@ fn ingest_hot_window() -> usize {
 /// a wedged persistence thread; it is not the expected path.
 const VRAM_OFFLOAD_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The pool a refused tier packs: its shape now, and the two passes. The
+/// [`Scheduler`] is one; a test stands a modelled pool in its place.
+pub(super) trait TierPool {
+    /// The pools' shape and the KV side's top region, read fresh.
+    fn shape(&self) -> Option<(PoolShape, Option<usize>)>;
+    /// Whether the stall gate holds `pass` over `shape`.
+    fn stalled(&self, pass: FrontierPass, shape: PoolShape) -> bool;
+    /// Run `pass`, started from `shape`.
+    fn run(&mut self, pass: FrontierPass, shape: PoolShape);
+}
+
+/// [`Scheduler::pack_for_refused_tier`]'s order: the KV pools packed for
+/// ground wherever they lie, then — over the shape that left — the span tenant
+/// on top moved into the holes below it. The tier stands at the frontier, so
+/// holes are no room for it until the second pass brings the frontier down.
+pub(super) fn pack_for_tier(pool: &mut impl TierPool) {
+    if let Some((shape, top)) = pool.shape() {
+        if shape.ground_pass(top) == Some(FrontierPass::Kv)
+            && !pool.stalled(FrontierPass::Kv, shape)
+        {
+            pool.run(FrontierPass::Kv, shape);
+        }
+    }
+    if let Some((shape, top)) = pool.shape() {
+        if shape.frontier_pass(top) == Some(FrontierPass::SpanTenants)
+            && !pool.stalled(FrontierPass::SpanTenants, shape)
+        {
+            pool.run(FrontierPass::SpanTenants, shape);
+        }
+    }
+}
+
+impl TierPool for Scheduler {
+    fn shape(&self) -> Option<(PoolShape, Option<usize>)> {
+        let stats = self.session.kv_region_stats()?;
+        Some((
+            PoolShape {
+                live: stats.live,
+                frontier: stats.live_watermark,
+                sparse: self.session.kv_sparse_arenas(),
+            },
+            self.session.kv_top_rank(),
+        ))
+    }
+
+    fn stalled(&self, pass: FrontierPass, shape: PoolShape) -> bool {
+        self.kv_compaction_stall.holds(pass, shape)
+    }
+
+    fn run(&mut self, pass: FrontierPass, shape: PoolShape) {
+        match pass {
+            FrontierPass::Kv => {
+                self.pack_until_settled(PackGoal::Ground);
+            }
+            FrontierPass::SpanTenants => self.pack_span_tenants_judged(shape),
+        }
+    }
+}
+
 /// What a KV pack is for, which decides when one is worth running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PackGoal {
@@ -616,10 +675,7 @@ impl Scheduler {
     /// brings the frontier down to them. Each pass's own gate decides whether it
     /// runs, and a pass the stall gate holds is not repeated.
     pub(super) fn pack_for_refused_tier(&mut self) {
-        self.pack_until_settled(PackGoal::Ground);
-        if let Some((shape, FrontierPass::SpanTenants)) = self.frontier_pass() {
-            self.pack_span_tenants_judged(shape);
-        }
+        pack_for_tier(self);
     }
 
     /// One KV compaction pass if the pools are fragmented enough to be worth it, then
@@ -3776,7 +3832,7 @@ impl Scheduler {
                     // apart, inside the wave loop's compaction interval, so
                     // without this nothing between them could make room: on the
                     // RTX 3090 (2026-10-18) the zone at its static floor, a creep
-                    // three regions short at the frontier with 114 holes below
+                    // three regions short at the frontier with eight holes below
                     // it, four retries in 25 ms, and its file ingests failed.
                     if tier_refusal_shortfall(&e).is_some() {
                         self.pack_for_refused_tier();
@@ -6415,5 +6471,116 @@ mod prefill_think_tests {
             OPEN,
             None
         ));
+    }
+}
+
+#[cfg(test)]
+mod refused_tier_pack_tests {
+    use super::super::admit::pass_budget::frontier_tier_ground;
+    use super::super::compaction_stall::{FrontierPass, PoolShape, MIN_FREEABLE_ARENAS};
+    use super::{pack_for_tier, TierPool};
+
+    const REGION: usize = 16 << 20;
+
+    /// A pool whose passes do what the real ones are for: the KV pass empties
+    /// the sparse arenas into holes, and the span tenants' pass moves the tenant
+    /// on top down into the holes below it.
+    struct Modelled {
+        total: usize,
+        shape: PoolShape,
+        kv_top: Option<usize>,
+        ran: Vec<FrontierPass>,
+    }
+
+    impl TierPool for Modelled {
+        fn shape(&self) -> Option<(PoolShape, Option<usize>)> {
+            Some((self.shape, self.kv_top))
+        }
+        fn stalled(&self, _pass: FrontierPass, _shape: PoolShape) -> bool {
+            false
+        }
+        fn run(&mut self, pass: FrontierPass, _shape: PoolShape) {
+            self.ran.push(pass);
+            match pass {
+                FrontierPass::Kv => {
+                    self.shape.live -= self.shape.sparse;
+                    self.shape.sparse = 0;
+                }
+                FrontierPass::SpanTenants => self.shape.frontier = self.shape.live,
+            }
+        }
+    }
+
+    impl Modelled {
+        fn tier_ground(&self) -> usize {
+            frontier_tier_ground(self.total, self.shape.frontier, 0, REGION)
+        }
+    }
+
+    /// **The refused tier's retry stands on lowered ground.** The RTX 3090 at
+    /// 08:51 (2026-10-18): 827 regions below the weight floor, the frontier at
+    /// 721 over 713 live — eight holes — a span tenant on top, the weight side
+    /// at its static floor, and a 109-region tier three regions short. The
+    /// tenants' pass brings the frontier down onto the live regions, and the
+    /// tier fits.
+    #[test]
+    fn a_refused_tier_is_retried_over_a_lowered_frontier() {
+        let tier = 109 * REGION;
+        let mut pool = Modelled {
+            total: 827,
+            shape: PoolShape {
+                live: 713,
+                frontier: 721,
+                sparse: 0,
+            },
+            kv_top: Some(700),
+            ran: Vec::new(),
+        };
+        assert_eq!(pool.shape.holes(), MIN_FREEABLE_ARENAS);
+        assert!(
+            pool.tier_ground() < tier,
+            "refused: 106 regions at the frontier"
+        );
+        pack_for_tier(&mut pool);
+        assert_eq!(pool.ran, vec![FrontierPass::SpanTenants]);
+        assert_eq!(pool.shape.frontier, 713);
+        assert!(pool.tier_ground() >= tier, "114 regions: the retry fits");
+    }
+
+    /// **Sparse KV arenas under the tenant are packed first**, and the holes
+    /// they leave are what the tenants' pass then moves into.
+    #[test]
+    fn sparse_kv_arenas_under_a_tenant_are_packed_before_it_moves() {
+        let mut pool = Modelled {
+            total: 827,
+            shape: PoolShape {
+                live: 720,
+                frontier: 721,
+                sparse: 9,
+            },
+            kv_top: Some(700),
+            ran: Vec::new(),
+        };
+        pack_for_tier(&mut pool);
+        assert_eq!(pool.ran, vec![FrontierPass::Kv, FrontierPass::SpanTenants]);
+        assert_eq!(pool.shape.frontier, 711);
+    }
+
+    /// **With nothing to pack, nothing runs**: one hole and no sparse arena is
+    /// not worth a pass's copies, and the retry meets the same ground.
+    #[test]
+    fn a_packed_pool_runs_no_pass() {
+        let mut pool = Modelled {
+            total: 827,
+            shape: PoolShape {
+                live: 720,
+                frontier: 721,
+                sparse: 0,
+            },
+            kv_top: Some(720),
+            ran: Vec::new(),
+        };
+        pack_for_tier(&mut pool);
+        assert!(pool.ran.is_empty());
     }
 }

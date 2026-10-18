@@ -59,7 +59,6 @@ pub(crate) mod projection_assembler;
 mod projection_identity;
 pub mod relief_trace;
 mod reproject_abandon;
-mod reproject_owed;
 mod run;
 mod sample;
 mod seal_scan;
@@ -1927,6 +1926,13 @@ struct ViewState {
     /// for. Forked at submit, a window of turns would claim their stores at once
     /// and fail the ones the span had no room for.
     state_forked: bool,
+    /// Whether the view holds the parent's state itself rather than a copy of
+    /// it: a reprojection moves the turn's store onto the view it re-carves
+    /// (`reproject_view_complete`), leaving the parent none. A discarded view
+    /// moves it back ([`Scheduler::discard_turn_view`]) instead of releasing
+    /// it, or the parent's next turn would start from a store with none of the
+    /// conversation in it.
+    holds_parent_state: bool,
 }
 
 /// A model-decode compression node in flight — the [`Content::Decode`]
@@ -3602,9 +3608,6 @@ pub(crate) struct Scheduler {
     /// Ephemeral-fork requests whose parent had a turn in flight when they
     /// arrived, answered at the turn boundary. See [`ephemeral_fork`].
     parked_forks: Vec<ephemeral_fork::ParkedFork>,
-    /// Reprojected turns waiting for the ground to carve their new view
-    /// ([`reproject_owed`]).
-    owed_views: Vec<reproject_owed::OwedView>,
 
     /// Continuous-fair-wave prefill cohort (`docs/continuous_fair_waves.md`): the
     /// in-flight prefill batch's inter-layer residual, held between steps in its
@@ -3965,7 +3968,6 @@ impl Scheduler {
             deferred_glue_fires: Vec::new(),
             stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
-            owed_views: Vec::new(),
             wave_prefill_residual: None,
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
@@ -4730,6 +4732,7 @@ impl Scheduler {
                         question_tokens: user_content_end as usize,
                         applied_identity: turn_start_identity(parent_block_count),
                         state_forked: false,
+                        holds_parent_state: false,
                     },
                 );
 
@@ -6957,6 +6960,18 @@ impl Scheduler {
         };
         if let Err(e) = self.session.free_sequence(view_id.0) {
             tracing::warn!("failed to free turn view {}: {}", view_id, e);
+        }
+        // A view a reprojection re-carved holds the parent's state itself, so
+        // it goes back to the parent; the release below then finds none.
+        if view_state.holds_parent_state {
+            if let Err(e) = self.model.move_recurrent(view_id.0, view_state.parent_id.0) {
+                tracing::warn!(
+                    "failed to hand turn view {}'s state back to parent {}: {}",
+                    view_id,
+                    view_state.parent_id,
+                    e
+                );
+            }
         }
         if let Err(e) = self.model.release_sequence(view_id.0) {
             tracing::warn!(
@@ -10105,7 +10120,7 @@ impl Scheduler {
     /// tier's: the tier stands at the frontier. A refused width recorded and
     /// lapsed against them lapsed with the tier no closer to fitting. Measured on
     /// the RTX 3090 (2026-10-18): 3,450 rows refused, 2,588 refused, then 3,450
-    /// composed again, 4,210 times over 27 s, with 114 holes below the frontier.
+    /// composed again, 4,210 times over 27 s, the frontier never moving.
     pub(super) fn frontier_tier_bytes(&self) -> Option<usize> {
         let stats = self.session.kv_region_stats()?;
         Some(admit::pass_budget::frontier_tier_ground(
@@ -11149,24 +11164,6 @@ impl Scheduler {
         view_id: SequenceId,
     ) -> Result<Option<ReprojectInFlight>, ConversationError> {
         let _t_total = PhaseTimer::new("reproject_total");
-        // **No ground for the rebuilt view's state: not now.** Past the move
-        // below, the turn's recurrent state lives on the parent and its old
-        // view is freed, so a refused claim there — the rebuilt view forking
-        // that state onto fresh slots — cannot hand the turn back: it fails
-        // it. On the RTX 3090 (2026-10-18), with the weight side at its
-        // defended floor, a rebuilt view's fork was refused "no region for
-        // recurrent state after 24 of 36 slots" and its turn ended. Checked
-        // here, before anything moves, a reprojection that could not finish
-        // is not started: the turn decodes on its view, and a later trigger
-        // tries again once ground is back.
-        if !self.reprojection_has_ground() {
-            tracing::debug!(
-                target: "candle_conversation::scheduler::reproject",
-                view_id = view_id.0,
-                "reprojection deferred: no ground for the rebuilt view's recurrent state"
-            );
-            return Ok(None);
-        }
         // Clone the policy out — `swap_view_with_new_ranges` mutates
         // `active_decodes` so we cannot hold a borrow over it.
         let policy = match self
@@ -11667,7 +11664,7 @@ impl Scheduler {
         let sampling_state = self.sampling_states.remove(&view_id);
         // Carry the turn-scoped view metadata (the Concept F question boundary)
         // into the re-carved view below.
-        let old_view_state = self.turn_views.remove(&view_id);
+        let old_view_state = self.turn_views.get(&view_id).copied();
         // Diagnostic log: drop the freed view's per-slot token mirror.
         // The kernel will recycle this slot index for the new view we
         // carve below; without this drop, the new view's `slot_tokens`
@@ -11743,6 +11740,10 @@ impl Scheduler {
                 .move_recurrent(view_id.0, parent_id.0)
                 .map_err(ConversationError::Model)
         );
+        // The parent has the turn's state now. Until here the old view stayed
+        // registered, so a failure above could hand back a state it held
+        // (`abandon_reprojection`).
+        self.turn_views.remove(&view_id);
         or_abandon!(
             self,
             view_id,
@@ -12106,39 +12107,64 @@ impl Scheduler {
         // prefix ends — `cleanup_finished`'s seal extracts
         // `parent[turn_start_parent_blocks..end]` to produce the substrate turn
         // entry, so the anchor excludes the freshly-injected sections / turns
-        // and includes the tail. A fork the span refuses for ground parks the
-        // turn whole until a later pass can carve it (`reproject_owed`).
+        // and includes the tail.
+        //
+        // **The turn's state moves onto the new view; it is not copied.** The
+        // move in prepare left the parent holding the turn's only copy, and the
+        // turn's seal moves it back there, so nothing reads the parent's while
+        // the turn runs. A fork here claimed a second whole store for the
+        // length of every reprojection — on the RTX 3090 (2026-10-18), 36 slots
+        // refused "after 20 of 36" with the weight side at its floor, ending the
+        // reply, and later parking it 0.1–6 s per rebuild. Moved, the rebuild
+        // claims nothing, and a view that is discarded hands its state back
+        // (`ViewState::holds_parent_state`).
         let parent_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
+        let effective_ranges: Vec<BlockRange> = if parent_block_count == 0 {
+            Vec::new()
+        } else {
+            vec![BlockRange::new(0, parent_block_count)]
+        };
         let t_view = Instant::now();
-        let view_span = profile::span("reproject:create_view");
-        let carved = self.carve_owed_view(reproject_owed::OwedView {
+        let view_span = profile::span("reproject:carve_view");
+        let (new_view_id, new_borrowed) = or_abandon!(
+            self,
             view_id,
             parent_id,
             decode_state,
-            sampling_state,
-            turn_start_parent_blocks: new_prefix_block_count,
-            question_tokens,
-            applied_identity,
-            since: Instant::now(),
-        })?;
+            false,
+            self.carve_view(parent_id, &effective_ranges)
+        );
+        if let Err(e) = self.model.move_recurrent(parent_id.0, new_view_id.0) {
+            if let Err(free) = self.session.free_sequence(new_view_id.0) {
+                tracing::warn!("failed to free view {new_view_id} after a failed move: {free}");
+            }
+            self.sampling_states.remove(&new_view_id);
+            let e = ConversationError::Model(e);
+            self.abandon_reprojection(view_id, parent_id, decode_state, false, &e);
+            return Err(e);
+        }
         view_span.end();
         let view_ms = t_view.elapsed().as_millis() as u64;
-        let new_view_id = match carved {
-            Ok(new_view_id) => new_view_id,
-            Err(owed) => {
-                tracing::info!(
-                    target: "candle_conversation::scheduler::reproject",
-                    view_id = view_id.0,
-                    "reprojected turn waits for ground to carve its view"
-                );
-                self.owed_views.push(owed);
-                return Ok(view_id);
-            }
-        };
-        let new_borrowed = self
-            .turn_views
-            .get(&new_view_id)
-            .map_or(BlockCount(0), |v| v.original_borrowed);
+        // The new view's slot may have been recycled from the freed old view's.
+        self.slot_tokens.remove(&new_view_id);
+        self.turn_views.insert(
+            new_view_id,
+            ViewState {
+                parent_id,
+                original_borrowed: new_borrowed,
+                turn_start_parent_blocks: new_prefix_block_count,
+                question_tokens,
+                applied_identity,
+                state_forked: true,
+                holds_parent_state: true,
+            },
+        );
+        // `carve_view` seeded a fresh sampling state from the parent; the live
+        // one carried across keeps DRY history and per-turn counters.
+        self.active_decodes.insert(new_view_id, decode_state);
+        if let Some(state) = sampling_state {
+            self.sampling_states.insert(new_view_id, state);
+        }
         // True end-to-end wall-clock of the whole reproject (prepare → wave →
         // complete), so the phase fields below — which are individually disjoint
         // but separated by the shared glue wave — can be read against a real
@@ -13603,6 +13629,7 @@ mod tests {
                 question_tokens: 0,
                 applied_identity: None,
                 state_forked: false,
+                holds_parent_state: false,
             },
         );
         sched.prefill_queue.push_back(test_prefill_work(view));
@@ -14708,6 +14735,77 @@ mod tests {
         );
     }
 
+    /// **A view a reprojection re-carved holds the parent's state, and a
+    /// discard hands it back.** The rebuild moves the turn's store onto the
+    /// view instead of copying it, so the parent has none while the turn runs;
+    /// releasing the view with its state would leave the parent's next turn
+    /// starting from a store with none of the conversation in it.
+    #[test]
+    fn a_discarded_recarved_view_hands_the_parents_state_back() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let parent = scheduler.session.create_sequence().unwrap();
+        forward_on(&mut scheduler, parent, &[1, 2, 3, 4]);
+        let held = probe.get(parent).expect("the parent carries state");
+
+        let (view, borrowed) = scheduler
+            .carve_view(SequenceId(parent), &[])
+            .expect("view carve");
+        scheduler.model.move_recurrent(parent, view.0).unwrap();
+        assert_eq!(probe.get(parent), None, "moved, not copied");
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: SequenceId(parent),
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+                applied_identity: None,
+                state_forked: true,
+                holds_parent_state: true,
+            },
+        );
+
+        scheduler.discard_turn_view(view);
+        assert_eq!(
+            probe.get(parent),
+            Some(held),
+            "the parent has its state back"
+        );
+        assert_eq!(probe.get(view.0), None);
+    }
+
+    /// **A view forked at admission holds a copy, and its discard leaves the
+    /// parent exactly where it stood**: the faulted turn's state goes with it.
+    #[test]
+    fn a_discarded_forked_view_leaves_the_parent_as_it_stood() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let parent = scheduler.session.create_sequence().unwrap();
+        forward_on(&mut scheduler, parent, &[1, 2, 3, 4]);
+        let held = probe.get(parent).expect("the parent carries state");
+
+        let (view, borrowed) = scheduler
+            .create_view(SequenceId(parent), &[])
+            .expect("view creation");
+        forward_on(&mut scheduler, view.0, &[5, 6]);
+        assert_ne!(probe.get(view.0), Some(held), "the view advanced its copy");
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: SequenceId(parent),
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+                applied_identity: None,
+                state_forked: true,
+                holds_parent_state: false,
+            },
+        );
+
+        scheduler.discard_turn_view(view);
+        assert_eq!(probe.get(parent), Some(held), "the parent is as it stood");
+        assert_eq!(probe.get(view.0), None);
+    }
+
     /// The seeded flag suppresses **exactly one** reset.
     ///
     /// A forked view legitimately stands at offset 0 before its first wave —
@@ -15304,6 +15402,7 @@ mod tests {
                 question_tokens: 0,
                 applied_identity: None,
                 state_forked: true,
+                holds_parent_state: false,
             },
         );
 
@@ -15648,6 +15747,7 @@ mod tests {
                 question_tokens: 0,
                 applied_identity: None,
                 state_forked: true,
+                holds_parent_state: false,
             },
         );
 
@@ -15694,6 +15794,7 @@ mod tests {
                 question_tokens: 0,
                 applied_identity: None,
                 state_forked: true,
+                holds_parent_state: false,
             },
         );
         scheduler.discard_turn_view(view);
@@ -15994,7 +16095,6 @@ mod tests {
     mod faulted_turn;
     mod refused_decode_tier;
     mod reproject_abandoned;
-    mod reproject_owed;
     mod speculation_exits;
     mod speculation_in_a_grammar;
 
@@ -16681,6 +16781,7 @@ mod tests {
                 question_tokens: 0,
                 applied_identity: None,
                 state_forked: true,
+                holds_parent_state: false,
             },
         );
         view
@@ -17007,6 +17108,7 @@ mod tests {
                 question_tokens: 0,
                 applied_identity: None,
                 state_forked: true,
+                holds_parent_state: false,
             },
         );
         view
