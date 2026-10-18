@@ -47,7 +47,9 @@ use super::residual_rows::{
 };
 use candle::quantized::pinned_staging::Generation;
 use candle_nn::kv_cache::PREFILL_KV_STAGE_MIN_Q_LEN;
-use candle_nn::kv_cache::{begin_wave, end_wave_transient, plan_wave_transient, LayerPhase};
+use candle_nn::kv_cache::{
+    begin_wave, end_wave_transient, plan_wave_transient, provision_held_ground, LayerPhase,
+};
 
 /// What a sweep does with the forward it is handed (`docs/wave_step.md` §2.1).
 #[derive(Debug, Clone, Copy)]
@@ -424,6 +426,7 @@ pub fn drive_wave<S: WaveSweep + ?Sized>(
     {
         candle::bail!("forward_wave: input/seq length mismatch");
     }
+    provision_held(model);
     // Whether this forward's GPU spans are sampled (`set_gpu_span_period`): a
     // forward carrying a prompt chunk always is.
     let bulk = prefill_inputs
@@ -1083,6 +1086,17 @@ pub struct StepOutcome {
     pub head: Result<WaveResult>,
 }
 
+/// **Between forwards:** fit the held ground's arenas to what recent forwards
+/// took, so the buffers this forward takes inside itself — a slot-state slab
+/// promoted at a 32-token boundary, a sampler pack growing — find room already
+/// claimed (`docs/held_ground_elimination.md` §4). Before admission, so the
+/// claims stand below the frontier the forward's tier is placed against.
+fn provision_held<S: WaveSweep + ?Sized>(model: &S) {
+    if let Device::Cuda(cuda) = model.device() {
+        provision_held_ground(cuda);
+    }
+}
+
 /// One forward of a step: its layer range, and whether the creep rides it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Segment {
@@ -1139,6 +1153,10 @@ pub fn drive_step<S: WaveSweep + ?Sized>(
     } = spec;
     let n = model.num_layers();
     let full = !decode.seqs.is_empty() || !verify.seqs.is_empty() || !glue.seqs.is_empty();
+    // A step without a creep is one forward, which provisions for itself.
+    if creep.is_some() {
+        provision_held(model);
+    }
     let Some(creep) = creep else {
         let head = drive_wave(
             model,

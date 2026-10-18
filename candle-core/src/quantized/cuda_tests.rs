@@ -14241,6 +14241,127 @@ fn cuda_live_gate_launch_reads_ahead_and_publishes() -> Result<()> {
     Ok(())
 }
 
+/// **The grouped expert GEMM at Qwen3.8-Flash-Next's decode shapes, against the bytes it must
+/// read.** One projection (640 × 2560, Q4_KO) over 256 VRAM-resident experts — 222 MB, past
+/// the 96 MiB L2 — routed `rows × top-10` from eight rotating expert sets, each bucketized once
+/// outside the timing. The timed loop is the GEMM alone, so the figure is device time per
+/// launch, and its GB/s is the distinct experts' weight bytes over that time: how far the
+/// decode-width launch sits from the DRAM floor.
+#[test]
+#[ignore = "measurement: cargo test --release --features cuda -p candle-core --lib \
+            quantized::cuda::test::bench_grouped_gemm_flash_next_decode -- \
+            --exact --ignored --nocapture"]
+fn bench_grouped_gemm_flash_next_decode() -> Result<()> {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let (n_experts, nrows, ncols, k) = (256usize, 640usize, 2560usize, 10usize);
+    let ko_dtype = GgmlDType::Q4_KO;
+    let mut rng = StdRng::seed_from_u64(0xf1a5_0001);
+    let shape = crate::Shape::from((nrows, ncols));
+    let mut storages = Vec::with_capacity(n_experts);
+    for _ in 0..n_experts {
+        let w: Vec<f32> = (0..nrows * ncols)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        let mut q = QCudaStorage::zeros(&dev, ncols * nrows, GgmlDType::Q4_K)?;
+        q.quantize(&CudaStorage::wrap_cuda_slice(
+            dev.memcpy_stod(&w)?,
+            dev.clone(),
+        ))?;
+        storages.push(q.repack_ko(&shape, ko_dtype)?);
+    }
+    let expert_bytes = storages[0].storage_size_in_bytes();
+    let ptrs: Vec<u64> = storages.iter().map(|s| s.data_ptr()).collect();
+    let table = dev.memcpy_stod(&ptrs)?;
+    println!(
+        "Flash-Next expert projection {nrows}×{ncols} {ko_dtype:?}: {expert_bytes} B, \
+         {n_experts} experts ({:.0} MB)",
+        (n_experts * expert_bytes) as f64 / 1e6
+    );
+    println!(
+        "{:>5} {:>9} {:>8} {:>9} {:>9}",
+        "rows", "experts", "n_sub", "µs", "GB/s"
+    );
+    const SETS: usize = 8;
+    for rows in [1usize, 5, 8, 16, 48] {
+        let a_ub = rows * k;
+        let n_sub = grouped_int8_n_sub(a_ub / n_experts, &[ko_dtype, ko_dtype]);
+        let tile_w = 16 * n_sub;
+        let launch_tiles = a_ub.min(a_ub.div_ceil(tile_w) + n_experts);
+        let act: Vec<f32> = (0..a_ub * ncols)
+            .map(|i| ((i % 97) as f32 - 48.0) / 50.0)
+            .collect();
+        let op = quantize_acts_q8a128_test(&dev, &act, a_ub, ncols)?;
+        let mut sets = Vec::with_capacity(SETS);
+        let mut distinct = 0usize;
+        for s in 0..SETS {
+            // Each set routes inside its own 32-expert window, so consecutive launches read
+            // disjoint weights and none is served from the L2 the previous one filled.
+            let base = (s * 32) as u32;
+            let ids: Vec<u32> = (0..rows)
+                .flat_map(|_| {
+                    let mut chosen = HashSet::new();
+                    while chosen.len() < k {
+                        chosen.insert(base + rng.random_range(0..32u32));
+                    }
+                    chosen.into_iter().collect::<Vec<_>>()
+                })
+                .collect();
+            distinct += ids.iter().collect::<HashSet<_>>().len();
+            let t = crate::Tensor::from_vec(ids, (rows, k), &device)?;
+            let mut ws = MoeBucketizeWorkspace::new(&dev, rows, k)?;
+            moe_bucketize(
+                &t,
+                n_experts,
+                tile_w,
+                &mut ws,
+                None,
+                &DecodeRows::prefix(rows),
+            )?;
+            sets.push(ws);
+        }
+        let launch = |ws: &MoeBucketizeWorkspace| {
+            grouped_qmatmul_dev_q8a128(
+                &op,
+                &table,
+                0,
+                n_experts,
+                ko_dtype,
+                nrows,
+                &ws.tile_expert,
+                &ws.tile_b_start,
+                &ws.tile_b_cnt,
+                launch_tiles,
+                n_sub,
+                None,
+                &dev,
+            )
+        };
+        for ws in &sets {
+            drop(launch(ws)?);
+        }
+        dev.synchronize()?;
+        let iters = 400usize;
+        let start = Instant::now();
+        for i in 0..iters {
+            drop(launch(&sets[i % SETS])?);
+        }
+        dev.synchronize()?;
+        let us = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let mean_distinct = distinct as f64 / SETS as f64;
+        println!(
+            "{rows:>5} {mean_distinct:>9.1} {n_sub:>8} {us:>9.1} {:>9.0}",
+            mean_distinct * expert_bytes as f64 / (us * 1e-6) / 1e9
+        );
+    }
+    Ok(())
+}
+
 /// **Measurements for live dispatch revision 2's kernel side**
 /// (`docs/moe_live_dispatch_design.md` §0.10): the unmodified grouped GEMM with
 /// its weights read from pinned host memory instead of VRAM.

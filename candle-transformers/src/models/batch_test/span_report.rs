@@ -10,8 +10,12 @@
 //! counts: the two round in different units, and a boundary that moved eighty
 //! times accumulates exactly the sort of gap that otherwise gets inferred away.
 
+use candle::cuda_backend::scratch_reserve;
 use candle::Device;
-use candle_nn::kv_cache::{arena_census, region_stats, REGION_BYTES};
+use candle_nn::kv_cache::{
+    arena_census, held_ground_sites, held_ground_stats, region_stats, span_partition_now,
+    REGION_BYTES,
+};
 
 use crate::models::expert_lre::PipelineStats;
 
@@ -39,16 +43,65 @@ pub fn print_span(title: &str, experts: Option<&PipelineStats>) {
     println!("  reserved            {:>9.1} MiB", mib(rs.reserved_bytes));
     let kv = rs.total * REGION_BYTES;
     // Whatever the reservation holds that is neither side of the moving
-    // boundary: the dense weights, loaded before the boundary existed.
-    let dense = rs
+    // boundary: the fixed left block and the dense weights, both laid down
+    // before the boundary existed.
+    let fixed = rs
         .reserved_bytes
         .saturating_sub(rs.weight_bytes)
         .saturating_sub(kv)
         .saturating_sub(rs.slack_bytes);
     println!(
-        "    dense block       {:>9.1} MiB   (loaded before the boundary, immovable)",
-        mib(dense)
+        "    fixed blocks      {:>9.1} MiB   (laid down before the boundary, immovable)",
+        mib(fixed)
     );
+    if let Some(p) = span_partition_now(0) {
+        let held = held_ground_stats(0);
+        println!(
+            "      held bootstrap  {:>9.1} MiB   (held ground used {:.1} of {:.1}, peak {:.1}; \
+             the rest in {} held arenas, below)",
+            mib(p.held_ground),
+            mib(held.map_or(0, |h| h.used)),
+            mib(held.map_or(0, |h| h.capacity)),
+            mib(held.map_or(0, |h| h.peak)),
+            held.map_or(0, |h| h.arenas),
+        );
+        println!(
+            "      persist staging {:>9.1} MiB   (hot→warm copy buffer and seal gathers)",
+            mib(p.persist_staging)
+        );
+        println!(
+            "      dense weights   {:>9.1} MiB   (every non-expert weight)",
+            mib(p.dense)
+        );
+        println!(
+            "      dense padding   {:>9.1} MiB   (to the region grid)",
+            mib(p.dense_padding)
+        );
+    }
+    if let Some(sites) = held_ground_sites(0) {
+        for s in sites
+            .iter()
+            .filter(|s| s.peak_bytes > 0 || s.declines > 0)
+            .take(10)
+        {
+            println!(
+                "        held {:>7.1} MiB (peak {:>7.1}){}  {}",
+                mib(s.live_bytes),
+                mib(s.peak_bytes),
+                if s.declines > 0 {
+                    format!(
+                        " — {} to the pool ({:.1} MiB, widest {:.1})",
+                        s.declines,
+                        mib(s.declined_bytes as usize),
+                        mib(s.largest_decline)
+                    )
+                } else {
+                    String::new()
+                },
+                s.site
+            );
+        }
+    }
     println!(
         "    KV regions        {:>9.1} MiB   ({} x {:.0} MiB: live {} of which span-tenant {}, \
          free {}, blocked {}, frontier {})",
@@ -67,8 +120,21 @@ pub fn print_span(title: &str, experts: Option<&PipelineStats>) {
         mib(rs.live.saturating_sub(rs.span_tenant) * REGION_BYTES),
         mib(rs.span_tenant * REGION_BYTES),
     );
-    // Who stands at the frontier: a span tenant whose top is the frontier, or —
-    // when none is — a KV arena.
+    if let Some(h) = held_ground_stats(0).filter(|h| h.arenas > 0) {
+        println!(
+            "        held arenas     {:>4} arenas,  {:>7.1} MiB of span, top {}{}",
+            h.arenas,
+            mib(h.arena_bytes),
+            h.arena_top,
+            if h.arena_top == rs.live_watermark {
+                "  ← the frontier"
+            } else {
+                ""
+            },
+        );
+    }
+    // Who stands at the frontier: a held arena or a span tenant whose top is the
+    // frontier, or — when none is — a KV arena.
     if let Ok(device) = Device::new_cuda(0) {
         for t in arena_census(&device).iter().filter(|t| t.regions > 0) {
             println!(
@@ -92,6 +158,11 @@ pub fn print_span(title: &str, experts: Option<&PipelineStats>) {
             rs.transient_ceiling,
         );
     }
+    println!(
+        "      launch scratch  {:>9.1} MiB   (priced into each forward's span, carved by \
+         its launchers)",
+        mib(scratch_reserve(0)),
+    );
     println!(
         "    weight zone       {:>9.1} MiB   (the expert side of the boundary)",
         mib(rs.weight_bytes)

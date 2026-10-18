@@ -49,14 +49,18 @@ Reading it left to right:
 
 - **the fixed block** — `PERSIST_SPAN_BYTES`, at the far **left** and fixed for
   the process lifetime, holding two tenants:
-  - **held ground** (`HELD_GROUND_BYTES`, `held_ground.rs`) — the device buffers
-    that outlive every forward and may be taken inside one: launch-table staging,
-    resident slot headers, the sampler's argument pack and count tables, decode
-    slot-state slabs, cold-load staging, the attention launchers' split partials
-    (`candle-kernels`' `grow_scratch.cuh` calls back into it). A
-    `candle::cuda_backend::Held` buffer takes a first-fit range here and gives it
-    back fenced on its stream; a request the ground cannot hold goes to the CUDA
-    pool and is reported by `forbidden_alloc`.
+  - **held ground's bootstrap** (`BOOTSTRAP_HELD_BYTES`, 32 MiB, `held_ground.rs`)
+    — the held buffers a model's load takes, before any region exists. Held
+    ground past the load is **held arenas**: span regions claimed as a tenant
+    between forwards, sized to what recent forwards took and given back when
+    idle (`docs/held_ground_elimination.md`). It holds the device buffers that
+    outlive a forward and may be taken inside one: launch-table staging, resident
+    slot headers, the sampler's argument pack and count tables, decode slot-state
+    slabs, cold-load staging. A `candle::cuda_backend::Held` buffer takes a
+    first-fit range and gives it back fenced on its stream; a request the ground
+    cannot hold goes to the CUDA pool, is reported, and is covered by the next
+    provisioning. The launchers' split partials (`grow_scratch.cuh`) are carved
+    from each forward's own span instead.
   - **persist staging** — the persistence thread's hot→warm copy buffer and its
     seal gathers, four regions' worth.
 

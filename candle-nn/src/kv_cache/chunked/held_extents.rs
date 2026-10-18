@@ -124,6 +124,9 @@ impl Extents {
         self.used
     }
 
+    /// High-water mark of [`Self::used`]. The held ground keeps its own across
+    /// every block it spans; this one is the block's, which its tests read.
+    #[cfg(test)]
     pub(crate) fn peak(&self) -> usize {
         self.peak
     }

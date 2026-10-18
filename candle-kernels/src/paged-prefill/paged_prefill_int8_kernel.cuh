@@ -1251,16 +1251,18 @@ inline void launch_paged_prefill_int8(
     // combine can merge.
     if (chunked) num_splits = 1;
 
-    // Persistent grow-on-demand partial pool (same idiom as the decode
-    // split-KV pool: single-stream, grown with `grow_scratch`, which is safe
-    // while the thread records a graph and keeps the block it replaces).
+    // The partial pool, held for one scratch epoch (same idiom as the decode
+    // split-KV pool: single-stream, taken with `grow_scratch`, which is safe
+    // while the thread records a graph). A pool the scratch cannot give runs
+    // the launch unsplit below.
     float* partials = nullptr;
     if (num_splits > 1) {
         static void* s_pool = nullptr;
         static size_t s_pool_bytes = 0;
+        static unsigned long long s_pool_epoch = 0;
         size_t need = (size_t)total_q * (size_t)n_head * (size_t)num_splits * (HEAD_DIM + 2)
                       * sizeof(float);
-        if (grow_scratch(&s_pool, &s_pool_bytes, need) == cudaSuccess) {
+        if (grow_scratch(&s_pool, &s_pool_bytes, &s_pool_epoch, need) == cudaSuccess) {
             partials = (float*)s_pool;
         }
         if (partials == nullptr) num_splits = 1; // OOM fallback: direct store

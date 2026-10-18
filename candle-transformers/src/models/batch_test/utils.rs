@@ -2284,15 +2284,21 @@ impl TestParams {
              cleanup above left empty arenas holding regions"
         );
         if let Some(rs) = candle_nn::kv_cache::region_stats(0) {
+            // The held ground's arenas stand across configs by design: they are
+            // the headroom provisioned for the next forward's held buffers, and
+            // go back to the span once a window of forwards leaves them idle.
+            let held = candle_nn::kv_cache::held_ground_stats(0)
+                .map_or(0, |h| h.arena_bytes / candle_nn::kv_cache::REGION_BYTES);
+            let live = rs.live.saturating_sub(held);
             assert_eq!(
-                rs.live,
+                live,
                 0,
-                "config {which}: {} KV regions ({} MiB) are still live after every \
-                 sequence was freed and the session dropped. Something outlives \
-                 the cleanup and holds them for the rest of the run, so the \
-                 weight zone can never grow back and every later config is slower.",
-                rs.live,
-                rs.live * (candle_nn::kv_cache::REGION_BYTES / (1024 * 1024)),
+                "config {which}: {live} KV regions ({} MiB) are still live after every \
+                 sequence was freed and the session dropped ({held} held-arena regions \
+                 not counted). Something outlives the cleanup and holds them for the \
+                 rest of the run, so the weight zone can never grow back and every \
+                 later config is slower.",
+                live * (candle_nn::kv_cache::REGION_BYTES / (1024 * 1024)),
             );
         }
 

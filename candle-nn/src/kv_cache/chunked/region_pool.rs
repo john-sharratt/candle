@@ -91,7 +91,7 @@ use super::backing::{TIER_REFUSED_MARKER, TIER_SHORT_BY};
 use super::bump_arena::KV_ARENA_MID_WAVE;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::growth_policy::{kv_grow_step, FreeRegionTarget, GrowthPolicy, Occupancy, Refusal};
-use super::held_ground::{HeldStats, SpanHeldGround, HELD_GROUND_BYTES};
+use super::held_ground::{HeldStats, SpanHeldGround, BOOTSTRAP_HELD_BYTES};
 use super::held_ledger::HeldSite;
 use super::reservation::Reservation;
 use super::span_geometry::{blocked, ceiling_regions, claimable, tier_fits};
@@ -114,21 +114,22 @@ const MAX_WAVE_TRANSIENT_BYTES: usize = super::wave_spans::WAVE_ATTN_BYTES
     + super::wave_spans::WAVE_FFN_BYTES
     + super::wave_spans::WAVE_FORWARD_BYTES;
 
-/// The fixed block at the far **left** of the span: the held ground
-/// ([`HELD_GROUND_BYTES`]) first, then the persistence thread's staging.
+/// The fixed block at the far **left** of the span: the held ground's bootstrap
+/// ([`BOOTSTRAP_HELD_BYTES`]) first, then the persistence thread's staging.
 ///
 /// Fixed for the process lifetime and out of both frontiers' way. Putting it
 /// left rather than letting it float is what lets the weight boundary move
 /// without ever having to reason about a copy stream that is not synchronised
-/// to the wave — and what lets a held buffer be taken mid-forward, where a
-/// region claim would be refused.
+/// to the wave — and what lets a model's load take held buffers before any region
+/// exists. The held ground past the load is held arenas, span regions
+/// (`held_ground.rs`).
 ///
 /// **No model widens it.** The residual a window hands from one forward to the
 /// next lives on the step's forward span or a creep's arena, sized to the rows
 /// in flight and held only while they are (`docs/wave_step.md`); held here, it
 /// would be priced at the widest forward the scheduler can send and stand on
 /// every card for the life of the process.
-const PERSIST_SPAN_BYTES: usize = HELD_GROUND_BYTES + MIGRATION_STAGING_CAP_BYTES;
+const PERSIST_SPAN_BYTES: usize = BOOTSTRAP_HELD_BYTES + MIGRATION_STAGING_CAP_BYTES;
 
 /// The smallest span that can run a forward whose fixed block is `persist`
 /// bytes: that block plus one wave's transient tier, with nothing left for KV.
@@ -541,7 +542,7 @@ struct RegionPool {
     persist_carved: usize,
     /// The whole fixed left block — [`PERSIST_SPAN_BYTES`].
     persist_bytes: usize,
-    /// The held ground at its base — [`HELD_GROUND_BYTES`].
+    /// The held ground's bootstrap block at its base — [`BOOTSTRAP_HELD_BYTES`].
     held_bytes: usize,
     /// Fresh regions claimed while a wave's transient tier was placed.
     ///
@@ -946,7 +947,7 @@ impl RegionPool {
             .bind_to_thread()
             .map_err(|e| candle::Error::Msg(format!("reservation: bind: {e}")))?;
         let graph_reserve = graph_budget_bytes()? as usize;
-        let held_bytes = HELD_GROUND_BYTES;
+        let held_bytes = BOOTSTRAP_HELD_BYTES;
         let persist_bytes = PERSIST_SPAN_BYTES;
         let span_minimum = span_minimum_bytes(persist_bytes);
         let target = span_target(ordinal, graph_reserve)?;
@@ -1090,8 +1091,9 @@ impl RegionPool {
             );
         }
 
-        // The held ground stands at the very base of the span, before the
-        // persistence staging is carved after it, and is live from here on.
+        // The held ground's bootstrap stands at the very base of the span, before
+        // the persistence staging is carved after it, and is live from here on;
+        // its arenas are claimed once the load has frozen the dense block.
         let held = SpanHeldGround::new(span_base, held_bytes);
         install_held_ground(ordinal, held.clone());
 
@@ -1745,6 +1747,22 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
             pool.growth.note_demand();
             return Ok(Claim::Exhausted);
         };
+        issue_region(pool, stream, index, recycled).map(Claim::Got)
+    }
+}
+
+/// Hand region `index` to a new owner: clean it if a previous tenant left bytes
+/// in it, and mark it held. `recycled` says whether it came off the free list
+/// rather than past `next`. The pick is the caller's ([`try_claim`] for one
+/// region, [`try_claim_run`] for a contiguous run); this is the part every
+/// issued region goes through, whoever picked it.
+fn issue_region(
+    pool: &mut RegionPool,
+    stream: &std::sync::Arc<CudaStream>,
+    index: usize,
+    recycled: bool,
+) -> Result<RegionHandle> {
+    {
         let base = pool.region_base(index);
         // **Whether it needs cleaning, not where it came from.** This used to key
         // on `recycled` — a region taken off the free list — which silently
@@ -1914,12 +1932,103 @@ fn try_claim(pool: &mut RegionPool, stream: &std::sync::Arc<CudaStream>) -> Resu
             pool.live,
             pool.total,
         );
-        Ok(Claim::Got(RegionHandle {
+        Ok(RegionHandle {
             ordinal: stream.context().ordinal(),
             index,
             base,
-        }))
+        })
     }
+}
+
+/// The lowest `k` consecutive region indices a run may take below `ceiling`:
+/// each either on the free list or at or past `next`, which is fresh ground.
+/// `None` when no such run fits.
+///
+/// Pure index arithmetic over the free set, so the rule — lowest run first, fresh
+/// ground counted as free, nothing at or above the ceiling — is tested without a
+/// device.
+fn lowest_run(
+    free: &std::collections::HashSet<usize>,
+    next: usize,
+    ceiling: usize,
+    k: usize,
+) -> Option<usize> {
+    if k == 0 {
+        return None;
+    }
+    let available = |i: usize| i >= next || free.contains(&i);
+    let mut start = 0;
+    while start + k <= ceiling {
+        match (start..start + k).find(|&i| !available(i)) {
+            None => return Some(start),
+            Some(blocked) => start = blocked + 1,
+        }
+    }
+    None
+}
+
+/// Whether `k` consecutive regions ending at or below region `below` are free now
+/// — [`SpanClaims::claim_run_below`]'s question, asked without a claims window,
+/// which would hand back a standing tier to learn the answer is no.
+pub(crate) fn run_free_below(stream: &std::sync::Arc<CudaStream>, k: usize, below: usize) -> bool {
+    with_pool(stream, |pool| {
+        let free: std::collections::HashSet<usize> =
+            pool.free.iter().map(|Reverse(i)| *i).collect();
+        Ok(lowest_run(&free, pool.next, pool.region_ceiling().min(below), k).is_some())
+    })
+    .unwrap_or(false)
+}
+
+/// [`try_claim`] for `k` consecutive regions — a tenant whose buffer is wider than
+/// one region — ending at or below region `below`. The run is taken whole or not at
+/// all: a region of it that cannot be issued puts back every one already issued.
+///
+/// A refusal is KV demand only when the pool's own ceiling bound it; a tighter
+/// `below` is a tenant asking to move down, which wants no new ground.
+fn try_claim_run(
+    pool: &mut RegionPool,
+    stream: &std::sync::Arc<CudaStream>,
+    k: usize,
+    below: usize,
+) -> Result<Option<Vec<RegionHandle>>> {
+    let ceiling = pool.region_ceiling();
+    let free: std::collections::HashSet<usize> = pool.free.iter().map(|Reverse(i)| *i).collect();
+    let Some(start) = lowest_run(&free, pool.next, ceiling.min(below), k) else {
+        if pool.transient_base.is_none() && below >= ceiling {
+            pool.growth.note_demand();
+        }
+        return Ok(None);
+    };
+    let run = start..start + k;
+    // Off the free list in one rebuild; fresh indices past `next` move it.
+    pool.free.retain(|Reverse(i)| !run.contains(i));
+    if run.end > pool.next {
+        pool.next = run.end;
+    }
+    let mut issued = Vec::with_capacity(k);
+    for index in run.clone() {
+        match issue_region(pool, stream, index, free.contains(&index)) {
+            Ok(handle) => issued.push(handle),
+            Err(e) => {
+                // The issued handles' own drops would take the pool lock, which
+                // is ours: they are put back by hand, exactly as a drop would.
+                for h in issued {
+                    pool.owned[h.index] = false;
+                    pool.dirty_epoch[h.index] = pool.quiesce_epoch;
+                    pool.free.push(Reverse(h.index));
+                    pool.live -= 1;
+                    std::mem::forget(h);
+                }
+                // `issue_region` puts back the region it refused; the ones after
+                // it were taken off the list (or past `next`) and never issued.
+                for later in index + 1..run.end {
+                    pool.free.push(Reverse(later));
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(Some(issued))
 }
 
 /// **Place the wave transient tier for the forward about to run.**
@@ -2949,6 +3058,47 @@ impl SpanClaims {
     pub fn claim(&self) -> Result<Option<SpanRegion>> {
         Ok(claim_region(&self.device.cuda_stream())?.map(SpanRegion::adopt))
     }
+
+    /// `k` consecutive regions — one block of `k × REGION_BYTES` — or `None`
+    /// when no such run is free and the weight side will not concede one.
+    pub fn claim_run(&self, k: usize) -> Result<Option<Vec<SpanRegion>>> {
+        Ok(claim_region_run(&self.device.cuda_stream(), k)?
+            .map(|run| run.into_iter().map(SpanRegion::adopt).collect()))
+    }
+
+    /// `k` consecutive regions ending at or below region `below`, from ground the
+    /// KV side already has spare — never bought — or `None` when no such run is
+    /// free. How a tenant standing high moves down onto ground packing freed.
+    pub fn claim_run_below(&self, k: usize, below: usize) -> Result<Option<Vec<SpanRegion>>> {
+        let stream = self.device.cuda_stream();
+        Ok(
+            with_pool(&stream, |pool| try_claim_run(pool, &stream, k, below))?
+                .map(|run| run.into_iter().map(SpanRegion::adopt).collect()),
+        )
+    }
+}
+
+/// [`claim_region`] for `k` consecutive regions: the lowest run that fits, bought
+/// from the weight side when the KV side has none.
+pub(crate) fn claim_region_run(
+    stream: &std::sync::Arc<CudaStream>,
+    k: usize,
+) -> Result<Option<Vec<RegionHandle>>> {
+    if let Some(run) = with_pool(stream, |pool| try_claim_run(pool, stream, k, usize::MAX))? {
+        return Ok(Some(run));
+    }
+    let tier_standing = with_pool(stream, |pool| Ok(pool.transient_base.is_some()))?;
+    if tier_standing || buy_ground(stream, k.max(KV_BUY_STEP))? == 0 {
+        return Ok(None);
+    }
+    with_pool(stream, |pool| try_claim_run(pool, stream, k, usize::MAX))
+}
+
+/// Whether span regions may be claimed on `stream`'s device yet: not while a
+/// model is loading into the dense block, whose right edge every region is
+/// measured from (`claim_dense` refuses once one exists).
+pub(crate) fn regions_open(stream: &std::sync::Arc<CudaStream>) -> bool {
+    with_pool(stream, |pool| Ok(pool.dense_frozen || !pool.dense_capable)).unwrap_or(false)
 }
 
 /// Why a [`claim_span_region`] came back empty, for an error message that can
@@ -3123,6 +3273,32 @@ pub fn held_ground_stats(ordinal: usize) -> Option<HeldStats> {
     map.get(&ordinal).map(|pool| pool.held.stats())
 }
 
+/// `device`'s held ground, or `None` if it has no reservation yet. Cloned out of
+/// the pools lock, which provisioning takes again to claim and release regions.
+fn held_ground_of(device: &candle::CudaDevice) -> Option<Arc<SpanHeldGround>> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&device.cuda_stream().context().ordinal())
+        .map(|pool| pool.held.clone())
+}
+
+/// **Between forwards:** fit `device`'s held ground arenas to what recent
+/// forwards took — see `SpanHeldGround::provision`. Does nothing before a
+/// reservation exists or while a model is loading.
+pub fn provision_held_ground(device: &candle::CudaDevice) {
+    if let Some(held) = held_ground_of(device) {
+        held.provision(device);
+    }
+}
+
+/// **With nothing in flight:** let `device`'s held ground go back to what it
+/// holds plus one region — see `SpanHeldGround::settle`. The idle counterpart of
+/// [`provision_held_ground`].
+pub fn settle_held_ground(device: &candle::CudaDevice) {
+    if let Some(held) = held_ground_of(device) {
+        held.settle(device);
+    }
+}
+
 /// Who holds a device's held ground, by call site and largest first, or `None`
 /// if it has no reservation yet.
 pub fn held_ground_sites(ordinal: usize) -> Option<Vec<HeldSite>> {
@@ -3256,7 +3432,20 @@ pub fn span_partition(ordinal: usize) -> Option<SpanPartition> {
     let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
     let pool = map.get_mut(&ordinal)?;
     let peak = std::mem::replace(&mut pool.tier_peak, pool.transient_bytes);
-    Some(partition(
+    Some(pool_partition(pool, peak))
+}
+
+/// [`span_partition`] without restarting the tier's peak — for a report that
+/// reads the fixed blocks and must not take the peak from the per-wave reading.
+pub fn span_partition_now(ordinal: usize) -> Option<SpanPartition> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    let pool = map.get(&ordinal)?;
+    Some(pool_partition(pool, pool.tier_peak))
+}
+
+/// `pool` cut by what holds each byte, with `peak` as the tier's widest.
+fn pool_partition(pool: &RegionPool, peak: usize) -> SpanPartition {
+    partition(
         pool.persist_bytes,
         pool.held_bytes,
         pool.span_bytes,
@@ -3265,12 +3454,46 @@ pub fn span_partition(ordinal: usize) -> Option<SpanPartition> {
         pool.live,
         pool.span_live,
         peak.max(pool.transient_bytes),
-    ))
+    )
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::lowest_run;
+    use std::collections::HashSet;
+
+    fn free(i: &[usize]) -> HashSet<usize> {
+        i.iter().copied().collect()
+    }
+
+    /// The lowest run of free regions is taken, holes too short for it skipped.
+    #[test]
+    fn the_lowest_run_that_fits_is_taken() {
+        // Free 1, 3–5 below `next` = 8: a run of 3 is 3–5, a run of 1 is 1.
+        assert_eq!(lowest_run(&free(&[1, 3, 4, 5]), 8, 20, 3), Some(3));
+        assert_eq!(lowest_run(&free(&[1, 3, 4, 5]), 8, 20, 1), Some(1));
+    }
+
+    /// Fresh ground past `next` counts as free, and a run may start in a hole
+    /// below it and continue into it.
+    #[test]
+    fn fresh_ground_extends_a_run() {
+        assert_eq!(lowest_run(&free(&[6, 7]), 8, 20, 4), Some(6));
+        assert_eq!(lowest_run(&free(&[]), 8, 20, 4), Some(8));
+    }
+
+    /// Nothing at or above the ceiling, and no run of nothing.
+    #[test]
+    fn the_ceiling_bounds_a_run() {
+        assert_eq!(lowest_run(&free(&[]), 8, 11, 4), None);
+        assert_eq!(lowest_run(&free(&[]), 8, 12, 4), Some(8));
+        assert_eq!(lowest_run(&free(&[1]), 8, 20, 0), None);
+    }
 }
 
 #[cfg(test)]
 mod partition_tests {
-    use super::{partition, SpanPartition, HELD_GROUND_BYTES, PERSIST_SPAN_BYTES, REGION_BYTES};
+    use super::{partition, SpanPartition, BOOTSTRAP_HELD_BYTES, PERSIST_SPAN_BYTES, REGION_BYTES};
 
     const R: usize = REGION_BYTES;
 
@@ -3285,7 +3508,7 @@ mod partition_tests {
         let floor = span - 8 * R;
         let p = partition(
             PERSIST_SPAN_BYTES,
-            HELD_GROUND_BYTES,
+            BOOTSTRAP_HELD_BYTES,
             span,
             dense,
             floor,
@@ -3296,8 +3519,8 @@ mod partition_tests {
         assert_eq!(
             p,
             SpanPartition {
-                held_ground: HELD_GROUND_BYTES,
-                persist_staging: PERSIST_SPAN_BYTES - HELD_GROUND_BYTES,
+                held_ground: BOOTSTRAP_HELD_BYTES,
+                persist_staging: PERSIST_SPAN_BYTES - BOOTSTRAP_HELD_BYTES,
                 dense,
                 dense_padding: R / 2,
                 kv: 10 * R,
@@ -3318,7 +3541,7 @@ mod partition_tests {
         let span = PERSIST_SPAN_BYTES + 6 * R;
         let p = partition(
             PERSIST_SPAN_BYTES,
-            HELD_GROUND_BYTES,
+            BOOTSTRAP_HELD_BYTES,
             span,
             0,
             span,
@@ -4679,6 +4902,91 @@ mod tests {
             let total = super::PERSIST_SPAN_BYTES + l.total * REGION_BYTES + l.slack + weights;
             assert_eq!(total, span, "span unaccounted at weight={weight_mib} MiB");
         }
+    }
+
+    /// **The held ground grows to what was refused and gives it back when idle.**
+    /// A take wider than anything held goes to the pool, once; the next
+    /// provisioning claims an arena that holds it, so the same take is held
+    /// ground; and once nothing holds the arena, a window of quiet provisionings
+    /// returns it to the span.
+    #[test]
+    fn held_arenas_cover_a_refused_take_and_go_back_when_idle() -> Result<()> {
+        use candle::cuda_backend::Held;
+        let _serial = serial();
+        let Ok(Device::Cuda(dev)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let s = dev.cuda_stream();
+        let held = with_pool(&s, |p| Ok(p.held.clone()))?;
+        held.provision(&dev);
+        let wide = 40 << 20;
+
+        // SAFETY: never read; its address is all the test looks at.
+        let first = unsafe { Held::<u8>::alloc_on(&s, wide)? };
+        assert!(!first.on_ground(), "nothing held is wide enough yet");
+        drop(first);
+
+        held.provision(&dev);
+        let grown = held.stats();
+        assert!(
+            grown.arena_bytes >= wide,
+            "an arena of at least the refused width: {grown:?}"
+        );
+        // SAFETY: as above.
+        let second = unsafe { Held::<u8>::alloc_on(&s, wide)? };
+        assert!(second.on_ground(), "the same take is held ground now");
+        drop(second);
+        s.synchronize().map_err(candle::Error::wrap)?;
+
+        for _ in 0..=super::super::held_ground::RECENT_WINDOW {
+            held.provision(&dev);
+        }
+        assert_eq!(held.stats().arenas, 0, "idle arenas went back to the span");
+        Ok(())
+    }
+
+    /// **An idle held arena moves down onto ground freed beneath it.** Claimed
+    /// while the low ground was taken, it stands high; once that ground is free,
+    /// the next provisioning moves it there, so it is not left as the frontier.
+    #[test]
+    fn an_idle_held_arena_moves_down_onto_freed_ground() -> Result<()> {
+        use candle::cuda_backend::Held;
+        let _serial = serial();
+        let Ok(Device::Cuda(dev)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let s = dev.cuda_stream();
+        let held = with_pool(&s, |p| Ok(p.held.clone()))?;
+        held.provision(&dev);
+        // The low ground, taken, so the arena is claimed above it.
+        let mut low = Vec::new();
+        for _ in 0..8 {
+            low.extend(claim_region(&s)?);
+        }
+        let wide = 72 << 20;
+        // SAFETY: never read; refused, so it only records the width.
+        drop(unsafe { Held::<u8>::alloc_on(&s, wide)? });
+        held.provision(&dev);
+        let high = held.stats().arena_top;
+        assert!(
+            held.stats().arena_bytes >= wide,
+            "an arena of the refused width"
+        );
+
+        drop(low);
+        s.synchronize().map_err(candle::Error::wrap)?;
+        held.provision(&dev);
+        let lowered = held.stats().arena_top;
+        assert!(
+            lowered < high,
+            "the idle arena moved down: top {high} → {lowered}"
+        );
+
+        for _ in 0..=super::super::held_ground::RECENT_WINDOW {
+            held.provision(&dev);
+        }
+        assert_eq!(held.stats().arenas, 0, "idle arenas went back to the span");
+        Ok(())
     }
 
     /// Live + free + blocked accounts for every region: nothing leaks out of
