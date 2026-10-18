@@ -485,6 +485,7 @@ extern "C" int run_bmma_bdp_scan(
     // next chunk's zeroing lands after this one's finalize has read them.
     static void *s_block = nullptr;
     static size_t s_cap = 0;
+    static unsigned long long s_epoch = 0;
     const size_t max_bytes = (nc * sizeof(unsigned int) + 255) & ~(size_t)255;
     const size_t acc_bytes = (nc * sizeof(unsigned long long) + 255) & ~(size_t)255;
     unsigned int *d_max = nullptr;
@@ -494,7 +495,7 @@ extern "C" int run_bmma_bdp_scan(
     // comment on BDP_BMMA_STAGE_*). "insufficient" told us nothing about which
     // of six CUDA calls actually rejected the work.
     int stage = BDP_BMMA_STAGE_ALLOC;
-    cudaError_t err = grow_scratch(&s_block, &s_cap, max_bytes + 2 * acc_bytes);
+    cudaError_t err = grow_scratch(&s_block, &s_cap, &s_epoch, max_bytes + 2 * acc_bytes);
     if (err == cudaSuccess) {
         d_max = (unsigned int *)s_block;
         d_sum = (unsigned long long *)((char *)s_block + max_bytes);

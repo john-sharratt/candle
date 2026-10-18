@@ -543,13 +543,14 @@ extern "C" int run_imma_bdp_scan(
     // keeps (`grow_scratch.cuh`) — see `run_bmma_bdp_scan`, which does the same.
     static void *s_block = nullptr;
     static size_t s_cap = 0;
+    static unsigned long long s_epoch = 0;
     const size_t max_bytes = (nc * sizeof(unsigned int) + 255) & ~(size_t)255;
     const size_t acc_bytes = (nc * sizeof(unsigned long long) + 255) & ~(size_t)255;
     unsigned int *d_max = nullptr;
     unsigned long long *d_sum = nullptr;
     unsigned long long *d_sq = nullptr;
     int stage = IMMA_STAGE_ALLOC;
-    cudaError_t err = grow_scratch(&s_block, &s_cap, max_bytes + 2 * acc_bytes);
+    cudaError_t err = grow_scratch(&s_block, &s_cap, &s_epoch, max_bytes + 2 * acc_bytes);
     if (err == cudaSuccess) {
         d_max = (unsigned int *)s_block;
         d_sum = (unsigned long long *)((char *)s_block + max_bytes);

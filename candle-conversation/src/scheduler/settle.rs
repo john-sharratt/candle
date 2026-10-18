@@ -16,7 +16,7 @@
 //! them for as long as the passes took.
 
 use candle::Device;
-use candle_nn::kv_cache::{end_wave_transient, forget_recent_tiers};
+use candle_nn::kv_cache::{end_wave_transient, forget_recent_tiers, settle_held_ground};
 
 use super::compaction_stall::FrontierPass;
 use super::interleave::reseed_achievable_weight;
@@ -96,6 +96,10 @@ impl Scheduler {
             let stream = d.cuda_stream();
             end_wave_transient(&stream);
             forget_recent_tiers(&stream);
+            // The held ground's arenas, fitted to an engine with nothing coming:
+            // what is held plus one region. Before the sweep and the packing, so
+            // the regions they free are among what those lower the frontier past.
+            settle_held_ground(d);
         }
         let mut arenas_released = self.session.release_empty_arenas().unwrap_or(0);
         // Lower the frontier as far as the tenants standing at it allow: each pass is

@@ -2167,10 +2167,10 @@ inline int fused_attn_sm_count() {
     return sm;
 }
 
-// Grow-on-demand device scratch for split-KV partials, reused across launches
-// and grown with `grow_scratch` (safe while the thread records a graph; the
-// replaced block is kept, not freed). Single-stream decode only (the pool is
-// process-global, not per-stream).
+// Device scratch for split-KV partials, reused across the launches of one scratch
+// epoch — inside a forward, a carve of that forward's tier — and taken with
+// `grow_scratch` (safe while the thread records a graph). Single-stream decode
+// only (the pool is process-global, not per-stream).
 inline void fused_attn_partial_pool(
     int64_t rows, int splits, int head_dim, float** acc_out, float** ml_out
 ) {
@@ -2178,10 +2178,12 @@ inline void fused_attn_partial_pool(
     static void* g_ml  = nullptr;
     static size_t g_cap_acc = 0;  // capacity in bytes
     static size_t g_cap_ml  = 0;
+    static unsigned long long g_epoch_acc = 0;
+    static unsigned long long g_epoch_ml  = 0;
     size_t need_acc = (size_t)(rows * splits * head_dim) * sizeof(float);
     size_t need_ml  = (size_t)(rows * splits * 2) * sizeof(float);
-    if (grow_scratch(&g_acc, &g_cap_acc, need_acc) != cudaSuccess ||
-        grow_scratch(&g_ml, &g_cap_ml, need_ml) != cudaSuccess) {
+    if (grow_scratch(&g_acc, &g_cap_acc, &g_epoch_acc, need_acc) != cudaSuccess ||
+        grow_scratch(&g_ml, &g_cap_ml, &g_epoch_ml, need_ml) != cudaSuccess) {
         *acc_out = nullptr; *ml_out = nullptr; return;
     }
     *acc_out = (float*)g_acc;

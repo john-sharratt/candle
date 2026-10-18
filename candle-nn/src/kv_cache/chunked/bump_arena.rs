@@ -53,6 +53,9 @@ use std::thread::{current, ThreadId};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
 use candle::cuda_backend::wave_provenance::{SpanState, WaveCarve, WaveTicket};
+use candle::cuda_backend::{
+    close_scratch_scope, install_scope_carve, open_scratch_scope, scratch_reserve,
+};
 use candle::Result;
 
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
@@ -593,6 +596,60 @@ fn bump_locked(inner: &mut Inner, name: &'static str, len: usize, align: usize) 
     Some(inner.base + start as u64)
 }
 
+/// The forward-wide span of each device whose forward is open — what the
+/// launchers' scratch is carved from while it is (`docs/held_ground_elimination.md`
+/// §3). Registered when the span's generation opens, removed when it closes.
+fn forward_scratch() -> &'static Mutex<HashMap<usize, Arc<Mutex<Inner>>>> {
+    static SPANS: OnceLock<Mutex<HashMap<usize, Arc<Mutex<Inner>>>>> = OnceLock::new();
+    SPANS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The alignment a launcher's scratch is carved at — what a fresh device
+/// allocation guarantees and its vectorised loads assume.
+const SCRATCH_ALIGN: usize = 256;
+
+/// The scratch scope's carver: `bytes` from the forward-wide span open on device
+/// `ordinal`, or `None` when none is open or it cannot hold them. Only the span's
+/// own lock is taken — never the domain map, which a scope is opened under.
+fn carve_forward_scratch(ordinal: usize, bytes: usize) -> Option<u64> {
+    let span = forward_scratch()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&ordinal)
+        .cloned()?;
+    let mut inner = span.lock().unwrap_or_else(|e| e.into_inner());
+    if inner.live == 0 {
+        return None;
+    }
+    bump_locked(
+        &mut inner,
+        "forward span (launch scratch)",
+        bytes,
+        SCRATCH_ALIGN,
+    )
+}
+
+/// A forward's span on device `ordinal` has opened: its launchers carve from
+/// `span` until [`close_forward_scratch`].
+fn open_forward_scratch(ordinal: usize, span: Arc<Mutex<Inner>>) {
+    install_scope_carve(carve_forward_scratch);
+    forward_scratch()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(ordinal, span);
+    open_scratch_scope(ordinal);
+}
+
+/// The forward's span on device `ordinal` is closing: nothing more is carved
+/// from it, and every launcher takes a fresh block at its next launch.
+fn close_forward_scratch(ordinal: usize) {
+    forward_scratch()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&ordinal);
+    close_scratch_scope(ordinal);
+}
+
 /// A live claim on a [`BumpArena`]'s current contents.
 ///
 /// While one exists the cursor cannot reset, so every range handed out since
@@ -685,7 +742,7 @@ impl Generation {
 
 impl Drop for Generation {
     fn drop(&mut self) {
-        let (should_reset, stream, reclaim) = {
+        let (should_reset, stream, reclaim, closing) = {
             let mut inner = self.inner.lock().unwrap();
             inner.live -= 1;
             // A nested generation releases to its mark and stops here. It does
@@ -723,8 +780,16 @@ impl Drop for Generation {
                 inner.live == 0 && inner.dirty,
                 inner.stream.clone(),
                 inner.reclaim,
+                inner.live == 0,
             )
         };
+        // The forward-wide span's last generation closing ends the forward's
+        // scratch scope — before the cursor rewinds below, so no launch is handed
+        // a block in ground about to be reused. Read under the lock that counted
+        // the drop, so a generation opening in between cannot be mistaken for it.
+        if closing && self.arena == FORWARD_ARENA && self.domain != NOT_A_WAVE {
+            close_forward_scratch(self.domain as usize);
+        }
         // The tier's reference count moves on **every** drop, not only the ones
         // that reset a cursor: a clean generation still held the tier open.
         //
@@ -1168,9 +1233,13 @@ fn phase_index(phase: LayerPhase) -> usize {
     match phase {
         LayerPhase::Attention => 0,
         LayerPhase::Ffn => 1,
-        LayerPhase::Forward => 2,
+        LayerPhase::Forward => FORWARD_ARENA as usize,
     }
 }
+
+/// The forward-wide span's arena index in a wave domain — the span a forward's
+/// launch scratch is carved from.
+const FORWARD_ARENA: u32 = 2;
 
 fn wave_domains() -> &'static Mutex<HashMap<usize, WaveDomain>> {
     static DOMAINS: OnceLock<Mutex<HashMap<usize, WaveDomain>>> = OnceLock::new();
@@ -1566,7 +1635,7 @@ pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> R
     // Normalised once, here, so the recorded plan, the tier purchase below, and
     // the span layout in `begin_wave` all see the same rounded figures — a raw
     // sum against a rounded layout would place a tier the last span overruns.
-    let per_phase = align_phase_plan(per_phase);
+    let per_phase = align_phase_plan(with_launch_scratch(stream, per_phase));
     let stream = stream.clone();
     // The previous forward's ground goes back before this one's frontier is
     // measured, so the reservation is taken against a partition that already
@@ -1603,6 +1672,20 @@ pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> R
         domain.reserved_by_forward = true;
         Ok(())
     })
+}
+
+/// `per_phase` with the forward-wide span widened by the launchers' scratch
+/// reserve on `stream`'s device: what recent forwards' launchers asked for
+/// (`candle::cuda_backend::scratch_reserve`). A plan prices the forward's own
+/// buffers; the launchers size theirs inside the launch, so the span carries
+/// what they have been seen to need.
+fn with_launch_scratch(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> [usize; 3] {
+    let [attn, ffn, forward] = per_phase;
+    [
+        attn,
+        ffn,
+        forward + scratch_reserve(stream.context().ordinal()),
+    ]
 }
 
 /// The plan that covers both `standing` and `wanted`, phase by phase.
@@ -1653,7 +1736,7 @@ fn covering_plan(standing: [usize; 3], wanted: [usize; 3]) -> [usize; 3] {
 /// the plan ([`WaveDomain::covering`]); dropped, the width goes with it, so no
 /// guard after the walk lays its spans out at a walk's width.
 pub fn cover_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<Covering> {
-    let wanted = align_phase_plan(per_phase);
+    let wanted = align_phase_plan(with_launch_scratch(stream, per_phase));
     let (ordinal, target) = {
         let mut map = lock_domains();
         let (ordinal, domain) = domain_entry(&mut map, stream);
@@ -1952,6 +2035,11 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
             // to drop and nothing to bring the count back down.
             let generation = arena.generation(ordinal, arena_idx)?;
             domain.live_generations += 1;
+            // The forward-wide span opening is the forward's scratch scope
+            // opening: its launchers carve from this span until it closes.
+            if arena_idx == FORWARD_ARENA {
+                open_forward_scratch(ordinal as usize, Arc::clone(&arena.inner));
+            }
             Ok(Some(generation))
         })?;
         if let Some(generation) = opened {

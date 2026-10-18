@@ -29,6 +29,11 @@ extern "C" {
     /// that grows a scratch.
     pub fn candle_set_kernel_scratch(take: KernelScratchFn, release: KernelScratchReleaseFn);
 
+    /// Set the scratch epoch. A launcher holding a block taken in another epoch
+    /// gives it back and takes a fresh one at its next launch — how a block carved
+    /// for one forward is never read by a launch after it.
+    pub fn candle_set_kernel_scratch_epoch(epoch: u64);
+
     // ========================================================================
     // Per-dtype dispatchers — persistent slot buffer API
     // Takes a single `headers_ptr` pointing to SlotHeader[num_active_slots] on GPU.

@@ -141,10 +141,14 @@ pub(crate) fn class_bytes_for(bytes: usize) -> Result<usize> {
 }
 
 struct ClassPool {
-    /// One entry per slab: the whole device allocation, held so it stays live.
-    slabs: Vec<Held<u8>>,
+    /// One entry per slab: the whole device allocation, held so it stays live;
+    /// `None` for a slab given back, whose index the next slab reuses.
+    slabs: Vec<Option<Held<u8>>>,
     /// Base device address of each slab, resolved once at creation.
     bases: Vec<u64>,
+    /// Slots each slab holds, and how many of them are free.
+    capacity: Vec<usize>,
+    free_in: Vec<usize>,
     /// Free `(slab, index)` pairs, most recently released first.
     free: Vec<(usize, usize)>,
 }
@@ -154,8 +158,54 @@ impl ClassPool {
         Self {
             slabs: Vec::new(),
             bases: Vec::new(),
+            capacity: Vec::new(),
+            free_in: Vec::new(),
             free: Vec::new(),
         }
+    }
+
+    /// Install `slab` of `per_slab` slots at `base`, every slot free: in the
+    /// index a given-back slab left, or a new one. Returns the index.
+    fn add_slab(&mut self, slab: Held<u8>, base: u64, per_slab: usize) -> usize {
+        let at = match self.slabs.iter().position(Option::is_none) {
+            Some(at) => {
+                self.slabs[at] = Some(slab);
+                self.bases[at] = base;
+                self.capacity[at] = per_slab;
+                self.free_in[at] = per_slab;
+                at
+            }
+            None => {
+                self.slabs.push(Some(slab));
+                self.bases.push(base);
+                self.capacity.push(per_slab);
+                self.free_in.push(per_slab);
+                self.slabs.len() - 1
+            }
+        };
+        self.free.extend((0..per_slab).rev().map(|i| (at, i)));
+        at
+    }
+
+    /// A slot of `slab` came back. When that empties the slab and the class
+    /// still has a slab's worth of free slots elsewhere, the slab is taken out
+    /// of the pool and returned — its slots off the free list — for the caller
+    /// to give back. The spare slab's worth is what keeps a 32-token boundary,
+    /// where many pairs promote at once, from freeing and re-carving.
+    fn returned(&mut self, slab: usize, index: usize) -> Option<Held<u8>> {
+        self.free.push((slab, index));
+        self.free_in[slab] += 1;
+        if self.free_in[slab] < self.capacity[slab] {
+            return None;
+        }
+        let elsewhere = self.free.len() - self.free_in[slab];
+        if elsewhere < self.capacity[slab] {
+            return None;
+        }
+        self.free.retain(|&(s, _)| s != slab);
+        self.free_in[slab] = 0;
+        self.capacity[slab] = 0;
+        self.slabs[slab].take()
     }
 }
 
@@ -245,21 +295,15 @@ pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> 
             base
         };
         drop(stream);
-        let slab_idx = inner.classes[class].slabs.len();
-        inner.classes[class].slabs.push(slab);
-        inner.classes[class].bases.push(base);
-        inner.classes[class]
-            .free
-            .extend((0..per_slab).rev().map(|i| (slab_idx, i)));
+        inner.classes[class].add_slab(slab, base, per_slab);
         inner.slabs += 1;
         inner.reserved += slab_bytes;
     }
 
-    let (slab, index) = inner.classes[class]
-        .free
-        .pop()
-        .expect("just refilled the class");
-    let ptr = inner.classes[class].bases[slab] + (index * slot_bytes) as u64;
+    let pool = &mut inner.classes[class];
+    let (slab, index) = pool.free.pop().expect("just refilled the class");
+    pool.free_in[slab] -= 1;
+    let ptr = pool.bases[slab] + (index * slot_bytes) as u64;
     inner.live += 1;
     drop(map);
     drop(paused);
@@ -276,12 +320,36 @@ pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> 
 /// No fence: see the module header. The slot's bytes are left as they are —
 /// the next tenant writes every byte it reads, and nothing reads past what it
 /// wrote (`n_chunks` bounds the kernel's walk).
+///
+/// **A slab this empties goes back**, once its class has a slab's worth of free
+/// slots elsewhere ([`ClassPool::returned`]): a sequence that went deep, or a wide
+/// cohort, no longer holds its peak for the life of the process. It is retired
+/// through the device, not dropped — a segment recorded and not yet launched may
+/// still read it.
 pub(crate) fn release(device: &CudaDevice, slot: SlotStateSlot) {
     let device_id = device.cuda_stream().context().ordinal();
-    let mut map = arenas().lock().unwrap();
-    if let Some(inner) = map.get_mut(&device_id) {
-        inner.classes[slot.class].free.push((slot.slab, slot.index));
+    let freed = {
+        let mut map = arenas().lock().unwrap();
+        let Some(inner) = map.get_mut(&device_id) else {
+            return;
+        };
         inner.live = inner.live.saturating_sub(1);
+        let freed = inner.classes[slot.class].returned(slot.slab, slot.index);
+        if freed.is_some() {
+            inner.slabs = inner.slabs.saturating_sub(1);
+            inner.reserved = inner.reserved.saturating_sub(
+                SLOT_STATE_LADDER[slot.class]
+                    * SLOTS_PER_SLAB
+                        .min(TARGET_ARENA_BYTES / SLOT_STATE_LADDER[slot.class])
+                        .max(1),
+            );
+        }
+        freed
+    };
+    // Outside the lock: retiring may free at once, which gives the range back to
+    // the held ground under its own lock.
+    if let Some(slab) = freed {
+        device.retire(slab);
     }
 }
 
@@ -300,6 +368,47 @@ pub fn stats() -> (usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slabs standing in `class` on device `ordinal`.
+    fn slabs_in(ordinal: usize, class: usize) -> usize {
+        arenas().lock().unwrap().get(&ordinal).map_or(0, |inner| {
+            inner.classes[class]
+                .slabs
+                .iter()
+                .filter(|s| s.is_some())
+                .count()
+        })
+    }
+
+    /// **A slab whose slots all come back is given back** — all but one slab's
+    /// worth of spare, which a 32-token boundary's promotions land in. On the
+    /// 8 MiB rung, two slots a slab, which no other test reaches.
+    #[test]
+    fn emptied_slabs_go_back_and_one_stays_spare() -> Result<()> {
+        use candle::backend::BackendDevice;
+        let dev = CudaDevice::new(0)?;
+        let ordinal = dev.cuda_stream().context().ordinal();
+        let bytes = 8 * 1024 * 1024;
+        let class = class_for(bytes).expect("a rung");
+        let before = slabs_in(ordinal, class);
+        let slots: Vec<SlotStateSlot> =
+            (0..5).map(|_| claim(&dev, bytes)).collect::<Result<_>>()?;
+        assert_eq!(
+            slabs_in(ordinal, class),
+            before + 3,
+            "five slots, two a slab"
+        );
+        for s in slots {
+            release(&dev, s);
+        }
+        assert_eq!(
+            slabs_in(ordinal, class),
+            before.max(1),
+            "every emptied slab but one went back"
+        );
+        dev.synchronize()?;
+        Ok(())
+    }
 
     #[test]
     fn the_ladder_doubles_and_is_strictly_increasing() {

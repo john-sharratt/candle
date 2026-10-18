@@ -34,6 +34,8 @@ pub mod config;
 pub mod convert;
 pub mod convert_bench;
 pub mod coverage;
+/// What the dense block holds, by kind of weight, off the pack's tensor table.
+pub mod dense_inventory;
 #[cfg(feature = "cuda")]
 pub mod device_operand;
 pub mod draft;
