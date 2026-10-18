@@ -45,7 +45,9 @@ use crate::persistence::record::{
     SnapshotPayload, TreeMetadataPayload,
 };
 use crate::persistence::remote::{turn_is_complete, RemoteBatch};
-use crate::persistence::resume::{read_persisted_section_windows, TurnChunkGrid};
+use crate::persistence::resume::{
+    read_persisted_section_windows, RecoveredTurnMeta, TurnChunkGrid,
+};
 use crate::persistence::sealed_reader::{SealedReader, SEALED_READ_ATTEMPTS};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::vfs::{VfsEventId, VfsEventPayload, VfsWrite};
@@ -2939,6 +2941,17 @@ impl Conversation {
             // index — never selected (no content), never materialisable (no
             // cold refs) — keeping every later turn aligned.
             if let Some(tl) = TimelineId::from_raw(decl.timeline_id) {
+                // **A tombstoned timeline is dead whole, and a runtime reload
+                // still sees its streams**: the in-RAM stream index is
+                // insert-only, while the compactor drops the timeline's records
+                // from disk. Recovering it read segments compaction had already
+                // unlinked, and reported a deleted conversation as corrupt — on
+                // `.5`, 85 turns of conversations deleted through the API, each
+                // then given a repair tombstone (2026-10-18). Replay at open
+                // leaves a tombstoned timeline's records inert; so does this.
+                if self.read().is_tombstoned(tl) {
+                    continue;
+                }
                 if self.read().is_turn_tombstoned(tl, decl.turn_index) {
                     let mut view = self.write();
                     if let (Some(layer), Some(group)) = (
@@ -2982,13 +2995,38 @@ impl Conversation {
             let recover_result = {
                 let mut p = self.persistence.lock().unwrap();
                 let substrate_read = self.read();
+                // **A distilled timeline's shed records are absent, not
+                // corrupt.** Its K/V was declared disposable when it was marked,
+                // and the compactor drops the chunks — and, provenance-only, the
+                // tokens — while the insert-only stream index keeps naming them.
+                // Replay at open finds those records gone; a runtime reload must
+                // read them the same way. Restored with the cold references they
+                // name, the turns were chosen by every projection, failed
+                // `cold-load found no chunks`, and were withdrawn — 18,724 times
+                // in 53 minutes on `.5` after one reload (2026-10-18). The live
+                // path clears the same references when it marks the timeline
+                // (`Substrate::release_distilled_kv`).
+                let distilled = TimelineId::from_raw(decl.timeline_id)
+                    .is_some_and(|tl| substrate_read.distill_mode(tl).is_some());
                 // Metadata only — token ids, signatures, and the chunk-index
                 // token count. The turn's KV payload bytes stay on disk; a
                 // later projection reads them via the cold→hot elevation
                 // (`recover_turn_grid`).
                 let r =
-                    crate::persistence::resume::recover_turn_meta(&mut p, &substrate_read, &decl);
-                let cr = if r.is_ok() {
+                    crate::persistence::resume::recover_turn_meta(&mut p, &substrate_read, &decl)
+                        .or_else(|e| {
+                            if distilled {
+                                Ok(RecoveredTurnMeta {
+                                    token_ids: Vec::new(),
+                                    token_count: 0,
+                                })
+                            } else {
+                                Err(e)
+                            }
+                        });
+                let cr = if distilled {
+                    Ok(None)
+                } else if r.is_ok() {
                     crate::persistence::resume::recover_turn_cold_refs(
                         &substrate_read,
                         &decl,

@@ -231,6 +231,8 @@ mod remote_turn_tests;
 #[cfg(test)]
 mod replication_tests;
 #[cfg(test)]
+mod stale_index_reload_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod turn_order_tests;
