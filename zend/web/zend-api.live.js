@@ -203,7 +203,16 @@
         think: opts ? opts.think : undefined,
         tools: opts ? opts.tools : undefined,
       };
-      fetch('/v1/chat/completions', {
+      // **A 503 that says when to come back is a wait, not a failure.** The
+      // gateway answers one, with `Retry-After`, while the member holding this
+      // conversation is reachable only through another gateway, and while every
+      // member is restarting; no turn started, so the same request is simply
+      // sent again. The bubble says what it waits on in the meantime, and only a
+      // wait past `RETRY_FOR_MS` is reported as an error.
+      const RETRY_FOR_MS = 120000;
+      const started = Date.now();
+      let retryTimer = null;
+      const send = () => fetch('/v1/chat/completions', {
         method: 'POST',
         // The conversation, named where a cluster's gateway reads it without
         // buffering the body (docs/replicated_substrate.md §5.2).
@@ -211,6 +220,22 @@
         body: JSON.stringify(payload),
         signal: controller.signal,
       }).then((resp) => {
+        const retryAfter = Number(resp.headers.get('retry-after'));
+        if (resp.status === 503 && retryAfter > 0 && Date.now() - started < RETRY_FOR_MS) {
+          resp
+            .json()
+            .then((body) => (body && body.error && body.error.message) || '')
+            .catch(() => '')
+            .then((detail) => {
+              if (controller.signal.aborted) { handlers.onDone(); return; }
+              const waitS = Math.min(Math.max(retryAfter, 1), 10);
+              if (handlers.onStatus) {
+                handlers.onStatus((detail || 'Waiting for the cluster') + ' — retrying in ' + waitS + ' s');
+              }
+              retryTimer = setTimeout(() => { retryTimer = null; send(); }, waitS * 1000);
+            });
+          return;
+        }
         // **A stream that failed is not a stream that finished.** Every one of
         // these used to call `onDone`, so an HTTP 500, a body-less response and
         // a mid-stream socket drop all rendered as a completed answer — an
@@ -247,7 +272,19 @@
         if (e && e.name === 'AbortError') { handlers.onDone(); return; }
         fail(handlers, 'Could not reach the daemon: ' + errText(e), false);
       });
-      return { cancel: () => controller.abort() };
+      send();
+      return {
+        cancel: () => {
+          controller.abort();
+          // A wait between sends has no request for the abort to end, so the
+          // stream is ended here instead.
+          if (retryTimer !== null) {
+            clearTimeout(retryTimer);
+            retryTimer = null;
+            handlers.onDone();
+          }
+        },
+      };
     },
 
     // GET /v1/conversations/{id}/live — the reply in flight, from its first
