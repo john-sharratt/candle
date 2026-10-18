@@ -20,7 +20,7 @@ use crate::recorded_reply::replayed_step;
 use crate::stats::streams_committed;
 use crate::token_buffer::TokenBuffer;
 use candle_nn::kv_cache::{
-    end_wave_transient, is_device_oom, tier_refusal_shortfall, FreeRegionTarget,
+    end_wave_transient, is_device_oom, is_span_full, tier_refusal_shortfall, FreeRegionTarget,
 };
 use candle_transformers::models::batched_inference::PendingGlue;
 use candle_transformers::models::expert_lre::is_expert_stall;
@@ -3068,9 +3068,10 @@ impl Scheduler {
     ) {
         if is_device_oom(err) {
             self.handle_prefill_oom(prefill_gidxs, err);
-        } else if is_expert_stall(err) {
+        } else if is_expert_stall(err) || is_span_full(err) {
             // Every member keeps its place and its progress; the same group
-            // re-forms on the next wave.
+            // re-forms on the next wave — after a full span, once turns
+            // finishing and the KV side's relief have given ground back.
         } else if tier_refusal_shortfall(err)
             .is_some_and(|short| self.note_refused_width(creep_rows, short))
         {
@@ -3699,6 +3700,7 @@ impl Scheduler {
                 // `MID_SWEEP_RETRIES` times in a row fails its members instead.
                 let retryable = is_device_oom(&e)
                     || tier_refusal_shortfall(&e).is_some()
+                    || is_span_full(&e)
                     || is_expert_stall(&e);
                 if cursor > 0 && retryable && self.wave_sweep_failures < MID_SWEEP_RETRIES {
                     self.wave_sweep_failures += 1;

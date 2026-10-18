@@ -82,6 +82,22 @@ pub fn is_tier_refusal(err: &candle::Error) -> bool {
     err.to_string().contains(TIER_REFUSED_MARKER)
 }
 
+/// Carried by a region claim refused because the span is full — no tier
+/// stands over the free ground, and the weight side is at its floor
+/// (`region_pool::span_region_refusal`). Like a refused tier it is ground, not
+/// a fault: it comes back as turns finish and the KV side relieves, so a turn
+/// that met it waits and runs again rather than failing. On `.5` (2026-10-18)
+/// two deep projections' promotes filled the span beside the ingest cohorts,
+/// and the recurrent-state claims of turns already in flight — a decode step,
+/// a creep's first window, a reprojection — failed their turns within seconds
+/// of submission.
+pub const SPAN_FULL_MARKER: &str = "the span is genuinely full";
+
+/// Recognize a claim refused by a full span — see [`SPAN_FULL_MARKER`].
+pub fn is_span_full(err: &candle::Error) -> bool {
+    err.to_string().contains(SPAN_FULL_MARKER)
+}
+
 /// Follows [`TIER_REFUSED_MARKER`] in a refusal: the bytes the tier was short
 /// of the ground it could be placed in, as `short by {bytes} B`.
 pub const TIER_SHORT_BY: &str = "short by ";
