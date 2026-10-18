@@ -18,6 +18,7 @@ use serde_json::Value;
 use super::served::{offered, HeldAs};
 use super::Upgrader;
 use crate::clock::now_ms;
+use crate::consensus::MAX_DECISION;
 use crate::frame::{BuildId, Verdict as VerdictFrame, VerdictResult};
 use crate::upgrade::artifacts::siblings;
 use crate::upgrade::decisions::{
@@ -63,6 +64,57 @@ fn failing_routes(figures: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A gateway's figures in a line: its overall verdict and how its routes
+/// came out. The routes themselves stay on the gateway's own page; the
+/// decision carries what it rests on in a form that fits a Paxos value.
+fn summary(figures: &[u8]) -> String {
+    let Ok(v) = serde_json::from_slice::<Value>(figures) else {
+        return String::new();
+    };
+    let routes = v["routes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let count = |o: &str| routes.iter().filter(|r| r["outcome"] == o).count();
+    format!(
+        "{}: {} pass, {} gap, {} fail",
+        v["overall"].as_str().unwrap_or("no_opinion"),
+        count("pass"),
+        count("gap"),
+        count("fail"),
+    )
+}
+
+/// `v` cut to fit one decision ([`MAX_DECISION`]): a decision that does not
+/// fit is refused by every vote journal, so the group would never hold it and
+/// the candidate would propose it again forever. The reason is shortened
+/// first, at a character boundary, then gateways' summaries are dropped from
+/// the end.
+fn fit(mut v: Verdict) -> Verdict {
+    const MORE: &str = "…";
+    while encode(&v).len() > MAX_DECISION {
+        if !v.reason.is_empty() {
+            let over = encode(&v).len() - MAX_DECISION + MORE.len();
+            let mut keep = v.reason.len().saturating_sub(over);
+            while !v.reason.is_char_boundary(keep) {
+                keep -= 1;
+            }
+            v.reason.truncate(keep);
+            if !v.reason.is_empty() {
+                v.reason.push_str(MORE);
+                if encode(&v).len() <= MAX_DECISION {
+                    break;
+                }
+                // The JSON escaping of what is left still overflows: drop it.
+                v.reason.clear();
+            }
+        } else if v.figures.pop().is_none() {
+            break;
+        }
+    }
+    v
+}
+
 /// The verdict a candidate proposes from the gateways' `verdicts`, once it
 /// has one from every socket in `sockets`, or a failure from any.
 pub fn settle(
@@ -78,11 +130,8 @@ pub fn settle(
     if failed.is_empty() && !all_in {
         return None;
     }
-    let figures: Vec<String> = verdicts
-        .values()
-        .map(|v| String::from_utf8_lossy(&v.figures).into_owned())
-        .collect();
-    Some(if failed.is_empty() {
+    let figures: Vec<String> = verdicts.values().map(|v| summary(&v.figures)).collect();
+    Some(fit(if failed.is_empty() {
         Verdict {
             result: Settled::Pass,
             by: BY_CERTIFICATION.into(),
@@ -102,7 +151,7 @@ pub fn settle(
                 .join("; "),
             figures,
         }
-    })
+    }))
 }
 
 impl Upgrader {
@@ -272,5 +321,69 @@ mod tests {
             "GET /v1/tools: its p50 is 1.60× the baseline's"
         );
         assert_eq!(settle(&BTreeMap::new(), &[], 1), None);
+    }
+
+    /// A gateway's figures are carried as a line: its overall verdict and
+    /// how many routes passed, had gaps and failed.
+    #[test]
+    fn a_gateway_s_figures_are_summed_up_in_a_line() {
+        let mut got = BTreeMap::new();
+        got.insert(
+            0,
+            verdict(
+                VerdictResult::Pass,
+                r#"{"overall":"pass_with_gaps","routes":[{"route":"a","outcome":"pass"},{"route":"b","outcome":"gap"},{"route":"c","outcome":"pass"}]}"#,
+            ),
+        );
+        got.insert(1, verdict(VerdictResult::NoOpinion, "not json"));
+        let pass = settle(&got, &[0, 1], 3).unwrap();
+        assert_eq!(
+            pass.figures,
+            vec![
+                "pass_with_gaps: 2 pass, 1 gap, 0 fail".to_string(),
+                String::new()
+            ]
+        );
+    }
+
+    /// However many routes fail and however long their reasons, the decision
+    /// fits a vote journal: the reason is cut short and marked so.
+    #[test]
+    fn a_verdict_always_fits_a_decision() {
+        let routes: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    r#"{{"route":"GET /v1/route/{i}","outcome":"fail","why":"its p95 is 9.99× the baseline's — “slow”"}}"#
+                )
+            })
+            .collect();
+        let figures = format!(r#"{{"overall":"fail","routes":[{}]}}"#, routes.join(","));
+        let mut got = BTreeMap::new();
+        for c in 0..3 {
+            got.insert(c, verdict(VerdictResult::Fail, &figures));
+        }
+        let fail = settle(&got, &[0, 1, 2], 5).unwrap();
+        assert!(
+            encode(&fail).len() <= MAX_DECISION,
+            "{}",
+            encode(&fail).len()
+        );
+        assert!(fail.reason.starts_with("GET /v1/route/0: its p95"));
+        assert!(fail.reason.ends_with('…'));
+        assert_eq!(fail.figures.len(), 3, "summaries fit once the reason is cut");
+        assert_eq!(fail.figures[0], "fail: 0 pass, 0 gap, 40 fail");
+    }
+
+    /// A verdict that already fits is left as it is.
+    #[test]
+    fn a_verdict_that_fits_is_unchanged() {
+        let v = Verdict {
+            result: Settled::Fail,
+            by: BY_CERTIFICATION.into(),
+            at_ms: 1,
+            reason: "GET /v1/x: slow".into(),
+            figures: vec!["fail: 0 pass, 0 gap, 1 fail".into()],
+        };
+        assert_eq!(fit(v.clone()), v);
     }
 }

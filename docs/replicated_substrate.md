@@ -585,8 +585,13 @@ failure on another is a failure.
 2. The candidate proposes the decision `certify/<app>/<count>-<hash>/<i>` (§5.9) once
    every socket it is admitted on has sent a verdict. A gateway that carried too little
    traffic sends *no opinion*. A failure from any gateway is proposed at once. The value
-   is `{ result: pass | fail, by, at_ms, reason, figures }`, with every gateway's figures
-   and, for a failure, the failing routes as the reason. `i` is one above the latest
+   is `{ result: pass | fail, by, at_ms, reason, figures }`, with each gateway's figures
+   summed up in a line (`<overall>: <n> pass, <n> gap, <n> fail`; the per-route figures
+   stay on the gateway's own page) and, for a failure, the failing routes as the reason.
+   A decision is at most 799 bytes (a vote journal's 800-byte value, less its tag), so
+   the reason is cut short, marked `…`, and then trailing summaries are dropped until it
+   fits; a value that did not fit would be refused by every journal and never be held.
+   `i` is one above the latest
    verdict the candidate holds on the build; a proposal that loses its number is made
    again under the next, every 5 s, until the group holds a verdict. The latest `i` is
    the group's verdict, which is how `certify-anyway`, `reject-build` and a forced

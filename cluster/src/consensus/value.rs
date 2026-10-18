@@ -6,7 +6,12 @@
 
 use std::time::Duration;
 
+use super::votes::MAX_VALUE;
 use crate::wire::{Reader, WireError, Writer};
+
+/// The most bytes a decision may hold: a vote journal stores at most
+/// [`MAX_VALUE`] bytes of value, the tag included.
+pub const MAX_DECISION: usize = MAX_VALUE - 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
