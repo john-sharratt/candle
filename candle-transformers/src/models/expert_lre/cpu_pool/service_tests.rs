@@ -400,16 +400,18 @@ fn the_service_computes_a_pageable_expert_without_waiting() -> candle::Result<()
         fault: fault.clone(),
         pinned: [(0, 0), (0, 0)],
         paged: Arc::new(paged),
-        spin_limit: Duration::from_secs(10),
+        spin_limit: Duration::from_secs(30),
     });
     let layer: &[(usize, usize, bool)] = &[(1, 1, true), (3, 2, true)];
     let t0 = Instant::now();
     fx.ring(0x5000, layer);
     fx.expect_answer(0x5000, layer, "pageable layer");
     // Nothing is ever published, so a service that waited on the live table
-    // would answer only past the 10 s spin limit, if at all.
+    // would answer only past the 30 s spin limit, if at all. The margin under
+    // it is wide: beside the suite's other pools calibrating on the same cores
+    // this answers in ~3 s, alone in ~0.1 s.
     assert!(
-        t0.elapsed() < Duration::from_secs(1),
+        t0.elapsed() < Duration::from_secs(10),
         "answered in {:?}: the service waited",
         t0.elapsed()
     );

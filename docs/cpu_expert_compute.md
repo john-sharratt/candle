@@ -659,7 +659,7 @@ capture.
 | `cpu_scale` | 1.0 | Multiplies every CPU cost. Above 1 biases to the GPU. |
 | `gpu_scale` | 1.0 | Multiplies `copy_ns`. |
 | `handoff_extra_ns` | 0 | Added to t_h. |
-| `cut_scale` | 1.0 | Step 1's cut: GPU when c(n) > `cut_scale` · (g + c_g(n)). |
+| `cut_scale` | 1.0 | Step 1's cut: GPU when c(n) > `cut_scale` · (g + c_g(n)), for n ≥ 2 — a lone token always passes and the layer model decides it (`SplitParams::split`). |
 | `min_gain_ns` | 0 | Hysteresis against near-ties. |
 | `max_cpu_assignments` | 1,024 | The cap, and the rings' rows at load. **0 sends everything to the GPU.** A deployment value, not a feature flag: the same arithmetic with a cap of zero. A live raise is held to the rings' rows. |
 | `wait_tight_ns` | 200,000 | How long the down launch's CPU item polls tightly before it backs off (§5.5). |
@@ -674,7 +674,9 @@ capture.
 2. the daemon config: an `expert_split:` section under `host:` in
    `motherd.yaml`, and the same settings as `--expert-split*` flags on `zend`
    and `npcd` (`host/src/expert_split.rs`). Deployment config, not an env flag:
-   `enabled` decides whether the pool starts with the engine;
+   `enabled` decides whether the pool starts with the engine. It is on by
+   default (2026-10-18); `enabled: false` or `--expert-split false` keeps every
+   expert on the GPU;
 3. `POST /v1/expert_split` (admin role) for live tuning. Its body names any
    subset of the knobs; an unknown knob refuses the whole patch. It returns the
    knobs, the measured costs, the cut and the layers served;

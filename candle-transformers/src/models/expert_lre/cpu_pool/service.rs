@@ -431,6 +431,27 @@ fn serve(ctx: &Ctx, pool: &Pool, isa: Isa) {
             .into_iter()
             .map(|w| (w, [w.gate, w.up, w.down]))
             .collect();
+        // Every projection of a pinned expert must be host memory: the pool
+        // reads it in place, and a device address is an access violation, not
+        // an error. Bucketize classes an expert pinned only when all three are
+        // (`snapshot_expert`); this refuses the layer if one ever is not.
+        if let Some(src) = ctx.cold.get() {
+            if let Some((w, a)) = ready
+                .iter()
+                .find(|(_, a)| a.iter().any(|&x| !src.host_readable(x)))
+            {
+                warn!(
+                    row = h.row,
+                    expert = w.expert,
+                    gate = format_args!("{:#x}", a[0]),
+                    up = format_args!("{:#x}", a[1]),
+                    down = format_args!("{:#x}", a[2]),
+                    "cpu expert service: a pinned expert names memory outside the pinned ranges — \
+                     the layer is refused"
+                );
+                continue;
+            }
+        }
         if !ready.is_empty() {
             run(&ready);
         }

@@ -158,9 +158,9 @@ impl Default for Knobs {
     }
 }
 
-/// The process's split parameters. The default is off, with neutral knobs and
-/// nothing measured.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// The process's split parameters. The default is on, with neutral knobs and
+/// nothing measured — all-GPU until the pool has calibrated.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SplitParams {
     /// Whether the CPU class runs at all — the daemon's config.
     pub enabled: bool,
@@ -171,6 +171,17 @@ pub struct SplitParams {
     /// multiple of its performance cores, set when the pool starts (`attach`).
     /// Its other misses stay on the GPU. 0 before the pool starts.
     pub max_experts: u32,
+}
+
+impl Default for SplitParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            knobs: Knobs::default(),
+            measured: None,
+            max_experts: 0,
+        }
+    }
 }
 
 /// The process's one set.
@@ -264,7 +275,18 @@ impl SplitParams {
 
     /// The device's split: off unless enabled and calibrated; otherwise the
     /// measured costs with the knobs applied, and the cut — the largest count
-    /// whose CPU compute stays within `cut_scale` of the GPU's copy + GEMM.
+    /// whose CPU compute stays within `cut_scale` of the GPU's copy + GEMM,
+    /// and never under one.
+    ///
+    /// **A lone token always passes the cut.** The cut keeps heavy experts on
+    /// the GPU; it prices one expert alone, CPU against copy, with nothing
+    /// running beside it. A one-token miss at the crossover is the layer
+    /// model's to judge (`cpu_split_decide`), which prices the pool running
+    /// beside the GPU's copies and holds the gain to `min_gain_ns`. A cut of
+    /// zero also left nothing eligible to explore with, so a correction that
+    /// pushed c(1) a microsecond past the copy shut the pool out for good:
+    /// Flash-Next on the RTX 3090 (2026-10-18) served one config and then
+    /// nothing, at c(1) 166 µs against 161 + 4.
     pub fn split(&self) -> CpuSplit {
         let Some(m) = self.measured.filter(|_| self.enabled) else {
             return CpuSplit::OFF;
@@ -282,7 +304,7 @@ impl SplitParams {
         s.min_gain_ns = k.min_gain_ns;
         s.promote = k.promote.device();
         s.max_experts = self.max_experts;
-        let mut max_n = 0u32;
+        let mut max_n = 1u32;
         for n in 1..=CPU_MAX_N {
             s.cpu_n_ns[n] = interpolate(&m.cpu_n_ns, n) * k.cpu_scale;
             s.gpu_n_ns[n] = interpolate(&m.gpu_n_ns, n);
@@ -314,15 +336,12 @@ mod tests {
         }
     }
 
-    /// Off by default, and off until calibrated even when enabled.
+    /// On by default, but off until calibrated, and off when disabled even
+    /// once calibrated.
     #[test]
     fn off_until_enabled_and_calibrated() {
+        assert!(SplitParams::default().enabled);
         assert_eq!(SplitParams::default().split(), CpuSplit::OFF);
-        let p = SplitParams {
-            enabled: true,
-            ..SplitParams::default()
-        };
-        assert_eq!(p.split(), CpuSplit::OFF);
         let p = SplitParams {
             enabled: false,
             measured: Some(measured()),
@@ -356,6 +375,10 @@ mod tests {
         assert_eq!(d.read_alone_ns, 50_000.0);
         // Doubled: n = 3 is 160k ≤ 162k; n = 4 is 180k > 162k.
         assert_eq!(d.max_n, 3);
+        // A CPU slower than the copy at every count still takes a lone token.
+        let mut slow = p;
+        slow.knobs.cpu_scale = 100.0;
+        assert_eq!(slow.split().max_n, 1);
     }
 
     /// The pool's prediction is the longer of its read and its compute, from

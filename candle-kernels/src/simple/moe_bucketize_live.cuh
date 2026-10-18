@@ -50,9 +50,20 @@ __device__ __forceinline__ uint8_t snapshot_expert(
 {
     const uint64_t pg = x.gate;
     uint8_t cls = CLS_VRAM;
+    // **Pinned only when all three entries are.** `publish` stores up, down,
+    // then gate, so a read that sees the new gate sees the new up and down —
+    // but one that sees the old gate may see either. A pinned expert being
+    // promoted reads as a pinned gate over VRAM up/down; the GPU reads both
+    // images alike, but the CPU pool, which takes pinned misses, reads only
+    // host memory, and faulted on the VRAM address (Flash-Next C5 ×8 on the
+    // RTX 3090, 2026-10-18, after the zone conceded 1,790 slots). Such a read
+    // is a promotion in flight: it stays on the GPU, classed VRAM.
+    const auto pinned = [&](uint64_t a) {
+        return (a >= pinned0_lo && a < pinned0_hi) || (a >= pinned1_lo && a < pinned1_hi);
+    };
     if (pg == 0ull || x.up == 0ull || x.down == 0ull) {
         cls = CLS_COLD;
-    } else if ((pg >= pinned0_lo && pg < pinned0_hi) || (pg >= pinned1_lo && pg < pinned1_hi)) {
+    } else if (pinned(pg) && pinned(x.up) && pinned(x.down)) {
         cls = CLS_PINNED;
     }
     if (slot_owner != nullptr && cls == CLS_VRAM && pg < zone_end &&
