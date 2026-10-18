@@ -30,6 +30,50 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// The residency the engine defends, in bytes: no retraction takes the zone
+/// below it, whoever asks (`set_defended_weight_bytes`).
+static DEFENDED_WEIGHT_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// **Defend `bytes` of expert residency against every claim**, not only the
+/// ones admission prices.
+///
+/// The zone's static floor is the least a forward can run on — on Flash-Next
+/// over the RTX 3090, 1,537 slots, ~2.9 GB — and a forward there streams every
+/// layer. Admission already refused offers that would take the zone under the
+/// engine's defended residency, but the KV a running turn grows by, a deep
+/// projection lifts at submission, and an ingest cohort places, buy their
+/// ground straight from the boundary, which conceded down to the static floor.
+/// Measured on the 3090 (2026-10-18): the zone held at 1,537 slots against
+/// 7,183 in the gate, experts hit 16–30% against 82–87%, and two chats decoded
+/// at ~9 t/s where the gate runs 90. Defended here, a claim past the defence
+/// meets a full span instead: the turn waits, and the KV side demotes.
+///
+/// Process-wide (one model per engine); 0, the default, defends nothing past
+/// the static floor.
+pub fn set_defended_weight_bytes(bytes: usize) {
+    DEFENDED_WEIGHT_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// What [`set_defended_weight_bytes`] last set.
+pub fn defended_weight_bytes() -> usize {
+    DEFENDED_WEIGHT_BYTES.load(Ordering::Relaxed)
+}
+
+/// The slots no retraction may take a zone of `capacity` slots below: its
+/// static `floor`, raised to the `defended` bytes in whole slots of
+/// `slot_bytes` (never past the zone's `limit`), and never more than it has.
+fn retraction_floor(
+    floor: usize,
+    defended: usize,
+    slot_bytes: usize,
+    limit: usize,
+    capacity: usize,
+) -> usize {
+    let defended = defended.checked_div(slot_bytes).unwrap_or(0).min(limit);
+    floor.max(defended).min(capacity)
+}
 
 use super::wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
 
@@ -258,7 +302,13 @@ impl WeightZone {
     /// Derived rather than stored, so that a zone which opens below its floor and
     /// later grows past it is protected by the real figure from that moment on.
     pub fn min_capacity(&self) -> usize {
-        self.floor.min(self.capacity)
+        retraction_floor(
+            self.floor,
+            defended_weight_bytes(),
+            self.slot_bytes,
+            self.limit,
+            self.capacity,
+        )
     }
 
     /// Slots that fit between `frontier` and the span's right edge.
@@ -574,6 +624,35 @@ impl WeightZoneStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The defended residency raises the floor, never past what the zone
+    /// has.** The measured case: a 1,537-slot static floor on 1.9 MiB slots,
+    /// 7.0 GiB defended, is ~3,773 slots — but a zone holding 3,000 cannot be
+    /// held above 3,000, and nothing defended leaves the static floor.
+    #[test]
+    fn the_defended_residency_raises_the_retraction_floor() {
+        let slot = 1_990_000;
+        let defended = 7 * (1 << 30);
+        assert_eq!(
+            retraction_floor(1_537, defended, slot, 25_088, 7_183),
+            defended / slot
+        );
+        assert_eq!(
+            retraction_floor(1_537, defended, slot, 25_088, 3_000),
+            3_000
+        );
+        assert_eq!(retraction_floor(1_537, 0, slot, 25_088, 7_183), 1_537);
+        assert_eq!(
+            retraction_floor(1_537, defended, 0, 25_088, 7_183),
+            1_537,
+            "no slots"
+        );
+        assert_eq!(
+            retraction_floor(10, usize::MAX, slot, 2_000, 7_183),
+            2_000,
+            "never past the zone's limit"
+        );
+    }
 
     const SLOT: usize = 3 * 1024 * 1024;
     const END: u64 = 0x8000_0000;

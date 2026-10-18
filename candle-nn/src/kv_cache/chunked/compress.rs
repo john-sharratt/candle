@@ -49,6 +49,7 @@ use candle::quantized::GgmlDType;
 use candle::{DType, Device, Result};
 
 #[cfg(feature = "cuda")]
+use super::arena::ArenaKey;
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
 use super::compression_policy::{
@@ -810,63 +811,104 @@ fn quantize_sealed_in_place_impl(
     // regardless of selection's K format pick. V always uses selection's
     // per-(c, h, p) format.
     let t_alloc = std::time::Instant::now();
-    let mut new_gids_per_chunk: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_chunks);
-    for chunk_i in 0..n_chunks {
-        // Per (head, side): resolve the N_PALETTE band formats up front. A
-        // uniform group allocates one CONTIGUOUS run for select/QREL walk
-        // locality (correctness is per-band via `resolve_band_source`, not the
-        // run layout — see `alloc_chunk_run_for_key`); mixed-format groups
-        // allocate per band.
-        let mut k_gids: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_kv_head);
-        let mut v_gids: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_kv_head);
-        for h in 0..n_kv_head {
-            let k_fmts: Vec<_> = (0..N_PALETTE)
-                .map(|p| {
-                    policy
-                        .override_k_quant
-                        .unwrap_or(k_palette_formats[chunk_i][h * N_PALETTE + p])
-                })
-                .collect();
-            let v_fmts: Vec<_> = (0..N_PALETTE)
-                .map(|p| {
-                    policy
-                        .override_v_quant
-                        .unwrap_or(v_palette_formats[chunk_i][h * N_PALETTE + p])
-                })
-                .collect();
-            // Eligibility for one contiguous run is a question about *keys*:
-            // four bands in four different formats that share a size class
-            // share an arena, so they can still be a run. Under per-format
-            // arenas this could only pass for identical formats.
-            let alloc_side = |fmts: &[crate::kv_cache::QuantFormat]| -> Result<Vec<ChunkGid>> {
-                let keys = fmts
-                    .iter()
-                    .map(|f| {
-                        backing
-                            .inner
-                            .arena_key_for(KvFormat::Quantized(*f), ArenaLocation::Gpu)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if keys.iter().all(|k| *k == keys[0]) {
-                    backing.alloc_chunk_run_for_key(keys[0], N_PALETTE)
-                } else {
-                    keys.into_iter()
-                        .map(|k| backing.alloc_chunk_for_key(k))
-                        .collect()
-                }
-            };
-            k_gids.push(alloc_side(&k_fmts)?);
-            v_gids.push(alloc_side(&v_fmts)?);
-        }
-        let mut chunk_gids: Vec<ChunkGid> = Vec::with_capacity(n_kv_head * GIDS_PER_HEAD);
-        for h in 0..n_kv_head {
-            for p in 0..N_PALETTE {
-                chunk_gids.push(k_gids[h][p].clone());
-                chunk_gids.push(v_gids[h][p].clone());
+    // The destination class of each band, and which bands go as one run: one
+    // answer for the allocation below and for the demand a refused one owes.
+    let band_keys = |fmts: &[crate::kv_cache::QuantFormat]| -> Result<Vec<ArenaKey>> {
+        fmts.iter()
+            .map(|f| {
+                backing
+                    .inner
+                    .arena_key_for(KvFormat::Quantized(*f), ArenaLocation::Gpu)
+            })
+            .collect()
+    };
+    let side_formats = |chunk_i: usize, h: usize| {
+        let k: Vec<_> = (0..N_PALETTE)
+            .map(|p| {
+                policy
+                    .override_k_quant
+                    .unwrap_or(k_palette_formats[chunk_i][h * N_PALETTE + p])
+            })
+            .collect();
+        let v: Vec<_> = (0..N_PALETTE)
+            .map(|p| {
+                policy
+                    .override_v_quant
+                    .unwrap_or(v_palette_formats[chunk_i][h * N_PALETTE + p])
+            })
+            .collect();
+        (k, v)
+    };
+    let allocated = (|| -> Result<Vec<Vec<ChunkGid>>> {
+        let mut new_gids_per_chunk: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_chunks);
+        for chunk_i in 0..n_chunks {
+            // Per (head, side): resolve the N_PALETTE band formats up front. A
+            // uniform group allocates one CONTIGUOUS run for select/QREL walk
+            // locality (correctness is per-band via `resolve_band_source`, not the
+            // run layout — see `alloc_chunk_run_for_key`); mixed-format groups
+            // allocate per band.
+            let mut k_gids: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_kv_head);
+            let mut v_gids: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_kv_head);
+            for h in 0..n_kv_head {
+                let (k_fmts, v_fmts) = side_formats(chunk_i, h);
+                // Eligibility for one contiguous run is a question about *keys*:
+                // four bands in four different formats that share a size class
+                // share an arena, so they can still be a run. Under per-format
+                // arenas this could only pass for identical formats.
+                let alloc_side = |fmts: &[crate::kv_cache::QuantFormat]| -> Result<Vec<ChunkGid>> {
+                    let keys = band_keys(fmts)?;
+                    if keys.iter().all(|k| *k == keys[0]) {
+                        backing.alloc_chunk_run_for_key(keys[0], N_PALETTE)
+                    } else {
+                        keys.into_iter()
+                            .map(|k| backing.alloc_chunk_for_key(k))
+                            .collect()
+                    }
+                };
+                k_gids.push(alloc_side(&k_fmts)?);
+                v_gids.push(alloc_side(&v_fmts)?);
             }
+            let mut chunk_gids: Vec<ChunkGid> = Vec::with_capacity(n_kv_head * GIDS_PER_HEAD);
+            for h in 0..n_kv_head {
+                for p in 0..N_PALETTE {
+                    chunk_gids.push(k_gids[h][p].clone());
+                    chunk_gids.push(v_gids[h][p].clone());
+                }
+            }
+            new_gids_per_chunk.push(chunk_gids);
         }
-        new_gids_per_chunk.push(chunk_gids);
-    }
+        Ok(new_gids_per_chunk)
+    })();
+    let new_gids_per_chunk = match allocated {
+        Ok(gids) => gids,
+        // **Refused mid-wave: owe the whole layer, then go.** The gap between
+        // forwards creates what is owed, and the pass's retry finds it all —
+        // where owing only the class it was refused at made the retry stop at
+        // the next arena it needed (`BackingInner::owe_capacity`). What this
+        // attempt claimed went back when it failed, so the whole layer is owed.
+        Err(e) if super::backing::BackingInner::is_wave_deferral(&e) => {
+            let mut demand: Vec<(ArenaKey, usize)> = Vec::new();
+            let mut add =
+                |key: ArenaKey, slots: usize| match demand.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, n)) => *n += slots,
+                    None => demand.push((key, slots)),
+                };
+            for chunk_i in 0..n_chunks {
+                for h in 0..n_kv_head {
+                    let (k_fmts, v_fmts) = side_formats(chunk_i, h);
+                    for fmts in [&k_fmts, &v_fmts] {
+                        let keys = band_keys(fmts)?;
+                        for key in keys {
+                            add(key, 1);
+                        }
+                    }
+                }
+            }
+            backing.inner.owe_capacity(&demand);
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
     if let Some(a) = alloc_ms {
         *a += t_alloc.elapsed().as_millis() as u64;
     }

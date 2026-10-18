@@ -559,7 +559,7 @@ impl Scheduler {
         // would read `achievable_weight_now() == None`, a hold of zero, and
         // admission defending nothing at all. A first pass that is too tight
         // self-corrects at the first idle; one that defends nothing does not.
-        super::interleave::reseed_achievable_weight();
+        super::interleave::reseed_achievable_weight(false);
         // **The weight side leaves what relief frees to.** Relief defends
         // `LOAD_TARGET` free regions by conceding weight ground; a weight side that
         // grew back below it would take those regions again on the next forward,
@@ -749,7 +749,7 @@ impl Scheduler {
                 }
                 // Nothing is in flight, so everything resident is permanent:
                 // the one moment the achievable weight residency is exact.
-                super::interleave::reseed_achievable_weight();
+                super::interleave::reseed_achievable_weight(true);
                 tracing::trace!("idle; waiting for a request");
                 // Time ONLY the recv block (not the request handling) — this is the
                 // scheduler idle between requests, attributed to the Idle phase so it
