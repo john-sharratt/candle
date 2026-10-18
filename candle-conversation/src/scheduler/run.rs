@@ -71,6 +71,12 @@ pub(super) fn take_housekeeping_split() -> (u64, u64, u64, u64) {
 /// telemetry — regardless of how fast or slow the individual steps run.
 const WAVE_SLICE: Duration = Duration::from_millis(2000);
 
+/// How long a loop that could admit nothing waits on its channel before it
+/// looks again on its own. What reopens admission — a submission, the
+/// persistence drain's backlog falling — arrives on the channel and ends the
+/// wait at once; this bounds only a change that sends nothing.
+const UNADMITTED_RECHECK: Duration = Duration::from_millis(100);
+
 /// Hard safety cap on decode steps within one quantum, independent of the wall
 /// clock. At the ~74 ms/step WDDM launch floor a 2 s slice is ~27 steps, far
 /// under this; the cap only engages if decode ever runs far faster (TCC mode /
@@ -1297,26 +1303,46 @@ impl Scheduler {
             // housekeeping cost.
             house_span.end();
 
-            // Livelock guard. If this wave had NO runnable forward work of any class,
-            // yet the idle `recv` above did not block (some queue is non-empty), then
-            // work exists that this thread cannot clear by spinning. During ingest a
-            // hot→warm backlog cuts `admit_budget` to the floor (`regulate_ingest_admission`),
-            // so queued prefills/sections can't be admitted and every width reads 0.
-            // Busy-spinning here burns a core AND continuously re-takes the conversation
-            // read lock, starving the persistence thread's install-warm WRITE lock — so
-            // the backlog can never drain, the gate never reopens, and the spin never
-            // ends. That is the observed deadlock: wave stuck 100% "blocked", backlog
-            // frozen, no hot→warm pass completing. A short sleep yields the uncontended
-            // lock window the drain needs and re-checks admission on the next wave;
-            // fresh submissions are still picked up by `drain_submissions` at the top.
-            // (On win32 the 2ms rounds up to the ~15ms scheduler timer granularity —
-            // ~60 Hz re-check, still far below a busy-spin, which is the point.)
+            // **Nothing admissible: block until something that could change that
+            // arrives.** This wave ran no forward of any class, yet the idle `recv`
+            // above did not block — a queue holds work this thread cannot admit.
+            // During ingest a hot→warm backlog cuts `admit_budget` to the floor
+            // (`regulate_ingest_admission`), so every width reads 0 until the
+            // persistence thread drains it. Going round again changes nothing, and
+            // every pass re-takes the substrate read lock: spun, that starved the
+            // persistence thread's install-warm WRITE lock, so the backlog never
+            // drained and the gate never reopened — the wave stuck 100% "blocked".
+            //
+            // So the loop waits on its channel, which is where every change it is
+            // waiting for arrives: a new submission, and the persistence thread's
+            // `Wake` the moment its backlog falls (`scheduler_waker`). With no pass
+            // running, nothing here holds the substrate lock, and the drain gets it.
+            // The timeout re-checks on its own for anything that changes admission
+            // without a message.
             if self.decode_width() == 0
                 && self.prefill_width() == 0
                 && self.section_ingest_width() == 0
                 && self.deferred_glue_fires.is_empty()
             {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                let t_wait = Instant::now();
+                match self.rx.recv_timeout(UNADMITTED_RECHECK) {
+                    Ok(req) => {
+                        self.wave_stats
+                            .add_idle(t_wait.elapsed().as_millis() as u64);
+                        let t_req = Instant::now();
+                        let keep_going = self.handle_request(req);
+                        self.wave_stats
+                            .add_requests(t_req.elapsed().as_micros() as u64);
+                        if !keep_going {
+                            break;
+                        }
+                    }
+                    Err(flume::RecvTimeoutError::Timeout) => {
+                        self.wave_stats
+                            .add_idle(t_wait.elapsed().as_millis() as u64);
+                    }
+                    Err(flume::RecvTimeoutError::Disconnected) => break,
+                }
             }
         }
 

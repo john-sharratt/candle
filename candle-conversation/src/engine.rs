@@ -11,7 +11,7 @@ use crate::models::identity::ModelKey;
 use crate::models::Dialect;
 use crate::persistence::manifest::ConvState;
 use crate::persistence::record::DistillMode;
-use crate::persistence::thread::PersistenceThread;
+use crate::persistence::thread::{BacklogWaker, PersistenceThread};
 use crate::persistence::triggers::FIRST_ATTACHMENT;
 use crate::persistence::vfs::{VfsEventId, VfsEventPayload, VfsWrite};
 use crate::persistence::BoundSubstrate;
@@ -466,6 +466,7 @@ impl ConversationEngine {
             compression_policy,
         );
         let persist_trigger = persist_thread.trigger_handle();
+        persist_trigger.on_backlog_fall(scheduler_waker(&tx));
 
         // **The AVL summariser is disconnected.** It is never spawned, and no
         // timeline enqueues turns for it (`Timeline::summarize` is false for
@@ -692,6 +693,20 @@ const RELOAD_POLL: Duration = Duration::from_millis(50);
 /// an internal fault, not a usage error.
 const SCHEDULER_PANIC_EXIT: i32 = 70;
 
+/// A persistence thread's wake for the scheduler, called when its hot→warm
+/// backlog falls ([`PersistenceTrigger::on_backlog_fall`]): with nothing
+/// admissible the scheduler blocks on its request channel, and this is what
+/// tells it the backlog that shut admission has moved. `try_send` on an
+/// unbounded channel, so the persistence thread never waits on it.
+///
+/// [`PersistenceTrigger::on_backlog_fall`]: crate::persistence::thread::PersistenceTrigger::on_backlog_fall
+fn scheduler_waker(tx: &Sender<SchedulerRequest>) -> BacklogWaker {
+    let tx = tx.clone();
+    Box::new(move || {
+        let _ = tx.try_send(SchedulerRequest::Wake);
+    })
+}
+
 /// Attaches substrates to an engine — a cheap clone of its shared core, so the
 /// engine's own handle can stay with the tenant that built it.
 #[derive(Clone)]
@@ -747,11 +762,13 @@ impl EngineAttacher {
         );
         let id = self.core.next_attachment.fetch_add(1, Ordering::Relaxed);
         let status = Arc::new(SubstrateReloadStatus::default());
+        let trigger = persist_thread.trigger_handle();
+        trigger.on_backlog_fall(scheduler_waker(&self.core.scheduler_tx));
         self.core
             .scheduler_tx
             .send(SchedulerRequest::AttachSubstrate {
                 id,
-                trigger: persist_thread.trigger_handle(),
+                trigger,
                 conversation: conversation.clone(),
                 status: Arc::clone(&status),
             })

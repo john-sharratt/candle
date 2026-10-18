@@ -33,7 +33,7 @@
 //! per residence to install the new tier.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -112,21 +112,36 @@ pub struct BacklogGauge {
     warm_residents: Arc<AtomicU64>,
     /// Byte size of the purge population, stamped alongside `warm_residents`.
     warm_resident_bytes: Arc<AtomicU64>,
+    /// Called whenever the drainable deficit falls — see
+    /// [`PersistenceTrigger::on_backlog_fall`].
+    on_fall: Arc<OnceLock<BacklogWaker>>,
 }
+
+/// What a fall in the backlog calls: the scheduler's wake.
+pub type BacklogWaker = Box<dyn Fn() + Send + Sync>;
 
 impl BacklogGauge {
     /// Record this pass's readings: the drainable hot→warm deficit and the
     /// pin-deferred bytes the drain skipped.
     fn stamp(&self, warm: u64, pinned: u64) {
-        self.warm.store(warm, Ordering::Relaxed);
+        self.stamp_warm(warm);
         self.pinned.store(pinned, Ordering::Relaxed);
     }
 
     /// Record only the drainable deficit, leaving the pinned reading from the
     /// last full split in place. Used at the points in a pass where the cheap
     /// `pending_warm_bytes` sum is refreshed but the split has not been recomputed.
+    ///
+    /// A fall wakes whoever gates on the figure: admission the backlog shut can
+    /// reopen now, and with nothing else running that is the one change the
+    /// scheduler could be waiting for.
     fn stamp_warm(&self, warm: u64) {
-        self.warm.store(warm, Ordering::Relaxed);
+        let before = self.warm.swap(warm, Ordering::Relaxed);
+        if warm < before {
+            if let Some(wake) = self.on_fall.get() {
+                wake();
+            }
+        }
     }
 
     /// Record the warm-resident population (see `warm_residents`).
@@ -184,6 +199,13 @@ impl PersistenceTrigger {
     /// trip ever fires.
     pub fn pending_warm_bytes(&self) -> u64 {
         self.backlog.warm.load(Ordering::Relaxed)
+    }
+
+    /// Have `wake` called whenever [`Self::pending_warm_bytes`] falls — the
+    /// scheduler's way to block, rather than poll, while that backlog holds its
+    /// admission shut. Set once per persistence thread; a later call is ignored.
+    pub fn on_backlog_fall(&self, wake: BacklogWaker) {
+        let _ = self.backlog.on_fall.set(wake);
     }
 
     /// Hot KV the drain most recently SKIPPED because it is an in-flight
@@ -1693,6 +1715,29 @@ mod tests {
     use super::*;
 
     use candle_nn::kv_cache::{KV_ARENA_MID_WAVE, KV_DEVICE_OOM_MARKER, TIER_STANDS_OVER_FREE};
+
+    /// **A falling backlog wakes the scheduler; a rising or unchanged one does
+    /// not.** The scheduler blocks while the backlog holds admission shut, and
+    /// this is its only cue that the drain moved — but a wake on every stamp
+    /// would spin it round for nothing. Every stamping path wakes the same way.
+    #[test]
+    fn a_falling_backlog_wakes_its_waiter_and_nothing_else_does() {
+        let gauge = BacklogGauge::default();
+        let wakes = Arc::new(AtomicU64::new(0));
+        let counted = wakes.clone();
+        let _ = gauge.on_fall.set(Box::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }));
+        gauge.stamp_warm(500);
+        assert_eq!(wakes.load(Ordering::Relaxed), 0, "a rise is no cue");
+        gauge.stamp_warm(500);
+        assert_eq!(wakes.load(Ordering::Relaxed), 0, "nor is no change");
+        gauge.stamp_warm(200);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1, "a fall wakes");
+        gauge.stamp(0, 7);
+        assert_eq!(wakes.load(Ordering::Relaxed), 2, "the full stamp too");
+        assert_eq!(gauge.pinned.load(Ordering::Relaxed), 7);
+    }
 
     /// **Both refusals a forward causes are waits, and nothing else is.** The
     /// region pool's "free ground stands above the tier" is the same wait the
