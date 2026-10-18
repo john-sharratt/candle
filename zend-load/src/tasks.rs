@@ -2,7 +2,10 @@
 //! with a short opening and a fixed decode, no projection and no tools.
 //! **Read** is zend itself: a `zen-code` question about the candle repository
 //! that it answers by reading code with its tools — the work a developer
-//! actually brings it.
+//! actually brings it. **Write** is zend changing code: an edit to a
+//! battle-cities crate, never candle, made in the conversation's overlay with
+//! `file_edit` and shown as a diff — told never to commit or push, so nothing
+//! reaches a branch or origin.
 
 use serde_json::{json, Value};
 
@@ -10,7 +13,24 @@ use serde_json::{json, Value};
 pub enum Task {
     Decode,
     Read,
+    Write,
 }
+
+/// The battle-cities crates a write task edits, one per client in turn.
+const CRATES: [&str; 9] = [
+    "math", "quadtree", "chat", "conf", "dmo", "llm", "lore", "recall", "sim",
+];
+
+/// What every write turn is told, so nothing it does leaves the overlay.
+const WRITE_RULES: &str = "Work only in the battle-cities repository, only on the file named, \
+     with file_edit. Do not commit, push, create branches, or touch any other file. \
+     Finish by showing the diff of what you changed.";
+
+/// Write follow-ups, asked after the first edit.
+const WRITE_FOLLOW_UPS: [&str; 2] = [
+    "Now add a unit test for that function in the same file.",
+    "Review your change and fix anything that would not compile.",
+];
 
 /// Read questions: each needs the repository read to answer, and none needs
 /// anything written.
@@ -46,6 +66,7 @@ impl Task {
         match name {
             "decode" => Some(Task::Decode),
             "read" => Some(Task::Read),
+            "write" => Some(Task::Write),
             _ => None,
         }
     }
@@ -54,6 +75,7 @@ impl Task {
         match self {
             Task::Decode => "decode",
             Task::Read => "read",
+            Task::Write => "write",
         }
     }
 
@@ -61,6 +83,7 @@ impl Task {
         match self {
             Task::Decode => 256,
             Task::Read => 1024,
+            Task::Write => 2048,
         }
     }
 
@@ -118,6 +141,30 @@ impl Task {
                 });
                 (body, conv_id)
             }
+            Task::Write => {
+                let conv_id = format!("{run}-w{client}");
+                let krate = CRATES[client % CRATES.len()];
+                let ask = if turn == 0 {
+                    format!(
+                        "In battle-cities, open crates/{krate}/src/lib.rs and add a one-line \
+                         doc comment above its first public function saying what it does. \
+                         {WRITE_RULES}"
+                    )
+                } else {
+                    format!(
+                        "{} {WRITE_RULES}",
+                        WRITE_FOLLOW_UPS[(turn - 1) % WRITE_FOLLOW_UPS.len()]
+                    )
+                };
+                let body = json!({
+                    "model": "zen-code",
+                    "conv_id": conv_id,
+                    "stream": true,
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": ask}],
+                });
+                (body, conv_id)
+            }
         }
     }
 }
@@ -156,5 +203,22 @@ mod tests {
         assert_eq!(messages[0]["content"], "You are a storyteller.");
         assert_eq!(messages[3]["content"], "Continue the story.");
         assert!(mark("zl-1", 5).starts_with(&run_mark("zl-1")));
+    }
+
+    /// A write turn names its own conversation, edits a battle-cities crate —
+    /// never candle — and carries the no-commit, no-push rules every turn.
+    #[test]
+    fn a_write_turn_stays_in_battle_cities_and_never_commits() {
+        let (first, conv) = Task::Write.body("zl-2", 1, 0, &[], 2048);
+        assert_eq!(conv, "zl-2-w1");
+        let ask = first["messages"][0]["content"].as_str().unwrap();
+        assert!(ask.contains("battle-cities, open crates/quadtree/src/lib.rs"));
+        assert!(!ask.contains("candle"));
+        assert!(ask.ends_with(WRITE_RULES));
+        let (next, _) = Task::Write.body("zl-2", 1, 1, &[], 2048);
+        let ask = next["messages"][0]["content"].as_str().unwrap();
+        assert!(ask.starts_with(WRITE_FOLLOW_UPS[0]));
+        assert!(ask.contains("Do not commit, push"));
+        assert_eq!(Task::parse("write"), Some(Task::Write));
     }
 }

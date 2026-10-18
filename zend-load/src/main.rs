@@ -42,8 +42,9 @@ struct Args {
     /// Rungs to run, in order: light, medium, heavy.
     #[arg(long, value_delimiter = ',', default_value = "light,medium,heavy")]
     levels: Vec<String>,
-    /// Tasks per rung: decode (passthrough), read (zen-code on the code).
-    #[arg(long, value_delimiter = ',', default_value = "decode,read")]
+    /// Tasks per rung: decode (passthrough), read (zen-code on the candle
+    /// code), write (zen-code editing battle-cities in its overlay).
+    #[arg(long, value_delimiter = ',', default_value = "decode,read,write")]
     tasks: Vec<String>,
     /// The longest one turn may take before it counts as cut.
     #[arg(long, default_value_t = 900)]
@@ -63,7 +64,7 @@ async fn main() -> Result<()> {
     for name in &args.tasks {
         match Task::parse(name) {
             Some(t) => tasks.push(t),
-            None => bail!("no task `{name}`: decode or read"),
+            None => bail!("no task `{name}`: decode, read or write"),
         }
     }
     let mut scenarios = Vec::new();
