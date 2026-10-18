@@ -1,0 +1,20 @@
+[package]
+name = "zend-load"
+version.workspace = true
+edition.workspace = true
+description = "Load ladder for a zend cluster: concurrent chats through the gateway, measured per request."
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "zend-load"
+path = "src/main.rs"
+
+[dependencies]
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+futures      = { workspace = true }
+reqwest      = { version = "0.12", features = ["stream", "json"] }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

@@ -8,6 +8,7 @@ members = [
     "candle-core",
     "embed-watch",
     "zend",
+    "zend-load",
     "candle-datasets",
     "candle-examples",
     "candle-nn",
