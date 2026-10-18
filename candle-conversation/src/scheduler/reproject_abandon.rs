@@ -29,6 +29,22 @@ macro_rules! or_abandon {
 pub(super) use or_abandon;
 
 impl Scheduler {
+    /// Whether the span can take a rebuilt view's recurrent state — the one
+    /// claim a reprojection makes after its turn's state has moved, where a
+    /// refusal can only fail the turn. Twice a store's bytes against the ground
+    /// a claim can reach (free regions and what the weight side would concede
+    /// above its defended floor): the store's slots may each need a fresh
+    /// region, and the ground counts whole regions only. A model that carries
+    /// no recurrent state always has room.
+    pub(super) fn reprojection_has_ground(&self) -> bool {
+        let need = self.model.recurrent_store_bytes();
+        need == 0
+            || self
+                .model
+                .prefill_ground_bytes()
+                .is_none_or(|ground| ground >= need.saturating_mul(2))
+    }
+
     /// Tell the turn its reprojection failed, and discard it unsealed. The
     /// caller logs the failure.
     ///

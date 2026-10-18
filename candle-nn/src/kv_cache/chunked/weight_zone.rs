@@ -61,6 +61,49 @@ pub fn defended_weight_bytes() -> usize {
     DEFENDED_WEIGHT_BYTES.load(Ordering::Relaxed)
 }
 
+/// Tier purchases in progress ([`TierPurchase`]).
+static TIER_PURCHASES: AtomicUsize = AtomicUsize::new(0);
+
+/// **A transient tier buys past the defence; a durable claim does not.**
+///
+/// The defence is against KV that stays: a claim past it holds the zone down
+/// for as long as its arena lives. A wave's tier is gone when its forward ends
+/// and the weight side grows back into what it frees, so conceding to it costs
+/// a few promotions — while refusing it mid-sweep fails a creep cohort whose
+/// width can no longer change. Measured on the 3090 (2026-10-18): the zone at
+/// its 3,419-slot defence, a 3,537-row creep three regions short at its fourth
+/// window, four retries in 4 ms with nothing to change, 21 file ingests failed.
+/// Pricing still reads the defended floor ([`WeightZone::min_capacity`]), so a
+/// cohort is fitted as if the defence held and only the forecast's error
+/// reaches into it.
+///
+/// Held across one placement's purchases. Process-wide, as the defence is: the
+/// concession runs on the pipeline thread, not the buyer's.
+pub(crate) struct TierPurchase(());
+
+impl TierPurchase {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn begin() -> Self {
+        TIER_PURCHASES.fetch_add(1, Ordering::AcqRel);
+        Self(())
+    }
+}
+
+impl Drop for TierPurchase {
+    fn drop(&mut self) {
+        TIER_PURCHASES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The defence a retraction honours now: none while a tier is buying.
+fn retraction_defence() -> usize {
+    if TIER_PURCHASES.load(Ordering::Acquire) > 0 {
+        0
+    } else {
+        defended_weight_bytes()
+    }
+}
+
 /// The slots no retraction may take a zone of `capacity` slots below: its
 /// static `floor`, raised to the `defended` bytes in whole slots of
 /// `slot_bytes` (never past the zone's `limit`), and never more than it has.
@@ -311,6 +354,19 @@ impl WeightZone {
         )
     }
 
+    /// The floor a retraction may go to now: [`Self::min_capacity`], less the
+    /// defence while a transient tier is buying ([`TierPurchase`]). Pricing
+    /// reads [`Self::min_capacity`]; only a retraction reads this.
+    pub fn retraction_capacity(&self) -> usize {
+        retraction_floor(
+            self.floor,
+            retraction_defence(),
+            self.slot_bytes,
+            self.limit,
+            self.capacity,
+        )
+    }
+
     /// Slots that fit between `frontier` and the span's right edge.
     ///
     /// The conversion from an address the KV side computed into the slot count
@@ -490,7 +546,7 @@ impl WeightZone {
         // Conceding *less* than asked is a slowdown. Conceding everything is an
         // engine that no longer works, so the floor holds even against a caller
         // that insists.
-        let new_capacity = new_capacity.max(self.min_capacity());
+        let new_capacity = new_capacity.max(self.retraction_capacity());
         if new_capacity >= self.capacity {
             return RetractPlan::default();
         }
