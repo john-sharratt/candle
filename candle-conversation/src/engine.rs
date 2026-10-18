@@ -1148,12 +1148,30 @@ impl ConversationEngine {
     /// This is metadata only. Nothing is copied and nothing has to stay
     /// resident: the ancestor's K/V is fetched from whatever tier it is on,
     /// by the same working-set elevation every other selected turn uses.
+    ///
+    /// A parent that is `child` itself or one of its descendants is refused
+    /// with [`ConversationError::ForkCycle`]: the lineage would loop, and
+    /// every projection of a timeline on the loop would lose the ancestors
+    /// past it.
     pub fn set_forked_from(&self, child: TimelineId, parent: TimelineId) -> crate::Result<()> {
+        if self.conversation.read().lineage_contains(parent, child) {
+            return Err(ConversationError::ForkCycle {
+                child: child.raw(),
+                parent: parent.raw(),
+            });
+        }
         self.set_conversation_metadata(
             child,
             crate::substrate::Substrate::FORKED_FROM_KEY,
             &parent.raw().to_string(),
         )
+    }
+
+    /// Record that `timeline` continues nothing: whatever parent it recorded
+    /// before is dropped, and its projection inherits no ancestor. The empty
+    /// value reads as absent ([`Substrate::parent_timeline`](crate::substrate::Substrate::parent_timeline)).
+    pub fn clear_forked_from(&self, timeline: TimelineId) -> crate::Result<()> {
+        self.set_conversation_metadata(timeline, crate::substrate::Substrate::FORKED_FROM_KEY, "")
     }
 
     /// Every live conversation whose `custom` metadata contains `key == value`.

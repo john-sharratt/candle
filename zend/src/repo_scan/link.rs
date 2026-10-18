@@ -11,6 +11,7 @@ use candle_conversation::{ConversationEngine, Sequence};
 
 use super::{process_one_dir, IngestPlan, UnitJob};
 use crate::branch_ingest::keys::CONTENT_KEY;
+use crate::branch_ingest::prime::repoint;
 use crate::ingest_report::Failures;
 use crate::refresh_ctx::RefreshContext;
 
@@ -32,13 +33,8 @@ pub(crate) fn ingest_link(
     parent: Option<TimelineId>,
 ) -> anyhow::Result<Option<TimelineId>> {
     if let Some(held) = holder(ctx.engine, &job.unit.key) {
-        if let Some(parent) = parent {
-            ctx.engine
-                .lock()
-                .unwrap()
-                .set_forked_from(held, parent)
-                .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", job.unit.dir))?;
-        }
+        repoint(&ctx.engine.lock().unwrap(), held, parent)
+            .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", job.unit.dir))?;
         return Ok(Some(held));
     }
     let plan = IngestPlan::new(ctx.engine, &ctx.proj_builder, &ctx.config, layer_name)?;

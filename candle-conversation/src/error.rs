@@ -43,6 +43,16 @@ pub enum ConversationError {
     #[error("download error: {0}")]
     Download(String),
 
+    /// Recording `parent` as `child`'s fork parent would close a cycle:
+    /// `parent` is `child` or one of its descendants.
+    #[error("timeline {child} cannot fork from {parent}: it is on {parent}'s own lineage")]
+    ForkCycle {
+        /// The timeline whose parent was being recorded.
+        child: u64,
+        /// The parent refused.
+        parent: u64,
+    },
+
     #[error("{0}")]
     Other(String),
 }

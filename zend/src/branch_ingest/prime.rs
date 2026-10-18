@@ -31,6 +31,7 @@
 use std::collections::HashSet;
 
 use candle_conversation::projection::TimelineId;
+use candle_conversation::ConversationEngine;
 use zend_vfs::Workspace;
 
 use super::walk::{walk, FileItem, UnitItem};
@@ -85,6 +86,22 @@ pub fn links<'a>(
         }
     }
     out
+}
+
+/// Re-point `held`, a link committed on an earlier boot, at `parent` — the
+/// link before it in this boot's chain. The first link has no parent and
+/// drops whatever it recorded before: a stale parent kept there is a link
+/// that may now come after it, and the next link re-pointed at it would close
+/// a cycle.
+pub(crate) fn repoint(
+    engine: &ConversationEngine,
+    held: TimelineId,
+    parent: Option<TimelineId>,
+) -> candle_conversation::Result<()> {
+    match parent {
+        Some(parent) => engine.set_forked_from(held, parent),
+        None => engine.clear_forked_from(held),
+    }
 }
 
 impl BranchIngest {

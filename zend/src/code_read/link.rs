@@ -11,6 +11,7 @@ use candle_conversation::{ConversationEngine, Sequence};
 
 use super::{chain_finished, finished_content_keys, process_one_file, FileJob, Job};
 use crate::branch_ingest::keys::CONTENT_KEY;
+use crate::branch_ingest::prime::repoint;
 use crate::ingest_report::Failures;
 use crate::refresh_ctx::RefreshContext;
 
@@ -34,13 +35,8 @@ pub(crate) fn ingest_link(
 ) -> anyhow::Result<Option<TimelineId>> {
     let key = file.key();
     if let Some(held) = holder(ctx.engine, &key) {
-        if let Some(parent) = parent {
-            ctx.engine
-                .lock()
-                .unwrap()
-                .set_forked_from(held, parent)
-                .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", file.path))?;
-        }
+        repoint(&ctx.engine.lock().unwrap(), held, parent)
+            .map_err(|e| anyhow::anyhow!("priming chain: {} parent: {e}", file.path))?;
         return Ok(Some(held));
     }
     let link_ctx = RefreshContext {

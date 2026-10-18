@@ -3376,6 +3376,24 @@ impl Substrate {
         Some(parent)
     }
 
+    /// Whether `ancestor` is `tl` or lies anywhere on its `forked_from`
+    /// lineage. Unlike [`Self::inherited_chain`] the walk is not capped by the
+    /// token budget: it answers whether recording a parent would close a
+    /// cycle, and an ancestor past the cap closes one just the same.
+    pub fn lineage_contains(&self, tl: TimelineId, ancestor: TimelineId) -> bool {
+        let mut seen: HashSet<TimelineId> = HashSet::from([tl]);
+        let mut cursor = tl;
+        loop {
+            if cursor == ancestor {
+                return true;
+            }
+            match self.parent_timeline(cursor) {
+                Some(parent) if seen.insert(parent) => cursor = parent,
+                _ => return false,
+            }
+        }
+    }
+
     // ── working sets ────────────────────────────────────────────────────────
 
     /// Whether `timeline` can deliver its content into `target`'s projection.
@@ -8293,6 +8311,28 @@ mod tests {
         let chain = sub.inherited_chain(tls[2]);
         assert_eq!(chain.len(), 3, "each timeline appears exactly once");
         assert_eq!(*chain.last().unwrap(), tls[2]);
+    }
+
+    /// The lineage walk sees past the token cap and stops on a cycle already
+    /// recorded.
+    #[test]
+    fn lineage_contains_walks_the_whole_lineage() {
+        let (mut sub, tls) = forked_line(4, Substrate::INHERITED_CHAIN_TOKEN_CAP);
+        assert!(sub.lineage_contains(tls[3], tls[0]), "past the token cap");
+        assert!(
+            sub.lineage_contains(tls[3], tls[3]),
+            "a timeline is its own"
+        );
+        assert!(!sub.lineage_contains(tls[0], tls[3]), "a descendant is not");
+        set_parent(&mut sub, tls[0], tls[2]);
+        assert!(
+            !sub.lineage_contains(tls[1], tls[3]),
+            "a cycle ends the walk"
+        );
+        assert!(
+            sub.lineage_contains(tls[0], tls[1]),
+            "round a recorded cycle"
+        );
     }
 
     #[test]
