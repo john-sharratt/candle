@@ -11,10 +11,12 @@
 //! | [`cost`] | a member's forward cost, term by term |
 //! | [`fit`] | that cost fitted to a member's samples |
 //! | [`curve`] | measured step time by batch size |
+//! | [`sim`] | the cluster simulator the placement policies are compared on |
 
 pub mod cost;
 pub mod curve;
 pub mod experts;
 pub mod fit;
 pub mod sample;
+pub mod sim;
 pub mod wave_log;

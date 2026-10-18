@@ -1,36 +1,181 @@
-//! `coop-lab`: fit each member's forward cost from its wave logs.
+//! `coop-lab`: fit each member's forward cost from its wave logs, and compare
+//! placement policies on the cluster simulator.
 //!
 //! ```text
-//! coop-lab --member BlackWorld=motherd.log.2,motherd.log --member WhiteWorld=ww.json
+//! coop-lab fit --member BlackWorld=motherd.log.2,motherd.log --member WhiteWorld=ww.json
+//! coop-lab sim
 //! ```
 //!
-//! A file is a plain log, or the JSON a member's `/v1/logs` answers (its
+//! A log file is a plain log, or the JSON a member's `/v1/logs` answers (its
 //! `lines`, or each member's under `members[].body.lines`).
 
 use std::fs;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde_json::Value;
 
 use coop::curve::{curve, Point};
 use coop::experts::ExpertGeometry;
 use coop::fit::{fit, Fitted};
 use coop::sample::{Channel, Sample};
+use coop::sim::engine::{simulate, Outage};
+use coop::sim::link::Link;
+use coop::sim::model::MemberModel;
+use coop::sim::policy::{Concentrate, ConcentrateProxy, EarliestFinish, Policy, Today};
+use coop::sim::report::Report;
+use coop::sim::workload::{generate, Conversation, Kind};
 use coop::wave_log::parse;
 
 #[derive(Parser)]
-#[command(about = "Fit each zend member's forward cost from its scheduler wave log")]
+#[command(about = "Cooperative admission: member cost fits and cluster placement experiments")]
 struct Args {
-    /// `NAME=FILE[,FILE…]`, once per member.
-    #[arg(long, required = true)]
-    member: Vec<String>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Fit each member's forward cost from its scheduler wave log.
+    Fit {
+        /// `NAME=FILE[,FILE…]`, once per member.
+        #[arg(long, required = true)]
+        member: Vec<String>,
+    },
+    /// Run the placement policies over the heavy rungs' workloads.
+    Sim {
+        /// Conversations per scenario.
+        #[arg(long, default_value_t = 24)]
+        conversations: usize,
+        /// Seconds over which they arrive.
+        #[arg(long, default_value_t = 10.0)]
+        spread: f64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    match Args::parse().command {
+        Command::Fit { member } => fit_members(&member),
+        Command::Sim {
+            conversations,
+            spread,
+            seed,
+        } => {
+            sim(conversations, spread, seed);
+            Ok(())
+        }
+    }
+}
+
+fn policies() -> Vec<Box<dyn Policy>> {
+    vec![
+        Box::new(Today),
+        Box::new(Concentrate { floor_hit: 0.9 }),
+        Box::new(ConcentrateProxy {
+            concentrate: Concentrate { floor_hit: 0.9 },
+            min_prefill: 4_000,
+            max_backlog: 16_000,
+        }),
+        Box::new(EarliestFinish { margin: 0.25 }),
+    ]
+}
+
+fn sim(n: usize, spread: f64, seed: u64) {
+    let models = [MemberModel::black_world(), MemberModel::white_world()];
+    for m in &models {
+        if !m.measured {
+            println!(
+                "note: {} is assumed from its gate figures, not measured",
+                m.name
+            );
+        }
+    }
+    let half = n / 2;
+    let mut mixed = generate(Kind::Chat, half, spread, seed);
+    for mut c in generate(Kind::Read, n - half, spread, seed + 1) {
+        c.id += half;
+        mixed.push(c);
+    }
+    let scenarios: Vec<(&str, Vec<Conversation>)> = vec![
+        ("chat", generate(Kind::Chat, n, spread, seed)),
+        ("read", generate(Kind::Read, n, spread, seed)),
+        ("chat + read", mixed),
+    ];
+    for (name, work) in &scenarios {
+        for outage in [
+            None,
+            Some(Outage {
+                member: 1,
+                at: 30.0,
+            }),
+        ] {
+            let title = match outage {
+                None => format!("{name}, {n} conversations"),
+                Some(o) => format!(
+                    "{name}, {n} conversations, {} drops at {} s",
+                    models[o.member].name, o.at
+                ),
+            };
+            println!("\n{title}");
+            print_header();
+            for mut p in policies() {
+                print_row(&simulate(
+                    &models,
+                    work,
+                    p.as_mut(),
+                    Link::gigabit(),
+                    outage,
+                ));
+            }
+        }
+    }
+}
+
+fn print_header() {
+    println!(
+        "  {:<30} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6} {:>9} {:>6} {:>4}",
+        "policy",
+        "tok/s",
+        "first50",
+        "first95",
+        "gap95",
+        "gapmax",
+        "slow95",
+        "jain",
+        "turns B/W",
+        "linkGB",
+        "rst"
+    );
+}
+
+fn print_row(r: &Report) {
+    let split = r
+        .per_member
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join("/");
+    println!(
+        "  {:<30} {:>7.0} {:>7.1}s {:>7.1}s {:>7.2}s {:>7.2}s {:>8.1} {:>6.3} {:>9} {:>6.1} {:>4}",
+        r.policy,
+        r.tokens_per_s,
+        r.first_token_p50,
+        r.first_token_p95,
+        r.longest_gap_p95,
+        r.longest_gap_max,
+        r.slowdown_p95,
+        r.fairness,
+        split,
+        r.link_gb,
+        r.restarted
+    );
+}
+
+fn fit_members(members: &[String]) -> Result<()> {
     let geometry = ExpertGeometry::FLASH_NEXT;
-    for spec in &args.member {
+    for spec in members {
         let Some((name, files)) = spec.split_once('=') else {
             bail!("--member takes NAME=FILE[,FILE…], not {spec:?}");
         };
@@ -48,16 +193,10 @@ fn main() -> Result<()> {
                 }
             }
         }
-        for (label, keep) in [
-            (
-                "decode, alone",
-                Box::new(|s: &Sample| s.alone) as Box<dyn Fn(&Sample) -> bool>,
-            ),
-            ("decode, beside prefill", Box::new(|s: &Sample| !s.alone)),
-        ] {
-            println!("  {label}:");
-            print_curve(&curve(&samples, Channel::Decode, keep));
-        }
+        println!("  decode, alone:");
+        print_curve(&curve(&samples, Channel::Decode, |s| s.alone));
+        println!("  decode, beside prefill:");
+        print_curve(&curve(&samples, Channel::Decode, |s| !s.alone));
         println!("  prefill, all:");
         print_curve(&curve(&samples, Channel::Prefill, |_| true));
     }

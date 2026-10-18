@@ -145,5 +145,48 @@ members whose step time is their measured curve, with the link above, under:
 3. **declared roles + lease transfer** (§2.2);
 4. **declared roles + proxied prefill** (§2.3).
 
+5. **earliest declared finish** — each member declares what this turn would
+   cost it now (its prefill backlog plus this prompt at its prefill rate, then
+   the reply at the step time one more row gives it); the turn goes to the
+   soonest, and a running conversation moves at a turn boundary only when the
+   other member is better by 25%, then stays a turn. It is §2.1's capacity
+   figure used as the only guide.
+
 Reported per policy: aggregate t/s, first-token p50/p95, longest stall, Jain
 index, and the same with one member dropping mid-run.
+
+### 3.1 First results (`coop-lab sim`, 24 conversations, seed 1)
+
+BlackWorld as measured; **WhiteWorld assumed** from its gate figures (decode
+slope 3.2× BlackWorld's, prefill half its rate, a 9 GB expert zone) until its
+wave log is fitted, so every WhiteWorld-dependent figure below moves when it is.
+
+| scenario | policy | t/s | first token p95 | Jain | turns BW/WW |
+|---|---|---|---|---|---|
+| chat | today | 141 | 1.8 s | 0.942 | 60/12 |
+| chat | concentrate | 160 | 2.7 s | 0.997 | 72/0 |
+| chat | earliest finish | **161** | 2.5 s | **0.997** | 71/1 |
+| read | today | 85 | **6.8 s** | 0.995 | 40/8 |
+| read | concentrate | 81 | 9.8 s | 0.997 | 48/0 |
+| read | proxied prefill | 83 | 9.8 s | 0.973 | 48/0 |
+| read | earliest finish | **87** | 8.7 s | 0.989 | 44/4 |
+| chat + read | today | 94 | 3.0 s | 0.969 | 50/10 |
+| chat + read | earliest finish | **106** | 5.0 s | **0.990** | 59/1 |
+
+With WhiteWorld dropping at 30 s, today's first-token p95 rises to 22–28 s
+(its turns restart); earliest finish stays at 2.7–9.0 s.
+
+What it says so far:
+
+- **Concentrating decodes beats today's power split** by 13% on chat and
+  evens the slowdown (Jain 0.94 → 1.00): today's split sends a sixth of the
+  conversations to the card that serves them several times slower.
+- **Proxied prefill to the assumed WhiteWorld hurts** on reads (gap p95
+  96 s): its prefill at a 9 GB zone is slow, and the queue it builds waits on
+  the snapshot crossing. Whether it pays depends on WhiteWorld's real prefill
+  rate, which is the next measurement.
+- **Earliest declared finish is the best single policy** on every mix but
+  read's first-token tail, and it is the simplest to build: each member
+  computes its own figure and the gateway compares numbers.
+- Every result assumes the member's own scheduler forms full-width prefills;
+  production forwards average ~200 tokens (§1), which no placement fixes.
