@@ -70,10 +70,12 @@ pub async fn turn(
     let mut content = String::new();
     let mut stream = res.bytes_stream();
     let deadline = sent + limit;
-    loop {
-        let next = tokio::time::timeout_at(deadline, stream.next()).await;
-        let Ok(Some(Ok(bytes))) = next else {
-            break;
+    let end = loop {
+        let bytes = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(e))) => break format!("transport: {e}"),
+            Ok(None) => break "closed".to_string(),
+            Err(_) => break "deadline".to_string(),
         };
         let at = sent.elapsed();
         for item in parser.push(&bytes) {
@@ -84,14 +86,14 @@ pub async fn turn(
             events.push((at, item));
             if done {
                 return (
-                    Sample::of(scenario, &member, &events, sent.elapsed()),
+                    Sample::of(scenario, &member, &events, sent.elapsed(), "done"),
                     content,
                 );
             }
         }
-    }
+    };
     (
-        Sample::of(scenario, &member, &events, sent.elapsed()),
+        Sample::of(scenario, &member, &events, sent.elapsed(), &end),
         content,
     )
 }

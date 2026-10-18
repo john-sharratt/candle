@@ -17,8 +17,9 @@ pub enum Outcome {
     Failed(String),
     /// A status other than 200, or a transport error.
     Refused(String),
-    /// The stream ended without `[DONE]`.
-    Cut,
+    /// The stream ended without `[DONE]`: how it ended — the run's deadline,
+    /// the server closing it, or a transport error.
+    Cut(String),
 }
 
 /// One request's measurements.
@@ -46,16 +47,18 @@ pub struct Sample {
 
 impl Sample {
     /// Read `events`, each with its arrival time since the request was sent,
-    /// and the time the stream ended.
+    /// the time the stream ended, and how it ended, which is the cut's reason
+    /// when no `[DONE]` came.
     pub fn of(
         scenario: &str,
         member: &str,
         events: &[(Duration, Item)],
         ended: Duration,
+        end: &str,
     ) -> Sample {
         let mut first_text = None;
         let mut text_chunks = 0;
-        let mut outcome = Outcome::Cut;
+        let mut outcome = Outcome::Cut(end.to_string());
         let mut last = Duration::ZERO;
         let mut longest = Duration::ZERO;
         let mut tools = Vec::new();
@@ -69,7 +72,7 @@ impl Sample {
             match item {
                 Item::Tools(names) => tools.extend(names.iter().cloned()),
                 Item::Failed(m) => outcome = Outcome::Failed(m.clone()),
-                Item::Done if outcome == Outcome::Cut => outcome = Outcome::Answered,
+                Item::Done if matches!(outcome, Outcome::Cut(_)) => outcome = Outcome::Answered,
                 _ => {}
             }
         }
@@ -152,7 +155,7 @@ mod tests {
             (ms(2_600), text("Once", 0)),
             (ms(2_610), Item::Done),
         ];
-        let s = Sample::of("light", "BlackWorld", &events, ms(2_620));
+        let s = Sample::of("light", "BlackWorld", &events, ms(2_620), "closed");
         assert_eq!(s.outcome, Outcome::Answered);
         assert_eq!(s.first_text, Some(ms(2_500)));
         assert_eq!(s.longest_silence, ms(1_400));
@@ -173,9 +176,16 @@ mod tests {
                 (ms(11), Item::Done),
             ],
             ms(12),
+            "closed",
         );
         assert_eq!(failed.outcome, Outcome::Failed("stalled".into()));
-        let cut = Sample::of("heavy", "WhiteWorld", &[(ms(10), text("a", 0))], ms(50));
-        assert_eq!(cut.outcome, Outcome::Cut);
+        let cut = Sample::of(
+            "heavy",
+            "WhiteWorld",
+            &[(ms(10), text("a", 0))],
+            ms(50),
+            "closed",
+        );
+        assert_eq!(cut.outcome, Outcome::Cut("closed".into()));
     }
 }

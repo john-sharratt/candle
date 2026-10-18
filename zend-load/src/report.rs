@@ -68,9 +68,10 @@ impl Row {
             answered: count(|o| *o == Outcome::Answered),
             failed: count(|o| matches!(o, Outcome::Failed(_))),
             refused: count(|o| matches!(o, Outcome::Refused(_))),
-            cut: count(|o| *o == Outcome::Cut),
+            cut: count(|o| matches!(o, Outcome::Cut(_))),
             first_failure: samples.iter().find_map(|s| match &s.outcome {
                 Outcome::Failed(m) | Outcome::Refused(m) => Some(m.clone()),
+                Outcome::Cut(m) => Some(format!("cut: {m}")),
                 _ => None,
             }),
             by_member,
@@ -165,7 +166,7 @@ mod tests {
             sample("BlackWorld", Outcome::Answered, Some(2), 3),
             sample("BlackWorld", Outcome::Answered, Some(4), 5),
             sample("WhiteWorld", Outcome::Failed("stalled".into()), None, 1),
-            sample("WhiteWorld", Outcome::Cut, Some(6), 9),
+            sample("WhiteWorld", Outcome::Cut("closed".into()), Some(6), 9),
         ];
         let row = Row::of("medium", &samples, s(20));
         assert_eq!(
