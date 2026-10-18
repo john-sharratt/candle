@@ -205,8 +205,9 @@ pub enum StreamItem {
     /// The turn failed: what the engine reported, worded for the user. Its own
     /// item rather than text, because text lands wherever the reply has got to
     /// — inside an open `<think>` block, where the GUI folds it away — and an
-    /// error is not part of the reply. Display-only; the collected completion
-    /// body appends it, for a client that reads only the body.
+    /// error is not part of the reply. A streamed reply sends it in-band; a
+    /// collected one answers `500` with it, since a body-reading client has the
+    /// status to go on.
     Error(String),
 }
 

@@ -200,9 +200,9 @@ pub async fn completions(
 
 /// `400` for a turn that named no conversation.
 ///
-/// A status, not an in-band `⚠` message in the reply text: the engine's failures
-/// are reported that way because a turn did start and the caller wants the
-/// stream, whereas this one is rejected before anything is submitted. The web
+/// A status, not an in-band `⚠` message in the reply text: a streamed turn's
+/// failures are reported that way because the turn did start and its `200` is
+/// already sent, whereas this one is rejected before anything is submitted. The web
 /// client already reads any non-200 as "no turn started" and surfaces it through
 /// `onError`.
 fn missing_conv_id() -> Response {
@@ -217,6 +217,29 @@ fn missing_conv_id() -> Response {
                 "param": "conv_id",
                 "code": "missing_conv_id",
             }
+        })),
+    )
+        .into_response()
+}
+
+/// `500` for a collected turn the engine failed part way.
+///
+/// A body-reading client has the status and nothing else to go on, so a turn
+/// that failed is not a `200`: one that was had a client — a load test, a
+/// gateway counting answers, an agent framework — read a turn that produced
+/// nothing as one that succeeded. What the turn wrote before it stopped rides
+/// along as `partial_content`. A streamed turn has already sent its `200` by
+/// the time anything fails, and says so in-band instead.
+fn turn_failed(message: &str, partial: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "server_error",
+                "code": "turn_failed",
+            },
+            "partial_content": partial,
         })),
     )
         .into_response()
@@ -414,6 +437,7 @@ async fn collect_completion(
     let mut tokens = 0usize;
     let mut usage: Option<Usage> = None;
     let mut finish = FinishReason::Stop;
+    let mut failed: Option<String> = None;
     while let Some(result) = token_stream.next().await {
         match result {
             Ok(StreamItem::Token(chunk)) => {
@@ -425,11 +449,8 @@ async fn collect_completion(
             Ok(StreamItem::Tool(_)) => {}   // tool lifecycle; display-only, not in the body
             Ok(StreamItem::Prefill { .. }) => {} // prefill progress; display-only
             Ok(StreamItem::Think { .. }) => {} // reasoning progress; display-only
-            // The only channel a body-reading client has: said after whatever
-            // the turn wrote before it stopped.
             Ok(StreamItem::Error(message)) => {
-                full.push_str("\n\n⚠ ");
-                full.push_str(&message);
+                failed.get_or_insert(message);
             }
             Ok(StreamItem::TurnEnd {
                 usage: turn,
@@ -442,6 +463,9 @@ async fn collect_completion(
         }
     }
     tracing::debug!(tokens, "non-stream complete");
+    if let Some(message) = failed {
+        return turn_failed(&message, &full);
+    }
     let (reasoning_content, answer) = if framing.split_reasoning {
         let piece = reasoning_split::split(&full);
         (
@@ -505,6 +529,63 @@ fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod collect_tests {
+    use super::*;
+
+    use axum::body::to_bytes;
+
+    fn framing() -> Framing {
+        Framing {
+            split_reasoning: false,
+            tools: None,
+        }
+    }
+
+    async fn collect(items: Vec<StreamItem>) -> (StatusCode, serde_json::Value) {
+        let stream: TokenStream = Box::pin(futures::stream::iter(items.into_iter().map(Ok)));
+        let res = collect_completion(stream, "zen-code".into(), "id-1".into(), 7, framing()).await;
+        let status = res.status();
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// **A collected turn the engine failed is a `500`**, its message the
+    /// error's and what it wrote first kept as `partial_content` — never a
+    /// `200` whose reply is the error text.
+    #[tokio::test]
+    async fn a_failed_turn_is_a_server_error() {
+        let (status, body) = collect(vec![
+            StreamItem::Token("Half an ".into()),
+            StreamItem::Token("answer".into()),
+            StreamItem::Error("the pool did not answer".into()),
+            StreamItem::Error("a later failure".into()),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "message": "the pool did not answer",
+                    "type": "server_error",
+                    "code": "turn_failed",
+                },
+                "partial_content": "Half an answer",
+            })
+        );
+    }
+
+    /// A turn with no failure is the completion it always was.
+    #[tokio::test]
+    async fn a_finished_turn_is_its_completion() {
+        let (status, body) = collect(vec![StreamItem::Token("All of it.".into())]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["choices"][0]["message"]["content"], "All of it.");
+        assert_eq!(body["object"], "chat.completion");
+    }
 }
 
 #[cfg(test)]
