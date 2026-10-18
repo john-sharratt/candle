@@ -1125,13 +1125,9 @@ impl RecurrentStateStore {
         if missing == 0 {
             return Ok(());
         }
-        // The scratch goes back when the sequence next runs with no long span,
-        // so it may buy past the defended weight residency.
         #[cfg(feature = "cuda")]
-        let mut claimed = {
-            let _transient = candle_nn::kv_cache::TransientPurchase::begin();
-            claim_layer_states(&self.dims, &self.device, missing)?.map(Vec::into_iter)
-        };
+        let mut claimed =
+            claim_layer_states(&self.dims, &self.device, missing)?.map(Vec::into_iter);
         for slot in self.slots.iter_mut().filter(|s| s.scratch.is_none()) {
             #[cfg(feature = "cuda")]
             let half = match claimed.as_mut() {

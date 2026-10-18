@@ -96,7 +96,7 @@ use super::held_ledger::HeldSite;
 use super::reservation::Reservation;
 use super::span_geometry::{blocked, ceiling_regions, claimable, tier_fits};
 use super::types::TARGET_ARENA_BYTES;
-use super::weight_zone::{TransientPurchase, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE};
+use super::weight_zone::{INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE};
 
 /// One region of the KV side. Every size class carves its arenas at this size.
 pub const REGION_BYTES: usize = TARGET_ARENA_BYTES;
@@ -2124,9 +2124,6 @@ pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize)
         // shortfall the placement measured.
         Placed::Short(regions) => regions,
     };
-    // The ground a tier buys returns when its forward ends, so the weight side
-    // may concede it past its defended residency, down to its static floor.
-    let _transient = TransientPurchase::begin();
     let mut conceded = 0u64;
     for _ in 0..MAX_PURCHASES {
         let got = buy_ground(stream, short)?;

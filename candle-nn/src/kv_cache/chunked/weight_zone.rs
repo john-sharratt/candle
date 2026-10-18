@@ -30,106 +30,6 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// The residency the engine defends, in bytes: no retraction takes the zone
-/// below it, whoever asks (`set_defended_weight_bytes`).
-static DEFENDED_WEIGHT_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-/// **Defend `bytes` of expert residency against every claim**, not only the
-/// ones admission prices.
-///
-/// The zone's static floor is the least a forward can run on — on Flash-Next
-/// over the RTX 3090, 1,537 slots, ~2.9 GB — and a forward there streams every
-/// layer. Admission already refused offers that would take the zone under the
-/// engine's defended residency, but the KV a running turn grows by, a deep
-/// projection lifts at submission, and an ingest cohort places, buy their
-/// ground straight from the boundary, which conceded down to the static floor.
-/// Measured on the 3090 (2026-10-18): the zone held at 1,537 slots against
-/// 7,183 in the gate, experts hit 16–30% against 82–87%, and two chats decoded
-/// at ~9 t/s where the gate runs 90. Defended here, a claim past the defence
-/// meets a full span instead: the turn waits, and the KV side demotes.
-///
-/// Process-wide (one model per engine); 0, the default, defends nothing past
-/// the static floor.
-pub fn set_defended_weight_bytes(bytes: usize) {
-    DEFENDED_WEIGHT_BYTES.store(bytes, Ordering::Relaxed);
-}
-
-/// What [`set_defended_weight_bytes`] last set.
-pub fn defended_weight_bytes() -> usize {
-    DEFENDED_WEIGHT_BYTES.load(Ordering::Relaxed)
-}
-
-/// Transient purchases in progress ([`TransientPurchase`]).
-static TRANSIENT_PURCHASES: AtomicUsize = AtomicUsize::new(0);
-
-/// **Ground a forward holds only briefly buys past the defence; a durable claim
-/// does not.**
-///
-/// The defence is against KV that stays: a claim past it holds the zone down
-/// for as long as its arena lives. A wave's tier is gone when its forward ends,
-/// and a recurrent store's prefill scratch when its sequence next runs with no
-/// long span, and the weight side grows back into what they free — so conceding
-/// to them costs a few promotions, while refusing them fails turns that did
-/// nothing wrong. Measured on the 3090 (2026-10-18): the zone at its 3,419-slot
-/// defence, a 3,537-row creep three regions short at its fourth window, four
-/// retries in 4 ms with nothing to change, 21 file ingests failed; and later a
-/// write turn's closing tail failed claiming its 36-slot scratch with the zone
-/// 381 slots above its static floor. Pricing still reads the defended floor
-/// ([`WeightZone::min_capacity`]), so a cohort is fitted as if the defence held
-/// and only the forecast's error reaches into it.
-///
-/// Held across one claim's purchases. Process-wide, as the defence is: the
-/// concession runs on the pipeline thread, not the buyer's.
-pub struct TransientPurchase(());
-
-impl TransientPurchase {
-    pub fn begin() -> Self {
-        TRANSIENT_PURCHASES.fetch_add(1, Ordering::AcqRel);
-        Self(())
-    }
-}
-
-impl Drop for TransientPurchase {
-    fn drop(&mut self) {
-        TRANSIENT_PURCHASES.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// Whether a [`TransientPurchase`] is held anywhere in the process.
-pub(crate) fn transient_purchase_open() -> bool {
-    TRANSIENT_PURCHASES.load(Ordering::Acquire) > 0
-}
-
-/// The defence a retraction honours now: none while transient ground is buying.
-fn retraction_defence() -> usize {
-    defence_during(transient_purchase_open(), defended_weight_bytes())
-}
-
-/// The `defended` residency a retraction honours, with or without a transient
-/// purchase `open`.
-fn defence_during(open: bool, defended: usize) -> usize {
-    if open {
-        0
-    } else {
-        defended
-    }
-}
-
-/// The slots no retraction may take a zone of `capacity` slots below: its
-/// static `floor`, raised to the `defended` bytes in whole slots of
-/// `slot_bytes` (never past the zone's `limit`), and never more than it has.
-fn retraction_floor(
-    floor: usize,
-    defended: usize,
-    slot_bytes: usize,
-    limit: usize,
-    capacity: usize,
-) -> usize {
-    let defended = defended.checked_div(slot_bytes).unwrap_or(0).min(limit);
-    floor.max(defended).min(capacity)
-}
 
 use super::wave_spans::{WAVE_ATTN_BYTES, WAVE_FFN_BYTES, WAVE_FORWARD_BYTES};
 
@@ -358,26 +258,7 @@ impl WeightZone {
     /// Derived rather than stored, so that a zone which opens below its floor and
     /// later grows past it is protected by the real figure from that moment on.
     pub fn min_capacity(&self) -> usize {
-        retraction_floor(
-            self.floor,
-            defended_weight_bytes(),
-            self.slot_bytes,
-            self.limit,
-            self.capacity,
-        )
-    }
-
-    /// The floor a retraction may go to now: [`Self::min_capacity`], less the
-    /// defence while transient ground is buying ([`TransientPurchase`]). Pricing
-    /// reads [`Self::min_capacity`]; only a retraction reads this.
-    pub fn retraction_capacity(&self) -> usize {
-        retraction_floor(
-            self.floor,
-            retraction_defence(),
-            self.slot_bytes,
-            self.limit,
-            self.capacity,
-        )
+        self.floor.min(self.capacity)
     }
 
     /// Slots that fit between `frontier` and the span's right edge.
@@ -559,7 +440,7 @@ impl WeightZone {
         // Conceding *less* than asked is a slowdown. Conceding everything is an
         // engine that no longer works, so the floor holds even against a caller
         // that insists.
-        let new_capacity = new_capacity.max(self.retraction_capacity());
+        let new_capacity = new_capacity.max(self.min_capacity());
         if new_capacity >= self.capacity {
             return RetractPlan::default();
         }
@@ -693,56 +574,6 @@ impl WeightZoneStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// **The defended residency raises the floor, never past what the zone
-    /// has.** The measured case: a 1,537-slot static floor on 1.9 MiB slots,
-    /// 7.0 GiB defended, is ~3,773 slots — but a zone holding 3,000 cannot be
-    /// held above 3,000, and nothing defended leaves the static floor.
-    #[test]
-    fn the_defended_residency_raises_the_retraction_floor() {
-        let slot = 1_990_000;
-        let defended = 7 * (1 << 30);
-        assert_eq!(
-            retraction_floor(1_537, defended, slot, 25_088, 7_183),
-            defended / slot
-        );
-        assert_eq!(
-            retraction_floor(1_537, defended, slot, 25_088, 3_000),
-            3_000
-        );
-        assert_eq!(retraction_floor(1_537, 0, slot, 25_088, 7_183), 1_537);
-        assert_eq!(
-            retraction_floor(1_537, defended, 0, 25_088, 7_183),
-            1_537,
-            "no slots"
-        );
-        assert_eq!(
-            retraction_floor(10, usize::MAX, slot, 2_000, 7_183),
-            2_000,
-            "never past the zone's limit"
-        );
-    }
-
-    /// **Transient ground buys down to the static floor; nothing else does.**
-    /// The 3090's shape at 08:18 (2026-10-18): a 1,537-slot static floor, the
-    /// defence at 1,918 slots of 1.99 MB, and a write turn's 36-slot prefill
-    /// scratch refused there with 381 slots between the two.
-    #[test]
-    fn a_transient_purchase_retracts_past_the_defence_to_the_static_floor() {
-        let slot = 1_990_000;
-        let defended = 1_918 * slot;
-        let floor =
-            |open| retraction_floor(1_537, defence_during(open, defended), slot, 25_088, 4_000);
-        assert_eq!(floor(false), 1_918, "a durable claim meets the defence");
-        assert_eq!(
-            floor(true),
-            1_537,
-            "transient ground reaches the static floor"
-        );
-        let held = TransientPurchase::begin();
-        assert!(transient_purchase_open(), "open while it is held");
-        drop(held);
-    }
 
     const SLOT: usize = 3 * 1024 * 1024;
     const END: u64 = 0x8000_0000;

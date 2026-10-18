@@ -128,9 +128,8 @@ pub(super) fn achievable_weight_bytes(
 /// made unreachable: the mark sat 2% above a zone that could never climb.
 ///
 /// A reading, not a controller: one identity evaluated at the moment it is
-/// exact. `defend` publishes [`HOLD`] of it as the residency the boundary
-/// defends — only for an exact reading, never the seed at entry.
-pub(super) fn reseed_achievable_weight(defend: bool) {
+/// exact.
+pub(super) fn reseed_achievable_weight() {
     use std::sync::atomic::Ordering;
     let Some(r) = stats() else {
         return;
@@ -143,21 +142,6 @@ pub(super) fn reseed_achievable_weight(defend: bool) {
         MIN_ELASTIC_RESERVE,
     );
     let before = ACHIEVABLE_WEIGHT.swap(achievable, Ordering::Relaxed);
-    // **Defended at the boundary, not only at admission.** The KV a running
-    // turn grows by, a projection lifts at submission and a creep cohort
-    // places buys its ground from the weight side directly; with only the
-    // static floor in its way the zone was driven to it, and every forward
-    // streamed (`set_defended_weight_bytes`). The same fraction admission
-    // defends: below it the weight side concedes nothing, and a claim meets a
-    // full span — a wait, and the KV side's relief — instead.
-    //
-    // Only from a reading that is exact (`defend`): at idle, and on settling
-    // after work. The seed at entry over-states the residency — nothing is
-    // prefilled yet — and defended at the boundary it would refuse the very
-    // prefills that make the next reading exact.
-    if defend {
-        candle_nn::kv_cache::set_defended_weight_bytes((achievable as f64 * HOLD) as usize);
-    }
     // The idle branch runs once per request while the engine waits, so this
     // fires many times a second at startup; a line per *change* of a region or
     // more is what a log wants.

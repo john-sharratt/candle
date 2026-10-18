@@ -124,7 +124,7 @@ impl Scheduler {
             },
             start,
         );
-        reseed_achievable_weight(true);
+        reseed_achievable_weight();
         let stats = self.session.kv_region_stats();
         let report = SettleReport {
             live_regions: stats.map_or(0, |r| r.live),

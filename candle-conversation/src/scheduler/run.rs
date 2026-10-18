@@ -236,7 +236,11 @@ impl Scheduler {
         {
             let _g = profile::span("loop:decode:relief_check");
             if self.vram_under_pressure_for(VramPhase::Decode) {
-                self.relieve_vram_pressure("decode", VramPhase::Decode);
+                self.relieve_vram_pressure(
+                    "decode",
+                    VramPhase::Decode,
+                    super::prefill::ReliefNeed::Paced,
+                );
             }
         }
         // Fire any reprojection queued by the just-completed prefill quantum
@@ -485,12 +489,32 @@ impl Scheduler {
                 );
             }
             // A refused tier is answered where it was refused — the next wave is
-            // composed narrower, or a wave already at the least chunk fails its
-            // members — so it is a warning here, not a fault, and not a failure
-            // the retry counts toward giving up.
-            Err(e) if is_tier_refusal(&e) || is_span_full(&e) => {
-                tracing::warn!("decode-less wave step refused its tier: {e}");
-            }
+            // composed narrower, or one already at the least chunk waits for
+            // ground like a full span — so it is not a fault. It is still waited
+            // between attempts and bounded like one: retried at once it spun
+            // (9,426 refusals in 27 s on the 3090), and a span that never gives
+            // ground back must end its members rather than hold them for ever.
+            Err(e) if is_tier_refusal(&e) || is_span_full(&e) => match self.wave_retry.failed() {
+                Next::Retry { attempt, wait } => {
+                    if WaveRetry::logs(attempt) {
+                        tracing::warn!(
+                            attempt,
+                            wait_us = wait.as_micros() as u64,
+                            "decode-less wave step refused its tier; waiting for ground: {e}"
+                        );
+                    }
+                }
+                Next::GiveUp { attempts } => {
+                    tracing::error!(
+                        attempts,
+                        "decode-less wave step refused its tier on every attempt; failing its \
+                         members: {e}"
+                    );
+                    self.fail_decode_less_wave(&format!(
+                        "the wave carrying this found no ground in {attempts} attempts: {e}"
+                    ));
+                }
+            },
             Err(e) => match self.wave_retry.failed() {
                 Next::Retry { wait, attempt } => {
                     if WaveRetry::logs(attempt) {
@@ -565,7 +589,7 @@ impl Scheduler {
         // would read `achievable_weight_now() == None`, a hold of zero, and
         // admission defending nothing at all. A first pass that is too tight
         // self-corrects at the first idle; one that defends nothing does not.
-        super::interleave::reseed_achievable_weight(false);
+        super::interleave::reseed_achievable_weight();
         // **The weight side leaves what relief frees to.** Relief defends
         // `LOAD_TARGET` free regions by conceding weight ground; a weight side that
         // grew back below it would take those regions again on the next forward,
@@ -667,7 +691,11 @@ impl Scheduler {
                     starvation_events = starved,
                     "background compression starved of VRAM"
                 );
-                self.relieve_vram_pressure("starvation", VramPhase::Load);
+                self.relieve_vram_pressure(
+                    "starvation",
+                    VramPhase::Load,
+                    super::prefill::ReliefNeed::Paced,
+                );
             }
 
             // 1c. **Serve any co-resident model waiting for the card.**
@@ -759,7 +787,7 @@ impl Scheduler {
                 }
                 // Nothing is in flight, so everything resident is permanent:
                 // the one moment the achievable weight residency is exact.
-                super::interleave::reseed_achievable_weight(true);
+                super::interleave::reseed_achievable_weight();
                 tracing::trace!("idle; waiting for a request");
                 // Time ONLY the recv block (not the request handling) — this is the
                 // scheduler idle between requests, attributed to the Idle phase so it

@@ -437,19 +437,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                 // they finish. A turn they yield to is judged on the row cap
                 // alone (`WaveRate::try_outranking`), and a cap refusal re-offers
                 // it as a join like a rate refusal does.
-                //
-                // **And a `High` prefill is judged the same way beside `High`
-                // decodes.** A person waits on each one's first token, so the
-                // trade the rate model weighs — this row's width against the
-                // decodes it slows — is the wrong question: on `.5`
-                // (2026-10-18) eight chats' first turns arriving together were
-                // admitted one a pass, each refused on the rate beside the
-                // others' decodes, and every one waited 10.2 s for its first
-                // text. The row cap still bounds the forward, and the residency
-                // the weights need is defended at the boundary now
-                // (`set_defended_weight_bytes`): a claim past it meets a full
-                // span and waits, it cannot strip the experts.
-                Kind::Prefill if ground.outranks_active(prio) || prio == DecodePriority::High => {
+                Kind::Prefill if ground.outranks_active(prio) => {
                     match rate.try_outranking(cost.rows, after) {
                         rate::Admit::Admitted { .. } => true,
                         rate::Admit::Refused(r @ rate::Refusal::Cap { .. })
@@ -772,31 +760,12 @@ mod tests {
         assert_eq!(got.prefills, 1, "the band they yield to is admitted");
         assert!(!got.stopped_on_weights);
 
-        // A person's turn beside other people's decodes is admitted too: the
-        // floor is defended at the boundary now, not by holding a waiting
-        // person's first token behind the rate (`.5`, 2026-10-18: eight first
-        // turns admitted one a pass, 10.2 s each to first text).
         let mut peer = Fake::new(Vec::new(), vec![REGION], under);
         peer.active = 14;
         peer.running_band = Some(DecodePriority::High);
         peer.prefill_prio = DecodePriority::High;
         let got = fill_once(&mut peer);
-        assert_eq!(
-            got.prefills, 1,
-            "a High turn beside High decodes is admitted"
-        );
-    }
-
-    /// **A burst of `High` first turns is admitted in one pass**, each judged
-    /// on the row cap alone, where the rate model admitted them one a pass.
-    #[test]
-    fn a_burst_of_high_turns_is_admitted_in_one_pass() {
-        let mut burst = Fake::new(Vec::new(), vec![REGION; 8], FLOOR + 64 * REGION);
-        burst.active = 8;
-        burst.running_band = Some(DecodePriority::High);
-        burst.prefill_prio = DecodePriority::High;
-        let got = fill_once(&mut burst);
-        assert_eq!(got.prefills, 8, "all eight in one pass");
+        assert_eq!(got.prefills, 0, "among equals the floor still holds");
     }
 
     /// **A turn whose rows do not pay joins the cohort instead of waiting for

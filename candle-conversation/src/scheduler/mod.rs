@@ -5017,7 +5017,11 @@ impl Scheduler {
                     // per-arena `vram_has_room` check, which OOMs per-arena instead
                     // of shedding ahead of the load.
                     if self.vram_under_pressure_for(prefill::VramPhase::Load) {
-                        self.relieve_vram_pressure("elevate", prefill::VramPhase::Load);
+                        self.relieve_vram_pressure(
+                            "elevate",
+                            prefill::VramPhase::Load,
+                            prefill::ReliefNeed::Now,
+                        );
                     }
                     if let Some(conversation) = self.slot_conversations.get(&sequence_id).cloned() {
                         let backings = self.session.backings().to_vec();
@@ -5566,7 +5570,11 @@ impl Scheduler {
         // make. Deferral remains for the case relief cannot fix: a genuinely
         // busy card, which is what this gate was built for.
         if self.vram_under_pressure() {
-            self.relieve_vram_pressure("summary", prefill::VramPhase::Load);
+            self.relieve_vram_pressure(
+                "summary",
+                prefill::VramPhase::Load,
+                prefill::ReliefNeed::Now,
+            );
             if self.vram_under_pressure() {
                 return Err("SubmitSummaryProbe: deferred — VRAM under pressure".to_string());
             }

@@ -143,6 +143,10 @@ pub struct GalleryArena {
     page_bytes: u64,
 }
 
+/// The gallery's VRAM ceiling: what its pages may hold before admission and
+/// relief start evicting the turns no scan has used recently (`evict_to_cap`).
+pub const GALLERY_CAP_BYTES: u64 = 512 * 1024 * 1024;
+
 impl GalleryArena {
     /// A gallery arena on `device` for the locked folded-signature geometry
     /// (`wpt` words per token, `n_groups` layer-groups). For the production fold
@@ -606,8 +610,7 @@ impl GalleryArena {
         freed
     }
 
-    /// The arena's own VRAM ceiling, in bytes (`ZEN_GALLERY_CAP_MB`, default
-    /// 512 MiB).
+    /// The arena's own VRAM ceiling, in bytes ([`GALLERY_CAP_BYTES`]).
     ///
     /// **This is what bounds gallery growth.** `alloc_and_upload` claims new
     /// arenas whenever the gallery's run out, and nothing else shrinks the
@@ -619,15 +622,7 @@ impl GalleryArena {
     /// reason given there. Enforced at admission in `ensure_locked`, where no
     /// lock is held that eviction needs.
     pub fn cap_bytes(&self) -> u64 {
-        static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *CAP.get_or_init(|| {
-            let mb = std::env::var("ZEN_GALLERY_CAP_MB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(512);
-            tracing::info!(cap_mb = mb, "gallery arena VRAM ceiling");
-            mb * 1024 * 1024
-        })
+        GALLERY_CAP_BYTES
     }
 
     /// Evict stale turns, oldest first, until the arena is back under
