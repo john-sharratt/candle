@@ -2,11 +2,12 @@
 //!
 //! Each member runs one forward at a time, alternating a decode step over
 //! every row decoding under its lease with a prefill forward packing the
-//! prompt tokens queued on it, up to its width. A conversation moves through
-//! its turns' segments: queued for prefill (at home, or proxied), across the
-//! link when its state must move, decoding, then the person's pause. Each
-//! turn's end replicates its state to every other member over the link, and a
-//! conversation moved to another member waits for that copy to have arrived.
+//! prompt tokens queued on it, up to its width. A conversation's lease is held
+//! for one turn — its prefills and its decodes — and its next turn is placed
+//! among the members that are up and hold its state through the turn just
+//! ended. A turn's end replicates its state to every other member over the
+//! link, FIFO, and a member is eligible for the next turn once its copy has
+//! arrived: a member still waiting for it is skipped, never waited on.
 //!
 //! Conversation `i`'s state is `convs[i]`, and its spec `workload[i]`.
 
@@ -24,12 +25,6 @@ pub struct Outage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Next {
-    Prefill { at: usize, left: usize },
-    Decode { left: usize },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
     NotYet,
     /// The person's pause before the next turn.
@@ -38,15 +33,7 @@ enum Phase {
     },
     /// A turn due, not yet placed.
     TurnDue,
-    /// The next segment of a running turn, not yet started.
-    SegmentDue,
-    /// State on the link.
-    Crossing {
-        until: f64,
-        next: Next,
-    },
     Prefill {
-        at: usize,
         left: usize,
     },
     Decode {
@@ -57,23 +44,21 @@ enum Phase {
 
 #[derive(Debug, Clone)]
 struct Conv {
+    /// The member whose lease the turn runs under, or ran its last under.
     home: Option<usize>,
-    stay: bool,
     turn: usize,
     seg: usize,
     phase: Phase,
     kv: f64,
-    /// When its latest turn's state reached the other members.
-    replicated_at: f64,
+    /// When each member came to hold its state through its latest turn;
+    /// `None` for a member that does not yet.
+    replicated: Vec<Option<f64>>,
     due: f64,
     first_token: Option<f64>,
     last_token: Option<f64>,
     longest_gap: f64,
     tokens: usize,
     restarted: bool,
-    /// Prompt tokens of this turn prefilled by a proxy: their KV came back
-    /// with its snapshot and is not replicated again at the turn's end.
-    proxied: usize,
 }
 
 impl Conv {
@@ -84,8 +69,11 @@ impl Conv {
         self.last_token = None;
         self.longest_gap = 0.0;
         self.tokens = 0;
-        self.proxied = 0;
         self.restarted = true;
+    }
+
+    fn running(&self) -> bool {
+        matches!(self.phase, Phase::Prefill { .. } | Phase::Decode { .. })
     }
 }
 
@@ -138,29 +126,30 @@ pub fn simulate(
             .iter()
             .map(|c| Conv {
                 home: None,
-                stay: false,
                 turn: 0,
                 seg: 0,
                 phase: Phase::NotYet,
                 kv: c.context as f64,
-                replicated_at: 0.0,
+                // Every member holds a conversation's history before its first
+                // turn: the substrate replicated it.
+                replicated: vec![Some(0.0); models.len()],
                 due: c.arrive_s,
                 first_token: None,
                 last_token: None,
                 longest_gap: 0.0,
                 tokens: 0,
                 restarted: false,
-                proxied: 0,
             })
             .collect(),
         link,
         records: Vec::new(),
     };
-    let start = workload
+    let first = workload
         .iter()
         .map(|c| c.arrive_s)
         .fold(f64::INFINITY, f64::min);
-    let mut now = if start.is_finite() { start } else { 0.0 };
+    let start = if first.is_finite() { first } else { 0.0 };
+    let mut now = start;
     let mut out = outage;
     loop {
         if let Some(o) = out.filter(|o| now >= o.at) {
@@ -169,7 +158,7 @@ pub fn simulate(
         }
         run.finish_forwards(now);
         run.wake(now);
-        run.start_turns_and_segments(now, policy);
+        run.start_turns(now, policy);
         run.start_forwards(now);
         let mut next = run.next_event();
         if let Some(o) = out {
@@ -184,7 +173,7 @@ pub fn simulate(
         policy.name(),
         &run.records,
         models.len(),
-        if start.is_finite() { start } else { 0.0 },
+        start,
         run.link.carried,
     )
 }
@@ -198,13 +187,7 @@ impl Run<'_> {
     fn held(&self, m: usize) -> usize {
         self.convs
             .iter()
-            .filter(|c| match c.phase {
-                Phase::Prefill { at, .. } => at == m || c.home == Some(m),
-                Phase::Crossing { .. } | Phase::Decode { .. } | Phase::SegmentDue => {
-                    c.home == Some(m)
-                }
-                _ => false,
-            })
+            .filter(|c| c.home == Some(m) && c.running())
             .count()
     }
 
@@ -221,8 +204,9 @@ impl Run<'_> {
                 prefill_backlog: self
                     .convs
                     .iter()
+                    .filter(|c| c.home == Some(m))
                     .map(|c| match c.phase {
-                        Phase::Prefill { at, left } if at == m => left,
+                        Phase::Prefill { left } => left,
                         _ => 0,
                     })
                     .sum(),
@@ -230,30 +214,18 @@ impl Run<'_> {
             .collect()
     }
 
-    /// A member dropping: its forward is lost, every turn running under its
-    /// lease starts again wherever it is placed next, and a prefill proxied to
-    /// it goes back to its home.
+    /// A member dropping: its forward is lost, and every turn running under
+    /// its lease starts again wherever it is placed next.
     fn take_out(&mut self, member: usize) {
         self.members[member].up = false;
         self.members[member].job = None;
         for c in self.convs.iter_mut() {
-            let running = matches!(
-                c.phase,
-                Phase::Crossing { .. }
-                    | Phase::Prefill { .. }
-                    | Phase::Decode { .. }
-                    | Phase::SegmentDue
-            );
+            c.replicated[member] = None;
             if c.home == Some(member) {
                 c.home = None;
-                c.stay = false;
-                if running {
+                if c.running() {
                     c.phase = Phase::TurnDue;
                     c.restart();
-                }
-            } else if let (Phase::Prefill { at, left }, Some(h)) = (c.phase, c.home) {
-                if at == member {
-                    c.phase = Phase::Prefill { at: h, left };
                 }
             }
         }
@@ -276,7 +248,7 @@ impl Run<'_> {
                 }
                 Job::Prefill(parts) => {
                     for (i, tokens) in parts {
-                        self.prefilled(i, tokens, t);
+                        self.prefilled(i, tokens);
                     }
                 }
             }
@@ -302,50 +274,40 @@ impl Run<'_> {
         let turn: &Turn = &self.workload[i].turns[c.turn];
         if c.seg + 1 < turn.segments.len() {
             c.seg += 1;
-            c.phase = Phase::SegmentDue;
+            let next = turn.segments[c.seg];
+            c.phase = Phase::Prefill { left: next.prefill };
             return;
         }
         self.end_turn(i, t);
     }
 
-    fn prefilled(&mut self, i: usize, tokens: usize, t: f64) {
+    fn prefilled(&mut self, i: usize, tokens: usize) {
         let seg = self.segment(i);
         let c = &mut self.convs[i];
-        let Phase::Prefill { at, left } = c.phase else {
+        let Phase::Prefill { left } = c.phase else {
             return;
         };
         c.kv += tokens as f64;
-        if left > tokens {
-            c.phase = Phase::Prefill {
-                at,
+        c.phase = if left > tokens {
+            Phase::Prefill {
                 left: left - tokens,
-            };
-            return;
-        }
-        c.phase = if Some(at) == c.home {
-            Phase::Decode { left: seg.decode }
-        } else {
-            // Proxied: its KV and snapshot come back before it decodes.
-            c.proxied += seg.prefill;
-            Phase::Crossing {
-                until: self.link.send(t, Link::state_bytes(seg.prefill)),
-                next: Next::Decode { left: seg.decode },
             }
+        } else {
+            Phase::Decode { left: seg.decode }
         };
     }
 
-    /// The turn is done: recorded, its state replicated to every other
-    /// member, and the person's pause before the next.
+    /// The turn is done: recorded, its state replicated to every other member,
+    /// and the person's pause before the next.
     fn end_turn(&mut self, i: usize, t: f64) {
         let ideal = self.ideal(i);
-        let others = self
-            .members
+        let turn_tokens: usize = self.workload[i].turns[self.convs[i].turn]
+            .segments
             .iter()
-            .filter(|m| m.up)
-            .count()
-            .saturating_sub(1);
-        let c = &mut self.convs[i];
-        let home = c.home.expect("a running turn has a home");
+            .map(|s| s.prefill + s.decode)
+            .sum();
+        let home = self.convs[i].home.expect("a running turn has a home");
+        let c = &self.convs[i];
         self.records.push(TurnRecord {
             conversation: i,
             turn: c.turn,
@@ -358,23 +320,20 @@ impl Run<'_> {
             ideal,
             restarted: c.restarted,
         });
-        let turn_tokens: usize = self.workload[i].turns[c.turn]
-            .segments
-            .iter()
-            .map(|s| s.prefill + s.decode)
-            .sum::<usize>()
-            - c.proxied;
-        let mut arrived = t;
-        for _ in 0..others {
-            arrived = self.link.send(t, Link::state_bytes(turn_tokens));
+        let mut replicated = vec![None; self.members.len()];
+        replicated[home] = Some(t);
+        for (m, member) in self.members.iter().enumerate() {
+            if m != home && member.up {
+                replicated[m] = Some(self.link.send(t, Link::state_bytes(turn_tokens)));
+            }
         }
-        c.replicated_at = arrived;
+        let c = &mut self.convs[i];
+        c.replicated = replicated;
         c.first_token = None;
         c.last_token = None;
         c.longest_gap = 0.0;
         c.tokens = 0;
         c.restarted = false;
-        c.proxied = 0;
         c.seg = 0;
         let turns = &self.workload[i].turns;
         if c.turn + 1 < turns.len() {
@@ -417,96 +376,38 @@ impl Run<'_> {
                     c.due = until;
                     c.phase = Phase::TurnDue;
                 }
-                Phase::Crossing { until, next } if until <= now => {
-                    c.phase = match next {
-                        Next::Prefill { at, left } => Phase::Prefill { at, left },
-                        Next::Decode { left } => Phase::Decode { left },
-                    };
-                }
                 _ => {}
             }
         }
     }
 
-    fn start_turns_and_segments(&mut self, now: f64, policy: &mut dyn Policy) {
+    /// Place each due turn among the members that are up and hold its state
+    /// through its latest turn, and queue its first prefill there.
+    fn start_turns(&mut self, now: f64, policy: &mut dyn Policy) {
         for i in 0..self.convs.len() {
-            match self.convs[i].phase {
-                Phase::TurnDue => {
-                    self.place(i, policy);
-                    self.begin_segment(i, now, policy);
-                }
-                Phase::SegmentDue => self.begin_segment(i, now, policy),
-                _ => {}
+            if self.convs[i].phase != Phase::TurnDue {
+                continue;
             }
-        }
-    }
-
-    /// Where a due turn runs: the policy's choice, held where it is while it
-    /// must stay, and never on a member that is down.
-    fn place(&mut self, i: usize, policy: &mut dyn Policy) {
-        let seg = self.segment(i);
-        let asking = Asking {
-            home: self.convs[i].home,
-            stay: self.convs[i].stay,
-            prefill: seg.prefill,
-            decode: seg.decode,
-        };
-        let chosen = policy.place(&self.views(), &asking);
-        let c = &self.convs[i];
-        let mut home = match c.home {
-            Some(h) if c.stay => h,
-            _ => chosen,
-        };
-        if !self.members[home].up {
-            home = (0..self.members.len())
-                .find(|m| self.members[*m].up)
-                .expect("a member is up");
-        }
-        let c = &mut self.convs[i];
-        let moved = c.home.is_some_and(|h| h != home);
-        c.stay = moved;
-        c.home = Some(home);
-    }
-
-    /// Queue the segment's prefill: at home, or proxied. A turn starts from
-    /// the state its last turn replicated; a segment in the middle of a turn
-    /// carries the home's state across first.
-    fn begin_segment(&mut self, i: usize, now: f64, policy: &mut dyn Policy) {
-        let seg = self.segment(i);
-        let home = self.convs[i].home.expect("a running turn has a home");
-        let asking = Asking {
-            home: Some(home),
-            stay: self.convs[i].stay,
-            prefill: seg.prefill,
-            decode: seg.decode,
-        };
-        let proxy = policy
-            .proxy(&self.views(), &asking, home)
-            .filter(|to| *to != home && self.members.get(*to).is_some_and(|m| m.up));
-        let at = proxy.unwrap_or(home);
-        let c = &self.convs[i];
-        let moved_home = c.stay;
-        let ready = if at == home && !moved_home {
-            now
-        } else if c.seg == 0 {
-            c.replicated_at.max(now)
-        } else if at == home {
-            now
-        } else {
-            self.link.send(now, Link::state_bytes(0))
-        };
-        let next = Next::Prefill {
-            at,
-            left: seg.prefill,
-        };
-        self.convs[i].phase = if ready > now {
-            Phase::Crossing { until: ready, next }
-        } else {
-            Phase::Prefill {
-                at,
-                left: seg.prefill,
+            let eligible: Vec<bool> = (0..self.members.len())
+                .map(|m| {
+                    self.members[m].up && self.convs[i].replicated[m].is_some_and(|at| at <= now)
+                })
+                .collect();
+            if !eligible.iter().any(|e| *e) {
+                // Nobody holds it yet: the only copy is still on the link.
+                continue;
             }
-        };
+            let seg = self.segment(i);
+            let asking = Asking {
+                home: self.convs[i].home,
+                prefill: seg.prefill,
+                decode: seg.decode,
+            };
+            let home = policy.place(&self.views(), &eligible, &asking);
+            let c = &mut self.convs[i];
+            c.home = Some(home);
+            c.phase = Phase::Prefill { left: seg.prefill };
+        }
     }
 
     fn start_forwards(&mut self, now: f64) {
@@ -516,18 +417,18 @@ impl Run<'_> {
                 continue;
             }
             let held = self.held(m);
+            let mine = |i: &usize| self.convs[*i].home == Some(m);
             let mut rows: Vec<usize> = (0..self.convs.len())
-                .filter(|&i| {
-                    self.convs[i].home == Some(m)
-                        && matches!(self.convs[i].phase, Phase::Decode { .. })
-                })
+                .filter(mine)
+                .filter(|&i| matches!(self.convs[i].phase, Phase::Decode { .. }))
                 .collect();
             // The rows furthest behind go first when there are more than a
             // step carries.
             rows.sort_by_key(|&i| (self.convs[i].tokens, i));
             rows.truncate(self.models[m].max_rows);
             let mut queue: Vec<usize> = (0..self.convs.len())
-                .filter(|&i| matches!(self.convs[i].phase, Phase::Prefill { at, .. } if at == m))
+                .filter(mine)
+                .filter(|&i| matches!(self.convs[i].phase, Phase::Prefill { .. }))
                 .collect();
             queue.sort_by(|&a, &b| {
                 self.convs[a]
@@ -547,7 +448,7 @@ impl Run<'_> {
                 let mut parts = Vec::new();
                 let (mut used, mut kv) = (0, 0.0);
                 for i in queue {
-                    let Phase::Prefill { left, .. } = self.convs[i].phase else {
+                    let Phase::Prefill { left } = self.convs[i].phase else {
                         continue;
                     };
                     let take = left.min(width - used);
@@ -567,6 +468,9 @@ impl Run<'_> {
         }
     }
 
+    /// The next moment anything happens: a forward ending, a pause ending, a
+    /// conversation arriving, or a replica landing that makes a due turn
+    /// placeable.
     fn next_event(&self) -> f64 {
         let mut next = f64::INFINITY;
         for m in &self.members {
@@ -577,7 +481,12 @@ impl Run<'_> {
         for c in &self.convs {
             match c.phase {
                 Phase::NotYet => next = next.min(c.due),
-                Phase::Waiting { until } | Phase::Crossing { until, .. } => next = next.min(until),
+                Phase::Waiting { until } => next = next.min(until),
+                Phase::TurnDue => {
+                    for at in c.replicated.iter().flatten() {
+                        next = next.min(*at);
+                    }
+                }
                 _ => {}
             }
         }
@@ -588,7 +497,7 @@ impl Run<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::policy::{Concentrate, ConcentrateProxy, Today};
+    use crate::sim::policy::{Concentrate, EarliestFinish, Today};
     use crate::sim::workload::{generate, Kind};
 
     fn one_turn(prefill: usize, decode: usize) -> Vec<Conversation> {
@@ -633,11 +542,7 @@ mod tests {
         let mut policies: Vec<Box<dyn Policy>> = vec![
             Box::new(Today),
             Box::new(Concentrate { floor_hit: 0.9 }),
-            Box::new(ConcentrateProxy {
-                concentrate: Concentrate { floor_hit: 0.9 },
-                min_prefill: 4_000,
-                max_backlog: 16_000,
-            }),
+            Box::new(EarliestFinish),
         ];
         for p in policies.iter_mut() {
             let r = simulate(&models, &work, p.as_mut(), Link::gigabit(), None);
@@ -664,5 +569,23 @@ mod tests {
         assert_eq!(r.turns, turns);
         assert!(r.restarted > 0);
         assert_eq!(r.per_member[1], 0, "nothing finishes on a dropped member");
+    }
+
+    /// A turn is never placed on a member still waiting for the
+    /// conversation's state: over a link too slow to deliver any, no
+    /// conversation moves, though the policy would move some given the chance.
+    #[test]
+    fn a_member_without_the_state_is_skipped() {
+        let models = [MemberModel::black_world(), MemberModel::white_world()];
+        let work = generate(Kind::Read, 24, 5.0, 3);
+        let turns: usize = work.iter().map(|c| c.turns.len()).sum();
+        let stuck = simulate(&models, &work, &mut EarliestFinish, Link::new(1.0), None);
+        assert_eq!(stuck.turns, turns);
+        assert_eq!(stuck.moves, 0);
+        let free = simulate(&models, &work, &mut EarliestFinish, Link::new(1e12), None);
+        assert!(
+            free.moves > 0,
+            "the policy moves some turns given the state"
+        );
     }
 }
