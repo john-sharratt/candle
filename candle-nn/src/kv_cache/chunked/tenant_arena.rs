@@ -48,8 +48,6 @@
 
 use candle::Result;
 
-use super::compact_plan::{pack_moves, SlotRun};
-
 #[cfg(feature = "cuda")]
 use std::collections::hash_map::Entry;
 #[cfg(feature = "cuda")]
@@ -74,6 +72,30 @@ pub const SLOT_ALIGN: usize = 256;
 /// The slot stride for a block of `bytes`.
 pub fn slot_stride(bytes: usize) -> usize {
     bytes.next_multiple_of(SLOT_ALIGN)
+}
+
+/// How many of the topmost arenas a pass can empty, given each arena's `live`
+/// slots in span order and `capacity` slots per arena: the most `k` whose live
+/// slots fit in the free slots of the arenas below them, within `max_moves`
+/// (zero for none) — the first arena always whole. An arena already empty is
+/// not counted; it has no region to give back here.
+fn arenas_to_empty(live: &[usize], capacity: usize, max_moves: usize) -> usize {
+    let mut moving = 0usize;
+    let mut k = 0usize;
+    for (i, &l) in live.iter().enumerate().rev() {
+        // The destinations are the arenas below this one, less what the arenas
+        // above already moved into them.
+        let free_below: usize = live[..i].iter().map(|&b| capacity - b).sum();
+        if l == 0 || moving + l > free_below {
+            break;
+        }
+        if k > 0 && max_moves != 0 && moving + l > max_moves {
+            break;
+        }
+        moving += l;
+        k += 1;
+    }
+    k
 }
 
 /// Who a slot arena belongs to. Arenas are never shared across tenants.
@@ -251,47 +273,53 @@ impl<R: Ground> StrideArenas<R> {
         Some((base, index, base + index as u64 * self.stride as u64))
     }
 
-    /// The moves that pack this stride's live slots into a gapless prefix of its
-    /// arenas in address order, each destination **already claimed**: its slot is
-    /// taken off the free set here, so nothing else can be handed it before the copy
-    /// lands. Answers `(source address, destination)` per move, the destination as
-    /// `(arena base, slot index, slot address)`.
+    /// The moves that empty this stride's topmost arenas into free slots below
+    /// them, each destination **already claimed**: its slot is taken off the free
+    /// set here, so nothing else can be handed it before the copy lands. Answers
+    /// `(source address, destination)` per move, the destination as `(arena base,
+    /// slot index, slot address)`.
     ///
-    /// The two-cursor walk the KV pools use ([`pack_moves`]): the highest occupied
-    /// slot goes to the lowest free one, each slot moves at most once, and a walk cut
-    /// short by `max_moves` (zero for none) still leaves the arenas better packed.
-    /// The sources stay occupied — they are the holders' to give back once they have
-    /// moved onto the destinations.
+    /// **Whole arenas or nothing.** A region goes back only when its arena's last
+    /// slot does, so a move that fills a hole below without finishing an arena
+    /// above frees nothing and is pure copy. The two-cursor walk planned exactly
+    /// those: on blackworld (2026-10-18) a pass every ~4 s moved 71–119 recurrent
+    /// states — up to ~460 MB of device copies — with the region count unchanged.
+    /// So the pass takes, from the top, the most arenas whose live slots fit in
+    /// the free slots of the arenas left below them, and moves only those slots,
+    /// highest first into the lowest free slot. Within `max_moves` (zero for none),
+    /// except that the first arena is always taken whole: a budget smaller than
+    /// one arena would otherwise never empty any. The sources stay occupied — they
+    /// are the holders' to give back once they have moved onto the destinations.
     pub(crate) fn plan_moves(&mut self, max_moves: usize) -> Vec<(u64, (u64, u32, u64))> {
-        let occupied: Vec<Vec<u32>> = self
+        let cap = self.capacity as usize;
+        let live: Vec<usize> = self
             .arenas
             .iter()
-            .map(|a| a.occupied(self.capacity))
+            .map(|a| cap - a.n_free as usize)
             .collect();
-        let runs: Vec<SlotRun<'_>> = occupied
-            .iter()
-            .enumerate()
-            .map(|(pos, occ)| SlotRun {
-                id: pos,
-                capacity: self.capacity as usize,
-                occupied: occ,
-            })
-            .collect();
-        let (moves, _) = pack_moves(&runs, max_moves);
+        let emptied = arenas_to_empty(&live, cap, max_moves);
+        let keep = self.arenas.len() - emptied;
         let stride = self.stride as u64;
-        moves
-            .into_iter()
-            .map(|m| {
-                let src_base = self.arenas[m.from.0].region.base();
-                let dst = &mut self.arenas[m.to.0];
-                dst.claim(m.to.1);
+        let mut moves = Vec::new();
+        let mut below = 0usize;
+        for from in (keep..self.arenas.len()).rev() {
+            let src_base = self.arenas[from].region.base();
+            for index in self.arenas[from].occupied(self.capacity).into_iter().rev() {
+                while below < keep && self.arenas[below].n_free == 0 {
+                    below += 1;
+                }
+                let dst = &mut self.arenas[below];
+                let slot = dst
+                    .take_lowest()
+                    .expect("arenas_to_empty counted a free slot here");
                 let dst_base = dst.region.base();
-                (
-                    src_base + m.from.1 as u64 * stride,
-                    (dst_base, m.to.1, dst_base + m.to.1 as u64 * stride),
-                )
-            })
-            .collect()
+                moves.push((
+                    src_base + index as u64 * stride,
+                    (dst_base, slot, dst_base + slot as u64 * stride),
+                ));
+            }
+        }
+        moves
     }
 
     /// Remove the arena at `base` if none of its slots is held, handing its region
@@ -1053,16 +1081,52 @@ mod tests {
         assert!(set.plan_moves(0).is_empty());
     }
 
-    /// `max_moves` stops the walk, and the moves it did plan are the lowest-cost end
-    /// of the full plan.
+    /// `max_moves` stops the pass at a whole arena, never inside one — and the
+    /// first arena is taken whole even past the budget, or an arena larger than
+    /// it would never empty.
     #[test]
-    fn max_moves_clips_the_pass() {
+    fn max_moves_clips_the_pass_at_whole_arenas() {
+        let live = [0, 2, 2];
+        assert_eq!(
+            arenas_to_empty(&live, 4, 0),
+            2,
+            "unbudgeted: both upper arenas"
+        );
+        assert_eq!(
+            arenas_to_empty(&live, 4, 3),
+            1,
+            "the second would pass the budget"
+        );
+        assert_eq!(arenas_to_empty(&live, 4, 1), 1, "the first is always whole");
+
         let quarter = REGION / 4;
         let mut set = StrideArenas::new(quarter, REGION).unwrap();
         set.adopt(Fake(5));
         let _held: Vec<_> = (0..4).map(|_| set.take().unwrap()).collect();
         set.adopt(Fake(0));
-        assert_eq!(set.plan_moves(2).len(), 2);
+        assert_eq!(set.plan_moves(2).len(), 4, "one arena, whole");
+    }
+
+    /// **A pass that cannot empty an arena plans nothing.** Blackworld's shape
+    /// (2026-10-18): every arena one hole short of full. The two-cursor walk
+    /// moved the top arena's states into the holes below without ever emptying
+    /// one — 71–119 moves a pass, every ~4 s, regions unchanged. Here the top
+    /// arena's three states fit the three holes below, so it empties; with only
+    /// two holes below it, nothing moves.
+    #[test]
+    fn a_pass_that_cannot_empty_an_arena_moves_nothing() {
+        assert_eq!(
+            arenas_to_empty(&[3, 3, 3, 3], 4, 0),
+            1,
+            "three holes below hold it"
+        );
+        assert_eq!(
+            arenas_to_empty(&[3, 3, 3], 4, 0),
+            0,
+            "two holes below do not"
+        );
+        assert_eq!(arenas_to_empty(&[4, 4, 4], 4, 0), 0, "nowhere to go");
+        assert_eq!(arenas_to_empty(&[], 4, 0), 0);
     }
 
     /// An arena the pass provisioned and put nothing in is handed back; one that took
