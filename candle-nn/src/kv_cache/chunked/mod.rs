@@ -183,8 +183,8 @@ pub use size_class::{
 pub use types::{ChunkMeta, CHUNK_SIZE};
 pub use types::{DetachedChunks, LiveChunkRef, SealedChunk, SealedSequence, WriterTail};
 pub use weight_zone::{
-    defended_weight_bytes, set_defended_weight_bytes, RetractPlan, WeightZone, WeightZoneStats,
-    INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
+    defended_weight_bytes, set_defended_weight_bytes, RetractPlan, TransientPurchase, WeightZone,
+    WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
 };
 
 // Re-export for use within submodules and tests

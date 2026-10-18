@@ -2373,6 +2373,11 @@ impl Scheduler {
                         "{what} did not run; the turns keep their place and it runs again: {err}"
                     );
                 }
+                // The next attempt comes inside the compaction interval: make
+                // the room it needs now (`pack_for_refused_tier`).
+                if candle_nn::kv_cache::tier_refusal_shortfall(err).is_some() {
+                    self.pack_for_refused_tier();
+                }
             }
             Next::GiveUp { attempts } => {
                 tracing::error!(attempts, "{what} failed on every attempt: {err}");
@@ -2418,7 +2423,7 @@ impl Scheduler {
 /// Whether `e` is the device having no room for the work right now — a refused
 /// tier, a full span, the KV budget — rather than a fault: ground that comes
 /// back as turns finish and the KV side relieves.
-fn is_ground_refusal(e: &ConversationError) -> bool {
+pub(super) fn is_ground_refusal(e: &ConversationError) -> bool {
     use candle_nn::kv_cache::{KV_DEVICE_OOM_MARKER, SPAN_FULL_MARKER, TIER_REFUSED_MARKER};
     let s = e.to_string();
     [SPAN_FULL_MARKER, TIER_REFUSED_MARKER, KV_DEVICE_OOM_MARKER]

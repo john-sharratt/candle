@@ -102,8 +102,8 @@ pub use chunked::{
 /// The weight side of the reservation. Pure arithmetic, so it is available
 /// whether or not the crate was built with a GPU backend.
 pub use chunked::{
-    defended_weight_bytes, set_defended_weight_bytes, RetractPlan, WeightZone, WeightZoneStats,
-    INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
+    defended_weight_bytes, set_defended_weight_bytes, RetractPlan, TransientPurchase, WeightZone,
+    WeightZoneStats, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
