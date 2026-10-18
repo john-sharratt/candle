@@ -1,14 +1,18 @@
-# The in-process agent on the laptop: agent.yaml's jobs and checkouts, on C:
-# (this machine has no D:). See agent.yaml for what each setting means.
-jobs_dir: C:/Users/johna/agent/jobs
+# The in-process agent on the laptop: agent.yaml's jobs and checkouts, on the
+# repositories already checked out beside this one under C:/Users/johna/prog
+# (this machine has no D:). The mind is named `mind`, as this machine's
+# workspace.yaml names it, not `battle-mind` as npcd's `mind_repo:` does — one
+# folder cannot be two checkouts, each would lock it alone. See agent.yaml for
+# what each setting means.
+jobs_dir: C:/Users/johna/prog/jobs
 slots: 4
 checkouts:
   - name: candle
-    dir: C:/Users/johna/agent/candle
+    dir: C:/Users/johna/prog/candle
     push: true
   - name: battle-cities
-    dir: C:/Users/johna/agent/battle-cities
+    dir: C:/Users/johna/prog/battle-cities
     push: true
-  - name: battle-mind
-    dir: C:/Users/johna/agent/battle-mind
+  - name: mind
+    dir: C:/Users/johna/prog/mind
     push: true

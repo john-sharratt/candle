@@ -596,11 +596,21 @@ fn bump_locked(inner: &mut Inner, name: &'static str, len: usize, align: usize) 
     Some(inner.base + start as u64)
 }
 
+/// An open forward-wide span the launchers' scratch is carved from.
+struct ForwardScratch {
+    span: Arc<Mutex<Inner>>,
+    /// The bytes of the span its plan priced for launch scratch
+    /// ([`WaveDomain::scratch_priced`]) — the most the launchers may carve.
+    budget: usize,
+    /// What they have carved so far, alignment padding included.
+    carved: usize,
+}
+
 /// The forward-wide span of each device whose forward is open — what the
 /// launchers' scratch is carved from while it is (`docs/held_ground_elimination.md`
 /// §3). Registered when the span's generation opens, removed when it closes.
-fn forward_scratch() -> &'static Mutex<HashMap<usize, Arc<Mutex<Inner>>>> {
-    static SPANS: OnceLock<Mutex<HashMap<usize, Arc<Mutex<Inner>>>>> = OnceLock::new();
+fn forward_scratch() -> &'static Mutex<HashMap<usize, ForwardScratch>> {
+    static SPANS: OnceLock<Mutex<HashMap<usize, ForwardScratch>>> = OnceLock::new();
     SPANS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -609,34 +619,53 @@ fn forward_scratch() -> &'static Mutex<HashMap<usize, Arc<Mutex<Inner>>>> {
 const SCRATCH_ALIGN: usize = 256;
 
 /// The scratch scope's carver: `bytes` from the forward-wide span open on device
-/// `ordinal`, or `None` when none is open or it cannot hold them. Only the span's
-/// own lock is taken — never the domain map, which a scope is opened under.
+/// `ordinal`, or `None` when none is open or its scratch budget cannot hold them.
+/// Only the span's own lock is taken — never the domain map, which a scope is
+/// opened under.
+///
+/// **Within the budget, never past it.** The span's cursor is shared with the
+/// forward's own buffers, so a carve the plan did not price takes their room: the
+/// first forwards after a start price no scratch (no scope has asked yet), the
+/// launchers carved anyway, and the MTP head's priced matmul output found the span
+/// spent — `wave arena exhausted`, and zend failed to load.
 fn carve_forward_scratch(ordinal: usize, bytes: usize) -> Option<u64> {
-    let span = forward_scratch()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&ordinal)
-        .cloned()?;
-    let mut inner = span.lock().unwrap_or_else(|e| e.into_inner());
+    let mut spans = forward_scratch().lock().unwrap_or_else(|e| e.into_inner());
+    let open = spans.get_mut(&ordinal)?;
+    let mut inner = open.span.lock().unwrap_or_else(|e| e.into_inner());
     if inner.live == 0 {
         return None;
     }
-    bump_locked(
+    let start = aligned_start(inner.base, inner.cursor, SCRATCH_ALIGN);
+    let consumed = (start + bytes).saturating_sub(inner.cursor);
+    if open.carved + consumed > open.budget {
+        return None;
+    }
+    let at = bump_locked(
         &mut inner,
         "forward span (launch scratch)",
         bytes,
         SCRATCH_ALIGN,
-    )
+    )?;
+    open.carved += consumed;
+    Some(at)
 }
 
-/// A forward's span on device `ordinal` has opened: its launchers carve from
-/// `span` until [`close_forward_scratch`].
-fn open_forward_scratch(ordinal: usize, span: Arc<Mutex<Inner>>) {
+/// A forward's span on device `ordinal` has opened, priced with `budget` bytes of
+/// launch scratch: its launchers carve up to that from `span` until
+/// [`close_forward_scratch`].
+fn open_forward_scratch(ordinal: usize, span: Arc<Mutex<Inner>>, budget: usize) {
     install_scope_carve(carve_forward_scratch);
     forward_scratch()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(ordinal, span);
+        .insert(
+            ordinal,
+            ForwardScratch {
+                span,
+                budget,
+                carved: 0,
+            },
+        );
     open_scratch_scope(ordinal);
 }
 
@@ -896,6 +925,11 @@ struct WaveDomain {
     /// path that opens a wave without going through the batched forward — tests,
     /// the migration helpers — and those get [`fallback_plan`].
     planned: Option<[usize; 3]>,
+    /// The bytes of `planned`'s forward-wide span that are the launchers'
+    /// scratch reserve (`candle::cuda_backend::scratch_reserve`) — what a
+    /// forward's scratch scope may carve. Zero with no plan: [`fallback_plan`]
+    /// prices no scratch.
+    scratch_priced: usize,
     /// The width the caller running **between forwards** — a draft walk —
     /// priced for itself through [`cover_wave_transient`], while it holds the
     /// [`Covering`] that call returned.
@@ -908,6 +942,8 @@ struct WaveDomain {
     /// a 912 MiB tier 19 regions short. The window leaves this as the plan
     /// instead, so the walk re-places only its own width.
     covering: Option<[usize; 3]>,
+    /// `covering`'s launch-scratch reserve, as `scratch_priced` is `planned`'s.
+    covering_scratch: usize,
     /// Where the tier currently sits, while it exists.
     placed_at: Option<u64>,
     /// **How much ground that placement bought**, which is the only figure the
@@ -1276,7 +1312,9 @@ fn domain_entry<'a>(
             ],
             live_generations: 0,
             planned: None,
+            scratch_priced: 0,
             covering: None,
+            covering_scratch: 0,
             placed_at: None,
             placed_bytes: None,
             reserved_by_forward: false,
@@ -1448,6 +1486,7 @@ pub fn enter_arena_window(stream: &Arc<CudaStream>, tenant: &'static str) -> Res
         if had_tier {
             domain.reserved_by_forward = false;
             domain.planned = domain.covering;
+            domain.scratch_priced = domain.covering_scratch;
         }
         // Counted before the lock drops, so a forward cannot begin placing a
         // tier in the gap between here and the release below.
@@ -1632,10 +1671,13 @@ pub fn end_wave_transient(stream: &Arc<CudaStream>) {
 /// [`enter_arena_window`] below, taken before the frontier is read and held
 /// until the tier is recorded.
 pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<()> {
-    // Normalised once, here, so the recorded plan, the tier purchase below, and
-    // the span layout in `begin_wave` all see the same rounded figures — a raw
-    // sum against a rounded layout would place a tier the last span overruns.
-    let per_phase = align_phase_plan(with_launch_scratch(stream, per_phase));
+    let (per_phase, scratch) = with_launch_scratch(stream, per_phase);
+    place_plan(stream, per_phase, scratch)
+}
+
+/// [`plan_wave_transient`] for a plan that already carries `scratch` bytes of
+/// launch-scratch reserve in its forward-wide span.
+fn place_plan(stream: &Arc<CudaStream>, per_phase: [usize; 3], scratch: usize) -> Result<()> {
     let stream = stream.clone();
     // The previous forward's ground goes back before this one's frontier is
     // measured, so the reservation is taken against a partition that already
@@ -1647,6 +1689,7 @@ pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> R
         let mut map = await_arena_windows(lock_domains(), &stream);
         let (_, domain) = domain_entry(&mut map, &stream);
         domain.planned = Some(per_phase);
+        domain.scratch_priced = scratch;
         if domain.live_generations > 0 {
             false
         } else {
@@ -1675,17 +1718,19 @@ pub fn plan_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> R
 }
 
 /// `per_phase` with the forward-wide span widened by the launchers' scratch
-/// reserve on `stream`'s device: what recent forwards' launchers asked for
-/// (`candle::cuda_backend::scratch_reserve`). A plan prices the forward's own
-/// buffers; the launchers size theirs inside the launch, so the span carries
-/// what they have been seen to need.
-fn with_launch_scratch(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> [usize; 3] {
+/// reserve on `stream`'s device — what recent forwards' launchers asked for
+/// (`candle::cuda_backend::scratch_reserve`) — and normalised; with the reserve.
+/// A plan prices the forward's own buffers; the launchers size theirs inside the
+/// launch, so the span carries what they have been seen to need, and they carve
+/// no more than that ([`carve_forward_scratch`]).
+///
+/// Normalised once, here, so the recorded plan, the tier purchase, and the span
+/// layout in `begin_wave` all see the same rounded figures — a raw sum against a
+/// rounded layout would place a tier the last span overruns.
+fn with_launch_scratch(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> ([usize; 3], usize) {
+    let scratch = scratch_reserve(stream.context().ordinal());
     let [attn, ffn, forward] = per_phase;
-    [
-        attn,
-        ffn,
-        forward + scratch_reserve(stream.context().ordinal()),
-    ]
+    (align_phase_plan([attn, ffn, forward + scratch]), scratch)
 }
 
 /// The plan that covers both `standing` and `wanted`, phase by phase.
@@ -1736,11 +1781,12 @@ fn covering_plan(standing: [usize; 3], wanted: [usize; 3]) -> [usize; 3] {
 /// the plan ([`WaveDomain::covering`]); dropped, the width goes with it, so no
 /// guard after the walk lays its spans out at a walk's width.
 pub fn cover_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> Result<Covering> {
-    let wanted = align_phase_plan(with_launch_scratch(stream, per_phase));
+    let (wanted, scratch) = with_launch_scratch(stream, per_phase);
     let (ordinal, target) = {
         let mut map = lock_domains();
         let (ordinal, domain) = domain_entry(&mut map, stream);
         domain.covering = Some(wanted);
+        domain.covering_scratch = scratch;
         let target = cover_target(
             domain.planned,
             domain.placed_at.and(domain.placed_bytes),
@@ -1751,12 +1797,21 @@ pub fn cover_wave_transient(stream: &Arc<CudaStream>, per_phase: [usize; 3]) -> 
         if let Cover::Relay(plan) = target {
             domain.planned = Some(plan);
         }
+        // **A kept or re-laid span carves the lesser of the two reserves.** Its
+        // forward-wide span holds both the standing plan's buffers and their
+        // reserve and the walk's and theirs, but not either one's buffers beside
+        // the other's reserve: a walk whose own buffers are wider than the
+        // standing forward's, carving that forward's larger reserve, would reach
+        // past what the span holds.
+        if !matches!(target, Cover::Place(_)) {
+            domain.scratch_priced = domain.scratch_priced.min(scratch);
+        }
         (ordinal, target)
     };
     // Built first, so a refused placement clears the width on the way out.
     let covering = Covering { ordinal };
     match target {
-        Cover::Place(plan) => plan_wave_transient(stream, plan)?,
+        Cover::Place(plan) => place_plan(stream, plan, scratch)?,
         Cover::Keep | Cover::Relay(_) => {}
     }
     Ok(covering)
@@ -2038,7 +2093,12 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
             // The forward-wide span opening is the forward's scratch scope
             // opening: its launchers carve from this span until it closes.
             if arena_idx == FORWARD_ARENA {
-                open_forward_scratch(ordinal as usize, Arc::clone(&arena.inner));
+                let budget = if domain.planned.is_some() {
+                    domain.scratch_priced
+                } else {
+                    0
+                };
+                open_forward_scratch(ordinal as usize, Arc::clone(&arena.inner), budget);
             }
             Ok(Some(generation))
         })?;
@@ -2617,6 +2677,7 @@ mod wave_tests {
         wave_domain_stats, LayerPhase,
     };
     use candle::{Device, Result};
+    use std::sync::Arc;
 
     /// The wave domain is process-global and `cargo test` runs tests in
     /// parallel, so these take turns. It is the *crate-wide* lock rather than a
@@ -2846,6 +2907,50 @@ mod wave_tests {
             "after the walk the guard placed {placed} B: the walk's width outlived it"
         );
         drop(guard);
+        Ok(())
+    }
+
+    /// **A forward's launchers carve only the scratch its plan priced**, and the
+    /// rest of the span stays the forward's own. With no budget the carve is
+    /// refused outright — the first forwards after a start price none, and
+    /// carving then took the MTP head's priced output and failed zend's load.
+    ///
+    /// On an ordinal no device has, outside any wave domain, so no forward of a
+    /// test running beside this one can carve from the span.
+    #[test]
+    fn launch_scratch_stops_at_what_the_plan_priced() -> Result<()> {
+        const NO_DEVICE: usize = 15;
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let arena = super::BumpArena::detached(&s, "test forward span");
+        arena.rebase(0x1_0000_0000, 64 << 10)?;
+        let generation = arena.generation(super::NOT_A_WAVE, super::FORWARD_ARENA)?;
+
+        super::open_forward_scratch(NO_DEVICE, Arc::clone(&arena.inner), 0);
+        assert!(
+            super::carve_forward_scratch(NO_DEVICE, 256).is_none(),
+            "a span priced no scratch carves none"
+        );
+
+        super::open_forward_scratch(NO_DEVICE, Arc::clone(&arena.inner), 4096);
+        assert!(super::carve_forward_scratch(NO_DEVICE, 3000).is_some());
+        // 3,000 carved; the next starts at 3,072, so 1,100 more is 4,172.
+        assert!(
+            super::carve_forward_scratch(NO_DEVICE, 1100).is_none(),
+            "past the budget, though the span has room"
+        );
+        assert!(super::carve_forward_scratch(NO_DEVICE, 1000).is_some());
+        super::close_forward_scratch(NO_DEVICE);
+        assert!(
+            super::carve_forward_scratch(NO_DEVICE, 256).is_none(),
+            "a closed scope carves nothing"
+        );
+
+        // The span past the budget is still the forward's.
+        let rest = generation.alloc(56 << 10, 256);
+        assert!(rest.is_ok(), "the forward's own buffer still fits");
+        drop(rest);
+        drop(generation);
         Ok(())
     }
 
