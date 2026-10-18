@@ -14,10 +14,13 @@
 //! `--patterns` runs named, fixed mixes ([`pattern`]) in place of the ladder,
 //! each part's row printed and then the pattern's as a whole. `--gateway` may
 //! name one member's own listener as well as the gateway, so the same pattern
-//! measures a member alone and the cluster.
+//! measures a member alone and the cluster. `ingest-alone` follows an ingest
+//! the operator started to its end ([`ingest`]); `ingest` does the same with
+//! 12 decode clients starting 60 s after its backlog appears.
 
 mod cleanup;
 mod client;
+mod ingest;
 mod ladder;
 mod pattern;
 mod report;
@@ -33,6 +36,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 
 use client::Target;
+use ingest::{watch, Watched};
 use ladder::rung;
 use pattern::{pattern, run_pattern};
 use report::Row;
@@ -103,9 +107,53 @@ async fn main() -> Result<()> {
     if !args.patterns.is_empty() {
         let mut patterns = Vec::new();
         for name in &args.patterns {
+            if matches!(name.as_str(), "ingest" | "ingest-alone") {
+                continue;
+            }
             match pattern(name) {
                 Some(p) => patterns.push(p),
-                None => bail!("no pattern `{name}`: heavy-decode, heavy-read, blend or shift"),
+                None => bail!(
+                    "no pattern `{name}`: heavy-decode, heavy-read, blend, shift, ingest or \
+                     ingest-alone"
+                ),
+            }
+        }
+        for name in args
+            .patterns
+            .iter()
+            .filter(|n| matches!(n.as_str(), "ingest" | "ingest-alone"))
+        {
+            let beside = (name == "ingest").then(|| ladder::Scenario {
+                name: "ingest-decode".into(),
+                task: Task::Decode,
+                clients: INGEST_DECODE_CLIENTS,
+                turns: 2,
+                max_tokens: Task::Decode.max_tokens(),
+            });
+            let ran = run_ingest(
+                Arc::clone(&target),
+                &base,
+                beside,
+                &format!("zl{stamp}"),
+                limit,
+            )
+            .await;
+            println!("{}", describe_ingest(name, &ran.watched));
+            if let Some((scenario, run_name, decode)) = &ran.decode {
+                if args.samples {
+                    for s in &decode.samples {
+                        println!("  {s}");
+                    }
+                }
+                let row = Row::of(&scenario.name, &decode.samples, decode.wall);
+                println!("{row}");
+                rows.push(row);
+                if !args.keep {
+                    let mark = format!("{} ", run_mark(run_name));
+                    let (gone, kept) =
+                        cleanup::delete_run(&target, &base, &decode.conversations, &mark).await;
+                    println!("  cleanup: {gone} conversations deleted, {kept} refused");
+                }
             }
         }
         for p in &patterns {
@@ -169,4 +217,78 @@ async fn main() -> Result<()> {
         println!("{row}");
     }
     Ok(())
+}
+
+/// Decode clients started beside an ingest.
+const INGEST_DECODE_CLIENTS: usize = 12;
+
+/// How long after the backlog appears they start.
+const INGEST_DECODE_AFTER: Duration = Duration::from_secs(60);
+
+/// How long a watch waits for the ingest's backlog to appear.
+const INGEST_APPEAR_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// The longest a watched ingest may run.
+const INGEST_LIMIT: Duration = Duration::from_secs(4 * 60 * 60);
+
+struct IngestRan {
+    watched: Watched,
+    decode: Option<(ladder::Scenario, String, run::Ran)>,
+}
+
+/// Watch an ingest at `base`, and with `beside`, run those decode clients
+/// starting [`INGEST_DECODE_AFTER`] after its backlog appears.
+async fn run_ingest(
+    target: Arc<Target>,
+    base: &str,
+    beside: Option<ladder::Scenario>,
+    stamp: &str,
+    limit: Duration,
+) -> IngestRan {
+    let (appeared, wait) = tokio::sync::oneshot::channel::<()>();
+    let decode = beside.map(|scenario| {
+        let target = Arc::clone(&target);
+        let run_name = format!("{stamp}-{}", scenario.name);
+        tokio::spawn(async move {
+            if wait.await.is_err() {
+                return None;
+            }
+            tokio::time::sleep(INGEST_DECODE_AFTER).await;
+            let ran = run::run(target, &scenario, &run_name, limit).await;
+            Some((scenario, run_name, ran))
+        })
+    });
+    let mut appeared = Some(appeared);
+    let watched = watch(&target, base, INGEST_APPEAR_WAIT, INGEST_LIMIT, || {
+        if let Some(tx) = appeared.take() {
+            let _ = tx.send(());
+        }
+    })
+    .await;
+    drop(appeared);
+    let decode = match decode {
+        Some(h) => h.await.ok().flatten(),
+        None => None,
+    };
+    IngestRan { watched, decode }
+}
+
+fn describe_ingest(name: &str, w: &Watched) -> String {
+    match (w.wall, w.units_per_minute()) {
+        (Some(wall), Some(rate)) => format!(
+            "{name:<14} ingest of {} units in {:.0}s ({rate:.1} units/min), backlog appeared after {:.0}s",
+            w.units,
+            wall.as_secs_f64(),
+            w.appeared_after.map_or(0.0, |d| d.as_secs_f64())
+        ),
+        _ if w.appeared_after.is_none() => format!(
+            "{name:<14} no ingest backlog appeared within {} min",
+            INGEST_APPEAR_WAIT.as_secs() / 60
+        ),
+        _ => format!(
+            "{name:<14} ingest of {}+ units still running after {} h",
+            w.units,
+            INGEST_LIMIT.as_secs() / 3600
+        ),
+    }
 }
