@@ -94,12 +94,9 @@ use super::growth_policy::{kv_grow_step, FreeRegionTarget, GrowthPolicy, Occupan
 use super::held_ground::{HeldStats, SpanHeldGround, BOOTSTRAP_HELD_BYTES};
 use super::held_ledger::HeldSite;
 use super::reservation::Reservation;
-use super::span_geometry::{blocked, ceiling_regions, claimable, defended_ceiling, tier_fits};
+use super::span_geometry::{blocked, ceiling_regions, claimable, tier_fits};
 use super::types::TARGET_ARENA_BYTES;
-use super::weight_zone::{
-    defended_weight_bytes, transient_purchase_open, TransientPurchase, INITIAL_KV_RESERVE,
-    MIN_ELASTIC_RESERVE,
-};
+use super::weight_zone::{TransientPurchase, INITIAL_KV_RESERVE, MIN_ELASTIC_RESERVE};
 
 /// One region of the KV side. Every size class carves its arenas at this size.
 pub const REGION_BYTES: usize = TARGET_ARENA_BYTES;
@@ -1229,27 +1226,13 @@ impl RegionPool {
     /// the ground it needs when it needs it, which is both exact and current
     /// where a withheld reserve was a one-sample guess at a quantity that varies
     /// eightfold between consecutive waves.
-    ///
-    /// **Less the band the weight zone is owed** ([`defended_ceiling`]), except
-    /// to a claim made under a [`TransientPurchase`]: what a transient conceded
-    /// past the defence goes back to the weight side, not to the next arena.
     fn region_ceiling(&self) -> usize {
-        let ceiling = ceiling_regions(
+        ceiling_regions(
             self.transient_base,
             self.weight_floor,
             self.region_base,
             self.total,
-        );
-        if transient_purchase_open() {
-            return ceiling;
-        }
-        let zone_bytes =
-            (self.span_base + self.span_bytes as u64).saturating_sub(self.weight_floor);
-        ceiling.min(defended_ceiling(
-            self.total,
-            zone_bytes as usize,
-            defended_weight_bytes(),
-        ))
+        )
     }
 
     fn region_base(&self, index: usize) -> u64 {
