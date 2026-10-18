@@ -3613,6 +3613,9 @@ pub(crate) struct Scheduler {
     /// persistence layer reports it durable and the slot's store is parked
     /// (`recurrent_park`).
     sealed_snapshots: HashMap<SequenceId, (TimelineId, u32)>,
+    /// The `(timeline, turn)` each parked slot's state was dropped at, which
+    /// its own record holds (`recurrent_park`).
+    parked_at: HashMap<SequenceId, (TimelineId, u32)>,
 
     /// Continuous-fair-wave prefill cohort (`docs/continuous_fair_waves.md`): the
     /// in-flight prefill batch's inter-layer residual, held between steps in its
@@ -3974,6 +3977,7 @@ impl Scheduler {
             stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
             sealed_snapshots: HashMap::new(),
+            parked_at: HashMap::new(),
             wave_prefill_residual: None,
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
@@ -6886,6 +6890,7 @@ impl Scheduler {
     /// frees-and-rebinds its own view state inline and does not route here.
     fn purge_freed_slot_scheduling_state(&mut self, id: SequenceId) {
         self.sealed_snapshots.remove(&id);
+        self.parked_at.remove(&id);
         self.prefill_queue.retain(|w| w.sequence_id != id);
         // A section still waiting for admission would otherwise be prepared on
         // whatever reuses this slot's id. Answered, so its caller is not left
@@ -8279,6 +8284,10 @@ impl Scheduler {
         if let Some(slot_state) = self.slot_projection_state.get_mut(&seal_slot) {
             slot_state.placed_pieces.clear();
         }
+        // An unresumed timeline keeps no snapshot, so no durable
+        // signal will ever park its slot — and its state is never read again.
+        // It goes now (`recurrent_park`).
+        self.park_never_resumed(seal_slot);
 
         let _ = state.event_tx.send(TurnEvent::Done(TurnResponse {
             text,
