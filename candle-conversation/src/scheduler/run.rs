@@ -462,11 +462,21 @@ impl Scheduler {
         {
             return;
         }
+        self.wave_step_creep_layer_rows = 0;
+        let t_step = Instant::now();
         match self.decode_forward_cobatched(&[], &[], &[], &[]) {
             Ok(_) => {
                 if let Some(failures) = self.wave_retry.succeeded() {
                     tracing::info!(failures, "decode-less wave step ran after failing");
                 }
+                // What a layer-row of creep costs with nothing beside it, so
+                // the next decode-less step fits `DECODE_LESS_SLICE`.
+                self.creep_layer_row_cost = next_layer_row_cost(
+                    self.creep_layer_row_cost,
+                    t_step.elapsed(),
+                    Duration::ZERO,
+                    self.wave_step_creep_layer_rows,
+                );
             }
             // A refused tier is answered where it was refused — the next wave is
             // composed narrower, or a wave already at the least chunk fails its

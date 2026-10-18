@@ -55,6 +55,10 @@ struct Shared {
     epoch: Line<AtomicU64>,
     /// Workers still running the current job.
     running: Line<AtomicUsize>,
+    /// A shared run's claims ([`Pool::run_shared`]): the run's tag in the high
+    /// word, [`CLOSED`] once the caller stops taking claimants, and the workers
+    /// that claimed it and have not yet left in the rest.
+    claims: Line<AtomicU64>,
     stop: AtomicBool,
     /// Written only by `run_on` before it bumps `epoch`; read by workers after
     /// they observe the bump.
@@ -165,6 +169,7 @@ impl Pool {
         let shared = Arc::new(Shared {
             epoch: Line(AtomicU64::new(0)),
             running: Line(AtomicUsize::new(0)),
+            claims: Line(AtomicU64::new(0)),
             stop: AtomicBool::new(false),
             job: UnsafeCell::new(None),
             parked: Mutex::new(Vec::new()),
@@ -239,6 +244,7 @@ impl Pool {
             *s.job.get() = Some(transmute::<*const (dyn Fn(usize) + Sync + '_), Job>(job));
         }
         s.running.0.store(workers, Ordering::Relaxed);
+        trace::start(workers + 1);
         bump(&s.epoch.0, workers);
         if workers > 0 {
             s.parked
@@ -252,7 +258,9 @@ impl Pool {
                     !taken
                 });
         }
+        trace::joined(0);
         let caller = catch_unwind(AssertUnwindSafe(|| job(0)));
+        trace::left(0);
         let mut backoff = Backoff::new(s.waits.caller_hot);
         loop {
             let running = s.running.0.load(Ordering::Acquire);
@@ -277,6 +285,116 @@ impl Pool {
             resume_unwind(payload);
         }
     }
+
+    /// Runs `job` on the caller and on whichever of the first `participants`
+    /// workers arrive while it runs, and returns once the caller's `job(0)` has
+    /// returned and every worker that joined has left — **not** once every
+    /// worker has.
+    ///
+    /// For a job whose participants share its work through atomics and take no
+    /// part of it by index, so the caller returning means the work is done: a
+    /// layer of experts (`layer::run_layer`), where a participant that arrives
+    /// after the last task finds nothing and leaves. [`Self::run_on`] waits for
+    /// every worker it hands a job to, and a worker that does not wake holds
+    /// the whole layer: on the RTX 3090 (2026-10-18) worker 3 of seven never
+    /// joined a run its six peers finished in 165 µs, and the device gave the
+    /// layer up after a second with the pool still waiting on it. Windows CPU
+    /// sets are soft affinity, and a pinned worker can be kept off its core.
+    ///
+    /// **A worker claims a shared run before it touches the job**, against the
+    /// run's tag, and the caller closes the claims once its share is done. A
+    /// worker arriving after that — or with another run's tag — sees the claim
+    /// refused and never reads the job, which is borrowed only until this
+    /// returns. Panics are raised as in [`Self::run_on`].
+    pub fn run_shared(&self, participants: usize, job: &(dyn Fn(usize) + Sync)) {
+        let _one_at_a_time = self.gate.lock().unwrap_or_else(|p| p.into_inner());
+        let s = &*self.shared;
+        let workers = participants.clamp(1, self.participants()) - 1;
+        // SAFETY: as in `run_on` — no worker holds the previous job: every
+        // claimant of the last shared run left before it returned, and a
+        // worker refused a claim never read it.
+        unsafe {
+            *s.job.get() = Some(transmute::<*const (dyn Fn(usize) + Sync + '_), Job>(job));
+        }
+        let tag = run_tag(next_count(&s.epoch.0));
+        s.claims.0.store(tag << 32, Ordering::Relaxed);
+        trace::start(workers + 1);
+        bump_shared(&s.epoch.0, workers);
+        if workers > 0 {
+            s.parked
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|(index, t)| {
+                    let taken = *index <= workers;
+                    if taken {
+                        t.unpark();
+                    }
+                    !taken
+                });
+        }
+        trace::joined(0);
+        let caller = catch_unwind(AssertUnwindSafe(|| job(0)));
+        trace::left(0);
+        // No claimant after this one: the work is the caller's to have finished.
+        s.claims.0.fetch_or(CLOSED, Ordering::AcqRel);
+        let mut backoff = Backoff::new(s.waits.caller_hot);
+        loop {
+            let c = s.claims.0.load(Ordering::Acquire);
+            if c & CLAIM_COUNT == 0 {
+                break;
+            }
+            // SAFETY: the pool's own claims word, a live aligned `u64`.
+            unsafe { backoff.wait_u64(s.claims.0.as_ptr() as *const u64, c, LOW_POWER_CYCLES) };
+        }
+        let worker = s.panic.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Err(payload) = caller {
+            resume_unwind(payload);
+        }
+        if let Some(payload) = worker {
+            resume_unwind(payload);
+        }
+    }
+}
+
+/// A shared run's claims word: set once the caller takes no more claimants.
+const CLOSED: u64 = 1 << 31;
+/// The claims word's count of workers in the run.
+const CLAIM_COUNT: u64 = CLOSED - 1;
+
+/// The tag a run published at epoch count `count` carries in its claims word.
+fn run_tag(count: u64) -> u64 {
+    count & 0xffff_ffff
+}
+
+/// The count the next [`bump`] of `epoch` publishes.
+fn next_count(epoch: &AtomicU64) -> u64 {
+    (epoch.load(Ordering::Relaxed) >> ACTIVE_BITS) + 1
+}
+
+/// Join the shared run published at `epoch`: `true` once claimed, and the
+/// worker must leave it with [`leave_shared`]; `false` when the caller has
+/// closed it or another run has replaced it — the job is not this worker's to
+/// read.
+fn claim_shared(s: &Shared, epoch: u64) -> bool {
+    let tag = run_tag(epoch >> ACTIVE_BITS);
+    let mut c = s.claims.0.load(Ordering::Acquire);
+    loop {
+        if c >> 32 != tag || c & CLOSED != 0 {
+            return false;
+        }
+        match s
+            .claims
+            .0
+            .compare_exchange_weak(c, c + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return true,
+            Err(now) => c = now,
+        }
+    }
+}
+
+fn leave_shared(s: &Shared) {
+    s.claims.0.fetch_sub(1, Ordering::Release);
 }
 
 impl Drop for Pool {
@@ -302,19 +420,36 @@ fn worker(s: &Shared, index: usize) {
         if s.stop.load(Ordering::Acquire) {
             return;
         }
+        #[cfg(test)]
+        tests::hold_here(s, index);
+        // A shared run is joined, not owed: one already closed, or replaced by
+        // the next, is not this worker's to read, and the caller is not
+        // waiting for it.
+        let shared = seen & SHARED_RUN != 0;
+        if shared && !claim_shared(s, seen) {
+            continue;
+        }
         // SAFETY: published before the epoch bump this thread acquired; valid
-        // until `running` reaches 0, which this thread's decrement below gates.
+        // until `running` reaches 0, which this thread's decrement below gates
+        // — or, for a shared run, until the claims count it joined falls to 0,
+        // which its `leave_shared` below gates.
         let job = unsafe { (*s.job.get()).expect("epoch moved without a job") };
         // SAFETY: as above. A panic is kept for the caller and the count still
         // falls, so `run_on` neither waits for this worker forever nor returns
         // while the job is in use.
+        trace::joined(index);
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| unsafe { (*job)(index) })) {
             s.panic
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .get_or_insert(payload);
         }
-        s.running.0.fetch_sub(1, Ordering::Release);
+        trace::left(index);
+        if shared {
+            leave_shared(s);
+        } else {
+            s.running.0.fetch_sub(1, Ordering::Release);
+        }
     }
 }
 
@@ -367,22 +502,119 @@ fn wait_for_epoch(s: &Shared, mut seen: u64, index: usize) -> u64 {
     }
 }
 
-/// Bits of the epoch word holding the workers its job takes; the count above
-/// them. One word, so a worker reads a job's epoch and its reach together.
+/// **Where the run in flight is, per participant** — process-wide, as the
+/// service's own state is (`service::state_line`), for a device that gave up
+/// waiting on the pool to name. A layer the pool normally serves in under two
+/// milliseconds once stood in its compute for over a second, while the device
+/// rang twenty layers behind it, and nothing said whether a worker never
+/// woke for the job or woke and ran slowly. Each participant stamps when it
+/// joined the run and when it left; the line reads them against the run's
+/// start. Relaxed stores, a handful per layer.
+mod trace {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    /// Participants traced; a pool wider than this traces its first ones.
+    pub(super) const SLOTS: usize = 64;
+
+    static START_NS: AtomicU64 = AtomicU64::new(0);
+    static PARTICIPANTS: AtomicUsize = AtomicUsize::new(0);
+    static JOINED_NS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static LEFT_NS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+
+    /// Nanoseconds since the first trace, never zero once read.
+    fn now_ns() -> u64 {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64 + 1
+    }
+
+    pub(super) fn start(participants: usize) {
+        PARTICIPANTS.store(participants, Ordering::Relaxed);
+        START_NS.store(now_ns(), Ordering::Release);
+    }
+
+    pub(super) fn joined(index: usize) {
+        if let Some(j) = JOINED_NS.get(index) {
+            j.store(now_ns(), Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn left(index: usize) {
+        if let Some(l) = LEFT_NS.get(index) {
+            l.store(now_ns(), Ordering::Relaxed);
+        }
+    }
+
+    /// The run in flight, or the last one: its age, and each participant as
+    /// `index:+joined/+left` µs from its start — `-` for a stamp older than
+    /// the run, which is a participant not yet there or not yet done.
+    pub(crate) fn line() -> String {
+        let start = START_NS.load(Ordering::Acquire);
+        if start == 0 {
+            return "no pool run yet".to_string();
+        }
+        let n = PARTICIPANTS.load(Ordering::Relaxed).min(SLOTS);
+        let at = |t: u64| {
+            if t >= start {
+                format!("+{}", (t - start) / 1_000)
+            } else {
+                "-".to_string()
+            }
+        };
+        let parts: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    "{i}:{}/{}",
+                    at(JOINED_NS[i].load(Ordering::Relaxed)),
+                    at(LEFT_NS[i].load(Ordering::Relaxed))
+                )
+            })
+            .collect();
+        format!(
+            "pool run started {} µs ago, participants joined/left µs [{}]",
+            (now_ns().saturating_sub(start)) / 1_000,
+            parts.join(" ")
+        )
+    }
+}
+
+/// The pool's run in flight, per participant — see `trace`.
+pub(crate) fn trace_line() -> String {
+    trace::line()
+}
+
+/// Bits of the epoch word holding the workers its job takes and its mode; the
+/// count above them. One word, so a worker reads a job's epoch, its reach and
+/// whether it is a shared run together — read apart, a worker could pair one
+/// run's epoch with the next run's mode.
 const ACTIVE_BITS: u32 = 16;
+/// Set in the epoch word of a shared run ([`Pool::run_shared`]).
+const SHARED_RUN: u64 = 1 << (ACTIVE_BITS - 1);
+/// The epoch word's workers field.
+const WORKERS: u64 = SHARED_RUN - 1;
 
 /// Publish the next job, taking workers `1..=workers` (the stop takes all).
 fn bump(epoch: &AtomicU64, workers: usize) {
-    let count = (epoch.load(Ordering::Relaxed) >> ACTIVE_BITS) + 1;
-    let workers = (workers as u64).min((1 << ACTIVE_BITS) - 1);
+    publish(epoch, workers, 0);
+}
+
+/// Publish the next job as a shared run, taking workers `1..=workers`.
+fn bump_shared(epoch: &AtomicU64, workers: usize) {
+    publish(epoch, workers, SHARED_RUN);
+}
+
+fn publish(epoch: &AtomicU64, workers: usize, mode: u64) {
+    let count = next_count(epoch);
+    let workers = (workers as u64).min(WORKERS);
     // Only the gate's holder (or the drop) bumps, so load-then-store races
     // with no other writer.
-    epoch.store((count << ACTIVE_BITS) | workers, Ordering::Release);
+    epoch.store((count << ACTIVE_BITS) | mode | workers, Ordering::Release);
 }
 
 /// Whether the job an epoch word publishes takes worker `index`.
 fn takes(epoch: u64, index: usize) -> bool {
-    index as u64 <= epoch & ((1 << ACTIVE_BITS) - 1)
+    index as u64 <= epoch & WORKERS
 }
 
 #[cfg(test)]
@@ -390,6 +622,107 @@ mod tests {
     use super::*;
     use crate::models::expert_lre::cpu_pool::topology::{performance_cores, physical_cores};
     use std::sync::atomic::AtomicU32;
+
+    /// The worker a test keeps off its next job (0: none), standing in for one
+    /// the OS has kept off its core — of the pool whose shared state is at
+    /// [`HOLD_POOL`], so no other test's pool is held.
+    static HOLD: AtomicUsize = AtomicUsize::new(0);
+    static HOLD_POOL: AtomicUsize = AtomicUsize::new(0);
+
+    /// Where a worker waits while [`HOLD`] names it: after it saw the epoch,
+    /// before it claims or touches the job — the late worker's window.
+    pub(super) fn hold_here(s: &Shared, index: usize) {
+        let me = s as *const Shared as usize;
+        while HOLD_POOL.load(Ordering::Acquire) == me && HOLD.load(Ordering::Acquire) == index {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn hold(pool: &Pool, index: usize) {
+        HOLD.store(index, Ordering::Release);
+        HOLD_POOL.store(&*pool.shared as *const Shared as usize, Ordering::Release);
+    }
+
+    fn release() {
+        HOLD_POOL.store(0, Ordering::Release);
+        HOLD.store(0, Ordering::Release);
+    }
+
+    /// **A worker that does not arrive does not hold a shared run.** The other
+    /// participants take the work, the run returns, and the late worker, once
+    /// it does arrive, finds the run closed and never touches the job — it is
+    /// borrowed only until the run returns. The next run takes it as ever.
+    #[test]
+    fn a_late_worker_neither_holds_nor_touches_a_shared_run() {
+        let pool = small_pool();
+        let workers = pool.participants() - 1;
+        let late = 2;
+        let first = AtomicU32::new(0);
+        let late_ran_first = AtomicBool::new(false);
+        hold(&pool, late);
+        let t0 = Instant::now();
+        pool.run_shared(pool.participants(), &|i| {
+            first.fetch_add(1, Ordering::Relaxed);
+            if i == late {
+                late_ran_first.store(true, Ordering::Relaxed);
+            }
+            thread::sleep(Duration::from_millis(20));
+        });
+        let took = t0.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "the run waited {took:?} for a worker that never arrived"
+        );
+        // The caller always runs it; the punctual workers join if they make it
+        // before the caller leaves — not guaranteed beside other tests' pools.
+        let ran = first.load(Ordering::Relaxed);
+        assert!(
+            (1..=workers as u32).contains(&ran),
+            "{ran} ran: the caller, and at most the punctual workers"
+        );
+        // The late worker arrives after the run has closed.
+        release();
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !late_ran_first.load(Ordering::Relaxed),
+            "it touched a closed run's job"
+        );
+        // The late worker takes part in runs again: an owed run waits for it.
+        let second = AtomicU32::new(0);
+        pool.run_on(pool.participants(), &|_| {
+            second.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(
+            second.load(Ordering::Relaxed),
+            pool.participants() as u32,
+            "the next run took every participant again"
+        );
+    }
+
+    /// Shared and owed runs alternate on one pool: a worker reads a run's mode
+    /// from the epoch it saw, so neither kind is taken for the other.
+    #[test]
+    fn shared_and_owed_runs_alternate() {
+        let pool = small_pool();
+        for round in 0..200 {
+            let n = AtomicU32::new(0);
+            if round % 2 == 0 {
+                pool.run_shared(pool.participants(), &|_| {
+                    n.fetch_add(1, Ordering::Relaxed);
+                });
+                assert!(n.load(Ordering::Relaxed) >= 1, "round {round}");
+            } else {
+                pool.run_on(pool.participants(), &|_| {
+                    n.fetch_add(1, Ordering::Relaxed);
+                });
+                assert_eq!(
+                    n.load(Ordering::Relaxed),
+                    pool.participants() as u32,
+                    "round {round}: an owed run is run by every participant"
+                );
+            }
+        }
+    }
 
     fn small_pool() -> Pool {
         let cores = performance_cores(&physical_cores().unwrap());

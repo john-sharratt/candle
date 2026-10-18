@@ -726,6 +726,17 @@ impl Scheduler {
         // the accept walk below commits exactly one token each — so there is no
         // second, plain decode path to drift out of step with this one.
         let t_fwd = std::time::Instant::now();
+        // The KV the decodes have committed, sampled before this step writes:
+        // what a creep cohort formed now will lose to them over its sweep
+        // (`sweep_forecast`). Before, not after — the forward writes every block
+        // whole and the rollback below takes the rejected rows off, so offsets
+        // read after it would count drafts that never reach the KV.
+        let offsets: Vec<(usize, usize)> = self
+            .active_decodes
+            .keys()
+            .filter_map(|&id| self.session.sequence_offset(id.0).map(|at| (id.0, at)))
+            .collect();
+        self.sweep_forecast.sample_decodes(t_fwd, offsets);
         // Who drafts, and where each block stops — see `BlockGuard`. Free decode
         // drafts, and so does a grammar inside a free-text span (a think block,
         // a tool-call value): nothing is masked there, so the proposals are

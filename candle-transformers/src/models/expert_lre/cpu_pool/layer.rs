@@ -314,7 +314,7 @@ pub fn run_layer_on(pool: &Pool, isa: Isa, work: &LayerWork, participants: usize
             resume_unwind(payload);
         }
     };
-    pool.run_on(participants, &job);
+    pool.run_shared(participants, &job);
     record_run(Run {
         rows: n_out,
         participants,

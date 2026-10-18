@@ -2209,9 +2209,18 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     /// model picks the width within it; on a small card it sits near the tier
     /// the partition always has room for.
     fn prefill_width_cap(&self, act_dtype: DType) -> usize {
+        self.prefill_width_cap_withholding(act_dtype, 0)
+    }
+
+    /// The width cap against the ground less `withheld`: the tier and the KV
+    /// side alike are paid from it, so both terms shrink by what others' KV will
+    /// have claimed by the sweep's last window. Never under the tier the
+    /// partition always leaves room for ([`WAVE_SPAN_BYTES`]), nor zero rows.
+    fn prefill_width_cap_withholding(&self, act_dtype: DType, withheld: usize) -> usize {
         let mut cap = MAX_PREFILL_TOKENS;
+        let kv_row = self.kv_bytes_per_row(act_dtype).unwrap_or(0);
         if let Some(ground) = self.placeable_tier_bytes() {
-            let kv_row = self.kv_bytes_per_row(act_dtype).unwrap_or(0);
+            let ground = ground.saturating_sub(withheld).max(WAVE_SPAN_BYTES);
             let fits = WavePlan::new(self.wave_geometry(act_dtype))
                 .max_prefill_rows_for_tier_and_kv(ground, WaveWidth::default(), kv_row);
             if fits > 0 {
@@ -2219,7 +2228,8 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             }
         }
         if let Some(kv_fits) = self.kv_width_cap(act_dtype) {
-            cap = cap.min(kv_fits);
+            let held_rows = withheld.checked_div(kv_row).unwrap_or(0);
+            cap = cap.min(kv_fits.saturating_sub(held_rows).max(1));
         }
         cap
     }
