@@ -1004,6 +1004,27 @@ impl Qwen4ExpBatched {
         Ok(layers)
     }
 
+    /// Device bytes pushing `blob` would newly place: zero when its piece is
+    /// already resident (the registry shares a placed page across slots), else
+    /// each attention layer's rows in whole `PAGE_BLOCKS` slots — the chunks
+    /// [`ResidentPage::place_host`] claims.
+    pub fn positional_lift_bytes(&self, blob: &[u8], key: &PieceKey) -> Result<usize> {
+        if self.pages.get(key).is_some() {
+            return Ok(0);
+        }
+        let d = self.model.cfg.indexer.head_dim;
+        let (_, sealed) = paged_index::decode_aux(blob)?;
+        let slot = candle_nn::kv_cache::slot_stride(
+            super::index_keys::PAGE_BLOCKS * d * DType::F32.size_in_bytes(),
+        );
+        Ok(sealed
+            .iter()
+            .zip(self.attention_ratios())
+            .filter(|(_, r)| *r > 0)
+            .map(|(s, _)| (s.rows.len() / d.max(1)).div_ceil(super::index_keys::PAGE_BLOCKS) * slot)
+            .sum())
+    }
+
     /// Install a sealed page per attention layer ahead of `seq`'s live tail.
     /// `key` is the page's [`PieceKey`], taken by the caller.
     #[cfg(feature = "cuda")]
@@ -2499,6 +2520,16 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     fn push_positional_state(&self, seq: usize, blob: &[u8], key: &PieceKey) -> Result<bool> {
         Qwen4ExpBatched::push_positional_state(self, seq, blob, key)?;
         Ok(true)
+    }
+
+    fn positional_lift_bytes(&self, page: &[u8], key: &PieceKey) -> Result<usize> {
+        Qwen4ExpBatched::positional_lift_bytes(self, page, key)
+    }
+
+    fn creep_residual_bytes(&self, session: &BatchedInferenceSession, rows: usize) -> usize {
+        // Two halves of the rows' hidden state — `CreepResidual::claim`.
+        WaveSweep::residual_row(self, session)
+            .map_or(0, |(width, dtype)| 2 * rows * width * dtype.size_in_bytes())
     }
     fn push_positional_gap(&self, seq: usize, tokens: usize) -> Result<()> {
         Qwen4ExpBatched::push_positional_gap(self, seq, tokens)

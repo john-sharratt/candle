@@ -5123,6 +5123,23 @@ pub trait ManagedBatchedModel {
         Ok(false)
     }
 
+    /// Device bytes [`Self::push_positional_state`] would newly place for
+    /// `page`: zero when a piece with `key` is already resident (a placed page
+    /// is shared across slots), else what placing it claims. What admission
+    /// prices a projection's index pages at, before anything is pushed.
+    fn positional_lift_bytes(&self, _page: &[u8], _key: &PieceKey) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Device bytes a creep residual for `rows` holds while its sweep runs —
+    /// what [`Self::claim_residual`] claims for them. Admission prices a
+    /// prefill's rows at this as well as at their tier, because the residual is
+    /// held from the cohort's formation to its end. Zero for a model whose
+    /// sweeps keep no residual.
+    fn creep_residual_bytes(&self, _session: &BatchedInferenceSession, _rows: usize) -> usize {
+        0
+    }
+
     /// Account for `tokens` of injected K/V that carry **no** per-position state.
     ///
     /// Advances where the next piece will be placed, and nothing else: the span
