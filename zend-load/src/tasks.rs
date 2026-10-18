@@ -4,8 +4,8 @@
 //! that it answers by reading code with its tools — the work a developer
 //! actually brings it. **Write** is zend changing code: an edit to a
 //! battle-cities crate, never candle, made in the conversation's overlay with
-//! `file_edit` and shown as a diff — told never to commit or push, so nothing
-//! reaches a branch or origin.
+//! `file_edit` and shown as a diff, then built with `cargo check` on an agent —
+//! told never to commit or push, so nothing reaches a branch or origin.
 
 use serde_json::{json, Value};
 
@@ -37,10 +37,14 @@ const WRITE_RULES: &str = "Work only in the battle-cities repository, only on th
      with file_edit. Do not commit, push, create branches, or touch any other file. \
      Finish by showing the diff of what you changed.";
 
-/// Write follow-ups, asked after the first edit.
+/// Write follow-ups, asked after the first edit. The second has the turn
+/// build what it wrote with `run_command`, which runs as a job on a cluster
+/// agent, so a write rung loads the agents with real builds as well as the
+/// members with turns.
 const WRITE_FOLLOW_UPS: [&str; 2] = [
     "Now add a unit test for that function in the same file.",
-    "Review your change and fix anything that would not compile.",
+    "Check that it builds: use run_command to run `cargo check -p sim --tests` in \
+     battle-cities, and fix anything it reports in the same file.",
 ];
 
 /// Read questions: each needs the repository read to answer, and none needs
