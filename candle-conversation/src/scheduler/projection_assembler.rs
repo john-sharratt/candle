@@ -38,6 +38,7 @@ use candle_nn::kv_cache::{SealedSequence, WriterTail};
 use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, PendingGlue, WINDOW_DIVERGENCE_MARKER,
 };
+use candle_transformers::models::expert_lre::is_expert_stall;
 use candle_transformers::models::sealed_injection::SealedInjection;
 
 use crate::conversation::slice_per_layer_sealed;
@@ -2506,6 +2507,25 @@ fn drive_prefill_and_capture(
     })
 }
 
+/// Times one gap-fill forward runs again after an expert stall
+/// ([`is_expert_stall`]) before its error fails the turns it carries. Each
+/// attempt waits on the reads the last one started, so a stall that does not
+/// clear in a few is a drive that has stopped, not one that is slow.
+const GAP_FILL_STALL_RETRIES: usize = 4;
+
+/// Each of `plans`' slots' gap scatter targets and forward bridge window, in
+/// order — what the gap-fill forward is staged with.
+fn pending_glue(plans: &[&GapFillPlan]) -> Vec<PendingGlue> {
+    plans
+        .iter()
+        .map(|p| PendingGlue {
+            write_slice: p.glue_write_slice.clone(),
+            write_in_blk: p.glue_write_in_blk.clone(),
+            fwd_ahead: p.fwd_ahead.clone(),
+        })
+        .collect()
+}
+
 /// Fire ONE batched gap-fill forward over `plans` (the cross-conversation wave),
 /// then fill each slot's gaps. Plans with no glue are skipped. The gaps were
 /// reserved IN PLACE during the walk, so this forward only scatters each glue
@@ -2529,7 +2549,6 @@ pub(super) fn fire_gap_fill_batch(
     }
     let mut ids: Vec<usize> = Vec::with_capacity(active.len());
     let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
-    let mut pending: Vec<PendingGlue> = Vec::with_capacity(active.len());
     for p in &active {
         ids.push(p.parent_id.0);
         // On the host: the forward lays the ids on its own span.
@@ -2537,11 +2556,6 @@ pub(super) fn fire_gap_fill_batch(
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
         inputs.push(input);
-        pending.push(PendingGlue {
-            write_slice: p.glue_write_slice.clone(),
-            write_in_blk: p.glue_write_in_blk.clone(),
-            fwd_ahead: p.fwd_ahead.clone(),
-        });
     }
     // Reconcile each slot's per-layer block count before this wave —
     // `BatchedInferenceSession::reconcile_block_counts`. This wave's own
@@ -2557,12 +2571,6 @@ pub(super) fn fire_gap_fill_batch(
             .reconcile_block_counts(p.parent_id.0)
             .map_err(ConversationError::Model)?;
     }
-    // Stage each slot's per-token gap scatter target + forward bridge window,
-    // aligned with `ids`. The forward routes the HD128 glue to the paged-glue
-    // kernel, which streams the quantized slot once (dequant-once), positions
-    // every column by its chunk `rope_base`, and masks each glue token by
-    // `cpos > row_pos + fwd_ahead[t]`.
-    session.set_pending_glue(pending);
     // Read the per-op pipeline profile so the delta below covers only this
     // gap-fill forward (attn_core / mlp_ffn / qkv / out_proj, summed over layers).
     //
@@ -2581,9 +2589,35 @@ pub(super) fn fire_gap_fill_batch(
         // A glue-only wave carries no logits (it only scatters K/V) and the result
         // is discarded — the forward's whole purpose is the K/V side effect.
         let n = model.num_layers();
-        model
-            .forward_wave(session, &[], &[], &[], &[], &ids, &inputs, 0, n, None)
-            .map_err(ConversationError::Model)?;
+        let mut stalls = 0;
+        loop {
+            // Stage each slot's per-token gap scatter target + forward bridge
+            // window, aligned with `ids` — again on a retry, since the forward
+            // takes them. The forward routes the HD128 glue to the paged-glue
+            // kernel, which streams the quantized slot once (dequant-once),
+            // positions every column by its chunk `rope_base`, and masks each
+            // glue token by `cpos > row_pos + fwd_ahead[t]`.
+            session.set_pending_glue(pending_glue(&active));
+            match model.forward_wave(session, &[], &[], &[], &[], &ids, &inputs, 0, n, None) {
+                Ok(_) => break,
+                // **A stall runs again, here.** The forward only scatters into
+                // gaps reserved before it — no commit, no advance — so running
+                // it again writes the same bytes to the same places, and the
+                // rolled-back one left nothing to undo. Failing it instead
+                // ended the turn of every conversation it carried over one
+                // slow pack read.
+                Err(e) if is_expert_stall(&e) && stalls < GAP_FILL_STALL_RETRIES => {
+                    stalls += 1;
+                    tracing::warn!(
+                        target: "candle_conversation::scheduler::reproject",
+                        attempt = stalls,
+                        n_slots = active.len(),
+                        "gap-fill forward stalled on an expert read; running it again: {e}"
+                    );
+                }
+                Err(e) => return Err(ConversationError::Model(e)),
+            }
+        }
     }
     // The gap-fill must ONLY scatter K/V into the pre-reserved gaps — it must not
     // advance the slot. If a trailing-append advance ever creeps back in, the
