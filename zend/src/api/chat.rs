@@ -363,7 +363,10 @@ fn stream_sse(
     let tokens = Arc::clone(&framer);
     let content_events = token_stream
         .map(move |result| match result {
-            Err(e) => vec![Err(e)],
+            // In band, as the engine's own failures are: an `Err` handed to the
+            // SSE body aborts the response, so the client saw its connection
+            // drop with no reason and no `[DONE]`.
+            Err(e) => vec![Ok(turn_error_event(&format!("{e:#}")))],
 
             Ok(StreamItem::Status(msg)) => {
                 let data = serde_json::json!({ "text": msg }).to_string();
@@ -395,10 +398,7 @@ fn stream_sse(
                 Vec::new()
             }
 
-            Ok(StreamItem::Error(message)) => {
-                let data = serde_json::json!({ "message": message }).to_string();
-                vec![Ok(Event::default().event("turn_error").data(data))]
-            }
+            Ok(StreamItem::Error(message)) => vec![Ok(turn_error_event(&message))],
         })
         .flat_map(futures::stream::iter);
 
@@ -422,6 +422,12 @@ fn stream_sse(
     Sse::new(content_events.chain(tail))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// The `turn_error` event a failed turn reports, with its message.
+fn turn_error_event(message: &str) -> Event {
+    let data = serde_json::json!({ "message": message }).to_string();
+    Event::default().event("turn_error").data(data)
 }
 
 // ── Non-streaming path ────────────────────────────────────────────────────────
@@ -459,7 +465,9 @@ async fn collect_completion(
                 usage = Some(usage.map_or(turn, |before| before.then(turn)));
                 finish = ended;
             }
-            Err(_) => {}
+            Err(e) => {
+                failed.get_or_insert(format!("{e:#}"));
+            }
         }
     }
     tracing::debug!(tokens, "non-stream complete");
@@ -576,6 +584,51 @@ mod collect_tests {
                 "partial_content": "Half an answer",
             })
         );
+    }
+
+    /// A stream that ended in an error is a failed turn too, not a `200`
+    /// carrying whatever came before it.
+    #[tokio::test]
+    async fn a_stream_error_is_a_server_error() {
+        let items: Vec<anyhow::Result<StreamItem>> = vec![
+            Ok(StreamItem::Token("Half".into())),
+            Err(anyhow::anyhow!("the turn's channel closed")),
+        ];
+        let stream: TokenStream = Box::pin(futures::stream::iter(items));
+        let res = collect_completion(stream, "zen-code".into(), "id-1".into(), 7, framing()).await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["message"], "the turn's channel closed");
+        assert_eq!(body["partial_content"], "Half");
+    }
+
+    /// **A streamed turn that errors says so in band and still ends with
+    /// `[DONE]`.** Handed to the SSE body as an `Err`, the error aborted the
+    /// response: the client saw a dropped connection, with no reason.
+    #[tokio::test]
+    async fn a_stream_error_is_a_turn_error_event() {
+        let items: Vec<anyhow::Result<StreamItem>> =
+            vec![Err(anyhow::anyhow!("the turn's channel closed"))];
+        let stream: TokenStream = Box::pin(futures::stream::iter(items));
+        let res = stream_sse(
+            stream,
+            "zen-code".into(),
+            "id-1".into(),
+            7,
+            framing(),
+            false,
+        );
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.starts_with(
+                "event: turn_error\ndata: {\"message\":\"the turn's channel closed\"}\n\n"
+            ),
+            "{body}"
+        );
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
     }
 
     /// A turn with no failure is the completion it always was.
