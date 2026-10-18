@@ -836,14 +836,16 @@ mod tests {
         assert_eq!(arena.resident_turns(), 0, "unpinned turns now evict");
     }
 
-    /// **A compaction moves pages and changes nothing a reader can see.**
+    /// **A compaction empties an arena and changes nothing a reader can see.**
     ///
-    /// Scatter first — upload several turns, then drop alternate ones, which is
-    /// the churn shape the pass exists for (variable-length runs freed out of
-    /// claim order) — then pack, and read every surviving page back. Compared
-    /// against the expected group-major transpose as **raw words**, not a
-    /// tolerance: a page is bytes, and a copy that alters one is a corrupted
-    /// signature, not an approximation.
+    /// Scatter across two arenas — fill the first, spill a few turns into the
+    /// second, then drop turns from the first — so the second's pages fit the
+    /// holes below and the pass can give its region back. A pass only moves
+    /// pages it can empty an arena with (`plan_slot_moves`); holes inside a
+    /// single arena free nothing and are left alone. Then read every surviving
+    /// page back, compared against the expected group-major transpose as **raw
+    /// words**, not a tolerance: a page is bytes, and a copy that alters one is
+    /// a corrupted signature, not an approximation.
     #[test]
     fn compaction_moves_pages_without_changing_them() {
         let device = match Device::new_cuda(0) {
@@ -852,38 +854,48 @@ mod tests {
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
-        // Runs of different lengths, so the freed holes are ragged.
         let sigs = |t: u64, n: usize| -> Vec<WideQSig> {
             (0..n).map(|k| sig((t << 40) + k as u64)).collect()
         };
-        let plan = [(0u64, 40usize), (1, 80), (2, 33), (3, 96), (4, 64)];
-        for &(t, n) in &plan {
-            arena.ensure_resident(sid(t), &sigs(t, n), t + 1).unwrap();
+        // Turns of 64 pages, enough to fill an arena and spill two into the next.
+        let per_arena = candle_nn::kv_cache::REGION_BYTES
+            / candle_nn::kv_cache::slot_stride(arena.page_bytes as usize);
+        let turn_tokens = 64 * PAGE_TOKENS;
+        let n_turns = (per_arena / 64 + 3) as u64;
+        for t in 0..n_turns {
+            arena
+                .ensure_resident(sid(t), &sigs(t, turn_tokens), t + 1)
+                .unwrap();
         }
-        // Free every other turn: holes below live pages.
-        arena.drop_turn(sid(1));
-        arena.drop_turn(sid(3));
+        let regions_before = arena_regions(&device, SlotTenant::Gallery);
+        assert!(regions_before >= 2, "the turns spill into a second arena");
+        // Holes in the first arena, more than the second holds.
+        let dropped = 0..4u64;
+        for t in dropped.clone() {
+            arena.drop_turn(sid(t));
+        }
         let live_before = arena.live_pages();
 
         let report = arena.compact(0).unwrap();
-        // **The test is worthless unless the pass actually moved something.** The
-        // holes above are below live pages by construction, so a pass that plans
-        // nothing here means the walk never saw them.
         assert!(
             report.moved > 0 && report.moved == report.planned,
-            "expected real moves, got {report:?}",
+            "expected the second arena's pages to move, got {report:?}",
         );
         assert_eq!(arena.live_pages(), live_before, "a move frees no page");
+        assert!(
+            arena_regions(&device, SlotTenant::Gallery) < regions_before,
+            "the emptied arena's region went back",
+        );
 
         // Every surviving turn still reads back exactly its own transpose.
         let res = arena.residency.lock().unwrap();
-        for &(t, n) in &plan {
-            if t == 1 || t == 3 {
+        for t in 0..n_turns {
+            if dropped.contains(&t) {
                 assert!(!res.contains_key(&sid(t)), "dropped turn is gone");
                 continue;
             }
             let pw = page_u64(24);
-            let expect = transpose_to_pages(&sigs(t, n), 24, 3, pw);
+            let expect = transpose_to_pages(&sigs(t, turn_tokens), 24, 3, pw);
             let run = &res.get(&sid(t)).expect("survivor").run;
             assert_eq!(run.slots.len() * pw, expect.len());
             for (p, slot) in run.slots.iter().enumerate() {
