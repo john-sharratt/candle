@@ -3917,6 +3917,25 @@ fn run_inference_stream(
                 );
                 break;
             }
+            // A conversation deleted while its reply runs ends the reply at the
+            // next round. A turn runs on with no one listening so a client that
+            // reconnects can follow it, but a deleted conversation has no one to
+            // come back: its K/V is dead to the compactor, which unlinks the
+            // segments holding it, and every further round would reproject turns
+            // whose chunks are gone.
+            if state
+                .engine
+                .lock()
+                .unwrap()
+                .is_timeline_tombstoned(timeline)
+            {
+                tracing::info!(
+                    conv_id = %conv_id,
+                    iteration,
+                    "conversation deleted while its reply ran — ending the turn",
+                );
+                break;
+            }
             tracing::debug!(conv_id = %conv_id, iteration, "submitting turn");
             // Collect this turn's projection events (reprojections + decode-end)
             // so they survive a browser reload (served back on hydrate).
