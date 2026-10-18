@@ -59,7 +59,7 @@ use agent::member::{node_in, Agent, APP as AGENT_APP};
 use axum::Router;
 use candle_conversation::phase_ring::latest_wave;
 use cluster::dispatch::RouteTable;
-use cluster::frame::{BuildId, MemberState, ModelId, RepoAd};
+use cluster::frame::{BuildId, ModelId, RepoAd};
 use cluster::handshake::GroupKey;
 use cluster::machine::measure;
 use cluster::member::{AppMember, ClusterView, Identity, Link};
@@ -73,7 +73,8 @@ use tokio_rustls::TlsConnector;
 use zend_vfs::sandbox::programs::policy;
 use zend_vfs::Priority;
 
-use capacity::{capacity, Wave};
+use candle::gpu_poison::device_failing;
+use capacity::{capacity, member_state, Wave};
 use in_flight::InFlight;
 
 use crate::telemetry::Telemetry;
@@ -351,11 +352,7 @@ impl Cluster {
             self.targets.iter().map(|t| t.url.clone()).collect(),
             routes,
             Box::new(move || {
-                let state = if ready.ready.load(Ordering::Relaxed) {
-                    MemberState::Ready
-                } else {
-                    MemberState::Loading
-                };
+                let state = member_state(ready.ready.load(Ordering::Relaxed), device_failing());
                 let wave = latest_wave().map(|w| Wave {
                     age_s: w.age_s,
                     backlog: w.sample.backlog,

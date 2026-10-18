@@ -2698,6 +2698,16 @@ and receiving live ones. The table's rows that exist because of a full disk do n
 to it. It leaves only by an admin's `certify-anyway` or `reject-build`, or by a forced
 rollout of its build (§3.11), never by itself.
 
+**A device that cannot take a turn reports `fault` too.** While the GPU context is
+poisoned, or every device operation has failed out of memory for 2 s
+(`candle::gpu_poison::device_failing`), `CAPACITY` says `fault` and `/v1/status` says
+`"state": "fault"`, whatever the tenants report, so the gateways route the member no new
+work. It gives up nothing else: its disk is fine, and the self-heal watchdog relaunches the
+process once the streak has run 60 s (`host/src/self_heal.rs`), which hands its claims back
+as any restart does. Until then a conversation it already holds still routes to it. Before
+this, a poisoned member reported ready for that minute and answered every chat with an
+empty stream.
+
 **What it gives up**, because each of these needs a write it can no longer make:
 
 | Role | What it does |

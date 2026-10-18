@@ -1,7 +1,8 @@
 //! `GET /v1/status` — what both consoles' loading screens read, and how they
 //! notice a restart or a new UI build.
 //!
-//! - `state` is `"ready"` once every tenant is, `"loading"` while any is.
+//! - `state` is `"ready"` once every tenant is, `"loading"` while any is, and
+//!   `"fault"` while the device cannot take a turn — whatever the tenants say.
 //! - `loading` is the load in progress — the highest-ranked tenant still
 //!   loading, which is the one loading the model when there is a model to load.
 //! - `engine_connected` is whether the model is loaded: some tenant is past its
@@ -16,6 +17,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::Json;
+use candle::gpu_poison::device_failing;
 use futures::future::join_all;
 use serde_json::{json, Map, Value};
 
@@ -48,6 +50,8 @@ pub struct Head<'a> {
     pub started_at_ms: u64,
     pub model: &'a ModelView,
     pub cluster: Option<&'a Cluster>,
+    /// The device cannot take a turn (`candle::gpu_poison::device_failing`).
+    pub device_failing: bool,
 }
 
 fn head_of(s: &Shared) -> Head<'_> {
@@ -55,8 +59,14 @@ fn head_of(s: &Shared) -> Head<'_> {
         started_at_ms: s.started_at_ms,
         model: &s.model,
         cluster: s.cluster.as_deref(),
+        device_failing: device_failing(),
     }
 }
+
+/// The `detail` of a member whose device is failing.
+const DEVICE_FAILING: &str = "The GPU is failing every operation — out of memory, or a poisoned \
+                              context. This member takes no turns, and relaunches itself if it \
+                              does not recover.";
 
 /// A tenant's line while the process stops (§12.4): loading again, the step
 /// in hand as its load, so the loading page shows the drain as it runs.
@@ -108,8 +118,17 @@ pub fn assemble(head: &Head<'_>, build: &str, tenants: Vec<(&str, TenantStatus)>
             serde_json::to_value(t).unwrap_or(Value::Null),
         );
     }
+    // A failing device outranks the tenants' own lines: they may read ready
+    // while every turn they take fails.
+    let (state, detail) = if head.device_failing {
+        ("fault", DEVICE_FAILING.to_string())
+    } else if loading.is_some() {
+        ("loading", detail)
+    } else {
+        ("ready", detail)
+    };
     json!({
-        "state": if loading.is_some() { "loading" } else { "ready" },
+        "state": state,
         "started_at_ms": head.started_at_ms,
         "build": build,
         "model": head.model,
@@ -180,6 +199,22 @@ mod tests {
                 "cluster": null,
             })
         );
+    }
+
+    /// **A failing device is a fault whatever the tenants say.** A poisoned
+    /// context read ready for the minute before the process relaunched, and
+    /// every chat in it answered an empty stream.
+    #[test]
+    fn a_failing_device_is_a_fault_over_ready_tenants() {
+        let s = shared(vec![]);
+        let head = Head {
+            device_failing: true,
+            ..head_of(&s)
+        };
+        let body = assemble(&head, "", vec![("zend", TenantStatus::of(None))]);
+        assert_eq!(body["state"], "fault");
+        assert_eq!(body["detail"], DEVICE_FAILING);
+        assert_eq!(body["tenants"]["zend"]["state"], "ready");
     }
 
     /// While the process stops, every tenant is loading again, its load the

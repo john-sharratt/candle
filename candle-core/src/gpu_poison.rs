@@ -25,17 +25,37 @@
 //! full poison once it has lasted [`OOM_STICKY_AFTER`] with no successful
 //! device operation in between ([`note_device_ok`] closes the run).
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 static POISONED: AtomicBool = AtomicBool::new(false);
 static ROOT_FAULT: OnceLock<String> = OnceLock::new();
-static OOM_STREAK_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// When the open out-of-memory streak began: nanoseconds since [`epoch`], plus
+/// one, so that `0` is "no streak". An atomic, not a lock: every device error
+/// and every capacity report reads it.
+static OOM_STREAK_START: AtomicU64 = AtomicU64::new(0);
 
 /// How long an unbroken run of out-of-memory errors — no successful device
 /// operation observed in between — is treated the same as a sticky fault.
 pub const OOM_STICKY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long an unbroken run of out-of-memory errors makes the device one that
+/// cannot take a turn. A busy device completes operations constantly and any
+/// one of them closes the run, so a run this long means nothing is working —
+/// long before [`OOM_STICKY_AFTER`] relaunches the process.
+pub const FAILING_AFTER: Duration = Duration::from_secs(2);
+
+/// The instant streak times are measured from.
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn now_mark() -> u64 {
+    (epoch().elapsed().as_nanos() as u64).saturating_add(1)
+}
 
 /// Flag the GPU context poisoned. `root` — the fault plus the recent
 /// kernel-launch breadcrumb — is evaluated and captured ONCE, on the first
@@ -65,16 +85,37 @@ pub fn note_oom(root: impl FnOnce() -> String) {
 /// 60-second wait, and without ever touching the one-way [`POISONED`] latch
 /// that a real test binary can only afford to flip once.
 fn oom_streak_exceeds(threshold: Duration) -> bool {
-    let mut streak = OOM_STREAK_START.lock().unwrap_or_else(|e| e.into_inner());
-    let started = *streak.get_or_insert_with(Instant::now);
-    started.elapsed() >= threshold
+    // Open the streak unless one is open; either way read the one that is.
+    let _ = OOM_STREAK_START.compare_exchange(0, now_mark(), Ordering::AcqRel, Ordering::Acquire);
+    oom_streak_age().is_some_and(|age| age >= threshold)
 }
 
 /// Record that a device operation completed without error, closing any open
 /// out-of-memory streak. A later, unrelated OOM then starts its own fresh
 /// countdown instead of inheriting one left over from a resolved episode.
+#[inline]
 pub fn note_device_ok() {
-    *OOM_STREAK_START.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if OOM_STREAK_START.load(Ordering::Relaxed) != 0 {
+        OOM_STREAK_START.store(0, Ordering::Release);
+    }
+}
+
+/// How long the open out-of-memory streak has run; `None` with none open.
+pub fn oom_streak_age() -> Option<Duration> {
+    let started = OOM_STREAK_START.load(Ordering::Acquire);
+    (started != 0).then(|| Duration::from_nanos(now_mark().saturating_sub(started)))
+}
+
+/// Whether the device can take a turn: not when its context is poisoned, and
+/// not while every operation has failed out of memory for [`FAILING_AFTER`].
+/// A member reports itself faulted while this holds, so nothing is routed to a
+/// card that would answer every turn with an error.
+pub fn device_failing() -> bool {
+    failing(is_gpu_poisoned(), oom_streak_age())
+}
+
+fn failing(poisoned: bool, streak: Option<Duration>) -> bool {
+    poisoned || streak.is_some_and(|age| age >= FAILING_AFTER)
 }
 
 /// Whether a sticky GPU fault has poisoned the context.
@@ -107,6 +148,16 @@ mod tests {
         assert_eq!(root_fault().as_deref(), Some("root-A"));
     }
 
+    /// A poisoned context fails; so does a streak of out-of-memory errors
+    /// once it has run [`FAILING_AFTER`]; a shorter one, or none, does not.
+    #[test]
+    fn a_device_fails_poisoned_or_out_of_memory_for_two_seconds() {
+        assert!(failing(true, None));
+        assert!(failing(false, Some(FAILING_AFTER)));
+        assert!(!failing(false, Some(Duration::from_millis(1_999))));
+        assert!(!failing(false, None));
+    }
+
     /// Exercises the OOM-streak timing and reset in isolation, via
     /// `oom_streak_exceeds` directly — never through `note_oom`/`poison_gpu` —
     /// so it cannot flip the one-way `POISONED` latch the other test in this
@@ -120,9 +171,12 @@ mod tests {
         std::thread::sleep(tiny * 2);
         // Same streak, now old enough.
         assert!(oom_streak_exceeds(tiny));
+        assert!(oom_streak_age().is_some_and(|a| a >= tiny));
         // A successful device operation closes the streak...
         note_device_ok();
+        assert_eq!(oom_streak_age(), None);
         // ...so a fresh check starts its own countdown from zero again.
         assert!(!oom_streak_exceeds(tiny));
+        note_device_ok();
     }
 }

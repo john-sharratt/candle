@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
+use candle::gpu_poison::device_failing;
 use futures::future::join_all;
 use serde_json::Value;
 use web::Roots;
@@ -90,6 +91,7 @@ async fn status(State(boot): State<Arc<Boot>>) -> Json<Value> {
         started_at_ms: boot.started_at_ms,
         model: &boot.model,
         cluster: boot.cluster.as_deref(),
+        device_failing: device_failing(),
     };
     Json(assemble(&head, &boot.build, named))
 }

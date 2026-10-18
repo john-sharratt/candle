@@ -30,6 +30,20 @@ pub struct Wave {
     pub budget_mib: u64,
 }
 
+/// What `CAPACITY`'s state says: faulted while the device cannot take a turn
+/// (`candle::gpu_poison::device_failing`) — a poisoned context, or every
+/// operation out of memory — whatever the tenant reports, so the gateways
+/// route it nothing; otherwise ready once the tenant is.
+pub fn member_state(tenant_ready: bool, device_failing: bool) -> MemberState {
+    if device_failing {
+        MemberState::Fault
+    } else if tenant_ready {
+        MemberState::Ready
+    } else {
+        MemberState::Loading
+    }
+}
+
 pub fn capacity(
     state: MemberState,
     card: CardReading,
@@ -103,6 +117,16 @@ mod tests {
             used_mib,
             budget_mib: 10_000,
         }
+    }
+
+    /// A failing device is a fault whatever the tenant says; a healthy one is
+    /// ready once its tenant is.
+    #[test]
+    fn a_failing_device_is_a_fault() {
+        assert_eq!(member_state(true, true), MemberState::Fault);
+        assert_eq!(member_state(false, true), MemberState::Fault);
+        assert_eq!(member_state(true, false), MemberState::Ready);
+        assert_eq!(member_state(false, false), MemberState::Loading);
     }
 
     /// Power is the measured peak once there is one, and the card's memory over
