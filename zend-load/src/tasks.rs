@@ -37,14 +37,14 @@ const WRITE_RULES: &str = "Work only in the battle-cities repository, only on th
      with file_edit. Do not commit, push, create branches, or touch any other file. \
      Finish by showing the diff of what you changed.";
 
-/// Write follow-ups, asked after the first edit. The second has the turn
+/// Write follow-ups, asked after the first edit. The first has the turn
 /// build what it wrote with `run_command`, which runs as a job on a cluster
 /// agent, so a write rung loads the agents with real builds as well as the
-/// members with turns.
+/// members with turns — first, because a rung of two turns asks only one.
 const WRITE_FOLLOW_UPS: [&str; 2] = [
-    "Now add a unit test for that function in the same file.",
     "Check that it builds: use run_command to run `cargo check -p sim --tests` in \
      battle-cities, and fix anything it reports in the same file.",
+    "Now add a unit test for that function in the same file.",
 ];
 
 /// Read questions: each needs the repository read to answer, and none needs
@@ -232,6 +232,10 @@ mod tests {
         let (next, _) = Task::Write.body("zl-2", 1, 1, &[], 2048);
         let ask = next["messages"][0]["content"].as_str().unwrap();
         assert!(ask.starts_with(WRITE_FOLLOW_UPS[0]));
+        assert!(
+            ask.contains("run_command"),
+            "the first follow-up builds the edit on an agent"
+        );
         assert!(ask.contains("Do not commit, push"));
         assert_eq!(Task::parse("write"), Some(Task::Write));
     }
