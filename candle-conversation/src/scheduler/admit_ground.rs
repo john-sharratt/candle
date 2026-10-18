@@ -956,6 +956,7 @@ impl Scheduler {
                 1,
                 &[],
                 &[],
+                self.decode_width(),
                 self.session.activation_dtype(),
             )
             .unwrap_or(0)
@@ -1106,7 +1107,7 @@ impl Scheduler {
     }
 
     /// The tier a forward composed as `wave` places — the same planner the
-    /// placement reads.
+    /// placement reads, with the running decodes the step carries beside it.
     pub(super) fn composed_tier(&self, wave: &Composed) -> u64 {
         self.model
             .wave_tier_bytes(
@@ -1114,6 +1115,7 @@ impl Scheduler {
                 wave.seqs.max(1),
                 &wave.advances,
                 &wave.depths,
+                self.decode_width(),
                 self.session.activation_dtype(),
             )
             .unwrap_or(0)

@@ -406,6 +406,13 @@ pub trait BatchedModelCore {
     /// quantity in the tier that follows context depth rather than width, up
     /// to its key-chunk bound).
     ///
+    /// `decodes` are the decode rows co-batched in the same step: each is a
+    /// row in the trunk's phases and a row the head scores. A creep step
+    /// carries the running decodes beside its window, and the head scores
+    /// them with the members the final window finishes; priced as prefill
+    /// alone, a cohort's tier came out a region short at exactly that window
+    /// (3090, 2026-10-18 and 19 — cursor 47 of 48, five runs).
+    ///
     /// **The same function the tier is actually placed from**, not an estimate
     /// of it: admission judges an offer on the residency it dislodges, and the
     /// tier dislodges weights exactly as a region claim does. Pricing it any
@@ -420,6 +427,7 @@ pub trait BatchedModelCore {
         _sequences: usize,
         _stage_q_lens: &[usize],
         _stage_offsets: &[usize],
+        _decodes: usize,
         _act_dtype: DType,
     ) -> Option<u64> {
         None

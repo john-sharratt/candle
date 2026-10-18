@@ -2852,10 +2852,14 @@ impl Scheduler {
                 .map(|m| self.session.sequence_offset(m.seq_id()).unwrap_or(0))
                 .collect();
             let rows: usize = q_lens.iter().sum();
-            let Some(tier) =
-                self.model
-                    .wave_tier_bytes(rows, members.len(), &q_lens, &offsets, dtype)
-            else {
+            let Some(tier) = self.model.wave_tier_bytes(
+                rows,
+                members.len(),
+                &q_lens,
+                &offsets,
+                self.decode_width(),
+                dtype,
+            ) else {
                 return;
             };
             let need = (tier as usize).saturating_add(rows.saturating_mul(kv_row));

@@ -2263,6 +2263,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         sequences: usize,
         stage_q_lens: &[usize],
         stage_offsets: &[usize],
+        decodes: usize,
         act_dtype: DType,
     ) -> Option<u64> {
         let geometry = self.wave_geometry(act_dtype);
@@ -2291,6 +2292,8 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             ),
             qsa_bytes,
             look_ahead_hops: look_ahead_hops(rows),
+            decode_rows: decodes,
+            scored_rows: sequences.max(1) + decodes,
             ..WaveWidth::prefill(rows, sequences.max(1))
         };
         Some(WavePlan::new(geometry).tier_bytes(width) as u64)

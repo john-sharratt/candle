@@ -4330,9 +4330,11 @@ pub trait ManagedBatchedModel {
         sequences: usize,
         stage_q_lens: &[usize],
         stage_offsets: &[usize],
+        decodes: usize,
         act_dtype: DType,
     ) -> Option<u64> {
         let geometry = self.wave_geometry(act_dtype);
+        let prefill = WaveWidth::prefill(rows, sequences.max(1));
         let width = WaveWidth {
             kv_stage: PrefillKvStageLayout::new(
                 stage_q_lens,
@@ -4342,7 +4344,9 @@ pub trait ManagedBatchedModel {
                 geometry.head_dim,
                 PrefillLaunchBounds::PRODUCTION,
             ),
-            ..WaveWidth::prefill(rows, sequences.max(1))
+            decode_rows: decodes,
+            scored_rows: prefill.scored_rows + decodes,
+            ..prefill
         };
         Some(WavePlan::new(geometry).tier_bytes(width) as u64)
     }

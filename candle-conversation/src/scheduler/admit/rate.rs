@@ -1082,9 +1082,9 @@ impl WaveRate {
     /// running. So many decodes and few prompts make a dislodge dear and the
     /// prompts wait; many prompts and few decodes make the rows worth the
     /// weights, and the weights go; in between the cheap prefills co-batch and
-    /// the balance follows the queues. The decode the turn becomes counts on
-    /// the decode side, so a turn whose decode pays for itself is not refused
-    /// for slowing the others by less.
+    /// the balance follows the queues. The decode side is the running decodes'
+    /// loss alone: the decode the turn becomes is waiting work, already counted
+    /// on the prefill side.
     ///
     /// The prefill floor still binds — under it the cache cannot serve a forward
     /// — and the row cap and the head waiver are `try_widen`'s. The decode is
@@ -1130,13 +1130,16 @@ impl WaveRate {
             };
             let decode_learned = self.decode_samples >= Self::MIN_DECODE_SAMPLES;
             let decode_now = self.decode_rate(self.decodes, self.routed_per_layer, weights_before);
+            // The running decodes' loss alone: the same decodes at the residency
+            // the offer leaves against the residency it found. The decode the
+            // turn becomes is not on this side — it is waiting work, which the
+            // prefill weight already counts — and counting it here added +1/n
+            // to every trade, so the decode side read as a gain on nearly every
+            // offer (WhiteWorld, 2026-10-18: dD +0.17 to +0.33, every trade
+            // admitted).
             let decode_change = if decode_learned && self.decodes > 0 && decode_now > 0.0 {
-                let decode_with = self.decode_rate(
-                    self.decodes + 1,
-                    self.routed_per_layer
-                        .saturating_add(self.experts_per_decode(0)),
-                    weights_after,
-                );
+                let decode_with =
+                    self.decode_rate(self.decodes, self.routed_per_layer, weights_after);
                 (decode_with - decode_now) / decode_now
             } else {
                 0.0
