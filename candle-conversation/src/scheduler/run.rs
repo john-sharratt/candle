@@ -732,6 +732,10 @@ impl Scheduler {
             // (`prefill_wait`).
             self.report_prefill_waits();
 
+            // 2c. An idle slot whose last seal is durable gives its recurrent
+            // store back (`recurrent_park`).
+            self.park_durable_states();
+
             // 3. If idle, block waiting for work. Deferred glue counts as work: the
             // unified wave step scatters it (`take_wave_glue`), so don't block while
             // any is pending or it would never be consumed.

@@ -37,6 +37,11 @@ impl Scheduler {
         self.turn_views.values().any(|v| v.parent_id == parent)
     }
 
+    /// Whether a fork request is waiting for `parent`'s turn to end.
+    pub(super) fn fork_waits_on(&self, parent: SequenceId) -> bool {
+        self.parked_forks.iter().any(|f| f.parent == parent)
+    }
+
     /// Answer a fork request now, or park it until the turn on `parent` ends.
     pub(super) fn request_ephemeral_fork(
         &mut self,
@@ -97,6 +102,8 @@ impl Scheduler {
                 sequence_id: parent,
             });
         }
+        // The fork copies the parent's state, so a parked one comes back first.
+        self.unpark_from_record(parent)?;
 
         let (child, _borrowed) = self.create_view(parent, &[])?;
 

@@ -57,6 +57,7 @@ mod prefill_wait;
 pub(crate) mod profile;
 pub(crate) mod projection_assembler;
 mod projection_identity;
+mod recurrent_park;
 pub mod relief_trace;
 mod reproject_abandon;
 mod run;
@@ -3608,6 +3609,10 @@ pub(crate) struct Scheduler {
     /// Ephemeral-fork requests whose parent had a turn in flight when they
     /// arrived, answered at the turn boundary. See [`ephemeral_fork`].
     parked_forks: Vec<ephemeral_fork::ParkedFork>,
+    /// Each slot's last sealed snapshot, `(timeline, turn)`, until the
+    /// persistence layer reports it durable and the slot's store is parked
+    /// (`recurrent_park`).
+    sealed_snapshots: HashMap<SequenceId, (TimelineId, u32)>,
 
     /// Continuous-fair-wave prefill cohort (`docs/continuous_fair_waves.md`): the
     /// in-flight prefill batch's inter-layer residual, held between steps in its
@@ -3968,6 +3973,7 @@ impl Scheduler {
             deferred_glue_fires: Vec::new(),
             stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
+            sealed_snapshots: HashMap::new(),
             wave_prefill_residual: None,
             wave_prefill_cursor: 0,
             wave_prefill_members: Vec::new(),
@@ -4252,6 +4258,13 @@ impl Scheduler {
                     let _ = event_tx.send(TurnEvent::Error(ConversationError::TurnInFlight {
                         sequence_id: parent_id,
                     }));
+                    return true;
+                }
+                // An idle slot's state may be parked in its record
+                // (`recurrent_park`): staged back before the projection or the
+                // view's fork reads it.
+                if let Err(e) = self.unpark_from_record(parent_id) {
+                    let _ = event_tx.send(TurnEvent::Error(e));
                     return true;
                 }
 
@@ -6872,6 +6885,7 @@ impl Scheduler {
     /// handler and [`Self::free_summary_slot`]). The mid-decode reproject swap
     /// frees-and-rebinds its own view state inline and does not route here.
     fn purge_freed_slot_scheduling_state(&mut self, id: SequenceId) {
+        self.sealed_snapshots.remove(&id);
         self.prefill_queue.retain(|w| w.sequence_id != id);
         // A section still waiting for admission would otherwise be prepared on
         // whatever reuses this slot's id. Answered, so its caller is not left
@@ -7457,9 +7471,14 @@ impl Scheduler {
             })
             .collect();
 
+        // **Staged, not built.** The store is claimed where its slot is next
+        // used — the view's fork at admission, or a wave on the slot — so a
+        // resume, or a parked slot coming back (`recurrent_park`), holds no
+        // device ground until then. A slot that already holds a store takes
+        // the state at once.
         match self
             .model
-            .restore_recurrent(slot_id.0, payload.schedule_hash, &layers)
+            .stage_recurrent(slot_id.0, payload.schedule_hash, Arc::from(layers))
         {
             Ok(true) => {
                 tracing::debug!(
@@ -9743,6 +9762,8 @@ impl Scheduler {
                             .fetch_add(t_export.elapsed().as_micros() as u64, Relaxed);
                         SNAPSHOT_BYTES.fetch_add(payload.encoded_len() as u64, Relaxed);
                         SNAPSHOT_COUNT.fetch_add(1, Relaxed);
+                        self.sealed_snapshots
+                            .insert(seal_slot, (target.timeline, idx.0));
                         conversation.enqueue_recurrent_snapshot(target.timeline, payload);
                     }
                     // **`None` from a model that declares recurrent state is a
@@ -12757,6 +12778,8 @@ mod tests {
         /// survive exactly one `offset == 0` reset. The store-level `seeded`
         /// flag of §10 decision 2, modelled per sequence.
         seeded: Arc<Mutex<HashSet<usize>>>,
+        /// Sequences whose state was parked in its record and not yet restored.
+        parked: Arc<Mutex<HashSet<usize>>>,
         /// What the scheduler installed ahead of each sequence's borrowed K/V,
         /// in order.
         pushed: Arc<Mutex<HashMap<usize, Vec<Pushed>>>>,
@@ -12952,6 +12975,7 @@ mod tests {
 
         fn release_sequence(&self, seq: usize) -> candle::Result<()> {
             self.probe.states.lock().unwrap().remove(&seq);
+            self.probe.parked.lock().unwrap().remove(&seq);
             self.probe.index.lock().unwrap().remove(&seq);
             self.probe.pages.lock().unwrap().remove(&seq);
             self.probe.seeded.lock().unwrap().remove(&seq);
@@ -13124,6 +13148,7 @@ mod tests {
             schedule_hash: u64,
             layers: &[ExportedLayerState],
         ) -> candle::Result<bool> {
+            self.probe.parked.lock().unwrap().remove(&seq);
             if schedule_hash != Self::SCHEDULE_HASH {
                 candle::bail!(
                     "schedule hash mismatch: {schedule_hash:#x} is not this model's \
@@ -13154,6 +13179,18 @@ mod tests {
 
         /// Move: the child's entry is gone afterwards and the parent's old
         /// state is replaced. Tolerant of a child that never ran a wave.
+        fn park_recurrent(&self, seq: usize) -> candle::Result<bool> {
+            let dropped = self.probe.states.lock().unwrap().remove(&seq).is_some();
+            if dropped {
+                self.probe.parked.lock().unwrap().insert(seq);
+            }
+            Ok(dropped)
+        }
+
+        fn recurrent_parked(&self, seq: usize) -> bool {
+            self.probe.parked.lock().unwrap().contains(&seq)
+        }
+
         fn move_recurrent(&self, child: usize, parent: usize) -> candle::Result<()> {
             let taken = self.probe.states.lock().unwrap().remove(&child);
             self.probe.seeded.lock().unwrap().remove(&child);
@@ -14804,6 +14841,55 @@ mod tests {
         scheduler.discard_turn_view(view);
         assert_eq!(probe.get(parent), Some(held), "the parent is as it stood");
         assert_eq!(probe.get(view.0), None);
+    }
+
+    /// **A parked slot is not idle while anything runs on it**, and is once
+    /// nothing does: a turn view carved from it keeps its store.
+    #[test]
+    fn a_slot_with_a_turn_carved_from_it_is_not_idle() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let parent = SequenceId(scheduler.session.create_sequence().unwrap());
+        assert!(scheduler.slot_idle(parent));
+        let (view, borrowed) = scheduler.carve_view(parent, &[]).expect("view carve");
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+                applied_identity: None,
+                state_forked: true,
+                holds_parent_state: false,
+            },
+        );
+        assert!(!scheduler.slot_idle(parent), "a turn runs on it");
+        scheduler.discard_turn_view(view);
+        assert!(scheduler.slot_idle(parent));
+    }
+
+    /// **A parked slot whose record cannot be read back is an error**, never a
+    /// slot that starts again from sequence-start: that would read fluently and
+    /// remember nothing.
+    #[test]
+    fn a_parked_slot_without_a_readable_record_refuses_to_start_over() {
+        let (mut scheduler, _tx, probe) = make_test_scheduler_recurrent();
+        let slot = scheduler.session.create_sequence().unwrap();
+        forward_on(&mut scheduler, slot, &[1, 2, 3, 4]);
+        assert!(scheduler.model.park_recurrent(slot).unwrap());
+        assert_eq!(probe.get(slot), None, "the store is gone");
+        let refused = scheduler.unpark_from_record(SequenceId(slot));
+        assert!(refused.is_err(), "no record: the slot does not start over");
+        assert!(scheduler.model.recurrent_parked(slot), "and stays parked");
+    }
+
+    /// **An unparked slot passes straight through**: nothing to stage.
+    #[test]
+    fn an_unparked_slot_needs_no_record() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let slot = scheduler.session.create_sequence().unwrap();
+        forward_on(&mut scheduler, slot, &[1, 2]);
+        assert!(scheduler.unpark_from_record(SequenceId(slot)).is_ok());
     }
 
     /// The seeded flag suppresses **exactly one** reset.

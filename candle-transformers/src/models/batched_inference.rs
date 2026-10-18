@@ -4935,6 +4935,24 @@ pub trait ManagedBatchedModel {
         self.restore_recurrent(seq, schedule_hash, &layers)
     }
 
+    /// Drop `seq`'s recurrent store: its last seal's snapshot is durable and
+    /// the sequence is out of every forward, so its state is the record's and
+    /// the store's device ground is idle. Until it is restored — staged from
+    /// the record ([`Self::stage_recurrent`]) — any use of its state is refused
+    /// with [`RECURRENT_PARKED_MARKER`], never met with a sequence-start store.
+    ///
+    /// `false` when nothing was dropped: no store, or one a wave still has
+    /// open. The default keeps everything, as a model without stores must.
+    fn park_recurrent(&self, _seq: usize) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether `seq`'s state was parked ([`Self::park_recurrent`]) and must be
+    /// restored from its record before anything reads it.
+    fn recurrent_parked(&self, _seq: usize) -> bool {
+        false
+    }
+
     /// Carried per-sequence state that is **not** a DeltaNet layer stack, as an
     /// opaque byte string the persistence layer stores verbatim.
     ///
@@ -6295,6 +6313,10 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
 /// literal on each side, so the two can't silently drift apart if this
 /// message is ever reworded.
 pub const WINDOW_DIVERGENCE_MARKER: &str = "different token windows";
+
+/// The refusal of a parked sequence's state before it is restored
+/// ([`ManagedBatchedModel::park_recurrent`]).
+pub const RECURRENT_PARKED_MARKER: &str = "recurrent state is parked in its record";
 
 /// Refuse a per-layer snapshot whose layers describe different token windows.
 ///
