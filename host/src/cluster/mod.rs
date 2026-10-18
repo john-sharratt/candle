@@ -7,6 +7,7 @@
 //! |---|---|
 //! | [`serve`] | a request a gateway sent over a socket, served by this host's router |
 //! | [`flush`] | its response ending only after the events it caused (§6.4) |
+//! | [`in_flight`] | the requests still running, which a member leaving lets finish (§12.4) |
 //! | [`listener`] | the own listener: forward up when joined, serve when cut off (§5.8) |
 //! | [`sticky`] | claiming a sticky key before serving it (§5.4) |
 //! | [`capacity`] | what `CAPACITY` reports (§5.3) |
@@ -33,6 +34,7 @@
 pub mod capacity;
 pub mod disk;
 pub mod flush;
+pub mod in_flight;
 pub mod leave;
 pub mod listener;
 pub mod serve;
@@ -72,6 +74,7 @@ use zend_vfs::sandbox::programs::policy;
 use zend_vfs::Priority;
 
 use capacity::{capacity, Wave};
+use in_flight::InFlight;
 
 use crate::telemetry::Telemetry;
 use crate::tenant::Reports;
@@ -169,6 +172,9 @@ pub struct Cluster {
     agent: Option<Arc<Jobs>>,
     /// The process's upgrades, across every app it serves (§3.8–§3.11).
     upgrader: Arc<Upgrader>,
+    /// The requests gateways sent that are still running, which a member
+    /// leaving lets finish before its sockets close.
+    in_flight: InFlight,
 }
 
 /// One tenant's app: unjoined until the tenant opens its substrate and
@@ -245,6 +251,7 @@ impl Cluster {
             tls,
             build: settings.build.clone(),
             runtime,
+            in_flight: InFlight::default(),
             sockets: Some(sockets),
             telemetry,
             router: OnceLock::new(),
@@ -388,7 +395,8 @@ impl Cluster {
                         // not stop it doing that.
                         http.spawn(async move {
                             if let Some(router) = cluster.router() {
-                                serve::serve(router, conn, c, replicator);
+                                let in_flight = cluster.in_flight.clone();
+                                serve::serve(router, conn, c, replicator, in_flight);
                             } else {
                                 conn.reset();
                             }
@@ -489,6 +497,14 @@ pub fn watch_readiness(tenants: Vec<(Arc<AppLink>, Arc<dyn Reports>)>) {
 }
 
 impl Cluster {
+    /// Wait, at most `limit`, for the requests gateways sent that are still
+    /// running — a turn streaming its reply among them — telling `waiting` how
+    /// many are left. Closing the sockets under them would cut each one
+    /// mid-stream. Returns how many were still running.
+    pub async fn settle_requests(&self, limit: Duration, waiting: impl FnMut(usize)) -> usize {
+        self.in_flight.settle(limit, waiting).await
+    }
+
     /// The process is stopping: every app's replication stops and its sockets
     /// close `1001`, before the tenants release their substrates.
     pub fn close_all(&self, reason: &str) {

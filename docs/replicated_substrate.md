@@ -3763,7 +3763,13 @@ now does, in order:
 2. **Flushes and commits** the log: everything its tenants handed the writer is on disk.
 3. **Waits**, bounded at 60 s, for its outbox of unsent and in-flight events to empty,
    so what it wrote reaches the group before it goes (`host/src/cluster/leave.rs`).
-4. **Finishes the requests in flight**, as the HTTP server's graceful stop does.
+4. **Finishes the requests in flight** — its own listener's, as the HTTP server's
+   graceful stop does, and those the gateways sent over its sockets. A request that can
+   append (anything but a `GET` or `HEAD`) counts until its response body ends, and the
+   member waits, bounded at 300 s, for none to be left (`host/src/cluster/in_flight.rs`).
+   A turn streaming its reply rides one of those sockets; closing it first cut every
+   such turn mid-stream. A `GET` — a log tail, a follow of a live reply — never ends on
+   its own and is not waited for.
 5. **Closes its sockets with `1001`.**
 6. **Runs the tenants' existing shutdown** (`docs/shared_model_host.md`).
 

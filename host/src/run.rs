@@ -29,6 +29,7 @@ use web::Roots;
 use crate::access::{roles, LocalSignin};
 use crate::boot::{router as boot_router, Boot, BootLine};
 use crate::cli::HostArgs;
+use crate::cluster::in_flight::IN_FLIGHT_WAIT;
 use crate::cluster::leave::drain_and_send;
 use crate::cluster::upgrade::{setup as upgrade_setup, HostInstaller};
 use crate::cluster::{standalone_agent, watch_readiness, Cluster, Join};
@@ -471,6 +472,20 @@ async fn serve_tenants(
     )
     .await;
     if let Some(c) = &cluster {
+        // Drained: the gateways route nothing new here, and the turns already
+        // running finish over the sockets before those close under them.
+        let left = c
+            .settle_requests(IN_FLIGHT_WAIT, |n| {
+                stopping.set_step("Stopping", format!("finishing {n} requests in flight"));
+            })
+            .await;
+        if left > 0 {
+            tracing::warn!(
+                left,
+                "requests still running after {} s are cut as the sockets close",
+                IN_FLIGHT_WAIT.as_secs()
+            );
+        }
         c.close_all("the member is shutting down");
     }
     stop_all(stops).await;
