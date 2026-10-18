@@ -159,13 +159,14 @@ pub fn state_line() -> String {
         t.get((v >> 56) as usize).copied().unwrap_or("?")
     }
     format!(
-        "service {} (last doorbell {}); {} layers refused, the last {} ({}); {} served",
+        "service {} (last doorbell {}); {} layers refused, the last {} ({}); {} served; {}",
         name(&PHASES, s),
         s & 0xffff_ffff,
         REFUSALS.load(Ordering::Relaxed),
         r & 0xffff_ffff,
         name(&REASONS, r),
         SERVED_TOTAL.load(Ordering::Relaxed),
+        super::pool::trace_line(),
     )
 }
 

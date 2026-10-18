@@ -118,6 +118,12 @@ const HIGH_BESIDE_HIGH_RATIO: u32 = 2;
 /// not going to be placed by waiting.
 const MID_SWEEP_RETRIES: u32 = 4;
 
+/// The longest a decode-less creep step runs: what a prompt arriving while
+/// nothing decodes waits, at most, before the creep yields to it at the step's
+/// end. Short against a whole 8K-row sweep at depth (~2.6 s), long against the
+/// step's fixed cost, so the sweep runs in a handful of windows, not dozens.
+pub(super) const DECODE_LESS_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Layers a creep advances per wave, out of `n`, at airtime ratio `ratio`:
 /// `ceil(n / ratio)`, never zero.
 fn creep_layer_budget(n: usize, ratio: u32) -> usize {
@@ -2337,6 +2343,7 @@ impl Scheduler {
     /// wave), and the recurrent state has seen the prompt twice. A member that
     /// must leave mid-sweep leaves through [`Self::drop_wave_members`].
     pub(super) fn reset_wave_prefill(&mut self) {
+        self.sweep_forecast.sweep_abandoned();
         self.wave_prefill_residual = None;
         self.wave_prefill_cursor = 0;
         self.wave_prefill_members.clear();
@@ -2705,6 +2712,7 @@ impl Scheduler {
             unresolved_decodes = unresolved,
             "creep group formed"
         );
+        self.sweep_forecast.sweep_formed(std::time::Instant::now());
         self.wave_prefill_members = members;
     }
 
@@ -3385,11 +3393,25 @@ impl Scheduler {
                 self.decode_only_step,
             )
         } else {
-            creep_layer_budget(n, ratio)
+            // **Decode-less, still bounded in time.** With nothing decoding
+            // there is no decode cadence to protect, but there is a prompt that
+            // may arrive: it can only take the device at a step boundary
+            // (`creep_outranked_by_a_waiting_prompt` pauses the creep there), so
+            // a whole-sweep step made it wait the sweep. Measured on `.5`
+            // (2026-10-18): a passthrough chat's every next request found an
+            // 8,190-row ingest cohort starting a 2.6 s, 48-layer decode-less
+            // step in the gap between two of its turns, and waited it out.
+            time_bounded_layers(
+                creep_layer_budget(n, ratio).min(n - cursor.min(n)),
+                creep_rows,
+                self.creep_layer_row_cost,
+                Some(DECODE_LESS_SLICE),
+            )
         };
         let win_end = (cursor + budget).min(n);
-        // What rode beside decode, for the next slice's cost estimate.
-        self.wave_step_creep_layer_rows = if head_rows > 0 && !seq_ids.is_empty() {
+        // What the creep ran this step, for the next slice's cost estimate:
+        // beside decode its excess over a decode-only step, alone its whole step.
+        self.wave_step_creep_layer_rows = if !seq_ids.is_empty() {
             creep_rows * (win_end - cursor.min(win_end))
         } else {
             0
@@ -3703,6 +3725,13 @@ impl Scheduler {
             let logits = head.logits_on_span();
             let d = head_rows.min(logits.len());
             let creep_end = (d + members.len()).min(logits.len());
+            // Timed only when it crept: a sweep finished in one step placed one
+            // tier, and nothing could take its ground between windows.
+            if cursor > 0 {
+                self.sweep_forecast.sweep_done(std::time::Instant::now());
+            } else {
+                self.sweep_forecast.sweep_abandoned();
+            }
             self.complete_wave_group(&members, &logits[d..creep_end]);
             return Ok(WaveLogits::held_rows(head, logits[..d].to_vec()));
         }
@@ -5610,8 +5639,9 @@ mod creep_member_drop_tests {
 
 #[cfg(test)]
 mod creep_throttle_tests {
-    use super::{creep_layer_budget, throttle_ratio, HIGH_BESIDE_HIGH_RATIO};
+    use super::{creep_layer_budget, throttle_ratio, DECODE_LESS_SLICE, HIGH_BESIDE_HIGH_RATIO};
     use crate::projection::DecodePriority::{High, Low, Normal};
+    use std::time::Duration;
 
     /// Work yields to a decode that outranks it at that decode's ratio, and
     /// `High` work to a `High` decode at [`HIGH_BESIDE_HIGH_RATIO`] — two
@@ -5654,6 +5684,33 @@ mod creep_throttle_tests {
         assert_eq!(creep_layer_budget(48, 64), 1);
         assert_eq!(creep_layer_budget(1, 64), 1);
         assert_eq!(creep_layer_budget(48, 0), 48, "a zero ratio reads as 1");
+    }
+
+    /// **A decode-less step is a slice, not the sweep.** The measured case: an
+    /// 8,190-row cohort at ~6.6 µs a layer-row (2.6 s over 48 layers) runs a
+    /// handful of layers a step within `DECODE_LESS_SLICE`, so a prompt arriving
+    /// between two of a chat's turns waits ~a quarter second, not 2.6 s; a
+    /// small cohort still finishes its sweep in one step; unmeasured, one layer.
+    #[test]
+    fn a_decode_less_step_is_bounded_by_its_slice() {
+        use super::super::creep_slice::time_bounded_layers;
+        let per_layer_row = Duration::from_nanos(6_600);
+        let layers = time_bounded_layers(
+            creep_layer_budget(48, 1),
+            8_190,
+            Some(per_layer_row),
+            Some(DECODE_LESS_SLICE),
+        );
+        assert_eq!(layers, 4, "250 ms / (8,190 × 6.6 µs) = 4.6 → 4 layers");
+        let step = per_layer_row.mul_f64((8_190 * layers) as f64);
+        assert!(step <= DECODE_LESS_SLICE, "a step of {step:?}");
+        let small = time_bounded_layers(48, 19, Some(per_layer_row), Some(DECODE_LESS_SLICE));
+        assert_eq!(small, 48, "a 19-row prompt sweeps whole");
+        assert_eq!(
+            time_bounded_layers(48, 8_190, None, Some(DECODE_LESS_SLICE)),
+            1,
+            "unmeasured, one layer"
+        );
     }
 }
 

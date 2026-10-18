@@ -66,6 +66,7 @@ mod section_pages;
 mod segment_rearm;
 mod settle;
 mod spec_chooser;
+mod sweep_forecast;
 #[cfg(test)]
 mod test_substrate;
 mod turn_group;
@@ -3626,6 +3627,9 @@ pub(crate) struct Scheduler {
     /// Consecutive failures of the creep's current mid-sweep window, retried in
     /// place up to `prefill::MID_SWEEP_RETRIES`.
     wave_sweep_failures: u32,
+    /// The KV the decodes will add over a creep cohort's sweep, which its
+    /// width is priced against at formation (`sweep_forecast`).
+    sweep_forecast: sweep_forecast::SweepForecast,
     /// A wave step swept in segments, open on the model for its full-sweep
     /// members (`ManagedBatchedModel::begin_step`): the trunk layers its
     /// segments have committed so far. Closed by `decode_forward_cobatched`.
@@ -3959,6 +3963,7 @@ impl Scheduler {
             wave_prefill_rows: Vec::new(),
             paused_creep: None,
             wave_sweep_failures: 0,
+            sweep_forecast: sweep_forecast::SweepForecast::default(),
             wave_step_open: None,
             wave_cohort_advanced: false,
             creep_owed: Duration::ZERO,
@@ -10100,12 +10105,22 @@ impl Scheduler {
     /// Tokens a prefill group of `total` queued tokens shares — the pass
     /// budget, or all of `total` when it passes the model's cap by no more than
     /// the model's own slack. See [`admit::pass_budget::prefill_group_budget`].
+    ///
+    /// **Priced for the whole sweep.** The group is a creep cohort whose width
+    /// holds until its head, and every window places its tier on the ground
+    /// left then — so the cap is sized against the ground less the KV the
+    /// running decodes will add over a sweep ([`sweep_forecast`]), not against
+    /// the ground standing now.
     pub(super) fn prefill_group_budget(&self, total: usize) -> usize {
+        let dtype = self.session.activation_dtype();
+        let withheld = self
+            .model
+            .kv_bytes_per_row(dtype)
+            .map_or(0, |row| self.sweep_forecast.withheld_bytes(row));
         admit::pass_budget::prefill_group_budget(
             total,
             self.composition_target(),
-            self.model
-                .prefill_width_cap(self.session.activation_dtype()),
+            self.model.prefill_width_cap_withholding(dtype, withheld),
             self.prefill_kv_token_cap(),
             CHUNK_SIZE,
         )

@@ -4287,6 +4287,25 @@ pub trait ManagedBatchedModel {
         cap
     }
 
+    /// [`Self::prefill_width_cap`] for a cohort whose sweep outlasts the
+    /// ground it is priced against: `withheld` bytes of that ground will be
+    /// claimed by others' KV before the sweep's last window places its tier,
+    /// so the width is sized against what is left.
+    ///
+    /// A creep cohort's width is fixed when it forms and its tier is placed
+    /// again at every window, minutes later, on ground nothing holds for it in
+    /// between. Measured on the RTX 3090 (Flash-Next, 2026-10-18): an 8,192-row
+    /// cohort formed against ~10 GB of ground; decode KV grew 3.6 → 7.2 GB over
+    /// its two-minute sweep and drove the weight side to its floor, and window
+    /// 23 found 453 regions for a 454-region tier.
+    ///
+    /// The default ignores `withheld`: a model whose cap is not sized from the
+    /// elastic ground has nothing to subtract it from.
+    fn prefill_width_cap_withholding(&self, act_dtype: DType, withheld: usize) -> usize {
+        let _ = withheld;
+        self.prefill_width_cap(act_dtype)
+    }
+
     /// The wave transient tier a prefill of `rows` rows across `sequences`
     /// would need, in bytes, with its attention launch carving for chunks of
     /// `stage_q_lens` rows at `stage_offsets` ([`WaveWidth::kv_stage`]).
