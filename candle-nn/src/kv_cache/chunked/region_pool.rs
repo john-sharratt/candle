@@ -2124,6 +2124,9 @@ pub(crate) fn place_transient(stream: &std::sync::Arc<CudaStream>, bytes: usize)
         // shortfall the placement measured.
         Placed::Short(regions) => regions,
     };
+    // The ground a tier buys returns when its forward ends, so the weight side
+    // may concede it past its defended residency, down to its static floor.
+    let _transient = super::weight_zone::TierPurchase::begin();
     let mut conceded = 0u64;
     for _ in 0..MAX_PURCHASES {
         let got = buy_ground(stream, short)?;

@@ -11128,6 +11128,24 @@ impl Scheduler {
         view_id: SequenceId,
     ) -> Result<Option<ReprojectInFlight>, ConversationError> {
         let _t_total = PhaseTimer::new("reproject_total");
+        // **No ground for the rebuilt view's state: not now.** Past the move
+        // below, the turn's recurrent state lives on the parent and its old
+        // view is freed, so a refused claim there — the rebuilt view forking
+        // that state onto fresh slots — cannot hand the turn back: it fails
+        // it. On the RTX 3090 (2026-10-18), with the weight side at its
+        // defended floor, a rebuilt view's fork was refused "no region for
+        // recurrent state after 24 of 36 slots" and its turn ended. Checked
+        // here, before anything moves, a reprojection that could not finish
+        // is not started: the turn decodes on its view, and a later trigger
+        // tries again once ground is back.
+        if !self.reprojection_has_ground() {
+            tracing::debug!(
+                target: "candle_conversation::scheduler::reproject",
+                view_id = view_id.0,
+                "reprojection deferred: no ground for the rebuilt view's recurrent state"
+            );
+            return Ok(None);
+        }
         // Clone the policy out — `swap_view_with_new_ranges` mutates
         // `active_decodes` so we cannot hold a borrow over it.
         let policy = match self
