@@ -40,6 +40,9 @@ tracing     = { workspace = true }
 sha2 = "0.10"
 
 [dev-dependencies]
+# The consensus harness's budget is the engine's cost, so it is timed on the
+# thread's CPU clock: a wall clock also counts what else the machine is running.
+cpu-time = "1"
 tempfile = { workspace = true }
 # `test-util` for `#[tokio::test(start_paused = true)]`: the backoff and
 # keep-alive schedules are asserted on a paused clock.

@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use cluster::consensus::votes::MemoryVotes;
 use cluster::member::{Check, Link};
-use cluster::replicate::{MemoryRecord, MemoryStore, Phase, Store};
+use cluster::replicate::{MemoryRecord, MemoryStore, Phase, Purpose, Store};
 
-use support::{converged, gateway, member, until};
+use support::{converged, gateway, member, until, APP};
 
 const WITHIN: Duration = Duration::from_secs(20);
 
@@ -352,4 +352,39 @@ async fn a_rejoin_without_a_quorum_stays_cut_off() {
         a.store.value(b"turn/t/c1").is_some()
     })
     .await;
+}
+
+/// **A member that has served comes back serving.** Admitted again on a
+/// socket that dropped, it reads ready at the gateway at once — its admission
+/// catch-up still open behind a peer that answers nothing — rather than as
+/// loading until the catch-up gives up, which after a gateway restart took
+/// every member out of service at once. The gateway syncs it against the
+/// members serving as it does any member joining beside them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_has_served_reads_ready_when_admitted_again() {
+    let gw = gateway("gw");
+    let a = member(&[&gw], 1, store(1), MemoryVotes::new(), true);
+    let b = member(&[&gw], 2, store(2), MemoryVotes::new(), true);
+    until("ready", WITHIN, || a.ready() && b.ready()).await;
+    let first = gw.member(APP, 1).unwrap().session;
+
+    // B reads nothing from here, so A's next admission catch-up is unanswered.
+    b.pause(0, true);
+    a.app.close_all("a blip");
+    until("a admitted again", WITHIN, || {
+        gw.member(APP, 1).is_some_and(|m| m.session != first)
+    })
+    .await;
+    until(
+        "a reads ready at the gateway",
+        Duration::from_secs(5),
+        || gw.member(APP, 1).is_some_and(|m| m.ready()),
+    )
+    .await;
+    let open = a.app.replicator().unwrap().view().catchups;
+    assert!(
+        open.iter().any(|c| c.purpose == Purpose::Admission),
+        "its admission catch-up is still open: {open:?}"
+    );
+    b.pause(0, false);
 }

@@ -7,13 +7,16 @@
 //! winner changed and shares follow the weights; no world ever has two
 //! holders at any instant; no decision ever changes; the partitioned minority
 //! holds and decides nothing; once proposers stop competing, every world has a
-//! holder and every key a decision. Budget 20 µs of engine time per Paxos
-//! round — what the engine costs, whatever number of rounds the backoff makes.
+//! holder and every key a decision. Budget 30 µs of engine time per Paxos
+//! round — what the engine costs, whatever number of rounds the backoff makes,
+//! on the thread's CPU clock, whatever else the machine is running.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use cpu_time::ThreadTime;
 
 use cluster::consensus::rendezvous::score;
 use cluster::consensus::votes::MemoryVotes;
@@ -63,7 +66,12 @@ const DROP: f64 = 0.02;
 const DUPLICATE: f64 = 0.01;
 /// Engine time per Paxos round. A budget on the whole run would judge the
 /// backoff — how many rounds a duel takes — rather than the engine's cost.
-const BUDGET_PER_ROUND: Duration = Duration::from_micros(20);
+///
+/// Measured on `.5` (2026-10-18): 18.7 µs a round idle, 23.5 µs beside a live
+/// `motherd`, on the thread's own CPU clock — the engine shares caches and
+/// memory bandwidth with whatever else runs. 20 µs failed on a busy machine
+/// with nothing regressed; 30 µs still fails a ~1.5× slowdown of the engine.
+const BUDGET_PER_ROUND: Duration = Duration::from_micros(30);
 
 fn world(w: usize) -> Vec<u8> {
     format!("world/{w}").into_bytes()
@@ -318,7 +326,9 @@ impl Sim {
 
 #[test]
 fn h7_consensus() {
-    let started = Instant::now();
+    // The simulation runs on this one thread, so its CPU clock is the
+    // engine's cost; a wall clock would also count the rest of the machine.
+    let started = ThreadTime::now();
     let mut sim = Sim::new();
 
     // Rendezvous scores, computed once.

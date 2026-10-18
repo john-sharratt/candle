@@ -244,6 +244,7 @@ impl Replicator {
                 return;
             }
             s.ready[c] = true;
+            s.served = true;
             let offer = !s.offered;
             s.offered = true;
             (offer.then(|| s.sockets[c].clone()).flatten(), s.phase)

@@ -89,6 +89,13 @@ pub(super) struct State {
     pub sockets: Vec<Option<SessionHandle>>,
     /// Per socket: its admission catch-up has finished.
     pub ready: Vec<bool>,
+    /// An admission catch-up has finished since the process started: the
+    /// member has served, and what it holds is current up to the moment a
+    /// socket dropped. A socket admitted again serves at once — the gateway
+    /// holds requests off it until its `ACK`s are in sync with the members
+    /// serving — instead of reading as loading, which after a gateway restart
+    /// took every member, and so the app, out of service for minutes.
+    pub served: bool,
     /// Per socket: how many times its admission catch-up has gone unanswered
     /// since the socket was admitted (`tick::ADMISSION_QUIET_LIMIT`).
     pub admission_quiet: Vec<u32>,
@@ -279,6 +286,7 @@ impl Replicator {
                 fresh: BTreeMap::new(),
                 sockets: vec![None; clusters],
                 ready: vec![false; clusters],
+                served: false,
                 admission_quiet: vec![0; clusters],
                 members: vec![None; clusters],
                 rr: 0,
@@ -492,14 +500,16 @@ impl Replicator {
         }
     }
 
-    /// Whether socket `c`'s admission catch-up has finished and the member
-    /// is in the group: what its `CAPACITY` reports as ready (§7.2).
+    /// Whether socket `c`'s `CAPACITY` reports ready (§7.2): the member is in
+    /// the group, and either that socket's admission catch-up has finished or
+    /// the member has already served since its process started (see
+    /// `State::served`).
     pub fn socket_ready(&self, c: usize) -> bool {
         let s = self.state();
         s.phase == Phase::Joined
             && s.fault.is_none()
             && !s.drained
-            && s.ready.get(c).copied().unwrap_or(false)
+            && (s.served || s.ready.get(c).copied().unwrap_or(false))
     }
 
     /// Whether any socket's admission catch-up has finished: the `catchup`
