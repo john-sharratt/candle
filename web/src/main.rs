@@ -17,7 +17,7 @@ use cluster::handshake::GroupKey;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
-use web::cluster::status_key::StatusKey;
+use web::cluster::bearer_key::BearerKey;
 use web::log_file::RotatingFileLog;
 use web::{Builder, Config};
 
@@ -58,6 +58,14 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     new_status_key: Option<PathBuf>,
 
+    /// Write a fresh ops key to this file, which must not exist, then exit
+    /// (`docs/replicated_substrate.md` §12). Name it in the `cluster:` block's
+    /// `ops_key` with the admin it acts as, and present its contents as
+    /// `Authorization: Bearer <key>` to run the gateway's commands — an
+    /// emergency rollback among them — without a session.
+    #[arg(long, value_name = "PATH")]
+    new_ops_key: Option<PathBuf>,
+
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
@@ -82,7 +90,10 @@ async fn main() -> anyhow::Result<()> {
     // keeps no record of a failed request at all. A `--check` or a key write
     // opens no file — opening truncates it, and the gateway serving beside
     // the check would lose its log. An unopenable file degrades to stdout.
-    let serving = !cli.check && cli.new_group_key.is_none() && cli.new_status_key.is_none();
+    let serving = !cli.check
+        && cli.new_group_key.is_none()
+        && cli.new_status_key.is_none()
+        && cli.new_ops_key.is_none();
     let log_dir = cli
         .config
         .parent()
@@ -112,10 +123,19 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(path) = &cli.new_status_key {
-        StatusKey::create(path)?;
+        BearerKey::create(path)?;
         println!(
             "wrote a new status key to {}: name it as the `cluster:` block's status_key_file, \
              and send its contents as `Authorization: Bearer <key>`",
+            path.display()
+        );
+        return Ok(());
+    }
+    if let Some(path) = &cli.new_ops_key {
+        BearerKey::create(path)?;
+        println!(
+            "wrote a new ops key to {}: name it as the `cluster:` block's \
+             `ops_key: {{file, admin}}`, and send its contents as `Authorization: Bearer <key>`",
             path.display()
         );
         return Ok(());

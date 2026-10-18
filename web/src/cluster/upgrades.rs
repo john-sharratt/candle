@@ -81,7 +81,9 @@ async fn command(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Response {
-    let identity = s.auth.as_ref().and_then(|a| a.identity(&headers));
+    // A session, or the ops key: an emergency rollback must not wait on a
+    // browser sign-in.
+    let identity = s.gateway.caller(s.auth.as_deref(), &headers);
     let role = s.roles.of(identity.as_ref());
     if !role.at_least(Role::Admin) {
         let status = if identity.is_none() {

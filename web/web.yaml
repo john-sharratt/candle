@@ -188,9 +188,20 @@ roles_file: "../host/roles.yaml"
 # (§12). Made once with
 #
 #   target\release\web.exe --new-status-key web/secrets/status.key
+#
+# `ops_key` is an admin without a session, for the emergency that cannot wait
+# for a sign-in: presenting `file`'s contents as `Authorization: Bearer <key>`
+# acts as `admin` on the gateway's page and every command on it — a `rollout`
+# back to the previous build among them (§12). `admin` must be in the role
+# table. Made once with
+#
+#   target\release\web.exe --new-ops-key web/secrets/ops.key
 cluster:
   group_key_file: "secrets/group.key"
   status_key_file: "secrets/status.key"
+  ops_key:
+    file: "secrets/ops.key"
+    admin: "johnathan.sharratt@gmail.com"
   name: "blackworld"
   floor_grace_minutes: 1
 

@@ -38,7 +38,9 @@ use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as TMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tower::Service;
-use web::cluster::status_key::StatusKey;
+use web::auth::{Principal, Roles};
+use web::cluster::bearer_key::BearerKey;
+use web::cluster::ops_key::OpsKey;
 use web::cluster::{ClusterPeer, Gateway};
 use web::{Builder, Config};
 
@@ -305,11 +307,19 @@ fn content_dir() -> &'static Path {
 }
 
 async fn gateway(dumb: SocketAddr) -> (SocketAddr, Arc<Hub>) {
-    gateway_keyed(dumb, None).await
+    gateway_keyed(dumb, None, None).await
 }
 
-/// [`gateway`], its status read with `status_key` too.
-async fn gateway_keyed(dumb: SocketAddr, status_key: Option<StatusKey>) -> (SocketAddr, Arc<Hub>) {
+/// The admin the tests' ops key acts as, the one admin their role table names.
+const OPS_ADMIN: &str = "op@tokera.test";
+
+/// [`gateway`], with its status key and its ops key — the latter acting as
+/// [`OPS_ADMIN`], whom the role table makes an admin.
+async fn gateway_keyed(
+    dumb: SocketAddr,
+    status_key: Option<BearerKey>,
+    ops_key: Option<BearerKey>,
+) -> (SocketAddr, Arc<Hub>) {
     let yaml = format!(
         r#"
 cluster: {{group_key_file: "secrets/group.key"}}
@@ -322,10 +332,15 @@ sites:
       - {{prefix: /plain, upstream: "http://{dumb}"}}
 "#
     );
-    let cfg = Config::from_yaml(&yaml, content_dir()).unwrap();
+    let mut cfg = Config::from_yaml(&yaml, content_dir()).unwrap();
+    cfg.roles = Roles {
+        admins: vec![Principal::Email(OPS_ADMIN.into())],
+        creators: Vec::new(),
+    };
     let hub = Hub::new(key(), "gw-test");
+    let ops_key = ops_key.map(|k| OpsKey::new(k, OPS_ADMIN));
     let router = Builder::new(cfg)
-        .cluster(Gateway::with_hub_and_status_key(hub.clone(), status_key))
+        .cluster(Gateway::with_hub_and_keys(hub.clone(), status_key, ops_key))
         .router();
     (spawn(router).await, hub)
 }
@@ -798,7 +813,7 @@ async fn the_status_page_is_an_admins() {
 async fn the_status_key_reads_the_status_and_nothing_else() {
     let dumb = spawn(dumb_daemon()).await;
     let key = "5a".repeat(32);
-    let (gw, hub) = gateway_keyed(dumb, StatusKey::from_hex(&key)).await;
+    let (gw, hub) = gateway_keyed(dumb, BearerKey::from_hex(&key), None).await;
     let bearer = format!("Bearer {key}");
     let with_key = [("authorization", bearer.as_str())];
 
@@ -821,6 +836,77 @@ async fn the_status_key_reads_the_status_and_nothing_else() {
     let drain = ask(gw, "POST", "/gateway/command/drain-gateway", &with_key, "").await;
     assert_eq!(drain.status, 401);
     assert!(!hub.draining());
+}
+
+/// **The ops key is an admin with no session**, so an emergency needs no
+/// browser: presented, the page answers, the gateway's own commands run, and
+/// an upgrade command is judged on its merits — here a `raise-floor` with no
+/// pending floor is refused as a conflict, not as unauthenticated. Any other
+/// key is nobody, and the status key still reads only the status.
+#[tokio::test]
+async fn the_ops_key_is_an_admin_without_a_session() {
+    let dumb = spawn(dumb_daemon()).await;
+    let ops = "6c".repeat(32);
+    let status = "5a".repeat(32);
+    let (gw, hub) = gateway_keyed(
+        dumb,
+        BearerKey::from_hex(&status),
+        BearerKey::from_hex(&ops),
+    )
+    .await;
+    let bearer = format!("Bearer {ops}");
+    let with_ops = [("authorization", bearer.as_str())];
+
+    assert_eq!(ask(gw, "GET", "/gateway", &with_ops, "").await.status, 200);
+    let read = ask(gw, "GET", "/gateway/status.json", &with_ops, "").await;
+    assert_eq!(read.status, 200, "{}", read.body);
+
+    let raise = ask(
+        gw,
+        "POST",
+        "/gateway/upgrade/raise-floor",
+        &with_ops,
+        r#"{"app":"zend"}"#,
+    )
+    .await;
+    assert_eq!(raise.status, 409, "judged, not refused: {}", raise.body);
+
+    let drain = ask(gw, "POST", "/gateway/command/drain-gateway", &with_ops, "").await;
+    assert_eq!(drain.status, 200, "{}", drain.body);
+    assert!(hub.draining(), "the ops key's command ran");
+    let undrain = ask(
+        gw,
+        "POST",
+        "/gateway/command/undrain-gateway",
+        &with_ops,
+        "",
+    )
+    .await;
+    assert_eq!(undrain.status, 200, "{}", undrain.body);
+    assert!(!hub.draining());
+
+    let wrong = format!("Bearer {}", "6d".repeat(32));
+    let with_wrong = [("authorization", wrong.as_str())];
+    assert_eq!(
+        ask(gw, "GET", "/gateway", &with_wrong, "").await.status,
+        401
+    );
+    let refused = ask(
+        gw,
+        "POST",
+        "/gateway/upgrade/raise-floor",
+        &with_wrong,
+        r#"{"app":"zend"}"#,
+    )
+    .await;
+    assert_eq!(refused.status, 401);
+
+    let status_bearer = format!("Bearer {status}");
+    let with_status = [("authorization", status_bearer.as_str())];
+    assert_eq!(
+        ask(gw, "GET", "/gateway", &with_status, "").await.status,
+        401
+    );
 }
 
 /// **The cluster socket** refuses an app that is none of the three, and a

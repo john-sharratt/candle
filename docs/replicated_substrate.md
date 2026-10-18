@@ -3536,9 +3536,34 @@ every host, merged ahead of site routing, and admin only. The data also answers 
 caller presenting the **status key** as `Authorization: Bearer <key>`: a server-side
 secret, written by `web --new-status-key <path>` and named by the `cluster:` block's
 `status_key_file`, so a script or an operator at a shell reads how the cluster stands
-without a browser session (`web/src/cluster/status_key.rs`). It reads the status and
-nothing else: the page and every command still want an admin's session, and it is its
-own key, never the group key, so it admits no member. tokera.com's top bar links to
+without a browser session (`web/src/cluster/bearer_key.rs`). It reads the status and
+nothing else, and it is its own key, never the group key, so it admits no member.
+
+The **ops key** is the same kind of secret with an admin's reach: written by
+`web --new-ops-key <path>` and named by the `cluster:` block's
+`ops_key: {file, admin}`, a caller presenting it is the admin `admin` names on every
+route of the gateway's own — the page, `drain-gateway`/`undrain-gateway`, every
+upgrade command (§12.4), and the member commands the page sends — and that admin is
+the identity the gateway names to the member a command goes to, so the role table
+must list it (`web/src/cluster/ops_key.rs`). It exists for the emergency that cannot
+wait for a sign-in: whoever can read the key file on the gateway's box — the same
+person who can replace the binaries keep runs there — rolls a bad build back from a
+shell:
+
+```text
+# the plan: which members install what, and the builds it rejects
+curl -X POST -H "Authorization: Bearer $(cat ops.key)" \
+     -d '{"app":"zend","build":"<previous count-hash>"}' \
+     https://<gateway>/gateway/upgrade/rollout
+# confirmed: the plan's source proposes rollout/<app>/<n>, which moves the floor
+curl -X POST -H "Authorization: Bearer $(cat ops.key)" \
+     -d '{"app":"zend","build":"<previous count-hash>","confirm":"<previous count-hash>"}' \
+     https://<gateway>/gateway/upgrade/rollout
+```
+
+A member's own `rollback` refuses a build below the floor — the member would be
+admitted only to be upgraded straight back — so a downgrade is always this `rollout`,
+which rejects the bad build and lowers the floor with it. tokera.com's top bar links to
 it as **Cluster** beside the signed-in name, for an admin or a creator only:
 `/auth/me` carries the caller's `role`, and `common/lib/auth.js` offers the link where
 the page would not be refused. The gateway resolves roles from `host/roles.yaml` itself

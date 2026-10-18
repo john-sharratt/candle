@@ -75,6 +75,18 @@ pub struct Config {
     pub base: PathBuf,
 }
 
+/// The `cluster:` block's `ops_key`.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OpsKeyConfig {
+    /// The key's file, resolved against this config.
+    pub file: PathBuf,
+    /// The admin it acts as, by the email the role table names them by: what
+    /// this gateway's role check sees and what it names to the member a
+    /// command goes to, so both must list them as an admin.
+    pub admin: String,
+}
+
 /// The `cluster:` block.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +99,12 @@ pub struct Cluster {
     /// only an admin's session reads it. `web --new-status-key` writes one.
     #[serde(default)]
     pub status_key_file: Option<PathBuf>,
+    /// The ops key (§12): a caller presenting it acts as `admin` on every
+    /// route of the gateway's own — its page and commands, and every upgrade
+    /// command, an emergency `rollout` back included — without a session.
+    /// Absent, those take an admin's session. `web --new-ops-key` writes one.
+    #[serde(default)]
+    pub ops_key: Option<OpsKeyConfig>,
     /// This gateway's name in the coordination log; default its bind address.
     #[serde(default)]
     pub name: Option<String>,
@@ -652,6 +670,11 @@ impl Config {
                     *p = base.join(&*p);
                 }
             }
+            if let Some(ops) = &mut cluster.ops_key {
+                if ops.file.is_relative() {
+                    ops.file = base.join(&ops.file);
+                }
+            }
             // Peers share certificates through the ACME store, which only a
             // gateway with a TLS entrance has; its node id lives there too.
             if !cluster.peers.is_empty() && self.server.tls.is_none() {
@@ -924,6 +947,24 @@ sites:
         assert_eq!(
             keyed.cluster.unwrap().status_key_file,
             Some(Path::new("/srv/web").join("secrets/status.key"))
+        );
+        // No ops key unless one is named; its file resolves the same way, and
+        // it names the admin it acts as.
+        assert_eq!(cluster.ops_key, None);
+        let ops = Config::from_yaml(
+            &ok.replace(
+                "{group_key_file:",
+                "{ops_key: {file: \"secrets/ops.key\", admin: \"op@tokera.com\"}, group_key_file:",
+            ),
+            Path::new("/srv/web"),
+        )
+        .unwrap();
+        assert_eq!(
+            ops.cluster.unwrap().ops_key,
+            Some(OpsKeyConfig {
+                file: Path::new("/srv/web").join("secrets/ops.key"),
+                admin: "op@tokera.com".into(),
+            })
         );
         let tuned = Config::from_yaml(
             &ok.replace(

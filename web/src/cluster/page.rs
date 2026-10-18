@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use super::route::{forward, Context};
 use super::{upgrades, Gateway};
-use crate::auth::{Auth, Role, Roles};
+use crate::auth::{Auth, Identity, Role, Roles};
 use crate::config::Cache;
 use crate::site::tokera::page::{nav_bar, Nav};
 
@@ -57,13 +57,14 @@ pub fn router(gateway: Arc<Gateway>, auth: Option<Arc<Auth>>, roles: Roles) -> R
         .merge(upgrades::router(gateway, auth, roles))
 }
 
-/// The refusal for a caller who is not an admin. Boxed because a `Response`
-/// is large and this is the cold path.
-fn admin(s: &PageState, headers: &HeaderMap) -> Result<(), Box<Response>> {
-    let identity = s.auth.as_ref().and_then(|a| a.identity(headers));
+/// The caller, if an admin — by session or by the ops key
+/// ([`Gateway::caller`]) — else the refusal for one who is not. Boxed because
+/// a `Response` is large and this is the cold path.
+fn admin(s: &PageState, headers: &HeaderMap) -> Result<Option<Identity>, Box<Response>> {
+    let identity = s.gateway.caller(s.auth.as_deref(), headers);
     let role = s.roles.of(identity.as_ref());
     if role.at_least(Role::Admin) {
-        return Ok(());
+        return Ok(identity);
     }
     let status = if identity.is_none() {
         StatusCode::UNAUTHORIZED
@@ -174,9 +175,10 @@ async fn member(
     peer: Option<ConnectInfo<SocketAddr>>,
     mut req: Request,
 ) -> Response {
-    if let Err(refused) = admin(&s, req.headers()) {
-        return *refused;
-    }
+    let identity = match admin(&s, req.headers()) {
+        Ok(identity) => identity,
+        Err(refused) => return *refused,
+    };
     let refuse = |status: StatusCode, detail: String| {
         (status, Json(json!({"error": "refused", "detail": detail}))).into_response()
     };
@@ -203,7 +205,6 @@ async fn member(
         Ok(uri) => *req.uri_mut() = uri,
         Err(e) => return refuse(StatusCode::BAD_REQUEST, format!("{target:?}: {e}")),
     }
-    let identity = s.auth.as_ref().and_then(|a| a.identity(req.headers()));
     let ctx = Context {
         want_html: false,
         peer: peer.map(|ConnectInfo(a)| a.ip()),

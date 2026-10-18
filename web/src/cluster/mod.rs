@@ -14,7 +14,8 @@
 //! | [`aggregate`], [`merge_ws`] | a request every ready member answers |
 //! | [`tunnel`] | a WebSocket to a member, closed `1011` when its socket drops |
 //! | [`page`] | the status page |
-//! | [`status_key`] | the key that reads the status without a session |
+//! | [`bearer_key`] | the keys that stand in for a session: status, ops |
+//! | [`ops_key`] | the admin an operator on the box acts as, for emergencies |
 //! | [`peers`] | the peer gateways: node id, identity, dial loops (§13.4) |
 //! | [`upgrades`] | the gateway's upgrade commands, the forced rollout's plan |
 //!
@@ -22,16 +23,17 @@
 //! crate's [`Hub`]; this module is its HTTP.
 
 pub mod aggregate;
+pub mod bearer_key;
 pub mod codec;
 pub mod endpoint;
 pub mod jobs;
 pub mod load;
 pub mod merge_ws;
 pub mod mirror;
+pub mod ops_key;
 pub mod page;
 pub mod peers;
 pub mod route;
-pub mod status_key;
 pub mod streams;
 pub mod transport;
 pub mod tunnel;
@@ -54,8 +56,11 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use crate::acme::names::groups;
 use crate::acme::peers::AcmePeers;
+use crate::auth::{Auth, Identity};
 use crate::config::{Cluster as ClusterConfig, Config};
-use status_key::StatusKey;
+use axum::http::HeaderMap;
+use bearer_key::BearerKey;
+use ops_key::OpsKey;
 
 /// How often the upgrades are judged: verdicts due, members left behind.
 const UPGRADE_TICK: Duration = Duration::from_secs(1);
@@ -114,7 +119,10 @@ pub struct Gateway {
     pub peering: Option<Arc<Peering>>,
     /// The key that reads the status without a session, when
     /// `cluster.status_key_file` names one.
-    pub status_key: Option<StatusKey>,
+    pub status_key: Option<BearerKey>,
+    /// The key an operator acts as an admin with, without a session, when
+    /// `cluster.ops_key` names one ([`OpsKey`]).
+    pub ops_key: Option<OpsKey>,
     /// The ACME shared with the peers, once the TLS entrance's certificates
     /// are loaded.
     acme: OnceLock<Arc<AcmePeers>>,
@@ -164,13 +172,19 @@ impl Gateway {
         let status_key = cluster
             .status_key_file
             .as_deref()
-            .map(StatusKey::load)
+            .map(BearerKey::load)
+            .transpose()?;
+        let ops_key = cluster
+            .ops_key
+            .as_ref()
+            .map(|o| OpsKey::load(&o.file, &o.admin))
             .transpose()?;
         Ok(Arc::new(Gateway {
             hub,
             node: voter,
             peering,
             status_key,
+            ops_key,
             acme: OnceLock::new(),
             sites: groups(cfg).into_iter().map(|g| g.site).collect(),
             router: OnceLock::new(),
@@ -214,21 +228,33 @@ impl Gateway {
 
     /// A gateway around `hub`, for tests that build the hub themselves.
     pub fn with_hub(hub: Arc<Hub>) -> Arc<Gateway> {
-        Gateway::with_hub_and_status_key(hub, None)
+        Gateway::with_hub_and_keys(hub, None, None)
     }
 
-    /// [`Self::with_hub`], reading its status with `status_key` too.
-    pub fn with_hub_and_status_key(hub: Arc<Hub>, status_key: Option<StatusKey>) -> Arc<Gateway> {
+    /// [`Self::with_hub`], with its status key and its ops key.
+    pub fn with_hub_and_keys(
+        hub: Arc<Hub>,
+        status_key: Option<BearerKey>,
+        ops_key: Option<OpsKey>,
+    ) -> Arc<Gateway> {
         Arc::new(Gateway {
             hub,
             node: 0,
             peering: None,
             status_key,
+            ops_key,
             acme: OnceLock::new(),
             sites: Vec::new(),
             router: OnceLock::new(),
             ticking: OnceLock::new(),
         })
+    }
+
+    /// Who a request to one of this gateway's own routes is: its session, or
+    /// the ops key's admin when it presents that key ([`OpsKey`]).
+    pub fn caller(&self, auth: Option<&Auth>, headers: &HeaderMap) -> Option<Identity> {
+        auth.and_then(|a| a.identity(headers))
+            .or_else(|| self.ops_key.as_ref().and_then(|k| k.caller(headers)))
     }
 
     pub fn set_router(&self, router: Router) {
