@@ -3729,6 +3729,11 @@ mod tests {
     /// are bookkeeping faults, so a test has to write one rather than provoke it.
     use super::with_pool;
 
+    use super::{SpanHeldGround, BOOTSTRAP_HELD_BYTES};
+    use candle::cuda_backend::HeldGround;
+    use std::panic::Location;
+    use std::sync::Arc;
+
     /// The pool is process-global and cargo runs tests in parallel, so region
     /// counts are only stable while one test at a time is looking at them — and
     /// that includes tests outside this module, which is why it is the
@@ -4903,27 +4908,37 @@ mod tests {
         }
     }
 
+    /// A held ground of the tests' own, with a bootstrap block like the device's:
+    /// the device's ground is the process's, and every CUDA test running beside
+    /// these takes from it, so its arenas, headroom and growth are theirs as much
+    /// as this test's. Only the span regions its arenas claim are shared. The
+    /// bootstrap base is never dereferenced — nothing here touches the memory.
+    fn own_held_ground() -> Arc<SpanHeldGround> {
+        SpanHeldGround::new(0x7f00_0000_0000, BOOTSTRAP_HELD_BYTES)
+    }
+
     /// **The held ground grows to what was refused and gives it back when idle.**
-    /// A take wider than anything held goes to the pool, once; the next
-    /// provisioning claims an arena that holds it, so the same take is held
-    /// ground; and once nothing holds the arena, a window of quiet provisionings
-    /// returns it to the span.
+    /// A take wider than anything held is refused, once; the next provisioning
+    /// claims an arena that holds it, so the same take is held ground; and once
+    /// nothing holds the arena, a window of quiet provisionings returns it to the
+    /// span.
     #[test]
     fn held_arenas_cover_a_refused_take_and_go_back_when_idle() -> Result<()> {
-        use candle::cuda_backend::Held;
         let _serial = serial();
         let Ok(Device::Cuda(dev)) = Device::new_cuda(0) else {
             return Ok(());
         };
         let s = dev.cuda_stream();
-        let held = with_pool(&s, |p| Ok(p.held.clone()))?;
+        let held = own_held_ground();
+        let site = Location::caller();
         held.provision(&dev);
         let wide = 40 << 20;
 
-        // SAFETY: never read; its address is all the test looks at.
-        let first = unsafe { Held::<u8>::alloc_on(&s, wide)? };
-        assert!(!first.on_ground(), "nothing held is wide enough yet");
-        drop(first);
+        assert_eq!(
+            held.take(wide, site),
+            None,
+            "nothing held is wide enough yet"
+        );
 
         held.provision(&dev);
         let grown = held.stats();
@@ -4931,10 +4946,10 @@ mod tests {
             grown.arena_bytes >= wide,
             "an arena of at least the refused width: {grown:?}"
         );
-        // SAFETY: as above.
-        let second = unsafe { Held::<u8>::alloc_on(&s, wide)? };
-        assert!(second.on_ground(), "the same take is held ground now");
-        drop(second);
+        let second = held
+            .take(wide, site)
+            .expect("the same take is held ground now");
+        held.give_back(second, &s);
         s.synchronize().map_err(candle::Error::wrap)?;
 
         for _ in 0..=super::super::held_ground::RECENT_WINDOW {
@@ -4949,13 +4964,12 @@ mod tests {
     /// the next provisioning moves it there, so it is not left as the frontier.
     #[test]
     fn an_idle_held_arena_moves_down_onto_freed_ground() -> Result<()> {
-        use candle::cuda_backend::Held;
         let _serial = serial();
         let Ok(Device::Cuda(dev)) = Device::new_cuda(0) else {
             return Ok(());
         };
         let s = dev.cuda_stream();
-        let held = with_pool(&s, |p| Ok(p.held.clone()))?;
+        let held = own_held_ground();
         held.provision(&dev);
         // The low ground, taken, so the arena is claimed above it.
         let mut low = Vec::new();
@@ -4963,8 +4977,11 @@ mod tests {
             low.extend(claim_region(&s)?);
         }
         let wide = 72 << 20;
-        // SAFETY: never read; refused, so it only records the width.
-        drop(unsafe { Held::<u8>::alloc_on(&s, wide)? });
+        assert_eq!(
+            held.take(wide, Location::caller()),
+            None,
+            "refused, so it only records the width"
+        );
         held.provision(&dev);
         let high = held.stats().arena_top;
         assert!(
