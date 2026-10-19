@@ -583,8 +583,48 @@ impl Scheduler {
                     .map(|p| p.work.tokens.len()),
             )
             .sum::<usize>() as u64;
+        // **The step a placed decode would get, not the step of the wave now.**
+        // With a cohort held, one more decode re-trades it (`traded_width`):
+        // the cohort narrows to what its rows still pay for beside that decode,
+        // and the decode steps at the residency the narrower cohort leaves.
+        // Published at the wave as it stands, a background ingest's width set
+        // the figure and no decode was ever placed to narrow it — a fixed point
+        // that kept WhiteWorld idle for dialogue (c673b63c9, 2026-10-19).
+        let placed_step = self.wave_rate.as_ref().and_then(|r| {
+            let q_lens: Vec<usize> =
+                self.wave_prefill_members
+                    .iter()
+                    .map(|m| match m {
+                        WaveMember::Prefill { advance, .. }
+                        | WaveMember::Section { advance, .. } => *advance,
+                    })
+                    .collect();
+            let seqs: Vec<usize> = self
+                .wave_prefill_members
+                .iter()
+                .map(|m| m.seq_id())
+                .collect();
+            let offsets: Vec<usize> = seqs
+                .iter()
+                .map(|&s| self.session.sequence_offset(s).unwrap_or(0))
+                .collect();
+            let full: usize = q_lens.iter().sum();
+            if full == 0 {
+                return None;
+            }
+            let zone = super::interleave::effective_weight_zone_bytes(0)?;
+            Some(r.placed_decode_step_ms(
+                self.decode_width(),
+                full,
+                super::admit_ground::PREFILL_MIN_ADVANCE,
+                CHUNK_SIZE,
+                q_lens.len() as f64,
+                |rows| self.weights_at_width(&q_lens, &offsets, &seqs, zone, rows),
+            ))
+        });
         let learned = learned.map(|r| super::phase_ring::LearnedRates {
             high_backlog_tokens: high_backlog,
+            decode_step_ms_plus_one: placed_step.unwrap_or(r.decode_step_ms_plus_one),
             ..r
         });
         if let Some(rates) = learned {
@@ -619,6 +659,86 @@ impl Scheduler {
                 ),
             }
         }
+    }
+
+    /// The widest a cohort of these members may run beside `decodes` decodes
+    /// routing to `routed` experts a layer, by the trade admission judges by
+    /// (`WaveRate::traded_width`), and the residency that width leaves. `None`
+    /// when there is nothing to trade: no rate model, or no member.
+    ///
+    /// **The width a held cohort is re-fitted to.** A cohort admitted once
+    /// re-forms every sweep, and fitted only to the ground it reaches it kept
+    /// its width beside any decode that arrived later: on WhiteWorld
+    /// (c673b63c9, 2026-10-19) a background ingest held the weights down so
+    /// that the card's decode stepped at 0.5–0.8 s with one turn on it.
+    /// Re-traded at each fit, it narrows to the width its prefill still pays
+    /// for, and keeps advancing.
+    pub(super) fn traded_width(
+        &self,
+        q_lens: &[usize],
+        offsets: &[usize],
+        seqs: &[usize],
+        decodes: usize,
+        routed: usize,
+    ) -> Option<(usize, u64)> {
+        let rate = self.wave_rate.as_ref()?;
+        let full: usize = q_lens.iter().sum();
+        if full == 0 {
+            return None;
+        }
+        let zone = super::interleave::effective_weight_zone_bytes(0)?;
+        let weights_at = |rows| self.weights_at_width(q_lens, offsets, seqs, zone, rows);
+        let width = rate.traded_width(
+            full,
+            super::admit_ground::PREFILL_MIN_ADVANCE,
+            CHUNK_SIZE,
+            q_lens.len() as f64,
+            decodes,
+            routed,
+            weights_at,
+        );
+        Some((
+            width,
+            self.weights_at_width(q_lens, offsets, seqs, zone, width),
+        ))
+    }
+
+    /// The residency a cohort of these members leaves at `rows` wide: the zone
+    /// less the tier their water-filled shares of `rows` place, beside the
+    /// running decodes.
+    fn weights_at_width(
+        &self,
+        q_lens: &[usize],
+        offsets: &[usize],
+        seqs: &[usize],
+        zone: u64,
+        rows: usize,
+    ) -> u64 {
+        let shares = super::admission::share_within(q_lens, rows, CHUNK_SIZE);
+        let mut adv = Vec::new();
+        let mut off = Vec::new();
+        let mut sq = Vec::new();
+        for ((&s, &o), &q) in shares.iter().zip(offsets).zip(seqs) {
+            if s > 0 {
+                adv.push(s);
+                off.push(o);
+                sq.push(q);
+            }
+        }
+        let width: usize = adv.iter().sum();
+        let tier = self
+            .model
+            .wave_tier_bytes(
+                width,
+                adv.len().max(1),
+                &adv,
+                &off,
+                &sq,
+                &self.decode_stage(),
+                self.session.activation_dtype(),
+            )
+            .unwrap_or(0);
+        zone.saturating_sub(tier)
     }
 
     pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {
@@ -3264,7 +3384,18 @@ impl Scheduler {
                     g,
                 )
             });
-            let Some(target) = [fitted_rows(rows, need, ground), at_frontier]
+            // And the width its rows still pay for beside the running decodes
+            // (`traded_width`): a cohort is re-traded at every fit, so one that
+            // went wide with no decode running narrows once decodes arrive.
+            let decodes = self.decode_width();
+            let traded = self
+                .wave_rate
+                .as_ref()
+                .map(|r| r.routed_for(decodes))
+                .and_then(|routed| self.traded_width(&q_lens, &offsets, &seqs, decodes, routed))
+                .map(|(w, _)| w)
+                .filter(|&w| w < rows);
+            let Some(target) = [fitted_rows(rows, need, ground), at_frontier, traded]
                 .into_iter()
                 .flatten()
                 .min()
@@ -4270,7 +4401,8 @@ impl Scheduler {
                 let retryable = is_device_oom(&e)
                     || tier_refusal_shortfall(&e).is_some()
                     || is_span_full(&e)
-                    || is_expert_stall(&e);
+                    || is_expert_stall(&e)
+                    || candle_nn::kv_cache::is_arena_exhausted(&e);
                 if cursor > 0 && retryable && self.wave_sweep_failures < MID_SWEEP_RETRIES {
                     self.wave_sweep_failures += 1;
                     // The ground the window was refused is often standing below

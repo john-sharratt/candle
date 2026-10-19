@@ -93,6 +93,27 @@ pub fn is_tier_refusal(err: &candle::Error) -> bool {
 /// of submission.
 pub const SPAN_FULL_MARKER: &str = "the span is genuinely full";
 
+/// Carried by a wave buffer asked past what its phase arena holds
+/// (`bump_arena`): the forward's span was laid out for a plan other than the
+/// one it ran — a step whose placement found an earlier forward's outputs
+/// still live keeps the arenas that forward sized, and a wider segment then
+/// asks past them. Like a refused tier it is the engine's state, not the turn's:
+/// the same step placed again once those outputs are gone is sized to its own
+/// plan. Measured on BlackWorld (c673b63c9, 2026-10-19): a creep segment
+/// priced at 335 MiB of forward phase carved from a 16 MiB span, and failed the
+/// fourteen turns its wave carried.
+pub const ARENA_EXHAUSTED_MARKER: &str = "wave arena exhausted";
+
+/// Recognize a wave buffer asked past its arena — see [`ARENA_EXHAUSTED_MARKER`]
+/// — or the refusal that now comes before it: spans a live generation holds,
+/// laid out for an earlier plan than this forward's
+/// ([`super::bump_arena::SPANS_OUTGROWN_MARKER`]). The same state either way,
+/// and retryable either way.
+pub fn is_arena_exhausted(err: &candle::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains(ARENA_EXHAUSTED_MARKER) || msg.contains(super::bump_arena::SPANS_OUTGROWN_MARKER)
+}
+
 /// Recognize a claim refused by a full span — see [`SPAN_FULL_MARKER`].
 pub fn is_span_full(err: &candle::Error) -> bool {
     err.to_string().contains(SPAN_FULL_MARKER)

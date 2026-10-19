@@ -8,7 +8,7 @@ use super::*;
 use crate::batched_sampler::DEGENERATE_TOKEN_RUN;
 use crate::recorded_reply::{departure, replayed_step};
 use crate::stats::streams_committed;
-use candle_nn::kv_cache::{is_span_full, is_tier_refusal};
+use candle_nn::kv_cache::{is_arena_exhausted, is_span_full, is_tier_refusal};
 use candle_transformers::models::expert_lre::{is_expert_stall, PipelineStats, ProfileSnapshot};
 use candle_transformers::models::held_tensor::hold_rows;
 use candle_transformers::models::speculative_choice::AcceptWalk;
@@ -793,7 +793,12 @@ impl Scheduler {
             budget,
         ) {
             Ok(d) => d,
-            Err(e) if is_tier_refusal(&e) || is_span_full(&e) || is_expert_stall(&e) => {
+            Err(e)
+                if is_tier_refusal(&e)
+                    || is_span_full(&e)
+                    || is_expert_stall(&e)
+                    || is_arena_exhausted(&e) =>
+            {
                 self.retry_step(&seq_ids, "decode draft", &e);
                 return;
             }
@@ -892,7 +897,11 @@ impl Scheduler {
             Ok(l) => l,
             Err(e) => {
                 self.model.abort_verify(&spec_seqs);
-                if is_tier_refusal(&e) || is_span_full(&e) || is_expert_stall(&e) {
+                if is_tier_refusal(&e)
+                    || is_span_full(&e)
+                    || is_expert_stall(&e)
+                    || is_arena_exhausted(&e)
+                {
                     self.retry_step(&seq_ids, "decode forward", &e);
                 } else {
                     self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));

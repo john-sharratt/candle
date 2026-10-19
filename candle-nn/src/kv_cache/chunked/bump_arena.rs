@@ -1000,6 +1000,9 @@ struct WaveDomain {
     /// Which thread opened the forward, so [`enter_arena_window`] can tell a
     /// *wait* from a **self-deadlock**.
     forward_thread: Option<ThreadId>,
+    /// Where the forward span now live was opened — what a refusal of a plan
+    /// that outgrew the spans names as the generation holding their layout.
+    forward_opener: Option<&'static std::panic::Location<'static>>,
 }
 
 /// What to reserve per phase when a wave opens without having priced itself.
@@ -1320,6 +1323,7 @@ fn domain_entry<'a>(
             reserved_by_forward: false,
             arena_windows: 0,
             forward_open: false,
+            forward_opener: None,
             forward_thread: None,
         }),
     };
@@ -1880,6 +1884,12 @@ fn cover_target(
     }
 }
 
+/// Begins a refusal [`begin_wave`] gives instead of handing out spans laid out
+/// for an earlier plan than the one this forward recorded, while a generation
+/// holds that layout. Retryable: the generation drops and the forward placed
+/// again lays out its own (`is_arena_exhausted`, which recognises both).
+pub const SPANS_OUTGROWN_MARKER: &str = "wave spans outgrown by their plan";
+
 /// Open a generation on `phase`'s span.
 ///
 /// **The guard must be held for the whole phase**, and the borrow checker holds
@@ -1893,7 +1903,9 @@ fn cover_target(
 /// means a phase was entered twice without leaving it, and the inner drop would
 /// reset the span the outer one is still allocating from. Refuse rather than
 /// corrupt (principle 7).
+#[track_caller]
 pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generation> {
+    let opener = std::panic::Location::caller();
     // Idempotent, and done here rather than at load: this is the first moment a
     // wave arena can exist, so it is the earliest point the resolver could be
     // useful and the latest it could be needed.
@@ -2098,6 +2110,37 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                     arena.rebase(at, plan[i])?;
                     at += plan[i] as u64;
                 }
+            } else if let Some(plan) = domain.planned {
+                // **A generation is live, so the spans stand as an earlier plan
+                // laid them out — and they must hold this one.** Inside one forward
+                // they always do: its phases open on the layout its own plan made.
+                // A forward opening while an earlier one's returned span is still
+                // held does not get a layout of its own, and when its plan has
+                // outgrown the spans standing, handing them out runs it on arenas
+                // sized for someone else: its first wide buffer asks past them. On
+                // BlackWorld (c673b63c9, 2026-10-19) a step priced at 340 MB of
+                // forward phase opened on a 16 MiB span a decode wave had laid out,
+                // and the creep segment's 320 MiB residual failed the fourteen
+                // turns its wave carried. Refused here instead, before anything
+                // runs: the generation drops, and the step placed again lays out
+                // its own spans.
+                let laid = arena.stats().2;
+                let wants = plan[phase_index(phase)];
+                if wants > laid {
+                    // Named: whether the holder is the failing step's own stack —
+                    // gone when the step returns, so its retry finds the spans free —
+                    // or something kept between steps, which a retry would only meet
+                    // again.
+                    let holder = domain
+                        .forward_opener
+                        .map_or_else(|| "an unknown site".to_string(), |l| l.to_string());
+                    return Err(candle::Error::Msg(format!(
+                        "{SPANS_OUTGROWN_MARKER}: the {phase:?} span is laid out at {laid} B \
+                         for an earlier plan, and this forward's plan asks {wants} B of it; \
+                         a generation still live holds that layout — the forward span \
+                         opened at {holder}"
+                    )));
+                }
             }
             // Count only once the guard exists. The count is what `release_if_last`
             // decrements on drop, so incrementing before a fallible call would strand
@@ -2108,6 +2151,7 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
             // The forward-wide span opening is the forward's scratch scope
             // opening: its launchers carve from this span until it closes.
             if arena_idx == FORWARD_ARENA {
+                domain.forward_opener = Some(opener);
                 let budget = if domain.planned.is_some() {
                     domain.scratch_priced
                 } else {
@@ -2921,6 +2965,53 @@ mod wave_tests {
              forward's plan {wide_bytes} B"
         );
         drop(guard);
+        Ok(())
+    }
+
+    /// **A plan that outgrew the spans a live generation holds is refused, not
+    /// handed the old spans.** A forward whose returned span is still held keeps
+    /// the layout its plan made; a wider plan recorded behind it gets no layout
+    /// of its own, and opening a phase on the old spans would run it on arenas
+    /// sized for the earlier forward — a 320 MiB residual asked of a 16 MiB span
+    /// on BlackWorld (c673b63c9). Refused with the retryable marker instead, and
+    /// a plan the standing spans hold still opens.
+    #[test]
+    fn a_plan_outgrowing_the_spans_a_live_generation_holds_is_refused() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let small = [1 << 20, 1 << 20, 1 << 20];
+        let forward = {
+            let _open = begin_forward(&s);
+            plan_wave_transient(&s, small)?;
+            // The earlier forward's span, still held — as a returned head span is.
+            begin_wave(&s, LayerPhase::Forward)?
+        };
+        // A wider forward records its plan behind it: placement waits on the
+        // live generation, so the spans stand as the small plan laid them out.
+        let wide = small.map(|b| b + (32 << 20));
+        {
+            let _open = begin_forward(&s);
+            plan_wave_transient(&s, wide)?;
+        }
+        let err = match begin_wave(&s, LayerPhase::Attention) {
+            Ok(_) => panic!("a phase opened on spans laid out for a smaller plan"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains(super::SPANS_OUTGROWN_MARKER),
+            "refused with the retryable marker: {err}"
+        );
+        assert!(
+            super::super::backing::is_arena_exhausted(&err),
+            "and recognised as retryable"
+        );
+        // A plan the standing spans hold opens as it always did.
+        {
+            let _open = begin_forward(&s);
+            plan_wave_transient(&s, small)?;
+        }
+        drop(begin_wave(&s, LayerPhase::Attention)?);
+        drop(forward);
         Ok(())
     }
 

@@ -1127,6 +1127,149 @@ impl WaveRate {
     /// not committed: it rides a later wave and is charged there. While the
     /// decode model is unlearned its side is left out, for
     /// `decode_would_carry`'s reason, and the prefill gain alone decides.
+    /// The trade [`Self::try_widen_trading`] judges, without admitting
+    /// anything: widening a wave from `tokens_before` to `tokens_after` rows,
+    /// which moves residency from `weights_before` to `weights_after`, gains the
+    /// prefill `prefill_weight × ΔP / P_cap` and costs the running decodes
+    /// `decode_weight × ΔD / D`. Positive pays.
+    ///
+    /// What a held cohort's width is re-judged by at each fit, so a sweep
+    /// admitted when no decode ran does not keep its width once one does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trade_net(
+        &self,
+        tokens_before: usize,
+        tokens_after: usize,
+        weights_before: u64,
+        weights_after: u64,
+        prefill_weight: f64,
+        decode_weight: f64,
+        decodes: usize,
+        routed: usize,
+    ) -> f64 {
+        let prefill_now = self.rate(tokens_before, weights_before);
+        let prefill_with = self.rate(tokens_after, weights_after);
+        let p_cap = self.rate(self.max_tokens.max(tokens_after), weights_before);
+        let prefill_gain = if p_cap > 0.0 {
+            (prefill_with - prefill_now) / p_cap
+        } else {
+            0.0
+        };
+        let decode_learned = self.decode_samples >= Self::MIN_DECODE_SAMPLES;
+        let decode_now = self.decode_rate(decodes, routed, weights_before);
+        let decode_change = if decode_learned && decodes > 0 && decode_now > 0.0 {
+            let decode_with = self.decode_rate(decodes, routed, weights_after);
+            (decode_with - decode_now) / decode_now
+        } else {
+            0.0
+        };
+        prefill_weight * prefill_gain + decode_weight * decode_change
+    }
+
+    /// Experts the decodes route to per layer were there `decodes` of them: the
+    /// wave's as it stands, and each decode more or fewer adding or taking its
+    /// own.
+    pub fn routed_for(&self, decodes: usize) -> usize {
+        let per = self.experts_per_decode(0);
+        if decodes >= self.decodes {
+            self.routed_per_layer
+                .saturating_add((decodes - self.decodes).saturating_mul(per))
+        } else {
+            self.routed_per_layer
+                .saturating_sub((self.decodes - decodes).saturating_mul(per))
+        }
+    }
+
+    /// Whether the decode model has learned enough to be traded against.
+    pub fn decode_learned(&self) -> bool {
+        self.decode_samples >= Self::MIN_DECODE_SAMPLES
+    }
+
+    /// The widest a cohort of `full` rows may run beside `decodes` decodes
+    /// routing to `routed` experts a layer: the widest chunk-aligned width,
+    /// down to `least`, whose last chunk's trade ([`Self::trade_net`]) still
+    /// pays, with `weights_at(rows)` the residency a width leaves. `full` when
+    /// there is nothing to trade against — no decode, or a decode model not yet
+    /// learned.
+    ///
+    /// Bisected: the decodes' loss grows with the width and the prefill's gain
+    /// falls, so the widths that pay are a prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn traded_width(
+        &self,
+        full: usize,
+        least: usize,
+        chunk: usize,
+        prefill_weight: f64,
+        decodes: usize,
+        routed: usize,
+        weights_at: impl Fn(usize) -> u64,
+    ) -> usize {
+        let least = least.min(full);
+        if decodes == 0 || !self.decode_learned() || full <= least {
+            return full;
+        }
+        let chunk = chunk.max(1);
+        let pays = |rows: usize| {
+            let before = rows.saturating_sub(chunk);
+            self.trade_net(
+                before,
+                rows,
+                weights_at(before),
+                weights_at(rows),
+                prefill_weight,
+                decodes as f64,
+                decodes,
+                routed,
+            ) > 1e-12
+        };
+        let (mut lo, mut hi) = (least.div_ceil(chunk), full.div_ceil(chunk));
+        let mut width = least;
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let rows = (mid * chunk).min(full);
+            if pays(rows) {
+                width = rows;
+                lo = mid + 1;
+            } else if mid == 0 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        width
+    }
+
+    /// The decode step a decode placed beside a held cohort would get, in
+    /// milliseconds: one decode more than `decodes` running, the cohort
+    /// re-traded against it ([`Self::traded_width`]) and the decodes stepping at
+    /// the residency that width leaves. What a member advertises as its next
+    /// step, so a wide cohort holding the weights down is priced at the width
+    /// a placed decode would narrow it to, not at the width it stands at.
+    #[allow(clippy::too_many_arguments)]
+    pub fn placed_decode_step_ms(
+        &self,
+        decodes: usize,
+        full: usize,
+        least: usize,
+        chunk: usize,
+        prefill_weight: f64,
+        weights_at: impl Fn(usize) -> u64,
+    ) -> f64 {
+        let decodes = decodes + 1;
+        let routed = self.routed_for(decodes);
+        let width = self.traded_width(
+            full,
+            least,
+            chunk,
+            prefill_weight,
+            decodes,
+            routed,
+            &weights_at,
+        );
+        self.decode_step_secs(routed, weights_at(width)) * 1e3
+    }
+
     pub fn try_widen_trading(
         &mut self,
         tokens: usize,
@@ -3780,5 +3923,96 @@ mod tests {
         )
         .expect_err("no link to measure on the CPU");
         assert!(err.to_string().contains("CUDA device"));
+    }
+
+    /// A planner whose decode side has learned a 20 ms layer, and a cohort whose
+    /// every row's tier dislodges a MiB of weights from 12 GiB resident — so a
+    /// wide cohort costs running decodes real stalls.
+    fn traded() -> (WaveRate, impl Fn(usize) -> u64) {
+        let mut rate = WaveRate::with_link_rate(
+            25e9,
+            ExpertGeometry::QWEN36_35B_A3B,
+            RateModel::default(),
+            DecodeModel::default(),
+        );
+        for _ in 0..WaveRate::MIN_DECODE_SAMPLES {
+            rate.observe_decode(1, 0, u64::MAX, 20e-3);
+        }
+        let weights_at = |rows: usize| (12u64 << 30).saturating_sub((rows as u64) << 20);
+        (rate, weights_at)
+    }
+
+    const FULL: usize = 8192;
+    const LEAST: usize = 128;
+    const CHUNK: usize = 32;
+
+    /// **The held cohort's width, re-traded.** With nothing decoding it keeps
+    /// its whole width; decodes narrow it, the more the narrower, never below
+    /// the least advance; and where it stops is where the trade turns.
+    #[test]
+    fn a_held_cohort_narrows_with_the_decodes_beside_it() {
+        let (rate, weights_at) = traded();
+        let width = |decodes: usize| {
+            rate.traded_width(
+                FULL,
+                LEAST,
+                CHUNK,
+                1.0,
+                decodes,
+                rate.routed_for(decodes),
+                &weights_at,
+            )
+        };
+        assert_eq!(width(0), FULL, "nothing decoding, nothing to trade");
+        let (one, four, many) = (width(1), width(4), width(24));
+        assert!(
+            one >= four && four >= many,
+            "monotone: {one} ≥ {four} ≥ {many}"
+        );
+        assert!(many < FULL, "24 decodes narrow a 8,192-row cohort: {many}");
+        assert!(many >= LEAST, "never below the least advance: {many}");
+        // The boundary is the trade's own: the last chunk in pays, the next out
+        // does not.
+        let routed = rate.routed_for(24);
+        let net = |before: usize, after: usize| {
+            rate.trade_net(
+                before,
+                after,
+                weights_at(before),
+                weights_at(after),
+                1.0,
+                24.0,
+                24,
+                routed,
+            )
+        };
+        if many > LEAST {
+            assert!(net(many - CHUNK, many) > 0.0, "the last chunk kept pays");
+        }
+        if many + CHUNK <= FULL {
+            assert!(net(many, many + CHUNK) <= 1e-12, "the next chunk would not");
+        }
+    }
+
+    /// **What a member advertises is the step a placed decode would get.** A
+    /// wide cohort held with nothing decoding publishes the step at the width
+    /// one placed decode would narrow it to — not at the width it stands at,
+    /// which no placement would ever come to narrow.
+    #[test]
+    fn a_wide_cohort_advertises_the_step_at_its_traded_width() {
+        let (rate, weights_at) = traded();
+        let placed = rate.placed_decode_step_ms(0, FULL, LEAST, CHUNK, 1.0, &weights_at);
+        let routed = rate.routed_for(1);
+        let narrowed = rate.traded_width(FULL, LEAST, CHUNK, 1.0, 1, routed, &weights_at);
+        let at = |rows: usize| rate.decode_step_secs(routed, weights_at(rows)) * 1e3;
+        assert!(
+            (placed - at(narrowed)).abs() < 1e-9,
+            "{placed} against {}",
+            at(narrowed)
+        );
+        assert!(
+            placed <= at(FULL),
+            "never slower than the cohort as it stands"
+        );
     }
 }

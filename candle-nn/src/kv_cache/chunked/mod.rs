@@ -138,7 +138,7 @@ mod tests;
 // Re-export public types
 pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use backing::{
-    is_device_oom, is_span_full, is_tier_refusal, is_tier_standing_over_free,
+    is_arena_exhausted, is_device_oom, is_span_full, is_tier_refusal, is_tier_standing_over_free,
     tier_refusal_shortfall, KV_DEVICE_OOM_MARKER, SPAN_FULL_MARKER, TIER_REFUSED_MARKER,
     TIER_SHORT_BY, TIER_STANDS_OVER_FREE,
 };
