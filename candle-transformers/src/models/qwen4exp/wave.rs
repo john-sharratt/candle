@@ -2414,6 +2414,13 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.has_recurrent(seq).unwrap_or(false)
     }
 
+    fn recurrent_census(&self) -> (usize, usize) {
+        (
+            self.recurrent_len().unwrap_or(0),
+            self.parked.read().map_or(0, |p| p.len()),
+        )
+    }
+
     fn prefill_scratch_bytes(&self, seq: usize) -> usize {
         let held = self
             .recurrent

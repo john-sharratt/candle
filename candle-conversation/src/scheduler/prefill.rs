@@ -1467,6 +1467,22 @@ impl Scheduler {
         if filled.prefills == 0 && filled.sections == 0 && self.running_members() == 0 {
             self.force_queue_head("admission refused every offer");
         }
+        // **A pass held on the floor over holes is held on ground that exists.**
+        // Residency is measured to the arena frontier, so holes stranded below it
+        // count for nothing until the frontier comes down into them — and relief,
+        // which measures free regions, never sees the shortage. On WhiteWorld
+        // (673f67a2a, heavy-read) residency read under the prefill floor in 329
+        // of 333 windows while 181 regions (about 3 GB) of holes stood beneath the
+        // frontier, and read turns waited six minutes between tool rounds. The
+        // frontier holder's own pass is what turns those holes into ground.
+        if filled.stopped_on_weights {
+            let holes = super::interleave::stranded_hole_bytes() as usize;
+            if holes
+                >= super::compaction_stall::MIN_FREEABLE_ARENAS * candle_nn::kv_cache::REGION_BYTES
+            {
+                self.lower_frontier_for(holes);
+            }
+        }
         // The pass acted on the completions that opened it; the next one waits
         // for its own.
         self.settled_since_admit = false;
@@ -2958,10 +2974,19 @@ impl Scheduler {
             let holes = self.session.kv_region_stats().map_or(0, |s| {
                 s.live_watermark.saturating_sub(s.live) * candle_nn::kv_cache::REGION_BYTES
             });
+            // And the K/V the running decodes add while the cohort sweeps: decodes
+            // step without admission, their claims land wherever the free list
+            // gives, and past the holes that is the frontier's ground — the
+            // tier's. The elastic check above withheld it; this one did not, and
+            // on WhiteWorld (673f67a2a) a cohort sweeping beside 24 decodes for
+            // 4.7 minutes found its window nine regions short.
+            let growth = self.decode_growth_bytes();
             let at_frontier = frontier.and_then(|g| {
                 fitted_rows(
                     rows,
-                    (tier as usize).saturating_add(claims.saturating_sub(holes)),
+                    (tier as usize)
+                        .saturating_add(claims.saturating_sub(holes))
+                        .saturating_add(growth),
                     g,
                 )
             });
@@ -3007,6 +3032,7 @@ impl Scheduler {
                     kv_geometry_mib = rows.saturating_mul(kv_row) >> 20,
                     stores,
                     scratch_mib = scratch >> 20,
+                    growth_mib = growth >> 20,
                     kv_blocks_mib = kv_blocks >> 20,
                     live_regions = live,
                     frontier_regions,

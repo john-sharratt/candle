@@ -4745,6 +4745,13 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// Recurrent stores held on the device, and sequences whose state is parked
+    /// in their record instead — `(held, parked)`. What says whether idle
+    /// conversations give their stores back. `(0, 0)` on a stack with none.
+    fn recurrent_census(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
     /// Claim `seq`'s carried per-sequence state now — whatever of it the
     /// sequence does not already hold — rather than at its first wave.
     ///

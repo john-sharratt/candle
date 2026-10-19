@@ -2616,6 +2616,7 @@ impl WaveStats {
         experts: Option<(usize, usize, usize, usize)>,
         graphs: Option<CaptureStats>,
         trades: Option<admit::rate::TradeWindow>,
+        stores: (usize, usize),
     ) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
@@ -2752,8 +2753,19 @@ impl WaveStats {
             }
             None => String::new(),
         };
+        // The recurrent stores on the device against the slots the scheduler
+        // holds, and the parked ones — so a window shows whether idle
+        // conversations are giving their stores back.
+        let stores_str = if stores.0 + stores.1 > 0 {
+            format!(
+                " | stores held={} parked={} slots={}",
+                stores.0, stores.1, slots.0
+            )
+        } else {
+            String::new()
+        };
         tracing::info!(
-            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}{trades_str}",
+            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}{trades_str}{stores_str}",
             elapsed.as_secs_f64()
         );
         // Phase breakdown: where the wall-clock went on the scheduler thread.
