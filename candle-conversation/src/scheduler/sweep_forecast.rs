@@ -18,7 +18,7 @@
 //! own offsets as they advance, and the duration from formation to the head.
 //! With neither measured yet, nothing is withheld — the width is what it was.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 /// Time constant of the decode rate's average, in seconds: long enough to ride
@@ -29,6 +29,16 @@ const RATE_TAU_SECS: f64 = 10.0;
 const MIN_SAMPLE_SECS: f64 = 0.5;
 /// Weight of the newest sweep in the duration's average.
 const SWEEP_WEIGHT: f64 = 0.5;
+/// Sweeps a forecast of what a sweep loses takes its peak over.
+///
+/// **The peak, not the mean, because the constraint is hard.** A window that
+/// finds its ground a region short loses every member of its cohort, so a
+/// growth priced at its mean is exceeded on about half the sweeps it matters
+/// for: on WhiteWorld (f3bf5e313, 2026-10-19) cohorts fitted with 40–130 MiB
+/// to spare were lost two to five regions short, each to a sweep that ran
+/// longer or took more held ground than the average said. A few sweeps show
+/// the load's spread, and few enough follow it when it moves.
+const RECENT_SWEEPS: usize = 4;
 
 /// See the module documentation.
 #[derive(Debug, Default)]
@@ -43,6 +53,12 @@ pub(super) struct SweepForecast {
     sweep_started: Option<Instant>,
     /// How long a sweep takes, formation to head, averaged.
     sweep_secs: Option<f64>,
+    /// Held ground's arena bytes when the sweep in flight formed.
+    held_at_formation: Option<u64>,
+    /// The most recent sweeps' durations and held-ground growths, newest last
+    /// — what the forecasts take their peak over ([`RECENT_SWEEPS`]).
+    recent_secs: VecDeque<f64>,
+    recent_held: VecDeque<u64>,
 }
 
 impl SweepForecast {
@@ -90,6 +106,7 @@ impl SweepForecast {
             return;
         };
         let secs = now.duration_since(start).as_secs_f64();
+        push_recent(&mut self.recent_secs, secs);
         self.sweep_secs = Some(match self.sweep_secs {
             Some(s) => s + SWEEP_WEIGHT * (secs - s),
             None => secs,
@@ -102,6 +119,32 @@ impl SweepForecast {
         self.sweep_started = None;
     }
 
+    /// Held ground's arena bytes as the sweep in flight forms.
+    pub(super) fn held_formed(&mut self, held_bytes: u64) {
+        self.held_at_formation = Some(held_bytes);
+    }
+
+    /// Held ground's arena bytes as the sweep in flight ends — at the head, or
+    /// short of it, whose growth up to its end is the growth that ended it —
+    /// against what they were at formation, joining the average.
+    pub(super) fn held_ended(&mut self, held_bytes: u64) {
+        let Some(at) = self.held_at_formation.take() else {
+            return;
+        };
+        push_recent(&mut self.recent_held, held_bytes.saturating_sub(at));
+    }
+
+    /// Held ground's growth over one sweep, as measured so far: zero until a
+    /// sweep has ended. Held ground provisions between every window of a sweep
+    /// (`provision_held`), so what it takes over the whole sweep is what a
+    /// cohort must leave room for, not only its next pass: an ingest cohort
+    /// fitted with 17 MiB to spare met held ground grown seven regions by its
+    /// last window, and was refused one short (WhiteWorld, f3bf5e313,
+    /// 2026-10-19).
+    pub(super) fn held_growth_bytes(&self) -> u64 {
+        self.recent_held.iter().copied().max().unwrap_or(0)
+    }
+
     /// A sweep's measured duration, in seconds — `None` until one has run.
     pub(super) fn sweep_secs(&self) -> Option<f64> {
         self.sweep_secs
@@ -110,7 +153,9 @@ impl SweepForecast {
     /// KV rows the decodes will add over one sweep, as measured so far: zero
     /// until both the rate and a sweep's duration have been observed.
     pub(super) fn withheld_rows(&self) -> usize {
-        match (self.rows_per_sec, self.sweep_secs) {
+        // Over the longest recent sweep: see `RECENT_SWEEPS`.
+        let longest = self.recent_secs.iter().copied().reduce(f64::max);
+        match (self.rows_per_sec, longest) {
             (Some(rate), Some(secs)) => (rate * secs).ceil().max(0.0) as usize,
             _ => 0,
         }
@@ -120,6 +165,14 @@ impl SweepForecast {
     pub(super) fn withheld_bytes(&self, kv_bytes_per_row: usize) -> usize {
         self.withheld_rows().saturating_mul(kv_bytes_per_row)
     }
+}
+
+/// `value` as the newest of a window of at most [`RECENT_SWEEPS`].
+fn push_recent<T>(window: &mut VecDeque<T>, value: T) {
+    if window.len() == RECENT_SWEEPS {
+        window.pop_front();
+    }
+    window.push_back(value);
 }
 
 #[cfg(test)]
@@ -159,6 +212,35 @@ mod tests {
         f.sweep_done(at(t0, 120.0));
         assert_eq!(f.withheld_rows(), 40 * 120);
         assert_eq!(f.withheld_bytes(24_576), 40 * 120 * 24_576);
+    }
+
+    /// The forecast runs over the longest of the recent sweeps, not their
+    /// average, and forgets a sweep once [`RECENT_SWEEPS`] newer ones have run.
+    #[test]
+    fn the_forecast_runs_over_the_longest_recent_sweep() {
+        let t0 = Instant::now();
+        let mut f = SweepForecast::default();
+        f.sample_decodes(t0, [(1, 0)]);
+        f.sample_decodes(at(t0, 1.0), [(1, 10)]);
+        let sweep = |f: &mut SweepForecast, secs: f64| {
+            f.sweep_formed(t0);
+            f.sweep_done(at(t0, secs));
+        };
+        sweep(&mut f, 120.0);
+        sweep(&mut f, 10.0);
+        assert_eq!(
+            f.withheld_rows(),
+            10 * 120,
+            "the long sweep is the forecast"
+        );
+        for _ in 0..RECENT_SWEEPS {
+            sweep(&mut f, 10.0);
+        }
+        assert_eq!(
+            f.withheld_rows(),
+            10 * 10,
+            "past the window it is forgotten"
+        );
     }
 
     /// A sequence seen for the first time, and one that went backwards, add no
@@ -205,5 +287,34 @@ mod tests {
         f.sweep_formed(at(t0, 100.0));
         f.sweep_done(at(t0, 300.0));
         assert_eq!(f.sweep_secs, Some(150.0));
+    }
+
+    /// Held ground's growth over a sweep is measured from formation to the
+    /// sweep's end, a short end included, and priced at its recent peak; a
+    /// sweep over which it shrank grew by nothing, and does not lower the peak.
+    #[test]
+    fn held_growth_is_what_held_ground_took_over_a_sweep() {
+        let mut f = SweepForecast::default();
+        assert_eq!(
+            f.held_growth_bytes(),
+            0,
+            "nothing measured, nothing withheld"
+        );
+        f.held_formed(100);
+        f.held_ended(212);
+        assert_eq!(f.held_growth_bytes(), 112);
+        f.held_formed(300);
+        f.held_ended(200);
+        assert_eq!(
+            f.held_growth_bytes(),
+            112,
+            "a shrinking sweep leaves the peak"
+        );
+        f.held_ended(999);
+        assert_eq!(
+            f.held_growth_bytes(),
+            112,
+            "an end with no formation measures nothing"
+        );
     }
 }

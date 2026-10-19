@@ -431,6 +431,84 @@ impl Scheduler {
         gained
     }
 
+    /// The span ground held ground's arenas stand on now — zero off CUDA or
+    /// before a reservation exists.
+    pub(super) fn held_arena_bytes(&self) -> u64 {
+        match self.session.device().location() {
+            candle::DeviceLocation::Cuda { gpu_id } => {
+                candle_nn::kv_cache::held_ground_stats(gpu_id).map_or(0, |h| h.arena_bytes as u64)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Set the gallery's keep time `T*` from the trade it stands for
+    /// (`provenance::gallery_arena::eviction`): a turn earns its ground while a
+    /// scan uses it more often than its re-upload costs, per byte, over what
+    /// the same ground would save the weights per byte per second.
+    ///
+    /// **The weights' side is the miss stall one more slot would spare.** A
+    /// routed expert not resident streams its image over the link — served from
+    /// pinned memory, so a miss need not evict anything, and a zone held small
+    /// and saturated can stall on every layer with its evictions near zero. So
+    /// the measure is the misses, not the evictions: one more slot keeps one
+    /// more of the experts not resident, and with routing spread over them it is
+    /// `1 / (experts − resident slots)` of the misses that then hit, each
+    /// sparing an image's link time, `slot bytes / link rate`. Per byte of the
+    /// slot, the slot's size cancels:
+    ///
+    /// ```text
+    /// misses/s × 1e6 / (link bytes/s × (experts − resident slots))   µs/s per byte
+    /// ```
+    ///
+    /// No misses, no pressure: the gallery keeps what it holds.
+    pub(super) fn update_gallery_keep(&mut self) {
+        /// Time constant of the miss rate's average, in seconds.
+        const RATE_TAU_SECS: f64 = 10.0;
+        let Some(arena) = self.gallery_arena.clone() else {
+            return;
+        };
+        let Some((misses, link, total, slots)) = self.model.expert_stats_shared().and_then(|s| {
+            s.lock().ok().map(|s| {
+                let slots = s.zone_bytes.checked_div(s.expert_slot_bytes).unwrap_or(0);
+                (
+                    s.expert_misses,
+                    s.link_bytes_per_sec,
+                    s.total_experts,
+                    slots,
+                )
+            })
+        }) else {
+            return;
+        };
+        let now = Instant::now();
+        if let Some((then, seen)) = self.gallery_misses_seen {
+            let secs = now.duration_since(then).as_secs_f64();
+            if secs > 0.0 {
+                // The tally restarts each interval: a count below the last one
+                // read is all new.
+                let new = if misses >= seen {
+                    misses - seen
+                } else {
+                    misses
+                };
+                let w = 1.0 - (-secs / RATE_TAU_SECS).exp();
+                self.gallery_miss_rate += w * (new as f64 / secs - self.gallery_miss_rate);
+            }
+        }
+        self.gallery_misses_seen = Some((now, misses));
+        let not_resident = total.saturating_sub(slots);
+        let weight_us_per_byte_sec = if link > 0.0 && not_resident > 0 {
+            self.gallery_miss_rate * 1e6 / (link * not_resident as f64)
+        } else {
+            0.0
+        };
+        arena.set_keep_within(crate::provenance::gallery_arena::eviction::keep_within(
+            arena.upload_us_per_byte(),
+            weight_us_per_byte_sec,
+        ));
+    }
+
     pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {
         /// Shortest interval between passes.
         ///
@@ -1064,25 +1142,26 @@ impl Scheduler {
         // Gallery eviction — **this cannot clear the pressure below it**, and is
         // not here to.
         //
-        // `evict_to_cap` drops `PageRun`s, returning page slots to the gallery's
+        // `evict_past_keep` drops `PageRun`s, returning page slots to the gallery's
         // own arenas. A region goes back to the span only when the last page in
         // its arena goes, so `gallery_freed` counts pages freed, and
         // `region_stats().free` moves only by the arenas that emptied — the next
         // `vram_under_pressure_for` can still be true.
         //
-        // Gallery growth is bounded by the arena itself — it evicts to its own
-        // ceiling at admission — so this is not the only limit, and it must not
-        // fire merely because KV is tight: that would shed belief-scan residency
-        // the next scan rebuilds from the substrate, every episode. It enforces
-        // the same ceiling by the same rule the arena does (`evict_to_cap`): only
-        // turns no scan has used recently go, so a working set above the ceiling
-        // stays. A plain LRU here shed a live dialogue's working set on every
+        // Gallery growth is bounded by the arena itself — it gives up the turns
+        // past its keep time at admission — so this is not the only limit, and it
+        // must not fire merely because KV is tight: that would shed belief-scan
+        // residency the next scan rebuilds from the substrate, every episode. It
+        // applies the same rule the arena does (`evict_past_keep`, the keep time
+        // `update_gallery_keep` derives): only turns not scanned often enough to
+        // be worth their ground go, so a working set scanned at every
+        // reprojection stays. A plain LRU here shed a live dialogue's working set on every
         // decode relief — 892 MiB a wave, `relieved=false` each time since
         // scattered pages return no region — and its next scan re-uploaded it,
         // a 1.6–2.0 s index rebuild per reprojection.
         if self.vram_under_pressure_for(phase) {
             if let Some(arena) = self.gallery_arena.as_ref() {
-                gallery_freed = arena.evict_to_cap();
+                gallery_freed = arena.evict_past_keep();
             }
         }
 
@@ -2547,6 +2626,8 @@ impl Scheduler {
     /// must leave mid-sweep leaves through [`Self::drop_wave_members`].
     pub(super) fn reset_wave_prefill(&mut self) {
         self.sweep_forecast.sweep_abandoned();
+        let held = self.held_arena_bytes();
+        self.sweep_forecast.held_ended(held);
         self.wave_prefill_residual = None;
         self.wave_prefill_cursor = 0;
         self.wave_prefill_members.clear();
@@ -2925,6 +3006,8 @@ impl Scheduler {
             "creep group formed"
         );
         self.sweep_forecast.sweep_formed(std::time::Instant::now());
+        let held = self.held_arena_bytes();
+        self.sweep_forecast.held_formed(held);
         self.wave_prefill_members = members;
     }
 
@@ -3017,7 +3100,15 @@ impl Scheduler {
                 .sum::<u64>()
                 .saturating_add(stores.saturating_mul(self.recurrent_cost()))
                 .saturating_add(scratch) as usize)
-                .saturating_add(self.model.creep_residual_bytes(&self.session, rows));
+                .saturating_add(self.model.creep_residual_bytes(&self.session, rows))
+                // And the selection index pages its rows open, member by member.
+                .saturating_add(
+                    q_lens
+                        .iter()
+                        .zip(&offsets)
+                        .map(|(&q, &at)| self.model.index_growth_bytes(at, q))
+                        .sum::<usize>(),
+                );
             let frontier = self.frontier_tier_bytes();
             let holes = self.session.kv_region_stats().map_or(0, |s| {
                 s.live_watermark.saturating_sub(s.live) * candle_nn::kv_cache::REGION_BYTES
@@ -3040,7 +3131,16 @@ impl Scheduler {
             // regions short (WhiteWorld, c8221fe39, 2026-10-19).
             let (held_growth, held_landing) =
                 held_next.as_ref().map_or((0, 0), |c| (c.growth, c.landing));
-            let claims = claims.saturating_add(held_growth);
+            // Its next pass is the least it will take; over a whole sweep it
+            // provisions at every window, so what it has measured to grow by
+            // over one sweep is what the cohort must leave it
+            // (`SweepForecast::held_growth_bytes`).
+            let held_growth = held_growth.max(self.sweep_forecast.held_growth_bytes() as usize);
+            // And the scratch the decodes' static runs may claim between its
+            // windows (`glue_scratch_bytes`), on the same ground.
+            let claims = claims
+                .saturating_add(held_growth)
+                .saturating_add(self.glue_scratch_bytes());
             let holes = holes.saturating_sub(held_landing);
             let at_frontier = frontier.and_then(|g| {
                 fitted_rows(
@@ -3070,6 +3170,20 @@ impl Scheduler {
                     .session
                     .kv_region_stats()
                     .map_or((0, 0), |s| (s.live, s.live_watermark));
+                // Held ground as the refusal's census reads it, so the K/V a
+                // sweep claimed is what is left of the live delta once every
+                // tenant's and held ground's are taken off.
+                let (held_regions, held_top) = match self.session.device().location() {
+                    candle::DeviceLocation::Cuda { gpu_id } => {
+                        candle_nn::kv_cache::held_ground_stats(gpu_id).map_or((0, 0), |h| {
+                            (
+                                h.arena_bytes / candle_nn::kv_cache::REGION_BYTES,
+                                h.arena_top,
+                            )
+                        })
+                    }
+                    _ => (0, 0),
+                };
                 // Who holds the span at formation, as the refusal line names it
                 // then — the difference between the two is who claimed the
                 // cohort's ground while it swept.
@@ -3094,8 +3208,13 @@ impl Scheduler {
                     stores,
                     scratch_mib = scratch >> 20,
                     growth_mib = growth >> 20,
+                    glue_scratch_mib = self.glue_scratch_bytes() >> 20,
                     held_growth_mib = held_growth >> 20,
                     held_landing_mib = held_landing >> 20,
+                    held_regions,
+                    held_top,
+                    kv_arenas = self.session.kv_gpu_class_stats().map_or(0, |s| s.total_arenas()),
+                    kv_live_mib = self.session.kv_gpu_class_stats().map_or(0, |s| s.classes.iter().map(|c| c.live_bytes).sum::<usize>()) >> 20,
                     kv_blocks_mib = kv_blocks >> 20,
                     live_regions = live,
                     frontier_regions,
@@ -4039,11 +4158,21 @@ impl Scheduler {
                     if let Some(short) = tier_refusal_shortfall(&e) {
                         self.lower_frontier_for(short);
                     }
+                    // The K/V pools as they stand, against the formation line's.
+                    let (kv_arenas, kv_live_mib) =
+                        self.session.kv_gpu_class_stats().map_or((0, 0), |s| {
+                            (
+                                s.total_arenas(),
+                                s.classes.iter().map(|c| c.live_bytes).sum::<usize>() >> 20,
+                            )
+                        });
                     tracing::warn!(
                         cursor,
                         win_end,
                         rows = creep_tok,
                         attempt = self.wave_sweep_failures,
+                        kv_arenas,
+                        kv_live_mib,
                         error = %e,
                         "creep window failed mid-sweep; holding the sweep to retry it"
                     );
@@ -4177,6 +4306,8 @@ impl Scheduler {
             } else {
                 self.sweep_forecast.sweep_abandoned();
             }
+            let held = self.held_arena_bytes();
+            self.sweep_forecast.held_ended(held);
             self.complete_wave_group(&members, &logits[d..creep_end]);
             return Ok(WaveLogits::held_rows(head, logits[..d].to_vec()));
         }

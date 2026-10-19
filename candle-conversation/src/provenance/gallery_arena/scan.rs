@@ -400,6 +400,14 @@ impl GalleryArena {
             Some(idx) => (idx, true),
             None => {
                 let built = Arc::new(self.build_index(segments)?);
+                // What a scan waits for when its working set is not all
+                // resident: the uploads of the turns it finds evicted and the
+                // index over them, per byte of the set — the stall a turn's
+                // residency spares (`eviction`).
+                self.note_upload(
+                    super::pages_for(built.n_tokens) as u64 * self.page_bytes,
+                    t_index.elapsed(),
+                );
                 self.store_index(fp, built.clone());
                 (built, false)
             }

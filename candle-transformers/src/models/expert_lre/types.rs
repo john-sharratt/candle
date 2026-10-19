@@ -239,6 +239,11 @@ pub struct PipelineStats {
     /// **Gauge**: bytes one expert slot occupies — the unit every figure above
     /// is a multiple of, and the grain the rate model prices a routed expert in.
     pub expert_slot_bytes: usize,
+    /// **Gauge**: the host-to-device link's measured rate, bytes a second —
+    /// what a reload of anything held on the host costs to bring back: an
+    /// expert's image, or a gallery page a scan finds evicted. Zero where it was
+    /// never measured.
+    pub link_bytes_per_sec: f64,
     /// The residency references: LRU's and Belady's hit rates, in percent,
     /// over the routing of the interval these tallies cover, at the zone's
     /// capacity (`ExpertCache::hit_references`). Not kept by the pipeline

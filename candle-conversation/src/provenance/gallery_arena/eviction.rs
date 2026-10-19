@@ -1,77 +1,90 @@
-//! Which resident turns the gallery gives up to get back under its ceiling.
+//! Which resident turns the gallery gives up: the ones whose ground is worth
+//! more to the weights than their residency is to the scans.
 //!
 //! The decision only — the arena gathers the candidates and drops the runs.
 //! Kept apart so the rule tests without a device.
 //!
-//! # The ceiling bounds stale turns, never a working set
+//! # The trade, in one currency
 //!
-//! Every reprojection scans several belief groups, one after another, and each
-//! scan's working set is every turn in its group's scope. When the working sets
-//! together outgrow the ceiling, a byte cap enforced at every admission evicts
-//! the least-recently-used turns — which are exactly the turns the *previous*
-//! group's scan just used and the next reprojection will need again. The arena
-//! then re-uploads most of the corpus every reprojection, and every upload bumps
-//! the residency generation, so every scan's cached index is rebuilt too.
-//! Measured on the live daemon at 1,143 ingested files: a 1.44 GB working set
-//! against a 512 MiB ceiling, and a belief scan of 5.1–5.6 s per reprojection
-//! where the same scan took 6–10 ms on a corpus that fit.
+//! A gallery page is a device copy of host signatures (the substrate's), so an
+//! evicted turn loses nothing but the time its next scan spends uploading it
+//! again. Keeping a turn resident therefore saves, every time a scan uses it,
+//! its upload — `bytes × upload cost per byte` — and a turn scanned every `T`
+//! saves `upload cost per byte / T` per byte per second. The same ground under
+//! the weights saves the expert stalls it would avoid: the weight side's
+//! marginal value per byte per second: the miss stall one more slot spares,
+//! measured from the expert cache's misses and the link's rate
+//! (`Scheduler::update_gallery_keep`).
+//! So a turn earns its ground while it is scanned more often than
 //!
-//! So a turn any scan has used within [`RECENT_USE`] is not a candidate. What
-//! the ceiling still bounds is the corpus nobody is scanning — turns left behind
-//! by a conversation that went quiet, or a scope that moved on.
+//! ```text
+//! T* = upload cost per byte / weight value per byte per second
+//! ```
 //!
-//! **Pressure relief comes through here too.** The scheduler's VRAM relief
-//! enforces the same ceiling (`GalleryArena::evict_to_cap`). It used to shed by
-//! plain LRU, which on the live daemon threw out 892 MiB of a dialogue's working
-//! set on every decode relief — to no effect, since scattered pages return no
-//! region (`relieved=false` every time) — and the next scan uploaded it again.
+//! and gives it up once the longer of its scan interval and its idle time
+//! passes `T*` — [`past_keep`]. With no weight pressure `T*` is unbounded and
+//! everything stays; under a reader workload whose experts stream, it falls to
+//! the seconds a working set's scans actually come at.
+//!
+//! # Why not a byte ceiling with a recency exemption
+//!
+//! That was the rule: a 512 MiB ceiling, and any turn scanned within ten
+//! minutes exempt from it. The exemption fixed a real thrash — a 1.44 GB
+//! working set re-uploaded every reprojection under a byte cap, a 10 ms scan
+//! taking 5 s — and `T*` keeps that fix, since a working set scanned at every
+//! reprojection is the turn most worth keeping. But under steady reading every
+//! turn was recent, so the ceiling bound nothing: on WhiteWorld (2026-10-19) the
+//! gallery held 3.9 GB, the weights sat at their floor, and prefill ran at
+//! 267 tok/s on a 15% expert hit rate. Two constants stood where the measured
+//! trade belongs.
+//!
+//! **Pressure relief comes through here too** (`GalleryArena::evict_past_keep`):
+//! scattered pages return no region, so shedding a working set on relief only
+//! made the next scan upload it again — the same rule decides there.
 
 use std::time::Duration;
 
-/// How long after its last scan a turn stays exempt from the ceiling.
-///
-/// Long enough to span a user reading a reply and writing the next message, so
-/// a conversation's working set survives the pause between its turns; short
-/// enough that a conversation abandoned for the afternoon gives its pages back.
-/// A turn evicted after that costs one re-upload on the scan that next wants it.
-pub const RECENT_USE: Duration = Duration::from_secs(10 * 60);
-
-/// One resident turn, as the ceiling sees it.
+/// One resident turn, as the trade sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resident {
     /// Admission order: lower is older.
     pub lru: u64,
     /// Time since a scan last used it.
     pub idle: Duration,
+    /// How long between the scans that use it, averaged; `None` until a second
+    /// scan has.
+    pub interval: Option<Duration>,
     /// Page bytes its run holds.
     pub bytes: u64,
     /// Read by an in-flight scan right now.
     pub pinned: bool,
 }
 
-/// Indices into `turns` to evict, oldest first, so that `held` falls to `cap` —
-/// taking only turns that are neither pinned nor used within `recent`.
-///
-/// Returns fewer than needed when the rest is in use: the working set is then
-/// larger than the ceiling, and it is served rather than thrashed.
-pub fn over_cap(turns: &[Resident], held: u64, cap: u64, recent: Duration) -> Vec<usize> {
-    if held <= cap {
+/// Indices into `turns` whose residency is worth less than its ground — the
+/// unpinned turns not scanned within `keep_within`, by the longer of their
+/// interval and their idle time, oldest first. `None` keeps everything: no
+/// measured weight pressure to trade against.
+pub fn past_keep(turns: &[Resident], keep_within: Option<Duration>) -> Vec<usize> {
+    let Some(keep) = keep_within else {
         return Vec::new();
-    }
-    let mut stale: Vec<usize> = (0..turns.len())
-        .filter(|&i| !turns[i].pinned && turns[i].idle >= recent)
-        .collect();
-    stale.sort_by_key(|&i| turns[i].lru);
-    let mut freed = 0u64;
-    let want = held - cap;
-    stale
-        .into_iter()
-        .take_while(|&i| {
-            let more = freed < want;
-            freed += turns[i].bytes;
-            more
+    };
+    let mut out: Vec<usize> = (0..turns.len())
+        .filter(|&i| {
+            let t = &turns[i];
+            !t.pinned && t.interval.map_or(t.idle, |iv| iv.max(t.idle)) > keep
         })
-        .collect()
+        .collect();
+    out.sort_by_key(|&i| turns[i].lru);
+    out
+}
+
+/// `T*`: how often a turn must be scanned to earn its ground — the upload cost
+/// per byte over the weight side's marginal value per byte per second, both in
+/// microseconds. `None` when the weights lose nothing to the ground (no miss
+/// measured), and the gallery keeps what it holds.
+pub fn keep_within(upload_us_per_byte: f64, weight_us_per_byte_sec: f64) -> Option<Duration> {
+    (weight_us_per_byte_sec > 0.0 && upload_us_per_byte > 0.0)
+        .then(|| Duration::from_secs_f64(upload_us_per_byte / weight_us_per_byte_sec))
 }
 
 /// Which cached scan indices to drop, oldest first, so that one more of
@@ -79,7 +92,7 @@ pub fn over_cap(turns: &[Resident], held: u64, cap: u64, recent: Duration) -> Ve
 /// `entries` are `(fingerprint, last use, device bytes)`; the returned
 /// fingerprints are the ones to remove.
 ///
-/// Unlike [`over_cap`] nothing here is exempt: an index is only a cache of work
+/// Unlike [`past_keep`] nothing here is exempt: an index is only a cache of work
 /// the next scan can redo, and the pages it points at stay resident either way.
 pub fn index_cache_evictions(
     entries: &[(u64, u64, u64)],
@@ -136,60 +149,51 @@ mod tests {
         assert_eq!(index_cache_evictions(&entries, MIB, 3, 256 * MIB), vec![8]);
     }
 
-    fn turn(lru: u64, idle_s: u64, mib: u64, pinned: bool) -> Resident {
+    fn turn(lru: u64, idle_s: u64, interval_s: Option<u64>, pinned: bool) -> Resident {
         Resident {
             lru,
             idle: Duration::from_secs(idle_s),
-            bytes: mib * MIB,
+            interval: interval_s.map(Duration::from_secs),
+            bytes: 100 * MIB,
             pinned,
         }
     }
 
+    /// With no weight pressure measured, nothing goes, however stale.
     #[test]
-    fn under_the_cap_nothing_goes() {
-        let turns = [turn(0, 3600, 100, false)];
-        assert!(over_cap(&turns, 100 * MIB, 512 * MIB, RECENT_USE).is_empty());
+    fn without_weight_pressure_everything_stays() {
+        let turns = [turn(0, 3600, None, false)];
+        assert!(past_keep(&turns, None).is_empty());
     }
 
-    /// **The regression.** Two groups' working sets, both used in the last
-    /// reprojection, together past the cap: neither is evicted.
+    /// **The regression the old exemption fixed, kept.** A working set scanned
+    /// at every reprojection stays, however large, while its scans come within
+    /// the threshold.
     #[test]
-    fn a_working_set_past_the_cap_is_kept_whole() {
+    fn a_working_set_scanned_within_the_threshold_stays() {
+        let turns = [turn(0, 2, Some(3), false), turn(1, 1, Some(3), false)];
+        assert!(past_keep(&turns, Some(Duration::from_secs(10))).is_empty());
+    }
+
+    /// A turn goes when the longer of its interval and its idle time passes the
+    /// threshold — a turn scanned often but not lately goes as surely as one
+    /// scanned rarely — oldest first; a pinned one never.
+    #[test]
+    fn turns_past_the_threshold_go_oldest_first_and_pinned_ones_stay() {
         let turns = [
-            turn(0, 2, 700, false), // code_reading's scan, two seconds ago
-            turn(1, 1, 740, false), // repo_map's scan, one second ago
+            turn(5, 1, Some(60), false), // scanned rarely
+            turn(1, 90, Some(2), false), // scanned often, but not lately
+            turn(3, 1, Some(2), false),  // in use
+            turn(0, 900, None, true),    // pinned
         ];
-        assert!(over_cap(&turns, 1440 * MIB, 512 * MIB, RECENT_USE).is_empty());
+        assert_eq!(past_keep(&turns, Some(Duration::from_secs(30))), vec![1, 0]);
     }
 
-    /// Stale turns go oldest first, and only as many as bring `held` under.
+    /// `T*` is the upload cost over the weight value per byte, and unbounded
+    /// when the weights lose nothing.
     #[test]
-    fn stale_turns_go_oldest_first_until_under() {
-        let turns = [
-            turn(5, 3600, 300, false),
-            turn(1, 3600, 300, false),
-            turn(3, 3600, 300, false),
-            turn(9, 10, 300, false), // in use
-        ];
-        // 1200 held, 700 cap: 500 to free — the two oldest stale (lru 1, 3).
-        assert_eq!(
-            over_cap(&turns, 1200 * MIB, 700 * MIB, RECENT_USE),
-            vec![1, 2]
-        );
-    }
-
-    /// A pinned turn is never a candidate, however old.
-    #[test]
-    fn a_pinned_turn_is_never_evicted() {
-        let turns = [turn(0, 3600, 900, true), turn(1, 3600, 100, false)];
-        assert_eq!(over_cap(&turns, 1000 * MIB, 512 * MIB, RECENT_USE), vec![1]);
-    }
-
-    /// Exactly `recent` idle is stale; one second less is in use.
-    #[test]
-    fn the_recent_window_boundary() {
-        let at = RECENT_USE.as_secs();
-        let turns = [turn(0, at, 100, false), turn(1, at - 1, 100, false)];
-        assert_eq!(over_cap(&turns, 200 * MIB, 50 * MIB, RECENT_USE), vec![0]);
+    fn the_threshold_is_the_upload_over_the_weights_value() {
+        assert_eq!(keep_within(1e-4, 0.0), None, "no weight pressure, no limit");
+        assert_eq!(keep_within(1e-4, 1e-5), Some(Duration::from_secs(10)));
     }
 }
