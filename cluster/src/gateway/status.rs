@@ -127,6 +127,12 @@ pub struct MemberRow {
     pub power: Option<u32>,
     pub idle: Option<bool>,
     pub slots_free: Option<u32>,
+    /// What it says a turn costs it, and its queued prefill — the figures `Best`
+    /// places a turn by (`docs/cooperative_admission.md` §2.1); zero rates until
+    /// it has learned them.
+    pub prefill_backlog: Option<u32>,
+    pub prefill_tok_s: Option<u32>,
+    pub decode_step_next_us: Option<u32>,
     /// Requests this gateway has handed it and it is still answering (§5.3).
     pub in_flight: u32,
     pub state: &'static str,
@@ -185,6 +191,9 @@ impl MemberRow {
             power: c.map(|c| c.power),
             idle: c.map(|c| c.idle),
             slots_free: c.map(|c| c.slots_free),
+            prefill_backlog: c.map(|c| c.prefill_backlog),
+            prefill_tok_s: c.map(|c| c.prefill_tok_s),
+            decode_step_next_us: c.map(|c| c.decode_step_next_us),
             in_flight: m.in_flight,
             state: state_name(m.state()),
             session: m.session,
@@ -291,6 +300,9 @@ mod tests {
             power: None,
             idle: None,
             slots_free: None,
+            prefill_backlog: None,
+            prefill_tok_s: None,
+            decode_step_next_us: None,
             in_flight: 0,
             state: "ready",
             session: 1,
