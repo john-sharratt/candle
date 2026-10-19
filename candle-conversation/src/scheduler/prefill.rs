@@ -2928,8 +2928,25 @@ impl Scheduler {
             // with its 3.83 GB tier alone against 3,948 MiB, the holes running
             // down 288 → 96 MiB as it swept, the ground then 3,790 MiB at
             // window 7 — two regions short and every member lost.
-            let claims = rows
-                .saturating_mul(kv_row)
+            // What the cohort claims as it sweeps, priced as admission prices it:
+            // each member's K/V in the formats it is written in, block-rounded;
+            // the residual its rows hold; and a recurrent store for every member
+            // that does not hold one yet, which its first window builds
+            // (`ensure_seq_state`). Without the stores the fit charged 592 MiB
+            // for a cohort that claimed 976 MiB over its sweep (WhiteWorld,
+            // 6b26e4976): its final window, the widest, found the ground 192 MiB
+            // short.
+            let per_block = self.per_block_kv_bytes();
+            let stores = members
+                .iter()
+                .filter(|m| !self.model.has_recurrent_state(m.seq_id()))
+                .count() as u64;
+            let claims = (q_lens
+                .iter()
+                .map(|&q| super::admission::prefill_cost_bytes(q, per_block))
+                .sum::<u64>()
+                .saturating_add(stores.saturating_mul(self.recurrent_cost()))
+                as usize)
                 .saturating_add(self.model.creep_residual_bytes(&self.session, rows));
             let frontier = self.frontier_tier_bytes();
             let holes = self.session.kv_region_stats().map_or(0, |s| {
@@ -2953,7 +2970,6 @@ impl Scheduler {
                 // engine prices it (the geometry the fit uses, and the formats
                 // admission charges), so the region delta to a refusal says
                 // which one the cohort actually claimed at.
-                let per_block = self.per_block_kv_bytes();
                 let kv_blocks: u64 = q_lens
                     .iter()
                     .map(|&q| super::admission::prefill_cost_bytes(q, per_block))
@@ -2969,6 +2985,7 @@ impl Scheduler {
                     decodes = self.decode_width(),
                     tier_mib = tier >> 20,
                     kv_geometry_mib = rows.saturating_mul(kv_row) >> 20,
+                    stores,
                     kv_blocks_mib = kv_blocks >> 20,
                     live_regions = live,
                     frontier_regions,
