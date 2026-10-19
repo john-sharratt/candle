@@ -311,6 +311,7 @@ impl Scheduler {
             // A turn its caller let go of costs nothing more: its prefill leaves
             // before the step, so the step does not sweep it.
             self.withdraw_abandoned_prefills();
+            self.update_gallery_keep();
             // Inject any pending tool-call static runs (Layer 3) before the
             // decode forward, so a `Static` run costs one prefill rather than N
             // decode steps.  No-op when no sequence has an active stencil.
@@ -1440,6 +1441,7 @@ impl Scheduler {
         let _g = profile::span("loop:prefill");
         let t = Instant::now();
         self.withdraw_abandoned_prefills();
+        self.update_gallery_keep();
         self.run_prefill_until_budget();
         self.wave_stats
             .add_phase(WavePhase::Prefill, t.elapsed().as_millis() as u64);

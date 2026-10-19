@@ -3671,6 +3671,11 @@ pub(crate) struct Scheduler {
     /// drain). See [`projection_assembler::apply_segments`].
     batch_drain_gap_fills: bool,
     deferred_glue_fires: Vec<projection_assembler::GapFillPlan>,
+    /// The expert cache's miss count when last read, and its rate since,
+    /// averaged — the weight side's half of the gallery's keep time
+    /// (`update_gallery_keep`).
+    gallery_misses_seen: Option<(Instant, usize)>,
+    gallery_miss_rate: f64,
     /// Sequences whose next token `inject_stencil_prefills` sampled this
     /// iteration from its static run's own prefill. They sit out the decode
     /// step that follows: the token it would carry is the one just sampled, and
@@ -3866,7 +3871,7 @@ impl Scheduler {
         // The arena used to register an eviction closure with the VRAM
         // governor, at a cheap relief rung, so the governor would shed resident
         // galleries before it ever evicted model KV. The rungs are gone;
-        // `relieve_vram_pressure` calls `evict_to_cap` directly and does it
+        // `relieve_vram_pressure` calls `evict_past_keep` directly and does it
         // before touching KV, which is the same priority expressed as call order.
         // **What this checkpoint actually brings to a decode.** Every one of
         // these is a capability the engine silently degrades around rather than
@@ -4046,6 +4051,8 @@ impl Scheduler {
             ingest_timelines: HashSet::new(),
             batch_drain_gap_fills: false,
             deferred_glue_fires: Vec::new(),
+            gallery_misses_seen: None,
+            gallery_miss_rate: 0.0,
             stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
             sealed_snapshots: HashMap::new(),

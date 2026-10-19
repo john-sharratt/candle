@@ -1696,6 +1696,7 @@ impl PipelineState {
             s.zone_min_bytes = self.inner.zone.min_capacity() * slot_bytes;
             s.zone_max_bytes = self.inner.zone.limit() * slot_bytes;
             s.expert_slot_bytes = slot_bytes;
+            s.link_bytes_per_sec = self.link_rate;
         }
     }
 

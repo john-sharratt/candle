@@ -451,8 +451,17 @@ impl<'a> AdmitPass<'a> {
     /// advancing — and `share_within` gives every member of the next fit its
     /// whole remainder up to a common level, so a short newcomer finishes in the
     /// sweep it joins while the long members keep the level's rows.
+    ///
+    /// **Only between sweeps.** The narrowing lands at the next fit, so it can
+    /// pay only for claims that land there too. Mid-sweep, an admitted turn
+    /// runs at once beside the sweep and claims its store and scratch now, on
+    /// ground the sweep's remaining windows still need: on WhiteWorld
+    /// (250ff7750, 2026-10-19) three turns credited this way mid-sweep took
+    /// 432 MiB of scratch under a 6,365-row cohort, and its last window was
+    /// refused seven regions short. A short prompt therefore waits for the
+    /// sweep in flight to end, and joins at its re-formation.
     fn held_narrowable(sched: &Scheduler, wave: &WaveDraft) -> u64 {
-        if wave.held_advances.is_empty() {
+        if wave.held_advances.is_empty() || sched.wave_prefill_cursor > 0 {
             return 0;
         }
         let at = |cap: usize| {

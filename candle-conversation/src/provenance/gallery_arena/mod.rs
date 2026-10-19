@@ -16,7 +16,7 @@
 //! substrate `wide_q_sigs` blob and its `decoded_wide_sig` `Arc` memo — so the
 //! arena owns only the hot VRAM tier and rebuilds an evicted turn on demand.
 
-mod eviction;
+pub(crate) mod eviction;
 mod page_io;
 mod pages;
 mod probe_rows;
@@ -29,7 +29,7 @@ pub use scan::{PagedSegment, PagedWindow};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use candle::{Device, Result};
 use candle_nn::kv_cache::{
@@ -40,7 +40,7 @@ use candle_nn::kv_cache::{
 use crate::persistence::streams::StreamId;
 
 use super::WideQSig;
-use eviction::{index_cache_evictions, over_cap, Resident, RECENT_USE};
+use eviction::{index_cache_evictions, past_keep, Resident};
 
 /// Max distinct segment-set indices cached at once — a handful of belief groups
 /// per reprojection, so this comfortably covers a whole reproject's scans.
@@ -96,14 +96,32 @@ struct ResidentTurn {
     run_id: u64,
     n_tokens: usize,
     lru: u64,
-    /// When a scan last used it — what exempts a working set from the ceiling
-    /// (see [`eviction`]).
+    /// When a scan last used it.
     used: Instant,
+    /// How long between the scans that use it, averaged — with `used`, how
+    /// often keeping it resident spares a re-upload (see [`eviction`]). `None`
+    /// until a second scan has used it.
+    interval: Option<Duration>,
     /// Non-zero while a scan is reading this turn's pages — the governor's
     /// eviction skips pinned turns so it can never free a page an in-flight launch
     /// dereferences (a scan pins every turn it touches, then unpins after launch).
     pinned: u32,
 }
+
+impl ResidentTurn {
+    /// A scan used it at `now`: its interval takes in the time since the last.
+    fn touch(&mut self, now: Instant) {
+        let since = now.saturating_duration_since(self.used);
+        self.interval = Some(match self.interval {
+            Some(i) => i.mul_f64(1.0 - INTERVAL_WEIGHT) + since.mul_f64(INTERVAL_WEIGHT),
+            None => since,
+        });
+        self.used = now;
+    }
+}
+
+/// Weight of the newest gap between scans in a turn's interval.
+const INTERVAL_WEIGHT: f64 = 0.5;
 
 /// Paged VRAM gallery arena. Clone-free; share via `Arc<GalleryArena>`.
 ///
@@ -120,6 +138,10 @@ pub struct GalleryArena {
     residency_gen: AtomicU64,
     /// Source of [`ResidentTurn::run_id`]s.
     next_run_id: AtomicU64,
+    /// `T*` in nanoseconds, `u64::MAX` for none — see [`Self::set_keep_within`].
+    keep_within_ns: AtomicU64,
+    /// Measured upload cost per byte, microseconds, as `f64` bits.
+    upload_us_per_byte: AtomicU64,
     /// This arena's device tensor capabilities `(b1 BMMA, INT8 IMMA)`, queried
     /// once on first scan. Cached PER ARENA (not per process) so heterogeneous
     /// multi-GPU setups — e.g. mixed Ada/Blackwell — resolve each arena's
@@ -143,9 +165,8 @@ pub struct GalleryArena {
     page_bytes: u64,
 }
 
-/// The gallery's VRAM ceiling: what its pages may hold before admission and
-/// relief start evicting the turns no scan has used recently (`evict_to_cap`).
-pub const GALLERY_CAP_BYTES: u64 = 512 * 1024 * 1024;
+/// Weight of the newest upload in the arena's per-byte upload cost.
+const UPLOAD_WEIGHT: f64 = 0.25;
 
 impl GalleryArena {
     /// A gallery arena on `device` for the locked folded-signature geometry
@@ -162,6 +183,8 @@ impl GalleryArena {
             lru_clock: AtomicU64::new(0),
             residency_gen: AtomicU64::new(0),
             next_run_id: AtomicU64::new(0),
+            keep_within_ns: AtomicU64::new(u64::MAX),
+            upload_us_per_byte: AtomicU64::new(0),
             index_cache: Mutex::new(HashMap::new()),
             tensor_caps: OnceLock::new(),
             device: device.clone(),
@@ -233,7 +256,7 @@ impl GalleryArena {
     /// One claim for the whole turn, so the arena window opens at most once however
     /// many new arenas it needs. A refusal means the span itself is full, and it
     /// **is** an error: routine growth is bounded well before this by the gallery's
-    /// own ceiling (`evict_to_cap_locked`, run before anything is admitted), so
+    /// own keep rule (`evict_past_keep_locked`, run before anything is admitted), so
     /// reaching a refusal is the KV side having no region to spare for a gallery
     /// that is already inside its budget.
     fn alloc_and_upload(&self, sigs: &[WideQSig]) -> Result<PageRun> {
@@ -258,7 +281,7 @@ impl GalleryArena {
     /// run id they belong to ([`ResidentTurn::run_id`]). A matching
     /// fingerprint is a hit; a mismatch (or absence) frees any stale pages and
     /// re-uploads. When `pin`, the turn's pin count is bumped **atomically with
-    /// residency** so a concurrent [`evict_to_cap`](Self::evict_to_cap) can never free it
+    /// residency** so a concurrent [`evict_past_keep`](Self::evict_past_keep) can never free it
     /// between here and the launch that reads its pages. The addresses are
     /// resolved while the residency lock is still held, so the gids cannot be
     /// recycled out from under them.
@@ -283,7 +306,7 @@ impl GalleryArena {
         // the arena. Doing it here — under `res`, before `inner` is taken —
         // respects the residency→inner lock order and skips pins, so an active
         // scan's working set is never evicted out from under it.
-        self.evict_to_cap_locked(res);
+        self.evict_past_keep_locked(res);
         let lru = self.lru_clock.fetch_add(1, Ordering::Relaxed);
         // Addresses are resolved while `res` is still held: evicting or replacing
         // a run needs the residency lock, so its slots can't be freed in this
@@ -291,7 +314,7 @@ impl GalleryArena {
         match res.get_mut(&sid) {
             Some(rt) if rt.fingerprint == fingerprint => {
                 rt.lru = lru;
-                rt.used = Instant::now();
+                rt.touch(Instant::now());
                 if pin {
                     rt.pinned += 1;
                 }
@@ -340,6 +363,7 @@ impl GalleryArena {
                 n_tokens: sigs.len(),
                 lru,
                 used: Instant::now(),
+                interval: None,
                 pinned: u32::from(pin),
             },
         );
@@ -444,7 +468,7 @@ impl GalleryArena {
             if let Some(rt) = res.get_mut(&sid) {
                 rt.pinned += 1;
                 rt.lru = lru;
-                rt.used = now;
+                rt.touch(now);
             }
         }
         Some(idx)
@@ -570,14 +594,6 @@ impl GalleryArena {
         })
     }
 
-    /// Bring the arena back under [`Self::cap_bytes`] by the ceiling's own rule
-    /// (see [`Self::evict_to_cap_locked`]) — the governor's relief rung, which
-    /// must shed only what no scan is using. Returns the bytes freed.
-    pub fn evict_to_cap(&self) -> u64 {
-        let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
-        self.evict_to_cap_locked(&mut res)
-    }
-
     /// Evict least-recently-used unpinned turns until at least `want` bytes are
     /// freed, regardless of recent use. Returns the bytes freed. The tests use it
     /// to empty the arena and prove a rebuild reproduces the scan; nothing in the
@@ -610,32 +626,56 @@ impl GalleryArena {
         freed
     }
 
-    /// The arena's own VRAM ceiling, in bytes ([`GALLERY_CAP_BYTES`]).
-    ///
-    /// **This is what bounds gallery growth.** `alloc_and_upload` claims new
-    /// arenas whenever the gallery's run out, and nothing else shrinks the
-    /// arena. The ceiling is enforced at admission and by the scheduler's
-    /// KV-pressure relief alike, by one rule that never discards a working set
-    /// (see [`eviction`]).
-    ///
-    /// Measured against [`Self::page_bytes`] — the pages eviction frees — for the
-    /// reason given there. Enforced at admission in `ensure_locked`, where no
-    /// lock is held that eviction needs.
-    pub fn cap_bytes(&self) -> u64 {
-        GALLERY_CAP_BYTES
+    /// How often a turn must be scanned to keep its ground — `T*`, set by the
+    /// scheduler from the weight side's measured marginal value
+    /// ([`eviction::keep_within`]); `None` keeps everything.
+    pub fn set_keep_within(&self, keep: Option<Duration>) {
+        let ns = keep.map_or(u64::MAX, |d| d.as_nanos().min(u64::MAX as u128 - 1) as u64);
+        self.keep_within_ns.store(ns, Ordering::Relaxed);
     }
 
-    /// Evict stale turns, oldest first, until the arena is back under
-    /// [`Self::cap_bytes`].
-    ///
-    /// Returns bytes freed. Only turns no scan has used within
-    /// [`eviction::RECENT_USE`] are candidates, and pinned turns never are, so a
-    /// working set larger than the cap is kept rather than re-uploaded on every
-    /// scan — the cap bounds the corpus nobody is scanning (see [`eviction`]).
-    fn evict_to_cap_locked(&self, res: &mut HashMap<StreamId, ResidentTurn>) -> u64 {
-        let cap = self.cap_bytes();
-        let held = self.page_bytes();
-        if held <= cap {
+    fn keep_within(&self) -> Option<Duration> {
+        match self.keep_within_ns.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            ns => Some(Duration::from_nanos(ns)),
+        }
+    }
+
+    /// What a scan waits per byte of its working set when that set is not all
+    /// resident — the uploads of the turns it finds evicted and the index over
+    /// them, in microseconds, timed on the scans that rebuilt — and so what a
+    /// turn's residency spares per byte at each scan. Zero until one has.
+    pub fn upload_us_per_byte(&self) -> f64 {
+        f64::from_bits(self.upload_us_per_byte.load(Ordering::Relaxed))
+    }
+
+    /// An upload of `bytes` took `elapsed`: it joins the per-byte average.
+    fn note_upload(&self, bytes: u64, elapsed: Duration) {
+        if bytes == 0 {
+            return;
+        }
+        let sample = elapsed.as_secs_f64() * 1e6 / bytes as f64;
+        let was = self.upload_us_per_byte();
+        let next = if was > 0.0 {
+            was + UPLOAD_WEIGHT * (sample - was)
+        } else {
+            sample
+        };
+        self.upload_us_per_byte
+            .store(next.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Give up every turn not worth its ground ([`eviction::past_keep`]) — the
+    /// governor's relief rung and every admission alike. Returns the bytes
+    /// freed. Pinned turns never go, so an in-flight scan's pages stay.
+    pub fn evict_past_keep(&self) -> u64 {
+        let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+        self.evict_past_keep_locked(&mut res)
+    }
+
+    fn evict_past_keep_locked(&self, res: &mut HashMap<StreamId, ResidentTurn>) -> u64 {
+        let keep = self.keep_within();
+        if keep.is_none() {
             return 0;
         }
         let now = Instant::now();
@@ -647,6 +687,7 @@ impl GalleryArena {
                     Resident {
                         lru: rt.lru,
                         idle: now.saturating_duration_since(rt.used),
+                        interval: rt.interval,
                         bytes: pages_for(rt.n_tokens) as u64 * self.page_bytes,
                         pinned: rt.pinned != 0,
                     },
@@ -654,10 +695,22 @@ impl GalleryArena {
             })
             .unzip();
         let mut freed = 0u64;
-        for i in over_cap(&turns, held, cap, RECENT_USE) {
+        let gone = past_keep(&turns, keep);
+        for &i in &gone {
             res.remove(&sids[i]); // drops the run → frees pages
             self.residency_gen.fetch_add(1, Ordering::Relaxed);
             freed += turns[i].bytes;
+        }
+        if !gone.is_empty() {
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                turns = gone.len(),
+                freed_mib = freed >> 20,
+                keep_ms = keep.map_or(0, |k| k.as_millis() as u64),
+                upload_ns_per_kib = (self.upload_us_per_byte() * 1024.0 * 1000.0) as u64,
+                kept = res.len(),
+                "gallery gave up the turns past its keep time"
+            );
         }
         freed
     }

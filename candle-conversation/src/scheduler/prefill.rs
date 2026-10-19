@@ -442,6 +442,73 @@ impl Scheduler {
         }
     }
 
+    /// Set the gallery's keep time `T*` from the trade it stands for
+    /// (`provenance::gallery_arena::eviction`): a turn earns its ground while a
+    /// scan uses it more often than its re-upload costs, per byte, over what
+    /// the same ground would save the weights per byte per second.
+    ///
+    /// **The weights' side is the miss stall one more slot would spare.** A
+    /// routed expert not resident streams its image over the link — served from
+    /// pinned memory, so a miss need not evict anything, and a zone held small
+    /// and saturated can stall on every layer with its evictions near zero. So
+    /// the measure is the misses, not the evictions: one more slot keeps one
+    /// more of the experts not resident, and with routing spread over them it is
+    /// `1 / (experts − resident slots)` of the misses that then hit, each
+    /// sparing an image's link time, `slot bytes / link rate`. Per byte of the
+    /// slot, the slot's size cancels:
+    ///
+    /// ```text
+    /// misses/s × 1e6 / (link bytes/s × (experts − resident slots))   µs/s per byte
+    /// ```
+    ///
+    /// No misses, no pressure: the gallery keeps what it holds.
+    pub(super) fn update_gallery_keep(&mut self) {
+        /// Time constant of the miss rate's average, in seconds.
+        const RATE_TAU_SECS: f64 = 10.0;
+        let Some(arena) = self.gallery_arena.clone() else {
+            return;
+        };
+        let Some((misses, link, total, slots)) = self.model.expert_stats_shared().and_then(|s| {
+            s.lock().ok().map(|s| {
+                let slots = s.zone_bytes.checked_div(s.expert_slot_bytes).unwrap_or(0);
+                (
+                    s.expert_misses,
+                    s.link_bytes_per_sec,
+                    s.total_experts,
+                    slots,
+                )
+            })
+        }) else {
+            return;
+        };
+        let now = Instant::now();
+        if let Some((then, seen)) = self.gallery_misses_seen {
+            let secs = now.duration_since(then).as_secs_f64();
+            if secs > 0.0 {
+                // The tally restarts each interval: a count below the last one
+                // read is all new.
+                let new = if misses >= seen {
+                    misses - seen
+                } else {
+                    misses
+                };
+                let w = 1.0 - (-secs / RATE_TAU_SECS).exp();
+                self.gallery_miss_rate += w * (new as f64 / secs - self.gallery_miss_rate);
+            }
+        }
+        self.gallery_misses_seen = Some((now, misses));
+        let not_resident = total.saturating_sub(slots);
+        let weight_us_per_byte_sec = if link > 0.0 && not_resident > 0 {
+            self.gallery_miss_rate * 1e6 / (link * not_resident as f64)
+        } else {
+            0.0
+        };
+        arena.set_keep_within(crate::provenance::gallery_arena::eviction::keep_within(
+            arena.upload_us_per_byte(),
+            weight_us_per_byte_sec,
+        ));
+    }
+
     pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {
         /// Shortest interval between passes.
         ///
@@ -1075,25 +1142,26 @@ impl Scheduler {
         // Gallery eviction — **this cannot clear the pressure below it**, and is
         // not here to.
         //
-        // `evict_to_cap` drops `PageRun`s, returning page slots to the gallery's
+        // `evict_past_keep` drops `PageRun`s, returning page slots to the gallery's
         // own arenas. A region goes back to the span only when the last page in
         // its arena goes, so `gallery_freed` counts pages freed, and
         // `region_stats().free` moves only by the arenas that emptied — the next
         // `vram_under_pressure_for` can still be true.
         //
-        // Gallery growth is bounded by the arena itself — it evicts to its own
-        // ceiling at admission — so this is not the only limit, and it must not
-        // fire merely because KV is tight: that would shed belief-scan residency
-        // the next scan rebuilds from the substrate, every episode. It enforces
-        // the same ceiling by the same rule the arena does (`evict_to_cap`): only
-        // turns no scan has used recently go, so a working set above the ceiling
-        // stays. A plain LRU here shed a live dialogue's working set on every
+        // Gallery growth is bounded by the arena itself — it gives up the turns
+        // past its keep time at admission — so this is not the only limit, and it
+        // must not fire merely because KV is tight: that would shed belief-scan
+        // residency the next scan rebuilds from the substrate, every episode. It
+        // applies the same rule the arena does (`evict_past_keep`, the keep time
+        // `update_gallery_keep` derives): only turns not scanned often enough to
+        // be worth their ground go, so a working set scanned at every
+        // reprojection stays. A plain LRU here shed a live dialogue's working set on every
         // decode relief — 892 MiB a wave, `relieved=false` each time since
         // scattered pages return no region — and its next scan re-uploaded it,
         // a 1.6–2.0 s index rebuild per reprojection.
         if self.vram_under_pressure_for(phase) {
             if let Some(arena) = self.gallery_arena.as_ref() {
-                gallery_freed = arena.evict_to_cap();
+                gallery_freed = arena.evict_past_keep();
             }
         }
 
