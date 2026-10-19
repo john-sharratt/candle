@@ -5009,6 +5009,13 @@ async fn passthrough_turn(
                     }
                     continue;
                 }
+                // The client went away before a token was due: a reply still
+                // queued for its prefill would otherwise run it, and seal, for
+                // nobody — the next send is what used to notice.
+                () = tx.closed() => {
+                    tracing::info!(key, "passthrough: client disconnected before the reply");
+                    return false;
+                }
             };
             let Some(event) = event else {
                 break;
