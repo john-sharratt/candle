@@ -1685,6 +1685,15 @@ struct DecodeState {
 }
 
 impl DecodeState {
+    /// Whether this turn drafts at its next step: not a replay, whose next token
+    /// is its recording's, and not held to a plain row by its grammar
+    /// ([`block_guard::BlockGuard::drafts`]). The one rule the step and a tier
+    /// price over it both read.
+    fn drafts(&self) -> bool {
+        self.recorded_reply.is_none()
+            && block_guard::BlockGuard::drafts(self.stencil.as_ref(), self.pending_mask.as_ref())
+    }
+
     /// End the turn on a fault: the caller gets `error`, and `cleanup_finished`
     /// discards what the turn decoded instead of sealing it ([`Self::faulted`]).
     /// Once is enough — a later fault on the same turn adds nothing the caller

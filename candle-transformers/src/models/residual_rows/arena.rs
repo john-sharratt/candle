@@ -82,6 +82,28 @@ fn rows_per_block(row_bytes: usize) -> Result<usize> {
 }
 
 impl ResidualArena {
+    /// What [`Self::claim`] takes of the span for `rows` rows of `width`
+    /// elements of `dtype`: on CUDA, one region-sized block per
+    /// `rows_per_block` rows, each at its slot's share of the region; elsewhere
+    /// the rows themselves.
+    ///
+    /// Not the rows' bytes. The blocks are whole slots, so a half's last block
+    /// claims its region however few rows it holds: priced at the rows, a
+    /// 22-member cohort's residual read under the eight regions its two halves
+    /// claimed, and its last window was refused two regions short (WhiteWorld,
+    /// c8221fe39, 2026-10-19).
+    pub fn claim_bytes(device: &Device, rows: usize, width: usize, dtype: DType) -> usize {
+        let row_bytes = width * dtype.size_in_bytes();
+        match device {
+            #[cfg(feature = "cuda")]
+            Device::Cuda(_) => rows_per_block(row_bytes).map_or(0, |per_block| {
+                rows.div_ceil(per_block)
+                    * candle_nn::kv_cache::slot_share_bytes(per_block * row_bytes)
+            }),
+            _ => rows * row_bytes,
+        }
+    }
+
     /// Claim room for `rows` rows of `width` elements of `dtype`.
     ///
     /// **Between forwards.** A new arena is a region claim, which takes the arena
@@ -323,6 +345,28 @@ mod tests {
         assert_eq!(
             row_ids(&a)?,
             (0..rows).map(|r| r as f32).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// **The price is the blocks a claim takes, not its rows.** Forty 1 MiB rows
+    /// are blocks of 16, 16 and 8, and the last block claims its whole region:
+    /// three regions, where the rows alone are two and a half.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_claim_is_priced_at_its_blocks() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let width = (1 << 20) / 4;
+        assert_eq!(
+            ResidualArena::claim_bytes(&device, 40, width, DType::F32),
+            3 * SpanRegion::bytes()
+        );
+        assert_eq!(
+            ResidualArena::claim_bytes(&Device::Cpu, 40, width, DType::F32),
+            40 << 20,
+            "off CUDA the rows are the allocation"
         );
         Ok(())
     }

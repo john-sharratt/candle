@@ -752,7 +752,7 @@ impl Scheduler {
             .map(|id| {
                 // Every id here was read from `active_decodes` above.
                 let s = &self.active_decodes[id];
-                if s.recorded_reply.is_some() {
+                if !s.drafts() {
                     return None;
                 }
                 BlockGuard::for_step(

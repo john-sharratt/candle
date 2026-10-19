@@ -95,7 +95,7 @@ use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::split_block_rows;
 use crate::models::residency_rows::residency_decode_rows;
-use crate::models::residual_rows::{CreepResidual, ResidualIn};
+use crate::models::residual_rows::{CreepResidual, ResidualArena, ResidualIn};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
 use crate::models::selection_strata::StrataTokens;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
@@ -2326,52 +2326,76 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         stage_q_lens: &[usize],
         stage_offsets: &[usize],
         stage_seqs: &[usize],
-        decode_stage: &[(usize, usize)],
+        decode_stage: &[(usize, usize, usize)],
         act_dtype: DType,
     ) -> Option<u64> {
         let geometry = self.wave_geometry(act_dtype);
-        let decodes = decode_stage.len();
-        let (q_lens, offsets) = if stage_q_lens.is_empty() {
+        let (mut q_lens, mut offsets) = if stage_q_lens.is_empty() {
             (vec![rows], vec![0])
         } else {
             (stage_q_lens.to_vec(), stage_offsets.to_vec())
         };
-        // Over every sequence the step carries, as it carves them: the decodes
-        // first, a row each at its own depth and over its own live index, then
-        // the stages. A stage not named is priced fresh inside the same walk.
-        // The decodes are not optional: a decode deep in its context carves its
-        // selection over every candidate block it holds, and priced as a bare
-        // row count a nine-member cohort beside seven decodes fitted a
+        let named = !stage_seqs.is_empty() && stage_seqs.len() == q_lens.len();
+        let mut seqs: Vec<usize> = (0..q_lens.len())
+            .map(|i| {
+                if named {
+                    stage_seqs[i]
+                } else {
+                    // Ids no live sequence holds: slot ids are small indices.
+                    usize::MAX - i
+                }
+            })
+            .collect();
+        // **The decodes as the step lays them out.** A plain one is a decode row;
+        // one verifying a draft is a span of its block — the committed token and
+        // its proposals — staged and carved like a prefill's, with every row a
+        // prediction the head scores. Priced as one row each, sixteen decodes
+        // verifying drafts placed a 105 MB forward phase, their head's logits,
+        // beside a cohort fitted at 96 MiB whole, and the cohort was lost two
+        // regions short (WhiteWorld, c8221fe39, 2026-10-19).
+        let plain: Vec<(usize, usize)> = decode_stage
+            .iter()
+            .filter(|&&(_, _, block)| block <= 1)
+            .map(|&(seq, at, _)| (seq, at))
+            .collect();
+        let mut verify_rows = 0usize;
+        let mut verify_spans = 0usize;
+        for &(seq, at, block) in decode_stage.iter().filter(|&&(_, _, b)| b > 1) {
+            q_lens.push(block);
+            offsets.push(at);
+            seqs.push(seq);
+            verify_rows += block;
+            verify_spans += 1;
+        }
+        let decodes = plain.len();
+        // Over every sequence the step carries, as it carves them: the plain
+        // decodes first, a row each at its own depth and over its own live
+        // index, then the spans. A span not named is priced fresh inside the
+        // same walk. The decodes are not optional: a decode deep in its context
+        // carves its selection over every candidate block it holds, and priced
+        // as a bare row count a nine-member cohort beside seven decodes fitted a
         // nine-region tier its window placed at thirteen (WhiteWorld,
         // 98860c583, 2026-10-19).
         #[cfg(feature = "cuda")]
         let carve = {
-            let named = !stage_seqs.is_empty() && stage_seqs.len() == q_lens.len();
-            let seqs: Vec<usize> = decode_stage
+            let all_seqs: Vec<usize> = plain
                 .iter()
                 .map(|&(seq, _)| seq)
-                .chain((0..q_lens.len()).map(|i| {
-                    if named {
-                        stage_seqs[i]
-                    } else {
-                        // Ids no live sequence holds: slot ids are small indices.
-                        usize::MAX - i
-                    }
-                }))
+                .chain(seqs.iter().copied())
                 .collect();
             let lens: Vec<usize> = std::iter::repeat_n(1, decodes)
                 .chain(q_lens.iter().copied())
                 .collect();
-            let depths: Vec<usize> = decode_stage
+            let depths: Vec<usize> = plain
                 .iter()
-                .map(|&(_, depth)| depth)
+                .map(|&(_, at)| at)
                 .chain(offsets.iter().copied())
                 .collect();
-            self.wave_qsa_bytes(&seqs, &lens, &depths, 0, self.model.cfg.num_layers)
+            self.wave_qsa_bytes(&all_seqs, &lens, &depths, 0, self.model.cfg.num_layers)
         };
         #[cfg(not(feature = "cuda"))]
         let carve = {
-            let _ = stage_seqs;
+            let _ = &seqs;
             self.fresh_qsa_bytes(&q_lens, &offsets)
         };
         let qsa_bytes = match carve {
@@ -2383,10 +2407,15 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
                 return None;
             }
         };
+        let span_rows = rows + verify_rows;
+        let spans = sequences.max(1) + verify_spans;
+        // The head scores each prefill span's last row, every verify row and
+        // every plain decode.
+        let scored = sequences.max(1) + verify_rows + decodes;
         let width = WaveWidth {
             kv_stage: PrefillKvStageLayout::new(
-                stage_q_lens,
-                stage_offsets,
+                &q_lens,
+                &offsets,
                 geometry.n_head,
                 geometry.n_kv_head,
                 geometry.head_dim,
@@ -2396,11 +2425,11 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             // As the step sets them: the look-ahead over every row, decodes
             // included, and the accept walk's selection on the head's span —
             // priced as if it reads the logits in place, the wider case.
-            look_ahead_hops: look_ahead_hops(rows + decodes),
+            look_ahead_hops: look_ahead_hops(span_rows + decodes),
             decode_rows: decodes,
-            scored_rows: sequences.max(1) + decodes,
-            accept_rows: sequences.max(1) + decodes,
-            ..WaveWidth::prefill(rows, sequences.max(1))
+            scored_rows: scored,
+            accept_rows: scored,
+            ..WaveWidth::prefill(span_rows, spans)
         };
         Some(WavePlan::new(geometry).tier_bytes(width) as u64)
     }
@@ -2658,9 +2687,11 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     }
 
     fn creep_residual_bytes(&self, session: &BatchedInferenceSession, rows: usize) -> usize {
-        // Two halves of the rows' hidden state — `CreepResidual::claim`.
-        WaveSweep::residual_row(self, session)
-            .map_or(0, |(width, dtype)| 2 * rows * width * dtype.size_in_bytes())
+        // Two halves of the rows' hidden state — `CreepResidual::claim` — each
+        // the region-sized blocks its arena claims.
+        WaveSweep::residual_row(self, session).map_or(0, |(width, dtype)| {
+            2 * ResidualArena::claim_bytes(&self.model.device, rows, width, dtype)
+        })
     }
     fn push_positional_gap(&self, seq: usize, tokens: usize) -> Result<()> {
         Qwen4ExpBatched::push_positional_gap(self, seq, tokens)

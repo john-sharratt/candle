@@ -415,8 +415,10 @@ pub trait BatchedModelCore {
     /// it the forward phase).
     ///
     /// `decode_stage` is the decodes co-batched in the same step, as each
-    /// one's `(sequence, position)`: each is a row in the trunk's phases and a
-    /// row the head scores. A creep step carries the running decodes beside its
+    /// one's `(sequence, position, block)`, the block being the rows it runs —
+    /// one for a plain decode, its committed token and proposals for one
+    /// verifying a draft, every one of which the head scores: each is a row in
+    /// the trunk's phases and a row the head scores. A creep step carries the running decodes beside its
     /// window, and the head scores them with the members the final window
     /// finishes; priced as prefill alone, a cohort's tier came out a region
     /// short at exactly that window (3090, 2026-10-18 and 19 — cursor 47 of 48,
@@ -443,7 +445,7 @@ pub trait BatchedModelCore {
         _stage_q_lens: &[usize],
         _stage_offsets: &[usize],
         _stage_seqs: &[usize],
-        _decode_stage: &[(usize, usize)],
+        _decode_stage: &[(usize, usize, usize)],
         _act_dtype: DType,
     ) -> Option<u64> {
         None
