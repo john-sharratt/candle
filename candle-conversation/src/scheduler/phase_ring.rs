@@ -492,6 +492,11 @@ pub struct LearnedRates {
     /// what one more decoding turn costs every decode on this card.
     pub decode_step_ms: f64,
     pub decode_step_ms_plus_one: f64,
+    /// Prompt tokens waiting at `High` — the dialogue band a placed turn takes —
+    /// that it would queue behind: admitted `High` prefills' remaining rows,
+    /// queued `High` turns and `High` submissions not yet carved. Background
+    /// work is not in it: a placed turn goes ahead of it.
+    pub high_backlog_tokens: u64,
 }
 
 /// The newest [`LearnedRates`] the scheduler published, and when.
@@ -767,6 +772,7 @@ mod tests {
             prefill_tok_s: 1234.5,
             decode_step_ms: 80.0,
             decode_step_ms_plus_one: 82.5,
+            high_backlog_tokens: 4096,
         };
         publish_learned_rates(rates);
         let (read, age) = learned_rates().expect("published");

@@ -798,6 +798,8 @@ impl WaveRate {
                 self.routed_per_layer
                     .saturating_add(self.experts_per_decode(0)),
             ),
+            // The scheduler fills it in: the rate model sees no queue.
+            high_backlog_tokens: 0,
         })
     }
 

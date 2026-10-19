@@ -560,6 +560,33 @@ impl Scheduler {
         let rate = self.wave_rate.as_ref().expect("checked above");
         let (learned, samples, decode_samples) =
             (rate.learned(rows), rate.samples(), rate.decode_samples());
+        // What a placed turn would wait behind: the `High` prompts ahead of it,
+        // not the background work it goes ahead of. On WhiteWorld (b4ea6e33b,
+        // 2026-10-19) a 68–92K-token backlog of file ingest read as every
+        // placed turn's wait, and the card took 2 of 48 dialogue turns.
+        let high = |id: SequenceId| self.decode_priority_or_high(id) == DecodePriority::High;
+        let high_backlog = self
+            .active_prefills
+            .iter()
+            .filter(|p| high(p.work.sequence_id))
+            .map(|p| p.work.tokens.len().saturating_sub(p.offset))
+            .chain(
+                self.prefill_queue
+                    .iter()
+                    .filter(|w| high(w.sequence_id))
+                    .map(|w| w.tokens.len()),
+            )
+            .chain(
+                self.pending_submits
+                    .iter()
+                    .filter(|p| high(p.parent()))
+                    .map(|p| p.work.tokens.len()),
+            )
+            .sum::<usize>() as u64;
+        let learned = learned.map(|r| super::phase_ring::LearnedRates {
+            high_backlog_tokens: high_backlog,
+            ..r
+        });
         if let Some(rates) = learned {
             super::phase_ring::publish_learned_rates(rates);
         }
@@ -577,6 +604,7 @@ impl Scheduler {
                     target: "candle_conversation::scheduler::admission",
                     rows,
                     prefill_tok_s = r.prefill_tok_s.round() as u64,
+                    high_backlog_tokens = r.high_backlog_tokens,
                     decode_step_ms = format!("{:.1}", r.decode_step_ms),
                     decode_step_ms_plus_one = format!("{:.1}", r.decode_step_ms_plus_one),
                     prefill_samples = samples,
