@@ -1125,6 +1125,13 @@ the answer's first fragment read as a restart of the live copy, and the gateway 
 the sender's socket. Fragments of an event whose relaying socket drops before the last
 one are discarded. The sender re-sends the whole event (§6.3).
 
+A copy of the same key that begins again — its first fragment, the same length — while
+another is partly held replaces it, and the restart is logged with how much was
+dropped: a sender only ever sends a record whole again, never from where it stopped,
+so the earlier copy will not be continued. Closing the socket instead cut every request
+riding it (WhiteWorld, 97 MiB held of a 113 MiB snapshot). The earlier copy carrying on
+after all is an interleave, and still closes it.
+
 A gateway relays only among the members connected to *it*. An event leaves its origin
 through one cluster (§6.3), so a member joined to every cluster receives it once, from
 that cluster. A member whose socket to that cluster was down misses it and gets it from

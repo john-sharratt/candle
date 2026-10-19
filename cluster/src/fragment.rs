@@ -5,8 +5,10 @@
 //! be in flight twice at once — live to everyone, and as an answer to a member
 //! catching up — its two copies' fragments interleaved. Each copy arrives in
 //! order on its own lane, so one copy's fragments arrive in offset order; a
-//! gap, an overlap or a changed total is refused. Partial records of a socket
-//! that drops are discarded — the sender sends the whole record again (§6.3).
+//! gap, an overlap or a changed total is refused. A copy that begins again
+//! replaces the one held: the sender sends a record whole again, never from
+//! where it stopped (§6.3). Partial records of a socket that drops are
+//! discarded for the same reason.
 
 use std::collections::HashMap;
 
@@ -66,6 +68,8 @@ type Copy = (u64, u64, Option<u64>);
 #[derive(Debug, Default)]
 pub struct Reassembly {
     partial: HashMap<Copy, (u32, Vec<u8>)>,
+    /// Copies that began again before the one held finished.
+    restarts: u64,
 }
 
 impl Reassembly {
@@ -74,8 +78,30 @@ impl Reassembly {
     }
 
     /// Take a fragment; a record's last fragment returns it whole.
+    ///
+    /// A copy starting again — its first fragment, the same length — replaces
+    /// the copy held so far: a sender sends a record whole again rather than
+    /// resuming it (§6.3), so what was held of the earlier copy is never
+    /// continued. Every such restart is reported, with how much was dropped.
     pub fn accept(&mut self, event: Event) -> Result<Option<Whole>, OutOfOrder> {
         let key = (event.origin, event.oseq, event.reply_to);
+        let restarted = event.offset == 0
+            && self
+                .partial
+                .get(&key)
+                .is_some_and(|(total, held)| *total == event.total && !held.is_empty());
+        if restarted {
+            let dropped = self.partial.remove(&key).map_or(0, |(_, held)| held.len());
+            self.restarts += 1;
+            tracing::warn!(
+                origin = format!("{:016x}", event.origin),
+                oseq = event.oseq,
+                reply_to = ?event.reply_to,
+                dropped,
+                total = event.total,
+                "a record began again before its earlier copy finished: the earlier copy is dropped"
+            );
+        }
         let (total, held) = self
             .partial
             .entry(key)
@@ -111,6 +137,11 @@ impl Reassembly {
 
     pub fn pending(&self) -> usize {
         self.partial.len()
+    }
+
+    /// How many copies began again before the one held finished.
+    pub fn restarts(&self) -> u64 {
+        self.restarts
     }
 }
 
@@ -182,6 +213,39 @@ mod tests {
         assert_eq!((done[0].reply_to, done[1].reply_to), (None, Some(42)));
         assert!(done.iter().all(|w| w.bytes == snapshot));
         assert_eq!(r.pending(), 0);
+    }
+
+    /// **A copy that begins again replaces the one held**, and is reported: a
+    /// sender sends a record whole again, so what was held of the first copy
+    /// is dropped, not continued, and the socket stays up — on WhiteWorld the
+    /// gateway closed the socket instead (4400, 97 MiB held of a 113 MiB
+    /// snapshot) and every turn riding it was cut. The earlier copy then
+    /// carrying on is a real interleave, and is refused.
+    #[test]
+    fn a_copy_beginning_again_replaces_the_one_held() {
+        let snapshot = record(5 << 20);
+        let frags = split(7, 1_571_104, &snapshot, None);
+        let mut r = Reassembly::new();
+        for f in &frags[..3] {
+            assert_eq!(r.accept(f.clone()).unwrap(), None);
+        }
+        let mut done = None;
+        for f in &frags {
+            if let Some(w) = r.accept(f.clone()).unwrap() {
+                done = Some(w);
+            }
+        }
+        assert_eq!(done.map(|w| w.bytes), Some(snapshot.clone()));
+        assert_eq!(r.restarts(), 1);
+        assert_eq!(r.pending(), 0);
+
+        r.accept(frags[0].clone()).unwrap();
+        r.accept(frags[1].clone()).unwrap();
+        r.accept(frags[0].clone()).unwrap();
+        assert!(
+            r.accept(frags[2].clone()).is_err(),
+            "the replaced copy carrying on is an interleave"
+        );
     }
 
     #[test]
