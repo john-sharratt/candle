@@ -32,7 +32,7 @@ use crate::kv_cache::arena_table::ResolvedArenaInfo;
 use crate::kv_cache::arena_table::N_PALETTE;
 use candle::cuda_backend::cudarc::driver::result::memcpy_htod_async;
 use candle::cuda_backend::cudarc::driver::CudaEvent;
-use candle::cuda_backend::WrapErr;
+use candle::cuda_backend::{vacate_epoch, WrapErr};
 use candle::quantized::pinned_staging::{give_recycled_wc, take_recycled_wc, PinnedBuf};
 use candle::CudaDevice;
 use std::sync::Arc;
@@ -165,6 +165,9 @@ pub(crate) struct GpuChunks {
     /// stream order, so its event retiring means every copy this object has
     /// issued has retired — the fence before the device slot changes hands.
     last_upload: Option<usize>,
+    /// The vacate epoch at which [`Self::slot`] last read "stay"
+    /// ([`Self::asked_to_move`]).
+    stays_at: u64,
 }
 
 /// One pinned staging buffer and the event recorded after the copies out of it.
@@ -267,7 +270,27 @@ impl GpuChunks {
             pins: Arc::new(Vec::new()),
             staging: [Staging::empty(), Staging::empty()],
             last_upload: None,
+            stays_at: vacate_epoch(),
         }
+    }
+
+    /// Whether the device slot stands on held ground being vacated, so the next
+    /// sync should rebuild into a slot claimed afresh — which lands elsewhere —
+    /// exactly as a promotion does. One atomic load while the vacate epoch
+    /// stands still; asked again on every call until the slot has moved.
+    pub(crate) fn asked_to_move(&mut self) -> bool {
+        let epoch = vacate_epoch();
+        if epoch == self.stays_at {
+            return false;
+        }
+        let moving = match (&self.slot, &self.device) {
+            (Some(slot), Some(device)) => slot_state_arena::vacating(device, slot),
+            _ => false,
+        };
+        if !moving {
+            self.stays_at = epoch;
+        }
+        moving
     }
 
     /// Record that chunks were appended to the host list this buffer
@@ -640,7 +663,8 @@ impl GpuChunksGuard<'_> {
             self.inner.host.resize(want, 0);
         }
 
-        // Device: keep the slot if it still fits, else promote.
+        // Device: keep the slot if it still fits and its ground is not being
+        // vacated, else claim afresh — a promotion, or a move.
         let Some(device) = self.inner.device.clone() else {
             self.inner.slot = None;
             return Ok(());
@@ -649,7 +673,8 @@ impl GpuChunksGuard<'_> {
             .inner
             .slot
             .as_ref()
-            .is_some_and(|s| s.capacity() >= byte_len);
+            .is_some_and(|s| s.capacity() >= byte_len)
+            && !self.inner.asked_to_move();
         if !fits {
             let next = slot_state_arena::claim(&device, byte_len)?;
             // The old slot changes hands: retire any copy still writing it.
@@ -1219,6 +1244,7 @@ impl Clone for GpuChunks {
             // Nothing was copied out of this one; it owns no slot and no copy.
             staging: [Staging::empty(), Staging::empty()],
             last_upload: None,
+            stays_at: vacate_epoch(),
         }
     }
 }

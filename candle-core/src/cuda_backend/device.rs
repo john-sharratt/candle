@@ -441,10 +441,19 @@ impl CudaDevice {
             &self.foreign_staging
         };
         let mut slot = scratch.lock().unwrap();
-        let fits = slot.as_ref().is_some_and(|s| s.len() >= bytes);
+        // A scratch its ground wants vacated is taken afresh at its width, where
+        // the ground now puts it; one too narrow doubles.
+        let moving = slot.as_mut().is_some_and(|s| s.asked_to_move());
+        let fits = !moving && slot.as_ref().is_some_and(|s| s.len() >= bytes);
         let _eager = if fits { None } else { self.pause_capture()? };
         if !fits {
-            let grown = slot.as_ref().map_or(0, |s| s.len() * 2).max(bytes).max(1);
+            let grown = match slot.as_ref() {
+                Some(s) if moving => s.len(),
+                Some(s) => s.len() * 2,
+                None => 0,
+            }
+            .max(bytes)
+            .max(1);
             // Retired rather than dropped: freed behind every launch that may
             // still read it — at once when nothing records, since the pause
             // above has launched this thread's segment.
@@ -488,8 +497,10 @@ impl CudaDevice {
         // as bytes, it is exactly what the kernel reads back.
         let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) };
         if bytes > 0 {
-            let slot = self.staging.lock().unwrap();
-            if let Some(buf) = slot.as_ref().filter(|s| s.len() >= bytes) {
+            let mut slot = self.staging.lock().unwrap();
+            // A scratch asked to move is moved by the eager path below.
+            let moving = slot.as_mut().is_some_and(|s| s.asked_to_move());
+            if let Some(buf) = slot.as_ref().filter(|s| !moving && s.len() >= bytes) {
                 let (ptr, _guard) = buf.device_ptr(&self.stream);
                 if self.record_upload(ptr, src) {
                     // The lock is held while `f` records, as on the eager path:
@@ -567,8 +578,17 @@ impl CudaDevice {
         let need = room_at + room;
         let _eager = self.pause_capture()?;
         let mut slot = self.synced_staging.lock().unwrap();
-        if !slot.as_ref().is_some_and(|s| s.len() >= need) {
-            let grown = slot.as_ref().map_or(0, |s| s.len() * 2).max(need).max(1);
+        // Every read of the scratch has retired by the time the lock is free, so
+        // one its ground wants vacated is simply taken afresh at its width.
+        let moving = slot.as_mut().is_some_and(|s| s.asked_to_move());
+        if moving || !slot.as_ref().is_some_and(|s| s.len() >= need) {
+            let grown = match slot.as_ref() {
+                Some(s) if moving => s.len(),
+                Some(s) => s.len() * 2,
+                None => 0,
+            }
+            .max(need)
+            .max(1);
             *slot = None;
             // SAFETY: every byte a launch reads is written by the upload below.
             *slot = Some(unsafe { Held::alloc(self, grown)? });

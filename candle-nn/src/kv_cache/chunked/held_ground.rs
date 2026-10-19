@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::{sys, CudaEvent, CudaStream};
 #[cfg(feature = "cuda")]
-use candle::cuda_backend::HeldGround;
+use candle::cuda_backend::{ask_holders_to_move, HeldGround};
 #[cfg(feature = "cuda")]
 use candle::{CudaDevice, Device};
 
@@ -110,6 +110,10 @@ struct Inner {
     bootstrap: Extents,
     /// Ascending by base, so first-fit takes the lowest arena first.
     arenas: Vec<HeldArena>,
+    /// Bases of the arenas whose holders are asked to move
+    /// ([`SpanHeldGround::vacate`]): live, with room claimed below them. Nothing new is taken from them, and their free
+    /// ground is not counted as headroom.
+    vacating: Vec<u64>,
     /// Ranges given back whose fence may not have fired.
     pending: Vec<(CudaEvent, Ground, Taken)>,
     /// The range behind each live address, and the site that holds it.
@@ -137,13 +141,29 @@ impl Inner {
         self.bootstrap.used() + self.arenas.iter().map(|a| a.extents.used()).sum::<usize>()
     }
 
+    /// Free ground a take can land in — not a vacating arena's.
     fn free(&self) -> usize {
         self.bootstrap.capacity() - self.bootstrap.used()
             + self
-                .arenas
-                .iter()
+                .staying()
                 .map(|a| a.extents.capacity() - a.extents.used())
                 .sum::<usize>()
+    }
+
+    /// Bytes standing in vacating arenas — the room their holders move into.
+    fn vacating_bytes(&self) -> usize {
+        self.arenas
+            .iter()
+            .filter(|a| self.vacating.contains(&a.base))
+            .map(|a| a.extents.used())
+            .sum()
+    }
+
+    /// The arenas a take may land in.
+    fn staying(&self) -> impl Iterator<Item = &HeldArena> {
+        self.arenas
+            .iter()
+            .filter(|a| !self.vacating.contains(&a.base))
     }
 
     fn capacity(&self) -> usize {
@@ -156,8 +176,7 @@ impl Inner {
     }
 
     fn largest_free(&self) -> usize {
-        self.arenas
-            .iter()
+        self.staying()
             .map(|a| a.extents.largest_free())
             .fold(self.bootstrap.largest_free(), usize::max)
     }
@@ -201,16 +220,21 @@ impl Inner {
         }
     }
 
-    /// `bytes` from the bootstrap block, else the lowest arena that holds them.
+    /// `bytes` from the bootstrap block, else the lowest arena that holds them and
+    /// is not being vacated.
     fn take_from(&mut self, bytes: usize) -> Option<(Ground, Taken, u64)> {
         if let Some(t) = self.bootstrap.take(bytes, HELD_ALIGN) {
             return Some((Ground::Bootstrap, t, 0));
         }
-        self.arenas.iter_mut().find_map(|a| {
-            a.extents
-                .take(bytes, HELD_ALIGN)
-                .map(|t| (Ground::Arena(a.base), t, a.base))
-        })
+        let vacating = &self.vacating;
+        self.arenas
+            .iter_mut()
+            .filter(|a| !vacating.contains(&a.base))
+            .find_map(|a| {
+                a.extents
+                    .take(bytes, HELD_ALIGN)
+                    .map(|t| (Ground::Arena(a.base), t, a.base))
+            })
     }
 
     /// Whether `ground` has a range live or behind a fence.
@@ -249,6 +273,7 @@ impl SpanHeldGround {
             inner: Mutex::new(Inner {
                 bootstrap: Extents::new(bootstrap),
                 arenas: Vec::new(),
+                vacating: Vec::new(),
                 pending: Vec::new(),
                 live: HashMap::new(),
                 ledger: HeldLedger::default(),
@@ -305,7 +330,7 @@ impl SpanHeldGround {
     /// Refused claims — a forward open, the span full — leave the arenas as they
     /// are; the next call tries again.
     pub(crate) fn provision(&self, device: &CudaDevice) {
-        let (short, widest) = {
+        {
             let mut inner = self.lock();
             inner.reclaim(false);
             let grew =
@@ -314,6 +339,12 @@ impl SpanHeldGround {
             inner.growth[at] = grew;
             inner.growth_at = (at + 1) % RECENT;
             inner.refused_since = 0;
+        }
+        // Before the headroom is reckoned: a vacating arena's free ground is not
+        // headroom.
+        self.vacate(device);
+        let (short, widest) = {
+            let mut inner = self.lock();
             let headroom = headroom_for(&inner.growth);
             let widest = std::mem::take(&mut inner.widest_refused);
             let widest = (widest > inner.largest_free()).then_some(widest);
@@ -338,15 +369,21 @@ impl SpanHeldGround {
             let mut inner = self.lock();
             let headroom = headroom_for(&inner.growth);
             let mut released = Vec::new();
-            // Highest first, so the arenas that stay are the low ones.
+            // Highest first, so the arenas that stay are the low ones. A vacated
+            // arena goes whatever the headroom: none of it was counted there.
+            // What still stands in vacating arenas keeps room of its own on top
+            // of the headroom, so a holder that has not yet moved finds it.
             let mut i = inner.arenas.len();
             while i > 0 {
                 i -= 1;
                 let a = &inner.arenas[i];
-                let idle = a.extents.used() == 0 && !inner.holds(Ground::Arena(a.base));
+                let base = a.base;
+                let idle = a.extents.used() == 0 && !inner.holds(Ground::Arena(base));
+                let vacated = inner.vacating.contains(&base);
                 let spare = inner.free().saturating_sub(a.extents.capacity());
-                if idle && spare >= headroom {
+                if idle && (vacated || spare >= headroom + inner.vacating_bytes()) {
                     released.push(inner.arenas.remove(i));
+                    inner.vacating.retain(|&b| b != base);
                 }
             }
             inner.used_at_provision = inner.used();
@@ -355,6 +392,63 @@ impl SpanHeldGround {
         };
         drop(released);
         self.lower(device);
+    }
+
+    /// Mark the arenas whose holders should move: something lives in them, and a
+    /// run as wide is free below.
+    ///
+    /// [`Self::lower`] moves an arena nothing holds; one with a live range cannot
+    /// move, because its holders have its addresses. A slot-state slab or a
+    /// scratch lives for as long as its owner does, so under a long decode cohort
+    /// such an arena never falls idle and stands as the frontier over the holes
+    /// packing opened below it — measured on WhiteWorld: held ground at region 629
+    /// over 165–194 free regions, the weight side and the wave tier shut out of
+    /// all of it. Asked to move, a holder takes afresh at its next natural point
+    /// (`Held::asked_to_move`), the take skips the vacating arena, and the arena
+    /// falls idle and goes back.
+    ///
+    /// Each newly marked arena first gets a run of its own width claimed below
+    /// it, so what it holds fits there as it fits now; one whose run cannot be
+    /// claimed is not marked, since a holder that found no room would go to the
+    /// CUDA pool — outside the span, worse than standing high. An arena stays
+    /// marked until it goes back: its room was claimed when it was marked, and
+    /// once idle it is released whatever the headroom.
+    fn vacate(&self, device: &CudaDevice) {
+        let stream = device.cuda_stream();
+        // Live arenas not yet marked, highest first, each with its first region's
+        // index and its width.
+        let live: Vec<(u64, usize, usize)> = {
+            let inner = self.lock();
+            inner
+                .arenas
+                .iter()
+                .rev()
+                .filter(|a| a.extents.used() > 0 && !inner.vacating.contains(&a.base))
+                .map(|a| (a.base, a.regions[0].index(), a.regions.len()))
+                .collect()
+        };
+        // Probed outside the held lock: the probe takes the pool's.
+        let fresh: Vec<_> = live
+            .into_iter()
+            .filter(|&(_, start, k)| run_free_below(&stream, k, start))
+            .collect();
+        let mut marked = false;
+        if !fresh.is_empty() && regions_open(&stream) {
+            if let Ok(claims) = SpanClaims::open(&Device::Cuda(device.clone()), "held ground") {
+                for (base, start, k) in fresh {
+                    let Ok(Some(lower)) = claims.claim_run_below(k, start) else {
+                        continue;
+                    };
+                    let mut inner = self.lock();
+                    inner.insert_arena(lower);
+                    inner.vacating.push(base);
+                    marked = true;
+                }
+            }
+        }
+        if marked {
+            ask_holders_to_move();
+        }
     }
 
     /// Move every arena nothing holds onto a free run below it.
@@ -406,6 +500,7 @@ impl SpanHeldGround {
             match inner.arenas.iter().position(|a| a.base == base) {
                 Some(i) if still_idle && inner.arenas[i].extents.used() == 0 => {
                     moved_off.push(inner.arenas.remove(i).regions);
+                    inner.vacating.retain(|&b| b != base);
                     inner.insert_arena(lower);
                 }
                 _ => moved_off.push(lower),
@@ -560,6 +655,14 @@ impl HeldGround for SpanHeldGround {
         inner.peak = inner.peak.max(used);
         inner.peak_since = inner.peak_since.max(used);
         Some(ptr)
+    }
+
+    fn vacating(&self, ptr: u64) -> bool {
+        let inner = self.lock();
+        match inner.live.get(&ptr) {
+            Some((Ground::Arena(base), _, _)) => inner.vacating.contains(base),
+            _ => false,
+        }
     }
 
     fn give_back(&self, ptr: u64, stream: &Arc<CudaStream>) {

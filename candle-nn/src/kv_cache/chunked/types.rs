@@ -1557,6 +1557,13 @@ impl SequenceState {
         // the device; one a later commit marks is noted again by its own
         // `set_len`.
         self.fill_from = None;
+        // A slot standing on held ground being vacated moves the way a promotion
+        // does: a rebuild into a slot claimed afresh, from the host state.
+        if !self.chunks.is_empty() && self.gpu_chunks.asked_to_move() {
+            let rebuilt =
+                self.rebuild_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?;
+            return Ok((rebuilt, DecodeGpuChunksSyncKind::Rebuild));
+        }
         if self.gpu_chunks.appended() {
             if let Some((extended, entries)) =
                 self.extend_decode_gpu_chunks(n_kv_head, head_dim, seq_offset, arena_info)?

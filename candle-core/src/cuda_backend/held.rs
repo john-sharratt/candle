@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::panic::Location;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{CudaSlice, CudaStream, DeviceRepr};
@@ -52,6 +53,27 @@ pub trait HeldGround: Send + Sync {
     /// `stream` before this call may still read it; the ground reuses it only
     /// once they have run.
     fn give_back(&self, ptr: u64, stream: &Arc<CudaStream>);
+    /// Whether the range [`Self::take`] returned at `ptr` stands on ground the
+    /// ground wants vacated. A holder that can take its buffer afresh does so at
+    /// its next natural point; the fresh take lands elsewhere. A ground that
+    /// changes which ranges it wants vacated calls [`ask_holders_to_move`].
+    fn vacating(&self, ptr: u64) -> bool;
+}
+
+/// Moves whenever a ground changes which of its ranges it wants vacated.
+static VACATE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The vacate epoch now: a holder that saw "not vacating" at this epoch need not
+/// ask its ground again until it moves.
+pub fn vacate_epoch() -> u64 {
+    VACATE_EPOCH.load(Ordering::Acquire)
+}
+
+/// A ground has changed which ranges it wants vacated: every holder asks again.
+/// Called after the new answer is in place, so a holder that reads the moved
+/// epoch reads the new answer.
+pub fn ask_holders_to_move() {
+    VACATE_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
 fn grounds() -> &'static Mutex<HashMap<usize, Arc<dyn HeldGround>>> {
@@ -76,6 +98,8 @@ enum Origin {
     Ground {
         ground: Arc<dyn HeldGround>,
         stream: Arc<CudaStream>,
+        /// The range's first byte, as the ground knows it.
+        ptr: u64,
     },
     /// A pool allocation, freed on drop like any slice.
     Pool,
@@ -89,6 +113,9 @@ enum Origin {
 pub struct Held<T: DeviceRepr> {
     slice: ManuallyDrop<CudaSlice<T>>,
     origin: Origin,
+    /// The vacate epoch at which this buffer last read "stay": until the epoch
+    /// moves, [`Self::asked_to_move`] answers without asking its ground.
+    stays_at: u64,
 }
 
 impl<T: DeviceRepr> Held<T> {
@@ -117,6 +144,10 @@ impl<T: DeviceRepr> Held<T> {
     pub unsafe fn alloc_on(stream: &Arc<CudaStream>, len: usize) -> Result<Self> {
         let bytes = len * std::mem::size_of::<T>();
         let ordinal = stream.context().ordinal();
+        // Read before the take: a ground skips the ground it wants vacated, so a
+        // take after an epoch moved is already clear of it, and one before is
+        // asked again at the next epoch.
+        let stays_at = vacate_epoch();
         if let Some(ground) = ground_for(ordinal) {
             if let Some(ptr) = ground.take(bytes.max(1), Location::caller()) {
                 let slice = stream.upgrade_device_ptr::<T>(ptr, len);
@@ -125,14 +156,46 @@ impl<T: DeviceRepr> Held<T> {
                     origin: Origin::Ground {
                         ground,
                         stream: stream.clone(),
+                        ptr,
                     },
+                    stays_at,
                 });
             }
         }
         Ok(Self {
             slice: ManuallyDrop::new(stream_alloc::<T>(stream, len)?),
             origin: Origin::Pool,
+            stays_at,
         })
+    }
+
+    /// Whether this buffer's ground wants its range vacated
+    /// ([`HeldGround::vacating`]) — for a holder that can take a fresh buffer
+    /// and drop this one at the point it asks.
+    ///
+    /// One atomic load while the vacate epoch stands still, so it is cheap
+    /// enough for a per-launch scratch. A "move" is not remembered: it is asked
+    /// again on every call until the holder moves, so two callers checking the
+    /// same buffer both see it.
+    pub fn asked_to_move(&mut self) -> bool {
+        let epoch = vacate_epoch();
+        if epoch == self.stays_at {
+            return false;
+        }
+        let vacating = self.stands_vacating();
+        if !vacating {
+            self.stays_at = epoch;
+        }
+        vacating
+    }
+
+    /// [`Self::asked_to_move`] without the epoch's shortcut, for a holder that
+    /// keeps its own (a slab whose slots are claimed by several owners).
+    pub fn stands_vacating(&self) -> bool {
+        match &self.origin {
+            Origin::Ground { ground, ptr, .. } => ground.vacating(*ptr),
+            Origin::Pool => false,
+        }
     }
 
     /// A held copy of `data`, uploaded on `dev`'s stream.
@@ -175,7 +238,7 @@ impl<T: DeviceRepr> Drop for Held<T> {
         // gives it back to the ground it came from.
         let ptr = slice.leak();
         let release = match std::mem::replace(&mut self.origin, Origin::Pool) {
-            Origin::Ground { ground, stream } => Release::Ground {
+            Origin::Ground { ground, stream, .. } => Release::Ground {
                 ptr,
                 ground,
                 stream,

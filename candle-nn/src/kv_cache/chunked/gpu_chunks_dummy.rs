@@ -75,6 +75,11 @@ impl GpuChunks {
         0
     }
 
+    /// The stub holds no device slot, so it never stands on ground to vacate.
+    pub(crate) fn asked_to_move(&mut self) -> bool {
+        false
+    }
+
     /// Empty, because the stub serialises nothing and so references no chunks.
     /// A consumer holding this across a launch is holding nothing, which is
     /// correct: without the feature there is no launch to outlive.

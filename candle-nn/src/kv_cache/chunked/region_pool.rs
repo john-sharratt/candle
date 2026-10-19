@@ -3730,7 +3730,7 @@ mod tests {
     use super::with_pool;
 
     use super::{SpanHeldGround, BOOTSTRAP_HELD_BYTES};
-    use candle::cuda_backend::HeldGround;
+    use candle::cuda_backend::{vacate_epoch, HeldGround};
     use std::panic::Location;
     use std::sync::Arc;
 
@@ -4998,6 +4998,71 @@ mod tests {
             "the idle arena moved down: top {high} → {lowered}"
         );
 
+        for _ in 0..=super::super::held_ground::RECENT_WINDOW {
+            held.provision(&dev);
+        }
+        assert_eq!(held.stats().arenas, 0, "idle arenas went back to the span");
+        Ok(())
+    }
+
+    /// **A live held arena is vacated onto ground freed beneath it.** Its holder
+    /// has its addresses, so it cannot be moved for it: the next provisioning
+    /// claims a run of its width below, asks its holders to move, and takes
+    /// nothing more from it. The holder's fresh take lands below, and once the
+    /// old range is let go the arena goes back — it is no longer the frontier.
+    #[test]
+    fn a_live_held_arena_is_vacated_onto_freed_ground() -> Result<()> {
+        let _serial = serial();
+        let Ok(Device::Cuda(dev)) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let s = dev.cuda_stream();
+        let held = own_held_ground();
+        let site = Location::caller();
+        held.provision(&dev);
+        // The low ground, taken, so the arena is claimed above it.
+        let mut low = Vec::new();
+        for _ in 0..8 {
+            low.extend(claim_region(&s)?);
+        }
+        let wide = 40 << 20;
+        assert_eq!(
+            held.take(wide, site),
+            None,
+            "refused, so it only records the width"
+        );
+        held.provision(&dev);
+        let old = held.take(wide, site).expect("held ground now");
+        let high = held.stats().arena_top;
+        assert!(!held.vacating(old), "nothing below it is free yet");
+
+        drop(low);
+        s.synchronize().map_err(candle::Error::wrap)?;
+        let epoch = vacate_epoch();
+        held.provision(&dev);
+        assert!(
+            held.vacating(old),
+            "a live arena over freed ground is vacated"
+        );
+        assert!(vacate_epoch() > epoch, "its holders were asked to move");
+        let moved = held.take(wide, site).expect("room was claimed below it");
+        assert!(
+            moved < old,
+            "the fresh take landed below: {moved:#x} against {old:#x}"
+        );
+        assert!(!held.vacating(moved), "the new range stays");
+
+        held.give_back(old, &s);
+        s.synchronize().map_err(candle::Error::wrap)?;
+        held.provision(&dev);
+        let lowered = held.stats().arena_top;
+        assert!(
+            lowered < high,
+            "the vacated arena went back: top {high} → {lowered}"
+        );
+
+        held.give_back(moved, &s);
+        s.synchronize().map_err(candle::Error::wrap)?;
         for _ in 0..=super::super::held_ground::RECENT_WINDOW {
             held.provision(&dev);
         }

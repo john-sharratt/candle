@@ -109,12 +109,31 @@ of **span regions** claimed as a tenant (`SlotTenant::Held`) instead of a fixed 
   promotions land in. The penalty-count table already shrinks after a run of narrow
   dispatches.
 
+- **Vacated when live.** An arena whose holders live as long as a decode cohort — the
+  slot-state slabs, a launch-table scratch — never falls idle, so moving only empty
+  arenas left it standing as the frontier: WhiteWorld measured held ground at region 629
+  over 165–194 free regions, 314 MB used of which slot-state slabs were 149 MB, a kernel
+  scratch 113 MB and the synced upload scratch 23 MB. Each provisioning now also marks a
+  live arena with a free run below it as **vacating** (`SpanHeldGround::vacate`): it
+  first claims a run of the arena's own width below it (so what it holds fits there as
+  it fits now; an arena whose run cannot be claimed is not marked, since a holder that
+  found no room would land in the CUDA pool), then moves the vacate epoch
+  (`ask_holders_to_move`). Nothing more is taken from a vacating arena, and its free
+  ground is not headroom. Holders that can take afresh do so at their natural point:
+  `GpuChunks` rebuilds into a fresh slot the way a promotion does
+  (`sync_decode_gpu_chunks`), the staging and synced-upload scratches re-take at their
+  width, and a kernel's launch scratch already re-takes at every forward. The check is
+  `Held::asked_to_move` — one atomic load while the epoch stands still. A vacating slab
+  hands out no slot and goes back as soon as it is empty. A vacating arena that falls
+  idle goes back whatever the headroom, and until it does, idle arenas keep room for what
+  still stands in it.
+
 The arenas do not move live buffers: a held buffer's holder keeps its raw address
-(recorded into graphs, baked into kernel tables), so relocating one would need every
-holder repointed. An *empty* arena holds no address, so it is the arena that moves:
-claimed lowest-first, moved down whenever it is empty and lower ground is free, and
-released when it is past the headroom — which is what keeps them off the frontier. The
-KV and recurrent compactions pack around them.
+(recorded into graphs, baked into kernel tables), so relocating one needs its holder to
+take afresh. An *empty* arena holds no address, so it is the arena that moves: claimed
+lowest-first, moved down whenever it is empty and lower ground is free, and released
+when it is past the headroom; a live one is vacated by its holders — which is what keeps
+them off the frontier. The KV and recurrent compactions pack around them.
 
 ## 5. What the report shows
 

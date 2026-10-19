@@ -188,7 +188,7 @@ mod thread_blas;
 mod utils;
 pub use device::{CudaDevice, DeviceId, Uploaded};
 pub use error::{CudaError, WrapErr};
-pub use held::{install_held_ground, Held, HeldGround};
+pub use held::{ask_holders_to_move, install_held_ground, vacate_epoch, Held, HeldGround};
 pub use kernel_scratch::{
     close_scratch_scope, install_scope_carve, open_scratch_scope, scratch_reserve, ScopeCarve,
 };

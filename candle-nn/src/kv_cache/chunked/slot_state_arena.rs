@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use candle::cuda_backend::cudarc::driver::DevicePtr;
-use candle::cuda_backend::Held;
+use candle::cuda_backend::{vacate_epoch, Held};
 use candle::{CudaDevice, Result};
 
 use super::types::TARGET_ARENA_BYTES;
@@ -151,6 +151,10 @@ struct ClassPool {
     free_in: Vec<usize>,
     /// Free `(slab, index)` pairs, most recently released first.
     free: Vec<(usize, usize)>,
+    /// Whether each slab stands on held ground its ground wants vacated, as of
+    /// [`Inner::vacate_epoch`]: no slot is claimed from it, its owners move out,
+    /// and it goes back once empty.
+    vacating: Vec<bool>,
 }
 
 impl ClassPool {
@@ -161,7 +165,14 @@ impl ClassPool {
             capacity: Vec::new(),
             free_in: Vec::new(),
             free: Vec::new(),
+            vacating: Vec::new(),
         }
+    }
+
+    /// Where in [`Self::free`] the next claim comes from: the most recently
+    /// released slot of a slab that is not being vacated.
+    fn usable(&self) -> Option<usize> {
+        self.free.iter().rposition(|&(s, _)| !self.vacating[s])
     }
 
     /// Install `slab` of `per_slab` slots at `base`, every slot free: in the
@@ -173,6 +184,7 @@ impl ClassPool {
                 self.bases[at] = base;
                 self.capacity[at] = per_slab;
                 self.free_in[at] = per_slab;
+                self.vacating[at] = false;
                 at
             }
             None => {
@@ -180,6 +192,7 @@ impl ClassPool {
                 self.bases.push(base);
                 self.capacity.push(per_slab);
                 self.free_in.push(per_slab);
+                self.vacating.push(false);
                 self.slabs.len() - 1
             }
         };
@@ -192,6 +205,9 @@ impl ClassPool {
     /// of the pool and returned — its slots off the free list — for the caller
     /// to give back. The spare slab's worth is what keeps a 32-token boundary,
     /// where many pairs promote at once, from freeing and re-carving.
+    ///
+    /// A vacating slab goes back as soon as it is empty: it is no spare, since
+    /// nothing is claimed from it, and its ground is wanted back.
     fn returned(&mut self, slab: usize, index: usize) -> Option<Held<u8>> {
         self.free.push((slab, index));
         self.free_in[slab] += 1;
@@ -199,12 +215,13 @@ impl ClassPool {
             return None;
         }
         let elsewhere = self.free.len() - self.free_in[slab];
-        if elsewhere < self.capacity[slab] {
+        if !self.vacating[slab] && elsewhere < self.capacity[slab] {
             return None;
         }
         self.free.retain(|&(s, _)| s != slab);
         self.free_in[slab] = 0;
         self.capacity[slab] = 0;
+        self.vacating[slab] = false;
         self.slabs[slab].take()
     }
 }
@@ -218,6 +235,36 @@ struct Inner {
     slabs: usize,
     /// Bytes those slabs hold, for the diagnostic.
     reserved: usize,
+    /// The vacate epoch [`ClassPool::vacating`] was read at.
+    vacate_epoch: u64,
+}
+
+impl Inner {
+    fn new() -> Self {
+        Self {
+            classes: (0..SLOT_STATE_LADDER.len())
+                .map(|_| ClassPool::new())
+                .collect(),
+            live: 0,
+            slabs: 0,
+            reserved: 0,
+            vacate_epoch: vacate_epoch(),
+        }
+    }
+
+    /// Re-read which slabs stand on ground being vacated, once per epoch.
+    fn refresh_vacating(&mut self) {
+        let epoch = vacate_epoch();
+        if epoch == self.vacate_epoch {
+            return;
+        }
+        self.vacate_epoch = epoch;
+        for pool in &mut self.classes {
+            for (slab, held) in pool.slabs.iter().enumerate() {
+                pool.vacating[slab] = held.as_ref().is_some_and(Held::stands_vacating);
+            }
+        }
+    }
 }
 
 static ARENAS: OnceLock<Mutex<HashMap<usize, Inner>>> = OnceLock::new();
@@ -255,26 +302,21 @@ pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> 
     // again — another thread may have refilled or drained it meanwhile.
     let mut paused = None;
     let mut map = loop {
-        let map = arenas().lock().unwrap();
-        let empty = map
-            .get(&device_id)
-            .is_none_or(|inner| inner.classes[class].free.is_empty());
+        let mut map = arenas().lock().unwrap();
+        let empty = map.get_mut(&device_id).is_none_or(|inner| {
+            inner.refresh_vacating();
+            inner.classes[class].usable().is_none()
+        });
         if !empty || paused.is_some() {
             break map;
         }
         drop(map);
         paused = Some(device.pause_capture()?);
     };
-    let inner = map.entry(device_id).or_insert_with(|| Inner {
-        classes: (0..SLOT_STATE_LADDER.len())
-            .map(|_| ClassPool::new())
-            .collect(),
-        live: 0,
-        slabs: 0,
-        reserved: 0,
-    });
+    let inner = map.entry(device_id).or_insert_with(Inner::new);
+    inner.refresh_vacating();
 
-    if inner.classes[class].free.is_empty() {
+    if inner.classes[class].usable().is_none() {
         // Carve a fresh slab.
         //
         // Sized to a fixed SLOT COUNT rather than a fixed byte count, capped at
@@ -301,7 +343,8 @@ pub(crate) fn claim(device: &CudaDevice, bytes: usize) -> Result<SlotStateSlot> 
     }
 
     let pool = &mut inner.classes[class];
-    let (slab, index) = pool.free.pop().expect("just refilled the class");
+    let at = pool.usable().expect("just refilled the class");
+    let (slab, index) = pool.free.remove(at);
     pool.free_in[slab] -= 1;
     let ptr = pool.bases[slab] + (index * slot_bytes) as u64;
     inner.live += 1;
@@ -351,6 +394,18 @@ pub(crate) fn release(device: &CudaDevice, slot: SlotStateSlot) {
     if let Some(slab) = freed {
         device.retire(slab);
     }
+}
+
+/// Whether `slot` stands in a slab whose held ground is being vacated — its owner
+/// should claim afresh, which lands elsewhere, and release this one.
+pub(crate) fn vacating(device: &CudaDevice, slot: &SlotStateSlot) -> bool {
+    let device_id = device.cuda_stream().context().ordinal();
+    let mut map = arenas().lock().unwrap();
+    let Some(inner) = map.get_mut(&device_id) else {
+        return false;
+    };
+    inner.refresh_vacating();
+    inner.classes[slot.class].vacating[slot.slab]
 }
 
 /// `(live slots, slabs allocated, bytes reserved)`.
@@ -405,6 +460,60 @@ mod tests {
             slabs_in(ordinal, class),
             before.max(1),
             "every emptied slab but one went back"
+        );
+        dev.synchronize()?;
+        Ok(())
+    }
+
+    /// **A vacating slab gives out no slot and goes back as soon as it empties**
+    /// — even with no spare slab elsewhere in its class, where an ordinary slab
+    /// is kept as the spare.
+    #[test]
+    fn a_vacating_slab_is_skipped_and_given_back_when_empty() -> Result<()> {
+        use candle::backend::BackendDevice;
+        let dev = CudaDevice::new(0)?;
+        let stream = dev.cuda_stream();
+        let slab = || -> Result<(Held<u8>, u64)> {
+            // SAFETY: never read; the test only claims and returns slot indices.
+            let held = unsafe { Held::<u8>::alloc_on(&stream, 4096)? };
+            let base = {
+                let (base, _guard) = held.device_ptr(&stream);
+                base
+            };
+            Ok((held, base))
+        };
+        let mut pool = ClassPool::new();
+        let (a, a_base) = slab()?;
+        let (b, b_base) = slab()?;
+        let stays = pool.add_slab(a, a_base, 1);
+        let leaves = pool.add_slab(b, b_base, 1);
+        pool.vacating[leaves] = true;
+
+        let at = pool.usable().expect("the staying slab's slot");
+        assert_eq!(
+            pool.free[at],
+            (stays, 0),
+            "nothing is claimed from a vacating slab"
+        );
+        pool.free.remove(at);
+        pool.free_in[stays] -= 1;
+        assert_eq!(
+            pool.usable(),
+            None,
+            "the vacating slab's slot is not usable"
+        );
+
+        // Its tenant claimed before it was marked, now gone: the slab goes back
+        // although the class has no free slot elsewhere.
+        pool.free.retain(|&(s, _)| s != leaves);
+        pool.free_in[leaves] -= 1;
+        assert!(
+            pool.returned(leaves, 0).is_some(),
+            "an emptied vacating slab goes back"
+        );
+        assert!(
+            pool.returned(stays, 0).is_none(),
+            "an emptied ordinary slab with no spare elsewhere stays as the spare"
         );
         dev.synchronize()?;
         Ok(())
