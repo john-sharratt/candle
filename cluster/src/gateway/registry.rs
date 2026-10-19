@@ -52,6 +52,11 @@ pub struct MemberView {
     /// counts it, so a burst of jobs is spread instead of all reading the
     /// same free slot.
     pub handed: u32,
+    /// Requests handed to it since its last `CAPACITY`: prompts its reported
+    /// backlog does not hold yet. A request handed earlier is either queued,
+    /// and in that backlog, or past its prefill and decoding, and in its
+    /// decode step — so `finish_us` charges a nominal prompt for these alone.
+    pub placed: u32,
     /// Its session has ended and the socket's cleanup has not yet run its
     /// leave: no stream can open to it, so it is routed nothing. A request
     /// picked for it in that window was answered `503` while another member
@@ -195,6 +200,7 @@ impl Registry {
         m.capacity = Some(capacity);
         // What it was handed is in what it reports now.
         m.handed = 0;
+        m.placed = 0;
         changed
     }
 
@@ -293,6 +299,7 @@ impl Registry {
     pub fn begin(&mut self, app: &str, node: u64) -> Option<u64> {
         let m = self.app(app).members.get_mut(&node)?;
         m.in_flight += 1;
+        m.placed += 1;
         Some(m.session)
     }
 
@@ -661,10 +668,11 @@ fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
 fn placement_view(m: &MemberView) -> String {
     let c = capacity_of(m);
     format!(
-        "{:016x} room={} in_flight={} backlog={} prefill_tok_s={} step_next_us={} finish_ms={}",
+        "{:016x} room={} in_flight={} placed={} backlog={} prefill_tok_s={} step_next_us={} finish_ms={}",
         m.node,
         has_room(m),
         m.in_flight,
+        m.placed,
         c.prefill_backlog,
         c.prefill_tok_s,
         c.decode_step_next_us,
@@ -684,8 +692,7 @@ fn finish_us(m: &MemberView) -> Option<u64> {
     if c.prefill_tok_s == 0 || c.decode_step_next_us == 0 {
         return None;
     }
-    let tokens =
-        u64::from(c.prefill_backlog) + (u64::from(m.in_flight) + 1) * NOMINAL_PROMPT_TOKENS;
+    let tokens = u64::from(c.prefill_backlog) + (u64::from(m.placed) + 1) * NOMINAL_PROMPT_TOKENS;
     let prefill_us = tokens * 1_000_000 / u64::from(c.prefill_tok_s);
     Some(prefill_us + NOMINAL_REPLY_TOKENS * u64::from(c.decode_step_next_us))
 }

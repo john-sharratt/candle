@@ -127,6 +127,7 @@ mod tests {
             syncing: false,
             in_flight: 0,
             handed: 0,
+            placed: 0,
             closing: false,
         };
         assert_eq!(

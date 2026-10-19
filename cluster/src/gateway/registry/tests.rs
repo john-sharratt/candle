@@ -39,6 +39,7 @@ fn member(node: u64, session: u64) -> MemberView {
         syncing: false,
         in_flight: 0,
         handed: 0,
+        placed: 0,
         closing: false,
     }
 }
@@ -420,6 +421,33 @@ fn a_burst_spills_to_the_slower_member_at_the_crossover() {
     let first_on_2 = picks.iter().position(|p| *p == Pick::Member(2));
     assert_eq!(first_on_2, Some(20), "the 21st turn is the first on node 2");
     assert!(picks[..20].iter().all(|p| *p == Pick::Member(1)));
+}
+
+/// **A turn already reported is not charged a prompt again.** Turns handed
+/// since a member's last `CAPACITY` are prompts its backlog does not hold yet;
+/// once it reports, they are in its backlog or decoding, and the decode step
+/// it advertises carries them. Counting every request in flight as a fresh
+/// 2,048-token prompt priced run 22's BlackWorld, decoding 20 turns with an
+/// empty queue, as 34 s of prefill it did not have.
+#[test]
+fn a_reported_turn_is_not_charged_a_prompt_again() {
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    learned(&mut r, 1, 541, 0, 1_196, 28_862);
+    learned(&mut r, 2, 27, 0, 980, 94_871);
+    for _ in 0..20 {
+        r.begin("zend", 1);
+    }
+    // Twenty handed and unreported: 1.712 × 21 + 14.78 = 50.73 s against
+    // node 2's 50.66 s.
+    assert_eq!(best(&mut r), Pick::Member(2));
+    // Node 1 reports them, decoding with nothing queued: its step carries
+    // them, and its prompt term is this turn's alone — 1.71 + 14.78 s.
+    learned(&mut r, 1, 541, 0, 1_196, 28_862);
+    assert_eq!(r.member("zend", 1).map(|m| m.in_flight), Some(20));
+    assert_eq!(best(&mut r), Pick::Member(1));
 }
 
 /// The canary takes a key let go only once it holds the last holder's writes.

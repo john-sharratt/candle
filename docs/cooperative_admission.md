@@ -99,8 +99,10 @@ prompt tokens), `prefill_tok_s` and `decode_step_next_us`. The last two are
 what the member's admission has learned (`phase_ring::learned_rates`): the
 prefill rate at the width it runs, and the decode step with one more row. The
 gateway's `Best` estimates each candidate's finish for a nominal turn: the
-backlog, plus 2,048 tokens per request in flight and for this one, at the
-prefill rate; then 512 tokens at the one-more-row step. It picks the soonest
+backlog, plus 2,048 tokens for each request handed to it since its last
+`CAPACITY` and for this one, at the prefill rate; then 512 tokens at the
+one-more-row step. A request handed earlier is not charged again: it is queued,
+and in the backlog, or decoding, and in the step. It picks the soonest
 (`gateway/registry.rs`, `finish_us`). Until every candidate has learned both
 rates, it ranks by power per request as before.
 
