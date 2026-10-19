@@ -8,7 +8,8 @@ mod link;
 mod listener;
 
 pub use app::{
-    AppMember, CapacitySource, ClusterView, Identity, APPLY_WAIT, CAPACITY_EVERY, GROUP,
+    AppMember, CapacitySource, ClaimUse, ClusterView, Identity, ReleaseHook, APPLY_WAIT,
+    CAPACITY_EVERY, GROUP,
 };
 pub use claims::{Check, MemberClaims};
 pub use link::{Link, Links, START_WAIT};

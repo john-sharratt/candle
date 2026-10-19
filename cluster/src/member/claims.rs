@@ -35,6 +35,18 @@ pub struct MemberClaims {
     /// Of those, the ones a lease stands behind (§9.6): never let go for
     /// idleness, only when the lease is.
     held: HashSet<Vec<u8>>,
+    /// The work using each of this member's claims now — a request in flight,
+    /// a turn still running ([`Self::begin_use`]).
+    uses: HashMap<Vec<u8>, u32>,
+    /// Whether a claim lasts only while something uses it
+    /// (`docs/cooperative_admission.md` §2.2): let go the moment its last use
+    /// ends, so the key's next piece of work is placed afresh, rather than kept
+    /// until it has served nothing for the idle timeout.
+    follow_use: bool,
+    /// Keys this member let go that no other member has claimed since: whatever
+    /// the app keeps of one stays current until another member takes it
+    /// ([`Self::heard`]), and a request coming back here first finds it intact.
+    let_go: HashSet<Vec<u8>>,
 }
 
 impl MemberClaims {
@@ -45,7 +57,51 @@ impl MemberClaims {
             seen: HashMap::new(),
             own: HashMap::new(),
             held: HashSet::new(),
+            uses: HashMap::new(),
+            follow_use: false,
+            let_go: HashSet::new(),
         }
+    }
+
+    /// `key` is no longer this member's, released by it: its own claim and the
+    /// table's entry go, and the key is remembered as let go.
+    fn release(&mut self, key: &[u8]) -> Option<Epoch> {
+        let (epoch, _) = self.own.remove(key)?;
+        self.table.unclaim(key, epoch);
+        self.let_go.insert(key.to_vec());
+        Some(epoch)
+    }
+
+    /// Hold each claim only while something uses it — see the field.
+    pub fn follow_use(&mut self) {
+        self.follow_use = true;
+    }
+
+    /// Whether claims last only while used.
+    pub fn follows_use(&self) -> bool {
+        self.follow_use
+    }
+
+    /// One more piece of work uses this member's claim on `key`.
+    pub fn begin_use(&mut self, key: &[u8]) {
+        *self.uses.entry(key.to_vec()).or_default() += 1;
+    }
+
+    /// A use [`Self::begin_use`] counted has ended. The claim's epoch to
+    /// announce as `UNCLAIM` when that was its last and claims follow use;
+    /// `None` while it is still used, when claims are kept until idle, or when
+    /// this member no longer holds it.
+    pub fn end_use(&mut self, key: &[u8]) -> Option<Epoch> {
+        let n = self.uses.get_mut(key)?;
+        *n = n.saturating_sub(1);
+        if *n > 0 {
+            return None;
+        }
+        self.uses.remove(key);
+        if !self.follow_use || self.held.contains(key) {
+            return None;
+        }
+        self.release(key)
     }
 
     /// Claim `key` for a lease this member now holds, whoever the table names:
@@ -65,6 +121,7 @@ impl MemberClaims {
         self.table.claim(key, epoch);
         self.own.insert(key.to_vec(), (epoch, now));
         self.held.insert(key.to_vec());
+        self.let_go.remove(key);
         Some(epoch)
     }
 
@@ -72,9 +129,7 @@ impl MemberClaims {
     /// `UNCLAIM`, if this member held it.
     pub fn let_go(&mut self, key: &[u8]) -> Option<Epoch> {
         self.held.remove(key);
-        let (epoch, _) = self.own.remove(key)?;
-        self.table.unclaim(key, epoch);
-        Some(epoch)
+        self.release(key)
     }
 
     fn saw(&mut self, key: &[u8], epoch: Epoch) {
@@ -83,16 +138,21 @@ impl MemberClaims {
     }
 
     /// A claim announced by any member — from `ADMIT`'s table or relayed.
-    /// Returns whether it took the key from this member, which lets its own
-    /// claim go.
+    /// Returns whether another member took a key this member held or last let
+    /// go: its own claim goes, and whatever it keeps of the key may now fall
+    /// behind what the taker writes.
     pub fn heard(&mut self, key: &[u8], epoch: Epoch) -> bool {
         self.saw(key, epoch);
         let took = self.table.claim(key, epoch);
-        let lost = took && epoch.node != self.node && self.own.remove(key).is_some();
-        if lost {
+        if !took || epoch.node == self.node {
+            return false;
+        }
+        let held = self.own.remove(key).is_some();
+        if held {
             self.held.remove(key);
         }
-        lost
+        let let_go = self.let_go.remove(key);
+        held || let_go
     }
 
     /// A release announced by any member.
@@ -127,6 +187,7 @@ impl MemberClaims {
                 self.saw(key, epoch);
                 self.table.claim(key, epoch);
                 self.own.insert(key.to_vec(), (epoch, now));
+                self.let_go.remove(key);
                 Check::Took(epoch)
             }
         }
@@ -138,13 +199,12 @@ impl MemberClaims {
         let gone: Vec<(Vec<u8>, Epoch)> = self
             .own
             .iter()
-            .filter(|(k, _)| !self.held.contains(*k))
+            .filter(|(k, _)| !self.held.contains(*k) && !self.uses.contains_key(*k))
             .filter(|(_, (_, served))| now.duration_since(*served) >= idle)
             .map(|(k, (e, _))| (k.clone(), *e))
             .collect();
-        for (key, epoch) in &gone {
-            self.own.remove(key);
-            self.table.unclaim(key, *epoch);
+        for (key, _) in &gone {
+            self.release(key);
         }
         gone
     }
@@ -222,6 +282,93 @@ mod tests {
         assert_eq!(c.let_go(b"w1"), Some(e(901, ME)));
         assert_eq!(c.holder(b"w1"), None);
         assert_eq!(c.let_go(b"w1"), None);
+    }
+
+    /// **A claim that follows use is let go when its last use ends**, and not
+    /// before: two uses overlap, the first ending keeps it, the second lets it
+    /// go. The key is then taken again above the release.
+    #[test]
+    fn a_claim_following_use_goes_with_its_last_use() {
+        let t = Instant::now();
+        let mut c = MemberClaims::new(ME);
+        c.follow_use();
+        assert_eq!(c.serve(b"conv", 100, t, |_| true), Check::Took(e(100, ME)));
+        c.begin_use(b"conv");
+        c.begin_use(b"conv");
+        assert_eq!(c.end_use(b"conv"), None, "one use still running");
+        assert_eq!(c.holder(b"conv"), Some(ME));
+        assert_eq!(
+            c.end_use(b"conv"),
+            Some(e(100, ME)),
+            "the last use let it go"
+        );
+        assert_eq!(c.holder(b"conv"), None);
+        assert!(c.own().is_empty());
+        assert_eq!(c.end_use(b"conv"), None, "nothing left to end");
+        assert_eq!(c.serve(b"conv", 50, t, |_| true), Check::Took(e(101, ME)));
+    }
+
+    /// **Another member taking a key this member let go is reported** — what
+    /// this member keeps of it may now fall behind. One it never held, or took
+    /// back itself in between, is not.
+    #[test]
+    fn a_key_let_go_and_taken_elsewhere_is_reported() {
+        let t = Instant::now();
+        let mut c = MemberClaims::new(ME);
+        c.follow_use();
+        c.serve(b"conv", 100, t, |_| true);
+        c.begin_use(b"conv");
+        c.end_use(b"conv");
+        assert!(c.heard(b"conv", e(200, 2)), "let go here, taken by 2");
+        assert!(!c.heard(b"conv", e(300, 2)), "reported once");
+
+        assert!(!c.heard(b"never", e(200, 2)), "never this member's");
+
+        c.serve(b"back", 100, t, |_| true);
+        c.begin_use(b"back");
+        c.end_use(b"back");
+        c.serve(b"back", 150, t, |_| true);
+        c.begin_use(b"back");
+        assert!(
+            c.heard(b"back", e(400, 2)),
+            "taken back here, then taken away while held"
+        );
+        assert_eq!(c.holder(b"back"), Some(2));
+    }
+
+    /// **Without following use, a claim outlives its uses** and goes only when
+    /// idle — and never while a use is running, however long ago it last
+    /// served.
+    #[test]
+    fn a_claim_kept_until_idle_is_not_idle_while_used() {
+        let t = Instant::now();
+        let mut c = MemberClaims::new(ME);
+        c.serve(b"job", 100, t, |_| true);
+        c.begin_use(b"job");
+        let later = t + Duration::from_secs(3600);
+        assert!(
+            c.idle(later, Duration::from_secs(600)).is_empty(),
+            "a running use is not idleness"
+        );
+        assert_eq!(c.end_use(b"job"), None, "kept: claims do not follow use");
+        assert_eq!(c.holder(b"job"), Some(ME));
+        assert_eq!(
+            c.idle(later, Duration::from_secs(600)),
+            vec![(b"job".to_vec(), e(100, ME))]
+        );
+    }
+
+    /// A claim a lease stands behind is the lease's to let go, however its uses
+    /// end.
+    #[test]
+    fn a_leases_claim_outlives_its_uses() {
+        let t = Instant::now();
+        let mut c = MemberClaims::new(ME);
+        c.follow_use();
+        c.hold(b"w1", 500, t);
+        c.begin_use(b"w1");
+        assert_eq!(c.end_use(b"w1"), None);
+        assert_eq!(c.holder(b"w1"), Some(ME));
     }
 
     /// A claim idle past the timeout is let go and reported; a served one

@@ -490,6 +490,14 @@ impl PassthroughCache {
         before - slots.len()
     }
 
+    /// Drop `key`'s conversation: this member no longer holds it, and its next
+    /// call — here or on another member — opens it from the substrate. A call
+    /// still running keeps its own reference.
+    pub fn forget(&self, key: &str) {
+        let slot = self.slots.lock().unwrap().remove(key);
+        drop(slot);
+    }
+
     /// Drop every conversation — at shutdown, while the scheduler still answers
     /// the slot frees.
     pub fn clear(&self) {

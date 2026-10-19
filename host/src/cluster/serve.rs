@@ -23,7 +23,8 @@ use tower::Service;
 use web::cluster::ClusterPeer;
 
 use super::flush::{self, flush_first, Flushed};
-use super::in_flight::{Held, InFlight};
+use super::held_body::HeldBody;
+use super::in_flight::InFlight;
 
 /// The address a request off a socket appears to come from: no address at
 /// all, so nothing that trusts a peer by address — `--local-signin`, the
@@ -56,14 +57,14 @@ pub fn serve(
                 let running = in_flight.enter();
                 let res = route(&mut router, req, cluster).await;
                 let Some(r) = replicator else {
-                    return Ok(res.map(|body| Body::new(Held::new(body, running))));
+                    return Ok(res.map(|body| Body::new(HeldBody::new(body, running))));
                 };
                 if flush_first(res.body()) {
                     r.flush(cluster).await;
-                    return Ok(res.map(|body| Body::new(Held::new(body, running))));
+                    return Ok(res.map(|body| Body::new(HeldBody::new(body, running))));
                 }
                 Ok(res.map(|body| {
-                    Body::new(Held::new(
+                    Body::new(HeldBody::new(
                         Body::new(Flushed::new(body, r, cluster)),
                         running,
                     ))

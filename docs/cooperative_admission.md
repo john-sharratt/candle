@@ -110,6 +110,36 @@ released with `through`, and the next turn is placed afresh.
 - A turn runs where it is placed, start to finish: no part of it is sent to
   another member mid-turn.
 
+How it is built:
+
+- **The claim follows use.** zend's member holds a conversation's claim (§5.4
+  of `replicated_substrate.md`) only while something uses it
+  (`AppMember::follow_use`). A request uses it until its response body ends (the
+  host's sticky check); a turn uses it from submit until its last record is
+  written (`zend::turn_claims`), because a dialogue turn outlives a client that
+  goes away. When the last use ends the claim goes as `UNCLAIM`, its `through`
+  this member's own `oseq` then — covering the turn. npcd and the agent keep
+  their claims until idle: their work runs on after the request that started
+  it.
+- **The gateway places the next request among those holding the turn.** It
+  keeps each key's last release (who, through which `oseq`) and each member's
+  applied set from its `ACK`s. A request for a key nobody holds goes `Best`
+  among the routable members that hold the releaser's records through that
+  `oseq` — the releaser itself always does — and the canary takes it only if it
+  does. With none holding it the request goes among them all, which is the most
+  anyone has (§2.4). A release every routable member already holds is
+  forgotten.
+- **A member forgets what it no longer holds.** Every way a claim stops being
+  this member's — its last use, idleness, a lease handed back, another member's
+  later claim — calls the app's release hook (`AppMember::on_release`). zend
+  drops the conversation's cached sequence and passthrough transcript there: a
+  conversation that moved away and back would otherwise be appended to as it
+  stood when it left, missing the turns written elsewhere. The next turn served
+  here resumes from the substrate.
+- A request the gateway sends after a release reaches a member that applies the
+  records relayed ahead of it before serving (`APPLY_WAIT`); placement only ever
+  chooses one that already has.
+
 ### 2.3 Fairness
 
 Every policy is judged on per-conversation slowdown (the turn's time against

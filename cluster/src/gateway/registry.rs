@@ -32,6 +32,8 @@ pub struct MemberView {
     pub routes: Option<RouteTable>,
     /// Its own highest `oseq`, from its `ACK`s (§7.1).
     pub high_water: u64,
+    /// Its last `ACK`: through which `oseq` it has applied each origin.
+    pub applied: Vec<(u64, u64)>,
     /// Its ordered lane passed its cap: it is sent no live event and routed
     /// no request until it has drained and caught up (§4.4).
     pub lagging: bool,
@@ -70,6 +72,16 @@ impl MemberView {
 
     pub fn ready(&self) -> bool {
         self.state() == MemberState::Ready
+    }
+
+    /// Whether it holds `origin`'s records through `through`: its own, or as
+    /// its last `ACK` reported them applied.
+    pub fn holds_through(&self, origin: u64, through: u64) -> bool {
+        origin == self.node
+            || self
+                .applied
+                .iter()
+                .any(|(o, t)| *o == origin && *t >= through)
     }
 
     /// Ready, not lagging, not still syncing and not closing: a request may be
@@ -113,6 +125,17 @@ struct AppMembers {
     /// The highest `oseq` each origin was heard at, kept when its member
     /// leaves: what a catch-up is owed while nobody is here to answer it.
     seen: BTreeMap<u64, u64>,
+    /// The last release of each sticky key: who let it go, and through which
+    /// of its own records. Dropped once every member a request may go to holds
+    /// them.
+    handovers: HashMap<Vec<u8>, Handover>,
+}
+
+/// A sticky key let go ([`Registry::released`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Handover {
+    by: u64,
+    through: u64,
 }
 
 #[derive(Debug, Default)]
@@ -181,14 +204,29 @@ impl Registry {
         }
     }
 
-    /// `node`'s own highest `oseq`, from its `ACK`.
-    pub fn high_water(&mut self, app: &str, node: u64, high_water: u64) {
+    /// `node`'s `ACK`: what it has applied of each origin, its own highest
+    /// `oseq` among them.
+    pub fn applied(&mut self, app: &str, node: u64, applied: Vec<(u64, u64)>) {
         let a = self.app(app);
-        let seen = a.seen.entry(node).or_default();
-        *seen = (*seen).max(high_water);
-        if let Some(m) = a.members.get_mut(&node) {
-            m.high_water = m.high_water.max(high_water);
+        if let Some(own) = applied.iter().find(|(o, _)| *o == node) {
+            let seen = a.seen.entry(node).or_default();
+            *seen = (*seen).max(own.1);
+            if let Some(m) = a.members.get_mut(&node) {
+                m.high_water = m.high_water.max(own.1);
+            }
         }
+        if let Some(m) = a.members.get_mut(&node) {
+            m.applied = applied;
+        }
+    }
+
+    /// `key`'s claim was let go by `by`, its own records then reaching
+    /// `through` (§5.4): the key's next request goes to a member that holds
+    /// them (`docs/cooperative_admission.md` §2.2).
+    pub fn released(&mut self, app: &str, key: &[u8], by: u64, through: u64) {
+        self.app(app)
+            .handovers
+            .insert(key.to_vec(), Handover { by, through });
     }
 
     /// Whether a member of `app` other than `except` is serving now: what a
@@ -385,10 +423,42 @@ impl Registry {
     }
 
     fn best_but(&self, app: &str, except: Option<u64>) -> Option<u64> {
-        let ready = self.ready_but(app, except);
-        let roomy: Vec<&MemberView> = ready.iter().copied().filter(|m| has_room(m)).collect();
-        let pool = if roomy.is_empty() { ready } else { roomy };
-        pool.into_iter().max_by(|a, b| rank(a, b)).map(|m| m.node)
+        best_of(self.ready_but(app, except))
+    }
+
+    /// Where a request for sticky `key`, which no member here holds, goes
+    /// (`docs/cooperative_admission.md` §2.2): `Best` among the members that
+    /// hold the records its last holder wrote before letting it go — never one
+    /// that would wait for them. When none does — the last holder has left
+    /// before anyone applied its last turn — among them all, which is the most
+    /// anyone holds (§2.4). A handover every candidate already holds is
+    /// forgotten.
+    fn best_for(&mut self, app: &str, key: Option<&str>) -> Option<u64> {
+        let handover = key.and_then(|k| self.apps.get(app)?.handovers.get(k.as_bytes()).copied());
+        let Some(h) = handover else {
+            return self.best(app);
+        };
+        let (pick, everyone_holds) = {
+            let ready = self.ready(app);
+            let holding: Vec<&MemberView> = ready
+                .iter()
+                .copied()
+                .filter(|m| m.holds_through(h.by, h.through))
+                .collect();
+            let everyone_holds = holding.len() == ready.len();
+            let pick = if holding.is_empty() {
+                best_of(ready)
+            } else {
+                best_of(holding)
+            };
+            (pick, everyone_holds)
+        };
+        if everyone_holds {
+            if let Some(k) = key {
+                self.app(app).handovers.remove(k.as_bytes());
+            }
+        }
+        pick
     }
 
     fn round_robin(&mut self, app: &str) -> Option<u64> {
@@ -479,7 +549,7 @@ impl Registry {
                 });
                 match holder {
                     Some(h) if self.member(app, h).is_some() => Some(h),
-                    _ => self.best(app),
+                    _ => self.best_for(app, key),
                 }
             }
             Dispatch::Ui => {
@@ -522,7 +592,15 @@ impl Registry {
                 .is_none_or(|h| self.member(app, h).is_none()),
             _ => false,
         };
-        if !shared || !routable(self, canary) {
+        // A key let go is the canary's to take only once it holds what the
+        // last holder wrote, as for any member.
+        let canary_holds = key
+            .and_then(|k| self.apps.get(app)?.handovers.get(k.as_bytes()).copied())
+            .is_none_or(|h| {
+                self.member(app, canary)
+                    .is_some_and(|m| m.holds_through(h.by, h.through))
+            });
+        if !shared || !canary_holds || !routable(self, canary) {
             return self.pick(app, dispatch, key, pinned);
         }
         if take() {
@@ -534,6 +612,14 @@ impl Registry {
         };
         Pick::Member(baseline.unwrap_or(canary))
     }
+}
+
+/// The best of `ready` (§5.3): among those with room, or among them all when
+/// none has, the largest share by [`rank`].
+fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
+    let roomy: Vec<&MemberView> = ready.iter().copied().filter(|m| has_room(m)).collect();
+    let pool = if roomy.is_empty() { ready } else { roomy };
+    pool.into_iter().max_by(|a, b| rank(a, b)).map(|m| m.node)
 }
 
 fn capacity_of(m: &MemberView) -> &Capacity {

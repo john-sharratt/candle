@@ -145,7 +145,6 @@ impl Hub {
                 .tick(Instant::now())
                 .map(|through| (x.handle.clone(), through));
             let drained = x.handle.gauges().live() == 0;
-            let acks = x.acks.clone();
             let lagging = s.registry.member(app, node).is_some_and(|m| m.lagging);
             let recovered = lagging && drained;
             if recovered {
@@ -159,16 +158,20 @@ impl Hub {
             let synced = syncing && {
                 // The most any member serving now has applied of each origin.
                 let mut serving: BTreeMap<u64, u64> = BTreeMap::new();
-                for ((a, n), x) in &s.sockets {
-                    let routable = s.registry.member(a, *n).is_some_and(|m| m.routable());
-                    if a != app || *n == node || !routable {
+                for m in s.registry.members(app) {
+                    if m.node == node || !m.routable() {
                         continue;
                     }
-                    for (origin, through) in &x.acks {
+                    for (origin, through) in &m.applied {
                         let top = serving.entry(*origin).or_default();
                         *top = (*top).max(*through);
                     }
                 }
+                let acks = s
+                    .registry
+                    .member(app, node)
+                    .map(|m| m.applied.clone())
+                    .unwrap_or_default();
                 Registry::in_sync(node, &acks, &serving)
             };
             if synced {
@@ -199,13 +202,7 @@ impl Hub {
     pub(super) fn relay_substrate(&self, app: &str, from: u64, frame: Frame) {
         match frame {
             Frame::Ack(ack) => {
-                let mut s = self.state();
-                if let Some(own) = ack.applied.iter().find(|(o, _)| *o == from) {
-                    s.registry.high_water(app, from, own.1);
-                }
-                if let Some(x) = s.sockets.get_mut(&(app.to_string(), from)) {
-                    x.acks = ack.applied;
-                }
+                self.state().registry.applied(app, from, ack.applied);
             }
             Frame::Catchup(c) => {
                 let requester = c.reply_to;

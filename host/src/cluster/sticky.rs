@@ -4,6 +4,12 @@
 //! every gateway relays: a key another live member holds is answered `409`
 //! naming the holder, and any other is claimed here — announced on every
 //! socket — before the request runs.
+//!
+//! When the member's claims follow use (`docs/cooperative_admission.md` §2.2),
+//! the request uses its claim until its response has ended, and the claim goes
+//! with its last use: the key's next request is placed afresh.
+
+use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::Request;
@@ -12,14 +18,18 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use cluster::dispatch::{extract, Dispatch, Extracted, RouteTable, BODY_LIMIT};
-use cluster::member::{AppMember, Check};
+use cluster::member::{AppMember, Check, ClaimUse};
 use serde_json::json;
 use web::cluster::route::HOLDER_HEADER;
 
+use super::held_body::HeldBody;
+
 /// What the check decided.
 pub enum Sticky {
-    /// Serve it — the request, its body buffered if its key needed it.
-    Serve(Request),
+    /// Serve it — the request, its body buffered if its key needed it — and,
+    /// when the member's claims follow use, the claim's use for as long as the
+    /// response lasts.
+    Serve(Request, Option<ClaimUse>),
     /// Answer it with this: another member holds its key, or its body could
     /// not be read for the key.
     Answer(Response),
@@ -44,14 +54,14 @@ pub fn held(key: &str, holder: u64) -> Response {
 }
 
 /// Check `req` against `table` and `member`'s claims.
-pub async fn check(member: &AppMember, table: &RouteTable, req: Request) -> Sticky {
+pub async fn check(member: &Arc<AppMember>, table: &RouteTable, req: Request) -> Sticky {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let Some(m) = table.lookup(&method, &path) else {
-        return Sticky::Serve(req);
+        return Sticky::Serve(req, None);
     };
     let Dispatch::Sticky(sources) = &m.route.dispatch else {
-        return Sticky::Serve(req);
+        return Sticky::Serve(req, None);
     };
     let declared = req
         .headers()
@@ -91,8 +101,19 @@ pub async fn check(member: &AppMember, table: &RouteTable, req: Request) -> Stic
     match key {
         Some(k) => match member.claim(k.as_bytes()) {
             Check::Held(holder) => Sticky::Answer(held(&k, holder)),
-            Check::Mine | Check::Took(_) => Sticky::Serve(req),
+            Check::Mine | Check::Took(_) => {
+                let used = member.follows_use().then(|| member.use_claim(k.as_bytes()));
+                Sticky::Serve(req, used)
+            }
         },
-        None => Sticky::Serve(req),
+        None => Sticky::Serve(req, None),
+    }
+}
+
+/// `res`, holding `used` until its body has ended.
+pub fn hold(res: Response, used: Option<ClaimUse>) -> Response {
+    match used {
+        Some(u) => res.map(|body| Body::new(HeldBody::new(body, u))),
+        None => res,
     }
 }

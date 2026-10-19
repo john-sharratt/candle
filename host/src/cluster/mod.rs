@@ -34,6 +34,7 @@
 pub mod capacity;
 pub mod disk;
 pub mod flush;
+pub mod held_body;
 pub mod in_flight;
 pub mod leave;
 pub mod listener;

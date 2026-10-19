@@ -34,6 +34,7 @@ fn member(node: u64, session: u64) -> MemberView {
         capacity: None,
         routes: None,
         high_water: 0,
+        applied: Vec::new(),
         lagging: false,
         syncing: false,
         in_flight: 0,
@@ -311,6 +312,62 @@ fn a_sticky_key_follows_its_claim() {
     assert_eq!(r.pick("zend", &sticky(), None, None), Pick::Member(2));
 }
 
+/// **A key let go goes to the best member holding what its holder wrote**
+/// (`docs/cooperative_admission.md` §2.2): the most powerful member is skipped
+/// while it lacks the last turn, never waited on. Once every member holds it the
+/// handover is forgotten and the key goes `Best`. When nobody holds it — its
+/// holder left first — it goes among them all.
+#[test]
+fn a_released_key_goes_to_a_member_holding_its_last_turn() {
+    let mut r = three();
+    r.released("zend", b"c", 1, 500);
+    r.applied("zend", 2, vec![(1, 100)]);
+    r.applied("zend", 3, vec![(1, 500)]);
+    // Without the handover, node 2 (power 300) takes it; it lacks node 1's
+    // records past 100, so among 1 (its own writer) and 3 the larger share.
+    assert_eq!(r.pick("zend", &sticky(), Some("c"), None), Pick::Member(3));
+    assert_eq!(
+        r.pick("zend", &sticky(), Some("other"), None),
+        Pick::Member(2),
+        "a key never let go is not held back"
+    );
+
+    r.applied("zend", 2, vec![(1, 500)]);
+    assert_eq!(r.pick("zend", &sticky(), Some("c"), None), Pick::Member(2));
+    assert!(
+        r.apps["zend"].handovers.is_empty(),
+        "every member holds it: forgotten"
+    );
+
+    // Released by a member gone, before anyone applied its last records.
+    r.released("zend", b"d", 9, 10);
+    assert_eq!(
+        r.pick("zend", &sticky(), Some("d"), None),
+        Pick::Member(2),
+        "nobody holds it: among them all"
+    );
+}
+
+/// The canary takes a key let go only once it holds the last holder's writes.
+#[test]
+fn a_canary_lacking_the_last_turn_is_not_handed_the_key() {
+    let mut r = three();
+    r.released("zend", b"c", 1, 500);
+    r.applied("zend", 2, vec![(1, 500)]);
+    r.applied("zend", 3, vec![(1, 400)]);
+    let mut take = || true;
+    assert_eq!(
+        r.pick_canary("zend", &sticky(), Some("c"), None, 3, &mut take),
+        Pick::Member(2),
+        "the canary lacks it: picked as ever"
+    );
+    r.applied("zend", 3, vec![(1, 500)]);
+    assert_eq!(
+        r.pick_canary("zend", &sticky(), Some("c"), None, 3, &mut take),
+        Pick::Member(3)
+    );
+}
+
 /// A page's files come from one member: a new page is pinned round robin, and
 /// every request carrying the pin reaches that member while it is ready; a
 /// pinned member that leaves is replaced.
@@ -401,7 +458,7 @@ fn writes_seen_from_a_member_that_left_are_still_owed() {
         "a group's first member is owed nothing"
     );
     r.join(member(1, 7));
-    r.high_water("zend", 1, 500);
+    r.applied("zend", 1, vec![(1, 500)]);
     assert!(r.leave("zend", 1, 7));
     assert!(r.owed("zend", 2, &AppliedSet::default()));
     let mut held = AppliedSet::default();
@@ -420,7 +477,7 @@ fn writes_seen_from_a_member_that_left_are_still_owed() {
 #[test]
 fn a_syncing_member_is_routed_only_its_own() {
     let mut r = three();
-    r.high_water("zend", 1, 500);
+    r.applied("zend", 1, vec![(1, 500)]);
     r.set_syncing("zend", 3, true);
     for _ in 0..6 {
         assert_ne!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(3));

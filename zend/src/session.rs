@@ -102,6 +102,7 @@ use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, Dispatch,
     ToolCall, ToolHost, ToolResult, CALIB_TOOL_SELECTOR,
 };
+use crate::turn_claims;
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
 use crate::working_set::restore::restore_locks;
 use crate::working_set::seeds::Seeding;
@@ -1039,6 +1040,22 @@ impl InferenceState {
     ///
     /// The released states are dropped after the map's lock is let go — each
     /// frees its scheduler slot as it drops.
+    /// Drop what this member keeps in memory of the conversation `key` names —
+    /// a dialogue's `conv_id`, a passthrough transcript's key — once it no
+    /// longer holds the conversation (`turn_claims`). Another member may write
+    /// its next turn, which this member's cached sequence would not hold: the
+    /// next turn served here resumes from the substrate, which does. A turn
+    /// still holding the state keeps its own reference to it.
+    fn forget_conversation(&self, key: &str) {
+        let released = {
+            let mut map = self.conversations.lock().unwrap();
+            self.conv_used.lock().unwrap().remove(key);
+            map.remove(key)
+        };
+        drop(released);
+        self.passthrough.forget(key);
+    }
+
     fn sweep_idle_conversations(&self, now: Instant) -> usize {
         let mut released: Vec<Arc<ConvLock<ConvState>>> = Vec::new();
         {
@@ -2775,6 +2792,16 @@ impl InferenceState {
             passthrough: PassthroughCache::new(),
             deletions: Deletions::default(),
         });
+        // A conversation is this member's for one turn at a time, and what it
+        // keeps of one goes when the conversation does.
+        if let Some(member) = cluster.as_ref().and_then(|join| join.link().member()) {
+            let held = Arc::downgrade(&state);
+            turn_claims::install(Arc::clone(member), move |key| {
+                if let Some(state) = held.upgrade() {
+                    state.forget_conversation(key);
+                }
+            });
+        }
         // The priming chain, read before `ready` and before the ingest worker's
         // first pass: the first question asked must already have it, and the
         // pass must find its links committed rather than read them unparented.
@@ -7218,8 +7245,11 @@ impl ZendSession {
             };
             state.passthrough.ensure_sweeper();
             let key = transcript.key();
+            // The conversation stays this member's until the reply is sealed.
+            let claim = turn_claims::hold(&key);
             let conv = state.passthrough.conversation(&key).lock_owned().await;
             run_passthrough(state, key, conv, transcript, max_tokens, tx).await;
+            drop(claim);
         });
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
@@ -7335,6 +7365,9 @@ impl ZendSession {
                 { inference.read().unwrap().as_ref().map(Arc::clone) };
             if let Some(state) = state {
                 let history_before = dialogue_history(&state, &conv_id).len();
+                // The conversation stays this member's until the turn's last
+                // record is written, however soon its client goes.
+                let claim = turn_claims::hold(&conv_id);
                 let live = live_turns.begin(&conv_id, last_user.clone(), history_before);
                 let mut ts = run_inference_stream(
                     state,
@@ -7352,6 +7385,7 @@ impl ZendSession {
                 );
                 relay_live(&mut ts, &tx, &live, &conv_id).await;
                 live_turns.end(&conv_id, &live);
+                drop(claim);
             } else {
                 tx.send(Ok(StreamItem::Status("Model unavailable.".into())))
                     .await

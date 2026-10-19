@@ -167,6 +167,7 @@ mod tests {
             }),
             routes: None,
             high_water: 0,
+            applied: Vec::new(),
             lagging: false,
             syncing: false,
             in_flight: 0,

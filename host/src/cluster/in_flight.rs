@@ -10,17 +10,13 @@
 //! waiting on one would hold every shutdown to the limit.
 //!
 //! A request is in flight until its response body ends or is dropped — the
-//! end of a stream of server-sent events, not the return of its head.
+//! end of a stream of server-sent events, not the return of its head
+//! ([`super::held_body::HeldBody`] holds its [`Running`] that long).
 
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::body::Body;
-use bytes::Bytes;
-use http_body::{Frame, SizeHint};
 use tokio::time::{sleep, Instant};
 
 /// How often a wait for the requests in flight looks again.
@@ -70,51 +66,9 @@ impl InFlight {
     }
 }
 
-/// A response body that keeps its request [`Running`] until it ends.
-pub struct Held {
-    inner: Body,
-    running: Option<Running>,
-}
-
-impl Held {
-    pub fn new(inner: Body, running: Running) -> Held {
-        Held {
-            inner,
-            running: Some(running),
-        }
-    }
-}
-
-impl http_body::Body for Held {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        let this = &mut *self;
-        let polled = Pin::new(&mut this.inner).poll_frame(cx);
-        if let Poll::Ready(None) = polled {
-            this.running = None;
-        }
-        polled
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use axum::body::to_bytes;
 
     /// A request counts from its start until its guard goes.
     #[test]
@@ -126,27 +80,6 @@ mod tests {
         drop(a);
         assert_eq!(f.count(), 1);
         drop(b);
-        assert_eq!(f.count(), 0);
-    }
-
-    /// The body holds its request in flight until the body is read to its
-    /// end, not until the head was returned.
-    #[tokio::test]
-    async fn a_body_holds_its_request_until_its_end() {
-        let f = InFlight::default();
-        let body = Body::new(Held::new(Body::from("data: [DONE]\n\n"), f.enter()));
-        assert_eq!(f.count(), 1);
-        let bytes = to_bytes(body, usize::MAX).await.unwrap();
-        assert_eq!(&bytes[..], b"data: [DONE]\n\n");
-        assert_eq!(f.count(), 0);
-    }
-
-    /// A body dropped unread — the client went away — releases it too.
-    #[test]
-    fn a_dropped_body_releases_its_request() {
-        let f = InFlight::default();
-        let body = Held::new(Body::from("partial"), f.enter());
-        drop(body);
         assert_eq!(f.count(), 0);
     }
 

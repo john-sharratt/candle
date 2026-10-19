@@ -95,7 +95,7 @@ pub async fn layer(State(l): State<Arc<Listener>>, req: Request, next: Next) -> 
 async fn here(link: &AppLink, req: Request, next: Next) -> Response {
     match (link.member(), link.routes.get()) {
         (Some(m), Some(table)) => match sticky::check(m, table, req).await {
-            Sticky::Serve(req) => next.run(req).await,
+            Sticky::Serve(req, used) => sticky::hold(next.run(req).await, used),
             Sticky::Answer(res) => res,
         },
         _ => next.run(req).await,

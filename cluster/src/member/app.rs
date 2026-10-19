@@ -8,6 +8,7 @@
 //! nothing else (§3.5).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
@@ -33,6 +34,27 @@ use crate::replicate::{Phase, Replication, Replicator};
 use crate::session::{Ended, Incoming, Session, SessionHandle, VirtualConn};
 use crate::upgrade::decisions::{certify_prefix, latest, Settled, Verdict};
 use crate::upgrade::runtime::Upgrader;
+
+/// Work using one of this member's claims ([`AppMember::use_claim`]); dropping
+/// it ends the use.
+pub struct ClaimUse {
+    member: Arc<AppMember>,
+    key: Vec<u8>,
+}
+
+impl Drop for ClaimUse {
+    fn drop(&mut self) {
+        self.member.end_use(&self.key);
+    }
+}
+
+impl fmt::Debug for ClaimUse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaimUse")
+            .field("key", &String::from_utf8_lossy(&self.key))
+            .finish()
+    }
+}
 
 /// How often `CAPACITY` is sent when nothing prompts it sooner (§4.1).
 pub const CAPACITY_EVERY: Duration = Duration::from_secs(1);
@@ -111,7 +133,13 @@ pub struct AppMember {
     upgrader: OnceLock<Weak<Upgrader>>,
     /// The group rejected this member's build: its `HELLO` says so (§3.11).
     rejected: AtomicBool,
+    /// Told each key another member takes from this one
+    /// ([`AppMember::on_release`]).
+    released: OnceLock<ReleaseHook>,
 }
+
+/// What an app does when another member takes a key from its member.
+pub type ReleaseHook = Box<dyn Fn(&[u8]) + Send + Sync>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -172,7 +200,27 @@ impl AppMember {
             floors: Mutex::new(vec![None; n]),
             upgrader: OnceLock::new(),
             rejected: AtomicBool::new(false),
+            released: OnceLock::new(),
         })
+    }
+
+    /// Call `hook` with each key another member takes that this member held or
+    /// last let go — a later claim heard. From then on that member writes it,
+    /// so whatever the app keeps of it in memory is no longer current. A key
+    /// this member let go and nobody has taken since is not reported: what the
+    /// app keeps of it is still exact, and the common next request — the same
+    /// conversation's next turn, placed back here — reuses it. The first hook
+    /// set is kept.
+    pub fn on_release(&self, hook: ReleaseHook) {
+        let _ = self.released.set(hook);
+    }
+
+    /// Tell the app's hook `key` is no longer this member's. Never under the
+    /// claims lock: the hook takes the app's own.
+    fn lost(&self, key: &[u8]) {
+        if let Some(hook) = self.released.get() {
+            hook(key);
+        }
     }
 
     /// Whether the group rejected this member's build, as its substrate's
@@ -394,11 +442,17 @@ impl AppMember {
         F: Fn(VirtualConn) + Send + Sync + 'static,
     {
         let handle = session.handle.clone();
-        {
+        let lost: Vec<Vec<u8>> = {
             let mut claims = lock(&self.claims);
-            for claim in &admit.claims {
-                claims.heard(&claim.key, claim.epoch);
-            }
+            admit
+                .claims
+                .iter()
+                .filter(|claim| claims.heard(&claim.key, claim.epoch))
+                .map(|claim| claim.key.clone())
+                .collect()
+        };
+        for key in &lost {
+            self.lost(key);
         }
         if admit.routes_wanted {
             let _ = handle.control(Frame::Routes(Routes {
@@ -512,7 +566,10 @@ impl AppMember {
                 lock(&self.members)[c] = Some(m);
             }
             Frame::Claim(claim) => {
-                lock(&self.claims).heard(&claim.key, claim.epoch);
+                let lost = lock(&self.claims).heard(&claim.key, claim.epoch);
+                if lost {
+                    self.lost(&claim.key);
+                }
             }
             Frame::Unclaim(u) => lock(&self.claims).heard_release(&u.key, u.epoch),
             // Build traffic is the process's upgrades' (§3.9).
@@ -720,6 +777,48 @@ impl AppMember {
         }));
     }
 
+    /// Hold each claim only while work uses it, and hand it back the moment the
+    /// last use ends (`docs/cooperative_admission.md` §2.2): an app whose every
+    /// piece of work is placed afresh — a conversation's next turn on whichever
+    /// member serves it soonest — rather than kept where it last ran.
+    pub fn follow_use(&self) {
+        lock(&self.claims).follow_use();
+    }
+
+    /// Whether this member's claims last only while used.
+    pub fn follows_use(&self) -> bool {
+        lock(&self.claims).follows_use()
+    }
+
+    /// Work using this member's claim on `key` — a request being answered, a
+    /// turn running — until the guard drops. When claims follow use and that
+    /// was the last, the claim goes, announced with this member's own `oseq`
+    /// as it stands then: what the key's next holder must have applied.
+    pub fn use_claim(self: &Arc<Self>, key: &[u8]) -> ClaimUse {
+        lock(&self.claims).begin_use(key);
+        ClaimUse {
+            member: Arc::clone(self),
+            key: key.to_vec(),
+        }
+    }
+
+    /// This member's own records are written through this `oseq`; 0 with no
+    /// substrate to replicate.
+    fn own_through(&self) -> u64 {
+        self.replicator.as_ref().map_or(0, |r| r.own_through())
+    }
+
+    fn end_use(&self, key: &[u8]) {
+        let Some(epoch) = lock(&self.claims).end_use(key) else {
+            return;
+        };
+        self.announce(Frame::Unclaim(Unclaim {
+            key: key.to_vec(),
+            epoch,
+            through: self.own_through(),
+        }));
+    }
+
     /// Hand back every claim this member holds — it is about to stop taking
     /// work — announcing each with this member's `oseq` at `through`.
     pub fn release_all(&self, through: u64) -> usize {
@@ -764,6 +863,79 @@ impl AppMember {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member on no cluster: its announcements go nowhere, its claims are its
+    /// own.
+    fn alone() -> Arc<AppMember> {
+        AppMember::new(
+            Identity {
+                app: "zend".into(),
+                node: 1,
+                host: "m".into(),
+                build: BuildId {
+                    count: 1,
+                    hash: "h".into(),
+                    local: String::new(),
+                },
+                model: None,
+                repos: Vec::new(),
+            },
+            GroupKey::from_bytes([1; 32]),
+            Vec::new(),
+            RouteTable::new(Vec::new()).unwrap(),
+            Box::new(Capacity::default),
+            None,
+            Instant::now(),
+        )
+    }
+
+    /// **A claim following use goes with its last use; the app is told only
+    /// when another member takes the key.** A request and a turn overlap: the
+    /// request ending first keeps it, the turn ending lets it go. Nobody has
+    /// taken it, so what the app keeps is still exact and it is told nothing;
+    /// another member's claim heard next tells it once.
+    #[test]
+    fn a_key_let_go_is_reported_when_another_member_takes_it() {
+        let member = alone();
+        member.follow_use();
+        let told: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let into = Arc::clone(&told);
+        member.on_release(Box::new(move |key| lock(&into).push(key.to_vec())));
+
+        assert!(matches!(member.claim(b"c-1"), Check::Took(_)));
+        let request = member.use_claim(b"c-1");
+        let turn = member.use_claim(b"c-1");
+        drop(request);
+        assert_eq!(member.holder_of(b"c-1"), Some(1), "the turn still uses it");
+        drop(turn);
+        assert_eq!(member.holder_of(b"c-1"), None);
+        assert!(lock(&told).is_empty(), "let go, and nobody took it");
+
+        let taken = Claim {
+            key: b"c-1".to_vec(),
+            epoch: Epoch {
+                ms: now_ms() + 1_000,
+                node: 2,
+            },
+        };
+        member.on_frame(0, Frame::Claim(taken.clone()), false);
+        assert_eq!(*lock(&told), vec![b"c-1".to_vec()]);
+        member.on_frame(0, Frame::Claim(taken), false);
+        assert_eq!(lock(&told).len(), 1, "told once");
+    }
+
+    /// Without following use the claim outlives its uses, and nothing is told.
+    #[test]
+    fn a_member_not_following_use_keeps_the_claim() {
+        let member = alone();
+        let told: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let into = Arc::clone(&told);
+        member.on_release(Box::new(move |key| lock(&into).push(key.to_vec())));
+        member.claim(b"c-1");
+        drop(member.use_claim(b"c-1"));
+        assert_eq!(member.holder_of(b"c-1"), Some(1));
+        assert!(lock(&told).is_empty());
+    }
 
     /// A socket that died and was admitted again is admitted. The close that
     /// killed the previous one stays out of the status body, and the attempt

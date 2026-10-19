@@ -30,7 +30,7 @@ use host::cluster::{Cluster, ClusterSettings, Join};
 use host::commands::jobs::Job;
 use host::commands::parse::{Body as CommandBody, Command};
 use host::commands::Commands;
-use host::guard::{dispatch_table, get, Api};
+use host::guard::{dispatch_table, get, post, Api};
 use host::model::ModelView;
 use host::server::{builder, Listen};
 use host::stopping::Stopping;
@@ -152,11 +152,13 @@ fn api(store: Arc<MemoryStore>) -> Api<()> {
             Dispatch::sticky_path("id"),
             get(|UrlPath(id): UrlPath<String>| async move { format!("served {id}") }),
         )
+        // A write is a POST: a member flushes what a request appended before
+        // its response ends only for a method that can append.
         .route(
             "/v1/write/:k",
             Role::Unauthenticated,
             Dispatch::Best,
-            get(write),
+            post(write),
         )
         .route(
             "/v1/read/:k",
@@ -288,12 +290,24 @@ sites:
 }
 
 async fn ask(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
+    send(addr, "GET", path, headers).await
+}
+
+async fn send(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
     let stream = TcpStream::connect(addr).await.unwrap();
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .unwrap();
     tokio::spawn(conn);
-    let mut req = hyper::Request::get(path).header("host", "code.test");
+    let mut req = hyper::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "code.test");
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
@@ -310,6 +324,22 @@ async fn ask_json(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Val
     let (status, body) = ask(addr, path, headers).await;
     assert_eq!(status, 200, "{path}: {body}");
     serde_json::from_str(&body).unwrap()
+}
+
+/// Wait for `read` to give `want`; on a timeout, fail with what it last gave.
+async fn until_eq<T: PartialEq + std::fmt::Debug>(what: &str, read: impl Fn() -> T, want: T) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = read();
+        if now == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what} to be {want:?}: it is {now:?}"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn until(what: &str, mut ok: impl FnMut() -> bool) {
@@ -386,7 +416,7 @@ async fn a_write_is_seen_by_the_next_request_on_any_member() {
 
     let mut readers = std::collections::BTreeSet::new();
     for k in 0..20 {
-        let (status, _) = ask(gw, &format!("/v1/write/k{k}"), &[]).await;
+        let (status, _) = send(gw, "POST", &format!("/v1/write/k{k}"), &[]).await;
         assert_eq!(status, 200);
         for _ in 0..2 {
             let read = ask_json(gw, &format!("/v1/read/k{k}"), &[]).await;
@@ -498,7 +528,7 @@ async fn commands_run_on_a_member_and_reach_the_log() {
         ended(&quorum).await["result"],
         json!({"zend": {"max_members": 1, "quorum": 1}})
     );
-    until("b holds one", || b.store.max_members() == 1).await;
+    until_eq("b's max_members", || b.store.max_members(), 1).await;
     until_logged(&hub, b_hex, "max_members 2 → 1, quorum 1").await;
     b.cluster.close_all("test over");
 }

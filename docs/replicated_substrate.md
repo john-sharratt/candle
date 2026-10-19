@@ -1360,16 +1360,27 @@ epoch in the stamp, so the epoch does not need to say whether a claim was taken 
   reachable only through another cluster and the next attempt may land on one.
 
 **When a claim ends.** A claim lives while its holder is a member of at least one
-cluster, as seen in `MEMBERS`, and has served the key within the idle timeout (10
-minutes, `--cluster-affinity-idle`).
+cluster, as seen in `MEMBERS`, and either:
 
-- An idle holder releases it with `UNCLAIM { key, through }`, where `through` is its own
-  `oseq` at release.
-- A holder that left every cluster loses it without an `UNCLAIM`. "Every cluster" is as
-  the member taking over sees it, through the gateways it is joined to. The gateways
-  are independent, so two members joined to different gateways can disagree. The
-  former holder then keeps writing while its successor writes too, and the cost when
-  they meet is a reload on the members whose turn order moves (§6.6).
+- has served the key within the idle timeout (10 minutes, `--cluster-affinity-idle`) —
+  npcd and the agent, whose work outlives the request that started it; or
+- **is still in use**, for an app whose claims follow use (zend,
+  `docs/cooperative_admission.md` §2.2): a request uses its claim until its response
+  ends, a turn until its last record is written, and the claim goes with its last use,
+  so a conversation's next turn is placed afresh.
+
+Either way the holder releases it with `UNCLAIM { key, through }`, where `through` is
+its own `oseq` at release. A gateway sends the key's next request only to a member that
+already holds those records (§2.2 there), and the member that releases forgets what it
+kept of the key in memory.
+
+A holder that left every cluster loses it without an `UNCLAIM`:
+
+- "Every cluster" is as the member taking over sees it, through the gateways it is
+  joined to.
+- The gateways are independent, so two members joined to different gateways can
+  disagree. The former holder then keeps writing while its successor writes too, and
+  the cost when they meet is a reload on the members whose turn order moves (§6.6).
 
 **The epoch is written into the turns.** The member stamps its claim's epoch on the
 turns it writes for that timeline (§6.6). A later claim has a later epoch, so the turns

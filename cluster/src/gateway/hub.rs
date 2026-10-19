@@ -134,8 +134,6 @@ pub(super) struct Socket {
     /// Its last `COORD` (§12.1).
     pub coord: Option<CoordState>,
     pub pacer: ReceiptPacer,
-    /// Its last `ACK`: what it has applied of each origin.
-    pub acks: Vec<(u64, u64)>,
     /// Live events not queued for it while it lagged, and catch-up frames
     /// dropped at its cap.
     pub skipped: u64,
@@ -415,7 +413,6 @@ impl Hub {
                     clock_offset_ms: hello.now_ms as i64 - connected_ms as i64,
                     coord: None,
                     pacer: ReceiptPacer::new(Instant::now()),
-                    acks: Vec::new(),
                     skipped: 0,
                     dropped: 0,
                     pulses_dropped: 0,
@@ -445,6 +442,7 @@ impl Hub {
                 capacity: None,
                 routes: None,
                 high_water: 0,
+                applied: Vec::new(),
                 lagging: false,
                 syncing,
                 in_flight: 0,
@@ -594,7 +592,14 @@ impl Hub {
                 self.to_others(app, node, Frame::Claim(c));
             }
             Frame::Unclaim(u) => {
-                let released = self.state().registry.claims(app).unclaim(&u.key, u.epoch);
+                let released = {
+                    let mut s = self.state();
+                    let released = s.registry.claims(app).unclaim(&u.key, u.epoch);
+                    if released {
+                        s.registry.released(app, &u.key, node, u.through);
+                    }
+                    released
+                };
                 if released {
                     self.note(
                         app,
