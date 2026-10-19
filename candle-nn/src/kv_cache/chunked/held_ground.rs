@@ -178,9 +178,11 @@ impl Inner {
                 landing_runs(&ranges).iter().sum::<usize>() * REGION
             })
             .sum();
+        let per_window = growth.iter().copied().max().unwrap_or(0);
         HeldClaim {
             growth: widest + short.div_ceil(REGION) * REGION,
             landing,
+            per_window: per_window.div_ceil(REGION) * REGION,
         }
     }
 
@@ -745,6 +747,11 @@ pub struct HeldClaim {
     /// its holders have moved. An upper bound: an arena with no room below
     /// claims nothing.
     pub landing: usize,
+    /// The most any one recent window grew held ground, in whole regions'
+    /// bytes. Provisioning runs at every forward's entry, so a sweep of many
+    /// windows meets a pass at each: past the first, which `growth` prices,
+    /// each later window may claim up to this again.
+    pub per_window: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -828,7 +835,8 @@ mod tests {
     /// with no device: a quiet one claims nothing; a take of a region and a half
     /// leaves a half free against two and a half of headroom, so two regions; a
     /// refused take of three regions adds its own three-region arena and grows
-    /// the headroom by three more.
+    /// the headroom by three more. The window's growth, rounded to regions, is
+    /// what each later window of a sweep may claim again.
     #[test]
     fn the_next_claim_is_what_provisioning_takes() {
         let held = SpanHeldGround::new(0x7f00_0000_0000, 2 * REGION);
@@ -844,6 +852,11 @@ mod tests {
         // refused take's own arena of three.
         assert_eq!(held.next_claim().growth, (5 + 3) * REGION);
         assert_eq!(held.next_claim().landing, 0, "no arena lives yet");
+        assert_eq!(
+            held.next_claim().per_window,
+            5 * REGION,
+            "the window grew four and a half regions"
+        );
     }
 
     /// **The landing is sized by what lives in an arena, not by the arena.** A
