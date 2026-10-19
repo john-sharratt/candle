@@ -6879,6 +6879,69 @@ impl Scheduler {
         }
     }
 
+    /// Withdraw the prefill work whose turn nobody holds any more: queued,
+    /// admitted, and members of the creep in flight or paused.
+    ///
+    /// A decode already stops at its next token when its handle is dropped; a
+    /// prefill had no such check, so a turn whose caller let go swept on to the
+    /// end of its round. Its caller ends it by dropping the handle — zend does
+    /// when a conversation is deleted under a running reply, and never merely
+    /// because a client disconnected, whose turn runs on for a reconnect — and
+    /// the slot is the caller's to free. Measured on WhiteWorld (a5e6cc3ec,
+    /// 2026-10-19): twelve deleted conversations' tool rounds swept on for
+    /// twelve minutes after the delete, and every new turn, chat and reader
+    /// alike, waited behind them for its first token.
+    ///
+    /// Members leave as a freed slot's do (`drop_wave_members`,
+    /// `drop_paused_member`): the survivors carry on from the layer they
+    /// reached.
+    pub(super) fn withdraw_abandoned_prefills(&mut self) {
+        self.prefill_queue.retain(|w| !w.event_tx.is_disconnected());
+        let gone: Vec<SequenceId> = self
+            .active_prefills
+            .iter()
+            .filter(|p| p.work.event_tx.is_disconnected())
+            .map(|p| p.work.sequence_id)
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        self.active_prefills
+            .retain(|p| !p.work.event_tx.is_disconnected());
+        self.settled_since_admit = true;
+        for &id in &gone {
+            tracing::info!(
+                target: "candle_conversation::scheduler::prefill",
+                slot = %id,
+                "prefill withdrawn: its turn's handle was dropped"
+            );
+            if let Err(e) = self.drop_paused_member(id.0) {
+                tracing::error!(
+                    slot = %id,
+                    error = %e,
+                    "could not take a withdrawn member out of the paused creep; failing its \
+                     members rather than replaying layers they already ran"
+                );
+                self.fail_paused_creep(&e.to_string());
+            }
+        }
+        let keep: Vec<bool> = self
+            .wave_prefill_members
+            .iter()
+            .map(|m| !gone.iter().any(|id| id.0 == m.seq_id()))
+            .collect();
+        if keep.contains(&false) {
+            if let Err(e) = self.drop_wave_members(&keep) {
+                tracing::error!(
+                    error = %e,
+                    "could not take withdrawn members out of the creep in flight; failing \
+                     the creep's members rather than replaying layers they already ran"
+                );
+                self.fail_wave_members(&e.to_string());
+            }
+        }
+    }
+
     /// Free a compression scratch slot and its per-slot bookkeeping. Called on
     /// every path out of a compression pass (success or error). The decoded
     /// delta's RAII `ChunkGid`s keep the arena chunks alive after this returns.
@@ -16198,9 +16261,12 @@ mod tests {
     }
 
     /// A minimal queued turn: the only fields admission reads are the slot and
-    /// the token count it prices.
+    /// the token count it prices. Its caller holds it — the receiver is kept for
+    /// the test's life — so the step does not withdraw it as let go
+    /// ([`Scheduler::withdraw_abandoned_prefills`]).
     fn test_prefill_work(sequence_id: SequenceId) -> PrefillWork {
-        let (event_tx, _rx) = flume::bounded(16);
+        let (event_tx, rx) = flume::bounded(16);
+        std::mem::forget(rx);
         PrefillWork {
             sequence_id,
             tokens: TokenBuffer::from(vec![1u32; 64]),
@@ -17080,6 +17146,35 @@ mod tests {
             "freeing a non-member slot must leave the in-flight cohort intact"
         );
         assert_eq!(scheduler.wave_prefill_cursor, 3);
+    }
+
+    /// **A queued turn its caller let go of leaves before the next step**; a
+    /// held one stays.
+    #[test]
+    fn a_let_go_prefill_is_withdrawn_and_a_held_one_stays() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let held = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let queued_let_go = SequenceId(scheduler.session.create_sequence().expect("create"));
+        let dropped = |id| {
+            let mut w = test_prefill_work(id);
+            let (tx, rx) = flume::bounded(1);
+            drop(rx);
+            w.event_tx = tx;
+            w
+        };
+        scheduler.prefill_queue.push_back(test_prefill_work(held));
+        scheduler.prefill_queue.push_back(dropped(queued_let_go));
+        scheduler.withdraw_abandoned_prefills();
+        assert_eq!(
+            scheduler
+                .prefill_queue
+                .iter()
+                .map(|w| w.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![held],
+            "the queued let-go turn leaves, the held one stays"
+        );
+        assert!(scheduler.active_prefills.is_empty());
     }
 
     fn fork_request(

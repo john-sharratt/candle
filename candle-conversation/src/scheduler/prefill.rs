@@ -3070,6 +3070,20 @@ impl Scheduler {
                     .session
                     .kv_region_stats()
                     .map_or((0, 0), |s| (s.live, s.live_watermark));
+                // Held ground as the refusal's census reads it, so the K/V a
+                // sweep claimed is what is left of the live delta once every
+                // tenant's and held ground's are taken off.
+                let (held_regions, held_top) = match self.session.device().location() {
+                    candle::DeviceLocation::Cuda { gpu_id } => {
+                        candle_nn::kv_cache::held_ground_stats(gpu_id).map_or((0, 0), |h| {
+                            (
+                                h.arena_bytes / candle_nn::kv_cache::REGION_BYTES,
+                                h.arena_top,
+                            )
+                        })
+                    }
+                    _ => (0, 0),
+                };
                 // Who holds the span at formation, as the refusal line names it
                 // then — the difference between the two is who claimed the
                 // cohort's ground while it swept.
@@ -3096,6 +3110,8 @@ impl Scheduler {
                     growth_mib = growth >> 20,
                     held_growth_mib = held_growth >> 20,
                     held_landing_mib = held_landing >> 20,
+                    held_regions,
+                    held_top,
                     kv_blocks_mib = kv_blocks >> 20,
                     live_regions = live,
                     frontier_regions,
