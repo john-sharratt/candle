@@ -193,6 +193,10 @@ pub(super) struct AdmitPass<'a> {
     /// landed — so two offers are not both told the same hole is theirs. See
     /// `admit::Cost::hole_credit`.
     holes_spoken: u64,
+    /// The tier the held cohort can give up to the offers this pass admits,
+    /// and how much of it they have been credited — see `Cost::narrow_credit`.
+    narrowable: u64,
+    narrow_spoken: u64,
     /// How far down `prefill_queue` this pass has offered, **per priority
     /// band**.
     ///
@@ -224,10 +228,13 @@ impl<'a> AdmitPass<'a> {
         let wave = sched.standing_wave();
         let composed = sched.compose(&wave);
         let wave_tier = sched.composed_tier(&composed);
+        let narrowable = Self::held_narrowable(sched, &wave);
         // Net of what the running decodes will claim over a sweep: see
         // `Scheduler::standing_ground_bytes`.
         let growth = sched.decode_growth_bytes();
-        let standing_tier = (wave_tier as usize).saturating_add(growth);
+        let standing_tier = (wave_tier as usize)
+            .saturating_add(growth)
+            .saturating_add(sched.glue_scratch_bytes());
         tracing::debug!(
             target: "candle_conversation::scheduler::admission",
             standing_tier_mib = wave_tier >> 20,
@@ -257,6 +264,8 @@ impl<'a> AdmitPass<'a> {
             offered: None,
             narrowed: false,
             holes_spoken: 0,
+            narrowable,
+            narrow_spoken: 0,
             prefill_cursor: [0; 3],
             submit_cursor: [0; 3],
             offering_submit: false,
@@ -422,10 +431,43 @@ impl<'a> AdmitPass<'a> {
     /// already promised to claims still to land.
     fn credited(&self, cost: Cost) -> Cost {
         let free = interleave::stranded_hole_bytes().saturating_sub(self.holes_spoken);
-        Cost {
+        let holed = Cost {
             hole_credit: cost.claimed_bytes().min(free),
+            narrow_credit: 0,
             ..cost
+        };
+        // And what the held cohort can still give up, less what this pass has
+        // already handed to the offers before it.
+        let narrow = self.narrowable.saturating_sub(self.narrow_spoken);
+        Cost {
+            narrow_credit: holed.dislodged_bytes().min(narrow),
+            ..holed
         }
+    }
+
+    /// The tier the held cohort can give up at its next fit: what its members
+    /// stand at now, less what they would stand at each held to the least
+    /// advance. A running member is never taken out — it narrows, and keeps
+    /// advancing — and `share_within` gives every member of the next fit its
+    /// whole remainder up to a common level, so a short newcomer finishes in the
+    /// sweep it joins while the long members keep the level's rows.
+    fn held_narrowable(sched: &Scheduler, wave: &WaveDraft) -> u64 {
+        if wave.held_advances.is_empty() {
+            return 0;
+        }
+        let at = |cap: usize| {
+            let advances: Vec<usize> = wave.held_advances.iter().map(|&a| a.min(cap)).collect();
+            Composed {
+                rows: advances.iter().sum(),
+                seqs: advances.len(),
+                advances,
+                depths: wave.held_depths.clone(),
+                stage_seqs: wave.held_seqs.clone(),
+            }
+        };
+        sched
+            .composed_tier(&at(usize::MAX))
+            .saturating_sub(sched.composed_tier(&at(PREFILL_MIN_ADVANCE)))
     }
 
     /// An admission credited `credit` of hole ground, and its carve has since
@@ -600,7 +642,8 @@ impl AdmitPass<'_> {
         };
         let room = self.room()?;
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
-        let kv = prefill_cost_bytes(turn, self.per_block);
+        let kv = prefill_cost_bytes(turn, self.per_block)
+            .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
         let (rows, activations, residual) =
             self.offer_tier(room, turn, depth, seq.0, kv.saturating_add(recurrent));
         Some(self.credited(Cost {
@@ -608,6 +651,7 @@ impl AdmitPass<'_> {
             recurrent,
             residual,
             hole_credit: 0,
+            narrow_credit: 0,
             activations,
             rows,
             decodes_after: false,
@@ -635,6 +679,7 @@ impl AdmitPass<'_> {
         self.rows_taken = self.rows_taken.saturating_add(cost.rows);
         self.take_offered(cost.rows);
         self.settle_holes(stranded, cost.hole_credit);
+        self.narrow_spoken = self.narrow_spoken.saturating_add(cost.narrow_credit);
         self.widened |= cost.rows > 0;
         // See `admit_prefill`: what the section dislodges as it runs is carried
         // so the offers behind it face the wave as it now stands, less what the
@@ -723,7 +768,8 @@ impl AdmitPass<'_> {
         };
         let room = self.room()?;
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
-        let kv = prefill_cost_bytes(turn, self.per_block);
+        let kv = prefill_cost_bytes(turn, self.per_block)
+            .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
         let (rows, activations, residual) =
             self.offer_tier(room, turn, depth, seq.0, kv.saturating_add(recurrent));
         Some(self.credited(Cost {
@@ -734,6 +780,7 @@ impl AdmitPass<'_> {
             recurrent,
             residual,
             hole_credit: 0,
+            narrow_credit: 0,
             activations,
             rows,
             // The turn decodes when this prefill finishes, which is what puts
@@ -759,7 +806,9 @@ impl AdmitPass<'_> {
         let p = self.sched.pending_submits.get(self.submit_cursor[band])?;
         let (turn, depth, lift, parent) = (p.work.tokens.len(), p.depth, p.lift, p.parent());
         let room = self.room()?;
-        let kv = prefill_cost_bytes(turn, self.per_block).saturating_add(lift);
+        let kv = prefill_cost_bytes(turn, self.per_block)
+            .saturating_add(lift)
+            .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
         let (rows, activations, residual) = self.offer_tier(
             room,
             turn,
@@ -773,6 +822,7 @@ impl AdmitPass<'_> {
             recurrent: self.recurrent,
             residual,
             hole_credit: 0,
+            narrow_credit: 0,
             activations,
             rows,
             decodes_after: true,
@@ -815,6 +865,7 @@ impl AdmitPass<'_> {
         self.rows_taken = self.rows_taken.saturating_add(cost.rows);
         self.take_offered(cost.rows);
         self.settle_holes(stranded, cost.hole_credit);
+        self.narrow_spoken = self.narrow_spoken.saturating_add(cost.narrow_credit);
         self.widened |= cost.rows > 0;
         let carved = before.saturating_sub(residency_now(self.standing_tier));
         self.committed = self
@@ -853,6 +904,7 @@ impl AdmitPass<'_> {
         self.rows_taken = self.rows_taken.saturating_add(cost.rows);
         self.take_offered(cost.rows);
         self.settle_holes(stranded, cost.hole_credit);
+        self.narrow_spoken = self.narrow_spoken.saturating_add(cost.narrow_credit);
         self.widened |= cost.rows > 0;
         // **Nothing is purchased here, and that is not an omission.**
         //
@@ -1023,6 +1075,25 @@ impl Scheduler {
     pub(super) fn standing_ground_bytes(&self) -> usize {
         self.standing_tier_bytes()
             .saturating_add(self.decode_growth_bytes())
+            .saturating_add(self.glue_scratch_bytes())
+    }
+
+    /// The prefill scratch the running decodes' static runs may claim: a
+    /// decode with a stencil plays its tool-call boilerplate as one prefill
+    /// span (`inject_stencil_prefills`), and a span past the timeline claims
+    /// its sequence's scratch at that step (`ensure_scratch`) — one slot per
+    /// recurrent layer, at its share of the region. Each decode with a stencil
+    /// that does not hold its scratch yet may take one, at any step, with no
+    /// admission of its own: priced nowhere, a 95-token run of two decodes
+    /// took 144 MiB inside a cohort fitted with 28 MiB to spare, and its next
+    /// window was refused five regions short (WhiteWorld, a5e6cc3ec,
+    /// 2026-10-19).
+    pub(super) fn glue_scratch_bytes(&self) -> usize {
+        self.active_decodes
+            .iter()
+            .filter(|(_, s)| !s.finished && s.stencil.as_ref().is_some_and(|d| !d.is_done()))
+            .map(|(id, _)| self.model.prefill_scratch_bytes(id.0))
+            .sum()
     }
 
     /// The K/V the running decodes will claim over one sweep, in whole regions

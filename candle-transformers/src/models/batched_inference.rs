@@ -4749,6 +4749,14 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// The selection index pages a prefill of `rows` rows from `offset` opens:
+    /// zero for a model with no sparse selection. Its live tail grows a page at
+    /// a time, so what a prefill claims is the pages past those its offset
+    /// already fills, on every layer that selects.
+    fn index_growth_bytes(&self, _offset: usize, _rows: usize) -> usize {
+        0
+    }
+
     /// Recurrent stores held on the device, and sequences whose state is parked
     /// in their record instead — `(held, parked)`. What says whether idle
     /// conversations give their stores back. `(0, 0)` on a stack with none.

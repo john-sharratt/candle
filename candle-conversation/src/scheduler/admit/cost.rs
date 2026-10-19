@@ -50,6 +50,15 @@ pub(crate) struct Cost {
     /// [`Self::dislodged_bytes`] leaves them out; the allocator still claims
     /// them, so [`Self::claimed_bytes`] does not.
     pub hole_credit: u64,
+    /// Of what this admission dislodges, the bytes the held cohort gives up at
+    /// its next fit to make room for it: the cohort re-forms on the ground that
+    /// stands, so a member that joins narrows the long members' next windows,
+    /// down to each one's least advance, rather than the weight side. Without it
+    /// a held cohort fitted below the prefill floor shut every newcomer out for
+    /// its whole life: on WhiteWorld (f3bf5e313, 2026-10-19) fifteen 42-row
+    /// prompts waited four minutes behind two 5,000-row ones, refused at the
+    /// floor on every pass. See `AdmitPass::narrowable`.
+    pub narrow_credit: u64,
     /// The wave transient tier this admission's rows would need.
     pub activations: u64,
     /// Rows this admission puts in the forward — the prefill chunk that rides
@@ -143,6 +152,7 @@ impl Cost {
         self.claimed_bytes()
             .saturating_sub(self.hole_credit)
             .saturating_add(self.activations)
+            .saturating_sub(self.narrow_credit)
     }
 }
 
@@ -226,6 +236,7 @@ mod tests {
             recurrent: 200,
             residual: 0,
             hole_credit: 0,
+            narrow_credit: 0,
             activations: 3_000,
             rows: 128,
             decodes_after: false,
@@ -247,6 +258,7 @@ mod tests {
             recurrent: 0,
             residual: 0,
             hole_credit: 0,
+            narrow_credit: 0,
             activations: 64 * region,
             rows: 128,
             decodes_after: false,
@@ -280,6 +292,7 @@ mod tests {
             recurrent: 0,
             residual: 0,
             hole_credit: 0,
+            narrow_credit: 0,
             activations: 3 * region,
             rows: 8,
             decodes_after: false,
@@ -292,6 +305,7 @@ mod tests {
                 recurrent: region,
                 residual: 0,
                 hole_credit: 0,
+                narrow_credit: 0,
                 ..Default::default()
             }
             .claimed_bytes(),
@@ -309,6 +323,7 @@ mod tests {
             recurrent: 0,
             residual: 0,
             hole_credit: 0,
+            narrow_credit: 0,
             activations: 128 << 20,
             rows: 3,
             decodes_after: false,
@@ -325,10 +340,33 @@ mod tests {
         let c = Cost {
             kv: 5 * region,
             hole_credit: 3 * region,
+            narrow_credit: 0,
             activations: 4 * region,
             ..Default::default()
         };
         assert_eq!(c.claimed_bytes(), 5 * region);
         assert_eq!(c.dislodged_bytes(), 2 * region + 4 * region);
+    }
+
+    /// A join the held cohort narrows for is still claimed whole, but the
+    /// weight side loses only what the narrowing does not cover — and nothing
+    /// at all when it covers everything.
+    #[test]
+    fn a_join_the_held_cohort_narrows_for_dislodges_only_the_rest() {
+        let region = REGION_BYTES as u64;
+        let c = Cost {
+            kv: 5 * region,
+            hole_credit: region,
+            narrow_credit: 3 * region,
+            activations: 2 * region,
+            ..Default::default()
+        };
+        assert_eq!(c.claimed_bytes(), 5 * region);
+        assert_eq!(c.dislodged_bytes(), 3 * region);
+        let covered = Cost {
+            narrow_credit: 6 * region,
+            ..c
+        };
+        assert_eq!(covered.dislodged_bytes(), 0);
     }
 }

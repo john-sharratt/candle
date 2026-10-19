@@ -431,6 +431,17 @@ impl Scheduler {
         gained
     }
 
+    /// The span ground held ground's arenas stand on now — zero off CUDA or
+    /// before a reservation exists.
+    pub(super) fn held_arena_bytes(&self) -> u64 {
+        match self.session.device().location() {
+            candle::DeviceLocation::Cuda { gpu_id } => {
+                candle_nn::kv_cache::held_ground_stats(gpu_id).map_or(0, |h| h.arena_bytes as u64)
+            }
+            _ => 0,
+        }
+    }
+
     pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {
         /// Shortest interval between passes.
         ///
@@ -2547,6 +2558,8 @@ impl Scheduler {
     /// must leave mid-sweep leaves through [`Self::drop_wave_members`].
     pub(super) fn reset_wave_prefill(&mut self) {
         self.sweep_forecast.sweep_abandoned();
+        let held = self.held_arena_bytes();
+        self.sweep_forecast.held_ended(held);
         self.wave_prefill_residual = None;
         self.wave_prefill_cursor = 0;
         self.wave_prefill_members.clear();
@@ -2925,6 +2938,8 @@ impl Scheduler {
             "creep group formed"
         );
         self.sweep_forecast.sweep_formed(std::time::Instant::now());
+        let held = self.held_arena_bytes();
+        self.sweep_forecast.held_formed(held);
         self.wave_prefill_members = members;
     }
 
@@ -3017,7 +3032,15 @@ impl Scheduler {
                 .sum::<u64>()
                 .saturating_add(stores.saturating_mul(self.recurrent_cost()))
                 .saturating_add(scratch) as usize)
-                .saturating_add(self.model.creep_residual_bytes(&self.session, rows));
+                .saturating_add(self.model.creep_residual_bytes(&self.session, rows))
+                // And the selection index pages its rows open, member by member.
+                .saturating_add(
+                    q_lens
+                        .iter()
+                        .zip(&offsets)
+                        .map(|(&q, &at)| self.model.index_growth_bytes(at, q))
+                        .sum::<usize>(),
+                );
             let frontier = self.frontier_tier_bytes();
             let holes = self.session.kv_region_stats().map_or(0, |s| {
                 s.live_watermark.saturating_sub(s.live) * candle_nn::kv_cache::REGION_BYTES
@@ -3040,7 +3063,16 @@ impl Scheduler {
             // regions short (WhiteWorld, c8221fe39, 2026-10-19).
             let (held_growth, held_landing) =
                 held_next.as_ref().map_or((0, 0), |c| (c.growth, c.landing));
-            let claims = claims.saturating_add(held_growth);
+            // Its next pass is the least it will take; over a whole sweep it
+            // provisions at every window, so what it has measured to grow by
+            // over one sweep is what the cohort must leave it
+            // (`SweepForecast::held_growth_bytes`).
+            let held_growth = held_growth.max(self.sweep_forecast.held_growth_bytes() as usize);
+            // And the scratch the decodes' static runs may claim between its
+            // windows (`glue_scratch_bytes`), on the same ground.
+            let claims = claims
+                .saturating_add(held_growth)
+                .saturating_add(self.glue_scratch_bytes());
             let holes = holes.saturating_sub(held_landing);
             let at_frontier = frontier.and_then(|g| {
                 fitted_rows(
@@ -3108,10 +3140,13 @@ impl Scheduler {
                     stores,
                     scratch_mib = scratch >> 20,
                     growth_mib = growth >> 20,
+                    glue_scratch_mib = self.glue_scratch_bytes() >> 20,
                     held_growth_mib = held_growth >> 20,
                     held_landing_mib = held_landing >> 20,
                     held_regions,
                     held_top,
+                    kv_arenas = self.session.kv_gpu_class_stats().map_or(0, |s| s.total_arenas()),
+                    kv_live_mib = self.session.kv_gpu_class_stats().map_or(0, |s| s.classes.iter().map(|c| c.live_bytes).sum::<usize>()) >> 20,
                     kv_blocks_mib = kv_blocks >> 20,
                     live_regions = live,
                     frontier_regions,
@@ -4055,11 +4090,21 @@ impl Scheduler {
                     if let Some(short) = tier_refusal_shortfall(&e) {
                         self.lower_frontier_for(short);
                     }
+                    // The K/V pools as they stand, against the formation line's.
+                    let (kv_arenas, kv_live_mib) =
+                        self.session.kv_gpu_class_stats().map_or((0, 0), |s| {
+                            (
+                                s.total_arenas(),
+                                s.classes.iter().map(|c| c.live_bytes).sum::<usize>() >> 20,
+                            )
+                        });
                     tracing::warn!(
                         cursor,
                         win_end,
                         rows = creep_tok,
                         attempt = self.wave_sweep_failures,
+                        kv_arenas,
+                        kv_live_mib,
                         error = %e,
                         "creep window failed mid-sweep; holding the sweep to retry it"
                     );
@@ -4193,6 +4238,8 @@ impl Scheduler {
             } else {
                 self.sweep_forecast.sweep_abandoned();
             }
+            let held = self.held_arena_bytes();
+            self.sweep_forecast.held_ended(held);
             self.complete_wave_group(&members, &logits[d..creep_end]);
             return Ok(WaveLogits::held_rows(head, logits[..d].to_vec()));
         }
