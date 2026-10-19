@@ -3681,6 +3681,8 @@ pub(crate) struct Scheduler {
     /// The held cohort's own claims as its fit priced them, and of them the K/V
     /// its windows write layer by layer — see `held_claims_outstanding`.
     held_fit_claims: Option<(u64, u64)>,
+    /// When the learned rates were last logged (`publish_learned_rates`).
+    rates_logged_at: Option<Instant>,
     /// Sequences whose next token `inject_stencil_prefills` sampled this
     /// iteration from its static run's own prefill. They sit out the decode
     /// step that follows: the token it would carry is the one just sampled, and
@@ -4060,6 +4062,7 @@ impl Scheduler {
             gallery_miss_rate: 0.0,
             gallery_evicted_at: None,
             held_fit_claims: None,
+            rates_logged_at: None,
             stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
             sealed_snapshots: HashMap::new(),

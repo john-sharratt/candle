@@ -3806,6 +3806,25 @@ impl WaveSweep for Qwen4ExpBatched {
         // stay pending for the rewind, which alone knows how many rows each
         // keeps. A close that fails commits nothing, so the wave is failed and
         // rolled back like any other, carried state and all.
+        //
+        // **And a sweep the device gave part of up fails here, before the
+        // commit, not after it.** A wait that gives an expert up does not stop
+        // the forward: the later layers run on what the given-up experts left,
+        // and the fault is read when the segment ends (`take_device_fault`).
+        // Read only by the driver, after this close, it found the stores
+        // already committed — each long span's scratch exchanged in as the live
+        // state — and rolled back the K/V alone. On WhiteWorld (c3ebac8bf,
+        // 2026-10-19) a creep window whose CPU experts were given up at MoE row
+        // 36 left its member's recurrent state non-finite from layer 37 on; the
+        // retry swept over it, and the turn decoded NaN and was discarded. Taken
+        // here, the fault fails the sweep and everything it wrote is rewound —
+        // the stores, the PLE histories and the index caches alike — and the
+        // driver, finding the fault already taken, fails it on the sweep's own
+        // error.
+        let swept = swept.and_then(|v| {
+            WaveSweep::take_device_fault(self)?;
+            Ok(v)
+        });
         let swept = {
             let armed: Vec<usize> = self
                 .verify

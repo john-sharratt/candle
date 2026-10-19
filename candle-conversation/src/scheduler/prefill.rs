@@ -534,10 +534,10 @@ impl Scheduler {
     /// prefill rate at the width the held cohort runs — or, with none held, the
     /// width admission would offer — and its decode step with and without one
     /// more decode.
-    pub(super) fn publish_learned_rates(&self) {
-        let Some(rate) = self.wave_rate.as_ref() else {
+    pub(super) fn publish_learned_rates(&mut self) {
+        if self.wave_rate.is_none() {
             return;
-        };
+        }
         let held: usize = self
             .wave_prefill_members
             .iter()
@@ -552,8 +552,39 @@ impl Scheduler {
         } else {
             self.prefill_pass_ceiling()
         };
-        if let Some(rates) = rate.learned(rows) {
+        let rate = self.wave_rate.as_ref().expect("checked above");
+        let (learned, samples, decode_samples) =
+            (rate.learned(rows), rate.samples(), rate.decode_samples());
+        if let Some(rates) = learned {
             super::phase_ring::publish_learned_rates(rates);
+        }
+        // What this member advertises, once a minute — and that it advertises
+        // nothing, which a gateway reads as unlearned: the figure a placement
+        // that never sends this card a turn is to be checked against.
+        let now = Instant::now();
+        if self
+            .rates_logged_at
+            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(60))
+        {
+            self.rates_logged_at = Some(now);
+            match learned {
+                Some(r) => tracing::info!(
+                    target: "candle_conversation::scheduler::admission",
+                    rows,
+                    prefill_tok_s = r.prefill_tok_s.round() as u64,
+                    decode_step_ms = format!("{:.1}", r.decode_step_ms),
+                    decode_step_ms_plus_one = format!("{:.1}", r.decode_step_ms_plus_one),
+                    prefill_samples = samples,
+                    decode_samples,
+                    "learned rates published"
+                ),
+                None => tracing::info!(
+                    target: "candle_conversation::scheduler::admission",
+                    prefill_samples = samples,
+                    decode_samples,
+                    "learned rates not yet published: the rate model has not learned both halves"
+                ),
+            }
         }
     }
 
