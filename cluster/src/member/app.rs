@@ -125,7 +125,8 @@ pub struct AppMember {
     rr: AtomicUsize,
     /// Bumped on every change of a socket's state.
     changed: watch::Sender<u64>,
-    /// Set when a 4410 stops the app on every cluster.
+    /// Set when a 4410 stops the app on every cluster, or the member shuts
+    /// down: no socket is dialled again.
     stop: watch::Sender<Option<Close>>,
     /// The floor each socket was admitted under (§3.5).
     floors: Mutex<Vec<Option<BuildId>>>,
@@ -145,7 +146,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The close that stopped the app on another cluster, once one has.
+/// The close that stopped the app — on another cluster, or by its own
+/// shutdown — once one has.
 async fn stopped_elsewhere(stop: &mut watch::Receiver<Option<Close>>) -> Close {
     loop {
         if let Some(close) = stop.borrow_and_update().clone() {
@@ -341,12 +343,13 @@ impl AppMember {
         );
         let stopped = tokio::select! {
             stopped = dialled => stopped,
-            // Another cluster closed the app 4410: this socket stops too.
+            // Another cluster closed the app 4410, or the member is shutting
+            // down: this socket stops too, and is not dialled again.
             close = stopped_elsewhere(&mut stop) => {
                 if let Some(h) = lock(&self.sockets)[c].take() {
                     h.close(Close::new(
                         CloseCode::GoingAway,
-                        format!("the app stopped on another cluster: {}", close.reason),
+                        format!("the app stopped: {}", close.reason),
                     ));
                 }
                 Stopped::App(close)
@@ -850,12 +853,23 @@ impl AppMember {
         }
     }
 
-    /// The member is shutting down: its sockets close `1001` and its
-    /// replication stops, before the tenant releases its substrate.
+    /// The member is shutting down: its replication stops, its dialling ends
+    /// and its sockets close `1001`, before the tenant releases its substrate.
+    /// It does not dial again: a member that rejoined between this and the
+    /// process ending would be admitted with its replication stopped, and
+    /// counted in the group it has left.
     pub fn shutdown(&self, reason: &str) {
         if let Some(r) = &self.replicator {
             r.shutdown();
         }
+        let close = Close::new(CloseCode::GoingAway, reason);
+        self.stop.send_if_modified(|s| {
+            let first = s.is_none();
+            if first {
+                *s = Some(close.clone());
+            }
+            first
+        });
         self.close_all(reason);
     }
 }

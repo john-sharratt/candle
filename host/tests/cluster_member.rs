@@ -528,7 +528,20 @@ async fn commands_run_on_a_member_and_reach_the_log() {
         ended(&quorum).await["result"],
         json!({"zend": {"max_members": 1, "quorum": 1}})
     );
-    until_eq("b's max_members", || b.store.max_members(), 1).await;
+    let b_link = b.cluster.link("zend").unwrap().member().unwrap().clone();
+    until_eq(
+        "b's max_members, and the group b sees",
+        || {
+            let group: Vec<(u64, String)> = b_link
+                .group()
+                .iter()
+                .map(|m| (m.node, state_name(m.state).to_string()))
+                .collect();
+            (b.store.max_members(), group)
+        },
+        (1, vec![(2, "ready".to_string())]),
+    )
+    .await;
     until_logged(&hub, b_hex, "max_members 2 → 1, quorum 1").await;
     b.cluster.close_all("test over");
 }
