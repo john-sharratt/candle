@@ -1388,6 +1388,38 @@ pub fn drive_step<S: WaveSweep + ?Sized>(
             }
             r
         };
+        // A buffer past what its phase was priced at names its call site; what
+        // says which segment of the step was priced short is the step's own
+        // composition — every segment's priced phases, the one that ran marked.
+        // Measured on WhiteWorld (b4ea6e33b, 2026-10-19): a 230 MiB fresh
+        // residual asked of a 16 MiB forward-phase arena, a segment priced for
+        // a decode width running a cohort's rows.
+        let result = result.map_err(|e| {
+            let msg = e.to_string();
+            if !msg.contains("wave arena exhausted") {
+                return e;
+            }
+            let segments: Vec<String> = segs
+                .iter()
+                .zip(&prices)
+                .enumerate()
+                .map(|(k, (g, p))| {
+                    format!(
+                        "{}[{}, {}){}: {:?}",
+                        if k == i { ">" } else { "" },
+                        g.start,
+                        g.end,
+                        if g.creep { " creep" } else { "" },
+                        p
+                    )
+                })
+                .collect();
+            candle::Error::Msg(format!(
+                "{msg} — in segment {i} (marked >) of a step of {} segments {}",
+                segs.len(),
+                segments.join(" ")
+            ))
+        });
         let out = match result {
             Ok(out) => out,
             Err(e) if s.creep => return Err(e),
