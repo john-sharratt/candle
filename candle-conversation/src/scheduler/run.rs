@@ -496,6 +496,12 @@ impl Scheduler {
             // ground back must end its members rather than hold them for ever.
             Err(e) if is_tier_refusal(&e) || is_span_full(&e) => match self.wave_retry.failed() {
                 Next::Retry { attempt, wait } => {
+                    // As a mid-sweep window does: lower the frontier into the
+                    // holes below it before waiting, so the retry finds the
+                    // ground the tier was refused.
+                    if let Some(short) = candle_nn::kv_cache::tier_refusal_shortfall(&e) {
+                        self.lower_frontier_for(short);
+                    }
                     if WaveRetry::logs(attempt) {
                         tracing::warn!(
                             attempt,

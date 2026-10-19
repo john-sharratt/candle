@@ -1327,6 +1327,23 @@ pub fn drive_step<S: WaveSweep + ?Sized>(
                     census.join(" "),
                 ))
             })?;
+            // A wide window's placement, with the span it stood on: a frontier
+            // that climbs gigabytes over a sweep while little more is live is
+            // read straight off these, window by window.
+            let placed: usize = plan.iter().sum();
+            if placed >= 1 << 30 {
+                if let Some(rs) = candle_nn::kv_cache::region_stats(stream.context().ordinal()) {
+                    tracing::info!(
+                        target: "candle_transformers::wave_step",
+                        layers = format!("[{}, {})", segs.first().map_or(0, |s| s.start), segs.last().map_or(0, |s| s.end)),
+                        placed_mib = placed >> 20,
+                        live = rs.live,
+                        frontier = rs.live_watermark,
+                        total = rs.total,
+                        "wide step placed its tier"
+                    );
+                }
+            }
             Some(begin_wave(&stream, LayerPhase::Forward)?)
         }
         _ => None,

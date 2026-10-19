@@ -337,6 +337,59 @@ impl Scheduler {
     ///
     /// Answers the arenas the pass emptied and handed back to the region free list —
     /// zero when it did not run.
+    /// **Lower the arena frontier for a tier refused `short` bytes**, by the
+    /// frontier holder's own pass, until the ground above the frontier has grown
+    /// by that much or a round moves it no further. Returns the bytes gained.
+    ///
+    /// The relief a refused tier needs, which [`Self::relieve_vram_pressure`]
+    /// cannot see: relief measures pressure as free regions, and a span with
+    /// hundreds of holes reads as having plenty — while the tier, which stands
+    /// only above every live arena, is short. Measured on WhiteWorld
+    /// (2026-10-19, 872957a58): cohorts refused one to six regions short with
+    /// 346 regions (5.5 GiB) of holes below the frontier, retried at once and
+    /// lost, because nothing moved the frontier down into them. The passes this
+    /// drives are the ones the wave loop already paces (`compact_kv_if_fragmented`)
+    /// — a K/V pack when a K/V arena holds the top, the span tenants' pass when
+    /// a tenant does — run here for as long as they make headway against a
+    /// shortfall that is known, rather than once per interval against none.
+    pub(super) fn lower_frontier_for(&mut self, short: usize) -> usize {
+        /// Rounds one refusal may drive. Each is one pass of the holder's kind,
+        /// a region or two for a tenant and the pools' worth for K/V, so this
+        /// covers the one-to-six-region shortfalls a cohort is refused by.
+        const ROUNDS: usize = 16;
+        let gap = |s: &Self| {
+            s.session.kv_region_stats().map_or(0, |st| {
+                st.total.saturating_sub(st.live_watermark) * candle_nn::kv_cache::REGION_BYTES
+            })
+        };
+        let start = gap(self);
+        let target = start.saturating_add(short);
+        for _ in 0..ROUNDS {
+            let now = gap(self);
+            if now >= target {
+                break;
+            }
+            match self.frontier_pass() {
+                Some((_, FrontierPass::Kv)) => {
+                    self.pack_until_settled(PackGoal::Frontier);
+                }
+                Some((shape, FrontierPass::SpanTenants)) => self.pack_span_tenants_judged(shape),
+                None => break,
+            }
+            if gap(self) <= now {
+                break;
+            }
+        }
+        let gained = gap(self).saturating_sub(start);
+        tracing::info!(
+            target: "candle_conversation::scheduler::vram_relief",
+            short_mib = short >> 20,
+            gained_mib = gained >> 20,
+            "lowered the arena frontier for a refused tier"
+        );
+        gained
+    }
+
     pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {
         /// Shortest interval between passes.
         ///
@@ -3852,6 +3905,12 @@ impl Scheduler {
                     || is_expert_stall(&e);
                 if cursor > 0 && retryable && self.wave_sweep_failures < MID_SWEEP_RETRIES {
                     self.wave_sweep_failures += 1;
+                    // The ground the window was refused is often standing below
+                    // the frontier as holes: move the frontier down before the
+                    // retry, or the retry finds the same ground and fails again.
+                    if let Some(short) = tier_refusal_shortfall(&e) {
+                        self.lower_frontier_for(short);
+                    }
                     tracing::warn!(
                         cursor,
                         win_end,
