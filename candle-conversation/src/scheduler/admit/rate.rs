@@ -146,6 +146,17 @@ pub struct RateModel {
     pub overhead_secs: f64,
     /// Compute per token — see [`RateModel::SEED_COMPUTE_SECS_PER_TOKEN`].
     pub compute_secs_per_token: f64,
+    /// Attention per attended pair: each row times the context it attends.
+    ///
+    /// **The per-token compute is flat in depth, and attention is not.** A
+    /// row at 114K positions attends 114K keys where a fresh one attends a
+    /// few, so pricing every row at one `c` priced a deep prompt as a shallow
+    /// one: on BlackWorld (6ebf6205a, 2026-10-19) heavy-read's 8,192-row
+    /// cohorts at ~114K context crept at about 100 tok/s while the model,
+    /// fitted on the forwards it could learn from, advertised a cold rate many
+    /// times that. Zero until [`CostFit`] sees forwards at different depths —
+    /// until then the depth the fit saw is folded into `c`.
+    pub attend_secs_per_pair: f64,
 }
 
 impl RateModel {
@@ -191,6 +202,7 @@ impl Default for RateModel {
             // another machine's scheduler, and the loop can simply measure it.
             overhead_secs: 0.0,
             compute_secs_per_token: Self::SEED_COMPUTE_SECS_PER_TOKEN,
+            attend_secs_per_pair: 0.0,
         }
     }
 }
@@ -235,8 +247,8 @@ impl Default for DecodeModel {
     }
 }
 
-/// The running fit of a forward's two costs: the copy rate and the per-token
-/// compute.
+/// The running fit of a forward's costs: the copy rate, the per-token compute,
+/// attention per attended pair, and the fixed cost per forward.
 ///
 /// # Why a fit rather than two constants
 ///
@@ -251,7 +263,7 @@ impl Default for DecodeModel {
 ///
 /// One forward is one equation in two unknowns. A *set* of forwards at
 /// different widths and residencies determines both, and that is all this is:
-/// the normal equations of a two-feature least squares, five running sums,
+/// the normal equations of a least squares over the features, decayed,
 /// solved whenever the observations have enough spread to be conditioned.
 ///
 /// # Forgetting
@@ -261,40 +273,28 @@ impl Default for DecodeModel {
 /// warming, a dtype change, thermal throttling — instead of averaging over the
 /// whole run. With `alpha` at its default the fit has a memory of a few dozen
 /// forwards.
+///
+/// # Four costs
+///
+/// `T = f + X/bw + W·c + P·p`: a fixed cost per forward, the copy, compute per
+/// row, and attention per attended pair `P` — each row times the context it
+/// attends. Each is a column of the normal equations, and a column that has
+/// not varied is dropped rather than guessed: a fully resident card copies
+/// nothing (no `X`), and forwards all at one depth make `P` a multiple of `W`
+/// (no separate `p`), and either way the rest still solve.
+///
+/// **The intercept is a cost, not a fudge.** Leaving `f` out did not make it
+/// zero — it made it invisible: with a streaming cache `X` absorbs it, but on
+/// a fully resident card `X` is zero, so the projected rate collapsed to
+/// `W/(W·c) = 1/c` — flat in width, and the fill refused the second row of
+/// every wave as saturated. Measured on the 30B-A3B at 72 GiB: nine turns
+/// queued, one admitted, 32 t/s against a batched ceiling of 518.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct CostFit {
-    /// Σ X², Σ X·W, Σ W² — the Gram matrix of the two scaled features.
-    xx: f64,
-    xw: f64,
-    ww: f64,
-    /// Σ X·T, Σ W·T — the right-hand side.
-    xt: f64,
-    wt: f64,
-    /// Σ X, Σ W, Σ T, Σ 1 — the intercept's row and column of the Gram matrix.
-    ///
-    /// **The fixed per-forward cost is a third unknown, and leaving it out of the
-    /// model did not make it zero — it made it invisible.** A forward is
-    /// `T = f + X/bw + W·c`, and fitting only `X/bw + W·c` forces `f` into the other
-    /// two: with a streaming cache `X` is large and absorbs it harmlessly, but on a
-    /// fully resident card `X` is *zero*, so the projected rate collapses to
-    /// `W/(W·c) = 1/c` — flat in width.
-    ///
-    /// A flat rate is what broke admission. The fill admits an offer while the rate
-    /// improves by at least `min_gain`, and a rate that does not vary with width shows
-    /// a gain of zero at every width, so the second row of every wave was refused
-    /// `Saturated`. Measured on the 30B-A3B at 72 GiB: nine turns queued, nothing in
-    /// flight, one admitted, `decode seqs avg=1.0 max=1`, 32 t/s against a batched
-    /// ceiling of 518 — and the bigger the card, the worse it got, because residency is
-    /// what drives `X` to zero.
-    ///
-    /// The per-forward cost is real and large: the wave loop pays tens of milliseconds
-    /// per forward in housekeeping, submission drain and promotion, none of which
-    /// scales with rows. That is exactly what width amortises, and now it is in the
-    /// model that decides how much width to buy.
-    x1: f64,
-    w1: f64,
-    t1: f64,
-    one: f64,
+    /// The Gram matrix of the features `[X, W, P, 1]`, decayed.
+    gram: [[f64; 4]; 4],
+    /// Σ feature × T, the right-hand side.
+    rhs: [f64; 4],
     /// Observations folded in, for the conditioning guard.
     n: u64,
 }
@@ -307,154 +307,183 @@ impl CostFit {
     /// this stops it being consulted while the sums are still tiny.
     const MIN_SAMPLES: u64 = 8;
 
-    /// The fraction of `Σ X² · Σ W²` the determinant must reach for the system
-    /// to be considered conditioned.
+    /// The fraction of the product of the active diagonal the determinant must
+    /// reach for the system to be considered conditioned.
     ///
-    /// The determinant is `ΣX²·ΣW² − (ΣX·W)²`, which is zero exactly when every
-    /// observation has the same `X`-to-`W` ratio — forwards that all sat at one
-    /// width and one residency, from which the two costs cannot be separated no
-    /// matter how many there are. Requiring a real fraction of the product means
-    /// the widths and residencies have genuinely varied.
+    /// The determinant is zero exactly when the observations lie on a plane —
+    /// forwards all at one width, or one residency, or one depth — from which
+    /// the costs cannot be separated however many there are. Requiring a real
+    /// fraction of the diagonal's product (Hadamard's bound, so the test is
+    /// scale-free) means the features have genuinely varied.
     const MIN_CONDITION: f64 = 1e-3;
 
+    /// Feature indices.
+    const X: usize = 0;
+    const W: usize = 1;
+    const P: usize = 2;
+    const ONE: usize = 3;
+
     /// Fold one forward in, decaying what came before.
-    fn observe(&mut self, x: f64, w: f64, t: f64, alpha: f64) {
+    fn observe(&mut self, x: f64, w: f64, p: f64, t: f64, alpha: f64) {
         let keep = 1.0 - alpha.clamp(0.0, 1.0);
-        self.xx = self.xx * keep + x * x;
-        self.xw = self.xw * keep + x * w;
-        self.ww = self.ww * keep + w * w;
-        self.xt = self.xt * keep + x * t;
-        self.wt = self.wt * keep + w * t;
-        self.x1 = self.x1 * keep + x;
-        self.w1 = self.w1 * keep + w;
-        self.t1 = self.t1 * keep + t;
-        self.one = self.one * keep + 1.0;
+        let f = [x, w, p, 1.0];
+        for i in 0..4 {
+            for j in 0..4 {
+                self.gram[i][j] = self.gram[i][j] * keep + f[i] * f[j];
+            }
+            self.rhs[i] = self.rhs[i] * keep + f[i] * t;
+        }
         self.n += 1;
     }
 
-    /// Solve for `(bw, c)`, or `None` while the observations cannot separate
-    /// them.
+    /// Solve for the costs, or `None` while the observations cannot separate
+    /// even width from the fixed cost.
     ///
-    /// Both answers are checked for physical sense before being returned: a
-    /// copy rate must be positive and no faster than the link, and a per-token
-    /// compute must be positive. A fit that produces either — noise, a stalled
-    /// forward, a residency that moved mid-wave — is discarded rather than
-    /// clamped, because a clamped nonsense answer is indistinguishable from a
-    /// real one downstream.
-    /// Solve for `(bw, c, fixed)`, or `None` while the observations cannot separate
-    /// them.
-    ///
-    /// Three unknowns from `T = f + a·X + c·W` with `a = 1/bw`, by Cramer's rule on the
-    /// 3×3 normal equations. Every answer is checked for physical sense before being
-    /// returned — a copy rate positive and no faster than the link, a positive per-token
-    /// compute, and a **non-negative** fixed cost — because a clamped nonsense answer is
-    /// indistinguishable from a real one downstream.
-    ///
-    /// The fixed term is allowed to come back at exactly zero and is rejected only when
-    /// negative: a card whose per-forward overhead really is negligible should be able to
-    /// say so, and a negative intercept means the fit is describing noise rather than a
-    /// cost.
+    /// The widest set of features that is conditioned wins: all four, then
+    /// without attention, then without the copy, then width alone. Every
+    /// answer is checked for physical sense before being returned — a copy rate
+    /// positive and no faster than the link, a positive per-row compute, and
+    /// non-negative fixed and attention costs — because a clamped nonsense
+    /// answer is indistinguishable from a real one downstream. Each may come
+    /// back at exactly zero: a card whose per-forward overhead, or whose
+    /// attention at the depths seen, really is negligible should be able to say
+    /// so. A set whose answer fails the check gives way to the next.
     fn solve(&self, link_bytes_per_s: f64) -> Option<FitSolution> {
         if self.n < Self::MIN_SAMPLES {
             return None;
         }
-        // **A fully resident cache copies nothing, so the copy feature is identically
-        // zero and the 3×3 is singular by construction.** That is not a failure to
-        // observe — it is the card telling us there is no bandwidth term to learn, and
-        // waiting for one would leave `fixed` unlearned forever, which is the exact state
-        // that flattened the rate and refused every second row.
-        //
-        // So when `X` carries no variance, drop it and fit `T = f + c·W` on the two
-        // features that do. Bandwidth keeps its prior, which is right: a forward that
-        // copied no bytes is silent about the link, and inventing a figure from it would
-        // be worse than keeping the measured one.
-        let scale = self.xx * self.ww * self.one;
-        if !(scale.is_finite() && scale > 0.0) {
-            return self.solve_without_copy();
-        }
-        // Symmetric 3×3, ordered (a, c, f) over features (X, W, 1).
-        let m = [
-            [self.xx, self.xw, self.x1],
-            [self.xw, self.ww, self.w1],
-            [self.x1, self.w1, self.one],
+        // Each pair is a set with attention and the same set without it. An
+        // unconditioned set gives way to the next; an unphysical one with
+        // attention gives way to its partner — attention at noise can come out
+        // negative where the rest is sound — but an unphysical one without it
+        // is the forwards describing noise or a stall, and nothing is learned.
+        const PAIRS: [(&[usize], &[usize]); 2] = [
+            (
+                &[CostFit::X, CostFit::W, CostFit::P, CostFit::ONE],
+                &[CostFit::X, CostFit::W, CostFit::ONE],
+            ),
+            (
+                &[CostFit::W, CostFit::P, CostFit::ONE],
+                &[CostFit::W, CostFit::ONE],
+            ),
         ];
-        let rhs = [self.xt, self.wt, self.t1];
-        let det3 = |m: &[[f64; 3]; 3]| {
-            m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
-        };
-        let det = det3(&m);
-        // **The conditioning guard scales with the whole Gram matrix, not a pair of
-        // its entries.** Zero determinant here means the observations lie on a plane —
-        // every forward at one width, or one residency, or a fixed ratio of the two —
-        // from which three costs cannot be separated however many there are.
-        if !(det.is_finite() && det.abs() > scale * Self::MIN_CONDITION) {
-            // Still separable in width alone, which is the half that matters for how wide
-            // to make a wave.
-            return self.solve_without_copy();
-        }
-        let mut sol = [0.0f64; 3];
-        for (i, s) in sol.iter_mut().enumerate() {
-            let mut mi = m;
-            for (row, r) in mi.iter_mut().zip(rhs.iter()) {
-                row[i] = *r;
+        for (with, without) in PAIRS {
+            if let Ok(sol) = self.solve_over(with, link_bytes_per_s) {
+                return Some(sol);
             }
-            *s = det3(&mi) / det;
+            match self.solve_over(without, link_bytes_per_s) {
+                Ok(sol) => return Some(sol),
+                Err(Unsolved::Unphysical) => return None,
+                Err(Unsolved::Unconditioned) => {}
+            }
         }
-        let [a, c, fixed] = sol;
-        if !(a.is_finite() && c.is_finite() && fixed.is_finite()) {
-            return None;
-        }
-        if a <= 0.0 || c <= 0.0 || fixed < 0.0 {
-            return None;
-        }
-        let bw = 1.0 / a;
-        if !bw.is_finite() || bw <= 0.0 {
-            return None;
-        }
-        Some(FitSolution {
-            bw: Some(bw.min(link_bytes_per_s)),
-            compute_secs_per_token: c,
-            fixed_secs: fixed,
-        })
+        None
     }
 
-    /// Fit `T = f + c·W`, for observations that copied nothing.
-    ///
-    /// The ordinary least squares of time on width: slope is the per-token compute, and
-    /// the **intercept is the per-forward cost** — the figure width exists to amortise and
-    /// the one the model was missing. Well-conditioned exactly when the observed widths
-    /// varied, which is the only thing it needs to separate two terms.
-    fn solve_without_copy(&self) -> Option<FitSolution> {
-        let det = self.ww * self.one - self.w1 * self.w1;
-        // Zero when every forward ran at one width: two costs, one equation.
-        if !(det.is_finite() && det.abs() > self.ww * self.one * Self::MIN_CONDITION) {
-            return None;
+    /// The least squares over the features in `set`, if conditioned and
+    /// physical.
+    fn solve_over(&self, set: &[usize], link_bytes_per_s: f64) -> Result<FitSolution, Unsolved> {
+        use Unsolved::{Unconditioned, Unphysical};
+        let k = set.len();
+        let mut m = [[0.0f64; 5]; 4];
+        let mut diag = 1.0f64;
+        for (r, &i) in set.iter().enumerate() {
+            for (c, &j) in set.iter().enumerate() {
+                m[r][c] = self.gram[i][j];
+            }
+            m[r][k] = self.rhs[i];
+            diag *= self.gram[i][i];
         }
-        let c = (self.one * self.wt - self.w1 * self.t1) / det;
-        let fixed = (self.ww * self.t1 - self.w1 * self.wt) / det;
-        if !(c.is_finite() && fixed.is_finite()) || c <= 0.0 || fixed < 0.0 {
-            return None;
+        if !(diag.is_finite() && diag > 0.0) {
+            return Err(Unconditioned);
         }
-        Some(FitSolution {
-            // Silent about the link — see the caller.
-            bw: None,
+        // Gaussian elimination with partial pivoting; the determinant is the
+        // product of the pivots, for the conditioning guard.
+        let mut det = 1.0f64;
+        for col in 0..k {
+            let pivot = (col..k)
+                .max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))
+                .ok_or(Unconditioned)?;
+            if m[pivot][col] == 0.0 {
+                return Err(Unconditioned);
+            }
+            if pivot != col {
+                m.swap(pivot, col);
+                det = -det;
+            }
+            det *= m[col][col];
+            for row in col + 1..k {
+                let factor = m[row][col] / m[col][col];
+                let pivot_row = m[col];
+                for (dst, src) in m[row][col..=k].iter_mut().zip(&pivot_row[col..=k]) {
+                    *dst -= factor * src;
+                }
+            }
+        }
+        if !(det.is_finite() && det.abs() > diag * Self::MIN_CONDITION) {
+            return Err(Unconditioned);
+        }
+        let mut sol = [0.0f64; 4];
+        for row in (0..k).rev() {
+            let mut s = m[row][k];
+            for c in row + 1..k {
+                s -= m[row][c] * sol[c];
+            }
+            sol[row] = s / m[row][row];
+        }
+        let at = |feature: usize| set.iter().position(|&i| i == feature).map(|r| sol[r]);
+        let c = at(Self::W).ok_or(Unconditioned)?;
+        let fixed = at(Self::ONE).ok_or(Unconditioned)?;
+        let attend = at(Self::P).unwrap_or(0.0);
+        let copy = at(Self::X);
+        if ![c, fixed, attend].iter().all(|v| v.is_finite()) {
+            return Err(Unphysical);
+        }
+        if c <= 0.0 || fixed < 0.0 || attend < 0.0 {
+            return Err(Unphysical);
+        }
+        let bw = match copy {
+            Some(a) => {
+                if !(a.is_finite() && a > 0.0) {
+                    return Err(Unphysical);
+                }
+                let bw = 1.0 / a;
+                if !(bw.is_finite() && bw > 0.0) {
+                    return Err(Unphysical);
+                }
+                Some(bw.min(link_bytes_per_s))
+            }
+            // Silent about the link: the forwards copied nothing that varied.
+            None => None,
+        };
+        Ok(FitSolution {
+            bw,
             compute_secs_per_token: c,
             fixed_secs: fixed,
+            attend_secs_per_pair: at(Self::P),
         })
     }
 }
 
 /// What a solved fit determined. `bw` is `None` when the observations copied nothing and
-/// so say nothing about the link.
+/// so say nothing about the link, and `attend_secs_per_pair` when they were all at one
+/// depth and so say nothing apart from `c`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FitSolution {
     bw: Option<f64>,
     compute_secs_per_token: f64,
     fixed_secs: f64,
+    attend_secs_per_pair: Option<f64>,
 }
 
+/// Why a set of the fit's features gave no answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Unsolved {
+    /// The observations did not vary in these features enough to separate them.
+    Unconditioned,
+    /// They did, and the answer was not a cost: noise, or a stalled forward.
+    Unphysical,
+}
 /// One candidate for the wave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
@@ -565,6 +594,10 @@ pub struct WaveRate {
     /// per-token compute together, so neither is a constant measured on one
     /// card with one checkpoint.
     fit: CostFit,
+    /// The context a learned-from row attended, on average over recent forwards:
+    /// what a caller that names no depth is priced at ([`Self::forward_secs`]),
+    /// which is what `c` held before attention was priced apart from it.
+    context_per_row: f64,
     // ── the wave being composed ────────────────────────────────────────────
     /// Resident weights as the wave stands: the reset figure, then each
     /// admission's `weights_after`.
@@ -681,6 +714,7 @@ impl WaveRate {
             decode_samples: 0,
             hit_samples: 0,
             fit: CostFit::default(),
+            context_per_row: 0.0,
             resident_now: 0,
             prefill_floor: 0,
             decode_floor: 0,
@@ -817,10 +851,23 @@ impl WaveRate {
     /// [`RateModel::overhead_secs`] gives: it is amortised by width exactly as the copy
     /// is, and on a resident card it is the only thing that is.
     pub fn forward_secs(&self, tokens: usize, resident: u64) -> f64 {
+        self.forward_secs_attending(tokens, tokens as f64 * self.context_per_row, resident)
+    }
+
+    /// The context the rows learned from have attended, on average: the depth
+    /// a prompt arriving here is priced at before its own is known.
+    pub fn context_per_row(&self) -> f64 {
+        self.context_per_row
+    }
+
+    /// [`Self::forward_secs`] for rows that attend `pairs` query×key pairs
+    /// between them — a cohort at a known depth.
+    pub fn forward_secs_attending(&self, tokens: usize, pairs: f64, resident: u64) -> f64 {
         self.model.fixed_secs
             + self.model.overhead_secs
             + self.non_resident_bytes(resident) as f64 / self.bw_bytes_per_s
             + tokens as f64 * self.model.compute_secs_per_token
+            + pairs * self.model.attend_secs_per_pair
     }
 
     /// Projected throughput of that forward, tokens a second. Zero for an
@@ -1276,6 +1323,10 @@ impl WaveRate {
     /// in a forward that carries the decodes' `decode_rows` beside it at the
     /// residency that width leaves. With no decode the trade keeps the whole
     /// width, and this is the wide forward's own rate.
+    ///
+    /// **At the depth the cohort attends.** Its rows attend `context` positions
+    /// each on average and the decodes `decode_pairs` between them, so a deep
+    /// prompt is priced as one ([`RateModel::attend_secs_per_pair`]).
     #[allow(clippy::too_many_arguments)]
     pub fn placed_prefill_tok_s(
         &self,
@@ -1285,6 +1336,8 @@ impl WaveRate {
         prefill_weight: f64,
         decodes: usize,
         decode_rows: usize,
+        context: f64,
+        decode_pairs: f64,
         weights_at: impl Fn(usize) -> u64,
     ) -> f64 {
         let width = self.traded_width(
@@ -1296,7 +1349,11 @@ impl WaveRate {
             self.routed_for(decodes),
             &weights_at,
         );
-        let secs = self.forward_secs(width + decode_rows, weights_at(width));
+        let secs = self.forward_secs_attending(
+            width + decode_rows,
+            width as f64 * context + decode_pairs,
+            weights_at(width),
+        );
         if secs > 0.0 {
             width as f64 / secs
         } else {
@@ -1826,9 +1883,24 @@ impl WaveRate {
     /// size, under the real workload — so it replaces it; anything smaller is
     /// still clamped, because a rate divided out of a short copy is mostly the
     /// error in the compute model.
+    #[cfg(test)]
     pub fn observe_prefill(
         &mut self,
         tokens: usize,
+        resident_bytes: u64,
+        forward_secs: f64,
+    ) -> Option<f64> {
+        self.observe_prefill_attending(tokens, 0.0, resident_bytes, forward_secs)
+    }
+
+    /// [`Self::observe_prefill`] for a forward whose rows attended `pairs`
+    /// query×key pairs between them — each row times the context it attends —
+    /// so the fit can price depth apart from width
+    /// ([`RateModel::attend_secs_per_pair`]).
+    pub fn observe_prefill_attending(
+        &mut self,
+        tokens: usize,
+        pairs: f64,
         resident_bytes: u64,
         forward_secs: f64,
     ) -> Option<f64> {
@@ -1842,6 +1914,9 @@ impl WaveRate {
             return None;
         }
         let bytes = self.non_resident_bytes(resident_bytes);
+        // The depth the learned-from rows attended, for callers that name none.
+        let context = pairs / tokens.max(1) as f64;
+        self.context_per_row += self.alpha * (context - self.context_per_row);
         // **Every unknown comes out of the same forwards.** A forward is
         // `T = f + X/bw + W·c` with `X` the non-resident bytes, so one observation
         // is one equation in three unknowns and a *set* of them at different
@@ -1861,9 +1936,12 @@ impl WaveRate {
         // back `None`), and the two terms width actually trades against — the fixed cost
         // and the per-token compute — are exactly what these forwards determine.
         self.fit
-            .observe(bytes as f64, tokens as f64, forward_secs, self.alpha);
+            .observe(bytes as f64, tokens as f64, pairs, forward_secs, self.alpha);
         if let Some(sol) = self.fit.solve(self.link_bytes_per_s) {
             self.model.compute_secs_per_token = sol.compute_secs_per_token;
+            // Zero when the forwards were all at one depth: their attention is in
+            // `c` then, and counting it again here would price it twice.
+            self.model.attend_secs_per_pair = sol.attend_secs_per_pair.unwrap_or(0.0);
             // The per-forward cost width exists to amortise. Learned, not seeded: it is
             // the wave loop's own overhead — housekeeping, the submission drain, promotion
             // — which is a property of this engine on this machine and not of the model.
@@ -1880,7 +1958,8 @@ impl WaveRate {
 
         let copy_secs = forward_secs
             - self.model.fixed_secs
-            - tokens as f64 * self.model.compute_secs_per_token;
+            - tokens as f64 * self.model.compute_secs_per_token
+            - pairs * self.model.attend_secs_per_pair;
         if copy_secs <= 0.0 {
             return None;
         }
@@ -2484,6 +2563,83 @@ mod tests {
             time_ratio > 1.5 && time_ratio < 1.8,
             "time ratio {time_ratio}"
         );
+    }
+
+    /// **Forwards at different depths separate attention from compute.** The
+    /// four costs of `T = f + X/bw + W·c + P·p` come back from forwards that
+    /// varied in width, residency and depth — heavy-read's 114K-position
+    /// prompts priced as deep, not as the shallow rows `c` alone describes.
+    #[test]
+    fn forwards_at_different_depths_separate_attention_from_compute() {
+        let (f, bw, c, p) = (0.05, 12e9, 0.3e-3, 2e-11);
+        let mut fit = CostFit::default();
+        let mut i = 0u64;
+        for w in [256.0f64, 1_024.0, 4_096.0, 8_192.0] {
+            for x in [0.0f64, 4e9, 12e9, 20e9] {
+                for ctx in [0.0f64, 16e3, 64e3, 120e3] {
+                    i += 1;
+                    let pairs = w * (ctx + w / 2.0);
+                    let t = f + x / bw + w * c + pairs * p;
+                    fit.observe(x, w, pairs, t, 0.01);
+                }
+            }
+        }
+        assert!(i >= CostFit::MIN_SAMPLES);
+        let sol = fit.solve(25e9).expect("all four vary");
+        assert!(approx(sol.compute_secs_per_token, c, 1e-6), "{sol:?}");
+        assert!(approx(sol.fixed_secs, f, 1e-6), "{sol:?}");
+        assert!(approx(sol.bw.unwrap(), bw, 1e-6), "{sol:?}");
+        assert!(
+            approx(sol.attend_secs_per_pair.unwrap(), p, 1e-6),
+            "{sol:?}"
+        );
+    }
+
+    /// **All at one depth, attention stays in `c`.** Pairs that are a fixed
+    /// multiple of the rows say nothing apart from width, so the fit drops the
+    /// column and `c` carries the depth it saw — the model as it was.
+    #[test]
+    fn forwards_at_one_depth_leave_attention_in_compute() {
+        let (f, bw, c, p, ctx) = (0.05, 12e9, 0.3e-3, 2e-11, 50e3);
+        let mut fit = CostFit::default();
+        for w in [256.0f64, 1_024.0, 4_096.0, 8_192.0] {
+            for x in [0.0f64, 4e9, 12e9, 20e9] {
+                let pairs = w * ctx;
+                fit.observe(x, w, pairs, f + x / bw + w * c + pairs * p, 0.01);
+            }
+        }
+        let sol = fit.solve(25e9).expect("width and residency vary");
+        assert_eq!(sol.attend_secs_per_pair, None, "{sol:?}");
+        assert!(
+            approx(sol.compute_secs_per_token, c + p * ctx, 1e-6),
+            "{sol:?}"
+        );
+    }
+
+    /// A caller that names no depth is priced at the depth the model learned
+    /// from; one that names a deeper cohort pays for it.
+    #[test]
+    fn a_deeper_cohort_is_priced_deeper() {
+        let mut p = WaveRate::with_link_rate(
+            LINK_4090_MOBILE,
+            ExpertGeometry::QWEN36_35B_A3B,
+            RateModel {
+                attend_secs_per_pair: 2e-11,
+                ..RateModel::default()
+            },
+            DecodeModel::default(),
+        );
+        let resident = RESIDENT_RUN15;
+        // Rows learned from at about 10K positions.
+        for _ in 0..200 {
+            p.observe_prefill_attending(2_048, 2_048.0 * 10e3, resident, 1.0);
+        }
+        let ctx = p.context_per_row();
+        assert!(ctx > 9e3 && ctx < 11e3, "learned depth {ctx}");
+        let named = p.forward_secs_attending(2_048, 2_048.0 * ctx, resident);
+        assert!(approx(p.forward_secs(2_048, resident), named, 1e-9));
+        let deep = p.forward_secs_attending(2_048, 2_048.0 * 114e3, resident);
+        assert!(deep > named, "a 114K cohort costs more than a 10K one");
     }
 
     /// With residency held, the rate climbs toward the compute ceiling and
@@ -4057,15 +4213,24 @@ mod tests {
     #[test]
     fn a_prompt_placed_beside_decodes_is_priced_at_its_traded_width() {
         let (rate, weights_at) = traded();
-        let alone = rate.placed_prefill_tok_s(FULL, LEAST, CHUNK, 1.0, 0, 0, &weights_at);
+        let alone = rate.placed_prefill_tok_s(FULL, LEAST, CHUNK, 1.0, 0, 0, 0.0, 0.0, &weights_at);
         let wide = FULL as f64 / rate.forward_secs(FULL, weights_at(FULL));
         assert!(
             (alone - wide).abs() < 1e-6 * wide,
             "with no decode the wide rate stands: {alone} against {wide}"
         );
         let decodes = 24;
-        let beside =
-            rate.placed_prefill_tok_s(FULL, LEAST, CHUNK, 1.0, decodes, decodes, &weights_at);
+        let beside = rate.placed_prefill_tok_s(
+            FULL,
+            LEAST,
+            CHUNK,
+            1.0,
+            decodes,
+            decodes,
+            0.0,
+            0.0,
+            &weights_at,
+        );
         let width = rate.traded_width(
             FULL,
             LEAST,

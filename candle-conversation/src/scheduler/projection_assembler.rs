@@ -2396,6 +2396,7 @@ fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), Conv
     // every path above returns on error, so reaching here means the whole
     // token run forwarded successfully at the current admission width.
     super::PREFILL_OK_TOKENS.fetch_add(tokens.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    super::TURN_CONTENT_TOKENS.fetch_add(tokens.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

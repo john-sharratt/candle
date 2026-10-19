@@ -511,10 +511,32 @@ impl Scheduler {
             _ if link > 0.0 => 1e6 / link,
             _ => 0.0,
         };
-        arena.set_keep_within(crate::provenance::gallery_arena::eviction::keep_within(
-            upload,
-            weight_us_per_byte_sec,
-        ));
+        let keep =
+            crate::provenance::gallery_arena::eviction::keep_within(upload, weight_us_per_byte_sec);
+        arena.set_keep_within(keep);
+        // The trade's inputs, once a minute: a gallery that never gives a turn
+        // up is either priced to keep everything or scanned within its keep
+        // time throughout, and nothing else says which. On WhiteWorld
+        // (6ebf6205a, 2026-10-19) 4.16 GB of it stood beside a 3.7 GB expert
+        // zone with no eviction ever logged.
+        if self
+            .gallery_logged_at
+            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(60))
+        {
+            self.gallery_logged_at = Some(now);
+            let (turns, pinned) = arena.residency_counts();
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                miss_per_s = format!("{:.0}", self.gallery_miss_rate),
+                link_gb_s = format!("{:.2}", link / 1e9),
+                not_resident,
+                upload_ns_per_kib = (upload * 1024.0 * 1000.0) as u64,
+                keep_ms = keep.map(|k| k.as_millis() as u64),
+                turns,
+                pinned,
+                "gallery keep trade"
+            );
+        }
         // And applied as it moves, not only when the gallery next uploads or
         // relief next runs: a gallery nothing scans holds its ground until one
         // of those comes, and on WhiteWorld (9940d0ffc, 2026-10-19) 4 GB of it
@@ -626,6 +648,13 @@ impl Scheduler {
         // backlog stands** — the backlog it joins and the decodes beside it
         // included, which the model's forward throughput is not (`high_drain`).
         // With no backlog standing for long enough to say, the model's figure.
+        self.high_backlog_rows = high_backlog as usize;
+        // The turn-content forwards since the last tick, before the meter moves
+        // on: they ran under the state the last tick saw.
+        let content = super::TURN_CONTENT_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
+        let since = content.saturating_sub(self.turn_content_seen);
+        self.turn_content_seen = content;
+        self.high_drain.drained(since as usize);
         self.high_drain.advance(Instant::now(), high_backlog > 0);
         let drain = self.high_drain.rate();
         // **Before the drain can say, the width the trade would give.** A
@@ -644,7 +673,11 @@ impl Scheduler {
             let mut seqs = Vec::new();
             for p in &self.active_prefills {
                 q_lens.push(p.work.tokens.len().saturating_sub(p.offset));
-                offsets.push(p.offset);
+                offsets.push(
+                    self.session
+                        .sequence_offset(p.work.sequence_id.0)
+                        .unwrap_or(0),
+                );
                 seqs.push(p.work.sequence_id.0);
             }
             for w in &self.prefill_queue {
@@ -652,13 +685,29 @@ impl Scheduler {
                 offsets.push(self.session.sequence_offset(w.sequence_id.0).unwrap_or(0));
                 seqs.push(w.sequence_id.0);
             }
-            // The placed turn itself: no sequence holds it yet.
+            // The placed turn itself: no sequence holds it yet, so it is put at
+            // the depth this card's prompts have been attending — a tool loop's
+            // next prompt continues a conversation, it does not start one.
             q_lens.push(NOMINAL_PROMPT_ROWS);
-            offsets.push(0);
+            offsets.push(r.context_per_row() as usize);
             seqs.push(usize::MAX);
             let zone = super::interleave::effective_weight_zone_bytes(0)?;
             let weights_at = |w| self.weights_at_width(&q_lens, &offsets, &seqs, zone, w);
-            let decode_rows: usize = self.decode_stage().iter().map(|&(_, _, b)| b.max(1)).sum();
+            let stage = self.decode_stage();
+            let decode_rows: usize = stage.iter().map(|&(_, _, b)| b.max(1)).sum();
+            let decode_pairs: f64 = stage
+                .iter()
+                .map(|&(_, at, b)| at as f64 * b.max(1) as f64)
+                .sum();
+            // The cohort's mean depth per row: each member's rows attend from
+            // its offset to its end.
+            let cohort_rows: usize = q_lens.iter().sum();
+            let context = q_lens
+                .iter()
+                .zip(&offsets)
+                .map(|(&q, &o)| q as f64 * (o as f64 + q as f64 / 2.0))
+                .sum::<f64>()
+                / cohort_rows.max(1) as f64;
             let rate = r.placed_prefill_tok_s(
                 rows,
                 super::admit_ground::PREFILL_MIN_ADVANCE,
@@ -666,6 +715,8 @@ impl Scheduler {
                 q_lens.len() as f64,
                 self.decode_width(),
                 decode_rows,
+                context,
+                decode_pairs,
                 weights_at,
             );
             (rate > 0.0).then_some(rate)
@@ -703,6 +754,9 @@ impl Scheduler {
                     } else {
                         "model"
                     },
+                    airtime_ratio = format!("{:.3}", self.wave_step_ratio),
+                    segment_tokens = self.segment_mean.tokens().map(|t| t.round() as u64),
+                    creep_rows_per_s = self.creep_airtime.per_s().map(|r| r.round() as u64),
                     prefill_samples = samples,
                     decode_samples,
                     "learned rates published"
@@ -4114,6 +4168,15 @@ impl Scheduler {
         };
         let glue_pending: Option<&Vec<PendingGlue>> = glue.as_ref().map(|(_, _, p)| p);
         let has_glue = !glue_seqs.is_empty();
+        // Glue rows are prompt rows too — a tool loop's results ride the decode
+        // sweep as glue — so the `High` ones count toward the drain (`high_drain`)
+        // once the forward that carried them has run.
+        let high_glue: usize = glue_seqs
+            .iter()
+            .zip(glue_inputs)
+            .filter(|(&id, _)| self.decode_priority_or_high(SequenceId(id)) == DecodePriority::High)
+            .map(|(_, t)| t.dims().get(1).copied().unwrap_or(0))
+            .sum();
         // A "full-sweep" wave carries decode and/or glue across all N layers; it
         // drives segments 1 and 3. With neither, only the creep runs (seg 2).
         let has_fullsweep = n_dec > 0 || has_glue;
@@ -4229,11 +4292,35 @@ impl Scheduler {
         } else {
             self.creep_priority(&members)
         };
-        let ratio = self.airtime_ratio_over(work);
-        self.wave_step_ratio = ratio;
+        let band = self.airtime_ratio_over(work);
+        // **A `High` prompt beside `High` decodes splits the device by the work
+        // each side holds** (`turn_airtime`): the two halves of a tool-calling
+        // turn, kept moving together. The band's constant stands until both
+        // sides are measured, and below `High` the bands decide alone —
+        // background ingest yields to dialogue whatever the backlogs say.
+        let derived = (work == DecodePriority::High && band == HIGH_BESIDE_HIGH_RATIO)
+            .then(|| {
+                super::turn_airtime::high_airtime_ratio(
+                    self.segment_mean.tokens()?,
+                    self.decode_only_step?,
+                    self.high_backlog_rows,
+                    self.creep_airtime.per_s()?,
+                )
+            })
+            .flatten();
+        let ratio = derived.unwrap_or(band.max(1) as f64);
+        self.wave_step_ratio = match derived {
+            Some(r) => super::turn_airtime::debt_ratio(r),
+            None => ratio,
+        };
+        self.wave_step_slice = super::turn_airtime::slice_steps(
+            ratio,
+            self.decode_only_step.unwrap_or(std::time::Duration::ZERO),
+        );
         // A creep advances `ceil(N / R)` layers — and beside decode rows no
-        // more than a decode-only step's worth of them (`creep_slice`), so the
-        // share `R` sets is paid in steps, not seconds.
+        // more than a decode-only step's worth of them (`creep_slice`), times
+        // what `R < 1` lets a slice carry, so the share `R` sets is paid in
+        // steps, not seconds.
         let creep_rows: usize = inputs
             .iter()
             .map(|t| t.dims().get(1).copied().unwrap_or(0))
@@ -4242,10 +4329,11 @@ impl Scheduler {
             n - cursor.min(n)
         } else if head_rows > 0 {
             time_bounded_layers(
-                creep_layer_budget(n, ratio).min(n - cursor.min(n)),
+                creep_layer_budget(n, ratio.ceil() as u32).min(n - cursor.min(n)),
                 creep_rows,
                 self.creep_layer_row_cost,
-                self.decode_only_step,
+                self.decode_only_step
+                    .map(|d| d.mul_f64(self.wave_step_slice)),
             )
         } else {
             // **Decode-less, still bounded in time.** With nothing decoding
@@ -4257,7 +4345,7 @@ impl Scheduler {
             // 8,190-row ingest cohort starting a 2.6 s, 48-layer decode-less
             // step in the gap between two of its turns, and waited it out.
             time_bounded_layers(
-                creep_layer_budget(n, ratio).min(n - cursor.min(n)),
+                creep_layer_budget(n, ratio.ceil() as u32).min(n - cursor.min(n)),
                 creep_rows,
                 self.creep_layer_row_cost,
                 Some(DECODE_LESS_SLICE),
@@ -4336,6 +4424,7 @@ impl Scheduler {
             if has_glue {
                 let _g = super::profile::span("loop:wave:reconcile_offsets");
                 self.reconcile_wave_offsets(glue_seqs)?;
+                self.high_drain.drained(high_glue);
             }
             // Read in place behind the forward's guard — see `WaveLogits`.
             let dec_logits = WaveLogits::held(out, head_rows);
@@ -4534,13 +4623,19 @@ impl Scheduler {
             let (mut pf_seqs, mut pf_tok, mut pf_kv) = (0usize, 0usize, 0usize);
             let (mut sc_seqs, mut sc_tok, mut sc_kv) = (0usize, 0usize, 0usize);
             let mut high_tok = 0usize;
+            // Query×key pairs the members' rows attend over the sweep: each row
+            // the context before it, for the rate model's depth term.
+            let (mut pf_pairs, mut sc_pairs) = (0f64, 0f64);
+            let pairs_of = |tok: usize, at: usize| tok as f64 * (at as f64 + tok as f64 / 2.0);
             for (m, inp) in members.iter().zip(inputs.iter()) {
                 let tok = inp.dims().get(1).copied().unwrap_or(0);
                 match m {
                     WaveMember::Prefill { seq_id, .. } => {
                         pf_seqs += 1;
                         pf_tok += tok;
-                        pf_kv += self.session.sequence_offset(*seq_id).unwrap_or(0);
+                        let at = self.session.sequence_offset(*seq_id).unwrap_or(0);
+                        pf_pairs += pairs_of(tok, at);
+                        pf_kv += at;
                         if self.decode_priority_or_high(SequenceId(*seq_id)) == DecodePriority::High
                         {
                             high_tok += tok;
@@ -4549,7 +4644,9 @@ impl Scheduler {
                     WaveMember::Section { seq_id, .. } => {
                         sc_seqs += 1;
                         sc_tok += tok;
-                        sc_kv += self.session.sequence_offset(*seq_id).unwrap_or(0);
+                        let at = self.session.sequence_offset(*seq_id).unwrap_or(0);
+                        sc_pairs += pairs_of(tok, at);
+                        sc_kv += at;
                     }
                 }
             }
@@ -4561,6 +4658,19 @@ impl Scheduler {
             // What the `High` backlog drained by, for the rate this card advertises.
             self.high_drain
                 .drained(window_tokens(high_tok, cursor, win_end, n));
+            // The creep's speed per second it held the device: its window's
+            // time, less what the decode rows beside it would have taken over
+            // those layers alone (`turn_airtime`).
+            let decode_part = match (head_rows > 0, self.decode_only_step) {
+                (true, Some(d)) => {
+                    d.mul_f64((win_end - cursor.min(win_end)) as f64 / n.max(1) as f64)
+                }
+                _ => std::time::Duration::ZERO,
+            };
+            self.creep_airtime.add(
+                pf_swept + sc_swept,
+                std::time::Duration::from_micros(creep_us).saturating_sub(decode_part),
+            );
             if pf_seqs > 0 {
                 self.wave_stats.record(true, pf_seqs, pf_swept, pf_kv, ms);
             }
@@ -4586,6 +4696,7 @@ impl Scheduler {
             // whole sweep, so a window's time is taken to the sweep it is part of.
             self.observe_prefill_forward(
                 pf_tok + sc_tok,
+                pf_pairs + sc_pairs,
                 full_sweep_us(creep_us, cursor, win_end, n),
             );
             // Every completed wave forward is OOM-free prefill throughput —
@@ -4608,6 +4719,7 @@ impl Scheduler {
             if has_glue {
                 let _g = super::profile::span("loop:wave:reconcile_offsets");
                 self.reconcile_wave_offsets(glue_seqs)?;
+                self.high_drain.drained(high_glue);
             }
             // Read in place behind the step's guard — see `WaveLogits`. The
             // creep's rows are consumed here; `complete_wave_group` copies the
@@ -4646,6 +4758,7 @@ impl Scheduler {
         if has_glue {
             let _g = super::profile::span("loop:wave:reconcile_offsets");
             self.reconcile_wave_offsets(glue_seqs)?;
+            self.high_drain.drained(high_glue);
         }
         Ok(WaveLogits::held(head, head_rows))
     }

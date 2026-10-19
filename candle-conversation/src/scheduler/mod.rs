@@ -73,6 +73,7 @@ mod submit_admit;
 mod sweep_forecast;
 #[cfg(test)]
 mod test_substrate;
+mod turn_airtime;
 mod turn_group;
 mod wave_logits;
 mod wave_retry;
@@ -1096,6 +1097,11 @@ static DRAIN_PREFILL_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// width" evidence that lets the window reopen under chronic nominal VRAM
 /// pressure (see `evidence_admit_grow`).
 static PREFILL_OK_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Every token a turn-content forward ([`projection_assembler`]'s drain path)
+/// has prefilled, monotone: a dialogue turn's own prompt, which drains the
+/// `High` backlog outside the creep, so `publish_learned_rates` reads its delta
+/// into `high_drain`.
+static TURN_CONTENT_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Add `us` to a drain sub-timer, but only during a submission drain (so the
 /// shared assembler helpers don't miscount reproject-path work). Used by
@@ -3677,6 +3683,8 @@ pub(crate) struct Scheduler {
     /// (`update_gallery_keep`).
     gallery_misses_seen: Option<(Instant, usize)>,
     gallery_miss_rate: f64,
+    /// When the gallery keep trade's inputs were last logged (`update_gallery_keep`).
+    gallery_logged_at: Option<Instant>,
     /// When the gallery last gave up the turns past its keep time.
     gallery_evicted_at: Option<Instant>,
     /// The held cohort's own claims as its fit priced them, and of them the K/V
@@ -3687,6 +3695,8 @@ pub(crate) struct Scheduler {
     /// The `High` backlog's measured drain per wall second — the prefill rate
     /// a member advertises while one stands (`high_drain`).
     high_drain: high_drain::HighDrain,
+    /// `TURN_CONTENT_TOKENS` as `publish_learned_rates` last read it.
+    turn_content_seen: u64,
     /// Sequences whose next token `inject_stencil_prefills` sampled this
     /// iteration from its static run's own prefill. They sit out the decode
     /// step that follows: the token it would carry is the one just sampled, and
@@ -3775,7 +3785,17 @@ pub(crate) struct Scheduler {
     /// the ratio of the decodes that outrank it (and, for `High` work, of the
     /// `High` decodes), 1 when there are none. Decode is
     /// owed that share of a co-batched step ([`Self::creep_owed`]).
-    wave_step_ratio: u32,
+    wave_step_ratio: f64,
+    /// How long the last step's creep slice could run beside decode rows, in
+    /// decode-only steps (`turn_airtime::slice_steps`).
+    wave_step_slice: f64,
+    /// The creep's rows per second of its own airtime (`turn_airtime`).
+    creep_airtime: turn_airtime::AirtimeRate,
+    /// The mean decode run of a `High` turn segment (`turn_airtime`).
+    segment_mean: turn_airtime::SegmentMean,
+    /// The `High` prompt rows outstanding, as `publish_learned_rates` last
+    /// counted them.
+    high_backlog_rows: usize,
     /// Set once per wave after the co-batched decode wave folded the active
     /// section-ingest chunk into its full sweep (section rides decode's `[0, N)`
     /// as a prefill-group member — one shared MoE grouped GEMM per layer serves
@@ -4064,10 +4084,12 @@ impl Scheduler {
             deferred_glue_fires: Vec::new(),
             gallery_misses_seen: None,
             gallery_miss_rate: 0.0,
+            gallery_logged_at: None,
             gallery_evicted_at: None,
             held_fit_claims: None,
             rates_logged_at: None,
             high_drain: high_drain::HighDrain::default(),
+            turn_content_seen: 0,
             stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
             sealed_snapshots: HashMap::new(),
@@ -4089,7 +4111,11 @@ impl Scheduler {
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),
             wave_cobatched: false,
-            wave_step_ratio: 1,
+            wave_step_ratio: 1.0,
+            wave_step_slice: 1.0,
+            creep_airtime: turn_airtime::AirtimeRate::default(),
+            segment_mean: turn_airtime::SegmentMean::default(),
+            high_backlog_rows: 0,
             wave_section_advanced: false,
             shutdown_requested: false,
             section_name_cache: HashMap::new(),
@@ -7836,10 +7862,17 @@ impl Scheduler {
         // each turn's seal and `Done`.
         let mut sealing: Vec<FinishedTurn> = Vec::with_capacity(finished_seq_ids.len());
         for seq_id in finished_seq_ids {
+            let high =
+                self.decode_priority_or_high(seq_id) == crate::projection::DecodePriority::High;
             if let Some(state) = self.active_decodes.remove(&seq_id) {
                 // The slot's ground is back, so an admission that did not fit
                 // before may fit now.
                 self.settled_since_admit = true;
+                // What a `High` decode run takes, for how the device is split
+                // beside the prompts (`turn_airtime`).
+                if high && !state.faulted {
+                    self.segment_mean.add(state.generated_tokens.len());
+                }
                 // A turn that ended on a fault has told its caller so; what it
                 // decoded is dropped with its view and never sealed.
                 if state.faulted {

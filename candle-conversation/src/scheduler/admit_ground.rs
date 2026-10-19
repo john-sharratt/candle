@@ -1307,7 +1307,7 @@ impl Scheduler {
     /// by, and one 26-row forward read 119 GB/s on a 25 GB/s link. Passing them
     /// in anyway is correct — the refusal belongs with the model that knows the
     /// routing, not with the caller.
-    pub(super) fn observe_prefill_forward(&mut self, rows: usize, us: u64) {
+    pub(super) fn observe_prefill_forward(&mut self, rows: usize, pairs: f64, us: u64) {
         if rows == 0 || us == 0 {
             return;
         }
@@ -1317,7 +1317,7 @@ impl Scheduler {
         self.wave_forwards += 1;
         let resident = residency_now(self.standing_ground_bytes());
         if let Some(rate) = self.wave_rate.as_mut() {
-            rate.observe_prefill(rows, resident, us as f64 / 1e6);
+            rate.observe_prefill_attending(rows, pairs, resident, us as f64 / 1e6);
         }
     }
 

@@ -64,10 +64,19 @@ impl HighDrain {
         }
     }
 
-    /// Tokens a second the backlog drained at, once it has stood long enough
-    /// to say; `None` before.
+    /// Tokens a second the backlog drained at, while one stands and once it
+    /// has stood long enough to say; `None` otherwise.
+    ///
+    /// **Only while one stands now.** The standing time decays over a minute,
+    /// so it stays past the threshold for minutes after the backlog has gone —
+    /// and a placed turn then joins no queue at all. On BlackWorld (6ebf6205a,
+    /// 2026-10-19) the last of heavy-read's backlog was cleaned up and the
+    /// member advertised 124 tok/s with nothing queued for 3+ minutes, while
+    /// WhiteWorld took 24 turns at a 700–880 ms step.
     pub(super) fn rate(&self) -> Option<f64> {
-        (self.standing_secs >= MIN_STANDING_SECS).then(|| self.tokens / self.standing_secs)
+        let standing = self.at.is_some_and(|(_, stood)| stood);
+        (standing && self.standing_secs >= MIN_STANDING_SECS)
+            .then(|| self.tokens / self.standing_secs)
     }
 }
 
@@ -103,6 +112,27 @@ mod tests {
             m.advance(t0 + Duration::from_secs(i), false);
         }
         assert_eq!(m.rate(), None);
+    }
+
+    /// The backlog gone, the drain is not the figure — the moment it goes, not
+    /// once its standing time has decayed.
+    #[test]
+    fn a_drained_backlog_stops_being_the_figure_at_once() {
+        let mut m = HighDrain::default();
+        let t0 = Instant::now();
+        m.advance(t0, true);
+        for i in 1..=60 {
+            m.drained(120);
+            m.advance(t0 + Duration::from_secs(i), true);
+        }
+        assert!(m.rate().is_some());
+        m.advance(t0 + Duration::from_secs(61), false);
+        assert_eq!(m.rate(), None, "nothing standing now");
+        m.advance(t0 + Duration::from_secs(62), true);
+        assert!(
+            m.rate().is_some(),
+            "a backlog back within the minute reads its drain again"
+        );
     }
 
     /// A backlog that has only just formed is not judged yet.

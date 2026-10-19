@@ -668,6 +668,13 @@ impl GalleryArena {
     /// Give up every turn not worth its ground ([`eviction::past_keep`]) — the
     /// governor's relief rung and every admission alike. Returns the bytes
     /// freed. Pinned turns never go, so an in-flight scan's pages stay.
+    /// Resident turns, and of them how many a scan holds pinned now — what the
+    /// keep trade may not take whatever their age.
+    pub fn residency_counts(&self) -> (usize, usize) {
+        let res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+        (res.len(), res.values().filter(|rt| rt.pinned != 0).count())
+    }
+
     pub fn evict_past_keep(&self) -> u64 {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
         self.evict_past_keep_locked(&mut res)
