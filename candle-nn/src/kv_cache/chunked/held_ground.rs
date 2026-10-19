@@ -404,8 +404,8 @@ impl SpanHeldGround {
         self.lower(device);
     }
 
-    /// Mark the arenas whose holders should move: something lives in them, and a
-    /// run as wide is free below.
+    /// Mark the arenas whose holders should move: something lives in them, and
+    /// room for it is free below.
     ///
     /// [`Self::lower`] moves an arena nothing holds; one with a live range cannot
     /// move, because its holders have its addresses. A slot-state slab or a
@@ -417,40 +417,77 @@ impl SpanHeldGround {
     /// (`Held::asked_to_move`), the take skips the vacating arena, and the arena
     /// falls idle and goes back.
     ///
-    /// Each newly marked arena first gets a run of its own width claimed below
-    /// it, so what it holds fits there as it fits now; one whose run cannot be
-    /// claimed is not marked, since a holder that found no room would go to the
-    /// CUDA pool — outside the span, worse than standing high. An arena stays
+    /// Each newly marked arena first gets runs claimed below it that hold what
+    /// lives in it ([`landing_runs`]), all of them or none; one that cannot land
+    /// is not marked, since a holder that found no room would go to the CUDA
+    /// pool — outside the span, worse than standing high. An arena stays
     /// marked until it goes back: its room was claimed when it was marked, and
     /// once idle it is released whatever the headroom.
     fn vacate(&self, device: &CudaDevice) {
         let stream = device.cuda_stream();
-        // Live arenas not yet marked, highest first, each with its first region's
-        // index and its width.
-        let live: Vec<(u64, usize, usize)> = {
+        // Live arenas not yet marked, highest first: each with its first region's
+        // index, its width, and the runs below that would hold what lives in it.
+        let live: Vec<(u64, usize, usize, Vec<usize>)> = {
             let inner = self.lock();
             inner
                 .arenas
                 .iter()
                 .rev()
                 .filter(|a| a.extents.used() > 0 && !inner.vacating.contains(&a.base))
-                .map(|a| (a.base, a.regions[0].index(), a.regions.len()))
+                .map(|a| {
+                    let ranges: Vec<usize> = inner
+                        .live
+                        .values()
+                        .filter(|(g, _, _)| *g == Ground::Arena(a.base))
+                        .map(|(_, t, _)| t.len)
+                        .collect();
+                    (
+                        a.base,
+                        a.regions[0].index(),
+                        a.regions.len(),
+                        landing_runs(&ranges),
+                    )
+                })
                 .collect()
         };
-        // Probed outside the held lock: the probe takes the pool's.
+        // Probed outside the held lock: the probe takes the pool's. The widest
+        // run is the one least likely to be free.
         let fresh: Vec<_> = live
             .into_iter()
-            .filter(|&(_, start, k)| run_free_below(&stream, k, start))
+            .filter(|(_, start, _, runs)| {
+                let widest = runs.iter().copied().max().unwrap_or(1);
+                run_free_below(&stream, widest, *start)
+            })
             .collect();
         let mut marked = false;
         if !fresh.is_empty() && regions_open(&stream) {
             if let Ok(claims) = SpanClaims::open(&Device::Cuda(device.clone()), "held ground") {
-                for (base, start, k) in fresh {
-                    let Ok(Some(lower)) = claims.claim_run_below(k, start) else {
+                for (base, start, width, runs) in fresh {
+                    // Every run or none: a partial landing would leave a holder
+                    // with nowhere in the span to go.
+                    let mut landed = Vec::new();
+                    for &k in &runs {
+                        match claims.claim_run_below(k, start) {
+                            Ok(Some(lower)) => landed.push(lower),
+                            _ => break,
+                        }
+                    }
+                    if landed.len() < runs.len() {
+                        drop(landed);
                         continue;
-                    };
+                    }
+                    tracing::info!(
+                        "held ground: vacating the arena at region {start} ({width} regions) \
+                         onto runs of {} regions below it",
+                        runs.iter()
+                            .map(|k| format!("{k}"))
+                            .collect::<Vec<_>>()
+                            .join("+")
+                    );
                     let mut inner = self.lock();
-                    inner.insert_arena(lower);
+                    for lower in landed {
+                        inner.insert_arena(lower);
+                    }
                     inner.vacating.push(base);
                     marked = true;
                 }
@@ -544,6 +581,31 @@ impl SpanHeldGround {
 #[cfg(feature = "cuda")]
 fn headroom_for(growth: &[usize]) -> usize {
     growth.iter().copied().max().unwrap_or(0) + REGION
+}
+
+/// The runs, in regions, that hold live ranges of `ranges` bytes: widest first,
+/// each into the first planned run with room, as a take lands first-fit, else
+/// into a new run of its own width.
+///
+/// Sized from what lives in an arena, not from the arena: one claimed for a
+/// wide take that has since gone may hold a few slot-state slabs across seven
+/// regions, and needing seven free in a row below it is what kept it from ever
+/// moving.
+#[cfg(feature = "cuda")]
+fn landing_runs(ranges: &[usize]) -> Vec<usize> {
+    let mut widest_first = ranges.to_vec();
+    widest_first.sort_unstable_by(|a, b| b.cmp(a));
+    let mut runs: Vec<Extents> = Vec::new();
+    for len in widest_first {
+        if runs.iter_mut().any(|r| r.take(len, HELD_ALIGN).is_some()) {
+            continue;
+        }
+        let mut run = Extents::new(len.div_ceil(REGION).max(1) * REGION);
+        run.take(len, HELD_ALIGN)
+            .expect("a run of a range's own width holds it");
+        runs.push(run);
+    }
+    runs.iter().map(|r| r.capacity() / REGION).collect()
 }
 
 #[cfg(feature = "cuda")]
@@ -706,5 +768,25 @@ mod tests {
         g[3] = 5 * REGION;
         g[7] = 2 * REGION;
         assert_eq!(headroom_for(&g), 6 * REGION);
+    }
+
+    /// **The landing is sized by what lives in an arena, not by the arena.** A
+    /// range and a half takes a run of two with half a region left, which the
+    /// two quarter ranges fill exactly; the whole range gets a run of its own.
+    #[test]
+    fn landing_runs_fit_the_live_ranges() {
+        assert_eq!(
+            landing_runs(&[REGION / 4, REGION, REGION / 4, REGION + REGION / 2]),
+            vec![2, 1]
+        );
+        assert_eq!(
+            landing_runs(&[100]),
+            vec![1],
+            "a sliver still takes a region"
+        );
+        assert!(
+            landing_runs(&[]).is_empty(),
+            "nothing lives there, nothing to land"
+        );
     }
 }
