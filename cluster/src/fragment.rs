@@ -1,8 +1,11 @@
 //! `EVENT` fragmentation (§4.2, §4.3): a record above 1 MiB travels as
 //! consecutive fragments, so no single transfer holds the socket. The receiver
-//! reassembles by `(origin, oseq)` from fragments relayed as they arrive. A
-//! socket delivers in order, so one record's fragments arrive in offset order;
-//! a gap, an overlap or a changed total is refused. Partial records of a socket
+//! reassembles by `(origin, oseq, reply_to)` from fragments relayed as they
+//! arrive: a socket carries a live lane and a catch-up lane, so one record can
+//! be in flight twice at once — live to everyone, and as an answer to a member
+//! catching up — its two copies' fragments interleaved. Each copy arrives in
+//! order on its own lane, so one copy's fragments arrive in offset order; a
+//! gap, an overlap or a changed total is refused. Partial records of a socket
 //! that drops are discarded — the sender sends the whole record again (§6.3).
 
 use std::collections::HashMap;
@@ -55,10 +58,14 @@ pub struct Whole {
     pub bytes: Vec<u8>,
 }
 
+/// One copy of a record in flight: its origin, its `oseq`, and the member
+/// it answers, `None` for the live copy.
+type Copy = (u64, u64, Option<u64>);
+
 /// One socket's partial records.
 #[derive(Debug, Default)]
 pub struct Reassembly {
-    partial: HashMap<(u64, u64), (u32, Vec<u8>)>,
+    partial: HashMap<Copy, (u32, Vec<u8>)>,
 }
 
 impl Reassembly {
@@ -68,7 +75,7 @@ impl Reassembly {
 
     /// Take a fragment; a record's last fragment returns it whole.
     pub fn accept(&mut self, event: Event) -> Result<Option<Whole>, OutOfOrder> {
-        let key = (event.origin, event.oseq);
+        let key = (event.origin, event.oseq, event.reply_to);
         let (total, held) = self
             .partial
             .entry(key)
@@ -151,6 +158,29 @@ mod tests {
         assert_eq!((done[0].origin, done[0].bytes.len()), (8, small.len()));
         assert_eq!(done[0].bytes, small);
         assert_eq!(done[1].bytes, big);
+        assert_eq!(r.pending(), 0);
+    }
+
+    /// **One record live and as a catch-up answer at once both reassemble.**
+    /// The two copies travel on the socket's two lanes, so their fragments
+    /// interleave; keyed by record alone, the answer's first fragment read as
+    /// a restart of the live copy, and the gateway closed the socket (4400:
+    /// "fragment … at 0 does not continue the 39845888 bytes held of
+    /// 118046975", a 118 MB recurrent snapshot).
+    #[test]
+    fn a_record_live_and_answering_a_catch_up_reassembles_twice() {
+        let snapshot = record(5 << 20);
+        let live = split(7, 589_009, &snapshot, None);
+        let answer = split(7, 589_009, &snapshot, Some(42));
+        let mut r = Reassembly::new();
+        let mut done = Vec::new();
+        for (a, b) in live.into_iter().zip(answer) {
+            done.extend(r.accept(a).unwrap());
+            done.extend(r.accept(b).unwrap());
+        }
+        assert_eq!(done.len(), 2);
+        assert_eq!((done[0].reply_to, done[1].reply_to), (None, Some(42)));
+        assert!(done.iter().all(|w| w.bytes == snapshot));
         assert_eq!(r.pending(), 0);
     }
 

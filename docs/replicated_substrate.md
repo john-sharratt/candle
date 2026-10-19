@@ -1117,9 +1117,13 @@ its recipients. Each of them recovers it through its own catch-up, on the reconn
 gateway's death forces (§7.1).
 
 **An `EVENT` larger than one fragment is reassembled by the receiver**, keyed
-`(origin, oseq)`, from fragments relayed as they arrive. Fragments of an event whose
-relaying socket drops before the last one are discarded. The sender re-sends the whole
-event (§6.3).
+`(origin, oseq, reply_to)`, from fragments relayed as they arrive. The `reply_to` is
+part of the key because a socket carries a live lane and a catch-up lane: one record
+can be in flight on both at once — live to every member, and as the answer to a member
+catching up — with the two copies' fragments interleaved. Keyed by the record alone,
+the answer's first fragment read as a restart of the live copy, and the gateway closed
+the sender's socket. Fragments of an event whose relaying socket drops before the last
+one are discarded. The sender re-sends the whole event (§6.3).
 
 A gateway relays only among the members connected to *it*. An event leaves its origin
 through one cluster (§6.3), so a member joined to every cluster receives it once, from
