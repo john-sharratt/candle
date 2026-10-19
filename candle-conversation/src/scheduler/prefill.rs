@@ -2895,13 +2895,30 @@ impl Scheduler {
                 .min()
             else {
                 // Fitted: what it was fitted to, once per cohort, so a window
-                // later refused can be read against the price it formed on.
+                // later refused can be read against the price it formed on —
+                // with the span as it stood, and the K/V priced both ways the
+                // engine prices it (the geometry the fit uses, and the formats
+                // admission charges), so the region delta to a refusal says
+                // which one the cohort actually claimed at.
+                let per_block = self.per_block_kv_bytes();
+                let kv_blocks: u64 = q_lens
+                    .iter()
+                    .map(|&q| super::admission::prefill_cost_bytes(q, per_block))
+                    .sum();
+                let (live, frontier_regions) = self
+                    .session
+                    .kv_region_stats()
+                    .map_or((0, 0), |s| (s.live, s.live_watermark));
                 tracing::info!(
                     target: "candle_conversation::scheduler::creep",
                     rows,
                     members = members.len(),
                     decodes = self.decode_width(),
                     tier_mib = tier >> 20,
+                    kv_geometry_mib = rows.saturating_mul(kv_row) >> 20,
+                    kv_blocks_mib = kv_blocks >> 20,
+                    live_regions = live,
+                    frontier_regions,
                     claims_mib = claims >> 20,
                     holes_mib = holes >> 20,
                     frontier_mib = frontier.unwrap_or(0) >> 20,
