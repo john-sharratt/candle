@@ -16338,6 +16338,14 @@ mod tests {
                 .saturating_add(sched.min_forward_tier_bytes()),
             "the prefill floor is the cache's minimum and a forward's tier",
         );
+        // A wave already standing reserves its own tier, so the next forward
+        // needs only what it does not already hold.
+        let tier = sched.min_forward_tier_bytes() as usize;
+        assert_eq!(sched.admit_headroom(tier).forward_reserve, 0);
+        assert_eq!(
+            sched.admit_headroom(tier / 2).forward_reserve,
+            (tier - tier / 2) as u64,
+        );
     }
 
     /// **A store cost is never derived from a division by zero.**

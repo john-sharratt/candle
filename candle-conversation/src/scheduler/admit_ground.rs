@@ -885,7 +885,11 @@ impl Scheduler {
     /// claimed and not yet spent rather than one it hopes to recover.
     pub(super) fn admit_headroom(&self, standing_tier: usize) -> Headroom {
         let zone = residency_now(standing_tier);
-        let tier_reserve = self.min_forward_tier_bytes();
+        // The next forward's tier, beyond what the standing ground already holds
+        // (`interleave::reserve_for` nets that out of `zone`).
+        let tier_reserve = self
+            .min_forward_tier_bytes()
+            .saturating_sub(standing_tier as u64);
         let room = Headroom {
             // **Deliberately zero here, and netted below.** The free list is not
             // headroom *beside* the zone, it is the same ground seen twice:
@@ -899,6 +903,7 @@ impl Scheduler {
             zone_min: interleave::optimal_weight_bytes().unwrap_or(0),
             zone_max: interleave::achievable_weight_now().unwrap_or(u64::MAX),
             zone_min_prefill: self.expert_zone_min_bytes(),
+            forward_reserve: tier_reserve,
         };
         Headroom {
             // **The spendable ground is one subtraction: how far residency
@@ -970,7 +975,7 @@ impl Scheduler {
     pub(super) fn decode_floor_holds_after(&self, bytes: u64) -> bool {
         let standing = self.standing_ground_bytes();
         let room = self.admit_headroom(standing);
-        let floor = room.floor().saturating_add(self.min_forward_tier_bytes());
+        let floor = room.floor().saturating_add(room.forward_reserve);
         residency_now(standing).saturating_sub(bytes) >= floor
     }
 
@@ -1131,10 +1136,8 @@ impl Scheduler {
             // The same line `headroom` nets out of the spendable ground: the
             // hold, the eviction margin that keeps the cache evictable, and a
             // useful forward's tier. The model enforces it as a hard refusal.
-            prefill_floor: room
-                .prefill_floor()
-                .saturating_add(self.min_forward_tier_bytes()),
-            decode_floor: room.floor().saturating_add(self.min_forward_tier_bytes()),
+            prefill_floor: room.prefill_floor().saturating_add(room.forward_reserve),
+            decode_floor: room.floor().saturating_add(room.forward_reserve),
             max_rows: chunk_rows,
             max_decodes: Self::MAX_DECODE_WIDTH,
         }

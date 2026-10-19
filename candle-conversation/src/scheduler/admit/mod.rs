@@ -720,6 +720,7 @@ mod tests {
                 zone_min: 4 << 30,
                 zone_max: 10 << 30,
                 zone_min_prefill: 2 << 30,
+                forward_reserve: 0,
             }
         }
         fn budget(&self) -> Budget {

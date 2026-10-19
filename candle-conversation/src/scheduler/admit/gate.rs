@@ -38,6 +38,11 @@ pub(crate) struct Headroom {
     /// prefill may spend residency down to the point the cache can no longer
     /// serve, and no further.
     pub zone_min_prefill: u64,
+    /// The tier a useful forward needs beyond what the standing wave already
+    /// reserves — the next forward stands on ground the standing ground does
+    /// not already hold, and no more of it. Zero when a wave is standing at
+    /// least that wide.
+    pub forward_reserve: u64,
 }
 
 /// Ground kept clear above the floor, so the expert cache always has something
@@ -114,6 +119,7 @@ mod tests {
             zone_max: 10 << 30,
             // Under the decode hold: the expert cache's own minimum.
             zone_min_prefill: 2 << 30,
+            forward_reserve: 0,
         }
     }
 

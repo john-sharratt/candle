@@ -12,9 +12,7 @@
 
 use std::sync::atomic::AtomicU64;
 
-use candle_nn::kv_cache::{
-    region_stats, RegionStats, MIN_ELASTIC_RESERVE, REGION_BYTES, WAVE_SPAN_BYTES,
-};
+use candle_nn::kv_cache::{region_stats, RegionStats, MIN_ELASTIC_RESERVE, REGION_BYTES};
 
 /// The device ordinal every figure here is read from.
 ///
@@ -60,8 +58,8 @@ pub(super) fn weight_zone_bytes() -> Option<u64> {
 /// overstatement is the difference: the model saw residency the published tier
 /// had already taken, kept admitting, and the weight zone collapsed under it.
 ///
-/// Only the **excess** over the constant's own tier term is added, so a wave
-/// inside the guarantee reads exactly as it did before and nothing narrow moves.
+/// It is netted **exactly** — see [`reserve_for`]: the load-time constant read
+/// here as well charged the tier and a first wave's K/V a second time.
 ///
 /// **Not the previous wave's published tier**, which is what would close the
 /// loop `prefill::WaveFill::budget` warns about — a bound that is its own
@@ -71,8 +69,7 @@ pub(super) fn weight_zone_bytes() -> Option<u64> {
 /// separately, as `admit::Cost::dislodged_bytes`. Between them they cover the
 /// whole wave's tier exactly once.
 ///
-/// Pass `0` where there is no wave in flight — the idle reseed, the reports —
-/// and the constant binds as it always did.
+/// Pass `0` where there is no wave in flight — the reports.
 ///
 /// **Measured to the arena frontier, not the live count.** A free region below
 /// the frontier is a hole: the next claim takes it (the free list recycles
@@ -103,13 +100,24 @@ pub(super) fn stranded_hole_bytes() -> u64 {
     })
 }
 
-/// The floor's reserve, raised by whatever a standing tier needs beyond the
-/// tier term [`MIN_ELASTIC_RESERVE`] already carries.
+/// The ground the residency reading nets out: exactly what the wave in flight
+/// has committed — its tier and its decodes' growth over a sweep
+/// (`Scheduler::standing_ground_bytes`) — and nothing more.
+///
+/// **Not [`MIN_ELASTIC_RESERVE`].** That constant is the weight zone's
+/// load-time guard — a wave's worth of tier (912 MiB) and a first wave's K/V
+/// (384 MiB) kept clear so a weight fill cannot leave no room for the first
+/// wave — and read inside admission it charged ground twice: the K/V every
+/// offer already pays and the standing K/V that is already live, and a
+/// standing tier narrower than 912 MiB as 912, on top of the floor's own
+/// forward tier. Measured on WhiteWorld (2026-10-19, heavy-decode on
+/// 93037633b): residency held 1.0–1.5 GiB against a 3.07 GiB prefill floor
+/// while nothing new was admitted, and every offer was refused on it.
 ///
 /// Pure and separate so the identity is testable without a device — the
 /// partition's defects have all been trajectory defects.
-pub(super) fn reserve_for(standing_tier: usize) -> usize {
-    MIN_ELASTIC_RESERVE.saturating_add(standing_tier.saturating_sub(WAVE_SPAN_BYTES))
+pub(super) fn reserve_for(standing_ground: usize) -> usize {
+    standing_ground
 }
 
 /// The residency the weight side could reach if nothing but what is resident
@@ -234,6 +242,7 @@ pub(crate) fn optimal_weight_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_nn::kv_cache::WAVE_SPAN_BYTES;
 
     /// The identity: span less the live KV less the floor's reserve.
     #[test]
@@ -244,44 +253,15 @@ mod tests {
         assert_eq!(got, (1 << 30) + (60 * (16 << 20)) - (256 << 20));
     }
 
-    /// **A standing tier is ground the weight side does not have**, and the
-    /// reserve says so.
-    ///
-    /// The floor's constant carries a flat `WAVE_SPAN_BYTES` tier term, so a
-    /// wave inside that guarantee must read exactly as it did before — nothing
-    /// narrow moves — while a wave beyond it raises the reserve by the excess
-    /// and by nothing more. Charging the whole tier on top of the constant
-    /// would count that first 912 MiB twice.
-    ///
-    /// This only ever *tightens*: the reserve is monotone in the tier and never
-    /// falls below the constant, so no wave is told it has more room than the
-    /// old figure promised.
+    /// **The reserve is the committed ground, exactly.** No wave in flight
+    /// reserves nothing; a standing wave reserves what it holds, narrow or
+    /// wide — not the load-time constant's 912 MiB tier and 384 MiB first-wave
+    /// K/V, which admission charged on top of its own forward tier.
     #[test]
-    fn a_standing_tier_raises_the_reserve_by_its_excess_over_the_guarantee() {
-        assert_eq!(reserve_for(0), MIN_ELASTIC_RESERVE, "no wave, no change");
-        assert_eq!(
-            reserve_for(WAVE_SPAN_BYTES),
-            MIN_ELASTIC_RESERVE,
-            "a wave inside the guarantee reads as it always did"
-        );
-        assert_eq!(
-            reserve_for(WAVE_SPAN_BYTES / 2),
-            MIN_ELASTIC_RESERVE,
-            "and so does a narrower one"
-        );
-        let over = 3 * WAVE_SPAN_BYTES;
-        assert_eq!(
-            reserve_for(over),
-            MIN_ELASTIC_RESERVE + 2 * WAVE_SPAN_BYTES,
-            "beyond it, the excess and only the excess"
-        );
-        // Monotone, and never below the constant — the two properties that make
-        // this safe to apply everywhere the old figure was read.
-        let mut prev = 0;
-        for mult in 0..8 {
-            let r = reserve_for(mult * WAVE_SPAN_BYTES);
-            assert!(r >= MIN_ELASTIC_RESERVE && r >= prev);
-            prev = r;
+    fn the_reserve_is_the_committed_ground_and_nothing_more() {
+        assert_eq!(reserve_for(0), 0, "no wave, nothing reserved");
+        for ground in [WAVE_SPAN_BYTES / 2, WAVE_SPAN_BYTES, 3 * WAVE_SPAN_BYTES] {
+            assert_eq!(reserve_for(ground), ground);
         }
     }
 
