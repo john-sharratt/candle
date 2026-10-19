@@ -213,12 +213,13 @@ pub use guest_stage_cpu::guest_stage;
 #[cfg(feature = "cuda")]
 pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,
-    forget_recent_tiers, freeze_dense, held_ground_sites, held_ground_stats, initial_weight_bytes,
-    kv_spare_regions, provision_held_ground, reclaim_empty_arenas, reclaim_load_headroom,
-    region_stats, set_ground_broker, set_kv_free_target, set_prompts_waiting, set_weight_floor,
-    settle_held_ground, span_end, span_layout, span_partition, span_partition_now,
-    span_region_refusal, spare_tally, weight_capacity_bytes, weight_floor_after, RegionStats,
-    SpanClaims, SpanLayout, SpanPartition, SpanRegion, REGION_BYTES,
+    forget_recent_tiers, freeze_dense, held_ground_sites, held_ground_stats, held_ground_top_rank,
+    initial_weight_bytes, kv_spare_regions, provision_held_ground, reclaim_empty_arenas,
+    reclaim_load_headroom, region_stats, set_ground_broker, set_kv_free_target,
+    set_prompts_waiting, set_weight_floor, settle_held_ground, span_end, span_layout,
+    span_partition, span_partition_now, span_region_refusal, spare_tally, weight_capacity_bytes,
+    weight_floor_after, RegionStats, SpanClaims, SpanLayout, SpanPartition, SpanRegion,
+    REGION_BYTES,
 };
 pub use region_runs::{runs_from, RegionRun};
 #[cfg(feature = "cuda")]

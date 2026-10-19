@@ -298,6 +298,16 @@ impl SpanHeldGround {
         stats_of(&self.lock())
     }
 
+    /// The highest region the held arenas stand on — whether held ground is what
+    /// holds the arena frontier.
+    pub(crate) fn top_rank(&self) -> Option<usize> {
+        self.lock()
+            .arenas
+            .iter()
+            .flat_map(|a| a.regions.iter().map(|r| r.index()))
+            .max()
+    }
+
     /// Every holder's account, the largest live holder first.
     pub(crate) fn sites(&self) -> Vec<HeldSite> {
         self.lock().ledger.sites()
