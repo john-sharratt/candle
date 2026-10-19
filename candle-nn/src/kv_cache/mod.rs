@@ -104,9 +104,9 @@ pub use chunked::{
 #[cfg(feature = "cuda")]
 pub use chunked::{
     empty_sweep_stats, forget_recent_tiers, held_ground_sites, held_ground_stats,
-    provision_held_ground, reclaim_empty_arenas, region_stats, settle_held_ground, span_partition,
-    span_partition_now, spare_tally, vram_bands, RegionStats, SpanPartition, VramBands,
-    REGION_BYTES,
+    held_ground_top_rank, provision_held_ground, reclaim_empty_arenas, region_stats,
+    settle_held_ground, span_partition, span_partition_now, spare_tally, vram_bands, RegionStats,
+    SpanPartition, VramBands, REGION_BYTES,
 };
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]

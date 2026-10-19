@@ -387,16 +387,36 @@ impl Scheduler {
             (s.live_watermark, s.live_watermark.saturating_sub(s.live))
         });
         let top = frontier.checked_sub(1);
-        let holder = if top.is_some() && self.session.kv_top_rank() == top {
+        let ordinal = match self.session.device().location() {
+            candle::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
+            _ => None,
+        };
+        let held_top = ordinal.and_then(candle_nn::kv_cache::held_ground_top_rank);
+        let holder = if top.is_none() {
+            "nothing"
+        } else if self.session.kv_top_rank() == top {
             "the KV pools"
+        } else if held_top == top {
+            "held ground"
         } else {
             candle_nn::kv_cache::SlotTenant::ALL
                 .iter()
-                .find(|&&t| {
-                    top.is_some()
-                        && candle_nn::kv_cache::arena_top_rank(self.session.device(), t) == top
-                })
-                .map_or("held ground", |t| t.label())
+                .find(|&&t| candle_nn::kv_cache::arena_top_rank(self.session.device(), t) == top)
+                .map_or("unaccounted", |t| t.label())
+        };
+        // Held ground is raw ranges, not slots a pass can move: what holds it is
+        // the call sites, the largest three.
+        let held_sites = if holder == "held ground" {
+            ordinal
+                .and_then(candle_nn::kv_cache::held_ground_sites)
+                .unwrap_or_default()
+                .iter()
+                .take(3)
+                .map(|s| format!("{}={}MiB/{}", s.site, s.live_bytes >> 20, s.live_count))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            String::new()
         };
         tracing::info!(
             target: "candle_conversation::scheduler::vram_relief",
@@ -405,6 +425,7 @@ impl Scheduler {
             frontier_regions = frontier,
             hole_regions = holes,
             holder,
+            held_sites = %held_sites,
             "lowered the arena frontier for a refused tier"
         );
         gained

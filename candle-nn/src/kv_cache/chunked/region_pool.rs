@@ -3272,6 +3272,13 @@ pub fn held_ground_stats(ordinal: usize) -> Option<HeldStats> {
     map.get(&ordinal).map(|pool| pool.held.stats())
 }
 
+/// The highest region a device's held ground stands on, or `None` when it holds
+/// no arena (or has no reservation yet).
+pub fn held_ground_top_rank(ordinal: usize) -> Option<usize> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ordinal).and_then(|pool| pool.held.top_rank())
+}
+
 /// `device`'s held ground, or `None` if it has no reservation yet. Cloned out of
 /// the pools lock, which provisioning takes again to claim and release regions.
 fn held_ground_of(device: &candle::CudaDevice) -> Option<Arc<SpanHeldGround>> {

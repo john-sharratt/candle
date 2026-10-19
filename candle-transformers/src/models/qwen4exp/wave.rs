@@ -35,10 +35,10 @@ use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::{DType, Device, LiveTensor, Result, Tensor};
 use candle_kernels::simple::qsa_topk::MAX_KEEP;
 use candle_nn::kv_cache::{
-    arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype,
-    plan_wave_transient, region_stats, DeltaNetWidths, HyperWidths, KvCache, LayerPhase,
-    ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds, SharedExpertWidths, SlotTenant,
-    SpanRegion, WavePlan, WaveWidth, REGION_BYTES, WAVE_SPAN_BYTES,
+    arena_regions, begin_forward, begin_wave, end_wave_transient, ffn_work_dtype, plan_slot_moves,
+    plan_wave_transient, region_stats, relocate_tensor, ArenaSlot, DeltaNetWidths, HyperWidths,
+    KvCache, LayerPhase, ModelGeometry, PrefillKvStageLayout, PrefillLaunchBounds,
+    SharedExpertWidths, SlotTenant, SpanRegion, WavePlan, WaveWidth, REGION_BYTES, WAVE_SPAN_BYTES,
 };
 
 use super::kv_row::kv_factors_for;
@@ -1650,12 +1650,67 @@ impl Qwen4ExpBatched {
             &self.model.device,
             max_moves,
         )?;
+        let (planned, moved) = self.compact_carried(max_moves)?;
+        // The carried buffers share the GDN state's tenant, so its region count
+        // (read after both passes) already covers them.
+        let regions_after =
+            arena_regions(&self.model.device, SlotTenant::RecurrentState) + qsa.regions_after;
         Ok(RecurrentCompaction {
-            planned: gdn.planned + qsa.planned,
-            moved: gdn.moved + qsa.moved,
+            planned: gdn.planned + qsa.planned + planned,
+            moved: gdn.moved + qsa.moved + moved,
             regions_before: gdn.regions_before + qsa.regions_before,
-            regions_after: gdn.regions_after + qsa.regions_after,
+            regions_after,
         })
+    }
+
+    /// Compact the buffers a sequence carries beside its GDN state in the same
+    /// tenant — the PLE block's conv histories and the draft head's seeds — each
+    /// geometry's pool by its own pass, every holder relocated through
+    /// [`relocate_tensor`]. Answers the moves planned and made.
+    ///
+    /// **They pin the frontier as surely as a state block.** They are claimed at
+    /// their own strides, so the GDN pass, keyed by the state block's, never plans
+    /// a move for them: on WhiteWorld (a09d18907, 2026-10-19) recurrent state held
+    /// the top region over 17 to 27 holes for forty seconds with no sweep in
+    /// flight and no store open, every lowering gaining nothing. A holder a
+    /// snapshot still shares keeps its old slot alive until the snapshot goes,
+    /// which costs reclaim, never correctness.
+    fn compact_carried(&self, max_moves: usize) -> Result<(usize, usize)> {
+        let poisoned = || candle::Error::Msg("qwen4exp: carried-state lock poisoned".into());
+        let mut ple = self.ple.write().map_err(|_| poisoned())?;
+        let mut seeds = self.seeds.write().map_err(|_| poisoned())?;
+        let mut spares = self.seed_spares.write().map_err(|_| poisoned())?;
+        let mut holders: Vec<&mut Tensor> = ple
+            .values_mut()
+            .flat_map(|s| std::iter::once(&mut s.conv_hist).chain(s.spare_hist.as_mut()))
+            .chain(seeds.values_mut())
+            .chain(spares.values_mut())
+            .collect();
+        let mut sizes: Vec<usize> = holders
+            .iter()
+            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+            .collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        let (mut planned, mut moved) = (0usize, 0usize);
+        for bytes in sizes {
+            let moves = plan_slot_moves(
+                &self.model.device,
+                SlotTenant::RecurrentState,
+                bytes,
+                max_moves,
+            )?;
+            planned += moves.len();
+            let mut by_source: HashMap<u64, ArenaSlot> =
+                moves.into_iter().map(|m| (m.src, m.dst)).collect();
+            for t in holders
+                .iter_mut()
+                .filter(|t| t.elem_count() * t.dtype().size_in_bytes() == bytes)
+            {
+                moved += usize::from(relocate_tensor(t, &mut by_source)?);
+            }
+        }
+        Ok((planned, moved))
     }
 
     /// What admitting **one** more sequence costs in carried state.
