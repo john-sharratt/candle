@@ -614,12 +614,49 @@ impl Registry {
     }
 }
 
+/// The prefill a turn brings, in tokens, as the gateway reckons it: a
+/// request carries only its new message, and the prompt a member prefills is
+/// what its projection makes of the conversation — a figure the gateway does
+/// not see. The same for every member, so it weighs each one's backlog and
+/// prefill rate alike.
+pub const NOMINAL_PROMPT_TOKENS: u64 = 2048;
+
+/// The reply a turn decodes, in tokens, as the gateway reckons it.
+pub const NOMINAL_REPLY_TOKENS: u64 = 512;
+
 /// The best of `ready` (§5.3): among those with room, or among them all when
-/// none has, the largest share by [`rank`].
+/// none has — the soonest finish when every one of them has said what a turn
+/// costs it ([`finish_us`]), otherwise the largest share by [`rank`].
 fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
     let roomy: Vec<&MemberView> = ready.iter().copied().filter(|m| has_room(m)).collect();
     let pool = if roomy.is_empty() { ready } else { roomy };
-    pool.into_iter().max_by(|a, b| rank(a, b)).map(|m| m.node)
+    let finishes: Option<Vec<(u64, &MemberView)>> =
+        pool.iter().map(|m| finish_us(m).map(|f| (f, *m))).collect();
+    match finishes {
+        Some(f) if !f.is_empty() => f
+            .into_iter()
+            .min_by(|(fa, a), (fb, b)| fa.cmp(fb).then(rank(b, a)))
+            .map(|(_, m)| m.node),
+        _ => pool.into_iter().max_by(|a, b| rank(a, b)).map(|m| m.node),
+    }
+}
+
+/// When a turn placed on `m` now would finish, in microseconds from now, by
+/// what it says a turn costs it (`docs/cooperative_admission.md` §2.1, §3
+/// "earliest advertised finish"): the prefill already queued there, the
+/// turns handed to it and not yet in its queue, and this one, at its
+/// prefill rate; then the reply at the decode step one more row gives it.
+/// `None` until it has learned both rates — a member is never placed by
+/// figures it has not measured.
+fn finish_us(m: &MemberView) -> Option<u64> {
+    let c = capacity_of(m);
+    if c.prefill_tok_s == 0 || c.decode_step_next_us == 0 {
+        return None;
+    }
+    let tokens =
+        u64::from(c.prefill_backlog) + (u64::from(m.in_flight) + 1) * NOMINAL_PROMPT_TOKENS;
+    let prefill_us = tokens * 1_000_000 / u64::from(c.prefill_tok_s);
+    Some(prefill_us + NOMINAL_REPLY_TOKENS * u64::from(c.decode_step_next_us))
 }
 
 fn capacity_of(m: &MemberView) -> &Capacity {

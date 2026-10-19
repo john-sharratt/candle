@@ -58,7 +58,7 @@ use agent::config::AgentConfig;
 use agent::jobs::Jobs;
 use agent::member::{node_in, Agent, APP as AGENT_APP};
 use axum::Router;
-use candle_conversation::phase_ring::latest_wave;
+use candle_conversation::phase_ring::{latest_wave, learned_rates};
 use cluster::dispatch::RouteTable;
 use cluster::frame::{BuildId, ModelId, RepoAd};
 use cluster::handshake::GroupKey;
@@ -75,7 +75,7 @@ use zend_vfs::sandbox::programs::policy;
 use zend_vfs::Priority;
 
 use candle::gpu_poison::device_failing;
-use capacity::{capacity, member_state, Wave};
+use capacity::{capacity, member_state, Rates, Wave};
 use in_flight::InFlight;
 
 use crate::telemetry::Telemetry;
@@ -362,7 +362,11 @@ impl Cluster {
                     used_mib: w.sample.used_mib,
                     budget_mib: w.sample.budget_mib,
                 });
-                capacity(state, telemetry.capacity(), wave, measure())
+                let rates = learned_rates().map(|(r, _)| Rates {
+                    prefill_tok_s: r.prefill_tok_s,
+                    decode_step_next_ms: r.decode_step_ms_plus_one,
+                });
+                capacity(state, telemetry.capacity(), wave, rates, measure())
             }),
             replication,
             Instant::now(),

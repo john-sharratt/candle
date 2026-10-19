@@ -348,6 +348,50 @@ fn a_released_key_goes_to_a_member_holding_its_last_turn() {
     );
 }
 
+/// Set node `n`'s learned rates, its backlog and its decodes on `r`.
+fn learned(r: &mut Registry, n: u64, power: u32, backlog: u32, prefill_tok_s: u32, next_us: u32) {
+    r.capacity(
+        "zend",
+        n,
+        Capacity {
+            prefill_backlog: backlog,
+            prefill_tok_s,
+            decode_step_next_us: next_us,
+            ..capacity(MemberState::Ready, power, true, 4)
+        },
+    );
+}
+
+/// **With every member's rates learned, a turn goes where it finishes
+/// soonest** (`docs/cooperative_admission.md` §2.1): the fast prefiller with
+/// a backlog against the slower one with none, decided by the arithmetic,
+/// not by power. A turn handed to a member counts as backlog until its next
+/// `CAPACITY`. One member that has learned nothing yet puts the whole pick
+/// back on power.
+#[test]
+fn a_turn_goes_where_it_finishes_soonest() {
+    let mut r = three();
+    // Node 1: 4,000 tok/s with 20,000 queued → (20,000 + 2,048) / 4,000 =
+    // 5.51 s, then 512 × 20 ms = 10.24 s: 15.75 s.
+    learned(&mut r, 1, 100, 20_000, 4_000, 20_000);
+    // Node 2: 2,000 tok/s, nothing queued → 1.02 s, then 512 × 40 ms =
+    // 20.48 s: 21.50 s — the most power, the slowest reply.
+    learned(&mut r, 2, 300, 0, 2_000, 40_000);
+    // Node 3: 1,000 tok/s, nothing queued → 2.05 s, then 512 × 25 ms = 12.8 s:
+    // 14.85 s.
+    learned(&mut r, 3, 200, 0, 1_000, 25_000);
+    assert_eq!(best(&mut r), Pick::Member(3));
+    // A turn handed to node 3 is 2,048 more tokens there: 16.90 s, and node 1
+    // is now the soonest.
+    r.begin("zend", 3);
+    assert_eq!(best(&mut r), Pick::Member(1));
+
+    // Node 2 has not learned a decode yet: every member goes back to power
+    // per request — 100, 300, 200/2.
+    learned(&mut r, 2, 300, 0, 2_000, 0);
+    assert_eq!(best(&mut r), Pick::Member(2));
+}
+
 /// The canary takes a key let go only once it holds the last holder's writes.
 #[test]
 fn a_canary_lacking_the_last_turn_is_not_handed_the_key() {

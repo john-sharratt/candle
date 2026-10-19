@@ -9,6 +9,10 @@
 //!   wave for [`QUIET`] has nothing in hand, and is idle.
 //! - **`slots_free`** is how many more residences of the newest wave's average
 //!   size fit in what its budget left.
+//! - **`prefill_tok_s`** and **`decode_step_next_us`** are what the scheduler
+//!   has learned a turn costs it — the gateway places a turn where it would
+//!   finish soonest (`docs/cooperative_admission.md` §2.1); zero until it has
+//!   learned them.
 
 use cluster::frame::{Capacity, MemberState};
 use cluster::machine::Machine;
@@ -30,6 +34,16 @@ pub struct Wave {
     pub budget_mib: u64,
 }
 
+/// What the scheduler has learned a turn costs it now, as capacity reads it
+/// (`docs/cooperative_admission.md` §2.1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rates {
+    /// Prefill rate at the width the scheduler runs, tokens a second.
+    pub prefill_tok_s: f64,
+    /// The decode step with one row more than it decodes, milliseconds.
+    pub decode_step_next_ms: f64,
+}
+
 /// What `CAPACITY`'s state says: faulted while the device cannot take a turn
 /// (`candle::gpu_poison::device_failing`) — a poisoned context, or every
 /// operation out of memory — whatever the tenant reports, so the gateways
@@ -48,8 +62,12 @@ pub fn capacity(
     state: MemberState,
     card: CardReading,
     wave: Option<Wave>,
+    rates: Option<Rates>,
     machine: Machine,
 ) -> Capacity {
+    // What the scheduler learned stands while it is quiet: a rate is the
+    // card's, not the window's. Only a rate it has actually measured is said.
+    let rates = rates.filter(|r| r.prefill_tok_s >= 1.0 && r.decode_step_next_ms > 0.0);
     let power = match card.peak_decode_tps {
         Some(tps) if tps >= 1.0 => tps.round() as u32,
         _ => card.vram_total_mib.map_or(0, |m| (m / 100) as u32),
@@ -84,6 +102,14 @@ pub fn capacity(
         // A model member runs no jobs; its host's agent, when it has one,
         // reports its own capacity.
         low_priority: false,
+        prefill_tok_s: rates.map_or(0, |r| {
+            r.prefill_tok_s.round().min(f64::from(u32::MAX)) as u32
+        }),
+        decode_step_next_us: rates.map_or(0, |r| {
+            (r.decode_step_next_ms * 1000.0)
+                .round()
+                .min(f64::from(u32::MAX)) as u32
+        }),
     }
 }
 
@@ -133,9 +159,9 @@ mod tests {
     /// 100 before.
     #[test]
     fn power_is_the_peak_decode_rate_or_the_card() {
-        let c = capacity(MemberState::Ready, card(Some(171.6)), None, machine());
+        let c = capacity(MemberState::Ready, card(Some(171.6)), None, None, machine());
         assert_eq!(c.power, 172);
-        let c = capacity(MemberState::Loading, card(None), None, machine());
+        let c = capacity(MemberState::Loading, card(None), None, None, machine());
         assert_eq!((c.power, c.state), (737, MemberState::Loading));
         assert_eq!((c.vram_free_mib, c.cores, c.load_milli), (4_096, 16, 1_250));
         assert_eq!((c.os.as_str(), c.mem_free_mib), ("linux", 20_000));
@@ -146,7 +172,7 @@ mod tests {
     /// said. Free slots are the room left over the average residence.
     #[test]
     fn idle_reads_the_newest_wave() {
-        let at = |w: Wave| capacity(MemberState::Ready, card(None), Some(w), machine());
+        let at = |w: Wave| capacity(MemberState::Ready, card(None), Some(w), None, machine());
         let busy = at(wave(1.0, 3, 8_000));
         assert_eq!(
             (busy.idle, busy.prefill_backlog, busy.decodes),
@@ -163,7 +189,41 @@ mod tests {
             (quiet.idle, quiet.decodes, quiet.prefill_backlog),
             (true, 0, 0)
         );
-        let never = capacity(MemberState::Ready, card(None), None, machine());
+        let never = capacity(MemberState::Ready, card(None), None, None, machine());
         assert_eq!((never.idle, never.slots_free), (true, 0));
+    }
+
+    /// **What a turn costs is said once it is learned**, in the frame's units —
+    /// tokens a second, and the one-more-row decode step in microseconds —
+    /// and stays said while the scheduler is quiet. Nothing learned, or a rate
+    /// of nothing, says zero: the gateway does not place by it.
+    #[test]
+    fn learned_rates_are_said_in_the_frames_units() {
+        let learned = Rates {
+            prefill_tok_s: 2_302.6,
+            decode_step_next_ms: 41.53,
+        };
+        let c = capacity(
+            MemberState::Ready,
+            card(None),
+            Some(wave(9.0, 0, 0)),
+            Some(learned),
+            machine(),
+        );
+        assert_eq!((c.prefill_tok_s, c.decode_step_next_us), (2_303, 41_530));
+        let none = capacity(MemberState::Ready, card(None), None, None, machine());
+        assert_eq!((none.prefill_tok_s, none.decode_step_next_us), (0, 0));
+        let unmeasured = Rates {
+            prefill_tok_s: 0.0,
+            decode_step_next_ms: 41.5,
+        };
+        let c = capacity(
+            MemberState::Ready,
+            card(None),
+            None,
+            Some(unmeasured),
+            machine(),
+        );
+        assert_eq!((c.prefill_tok_s, c.decode_step_next_us), (0, 0));
     }
 }

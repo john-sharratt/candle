@@ -139,8 +139,10 @@ async fn a_forged_member_proof_is_closed_4401_by_the_gateway() {
 
 #[tokio::test]
 async fn another_protocol_version_is_closed_4426() {
+    // A member a build behind the gateway: the case a cut-over meets.
+    let older = PROTO - 1;
     let mut h = hello(5);
-    h.proto = 2;
+    h.proto = older;
     let (m, g) = run(key(), key(), h, |_| panic!("never admitted")).await;
     let Err(HandshakeError::Closed(close)) = m else {
         panic!("{m:?}")
@@ -148,7 +150,7 @@ async fn another_protocol_version_is_closed_4426() {
     assert_eq!(close.code, 4426);
     assert_eq!(
         close.reason,
-        "protocol 2 is not supported; this gateway speaks 1"
+        format!("protocol {older} is not supported; this gateway speaks {PROTO}")
     );
     assert!(matches!(g, Err(HandshakeError::Refused(c)) if c.code == 4426));
 }

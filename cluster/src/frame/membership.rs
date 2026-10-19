@@ -51,6 +51,14 @@ pub struct Capacity {
     /// below normal priority, and it is chosen only when no dedicated agent
     /// can take a job.
     pub low_priority: bool,
+    /// What one more turn would cost a model member now, from what its own
+    /// scheduler has learned (`docs/cooperative_admission.md` §2.1): its
+    /// prefill rate at the width it runs, tokens a second, and its decode
+    /// step with one row more than it decodes, in microseconds. Both zero
+    /// until it has learned from a prefill and a decode — and always for an
+    /// agent.
+    pub prefill_tok_s: u32,
+    pub decode_step_next_us: u32,
 }
 
 impl Capacity {
@@ -70,7 +78,9 @@ impl Capacity {
             .list(&self.toolchains, |w, t| {
                 w.str(t);
             })
-            .bool(self.low_priority);
+            .bool(self.low_priority)
+            .u32(self.prefill_tok_s)
+            .u32(self.decode_step_next_us);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -89,6 +99,8 @@ impl Capacity {
             jobs: r.u32()?,
             toolchains: r.list(|r| r.str())?,
             low_priority: r.bool()?,
+            prefill_tok_s: r.u32()?,
+            decode_step_next_us: r.u32()?,
         })
     }
 

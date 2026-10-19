@@ -94,6 +94,16 @@ The gateway compares these numbers and nothing else. It models nothing of a
 member's insides; the member that knows its card is the one that says what
 the card can do.
 
+How it is built (protocol 2): `CAPACITY` carries `prefill_backlog` (queued
+prompt tokens), `prefill_tok_s` and `decode_step_next_us`. The last two are
+what the member's admission has learned (`phase_ring::learned_rates`): the
+prefill rate at the width it runs, and the decode step with one more row. The
+gateway's `Best` estimates each candidate's finish for a nominal turn: the
+backlog, plus 2,048 tokens per request in flight and for this one, at the
+prefill rate; then 512 tokens at the one-more-row step. It picks the soonest
+(`gateway/registry.rs`, `finish_us`). Until every candidate has learned both
+rates, it ranks by power per request as before.
+
 ### 2.2 A lease per turn, placed among the replicated
 
 A conversation's lease (its claim, §5.4 of `replicated_substrate.md`) is held

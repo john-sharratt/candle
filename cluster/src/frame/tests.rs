@@ -207,6 +207,8 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 jobs: 2,
                 toolchains: vec!["cargo".into(), "npm".into()],
                 low_priority: true,
+                prefill_tok_s: 2300,
+                decode_step_next_us: 41_500,
             }),
             B::header(11, 0, 0)
                 .u8(0)
@@ -225,6 +227,8 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .s("cargo")
                 .s("npm")
                 .u8(1)
+                .u32(2300)
+                .u32(41_500)
                 .0,
         ),
         (

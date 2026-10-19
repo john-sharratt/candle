@@ -975,7 +975,7 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 |---|---|---|
 | `HELLO` `CHALLENGE` `PROVE` `ADMIT` | §3.3 | control |
 | `MEMBERS` | `{ epoch, members: [{node, host, app, build, weight, state, high_water}] }` — sent on every change and every 5 s; `high_water` is each member's own highest `oseq`, so any member can see that an origin has written something it does not hold (§7.1) | control |
-| `CAPACITY` | `{ state, power, idle, slots_free, decodes, prefill_backlog, vram_free_mib, cores, load }` every 1 s or on change | control |
+| `CAPACITY` | `{ state, power, idle, slots_free, decodes, prefill_backlog, vram_free_mib, cores, load, …, prefill_tok_s, decode_step_next_us }` every 1 s or on change | control |
 | `PING` / `PONG` | 8-byte nonce | control |
 | `ROUTES` | the member's dispatch table (§5.2) | control |
 | `CLAIM` / `UNCLAIM` | `{ key, epoch }` / `{ key, epoch, through }` — this member serves `key` (a sticky key or a lease), or has let it go with its own `oseq` at `through` (§5.4, §9) | control |
@@ -1022,7 +1022,7 @@ misread, and on an admitted socket closes it 4400.
 | `PROVE` | 3 | `[32] proof` |
 | `ADMIT` | 4 | `u64 session` · `list<member>` · `list<claim>` · `u32 floor_count` · `str floor_hash` · `bool routes_wanted` · `u64 own_applied_through` |
 | `MEMBERS` | 10 | `u64 epoch` · `list<member>` |
-| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` |
+| `CAPACITY` | 11 | `u8 state` · `u32 power` · `bool idle` · `u32 slots_free` · `u32 decodes` · `u32 prefill_backlog` · `u32 vram_free_mib` · `u16 cores` · `u32 load_milli` · `str os` · `u32 mem_free_mib` · `u32 jobs` · `list<str> toolchains` · `bool low_priority` · `u32 prefill_tok_s` · `u32 decode_step_next_us` (protocol 2) |
 | `PING` / `PONG` | 12 / 13 | `[8] nonce` |
 | `ROUTES` | 14 | `blob table` (§5.2's encoding) |
 | `CLAIM` | 15 | `blob key` · `epoch` |
@@ -1329,6 +1329,22 @@ calibration pass — is not a request and does not count: the dialogue a request
 decodes at `High` priority, 64 shares to background work's one (`DecodePriority`). So the strongest member takes new conversations until its share per
 request falls to another's, and a burst spreads over the members as it arrives rather
 than all reading the same second-old `CAPACITY`. Agents rank by idle cores (§11.3).
+
+**Once every candidate has learned what a turn costs it, `Best` ranks by when the turn
+would finish instead** (`docs/cooperative_admission.md` §2.1, protocol 2). `CAPACITY`
+then also carries the member's **`prefill_tok_s`**, its prefill rate at the width its
+scheduler runs, and **`decode_step_next_us`**, its decode step with one row more than
+it decodes. Both come from the rates its admission learns from every forward. A turn's
+finish on a member is:
+
+- its `prefill_backlog`, plus a nominal prompt of 2,048 tokens for each request in
+  flight there and for this one, at `prefill_tok_s`;
+- then a nominal 512-token reply at `decode_step_next_us`.
+
+The nominal sizes are the same for every member: the gateway sees a request's new
+message, not the prompt a member's projection makes of the conversation. The soonest
+finish wins, among those with room. A member that has not yet learned both rates says
+zero, and while any candidate does, the pick falls back to power per request.
 
 ### 5.4 Affinity is a claim the member holds
 
