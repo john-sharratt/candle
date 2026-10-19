@@ -27,6 +27,7 @@ pub mod conv_files;
 pub mod conv_order;
 pub mod conv_overlay;
 pub mod conv_sweep;
+pub mod deletions;
 pub mod fast_path;
 pub mod ingest;
 pub mod ingest_backlog;

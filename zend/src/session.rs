@@ -77,6 +77,7 @@ use crate::conv_branches::{self, BaseBranches};
 use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
 use crate::conv_sweep::{self, Sweep, CONV_IDLE_TTL, CONV_SWEEP_EVERY};
+use crate::deletions::Deletions;
 use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
@@ -659,6 +660,9 @@ struct InferenceState {
     think_closer_phrase: Vec<u32>,
     /// Live OpenAI-passthrough conversations — see [`crate::passthrough`].
     passthrough: Arc<PassthroughCache>,
+    /// Moved by every conversation delete, so a reply running on the deleted
+    /// conversation ends mid-round rather than at its next one.
+    deletions: Deletions,
 }
 
 // The titler uses this plain system prompt (not the projection schema), so the
@@ -2769,6 +2773,7 @@ impl InferenceState {
             tool_stencil,
             think_steering,
             passthrough: PassthroughCache::new(),
+            deletions: Deletions::default(),
         });
         // The priming chain, read before `ready` and before the ingest worker's
         // first pass: the first question asked must already have it, and the
@@ -4061,12 +4066,35 @@ fn run_inference_stream(
             // The last "waiting for the GPU" status sent, so a wait reported
             // every second reaches the client only when its text changes.
             let mut last_queued: Option<String> = None;
+            // Set when the conversation is deleted while this round runs: the
+            // round ends where it stands and the handle goes with it, so the
+            // engine stops spending on a reply nobody can come back to.
+            let mut deleted = false;
+            let mut deletions = state.deletions.watch();
 
             // Scoped so the stream's borrow of `handle` ends with the loop —
             // `finish_turn` consumes the handle below.
             {
                 let mut events_in = std::pin::pin!(handle.stream_async());
-                while let Some(event) = events_in.next().await {
+                loop {
+                    let event = tokio::select! {
+                        event = events_in.next() => event,
+                        Ok(()) = deletions.changed() => {
+                            if state
+                                .engine
+                                .lock()
+                                .unwrap()
+                                .is_timeline_tombstoned(timeline)
+                            {
+                                deleted = true;
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let Some(event) = event else {
+                        break;
+                    };
                     match event {
                         TurnEvent::Token(id) => {
                             if turn_error.is_none() {
@@ -4252,6 +4280,18 @@ fn run_inference_stream(
                         _ => {}
                     }
                 }
+            }
+
+            if deleted {
+                tracing::info!(
+                    conv_id = %conv_id,
+                    iteration,
+                    "conversation deleted mid-round — ending the turn now",
+                );
+                // As a turn that ended without its Done: the scope it was given
+                // goes with it.
+                state.engine.lock().unwrap().clear_retrieval_scope(timeline);
+                break;
             }
 
             if listener_gone {
@@ -4953,9 +4993,26 @@ async fn passthrough_turn(
     let mut tokens: Vec<u32> = Vec::new();
     let mut emitted_len = 0usize;
     let mut done = None;
+    let mut deletions = state.deletions.watch();
+    let timeline = live.seq.timeline_id();
     {
         let mut stream = std::pin::pin!(handle.stream_async());
-        while let Some(event) = stream.next().await {
+        loop {
+            let event = tokio::select! {
+                event = stream.next() => event,
+                Ok(()) = deletions.changed() => {
+                    if state.engine.lock().unwrap().is_timeline_tombstoned(timeline) {
+                        // Deleted under the reply: dropping the handle withdraws it
+                        // from the engine, and the turn never seals.
+                        tracing::info!(key, "passthrough: conversation deleted mid-reply");
+                        return false;
+                    }
+                    continue;
+                }
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
                 TurnEvent::Token(id) => {
                     tokens.push(id);
@@ -6225,6 +6282,9 @@ impl ZendSession {
         let result = state.engine.lock().unwrap().tombstone_timeline(timeline);
         if result.is_ok() {
             state.conversations.lock().unwrap().remove(conv_id);
+            // After the tombstone, so a turn woken by it finds its timeline
+            // tombstoned.
+            state.deletions.deleted();
         }
         Some(result)
     }
