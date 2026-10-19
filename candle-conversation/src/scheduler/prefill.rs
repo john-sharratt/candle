@@ -538,20 +538,25 @@ impl Scheduler {
         if self.wave_rate.is_none() {
             return;
         }
-        let held: usize = self
-            .wave_prefill_members
+        // **At the width a placed turn would run at, not the width running
+        // now.** A forward streams its experts whatever its width, so the rate
+        // at a narrow width says almost nothing about the card under the load
+        // a placement sends it: on WhiteWorld (359d3bf58, 2026-10-19) a 177-row
+        // width read as 40 tok/s, the gateway priced every turn's prefill at
+        // that, and placed none here through two patterns. So the width is
+        // what this card has waiting to prefill — every admitted prefill's
+        // remaining rows and every queued turn's — and one turn more, at the
+        // gateway's own nominal prompt, up to the width admission would offer.
+        const NOMINAL_PROMPT_ROWS: usize = 2048;
+        let waiting: usize = self
+            .active_prefills
             .iter()
-            .map(|m| match m {
-                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
-                    *advance
-                }
-            })
+            .map(|p| p.work.tokens.len().saturating_sub(p.offset))
+            .chain(self.prefill_queue.iter().map(|w| w.tokens.len()))
             .sum();
-        let rows = if held > 0 {
-            held
-        } else {
-            self.prefill_pass_ceiling()
-        };
+        let rows = waiting
+            .saturating_add(NOMINAL_PROMPT_ROWS)
+            .min(self.prefill_pass_ceiling().max(1));
         let rate = self.wave_rate.as_ref().expect("checked above");
         let (learned, samples, decode_samples) =
             (rate.learned(rows), rate.samples(), rate.decode_samples());
