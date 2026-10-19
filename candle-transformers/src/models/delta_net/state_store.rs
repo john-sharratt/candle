@@ -93,7 +93,7 @@ fn release_readback_in(slot: &Mutex<Option<PinnedBuf>>) {
 use candle::{Device, Error, Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    arena_regions, claim_arena_slots, plan_slot_moves, slot_stride, ArenaSlot, SlotTenant,
+    arena_regions, claim_arena_slots, plan_slot_moves, slot_share_bytes, ArenaSlot, SlotTenant,
     SpanRegion, SLOT_ALIGN,
 };
 
@@ -1418,14 +1418,16 @@ impl RecurrentStateStore {
     /// throughput-worse on fifteen consecutive passes, seven turns queued
     /// behind it and 20 GiB standing free above the floor.
     ///
-    /// The price is the store's slots at their stride: one per DeltaNet layer,
-    /// each [`slot_stride`] of the layer's block (`s`, its conv tail and its
-    /// timeline, each on a 256-byte boundary) — exactly what
-    /// [`Self::reserved_bytes`] reports once the store stands. A prefilling
-    /// sequence holds [`Self::scratch_bytes_for`] more. The arenas those slots
-    /// live in are shared by every sequence of the geometry, so a region's unused
-    /// tail is not charged to any one of them. Nothing here reads the device, so
-    /// it answers on any backend and at any moment.
+    /// The price is the store's slots at what they claim: one per DeltaNet
+    /// layer, each the layer's block (`s`, its conv tail and its timeline, each
+    /// on a 256-byte boundary) at its [`slot_share_bytes`] — its share of the
+    /// region its arena stands on, the region's unused tail included. A
+    /// prefilling sequence holds [`Self::scratch_bytes_for`] more. Priced at the
+    /// stride instead, as [`Self::reserved_bytes`] reports a standing store, the
+    /// tails were ground every store claimed and no price carried: 8.0 % of each
+    /// recurrent-state region on Flash-Next, a cohort's two regions short at its
+    /// second window (see [`slot_share_bytes`]). Nothing here reads the device,
+    /// so it answers on any backend and at any moment.
     pub fn reserved_bytes_for(layer_kinds: &[LayerKind], dims: &DeltaNetDims) -> usize {
         #[cfg(feature = "cuda")]
         {
@@ -1433,7 +1435,7 @@ impl RecurrentStateStore {
                 .iter()
                 .filter(|k| **k == LayerKind::DeltaNet)
                 .count();
-            layers * slot_stride(state_block(dims).bytes)
+            layers * slot_share_bytes(state_block(dims).bytes)
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -1761,6 +1763,8 @@ mod tests {
     use crate::models::delta_net::mix::DeltaNetOut;
     #[cfg(feature = "cuda")]
     use crate::models::gpu_test_lock::gpu_serial;
+    #[cfg(feature = "cuda")]
+    use candle_nn::kv_cache::slot_stride;
 
     /// The wire bytes are each float's IEEE-754 little-endian image, in order.
     #[test]
@@ -2840,16 +2844,17 @@ mod tests {
 
     /// The whole point of the geometry price: it answers the same for a process
     /// holding no stores as for one holding a hundred, because it never looks at
-    /// them. Three DeltaNet layers, one 2,560 B slot each, is 7,680 B — and the
+    /// them. Three DeltaNet layers, one 2,560 B slot each: 6,553 slots to a
+    /// region, so each claims 2,561 B of it and the store 7,683 B — and the
     /// scratch a prefilling sequence adds is as much again.
     #[cfg(feature = "cuda")]
     #[test]
     fn a_store_is_priced_from_geometry_not_from_what_is_resident() {
         let priced = RecurrentStateStore::reserved_bytes_for(&kinds(), &dims());
-        assert_eq!(priced, 3 * 2560, "three slots");
+        assert_eq!(priced, 3 * 2561, "three slots at their share of a region");
         assert_eq!(
             RecurrentStateStore::scratch_bytes_for(&kinds(), &dims()),
-            3 * 2560
+            3 * 2561
         );
 
         // Nothing in the call depends on a store existing, so building some

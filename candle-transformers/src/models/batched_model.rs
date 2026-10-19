@@ -414,12 +414,16 @@ pub trait BatchedModelCore {
     /// 12-row cohort fitted at 32 MiB, its window placing 80 MiB, 35.6 MB of
     /// it the forward phase).
     ///
-    /// `decodes` are the decode rows co-batched in the same step: each is a
-    /// row in the trunk's phases and a row the head scores. A creep step
-    /// carries the running decodes beside its window, and the head scores
-    /// them with the members the final window finishes; priced as prefill
-    /// alone, a cohort's tier came out a region short at exactly that window
-    /// (3090, 2026-10-18 and 19 — cursor 47 of 48, five runs).
+    /// `decode_stage` is the decodes co-batched in the same step, as each
+    /// one's `(sequence, position)`: each is a row in the trunk's phases and a
+    /// row the head scores. A creep step carries the running decodes beside its
+    /// window, and the head scores them with the members the final window
+    /// finishes; priced as prefill alone, a cohort's tier came out a region
+    /// short at exactly that window (3090, 2026-10-18 and 19 — cursor 47 of 48,
+    /// five runs). And each carves its selection over its own live index at its
+    /// own depth, as a stage does: priced as a bare row count, a cohort beside
+    /// seven deep decodes fitted a nine-region tier its window placed at
+    /// thirteen (WhiteWorld, 98860c583, 2026-10-19).
     ///
     /// **The same function the tier is actually placed from**, not an estimate
     /// of it: admission judges an offer on the residency it dislodges, and the
@@ -439,7 +443,7 @@ pub trait BatchedModelCore {
         _stage_q_lens: &[usize],
         _stage_offsets: &[usize],
         _stage_seqs: &[usize],
-        _decodes: usize,
+        _decode_stage: &[(usize, usize)],
         _act_dtype: DType,
     ) -> Option<u64> {
         None

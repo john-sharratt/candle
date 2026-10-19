@@ -16244,7 +16244,7 @@ mod tests {
         let tier = |n: usize| {
             sched
                 .model
-                .wave_tier_bytes(chunk, n, &[], &[], &[], 0, dtype)
+                .wave_tier_bytes(chunk, n, &[], &[], &[], &[], dtype)
                 .unwrap_or(0)
         };
         let join_price: Vec<u64> = (0..=members)

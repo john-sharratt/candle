@@ -381,10 +381,30 @@ impl Scheduler {
             }
         }
         let gained = gap(self).saturating_sub(start);
+        // Who stands on the frontier's top region after the pass — the tenant a
+        // pass that gained nothing could not move — and the holes under it.
+        let (frontier, holes) = self.session.kv_region_stats().map_or((0, 0), |s| {
+            (s.live_watermark, s.live_watermark.saturating_sub(s.live))
+        });
+        let top = frontier.checked_sub(1);
+        let holder = if top.is_some() && self.session.kv_top_rank() == top {
+            "the KV pools"
+        } else {
+            candle_nn::kv_cache::SlotTenant::ALL
+                .iter()
+                .find(|&&t| {
+                    top.is_some()
+                        && candle_nn::kv_cache::arena_top_rank(self.session.device(), t) == top
+                })
+                .map_or("held ground", |t| t.label())
+        };
         tracing::info!(
             target: "candle_conversation::scheduler::vram_relief",
             short_mib = short >> 20,
             gained_mib = gained >> 20,
+            frontier_regions = frontier,
+            hole_regions = holes,
+            holder,
             "lowered the arena frontier for a refused tier"
         );
         gained
@@ -2911,6 +2931,7 @@ impl Scheduler {
         };
         let kv_row = self.model.kv_bytes_per_row(dtype).unwrap_or(0);
         let ground = ground.saturating_sub(self.sweep_forecast.withheld_bytes(kv_row));
+        let decode_stage = self.decode_stage();
         let advance = |m: &WaveMember| match m {
             WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => *advance,
         };
@@ -2929,7 +2950,7 @@ impl Scheduler {
                 &q_lens,
                 &offsets,
                 &seqs,
-                self.decode_width(),
+                &decode_stage,
                 dtype,
             ) else {
                 return;

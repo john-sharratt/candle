@@ -195,6 +195,18 @@ impl Scheduler {
         self.active_decodes.values().filter(|s| !s.finished).count()
     }
 
+    /// The decodes [`Self::decode_width`] counts, as a tier is priced over them:
+    /// each one's sequence and the position its next row stands at. A decode's
+    /// selection carve follows its depth and its live index, so the count alone
+    /// under-prices a step beside deep conversations.
+    pub(super) fn decode_stage(&self) -> Vec<(usize, usize)> {
+        self.active_decodes
+            .iter()
+            .filter(|(_, s)| !s.finished)
+            .map(|(id, _)| (id.0, self.session.sequence_offset(id.0).unwrap_or(0)))
+            .collect()
+    }
+
     /// Active *foreground* decode sequences — excludes compression passes.
     ///
     /// Count the active foreground dialogue decodes that feed the

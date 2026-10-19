@@ -74,6 +74,21 @@ pub fn slot_stride(bytes: usize) -> usize {
     bytes.next_multiple_of(SLOT_ALIGN)
 }
 
+/// What one slot of a block of `bytes` costs the span: its share of the region its
+/// arena claims, the region's unused tail included.
+///
+/// Not [`slot_stride`]. An arena is a whole region and holds `REGION_BYTES / stride`
+/// slots, so the tail the last slot leaves is ground the tenant holds as surely as
+/// the slots — and priced at the stride, nobody paid for it. On Flash-Next that tail
+/// is 8.0 % of every recurrent-state region: on WhiteWorld (98860c583, 2026-10-19) a
+/// nine-member cohort's prefill scratch was priced at 1,192 MiB, claimed 81 regions
+/// (1,296 MiB) as it swept, and its second window was refused two regions short.
+#[cfg(feature = "cuda")]
+pub fn slot_share_bytes(bytes: usize) -> usize {
+    let per_arena = (REGION_BYTES / slot_stride(bytes)).max(1);
+    REGION_BYTES.div_ceil(per_arena)
+}
+
 /// How many of the topmost arenas a pass can empty, given each arena's `live`
 /// slots in span order and `capacity` slots per arena: the most `k` whose live
 /// slots fit in the free slots of the arenas below them, within `max_moves`
@@ -833,6 +848,23 @@ pub fn plan_slot_moves(
         .collect())
 }
 
+/// The highest region `tenant`'s arenas on `device` stand on, every stride
+/// together — whether it is the tenant holding the arena frontier, and so the one
+/// a pass must move to lower it.
+#[cfg(feature = "cuda")]
+pub fn arena_top_rank(device: &Device, tenant: SlotTenant) -> Option<usize> {
+    let DeviceLocation::Cuda { gpu_id } = device.location() else {
+        return None;
+    };
+    pools()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((g, t, _), _)| *g == gpu_id && *t == tenant)
+        .filter_map(|(_, set)| set.ranks().max())
+        .max()
+}
+
 /// Regions `tenant`'s arenas on `device` hold, every stride together — what that
 /// tenant denies the rest of the span.
 #[cfg(feature = "cuda")]
@@ -957,6 +989,19 @@ mod tests {
         assert_eq!(stride, 3_268_608);
         let set = StrideArenas::<Fake>::new(stride, REGION).unwrap();
         assert_eq!(set.capacity(), 5);
+    }
+
+    /// With its timeline the block is 3,859,968 B and four fit a region, so each
+    /// slot claims a quarter of it — 4 MiB, not the 3.68 MiB stride — and a store
+    /// priced at the stride ran 8 % short of the regions it claimed.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_slot_claims_its_share_of_the_region() {
+        let block = 3_859_968;
+        assert_eq!(slot_stride(block), block);
+        assert_eq!(slot_share_bytes(block), REGION / 4);
+        // A region the stride divides exactly leaves no tail to share.
+        assert_eq!(slot_share_bytes(REGION / 8), REGION / 8);
     }
 
     /// A gallery page — 32 tokens of 24 folded words — is 6 KiB, and a region holds

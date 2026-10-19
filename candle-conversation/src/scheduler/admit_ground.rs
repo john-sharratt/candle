@@ -977,7 +977,7 @@ impl Scheduler {
                 &[],
                 &[],
                 &[],
-                self.decode_width(),
+                &self.decode_stage(),
                 self.session.activation_dtype(),
             )
             .unwrap_or(0)
@@ -1140,7 +1140,7 @@ impl Scheduler {
                 &wave.advances,
                 &wave.depths,
                 &wave.stage_seqs,
-                self.decode_width(),
+                &self.decode_stage(),
                 self.session.activation_dtype(),
             )
             .unwrap_or(0)

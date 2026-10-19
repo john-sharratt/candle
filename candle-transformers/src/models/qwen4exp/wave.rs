@@ -2038,6 +2038,7 @@ impl Qwen4ExpBatched {
     /// the whole stack. What a turn's admission prices its chunks' tiers with,
     /// through the same `select_layer_bytes` the wave itself carves by (a sequence
     /// with no cache is priced there as one live tail from position zero).
+    #[cfg(not(feature = "cuda"))]
     fn fresh_qsa_bytes(&self, q_lens: &[usize], offsets: &[usize]) -> Result<usize> {
         // Ids no live sequence holds: slot ids are small indices.
         let seqs: Vec<usize> = (0..q_lens.len()).map(|i| usize::MAX - i).collect();
@@ -2254,9 +2255,12 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     /// the tier of its first.
     ///
     /// Priced through the same `select_layer_bytes` the wave places its tier
-    /// by, over fresh contiguous indexes ([`Self::fresh_qsa_bytes`]) — the shape
-    /// a sequence prefilling its whole prompt has. With no chunk list the rows
-    /// are priced as one chunk from position zero.
+    /// by, over every sequence the step carries: each running decode at its own
+    /// depth over its live index (`decode_stage`, the `(sequence, position)` of
+    /// each), then each stage over its own when it is named and over a fresh
+    /// contiguous index — the shape a sequence prefilling its whole prompt has —
+    /// when it is not. With no chunk list the rows are priced as one chunk from
+    /// position zero.
     // One wave's description: its rows and sequences, then each stage's length,
     // depth and sequence, and the decodes beside it.
     #[allow(clippy::too_many_arguments)]
@@ -2267,22 +2271,48 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         stage_q_lens: &[usize],
         stage_offsets: &[usize],
         stage_seqs: &[usize],
-        decodes: usize,
+        decode_stage: &[(usize, usize)],
         act_dtype: DType,
     ) -> Option<u64> {
         let geometry = self.wave_geometry(act_dtype);
+        let decodes = decode_stage.len();
         let (q_lens, offsets) = if stage_q_lens.is_empty() {
             (vec![rows], vec![0])
         } else {
             (stage_q_lens.to_vec(), stage_offsets.to_vec())
         };
-        // Over each named sequence's live index, as the step carves it; a
-        // sequence with no index yet is priced fresh inside the same walk.
+        // Over every sequence the step carries, as it carves them: the decodes
+        // first, a row each at its own depth and over its own live index, then
+        // the stages. A stage not named is priced fresh inside the same walk.
+        // The decodes are not optional: a decode deep in its context carves its
+        // selection over every candidate block it holds, and priced as a bare
+        // row count a nine-member cohort beside seven decodes fitted a
+        // nine-region tier its window placed at thirteen (WhiteWorld,
+        // 98860c583, 2026-10-19).
         #[cfg(feature = "cuda")]
-        let carve = if !stage_seqs.is_empty() && stage_seqs.len() == q_lens.len() {
-            self.wave_qsa_bytes(stage_seqs, &q_lens, &offsets, 0, self.model.cfg.num_layers)
-        } else {
-            self.fresh_qsa_bytes(&q_lens, &offsets)
+        let carve = {
+            let named = !stage_seqs.is_empty() && stage_seqs.len() == q_lens.len();
+            let seqs: Vec<usize> = decode_stage
+                .iter()
+                .map(|&(seq, _)| seq)
+                .chain((0..q_lens.len()).map(|i| {
+                    if named {
+                        stage_seqs[i]
+                    } else {
+                        // Ids no live sequence holds: slot ids are small indices.
+                        usize::MAX - i
+                    }
+                }))
+                .collect();
+            let lens: Vec<usize> = std::iter::repeat_n(1, decodes)
+                .chain(q_lens.iter().copied())
+                .collect();
+            let depths: Vec<usize> = decode_stage
+                .iter()
+                .map(|&(_, depth)| depth)
+                .chain(offsets.iter().copied())
+                .collect();
+            self.wave_qsa_bytes(&seqs, &lens, &depths, 0, self.model.cfg.num_layers)
         };
         #[cfg(not(feature = "cuda"))]
         let carve = {
