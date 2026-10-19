@@ -628,17 +628,48 @@ pub const NOMINAL_REPLY_TOKENS: u64 = 512;
 /// none has — the soonest finish when every one of them has said what a turn
 /// costs it ([`finish_us`]), otherwise the largest share by [`rank`].
 fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
+    // Every candidate as the pick saw it, for the placement line below.
+    let seen: Vec<String> = ready.iter().map(|m| placement_view(m)).collect();
     let roomy: Vec<&MemberView> = ready.iter().copied().filter(|m| has_room(m)).collect();
     let pool = if roomy.is_empty() { ready } else { roomy };
     let finishes: Option<Vec<(u64, &MemberView)>> =
         pool.iter().map(|m| finish_us(m).map(|f| (f, *m))).collect();
-    match finishes {
-        Some(f) if !f.is_empty() => f
-            .into_iter()
-            .min_by(|(fa, a), (fb, b)| fa.cmp(fb).then(rank(b, a)))
-            .map(|(_, m)| m.node),
-        _ => pool.into_iter().max_by(|a, b| rank(a, b)).map(|m| m.node),
-    }
+    let (by, pick) = match finishes {
+        Some(f) if !f.is_empty() => (
+            "finish",
+            f.into_iter()
+                .min_by(|(fa, a), (fb, b)| fa.cmp(fb).then(rank(b, a)))
+                .map(|(_, m)| m.node),
+        ),
+        _ => (
+            "power",
+            pool.into_iter().max_by(|a, b| rank(a, b)).map(|m| m.node),
+        ),
+    };
+    tracing::info!(
+        target: "cluster::gateway::placement",
+        picked = %pick.map_or_else(|| "none".to_string(), |n| format!("{n:016x}")),
+        by,
+        candidates = %seen.join("; "),
+        "placed"
+    );
+    pick
+}
+
+/// One candidate as a placement weighed it: its node, whether it had room,
+/// its requests in flight, the figures it advertised, and the finish they give.
+fn placement_view(m: &MemberView) -> String {
+    let c = capacity_of(m);
+    format!(
+        "{:016x} room={} in_flight={} backlog={} prefill_tok_s={} step_next_us={} finish_ms={}",
+        m.node,
+        has_room(m),
+        m.in_flight,
+        c.prefill_backlog,
+        c.prefill_tok_s,
+        c.decode_step_next_us,
+        finish_us(m).map_or_else(|| "-".to_string(), |f| (f / 1000).to_string()),
+    )
 }
 
 /// When a turn placed on `m` now would finish, in microseconds from now, by

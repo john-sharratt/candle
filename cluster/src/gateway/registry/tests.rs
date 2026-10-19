@@ -392,6 +392,36 @@ fn a_turn_goes_where_it_finishes_soonest() {
     assert_eq!(best(&mut r), Pick::Member(2));
 }
 
+/// **A burst spills to the slower member once the faster one's queue costs
+/// more than the slower one's reply.** Run 21's heavy-decode burst, with the
+/// figures each member advertised at 21:33:01Z: BlackWorld 1,196 tok/s and a
+/// 28.9 ms step, WhiteWorld 980 tok/s and a 94.9 ms step. A turn on WhiteWorld
+/// finishes in 2.09 + 48.57 = 50.66 s. On BlackWorld with `k` turns already
+/// handed, it finishes in 1.712 × (k + 1) + 14.78 s, which passes that at
+/// k = 20 (50.73 s). So the first 20 go to BlackWorld and the 21st to
+/// WhiteWorld.
+#[test]
+fn a_burst_spills_to_the_slower_member_at_the_crossover() {
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    learned(&mut r, 1, 541, 0, 1_196, 28_862);
+    learned(&mut r, 2, 27, 0, 980, 94_871);
+    let picks: Vec<Pick> = (0..24)
+        .map(|_| {
+            let p = best(&mut r);
+            if let Pick::Member(n) = p {
+                r.begin("zend", n);
+            }
+            p
+        })
+        .collect();
+    let first_on_2 = picks.iter().position(|p| *p == Pick::Member(2));
+    assert_eq!(first_on_2, Some(20), "the 21st turn is the first on node 2");
+    assert!(picks[..20].iter().all(|p| *p == Pick::Member(1)));
+}
+
 /// The canary takes a key let go only once it holds the last holder's writes.
 #[test]
 fn a_canary_lacking_the_last_turn_is_not_handed_the_key() {
