@@ -1299,10 +1299,32 @@ pub fn drive_step<S: WaveSweep + ?Sized>(
                         )
                     })
                     .collect();
+                // And who holds the span: every slot tenant's regions and the
+                // held ground's, with how high it reaches — a frontier that rose
+                // under a sweep while holes stood below it rose by someone's
+                // contiguous claim, and this names whose.
+                let census: Vec<String> = candle_nn::kv_cache::SlotTenant::ALL
+                    .iter()
+                    .map(|&t| {
+                        format!(
+                            "{}={}",
+                            t.label(),
+                            candle_nn::kv_cache::arena_regions(model.device(), t)
+                        )
+                    })
+                    .collect();
+                let held = candle_nn::kv_cache::held_ground_stats(stream.context().ordinal())
+                    .map_or(String::new(), |h| {
+                        format!(
+                            ", held ground {} arenas {} B reaching region {}",
+                            h.arenas, h.arena_bytes, h.arena_top
+                        )
+                    });
                 candle::Error::Msg(format!(
-                    "{e} — for a step of {} segments {}, placed {plan:?} B",
+                    "{e} — for a step of {} segments {}, placed {plan:?} B; tenants {}{held}",
                     segs.len(),
                     segments.join(" "),
+                    census.join(" "),
                 ))
             })?;
             Some(begin_wave(&stream, LayerPhase::Forward)?)
