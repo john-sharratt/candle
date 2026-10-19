@@ -503,10 +503,58 @@ impl Scheduler {
         } else {
             0.0
         };
+        // The rebuild a scan waits for, as timed on the scans that rebuilt;
+        // before one has, its least part — the copy over the link — so a cold
+        // gallery is priced rather than kept whole.
+        let upload = match arena.upload_us_per_byte() {
+            u if u > 0.0 => u,
+            _ if link > 0.0 => 1e6 / link,
+            _ => 0.0,
+        };
         arena.set_keep_within(crate::provenance::gallery_arena::eviction::keep_within(
-            arena.upload_us_per_byte(),
+            upload,
             weight_us_per_byte_sec,
         ));
+        // And applied as it moves, not only when the gallery next uploads or
+        // relief next runs: a gallery nothing scans holds its ground until one
+        // of those comes, and on WhiteWorld (9940d0ffc, 2026-10-19) 4 GB of it
+        // stood minutes past its keep time while heavy-decode's opening prompts
+        // were refused at the floor. Once a second: the pass walks every
+        // resident turn under the residency lock scans take.
+        if self
+            .gallery_evicted_at
+            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(1))
+        {
+            self.gallery_evicted_at = Some(now);
+            arena.evict_past_keep();
+        }
+    }
+
+    /// Publish what the rate model holds now (`phase_ring::learned_rates`): its
+    /// prefill rate at the width the held cohort runs — or, with none held, the
+    /// width admission would offer — and its decode step with and without one
+    /// more decode.
+    pub(super) fn publish_learned_rates(&self) {
+        let Some(rate) = self.wave_rate.as_ref() else {
+            return;
+        };
+        let held: usize = self
+            .wave_prefill_members
+            .iter()
+            .map(|m| match m {
+                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
+                    *advance
+                }
+            })
+            .sum();
+        let rows = if held > 0 {
+            held
+        } else {
+            self.prefill_pass_ceiling()
+        };
+        if let Some(rates) = rate.learned(rows) {
+            super::phase_ring::publish_learned_rates(rates);
+        }
     }
 
     pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {

@@ -480,6 +480,43 @@ pub fn snapshot_waves() -> Vec<WaveSnapshot> {
         .collect()
 }
 
+/// What this card does now, as admission's rate model has learned it — what a
+/// cluster member advertises for the gateway to place a turn by (the earliest
+/// declared finish, `docs/cooperative_admission.md` §2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LearnedRates {
+    /// Prefill tokens a second at the width admission is running now, at the
+    /// residency the wave stands at.
+    pub prefill_tok_s: f64,
+    /// A decode step's time at the current decode rows, and with one row more —
+    /// what one more decoding turn costs every decode on this card.
+    pub decode_step_ms: f64,
+    pub decode_step_ms_plus_one: f64,
+}
+
+/// The newest [`LearnedRates`] the scheduler published, and when.
+static LEARNED: OnceLock<Mutex<Option<(Instant, LearnedRates)>>> = OnceLock::new();
+
+/// Publish what the rate model holds now. The scheduler calls this as it
+/// runs; a reader takes the newest.
+pub fn publish_learned_rates(rates: LearnedRates) {
+    let cell = LEARNED.get_or_init(|| Mutex::new(None));
+    if let Ok(mut c) = cell.lock() {
+        *c = Some((Instant::now(), rates));
+    }
+}
+
+/// The rates the scheduler last published, and how old they are in seconds —
+/// `None` before its rate model has learned from a forward.
+pub fn learned_rates() -> Option<(LearnedRates, f64)> {
+    let c = LEARNED.get()?.lock().ok()?;
+    let (at, rates) = (*c)?;
+    Some((
+        rates,
+        Instant::now().saturating_duration_since(at).as_secs_f64(),
+    ))
+}
+
 /// The newest wave, without copying the ring: what a cluster member reads its
 /// idle capacity from every second.
 pub fn latest_wave() -> Option<WaveSnapshot> {
@@ -721,5 +758,19 @@ mod tests {
         let before = snapshot_migrates().len();
         push_idle_migrate(7);
         assert_eq!(snapshot_migrates().len(), before);
+    }
+
+    /// What the scheduler publishes is what a reader takes, fresh.
+    #[test]
+    fn published_rates_read_back_with_their_age() {
+        let rates = LearnedRates {
+            prefill_tok_s: 1234.5,
+            decode_step_ms: 80.0,
+            decode_step_ms_plus_one: 82.5,
+        };
+        publish_learned_rates(rates);
+        let (read, age) = learned_rates().expect("published");
+        assert_eq!(read, rates);
+        assert!(age < 5.0, "just published: {age}");
     }
 }

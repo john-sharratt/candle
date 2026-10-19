@@ -780,6 +780,27 @@ impl WaveRate {
         self.decode_samples
     }
 
+    /// What this card does now, by what the model has learned: prefill
+    /// throughput at `prefill_rows` and the residency the wave stands at, and
+    /// a decode step's time at the wave's decodes and with one more — what one
+    /// more decoding turn would cost every decode here. `None` until both
+    /// halves have learned from a forward, so a cluster never places by a
+    /// model's defaults.
+    pub fn learned(&self, prefill_rows: usize) -> Option<super::super::phase_ring::LearnedRates> {
+        if self.samples == 0 || self.decode_samples == 0 {
+            return None;
+        }
+        let step = |routed: usize| self.decode_step_secs(routed, self.resident_now) * 1e3;
+        Some(super::super::phase_ring::LearnedRates {
+            prefill_tok_s: self.rate(prefill_rows.max(1), self.resident_now),
+            decode_step_ms: step(self.routed_per_layer),
+            decode_step_ms_plus_one: step(
+                self.routed_per_layer
+                    .saturating_add(self.experts_per_decode(0)),
+            ),
+        })
+    }
+
     // ── the prefill model ──────────────────────────────────────────────────
 
     /// Expert bytes a prefill forward copies with `resident` bytes on the card.

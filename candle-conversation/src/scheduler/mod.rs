@@ -3676,6 +3676,8 @@ pub(crate) struct Scheduler {
     /// (`update_gallery_keep`).
     gallery_misses_seen: Option<(Instant, usize)>,
     gallery_miss_rate: f64,
+    /// When the gallery last gave up the turns past its keep time.
+    gallery_evicted_at: Option<Instant>,
     /// Sequences whose next token `inject_stencil_prefills` sampled this
     /// iteration from its static run's own prefill. They sit out the decode
     /// step that follows: the token it would carry is the one just sampled, and
@@ -4053,6 +4055,7 @@ impl Scheduler {
             deferred_glue_fires: Vec::new(),
             gallery_misses_seen: None,
             gallery_miss_rate: 0.0,
+            gallery_evicted_at: None,
             stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
             sealed_snapshots: HashMap::new(),
