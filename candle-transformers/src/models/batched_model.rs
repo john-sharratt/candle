@@ -406,6 +406,14 @@ pub trait BatchedModelCore {
     /// quantity in the tier that follows context depth rather than width, up
     /// to its key-chunk bound).
     ///
+    /// `stage_seqs` names each stage's sequence where it has one (empty, or a
+    /// sequence that holds no index yet, prices as a fresh one): a sequence's
+    /// selection carve is taken over its **live** index, as the step takes it —
+    /// on a deep conversation that is most of the final window's forward phase,
+    /// which a fresh index prices at a fraction (WhiteWorld 2026-10-19: a
+    /// 12-row cohort fitted at 32 MiB, its window placing 80 MiB, 35.6 MB of
+    /// it the forward phase).
+    ///
     /// `decodes` are the decode rows co-batched in the same step: each is a
     /// row in the trunk's phases and a row the head scores. A creep step
     /// carries the running decodes beside its window, and the head scores
@@ -421,12 +429,16 @@ pub trait BatchedModelCore {
     ///
     /// `None` for a model that cannot price a wave — the caller then charges no
     /// tier, which is what it did before this existed.
+    // One wave's description: its rows and sequences, then each stage's length,
+    // depth and sequence, and the decodes beside it.
+    #[allow(clippy::too_many_arguments)]
     fn wave_tier_bytes(
         &self,
         _rows: usize,
         _sequences: usize,
         _stage_q_lens: &[usize],
         _stage_offsets: &[usize],
+        _stage_seqs: &[usize],
         _decodes: usize,
         _act_dtype: DType,
     ) -> Option<u64> {

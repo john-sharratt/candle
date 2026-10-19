@@ -2852,11 +2852,14 @@ impl Scheduler {
                 .map(|m| self.session.sequence_offset(m.seq_id()).unwrap_or(0))
                 .collect();
             let rows: usize = q_lens.iter().sum();
+            // Over each member's live index, as its windows carve it.
+            let seqs: Vec<usize> = members.iter().map(|m| m.seq_id()).collect();
             let Some(tier) = self.model.wave_tier_bytes(
                 rows,
                 members.len(),
                 &q_lens,
                 &offsets,
+                &seqs,
                 self.decode_width(),
                 dtype,
             ) else {

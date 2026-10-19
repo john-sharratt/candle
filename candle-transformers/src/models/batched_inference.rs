@@ -4324,12 +4324,16 @@ pub trait ManagedBatchedModel {
     /// with the first — so `sequences` is not decoration, and a caller that
     /// prices N admissions as N separate one-sequence waves understates the wave
     /// they compose.
+    // One wave's description: its rows and sequences, then each stage's length,
+    // depth and sequence, and the decodes beside it.
+    #[allow(clippy::too_many_arguments)]
     fn wave_tier_bytes(
         &self,
         rows: usize,
         sequences: usize,
         stage_q_lens: &[usize],
         stage_offsets: &[usize],
+        _stage_seqs: &[usize],
         decodes: usize,
         act_dtype: DType,
     ) -> Option<u64> {

@@ -2257,12 +2257,16 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
     /// by, over fresh contiguous indexes ([`Self::fresh_qsa_bytes`]) — the shape
     /// a sequence prefilling its whole prompt has. With no chunk list the rows
     /// are priced as one chunk from position zero.
+    // One wave's description: its rows and sequences, then each stage's length,
+    // depth and sequence, and the decodes beside it.
+    #[allow(clippy::too_many_arguments)]
     fn wave_tier_bytes(
         &self,
         rows: usize,
         sequences: usize,
         stage_q_lens: &[usize],
         stage_offsets: &[usize],
+        stage_seqs: &[usize],
         decodes: usize,
         act_dtype: DType,
     ) -> Option<u64> {
@@ -2272,7 +2276,20 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         } else {
             (stage_q_lens.to_vec(), stage_offsets.to_vec())
         };
-        let qsa_bytes = match self.fresh_qsa_bytes(&q_lens, &offsets) {
+        // Over each named sequence's live index, as the step carves it; a
+        // sequence with no index yet is priced fresh inside the same walk.
+        #[cfg(feature = "cuda")]
+        let carve = if !stage_seqs.is_empty() && stage_seqs.len() == q_lens.len() {
+            self.wave_qsa_bytes(stage_seqs, &q_lens, &offsets, 0, self.model.cfg.num_layers)
+        } else {
+            self.fresh_qsa_bytes(&q_lens, &offsets)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let carve = {
+            let _ = stage_seqs;
+            self.fresh_qsa_bytes(&q_lens, &offsets)
+        };
+        let qsa_bytes = match carve {
             Ok(bytes) => bytes,
             Err(e) => {
                 // The wave this would price refuses by the same error at
@@ -2291,9 +2308,13 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
                 PrefillLaunchBounds::PRODUCTION,
             ),
             qsa_bytes,
-            look_ahead_hops: look_ahead_hops(rows),
+            // As the step sets them: the look-ahead over every row, decodes
+            // included, and the accept walk's selection on the head's span —
+            // priced as if it reads the logits in place, the wider case.
+            look_ahead_hops: look_ahead_hops(rows + decodes),
             decode_rows: decodes,
             scored_rows: sequences.max(1) + decodes,
+            accept_rows: sequences.max(1) + decodes,
             ..WaveWidth::prefill(rows, sequences.max(1))
         };
         Some(WavePlan::new(geometry).tier_bytes(width) as u64)

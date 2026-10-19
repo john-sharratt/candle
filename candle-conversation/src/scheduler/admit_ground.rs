@@ -107,8 +107,10 @@ pub(super) struct WaveDraft {
     held_rows: usize,
     held_advances: Vec<usize>,
     held_depths: Vec<usize>,
-    /// `(remaining, depth)` of each member not in the held group.
-    joining: Vec<(usize, usize)>,
+    /// The held members' sequences, whose live indexes their tier is priced over.
+    held_seqs: Vec<usize>,
+    /// `(remaining, depth, sequence)` of each member not in the held group.
+    joining: Vec<(usize, usize, usize)>,
     /// The width the rate model chose for the cohort, which its forwards are
     /// composed at — `None` when no choice stands. A pass that widens clears
     /// it, one that closes sets it; the draft follows, so each offer is priced
@@ -122,6 +124,7 @@ pub(super) struct Composed {
     seqs: usize,
     advances: Vec<usize>,
     depths: Vec<usize>,
+    stage_seqs: Vec<usize>,
 }
 
 /// A priority's slot in the per-band cursors. Three bands, in the order
@@ -182,7 +185,7 @@ pub(super) struct AdmitPass<'a> {
     wave_rows: usize,
     /// The member the offer [`Ground::peek`] last answered would add to
     /// [`Self::wave`]: its remaining rows and depth.
-    offered: Option<(usize, usize)>,
+    offered: Option<(usize, usize, usize)>,
     /// Whether that offer was sized to the floor, so its admission closes the
     /// forward at its width — see `offer_tier`.
     narrowed: bool,
@@ -280,7 +283,7 @@ impl<'a> AdmitPass<'a> {
     /// A member that adds no row is not free: the span tables hold an entry
     /// per span, and pricing it at zero lets a forward widen to the sequence
     /// cap on a tier admission never charged.
-    fn added(&self, member: (usize, usize), width: Option<usize>) -> (u64, usize) {
+    fn added(&self, member: (usize, usize, usize), width: Option<usize>) -> (u64, usize) {
         let mut with = self.wave.clone();
         with.joining.push(member);
         with.width = width;
@@ -328,9 +331,10 @@ impl<'a> AdmitPass<'a> {
         room: usize,
         turn: usize,
         depth: usize,
+        seq: usize,
         claim: u64,
     ) -> (usize, u64, u64) {
-        let member = (turn, depth);
+        let member = (turn, depth, seq);
         self.offered = Some(member);
         self.narrowed = false;
         let rows = turn.min(room);
@@ -598,7 +602,7 @@ impl AdmitPass<'_> {
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block);
         let (rows, activations, residual) =
-            self.offer_tier(room, turn, depth, kv.saturating_add(recurrent));
+            self.offer_tier(room, turn, depth, seq.0, kv.saturating_add(recurrent));
         Some(self.credited(Cost {
             kv,
             recurrent,
@@ -715,7 +719,7 @@ impl AdmitPass<'_> {
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block);
         let (rows, activations, residual) =
-            self.offer_tier(room, turn, depth, kv.saturating_add(recurrent));
+            self.offer_tier(room, turn, depth, seq.0, kv.saturating_add(recurrent));
         Some(self.credited(Cost {
             // The whole turn's K/V, not this chunk's: admitting the turn commits
             // the engine to feeding all of it, and a cost that priced only the
@@ -747,11 +751,16 @@ impl AdmitPass<'_> {
             self.submit_cursor[band] += 1;
         }
         let p = self.sched.pending_submits.get(self.submit_cursor[band])?;
-        let (turn, depth, lift) = (p.work.tokens.len(), p.depth, p.lift);
+        let (turn, depth, lift, parent) = (p.work.tokens.len(), p.depth, p.lift, p.parent());
         let room = self.room()?;
         let kv = prefill_cost_bytes(turn, self.per_block).saturating_add(lift);
-        let (rows, activations, residual) =
-            self.offer_tier(room, turn, depth, kv.saturating_add(self.recurrent));
+        let (rows, activations, residual) = self.offer_tier(
+            room,
+            turn,
+            depth,
+            parent.0,
+            kv.saturating_add(self.recurrent),
+        );
         self.offering_submit = true;
         Some(self.credited(Cost {
             kv,
@@ -961,6 +970,7 @@ impl Scheduler {
                 1,
                 &[],
                 &[],
+                &[],
                 self.decode_width(),
                 self.session.activation_dtype(),
             )
@@ -1046,6 +1056,7 @@ impl Scheduler {
             wave.held_advances.push(*advance);
             wave.held_depths
                 .push(self.session.sequence_offset(*seq_id).unwrap_or(0));
+            wave.held_seqs.push(*seq_id);
             held.push(*seq_id);
         }
         let prefills = self
@@ -1066,7 +1077,7 @@ impl Scheduler {
         for (seq, remaining) in prefills.chain(sections) {
             if remaining > 0 && !held.contains(&seq.0) {
                 let depth = self.session.sequence_offset(seq.0).unwrap_or(0);
-                wave.joining.push((remaining, depth));
+                wave.joining.push((remaining, depth, seq.0));
             }
         }
         wave.width = self.rate_width.map(|w| w.rows);
@@ -1091,18 +1102,20 @@ impl Scheduler {
     pub(super) fn compose(&self, wave: &WaveDraft) -> Composed {
         let total = wave
             .held_rows
-            .saturating_add(wave.joining.iter().map(|&(r, _)| r).sum::<usize>());
+            .saturating_add(wave.joining.iter().map(|&(r, _, _)| r).sum::<usize>());
         let ceiling = self.prefill_group_budget_at(total, self.composition_target_at(wave.width));
         let mut out = Composed {
             rows: wave.held_rows,
             seqs: wave.held_advances.len() + wave.joining.len(),
             advances: wave.held_advances.clone(),
             depths: wave.held_depths.clone(),
+            stage_seqs: wave.held_seqs.clone(),
         };
-        for &(remaining, depth) in &wave.joining {
+        for &(remaining, depth, seq) in &wave.joining {
             let rows = remaining.min(ceiling.saturating_sub(out.rows));
             if rows > 0 {
                 out.advances.push(rows);
+                out.stage_seqs.push(seq);
                 out.depths
                     .push(deepest_chunk_offset(depth, remaining, rows));
                 out.rows += rows;
@@ -1120,6 +1133,7 @@ impl Scheduler {
                 wave.seqs.max(1),
                 &wave.advances,
                 &wave.depths,
+                &wave.stage_seqs,
                 self.decode_width(),
                 self.session.activation_dtype(),
             )
