@@ -196,14 +196,31 @@ impl Scheduler {
     }
 
     /// The decodes [`Self::decode_width`] counts, as a tier is priced over them:
-    /// each one's sequence and the position its next row stands at. A decode's
-    /// selection carve follows its depth and its live index, so the count alone
-    /// under-prices a step beside deep conversations.
-    pub(super) fn decode_stage(&self) -> Vec<(usize, usize)> {
+    /// each one's sequence, the position its next row stands at, and the block
+    /// its next step runs — one row, or its committed token and the draft depth
+    /// the step will give it, by the step's own rule (`DecodeState::drafts`,
+    /// `DraftDepth::budget` under the model's width ceiling). A decode's
+    /// selection carve follows its depth and its live index, and a verifying
+    /// one's head scores every row of its block, so the count alone under-prices
+    /// a step beside deep or drafting conversations.
+    pub(super) fn decode_stage(&self) -> Vec<(usize, usize, usize)> {
+        let ceiling = self.model.draft_budget(self.decode_width());
+        let token_cost = self.model.draft_token_cost();
         self.active_decodes
             .iter()
             .filter(|(_, s)| !s.finished)
-            .map(|(id, _)| (id.0, self.session.sequence_offset(id.0).unwrap_or(0)))
+            .map(|(id, s)| {
+                let depth = if s.drafts() {
+                    s.draft_depth.budget(ceiling, token_cost)
+                } else {
+                    0
+                };
+                (
+                    id.0,
+                    self.session.sequence_offset(id.0).unwrap_or(0),
+                    1 + depth,
+                )
+            })
             .collect()
     }
 

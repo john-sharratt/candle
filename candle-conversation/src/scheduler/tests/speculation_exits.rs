@@ -374,3 +374,35 @@ fn the_standalone_step_bounds_a_recurrent_block_at_the_timeline() {
     assert_eq!(kept, (111..=110 + TIMELINE_ROWS as u32).collect::<Vec<_>>());
     assert_eq!(step(false, TIMELINE_ROWS).unwrap().len(), TIMELINE_ROWS + 1);
 }
+
+/// **A tier price carries each decode's block as its step will run it.** A
+/// free decode drafts, so its block is its committed token and the depth the
+/// step gives it, at most the model's ceiling; a replayed turn proposes
+/// nothing and runs one row.
+#[test]
+fn the_decode_stage_carries_each_decodes_block() {
+    let Pair {
+        mut scheduler,
+        ids,
+        _events,
+        ..
+    } = decoding_pair(false);
+    let block = |s: &Scheduler, id: SequenceId| {
+        s.decode_stage()
+            .into_iter()
+            .find(|&(seq, _, _)| seq == id.0)
+            .map(|(_, _, block)| block)
+            .expect("an active decode is staged")
+    };
+    let drafting = block(&scheduler, ids[0]);
+    assert!(
+        (2..=1 + DRAFT).contains(&drafting),
+        "a drafting decode runs its token and its proposals: {drafting}"
+    );
+    scheduler
+        .active_decodes
+        .get_mut(&ids[1])
+        .unwrap()
+        .recorded_reply = Some(crate::recorded_reply::Replay::new(vec![1, 2, 3]));
+    assert_eq!(block(&scheduler, ids[1]), 1, "a replay runs one row");
+}

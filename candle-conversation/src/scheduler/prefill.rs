@@ -2953,6 +2953,12 @@ impl Scheduler {
         let kv_row = self.model.kv_bytes_per_row(dtype).unwrap_or(0);
         let ground = ground.saturating_sub(self.sweep_forecast.withheld_bytes(kv_row));
         let decode_stage = self.decode_stage();
+        let held_next = match self.session.device().location() {
+            candle::DeviceLocation::Cuda { gpu_id } => {
+                candle_nn::kv_cache::held_ground_next_claim(gpu_id)
+            }
+            _ => None,
+        };
         let advance = |m: &WaveMember| match m {
             WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => *advance,
         };
@@ -3023,6 +3029,19 @@ impl Scheduler {
             // on WhiteWorld (673f67a2a) a cohort sweeping beside 24 decodes for
             // 4.7 minutes found its window nine regions short.
             let growth = self.decode_growth_bytes();
+            // And what held ground claims at its next provisioning, which runs
+            // between the cohort's windows: its growth lands at the lowest free
+            // regions as the cohort's claims do, holes first and then the
+            // frontier, so it is one more claim on the same ground; the landing
+            // for an arena it vacates is claimed only below that arena, so it
+            // spends holes the claims would otherwise fill. Unpriced, an ingest
+            // cohort fitted with 195 MiB to spare met held ground grown to 256
+            // MiB at the frontier by its last window, and was refused five
+            // regions short (WhiteWorld, c8221fe39, 2026-10-19).
+            let (held_growth, held_landing) =
+                held_next.as_ref().map_or((0, 0), |c| (c.growth, c.landing));
+            let claims = claims.saturating_add(held_growth);
+            let holes = holes.saturating_sub(held_landing);
             let at_frontier = frontier.and_then(|g| {
                 fitted_rows(
                     rows,
@@ -3075,6 +3094,8 @@ impl Scheduler {
                     stores,
                     scratch_mib = scratch >> 20,
                     growth_mib = growth >> 20,
+                    held_growth_mib = held_growth >> 20,
+                    held_landing_mib = held_landing >> 20,
                     kv_blocks_mib = kv_blocks >> 20,
                     live_regions = live,
                     frontier_regions,

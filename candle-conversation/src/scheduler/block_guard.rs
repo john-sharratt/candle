@@ -55,14 +55,25 @@ impl BlockGuard {
         triggers: &Arc<TriggerRegistry>,
         last: Option<u32>,
     ) -> Option<Self> {
-        let walk = match (stencil, pending) {
-            (None, _) => Walk::Open(Arc::clone(triggers)),
-            (Some(driver), Some(StepMask::Free { .. })) if driver.mid_free_span() => {
-                Walk::Free(driver.clone())
-            }
-            _ => return None,
+        if !Self::drafts(stencil, pending) {
+            return None;
+        }
+        let walk = match stencil {
+            None => Walk::Open(Arc::clone(triggers)),
+            Some(driver) => Walk::Free(driver.clone()),
         };
         Some(Self { walk, prev: last })
+    }
+
+    /// Whether a sequence about to decode may draft this step — whether
+    /// [`Self::for_step`] would give it a guard — without building one. What a
+    /// tier price asks of each decode it carries, before the step.
+    pub(super) fn drafts(stencil: Option<&StencilDriver>, pending: Option<&StepMask>) -> bool {
+        match (stencil, pending) {
+            (None, _) => true,
+            (Some(driver), Some(StepMask::Free { .. })) => driver.mid_free_span(),
+            _ => false,
+        }
     }
 
     /// Whether the block may go on to the position after `token`.
