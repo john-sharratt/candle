@@ -594,7 +594,7 @@ impl AdmitPass<'_> {
         // A reused slot already holds a store, whose regions the residency
         // already counts: its restart zeroes that store where it stands.
         let recurrent = if self.sched.model.has_recurrent_state(seq.0) {
-            0
+            self.sched.model.prefill_scratch_bytes(seq.0) as u64
         } else {
             self.recurrent
         };
@@ -714,7 +714,13 @@ impl AdmitPass<'_> {
         // and both are charged.
         let holds_store =
             self.sched.uncarved_case(w).is_none() && self.sched.model.has_recurrent_state(seq.0);
-        let recurrent = if holds_store { 0 } else { self.recurrent };
+        // A store it holds is in the residency already; the prefill scratch it
+        // will claim on top is not (`ManagedBatchedModel::prefill_scratch_bytes`).
+        let recurrent = if holds_store {
+            self.sched.model.prefill_scratch_bytes(seq.0) as u64
+        } else {
+            self.recurrent
+        };
         let room = self.room()?;
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block);

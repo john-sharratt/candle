@@ -2941,12 +2941,18 @@ impl Scheduler {
                 .iter()
                 .filter(|m| !self.model.has_recurrent_state(m.seq_id()))
                 .count() as u64;
+            // And the prefill scratch a member that kept its store still claims
+            // at its first window — one more slot per recurrent layer.
+            let scratch: u64 = members
+                .iter()
+                .map(|m| self.model.prefill_scratch_bytes(m.seq_id()) as u64)
+                .sum();
             let claims = (q_lens
                 .iter()
                 .map(|&q| super::admission::prefill_cost_bytes(q, per_block))
                 .sum::<u64>()
                 .saturating_add(stores.saturating_mul(self.recurrent_cost()))
-                as usize)
+                .saturating_add(scratch) as usize)
                 .saturating_add(self.model.creep_residual_bytes(&self.session, rows));
             let frontier = self.frontier_tier_bytes();
             let holes = self.session.kv_region_stats().map_or(0, |s| {
@@ -3000,6 +3006,7 @@ impl Scheduler {
                     tier_mib = tier >> 20,
                     kv_geometry_mib = rows.saturating_mul(kv_row) >> 20,
                     stores,
+                    scratch_mib = scratch >> 20,
                     kv_blocks_mib = kv_blocks >> 20,
                     live_regions = live,
                     frontier_regions,

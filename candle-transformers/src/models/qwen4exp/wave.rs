@@ -2414,6 +2414,21 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         self.has_recurrent(seq).unwrap_or(false)
     }
 
+    fn prefill_scratch_bytes(&self, seq: usize) -> usize {
+        let held = self
+            .recurrent
+            .read()
+            .ok()
+            .and_then(|map| map.get(&seq).map(|store| store.holds_scratch()));
+        match held {
+            Some(false) => {
+                let cfg = &self.model.cfg;
+                RecurrentStateStore::scratch_bytes_for(&cfg.layer_kinds, &cfg.delta_net)
+            }
+            _ => 0,
+        }
+    }
+
     fn park_recurrent(&self, seq: usize) -> Result<bool> {
         Qwen4ExpBatched::park_recurrent(self, seq)
     }
