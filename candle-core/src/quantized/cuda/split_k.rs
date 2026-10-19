@@ -191,7 +191,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::super::super::int8_split_k::{
-        dense_k_split_depth, q8a128_dense_k_splits, DensePlan,
+        dense_k_split_depth, q8a128_dense_k_splits, DensePlan, MAX_SPLIT_ROWS,
     };
     use super::super::super::{GgmlDType, Int8Mode, QMatMul, QStorage, QTensor, SumScale};
     use super::super::{dense_qmatmul_with_plan, to_dynamic, CudaDevice, DynamicActs};
@@ -393,11 +393,13 @@ mod tests {
         let dev = CudaDevice::new(0)?;
         let sm = dev.multiprocessor_count()?;
         let (n, k) = (416usize, 10_240usize);
-        let (w, wide) = operands(&dev, GgmlDType::Q8_0, 40, n, k, 11)?;
+        // Past the widest split launch, so the wide one runs unsplit on every part.
+        let rows = MAX_SPLIT_ROWS + 32;
+        let (w, wide) = operands(&dev, GgmlDType::Q8_0, rows, n, k, 11)?;
         assert_eq!(
-            q8a128_dense_k_splits(40, n, k, sm),
+            q8a128_dense_k_splits(rows, n, k, sm),
             1,
-            "40 rows run unsplit"
+            "{rows} rows run unsplit"
         );
         let wide_out = run(&dev, &w, &wide, 1)?;
         for m in [1usize, 5] {
