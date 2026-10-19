@@ -47,6 +47,21 @@ use crate::repo_scan::{self, UnitJob};
 /// never a subfolder's.
 pub const ANCHOR_FILES: [&str; 4] = ["README.md", "ARCHITECTURE.md", "AGENTS.md", "CLAUDE.md"];
 
+/// Whether the folder unit `dir` (`"{repo}/…/"`) is a chain link: a
+/// repository's root folder. [`links`] takes no other folder.
+pub fn is_link_dir(dir: &str) -> bool {
+    dir.strip_suffix('/')
+        .is_some_and(|repo| !repo.is_empty() && !repo.contains('/'))
+}
+
+/// Whether the file `path` (`"{repo}/…"`) is a chain link: one of
+/// [`ANCHOR_FILES`] at a repository's root. [`links`] takes no other file.
+pub fn is_link_file(path: &str) -> bool {
+    path.split_once('/').is_some_and(|(_, name)| {
+        !name.contains('/') && ANCHOR_FILES.iter().any(|a| name.eq_ignore_ascii_case(a))
+    })
+}
+
 /// One link of the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link<'a> {
@@ -300,5 +315,30 @@ mod tests {
     #[test]
     fn nothing_to_chain_is_an_empty_chain() {
         assert!(links(&[], &[], &[("a".to_string(), "main".to_string())]).is_empty());
+    }
+
+    /// Every link the chain takes reads as a link, and nothing else does: a
+    /// subfolder, a nested README, an ordinary root file.
+    #[test]
+    fn a_link_is_known_by_its_path_alone() {
+        let units = [unit("a/", &["main"]), unit("a/src/", &["main"])];
+        let files = [
+            file("a/readme.md", &["main"]),
+            file("a/CLAUDE.md", &["main"]),
+            file("a/src/README.md", &["main"]),
+            file("a/Cargo.toml", &["main"]),
+        ];
+        let repos = [("a".to_string(), "main".to_string())];
+        for link in links(&units, &files, &repos) {
+            match link {
+                Link::Folder(u) => assert!(is_link_dir(&u.unit.dir), "{}", u.unit.dir),
+                Link::File(f) => assert!(is_link_file(&f.file.path), "{}", f.file.path),
+            }
+        }
+        assert!(!is_link_dir("a/src/"));
+        assert!(!is_link_dir("/"));
+        assert!(!is_link_file("a/src/README.md"));
+        assert!(!is_link_file("a/Cargo.toml"));
+        assert!(!is_link_file("README.md"));
     }
 }

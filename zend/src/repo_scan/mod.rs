@@ -37,6 +37,7 @@ use crate::branch_ingest::plan::Committed;
 use crate::branch_ingest::units::FolderUnit;
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::{Failures, IngestReport};
+use crate::ingest_snapshots::{finished, Unit};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
 
@@ -1265,10 +1266,13 @@ fn process_one_dir(
     // and frees both the VRAM and RAM copies; `elevate_to_hot` pulls them back on
     // demand. `FreeSequence` on drop only releases the batch slot, not the sealed
     // KV, so this is what actually reclaims the space across a large scan.
-    engine
-        .lock()
-        .unwrap()
-        .evict_ingest_timeline(conv.timeline_id());
+    {
+        let e = engine.lock().unwrap();
+        // Read once, never continued: it keeps its turns and no recurrent
+        // snapshot (`crate::ingest_snapshots`).
+        finished(&e, conv.timeline_id(), Unit::Folder(&unit.dir));
+        e.evict_ingest_timeline(conv.timeline_id());
+    }
     tracing::debug!(
         target: "zend::repo_scan",
         dir = %unit.dir,

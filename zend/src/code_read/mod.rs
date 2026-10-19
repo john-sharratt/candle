@@ -53,6 +53,7 @@ use crate::branch_ingest::keys::{
 use crate::branch_ingest::plan::Committed;
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::Failures;
+use crate::ingest_snapshots::{finished, Unit};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_path::split;
@@ -1006,11 +1007,13 @@ fn process_one_file(
     // releases the batch slot, not the sealed KV, so this proactive flag is what
     // actually reclaims the space; `elevate_to_hot` pulls the file back from cold
     // on demand if reselected.
-    let flagged = ctx
-        .engine
-        .lock()
-        .unwrap()
-        .evict_ingest_timeline(conv.timeline_id());
+    let flagged = {
+        let e = ctx.engine.lock().unwrap();
+        // Read once, never continued: it keeps its turns and no recurrent
+        // snapshot (`crate::ingest_snapshots`).
+        finished(&e, conv.timeline_id(), Unit::File(&file.path));
+        e.evict_ingest_timeline(conv.timeline_id())
+    };
     tracing::debug!(
         target: "zend::code_read::ingest",
         file = %file.path,

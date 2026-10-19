@@ -7,7 +7,8 @@
 //! Grouped by concern: HTTP surface (`api`, `chatml`, `session`,
 //! `projection_event`); the host contract (`tenant`); model bring-up
 //! (`loading`, `config`); workspace ingestion
-//! (`ingest`, `ingest_backlog`, `ingest_lease`, `ingest_report`, `ingest_worker`, `repo_scan`,
+//! (`ingest`, `ingest_backlog`, `ingest_lease`, `ingest_report`, `ingest_snapshots`,
+//! `ingest_worker`, `repo_scan`,
 //! `code_read`, `raw_read`, `refresh_ctx`, `turn_sink`); tool
 //! orchestration (`tools`, `tool_def`, `tool_summary`, `agent_exec`);
 //! conversation-attached files (`conv_files`, `uploads`, `legacy_uploads`);
@@ -32,6 +33,7 @@ pub mod ingest_backlog;
 pub mod ingest_cancel;
 pub mod ingest_lease;
 pub mod ingest_report;
+pub mod ingest_snapshots;
 pub mod ingest_worker;
 pub mod legacy_uploads;
 pub mod lenient_json;

@@ -2578,6 +2578,16 @@ impl InferenceState {
             )?;
         }
 
+        // Ingest conversations are read, never continued: retire the recurrent
+        // snapshot tails they kept from before the mark existed, and mark each
+        // so no later seal writes another (`crate::ingest_snapshots`).
+        let retired = crate::ingest_snapshots::retire_finished(&engine.lock().unwrap());
+        if retired > 0 {
+            tracing::info!(
+                retired,
+                "retired the recurrent snapshots of finished ingest conversations"
+            );
+        }
         for il in &ingest_layers {
             if disabled_layers.contains(&il.name) {
                 continue;
