@@ -930,6 +930,17 @@ struct WaveDomain {
     /// forward's scratch scope may carve. Zero with no plan: [`fallback_plan`]
     /// prices no scratch.
     scratch_priced: usize,
+    /// `planned` belongs to a forward that has not laid its spans out yet: it
+    /// priced itself and has still to open its first phase.
+    ///
+    /// Such a plan is not a finished forward's width but the next layout's, so
+    /// an arena window that hands the tier back keeps it — the forward's guard
+    /// re-places it at the frontier the window left. Dropped there, the guard
+    /// laid the fallback out under the forward instead: on WhiteWorld
+    /// (a965e3a07, 2026-10-19) three arenas created between a creep step's
+    /// placement and its forward span left a 74 MB residual asking a 16 MiB
+    /// span, with no generation live for the outgrown-spans refusal to see.
+    plan_pending: bool,
     /// The width the caller running **between forwards** — a draft walk —
     /// priced for itself through [`cover_wave_transient`], while it holds the
     /// [`Covering`] that call returned.
@@ -1316,6 +1327,7 @@ fn domain_entry<'a>(
             live_generations: 0,
             planned: None,
             scratch_priced: 0,
+            plan_pending: false,
             covering: None,
             covering_scratch: 0,
             placed_at: None,
@@ -1497,9 +1509,14 @@ pub fn enter_arena_window(lease: StreamLease, tenant: &'static str) -> Result<Ar
         // region, every walk, and the decodes on it failed. With the plan gone,
         // the next caller prices itself — unless the caller still running is
         // one that already has, a walk mid-walk ([`WaveDomain::covering`]).
+        //
+        // **A plan not yet laid out is not a finished forward's.** It is the
+        // forward about to open, between its placement and its first phase; its
+        // guard re-places it against the frontier this window leaves, and the
+        // tier it buys is still that forward's ([`WaveDomain::plan_pending`]).
         let had_tier = domain.placed_at.take().is_some();
         domain.placed_bytes = None;
-        if had_tier {
+        if had_tier && !domain.plan_pending {
             domain.reserved_by_forward = false;
             domain.planned = domain.covering;
             domain.scratch_priced = domain.covering_scratch;
@@ -1709,6 +1726,7 @@ fn place_plan(stream: &Arc<CudaStream>, per_phase: [usize; 3], scratch: usize) -
         let (_, domain) = domain_entry(&mut map, &stream);
         domain.planned = Some(per_phase);
         domain.scratch_priced = scratch;
+        domain.plan_pending = true;
         if domain.live_generations > 0 {
             false
         } else {
@@ -1884,11 +1902,22 @@ fn cover_target(
     }
 }
 
-/// Begins a refusal [`begin_wave`] gives instead of handing out spans laid out
-/// for an earlier plan than the one this forward recorded, while a generation
-/// holds that layout. Retryable: the generation drops and the forward placed
-/// again lays out its own (`is_arena_exhausted`, which recognises both).
-pub const SPANS_OUTGROWN_MARKER: &str = "wave spans outgrown by their plan";
+/// What `stream`'s wave domain stands at now: the plan recorded for it, each
+/// phase arena's laid-out capacity, and the generations live — read for a
+/// refusal or an overrun to say whether the spans were laid out for the plan
+/// that ran on them.
+pub fn wave_domain_layout(stream: &Arc<CudaStream>) -> Option<([usize; 3], [usize; 3], usize)> {
+    let mut map = lock_domains();
+    let (_, domain) = domain_entry(&mut map, stream);
+    let planned = domain.planned?;
+    let mut laid = [0usize; 3];
+    for (i, arena) in domain.arenas.iter().enumerate().take(3) {
+        laid[i] = arena.stats().2;
+    }
+    Some((planned, laid, domain.live_generations))
+}
+
+pub use super::backing::SPANS_OUTGROWN_MARKER;
 
 /// Open a generation on `phase`'s span.
 ///
@@ -2110,6 +2139,7 @@ pub fn begin_wave(stream: &Arc<CudaStream>, phase: LayerPhase) -> Result<Generat
                     arena.rebase(at, plan[i])?;
                     at += plan[i] as u64;
                 }
+                domain.plan_pending = false;
             } else if let Some(plan) = domain.planned {
                 // **A generation is live, so the spans stand as an earlier plan
                 // laid them out — and they must hold this one.** Inside one forward
@@ -2944,6 +2974,8 @@ mod wave_tests {
         {
             let _open = begin_forward(&s);
             plan_wave_transient(&s, wide)?;
+            // Finished: it laid its spans out, as every forward that ran has.
+            drop(begin_wave(&s, LayerPhase::Forward)?);
         }
         drop(enter_arena_window(lease(), "a test tenant")?);
         let tier = |ordinal| {
@@ -2965,6 +2997,80 @@ mod wave_tests {
              forward's plan {wide_bytes} B"
         );
         drop(guard);
+        Ok(())
+    }
+
+    /// **A forward that has placed but not yet opened keeps its plan through an
+    /// arena window.** Another thread's arena between a step's placement and its
+    /// forward span handed the tier back with the plan, and the span opened at
+    /// the fallback's 16 MiB under a 74 MB residual (WhiteWorld, a965e3a07).
+    #[test]
+    fn a_placed_forward_keeps_its_plan_through_an_arena_window() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let forward_wide = [1 << 20, 1 << 20, 64 << 20];
+        let forward = {
+            plan_wave_transient(&s, forward_wide)?;
+            drop(enter_arena_window(lease(), "a test tenant")?);
+            let _open = begin_forward(&s);
+            begin_wave(&s, LayerPhase::Forward)?
+        };
+        let (_, laid, _) = super::wave_domain_layout(&s).expect("a plan is recorded");
+        assert!(
+            laid[2] >= forward_wide[2],
+            "the forward span was laid out at {} B for a plan of {} B",
+            laid[2],
+            forward_wide[2]
+        );
+        drop(forward);
+        Ok(())
+    }
+
+    /// **And when the window left no room for it, the forward is refused** —
+    /// with the retryable tier refusal, never a layout of the fallback in its
+    /// place. The pending plan is what the guard places, so a partition too
+    /// small for it is a refusal of that width, not a silent 16 MiB span.
+    #[test]
+    fn a_placed_forward_the_window_left_no_room_for_is_refused() -> Result<()> {
+        let _serial = serial();
+        let Some(s) = stream() else { return Ok(()) };
+        let ordinal = s.context().ordinal();
+        // The lowest floor the pool allows: the arena frontier, or the elastic
+        // reserve above the region base where that stands higher.
+        drop(begin_wave(&s, LayerPhase::Attention)?);
+        let layout = super::super::region_pool::span_layout(ordinal).expect("a span");
+        let frontier = super::super::region_pool::region_stats(ordinal)
+            .expect("a pool")
+            .live_watermark;
+        let frontier_end =
+            layout.region_base + (frontier * super::super::region_pool::REGION_BYTES) as u64;
+        let floor = frontier_end
+            .max(layout.region_base + super::super::weight_zone::MIN_ELASTIC_RESERVE as u64);
+        // A forward wider than the ground that floor leaves, placed while the
+        // floor still stands where it was.
+        let room = (floor - frontier_end) as usize;
+        plan_wave_transient(&s, [1 << 20, 1 << 20, room + (64 << 20)])?;
+        drop(enter_arena_window(lease(), "a test tenant")?);
+        // The window's claim took the room: the floor now stands where no tier
+        // of that width fits below it.
+        super::super::region_pool::set_weight_floor(&s, floor)?;
+        let opened = {
+            let _open = begin_forward(&s);
+            begin_wave(&s, LayerPhase::Forward).map(|g| {
+                let laid = super::wave_domain_layout(&s).map(|(_, l, _)| l[2]);
+                drop(g);
+                laid
+            })
+        };
+        // Restored before anything is asserted: the floor is process-global.
+        super::super::region_pool::set_weight_floor(&s, layout.weight_floor)?;
+        match opened {
+            Ok(laid) => panic!("the forward opened on a {laid:?} B span with no room for its plan"),
+            Err(e) => assert!(
+                super::super::backing::is_tier_refusal(&e),
+                "refused with the retryable tier refusal: {e}"
+            ),
+        }
         Ok(())
     }
 
@@ -3037,6 +3143,7 @@ mod wave_tests {
         {
             let _open = begin_forward(&s);
             plan_wave_transient(&s, wide)?;
+            drop(begin_wave(&s, LayerPhase::Forward)?);
         }
         // The walk fits inside the forward's standing tier, so the cover keeps
         // the forward's plan and records the walk's width beside it.
@@ -3057,6 +3164,7 @@ mod wave_tests {
         {
             let _open = begin_forward(&s);
             plan_wave_transient(&s, wide)?;
+            drop(begin_wave(&s, LayerPhase::Forward)?);
         }
         drop(enter_arena_window(lease(), "a test tenant")?);
         let guard = begin_wave(&s, LayerPhase::Attention)?;

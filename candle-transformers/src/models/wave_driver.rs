@@ -1414,8 +1414,23 @@ pub fn drive_step<S: WaveSweep + ?Sized>(
                     )
                 })
                 .collect();
+            // And the domain as it stands: the plan recorded, each arena's laid-out
+            // capacity and the generations live — whether the spans were laid out
+            // for the plan this step ran.
+            let layout = match model.device() {
+                Device::Cuda(cuda) => candle_nn::kv_cache::wave_domain_layout(&cuda.cuda_stream())
+                    .map_or_else(
+                        || "; no plan recorded".to_string(),
+                        |(planned, laid, live)| {
+                            format!(
+                                "; domain planned {planned:?} B, laid out {laid:?} B, {live} live"
+                            )
+                        },
+                    ),
+                _ => String::new(),
+            };
             candle::Error::Msg(format!(
-                "{msg} — in segment {i} (marked >) of a step of {} segments {}",
+                "{msg} — in segment {i} (marked >) of a step of {} segments {}{layout}",
                 segs.len(),
                 segments.join(" ")
             ))

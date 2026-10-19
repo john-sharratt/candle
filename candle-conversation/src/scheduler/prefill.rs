@@ -622,7 +622,56 @@ impl Scheduler {
                 |rows| self.weights_at_width(&q_lens, &offsets, &seqs, zone, rows),
             ))
         });
+        // **The rate a placed turn's prompt drains at, measured while a `High`
+        // backlog stands** — the backlog it joins and the decodes beside it
+        // included, which the model's forward throughput is not (`high_drain`).
+        // With no backlog standing for long enough to say, the model's figure.
+        self.high_drain.advance(Instant::now(), high_backlog > 0);
+        let drain = self.high_drain.rate();
+        // **Before the drain can say, the width the trade would give.** A
+        // pattern's opening burst is placed inside the drain's first seconds,
+        // and the dedicated forward at the pass ceiling took all of it: on
+        // BlackWorld (a965e3a07, 2026-10-19) heavy-read's 24 opening turns went
+        // to a member advertising 2,390 tok/s that drained a few hundred. So the
+        // cohort a placed turn would join — every waiting prefill and one turn
+        // more — is traded against the running decodes as admission will trade
+        // it, and runs in a forward that carries the decodes' rows beside it.
+        // With no decode the trade keeps the whole width, and the wide rate is
+        // what such a card gives.
+        let traded = self.wave_rate.as_ref().and_then(|r| {
+            let mut q_lens = Vec::new();
+            let mut offsets = Vec::new();
+            let mut seqs = Vec::new();
+            for p in &self.active_prefills {
+                q_lens.push(p.work.tokens.len().saturating_sub(p.offset));
+                offsets.push(p.offset);
+                seqs.push(p.work.sequence_id.0);
+            }
+            for w in &self.prefill_queue {
+                q_lens.push(w.tokens.len());
+                offsets.push(self.session.sequence_offset(w.sequence_id.0).unwrap_or(0));
+                seqs.push(w.sequence_id.0);
+            }
+            // The placed turn itself: no sequence holds it yet.
+            q_lens.push(NOMINAL_PROMPT_ROWS);
+            offsets.push(0);
+            seqs.push(usize::MAX);
+            let zone = super::interleave::effective_weight_zone_bytes(0)?;
+            let weights_at = |w| self.weights_at_width(&q_lens, &offsets, &seqs, zone, w);
+            let decode_rows: usize = self.decode_stage().iter().map(|&(_, _, b)| b.max(1)).sum();
+            let rate = r.placed_prefill_tok_s(
+                rows,
+                super::admit_ground::PREFILL_MIN_ADVANCE,
+                CHUNK_SIZE,
+                q_lens.len() as f64,
+                self.decode_width(),
+                decode_rows,
+                weights_at,
+            );
+            (rate > 0.0).then_some(rate)
+        });
         let learned = learned.map(|r| super::phase_ring::LearnedRates {
+            prefill_tok_s: drain.or(traded).unwrap_or(r.prefill_tok_s),
             high_backlog_tokens: high_backlog,
             decode_step_ms_plus_one: placed_step.unwrap_or(r.decode_step_ms_plus_one),
             ..r
@@ -647,6 +696,13 @@ impl Scheduler {
                     high_backlog_tokens = r.high_backlog_tokens,
                     decode_step_ms = format!("{:.1}", r.decode_step_ms),
                     decode_step_ms_plus_one = format!("{:.1}", r.decode_step_ms_plus_one),
+                    prefill_from = if drain.is_some() {
+                        "high drain"
+                    } else if traded.is_some() {
+                        "traded width"
+                    } else {
+                        "model"
+                    },
                     prefill_samples = samples,
                     decode_samples,
                     "learned rates published"
@@ -4477,6 +4533,7 @@ impl Scheduler {
             let ms = creep_us / 1000;
             let (mut pf_seqs, mut pf_tok, mut pf_kv) = (0usize, 0usize, 0usize);
             let (mut sc_seqs, mut sc_tok, mut sc_kv) = (0usize, 0usize, 0usize);
+            let mut high_tok = 0usize;
             for (m, inp) in members.iter().zip(inputs.iter()) {
                 let tok = inp.dims().get(1).copied().unwrap_or(0);
                 match m {
@@ -4484,6 +4541,10 @@ impl Scheduler {
                         pf_seqs += 1;
                         pf_tok += tok;
                         pf_kv += self.session.sequence_offset(*seq_id).unwrap_or(0);
+                        if self.decode_priority_or_high(SequenceId(*seq_id)) == DecodePriority::High
+                        {
+                            high_tok += tok;
+                        }
                     }
                     WaveMember::Section { seq_id, .. } => {
                         sc_seqs += 1;
@@ -4497,6 +4558,9 @@ impl Scheduler {
             // over several waves counts its tokens once.
             let pf_swept = window_tokens(pf_tok, cursor, win_end, n);
             let sc_swept = window_tokens(sc_tok, cursor, win_end, n);
+            // What the `High` backlog drained by, for the rate this card advertises.
+            self.high_drain
+                .drained(window_tokens(high_tok, cursor, win_end, n));
             if pf_seqs > 0 {
                 self.wave_stats.record(true, pf_seqs, pf_swept, pf_kv, ms);
             }

@@ -104,14 +104,21 @@ pub const SPAN_FULL_MARKER: &str = "the span is genuinely full";
 /// fourteen turns its wave carried.
 pub const ARENA_EXHAUSTED_MARKER: &str = "wave arena exhausted";
 
+/// Begins a refusal `begin_wave` gives instead of handing out spans laid out
+/// for an earlier plan than the one this forward recorded, while a generation
+/// holds that layout. Retryable: the generation drops and the forward placed
+/// again lays out its own (`is_arena_exhausted`, which recognises both). Here
+/// rather than beside `begin_wave`, so a build without CUDA still has it.
+pub const SPANS_OUTGROWN_MARKER: &str = "wave spans outgrown by their plan";
+
 /// Recognize a wave buffer asked past its arena — see [`ARENA_EXHAUSTED_MARKER`]
 /// — or the refusal that now comes before it: spans a live generation holds,
 /// laid out for an earlier plan than this forward's
-/// ([`super::bump_arena::SPANS_OUTGROWN_MARKER`]). The same state either way,
+/// ([`SPANS_OUTGROWN_MARKER`]). The same state either way,
 /// and retryable either way.
 pub fn is_arena_exhausted(err: &candle::Error) -> bool {
     let msg = err.to_string();
-    msg.contains(ARENA_EXHAUSTED_MARKER) || msg.contains(super::bump_arena::SPANS_OUTGROWN_MARKER)
+    msg.contains(ARENA_EXHAUSTED_MARKER) || msg.contains(SPANS_OUTGROWN_MARKER)
 }
 
 /// Recognize a claim refused by a full span — see [`SPAN_FULL_MARKER`].

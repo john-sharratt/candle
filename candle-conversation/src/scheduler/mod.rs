@@ -40,6 +40,7 @@ pub mod exported_state;
 mod first_sample;
 mod graph_window;
 mod guest_room;
+mod high_drain;
 mod injected_piece;
 mod interleave;
 #[cfg(feature = "kv-zero-check")]
@@ -3683,6 +3684,9 @@ pub(crate) struct Scheduler {
     held_fit_claims: Option<(u64, u64)>,
     /// When the learned rates were last logged (`publish_learned_rates`).
     rates_logged_at: Option<Instant>,
+    /// The `High` backlog's measured drain per wall second — the prefill rate
+    /// a member advertises while one stands (`high_drain`).
+    high_drain: high_drain::HighDrain,
     /// Sequences whose next token `inject_stencil_prefills` sampled this
     /// iteration from its static run's own prefill. They sit out the decode
     /// step that follows: the token it would carry is the one just sampled, and
@@ -4063,6 +4067,7 @@ impl Scheduler {
             gallery_evicted_at: None,
             held_fit_claims: None,
             rates_logged_at: None,
+            high_drain: high_drain::HighDrain::default(),
             stencil_sampled: HashSet::new(),
             parked_forks: Vec::new(),
             sealed_snapshots: HashMap::new(),

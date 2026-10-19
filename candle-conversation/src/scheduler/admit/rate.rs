@@ -1270,6 +1270,40 @@ impl WaveRate {
         self.decode_step_secs(routed, weights_at(width)) * 1e3
     }
 
+    /// The prefill rate a turn placed here would drain at, in tokens a second,
+    /// before any drain has been measured: the cohort of `full` rows it would
+    /// join, traded against the `decodes` running ([`Self::traded_width`]),
+    /// in a forward that carries the decodes' `decode_rows` beside it at the
+    /// residency that width leaves. With no decode the trade keeps the whole
+    /// width, and this is the wide forward's own rate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn placed_prefill_tok_s(
+        &self,
+        full: usize,
+        least: usize,
+        chunk: usize,
+        prefill_weight: f64,
+        decodes: usize,
+        decode_rows: usize,
+        weights_at: impl Fn(usize) -> u64,
+    ) -> f64 {
+        let width = self.traded_width(
+            full,
+            least,
+            chunk,
+            prefill_weight,
+            decodes,
+            self.routed_for(decodes),
+            &weights_at,
+        );
+        let secs = self.forward_secs(width + decode_rows, weights_at(width));
+        if secs > 0.0 {
+            width as f64 / secs
+        } else {
+            0.0
+        }
+    }
+
     pub fn try_widen_trading(
         &mut self,
         tokens: usize,
@@ -4013,6 +4047,42 @@ mod tests {
         assert!(
             placed <= at(FULL),
             "never slower than the cohort as it stands"
+        );
+    }
+
+    /// **A prompt placed beside decodes is priced at the width the trade gives
+    /// it**, in a forward carrying the decodes' rows — not at the dedicated
+    /// forward's rate. On BlackWorld (a965e3a07) the pass ceiling's 2,390 tok/s
+    /// drew a pattern's opening burst to a member draining a few hundred.
+    #[test]
+    fn a_prompt_placed_beside_decodes_is_priced_at_its_traded_width() {
+        let (rate, weights_at) = traded();
+        let alone = rate.placed_prefill_tok_s(FULL, LEAST, CHUNK, 1.0, 0, 0, &weights_at);
+        let wide = FULL as f64 / rate.forward_secs(FULL, weights_at(FULL));
+        assert!(
+            (alone - wide).abs() < 1e-6 * wide,
+            "with no decode the wide rate stands: {alone} against {wide}"
+        );
+        let decodes = 24;
+        let beside =
+            rate.placed_prefill_tok_s(FULL, LEAST, CHUNK, 1.0, decodes, decodes, &weights_at);
+        let width = rate.traded_width(
+            FULL,
+            LEAST,
+            CHUNK,
+            1.0,
+            decodes,
+            rate.routed_for(decodes),
+            &weights_at,
+        );
+        let expect = width as f64 / rate.forward_secs(width + decodes, weights_at(width));
+        assert!(
+            (beside - expect).abs() < 1e-6 * expect,
+            "{beside} against {expect} at {width} rows"
+        );
+        assert!(
+            beside < alone,
+            "decodes beside it cost the prompt: {beside} vs {alone}"
         );
     }
 }
