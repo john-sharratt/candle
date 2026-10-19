@@ -33,18 +33,37 @@ pub async fn turn(
     limit: Duration,
 ) -> (Sample, String) {
     let sent = Instant::now();
-    let res = target
-        .http
-        .post(&target.chat_url)
-        .header("host", &target.host)
-        .json(body)
-        .send()
-        .await;
+    // The limit covers the whole turn, the wait for the response's headers
+    // included: a request the gateway or a member holds without answering is a
+    // cut turn, not a client that never returns.
+    let deadline = sent + limit;
+    let res = tokio::time::timeout_at(
+        deadline,
+        target
+            .http
+            .post(&target.chat_url)
+            .header("host", &target.host)
+            .json(body)
+            .send(),
+    )
+    .await;
     let res = match res {
-        Ok(r) => r,
-        Err(e) => {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             return (
                 Sample::refused(scenario, "-", e.to_string(), sent.elapsed()),
+                String::new(),
+            )
+        }
+        Err(_) => {
+            return (
+                Sample::of(
+                    scenario,
+                    "-",
+                    &[],
+                    sent.elapsed(),
+                    "deadline before headers",
+                ),
                 String::new(),
             )
         }
@@ -69,7 +88,6 @@ pub async fn turn(
     let mut events: Vec<(Duration, Item)> = Vec::new();
     let mut content = String::new();
     let mut stream = res.bytes_stream();
-    let deadline = sent + limit;
     let end = loop {
         let bytes = match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(Some(Ok(bytes))) => bytes,
@@ -96,4 +114,43 @@ pub async fn turn(
         Sample::of(scenario, &member, &events, sent.elapsed(), &end),
         content,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::sample::Outcome;
+
+    /// **A request held without headers is cut at the turn's limit.** The
+    /// server accepts and never answers; the turn ends as a cut, not a client
+    /// that waits for ever.
+    #[tokio::test]
+    async fn a_request_held_without_headers_is_cut_at_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accepted and held open, never answered, until the test ends.
+        let held = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+        let target = Target {
+            http: Client::new(),
+            chat_url: format!("http://{addr}/v1/chat/completions"),
+            host: "zend.localhost".to_string(),
+        };
+        let limit = Duration::from_millis(300);
+        let (sample, content) = turn(&target, "held", &json!({}), limit).await;
+        assert_eq!(
+            sample.outcome,
+            Outcome::Cut("deadline before headers".to_string())
+        );
+        assert!(content.is_empty());
+        assert!(
+            sample.total < Duration::from_secs(5),
+            "ended at the limit, not long after: {:?}",
+            sample.total
+        );
+        drop(held.join().unwrap());
+    }
 }
