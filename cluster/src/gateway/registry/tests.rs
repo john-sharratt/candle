@@ -450,6 +450,31 @@ fn a_reported_turn_is_not_charged_a_prompt_again() {
     assert_eq!(best(&mut r), Pick::Member(1));
 }
 
+/// **A request answered before the next report brought no waiting prompt.**
+/// Run 23's gateway counted 33 handed to BlackWorld since its last `CAPACITY`
+/// with 10 still in flight: the rest had been answered in milliseconds and
+/// left nothing queued. Only the ones still open are charged.
+#[test]
+fn an_answered_request_is_not_charged_a_prompt() {
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    learned(&mut r, 1, 541, 0, 1_196, 28_862);
+    learned(&mut r, 2, 27, 0, 980, 94_871);
+    // Thirty handed to node 1 and answered at once, before its next report.
+    for _ in 0..30 {
+        let session = r.begin("zend", 1).expect("admitted");
+        r.end("zend", 1, session);
+    }
+    assert_eq!(
+        r.member("zend", 1).map(|m| (m.placed, m.in_flight)),
+        Some((30, 0))
+    );
+    // Nothing waiting there: 1.71 + 14.78 s against node 2's 50.66 s.
+    assert_eq!(best(&mut r), Pick::Member(1));
+}
+
 /// The canary takes a key let go only once it holds the last holder's writes.
 #[test]
 fn a_canary_lacking_the_last_turn_is_not_handed_the_key() {

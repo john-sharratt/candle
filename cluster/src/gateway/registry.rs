@@ -692,7 +692,10 @@ fn finish_us(m: &MemberView) -> Option<u64> {
     if c.prefill_tok_s == 0 || c.decode_step_next_us == 0 {
         return None;
     }
-    let tokens = u64::from(c.prefill_backlog) + (u64::from(m.placed) + 1) * NOMINAL_PROMPT_TOKENS;
+    // A request handed since the report and already answered brought no
+    // prompt that is still waiting: only those still in flight can be.
+    let pending = m.placed.min(m.in_flight);
+    let tokens = u64::from(c.prefill_backlog) + (u64::from(pending) + 1) * NOMINAL_PROMPT_TOKENS;
     let prefill_us = tokens * 1_000_000 / u64::from(c.prefill_tok_s);
     Some(prefill_us + NOMINAL_REPLY_TOKENS * u64::from(c.decode_step_next_us))
 }
