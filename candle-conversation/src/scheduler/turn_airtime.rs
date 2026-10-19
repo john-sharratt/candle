@@ -2,25 +2,34 @@
 //!
 //! A dialogue turn that calls tools alternates the two: a prompt — the user's
 //! message, then each tool's result — and a decode run that ends at the next
-//! tool call. Neither half finishes a turn alone, so the device is split to
-//! keep both moving: each side gets airtime in proportion to the work it has
-//! outstanding, in seconds of its own airtime, and the two backlogs drain
-//! together. A side that falls behind holds more of the work and so draws more
-//! of the device, which is how a waiting prompt rises.
+//! tool call. The device is busy either way, so how it is split does not
+//! change how much work it does; it orders what finishes first. **The side with
+//! less outstanding work goes first** — the smaller backlog, in seconds of its
+//! own airtime, takes the larger share — which is the order that minimises the
+//! mean time to completion: a short prompt beside a long decode run reaches
+//! its first text in seconds instead of waiting the run out, and short decode
+//! runs beside a deep read finish their segments and come back as prompts.
 //!
-//! This replaced a fixed `R = 2` — decode owed twice the creep's airtime —
-//! which held a 50K-token `High` backlog to a third of the device while the
-//! decodes beside it ran one to five rows a step: on BlackWorld (a965e3a07,
-//! 2026-10-19) heavy-read decoded 221 s and prefilled 87 s of 455, and its
-//! prompts drained at 43–277 tok/s where a dedicated forward ran thousands.
+//! **And a prompt that has waited rises to the front.** Its backlog is counted
+//! down by its wait against its own expected time, so a prompt that has waited
+//! as long as it would take alone holds the split's whole width toward it —
+//! however short the decode runs that keep arriving beside it.
 //!
-//! `R` is the decode backlog over the prompt backlog: decode's airtime for
-//! each second of the creep's. Decode rides every step the creep rides, so a
-//! co-batched step of one decode-only step `d` plus a slice `s` gives decode
-//! `d` and the creep `s`. The step loop takes `R` two ways: when `R ≥ 1` the
-//! slice is `d` and decode is owed `(R − 1) d` of decode-only steps after it
-//! ([`debt_ratio`]); when `R < 1` nothing is owed and the slice is `d / R`
-//! ([`slice_steps`]). Either way decode holds `R / (1 + R)` of the device.
+//! This replaced, in turn, a fixed `R = 2` — decode owed twice the creep's
+//! airtime — which held a 50K-token `High` backlog to a third of the device
+//! (BlackWorld, a965e3a07, 2026-10-19: heavy-read decoded 221 s and prefilled
+//! 87 s of 455), and then a split by backlog *size* that gave the larger side
+//! the larger share: on WhiteWorld (e119fd7d7) a 1,768-row prompt beside one
+//! long decode drained at 11 tok/s, its turn silent until it finished.
+//!
+//! `R` is decode's airtime for each second of the creep's. Decode rides every
+//! step the creep rides, so a co-batched step of one decode-only step `d` plus
+//! a slice `s` gives decode `d` and the creep `s`. The step loop takes `R` two
+//! ways: when `R ≥ 1` the slice is `d` and decode is owed `(R − 1) d` of
+//! decode-only steps after it ([`debt_ratio`]); when `R < 1` nothing is owed
+//! and the slice is `d / R` ([`slice_steps`]). Either way decode holds
+//! `R / (1 + R)` of the device — and never less than a token every
+//! [`STREAM_GAP`].
 
 use std::time::Duration;
 
@@ -28,17 +37,19 @@ use std::time::Duration;
 /// beside the other's, and the far side still advances once in this many.
 const MAX_RATIO: f64 = 64.0;
 
-/// Decode's airtime for each second of the creep's: the decodes' backlog —
-/// one mean decode run of `segment_tokens` at `decode_step` a step, which every
-/// decode advances through together — over the prompts' backlog — `prompt_rows`
-/// at `creep_rows_per_s` of the creep's own airtime. `None` while any input is
-/// unmeasured or a side has nothing outstanding; the caller then keeps its
+/// Decode's airtime for each second of the creep's: the prompts' backlog —
+/// `prompt_rows` at `creep_rows_per_s` of the creep's own airtime, counted
+/// down by `waited`, how long the longest-waiting of them has waited — over
+/// the decodes' — one mean decode run of `segment_tokens` at `decode_step` a
+/// step, which every decode advances through together. `None` while any input
+/// is unmeasured or a side has nothing outstanding; the caller then keeps its
 /// default.
 pub(super) fn high_airtime_ratio(
     segment_tokens: f64,
     decode_step: Duration,
     prompt_rows: usize,
     creep_rows_per_s: f64,
+    waited: Duration,
 ) -> Option<f64> {
     let decode_s = segment_tokens * decode_step.as_secs_f64();
     if decode_s.is_nan()
@@ -50,7 +61,11 @@ pub(super) fn high_airtime_ratio(
         return None;
     }
     let prompt_s = prompt_rows as f64 / creep_rows_per_s;
-    Some((decode_s / prompt_s).clamp(1.0 / MAX_RATIO, MAX_RATIO))
+    // What is left of the prompt's own time once its wait is taken off: none
+    // left, and it is due.
+    let due = (1.0 - waited.as_secs_f64() / prompt_s).max(0.0);
+    let ratio = prompt_s / decode_s;
+    Some((ratio.clamp(1.0 / MAX_RATIO, MAX_RATIO) * due).max(1.0 / MAX_RATIO))
 }
 
 /// The debt a co-batched step owes decode, per second of the creep's share of
@@ -146,20 +161,83 @@ impl SegmentMean {
 mod tests {
     use super::*;
 
-    /// Heavy-read's shape: a 50K-row backlog at 1,500 rows a second of creep
-    /// beside decodes running 117-token segments at 50 ms — the decodes hold
-    /// 5.9 s of work against the prompts' 33 s, so the creep takes most of the
-    /// device, where the old constant gave it a third.
+    const NOW: Duration = Duration::ZERO;
+
+    /// The WhiteWorld case: a 1,768-row prompt at 102 rows a second beside a
+    /// decode with 245-token runs at 200 ms — 17 s of prompt against 49 s of
+    /// decode. The smaller backlog goes first: the prompt takes most of the
+    /// device, where splitting by size gave the decode three quarters.
     #[test]
-    fn a_deep_prompt_backlog_takes_most_of_the_device() {
-        let r = high_airtime_ratio(117.0, Duration::from_millis(50), 50_000, 1_500.0)
+    fn a_short_prompt_beside_a_long_run_goes_first() {
+        let r = high_airtime_ratio(245.0, Duration::from_millis(200), 1_768, 102.0, NOW)
             .expect("both sides measured");
-        assert!((r - 5.85 / (50_000.0 / 1_500.0)).abs() < 1e-9, "R = {r}");
-        let creep_share = 1.0 / (1.0 + r);
-        assert!(creep_share > 0.8, "the creep's share {creep_share}");
-        // 5.7 decode steps of slice by the backlogs, but a 50 ms step and its
-        // slice may not outlast the stream gap: four steps of slice, 80%.
-        assert!((slice_steps(r, Duration::from_millis(50)) - 4.0).abs() < 1e-9);
+        let want = (1_768.0 / 102.0) / (245.0 * 0.2);
+        assert!((r - want).abs() < 1e-9, "R = {r}");
+        assert!(1.0 / (1.0 + r) > 0.7, "the prompt's share at R = {r}");
+    }
+
+    /// Heavy-read's shape: 117-token runs at 50 ms beside a 50K-row backlog at
+    /// 1,500 rows a second — 5.9 s of decode against 33 s of prompt. The decode
+    /// runs finish first and come back as prompts.
+    #[test]
+    fn short_decode_runs_beside_a_deep_backlog_finish_first() {
+        let r = high_airtime_ratio(117.0, Duration::from_millis(50), 50_000, 1_500.0, NOW)
+            .expect("both sides measured");
+        assert!(r > 1.0, "R = {r}");
+        assert_eq!(slice_steps(r, Duration::from_millis(50)), 1.0);
+    }
+
+    /// **A prompt that has waited its own time is due, whatever the decodes
+    /// hold.** A busy chat cluster can keep the decode backlog short
+    /// indefinitely; the prompt's share still reaches the split's full width
+    /// toward it once it has waited as long as it would take alone, and rises
+    /// all the way there.
+    #[test]
+    fn a_waiting_prompt_reaches_the_front_within_its_own_time() {
+        let (rows, rate) = (50_000usize, 1_500.0);
+        let own = Duration::from_secs_f64(rows as f64 / rate);
+        for (seg, step_ms) in [(1.0, 1u64), (20.0, 10), (117.0, 50), (2_000.0, 200)] {
+            let step = Duration::from_millis(step_ms);
+            let mut last = f64::INFINITY;
+            for k in 0..=10 {
+                let waited = own.mul_f64(k as f64 / 10.0);
+                let r = high_airtime_ratio(seg, step, rows, rate, waited).unwrap();
+                assert!(r <= last, "R rose as the prompt waited: {r} after {last}");
+                last = r;
+            }
+            assert_eq!(
+                last,
+                1.0 / MAX_RATIO,
+                "due at its own time beside {seg}-token runs"
+            );
+        }
+    }
+
+    /// **The clamp and the floor compose.** At the split's full width toward
+    /// decode, a slice still rides once in each debt cycle, so a prompt beside
+    /// long decode runs advances — and at full width toward the prompt the
+    /// decodes still stream.
+    #[test]
+    fn neither_side_stops_at_the_split_s_widest() {
+        let d = Duration::from_millis(50);
+        // Toward decode: one step of slice, owed 63 decode-only steps.
+        let slice = slice_steps(MAX_RATIO, d);
+        let owed = debt_ratio(MAX_RATIO) * slice;
+        assert_eq!(slice, 1.0);
+        assert!(owed.is_finite() && owed > 0.0);
+        let creep_share = slice / (1.0 + owed + slice);
+        assert!(
+            creep_share >= 1.0 / (MAX_RATIO + 2.0),
+            "the creep's share {creep_share}"
+        );
+        // Toward the prompt: no debt, and a co-batched step inside the gap.
+        let r = 1.0 / MAX_RATIO;
+        assert_eq!(debt_ratio(r), 0.0);
+        let step = d.as_secs_f64() * (1.0 + slice_steps(r, d));
+        assert!(
+            step <= STREAM_GAP.as_secs_f64() + 1e-9,
+            "co-batched step {step} s"
+        );
     }
 
     /// However `R` falls, a co-batched step and the decode-only steps it owes
@@ -200,37 +278,31 @@ mod tests {
         );
     }
 
-    /// A short prompt beside long decode runs yields to them.
-    #[test]
-    fn a_short_prompt_beside_long_runs_yields() {
-        let r = high_airtime_ratio(2_000.0, Duration::from_millis(60), 512, 1_500.0)
-            .expect("both sides measured");
-        assert!(r > 1.0, "R = {r}");
-        assert_eq!(slice_steps(r, Duration::from_millis(60)), 1.0);
-    }
-
     /// Nothing measured, nothing outstanding: the caller keeps its default.
     #[test]
     fn an_unmeasured_side_gives_no_ratio() {
         let step = Duration::from_millis(50);
-        assert_eq!(high_airtime_ratio(0.0, step, 1_000, 1_500.0), None);
+        assert_eq!(high_airtime_ratio(0.0, step, 1_000, 1_500.0, NOW), None);
         assert_eq!(
-            high_airtime_ratio(100.0, Duration::ZERO, 1_000, 1_500.0),
+            high_airtime_ratio(100.0, Duration::ZERO, 1_000, 1_500.0, NOW),
             None
         );
-        assert_eq!(high_airtime_ratio(100.0, step, 0, 1_500.0), None);
-        assert_eq!(high_airtime_ratio(100.0, step, 1_000, 0.0), None);
+        assert_eq!(high_airtime_ratio(100.0, step, 0, 1_500.0, NOW), None);
+        assert_eq!(high_airtime_ratio(100.0, step, 1_000, 0.0, NOW), None);
     }
 
     /// The split stays inside its bounds however lopsided the backlogs.
     #[test]
     fn the_split_is_bounded_both_ways() {
         let step = Duration::from_millis(50);
-        let tiny = high_airtime_ratio(1.0, step, 10_000_000, 100.0).unwrap();
-        let huge = high_airtime_ratio(1e9, step, 1, 1e9).unwrap();
-        assert_eq!(tiny, 1.0 / MAX_RATIO);
-        assert_eq!(huge, MAX_RATIO);
-        assert_eq!(slice_steps(tiny, Duration::from_micros(1)), MAX_RATIO);
+        let toward_decode = high_airtime_ratio(1.0, step, 10_000_000, 100.0, NOW).unwrap();
+        let toward_prompt = high_airtime_ratio(1e9, step, 1, 1e9, NOW).unwrap();
+        assert_eq!(toward_decode, MAX_RATIO);
+        assert_eq!(toward_prompt, 1.0 / MAX_RATIO);
+        assert_eq!(
+            slice_steps(toward_prompt, Duration::from_micros(1)),
+            MAX_RATIO
+        );
     }
 
     /// The creep's rate is its speed per second it ran, whatever the gaps.

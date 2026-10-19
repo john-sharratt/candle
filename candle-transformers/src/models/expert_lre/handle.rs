@@ -1164,6 +1164,12 @@ impl ExpertCache {
                 .map_or(String::new(), |(bell, done)| {
                     format!("; doorbell {bell}, done {done}")
                 });
+            let words = match self.dispatch.cpu_export_words() {
+                Some((ticket, blocks, slot)) => format!(
+                    "{words}; export counted {blocks} blocks of ticket {ticket}, work slot names {slot}"
+                ),
+                None => words,
+            };
             return Err(candle::Error::Msg(format!(
                 "{}; pool: {}{words}",
                 fault.error(),

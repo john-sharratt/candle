@@ -481,6 +481,20 @@ impl Scheduler {
         }) else {
             return;
         };
+        // **The link the scheduler measured, where the pipeline measured none.**
+        // The pipeline probes its link only for read-ahead or the CPU class, and
+        // a card running neither publishes zero — which priced every weight byte
+        // at nothing, so the gallery kept all it held: on WhiteWorld (e119fd7d7,
+        // 2026-10-19) 4.16 GB of it beside a 3.7 GB expert zone, `link_gb_s=0.00`.
+        // The rate model probes the same bus at start and raises it on the
+        // forwards that beat it.
+        let link = if link > 0.0 {
+            link
+        } else {
+            self.wave_rate
+                .as_ref()
+                .map_or(0.0, |r| r.link_bytes_per_s())
+        };
         let now = Instant::now();
         if let Some((then, seen)) = self.gallery_misses_seen {
             let secs = now.duration_since(then).as_secs_f64();
@@ -754,7 +768,8 @@ impl Scheduler {
                     } else {
                         "model"
                     },
-                    airtime_ratio = format!("{:.3}", self.wave_step_ratio),
+                    high_airtime_ratio = self.high_airtime.map(|r| format!("{r:.3}")),
+                    step_debt_ratio = format!("{:.3}", self.wave_step_ratio),
                     segment_tokens = self.segment_mean.tokens().map(|t| t.round() as u64),
                     creep_rows_per_s = self.creep_airtime.per_s().map(|r| r.round() as u64),
                     prefill_samples = samples,
@@ -2700,6 +2715,27 @@ impl Scheduler {
     ///
     /// Each decode counts at its target layer's `decode_priority`, `High`
     /// where that does not resolve.
+    /// How long the longest-waiting `High` prompt has waited since it was
+    /// submitted — prefilling or still queued — for the split's aging
+    /// (`turn_airtime`). Zero with none.
+    pub(super) fn longest_high_prompt_wait(&self) -> std::time::Duration {
+        let now = Instant::now();
+        let high = |id: SequenceId| self.decode_priority_or_high(id) == DecodePriority::High;
+        self.active_prefills
+            .iter()
+            .filter(|p| p.error.is_none() && p.finished.is_none() && high(p.work.sequence_id))
+            .map(|p| p.work.submitted_at)
+            .chain(
+                self.prefill_queue
+                    .iter()
+                    .filter(|w| high(w.sequence_id))
+                    .map(|w| w.submitted_at),
+            )
+            .map(|at| now.saturating_duration_since(at))
+            .max()
+            .unwrap_or_default()
+    }
+
     pub(super) fn airtime_ratio_over(&self, work: DecodePriority) -> u32 {
         throttle_ratio(
             work,
@@ -4294,10 +4330,10 @@ impl Scheduler {
         };
         let band = self.airtime_ratio_over(work);
         // **A `High` prompt beside `High` decodes splits the device by the work
-        // each side holds** (`turn_airtime`): the two halves of a tool-calling
-        // turn, kept moving together. The band's constant stands until both
-        // sides are measured, and below `High` the bands decide alone —
-        // background ingest yields to dialogue whatever the backlogs say.
+        // each side holds** (`turn_airtime`): the smaller backlog first, and a
+        // prompt that has waited its own time at the front. The band's constant
+        // stands until both sides are measured, and below `High` the bands decide
+        // alone — background ingest yields to dialogue whatever the backlogs say.
         let derived = (work == DecodePriority::High && band == HIGH_BESIDE_HIGH_RATIO)
             .then(|| {
                 super::turn_airtime::high_airtime_ratio(
@@ -4305,9 +4341,13 @@ impl Scheduler {
                     self.decode_only_step?,
                     self.high_backlog_rows,
                     self.creep_airtime.per_s()?,
+                    self.longest_high_prompt_wait(),
                 )
             })
             .flatten();
+        if derived.is_some() {
+            self.high_airtime = derived;
+        }
         let ratio = derived.unwrap_or(band.max(1) as f64);
         self.wave_step_ratio = match derived {
             Some(r) => super::turn_airtime::debt_ratio(r),

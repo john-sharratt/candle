@@ -525,8 +525,9 @@ pub(crate) struct CpuPath {
     paged: Arc<PagedImages>,
     /// `u32[2 · MAX_PREFILL_TOKENS · k]`: ring row → expert-grouped row.
     dst_row: CudaSlice<u32>,
-    /// The export kernel's finished-block count, zero between launches.
-    blocks_done: CudaSlice<u32>,
+    /// The export kernel's finished-block count, keyed by the ticket it counts
+    /// (`moe_cpu_export.cu`): the ticket's low word above the count.
+    blocks_done: CudaSlice<u64>,
     /// `u32[CPU_CARRY_WORDS]`: the CPU experts one launch hands the next to
     /// promote behind the pool (`moe_bucketize_cpu.cuh`, THE CARRY). Zeroed:
     /// sequence word 0 names no launch, so the first launch finds nothing.
@@ -562,7 +563,7 @@ impl CpuPath {
             tok_first: unsafe { device.alloc::<u32>(2 * MAX_PREFILL_TOKENS)? },
             in_tok: unsafe { device.alloc::<u32>(cap_rows.max(1))? },
             service,
-            blocks_done: device.memcpy_stod(&[0u32])?,
+            blocks_done: device.memcpy_stod(&[0u64])?,
             carry: device.memcpy_stod(&[0u32; CPU_CARRY_WORDS])?,
             explore: Mutex::new(Quiet::default()),
         })
@@ -642,6 +643,26 @@ impl Dispatch {
         self.cpu
             .as_ref()
             .map(|c| (c.service.rings().doorbell(), c.service.rings().done()))
+    }
+
+    /// The CPU export's block counter as the device holds it now — the ticket
+    /// it last counted and how many of that launch's blocks were out — and the
+    /// work slot's invocation: what a doorbell that never moved, with `done`
+    /// level beside it, is to be told apart by.
+    pub(crate) fn cpu_export_words(&self) -> Option<(u32, u32, u32)> {
+        let c = self.cpu.as_ref()?;
+        let word = c
+            .blocks_done
+            .stream()
+            .memcpy_dtov(&c.blocks_done)
+            .ok()?
+            .first()
+            .copied()?;
+        Some((
+            (word >> 32) as u32,
+            word as u32,
+            c.service.rings().header().seq,
+        ))
     }
 
     /// `slot_bytes` is the largest 32-row tile slice of any projection — one

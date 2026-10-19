@@ -3789,6 +3789,9 @@ pub(crate) struct Scheduler {
     /// How long the last step's creep slice could run beside decode rows, in
     /// decode-only steps (`turn_airtime::slice_steps`).
     wave_step_slice: f64,
+    /// The split the last `High`-beside-`High` step derived (`turn_airtime`), for
+    /// the rates line: `wave_step_ratio` is whatever band the last step ran in.
+    high_airtime: Option<f64>,
     /// The creep's rows per second of its own airtime (`turn_airtime`).
     creep_airtime: turn_airtime::AirtimeRate,
     /// The mean decode run of a `High` turn segment (`turn_airtime`).
@@ -4113,6 +4116,7 @@ impl Scheduler {
             wave_cobatched: false,
             wave_step_ratio: 1.0,
             wave_step_slice: 1.0,
+            high_airtime: None,
             creep_airtime: turn_airtime::AirtimeRate::default(),
             segment_mean: turn_airtime::SegmentMean::default(),
             high_backlog_rows: 0,

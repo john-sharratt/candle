@@ -12983,6 +12983,74 @@ fn cuda_cpu_class_faults_promptly_on_a_dead_pool() -> Result<()> {
     cpu_class_round_trip(false, 2, 24, 16)
 }
 
+/// **A count another launch left behind cannot keep this one from ringing.**
+/// The export's last block rings the doorbell, found by a counter every launch
+/// shares; a launch that did not count all its blocks out — discarded
+/// mid-layer, or of another grid — left it part-way, and the next launch's
+/// count then reached the grid early or never, so nothing rang and the down
+/// launch waited out its deadline with `done` level with the doorbell
+/// (WhiteWorld, e119fd7d7). Keyed by ticket, a stale count is replaced, and
+/// every launch rings its own.
+#[test]
+fn cuda_cpu_export_rings_whatever_count_another_launch_left() -> Result<()> {
+    use candle_kernels::simple::moe_cpu_export::{run_moe_cpu_export, EXPORT_WARPS};
+
+    let dev = CudaDevice::new(0)?;
+    let stream = dev.cuda_stream();
+    let (rows, ncols) = (16usize, 1024usize);
+    let tiles = ncols / 128;
+    let act: Vec<f32> = (0..rows * ncols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 50.0)
+        .collect();
+    let op = quantize_acts_q8a128_test(&dev, &act, rows, ncols)?;
+    let in_tok = dev.memcpy_stod(&(0..rows as u32).collect::<Vec<_>>())?;
+    let mut header = vec![0i32; 16];
+    header[7] = rows as i32;
+    let header = dev.memcpy_stod(&header)?;
+    let (_ring_h, ring_d) = mapped_host((rows * tiles).div_ceil(8) * 1152);
+    let (word_h, word_d) = mapped_host(64);
+    // Several blocks, so the count matters: one block would ring alone.
+    let grid = 3i32;
+    assert!((rows * tiles).div_ceil(EXPORT_WARPS) >= grid as usize);
+    let launch = |blocks: &CudaSlice<u64>, seq: u64| {
+        let (hp, _g1) = header.device_ptr(&stream);
+        let (ip, _g2) = in_tok.device_ptr(&stream);
+        let (bp, _g3) = blocks.device_ptr(&stream);
+        let status = op.with_device_ptr(&dev, |src| unsafe {
+            Ok(run_moe_cpu_export(
+                src as *const c_void,
+                tiles as i32,
+                ip as *const c_void,
+                hp as *const c_void,
+                ring_d as *mut c_void,
+                rows as u32,
+                word_d as *mut c_void,
+                seq,
+                bp as *mut c_void,
+                grid,
+                stream.cu_stream() as *mut c_void,
+            ))
+        })?;
+        assert_eq!(status, 0, "export launched");
+        stream.synchronize().map_err(crate::Error::wrap)?;
+        Ok::<_, crate::Error>(unsafe { std::ptr::read_volatile(word_h as *const u64) })
+    };
+    // Another ticket's launch, two of its three blocks counted out.
+    let stale = dev.memcpy_stod(&[(7u64 << 32) | 2])?;
+    assert_eq!(
+        launch(&stale, 8)?,
+        8,
+        "the stale count did not complete or block this launch"
+    );
+    // And back to back from there, as layers run.
+    assert_eq!(launch(&stale, 9)?, 9);
+    assert_eq!(launch(&stale, 10)?, 10);
+    // A count left at this very ticket's grid by a launch that rang already
+    // is the one case the key cannot tell apart, and it cannot arise: a ticket
+    // is launched once.
+    Ok(())
+}
+
 /// **Layers back to back, as a forward runs them.** Three invocations —
 /// bucketize, export, live launch each — enqueued on the stream with no host
 /// synchronisation between them, the stand-in pool answering each doorbell in
@@ -13033,7 +13101,7 @@ fn cuda_cpu_class_back_to_back_layers_pull_their_own_results() -> Result<()> {
     let tok_first = dev.memcpy_stod(&vec![0u32; n_tokens])?;
     let in_tok = dev.memcpy_stod(&vec![u32::MAX; a_ub])?;
     let (inputs_h, inputs_d) = mapped_host(4 * (1 + a_ub));
-    let blocks_done = dev.memcpy_stod(&[0u32])?;
+    let blocks_done = dev.memcpy_stod(&[0u64])?;
     const W: usize = 8;
     let slot_bytes = (ncols / 128) * 4 * fx.chunk_bytes;
     let scratch = unsafe { dev.alloc::<u8>(W * slot_bytes)? };
@@ -13313,7 +13381,7 @@ fn cpu_class_round_trip(
     let tok_first = dev.memcpy_stod(&vec![0u32; n_tokens])?;
     let in_tok = dev.memcpy_stod(&vec![u32::MAX; a_ub])?;
     let (inputs_h, inputs_d) = mapped_host(4 * (1 + a_ub));
-    let blocks_done = dev.memcpy_stod(&[0u32])?;
+    let blocks_done = dev.memcpy_stod(&[0u64])?;
     const W: usize = 8;
     let slot_bytes = (ncols / 128) * 4 * fx.chunk_bytes;
     let scratch = unsafe { dev.alloc::<u8>(W * slot_bytes)? };

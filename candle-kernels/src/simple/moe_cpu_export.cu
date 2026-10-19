@@ -19,7 +19,7 @@
 // block's: every block that copied fences its writes system-wide before
 // counting itself out, so the block that takes the count to the grid size
 // knows every row is visible to the host before it stores the doorbell — and
-// resets the count for the next launch.
+// keys the count by the ticket it counts, so no other launch's count completes it.
 // =============================================================================
 
 #include <stdint.h>
@@ -36,7 +36,7 @@ extern "C" __global__ void moe_cpu_export_kernel(
     const uint32_t cap_rows,               // rows the ring holds
     unsigned long long* doorbell,          // the pool's doorbell (mapped)
     const unsigned long long seq,
-    unsigned int* blocks_done)             // device counter, 0 between launches
+    unsigned long long* blocks_done)       // device counter, keyed by ticket
 {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -61,13 +61,28 @@ extern "C" __global__ void moe_cpu_export_kernel(
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        const unsigned int done = atomicAdd(blocks_done, 1u) + 1u;
-        if (done == gridDim.x) {
-            *blocks_done = 0u;
-            if (n > 0) {
-                __threadfence_system();
-                *(volatile unsigned long long*)doorbell = seq;
+        // The count is keyed by the invocation: the high word names the ticket
+        // it counts, the low word how many of its blocks are out. A count left
+        // by another launch — one discarded mid-layer before its blocks all
+        // counted out, or one with another grid — names another ticket, and the
+        // first block here starts this one's from its own 1 instead of adding
+        // to it. Shared and unkeyed, a stale count reached `gridDim` early or
+        // never, and a never rang nothing: the down launch waited out its
+        // deadline on a doorbell that had not moved.
+        const unsigned long long key = (seq & 0xffffffffull) << 32;
+        unsigned long long seen = *(volatile unsigned long long*)blocks_done;
+        unsigned long long next;
+        for (;;) {
+            next = ((seen & 0xffffffff00000000ull) == key) ? seen + 1ull : (key | 1ull);
+            const unsigned long long was = atomicCAS(blocks_done, seen, next);
+            if (was == seen) {
+                break;
             }
+            seen = was;
+        }
+        if ((next & 0xffffffffull) == (unsigned long long)gridDim.x && n > 0) {
+            __threadfence_system();
+            *(volatile unsigned long long*)doorbell = seq;
         }
     }
 }
@@ -96,6 +111,6 @@ extern "C" int32_t run_moe_cpu_export(
     moe_cpu_export_kernel<<<grid, EXPORT_WARPS * 32, 0, (cudaStream_t)stream>>>(
         (const uint8_t*)src, tiles, (const uint32_t*)in_tok, (const int32_t*)header,
         (uint8_t*)ring, cap_rows, (unsigned long long*)doorbell, (unsigned long long)seq,
-        (unsigned int*)blocks_done);
+        (unsigned long long*)blocks_done);
     return cudaPeekAtLastError() == cudaSuccess ? 0 : 2;
 }
