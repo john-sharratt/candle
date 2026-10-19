@@ -2978,6 +2978,20 @@ impl Scheduler {
                     .session
                     .kv_region_stats()
                     .map_or((0, 0), |s| (s.live, s.live_watermark));
+                // Who holds the span at formation, as the refusal line names it
+                // then — the difference between the two is who claimed the
+                // cohort's ground while it swept.
+                let tenants: String = candle_nn::kv_cache::SlotTenant::ALL
+                    .iter()
+                    .map(|&t| {
+                        format!(
+                            "{}={}",
+                            t.label(),
+                            candle_nn::kv_cache::arena_regions(self.session.device(), t)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 tracing::info!(
                     target: "candle_conversation::scheduler::creep",
                     rows,
@@ -2989,6 +3003,7 @@ impl Scheduler {
                     kv_blocks_mib = kv_blocks >> 20,
                     live_regions = live,
                     frontier_regions,
+                    tenants = %tenants,
                     claims_mib = claims >> 20,
                     holes_mib = holes >> 20,
                     frontier_mib = frontier.unwrap_or(0) >> 20,
