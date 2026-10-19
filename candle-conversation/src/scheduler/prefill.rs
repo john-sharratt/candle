@@ -2875,10 +2875,11 @@ impl Scheduler {
             let claims = rows
                 .saturating_mul(kv_row)
                 .saturating_add(self.model.creep_residual_bytes(&self.session, rows));
-            let at_frontier = self.frontier_tier_bytes().and_then(|g| {
-                let holes = self.session.kv_region_stats().map_or(0, |s| {
-                    s.live_watermark.saturating_sub(s.live) * candle_nn::kv_cache::REGION_BYTES
-                });
+            let frontier = self.frontier_tier_bytes();
+            let holes = self.session.kv_region_stats().map_or(0, |s| {
+                s.live_watermark.saturating_sub(s.live) * candle_nn::kv_cache::REGION_BYTES
+            });
+            let at_frontier = frontier.and_then(|g| {
                 fitted_rows(
                     rows,
                     (tier as usize).saturating_add(claims.saturating_sub(holes)),
@@ -2890,6 +2891,20 @@ impl Scheduler {
                 .flatten()
                 .min()
             else {
+                // Fitted: what it was fitted to, once per cohort, so a window
+                // later refused can be read against the price it formed on.
+                tracing::info!(
+                    target: "candle_conversation::scheduler::creep",
+                    rows,
+                    members = members.len(),
+                    decodes = self.decode_width(),
+                    tier_mib = tier >> 20,
+                    claims_mib = claims >> 20,
+                    holes_mib = holes >> 20,
+                    frontier_mib = frontier.unwrap_or(0) >> 20,
+                    ground_mib = ground >> 20,
+                    "creep cohort fitted to the ground its windows will place on"
+                );
                 return;
             };
             tracing::debug!(

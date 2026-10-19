@@ -1282,7 +1282,29 @@ pub fn drive_step<S: WaveSweep + ?Sized>(
     let step_span = match model.device() {
         Device::Cuda(cuda) if plan != [0; 3] => {
             let stream = cuda.cuda_stream();
-            plan_wave_transient(&stream, plan)?;
+            // The refusal names the partition; what the step's segments priced
+            // — each `[layer range): [attention, ffn, forward]` — is what says
+            // which part of the step the admission that composed it missed.
+            plan_wave_transient(&stream, plan).map_err(|e| {
+                let segments: Vec<String> = segs
+                    .iter()
+                    .zip(&prices)
+                    .map(|(s, p)| {
+                        format!(
+                            "[{}, {}){}: {:?}",
+                            s.start,
+                            s.end,
+                            if s.creep { " creep" } else { "" },
+                            p
+                        )
+                    })
+                    .collect();
+                candle::Error::Msg(format!(
+                    "{e} — for a step of {} segments {}, placed {plan:?} B",
+                    segs.len(),
+                    segments.join(" "),
+                ))
+            })?;
             Some(begin_wave(&stream, LayerPhase::Forward)?)
         }
         _ => None,

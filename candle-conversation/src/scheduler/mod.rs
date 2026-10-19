@@ -2711,20 +2711,46 @@ impl WaveStats {
         // judged on the trade and admitted, the mean weights each side carried,
         // and the mean shares of its own rate each side moved by — the figures
         // the formula is tuned from (`WaveRate::try_widen_trading`).
+        // And every admission decision of the window by its outcome — what was
+        // admitted (and how much of it outranked the running work), what was
+        // refused and by which rule, and where residency stood against the
+        // prefill floor — so a run that starves shows which rule held it.
         let trades_str = match trades {
-            Some(t) if t.judged > 0 => {
-                let n = t.judged as f64;
-                format!(
-                    " | trades n={} ok={} pw={:.1} dw={:.1} dP={:.4} dD={:.4}",
-                    t.judged,
-                    t.admitted,
-                    t.prefill_weight / n,
-                    t.decode_weight / n,
-                    t.prefill_gain / n,
-                    t.decode_change / n,
-                )
+            Some(t) => {
+                let mut s = String::new();
+                let offered = t.offers_admitted
+                    + t.refused_floor
+                    + t.refused_cap
+                    + t.refused_rate
+                    + t.refused_full;
+                if offered > 0 {
+                    s.push_str(&format!(
+                        " | admit ok={} out={} floor={} cap={} rate={} full={} res={}MiB/{}MiB",
+                        t.offers_admitted,
+                        t.outranking,
+                        t.refused_floor,
+                        t.refused_cap,
+                        t.refused_rate,
+                        t.refused_full,
+                        t.last_after >> 20,
+                        t.last_floor >> 20,
+                    ));
+                }
+                if t.judged > 0 {
+                    let n = t.judged as f64;
+                    s.push_str(&format!(
+                        " | trades n={} ok={} pw={:.1} dw={:.1} dP={:.4} dD={:.4}",
+                        t.judged,
+                        t.admitted,
+                        t.prefill_weight / n,
+                        t.decode_weight / n,
+                        t.prefill_gain / n,
+                        t.decode_change / n,
+                    ));
+                }
+                s
             }
-            _ => String::new(),
+            None => String::new(),
         };
         tracing::info!(
             "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}{trades_str}",

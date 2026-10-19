@@ -235,7 +235,9 @@ pub(crate) struct Filled {
 /// rules said no — and those are exactly the questions asked of a run that
 /// admitted nothing for an hour. One line per refusal, at debug, and refusals
 /// are rare on a healthy engine by construction: the band stops at the first.
+#[allow(clippy::too_many_arguments)]
 fn log_refusal(
+    rate: &mut WaveRate,
     kind: Kind,
     prio: DecodePriority,
     cost: &Cost,
@@ -244,6 +246,7 @@ fn log_refusal(
     budget: &Budget,
     refusal: rate::Refusal,
 ) {
+    rate.note_refusal(refusal, after, budget.prefill_floor);
     tracing::debug!(
         target: "candle_conversation::scheduler::admission",
         kind = ?kind,
@@ -403,7 +406,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                             rate::Admit::Admitted { .. } => true,
                             rate::Admit::Refused(r) => {
                                 out.note(r);
-                                log_refusal(kind, prio, &cost, before, after, &budget, r);
+                                log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                                 false
                             }
                         }
@@ -456,13 +459,13 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                         rate::Admit::Refused(r @ rate::Refusal::Cap { .. })
                             if cost.rows > 0 && ground.close_rows() =>
                         {
-                            log_refusal(kind, prio, &cost, before, after, &budget, r);
+                            log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                             continue;
                         }
                         rate::Admit::Refused(r) => {
                             rate.latch_full();
                             out.note(r);
-                            log_refusal(kind, prio, &cost, before, after, &budget, r);
+                            log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                             false
                         }
                     }
@@ -494,7 +497,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                             Ok(_) => true,
                             Err(r) => {
                                 out.note(r);
-                                log_refusal(kind, prio, &cost, before, after, &budget, r);
+                                log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                                 false
                             }
                         }
@@ -530,7 +533,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                             rate::Admit::Refused(
                                 r @ (rate::Refusal::Saturated { .. } | rate::Refusal::Worse { .. }),
                             ) if kind == Kind::Prefill && ground.close_rows() => {
-                                log_refusal(kind, prio, &cost, before, after, &budget, r);
+                                log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                                 continue;
                             }
                             rate::Admit::Refused(r) => {
@@ -539,7 +542,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                                 // the wave as `try_admit`'s does.
                                 rate.latch_full();
                                 out.note(r);
-                                log_refusal(kind, prio, &cost, before, after, &budget, r);
+                                log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                                 false
                             }
                         }
@@ -549,6 +552,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                 break;
             }
             if kind != Kind::Decode {
+                rate.note_admitted(ground.outranks_active(prio), after, budget.prefill_floor);
                 // The refusal's twin: a pass that admits more than its readings
                 // allow is read from these, not from the pass total.
                 tracing::debug!(
