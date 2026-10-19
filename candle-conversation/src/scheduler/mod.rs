@@ -68,6 +68,7 @@ mod section_pages;
 mod segment_rearm;
 mod settle;
 mod spec_chooser;
+mod submit_admit;
 mod sweep_forecast;
 #[cfg(test)]
 mod test_substrate;
@@ -2614,6 +2615,7 @@ impl WaveStats {
         slots: (u32, u32, u32, u32),
         experts: Option<(usize, usize, usize, usize)>,
         graphs: Option<CaptureStats>,
+        trades: Option<admit::rate::TradeWindow>,
     ) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
@@ -2705,8 +2707,27 @@ impl WaveStats {
             _ => String::new(),
         };
         self.graphs_prev = graphs;
+        // This window's prefill-against-decode trades: how many turns were
+        // judged on the trade and admitted, the mean weights each side carried,
+        // and the mean shares of its own rate each side moved by — the figures
+        // the formula is tuned from (`WaveRate::try_widen_trading`).
+        let trades_str = match trades {
+            Some(t) if t.judged > 0 => {
+                let n = t.judged as f64;
+                format!(
+                    " | trades n={} ok={} pw={:.1} dw={:.1} dP={:.4} dD={:.4}",
+                    t.judged,
+                    t.admitted,
+                    t.prefill_weight / n,
+                    t.decode_weight / n,
+                    t.prefill_gain / n,
+                    t.decode_change / n,
+                )
+            }
+            _ => String::new(),
+        };
         tracing::info!(
-            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}",
+            "wave {:.1}s: {body}{vram}{backlog_str}{experts_str}{graphs_str}{trades_str}",
             elapsed.as_secs_f64()
         );
         // Phase breakdown: where the wall-clock went on the scheduler thread.
@@ -3201,6 +3222,9 @@ pub(crate) struct Scheduler {
     sampling_states: HashMap<SequenceId, SequenceSamplingState>,
     /// Prefill queue (FIFO) — newly submitted, not yet started.
     prefill_queue: VecDeque<PrefillWork>,
+    /// Submitted turns whose projection is chosen but not yet on the device,
+    /// offered to the admission fill with their lift priced (`submit_admit`).
+    pub(super) pending_submits: VecDeque<submit_admit::PendingSubmit>,
     /// Whether a slot has released its ground since the last admission pass.
     ///
     /// **Admission opportunities are created only by completions.** Nothing new
@@ -3911,6 +3935,7 @@ impl Scheduler {
             active_decodes: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
+            pending_submits: VecDeque::new(),
             // See the field: the first pass has nothing to wait for.
             settled_since_admit: true,
             settle_owed: false,
@@ -4257,6 +4282,14 @@ impl Scheduler {
                         Some(_) | None => wind_down_refused = true,
                     }
                 }
+                // A submission still waiting for admission on this parent is a turn
+                // in flight as well: one whose caller left is dropped, a live one
+                // refuses the new turn as a live decode does.
+                self.pending_submits
+                    .retain(|p| p.parent() != parent_id || !p.work.event_tx.is_disconnected());
+                if self.pending_submits.iter().any(|p| p.parent() == parent_id) {
+                    wind_down_refused = true;
+                }
                 self.cleanup_finished();
                 if wind_down_refused {
                     let _ = event_tx.send(TurnEvent::Error(ConversationError::TurnInFlight {
@@ -4561,201 +4594,23 @@ impl Scheduler {
                     (Vec::new(), Vec::new())
                 };
 
-                // Read guard dropped above when the projection block
-                // exited; now safe to take a write guard for the
-                // diagnostic side-channel.  No-op when projection used
-                // the rule-based path (no tree on the target timeline).
-                // Ephemeral probe slots write NOTHING to the substrate — not even
-                // this diagnostic side-channel on the (shared) target timeline.
-                if let Some((timeline, diag)) = diag_to_write {
-                    if !self.ephemeral_slots.contains(&parent_id) {
-                        if let Some(conv) = self.slot_conversations.get(&parent_id) {
-                            conv.write().set_last_selection(timeline, diag);
-                        }
-                    }
-                }
-
-                // Step 1.5: select-promote (cold → warm → hot).
-                //
-                // Batched warm→hot scatter (one `kv_migrate_on` per
-                // layer on `elevate_copy_stream`) + per-item
-                // cold→hot recover for any turn whose sealed bytes
-                // live in the redo log. After this returns,
-                // `apply_projection`'s per-unit `ensure_*_hot`
-                // calls hit the hot branch immediately.
-                //
-                // Skipped when nothing was projected — `elevate_to_hot`
-                // would no-op anyway, but the substrate read-lock
-                // snapshot is cheap to avoid.
-                let mut projected_segments = projected_segments;
-                if let Some(conversation) = self.slot_conversations.get(&parent_id).cloned() {
-                    // Free VRAM held by yesterday's working set (warm-backed hot
-                    // residences NOT in the incoming projection), then batch
-                    // select-promote the projected sections/turns into hot before
-                    // `apply_projection` injects them.
-                    // Warm → hot for everything the projection selected that is not
-                    // already resident. A tier crossing, so it is bounded by PCIe rather
-                    // than by compute, and it runs before any forward can start.
-                    let _g = profile::span("drain:elevate");
-                    self.elevate_projection_working_set(
-                        &conversation,
-                        &projected_sections,
-                        &turn_keys_for_elevate,
-                        "submit",
-                    );
-                    // Every other conversation whole, or not this time.
-                    Self::keep_conversations_whole(
-                        &conversation,
-                        slot_target.map(|t| t.timeline),
-                        &mut projected_segments,
-                        "submit",
-                    );
-                }
-
-                // When reprojection is disabled and the slot is already
-                // seeded, leave the cumulative slot intact — prefill appends
-                // onto it below. `apply_projection(_, BlockCount(0), _)` would
-                // reset it to empty, so it must be skipped here (not just fed
-                // empty segments, which is the RULER/summarisation reset path).
-                if !skip_projection {
-                    // Injecting the projected context into the parent slot: the K/V
-                    // scatter and the block-table writes for every selected segment. The
-                    // heaviest single step in the handler, and the one that scales with
-                    // how much context the projection chose.
-                    let _g = profile::span("drain:apply_projection");
-                    if let Err(e) =
-                        self.apply_projection(parent_id, BlockCount(0), &projected_segments)
-                    {
-                        let _ = event_tx.send(TurnEvent::Error(e));
-                        return true;
-                    }
-                }
-
-                // Step 2: borrowed ranges cover the whole
-                // post-injection parent — the projection itself
-                // already selected what's visible.  Use the
-                // *chunk-count* API (`sequence_block_count`) rather
-                // than `offset / CHUNK_SIZE`: each projected section
-                // ends in its own partial trailing chunk that the
-                // divided value silently under-counts, leaving the
-                // tail invisible to the view.  See
-                // `BatchedInferenceSession::sequence_block_count`.
-                let parent_block_count =
-                    self.session.sequence_block_count(parent_id.0).unwrap_or(0);
-                let parent_offset_for_log = self.session.sequence_offset(parent_id.0).unwrap_or(0);
-                tracing::trace!(
-                    target: "candle_conversation::scheduler::view_create",
-                    parent = parent_id.0,
-                    parent_block_count,
-                    parent_offset = parent_offset_for_log,
-                    offset_div_ceil = parent_offset_for_log.div_ceil(self.chunk_size),
-                    "view borrow plan",
-                );
-                // Rolling window over an append-only ingest (design §4.7): on the
-                // disable-reprojection path (`skip_projection`), borrow just the
-                // system prompt + the last `CODE_READ_WINDOW_TURNS` sealed turns
-                // instead of the whole growing parent — bounding otherwise-
-                // unbounded ingest context. `window == 0` is the whole-parent
-                // borrow.
-                let window = if skip_projection {
-                    CODE_READ_WINDOW_TURNS
-                } else {
-                    0
+                // **What the projection will put on the device is priced here, and
+                // put there only when admission takes the turn** (`submit_admit`).
+                // The lift of the selected history and its index pages is ground
+                // the weight side loses exactly as the turn's own K/V is; spent at
+                // submit, it was spent before admission could weigh it, and a
+                // burst of reads took the experts' ground with no decision made.
+                let (lift, depth) = match self.slot_conversations.get(&parent_id).cloned() {
+                    Some(conversation) => (
+                        self.projection_lift(
+                            &conversation,
+                            &projected_sections,
+                            &turn_keys_for_elevate,
+                        ),
+                        submit_admit::projected_depth(&conversation, &projected_segments),
+                    ),
+                    None => (0, 0),
                 };
-                let effective_ranges: Vec<BlockRange> = if window > 0 {
-                    self.slot_targets
-                        .get(&parent_id)
-                        .map(|t| t.timeline)
-                        .zip(self.slot_conversations.get(&parent_id))
-                        .map(|(tl, c)| c.windowed_ingest_ranges(tl, window, parent_block_count))
-                        .unwrap_or_else(|| {
-                            if parent_block_count == 0 {
-                                Vec::new()
-                            } else {
-                                vec![(0, parent_block_count)]
-                            }
-                        })
-                        .into_iter()
-                        .map(|(s, e)| BlockRange::new(s, e))
-                        .collect()
-                } else if parent_block_count == 0 {
-                    Vec::new()
-                } else {
-                    vec![BlockRange::new(0, parent_block_count)]
-                };
-
-                // A turn group carves one view per case, each over the same
-                // ranges, instead of the one view below.
-                if let Some(cases) = seal_group {
-                    // Every case is sealed as a turn, so a group has the same
-                    // preconditions as one: a projection and a substrate target
-                    // to write into.
-                    if !matches!(seal_action, SealAction::Turn) {
-                        let _ =
-                            event_tx.send(TurnEvent::Error(ConversationError::Channel(format!(
-                                "submit_turn: a turn group on slot {parent_id} has no substrate \
-                                 target to seal its cases into"
-                            ))));
-                        return true;
-                    }
-                    self.start_turn_group(
-                        parent_id,
-                        effective_ranges,
-                        cases,
-                        sampling,
-                        turn_belief,
-                        event_tx,
-                    );
-                    return true;
-                }
-
-                // Step 3: carve the view sequence. Its per-sequence state is
-                // forked when admission takes the turn, not here — see
-                // `ViewState::state_forked`.
-                let (view_id, borrowed) = match self.carve_view(parent_id, &effective_ranges) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = event_tx.send(TurnEvent::Error(e));
-                        return true;
-                    }
-                };
-
-                // Step 4: anchor the active turn's start index in the
-                // view's chunk list.
-                //
-                // Under the read-only projection model, all borrowed
-                // chunks (including any partial tail) are shared Arc
-                // clones; the view's writable tail is a fresh active
-                // chunk pushed at view index `borrowed.0` by
-                // `create_view_sequence`. So `borrowed.0` is the
-                // anchor for mid-turn captures and final seals.
-                let turn_start_parent_blocks = borrowed.0;
-                tracing::trace!(
-                    target: "candle_conversation::scheduler::view_create",
-                    "view carve: parent {} borrowed {} blocks, parent layout {:?}",
-                    parent_id,
-                    borrowed.0,
-                    self.session
-                        .provenance_chunk_layout(parent_id.0, parent_offset_for_log),
-                );
-
-                // Step 5: register the view so cleanup_finished can auto-finalize.
-                self.turn_views.insert(
-                    view_id,
-                    ViewState {
-                        parent_id,
-                        original_borrowed: borrowed,
-                        turn_start_parent_blocks,
-                        question_tokens: user_content_end as usize,
-                        applied_identity: turn_start_identity(parent_block_count),
-                        state_forked: false,
-                        holds_parent_state: false,
-                    },
-                );
-
-                // Step 6: queue prefill on the view sequence, carrying the
-                // reprojection policy through to DecodeState.
-                //
                 // **An arrival is an admission opportunity too.** The pass is
                 // otherwise gated on completions — nothing new can fit that did
                 // not fit before unless something freed ground — but that is
@@ -4764,37 +4619,62 @@ impl Scheduler {
                 // completion that will never come (nothing is running) leaves it
                 // queued indefinitely.
                 self.settled_since_admit = true;
-                self.prefill_queue.push_back(PrefillWork {
-                    sequence_id: view_id,
-                    tokens: prefill_tokens,
-                    prefill_text,
-                    user_text,
-                    tags,
-                    user_content_start,
-                    user_content_end,
-                    assistant_content_start,
-                    no_think,
-                    prefill_assistant_text,
-                    event_tx,
-                    max_decode_tokens,
-                    sampling,
-                    submitted_at: Instant::now(),
-                    reprojection,
-                    belief: turn_belief,
-                    seal_action,
-                    post_decode_tokens,
-                    projection_offsets,
-                    staged_composition,
-                    triggers,
-                    turn_grammar,
-                    free_tool_calls_from_penalties,
-                    recorded_reply,
+                self.pending_submits.push_back(submit_admit::PendingSubmit {
+                    work: PrefillWork {
+                        sequence_id: parent_id,
+                        tokens: prefill_tokens,
+                        prefill_text,
+                        user_text,
+                        tags,
+                        user_content_start,
+                        user_content_end,
+                        assistant_content_start,
+                        no_think,
+                        prefill_assistant_text,
+                        event_tx,
+                        max_decode_tokens,
+                        sampling,
+                        submitted_at: Instant::now(),
+                        reprojection,
+                        belief: turn_belief,
+                        seal_action,
+                        post_decode_tokens,
+                        projection_offsets,
+                        staged_composition,
+                        triggers,
+                        turn_grammar,
+                        free_tool_calls_from_penalties,
+                        recorded_reply,
+                    },
+                    lift,
+                    depth,
+                    diag_to_write,
+                    projected_sections,
+                    projected_segments,
+                    turn_keys_for_elevate,
+                    slot_target,
+                    skip_projection,
+                    seal_group,
                 });
                 true
             }
 
             SchedulerRequest::FreeSequence { sequence_id } => {
                 tracing::debug!(target: "sched", "free_sequence {}", sequence_id);
+                // A submission still waiting on this slot cannot be projected onto it
+                // any more: its caller hears so, rather than waiting on nothing.
+                let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_submits)
+                    .into_iter()
+                    .partition(|p| p.parent() == sequence_id);
+                self.pending_submits = kept.into_iter().collect();
+                for p in gone {
+                    let _ = p
+                        .work
+                        .event_tx
+                        .send(TurnEvent::Error(ConversationError::Channel(format!(
+                            "slot {sequence_id} was freed before its turn was admitted"
+                        ))));
+                }
                 // A turn view borrows this slot's blocks, so it cannot outlive
                 // them; and a view freed directly takes its registration with it.
                 self.discard_turn_views_of(sequence_id);
@@ -10111,8 +9991,15 @@ impl Scheduler {
     /// rate model's narrower choice for the cohort in flight, and never wider
     /// than a width the partition has refused since ground last freed.
     fn composition_target(&self) -> usize {
-        let target = self.rate_width.map_or(self.max_prefill_pass_tokens, |w| {
-            w.rows.min(self.max_prefill_pass_tokens)
+        self.composition_target_at(self.rate_width.map(|w| w.rows))
+    }
+
+    /// [`Self::composition_target`] had the rate model chosen `width` (`None`:
+    /// no choice) — what admission prices a cohort at when its own pass is
+    /// about to set or clear that choice.
+    pub(super) fn composition_target_at(&self, width: Option<usize>) -> usize {
+        let target = width.map_or(self.max_prefill_pass_tokens, |w| {
+            w.min(self.max_prefill_pass_tokens)
         });
         self.refused_width.map_or(target, |w| target.min(w.rows))
     }
@@ -10191,6 +10078,12 @@ impl Scheduler {
     /// running decodes will add over a sweep ([`sweep_forecast`]), not against
     /// the ground standing now.
     pub(super) fn prefill_group_budget(&self, total: usize) -> usize {
+        self.prefill_group_budget_at(total, self.composition_target())
+    }
+
+    /// [`Self::prefill_group_budget`] against an explicit composition target —
+    /// see [`Self::composition_target_at`].
+    pub(super) fn prefill_group_budget_at(&self, total: usize, target: usize) -> usize {
         let dtype = self.session.activation_dtype();
         let withheld = self
             .model
@@ -10198,7 +10091,7 @@ impl Scheduler {
             .map_or(0, |row| self.sweep_forecast.withheld_bytes(row));
         admit::pass_budget::prefill_group_budget(
             total,
-            self.composition_target(),
+            target,
             self.model.prefill_width_cap_withholding(dtype, withheld),
             self.prefill_kv_token_cap(),
             CHUNK_SIZE,
@@ -11202,6 +11095,16 @@ impl Scheduler {
         view_id: SequenceId,
     ) -> Result<Option<ReprojectInFlight>, ConversationError> {
         let _t_total = PhaseTimer::new("reproject_total");
+        // **Not while the decodes are short of their weights.** A reprojection's
+        // scan uploads gallery pages for the turns it scores, before any lift is
+        // known — and below the decode floor admission defends, every byte it
+        // places is one the decode set is already streaming for. On the 3090
+        // (2026-10-18) the gallery held 2.38 GB of scanned working set while the
+        // experts stood at 3.07 of the 6.45 GB the engine needs. The turn keeps
+        // its view; a later trigger asks again.
+        if !self.decode_floor_holds_after(0) {
+            return Ok(None);
+        }
         // Clone the policy out — `swap_view_with_new_ranges` mutates
         // `active_decodes` so we cannot hold a borrow over it.
         let policy = match self
@@ -11583,6 +11486,28 @@ impl Scheduler {
                 scan_ms,
                 project_ms,
                 "reproject: selection unchanged — the parent is kept"
+            );
+            return Ok(None);
+        }
+        // **A rebuild spends residency as an admission does, and is judged by
+        // the same line.** Its lift — the newly selected history brought hot and
+        // its index pages placed — is ground the weight side loses, and a
+        // decoding turn's rebuild adds no rows to repay it: the decodes it would
+        // slow are the only thing at stake. Below the decode floor admission
+        // defends, the turn keeps decoding on the view it has, and a later
+        // trigger asks again. Nothing has moved yet, so not starting is free.
+        let lift = self.projection_lift(
+            &policy.substrate,
+            &projected_sections,
+            &turn_keys_for_elevate,
+        );
+        if !self.decode_floor_holds_after(lift) {
+            tracing::debug!(
+                target: "candle_conversation::scheduler::reproject",
+                view = view_id.0,
+                lift_mib = lift >> 20,
+                "reproject: the rebuild's lift would take the weights below the decode floor — \
+                 the turn keeps its view"
             );
             return Ok(None);
         }
@@ -15521,9 +15446,9 @@ mod tests {
             "the abandoned decode must be finalized before the new turn runs"
         );
         assert_eq!(
-            scheduler.prefill_queue.len(),
+            scheduler.pending_submits.len(),
             1,
-            "the new turn must proceed into prefill"
+            "the new turn must wait for admission, its projection priced"
         );
         assert!(
             !matches!(
@@ -15918,9 +15843,9 @@ mod tests {
             "a submit after a failed view is reclaimed must not be refused"
         );
         assert_eq!(
-            scheduler.prefill_queue.len(),
+            scheduler.pending_submits.len(),
             1,
-            "the new turn must proceed into prefill"
+            "the new turn must wait for admission, its projection priced"
         );
     }
 
@@ -16281,7 +16206,7 @@ mod tests {
         let tier = |n: usize| {
             sched
                 .model
-                .wave_tier_bytes(chunk, n, &[], &[], dtype)
+                .wave_tier_bytes(chunk, n, &[], &[], 0, dtype)
                 .unwrap_or(0)
         };
         let join_price: Vec<u64> = (0..=members)
@@ -16385,7 +16310,7 @@ mod tests {
             budget.prefill_floor,
             room.prefill_floor()
                 .saturating_add(sched.min_forward_tier_bytes()),
-            "the prefill floor is its own hold, the margin and a forward's tier",
+            "the prefill floor is the cache's minimum and a forward's tier",
         );
     }
 

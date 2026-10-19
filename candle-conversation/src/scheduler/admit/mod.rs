@@ -168,6 +168,19 @@ pub(crate) trait Ground {
     /// `Low`.
     fn outranks_active(&self, prio: DecodePriority) -> bool;
 
+    /// The weight waiting prompts put on prefill throughput when a turn is
+    /// judged on the trade against decode ([`rate::WaveRate::try_widen_trading`],
+    /// whose other weight is the decodes running): one per prompt waiting, each
+    /// counted more the longer it has waited, so prefill's claim on the engine
+    /// grows with both how much is waiting and for how long. It reorders
+    /// nothing and pre-empts nothing: admitted turns still get the forwards
+    /// that finish them, which is how their ground comes back. `prio` is the
+    /// band being offered. The default, one, is a lone prompt that has not
+    /// waited.
+    fn prefill_weight(&self, _prio: DecodePriority) -> f64 {
+        1.0
+    }
+
     /// Admit the candidate [`Self::peek`] just priced at `cost`. `false` when the
     /// allocators refused it after all.
     ///
@@ -469,11 +482,15 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                     // It buys nothing extra: the decode still takes its ground a
                     // lease at a time. The head waiver is applied explicitly
                     // because the second question is outside the model's own.
-                    let decode_ok = if cost.decodes_after && !rate.carries_nothing() {
+                    // A turn that widens the forward and then decodes is judged on
+                    // one trade, both phases at once (`WaveRate::try_widen_trading`);
+                    // the separate decode question is for the joins.
+                    let trading = kind == Kind::Prefill && cost.rows > 0 && cost.decodes_after;
+                    let decode_ok = if cost.decodes_after && !trading && !rate.carries_nothing() {
                         // The decode that follows steps one row at a time; a
                         // drafted turn is wider, and would only be refused more
                         // readily than this asks for.
-                        match rate.decode_would_carry(0, after) {
+                        match rate.decode_would_carry(0, before, after) {
                             Ok(_) => true,
                             Err(r) => {
                                 out.note(r);
@@ -496,6 +513,14 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                     decode_ok
                         && match if cost.rows == 0 {
                             rate.try_join(after)
+                        } else if trading {
+                            rate.try_widen_trading(
+                                cost.rows,
+                                before,
+                                after,
+                                ground.prefill_weight(prio),
+                                ground.decodes_active() as f64,
+                            )
                         } else if kind == Kind::Prefill {
                             rate.try_widen(cost.rows, before, after)
                         } else {
@@ -522,6 +547,24 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
             };
             if !allowed {
                 break;
+            }
+            if kind != Kind::Decode {
+                // The refusal's twin: a pass that admits more than its readings
+                // allow is read from these, not from the pass total.
+                tracing::debug!(
+                    target: "candle_conversation::scheduler::admission",
+                    kind = ?kind,
+                    prio = ?prio,
+                    outranking = ground.outranks_active(prio),
+                    rows = cost.rows,
+                    tier_mib = cost.activations >> 20,
+                    dislodged_mib = cost.dislodged_bytes() >> 20,
+                    hole_credit_mib = cost.hole_credit >> 20,
+                    resident_before_mib = before >> 20,
+                    resident_after_mib = after >> 20,
+                    prefill_floor_mib = budget.prefill_floor >> 20,
+                    "offer admitted",
+                );
             }
             if !ground.admit(kind, prio, cost) {
                 // The allocators refused after the model said yes. The ground
@@ -611,6 +654,8 @@ mod tests {
         rows_closed: bool,
         /// The band of the slots already running, when one is set.
         running_band: Option<DecodePriority>,
+        /// The prefill floor, when a case needs it apart from the decode floor.
+        prefill_floor: u64,
     }
 
     impl Fake {
@@ -634,6 +679,7 @@ mod tests {
                 closes_rows: false,
                 rows_closed: false,
                 running_band: None,
+                prefill_floor: FLOOR,
             }
         }
         fn queue(&mut self, kind: Kind) -> &mut Vec<u64> {
@@ -679,7 +725,7 @@ mod tests {
                 // model's gain arithmetic and its caps, not about the prefill /
                 // decode split, and giving them the same number keeps each
                 // assertion meaning exactly what it meant before the split.
-                prefill_floor: FLOOR,
+                prefill_floor: self.prefill_floor,
                 decode_floor: FLOOR,
                 max_rows: 8_192,
                 max_decodes: 64,
@@ -738,10 +784,12 @@ mod tests {
         }
     }
 
-    /// **A dialogue turn is not held behind the background work it outranks.**
-    /// Residency already stands under the floor — the running `Low` slots spent
-    /// it — so a `Low` turn is refused there, while a `High` one is admitted
-    /// past it.
+    /// **A dialogue turn is not held behind the background work it outranks —
+    /// down to the prefill floor, and no further.** Residency already stands
+    /// under the decode floor — the running `Low` slots spent it — so a `Low`
+    /// turn is refused there, while a `High` one is admitted past it. Under the
+    /// prefill floor the committed wave no longer fits, and the `High` turn
+    /// waits as well: admitted there, it breaks its own cohort's sweep.
     #[test]
     fn a_turn_outranking_the_running_slots_is_admitted_under_the_floor() {
         let under = FLOOR - 4 * REGION;
@@ -756,9 +804,18 @@ mod tests {
         high.active = 14;
         high.running_band = Some(DecodePriority::Low);
         high.prefill_prio = DecodePriority::High;
+        high.prefill_floor = FLOOR - 8 * REGION;
         let got = fill_once(&mut high);
         assert_eq!(got.prefills, 1, "the band they yield to is admitted");
         assert!(!got.stopped_on_weights);
+
+        let mut broke = Fake::new(Vec::new(), vec![REGION], under);
+        broke.active = 14;
+        broke.running_band = Some(DecodePriority::Low);
+        broke.prefill_prio = DecodePriority::High;
+        let got = fill_once(&mut broke);
+        assert_eq!(got.prefills, 0, "under the prefill floor it waits too");
+        assert!(got.stopped_on_weights);
 
         let mut peer = Fake::new(Vec::new(), vec![REGION], under);
         peer.active = 14;
@@ -961,48 +1018,33 @@ mod tests {
         assert_eq!(f.resident, FLOOR, "the floor held");
     }
 
-    /// **A busy engine with no standing rows is still judged by both models.**
-    ///
-    /// The charge is `Prefill { tokens: 0 }` there, which leaves
-    /// `WaveRate::tokens` at zero and so skips `judge_prefill`'s gain
-    /// comparison — the thing this module's header recorded as a defect. It is
-    /// not one, and this pins why: what the charge exists to deny is the head
-    /// waiver, and it denies it by marking the wave non-empty, not by the token
-    /// count. So the first offer is still floor-checked, and the decode model
-    /// still judges the turn it will become.
-    ///
-    /// The comparison that is skipped has nothing to compare against: a wave
-    /// carrying no prefill rows has a prefill rate of zero, so every positive
-    /// rate is an unbounded gain. The judgement that matters on such a wave is
-    /// the decode one, and that is live — the continuations were charged, so
-    /// `decode_would_carry` has a `decodes > 0` to weigh against.
+    /// **Admission sways with what is waiting.** A turn that widens the forward
+    /// and then decodes is judged on one trade (`WaveRate::try_widen_trading`):
+    /// the prefill throughput it earns, weighted by the prompts waiting, against
+    /// the decode throughput it costs, weighted by the decodes running. So the
+    /// same queue on the same ground is taken more sparingly beside many
+    /// decodes than beside few, and more freely the more — or the longer — the
+    /// prompts have waited.
     #[test]
-    fn a_busy_engine_with_no_standing_rows_is_still_judged_by_the_decode_model() {
+    fn admission_sways_between_decode_and_prefill_with_what_is_waiting() {
         // A planner whose decode side has been measured — below
-        // `MIN_DECODE_SAMPLES` the second judge abstains by design. The default
-        // minimum gain, not the zero the other tests use: a bus-bound decode
-        // wave's rate is *flat* in the number of decodes (the copy grows with
-        // the routed set, so the step grows with it), and flat is refused as
-        // `Saturated` rather than as `Worse`. A short layer time is what puts the
-        // wave on the bus: a 20 ms step is long enough to be learned as compute
-        // (it outlasts even a fully resident decode's copy), and short enough
-        // that at the residency below the copy a wider wave streams outruns the
-        // layer it hides under — so the decode model is what refuses.
-        let mut rate = WaveRate::with_link_rate(
-            25e9,
-            ExpertGeometry::QWEN36_35B_A3B,
-            RateModel::default(),
-            DecodeModel::default(),
-        );
-        for _ in 0..WaveRate::MIN_DECODE_SAMPLES {
-            rate.observe_decode(1, 0, u64::MAX, 20e-3);
-        }
-        assert!(rate.decode_samples() >= WaveRate::MIN_DECODE_SAMPLES);
-
-        // Room to spare, so nothing here is a floor refusal: the decode model
-        // is the only thing that can say no.
-        struct Decoding(Fake);
-        impl Ground for Decoding {
+        // `MIN_DECODE_SAMPLES` the decode side abstains by design. A 20 ms layer
+        // puts the wave on the bus at this residency, so a dislodge slows every
+        // running decode and the trade has a real decode side.
+        let learned = || {
+            let mut rate = WaveRate::with_link_rate(
+                25e9,
+                ExpertGeometry::QWEN36_35B_A3B,
+                RateModel::default(),
+                DecodeModel::default(),
+            );
+            for _ in 0..WaveRate::MIN_DECODE_SAMPLES {
+                rate.observe_decode(1, 0, u64::MAX, 20e-3);
+            }
+            rate
+        };
+        struct Waiting(Fake, f64);
+        impl Ground for Waiting {
             fn active(&self) -> usize {
                 self.0.active()
             }
@@ -1025,8 +1067,8 @@ mod tests {
                 self.0.standing_rows()
             }
             fn peek(&mut self, kind: Kind, prio: DecodePriority) -> Option<Cost> {
-                // The turn this prefill becomes goes on to decode, which is
-                // what puts the second judge in play.
+                // Every turn goes on to decode, which is what puts the decode
+                // side of the trade in play.
                 self.0.peek(kind, prio).map(|c| Cost {
                     decodes_after: true,
                     ..c
@@ -1038,26 +1080,31 @@ mod tests {
             fn outranks_active(&self, prio: DecodePriority) -> bool {
                 self.0.outranks_active(prio)
             }
+            fn prefill_weight(&self, _prio: DecodePriority) -> f64 {
+                self.1
+            }
         }
-
-        // Residency far above the floor, so nothing here can be a weight
-        // refusal: whatever stops the band is a rate judgement. And below the
-        // experts' total, so a decode streams what is not resident — with every
-        // expert on the card a decode copies nothing, its rate climbs with every
-        // row, and the decode model has nothing to refuse.
-        let mut f = Fake::new(Vec::new(), vec![REGION; 8], 12 << 30);
-        f.active = 4;
-        f.decodes_active = 4;
-        f.standing = 0;
-        let mut g = Decoding(f);
-        let got = fill(&mut g, &mut rate);
+        // Residency far above the floor and below the experts' total, so every
+        // dislodge is streamed by the decodes and no floor rule fires.
+        let taken = |decodes: usize, waiting: f64| {
+            let mut f = Fake::new(Vec::new(), vec![32 * REGION; 32], 12 << 30);
+            f.active = decodes;
+            f.decodes_active = decodes;
+            let mut g = Waiting(f, waiting);
+            let mut rate = learned();
+            fill(&mut g, &mut rate).prefills
+        };
+        let beside_many = taken(24, 1.0);
+        let beside_few = taken(1, 1.0);
+        let many_waiting = taken(24, 24.0);
         assert!(
-            got.stopped_on_rate,
-            "the decode model must be what stops the band: {got:?}"
+            beside_many < beside_few,
+            "many decodes keep the weights: {beside_many} taken beside 24, {beside_few} beside 1"
         );
         assert!(
-            !got.stopped_on_weights,
-            "with the floor nowhere near, no weight rule may fire: {got:?}"
+            many_waiting > beside_many,
+            "prompts waiting pull the balance back: {many_waiting} with 24 waiting, \
+             {beside_many} with one"
         );
     }
 

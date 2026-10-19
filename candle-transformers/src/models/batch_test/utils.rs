@@ -1092,7 +1092,7 @@ fn prefill_pass_cost<M: ManagedBatchedModel + ?Sized>(
         .map(|&s| session.sequence_offset(s).unwrap_or(0))
         .collect();
     let rows: usize = takes.iter().sum();
-    let tier = model.wave_tier_bytes(rows, seqs.len(), takes, &offsets, act)? as usize;
+    let tier = model.wave_tier_bytes(rows, seqs.len(), takes, &offsets, 0, act)? as usize;
     let kv = model.kv_bytes_per_row(act).map_or(0, |per_row| {
         rows.saturating_mul(per_row).div_ceil(REGION_BYTES) * REGION_BYTES
     });

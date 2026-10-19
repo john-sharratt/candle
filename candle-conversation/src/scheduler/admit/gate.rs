@@ -29,13 +29,14 @@ pub(crate) struct Headroom {
     /// The floor it may not go under, and the residency it could reach.
     pub zone_min: u64,
     pub zone_max: u64,
-    /// The floor a **prefill** may go down to, below [`Self::zone_min`].
+    /// The floor a **prefill** may go down to, below [`Self::zone_min`]: the
+    /// expert cache's own minimum, `Scheduler::expert_zone_min_bytes`.
     ///
     /// A prefill's expert copy is once per forward and amortises over its rows, so
     /// bytes buy rows at a good rate; a decode pays per layer per step against
-    /// `1 − hit(R)`, so the same byte is charged again on every step after. One
-    /// floor for both had to be the decode's, which is what starved prefill width.
-    /// See `interleave::PREFILL_HOLD`.
+    /// `1 − hit(R)`, so the same byte is charged again on every step after. So a
+    /// prefill may spend residency down to the point the cache can no longer
+    /// serve, and no further.
     pub zone_min_prefill: u64,
 }
 
@@ -65,16 +66,17 @@ impl Headroom {
         self.zone_min.saturating_add(EVICTION_MARGIN)
     }
 
-    /// The floor a prefill stops at — its lower hold, plus the same margin.
+    /// The floor a prefill stops at: the expert cache's own minimum.
     ///
-    /// **The margin is not negotiable even for a prefill.** It is not about
-    /// residency, it is about the cache having something left to evict: reaching a
-    /// floor with every remaining slot pinned by the wave that needs it fails the
-    /// forward outright (`Expert cache full, cannot evict (all pinned)`), rather
-    /// than degrading. Spending weights for rows is a trade; spending the last
-    /// evictable slot is a stall.
+    /// **No margin above it, because the minimum already is one.** What a
+    /// margin here used to protect — the cache keeping something to evict, so a
+    /// wave never finds every slot pinned (`Expert cache full, cannot evict (all
+    /// pinned)`) — is exactly what `minimum_resident_slots` prices: the pinned
+    /// set, a worst-case routed set for the layer executing, and one slot for
+    /// the load that triggered the eviction. A fixed 512 MiB on top of that was
+    /// residency withheld for nothing.
     pub(crate) fn prefill_floor(&self) -> u64 {
-        self.zone_min_prefill.saturating_add(EVICTION_MARGIN)
+        self.zone_min_prefill
     }
 }
 
@@ -110,7 +112,7 @@ mod tests {
             zone: 8 << 30,
             zone_min: 4 << 30,
             zone_max: 10 << 30,
-            // Half the decode hold, as `interleave::PREFILL_HOLD` sets it.
+            // Under the decode hold: the expert cache's own minimum.
             zone_min_prefill: 2 << 30,
         }
     }

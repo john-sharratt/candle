@@ -1153,27 +1153,6 @@ impl Scheduler {
         still
     }
 
-    /// Rows the next wave already carries before admission adds anything: the
-    /// held creep group, which rides that wave whole.
-    ///
-    /// **Charged to the wave before any offer is judged**, for two reasons. The
-    /// offers behind it are then priced against the forward that will actually
-    /// run rather than an empty one — a cohort already in flight is most of the
-    /// copy those offers would otherwise look like they were amortising alone.
-    /// And it denies the head waiver: the model carries its first offer
-    /// unconditionally so a slot too large to ever fit cannot block the queue
-    /// forever, and a wave already carrying a cohort is not that case.
-    pub(super) fn standing_rows(&self) -> usize {
-        self.wave_prefill_members
-            .iter()
-            .map(|m| match m {
-                WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => {
-                    *advance
-                }
-            })
-            .sum()
-    }
-
     /// Bytes one 32-token KV block costs across the whole model, in the formats
     /// a **live** sequence actually occupies — the unit every admission cost is
     /// quoted in. See [`per_block_kv_bytes`].
@@ -1272,7 +1251,10 @@ impl Scheduler {
     /// regardless, so an oversized lone turn still runs and is bounded by the
     /// per-arena VRAM gate rather than by a refusal it can never clear.
     pub(super) fn promote_new_prefills(&mut self) {
-        if self.prefill_queue.is_empty() && self.section_queue.is_empty() {
+        if self.prefill_queue.is_empty()
+            && self.pending_submits.is_empty()
+            && self.section_queue.is_empty()
+        {
             return;
         }
         // `in_flight` counts only work that can advance — prefills and section
@@ -1440,6 +1422,7 @@ impl Scheduler {
             || filled.stopped_on_weights
             || filled.stopped_on_rate
             || !self.prefill_queue.is_empty()
+            || !self.pending_submits.is_empty()
             || !self.section_queue.is_empty()
         {
             tracing::debug!(
@@ -1511,16 +1494,43 @@ impl Scheduler {
 
     /// Remove and return the first queued prefill of the highest band queued,
     /// in queue order.
+    ///
+    /// A pending submission counts as queued: forced, its projection is put on
+    /// the device first ([`Self::materialise_submit`]). Within a band, carved
+    /// work goes ahead of submissions, which arrived after it.
     fn pop_highest_band_head(&mut self) -> Option<PrefillWork> {
-        let top = self
-            .prefill_queue
-            .iter()
-            .map(|w| rank(self.decode_priority_or_high(w.sequence_id)))
-            .max()?;
-        let at = (0..self.prefill_queue.len()).find(|&i| {
-            rank(self.decode_priority_or_high(self.prefill_queue[i].sequence_id)) == top
-        })?;
-        self.prefill_queue.remove(at)
+        loop {
+            let queued = self
+                .prefill_queue
+                .iter()
+                .map(|w| rank(self.decode_priority_or_high(w.sequence_id)))
+                .max();
+            let pending = self
+                .pending_submits
+                .iter()
+                .map(|p| rank(self.decode_priority_or_high(p.parent())))
+                .max();
+            match (queued, pending) {
+                (Some(q), p) if p.is_none_or(|p| q >= p) => {
+                    let at = (0..self.prefill_queue.len()).find(|&i| {
+                        rank(self.decode_priority_or_high(self.prefill_queue[i].sequence_id)) == q
+                    })?;
+                    return self.prefill_queue.remove(at);
+                }
+                (_, Some(p)) => {
+                    let at = (0..self.pending_submits.len()).find(|&i| {
+                        rank(self.decode_priority_or_high(self.pending_submits[i].parent())) == p
+                    })?;
+                    let pending = self.pending_submits.remove(at)?;
+                    // A submission that could not be carved has told its caller;
+                    // the next head is offered instead.
+                    if let Some(work) = self.materialise_submit(pending) {
+                        return Some(work);
+                    }
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// The planner, built on first use and taken for the duration of a pass.
@@ -2327,7 +2337,7 @@ impl Scheduler {
                 }
             })
             .collect();
-        let room = self.admit_headroom(self.standing_tier_bytes()).free_kv;
+        let room = self.admit_headroom(self.standing_ground_bytes()).free_kv;
         let fresh_allowed = section_pack::fresh_allowance(room, self.recurrent_cost());
         let packed = section_pack::pack(&candidates, cap, fresh_allowed);
         let mut seq_ids: Vec<usize> = Vec::with_capacity(packed.len());
@@ -2842,18 +2852,39 @@ impl Scheduler {
                 .map(|m| self.session.sequence_offset(m.seq_id()).unwrap_or(0))
                 .collect();
             let rows: usize = q_lens.iter().sum();
-            let Some(tier) =
-                self.model
-                    .wave_tier_bytes(rows, members.len(), &q_lens, &offsets, dtype)
-            else {
+            let Some(tier) = self.model.wave_tier_bytes(
+                rows,
+                members.len(),
+                &q_lens,
+                &offsets,
+                self.decode_width(),
+                dtype,
+            ) else {
                 return;
             };
             let need = (tier as usize).saturating_add(rows.saturating_mul(kv_row));
-            // The KV the cohort writes may fill holes below the frontier; its
-            // tier may not, so the tier alone fits the frontier's ground too.
-            let at_frontier = self
-                .frontier_tier_bytes()
-                .and_then(|g| fitted_rows(rows, tier as usize, g));
+            // The KV the cohort writes and the residual it holds may fill holes
+            // below the frontier; its tier may not. But only **as far as the
+            // holes go**: past them its claims raise the frontier into the
+            // tier's own ground, a window at a time. So the frontier's ground
+            // must hold the tier and whatever of those claims the holes cannot.
+            // Measured on the 3090 scratch daemon (2026-10-18): a cohort fitted
+            // with its 3.83 GB tier alone against 3,948 MiB, the holes running
+            // down 288 → 96 MiB as it swept, the ground then 3,790 MiB at
+            // window 7 — two regions short and every member lost.
+            let claims = rows
+                .saturating_mul(kv_row)
+                .saturating_add(self.model.creep_residual_bytes(&self.session, rows));
+            let at_frontier = self.frontier_tier_bytes().and_then(|g| {
+                let holes = self.session.kv_region_stats().map_or(0, |s| {
+                    s.live_watermark.saturating_sub(s.live) * candle_nn::kv_cache::REGION_BYTES
+                });
+                fitted_rows(
+                    rows,
+                    (tier as usize).saturating_add(claims.saturating_sub(holes)),
+                    g,
+                )
+            });
             let Some(target) = [fitted_rows(rows, need, ground), at_frontier]
                 .into_iter()
                 .flatten()

@@ -770,6 +770,7 @@ impl Scheduler {
             if self.active_decodes.is_empty()
                 && self.active_prefills.is_empty()
                 && self.prefill_queue.is_empty()
+                && self.pending_submits.is_empty()
                 && self.section_queue.is_empty()
                 && self.active_section_ingests.is_empty()
                 && self.deferred_glue_fires.is_empty()
@@ -1205,6 +1206,7 @@ impl Scheduler {
                         Device::Cuda(d) => Some(d.capture_stats()),
                         _ => None,
                     },
+                    self.wave_rate.as_mut().map(|r| r.take_trades()),
                 );
                 // Same cadence: publish the full memory report (global slot for
                 // `GET /v1/memory` + one JSON debug line). See `memory_report`.

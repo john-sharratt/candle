@@ -35,6 +35,7 @@ impl Scheduler {
     /// Whether a turn is in flight on `parent`: a view carved from it is alive.
     fn turn_in_flight(&self, parent: SequenceId) -> bool {
         self.turn_views.values().any(|v| v.parent_id == parent)
+            || self.pending_submits.iter().any(|p| p.parent() == parent)
     }
 
     /// Whether a fork request is waiting for `parent`'s turn to end.
