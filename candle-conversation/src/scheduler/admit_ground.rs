@@ -234,7 +234,8 @@ impl<'a> AdmitPass<'a> {
         let growth = sched.decode_growth_bytes();
         let standing_tier = (wave_tier as usize)
             .saturating_add(growth)
-            .saturating_add(sched.glue_scratch_bytes());
+            .saturating_add(sched.glue_scratch_bytes())
+            .saturating_add(sched.held_claims_outstanding());
         tracing::debug!(
             target: "candle_conversation::scheduler::admission",
             standing_tier_mib = wave_tier >> 20,
@@ -1085,6 +1086,32 @@ impl Scheduler {
         self.standing_tier_bytes()
             .saturating_add(self.decode_growth_bytes())
             .saturating_add(self.glue_scratch_bytes())
+            .saturating_add(self.held_claims_outstanding())
+    }
+
+    /// What the held cohort will still claim as it sweeps: all of its own
+    /// claims before its first window — the residual, its stores and scratch
+    /// are claimed there — and after it the K/V its remaining layers write.
+    ///
+    /// Its fit priced them against the ground at formation; a turn admitted
+    /// mid-sweep claims from that same ground at once. Unreserved, one admitted
+    /// above the floor took a 144 MiB scratch under an 8,192-row cohort fitted
+    /// with 57 MiB to spare, and its last window was refused four regions short
+    /// (WhiteWorld, c3ebac8bf, 2026-10-19).
+    pub(super) fn held_claims_outstanding(&self) -> usize {
+        let Some((own, kv)) = self.held_fit_claims else {
+            return 0;
+        };
+        if self.wave_prefill_members.is_empty() {
+            return 0;
+        }
+        let layers = self.session.num_layers().max(1);
+        let cursor = self.wave_prefill_cursor.min(layers);
+        if cursor == 0 {
+            own as usize
+        } else {
+            (kv as usize).saturating_mul(layers - cursor) / layers
+        }
     }
 
     /// The prefill scratch the running decodes' static runs may claim: a

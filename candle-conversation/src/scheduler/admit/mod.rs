@@ -488,7 +488,20 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                     // A turn that widens the forward and then decodes is judged on
                     // one trade, both phases at once (`WaveRate::try_widen_trading`);
                     // the separate decode question is for the joins.
-                    let trading = kind == Kind::Prefill && cost.rows > 0 && cost.decodes_after;
+                    // **A section beside running decodes trades too.** It decodes
+                    // nothing itself, but its rows dislodge the residency the
+                    // running decodes step on exactly as a turn's do; judged on
+                    // the prefill rate alone it paid none of their loss. On
+                    // WhiteWorld (c3ebac8bf, 2026-10-19) a 6,968-row file ingest
+                    // went in beside seven decodes while the dialogue prompts
+                    // queued behind it were refused, and held the ground for a
+                    // minute and a half: ten openings waited 132 s for it.
+                    let trading = cost.rows > 0
+                        && match kind {
+                            Kind::Prefill => cost.decodes_after,
+                            Kind::Section => ground.decodes_active() > 0,
+                            Kind::Decode => false,
+                        };
                     let decode_ok = if cost.decodes_after && !trading && !rate.carries_nothing() {
                         // The decode that follows steps one row at a time; a
                         // drafted turn is wider, and would only be refused more
@@ -1110,6 +1123,41 @@ mod tests {
             many_waiting > beside_many,
             "prompts waiting pull the balance back: {many_waiting} with 24 waiting, \
              {beside_many} with one"
+        );
+    }
+
+    /// **A section beside running decodes pays their loss as a prompt does.** It
+    /// decodes nothing itself, but its rows dislodge the residency the decodes
+    /// step on, so many running decodes hold sections back as they hold prompts
+    /// back — judged on the prefill rate alone, they went in regardless.
+    #[test]
+    fn a_section_beside_running_decodes_is_traded_against_them() {
+        let learned = || {
+            let mut rate = WaveRate::with_link_rate(
+                25e9,
+                ExpertGeometry::QWEN36_35B_A3B,
+                RateModel::default(),
+                DecodeModel::default(),
+            );
+            for _ in 0..WaveRate::MIN_DECODE_SAMPLES {
+                rate.observe_decode(1, 0, u64::MAX, 20e-3);
+            }
+            rate
+        };
+        let taken = |decodes: usize| {
+            let mut f = Fake::new(Vec::new(), Vec::new(), 12 << 30);
+            f.sections = vec![32 * REGION; 32];
+            f.active = decodes;
+            f.decodes_active = decodes;
+            let mut rate = learned();
+            fill(&mut f, &mut rate).sections
+        };
+        let beside_many = taken(24);
+        let beside_one = taken(1);
+        assert!(
+            beside_many < beside_one,
+            "many decodes keep the weights from sections too: {beside_many} beside 24, \
+             {beside_one} beside 1"
         );
     }
 

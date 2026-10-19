@@ -2673,6 +2673,7 @@ impl Scheduler {
     /// wave), and the recurrent state has seen the prompt twice. A member that
     /// must leave mid-sweep leaves through [`Self::drop_wave_members`].
     pub(super) fn reset_wave_prefill(&mut self) {
+        self.held_fit_claims = None;
         self.sweep_forecast.sweep_abandoned();
         let held = self.held_arena_bytes();
         self.sweep_forecast.held_ended(held);
@@ -3074,7 +3075,7 @@ impl Scheduler {
     /// over the sweep (`sweep_forecast`), and its shares shrink until it fits.
     /// Never below one chunk: a cohort that cannot fit one is the partition's
     /// refusal to answer, which narrows the next.
-    fn fit_cohort_to_ground(&self, members: &mut Vec<WaveMember>) {
+    fn fit_cohort_to_ground(&mut self, members: &mut Vec<WaveMember>) {
         /// Shrinks one fit may make; each scales by the shortfall, so a few do.
         const FIT_PASSES: usize = 6;
         let dtype = self.session.activation_dtype();
@@ -3273,6 +3274,14 @@ impl Scheduler {
                     ground_mib = ground >> 20,
                     "creep cohort fitted to the ground its windows will place on"
                 );
+                // What the cohort itself will claim as it sweeps, for admission to
+                // hold back from the turns it lets in meanwhile
+                // (`held_claims_outstanding`): its own claims, and of them the K/V
+                // its windows write layer by layer.
+                let own = claims
+                    .saturating_sub(held_growth)
+                    .saturating_sub(self.glue_scratch_bytes()) as u64;
+                self.held_fit_claims = Some((own, kv_blocks));
                 return;
             };
             tracing::debug!(
