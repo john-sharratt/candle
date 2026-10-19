@@ -518,6 +518,19 @@ pub struct TradeWindow {
     pub decode_weight: f64,
     pub prefill_gain: f64,
     pub decode_change: f64,
+    /// Offers admitted, and of them how many outranked the running work.
+    pub offers_admitted: u64,
+    pub outranking: u64,
+    /// Offers refused, by the rule that refused them: the prefill floor, the
+    /// row or decode cap, the rate (worse or saturated), and the latch.
+    pub refused_floor: u64,
+    pub refused_cap: u64,
+    pub refused_rate: u64,
+    pub refused_full: u64,
+    /// The residency the last offer of the window would leave, and the
+    /// prefill floor it was judged against.
+    pub last_after: u64,
+    pub last_floor: u64,
 }
 
 /// The wave throughput planner: the two models, the learned rates, and the
@@ -1187,6 +1200,26 @@ impl WaveRate {
     }
 
     /// The trades judged since the last call, and a fresh window.
+    pub fn note_admitted(&mut self, outranking: bool, after: u64, floor: u64) {
+        self.trades.offers_admitted += 1;
+        self.trades.outranking += u64::from(outranking);
+        self.trades.last_after = after;
+        self.trades.last_floor = floor;
+    }
+
+    /// A refusal the fill made, for the window — see [`TradeWindow`].
+    pub fn note_refusal(&mut self, refusal: Refusal, after: u64, floor: u64) {
+        let t = &mut self.trades;
+        match refusal {
+            Refusal::Floor { .. } => t.refused_floor += 1,
+            Refusal::Cap { .. } | Refusal::DecodeCap { .. } => t.refused_cap += 1,
+            Refusal::Worse { .. } | Refusal::Saturated { .. } => t.refused_rate += 1,
+            Refusal::Full => t.refused_full += 1,
+        }
+        t.last_after = after;
+        t.last_floor = floor;
+    }
+
     pub fn take_trades(&mut self) -> TradeWindow {
         std::mem::take(&mut self.trades)
     }
