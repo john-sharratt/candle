@@ -150,6 +150,40 @@ impl Inner {
                 .sum::<usize>()
     }
 
+    /// [`SpanHeldGround::provision`]'s claims, worked out as it works them out
+    /// and changing nothing: the window since the last pass folded into the
+    /// growth record, the headroom short of free ground in whole regions, the
+    /// widest refused take's arena, and the landings of the live arenas.
+    fn next_claim(&self) -> HeldClaim {
+        let grew = self.peak_since.saturating_sub(self.used_at_provision) + self.refused_since;
+        let mut growth = self.growth;
+        growth[self.growth_at] = grew;
+        let short = headroom_for(&growth).saturating_sub(self.free());
+        let widest = if self.widest_refused > self.largest_free() {
+            self.widest_refused.div_ceil(REGION).max(1) * REGION
+        } else {
+            0
+        };
+        let landing = self
+            .arenas
+            .iter()
+            .filter(|a| a.extents.used() > 0 && !self.vacating.contains(&a.base))
+            .map(|a| {
+                let ranges: Vec<usize> = self
+                    .live
+                    .values()
+                    .filter(|(g, _, _)| *g == Ground::Arena(a.base))
+                    .map(|(_, t, _)| t.len)
+                    .collect();
+                landing_runs(&ranges).iter().sum::<usize>() * REGION
+            })
+            .sum();
+        HeldClaim {
+            growth: widest + short.div_ceil(REGION) * REGION,
+            landing,
+        }
+    }
+
     /// Bytes standing in vacating arenas — the room their holders move into.
     fn vacating_bytes(&self) -> usize {
         self.arenas
@@ -306,6 +340,11 @@ impl SpanHeldGround {
             .iter()
             .flat_map(|a| a.regions.iter().map(|r| r.index()))
             .max()
+    }
+
+    /// What [`Self::provision`] would claim if it ran now ([`HeldClaim`]).
+    pub(crate) fn next_claim(&self) -> HeldClaim {
+        self.lock().next_claim()
     }
 
     /// Every holder's account, the largest live holder first.
@@ -694,6 +733,20 @@ pub struct HeldStats {
     pub arena_top: usize,
 }
 
+/// What the next provisioning pass will claim from the span, in whole regions'
+/// bytes — ground a forward planned now cannot otherwise see coming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HeldClaim {
+    /// The headroom top-up and the arena for the widest refused take: claimed
+    /// at the lowest free regions, wherever they stand.
+    pub growth: usize,
+    /// At most this much more, to land the live arenas not yet being vacated
+    /// — claimed only below an arena with room under it, and given back once
+    /// its holders have moved. An upper bound: an arena with no room below
+    /// claims nothing.
+    pub landing: usize,
+}
+
 #[cfg(feature = "cuda")]
 impl HeldGround for SpanHeldGround {
     fn take(&self, bytes: usize, site: &'static Location<'static>) -> Option<u64> {
@@ -768,6 +821,29 @@ mod tests {
         g[3] = 5 * REGION;
         g[7] = 2 * REGION;
         assert_eq!(headroom_for(&g), 6 * REGION);
+    }
+
+    /// **The next claim is the headroom short of free ground and the widest
+    /// refused take's arena, in whole regions.** On a ground of bootstrap only,
+    /// with no device: a quiet one claims nothing; a take of a region and a half
+    /// leaves a half free against two and a half of headroom, so two regions; a
+    /// refused take of three regions adds its own three-region arena and grows
+    /// the headroom by three more.
+    #[test]
+    fn the_next_claim_is_what_provisioning_takes() {
+        let held = SpanHeldGround::new(0x7f00_0000_0000, 2 * REGION);
+        let site = Location::caller();
+        assert_eq!(held.next_claim(), HeldClaim::default(), "a quiet ground");
+
+        held.take(REGION + REGION / 2, site)
+            .expect("bootstrap room");
+        assert_eq!(held.next_claim().growth, 2 * REGION);
+
+        assert_eq!(held.take(3 * REGION, site), None, "wider than any ground");
+        // Grew 4.5 regions → headroom 5.5, free 0.5: five regions short, and the
+        // refused take's own arena of three.
+        assert_eq!(held.next_claim().growth, (5 + 3) * REGION);
+        assert_eq!(held.next_claim().landing, 0, "no arena lives yet");
     }
 
     /// **The landing is sized by what lives in an arena, not by the arena.** A

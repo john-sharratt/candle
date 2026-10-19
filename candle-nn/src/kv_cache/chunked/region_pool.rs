@@ -91,7 +91,7 @@ use super::backing::{TIER_REFUSED_MARKER, TIER_SHORT_BY};
 use super::bump_arena::KV_ARENA_MID_WAVE;
 use super::chunk_ops::MIGRATION_STAGING_CAP_BYTES;
 use super::growth_policy::{kv_grow_step, FreeRegionTarget, GrowthPolicy, Occupancy, Refusal};
-use super::held_ground::{HeldStats, SpanHeldGround, BOOTSTRAP_HELD_BYTES};
+use super::held_ground::{HeldClaim, HeldStats, SpanHeldGround, BOOTSTRAP_HELD_BYTES};
 use super::held_ledger::HeldSite;
 use super::reservation::Reservation;
 use super::span_geometry::{blocked, ceiling_regions, claimable, tier_fits};
@@ -3277,6 +3277,14 @@ pub fn held_ground_stats(ordinal: usize) -> Option<HeldStats> {
 pub fn held_ground_top_rank(ordinal: usize) -> Option<usize> {
     let map = pools().lock().unwrap_or_else(|e| e.into_inner());
     map.get(&ordinal).and_then(|pool| pool.held.top_rank())
+}
+
+/// What a device's held ground will claim at its next provisioning pass, or
+/// `None` if it has no reservation yet — ground a forward priced now should
+/// count as taken.
+pub fn held_ground_next_claim(ordinal: usize) -> Option<HeldClaim> {
+    let map = pools().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&ordinal).map(|pool| pool.held.next_claim())
 }
 
 /// `device`'s held ground, or `None` if it has no reservation yet. Cloned out of
