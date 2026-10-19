@@ -365,6 +365,7 @@ impl Cluster {
                 let rates = learned_rates().map(|(r, _)| Rates {
                     prefill_tok_s: r.prefill_tok_s,
                     decode_step_next_ms: r.decode_step_ms_plus_one,
+                    high_backlog_tokens: r.high_backlog_tokens,
                 });
                 capacity(state, telemetry.capacity(), wave, rates, measure())
             }),

@@ -42,6 +42,10 @@ pub struct Rates {
     pub prefill_tok_s: f64,
     /// The decode step with one row more than it decodes, milliseconds.
     pub decode_step_next_ms: f64,
+    /// Prompt tokens a placed turn would queue behind: those waiting at its
+    /// own priority. Background ingest is not among them — a placed turn goes
+    /// ahead of it.
+    pub high_backlog_tokens: u64,
 }
 
 /// What `CAPACITY`'s state says: faulted while the device cannot take a turn
@@ -89,7 +93,11 @@ pub fn capacity(
         idle: recent.is_none_or(|w| w.backlog == 0 && w.used_mib < w.budget_mib),
         slots_free,
         decodes: recent.map_or(0, |w| w.decodes),
-        prefill_backlog: recent.map_or(0, |w| w.backlog.min(u64::from(u32::MAX)) as u32),
+        // What a placed turn would wait behind, which is what `Best` divides
+        // by the prefill rate — not the whole pending total, whose background
+        // ingest a placed turn goes ahead of. `idle` reads the total: it says
+        // whether the scheduler can admit now.
+        prefill_backlog: rates.map_or(0, |r| r.high_backlog_tokens.min(u64::from(u32::MAX)) as u32),
         vram_free_mib: card
             .vram_free_mib
             .map_or(0, |m| m.min(u64::from(u32::MAX)) as u32),
@@ -169,14 +177,16 @@ mod tests {
 
     /// A recent wave with a backlog or a full budget is not idle; one with
     /// neither is; a scheduler quiet for 5 s is idle whatever its last wave
-    /// said. Free slots are the room left over the average residence.
+    /// said. Free slots are the room left over the average residence. The
+    /// wave's backlog is everything pending, background ingest included: it
+    /// decides idleness, never the backlog a placed turn is said to wait on.
     #[test]
     fn idle_reads_the_newest_wave() {
         let at = |w: Wave| capacity(MemberState::Ready, card(None), Some(w), None, machine());
         let busy = at(wave(1.0, 3, 8_000));
         assert_eq!(
             (busy.idle, busy.prefill_backlog, busy.decodes),
-            (false, 3, 6)
+            (false, 0, 6)
         );
         // 8,000 MiB over 4 residences is 2,000 each; 2,000 left is one more.
         assert_eq!(busy.slots_free, 1);
@@ -194,28 +204,36 @@ mod tests {
     }
 
     /// **What a turn costs is said once it is learned**, in the frame's units —
-    /// tokens a second, and the one-more-row decode step in microseconds —
-    /// and stays said while the scheduler is quiet. Nothing learned, or a rate
-    /// of nothing, says zero: the gateway does not place by it.
+    /// tokens a second, the one-more-row decode step in microseconds, and the
+    /// prompt tokens a placed turn would queue behind — and stays said while
+    /// the scheduler is quiet. Background ingest waiting in the wave is not
+    /// what a placed turn waits on. Nothing learned, or a rate of nothing,
+    /// says zero: the gateway does not place by it.
     #[test]
     fn learned_rates_are_said_in_the_frames_units() {
         let learned = Rates {
             prefill_tok_s: 2_302.6,
             decode_step_next_ms: 41.53,
+            high_backlog_tokens: 6_144,
         };
         let c = capacity(
             MemberState::Ready,
             card(None),
-            Some(wave(9.0, 0, 0)),
+            Some(wave(1.0, 91_818, 0)),
             Some(learned),
             machine(),
         );
-        assert_eq!((c.prefill_tok_s, c.decode_step_next_us), (2_303, 41_530));
+        assert_eq!(
+            (c.prefill_tok_s, c.decode_step_next_us, c.prefill_backlog),
+            (2_303, 41_530, 6_144)
+        );
+        assert!(!c.idle, "the ingest still keeps it from admitting now");
         let none = capacity(MemberState::Ready, card(None), None, None, machine());
         assert_eq!((none.prefill_tok_s, none.decode_step_next_us), (0, 0));
         let unmeasured = Rates {
             prefill_tok_s: 0.0,
             decode_step_next_ms: 41.5,
+            high_backlog_tokens: 0,
         };
         let c = capacity(
             MemberState::Ready,
