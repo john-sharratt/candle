@@ -337,6 +337,79 @@ impl Scheduler {
     ///
     /// Answers the arenas the pass emptied and handed back to the region free list —
     /// zero when it did not run.
+    /// **Lower the arena frontier for a tier refused `short` bytes**, by the
+    /// frontier holder's own pass, until the ground above the frontier has grown
+    /// by that much or a round moves it no further. Returns the bytes gained.
+    ///
+    /// The relief a refused tier needs, which [`Self::relieve_vram_pressure`]
+    /// cannot see: relief measures pressure as free regions, and a span with
+    /// hundreds of holes reads as having plenty — while the tier, which stands
+    /// only above every live arena, is short. Measured on WhiteWorld
+    /// (2026-10-19, 872957a58): cohorts refused one to six regions short with
+    /// 346 regions (5.5 GiB) of holes below the frontier, retried at once and
+    /// lost, because nothing moved the frontier down into them. The passes this
+    /// drives are the ones the wave loop already paces (`compact_kv_if_fragmented`)
+    /// — a K/V pack when a K/V arena holds the top, the span tenants' pass when
+    /// a tenant does — run here for as long as they make headway against a
+    /// shortfall that is known, rather than once per interval against none.
+    pub(super) fn lower_frontier_for(&mut self, short: usize) -> usize {
+        /// Rounds one refusal may drive. Each is one pass of the holder's kind,
+        /// a region or two for a tenant and the pools' worth for K/V, so this
+        /// covers the one-to-six-region shortfalls a cohort is refused by.
+        const ROUNDS: usize = 16;
+        let gap = |s: &Self| {
+            s.session.kv_region_stats().map_or(0, |st| {
+                st.total.saturating_sub(st.live_watermark) * candle_nn::kv_cache::REGION_BYTES
+            })
+        };
+        let start = gap(self);
+        let target = start.saturating_add(short);
+        for _ in 0..ROUNDS {
+            let now = gap(self);
+            if now >= target {
+                break;
+            }
+            match self.frontier_pass() {
+                Some((_, FrontierPass::Kv)) => {
+                    self.pack_until_settled(PackGoal::Frontier);
+                }
+                Some((shape, FrontierPass::SpanTenants)) => self.pack_span_tenants_judged(shape),
+                None => break,
+            }
+            if gap(self) <= now {
+                break;
+            }
+        }
+        let gained = gap(self).saturating_sub(start);
+        // Who stands on the frontier's top region after the pass — the tenant a
+        // pass that gained nothing could not move — and the holes under it.
+        let (frontier, holes) = self.session.kv_region_stats().map_or((0, 0), |s| {
+            (s.live_watermark, s.live_watermark.saturating_sub(s.live))
+        });
+        let top = frontier.checked_sub(1);
+        let holder = if top.is_some() && self.session.kv_top_rank() == top {
+            "the KV pools"
+        } else {
+            candle_nn::kv_cache::SlotTenant::ALL
+                .iter()
+                .find(|&&t| {
+                    top.is_some()
+                        && candle_nn::kv_cache::arena_top_rank(self.session.device(), t) == top
+                })
+                .map_or("held ground", |t| t.label())
+        };
+        tracing::info!(
+            target: "candle_conversation::scheduler::vram_relief",
+            short_mib = short >> 20,
+            gained_mib = gained >> 20,
+            frontier_regions = frontier,
+            hole_regions = holes,
+            holder,
+            "lowered the arena frontier for a refused tier"
+        );
+        gained
+    }
+
     pub(super) fn compact_kv_if_fragmented(&mut self) -> usize {
         /// Shortest interval between passes.
         ///
@@ -1413,6 +1486,22 @@ impl Scheduler {
         // expensive work is never the cheapest.
         if filled.prefills == 0 && filled.sections == 0 && self.running_members() == 0 {
             self.force_queue_head("admission refused every offer");
+        }
+        // **A pass held on the floor over holes is held on ground that exists.**
+        // Residency is measured to the arena frontier, so holes stranded below it
+        // count for nothing until the frontier comes down into them — and relief,
+        // which measures free regions, never sees the shortage. On WhiteWorld
+        // (673f67a2a, heavy-read) residency read under the prefill floor in 329
+        // of 333 windows while 181 regions (about 3 GB) of holes stood beneath the
+        // frontier, and read turns waited six minutes between tool rounds. The
+        // frontier holder's own pass is what turns those holes into ground.
+        if filled.stopped_on_weights {
+            let holes = super::interleave::stranded_hole_bytes() as usize;
+            if holes
+                >= super::compaction_stall::MIN_FREEABLE_ARENAS * candle_nn::kv_cache::REGION_BYTES
+            {
+                self.lower_frontier_for(holes);
+            }
         }
         // The pass acted on the completions that opened it; the next one waits
         // for its own.
@@ -2842,6 +2931,7 @@ impl Scheduler {
         };
         let kv_row = self.model.kv_bytes_per_row(dtype).unwrap_or(0);
         let ground = ground.saturating_sub(self.sweep_forecast.withheld_bytes(kv_row));
+        let decode_stage = self.decode_stage();
         let advance = |m: &WaveMember| match m {
             WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. } => *advance,
         };
@@ -2852,12 +2942,15 @@ impl Scheduler {
                 .map(|m| self.session.sequence_offset(m.seq_id()).unwrap_or(0))
                 .collect();
             let rows: usize = q_lens.iter().sum();
+            // Over each member's live index, as its windows carve it.
+            let seqs: Vec<usize> = members.iter().map(|m| m.seq_id()).collect();
             let Some(tier) = self.model.wave_tier_bytes(
                 rows,
                 members.len(),
                 &q_lens,
                 &offsets,
-                self.decode_width(),
+                &seqs,
+                &decode_stage,
                 dtype,
             ) else {
                 return;
@@ -2872,17 +2965,49 @@ impl Scheduler {
             // with its 3.83 GB tier alone against 3,948 MiB, the holes running
             // down 288 → 96 MiB as it swept, the ground then 3,790 MiB at
             // window 7 — two regions short and every member lost.
-            let claims = rows
-                .saturating_mul(kv_row)
+            // What the cohort claims as it sweeps, priced as admission prices it:
+            // each member's K/V in the formats it is written in, block-rounded;
+            // the residual its rows hold; and a recurrent store for every member
+            // that does not hold one yet, which its first window builds
+            // (`ensure_seq_state`). Without the stores the fit charged 592 MiB
+            // for a cohort that claimed 976 MiB over its sweep (WhiteWorld,
+            // 6b26e4976): its final window, the widest, found the ground 192 MiB
+            // short.
+            let per_block = self.per_block_kv_bytes();
+            let stores = members
+                .iter()
+                .filter(|m| !self.model.has_recurrent_state(m.seq_id()))
+                .count() as u64;
+            // And the prefill scratch a member that kept its store still claims
+            // at its first window — one more slot per recurrent layer.
+            let scratch: u64 = members
+                .iter()
+                .map(|m| self.model.prefill_scratch_bytes(m.seq_id()) as u64)
+                .sum();
+            let claims = (q_lens
+                .iter()
+                .map(|&q| super::admission::prefill_cost_bytes(q, per_block))
+                .sum::<u64>()
+                .saturating_add(stores.saturating_mul(self.recurrent_cost()))
+                .saturating_add(scratch) as usize)
                 .saturating_add(self.model.creep_residual_bytes(&self.session, rows));
             let frontier = self.frontier_tier_bytes();
             let holes = self.session.kv_region_stats().map_or(0, |s| {
                 s.live_watermark.saturating_sub(s.live) * candle_nn::kv_cache::REGION_BYTES
             });
+            // And the K/V the running decodes add while the cohort sweeps: decodes
+            // step without admission, their claims land wherever the free list
+            // gives, and past the holes that is the frontier's ground — the
+            // tier's. The elastic check above withheld it; this one did not, and
+            // on WhiteWorld (673f67a2a) a cohort sweeping beside 24 decodes for
+            // 4.7 minutes found its window nine regions short.
+            let growth = self.decode_growth_bytes();
             let at_frontier = frontier.and_then(|g| {
                 fitted_rows(
                     rows,
-                    (tier as usize).saturating_add(claims.saturating_sub(holes)),
+                    (tier as usize)
+                        .saturating_add(claims.saturating_sub(holes))
+                        .saturating_add(growth),
                     g,
                 )
             });
@@ -2892,13 +3017,47 @@ impl Scheduler {
                 .min()
             else {
                 // Fitted: what it was fitted to, once per cohort, so a window
-                // later refused can be read against the price it formed on.
+                // later refused can be read against the price it formed on —
+                // with the span as it stood, and the K/V priced both ways the
+                // engine prices it (the geometry the fit uses, and the formats
+                // admission charges), so the region delta to a refusal says
+                // which one the cohort actually claimed at.
+                let kv_blocks: u64 = q_lens
+                    .iter()
+                    .map(|&q| super::admission::prefill_cost_bytes(q, per_block))
+                    .sum();
+                let (live, frontier_regions) = self
+                    .session
+                    .kv_region_stats()
+                    .map_or((0, 0), |s| (s.live, s.live_watermark));
+                // Who holds the span at formation, as the refusal line names it
+                // then — the difference between the two is who claimed the
+                // cohort's ground while it swept.
+                let tenants: String = candle_nn::kv_cache::SlotTenant::ALL
+                    .iter()
+                    .map(|&t| {
+                        format!(
+                            "{}={}",
+                            t.label(),
+                            candle_nn::kv_cache::arena_regions(self.session.device(), t)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 tracing::info!(
                     target: "candle_conversation::scheduler::creep",
                     rows,
                     members = members.len(),
                     decodes = self.decode_width(),
                     tier_mib = tier >> 20,
+                    kv_geometry_mib = rows.saturating_mul(kv_row) >> 20,
+                    stores,
+                    scratch_mib = scratch >> 20,
+                    growth_mib = growth >> 20,
+                    kv_blocks_mib = kv_blocks >> 20,
+                    live_regions = live,
+                    frontier_regions,
+                    tenants = %tenants,
                     claims_mib = claims >> 20,
                     holes_mib = holes >> 20,
                     frontier_mib = frontier.unwrap_or(0) >> 20,
@@ -3832,6 +3991,12 @@ impl Scheduler {
                     || is_expert_stall(&e);
                 if cursor > 0 && retryable && self.wave_sweep_failures < MID_SWEEP_RETRIES {
                     self.wave_sweep_failures += 1;
+                    // The ground the window was refused is often standing below
+                    // the frontier as holes: move the frontier down before the
+                    // retry, or the retry finds the same ground and fails again.
+                    if let Some(short) = tier_refusal_shortfall(&e) {
+                        self.lower_frontier_for(short);
+                    }
                     tracing::warn!(
                         cursor,
                         win_end,

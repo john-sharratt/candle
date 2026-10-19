@@ -195,6 +195,18 @@ impl Scheduler {
         self.active_decodes.values().filter(|s| !s.finished).count()
     }
 
+    /// The decodes [`Self::decode_width`] counts, as a tier is priced over them:
+    /// each one's sequence and the position its next row stands at. A decode's
+    /// selection carve follows its depth and its live index, so the count alone
+    /// under-prices a step beside deep conversations.
+    pub(super) fn decode_stage(&self) -> Vec<(usize, usize)> {
+        self.active_decodes
+            .iter()
+            .filter(|(_, s)| !s.finished)
+            .map(|(id, _)| (id.0, self.session.sequence_offset(id.0).unwrap_or(0)))
+            .collect()
+    }
+
     /// Active *foreground* decode sequences — excludes compression passes.
     ///
     /// Count the active foreground dialogue decodes that feed the
@@ -496,6 +508,12 @@ impl Scheduler {
             // ground back must end its members rather than hold them for ever.
             Err(e) if is_tier_refusal(&e) || is_span_full(&e) => match self.wave_retry.failed() {
                 Next::Retry { attempt, wait } => {
+                    // As a mid-sweep window does: lower the frontier into the
+                    // holes below it before waiting, so the retry finds the
+                    // ground the tier was refused.
+                    if let Some(short) = candle_nn::kv_cache::tier_refusal_shortfall(&e) {
+                        self.lower_frontier_for(short);
+                    }
                     if WaveRetry::logs(attempt) {
                         tracing::warn!(
                             attempt,
@@ -1207,6 +1225,7 @@ impl Scheduler {
                         _ => None,
                     },
                     self.wave_rate.as_mut().map(|r| r.take_trades()),
+                    self.model.recurrent_census(),
                 );
                 // Same cadence: publish the full memory report (global slot for
                 // `GET /v1/memory` + one JSON debug line). See `memory_report`.

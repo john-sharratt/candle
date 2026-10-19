@@ -226,6 +226,7 @@ pub(crate) fn wave_root_ticketed(ticket: Option<WaveTicket>) -> candle::cuda_bac
 ///
 /// SAFETY / CONTRACT: as [`candle::Tensor::empty`] — every element must be
 /// written before it is read.
+#[track_caller]
 pub(crate) fn wave_empty<'w, S: Into<Shape>>(
     shape: S,
     dtype: DType,
@@ -279,6 +280,7 @@ pub(crate) fn wave_empty<'w, S: Into<Shape>>(
 /// and `cuMemcpyHtoDAsync` returns only once `data` has been copied into it, so
 /// the `Vec` may drop when this returns. The DMA to the device may still be
 /// outstanding, which is what the stream ordering covers.
+#[track_caller]
 pub(crate) fn wave_from_vec_ticketed<D: CudaDType + candle::WithDType, S: Into<Shape>>(
     data: Vec<D>,
     shape: S,
@@ -372,6 +374,7 @@ pub(crate) fn upload_into<D: CudaDType + candle::WithDType>(
 ///
 /// SAFETY / CONTRACT: as [`candle::Tensor::empty`] — every element must be
 /// written before it is read.
+#[track_caller]
 pub(crate) fn wave_empty_ticketed<S: Into<Shape>>(
     shape: S,
     dtype: DType,

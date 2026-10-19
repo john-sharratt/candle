@@ -71,6 +71,8 @@ pub use chunked::prefill_kv_stage::{
 #[cfg(feature = "cuda")]
 pub use chunked::seal_gather::{gather_sealed_chunks, GatheredChunk};
 #[cfg(feature = "cuda")]
+pub use chunked::slot_share_bytes;
+#[cfg(feature = "cuda")]
 pub use chunked::slot_state_stats;
 /// Where the tier may stand and what the KV side may reach — the span's
 /// arithmetic. Pure, and public for the same reason: three of the partition's
@@ -83,8 +85,8 @@ pub use chunked::wave_plan::{
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{
-    arena_census, arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves,
-    relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
+    arena_census, arena_held_bytes, arena_regions, arena_top_rank, claim_arena_slots,
+    plan_slot_moves, relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{

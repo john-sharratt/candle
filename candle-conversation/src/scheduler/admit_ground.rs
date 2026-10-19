@@ -107,8 +107,10 @@ pub(super) struct WaveDraft {
     held_rows: usize,
     held_advances: Vec<usize>,
     held_depths: Vec<usize>,
-    /// `(remaining, depth)` of each member not in the held group.
-    joining: Vec<(usize, usize)>,
+    /// The held members' sequences, whose live indexes their tier is priced over.
+    held_seqs: Vec<usize>,
+    /// `(remaining, depth, sequence)` of each member not in the held group.
+    joining: Vec<(usize, usize, usize)>,
     /// The width the rate model chose for the cohort, which its forwards are
     /// composed at — `None` when no choice stands. A pass that widens clears
     /// it, one that closes sets it; the draft follows, so each offer is priced
@@ -122,6 +124,7 @@ pub(super) struct Composed {
     seqs: usize,
     advances: Vec<usize>,
     depths: Vec<usize>,
+    stage_seqs: Vec<usize>,
 }
 
 /// A priority's slot in the per-band cursors. Three bands, in the order
@@ -182,7 +185,7 @@ pub(super) struct AdmitPass<'a> {
     wave_rows: usize,
     /// The member the offer [`Ground::peek`] last answered would add to
     /// [`Self::wave`]: its remaining rows and depth.
-    offered: Option<(usize, usize)>,
+    offered: Option<(usize, usize, usize)>,
     /// Whether that offer was sized to the floor, so its admission closes the
     /// forward at its width — see `offer_tier`.
     narrowed: bool,
@@ -280,7 +283,7 @@ impl<'a> AdmitPass<'a> {
     /// A member that adds no row is not free: the span tables hold an entry
     /// per span, and pricing it at zero lets a forward widen to the sequence
     /// cap on a tier admission never charged.
-    fn added(&self, member: (usize, usize), width: Option<usize>) -> (u64, usize) {
+    fn added(&self, member: (usize, usize, usize), width: Option<usize>) -> (u64, usize) {
         let mut with = self.wave.clone();
         with.joining.push(member);
         with.width = width;
@@ -328,9 +331,10 @@ impl<'a> AdmitPass<'a> {
         room: usize,
         turn: usize,
         depth: usize,
+        seq: usize,
         claim: u64,
     ) -> (usize, u64, u64) {
-        let member = (turn, depth);
+        let member = (turn, depth, seq);
         self.offered = Some(member);
         self.narrowed = false;
         let rows = turn.min(room);
@@ -590,7 +594,7 @@ impl AdmitPass<'_> {
         // A reused slot already holds a store, whose regions the residency
         // already counts: its restart zeroes that store where it stands.
         let recurrent = if self.sched.model.has_recurrent_state(seq.0) {
-            0
+            self.sched.model.prefill_scratch_bytes(seq.0) as u64
         } else {
             self.recurrent
         };
@@ -598,7 +602,7 @@ impl AdmitPass<'_> {
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block);
         let (rows, activations, residual) =
-            self.offer_tier(room, turn, depth, kv.saturating_add(recurrent));
+            self.offer_tier(room, turn, depth, seq.0, kv.saturating_add(recurrent));
         Some(self.credited(Cost {
             kv,
             recurrent,
@@ -710,12 +714,18 @@ impl AdmitPass<'_> {
         // and both are charged.
         let holds_store =
             self.sched.uncarved_case(w).is_none() && self.sched.model.has_recurrent_state(seq.0);
-        let recurrent = if holds_store { 0 } else { self.recurrent };
+        // A store it holds is in the residency already; the prefill scratch it
+        // will claim on top is not (`ManagedBatchedModel::prefill_scratch_bytes`).
+        let recurrent = if holds_store {
+            self.sched.model.prefill_scratch_bytes(seq.0) as u64
+        } else {
+            self.recurrent
+        };
         let room = self.room()?;
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block);
         let (rows, activations, residual) =
-            self.offer_tier(room, turn, depth, kv.saturating_add(recurrent));
+            self.offer_tier(room, turn, depth, seq.0, kv.saturating_add(recurrent));
         Some(self.credited(Cost {
             // The whole turn's K/V, not this chunk's: admitting the turn commits
             // the engine to feeding all of it, and a cost that priced only the
@@ -747,11 +757,16 @@ impl AdmitPass<'_> {
             self.submit_cursor[band] += 1;
         }
         let p = self.sched.pending_submits.get(self.submit_cursor[band])?;
-        let (turn, depth, lift) = (p.work.tokens.len(), p.depth, p.lift);
+        let (turn, depth, lift, parent) = (p.work.tokens.len(), p.depth, p.lift, p.parent());
         let room = self.room()?;
         let kv = prefill_cost_bytes(turn, self.per_block).saturating_add(lift);
-        let (rows, activations, residual) =
-            self.offer_tier(room, turn, depth, kv.saturating_add(self.recurrent));
+        let (rows, activations, residual) = self.offer_tier(
+            room,
+            turn,
+            depth,
+            parent.0,
+            kv.saturating_add(self.recurrent),
+        );
         self.offering_submit = true;
         Some(self.credited(Cost {
             kv,
@@ -885,7 +900,11 @@ impl Scheduler {
     /// claimed and not yet spent rather than one it hopes to recover.
     pub(super) fn admit_headroom(&self, standing_tier: usize) -> Headroom {
         let zone = residency_now(standing_tier);
-        let tier_reserve = self.min_forward_tier_bytes();
+        // The next forward's tier, beyond what the standing ground already holds
+        // (`interleave::reserve_for` nets that out of `zone`).
+        let tier_reserve = self
+            .min_forward_tier_bytes()
+            .saturating_sub(standing_tier as u64);
         let room = Headroom {
             // **Deliberately zero here, and netted below.** The free list is not
             // headroom *beside* the zone, it is the same ground seen twice:
@@ -899,6 +918,7 @@ impl Scheduler {
             zone_min: interleave::optimal_weight_bytes().unwrap_or(0),
             zone_max: interleave::achievable_weight_now().unwrap_or(u64::MAX),
             zone_min_prefill: self.expert_zone_min_bytes(),
+            forward_reserve: tier_reserve,
         };
         Headroom {
             // **The spendable ground is one subtraction: how far residency
@@ -956,7 +976,8 @@ impl Scheduler {
                 1,
                 &[],
                 &[],
-                self.decode_width(),
+                &[],
+                &self.decode_stage(),
                 self.session.activation_dtype(),
             )
             .unwrap_or(0)
@@ -970,7 +991,7 @@ impl Scheduler {
     pub(super) fn decode_floor_holds_after(&self, bytes: u64) -> bool {
         let standing = self.standing_ground_bytes();
         let room = self.admit_headroom(standing);
-        let floor = room.floor().saturating_add(self.min_forward_tier_bytes());
+        let floor = room.floor().saturating_add(room.forward_reserve);
         residency_now(standing).saturating_sub(bytes) >= floor
     }
 
@@ -1041,6 +1062,7 @@ impl Scheduler {
             wave.held_advances.push(*advance);
             wave.held_depths
                 .push(self.session.sequence_offset(*seq_id).unwrap_or(0));
+            wave.held_seqs.push(*seq_id);
             held.push(*seq_id);
         }
         let prefills = self
@@ -1061,7 +1083,7 @@ impl Scheduler {
         for (seq, remaining) in prefills.chain(sections) {
             if remaining > 0 && !held.contains(&seq.0) {
                 let depth = self.session.sequence_offset(seq.0).unwrap_or(0);
-                wave.joining.push((remaining, depth));
+                wave.joining.push((remaining, depth, seq.0));
             }
         }
         wave.width = self.rate_width.map(|w| w.rows);
@@ -1086,18 +1108,20 @@ impl Scheduler {
     pub(super) fn compose(&self, wave: &WaveDraft) -> Composed {
         let total = wave
             .held_rows
-            .saturating_add(wave.joining.iter().map(|&(r, _)| r).sum::<usize>());
+            .saturating_add(wave.joining.iter().map(|&(r, _, _)| r).sum::<usize>());
         let ceiling = self.prefill_group_budget_at(total, self.composition_target_at(wave.width));
         let mut out = Composed {
             rows: wave.held_rows,
             seqs: wave.held_advances.len() + wave.joining.len(),
             advances: wave.held_advances.clone(),
             depths: wave.held_depths.clone(),
+            stage_seqs: wave.held_seqs.clone(),
         };
-        for &(remaining, depth) in &wave.joining {
+        for &(remaining, depth, seq) in &wave.joining {
             let rows = remaining.min(ceiling.saturating_sub(out.rows));
             if rows > 0 {
                 out.advances.push(rows);
+                out.stage_seqs.push(seq);
                 out.depths
                     .push(deepest_chunk_offset(depth, remaining, rows));
                 out.rows += rows;
@@ -1115,7 +1139,8 @@ impl Scheduler {
                 wave.seqs.max(1),
                 &wave.advances,
                 &wave.depths,
-                self.decode_width(),
+                &wave.stage_seqs,
+                &self.decode_stage(),
                 self.session.activation_dtype(),
             )
             .unwrap_or(0)
@@ -1131,10 +1156,8 @@ impl Scheduler {
             // The same line `headroom` nets out of the spendable ground: the
             // hold, the eviction margin that keeps the cache evictable, and a
             // useful forward's tier. The model enforces it as a hard refusal.
-            prefill_floor: room
-                .prefill_floor()
-                .saturating_add(self.min_forward_tier_bytes()),
-            decode_floor: room.floor().saturating_add(self.min_forward_tier_bytes()),
+            prefill_floor: room.prefill_floor().saturating_add(room.forward_reserve),
+            decode_floor: room.floor().saturating_add(room.forward_reserve),
             max_rows: chunk_rows,
             max_decodes: Self::MAX_DECODE_WIDTH,
         }

@@ -4324,13 +4324,17 @@ pub trait ManagedBatchedModel {
     /// with the first — so `sequences` is not decoration, and a caller that
     /// prices N admissions as N separate one-sequence waves understates the wave
     /// they compose.
+    // One wave's description: its rows and sequences, then each stage's length,
+    // depth and sequence, and the decodes beside it.
+    #[allow(clippy::too_many_arguments)]
     fn wave_tier_bytes(
         &self,
         rows: usize,
         sequences: usize,
         stage_q_lens: &[usize],
         stage_offsets: &[usize],
-        decodes: usize,
+        _stage_seqs: &[usize],
+        decode_stage: &[(usize, usize)],
         act_dtype: DType,
     ) -> Option<u64> {
         let geometry = self.wave_geometry(act_dtype);
@@ -4344,8 +4348,8 @@ pub trait ManagedBatchedModel {
                 geometry.head_dim,
                 PrefillLaunchBounds::PRODUCTION,
             ),
-            decode_rows: decodes,
-            scored_rows: prefill.scored_rows + decodes,
+            decode_rows: decode_stage.len(),
+            scored_rows: prefill.scored_rows + decode_stage.len(),
             ..prefill
         };
         Some(WavePlan::new(geometry).tier_bytes(width) as u64)
@@ -4724,6 +4728,28 @@ pub trait ManagedBatchedModel {
     /// none.
     fn has_recurrent_state(&self, _seq: usize) -> bool {
         false
+    }
+
+    /// The prefill scratch a prefill of `seq` would claim on top of the store it
+    /// already holds — one more slot per recurrent layer, taken at the prefill's
+    /// first window and held until it decodes. Zero when it holds the scratch
+    /// already, or holds no store (whose cost [`Self::recurrent_store_bytes`]
+    /// prices whole, scratch included), or the stack carries no recurrent state.
+    ///
+    /// Priced because a sequence whose store survived its last turn still claims
+    /// this when it prefills again, and neither admission nor the cohort fit
+    /// charged it: on WhiteWorld (2026-10-19) a cohort with no store to build
+    /// grew the recurrent tenant by 18 regions over its sweep, and its final
+    /// window was refused.
+    fn prefill_scratch_bytes(&self, _seq: usize) -> usize {
+        0
+    }
+
+    /// Recurrent stores held on the device, and sequences whose state is parked
+    /// in their record instead — `(held, parked)`. What says whether idle
+    /// conversations give their stores back. `(0, 0)` on a stack with none.
+    fn recurrent_census(&self) -> (usize, usize) {
+        (0, 0)
     }
 
     /// Claim `seq`'s carried per-sequence state now — whatever of it the

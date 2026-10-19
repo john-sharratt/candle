@@ -224,9 +224,11 @@ pub use region_runs::{runs_from, RegionRun};
 #[cfg(feature = "cuda")]
 pub use slot_state_arena::stats as slot_state_stats;
 #[cfg(feature = "cuda")]
+pub use tenant_arena::slot_share_bytes;
+#[cfg(feature = "cuda")]
 pub use tenant_arena::{
-    arena_census, arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves,
-    relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
+    arena_census, arena_held_bytes, arena_regions, arena_top_rank, claim_arena_slots,
+    plan_slot_moves, relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
 };
 pub use tenant_arena::{slot_stride, SlotTenant, SLOT_ALIGN};
 #[cfg(feature = "cuda")]

@@ -93,7 +93,7 @@ fn release_readback_in(slot: &Mutex<Option<PinnedBuf>>) {
 use candle::{Device, Error, Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{
-    arena_regions, claim_arena_slots, plan_slot_moves, slot_stride, ArenaSlot, SlotTenant,
+    arena_regions, claim_arena_slots, plan_slot_moves, slot_share_bytes, ArenaSlot, SlotTenant,
     SpanRegion, SLOT_ALIGN,
 };
 
@@ -420,10 +420,10 @@ impl RecurrentCompaction {
 /// Compact the state arenas `stores` live in: plan the two-cursor pass for their
 /// geometry and move every half whose slot is a source onto its destination.
 ///
-/// **Between steps, and a no-op while any store has a wave open or a layer
-/// pending.** A relocation rebuilds a half's tensors on a new slot, and an open
-/// wave has already resolved the old addresses into its pointer tables; between
-/// steps nothing holds one — the tables are rebuilt every forward — so a moved
+/// **Between steps, and never a store with a wave open.** A relocation rebuilds a
+/// half's tensors on a new slot, and an open wave has already resolved the old
+/// addresses into its pointer tables, so its stores keep their slots; between
+/// steps nothing else holds one — the tables are rebuilt every forward — so a moved
 /// half is simply read at its new address by the next forward.
 ///
 /// Every store that could hold a source must be in `stores`: a source left behind
@@ -440,10 +440,10 @@ pub fn compact_stores<'a>(
         if !matches!(device, Device::Cuda(_)) {
             return Ok(RecurrentCompaction::default());
         }
-        let stores: Vec<&mut RecurrentStateStore> = stores.into_iter().collect();
-        if stores.iter().any(|s| s.open || s.has_pending()) {
-            return Ok(RecurrentCompaction::default());
-        }
+        // A store with a wave open keeps its slots: the wave has resolved them.
+        // Every other store moves, its pending timeline rows with it.
+        let stores: Vec<&mut RecurrentStateStore> =
+            stores.into_iter().filter(|s| !s.open).collect();
         let regions_before = arena_regions(device, SlotTenant::RecurrentState);
         let moves = plan_slot_moves(
             device,
@@ -1307,28 +1307,39 @@ impl RecurrentStateStore {
     ///
     /// Per half: the half's tensors rebuilt on the destination slot, the source slot
     /// dropped. A live half's state and conv tail are copied first — one device copy
-    /// on the primary stream; its timeline is not, because nothing is pending
-    /// between steps, and neither is a scratch, which a long span overwrites whole
-    /// before reading. The drop is on the host while the copy may still be queued,
+    /// on the primary stream — and its timeline with them when the layer holds rows
+    /// nothing has folded yet: a decoding sequence carries them from step to step
+    /// until a fold, so between steps is not between folds, and a store that refused
+    /// to move while any were pending pinned the frontier under every running decode
+    /// (WhiteWorld, f66456bc2, 2026-10-19: recurrent state on the top region over 13
+    /// to 18 holes, every lowering gaining nothing). A scratch is never copied: a
+    /// long span overwrites it whole before reading. The drop is on the host while the copy may still be queued,
     /// which is sound for the reason `ArenaSlot` gives — the source's next tenant is
     /// ordered behind the copy on the same stream, or, if it empties its arena,
     /// behind the region pool's fence. Anything else still holding the old half
     /// keeps the old slot alive until it lets go.
     #[cfg(feature = "cuda")]
     pub fn relocate(&mut self, moves: &mut HashMap<u64, ArenaSlot>) -> Result<usize> {
-        if self.open || self.has_pending() {
+        if self.open {
             candle::bail!(
-                "recurrent store: relocate mid-wave or with timeline rows pending — the \
-                 store's addresses are resolved or its timelines still unapplied"
+                "recurrent store: relocate mid-wave — the wave has resolved the store's \
+                 addresses"
             );
         }
         let Device::Cuda(cuda) = &self.device else {
             return Ok(0);
         };
         let stream = cuda.cuda_stream();
-        let copy = state_block(&self.dims).state_end;
+        let block = state_block(&self.dims);
         let mut moved = 0usize;
         for slot in &mut self.slots {
+            // The state and its tail, and the whole block when timeline rows wait
+            // in it to be folded.
+            let copy = if slot.pending.is_some() {
+                block.bytes
+            } else {
+                block.state_end
+            };
             let halves = std::iter::once((&mut slot.live, true))
                 .chain(slot.scratch.as_mut().map(|s| (s, false)));
             for (half, carries_state) in halves {
@@ -1418,14 +1429,16 @@ impl RecurrentStateStore {
     /// throughput-worse on fifteen consecutive passes, seven turns queued
     /// behind it and 20 GiB standing free above the floor.
     ///
-    /// The price is the store's slots at their stride: one per DeltaNet layer,
-    /// each [`slot_stride`] of the layer's block (`s`, its conv tail and its
-    /// timeline, each on a 256-byte boundary) — exactly what
-    /// [`Self::reserved_bytes`] reports once the store stands. A prefilling
-    /// sequence holds [`Self::scratch_bytes_for`] more. The arenas those slots
-    /// live in are shared by every sequence of the geometry, so a region's unused
-    /// tail is not charged to any one of them. Nothing here reads the device, so
-    /// it answers on any backend and at any moment.
+    /// The price is the store's slots at what they claim: one per DeltaNet
+    /// layer, each the layer's block (`s`, its conv tail and its timeline, each
+    /// on a 256-byte boundary) at its [`slot_share_bytes`] — its share of the
+    /// region its arena stands on, the region's unused tail included. A
+    /// prefilling sequence holds [`Self::scratch_bytes_for`] more. Priced at the
+    /// stride instead, as [`Self::reserved_bytes`] reports a standing store, the
+    /// tails were ground every store claimed and no price carried: 8.0 % of each
+    /// recurrent-state region on Flash-Next, a cohort's two regions short at its
+    /// second window (see [`slot_share_bytes`]). Nothing here reads the device,
+    /// so it answers on any backend and at any moment.
     pub fn reserved_bytes_for(layer_kinds: &[LayerKind], dims: &DeltaNetDims) -> usize {
         #[cfg(feature = "cuda")]
         {
@@ -1433,7 +1446,7 @@ impl RecurrentStateStore {
                 .iter()
                 .filter(|k| **k == LayerKind::DeltaNet)
                 .count();
-            layers * slot_stride(state_block(dims).bytes)
+            layers * slot_share_bytes(state_block(dims).bytes)
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -1761,6 +1774,8 @@ mod tests {
     use crate::models::delta_net::mix::DeltaNetOut;
     #[cfg(feature = "cuda")]
     use crate::models::gpu_test_lock::gpu_serial;
+    #[cfg(feature = "cuda")]
+    use candle_nn::kv_cache::slot_stride;
 
     /// The wire bytes are each float's IEEE-754 little-endian image, in order.
     #[test]
@@ -2838,18 +2853,75 @@ mod tests {
         Ok(())
     }
 
+    /// **A decoding store moves with its timeline rows pending.** They wait in the
+    /// slot from step to step until a fold, so a store that refused to move while
+    /// any were pending pinned the frontier under every running decode; moved,
+    /// the destination holds the state, its tail and the unfolded rows, and the
+    /// rows are still pending.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_store_relocates_with_its_timeline_rows_pending() -> Result<()> {
+        let _gpu = gpu_serial();
+        let dev = Device::new_cuda(0)?;
+        let mut store = filled_store_on(&dev);
+        // A two-row span over layer 1 leaves its rows pending once committed.
+        store.begin_wave()?;
+        let (_, write) = store.layer_span_mut(1, 2)?;
+        let SpanWrite::Timeline(timeline) = write else {
+            unreachable!("a two-row span writes the timeline")
+        };
+        let n = timeline.elem_count();
+        let rows: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
+        timeline.slice_set(
+            &Tensor::from_vec(rows.clone(), timeline.shape(), &dev)?,
+            0,
+            0,
+        )?;
+        store.commit_wave();
+        assert!(store.has_pending(), "the rows wait for a fold");
+        let state = |store: &RecurrentStateStore| -> Result<Vec<Vec<f32>>> {
+            store
+                .slots
+                .iter()
+                .flat_map(|s| [&s.live.state.s, &s.live.state.conv_tail])
+                .map(|t| t.flatten_all()?.to_vec1())
+                .collect()
+        };
+        let before = state(&store)?;
+
+        // Every live half onto a fresh slot of its stride.
+        let stride = state_block(&dims()).bytes;
+        let fresh = claim_arena_slots(&dev, SlotTenant::RecurrentState, stride, 3)?;
+        let mut moves: HashMap<u64, ArenaSlot> = store
+            .slots
+            .iter()
+            .filter_map(|s| s.live.held.as_ref().map(|h| h.ptr()))
+            .zip(fresh)
+            .collect();
+        assert_eq!(store.relocate(&mut moves)?, 3, "every live half moved");
+        assert!(moves.is_empty(), "every destination taken");
+
+        assert_eq!(state(&store)?, before, "state and tail moved whole");
+        let at = store.slots.iter().position(|s| s.layer_index == 1).unwrap();
+        let moved: Vec<f32> = store.slots[at].live.timeline.flatten_all()?.to_vec1()?;
+        assert_eq!(moved, rows, "the pending rows moved with it");
+        assert_eq!(store.pending_layers().collect::<Vec<_>>(), vec![(1, 2)]);
+        Ok(())
+    }
+
     /// The whole point of the geometry price: it answers the same for a process
     /// holding no stores as for one holding a hundred, because it never looks at
-    /// them. Three DeltaNet layers, one 2,560 B slot each, is 7,680 B — and the
+    /// them. Three DeltaNet layers, one 2,560 B slot each: 6,553 slots to a
+    /// region, so each claims 2,561 B of it and the store 7,683 B — and the
     /// scratch a prefilling sequence adds is as much again.
     #[cfg(feature = "cuda")]
     #[test]
     fn a_store_is_priced_from_geometry_not_from_what_is_resident() {
         let priced = RecurrentStateStore::reserved_bytes_for(&kinds(), &dims());
-        assert_eq!(priced, 3 * 2560, "three slots");
+        assert_eq!(priced, 3 * 2561, "three slots at their share of a region");
         assert_eq!(
             RecurrentStateStore::scratch_bytes_for(&kinds(), &dims()),
-            3 * 2560
+            3 * 2561
         );
 
         // Nothing in the call depends on a store existing, so building some

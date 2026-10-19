@@ -1299,12 +1299,51 @@ pub fn drive_step<S: WaveSweep + ?Sized>(
                         )
                     })
                     .collect();
+                // And who holds the span: every slot tenant's regions and the
+                // held ground's, with how high it reaches — a frontier that rose
+                // under a sweep while holes stood below it rose by someone's
+                // contiguous claim, and this names whose.
+                let census: Vec<String> = candle_nn::kv_cache::SlotTenant::ALL
+                    .iter()
+                    .map(|&t| {
+                        format!(
+                            "{}={}",
+                            t.label(),
+                            candle_nn::kv_cache::arena_regions(model.device(), t)
+                        )
+                    })
+                    .collect();
+                let held = candle_nn::kv_cache::held_ground_stats(stream.context().ordinal())
+                    .map_or(String::new(), |h| {
+                        format!(
+                            ", held ground {} arenas {} B reaching region {}",
+                            h.arenas, h.arena_bytes, h.arena_top
+                        )
+                    });
                 candle::Error::Msg(format!(
-                    "{e} — for a step of {} segments {}, placed {plan:?} B",
+                    "{e} — for a step of {} segments {}, placed {plan:?} B; tenants {}{held}",
                     segs.len(),
                     segments.join(" "),
+                    census.join(" "),
                 ))
             })?;
+            // A wide window's placement, with the span it stood on: a frontier
+            // that climbs gigabytes over a sweep while little more is live is
+            // read straight off these, window by window.
+            let placed: usize = plan.iter().sum();
+            if placed >= 1 << 30 {
+                if let Some(rs) = candle_nn::kv_cache::region_stats(stream.context().ordinal()) {
+                    tracing::info!(
+                        target: "candle_transformers::wave_step",
+                        layers = format!("[{}, {})", segs.first().map_or(0, |s| s.start), segs.last().map_or(0, |s| s.end)),
+                        placed_mib = placed >> 20,
+                        live = rs.live,
+                        frontier = rs.live_watermark,
+                        total = rs.total,
+                        "wide step placed its tier"
+                    );
+                }
+            }
             Some(begin_wave(&stream, LayerPhase::Forward)?)
         }
         _ => None,
