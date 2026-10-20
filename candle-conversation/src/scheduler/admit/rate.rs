@@ -925,6 +925,18 @@ impl WaveRate {
         self.context_per_row
     }
 
+    /// The decode model as it stands at the residency now: the hit rate it
+    /// projects there, and the fitted per-layer seconds at no miss and per
+    /// missed expert (`None` until fitted). What a trade's decode side is
+    /// priced from, so a decode change that reads too dear can be checked
+    /// against the hit rate the cache measured.
+    pub fn decode_terms(&self) -> (f64, Option<(f64, f64)>) {
+        (
+            self.hit_fraction(self.resident_now),
+            self.decode_fit.solve(),
+        )
+    }
+
     /// The shares of a `rows`-wide forward at the learned depth and the
     /// residency now that go to the copy, the rows' compute and their
     /// attention, by the fit. Whether a falling creep rate is the zone

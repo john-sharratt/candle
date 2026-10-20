@@ -761,10 +761,17 @@ impl Scheduler {
             .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(60))
         {
             self.rates_logged_at = Some(now);
-            let ((copy, compute, attend), context) =
-                self.wave_rate.as_ref().map_or(((0.0, 0.0, 0.0), 0.0), |r| {
-                    (r.forward_shares(rows), r.context_per_row())
+            let ((copy, compute, attend), context, (hit_model, fit)) = self
+                .wave_rate
+                .as_ref()
+                .map_or(((0.0, 0.0, 0.0), 0.0, (0.0, None)), |r| {
+                    (
+                        r.forward_shares(rows),
+                        r.context_per_row(),
+                        r.decode_terms(),
+                    )
                 });
+            let decode_fit = fit.map(|(a, b)| format!("a={:.3}ms b={:.4}ms", a * 1e3, b * 1e3));
             let steps = self.step_census.take(now);
             match learned {
                 Some(r) => tracing::info!(
@@ -788,6 +795,8 @@ impl Scheduler {
                     creep_rows_per_s = self.creep_airtime.per_s().map(|r| r.round() as u64),
                     forward_shares = format!("copy={copy:.2} compute={compute:.2} attend={attend:.2}"),
                     context_per_row = context.round() as u64,
+                    hit_model = format!("{hit_model:.3}"),
+                    decode_fit,
                     steps,
                     prefill_samples = samples,
                     decode_samples,

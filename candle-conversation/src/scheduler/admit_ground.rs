@@ -579,6 +579,11 @@ impl Ground for AdmitPass<'_> {
     /// offer has no room and comes back as a join, and the forwards the cohort
     /// shares are composed at this width (`Scheduler::rate_width`).
     fn close_rows(&mut self) -> bool {
+        // Closed already, the offer refused had no rows to give up: there is
+        // no join to re-offer it as, and the refusal ends the band.
+        if self.closed {
+            return false;
+        }
         let width = self.standing_rows.saturating_add(self.rows_taken);
         self.chunk_rows = width.max(CHUNK_SIZE);
         self.sched.set_rate_width(width);
@@ -626,14 +631,12 @@ impl AdmitPass<'_> {
     /// — or `None` when the forward is full and one more member could not
     /// advance a chunk beside the rest.
     fn room(&self) -> Option<usize> {
-        let room = self
-            .chunk_rows
-            .saturating_sub(self.standing_rows.saturating_add(self.rows_taken));
-        let members = self.sched.prefill_width() + self.sched.section_ingest_width();
-        if room == 0 && (members + 1).saturating_mul(CHUNK_SIZE) > self.chunk_rows {
-            return None;
-        }
-        Some(room)
+        room_left(
+            self.chunk_rows,
+            self.standing_rows.saturating_add(self.rows_taken),
+            self.closed,
+            self.sched.prefill_width() + self.sched.section_ingest_width(),
+        )
     }
 
     /// The section band's next candidate: the head of the section queue,
@@ -1415,9 +1418,54 @@ impl Scheduler {
     }
 }
 
+/// Rows a forward `chunk_rows` wide still has for an offer once `taken` are
+/// spent, or `None` when it is full and one more member beside `members`
+/// could not advance a chunk.
+///
+/// **A closed forward has no rows left, whatever its width.** Closing ends the
+/// rows at what the pass admitted, and the cohort composes at no less than a
+/// chunk (`Scheduler::set_rate_width`), so a pass closed below a chunk is
+/// still a chunk wide. Read as room, that chunk re-offered the turn the rate
+/// had just refused with the same rows, the rate refused it again, and the
+/// pass never ended: on BlackWorld (d919bd410, 2026-10-20) one 4-row `Normal`
+/// prompt was offered and refused every 1.4 ms for four hours, and no wave ran
+/// to step the seventeen decodes the refusal was protecting. Closed, the turn
+/// comes back as a join — the rows already spent are the ones it shares.
+fn room_left(chunk_rows: usize, taken: usize, closed: bool, members: usize) -> Option<usize> {
+    let room = if closed {
+        0
+    } else {
+        chunk_rows.saturating_sub(taken)
+    };
+    if room == 0 && (members + 1).saturating_mul(CHUNK_SIZE) > chunk_rows {
+        return None;
+    }
+    Some(room)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::deepest_chunk_offset;
+    use super::{deepest_chunk_offset, room_left, CHUNK_SIZE};
+
+    #[test]
+    fn a_closed_forward_offers_only_joins_even_below_a_chunk() {
+        // Nothing standing, the rate refused the first rows offered: the pass
+        // closes at width zero and composes at one chunk.
+        assert_eq!(room_left(CHUNK_SIZE, 0, false, 0), Some(CHUNK_SIZE));
+        assert_eq!(
+            room_left(CHUNK_SIZE, 0, true, 0),
+            Some(0),
+            "a closed pass re-offers the turn as a join, not with the rows it was refused"
+        );
+        // With a member already sharing that chunk, there is no room for a
+        // join that could advance beside it either.
+        assert_eq!(room_left(CHUNK_SIZE, 0, true, 1), None);
+        // Open, a wider forward still has its unspent rows.
+        assert_eq!(
+            room_left(4 * CHUNK_SIZE, CHUNK_SIZE, false, 1),
+            Some(3 * CHUNK_SIZE)
+        );
+    }
 
     #[test]
     fn the_deepest_chunk_ends_at_the_turns_last_token() {
