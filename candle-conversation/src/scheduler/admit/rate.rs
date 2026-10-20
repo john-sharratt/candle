@@ -925,6 +925,23 @@ impl WaveRate {
         self.context_per_row
     }
 
+    /// The shares of a `rows`-wide forward at the learned depth and the
+    /// residency now that go to the copy, the rows' compute and their
+    /// attention, by the fit. Whether a falling creep rate is the zone
+    /// shrinking (the copy's share grows) or contexts deepening (attention's
+    /// does) is read from these.
+    pub fn forward_shares(&self, rows: usize) -> (f64, f64, f64) {
+        let copy = self.non_resident_bytes(self.resident_now) as f64 / self.bw_bytes_per_s;
+        let compute = rows as f64 * self.model.compute_secs_per_token;
+        let attend = rows as f64 * self.context_per_row * self.model.attend_secs_per_pair;
+        let total = self.forward_secs(rows, self.resident_now);
+        if total > 0.0 {
+            (copy / total, compute / total, attend / total)
+        } else {
+            (0.0, 0.0, 0.0)
+        }
+    }
+
     /// [`Self::forward_secs`] for rows that attend `pairs` query×key pairs
     /// between them — a cohort at a known depth.
     pub fn forward_secs_attending(&self, tokens: usize, pairs: f64, resident: u64) -> f64 {
@@ -2747,6 +2764,37 @@ mod tests {
         assert!(approx(p.forward_secs(2_048, resident), named, 1e-9));
         let deep = p.forward_secs_attending(2_048, 2_048.0 * 114e3, resident);
         assert!(deep > named, "a 114K cohort costs more than a 10K one");
+    }
+
+    /// **The shares say which cost grew.** Rows that come to attend deeper
+    /// put more of a forward in attention and less in the copy, and the three
+    /// shares leave the fixed costs the rest.
+    #[test]
+    fn a_deepening_context_shows_in_the_attention_share() {
+        let mut p = WaveRate::with_link_rate(
+            LINK_4090_MOBILE,
+            ExpertGeometry::QWEN36_35B_A3B,
+            RateModel {
+                attend_secs_per_pair: 2e-11,
+                ..RateModel::default()
+            },
+            DecodeModel::default(),
+        );
+        let resident = RESIDENT_RUN15;
+        for _ in 0..200 {
+            p.observe_prefill_attending(2_048, 2_048.0 * 10e3, resident, 1.0);
+        }
+        let (copy0, compute0, attend0) = p.forward_shares(2_048);
+        assert!(
+            copy0 + compute0 + attend0 < 1.0 + 1e-9,
+            "{copy0} {compute0} {attend0}"
+        );
+        for _ in 0..400 {
+            p.observe_prefill_attending(2_048, 2_048.0 * 100e3, resident, 1.0);
+        }
+        let (copy1, _, attend1) = p.forward_shares(2_048);
+        assert!(attend1 > attend0, "attention {attend0} → {attend1}");
+        assert!(copy1 < copy0, "copy {copy0} → {copy1}");
     }
 
     /// With residency held, the rate climbs toward the compute ceiling and

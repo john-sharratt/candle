@@ -69,6 +69,7 @@ mod section_pages;
 mod segment_rearm;
 mod settle;
 mod spec_chooser;
+mod step_census;
 mod submit_admit;
 mod sweep_forecast;
 #[cfg(test)]
@@ -3796,6 +3797,9 @@ pub(crate) struct Scheduler {
     creep_airtime: turn_airtime::AirtimeRate,
     /// The mean decode run of a `High` turn segment (`turn_airtime`).
     segment_mean: turn_airtime::SegmentMean,
+    /// Every step by what it carried, reported with the learned rates
+    /// (`step_census`).
+    step_census: step_census::StepCensus,
     /// The `High` prompt rows outstanding, as `publish_learned_rates` last
     /// counted them.
     high_backlog_rows: usize,
@@ -4119,6 +4123,7 @@ impl Scheduler {
             high_airtime: None,
             creep_airtime: turn_airtime::AirtimeRate::default(),
             segment_mean: turn_airtime::SegmentMean::default(),
+            step_census: step_census::StepCensus::default(),
             high_backlog_rows: 0,
             wave_section_advanced: false,
             shutdown_requested: false,

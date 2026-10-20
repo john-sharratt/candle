@@ -761,6 +761,11 @@ impl Scheduler {
             .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(60))
         {
             self.rates_logged_at = Some(now);
+            let ((copy, compute, attend), context) =
+                self.wave_rate.as_ref().map_or(((0.0, 0.0, 0.0), 0.0), |r| {
+                    (r.forward_shares(rows), r.context_per_row())
+                });
+            let steps = self.step_census.take(now);
             match learned {
                 Some(r) => tracing::info!(
                     target: "candle_conversation::scheduler::admission",
@@ -781,6 +786,9 @@ impl Scheduler {
                     step_debt_ratio = format!("{:.3}", self.wave_step_ratio),
                     segment_tokens = self.segment_mean.tokens().map(|t| t.round() as u64),
                     creep_rows_per_s = self.creep_airtime.per_s().map(|r| r.round() as u64),
+                    forward_shares = format!("copy={copy:.2} compute={compute:.2} attend={attend:.2}"),
+                    context_per_row = context.round() as u64,
+                    steps,
                     prefill_samples = samples,
                     decode_samples,
                     "learned rates published"
@@ -789,6 +797,7 @@ impl Scheduler {
                     target: "candle_conversation::scheduler::admission",
                     prefill_samples = samples,
                     decode_samples,
+                    steps,
                     "learned rates not yet published: the rate model has not learned both halves"
                 ),
             }

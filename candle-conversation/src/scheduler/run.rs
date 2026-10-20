@@ -333,6 +333,9 @@ impl Scheduler {
                 // decode-only, then filed by the shape the wave turned out to be.
                 self.wave_cobatched = false;
                 self.wave_step_creep_layer_rows = 0;
+                // What the creep had to ride with, before the step moves it.
+                let admitted = self.prefill_width() > 0 || self.section_ingest_width() > 0;
+                let queued = !self.prefill_queue.is_empty() || !self.pending_submits.is_empty();
                 let t_step = Instant::now();
                 self.batch_decode_step();
                 let step = t_step.elapsed();
@@ -348,6 +351,16 @@ impl Scheduler {
                 // reprojection, not the creep: only the creep or a section chunk
                 // riding this step runs up the debt.
                 let carried = !owed && (self.wave_cohort_advanced || self.wave_section_advanced);
+                self.step_census.record(
+                    super::step_census::StepShape::of_decode(
+                        self.wave_cobatched,
+                        carried,
+                        owed,
+                        admitted,
+                        queued,
+                    ),
+                    step,
+                );
                 self.creep_owed = next_creep_owed(
                     self.creep_owed,
                     step,
@@ -508,7 +521,17 @@ impl Scheduler {
         }
         self.wave_step_creep_layer_rows = 0;
         let t_step = Instant::now();
-        match self.decode_forward_cobatched(&[], &[], &[], &[]) {
+        let out = self.decode_forward_cobatched(&[], &[], &[], &[]);
+        self.step_census.record(
+            match &out {
+                Err(e) if is_tier_refusal(e) || is_span_full(e) => {
+                    super::step_census::StepShape::Refused
+                }
+                _ => super::step_census::StepShape::CreepOnly,
+            },
+            t_step.elapsed(),
+        );
+        match out {
             Ok(_) => {
                 if let Some(failures) = self.wave_retry.succeeded() {
                     tracing::info!(failures, "decode-less wave step ran after failing");
