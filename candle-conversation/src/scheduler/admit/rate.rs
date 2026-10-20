@@ -1146,7 +1146,30 @@ impl WaveRate {
     /// `resident` bytes on the card: no more than the layer has, of which the
     /// streamed fraction it does not hold.
     fn decode_misses(&self, routed: usize, resident: u64) -> f64 {
-        routed.min(self.geometry.experts_per_layer) as f64 * self.streamed_fraction(resident)
+        self.distinct_routed(routed) * self.streamed_fraction(resident)
+    }
+
+    /// The distinct experts a layer serves when its rows route to `routed`
+    /// between them: each row picks its top-k of the layer, so rows share
+    /// experts, and the layer fetches each one once however many rows chose
+    /// it — `E · (1 − (1 − k/E)^(routed/k))` in expectation.
+    ///
+    /// **Counted as routed, the misses grew with every row.** Twenty-four
+    /// decodes route to 192 experts of a 256-expert layer and share them down
+    /// to about 136 distinct, so a step's misses were read 40% high, the fit's
+    /// slope was learned on that, and the step published at the width it
+    /// prices outran the steps the card took: on BlackWorld (dcba2cc3b,
+    /// 2026-10-20) 0.7–3.3 s against co-batched steps of about 0.3 s.
+    fn distinct_routed(&self, routed: usize) -> f64 {
+        let e = self.geometry.experts_per_layer as f64;
+        let k = self.decode.experts_per_token.max(1) as f64;
+        if e <= 0.0 || routed == 0 {
+            return 0.0;
+        }
+        if k >= e {
+            return e;
+        }
+        e * (1.0 - (1.0 - k / e).powf(routed as f64 / k))
     }
 
     /// Projected decode throughput: `decodes` sequences stepped a second, for a
@@ -1810,6 +1833,44 @@ impl WaveRate {
         }
     }
 
+    /// [`Self::try_join`] beside running decodes: a join adds no row, so it has
+    /// no prefill gain, but the K/V it claims dislodges residency every running
+    /// decode steps slower for. `decode_weight` is those decodes' claim, as in
+    /// [`Self::try_widen_trading`]; a join that would cost them anything is
+    /// refused as `Worse`, unlatched, and the turn waits for a pass that offers
+    /// it rows — where its waiting weight is traded against the same loss.
+    ///
+    /// **A refusal the join undid.** On BlackWorld (dcba2cc3b, 2026-10-20)
+    /// heavy-read's outranking tool results were refused on the trade and
+    /// admitted at once as joins, judged on the prefill floor alone — `ok=1
+    /// rate=1` on almost every pass for five minutes — and the expert zone fell
+    /// to 21 GB against its 28.5 GB hold as before the trade was asked at all.
+    pub fn try_join_trading(
+        &mut self,
+        weights_before: u64,
+        weights_after: u64,
+        decode_weight: f64,
+    ) -> Admit {
+        if self.full {
+            return Admit::Refused(Refusal::Full);
+        }
+        if self.admitted_any
+            && self.decodes > 0
+            && self.decode_learned()
+            && weights_after < weights_before
+        {
+            let now = self.decode_rate(self.decodes, self.routed_per_layer, weights_before);
+            let with = self.decode_rate(self.decodes, self.routed_per_layer, weights_after);
+            if now > 0.0 && decode_weight * (with - now) / now < -1e-12 {
+                return Admit::Refused(Refusal::Worse {
+                    before: now,
+                    after: with,
+                });
+            }
+        }
+        self.try_join(weights_after)
+    }
+
     /// Offer a prefill that **outranks work the engine is already running** — a
     /// band above some active slot's. The row cap and the prefill floor are
     /// judged; the decode floor and the gain rules are not.
@@ -2401,6 +2462,57 @@ mod tests {
     const DECODE_DISLODGE: u64 = 176 * MIB;
     const SLOT: f64 = 1_933_312.0;
     const LAYERS: f64 = 41.0;
+
+    /// **Rows share experts, and a layer fetches each once.** One decode's
+    /// top-8 are eight distinct experts; twenty-four decodes' 192 picks are
+    /// about 136 of a 256-expert layer; and however many rows route, never
+    /// more than the layer holds.
+    #[test]
+    fn the_distinct_experts_a_layer_serves_are_fewer_than_its_picks() {
+        let p = planner(LINK_4090_MOBILE);
+        assert!(
+            approx(p.distinct_routed(8), 8.0, 1e-9),
+            "{}",
+            p.distinct_routed(8)
+        );
+        assert!(
+            approx(p.distinct_routed(192), 136.5, 1e-2),
+            "{}",
+            p.distinct_routed(192)
+        );
+        assert!(p.distinct_routed(100_000) <= 256.0);
+        assert!(p.distinct_routed(200) > p.distinct_routed(192));
+        assert_eq!(p.distinct_routed(0), 0.0);
+    }
+
+    /// **A fit learned at a few decodes prices twenty-four at what they cost.**
+    /// The card's per-layer time is its fixed part plus a cost per distinct
+    /// expert it fetched; taught at one to six decodes over a spread of
+    /// residencies, the fit's step at twenty-four — whose 192 picks share down
+    /// to about 136 experts — lands on that truth, where counting the picks
+    /// would have read 40% more misses at the width a placement prices.
+    #[test]
+    fn a_decode_fit_extrapolates_by_distinct_experts_not_picks() {
+        let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
+        let mut p = planner(LINK_4090_MOBILE);
+        let (a, b) = (0.25e-3, 0.05e-3);
+        let truth = |p: &WaveRate, decodes: usize, resident: u64| {
+            let m = p.distinct_routed(decodes * 8) * p.streamed_fraction(resident);
+            (a + b * m) * LAYERS
+        };
+        for round in 0..40 {
+            for decodes in 1..=6usize {
+                let share = 0.3 + 0.1 * ((round + decodes) % 5) as f64;
+                let resident = (total as f64 * share) as u64;
+                let secs = truth(&p, decodes, resident);
+                p.observe_decode(decodes, 0, resident, secs);
+            }
+        }
+        let resident = (total as f64 * 0.6) as u64;
+        let priced = p.decode_step_secs(24 * 8, resident);
+        let real = truth(&p, 24, resident);
+        assert!(approx(priced, real, 0.05), "priced {priced} against {real}");
+    }
 
     /// **Searched from a hint, the same answer as from nothing.** Every
     /// threshold of a prefix that pays, every hint in and around the range,

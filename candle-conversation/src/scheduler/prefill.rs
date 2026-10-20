@@ -787,6 +787,32 @@ impl Scheduler {
                 .map_or(r.decode_step_ms_plus_wide, |(_, wide)| wide),
             ..r
         });
+        // **Never slower than the card is stepping.** A co-batched step carries
+        // the decodes and the creep beside them, so its wall is a measured
+        // upper bound on the decode part at the width now — and the fit, which
+        // learns from decode-only steps alone, has none to correct it while
+        // every step co-batches: on BlackWorld (dcba2cc3b, 2026-10-20) it froze
+        // on heavy-read's last decode-only steps and published 0.7–3.3 s against
+        // co-batched steps of about 0.3 s, the hit model moving under it. Held
+        // to the bound, the whole curve scales by the same factor, so the
+        // steps a wider placement would get keep the model's shape around what
+        // was measured.
+        let bound = std::mem::take(&mut self.cobatched_since_priced)
+            .then_some(self.cobatched_step)
+            .flatten()
+            .map(|d| d.as_secs_f64() * 1e3);
+        let learned = learned.map(|r| match bound {
+            Some(b) if r.decode_step_ms > b && r.decode_step_ms > 0.0 => {
+                let f = b / r.decode_step_ms;
+                super::phase_ring::LearnedRates {
+                    decode_step_ms: r.decode_step_ms * f,
+                    decode_step_ms_plus_one: r.decode_step_ms_plus_one * f,
+                    decode_step_ms_plus_wide: r.decode_step_ms_plus_wide * f,
+                    ..r
+                }
+            }
+            _ => r,
+        });
         if let Some(rates) = learned {
             super::phase_ring::publish_learned_rates(rates);
         }
@@ -820,6 +846,7 @@ impl Scheduler {
                     decode_step_ms = format!("{:.1}", r.decode_step_ms),
                     decode_step_ms_plus_one = format!("{:.1}", r.decode_step_ms_plus_one),
                     decode_step_ms_plus_wide = format!("{:.1}", r.decode_step_ms_plus_wide),
+                    step_bound_ms = bound.map(|b| format!("{b:.1}")),
                     prefill_from = if drain.is_some() {
                         "high drain"
                     } else if traded.is_some() {

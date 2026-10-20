@@ -372,6 +372,10 @@ impl Scheduler {
                     self.decode_only_step,
                     self.wave_step_ratio,
                 );
+                if self.wave_cobatched {
+                    self.cobatched_step = Some(next_decode_only(self.cobatched_step, step));
+                    self.cobatched_since_priced = true;
+                }
                 if !self.wave_cobatched {
                     self.decode_only_step = Some(next_decode_only(self.decode_only_step, step));
                 } else if let Some(decode_only) = self.decode_only_step {

@@ -481,6 +481,9 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                             ground.prefill_weight(prio),
                             peers as f64,
                         )
+                    } else if peers > 0 {
+                        // Its rows refused, it joins only at no cost to them.
+                        rate.try_join_trading(before, after, peers as f64)
                     } else {
                         rate.try_outranking(cost.rows, after)
                     };
@@ -559,7 +562,11 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                     // and the ground re-offers the same turn as a join on the next
                     // peek (`Ground::close_rows`, `WaveRate::try_widen`).
                     decode_ok
-                        && match if cost.rows == 0 {
+                        && match if cost.rows == 0 && ground.decodes_active() > 0 {
+                            // A join's K/V slows the decodes running beside it
+                            // as a widening's does (`WaveRate::try_join_trading`).
+                            rate.try_join_trading(before, after, ground.decodes_active() as f64)
+                        } else if cost.rows == 0 {
                             rate.try_join(after)
                         } else if trading {
                             rate.try_widen_trading(
