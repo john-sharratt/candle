@@ -1382,7 +1382,10 @@ impl Scheduler {
         if routed == 0 {
             return;
         }
-        let hit = hits as f64 / routed as f64;
+        // Smoothed by half an expert each way: an interval that found every
+        // expert says the hit is near certain, not that it is certain at every
+        // residency, which an exponent of zero would claim.
+        let hit = (hits as f64 + 0.5) / (routed as f64 + 1.0);
         let resident = residency_now(self.standing_ground_bytes());
         if let Some(rate) = self.wave_rate.as_mut() {
             rate.observe_hit_rate(hit, resident);

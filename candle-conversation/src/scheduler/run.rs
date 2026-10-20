@@ -1376,7 +1376,7 @@ impl Scheduler {
                         link_fraction = r.link_fraction(),
                         compute_us_per_row = r.compute_secs_per_token() * 1e6,
                         layer_us = r.layer_secs() * 1e6,
-                        hit_coefficient = r.hit_rate(),
+                        hit_exponent = r.hit_exponent(),
                         // The two-cost fit only answers once the observations
                         // have enough spread to separate the copy from the
                         // compute; until then both are seeds.

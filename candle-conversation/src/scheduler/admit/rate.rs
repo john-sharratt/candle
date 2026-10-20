@@ -31,18 +31,17 @@
 //! card at a rate that scales with how much of the model is resident:
 //!
 //! ```text
-//! hit(R)        = min(1, hit_rate · R / E_total)   (hit_rate learned, ~1.65)
+//! hit(R)        = (R / E_total) ^ γ               (γ learned, ~0.46)
 //! bytes/layer   = min(Σ 8 · (1 + draft_i), experts_per_layer) · slot · (1 − hit(R))
 //! T_step(R)     = moe_layers · max(layer_secs, bytes/layer ÷ bw)
 //! ```
 //!
-//! `hit_rate` is a **coefficient on the resident fraction, not a probability**:
-//! the LRU zone holds the hot set and the predictor runs ahead of the sweep, so
-//! a cache holding two fifths of the model hits far more than two fifths of the
-//! time. Measured on the 35B ingest: 0.65 at 39% resident, so the coefficient is
-//! ~1.65 and the hit saturates at 58% residency. It is learned from the expert
-//! cache's own counters — assuming it costs a factor of two in every decode's
-//! priced copy.
+//! `γ` is **an exponent on the resident fraction**: the LRU zone holds the hot
+//! set and the predictor runs ahead of the sweep, so a cache holding two fifths
+//! of the model hits far more than two fifths of the time. Measured on the 35B
+//! ingest: 0.65 at 39% resident, so `γ` ≈ 0.46. It is learned from the expert
+//! cache's own counters, and the curve passes through what they measured while
+//! reaching certainty only with the whole model resident.
 //!
 //! The copy hides under the layer's own time, `layer_secs`, until it does not;
 //! from there the bus sets the step. **A dislodge lowers `R`, which lowers the
@@ -85,7 +84,7 @@
 //! * **The decode layer time** — seeded from
 //!   [`DecodeModel::initial_tok_per_s`], learned from decode forwards that ran
 //!   compute-bound. A bus-bound step says nothing about the layer.
-//! * **The hit coefficient** — seeded at [`DecodeModel::hit_rate`], learned
+//! * **The hit exponent** — seeded at [`DecodeModel::hit_exponent`], learned
 //!   from the expert cache's hit and miss counters
 //!   ([`WaveRate::observe_hit_rate`]).
 
@@ -214,23 +213,28 @@ pub struct DecodeModel {
     /// Experts one token routes to per layer — the top-k. 8 on the 35B.
     pub experts_per_token: usize,
     /// How well the cache converts residency into hits: a routed expert is
-    /// found on the card at `hit_rate × resident_fraction`, capped at certainty.
+    /// found on the card at `resident_fraction ^ hit_exponent`.
     ///
-    /// **A coefficient, not itself a probability.** The LRU zone holds the hot
-    /// set and the Markov predictor prefetches ahead of the sweep, so a cache
-    /// holding a third of the model hits far more than a third of the time —
-    /// that is the entire point of both. Seeded at the 0.7 the predictor was
-    /// measured at with everything resident, and then **learned**
-    /// ([`WaveRate::observe_hit_rate`]) from the expert cache's own hit and miss
-    /// counters, which is the only figure that knows what this workload's
-    /// routing actually looks like. Measured on the 35B at 37% resident: a hit
-    /// rate of 0.65, so the coefficient is ~1.73 — seeding it at 0.7 alone would
-    /// have priced every decode's copy at two and a half times its real cost.
+    /// Below 1 the cache beats its share — the LRU zone holds the hot set and
+    /// the Markov predictor prefetches ahead of the sweep, so a cache holding a
+    /// third of the model hits far more than a third of the time; above 1
+    /// residency churns faster than it is reused. **Learned**
+    /// ([`WaveRate::observe_hit_rate`]) from the expert cache's own hit and
+    /// miss counters, which is the only figure that knows what this workload's
+    /// routing looks like; seeded at 1, the cache hitting its share.
     ///
-    /// What the shape preserves is the sensitivity the whole refinement is for:
-    /// residency still multiplies, so a dislodge still raises the streamed bytes
-    /// of every decode already in the wave.
-    pub hit_rate: f64,
+    /// **A power, not a line through the origin.** The coefficient it replaces
+    /// (`hit = c × fraction`, capped at 1) was learned at the residency the
+    /// cache ran at and priced at another, and wherever the line crossed 1 it
+    /// read every expert as found: on WhiteWorld (a94d106e0, 2026-10-20) a hit
+    /// of 0.47 learned at its residency priced the residency a placed cohort
+    /// leaves as all hits, so the step it published fell to 7.9 ms at every
+    /// width against 100–500 ms stepped, and the gateway sent it 38 of 48
+    /// turns; BlackWorld's read 1.000 against 82–99% measured. The power
+    /// passes through the measured hit, reaches 1 only at the whole model, and
+    /// still rises with residency, so a dislodge still raises the streamed
+    /// bytes of every decode already in the wave.
+    pub hit_exponent: f64,
     /// The step rate the layer time is seeded from: one step at this rate,
     /// spread over the MoE layers, is the time a layer has to hide its copies
     /// behind until the waves say otherwise.
@@ -241,7 +245,7 @@ impl Default for DecodeModel {
     fn default() -> Self {
         Self {
             experts_per_token: 8,
-            hit_rate: 0.7,
+            hit_exponent: 1.0,
             initial_tok_per_s: 30.0,
         }
     }
@@ -484,6 +488,17 @@ enum Unsolved {
     /// They did, and the answer was not a cost: noise, or a stalled forward.
     Unphysical,
 }
+/// The hit rate at resident `fraction` of the model under exponent `gamma`:
+/// none with nothing resident, all with everything.
+fn hit_at(fraction: f64, gamma: f64) -> f64 {
+    let f = fraction.clamp(0.0, 1.0);
+    if f <= 0.0 {
+        0.0
+    } else {
+        f.powf(gamma).clamp(0.0, 1.0)
+    }
+}
+
 /// The running fit of a decode step's per-layer time against the experts it
 /// had to fetch: `t = a + b·m`, `m` the routed experts a layer did not hold.
 ///
@@ -758,8 +773,8 @@ impl WaveRate {
             "a decode step rate and a layer count are needed to seed the layer time"
         );
         assert!(
-            decode.hit_rate.is_finite() && decode.hit_rate >= 0.0,
-            "a hit coefficient is a non-negative finite multiplier on the resident fraction"
+            decode.hit_exponent.is_finite() && decode.hit_exponent > 0.0,
+            "a hit exponent is a positive finite power of the resident fraction"
         );
         Self {
             geometry,
@@ -1013,11 +1028,12 @@ impl WaveRate {
     }
 
     /// The rate at which a routed expert is found on the card at `resident`
-    /// bytes: the coefficient times the resident fraction, and never more than
-    /// certainty — a learned coefficient above 1 means the cache out-performs
-    /// its share, which stops being true before it reaches "always".
+    /// bytes: the resident fraction raised to the learned exponent
+    /// ([`DecodeModel::hit_exponent`]) — nothing with nothing resident, every
+    /// expert only with the whole model resident, and through the hit rate the
+    /// cache measured where it measured it.
     pub fn hit_fraction(&self, resident: u64) -> f64 {
-        (self.decode.hit_rate * self.resident_fraction(resident)).clamp(0.0, 1.0)
+        hit_at(self.resident_fraction(resident), self.decode.hit_exponent)
     }
 
     /// The fraction of a decode's routed experts that have to be streamed with
@@ -2114,41 +2130,40 @@ impl WaveRate {
     /// cache's own counters: `hit` is the fraction of routed experts it found
     /// resident over some interval, at `resident_bytes` on the card.
     ///
-    /// The model prices a decode's copy at `1 − hit_rate × resident_fraction`,
-    /// so what is learned is the **coefficient** — the observed hit rate over
-    /// the residency that produced it. Guessing it is the one thing that cannot
-    /// be done well: the LRU zone and the Markov predictor together are worth
-    /// far more than the resident fraction alone, and by how much depends on the
-    /// workload's routing. On the 35B ingest, 0.65 at 37% resident gives 1.73,
-    /// against a seed of 0.7 — a decode's copy priced 2.5× too dear, which the
-    /// wave pays for by refusing decodes that would have fitted.
+    /// The model prices a decode's copy at `1 − resident_fraction^γ`, so what
+    /// is learned is the **exponent** that puts the curve through the measured
+    /// hit at the residency that produced it: `γ = ln hit / ln fraction`.
+    /// Guessing it is the one thing that cannot be done well: the LRU zone and
+    /// the Markov predictor together are worth far more than the resident
+    /// fraction alone, and by how much depends on the workload's routing — on
+    /// the 35B ingest, 0.65 at 39% resident, γ ≈ 0.46.
     ///
-    /// Returns the observed coefficient, or `None` when the interval says
-    /// nothing: no routing at all, or a card holding no experts (from which no
-    /// coefficient can be recovered, since every hit came from nowhere).
-    /// Dampened by `alpha` like the other estimates.
+    /// Returns the observed exponent, or `None` when the interval says nothing:
+    /// a card holding none of the model or all of it (where every residency
+    /// gives the same hit), or a hit rate at either end, which no exponent puts
+    /// a curve through. Dampened by `alpha` like the other estimates.
     pub fn observe_hit_rate(&mut self, hit: f64, resident_bytes: u64) -> Option<f64> {
-        if !hit.is_finite() || !(0.0..=1.0).contains(&hit) {
+        if !hit.is_finite() || hit <= 0.0 || hit >= 1.0 {
             return None;
         }
         let fraction = self.resident_fraction(resident_bytes);
-        if fraction <= 0.0 {
+        if fraction <= 0.0 || fraction >= 1.0 {
             return None;
         }
-        let observed = hit / fraction;
-        self.decode.hit_rate += self.alpha * (observed - self.decode.hit_rate);
+        let observed = hit.ln() / fraction.ln();
+        self.decode.hit_exponent += self.alpha * (observed - self.decode.hit_exponent);
         self.hit_samples += 1;
         Some(observed)
     }
 
-    /// Intervals the hit coefficient has learned from.
+    /// Intervals the hit exponent has learned from.
     pub fn hit_samples(&self) -> u64 {
         self.hit_samples
     }
 
-    /// The hit coefficient the model currently believes.
-    pub fn hit_rate(&self) -> f64 {
-        self.decode.hit_rate
+    /// The hit exponent the model currently believes.
+    pub fn hit_exponent(&self) -> f64 {
+        self.decode.hit_exponent
     }
 
     /// Seconds of compute the model currently believes one prefill row costs.
@@ -2242,13 +2257,26 @@ mod tests {
     const SLOT: f64 = 1_933_312.0;
     const LAYERS: f64 = 41.0;
 
+    /// The test planner. Its hit exponent puts the curve through the hit the
+    /// old seed (`0.7 × resident fraction`) gave at run 15's residency, so the
+    /// decode figures worked out there by hand still hold; the deployed seed
+    /// is [`DecodeModel::default`]'s.
     fn planner(link: f64) -> WaveRate {
         WaveRate::with_link_rate(
             link,
             ExpertGeometry::QWEN36_35B_A3B,
             RateModel::default(),
-            DecodeModel::default(),
+            DecodeModel {
+                hit_exponent: run15_hit_exponent(),
+                ..DecodeModel::default()
+            },
         )
+    }
+
+    /// The exponent through a 0.7 × 39.3% hit at run 15's 39.3% residency.
+    fn run15_hit_exponent() -> f64 {
+        let f = RESIDENT_RUN15 as f64 / ExpertGeometry::QWEN36_35B_A3B.total_bytes() as f64;
+        (0.7 * f).ln() / f.ln()
     }
 
     /// The planner as run 15 measured it: effective rate learned, not seeded.
@@ -3145,19 +3173,19 @@ mod tests {
 
     // ── the decode model: what residency does to the copy ──────────────────
 
-    /// The streamed fraction is what the zone and the predictor miss: 30% with
-    /// everything resident, everything with nothing resident, and in between a
-    /// straight line through the resident fraction — run 15's 39% resident
+    /// The streamed fraction is what the zone and the predictor miss: nothing
+    /// with everything resident, everything with nothing resident, and in
+    /// between the power curve through the measured hit — run 15's 39% resident
     /// streams 72% of what a decode routes to.
     #[test]
     fn weight_pressure_raises_the_streamed_fraction() {
         let p = planner(LINK_4090_MOBILE);
         let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
-        assert!(approx(p.streamed_fraction(total), 0.3, 1e-12));
+        assert!(approx(p.streamed_fraction(total), 0.0, 1e-12));
         assert!(approx(p.streamed_fraction(0), 1.0, 1e-12));
         assert!(approx(p.resident_fraction(RESIDENT_RUN15), 0.3933, 1e-3));
         assert!(approx(p.streamed_fraction(RESIDENT_RUN15), 0.7247, 1e-3));
-        assert!(approx(p.streamed_fraction(total / 2), 0.65, 1e-12));
+        assert!(approx(p.streamed_fraction(total / 2), 0.6164, 1e-3));
         assert!(
             p.streamed_fraction(RESIDENT_RUN15 - GIB) > p.streamed_fraction(RESIDENT_RUN15),
             "less resident, more streamed"
@@ -3266,8 +3294,8 @@ mod tests {
                     1e-9
                 ));
                 assert!(after < before);
-                assert!(approx(before, 10.285, 1e-3), "{before}");
-                assert!(approx(after, 10.202, 1e-3), "{after}");
+                assert!(approx(before, 10.046, 1e-3), "{before}");
+                assert!(approx(after, 9.946, 1e-3), "{after}");
             }
             other => panic!("expected worse, got {other:?}"),
         }
@@ -3317,8 +3345,9 @@ mod tests {
     /// The refinement itself: the same decodes on the same card, once with
     /// nothing dislodged and once with half a GiB a decode. The dislodge lowers
     /// the hit rate for every decode already in the wave, so the copy outruns
-    /// the layer sooner and the rate turns down where the fixed-residency wave
-    /// was still climbing — nine admitted against seven.
+    /// the layer and the rate turns down where the fixed-residency wave — at
+    /// 74% resident, its copy hidden under the layer — runs to the cap: sixty-
+    /// four admitted against eight.
     #[test]
     fn dislodged_weights_refuse_decodes_a_fixed_residency_wave_would_take() {
         let resident = 14 * GIB;
@@ -3327,7 +3356,7 @@ mod tests {
             let mut p = planner_with_layer(LINK_3090, 9.6e9, 20e-3);
             p.reset(resident, floor, floor, CAP, DECODE_CAP);
             let (n, refusal) = fill_with(&mut p, decode(2), 0);
-            assert!(matches!(refusal, Refusal::Saturated { .. }), "{refusal:?}");
+            assert!(matches!(refusal, Refusal::DecodeCap { .. }), "{refusal:?}");
             n
         };
         let dislodging = {
@@ -3339,13 +3368,13 @@ mod tests {
                 "{refusal:?}"
             );
             assert!(
-                p.resident_now() > floor + 4 * GIB,
+                p.resident_now() >= floor + 4 * GIB,
                 "the floor was nowhere near"
             );
             n
         };
-        assert_eq!(fixed, 9);
-        assert_eq!(dislodging, 7);
+        assert_eq!(fixed, DECODE_CAP);
+        assert_eq!(dislodging, 8);
     }
 
     /// A decode's dislodge is judged against the floor like a prefill's: with
@@ -3450,33 +3479,32 @@ mod tests {
     /// one more. Same formula, different card.
     #[test]
     fn the_bus_sets_how_many_decodes_a_layer_can_hide() {
-        // 3090 at its 9.6 GB/s seed with 12 GiB resident: 24 experts, 56%
-        // streamed, 2.69 ms a decode — seven fit in 20 ms.
+        // 3090 at its 9.6 GB/s seed with 12 GiB resident: 24 experts, 47%
+        // streamed, 2.25 ms a decode — eight fit in 20 ms.
         let p = planner_with_layer(LINK_3090, 9.6e9, 20e-3);
-        assert!(approx(p.decode_copy_secs(24, 12 * GIB), 2.685e-3, 1e-3));
-        assert_eq!(p.decode_bus_limit(2, 12 * GIB), 7);
-        // Blackwell at its 48 GB/s seed with 19 GB resident: 31% streamed,
-        // 0.30 ms a decode; eleven drafted decodes route to every expert and
-        // the whole layer's share is 3.2 ms, so the cap alone bounds the wave.
+        assert!(approx(p.decode_copy_secs(24, 12 * GIB), 2.253e-3, 1e-3));
+        assert_eq!(p.decode_bus_limit(2, 12 * GIB), 8);
+        // Blackwell at its 48 GB/s seed with 19 GB resident: 2.5% streamed;
+        // eleven drafted decodes route to every expert and the whole layer's
+        // share is 0.26 ms, so the cap alone bounds the wave.
         let p = planner_with_layer(LINK_BLACKWELL, 48e9, 20e-3);
         assert!(approx(
             p.decode_copy_secs(256, 19_000 * MIB),
-            3.224e-3,
+            0.2583e-3,
             1e-3
         ));
         assert_eq!(p.decode_bus_limit(2, 19_000 * MIB), usize::MAX);
     }
 
-    /// A fully resident card still streams what the predictor misses — 30% of
-    /// every routed expert — but the whole layer's share is 9.7 ms against a
-    /// 20 ms layer, so the bus never limits it, where the same layer at run
+    /// A fully resident card holds every expert a decode routes to, so it
+    /// streams none and the bus never limits it, where the same layer at run
     /// 15's residency streams 72% and hides nine drafted decodes.
     #[test]
-    fn a_fully_resident_card_still_pays_the_miss_rate() {
+    fn a_fully_resident_card_streams_nothing() {
         let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
         let p = planner_with_layer(LINK_4090_MOBILE, BW_RUN15, 20e-3);
-        assert!(approx(p.decode_copy_secs(24, total), 0.9098e-3, 1e-3));
-        assert!(approx(p.decode_copy_secs(256, total), 9.705e-3, 1e-3));
+        assert_eq!(p.decode_copy_secs(24, total), 0.0);
+        assert_eq!(p.decode_copy_secs(256, total), 0.0);
         assert_eq!(p.decode_bus_limit(2, total), usize::MAX);
         assert_eq!(p.decode_bus_limit(2, RESIDENT_RUN15), 9);
         // Plain decodes: 32 route to every expert, and at full residency 65
@@ -3582,12 +3610,11 @@ mod tests {
             p.resident_now(),
             RESIDENT_RUN15 - 3 * DECODE_DISLODGE - 900 * MIB
         );
-        // 951 MiB above the floor: five more stores fit, the sixth does not,
-        // and the copy is still under the layer the whole way.
+        // 951 MiB above the floor: five more stores fit, and the floor — not
+        // the rate — refuses the sixth.
         for _ in 0..5 {
             assert!(offer(&mut p, decode(2), DECODE_DISLODGE).is_admitted());
         }
-        assert!(p.decode_copy_secs(p.routed_per_layer(), p.resident_now()) < p.layer_secs());
         assert!(matches!(
             offer(&mut p, decode(2), DECODE_DISLODGE),
             Admit::Refused(Refusal::Floor { .. })
@@ -4001,45 +4028,94 @@ mod tests {
         );
     }
 
-    /// A coefficient above 1 is ordinary — a cache holding a third of the model
-    /// hits far more than a third of the time — and the hit it produces is
-    /// capped at certainty rather than the coefficient being capped at 1.
+    /// An exponent below 1 is ordinary — a cache holding a third of the model
+    /// hits far more than a third of the time — and the hit reaches certainty
+    /// only with the whole model resident.
     #[test]
-    fn a_hit_coefficient_above_one_is_ordinary_and_the_hit_still_caps() {
+    fn a_hit_exponent_below_one_beats_the_share_and_never_saturates_early() {
         let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
         let p = WaveRate::with_link_rate(
             LINK_4090_MOBILE,
             ExpertGeometry::QWEN36_35B_A3B,
             RateModel::default(),
             DecodeModel {
-                hit_rate: 1.73,
+                hit_exponent: 0.4616,
                 ..DecodeModel::default()
             },
         );
-        // Run 15's residency: 39.3% resident × 1.73 is a 0.68 hit.
-        assert!(approx(p.hit_fraction(RESIDENT_RUN15), 0.6804, 1e-3));
-        assert!(approx(p.streamed_fraction(RESIDENT_RUN15), 0.3196, 1e-3));
-        // Past 1/1.73 — 58% of the model — the coefficient would exceed
-        // certainty. It does not; the hit stops at 1 and the copy at 0.
+        // Run 15's residency: 39.3% resident to the 0.46 is a 0.65 hit.
+        assert!(approx(p.hit_fraction(RESIDENT_RUN15), 0.65, 2e-3));
         assert!(approx(p.hit_fraction(total), 1.0, 1e-12));
         assert!(approx(p.streamed_fraction(total), 0.0, 1e-12));
-        assert!(
-            p.streamed_fraction(total / 2) > 0.0,
-            "and stays a real fraction below the saturation point",
-        );
+        assert_eq!(p.hit_fraction(0), 0.0);
+        for share in [0.5, 0.8, 0.95, 0.99] {
+            let r = (total as f64 * share) as u64;
+            assert!(
+                p.streamed_fraction(r) > 0.0,
+                "a card short of the whole model still misses at {share}",
+            );
+        }
     }
 
     #[test]
-    #[should_panic(expected = "hit coefficient")]
-    fn a_negative_hit_coefficient_is_refused() {
+    #[should_panic(expected = "hit exponent")]
+    fn a_non_positive_hit_exponent_is_refused() {
         let _ = WaveRate::with_link_rate(
             LINK_4090_MOBILE,
             ExpertGeometry::QWEN36_35B_A3B,
             RateModel::default(),
             DecodeModel {
-                hit_rate: -0.1,
+                hit_exponent: 0.0,
                 ..DecodeModel::default()
             },
+        );
+    }
+
+    /// **Learned at one residency, priced at another, it does not read every
+    /// expert as found.** WhiteWorld (a94d106e0, 2026-10-20) measured a 0.47
+    /// hit; the line through the origin learned there crossed 1 at the
+    /// residency a placed cohort leaves, and the step published at every width
+    /// was the layer time alone. The power keeps misses on both sides, and
+    /// a wider placement still steps slower.
+    #[test]
+    fn a_hit_learned_low_still_misses_where_it_is_priced_higher() {
+        let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
+        let mut p = planner(LINK_4090_MOBILE).with_alpha(1.0);
+        let learned_at = (total as f64 * 0.30) as u64;
+        p.observe_hit_rate(0.47, learned_at).expect("an interval");
+        assert!(approx(p.hit_fraction(learned_at), 0.47, 1e-9));
+        let priced_at = (total as f64 * 0.70) as u64;
+        let streamed = p.streamed_fraction(priced_at);
+        assert!(
+            streamed > 0.1 && streamed < 0.53,
+            "more resident, fewer misses, but not none: {streamed}"
+        );
+        let one = p.decode_copy_secs(8, priced_at);
+        let wide = p.decode_copy_secs(8 * 17, priced_at);
+        assert!(
+            wide > one * 4.0,
+            "seventeen decodes route more: {one} → {wide}"
+        );
+    }
+
+    /// **A small dislodge near full residency costs what the misses it adds
+    /// cost.** BlackWorld measured 0.82 at about 94% resident; the coefficient
+    /// read 1.000 there, so 352 MiB dislodged priced every decode 31% slower.
+    /// Through the measured point, the streamed share moves by the share of
+    /// residency moved, scaled by the exponent.
+    #[test]
+    fn a_hit_learned_near_full_residency_prices_a_small_dislodge_small() {
+        let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
+        let mut p = planner(LINK_4090_MOBILE).with_alpha(1.0);
+        let at = (total as f64 * 0.94) as u64;
+        p.observe_hit_rate(0.82, at).expect("an interval");
+        let before = p.streamed_fraction(at);
+        // BlackWorld's 352 MiB, as a share of its model: about 0.75%.
+        let after = p.streamed_fraction(at - (total as f64 * 0.0075) as u64);
+        assert!(approx(before, 0.18, 1e-9), "{before}");
+        assert!(
+            after > before && (after - before) / before < 0.15,
+            "a 352 MiB dislodge moves the misses a little: {before} → {after}"
         );
     }
 
@@ -4074,52 +4150,62 @@ mod tests {
         assert!(p.observe_prefill(rows, RESIDENT_RUN15, secs).is_some());
     }
 
-    /// **The coefficient is learned from the cache's own counters.** Run 15
+    /// **The exponent is learned from the cache's own counters.** Run 15
     /// reported a 0.65 hit rate at 7,611 MiB resident of a 20.29 GB model —
-    /// 39.3% — so the coefficient is 1.65, and the seed of 0.7 was pricing every
-    /// decode's copy at twice its real cost.
+    /// 39.3% — so the exponent is 0.46, and the seed of 1 (the cache hitting
+    /// its share) was pricing every decode's copy 1.7 times too dear.
     #[test]
-    fn the_hit_coefficient_is_learned_from_the_caches_counters() {
-        let mut p = planner(LINK_4090_MOBILE).with_alpha(1.0);
-        assert!(
-            approx(p.hit_rate(), 0.7, 1e-12),
-            "seeded at the measured 0.7"
-        );
+    fn the_hit_exponent_is_learned_from_the_caches_counters() {
+        let deployed = || {
+            WaveRate::with_link_rate(
+                LINK_4090_MOBILE,
+                ExpertGeometry::QWEN36_35B_A3B,
+                RateModel::default(),
+                DecodeModel::default(),
+            )
+        };
+        let mut p = deployed().with_alpha(1.0);
+        assert!(approx(p.hit_exponent(), 1.0, 1e-12), "seeded at the share");
         let observed = p
             .observe_hit_rate(0.65, RESIDENT_RUN15)
             .expect("a routing interval");
-        assert!(approx(observed, 1.6527, 1e-3), "{observed}");
-        assert!(approx(p.hit_rate(), observed, 1e-12));
+        assert!(approx(observed, 0.4616, 2e-3), "{observed}");
+        assert!(approx(p.hit_exponent(), observed, 1e-12));
         assert_eq!(p.hit_samples(), 1);
-        // And the copy it prices falls by the same factor it was over by.
+        // And the copy it prices is the one the counters measured.
         let streamed = p.streamed_fraction(RESIDENT_RUN15);
         assert!(approx(streamed, 0.35, 1e-2), "{streamed}");
-        let seeded = planner(LINK_4090_MOBILE).streamed_fraction(RESIDENT_RUN15);
+        let seeded = deployed().streamed_fraction(RESIDENT_RUN15);
         assert!(
-            approx(seeded / streamed, 2.07, 0.02),
-            "the copy was over by 2x"
+            approx(seeded / streamed, 1.73, 0.02),
+            "the seed's copy was over by 1.7x"
         );
     }
 
-    /// Intervals that cannot say anything about the coefficient leave it alone:
-    /// a card holding no experts, and a rate that is not a fraction.
+    /// Intervals that cannot say anything about the exponent leave it alone: a
+    /// card holding none of the model or all of it, and a hit rate at either
+    /// end or not a fraction.
     #[test]
     fn hit_intervals_that_teach_nothing_are_ignored() {
+        let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
         let mut p = planner(LINK_4090_MOBILE);
-        let seed = p.hit_rate();
+        let seed = p.hit_exponent();
         assert_eq!(p.observe_hit_rate(0.5, 0), None, "nothing resident");
+        assert_eq!(p.observe_hit_rate(0.5, total), None, "everything resident");
+        assert_eq!(p.observe_hit_rate(1.0, RESIDENT_RUN15), None);
+        assert_eq!(p.observe_hit_rate(0.0, RESIDENT_RUN15), None);
         assert_eq!(p.observe_hit_rate(1.5, RESIDENT_RUN15), None);
         assert_eq!(p.observe_hit_rate(-0.1, RESIDENT_RUN15), None);
         assert_eq!(p.observe_hit_rate(f64::NAN, RESIDENT_RUN15), None);
-        assert_eq!(p.hit_rate(), seed);
+        assert_eq!(p.hit_exponent(), seed);
         assert_eq!(p.hit_samples(), 0);
     }
 
     /// **Residency still multiplies, which is the point of the refinement.**
-    /// Whatever the coefficient has learned, dislodging weights raises the
+    /// Whatever the exponent has learned, dislodging weights raises the
     /// streamed share of every decode already in the wave.
     #[test]
-    fn a_learned_coefficient_still_answers_to_weight_pressure() {
+    fn a_learned_exponent_still_answers_to_weight_pressure() {
         let mut p = planner(LINK_4090_MOBILE).with_alpha(1.0);
         p.observe_hit_rate(0.65, RESIDENT_RUN15);
         let before = p.streamed_fraction(RESIDENT_RUN15);
