@@ -637,9 +637,21 @@ impl Scheduler {
         // width read as 40 tok/s, the gateway priced every turn's prefill at
         // that, and placed none here through two patterns. So the width is
         // what this card has waiting to prefill — every admitted prefill's
-        // remaining rows and every queued turn's — and one turn more, at the
-        // gateway's own nominal prompt, up to the width admission would offer.
-        const NOMINAL_PROMPT_ROWS: usize = 2048;
+        // remaining rows and every queued turn's — and one turn more, up to the
+        // width admission would offer.
+        //
+        // **That turn is the size this card's turns are.** A fixed nominal
+        // prompt priced every workload as one: heavy-decode's short prompts
+        // were charged as 2,048-row ones, and a card's wide prefill rate bit
+        // where its real prompts would not (BlackWorld, 437000551, 2026-10-20).
+        // The mean prompt of the turns begun here, published so the gateway
+        // prices with it too; the gateway's former nominal seeds it until one
+        // has begun.
+        const SEED_PROMPT_ROWS: usize = 2048;
+        let placed_prompt = self
+            .prompt_mean
+            .tokens()
+            .map_or(SEED_PROMPT_ROWS, |t| t.round().max(1.0) as usize);
         let waiting: usize = self
             .active_prefills
             .iter()
@@ -647,7 +659,7 @@ impl Scheduler {
             .chain(self.prefill_queue.iter().map(|w| w.tokens.len()))
             .sum();
         let rows = waiting
-            .saturating_add(NOMINAL_PROMPT_ROWS)
+            .saturating_add(placed_prompt)
             .min(self.prefill_pass_ceiling().max(1));
         let rate = self.wave_rate.as_ref().expect("checked above");
         let (learned, samples, decode_samples) =
@@ -741,7 +753,7 @@ impl Scheduler {
             // The placed turn itself: no sequence holds it yet, so it is put at
             // the depth this card's prompts have been attending — a tool loop's
             // next prompt continues a conversation, it does not start one.
-            q_lens.push(NOMINAL_PROMPT_ROWS);
+            q_lens.push(placed_prompt);
             offsets.push(r.context_per_row() as usize);
             seqs.push(usize::MAX);
             let zone = super::interleave::effective_weight_zone_bytes(0)?;
@@ -811,6 +823,8 @@ impl Scheduler {
             prefill_tok_s: drain.or(traded).unwrap_or(r.prefill_tok_s),
             prefill_tok_s_plus_wide: prefill_wide.unwrap_or(r.prefill_tok_s_plus_wide),
             high_backlog_tokens: high_backlog,
+            prompt_tokens: self.prompt_mean.tokens().unwrap_or(0.0),
+            reply_tokens: self.segment_mean.tokens().unwrap_or(0.0),
             // **The placed figures as multiples of the step now.** The solve
             // prices them at the zone less the composed cohort's tier, a
             // residency the step now is not read at, and the hit falls steeply
@@ -2520,6 +2534,9 @@ impl Scheduler {
     /// touching what the choice means.
     pub(super) fn begin_prefill(&mut self, work: PrefillWork) {
         let total = work.tokens.len();
+        if total > 0 {
+            self.prompt_mean.add(total);
+        }
         let _ = work
             .event_tx
             .send(TurnEvent::Prefill(work.prefill_text.clone()));

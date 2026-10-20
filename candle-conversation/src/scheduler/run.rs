@@ -804,7 +804,11 @@ impl Scheduler {
             // where nothing is queued.
             {
                 let guests = Arc::clone(&self.guests);
-                if let Some(report) = self.drain_guests(&guests) {
+                let t_guests = Instant::now();
+                let served = self.drain_guests(&guests);
+                self.step_census
+                    .spend(super::step_census::Activity::Device, t_guests.elapsed());
+                if let Some(report) = served {
                     // The drain evicted, ran and handed its ground back. Skip
                     // straight to the top: the widths this pass measured are
                     // from before the eviction, and forming a wave against them
@@ -840,7 +844,10 @@ impl Scheduler {
             }
 
             // 2a. One turn of the normalization warm-up replay (see `norm_warm`).
+            let t_warm = Instant::now();
             self.step_norm_warm();
+            self.step_census
+                .spend(super::step_census::Activity::Warm, t_warm.elapsed());
 
             // 2b. A turn whose prefill stands still is told what it waits
             // behind, so its caller can show it rather than look hung
@@ -874,7 +881,10 @@ impl Scheduler {
                 // freed is handed back whole before the loop parks — otherwise it
                 // waits, owed, inside the next request's first forwards.
                 if std::mem::take(&mut self.settle_owed) {
+                    let t_settle = Instant::now();
                     let report = self.settle_device();
+                    self.step_census
+                        .spend(super::step_census::Activity::Device, t_settle.elapsed());
                     for waiter in self.settle_waiters.drain(..) {
                         let _ = waiter.send(report);
                     }
@@ -953,6 +963,8 @@ impl Scheduler {
                 // leaving it untimed put it in the Blocked remainder.
                 let t_req = Instant::now();
                 let keep_going = self.handle_request(req);
+                self.step_census
+                    .spend(super::step_census::Activity::Requests, t_req.elapsed());
                 self.wave_stats
                     .add_requests(t_req.elapsed().as_micros() as u64);
                 if !keep_going {
@@ -983,6 +995,8 @@ impl Scheduler {
                             .add_idle(t_wait.elapsed().as_millis() as u64);
                         let t_req = Instant::now();
                         let keep_going = self.handle_request(req);
+                        self.step_census
+                            .spend(super::step_census::Activity::Requests, t_req.elapsed());
                         self.wave_stats
                             .add_requests(t_req.elapsed().as_micros() as u64);
                         if !keep_going {
@@ -1509,6 +1523,8 @@ impl Scheduler {
                             .add_idle(t_wait.elapsed().as_millis() as u64);
                         let t_req = Instant::now();
                         let keep_going = self.handle_request(req);
+                        self.step_census
+                            .spend(super::step_census::Activity::Requests, t_req.elapsed());
                         self.wave_stats
                             .add_requests(t_req.elapsed().as_micros() as u64);
                         if !keep_going {

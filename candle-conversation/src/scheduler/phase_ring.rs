@@ -516,6 +516,11 @@ pub struct LearnedRates {
     /// queued `High` turns and `High` submissions not yet carved. Background
     /// work is not in it: a placed turn goes ahead of it.
     pub high_backlog_tokens: u64,
+    /// The mean prompt and the mean reply run of the turns this card has
+    /// served — the size a turn placed here is priced at, measured where the
+    /// turns arrive rather than set at the gateway. Zero until one has been.
+    pub prompt_tokens: f64,
+    pub reply_tokens: f64,
 }
 
 /// The newest [`LearnedRates`] the scheduler published, and when.
@@ -676,6 +681,9 @@ fn parse_learned_rates(text: &str) -> Option<LearnedRates> {
         // flattest the width could be, until the first publish replaces it.
         decode_step_ms_plus_wide: get("decode_step_ms_plus_wide").unwrap_or(plus_one),
         high_backlog_tokens: 0,
+        // The sizes belong to the run that served them, as the backlog does.
+        prompt_tokens: 0.0,
+        reply_tokens: 0.0,
     })
 }
 
@@ -806,6 +814,8 @@ mod tests {
             decode_step_ms_plus_one: 112.25,
             decode_step_ms_plus_wide: 240.0,
             high_backlog_tokens: 3_545,
+            prompt_tokens: 0.0,
+            reply_tokens: 0.0,
         };
         let back = parse_learned_rates(&format_learned_rates(&r)).expect("sound");
         assert_eq!(
@@ -983,6 +993,8 @@ mod tests {
             decode_step_ms_plus_one: 82.5,
             decode_step_ms_plus_wide: 210.0,
             high_backlog_tokens: 4096,
+            prompt_tokens: 1800.0,
+            reply_tokens: 240.0,
         };
         publish_learned_rates(rates);
         let (read, age) = learned_rates().expect("published");

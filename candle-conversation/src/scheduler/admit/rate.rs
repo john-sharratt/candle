@@ -1164,6 +1164,8 @@ impl WaveRate {
             )),
             // The scheduler fills it in: the rate model sees no queue.
             high_backlog_tokens: 0,
+            prompt_tokens: 0.0,
+            reply_tokens: 0.0,
         })
     }
 
@@ -2744,7 +2746,13 @@ impl WaveRate {
         if !positive(bw) || !positive(layer) || !positive(hit) {
             return false;
         }
-        self.bw_bytes_per_s = bw.min(self.link_bytes_per_s);
+        // A rate the card's own forwards reached is a link it has: it corrects
+        // a probe that read low at this start, as a forward faster than the
+        // probe does in a run. WhiteWorld's probe read 6.2 GB/s on one start
+        // and 12.7 on the one before (502c311db, 2026-10-20), the card and
+        // its bus unchanged.
+        self.link_bytes_per_s = self.link_bytes_per_s.max(bw);
+        self.bw_bytes_per_s = bw;
         self.layer_secs = layer;
         self.decode.hit_exponent = hit;
         self.model.fixed_secs = model[0];
@@ -3078,6 +3086,17 @@ mod tests {
             1e-9
         ));
         assert_eq!(restored.decode_samples(), taught.decode_samples());
+
+        // Restored on a start whose probe read the link at half, the copy rate
+        // the forwards learned stands, and the link is raised to it.
+        let mut slow = planner(LINK_4090_MOBILE / 2.0);
+        assert!(slow.import_learned(&kept));
+        assert!(approx(
+            slow.effective_bytes_per_s(),
+            taught.effective_bytes_per_s(),
+            1e-9
+        ));
+        assert!(slow.link_bytes_per_s() >= taught.effective_bytes_per_s());
 
         let mut other = WaveRate::with_link_rate(
             LINK_4090_MOBILE,

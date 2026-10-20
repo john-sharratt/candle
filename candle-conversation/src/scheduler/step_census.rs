@@ -119,9 +119,15 @@ pub(super) enum Activity {
     Withdraw,
     /// Telling waiting prompts what they wait behind.
     Waits,
+    /// Handling a request that ended a wait.
+    Requests,
+    /// The normalization warm-up's replayed turns.
+    Warm,
+    /// Serving a co-resident model and settling the device on falling idle.
+    Device,
 }
 
-const ACTIVITIES: [Activity; 14] = [
+const ACTIVITIES: [Activity; 17] = [
     Activity::Drain,
     Activity::Promote,
     Activity::MidAdmit,
@@ -136,6 +142,9 @@ const ACTIVITIES: [Activity; 14] = [
     Activity::Relief,
     Activity::Withdraw,
     Activity::Waits,
+    Activity::Requests,
+    Activity::Warm,
+    Activity::Device,
 ];
 
 impl Activity {
@@ -155,6 +164,9 @@ impl Activity {
             Activity::Relief => "relief",
             Activity::Withdraw => "withdraw",
             Activity::Waits => "waits",
+            Activity::Requests => "requests",
+            Activity::Warm => "warm",
+            Activity::Device => "device",
         }
     }
 
