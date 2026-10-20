@@ -455,6 +455,9 @@ mod tests {
     use std::collections::HashSet;
     use std::fs::File;
 
+    /// The speculation sweep, by width, one process per width.
+    mod spec_sweep;
+
     fn pinned_shards() -> Result<Vec<PathBuf>> {
         (1..=QWEN4EXP_Q8_0_SHARDS)
             .map(|i| {
