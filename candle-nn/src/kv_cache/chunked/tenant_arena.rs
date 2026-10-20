@@ -288,6 +288,18 @@ impl<R: Ground> StrideArenas<R> {
         Some((base, index, base + index as u64 * self.stride as u64))
     }
 
+    /// How many of this stride's arenas a pass with no move budget would empty —
+    /// [`Self::plan_moves`]'s count, without claiming anything.
+    pub(crate) fn freeable(&self) -> usize {
+        let cap = self.capacity as usize;
+        let live: Vec<usize> = self
+            .arenas
+            .iter()
+            .map(|a| cap - a.n_free as usize)
+            .collect();
+        arenas_to_empty(&live, cap, 0)
+    }
+
     /// The moves that empty this stride's topmost arenas into free slots below
     /// them, each destination **already claimed**: its slot is taken off the free
     /// set here, so nothing else can be handed it before the copy lands. Answers
@@ -868,6 +880,25 @@ pub fn arena_top_rank(device: &Device, tenant: SlotTenant) -> Option<usize> {
 /// Regions `tenant`'s arenas on `device` hold, every stride together — what that
 /// tenant denies the rest of the span.
 #[cfg(feature = "cuda")]
+/// Arenas every span tenant on `device` could give back by packing its own slots
+/// downward — each stride's topmost arenas whose live slots fit in the free slots
+/// below them. What says a tenant's arenas are sparse, wherever they stand: a
+/// tenant that holds no frontier still holds every region its emptied-out arenas
+/// would return. Zero off CUDA.
+#[cfg(feature = "cuda")]
+pub fn tenant_freeable_arenas(device: &Device) -> usize {
+    let DeviceLocation::Cuda { gpu_id } = device.location() else {
+        return 0;
+    };
+    pools()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((g, _, _), _)| *g == gpu_id)
+        .map(|(_, set)| set.freeable())
+        .sum()
+}
+
 pub fn arena_regions(device: &Device, tenant: SlotTenant) -> usize {
     let DeviceLocation::Cuda { gpu_id } = device.location() else {
         return 0;

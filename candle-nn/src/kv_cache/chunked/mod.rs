@@ -230,7 +230,7 @@ pub use tenant_arena::slot_share_bytes;
 #[cfg(feature = "cuda")]
 pub use tenant_arena::{
     arena_census, arena_held_bytes, arena_regions, arena_top_rank, claim_arena_slots,
-    plan_slot_moves, relocate_tensor, ArenaSlot, SlotMove, TenantArenas,
+    plan_slot_moves, relocate_tensor, tenant_freeable_arenas, ArenaSlot, SlotMove, TenantArenas,
 };
 pub use tenant_arena::{slot_stride, SlotTenant, SLOT_ALIGN};
 #[cfg(feature = "cuda")]

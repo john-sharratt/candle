@@ -273,8 +273,12 @@ struct StepSnapshot {
 ///   opaque auxiliary blob.
 /// * **QSA index** — `n_blocks × head_dim` keys per attention layer, which at
 ///   128K tokens and ratio 4 is ~16 MiB a layer and ~192 MiB a sequence. That
-///   is not a per-turn snapshot; it is **rebuilt** from the restored K by
-///   [`Self::reindex_from_kv`].
+///   is not a per-turn snapshot. The keys are the indexer's own projection of
+///   each layer's hidden states, not a function of K, so they cannot be rebuilt
+///   from resident K/V: the live tail is stored in the seal's auxiliary blob
+///   (`seal_live`, restored by [`Self::restore_aux_state`]) and the injected
+///   pages ahead of it come back with the projection that injects their K/V. An
+///   index dropped any other way costs a re-prefill of its context.
 /// * **Draft seeds** — one residual row per sequence, and only meaningful
 ///   inside the wave that produced it. Neither stored nor rebuilt: a resumed
 ///   sequence simply drafts nothing until its first wave seeds it, which costs

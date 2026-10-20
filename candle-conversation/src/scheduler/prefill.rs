@@ -954,6 +954,7 @@ impl Scheduler {
                 live: stats.live,
                 frontier: stats.live_watermark,
                 sparse: self.session.kv_sparse_arenas(),
+                tenant_sparse: candle_nn::kv_cache::tenant_freeable_arenas(self.session.device()),
             };
             let pass = choose(&shape, self.session.kv_top_rank())?;
             (!self.kv_compaction_stall.holds(pass, shape)).then_some((shape, pass))

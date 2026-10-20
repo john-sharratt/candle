@@ -36,13 +36,15 @@
 /// probe's efficiency gate from 98–99% to 76–87%.
 pub(super) const MIN_FREEABLE_ARENAS: usize = 8;
 
-/// The occupancy a pass is judged against: regions held, the frontier, and the
-/// sparse KV arenas beneath it.
+/// The occupancy a pass is judged against: regions held, the frontier, the
+/// sparse KV arenas beneath it, and the arenas the span tenants could empty by
+/// packing their own slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PoolShape {
     pub live: usize,
     pub frontier: usize,
     pub sparse: usize,
+    pub tenant_sparse: usize,
 }
 
 /// The pass that could lower the frontier.
@@ -65,14 +67,16 @@ impl PoolShape {
     /// The pass that could lower this frontier, given `kv_top`, the highest region
     /// any KV arena holds. `None` when no pass could: nothing is live, or the KV
     /// side holds the top with too little air to move it, or a span tenant holds it
-    /// over too few holes to be worth moving.
+    /// over too few holes to be worth moving — and no span tenant's own arenas are
+    /// sparse enough to pack ([`Self::tenant_pass`]).
     pub fn frontier_pass(&self, kv_top: Option<usize>) -> Option<FrontierPass> {
         let top = self.frontier.checked_sub(1)?;
-        if kv_top == Some(top) {
+        let pass = if kv_top == Some(top) {
             (self.holes() + self.sparse >= MIN_FREEABLE_ARENAS).then_some(FrontierPass::Kv)
         } else {
             (self.holes() >= MIN_FREEABLE_ARENAS).then_some(FrontierPass::SpanTenants)
-        }
+        };
+        pass.or_else(|| self.tenant_pass())
     }
 
     /// The pass that recovers free regions, wherever they lie: the KV pass whenever
@@ -94,6 +98,20 @@ impl PoolShape {
             self.frontier_pass(kv_top)
         }
     }
+
+    /// The span tenants' pass when their own arenas are sparse enough to empty
+    /// [`MIN_FREEABLE_ARENAS`] of them, wherever those arenas stand.
+    ///
+    /// **A tenant below the frontier is not a tenant without air.** Its arenas'
+    /// free slots are inside regions it holds, so they count as no hole, and a
+    /// frontier the KV side holds — or one over too few holes — asks nothing of
+    /// it. Over a night of patterns on BlackWorld (2026-10-20) the recurrent
+    /// state store stood at up to ~660 regions, every one of them expert
+    /// ground. Packing the tenant's own slots downward empties its top arenas,
+    /// and an emptied arena's region goes straight back.
+    pub fn tenant_pass(&self) -> Option<FrontierPass> {
+        (self.tenant_sparse >= MIN_FREEABLE_ARENAS).then_some(FrontierPass::SpanTenants)
+    }
 }
 
 /// The pass that last failed to improve its ground, and the shape it started
@@ -110,7 +128,10 @@ impl CompactionStall {
     /// live count did in between.
     pub fn holds(&self, pass: FrontierPass, now: PoolShape) -> bool {
         self.stalled_at.is_some_and(|(stalled, s)| {
-            stalled == pass && now.holes() <= s.holes() && now.sparse <= s.sparse
+            stalled == pass
+                && now.holes() <= s.holes()
+                && now.sparse <= s.sparse
+                && now.tenant_sparse <= s.tenant_sparse
         })
     }
 
@@ -143,6 +164,7 @@ mod tests {
         live: 690,
         frontier: 703,
         sparse: 9,
+        tenant_sparse: 0,
     };
 
     const KV: FrontierPass = FrontierPass::Kv;
@@ -156,6 +178,50 @@ mod tests {
         }
     }
 
+    /// **A span tenant below the frontier packs once its own arenas are sparse.**
+    /// The frontier stands over four holes, too few for either pass, and the KV pools
+    /// are packed, but the recurrent store's arenas could give eight back: the
+    /// span tenants' pass is chosen, by the routine gate and by relief. One fewer
+    /// and nothing is; and once it has run, the same shape does not run it again.
+    #[test]
+    fn a_sparse_tenant_below_the_frontier_is_packed() {
+        let dense = PoolShape {
+            live: 1_436,
+            frontier: 1_440,
+            sparse: 0,
+            tenant_sparse: MIN_FREEABLE_ARENAS - 1,
+        };
+        assert_eq!(dense.frontier_pass(Some(1_439)), None);
+        assert_eq!(dense.ground_pass(Some(1_439)), None);
+        let sparse = PoolShape {
+            tenant_sparse: MIN_FREEABLE_ARENAS,
+            ..dense
+        };
+        assert_eq!(
+            sparse.frontier_pass(Some(1_439)),
+            Some(FrontierPass::SpanTenants)
+        );
+        assert_eq!(
+            sparse.ground_pass(Some(1_439)),
+            Some(FrontierPass::SpanTenants)
+        );
+        let stall = CompactionStall {
+            stalled_at: Some((FrontierPass::SpanTenants, sparse)),
+        };
+        assert!(
+            stall.holds(FrontierPass::SpanTenants, sparse),
+            "no new air: held"
+        );
+        let sparser = PoolShape {
+            tenant_sparse: MIN_FREEABLE_ARENAS + 1,
+            ..sparse
+        };
+        assert!(
+            !stall.holds(FrontierPass::SpanTenants, sparser),
+            "sparser: reopened"
+        );
+    }
+
     /// A KV arena at the frontier with enough air is the KV pass's; one with too
     /// little is nobody's.
     #[test]
@@ -165,6 +231,7 @@ mod tests {
             live: 700,
             frontier: 703,
             sparse: 4,
+            tenant_sparse: 0,
         };
         // 3 holes + 4 sparse arenas = 7, one short of a pass.
         assert_eq!(tight.frontier_pass(Some(702)), None);
@@ -179,6 +246,7 @@ mod tests {
             live: 155,
             frontier: 167,
             sparse: 40,
+            tenant_sparse: 0,
         };
         assert_eq!(
             index_on_top.frontier_pass(Some(162)),
@@ -189,6 +257,7 @@ mod tests {
             live: 167,
             frontier: 167,
             sparse: 40,
+            tenant_sparse: 0,
         };
         assert_eq!(packed.frontier_pass(Some(162)), None);
         // And with no KV arena at all, the top is a span tenant's.
@@ -208,6 +277,7 @@ mod tests {
             live: 1_990,
             frontier: 2_080,
             sparse: 201,
+            tenant_sparse: 0,
         };
         assert_eq!(
             recurrent_on_top.frontier_pass(Some(1_500)),
@@ -222,6 +292,7 @@ mod tests {
             live: 167,
             frontier: 167,
             sparse: 7,
+            tenant_sparse: 0,
         };
         assert_eq!(packed.ground_pass(Some(162)), None);
         assert_eq!(
@@ -234,6 +305,7 @@ mod tests {
             live: 0,
             frontier: 0,
             sparse: 9,
+            tenant_sparse: 0,
         };
         assert_eq!(empty.ground_pass(None), None);
     }
@@ -247,6 +319,7 @@ mod tests {
             live: 166,
             frontier: 167,
             sparse: 40,
+            tenant_sparse: 0,
         };
         assert_eq!(one_hole.frontier_pass(Some(162)), None);
         let seven = PoolShape {
@@ -282,6 +355,7 @@ mod tests {
             live: 0,
             frontier: 0,
             sparse: 0,
+            tenant_sparse: 0,
         };
         assert_eq!(empty.frontier_pass(None), None);
     }
@@ -322,11 +396,13 @@ mod tests {
                 live: 700,
                 frontier: 713,
                 sparse: 9,
+                tenant_sparse: 0,
             },
             PoolShape {
                 live: 760,
                 frontier: 765,
                 sparse: 8,
+                tenant_sparse: 0,
             },
         ] {
             assert!(stall.holds(KV, grown), "{grown:?} freed nothing");
@@ -343,6 +419,7 @@ mod tests {
             PoolShape { live: 689, ..SHAPE },
             PoolShape {
                 sparse: 10,
+                tenant_sparse: 0,
                 ..SHAPE
             },
         ] {
