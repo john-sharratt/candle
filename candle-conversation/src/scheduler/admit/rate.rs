@@ -1415,6 +1415,23 @@ impl WaveRate {
         self.full = false;
     }
 
+    /// Put the model in the state an idle card stands in — `resident_bytes` on
+    /// the card, nothing charged — for figures priced with nothing running.
+    ///
+    /// **Idle is a state, not the last pass's.** The charges a model holds are
+    /// the last fill's, made under whatever wave stood then; priced idle from
+    /// them, a member advertised a loaded heavy-read's step: on WhiteWorld
+    /// (da11a3717, 2026-10-20) a hit of 0.12 and a 3.4 s burst step for ten
+    /// idle minutes, the zone long since grown back.
+    pub fn settle_idle(&mut self, resident_bytes: u64) {
+        self.resident_now = resident_bytes;
+        self.tokens = 0;
+        self.decodes = 0;
+        self.routed_per_layer = 0;
+        self.admitted_any = false;
+        self.full = false;
+    }
+
     /// Whether the wave reached a limit this pass. Latched by the first
     /// refusal of either kind; cleared by reset.
     #[cfg(test)]

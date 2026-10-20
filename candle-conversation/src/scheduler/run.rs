@@ -920,6 +920,14 @@ impl Scheduler {
                             if self.wave_rate.is_none() {
                                 self.wave_rate = self.take_planner();
                             }
+                            // Priced as the idle card it is: the residency the
+                            // zone holds now, nothing charged (`settle_idle`).
+                            if let (Some(rate), Some(zone)) = (
+                                self.wave_rate.as_mut(),
+                                super::interleave::effective_weight_zone_bytes(0),
+                            ) {
+                                rate.settle_idle(zone);
+                            }
                             self.publish_learned_rates();
                             continue;
                         }

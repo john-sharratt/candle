@@ -699,7 +699,11 @@ impl Scheduler {
                 )
             };
             let [_, one_hint, wide_hint, _] = self.rates_width_hints;
+            // The width now as well: the figures above it are published as
+            // its multiples, so the residency the solve prices them at — the
+            // zone less the composed cohort's tier — is the same for all three.
             Some((
+                at(0, one_hint),
                 at(1, one_hint),
                 at(super::phase_ring::PLACEMENT_WIDE, wide_hint),
             ))
@@ -784,20 +788,56 @@ impl Scheduler {
         // The widths the trades settled at, each the next pricing's start.
         self.rates_width_hints = [
             traded.map(|((_, w), _)| w),
-            placed_step.map(|((_, w), _)| w),
-            placed_step.map(|(_, (_, w))| w),
+            placed_step.map(|(_, (_, w), _)| w),
+            placed_step.map(|(_, _, (_, w))| w),
             traded.map(|(_, (_, w))| w),
         ];
         let traded_wide = traded.map(|(_, (rate, _))| rate).filter(|&rate| rate > 0.0);
         let traded = traded.map(|((rate, _), _)| rate).filter(|&rate| rate > 0.0);
-        let placed_step = placed_step.map(|((one, _), (wide, _))| (one, wide));
+        // **The wide rate in the published rate's own currency.** Under a
+        // backlog the rate published is the drain measured; the model's wide
+        // rate beside it read faster than the measurement (BlackWorld,
+        // da11a3717, 2026-10-20: 233–1,796 wide against 182–375 drained), so
+        // the burst was clamped flat and went unpriced. The model gives the
+        // shape — how much a burst's decodes slow the prefill — and the
+        // measurement the scale.
+        let prefill_wide = match (drain, traded, traded_wide) {
+            (Some(d), Some(now), Some(wide)) => Some(d * wide / now),
+            (None, _, wide) => wide,
+            _ => None,
+        };
+        let placed_step = placed_step.map(|((now, _), (one, _), (wide, _))| (now, one, wide));
         let learned = learned.map(|r| super::phase_ring::LearnedRates {
             prefill_tok_s: drain.or(traded).unwrap_or(r.prefill_tok_s),
-            prefill_tok_s_plus_wide: traded_wide.unwrap_or(r.prefill_tok_s_plus_wide),
+            prefill_tok_s_plus_wide: prefill_wide.unwrap_or(r.prefill_tok_s_plus_wide),
             high_backlog_tokens: high_backlog,
-            decode_step_ms_plus_one: placed_step.map_or(r.decode_step_ms_plus_one, |(one, _)| one),
-            decode_step_ms_plus_wide: placed_step
-                .map_or(r.decode_step_ms_plus_wide, |(_, wide)| wide),
+            // **The placed figures as multiples of the step now.** The solve
+            // prices them at the zone less the composed cohort's tier, a
+            // residency the step now is not read at, and the hit falls steeply
+            // there: WhiteWorld (da11a3717, 2026-10-20) published 37.7 ms now,
+            // 438.7 one more and 1,751.5 a burst, while stepping 12 decodes at
+            // about 100 ms. Taken as ratios of the same solve, the shape is the
+            // model's and the scale the step's.
+            decode_step_ms_plus_one: placed_step.map_or(
+                r.decode_step_ms_plus_one,
+                |(now, one, _)| {
+                    if now > 0.0 {
+                        r.decode_step_ms * one / now
+                    } else {
+                        one
+                    }
+                },
+            ),
+            decode_step_ms_plus_wide: placed_step.map_or(
+                r.decode_step_ms_plus_wide,
+                |(now, _, wide)| {
+                    if now > 0.0 {
+                        r.decode_step_ms * wide / now
+                    } else {
+                        wide
+                    }
+                },
+            ),
             ..r
         });
         // **Never slower than the card has stepped.** A step at a width bounds
