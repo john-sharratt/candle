@@ -572,8 +572,10 @@ impl Replicator {
                     return;
                 };
                 let request = s.next_request();
-                s.catchups
-                    .insert(request, Requester::new(request, c, purpose, me.node));
+                s.catchups.insert(
+                    request,
+                    Requester::new(request, c, purpose, me.node, since.clone()),
+                );
                 s.heard.insert(request, Instant::now());
                 s.stats.catchups += 1;
                 (request, handle)

@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use applied_set::AppliedSet;
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{Fetch, Gone, Headers};
@@ -93,11 +94,20 @@ pub struct Requester {
     progress: Progress,
     /// `oseq`s the answer listed as gone.
     gone_learned: u64,
+    /// What this member held when it asked: the request's `since`.
+    since: AppliedSet,
 }
 
 impl Requester {
-    /// Catch-up `request`, run by member `node` on `socket`.
-    pub fn new(request: u64, socket: usize, purpose: Purpose, node: u64) -> Self {
+    /// Catch-up `request`, run by member `node` on `socket`, asking for what
+    /// exists after `since`.
+    pub fn new(
+        request: u64,
+        socket: usize,
+        purpose: Purpose,
+        node: u64,
+        since: AppliedSet,
+    ) -> Self {
         Self {
             request,
             socket,
@@ -110,6 +120,7 @@ impl Requester {
             tries: HashMap::new(),
             progress: Progress::default(),
             gone_learned: 0,
+            since,
         }
     }
 
@@ -246,10 +257,19 @@ impl Requester {
     /// before the socket is ready: an answer is bounded (`answer.rs`), so one
     /// that brought anything may have stopped short. One that brought nothing
     /// was the whole of what its answerer covers.
-    pub fn asks_again(&self) -> bool {
+    ///
+    /// Moved on is judged by what this member holds `now` against what it
+    /// held when it asked, not by what the answer listed. An answer can list
+    /// the same `oseq`s gone every time — records of a type this store never
+    /// takes, which the next request's `since` does not cover either — and a
+    /// count of them alone asked again for ever: WhiteWorld's admission on
+    /// d7f850f79 (2026-10-20) ran 660,000 catch-ups at ~400 a second and never
+    /// served. The same answer to the same question is the whole answer.
+    pub fn asks_again(&self, now: &AppliedSet) -> bool {
         self.purpose == Purpose::Admission
             && self.finished()
             && (self.progress.wanted > self.progress.left || self.gone_learned > 0)
+            && *now != self.since
     }
 
     pub fn progress(&self) -> &Progress {
@@ -295,6 +315,13 @@ mod tests {
         }
     }
 
+    /// What a member holds once an answer has moved it on from nothing.
+    fn moved() -> AppliedSet {
+        let mut a = AppliedSet::default();
+        a.insert(9, 1);
+        a
+    }
+
     fn counter() -> impl FnMut() -> u64 {
         let mut n = 100;
         move || {
@@ -307,7 +334,7 @@ mod tests {
     /// them, grouped by origin.
     #[test]
     fn what_is_held_is_skipped_and_the_rest_fetched_from_its_answerer() {
-        let mut r = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut r = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         let (gone, wanted) = r.headers(listing(3, 9, 1, 3, &[10, 20, 30]), |_, oseq| oseq == 2);
         assert!(gone.is_empty());
         assert_eq!(wanted, vec![(9, 1), (9, 3)]);
@@ -354,7 +381,7 @@ mod tests {
     /// `DONE` frees the window.
     #[test]
     fn fetches_stay_within_the_window() {
-        let mut r = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut r = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         let eighth = (FETCH_WINDOW / 8) as u32;
         r.headers(listing(3, 9, 1, 12, &[eighth; 12]), |_, _| false);
         let first = r.headers_done(counter());
@@ -369,7 +396,7 @@ mod tests {
     /// outstanding.
     #[test]
     fn an_outsized_record_is_fetched_alone() {
-        let mut r = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut r = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         let outsized = (FETCH_WINDOW + 1) as u32;
         r.headers(listing(3, 9, 1, 2, &[1 << 20, outsized]), |_, _| false);
         let first = r.headers_done(counter());
@@ -383,7 +410,7 @@ mod tests {
     /// record is left for a later catch-up and this one finishes.
     #[test]
     fn a_short_fetch_is_fetched_again_then_left() {
-        let mut r = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut r = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         r.headers(listing(3, 9, 1, 2, &[10, 10]), |_, _| false);
         let f = r.headers_done(counter());
         let (again, _) = r.fetch_done(f[0].request, |_, oseq| oseq == 1, counter());
@@ -401,24 +428,24 @@ mod tests {
     /// asks no more of it.
     #[test]
     fn an_empty_answer_finishes_at_once() {
-        let mut r = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut r = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         assert!(r.headers_done(counter()).is_empty());
         assert!(r.finished());
-        assert!(!r.asks_again());
+        assert!(!r.asks_again(&moved()));
     }
 
     /// An admission whose answer brought a record, or taught an `oseq` gone,
     /// asks again once it finishes — and not before.
     #[test]
     fn an_admission_that_moved_on_asks_again() {
-        let mut fetched = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut fetched = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         fetched.headers(listing(3, 9, 1, 1, &[10]), |_, _| false);
         let f = fetched.headers_done(counter());
-        assert!(!fetched.asks_again(), "still fetching");
+        assert!(!fetched.asks_again(&moved()), "still fetching");
         fetched.fetch_done(f[0].request, |_, _| true, counter());
-        assert!(fetched.asks_again());
+        assert!(fetched.asks_again(&moved()));
 
-        let mut gone = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut gone = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         let mut h = listing(3, 9, 1, 4, &[]);
         h.gone = vec![Gone {
             oseq: 4,
@@ -426,7 +453,35 @@ mod tests {
         }];
         gone.headers(h, |_, _| false);
         gone.headers_done(counter());
-        assert!(gone.asks_again());
+        assert!(gone.asks_again(&moved()));
+    }
+
+    /// **The same answer to the same question is the whole answer.** An
+    /// answer listing `oseq`s gone that leave this member holding exactly what
+    /// it asked from — records of a type it never takes — does not ask again:
+    /// counting them asked again for ever, 660,000 times on WhiteWorld.
+    #[test]
+    fn an_answer_that_left_the_member_where_it_was_asks_no_more() {
+        let since = moved();
+        let mut r = Requester::new(1, 0, Purpose::Admission, 7, since.clone());
+        let mut h = listing(3, 9, 2, 4, &[]);
+        h.gone = vec![
+            Gone {
+                oseq: 3,
+                deleted_entry: None,
+            },
+            Gone {
+                oseq: 4,
+                deleted_entry: None,
+            },
+        ];
+        r.headers(h, |_, _| false);
+        r.headers_done(counter());
+        assert!(r.finished());
+        assert!(!r.asks_again(&since), "nothing it holds changed");
+        let mut further = since;
+        further.insert(9, 3);
+        assert!(r.asks_again(&further), "what it holds moved: ask again");
     }
 
     /// Nothing moved on — every record held already, or left undeliverable —
@@ -434,13 +489,13 @@ mod tests {
     /// watch and the periodic catch-up come round on their own.
     #[test]
     fn an_admission_that_moved_nothing_is_done() {
-        let mut held = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut held = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         held.headers(listing(3, 9, 1, 2, &[10, 10]), |_, _| true);
         held.headers_done(counter());
         assert!(held.finished());
-        assert!(!held.asks_again());
+        assert!(!held.asks_again(&moved()));
 
-        let mut left = Requester::new(1, 0, Purpose::Admission, 7);
+        let mut left = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         left.headers(listing(3, 9, 1, 1, &[10]), |_, _| false);
         let mut f = left.headers_done(counter());
         for _ in 0..FETCH_TRIES {
@@ -450,13 +505,13 @@ mod tests {
             }
         }
         assert!(left.finished());
-        assert!(!left.asks_again());
+        assert!(!left.asks_again(&moved()));
 
-        let mut gap = Requester::new(1, 0, Purpose::Gap(9), 7);
+        let mut gap = Requester::new(1, 0, Purpose::Gap(9), 7, AppliedSet::default());
         gap.headers(listing(3, 9, 1, 1, &[10]), |_, _| false);
         let f = gap.headers_done(counter());
         gap.fetch_done(f[0].request, |_, _| true, counter());
         assert!(gap.finished());
-        assert!(!gap.asks_again());
+        assert!(!gap.asks_again(&moved()));
     }
 }

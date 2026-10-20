@@ -204,7 +204,7 @@ impl Replicator {
             };
             let finished = r
                 .finished()
-                .then_some((r.purpose, r.socket, r.asks_again()));
+                .then_some((r.purpose, r.socket, r.asks_again(&applied)));
             s.next_request = next;
             for k in settled {
                 s.claimed.remove(&k);
