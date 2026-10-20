@@ -250,3 +250,45 @@ fn a_released_conversation_is_held_complete_by_its_own_commit() {
         "the first turn a chunk short is a gap below the commit"
     );
 }
+
+/// **A release waits for its turn's commit.** The turn seals before the
+/// persistence writer commits it, and a release sent between the two named the
+/// commit before — so every turn its writer declared with K/V must carry a
+/// commit before the conversation is let go; another writer's turns are not
+/// this one's to wait for.
+#[test]
+fn a_conversation_is_committed_once_every_turn_its_writer_declared_is() {
+    let sender_dir = TempDir::new().unwrap();
+    let (_, mut sender) = open(&sender_dir);
+    let first = turn_events(&mut sender, 0, 10, 1);
+    let second = turn_events(&mut sender, 1, 20, 2);
+    let first_commit = commit(&mut sender, 0, 30);
+    let second_commit = commit(&mut sender, 1, 31);
+    let tl = TimelineId::from_raw(TL).unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let conv = reload(&dir);
+    let turns: Vec<&[u8]> = first
+        .iter()
+        .chain(second.iter())
+        .map(Vec::as_slice)
+        .collect();
+    conv.apply_remote(&turns, N_LAYERS).unwrap();
+    assert!(
+        !conv.own_turns_committed(tl, A),
+        "sealed, nothing committed"
+    );
+    conv.apply_remote(&[first_commit.as_slice()], N_LAYERS)
+        .unwrap();
+    assert!(
+        !conv.own_turns_committed(tl, A),
+        "the newest turn's commit is still owed"
+    );
+    conv.apply_remote(&[second_commit.as_slice()], N_LAYERS)
+        .unwrap();
+    assert!(conv.own_turns_committed(tl, A));
+    assert!(
+        conv.own_turns_committed(tl, 0xB),
+        "another writer owes nothing here"
+    );
+}

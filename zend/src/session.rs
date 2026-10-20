@@ -7259,8 +7259,8 @@ impl ZendSession {
             // The conversation stays this member's until the reply is sealed.
             let claim = turn_claims::hold(&key);
             let conv = state.passthrough.conversation(&key).lock_owned().await;
-            run_passthrough(state, key, conv, transcript, max_tokens, tx).await;
-            drop(claim);
+            run_passthrough(state, key.clone(), conv, transcript, max_tokens, tx).await;
+            turn_claims::release(claim, &key).await;
         });
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
@@ -7396,7 +7396,7 @@ impl ZendSession {
                 );
                 relay_live(&mut ts, &tx, &live, &conv_id).await;
                 live_turns.end(&conv_id, &live);
-                drop(claim);
+                turn_claims::release(claim, &conv_id).await;
             } else {
                 tx.send(Ok(StreamItem::Status("Model unavailable.".into())))
                     .await

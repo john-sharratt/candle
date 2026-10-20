@@ -21,6 +21,8 @@ use candle_conversation::projection::{Conversation, TimelineId};
 use cluster::member::AppMember;
 use host::cluster::store::ConversationStore;
 
+use crate::turn_claims;
+
 /// Released conversations this member does not yet hold complete: each claim
 /// key with the releaser and the `oseq` of its newest commit.
 ///
@@ -104,6 +106,14 @@ pub fn install(
             let id = std::str::from_utf8(key).ok()?;
             conversation.last_commit_oseq(timeline_of(id), conversation.node())
         }));
+    }
+    {
+        // A turn's claim waits for this before it goes, so the commit its
+        // release names is the turn's own (`turn_claims::release`).
+        let conversation = conversation.clone();
+        turn_claims::committed_by(move |id| {
+            conversation.own_turns_committed(timeline_of(id), conversation.node())
+        });
     }
     store.on_applied(move || {
         let held = awaited

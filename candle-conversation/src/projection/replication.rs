@@ -10,12 +10,14 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use super::ids::TimelineId;
 use super::resolver::Conversation;
 use crate::persistence::deleted::{DeletedEntry, DeletedPayload};
 use crate::persistence::identity::{MintGeneration, VersionStamp, GEN_DETACHED};
 use crate::persistence::listing::ListedRecord;
 use crate::persistence::record::{decode_header, CustomObjectPayload};
 use crate::persistence::replica::AppliedSet;
+use crate::persistence::streams::StreamDecl;
 use crate::persistence::{Result as PersistenceResult, Tap};
 
 /// The keys consensus decisions and `max_members` are kept under (§5.9).
@@ -64,6 +66,31 @@ impl Conversation {
             .filter(|c| c.origin == origin && c.oseq > 0)
             .map(|c| c.oseq)
             .max()
+    }
+
+    /// Whether every turn of `timeline` that `origin` declared with K/V has its
+    /// commit — the point a release of it may name (§2.2).
+    ///
+    /// **A turn seals before its commit is written.** The seal runs in the
+    /// turn's own loop; the commit is the persistence writer's, after the
+    /// turn's chunks. A release sent between the two named the commit before —
+    /// the previous turn's — and a member holding everything through *that*
+    /// was handed the conversation while the new turn's snapshot, written
+    /// first, had already reached it: on WhiteWorld (2026-10-20 20:02:24) a
+    /// resume found a snapshot one turn ahead of the history it recovered and
+    /// went on with no recurrent memory at all. A turn declared with no K/V
+    /// writes no commit, and is not waited for.
+    pub fn own_turns_committed(&self, timeline: TimelineId, origin: u64) -> bool {
+        let read = self.read();
+        let committed = read
+            .turn_streams_of(timeline.raw())
+            .filter(|(_, _, rt)| rt.ids.decl.origin == origin)
+            .filter(|(_, _, rt)| match &rt.decl {
+                Some(StreamDecl::Turn(t)) => t.block_end > t.block_start,
+                _ => false,
+            })
+            .all(|(_, _, rt)| rt.ids.commit.oseq > 0);
+        committed
     }
 
     /// Whether this member holds `timeline` complete through `origin`'s
