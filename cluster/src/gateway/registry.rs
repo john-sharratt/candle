@@ -6,7 +6,7 @@
 //! **dumb** otherwise: its routes then go to their configured upstream (§5.7).
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use applied_set::AppliedSet;
 
@@ -146,10 +146,22 @@ struct AppMembers {
 }
 
 /// A sticky key let go ([`Registry::released`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Handover {
     by: u64,
     through: u64,
+    /// The members that reported holding the key complete since this release
+    /// ([`Registry::completed`]): its next turn may go to them whatever else of
+    /// its last holder's they lack.
+    complete: BTreeSet<u64>,
+}
+
+impl Handover {
+    /// Whether `m` may take the key's next turn: it holds the key complete, or
+    /// every record of its last holder's through the release.
+    fn held_by(&self, m: &MemberView) -> bool {
+        self.complete.contains(&m.node) || m.holds_through(self.by, self.through)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -239,9 +251,27 @@ impl Registry {
     /// `through` (§5.4): the key's next request goes to a member that holds
     /// them (`docs/cooperative_admission.md` §2.2).
     pub fn released(&mut self, app: &str, key: &[u8], by: u64, through: u64) {
-        self.app(app)
-            .handovers
-            .insert(key.to_vec(), Handover { by, through });
+        self.app(app).handovers.insert(
+            key.to_vec(),
+            Handover {
+                by,
+                through,
+                complete: BTreeSet::new(),
+            },
+        );
+    }
+
+    /// `node` holds each of `keys` complete (`COMPLETE`): every record of the
+    /// conversation it names through its release, and every turn of it whole.
+    /// A key with no release standing is ignored — it is held, or every member
+    /// already holds it.
+    pub fn completed(&mut self, app: &str, node: u64, keys: &[Vec<u8>]) {
+        let a = self.app(app);
+        for key in keys {
+            if let Some(h) = a.handovers.get_mut(key) {
+                h.complete.insert(node);
+            }
+        }
     }
 
     /// Whether a member of `app` other than `except` is serving now: what a
@@ -460,17 +490,14 @@ impl Registry {
     /// anyone holds (§2.4). A handover every candidate already holds is
     /// forgotten.
     fn best_for(&mut self, app: &str, key: Option<&str>) -> Option<u64> {
-        let handover = key.and_then(|k| self.apps.get(app)?.handovers.get(k.as_bytes()).copied());
+        let handover = key.and_then(|k| self.apps.get(app)?.handovers.get(k.as_bytes()).cloned());
         let Some(h) = handover else {
             return self.best(app);
         };
         let (pick, everyone_holds) = {
             let ready = self.placeable_but(app, None);
-            let holding: Vec<&MemberView> = ready
-                .iter()
-                .copied()
-                .filter(|m| m.holds_through(h.by, h.through))
-                .collect();
+            let holding: Vec<&MemberView> =
+                ready.iter().copied().filter(|m| h.held_by(m)).collect();
             let everyone_holds = holding.len() == ready.len();
             let pick = if holding.is_empty() {
                 best_of(ready)
@@ -621,11 +648,8 @@ impl Registry {
         // A key let go is the canary's to take only once it holds what the
         // last holder wrote, as for any member.
         let canary_holds = key
-            .and_then(|k| self.apps.get(app)?.handovers.get(k.as_bytes()).copied())
-            .is_none_or(|h| {
-                self.member(app, canary)
-                    .is_some_and(|m| m.holds_through(h.by, h.through))
-            });
+            .and_then(|k| self.apps.get(app)?.handovers.get(k.as_bytes()).cloned())
+            .is_none_or(|h| self.member(app, canary).is_some_and(|m| h.held_by(m)));
         if !shared || !canary_holds || !routable(self, canary) {
             return self.pick(app, dispatch, key, pinned);
         }

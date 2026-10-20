@@ -987,6 +987,7 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 | `VERDICT` | `{ build, result: pass \| fail \| no_opinion, figures }` — gateway → candidate: this gateway's certification verdict, sent again every 10 s until the group decides (§3.8) | control |
 | `PULSE` | `{ world, kind, body }` — a transient world event: never persisted, no `oseq`, no retransmit (§9.1) | ordered, dropped first under pressure |
 | `COORD` | the member's coordination state, for the status page: mode, generation, grants, leases, claims, catch-up, outbox, tombstones, clock (§12.1) | control |
+| `COMPLETE` | `{ keys }` — member → gateway: keys another member let go that this member now holds complete, sent as each turns complete and whole again on every admission until each is claimed (`cooperative_admission.md` §2.2) | control |
 | `OPEN` | `{ stream, target }` — open a virtual connection (§5.1) | ordered |
 | `DATA` | ≤ 64 KiB of one stream's bytes | ordered |
 | `WINDOW` | `{ stream, credit }` | control |
@@ -1026,8 +1027,9 @@ misread, and on an admitted socket closes it 4400.
 | `PING` / `PONG` | 12 / 13 | `[8] nonce` |
 | `ROUTES` | 14 | `blob table` (§5.2's encoding) |
 | `CLAIM` | 15 | `blob key` · `epoch` |
-| `UNCLAIM` | 16 | `blob key` · `epoch` · `u64 through` |
+| `UNCLAIM` | 16 | `blob key` · `epoch` · `u64 through` (the key's own last state record's `oseq`, protocol 4) |
 | `COORD` | 17 | `blob state` (§12.1's encoding) |
+| `COMPLETE` | 18 | `list<blob> keys` — keys let go that the member holds complete (protocol 4; `cooperative_admission.md` §2.2) |
 | `PREPARE` | 20 | `blob key` · `ballot` |
 | `PROMISE` | 21 | `blob key` · `ballot` · `opt<ballot · blob value>` accepted · `u64 from` · `u64 reply_to` |
 | `NACK` | 22 | `blob key` · `ballot promised` · `u64 from` · `u64 reply_to` |
