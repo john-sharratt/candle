@@ -1328,6 +1328,30 @@ impl Scheduler {
         }
     }
 
+    /// A co-batched decode forward, for the decode fit: its creep's rows
+    /// through layers are the fit's third term.
+    pub(super) fn observe_decode_beside(
+        &mut self,
+        decodes: usize,
+        us: u64,
+        creep_layer_rows: usize,
+        creep_layer_pairs: f64,
+    ) {
+        if decodes == 0 || us == 0 {
+            return;
+        }
+        let resident = residency_now(self.standing_ground_bytes());
+        if let Some(rate) = self.wave_rate.as_mut() {
+            rate.observe_decode_beside(
+                decodes,
+                resident,
+                us as f64 / 1e6,
+                creep_layer_rows,
+                creep_layer_pairs,
+            );
+        }
+    }
+
     /// Fold one completed decode forward into the planner.
     ///
     /// A bus-bound step says nothing about the layer time, and the model drops

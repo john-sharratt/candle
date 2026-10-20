@@ -264,6 +264,7 @@ impl Scheduler {
         // per quantum (not per step) keeps it cheap.
         {
             let _g = profile::span("loop:decode:relief_check");
+            let t = Instant::now();
             if self.vram_under_pressure_for(VramPhase::Decode) {
                 self.relieve_vram_pressure(
                     "decode",
@@ -271,6 +272,8 @@ impl Scheduler {
                     super::prefill::ReliefNeed::Paced,
                 );
             }
+            self.step_census
+                .spend(super::step_census::Activity::Relief, t.elapsed());
         }
         // Fire any reprojection queued by the just-completed prefill quantum
         // BEFORE the first decode step of this quantum. The turn's first
@@ -312,7 +315,10 @@ impl Scheduler {
             }
             // A turn its caller let go of costs nothing more: its prefill leaves
             // before the step, so the step does not sweep it.
-            self.withdraw_abandoned_prefills();
+            self.timed_activity(
+                super::step_census::Activity::Withdraw,
+                Self::withdraw_abandoned_prefills,
+            );
             self.timed_rates_and_gallery();
             // Inject any pending tool-call static runs (Layer 3) before the
             // decode forward, so a `Static` run costs one prefill rather than N
@@ -337,9 +343,11 @@ impl Scheduler {
                 // decode-only, then filed by the shape the wave turned out to be.
                 self.wave_cobatched = false;
                 self.wave_step_creep_layer_rows = 0;
+                self.wave_step_creep_layer_pairs = 0.0;
                 // What the creep had to ride with, before the step moves it.
                 let admitted = self.prefill_width() > 0 || self.section_ingest_width() > 0;
                 let queued = !self.prefill_queue.is_empty() || !self.pending_submits.is_empty();
+                let width = self.decode_width();
                 let t_step = Instant::now();
                 self.batch_decode_step();
                 let step = t_step.elapsed();
@@ -372,10 +380,7 @@ impl Scheduler {
                     self.decode_only_step,
                     self.wave_step_ratio,
                 );
-                if self.wave_cobatched {
-                    self.cobatched_step = Some(next_decode_only(self.cobatched_step, step));
-                    self.cobatched_since_priced = true;
-                }
+                self.width_steps.record(width, step, Instant::now());
                 if !self.wave_cobatched {
                     self.decode_only_step = Some(next_decode_only(self.decode_only_step, step));
                 } else if let Some(decode_only) = self.decode_only_step {
@@ -534,6 +539,7 @@ impl Scheduler {
             return;
         }
         self.wave_step_creep_layer_rows = 0;
+        self.wave_step_creep_layer_pairs = 0.0;
         let t_step = Instant::now();
         let out = self.decode_forward_cobatched(&[], &[], &[], &[]);
         self.step_census.record(
@@ -839,7 +845,10 @@ impl Scheduler {
             // 2b. A turn whose prefill stands still is told what it waits
             // behind, so its caller can show it rather than look hung
             // (`prefill_wait`).
-            self.report_prefill_waits();
+            self.timed_activity(
+                super::step_census::Activity::Waits,
+                Self::report_prefill_waits,
+            );
 
             // 2c. An idle slot whose last seal is durable gives its recurrent
             // store back (`recurrent_park`).
@@ -1495,6 +1504,13 @@ impl Scheduler {
             .add_phase(WavePhase::Decode, t.elapsed().as_millis() as u64);
     }
 
+    /// Run `work`, filing its wall with the census under `activity`.
+    fn timed_activity(&mut self, activity: super::step_census::Activity, work: fn(&mut Self)) {
+        let t = Instant::now();
+        work(self);
+        self.step_census.spend(activity, t.elapsed());
+    }
+
     /// Clean up finished turns — their seals — filed with the census.
     fn timed_cleanup(&mut self) {
         let t = Instant::now();
@@ -1522,7 +1538,10 @@ impl Scheduler {
     fn timed_prefill(&mut self) {
         let _g = profile::span("loop:prefill");
         let t = Instant::now();
-        self.withdraw_abandoned_prefills();
+        self.timed_activity(
+            super::step_census::Activity::Withdraw,
+            Self::withdraw_abandoned_prefills,
+        );
         self.timed_rates_and_gallery();
         self.run_prefill_until_budget();
         self.wave_stats
@@ -1534,7 +1553,10 @@ impl Scheduler {
     fn timed_section(&mut self) {
         let _g = profile::span("loop:section");
         let t = Instant::now();
-        self.run_section_ingest_until_budget();
+        self.timed_activity(
+            super::step_census::Activity::Seal,
+            Self::run_section_ingest_until_budget,
+        );
         self.wave_stats
             .add_phase(WavePhase::Section, t.elapsed().as_millis() as u64);
     }

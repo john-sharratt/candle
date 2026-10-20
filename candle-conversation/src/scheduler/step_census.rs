@@ -113,9 +113,15 @@ pub(super) enum Activity {
     House,
     /// Blocked on the request channel with nothing to run.
     Idle,
+    /// The decode quantum's relief check and what it relieved.
+    Relief,
+    /// Withdrawing prefills their callers let go of.
+    Withdraw,
+    /// Telling waiting prompts what they wait behind.
+    Waits,
 }
 
-const ACTIVITIES: [Activity; 11] = [
+const ACTIVITIES: [Activity; 14] = [
     Activity::Drain,
     Activity::Promote,
     Activity::MidAdmit,
@@ -127,6 +133,9 @@ const ACTIVITIES: [Activity; 11] = [
     Activity::Park,
     Activity::House,
     Activity::Idle,
+    Activity::Relief,
+    Activity::Withdraw,
+    Activity::Waits,
 ];
 
 impl Activity {
@@ -143,6 +152,9 @@ impl Activity {
             Activity::Park => "park",
             Activity::House => "house",
             Activity::Idle => "idle",
+            Activity::Relief => "relief",
+            Activity::Withdraw => "withdraw",
+            Activity::Waits => "waits",
         }
     }
 
@@ -233,6 +245,49 @@ impl StepCensus {
     }
 }
 
+/// The recent step time at each decode width the scheduler has stepped, an
+/// average per width.
+///
+/// **A step at a width bounds every narrower one from above.** One more
+/// decode never makes a step faster, so a step measured at `w` decodes — alone
+/// or carrying a creep, which only adds — is the most a step at `w` or fewer
+/// can take. What the rates publish for a width is held to the fastest fresh
+/// measurement at that width or wider: on BlackWorld (136060fab, 2026-10-20)
+/// its step sixteen decodes wider was published at 492 ms where heavy-decode
+/// had stepped 20–24 decodes in 35–45 ms, and shift's first decode phase went
+/// 28 of 48 to WhiteWorld for it.
+#[derive(Debug, Default)]
+pub(super) struct WidthSteps {
+    by: std::collections::BTreeMap<usize, (Duration, Instant)>,
+}
+
+impl WidthSteps {
+    /// The newest step's weight in each width's average.
+    const NEWEST: f64 = 0.25;
+
+    /// Fold one step of `decodes` decodes that took `took`, at `now`.
+    pub(super) fn record(&mut self, decodes: usize, took: Duration, now: Instant) {
+        if decodes == 0 {
+            return;
+        }
+        let avg = match self.by.get(&decodes) {
+            Some(&(a, _)) => a.mul_f64(1.0 - Self::NEWEST) + took.mul_f64(Self::NEWEST),
+            None => took,
+        };
+        self.by.insert(decodes, (avg, now));
+    }
+
+    /// The most a step of `decodes` decodes takes, by the fastest width at or
+    /// above it measured within `fresh` of `now` — `None` with none.
+    pub(super) fn bound(&self, decodes: usize, now: Instant, fresh: Duration) -> Option<Duration> {
+        self.by
+            .range(decodes.max(1)..)
+            .filter(|(_, &(_, at))| now.saturating_duration_since(at) <= fresh)
+            .map(|(_, &(avg, _))| avg)
+            .min()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +304,27 @@ mod tests {
             StepShape::DecodeQueued
         );
         assert_eq!(of(false, false, true, false, false), StepShape::DecodeAlone);
+    }
+
+    #[test]
+    fn a_step_at_a_width_bounds_every_narrower_one() {
+        let t0 = Instant::now();
+        let fresh = Duration::from_secs(60);
+        let mut w = WidthSteps::default();
+        w.record(24, Duration::from_millis(40), t0);
+        w.record(8, Duration::from_millis(30), t0);
+        // Sixteen wider than eight: bounded by the 24-decode step.
+        assert_eq!(w.bound(24, t0, fresh), Some(Duration::from_millis(40)));
+        assert_eq!(w.bound(9, t0, fresh), Some(Duration::from_millis(40)));
+        // At eight, the fastest of eight and wider.
+        assert_eq!(w.bound(8, t0, fresh), Some(Duration::from_millis(30)));
+        // Wider than any measured: nothing to say.
+        assert_eq!(w.bound(40, t0, fresh), None);
+        // A stale width says nothing either.
+        let later = t0 + Duration::from_secs(120);
+        w.record(8, Duration::from_millis(30), later);
+        assert_eq!(w.bound(9, later, fresh), None);
+        assert_eq!(w.bound(8, later, fresh), Some(Duration::from_millis(30)));
     }
 
     #[test]

@@ -3781,13 +3781,9 @@ pub(crate) struct Scheduler {
     /// What a decode-only step takes now — an average over the recent ones, so
     /// it follows the decode width and depth. `None` until one has run.
     decode_only_step: Option<Duration>,
-    /// What a co-batched decode step takes now, averaged as
-    /// [`Self::decode_only_step`] is: its wall bounds the decode part of it
-    /// from above, the bound the published step is held to.
-    cobatched_step: Option<Duration>,
-    /// Whether a co-batched step has run since the rates were last priced —
-    /// the bound is a measurement of the width now only while it is fresh.
-    cobatched_since_priced: bool,
+    /// The recent step at each decode width, the bound every published step
+    /// is held to (`step_census::WidthSteps`).
+    width_steps: step_census::WidthSteps,
     /// What one row of creep through one layer costs beside decode rows — an
     /// average over the steps it rode (`creep_slice::next_layer_row_cost`), so
     /// a slice can be bounded in time. `None` until a creep has ridden one.
@@ -3795,6 +3791,8 @@ pub(crate) struct Scheduler {
     /// Rows times layers of creep the last wave step carried beside decode
     /// rows; zero when it carried none, or carried no decode.
     wave_step_creep_layer_rows: usize,
+    /// The query×key pairs the creep attended through those layers this step.
+    wave_step_creep_layer_pairs: f64,
     /// Consecutive failures of the decode-less wave step and the wait owed
     /// before the next — see `wave_retry`.
     wave_retry: wave_retry::WaveRetry,
@@ -4139,10 +4137,10 @@ impl Scheduler {
             wave_cohort_advanced: false,
             creep_owed: Duration::ZERO,
             decode_only_step: None,
-            cobatched_step: None,
-            cobatched_since_priced: false,
+            width_steps: step_census::WidthSteps::default(),
             creep_layer_row_cost: None,
             wave_step_creep_layer_rows: 0,
+            wave_step_creep_layer_pairs: 0.0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),
             wave_cobatched: false,

@@ -564,7 +564,10 @@ fn hit_at(fraction: f64, gamma: f64) -> f64 {
 }
 
 /// The running fit of a decode step's per-layer time against the experts it
-/// had to fetch: `t = a + b·m`, `m` the routed experts a layer did not hold.
+/// had to fetch and the creep that rode it: `t = a + b·m + c·r + d·p`, `m`
+/// the distinct routed experts a layer did not hold, `r` the creep's rows
+/// through it and `p` the query×key pairs those rows attend — the creep's
+/// cost at depth, which at 120–190K context its rows alone do not carry.
 ///
 /// **What a missed expert costs is this card's to say.** The model it replaces
 /// took a layer as its compute or its copy, whichever was longer, and put
@@ -575,48 +578,117 @@ fn hit_at(fraction: f64, gamma: f64) -> f64 {
 /// priced at 69.3 ms, the same as one more, where twenty-three decodes had
 /// stepped 451–580 ms. The slope here is whatever a miss costs — bus, CPU or
 /// both — learned from the widths the card actually stepped at.
+///
+/// **Learned from co-batched steps too, the creep their third term.** Taught
+/// on decode-only steps alone, the fit went blind wherever every step carries
+/// a creep: on BlackWorld (136060fab, 2026-10-20) it never solved through a
+/// heavy-read, and the run before it froze on the phase's last decode-only
+/// steps and priced 0.7–3.3 s against co-batched steps of about 0.3 s. Each
+/// co-batched step is one more equation with its creep rows in it, so the
+/// decode's cost is separated from the creep's by the fit itself rather than
+/// by subtracting an estimate learned from the decode-only steps it lacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct DecodeFit {
-    mm: f64,
-    m1: f64,
-    one: f64,
-    mt: f64,
-    t1: f64,
+    /// The normal equations over `[1, m, r, p]` — `XᵀX` and `Xᵀt` — with `p`
+    /// in millions of pairs so the sums stay within a few orders of the rest.
+    xx: [[f64; 4]; 4],
+    xt: [f64; 4],
     n: u64,
 }
 
 impl DecodeFit {
     /// Steps folded in before the fit is believed.
     const MIN_SAMPLES: u64 = 8;
-    /// The fraction of `Σm²·Σ1` the determinant must reach: the steps must have
-    /// fetched different numbers of experts for a slope to be told from the
-    /// intercept.
+    /// The fraction of its own sum of squares each column's pivot must keep:
+    /// the steps must have varied in it apart from the others for its
+    /// coefficient to be told from theirs.
     const MIN_CONDITION: f64 = 1e-3;
+    /// The pairs column's unit.
+    const PAIRS: f64 = 1e6;
 
-    fn observe(&mut self, m: f64, t: f64, alpha: f64) {
+    fn observe(&mut self, m: f64, r: f64, p: f64, t: f64, alpha: f64) {
         let keep = 1.0 - alpha.clamp(0.0, 1.0);
-        self.mm = self.mm * keep + m * m;
-        self.m1 = self.m1 * keep + m;
-        self.one = self.one * keep + 1.0;
-        self.mt = self.mt * keep + m * t;
-        self.t1 = self.t1 * keep + t;
+        let x = [1.0, m, r, p / Self::PAIRS];
+        for i in 0..4 {
+            for j in 0..4 {
+                self.xx[i][j] = self.xx[i][j] * keep + x[i] * x[j];
+            }
+            self.xt[i] = self.xt[i] * keep + x[i] * t;
+        }
         self.n += 1;
     }
 
     /// `(a, b)` — per-layer seconds at no miss, and per missed expert — or
     /// `None` until the steps have varied enough to separate them, or when the
-    /// answer is not a cost (a negative intercept or slope).
+    /// answer is not a cost (a negative coefficient).
     fn solve(&self) -> Option<(f64, f64)> {
+        self.solve_all().map(|(a, b, _, _)| (a, b))
+    }
+
+    /// `(a, b, c, d)`: `c` per creep row through a layer, `d` per pair it
+    /// attends there. A creep column the steps did not vary apart from the
+    /// others is left out (its coefficient zero) — rows and pairs move together
+    /// at one depth, and either then carries the creep — and with a creep
+    /// present that neither column separates, there is no answer: the decode's
+    /// coefficients would be holding the creep's cost.
+    fn solve_all(&self) -> Option<(f64, f64, f64, f64)> {
         if self.n < Self::MIN_SAMPLES {
             return None;
         }
-        let det = self.mm * self.one - self.m1 * self.m1;
-        if !det.is_finite() || det <= self.mm * self.one * Self::MIN_CONDITION {
-            return None;
+        let present = |i: usize| self.xx[i][i] > f64::EPSILON * self.xx[0][0].max(1.0);
+        let creep = present(2) || present(3);
+        let tries: &[&[usize]] = if creep {
+            &[&[0, 1, 2, 3], &[0, 1, 3], &[0, 1, 2]]
+        } else {
+            &[&[0, 1]]
+        };
+        for cols in tries {
+            if cols.iter().any(|&c| c >= 2 && !present(c)) {
+                continue;
+            }
+            if let Some(coef) = self.solve_cols(cols) {
+                let mut out = [0.0; 4];
+                for (&c, v) in cols.iter().zip(coef) {
+                    out[c] = v;
+                }
+                if out.iter().all(|v| v.is_finite() && *v >= 0.0) {
+                    return Some((out[0], out[1], out[2], out[3] / Self::PAIRS));
+                }
+            }
         }
-        let b = (self.one * self.mt - self.m1 * self.t1) / det;
-        let a = (self.mm * self.t1 - self.m1 * self.mt) / det;
-        (a.is_finite() && b.is_finite() && a >= 0.0 && b >= 0.0).then_some((a, b))
+        None
+    }
+
+    /// Least squares over `cols` by elimination on the normal equations,
+    /// refusing a pivot that keeps less than [`Self::MIN_CONDITION`] of its
+    /// column's sum of squares.
+    fn solve_cols(&self, cols: &[usize]) -> Option<Vec<f64>> {
+        let k = cols.len();
+        let mut a: Vec<Vec<f64>> = cols
+            .iter()
+            .map(|&i| cols.iter().map(|&j| self.xx[i][j]).collect())
+            .collect();
+        let mut b: Vec<f64> = cols.iter().map(|&i| self.xt[i]).collect();
+        let diag: Vec<f64> = (0..k).map(|i| a[i][i]).collect();
+        for p in 0..k {
+            if !a[p][p].is_finite() || a[p][p] <= diag[p] * Self::MIN_CONDITION {
+                return None;
+            }
+            let pivot = a[p].clone();
+            for r in p + 1..k {
+                let f = a[r][p] / pivot[p];
+                for (v, &u) in a[r].iter_mut().zip(&pivot).skip(p) {
+                    *v -= f * u;
+                }
+                b[r] -= f * b[p];
+            }
+        }
+        let mut x = vec![0.0; k];
+        for p in (0..k).rev() {
+            let s: f64 = (p + 1..k).map(|c| a[p][c] * x[c]).sum();
+            x[p] = (b[p] - s) / a[p][p];
+        }
+        Some(x)
     }
 }
 
@@ -1009,10 +1081,10 @@ impl WaveRate {
     /// missed expert (`None` until fitted). What a trade's decode side is
     /// priced from, so a decode change that reads too dear can be checked
     /// against the hit rate the cache measured.
-    pub fn decode_terms(&self) -> (f64, Option<(f64, f64)>) {
+    pub fn decode_terms(&self) -> (f64, Option<(f64, f64, f64, f64)>) {
         (
             self.hit_fraction(self.resident_now),
-            self.decode_fit.solve(),
+            self.decode_fit.solve_all(),
         )
     }
 
@@ -2386,6 +2458,35 @@ impl WaveRate {
         self.fit.solve(self.link_bytes_per_s).is_some()
     }
 
+    /// Learn the decode fit from one co-batched forward: `decodes` sequences
+    /// stepped beside a creep of `creep_layer_rows` rows-through-layers, in
+    /// `forward_secs` with `resident_bytes` of experts on the card. Only the
+    /// fit learns — its creep term takes what the creep cost — and the layer
+    /// time, which a creep's rows would inflate, is left to the decode-only
+    /// steps ([`Self::observe_decode`]).
+    pub fn observe_decode_beside(
+        &mut self,
+        decodes: usize,
+        resident_bytes: u64,
+        forward_secs: f64,
+        creep_layer_rows: usize,
+        creep_layer_pairs: f64,
+    ) {
+        if decodes == 0 || creep_layer_rows == 0 || !forward_secs.is_finite() || forward_secs <= 0.0
+        {
+            return;
+        }
+        let layers = self.geometry.moe_layers.max(1) as f64;
+        let routed = decodes.saturating_mul(self.experts_per_decode(0));
+        self.decode_fit.observe(
+            self.decode_misses(routed, resident_bytes),
+            creep_layer_rows as f64 / layers,
+            creep_layer_pairs / layers,
+            forward_secs / layers,
+            self.alpha,
+        );
+    }
+
     /// Learn from one decode forward: `decodes` sequences each drafting
     /// `draft` proposals stepped in `forward_secs` with `resident_bytes` of
     /// experts on the card.
@@ -2413,6 +2514,8 @@ impl WaveRate {
         // the experts fetched that the fit is of.
         self.decode_fit.observe(
             self.decode_misses(routed, resident_bytes),
+            0.0,
+            0.0,
             per_layer,
             self.alpha,
         );
@@ -2483,6 +2586,54 @@ mod tests {
         assert!(p.distinct_routed(100_000) <= 256.0);
         assert!(p.distinct_routed(200) > p.distinct_routed(192));
         assert_eq!(p.distinct_routed(0), 0.0);
+    }
+
+    /// **The creep that rode a step is the fit's to separate, not to absorb.**
+    /// A layer costs its fixed part, a cost per missed expert and a cost per
+    /// creep row; taught from co-batched steps alone — a heavy-read, with no
+    /// decode-only step to learn from — the fit recovers all three, and the
+    /// decode step it prices carries none of the creep's.
+    ///
+    /// **And at whatever depth it attends.** The creep's cost at 120–190K
+    /// context is its attention, which rows alone do not carry: with the creep
+    /// at two depths the pairs column takes the difference, where a rows-only
+    /// fit would have folded the deeper creep's attention into `a` and `b`.
+    #[test]
+    fn a_decode_fit_taught_beside_a_creep_prices_the_decode_alone() {
+        let (a, b, c, d) = (0.25e-3, 0.05e-3, 2e-6, 4e-14);
+        let mut fit = DecodeFit::default();
+        for round in 0..80 {
+            let m = 4.0 + (round % 7) as f64 * 6.0;
+            let r = 100.0 + (round % 5) as f64 * 900.0;
+            // Two depths: a creep at 20K, and one at 180K.
+            let depth = if round % 3 == 0 { 180_000.0 } else { 20_000.0 };
+            let p = r * depth;
+            fit.observe(m, r, p, a + b * m + c * r + d * p, 0.05);
+        }
+        let (fa, fb, fc, fd) = fit.solve_all().expect("the steps varied in every column");
+        assert!(approx(fa, a, 1e-6), "a {fa}");
+        assert!(approx(fb, b, 1e-6), "b {fb}");
+        assert!(approx(fc, c, 1e-5), "c {fc}");
+        assert!(approx(fd, d, 1e-5), "d {fd}");
+        // At one depth rows and pairs move together: one creep column carries
+        // it, and the decode's coefficients are still the decode's.
+        let mut one_depth = DecodeFit::default();
+        for round in 0..80 {
+            let m = 4.0 + (round % 7) as f64 * 6.0;
+            let r = 100.0 + (round % 5) as f64 * 900.0;
+            let p = r * 60_000.0;
+            one_depth.observe(m, r, p, a + b * m + c * r + d * p, 0.05);
+        }
+        let (oa, ob, _, _) = one_depth.solve_all().expect("one creep column separates");
+        assert!(approx(oa, a, 1e-5) && approx(ob, b, 1e-5), "a {oa} b {ob}");
+        // Decode-only steps alone: the two-term fit, no creep to find.
+        let mut alone = DecodeFit::default();
+        for round in 0..60 {
+            let m = 4.0 + (round % 7) as f64 * 6.0;
+            alone.observe(m, 0.0, 0.0, a + b * m, 0.05);
+        }
+        let (aa, ab, ac, ad) = alone.solve_all().expect("the widths varied");
+        assert!(approx(aa, a, 1e-6) && approx(ab, b, 1e-6) && ac == 0.0 && ad == 0.0);
     }
 
     /// **A fit learned at a few decodes prices twenty-four at what they cost.**

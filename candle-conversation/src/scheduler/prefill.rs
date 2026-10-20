@@ -787,31 +787,36 @@ impl Scheduler {
                 .map_or(r.decode_step_ms_plus_wide, |(_, wide)| wide),
             ..r
         });
-        // **Never slower than the card is stepping.** A co-batched step carries
-        // the decodes and the creep beside them, so its wall is a measured
-        // upper bound on the decode part at the width now — and the fit, which
-        // learns from decode-only steps alone, has none to correct it while
-        // every step co-batches: on BlackWorld (dcba2cc3b, 2026-10-20) it froze
-        // on heavy-read's last decode-only steps and published 0.7–3.3 s against
-        // co-batched steps of about 0.3 s, the hit model moving under it. Held
-        // to the bound, the whole curve scales by the same factor, so the
-        // steps a wider placement would get keep the model's shape around what
-        // was measured.
-        let bound = std::mem::take(&mut self.cobatched_since_priced)
-            .then_some(self.cobatched_step)
-            .flatten()
-            .map(|d| d.as_secs_f64() * 1e3);
-        let learned = learned.map(|r| match bound {
-            Some(b) if r.decode_step_ms > b && r.decode_step_ms > 0.0 => {
-                let f = b / r.decode_step_ms;
-                super::phase_ring::LearnedRates {
-                    decode_step_ms: r.decode_step_ms * f,
-                    decode_step_ms_plus_one: r.decode_step_ms_plus_one * f,
-                    decode_step_ms_plus_wide: r.decode_step_ms_plus_wide * f,
-                    ..r
-                }
+        // **Never slower than the card has stepped.** A step at a width bounds
+        // every narrower one from above (`step_census::WidthSteps`): a creep
+        // riding it only adds. The fit, with no decode-only step to learn from
+        // while every step co-batches, froze on heavy-read's last ones and
+        // published 0.7–3.3 s against co-batched steps of about 0.3 s
+        // (BlackWorld, dcba2cc3b, 2026-10-20). So the step now is held to the
+        // fastest measured at its width or wider, the whole curve scaled by the
+        // same factor to keep the model's shape around what was measured — and
+        // each wider figure is then held to its own width's measurement too,
+        // where one has been taken.
+        let width = self.decode_width();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let bound_at = |w: usize| self.width_steps.bound(w, now, RATES_LOG_EVERY).map(ms);
+        let (bound, bound_one, bound_wide) = (
+            bound_at(width),
+            bound_at(width + 1),
+            bound_at(width + super::phase_ring::PLACEMENT_WIDE),
+        );
+        let learned = learned.map(|r| {
+            let f = match bound {
+                Some(b) if r.decode_step_ms > b && r.decode_step_ms > 0.0 => b / r.decode_step_ms,
+                _ => 1.0,
+            };
+            let held = |v: f64, at: Option<f64>| at.map_or(v * f, |b| (v * f).min(b));
+            super::phase_ring::LearnedRates {
+                decode_step_ms: held(r.decode_step_ms, bound),
+                decode_step_ms_plus_one: held(r.decode_step_ms_plus_one, bound_one),
+                decode_step_ms_plus_wide: held(r.decode_step_ms_plus_wide, bound_wide),
+                ..r
             }
-            _ => r,
         });
         if let Some(rates) = learned {
             super::phase_ring::publish_learned_rates(rates);
@@ -834,7 +839,15 @@ impl Scheduler {
                         r.decode_terms(),
                     )
                 });
-            let decode_fit = fit.map(|(a, b)| format!("a={:.3}ms b={:.4}ms", a * 1e3, b * 1e3));
+            let decode_fit = fit.map(|(a, b, c, d)| {
+                format!(
+                    "a={:.3}ms b={:.4}ms c={:.2}us d={:.3}us/Mpair",
+                    a * 1e3,
+                    b * 1e3,
+                    c * 1e6,
+                    d * 1e12
+                )
+            });
             let steps = self.step_census.take(now);
             let idle = self.idle_census(now);
             match learned {
@@ -846,7 +859,12 @@ impl Scheduler {
                     decode_step_ms = format!("{:.1}", r.decode_step_ms),
                     decode_step_ms_plus_one = format!("{:.1}", r.decode_step_ms_plus_one),
                     decode_step_ms_plus_wide = format!("{:.1}", r.decode_step_ms_plus_wide),
-                    step_bound_ms = bound.map(|b| format!("{b:.1}")),
+                    step_bound_ms = format!(
+                        "{}/{}/{}",
+                        bound.map_or("-".into(), |b| format!("{b:.1}")),
+                        bound_one.map_or("-".into(), |b| format!("{b:.1}")),
+                        bound_wide.map_or("-".into(), |b| format!("{b:.1}")),
+                    ),
                     prefill_from = if drain.is_some() {
                         "high drain"
                     } else if traded.is_some() {
@@ -4534,10 +4552,27 @@ impl Scheduler {
         let win_end = (cursor + budget).min(n);
         // What the creep ran this step, for the next slice's cost estimate:
         // beside decode its excess over a decode-only step, alone its whole step.
+        let swept = win_end - cursor.min(win_end);
         self.wave_step_creep_layer_rows = if !seq_ids.is_empty() {
-            creep_rows * (win_end - cursor.min(win_end))
+            creep_rows * swept
         } else {
             0
+        };
+        // And the query×key pairs those rows attend through the same layers —
+        // the creep's cost at depth, which its rows alone do not say.
+        self.wave_step_creep_layer_pairs = if !seq_ids.is_empty() {
+            members
+                .iter()
+                .zip(inputs.iter())
+                .map(|(m, inp)| {
+                    let tok = inp.dims().get(1).copied().unwrap_or(0) as f64;
+                    let at = self.session.sequence_offset(m.seq_id()).unwrap_or(0) as f64;
+                    tok * (at + tok / 2.0)
+                })
+                .sum::<f64>()
+                * swept as f64
+        } else {
+            0.0
         };
 
         // No creep group → one full-sweep [0, N) forward folding decode + a

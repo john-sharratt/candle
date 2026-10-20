@@ -959,8 +959,19 @@ impl Scheduler {
         // published step, the trade's decode side, a burst's placement. On
         // BlackWorld (d7f850f79, 2026-10-20) 24 decodes priced at 225–575 ms
         // through heavy-read's co-batched steps.
+        // A co-batched step teaches the fit with its creep as the third term
+        // (`WaveRate::observe_decode_beside`), so a phase that co-batches every
+        // step still says what its decodes cost; one carrying only glue, a cost
+        // that term does not hold, teaches nothing.
         if !self.wave_cobatched {
             self.observe_decode_forward(seq_ids.len(), fwd_us);
+        } else {
+            self.observe_decode_beside(
+                seq_ids.len(),
+                fwd_us,
+                self.wave_step_creep_layer_rows,
+                self.wave_step_creep_layer_pairs,
+            );
         }
         self.observe_expert_hit_rate();
 
