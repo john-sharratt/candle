@@ -21,6 +21,7 @@ mod candidate;
 pub mod commands;
 pub mod decide;
 mod facts;
+mod failed_install;
 mod fetch;
 mod install;
 pub mod refused;
@@ -41,6 +42,7 @@ use super::watchdog::{Failure, FAILED};
 use crate::coord::{KeptLine, VerdictLine};
 use crate::frame::{BuildArtifacts, Frame};
 use crate::member::AppMember;
+use failed_install::failed_install;
 
 pub use decide::{prefetch, target, Facts, Lease, Target};
 pub use install::{InstallJob, Installer, HANDBACK_TTL, LEASE_TTL};
@@ -111,7 +113,7 @@ impl Upgrader {
     ) -> Arc<Upgrader> {
         let dir = setup.upgrade_dir.clone();
         let mut refused = refused::read(&dir);
-        if let Some(build) = &setup.failed_from {
+        if let Some(build) = &failed_install(&setup, &dir) {
             match refused::refuse(&dir, build) {
                 Ok(r) => refused = r,
                 Err(e) => tracing::error!("the failed build {build} was not recorded: {e}"),

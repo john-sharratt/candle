@@ -386,6 +386,15 @@ fn apply(svc: &Service, live: Option<Live>, path: &Path, reply: Sender<Answer>) 
     if let Some(mut live) = live {
         stop(&mut live);
     }
+    // **The trial runs alone.** One found by name is the service too, whoever
+    // started it — a start by hand, a keep that restarted — and a trial spawned
+    // beside it loads into a card and a commit the old process still holds. On
+    // WhiteWorld (24 GB, 2026-10-20) every trial of a rolled-out build ran out
+    // partway through its load, rolled back, and the member was told to upgrade
+    // again: a loop that served nothing for a whole run.
+    if let Some(found) = find(&svc.file) {
+        stop(&mut Live::Adopted(found.pid));
+    }
     let result = switch_to(
         path,
         &svc.stable,
