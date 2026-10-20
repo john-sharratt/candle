@@ -963,14 +963,20 @@ impl Scheduler {
         // (`WaveRate::observe_decode_beside`), so a phase that co-batches every
         // step still says what its decodes cost; one carrying only glue, a cost
         // that term does not hold, teaches nothing.
+        // The positions the decode rows attended, the fit's depth column.
+        let positions: f64 = seq_ids
+            .iter()
+            .map(|&s| self.session.sequence_offset(s.0).unwrap_or(0) as f64)
+            .sum();
         if !self.wave_cobatched {
-            self.observe_decode_forward(seq_ids.len(), fwd_us);
+            self.observe_decode_forward(seq_ids.len(), fwd_us, positions);
         } else {
             self.observe_decode_beside(
                 seq_ids.len(),
                 fwd_us,
                 self.wave_step_creep_layer_rows,
                 self.wave_step_creep_layer_pairs,
+                positions,
             );
         }
         self.observe_expert_hit_rate();

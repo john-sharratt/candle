@@ -589,13 +589,17 @@ fn hit_at(fraction: f64, gamma: f64) -> f64 {
 /// by subtracting an estimate learned from the decode-only steps it lacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct DecodeFit {
-    /// The normal equations over `[1, m, r, p]` — `XᵀX`, `Xᵀt` and `tᵀt` — with
-    /// `p` in millions of pairs so the sums stay within a few orders of the
-    /// rest.
-    xx: [[f64; 4]; 4],
-    xt: [f64; 4],
+    /// The normal equations over `[1, m, q, r, p]` — `XᵀX`, `Xᵀt` and `tᵀt` —
+    /// with `q` and `p` in millions so the sums stay within a few orders of
+    /// the rest.
+    xx: [[f64; 5]; 5],
+    xt: [f64; 5],
     tt: f64,
     n: u64,
+    /// The answer as of the last step folded in: solved there, once, and read
+    /// by every price after it — the trade prices the decode side many times
+    /// a pass, and the fit changes only when it learns.
+    cached: Option<Result<[f64; 5], FitWhy>>,
 }
 
 /// Why the decode fit gave no answer, for the line that reports it.
@@ -614,71 +618,89 @@ impl DecodeFit {
     /// the steps must have varied in it apart from the others for its
     /// coefficient to be told from theirs.
     const MIN_CONDITION: f64 = 1e-3;
-    /// The pairs column's unit.
-    const PAIRS: f64 = 1e6;
+    /// The positions and pairs columns' unit.
+    const MILLION: f64 = 1e6;
+    /// Columns: the fixed term, the misses, the decodes' attended positions,
+    /// the creep's rows, the creep's pairs.
+    const K: usize = 5;
 
-    /// Fold one step in, the sums so far kept `1 − alpha` of their weight.
-    fn observe(&mut self, m: f64, r: f64, p: f64, t: f64, alpha: f64) {
+    /// Fold one step in — `q` the positions its decode rows attended, `r` and
+    /// `p` its creep's rows and pairs through the layer — the sums so far kept
+    /// `1 − alpha` of their weight.
+    fn observe(&mut self, m: f64, q: f64, r: f64, p: f64, t: f64, alpha: f64) {
         let keep = 1.0 - alpha.clamp(0.0, 1.0);
-        let x = [1.0, m, r, p / Self::PAIRS];
-        for i in 0..4 {
-            for j in 0..4 {
+        let x = [1.0, m, q / Self::MILLION, r, p / Self::MILLION];
+        for i in 0..Self::K {
+            for j in 0..Self::K {
                 self.xx[i][j] = self.xx[i][j] * keep + x[i] * x[j];
             }
             self.xt[i] = self.xt[i] * keep + x[i] * t;
         }
         self.tt = self.tt * keep + t * t;
         self.n += 1;
+        self.cached = Some(self.compute());
     }
 
     /// `(a, b)` — per-layer seconds at no miss, and per missed expert — or
     /// `None` until the steps have varied enough to separate them.
     fn solve(&self) -> Option<(f64, f64)> {
-        self.solve_all().map(|(a, b, _, _)| (a, b))
+        self.answer().ok().map(|x| (x[0], x[1]))
     }
 
     /// `(a, b, c, d)`: `c` per creep row through a layer, `d` per pair it
     /// attends there.
     fn solve_all(&self) -> Option<(f64, f64, f64, f64)> {
-        self.answer().ok()
+        self.answer()
+            .ok()
+            .map(|x| (x[0], x[1], x[3], x[4] / Self::MILLION))
     }
 
-    /// The fit, or why there is none.
+    /// Per-layer seconds per position a decode row attends, `0` when the
+    /// steps did not vary in depth apart from the rest.
+    fn depth(&self) -> Option<f64> {
+        self.answer().ok().map(|x| x[2] / Self::MILLION)
+    }
+
+    /// The fit's coefficients over `[1, m, q, r, p]` in its own units, or why
+    /// there are none.
     ///
     /// **Non-negative least squares over its columns' subsets.** A cost cannot
     /// be negative, and the columns the steps did not vary apart from the
     /// others say nothing; so of the subsets that keep the fixed term and the
-    /// misses,
-    /// condition, and come out non-negative, the one that leaves the least
-    /// residual is the answer, each left-out column's coefficient zero. With a
-    /// creep in the steps a subset must keep a creep column: without one the
-    /// decode's coefficients would be holding the creep's cost.
-    fn answer(&self) -> Result<(f64, f64, f64, f64), FitWhy> {
+    /// misses, condition, and come out all costs, the one that leaves the
+    /// least residual is the answer, each left-out column's coefficient zero.
+    /// The fixed term and the misses always: a fit that cannot say what a
+    /// miss costs is no answer, and the physical model prices it instead — one
+    /// width's steps fitted as a flat layer time priced every dislodge free.
+    /// With a creep in the steps a subset must keep a creep column: without one
+    /// the decode's coefficients would be holding the creep's cost.
+    fn answer(&self) -> Result<[f64; 5], FitWhy> {
+        self.cached.unwrap_or(Err(FitWhy::Samples))
+    }
+
+    /// [`Self::answer`], solved from the sums.
+    fn compute(&self) -> Result<[f64; 5], FitWhy> {
         if self.n < Self::MIN_SAMPLES {
             return Err(FitWhy::Samples);
         }
         let present = |i: usize| self.xx[i][i] > f64::EPSILON * self.xx[0][0].max(1.0);
-        let creep = present(2) || present(3);
-        let mut best: Option<(f64, [f64; 4])> = None;
-        // The fixed term and the misses always: a fit that cannot say what a
-        // miss costs is no answer, and the physical model prices it instead —
-        // one width's steps fitted as a flat layer time priced every dislodge
-        // free and every wider placement no slower.
-        for mask in 0u8..4 {
+        let creep = present(3) || present(4);
+        let mut best: Option<(f64, [f64; 5])> = None;
+        for mask in 0u8..8 {
             let cols: Vec<usize> = [0, 1]
                 .into_iter()
-                .chain((2..4).filter(|&c| mask & (1 << (c - 2)) != 0))
+                .chain((2..Self::K).filter(|&c| mask & (1 << (c - 2)) != 0))
                 .collect();
             if cols.iter().any(|&c| c >= 2 && !present(c)) {
                 continue;
             }
-            if creep && !cols.iter().any(|&c| c >= 2) {
+            if creep && !cols.iter().any(|&c| c >= 3) {
                 continue;
             }
             let Some(coef) = self.solve_cols(&cols) else {
                 continue;
             };
-            let mut x = [0.0; 4];
+            let mut x = [0.0; 5];
             for (&c, v) in cols.iter().zip(&coef) {
                 x[c] = *v;
             }
@@ -690,32 +712,31 @@ impl DecodeFit {
                 best = Some((rss, x));
             }
         }
-        best.map(|(_, x)| (x[0], x[1], x[2], x[3] / Self::PAIRS))
-            .ok_or(FitWhy::Unseparated)
+        best.map(|(_, x)| x).ok_or(FitWhy::Unseparated)
     }
 
     /// The residual sum of squares `x` leaves: `tᵀt − 2xᵀXᵀt + xᵀXᵀXx`.
-    fn residual(&self, x: &[f64; 4]) -> f64 {
+    fn residual(&self, x: &[f64; 5]) -> f64 {
         let mut xxx = 0.0;
-        for i in 0..4 {
-            for j in 0..4 {
+        for i in 0..Self::K {
+            for j in 0..Self::K {
                 xxx += x[i] * self.xx[i][j] * x[j];
             }
         }
-        let xxt: f64 = (0..4).map(|i| x[i] * self.xt[i]).sum();
+        let xxt: f64 = (0..Self::K).map(|i| x[i] * self.xt[i]).sum();
         self.tt - 2.0 * xxt + xxx
     }
 
     /// What the fit has seen, for the line that reports it: its steps and the
-    /// spread of each column — the standard deviation of `m`, `r` and `p`
-    /// (pairs in millions) over the weight it holds.
-    fn spread(&self) -> (u64, [f64; 3]) {
+    /// spread of each column — the standard deviation of `m`, `q`, `r` and
+    /// `p` (`q` and `p` in millions) over the weight it holds.
+    fn spread(&self) -> (u64, [f64; 4]) {
         let w = self.xx[0][0].max(f64::MIN_POSITIVE);
         let sd = |i: usize| {
             let mean = self.xx[0][i] / w;
             (self.xx[i][i] / w - mean * mean).max(0.0).sqrt()
         };
-        (self.n, [sd(1), sd(2), sd(3)])
+        (self.n, [sd(1), sd(2), sd(3), sd(4)])
     }
 
     /// Least squares over `cols` by elimination on the normal equations,
@@ -850,6 +871,9 @@ pub struct WaveRate {
     decode_fit: DecodeFit,
     /// When the decode fit last learned, for its forgetting in time.
     decode_fit_at: Option<std::time::Instant>,
+    /// The positions a decode row attends, on average over the recent steps —
+    /// the depth a decode the rates price is put at.
+    decode_context: f64,
     /// Dampening: the fraction of each observation an estimate moves by.
     alpha: f64,
     /// Relative rate gain below which an admission is refused as saturated.
@@ -982,6 +1006,7 @@ impl WaveRate {
             layer_secs: 1.0 / (decode.initial_tok_per_s * geometry.moe_layers as f64),
             decode_fit: DecodeFit::default(),
             decode_fit_at: None,
+            decode_context: 0.0,
             alpha: Self::DEFAULT_ALPHA,
             min_gain: Self::DEFAULT_MIN_GAIN,
             trades: TradeWindow::default(),
@@ -1270,10 +1295,30 @@ impl WaveRate {
     /// longer.
     pub fn decode_step_secs(&self, routed: usize, resident: u64) -> f64 {
         let per_layer = match self.decode_fit.solve() {
-            Some((a, b)) => a + b * self.decode_misses(routed, resident),
+            Some((a, b)) => {
+                // The decodes' attention at the depth they attend: `routed`'s
+                // decodes at the mean context a decode row has attended.
+                let decodes = routed as f64 / self.experts_per_decode(0).max(1) as f64;
+                let depth = self.decode_fit.depth().unwrap_or(0.0);
+                a + b * self.decode_misses(routed, resident) + depth * decodes * self.decode_context
+            }
             None => self.layer_secs.max(self.decode_copy_secs(routed, resident)),
         };
         self.geometry.moe_layers as f64 * per_layer
+    }
+
+    /// Fold one step's attended positions into the mean context a decode row
+    /// attends: `positions` across its `decodes` rows.
+    fn learn_decode_context(&mut self, decodes: usize, positions: f64) {
+        if decodes == 0 || !positions.is_finite() || positions <= 0.0 {
+            return;
+        }
+        let per_row = positions / decodes as f64;
+        self.decode_context = if self.decode_context > 0.0 {
+            self.decode_context + self.alpha * (per_row - self.decode_context)
+        } else {
+            per_row
+        };
     }
 
     /// Experts a layer fetches for decodes routing to `routed` of them with
@@ -2546,9 +2591,15 @@ impl WaveRate {
     /// The decode fit's state for the rates line: its steps, its columns'
     /// spread (misses, creep rows, creep pairs in millions), and why it has
     /// no answer when it has none.
-    pub fn decode_fit_report(&self) -> (u64, [f64; 3], Option<FitWhy>) {
+    pub fn decode_fit_report(&self) -> (u64, [f64; 4], Option<FitWhy>) {
         let (n, sd) = self.decode_fit.spread();
         (n, sd, self.decode_fit.answer().err())
+    }
+
+    /// The fit's per-layer seconds per position a decode row attends, and the
+    /// mean context a decode row attends — `None` until fitted.
+    pub fn decode_depth(&self) -> Option<(f64, f64)> {
+        self.decode_fit.depth().map(|e| (e, self.decode_context))
     }
 
     /// Learn the decode fit from one co-batched forward: `decodes` sequences
@@ -2564,6 +2615,7 @@ impl WaveRate {
         forward_secs: f64,
         creep_layer_rows: usize,
         creep_layer_pairs: f64,
+        positions: f64,
     ) {
         if decodes == 0 || creep_layer_rows == 0 || !forward_secs.is_finite() || forward_secs <= 0.0
         {
@@ -2572,8 +2624,10 @@ impl WaveRate {
         let layers = self.geometry.moe_layers.max(1) as f64;
         let routed = decodes.saturating_mul(self.experts_per_decode(0));
         let fit_alpha = self.fit_alpha();
+        self.learn_decode_context(decodes, positions);
         self.decode_fit.observe(
             self.decode_misses(routed, resident_bytes),
+            positions,
             creep_layer_rows as f64 / layers,
             creep_layer_pairs / layers,
             forward_secs / layers,
@@ -2592,6 +2646,7 @@ impl WaveRate {
     /// forward says nothing about the layer: `None`, and the estimate is left
     /// alone. Also `None` for a forward with no decodes or a duration that is
     /// not a number.
+    #[cfg(test)]
     pub fn observe_decode(
         &mut self,
         decodes: usize,
@@ -2599,16 +2654,32 @@ impl WaveRate {
         resident_bytes: u64,
         forward_secs: f64,
     ) -> Option<f64> {
+        let positions = decodes as f64 * self.decode_context;
+        self.observe_decode_at(decodes, draft, resident_bytes, forward_secs, positions)
+    }
+
+    /// [`Self::observe_decode`] with the positions its decode rows attended —
+    /// the depth the fit's third column prices.
+    pub fn observe_decode_at(
+        &mut self,
+        decodes: usize,
+        draft: usize,
+        resident_bytes: u64,
+        forward_secs: f64,
+        positions: f64,
+    ) -> Option<f64> {
         if decodes == 0 || !forward_secs.is_finite() || forward_secs <= 0.0 {
             return None;
         }
         let routed = decodes.saturating_mul(self.experts_per_decode(draft));
         let per_layer = forward_secs / self.geometry.moe_layers as f64;
         let fit_alpha = self.fit_alpha();
+        self.learn_decode_context(decodes, positions);
         // Every step teaches the fit, bus-bound or not: it is the time against
         // the experts fetched that the fit is of.
         self.decode_fit.observe(
             self.decode_misses(routed, resident_bytes),
+            positions,
             0.0,
             0.0,
             per_layer,
@@ -2703,7 +2774,7 @@ mod tests {
             // Two depths: a creep at 20K, and one at 180K.
             let depth = if round % 3 == 0 { 180_000.0 } else { 20_000.0 };
             let p = r * depth;
-            fit.observe(m, r, p, a + b * m + c * r + d * p, 0.05);
+            fit.observe(m, 0.0, r, p, a + b * m + c * r + d * p, 0.05);
         }
         let (fa, fb, fc, fd) = fit.solve_all().expect("the steps varied in every column");
         assert!(approx(fa, a, 1e-6), "a {fa}");
@@ -2717,7 +2788,7 @@ mod tests {
             let m = 4.0 + (round % 7) as f64 * 6.0;
             let r = 100.0 + (round % 5) as f64 * 900.0;
             let p = r * 60_000.0;
-            one_depth.observe(m, r, p, a + b * m + c * r + d * p, 0.05);
+            one_depth.observe(m, 0.0, r, p, a + b * m + c * r + d * p, 0.05);
         }
         let (oa, ob, _, _) = one_depth.solve_all().expect("one creep column separates");
         assert!(approx(oa, a, 1e-5) && approx(ob, b, 1e-5), "a {oa} b {ob}");
@@ -2725,10 +2796,34 @@ mod tests {
         let mut alone = DecodeFit::default();
         for round in 0..60 {
             let m = 4.0 + (round % 7) as f64 * 6.0;
-            alone.observe(m, 0.0, 0.0, a + b * m, 0.05);
+            alone.observe(m, 0.0, 0.0, 0.0, a + b * m, 0.05);
         }
         let (aa, ab, ac, ad) = alone.solve_all().expect("the widths varied");
         assert!(approx(aa, a, 1e-6) && approx(ab, b, 1e-6) && ac == 0.0 && ad == 0.0);
+    }
+
+    /// **The decodes' own attention is the fit's to price, not its fixed
+    /// term's.** Each decode row attends its whole context; with steps at
+    /// deepening contexts the positions column takes that cost, and the
+    /// fixed part stays what it is — where without it `a` climbed 0.60 → 1.27
+    /// ms a layer through a heavy-read as its conversations deepened
+    /// (BlackWorld, f20da86f0, 2026-10-20).
+    #[test]
+    fn a_decode_fit_prices_its_rows_attention_apart_from_its_fixed_cost() {
+        let (a, b, e) = (0.6e-3, 0.15e-3, 3e-9);
+        let mut fit = DecodeFit::default();
+        for round in 0..80 {
+            let m = 4.0 + (round % 7) as f64 * 6.0;
+            let decodes = 8.0 + (round % 4) as f64 * 4.0;
+            let context = 20_000.0 + (round % 9) as f64 * 20_000.0;
+            let q = decodes * context;
+            fit.observe(m, q, 0.0, 0.0, a + b * m + e * q, 0.05);
+        }
+        let x = fit.answer().expect("the depths varied");
+        assert!(approx(x[0], a, 1e-6), "a {}", x[0]);
+        assert!(approx(x[1], b, 1e-6), "b {}", x[1]);
+        let depth = fit.depth().expect("fitted");
+        assert!(approx(depth, e, 1e-5), "e {depth}");
     }
 
     /// **A fit learned at a few decodes prices twenty-four at what they cost.**

@@ -839,11 +839,15 @@ impl Scheduler {
                         r.decode_terms(),
                     )
                 });
+            let depth = self.wave_rate.as_ref().and_then(|r| r.decode_depth());
             let decode_fit = fit.map(|(a, b, c, d)| {
+                let (e, ctx) = depth.unwrap_or((0.0, 0.0));
                 format!(
-                    "a={:.3}ms b={:.4}ms c={:.2}us d={:.3}us/Mpair",
+                    "a={:.3}ms b={:.4}ms e={:.3}us/Kpos@{:.0} c={:.2}us d={:.3}us/Mpair",
                     a * 1e3,
                     b * 1e3,
+                    e * 1e9,
+                    ctx,
                     c * 1e6,
                     d * 1e12
                 )
@@ -851,9 +855,9 @@ impl Scheduler {
             // What the fit has seen, answered or not: whether a missing answer
             // is the data's (too few steps, too little spread) or the solver's.
             let fit_seen = self.wave_rate.as_ref().map(|r| {
-                let (n, [m, r_sd, p], why) = r.decode_fit_report();
+                let (n, [m, q, r_sd, p], why) = r.decode_fit_report();
                 format!(
-                    "n={n} sd_m={m:.2} sd_r={r_sd:.1} sd_p={p:.2}{}",
+                    "n={n} sd_m={m:.2} sd_q={q:.2} sd_r={r_sd:.1} sd_p={p:.2}{}",
                     why.map_or(String::new(), |w| format!(" none={w:?}"))
                 )
             });

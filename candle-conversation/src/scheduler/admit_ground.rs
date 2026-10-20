@@ -1336,6 +1336,7 @@ impl Scheduler {
         us: u64,
         creep_layer_rows: usize,
         creep_layer_pairs: f64,
+        positions: f64,
     ) {
         if decodes == 0 || us == 0 {
             return;
@@ -1348,6 +1349,7 @@ impl Scheduler {
                 us as f64 / 1e6,
                 creep_layer_rows,
                 creep_layer_pairs,
+                positions,
             );
         }
     }
@@ -1358,7 +1360,7 @@ impl Scheduler {
     /// it; only a compute-bound one teaches anything. `draft: 0` prices the
     /// unspeculated row — a verify block was priced by the speculative driver
     /// when it was staged.
-    pub(super) fn observe_decode_forward(&mut self, decodes: usize, us: u64) {
+    pub(super) fn observe_decode_forward(&mut self, decodes: usize, us: u64, positions: f64) {
         if decodes == 0 || us == 0 {
             return;
         }
@@ -1367,7 +1369,7 @@ impl Scheduler {
         self.wave_forwards += 1;
         let resident = residency_now(self.standing_ground_bytes());
         if let Some(rate) = self.wave_rate.as_mut() {
-            rate.observe_decode(decodes, 0, resident, us as f64 / 1e6);
+            rate.observe_decode_at(decodes, 0, resident, us as f64 / 1e6, positions);
         }
     }
 
