@@ -16,6 +16,7 @@
 //! capped by age (60 min — the widest phase graph) and by a hard length backstop.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -509,6 +510,102 @@ pub fn publish_learned_rates(rates: LearnedRates) {
     if let Ok(mut c) = cell.lock() {
         *c = Some((Instant::now(), rates));
     }
+    save_learned_rates(&rates);
+}
+
+/// Where the published rates are kept across restarts, and when they were last
+/// written there.
+static LEARNED_STORE: OnceLock<Mutex<(PathBuf, Option<Instant>)>> = OnceLock::new();
+
+/// How often the published rates are written to their store: a figure a
+/// minute old is as good a start as one a second old, and the rates publish on
+/// every loop pass.
+const LEARNED_SAVE_EVERY: Duration = Duration::from_secs(60);
+
+/// **Keep the published rates at `path` across restarts, and start from them.**
+///
+/// A member that has just started has learned nothing, so it advertises
+/// nothing, and the gateway places by power until it has — but it learns only
+/// from the turns it is given. On the cluster (run 23, 2026-10-19) WhiteWorld,
+/// restarted three minutes before heavy-read's burst, advertised zero for both
+/// rates, every pick fell back to power for both members, and the burst was
+/// placed by nothing it measured. The same card and model an hour ago is a far
+/// better figure than none, and the drain and the rate model correct it within
+/// a minute of the first forward.
+///
+/// Reads what `path` holds — rates this card published before — and, when it
+/// is sound, publishes it now as the starting figure with no backlog; then
+/// keeps writing what the scheduler publishes there, once a
+/// [`LEARNED_SAVE_EVERY`]. Call it once, before the scheduler runs, with a
+/// path that belongs to this card and model — beside the substrate the rates
+/// were learned against.
+pub fn keep_learned_rates_at(path: PathBuf) {
+    if let Some(rates) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| parse_learned_rates(&s))
+    {
+        let cell = LEARNED.get_or_init(|| Mutex::new(None));
+        if let Ok(mut c) = cell.lock() {
+            if c.is_none() {
+                *c = Some((Instant::now(), rates));
+            }
+        }
+    }
+    let store = LEARNED_STORE.get_or_init(|| Mutex::new((path.clone(), None)));
+    if let Ok(mut s) = store.lock() {
+        s.0 = path;
+    }
+}
+
+/// Write `rates` to the store, once a [`LEARNED_SAVE_EVERY`]; nothing without
+/// one. Best effort: a store that cannot be written costs the next start its
+/// head start, not this run anything.
+fn save_learned_rates(rates: &LearnedRates) {
+    let Some(store) = LEARNED_STORE.get() else {
+        return;
+    };
+    let Ok(mut s) = store.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if s.1
+        .is_some_and(|at| now.saturating_duration_since(at) < LEARNED_SAVE_EVERY)
+    {
+        return;
+    }
+    s.1 = Some(now);
+    let text = format_learned_rates(rates);
+    let tmp = s.0.with_extension("tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &s.0);
+    }
+}
+
+/// The store's form: one `key value` a line, so a figure added later reads as
+/// absent from an older file rather than breaking it.
+fn format_learned_rates(r: &LearnedRates) -> String {
+    format!(
+        "prefill_tok_s {}\ndecode_step_ms {}\ndecode_step_ms_plus_one {}\n",
+        r.prefill_tok_s, r.decode_step_ms, r.decode_step_ms_plus_one
+    )
+}
+
+/// The rates a store holds, with no backlog — a backlog belongs to the run
+/// that had it — or `None` unless every rate is there, finite and positive.
+fn parse_learned_rates(text: &str) -> Option<LearnedRates> {
+    let get = |key: &str| {
+        text.lines()
+            .filter_map(|l| l.split_once(' '))
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+    };
+    Some(LearnedRates {
+        prefill_tok_s: get("prefill_tok_s")?,
+        decode_step_ms: get("decode_step_ms")?,
+        decode_step_ms_plus_one: get("decode_step_ms_plus_one")?,
+        high_backlog_tokens: 0,
+    })
 }
 
 /// The rates the scheduler last published, and how old they are in seconds —
@@ -625,6 +722,39 @@ pub fn migrate_sample(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// A store reads back as the rates it was written from, without the run's
+    /// backlog; a store with any rate missing, unparsable, zero or not finite
+    /// starts nothing.
+    #[test]
+    fn a_kept_store_reads_back_its_rates_and_no_backlog() {
+        let r = LearnedRates {
+            prefill_tok_s: 703.5,
+            decode_step_ms: 107.6,
+            decode_step_ms_plus_one: 112.25,
+            high_backlog_tokens: 3_545,
+        };
+        let back = parse_learned_rates(&format_learned_rates(&r)).expect("sound");
+        assert_eq!(
+            back,
+            LearnedRates {
+                high_backlog_tokens: 0,
+                ..r
+            }
+        );
+        for bad in [
+            "",
+            "prefill_tok_s 700\ndecode_step_ms 100\n",
+            "prefill_tok_s 0\ndecode_step_ms 100\ndecode_step_ms_plus_one 100\n",
+            "prefill_tok_s NaN\ndecode_step_ms 100\ndecode_step_ms_plus_one 100\n",
+            "prefill_tok_s x\ndecode_step_ms 100\ndecode_step_ms_plus_one 100\n",
+        ] {
+            assert_eq!(parse_learned_rates(bad), None, "{bad:?}");
+        }
+        // A line added later is ignored by this reader, not fatal to it.
+        let newer = format!("{}some_new_rate 5\n", format_learned_rates(&r));
+        assert!(parse_learned_rates(&newer).is_some());
+    }
 
     /// The phase / wave / migrate rings are process-global, and the harness runs
     /// tests in parallel — so a test that pushes and then reads the ring cannot

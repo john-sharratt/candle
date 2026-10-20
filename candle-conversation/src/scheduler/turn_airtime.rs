@@ -38,18 +38,26 @@ use std::time::Duration;
 const MAX_RATIO: f64 = 64.0;
 
 /// Decode's airtime for each second of the creep's: the prompts' backlog —
-/// `prompt_rows` at `creep_rows_per_s` of the creep's own airtime, counted
-/// down by `waited`, how long the longest-waiting of them has waited — over
-/// the decodes' — one mean decode run of `segment_tokens` at `decode_step` a
-/// step, which every decode advances through together. `None` while any input
+/// `prompt_rows` at `creep_rows_per_s` of the creep's own airtime — over the
+/// decodes' — one mean decode run of `segment_tokens` at `decode_step` a step,
+/// which every decode advances through together — narrowed toward the prompts
+/// by the most-due of `prompts`, each `(rows, waited)`. `None` while any input
 /// is unmeasured or a side has nothing outstanding; the caller then keeps its
 /// default.
+///
+/// **Each prompt is due by its own time, not the backlog's.** A prompt that
+/// has waited its own rows' solo time is overdue, and holds the split at its
+/// widest toward the prompts until it is served. Measured against the whole
+/// backlog instead, the oldest of a steady stream is always old beside work it
+/// is not alone in, and the split pinned at its widest for good: on WhiteWorld
+/// (9d69e59c5, 2026-10-19) every `High` step of heavy-read ran at `1/64`, and
+/// decode at the stream floor was every busy member's steady state.
 pub(super) fn high_airtime_ratio(
     segment_tokens: f64,
     decode_step: Duration,
     prompt_rows: usize,
     creep_rows_per_s: f64,
-    waited: Duration,
+    prompts: &[(usize, Duration)],
 ) -> Option<f64> {
     let decode_s = segment_tokens * decode_step.as_secs_f64();
     if decode_s.is_nan()
@@ -61,9 +69,16 @@ pub(super) fn high_airtime_ratio(
         return None;
     }
     let prompt_s = prompt_rows as f64 / creep_rows_per_s;
-    // What is left of the prompt's own time once its wait is taken off: none
-    // left, and it is due.
-    let due = (1.0 - waited.as_secs_f64() / prompt_s).max(0.0);
+    // What is left of each prompt's own time once its wait is taken off — none
+    // left, and it is due — and the most due of them.
+    let due = prompts
+        .iter()
+        .filter(|&&(rows, _)| rows > 0)
+        .map(|&(rows, waited)| {
+            let own = rows as f64 / creep_rows_per_s;
+            (1.0 - waited.as_secs_f64() / own).max(0.0)
+        })
+        .fold(1.0f64, f64::min);
     let ratio = prompt_s / decode_s;
     Some((ratio.clamp(1.0 / MAX_RATIO, MAX_RATIO) * due).max(1.0 / MAX_RATIO))
 }
@@ -161,7 +176,8 @@ impl SegmentMean {
 mod tests {
     use super::*;
 
-    const NOW: Duration = Duration::ZERO;
+    /// No prompt has waited.
+    const NOW: &[(usize, Duration)] = &[];
 
     /// The WhiteWorld case: a 1,768-row prompt at 102 rows a second beside a
     /// decode with 245-token runs at 200 ms — 17 s of prompt against 49 s of
@@ -201,7 +217,7 @@ mod tests {
             let mut last = f64::INFINITY;
             for k in 0..=10 {
                 let waited = own.mul_f64(k as f64 / 10.0);
-                let r = high_airtime_ratio(seg, step, rows, rate, waited).unwrap();
+                let r = high_airtime_ratio(seg, step, rows, rate, &[(rows, waited)]).unwrap();
                 assert!(r <= last, "R rose as the prompt waited: {r} after {last}");
                 last = r;
             }
@@ -211,6 +227,46 @@ mod tests {
                 "due at its own time beside {seg}-token runs"
             );
         }
+    }
+
+    /// **One old prompt holds the split only until it is served.** Behind it,
+    /// a steady stream of fresh short prompts is due by its own times, not the
+    /// old one's: with the old prompt in the backlog the split is at its widest
+    /// toward the prompts, and with it gone the split is the backlogs' again —
+    /// whatever the total backlog, however long the stream has been arriving.
+    #[test]
+    fn a_stream_of_fresh_prompts_does_not_pin_the_split() {
+        let (rate, seg, step) = (1_000.0, 250.0, Duration::from_millis(100));
+        // 25 s of decode run; ten fresh 2,000-row prompts, 2 s each alone.
+        let fresh: Vec<(usize, Duration)> = (0..10)
+            .map(|i| (2_000usize, Duration::from_millis(100 * i)))
+            .collect();
+        let old = (4_000usize, Duration::from_secs(60)); // 4 s alone, waited 60 s
+        let mut with_old = fresh.clone();
+        with_old.push(old);
+        let total_with: usize = with_old.iter().map(|p| p.0).sum();
+        let r = high_airtime_ratio(seg, step, total_with, rate, &with_old).unwrap();
+        assert_eq!(r, 1.0 / MAX_RATIO, "the overdue prompt holds the front");
+        let total: usize = fresh.iter().map(|p| p.0).sum();
+        let r = high_airtime_ratio(seg, step, total, rate, &fresh).unwrap();
+        let base = (total as f64 / rate) / (seg * step.as_secs_f64());
+        assert!(
+            r > 1.0 / MAX_RATIO,
+            "the split pinned once the old prompt left: {r}"
+        );
+        // The most-due fresh prompt has waited 0.9 s of its own 2 s.
+        let want = base * (1.0 - 0.9 / 2.0);
+        assert!((r - want).abs() < 1e-9, "R = {r}, want {want}");
+        // Waits short of each prompt's own time are not overdue, however many.
+        let aged: Vec<(usize, Duration)> = fresh
+            .iter()
+            .map(|&(rows, _)| (rows, Duration::from_millis(1_500)))
+            .collect();
+        let r = high_airtime_ratio(seg, step, total, rate, &aged).unwrap();
+        assert!(
+            r > 1.0 / MAX_RATIO,
+            "1.5 s waits on 2 s prompts are not overdue: {r}"
+        );
     }
 
     /// **The clamp and the floor compose.** At the split's full width toward

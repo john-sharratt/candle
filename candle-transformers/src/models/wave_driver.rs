@@ -156,6 +156,14 @@ pub struct WaveGroups<'a> {
 pub trait WaveSweep {
     fn device(&self) -> &Device;
 
+    /// The sequences whose every prefill row the head scores this wave — a
+    /// speculative verify's blocks — where every other prefill span is scored
+    /// at its last row. What the driver maps the head's rows back to members
+    /// by. Empty for a model that never verifies.
+    fn verify_row_seqs(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
     /// Transformer depth — what bounds a wave's layer range. On a hybrid this
     /// is the trunk depth, not the KV-layer count.
     fn num_layers(&self) -> usize;
@@ -930,18 +938,27 @@ fn forward_core<S: WaveSweep + ?Sized>(
             let out = if single.is_empty() {
                 lg
             } else {
-                // Original-prefill index → its logit position (one per row).
-                let mut pre_logit_idx = vec![0usize; n_prefill_in];
-                for (r, &j) in single.iter().enumerate() {
-                    pre_logit_idx[j] = n_decode_in + r;
-                }
-                for (r, &j) in multi.iter().enumerate() {
-                    pre_logit_idx[j] = n_decode + r;
-                }
+                // **Back to the caller's order, each member with all of its
+                // scored rows.** A folded single-token prefill scored its one
+                // row among the decode rows; a multi-token member scored its
+                // last row — or, verifying, every row of its block — after them;
+                // the glue rows trail. Taking one row per member handed a verify
+                // block beside a folded prefill a single row and shifted every
+                // member after it onto another's logits.
+                let verifying = model.verify_row_seqs();
+                let scored: Vec<usize> = (0..n_prefill_in)
+                    .map(|j| {
+                        if verifying.contains(&prefill_seqs[j]) {
+                            pre_lens_in[j]
+                        } else {
+                            1
+                        }
+                    })
+                    .collect();
+                let order = caller_order_rows(n_decode_in, &single, &multi, &scored, lg.len())?;
                 let mut o: Vec<Tensor> = Vec::with_capacity(lg.len());
-                o.extend_from_slice(&lg[0..n_decode_in]);
-                for j in 0..n_prefill_in {
-                    o.push(lg[pre_logit_idx[j]].clone());
+                for rows in order {
+                    o.extend_from_slice(&lg[rows]);
                 }
                 o
             };
@@ -1108,6 +1125,42 @@ pub(crate) struct Segment {
 /// A step's forwards, in layer order: the full-sweep rows alone up to the
 /// creep's window, with the creep across it, alone again after it. Without
 /// full-sweep rows, the creep's window alone.
+/// The head's rows in the caller's order, as ranges of the head's output: the
+/// caller's `n_decode_in` decode rows, then each prefill member's — a folded
+/// single-token member (`single`, scored among the decode rows after the
+/// caller's) one row, a multi-token one (`multi`, after all of those) its
+/// `scored` rows, its last or every row of a verify block — then whatever the
+/// head scored past them, the glue rows. `lg_len` is how many the head
+/// returned; fewer than the members need is refused.
+pub(crate) fn caller_order_rows(
+    n_decode_in: usize,
+    single: &[usize],
+    multi: &[usize],
+    scored: &[usize],
+    lg_len: usize,
+) -> Result<Vec<std::ops::Range<usize>>> {
+    let mut member: Vec<std::ops::Range<usize>> = vec![0..0; scored.len()];
+    for (r, &j) in single.iter().enumerate() {
+        member[j] = n_decode_in + r..n_decode_in + r + 1;
+    }
+    let mut at = n_decode_in + single.len();
+    for &j in multi {
+        member[j] = at..at + scored[j];
+        at += scored[j];
+    }
+    if at > lg_len {
+        candle::bail!(
+            "forward wave: the head scored {lg_len} rows, short of the {at} its decode rows and \
+             prefill spans need"
+        );
+    }
+    let mut out = Vec::with_capacity(scored.len() + 2);
+    out.push(0..n_decode_in);
+    out.extend(member);
+    out.push(at..lg_len);
+    Ok(out)
+}
+
 pub(crate) fn segments(n: usize, cursor: usize, win_end: usize, full: bool) -> Vec<Segment> {
     let seg = |start, end, creep| Segment { start, end, creep };
     if !full {
@@ -1504,6 +1557,26 @@ pub fn drive_step<S: WaveSweep + ?Sized>(
 #[cfg(test)]
 mod step_tests {
     use super::*;
+
+    /// **A verify block beside a folded single-token prefill keeps all its
+    /// rows, and every member after it its own.** The head scores the caller's
+    /// decode rows, the folded prefill among them, then the verify block's
+    /// every row and the prompt's last, then glue; back in the caller's order
+    /// each member takes exactly its scored rows, and the glue still trails.
+    #[test]
+    fn a_verify_block_beside_a_folded_prefill_keeps_its_rows() {
+        // Prefill members in caller order: a 5-token verify block, a 1-token
+        // prefill (folded into the decode rows), a 100-token prompt.
+        let (single, multi) = (vec![1usize], vec![0usize, 2]);
+        let scored = vec![5usize, 1, 1];
+        // Head rows: decode 0 | folded 1 | verify 2..7 | prompt 7 | glue 8.
+        let order = super::caller_order_rows(1, &single, &multi, &scored, 9).unwrap();
+        assert_eq!(order, vec![0..1, 2..7, 1..2, 7..8, 8..9]);
+        let total: usize = order.iter().map(|r| r.len()).sum();
+        assert_eq!(total, 9, "every row the head scored, once");
+        // A head short of what the members need is refused, not misassigned.
+        assert!(super::caller_order_rows(1, &single, &multi, &scored, 7).is_err());
+    }
 
     fn seg(start: usize, end: usize, creep: bool) -> Segment {
         Segment { start, end, creep }

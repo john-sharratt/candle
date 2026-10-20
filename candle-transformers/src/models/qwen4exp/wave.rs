@@ -3341,6 +3341,16 @@ impl WaveSweep for Qwen4ExpBatched {
         &self.model.device
     }
 
+    /// The armed cohort: the head scores every row of a sequence the verify
+    /// capture holds (`SpecCapture::seqs`).
+    fn verify_row_seqs(&self) -> Vec<usize> {
+        self.verify
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.seqs.keys().copied().collect()))
+            .unwrap_or_default()
+    }
+
     fn take_device_fault(&self) -> Result<()> {
         self.model.experts.take_segment_fault(&self.model.device)
     }

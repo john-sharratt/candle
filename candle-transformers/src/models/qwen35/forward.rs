@@ -817,6 +817,10 @@ impl WaveSweep for HybridBatched {
         HybridBatched::device(self)
     }
 
+    fn verify_row_seqs(&self) -> Vec<usize> {
+        HybridBatched::verify_row_seqs(self).unwrap_or_default()
+    }
+
     fn num_layers(&self) -> usize {
         HybridBatched::num_layers(self)
     }

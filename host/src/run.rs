@@ -161,6 +161,10 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
              only loopback callers are served — the `online` command lifts it"
         );
     }
+    // A restart advertises what this card last learned, not nothing
+    // (`phase_ring::keep_learned_rates_at`): until it decodes, a member that
+    // says nothing is placed by power alone.
+    candle_conversation::phase_ring::keep_learned_rates_at(state_dir.join("learned_rates"));
     // A sticky CUDA fault or an unbroken out-of-memory streak kills the
     // context for good; nothing supervises this process, so it relaunches
     // itself (`self_heal.rs`).

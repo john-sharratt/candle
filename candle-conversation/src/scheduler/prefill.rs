@@ -2707,6 +2707,35 @@ impl Scheduler {
         report
     }
 
+    /// Every `High` prompt outstanding — prefilling or still queued — as its
+    /// remaining rows and how long it has waited since it was submitted, for
+    /// the split's per-prompt deadline (`turn_airtime`).
+    pub(super) fn high_prompt_waits(&self) -> Vec<(usize, std::time::Duration)> {
+        let now = Instant::now();
+        let high = |id: SequenceId| self.decode_priority_or_high(id) == DecodePriority::High;
+        self.active_prefills
+            .iter()
+            .filter(|p| p.error.is_none() && p.finished.is_none() && high(p.work.sequence_id))
+            .map(|p| {
+                (
+                    p.work.tokens.len().saturating_sub(p.offset),
+                    now.saturating_duration_since(p.work.submitted_at),
+                )
+            })
+            .chain(
+                self.prefill_queue
+                    .iter()
+                    .filter(|w| high(w.sequence_id))
+                    .map(|w| {
+                        (
+                            w.tokens.len(),
+                            now.saturating_duration_since(w.submitted_at),
+                        )
+                    }),
+            )
+            .collect()
+    }
+
     /// `R` for co-batched work of priority `work`: the decode-to-prefill airtime
     /// ratio of the active foreground decodes that protect themselves from it
     /// ([`throttle_ratio`], `docs/continuous_fair_waves.md` §3). The creep advances `ceil(N / R)`
@@ -2715,27 +2744,6 @@ impl Scheduler {
     ///
     /// Each decode counts at its target layer's `decode_priority`, `High`
     /// where that does not resolve.
-    /// How long the longest-waiting `High` prompt has waited since it was
-    /// submitted — prefilling or still queued — for the split's aging
-    /// (`turn_airtime`). Zero with none.
-    pub(super) fn longest_high_prompt_wait(&self) -> std::time::Duration {
-        let now = Instant::now();
-        let high = |id: SequenceId| self.decode_priority_or_high(id) == DecodePriority::High;
-        self.active_prefills
-            .iter()
-            .filter(|p| p.error.is_none() && p.finished.is_none() && high(p.work.sequence_id))
-            .map(|p| p.work.submitted_at)
-            .chain(
-                self.prefill_queue
-                    .iter()
-                    .filter(|w| high(w.sequence_id))
-                    .map(|w| w.submitted_at),
-            )
-            .map(|at| now.saturating_duration_since(at))
-            .max()
-            .unwrap_or_default()
-    }
-
     pub(super) fn airtime_ratio_over(&self, work: DecodePriority) -> u32 {
         throttle_ratio(
             work,
@@ -4341,7 +4349,7 @@ impl Scheduler {
                     self.decode_only_step?,
                     self.high_backlog_rows,
                     self.creep_airtime.per_s()?,
-                    self.longest_high_prompt_wait(),
+                    &self.high_prompt_waits(),
                 )
             })
             .flatten();
@@ -4766,6 +4774,39 @@ impl Scheduler {
             // one row a finished prefill keeps past this wave.
             let head = stepped.head?;
             let logits = head.logits_on_span();
+            // **The head scores the step's own rows or the step names itself.**
+            // Decode and every verify row first, then each creep member's last
+            // row, then each glue sequence's: a head that returned fewer gave
+            // some of them nobody's logits, and the verify readback fails every
+            // turn in the wave. On BlackWorld (9d69e59c5, 2026-10-20) a step
+            // carrying 1 plain decode, 7 verify blocks (33 rows) and a 16-member
+            // creep scored 18 rows; this is what says which part was dropped.
+            let scored_want = head_rows + members.len() + glue_seqs.len();
+            if logits.len() != scored_want {
+                let blocks: Vec<usize> = verify_inputs
+                    .iter()
+                    .map(|t| t.dims().get(1).copied().unwrap_or(0))
+                    .collect();
+                let creep_rows: Vec<usize> = inputs
+                    .iter()
+                    .map(|t| t.dims().get(1).copied().unwrap_or(0))
+                    .collect();
+                tracing::error!(
+                    target: "candle_conversation::scheduler::prefill",
+                    scored = logits.len(),
+                    want = scored_want,
+                    decode = n_dec,
+                    verify_seqs = ?verify_seqs,
+                    verify_blocks = ?blocks,
+                    creep_members = members.len(),
+                    creep_rows = ?creep_rows,
+                    glue = glue_seqs.len(),
+                    cursor,
+                    win_end,
+                    layers = n,
+                    "the step's head scored a different number of rows than it carried"
+                );
+            }
             let d = head_rows.min(logits.len());
             let creep_end = (d + members.len()).min(logits.len());
             // Timed only when it crept: a sweep finished in one step placed one
