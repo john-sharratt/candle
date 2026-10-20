@@ -83,12 +83,85 @@ impl StepShape {
     }
 }
 
-/// Steps and their wall time by shape, since the census last reported.
+/// What the scheduler thread was doing between steps.
+///
+/// **The wall no step covers, by what covered it.** On BlackWorld (41bd79ae3,
+/// 2026-10-20) heavy-read stepped 19–26 s of every minute with work queued,
+/// and the rest sat inside the decode quantum by the phase timeline — host
+/// work around each step, which nothing named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Activity {
+    /// The loop's drain of new submissions: projection, elevation, gap-fill.
+    Drain,
+    /// Promoting queued prefills and finished ones: the admission passes.
+    Promote,
+    /// Mid-quantum admission: its drain and its admission pass.
+    MidAdmit,
+    /// Continuous re-projection between steps.
+    Reproject,
+    /// Cleaning up finished turns: their seals.
+    Seal,
+    /// Publishing the learned rates: the placed step and the traded width.
+    Rates,
+    /// The gallery keep trade and its eviction pass.
+    Gallery,
+    /// Tool-call stencil injection.
+    Stencil,
+    /// Giving idle recurrent stores back.
+    Park,
+    /// The between-quanta housekeeping block.
+    House,
+    /// Blocked on the request channel with nothing to run.
+    Idle,
+}
+
+const ACTIVITIES: [Activity; 11] = [
+    Activity::Drain,
+    Activity::Promote,
+    Activity::MidAdmit,
+    Activity::Reproject,
+    Activity::Seal,
+    Activity::Rates,
+    Activity::Gallery,
+    Activity::Stencil,
+    Activity::Park,
+    Activity::House,
+    Activity::Idle,
+];
+
+impl Activity {
+    fn label(self) -> &'static str {
+        match self {
+            Activity::Drain => "drain",
+            Activity::Promote => "promote",
+            Activity::MidAdmit => "midadmit",
+            Activity::Reproject => "reproject",
+            Activity::Seal => "seal",
+            Activity::Rates => "rates",
+            Activity::Gallery => "gallery",
+            Activity::Stencil => "stencil",
+            Activity::Park => "park",
+            Activity::House => "house",
+            Activity::Idle => "idle",
+        }
+    }
+
+    fn index(self) -> usize {
+        ACTIVITIES
+            .iter()
+            .position(|&a| a == self)
+            .expect("every activity is listed")
+    }
+}
+
+/// Steps and their wall time by shape, and the activities between them, since
+/// the census last reported.
 #[derive(Debug)]
 pub(super) struct StepCensus {
     since: Instant,
     steps: [u64; SHAPES.len()],
     wall: [Duration; SHAPES.len()],
+    spent: [Duration; ACTIVITIES.len()],
 }
 
 impl Default for StepCensus {
@@ -103,6 +176,7 @@ impl StepCensus {
             since,
             steps: [0; SHAPES.len()],
             wall: [Duration::ZERO; SHAPES.len()],
+            spent: [Duration::ZERO; ACTIVITIES.len()],
         }
     }
 
@@ -112,8 +186,14 @@ impl StepCensus {
         self.wall[i] += took;
     }
 
+    /// File `took` of wall the thread spent on `activity` between steps.
+    pub(super) fn spend(&mut self, activity: Activity, took: Duration) {
+        self.spent[activity.index()] += took;
+    }
+
     /// The census since it last reported, as `shape=steps/ms` for every shape
-    /// that ran and `outside` for the wall no step covered; then start again.
+    /// that ran, `outside` for the wall no step covered, and what of it each
+    /// activity took with `other` the rest; then start again.
     pub(super) fn take(&mut self, now: Instant) -> String {
         let elapsed = now.saturating_duration_since(self.since);
         let stepped: Duration = self.wall.iter().sum();
@@ -130,11 +210,24 @@ impl StepCensus {
                 )
             })
             .collect();
+        let outside = elapsed.saturating_sub(stepped);
         parts.push(format!(
             "outside={}ms of {}ms",
-            elapsed.saturating_sub(stepped).as_millis(),
+            outside.as_millis(),
             elapsed.as_millis()
         ));
+        let spent: Duration = self.spent.iter().sum();
+        let mut around: Vec<String> = ACTIVITIES
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| !self.spent[i].is_zero())
+            .map(|(i, a)| format!("{}={}ms", a.label(), self.spent[i].as_millis()))
+            .collect();
+        around.push(format!(
+            "other={}ms",
+            outside.saturating_sub(spent).as_millis()
+        ));
+        parts.push(format!("around[{}]", around.join(" ")));
         *self = Self::starting(now);
         parts.join(" ")
     }
@@ -159,16 +252,22 @@ mod tests {
     }
 
     #[test]
-    fn the_census_reports_each_shape_and_the_wall_no_step_covered() {
+    fn the_census_reports_each_shape_and_what_covered_the_rest() {
         let t0 = Instant::now();
         let mut c = StepCensus::starting(t0);
         c.record(StepShape::Cobatched, Duration::from_millis(300));
         c.record(StepShape::Cobatched, Duration::from_millis(200));
         c.record(StepShape::DecodeHeld, Duration::from_millis(100));
+        c.spend(Activity::Rates, Duration::from_millis(250));
+        c.spend(Activity::Seal, Duration::from_millis(50));
         let line = c.take(t0 + Duration::from_secs(1));
-        assert_eq!(line, "cob=2/500ms held=1/100ms outside=400ms of 1000ms");
+        assert_eq!(
+            line,
+            "cob=2/500ms held=1/100ms outside=400ms of 1000ms \
+             around[seal=50ms rates=250ms other=100ms]"
+        );
         // And it starts again from the report.
         let line = c.take(t0 + Duration::from_secs(2));
-        assert_eq!(line, "outside=1000ms of 1000ms");
+        assert_eq!(line, "outside=1000ms of 1000ms around[other=1000ms]");
     }
 }

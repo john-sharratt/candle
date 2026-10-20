@@ -58,12 +58,12 @@ use agent::config::AgentConfig;
 use agent::jobs::Jobs;
 use agent::member::{node_in, Agent, APP as AGENT_APP};
 use axum::Router;
-use candle_conversation::phase_ring::{latest_wave, learned_rates};
+use candle_conversation::phase_ring::{latest_wave, learned_rates, rates_read_every};
 use cluster::dispatch::RouteTable;
 use cluster::frame::{BuildId, ModelId, RepoAd};
 use cluster::handshake::GroupKey;
 use cluster::machine::measure;
-use cluster::member::{AppMember, ClusterView, Identity, Link};
+use cluster::member::{AppMember, ClusterView, Identity, Link, CAPACITY_EVERY};
 use cluster::replicate::{CatchupView, Phase, Replication, ReplicationView};
 use cluster::upgrade::runtime::Upgrader;
 use cluster::version::this_build;
@@ -340,6 +340,9 @@ impl Cluster {
         };
         let telemetry = self.telemetry.clone();
         let ready = link.clone();
+        // The capacity frame below is the published rates' one reader: the
+        // scheduler prices them as often as it reads them.
+        rates_read_every(CAPACITY_EVERY);
         let member = AppMember::new(
             Identity {
                 app: link.app.to_string(),

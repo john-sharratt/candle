@@ -515,6 +515,22 @@ pub struct LearnedRates {
 /// The newest [`LearnedRates`] the scheduler published, and when.
 static LEARNED: OnceLock<Mutex<Option<(Instant, LearnedRates)>>> = OnceLock::new();
 
+/// How often the published rates are read, as the reader registered it.
+static RATES_READ_EVERY: OnceLock<Duration> = OnceLock::new();
+
+/// **The rates are read every `period`: price them that often.** Registered
+/// by the reader — a cluster member sends them in its `CAPACITY` frame once a
+/// period — so the scheduler's cadence is the consumer's and not a figure of
+/// its own. The first registration holds.
+pub fn rates_read_every(period: Duration) {
+    let _ = RATES_READ_EVERY.set(period);
+}
+
+/// The period [`rates_read_every`] registered, if a reader has.
+pub fn rates_read_period() -> Option<Duration> {
+    RATES_READ_EVERY.get().copied()
+}
+
 /// Publish what the rate model holds now. The scheduler calls this as it
 /// runs; a reader takes the newest.
 pub fn publish_learned_rates(rates: LearnedRates) {

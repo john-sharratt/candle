@@ -118,6 +118,10 @@ const HIGH_BESIDE_HIGH_RATIO: u32 = 2;
 /// not going to be placed by waiting.
 const MID_SWEEP_RETRIES: u32 = 4;
 
+/// How often the learned rates are logged — and, with no reader registered
+/// (`phase_ring::rates_read_every`), how often they are priced at all.
+const RATES_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The rows a cohort of `rows` that needs `need` bytes of tier and KV shrinks
 /// to, to fit `ground`: scaled by the shortfall and a margin for the staircase
 /// a tier's regions make — or `None` when it already fits, or is one chunk and
@@ -574,28 +578,6 @@ impl Scheduler {
         if self.wave_rate.is_none() {
             return;
         }
-        // **At the width a placed turn would run at, not the width running
-        // now.** A forward streams its experts whatever its width, so the rate
-        // at a narrow width says almost nothing about the card under the load
-        // a placement sends it: on WhiteWorld (359d3bf58, 2026-10-19) a 177-row
-        // width read as 40 tok/s, the gateway priced every turn's prefill at
-        // that, and placed none here through two patterns. So the width is
-        // what this card has waiting to prefill — every admitted prefill's
-        // remaining rows and every queued turn's — and one turn more, at the
-        // gateway's own nominal prompt, up to the width admission would offer.
-        const NOMINAL_PROMPT_ROWS: usize = 2048;
-        let waiting: usize = self
-            .active_prefills
-            .iter()
-            .map(|p| p.work.tokens.len().saturating_sub(p.offset))
-            .chain(self.prefill_queue.iter().map(|w| w.tokens.len()))
-            .sum();
-        let rows = waiting
-            .saturating_add(NOMINAL_PROMPT_ROWS)
-            .min(self.prefill_pass_ceiling().max(1));
-        let rate = self.wave_rate.as_ref().expect("checked above");
-        let (learned, samples, decode_samples) =
-            (rate.learned(rows), rate.samples(), rate.decode_samples());
         // What a placed turn would wait behind: the `High` prompts ahead of it,
         // not the background work it goes ahead of. On WhiteWorld (b4ea6e33b,
         // 2026-10-19) a 68–92K-token backlog of file ingest read as every
@@ -619,6 +601,56 @@ impl Scheduler {
                     .map(|p| p.work.tokens.len()),
             )
             .sum::<usize>() as u64;
+        // **The rate a placed turn's prompt drains at, measured while a `High`
+        // backlog stands** — the backlog it joins and the decodes beside it
+        // included, which the model's forward throughput is not (`high_drain`).
+        // Metered every step, for the airtime split reads the backlog per step.
+        self.high_backlog_rows = high_backlog as usize;
+        // The turn-content forwards since the last tick, before the meter moves
+        // on: they ran under the state the last tick saw.
+        let content = super::TURN_CONTENT_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
+        let since = content.saturating_sub(self.turn_content_seen);
+        self.turn_content_seen = content;
+        self.high_drain.drained(since as usize);
+        let now = Instant::now();
+        self.high_drain.advance(now, high_backlog > 0);
+        // **Priced as often as it is read, never per step.** The figures below
+        // re-trade the cohort and compose its tier for every width they probe;
+        // their one reader takes them once a period (`phase_ring::rates_read_every`),
+        // and with no reader only the minute's log line does. Priced on every
+        // step, the work nobody read sat between the steps: on BlackWorld
+        // (41bd79ae3, 2026-10-20) heavy-read stepped 19–26 s of each minute
+        // with 34–43 s outside any step.
+        let period = super::phase_ring::rates_read_period().unwrap_or(RATES_LOG_EVERY);
+        if self
+            .rates_priced_at
+            .is_some_and(|t| now.duration_since(t) < period)
+        {
+            return;
+        }
+        self.rates_priced_at = Some(now);
+        // **At the width a placed turn would run at, not the width running
+        // now.** A forward streams its experts whatever its width, so the rate
+        // at a narrow width says almost nothing about the card under the load
+        // a placement sends it: on WhiteWorld (359d3bf58, 2026-10-19) a 177-row
+        // width read as 40 tok/s, the gateway priced every turn's prefill at
+        // that, and placed none here through two patterns. So the width is
+        // what this card has waiting to prefill — every admitted prefill's
+        // remaining rows and every queued turn's — and one turn more, at the
+        // gateway's own nominal prompt, up to the width admission would offer.
+        const NOMINAL_PROMPT_ROWS: usize = 2048;
+        let waiting: usize = self
+            .active_prefills
+            .iter()
+            .map(|p| p.work.tokens.len().saturating_sub(p.offset))
+            .chain(self.prefill_queue.iter().map(|w| w.tokens.len()))
+            .sum();
+        let rows = waiting
+            .saturating_add(NOMINAL_PROMPT_ROWS)
+            .min(self.prefill_pass_ceiling().max(1));
+        let rate = self.wave_rate.as_ref().expect("checked above");
+        let (learned, samples, decode_samples) =
+            (rate.learned(rows), rate.samples(), rate.decode_samples());
         // **The step a placed decode would get, not the step of the wave now.**
         // With a cohort held, one more decode re-trades it (`traded_width`):
         // the cohort narrows to what its rows still pay for beside that decode,
@@ -664,18 +696,7 @@ impl Scheduler {
             };
             Some((at(1), at(super::phase_ring::PLACEMENT_WIDE)))
         });
-        // **The rate a placed turn's prompt drains at, measured while a `High`
-        // backlog stands** — the backlog it joins and the decodes beside it
-        // included, which the model's forward throughput is not (`high_drain`).
         // With no backlog standing for long enough to say, the model's figure.
-        self.high_backlog_rows = high_backlog as usize;
-        // The turn-content forwards since the last tick, before the meter moves
-        // on: they ran under the state the last tick saw.
-        let content = super::TURN_CONTENT_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
-        let since = content.saturating_sub(self.turn_content_seen);
-        self.turn_content_seen = content;
-        self.high_drain.drained(since as usize);
-        self.high_drain.advance(Instant::now(), high_backlog > 0);
         let drain = self.high_drain.rate();
         // **Before the drain can say, the width the trade would give.** A
         // pattern's opening burst is placed inside the drain's first seconds,
@@ -755,10 +776,9 @@ impl Scheduler {
         // What this member advertises, once a minute — and that it advertises
         // nothing, which a gateway reads as unlearned: the figure a placement
         // that never sends this card a turn is to be checked against.
-        let now = Instant::now();
         if self
             .rates_logged_at
-            .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(60))
+            .is_none_or(|t| now.duration_since(t) >= RATES_LOG_EVERY)
         {
             self.rates_logged_at = Some(now);
             let ((copy, compute, attend), context, (hit_model, fit)) = self

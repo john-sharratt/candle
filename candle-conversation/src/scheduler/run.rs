@@ -287,6 +287,8 @@ impl Scheduler {
             let _g = profile::span("loop:decode:reproject_first");
             self.drain_pending_reprojections();
         }
+        self.step_census
+            .spend(super::step_census::Activity::Reproject, t_reproj0.elapsed());
         self.wave_stats
             .add_phase(WavePhase::Reproject, t_reproj0.elapsed().as_millis() as u64);
         let deadline = Instant::now() + WAVE_SLICE;
@@ -305,20 +307,22 @@ impl Scheduler {
                 // most likely to be the whole cost, so leaving it unattributed
                 // under-reports the span precisely when it matters.
                 let _g = profile::span("loop:decode:cleanup");
-                self.cleanup_finished();
+                self.timed_cleanup();
                 return;
             }
             // A turn its caller let go of costs nothing more: its prefill leaves
             // before the step, so the step does not sweep it.
             self.withdraw_abandoned_prefills();
-            self.update_gallery_keep();
-            self.publish_learned_rates();
+            self.timed_rates_and_gallery();
             // Inject any pending tool-call static runs (Layer 3) before the
             // decode forward, so a `Static` run costs one prefill rather than N
             // decode steps.  No-op when no sequence has an active stencil.
             {
                 let _g = profile::span("loop:decode:stencil");
+                let t = Instant::now();
                 self.inject_stencil_prefills();
+                self.step_census
+                    .spend(super::step_census::Activity::Stencil, t.elapsed());
             }
             {
                 let _g = profile::span("loop:decode:step");
@@ -391,6 +395,8 @@ impl Scheduler {
                 let _g = profile::span("loop:decode:reproject");
                 self.drain_pending_reprojections();
             }
+            self.step_census
+                .spend(super::step_census::Activity::Reproject, t_reproj.elapsed());
             self.wave_stats
                 .add_phase(WavePhase::Reproject, t_reproj.elapsed().as_millis() as u64);
             if first_finished.is_none() && self.active_decodes.values().any(|s| s.finished) {
@@ -403,7 +409,7 @@ impl Scheduler {
                     .any(|s| s.finished && s.wrote_tool_call);
             if cleanup_due(first_finished, Instant::now(), self.decode_width(), urgent) {
                 let _g = profile::span("loop:decode:cleanup");
-                self.cleanup_finished();
+                self.timed_cleanup();
                 first_finished = None;
             }
             steps += 1;
@@ -415,13 +421,17 @@ impl Scheduler {
             // next step the creep rides with no cohort in flight.
             let admitted = {
                 let _g = profile::span("loop:decode:mid_wave_admit");
-                self.mid_wave_admission()
+                let t = Instant::now();
+                let admitted = self.mid_wave_admission();
+                self.step_census
+                    .spend(super::step_census::Activity::MidAdmit, t.elapsed());
+                admitted
             };
             if !admitted {
                 self.shutdown_requested = true;
                 if first_finished.is_some() {
                     let _g = profile::span("loop:decode:cleanup");
-                    self.cleanup_finished();
+                    self.timed_cleanup();
                 }
                 return;
             }
@@ -435,7 +445,7 @@ impl Scheduler {
             if Instant::now() >= deadline || steps >= MAX_DECODE_STEPS {
                 if first_finished.is_some() {
                     let _g = profile::span("loop:decode:cleanup");
-                    self.cleanup_finished();
+                    self.timed_cleanup();
                 }
                 return;
             }
@@ -719,6 +729,8 @@ impl Scheduler {
             self.batch_drain_gap_fills = false;
             IN_DRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
             let drain_elapsed = t_drain.elapsed();
+            self.step_census
+                .spend(super::step_census::Activity::Drain, drain_elapsed);
             self.wave_stats
                 .add_phase(WavePhase::Drain, drain_elapsed.as_millis() as u64);
             // Non-forward wall clock, and therefore per-forward overhead the planner has
@@ -803,6 +815,8 @@ impl Scheduler {
                 let _g = profile::span("loop:promote_new_prefills");
                 let t_promote = Instant::now();
                 self.promote_new_prefills();
+                self.step_census
+                    .spend(super::step_census::Activity::Promote, t_promote.elapsed());
                 self.wave_stats
                     .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
             }
@@ -825,7 +839,10 @@ impl Scheduler {
 
             // 2c. An idle slot whose last seal is durable gives its recurrent
             // store back (`recurrent_park`).
+            let t_park = Instant::now();
             self.park_durable_states();
+            self.step_census
+                .spend(super::step_census::Activity::Park, t_park.elapsed());
 
             // 3. If idle, block waiting for work. Deferred glue counts as work: the
             // unified wave step scatters it (`take_wave_glue`), so don't block while
@@ -863,6 +880,8 @@ impl Scheduler {
                     match self.rx.recv_timeout(wait) {
                         Ok(req) => req,
                         Err(flume::RecvTimeoutError::Timeout) => {
+                            self.step_census
+                                .spend(super::step_census::Activity::Idle, t_idle.elapsed());
                             self.wave_stats
                                 .add_idle(t_idle.elapsed().as_millis() as u64);
                             continue;
@@ -875,6 +894,8 @@ impl Scheduler {
                         Err(_) => break, // Engine dropped.
                     }
                 };
+                self.step_census
+                    .spend(super::step_census::Activity::Idle, t_idle.elapsed());
                 self.wave_stats
                     .add_idle(t_idle.elapsed().as_millis() as u64);
                 // The handling itself is Requests, not Idle — it is work, and
@@ -905,6 +926,8 @@ impl Scheduler {
                 let t_wait = Instant::now();
                 match self.rx.recv_timeout(wait) {
                     Ok(req) => {
+                        self.step_census
+                            .spend(super::step_census::Activity::Idle, t_wait.elapsed());
                         self.wave_stats
                             .add_idle(t_wait.elapsed().as_millis() as u64);
                         let t_req = Instant::now();
@@ -917,6 +940,8 @@ impl Scheduler {
                         continue;
                     }
                     Err(flume::RecvTimeoutError::Timeout) => {
+                        self.step_census
+                            .spend(super::step_census::Activity::Idle, t_wait.elapsed());
                         self.wave_stats
                             .add_idle(t_wait.elapsed().as_millis() as u64);
                     }
@@ -1102,6 +1127,8 @@ impl Scheduler {
             // Closed BEFORE the flush block: the flush is the window boundary
             // itself, and its own cost is already accounted (eviction/sync carve
             // out of the remainder), so folding it in here would double-count.
+            self.step_census
+                .spend(super::step_census::Activity::House, t_house.elapsed());
             let house_us = t_house.elapsed().as_micros() as u64;
             self.wave_stats.add_housekeeping(house_us);
             self.wave_overhead_us += house_us;
@@ -1425,6 +1452,8 @@ impl Scheduler {
                 let t_wait = Instant::now();
                 match self.rx.recv_timeout(UNADMITTED_RECHECK) {
                     Ok(req) => {
+                        self.step_census
+                            .spend(super::step_census::Activity::Idle, t_wait.elapsed());
                         self.wave_stats
                             .add_idle(t_wait.elapsed().as_millis() as u64);
                         let t_req = Instant::now();
@@ -1436,6 +1465,8 @@ impl Scheduler {
                         }
                     }
                     Err(flume::RecvTimeoutError::Timeout) => {
+                        self.step_census
+                            .spend(super::step_census::Activity::Idle, t_wait.elapsed());
                         self.wave_stats
                             .add_idle(t_wait.elapsed().as_millis() as u64);
                     }
@@ -1460,13 +1491,35 @@ impl Scheduler {
             .add_phase(WavePhase::Decode, t.elapsed().as_millis() as u64);
     }
 
+    /// Clean up finished turns — their seals — filed with the census.
+    fn timed_cleanup(&mut self) {
+        let t = Instant::now();
+        self.cleanup_finished();
+        self.step_census
+            .spend(super::step_census::Activity::Seal, t.elapsed());
+    }
+
+    /// Update the gallery's keep trade and publish the learned rates, each
+    /// filed with the census (`step_census`).
+    fn timed_rates_and_gallery(&mut self) {
+        let t = Instant::now();
+        self.update_gallery_keep();
+        let gallery = t.elapsed();
+        self.publish_learned_rates();
+        self.step_census
+            .spend(super::step_census::Activity::Gallery, gallery);
+        self.step_census.spend(
+            super::step_census::Activity::Rates,
+            t.elapsed().saturating_sub(gallery),
+        );
+    }
+
     /// Run the prefill quantum, attributing its wall-clock to [`WavePhase::Prefill`].
     fn timed_prefill(&mut self) {
         let _g = profile::span("loop:prefill");
         let t = Instant::now();
         self.withdraw_abandoned_prefills();
-        self.update_gallery_keep();
-        self.publish_learned_rates();
+        self.timed_rates_and_gallery();
         self.run_prefill_until_budget();
         self.wave_stats
             .add_phase(WavePhase::Prefill, t.elapsed().as_millis() as u64);

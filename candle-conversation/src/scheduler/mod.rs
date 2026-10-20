@@ -3693,6 +3693,8 @@ pub(crate) struct Scheduler {
     held_fit_claims: Option<(u64, u64)>,
     /// When the learned rates were last logged (`publish_learned_rates`).
     rates_logged_at: Option<Instant>,
+    /// When the learned rates were last priced (`publish_learned_rates`).
+    rates_priced_at: Option<Instant>,
     /// The `High` backlog's measured drain per wall second — the prefill rate
     /// a member advertises while one stands (`high_drain`).
     high_drain: high_drain::HighDrain,
@@ -4095,6 +4097,7 @@ impl Scheduler {
             gallery_evicted_at: None,
             held_fit_claims: None,
             rates_logged_at: None,
+            rates_priced_at: None,
             high_drain: high_drain::HighDrain::default(),
             turn_content_seen: 0,
             stencil_sampled: HashSet::new(),
