@@ -2256,7 +2256,12 @@ not move under it.
 
 **The reload rebuilds the whole substrate**, not one timeline. It costs what loading the
 substrate costs at startup, so a rejoin or a cross-gateway takeover costs that member
-one load. The second case needs the gateways to disagree about which members are
+one load. It runs on a live substrate, so every turn is put at the position the log
+gives it, not appended (`Substrate::reload_turn`): a turn the log puts where it already
+is stays there with its resident K/V; one the log does not hold yet stays as it is; one a
+rerank displaced takes a fresh residence, and the displaced K/V is released once no
+working set holds it. Appending instead duplicated every timeline's turns at indices no
+chunk is keyed by (`.5`, 2026-10-20). The second case needs the gateways to disagree about which members are
 connected, and it is rare. The status page counts reloads and their cause (§12.2).
 
 VFS events are keyed by origin (§6.2) and follow the same order.

@@ -140,6 +140,49 @@ fn a_runtime_reload_leaves_a_tombstoned_timeline_alone() {
     );
 }
 
+/// **A runtime reload leaves every timeline the turns it holds.** The replay
+/// appended each declared turn after the ones already there, so a two-turn
+/// timeline came back with four, the copies at indices no chunk is keyed by.
+/// On `.5` (2026-10-20) a gateway restart's rejoin reloaded the live substrate,
+/// and every heavy-read projection then selected turns 2–5 of seven shared
+/// timelines that hold two or three — `cold-load found no chunks`, withdrawn
+/// from every prompt for 70 minutes.
+#[test]
+fn a_runtime_reload_leaves_every_timeline_its_turns() {
+    const TL: u64 = 0x5000_0003;
+    let dir = TempDir::new().unwrap();
+    {
+        let mut substrate = Substrate::new();
+        let mut sp =
+            SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+        write_turn(&mut sp, TL, 0, 0, 10);
+        write_turn(&mut sp, TL, 1, 0, 20);
+        sp.commit().unwrap();
+    }
+    let (conv, _) = open(&dir);
+    let tl = TimelineId::from_raw(TL).unwrap();
+    let residences = |conv: &Conversation| {
+        let read = conv.read();
+        (0..read.turn_count(tl))
+            .map(|i| read.turn_residence(tl, TurnIndex(i)))
+            .collect::<Vec<_>>()
+    };
+    let before = residences(&conv);
+    assert_eq!(before.len(), 2);
+
+    conv.reconstruct_from_log(1, None).unwrap();
+    conv.reconstruct_from_log(1, None).unwrap();
+    assert_eq!(conv.read().turn_count(tl), 2, "the reload appended copies");
+    assert_eq!(
+        residences(&conv),
+        before,
+        "a turn the log still puts at its index keeps the residence its K/V is in"
+    );
+    for i in 0..2 {
+        assert_eq!(conv.read().token_ids_of(tl, TurnIndex(i)), vec![7, 8]);
+    }
+}
+
 /// **A distilled turn's shed records are absent, not corrupt**, and it comes
 /// back with no cold tier: selection must never be offered K/V that
 /// compaction shed.

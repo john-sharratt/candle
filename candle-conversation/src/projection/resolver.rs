@@ -65,8 +65,8 @@ use crate::provenance::{
 };
 use crate::scheduler::profile;
 use crate::substrate::{
-    ContentResolver, IndexPage, ProjectionScores, ResidenceIndex, StoredSequence, Substrate,
-    SubstrateRead, SubstrateWrite, TreeNodeMeta, TurnPartWrite, TurnStream,
+    ContentResolver, IndexPage, ProjectionScores, ResidenceIndex, RestoredTurn, StoredSequence,
+    Substrate, SubstrateRead, SubstrateWrite, TreeNodeMeta, TurnPartWrite, TurnStream,
 };
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
@@ -2871,7 +2871,11 @@ impl Conversation {
         ) {
             view.register_timeline(timeline, layer, group);
         }
-        view.restore_gap_turn(timeline);
+        // Its position, as a gap, unless something holds it already: a runtime
+        // reload finds the gap a live adoption left there.
+        while view.turn_count(timeline) <= decl.turn_index {
+            view.restore_gap_turn(timeline);
+        }
     }
 
     /// Rebuild the in-RAM [`Substrate`] from the persistence redo log — the
@@ -2967,14 +2971,17 @@ impl Conversation {
                     ) {
                         view.register_timeline(tl, layer, group);
                     }
-                    view.restore_turn(
+                    view.reload_turn(
                         tl,
-                        TurnLayout::new(Vec::new()),
-                        TokenBuffer::default(),
-                        0,
-                        None,
-                        decl.block_start,
-                        decl.block_end,
+                        TurnIndex(decl.turn_index),
+                        RestoredTurn {
+                            layout: TurnLayout::new(Vec::new()),
+                            token_ids: TokenBuffer::default(),
+                            token_count: 0,
+                            cold: None,
+                            block_start: decl.block_start,
+                            block_end: decl.block_end,
+                        },
                     );
                     continue;
                 }
@@ -3136,14 +3143,17 @@ impl Conversation {
                                 ) {
                                     view.register_timeline(timeline, layer, group);
                                 }
-                                view.restore_turn(
+                                view.reload_turn(
                                     timeline,
-                                    TurnLayout::new(Vec::new()),
-                                    TokenBuffer::default(),
-                                    0,
-                                    None,
-                                    decl.block_start,
-                                    decl.block_end,
+                                    TurnIndex(decl.turn_index),
+                                    RestoredTurn {
+                                        layout: TurnLayout::new(Vec::new()),
+                                        token_ids: TokenBuffer::default(),
+                                        token_count: 0,
+                                        cold: None,
+                                        block_start: decl.block_start,
+                                        block_end: decl.block_end,
+                                    },
                                 );
                             }
                         }
@@ -3246,14 +3256,17 @@ impl Conversation {
             // a recoverable-token-only turn (no persisted chunks) —
             // the substrate keeps it discoverable but it stays unable
             // to materialise KV.
-            view.restore_turn(
+            view.reload_turn(
                 timeline,
-                TurnLayout::new(std::mem::take(&mut decl.segments)),
-                TokenBuffer::from(recovered.token_ids),
-                token_count,
-                cold_refs,
-                decl.block_start,
-                decl.block_end,
+                TurnIndex(decl.turn_index),
+                RestoredTurn {
+                    layout: TurnLayout::new(std::mem::take(&mut decl.segments)),
+                    token_ids: TokenBuffer::from(recovered.token_ids),
+                    token_count,
+                    cold: cold_refs,
+                    block_start: decl.block_start,
+                    block_end: decl.block_end,
+                },
             );
             restored += 1;
         }

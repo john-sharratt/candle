@@ -14,7 +14,10 @@
 //! the hot path, so the member reloads (§6.6): [`Substrate::take_reload_due`]
 //! says when.
 
-use super::{StoredSequence, Substrate, TimelineId, TokenBuffer, TurnIndex, TurnLayout};
+use super::{
+    turn_stream_id, ResidenceIndex, StoredSequence, Substrate, TimelineId, TokenBuffer, TurnIndex,
+    TurnLayout,
+};
 
 /// A turn's content as its records hold it — what a reload or an adoption
 /// restores.
@@ -97,6 +100,96 @@ impl Substrate {
         );
         self.gallery_epoch += 1;
         true
+    }
+
+    /// Put `turn` at `index` of `timeline` as a reload reads it from the log,
+    /// whatever the timeline holds already: a reload runs on a live substrate
+    /// as well as on an empty one.
+    ///
+    /// - A gap there, or no turn yet, is [`Self::place_turn`].
+    /// - **The same turn there stays where it is**, its residence and the hot
+    ///   and warm K/V in it untouched, and takes the cold references the log
+    ///   now holds for it if it has none: a turn sealed before the reload and
+    ///   written since is the case that needs them.
+    /// - **A different turn there replaces it** — a turn ranked below one this
+    ///   member held moved it up (§6.6). It takes a fresh residence: the old
+    ///   one holds the displaced turn's K/V, and a live slot may still attend
+    ///   it, so it is never rewritten under one. Its hot and warm copies are
+    ///   dropped now when no working set pins it, and otherwise left to the
+    ///   tiers' own eviction once the slot lets it go.
+    /// - A log that holds no tokens for the turn is behind the live turn, not
+    ///   different from it — a turn sealed moments before the reload whose
+    ///   records are still queued — and the live turn stays.
+    ///
+    /// Restored by appending instead, every turn a timeline held came back a
+    /// second time above the first, at indices no chunk is keyed by (`.5`,
+    /// 2026-10-20: a rejoin's reload, then 70 minutes of `cold-load found no
+    /// chunks` on every projection that selected them).
+    pub fn reload_turn(&mut self, timeline: TimelineId, index: TurnIndex, turn: RestoredTurn) {
+        if !self.holds_turn(timeline, index) {
+            self.place_turn(timeline, index, turn);
+            return;
+        }
+        let entry = self
+            .timelines
+            .get(&timeline)
+            .and_then(|tl| tl.turns.get(&index))
+            .expect("a held turn has an entry");
+        let same = turn.token_ids.is_empty()
+            || (entry.content.token_ids[..] == turn.token_ids[..]
+                && entry.block_range == (turn.block_start, turn.block_end));
+        let residence = if same {
+            entry.content.residence
+        } else {
+            self.replace_turn_content(timeline, index, &turn)
+        };
+        if self.residence[residence.0].cold.is_none() {
+            if let Some(cold) = turn.cold.filter(|c| !c.is_empty()) {
+                if self.residence[residence.0].byte_size == 0 {
+                    self.residence[residence.0].byte_size = cold
+                        .iter()
+                        .flat_map(|s| s.chunks.iter())
+                        .map(|c| c.record_len)
+                        .sum();
+                }
+                self.install_cold(residence, cold);
+            }
+        }
+        self.gallery_epoch += 1;
+    }
+
+    /// Give the turn at `index` of `timeline` `turn`'s content in a fresh
+    /// residence, and release the displaced one's hot and warm copies unless a
+    /// working set pins it ([`Self::reload_turn`]). Returns the new residence.
+    fn replace_turn_content(
+        &mut self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        turn: &RestoredTurn,
+    ) -> ResidenceIndex {
+        let compression = self.timeline_compression.get(&timeline).copied();
+        let fresh = self.alloc_residence(turn_stream_id(timeline.raw(), index.0), compression);
+        let entry = self
+            .timelines
+            .get_mut(&timeline)
+            .and_then(|tl| tl.turns.get_mut(&index))
+            .expect("a held turn has an entry");
+        let displaced = std::mem::replace(&mut entry.content.residence, fresh);
+        let previous = entry.content.token_count;
+        entry.block_range = (turn.block_start, turn.block_end);
+        entry.content.layout = turn.layout.clone();
+        entry.content.token_ids = turn.token_ids.clone();
+        entry.content.token_count = turn.token_count;
+        let total = self.timeline_token_totals.entry(timeline).or_default();
+        *total = total.saturating_sub(previous) + turn.token_count;
+        if !self.working_set_pins.contains(&displaced) {
+            let slot = &mut self.residence[displaced.0];
+            slot.hot = None;
+            slot.warm = None;
+            Self::remove_from_lru(&mut self.hot_lru, displaced);
+            Self::remove_from_lru(&mut self.warm_lru, displaced);
+        }
+        fresh
     }
 
     /// Install `turn` in the gap at `index` — the placeholder's entry and
@@ -183,6 +276,80 @@ mod tests {
         assert_eq!(tokens(&sub, tl), vec![vec![], vec![3], vec![5, 6]]);
         assert!(sub.holds_turn(tl, TurnIndex(1)) && !sub.is_gap_turn(tl, TurnIndex(1)));
         assert_eq!(sub.timeline_token_total(tl), 3);
+    }
+
+    /// Mark `tl`'s turn `i` as resident hot and warm, as a slot borrowing it
+    /// finds it; return its residence.
+    fn resident(sub: &mut Substrate, tl: TimelineId, i: u32) -> ResidenceIndex {
+        let r = sub.turn_residence(tl, TurnIndex(i)).unwrap();
+        sub.residence[r.0].hot = Some(Vec::new());
+        sub.residence[r.0].warm = Some(Vec::new());
+        sub.hot_lru.push_front(r);
+        sub.warm_lru.push_front(r);
+        r
+    }
+
+    /// **The same turn, reloaded, stays where a live slot reads it**: the
+    /// timeline keeps its count, and the turn its residence and the hot and
+    /// warm K/V in it.
+    #[test]
+    fn a_reloaded_turn_keeps_its_residence_and_its_kv() {
+        let (mut sub, tl) = timeline();
+        sub.place_turn(tl, TurnIndex(0), turn(&[1, 2]));
+        sub.place_turn(tl, TurnIndex(1), turn(&[3]));
+        let r = resident(&mut sub, tl, 1);
+
+        sub.reload_turn(tl, TurnIndex(0), turn(&[1, 2]));
+        sub.reload_turn(tl, TurnIndex(1), turn(&[3]));
+        assert_eq!(tokens(&sub, tl), vec![vec![1, 2], vec![3]]);
+        assert_eq!(sub.turn_residence(tl, TurnIndex(1)), Some(r));
+        assert!(sub.residence[r.0].hot.is_some() && sub.residence[r.0].warm.is_some());
+        assert_eq!(sub.timeline_token_total(tl), 3);
+    }
+
+    /// A log that holds no tokens for a live turn is behind it: the live turn
+    /// stays as it is.
+    #[test]
+    fn a_log_behind_the_live_turn_leaves_it() {
+        let (mut sub, tl) = timeline();
+        sub.place_turn(tl, TurnIndex(0), turn(&[4, 5]));
+        let r = resident(&mut sub, tl, 0);
+        sub.reload_turn(tl, TurnIndex(0), turn(&[]));
+        assert_eq!(tokens(&sub, tl), vec![vec![4, 5]]);
+        assert_eq!(sub.turn_residence(tl, TurnIndex(0)), Some(r));
+        assert!(sub.residence[r.0].hot.is_some());
+    }
+
+    /// **A turn moved by a rerank takes a fresh residence**; the displaced
+    /// turn's K/V is released when no working set holds it, and left for the
+    /// tiers' eviction while one does.
+    #[test]
+    fn a_reranked_turn_takes_a_fresh_residence() {
+        let (mut sub, tl) = timeline();
+        sub.place_turn(tl, TurnIndex(0), turn(&[1]));
+        sub.place_turn(tl, TurnIndex(1), turn(&[2, 2]));
+        let free = resident(&mut sub, tl, 0);
+        let held = resident(&mut sub, tl, 1);
+        sub.working_set_pins.insert(held);
+
+        sub.reload_turn(tl, TurnIndex(0), turn(&[9]));
+        sub.reload_turn(tl, TurnIndex(1), turn(&[8, 8, 8]));
+        assert_eq!(tokens(&sub, tl), vec![vec![9], vec![8, 8, 8]]);
+        assert_eq!(sub.timeline_token_total(tl), 4);
+        let (now_0, now_1) = (
+            sub.turn_residence(tl, TurnIndex(0)).unwrap(),
+            sub.turn_residence(tl, TurnIndex(1)).unwrap(),
+        );
+        assert!(now_0 != free && now_1 != held);
+        assert!(sub.residence[now_0.0].hot.is_none() && sub.residence[now_1.0].hot.is_none());
+        assert!(
+            sub.residence[free.0].hot.is_none() && sub.residence[free.0].warm.is_none(),
+            "an unpinned displaced turn's K/V is released"
+        );
+        assert!(
+            sub.residence[held.0].hot.is_some(),
+            "a pinned one stays for the slot attending it"
+        );
     }
 
     /// A position a turn already holds is refused, and nothing changes.
