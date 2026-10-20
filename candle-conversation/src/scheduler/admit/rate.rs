@@ -600,6 +600,10 @@ struct DecodeFit {
     /// by every price after it — the trade prices the decode side many times
     /// a pass, and the fit changes only when it learns.
     cached: Option<Result<[f64; 5], FitWhy>>,
+    /// The fewest and most misses its steps have had, each drawn toward their
+    /// mean by the weight the sums lose — so an extreme fades with the steps
+    /// that set it. `None` before the first.
+    miss_range: Option<(f64, f64)>,
 }
 
 /// Why the decode fit gave no answer, for the line that reports it.
@@ -638,6 +642,14 @@ impl DecodeFit {
         }
         self.tt = self.tt * keep + t * t;
         self.n += 1;
+        let mean = self.xx[0][1] / self.xx[0][0].max(f64::MIN_POSITIVE);
+        self.miss_range = Some(match self.miss_range {
+            Some((lo, hi)) => (
+                m.min(mean - (mean - lo) * keep),
+                m.max(mean + (hi - mean) * keep),
+            ),
+            None => (m, m),
+        });
         self.cached = Some(self.compute());
     }
 
@@ -730,6 +742,18 @@ impl DecodeFit {
     /// What the fit has seen, for the line that reports it: its steps and the
     /// spread of each column — the standard deviation of `m`, `q`, `r` and
     /// `p` (`q` and `p` in millions) over the weight it holds.
+    /// The misses the fit has seen steps at, fewest to most (`miss_range`); a
+    /// fit restored without them spans two standard deviations of its mean.
+    fn miss_support(&self) -> (f64, f64) {
+        if let Some(range) = self.miss_range {
+            return range;
+        }
+        let w = self.xx[0][0].max(f64::MIN_POSITIVE);
+        let mean = self.xx[0][1] / w;
+        let sd = (self.xx[1][1] / w - mean * mean).max(0.0).sqrt();
+        ((mean - 2.0 * sd).max(0.0), mean + 2.0 * sd)
+    }
+
     fn spread(&self) -> (u64, [f64; 4]) {
         let w = self.xx[0][0].max(f64::MIN_POSITIVE);
         let sd = |i: usize| {
@@ -1303,7 +1327,25 @@ impl WaveRate {
                 // decodes at the mean context a decode row has attended.
                 let decodes = routed as f64 / self.experts_per_decode(0).max(1) as f64;
                 let depth = self.decode_fit.depth().unwrap_or(0.0);
-                a + b * self.decode_misses(routed, resident) + depth * decodes * self.decode_context
+                let m = self.decode_misses(routed, resident);
+                // **The slope where the steps taught it, the link beyond.** A
+                // fit learned over a narrow spread of misses says what a miss
+                // costs there and nothing far from it: restored on WhiteWorld
+                // (71b3b203a, 2026-10-20) from steps a miss or so apart, its
+                // slope priced one idle decode at 177 ms. Past the misses it saw,
+                // the step moves from the nearest it saw by what a miss costs the
+                // link — a slot over the copy rate learned.
+                let (lo, hi) = self.decode_fit.miss_support();
+                let per_miss = self.geometry.slot_bytes as f64 / self.bw_bytes_per_s.max(1.0);
+                let fitted = |m: f64| a + b * m;
+                let misses_part = if m < lo {
+                    (fitted(lo) - per_miss * (lo - m)).max(a)
+                } else if m > hi {
+                    fitted(hi) + per_miss * (m - hi)
+                } else {
+                    fitted(m)
+                };
+                misses_part + depth * decodes * self.decode_context
             }
             None => self.layer_secs.max(self.decode_copy_secs(routed, resident)),
         };
@@ -2641,6 +2683,9 @@ impl WaveRate {
             row(&d.xx.concat()),
             row(&d.xt)
         ));
+        if let Some((lo, hi)) = d.miss_range {
+            out.push_str(&format!("miss_range {lo} {hi}\n"));
+        }
         out
     }
 
@@ -2727,6 +2772,9 @@ impl WaveRate {
             }
             d.xt[i] = dfit[27 + i];
         }
+        d.miss_range = nums("miss_range")
+            .filter(|v| v.len() == 2 && v.iter().all(|x| x.is_finite()))
+            .map(|v| (v[0], v[1]));
         d.cached = Some(d.compute());
         true
     }
@@ -2968,6 +3016,35 @@ mod tests {
         assert!(approx(aa, a, 1e-6) && approx(ab, b, 1e-6) && ac == 0.0 && ad == 0.0);
     }
 
+    /// **A slope where it was taught, the link's beyond.** Taught on steps a
+    /// miss or so apart, a fit's slope says nothing of a step twenty misses
+    /// away: there the step moves from the nearest it saw by what a miss costs
+    /// the link, so a slope the data barely set cannot price a far width.
+    #[test]
+    fn a_fit_prices_far_misses_by_the_link_not_its_slope() {
+        let mut p = planner_learned(LINK_4090_MOBILE, BW_RUN15);
+        let (a, b) = (0.25e-3, 2e-3);
+        for round in 0..60 {
+            let m = 10.0 + (round % 3) as f64 * 0.5;
+            p.decode_fit.observe(m, 0.0, 0.0, 0.0, a + b * m, 0.05);
+        }
+        let (lo, hi) = p.decode_fit.miss_support();
+        assert!(lo > 9.0 && hi < 12.0, "taught at 10–11: {lo}..{hi}");
+        let per_miss = ExpertGeometry::QWEN36_35B_A3B.slot_bytes as f64 / p.effective_bytes_per_s();
+        // Find a width and residency whose misses land far above the band.
+        let resident = 0;
+        let routed = 256;
+        let m = p.decode_misses(routed, resident);
+        assert!(m > hi + 50.0, "{m}");
+        let priced = p.decode_step_secs(routed, resident) / LAYERS;
+        let expect = a + b * hi + per_miss * (m - hi);
+        assert!(
+            approx(priced, expect, 1e-6),
+            "priced {priced} against {expect}"
+        );
+        assert!(priced < a + b * m, "the slope would have priced it dearer");
+    }
+
     /// **What a run learned, a restart starts from.** A model taught its card
     /// and kept as text prices the same steps once read back into a fresh
     /// one — and one learned on another model's geometry is refused, leaving
@@ -3040,12 +3117,14 @@ mod tests {
         assert!(approx(depth, e, 1e-5), "e {depth}");
     }
 
-    /// **A fit learned at a few decodes prices twenty-four at what they cost.**
+    /// **A fit prices twenty-four decodes at what their distinct experts cost.**
     /// The card's per-layer time is its fixed part plus a cost per distinct
-    /// expert it fetched; taught at one to six decodes over a spread of
+    /// expert it fetched; taught at one to thirty-two decodes over a spread of
     /// residencies, the fit's step at twenty-four — whose 192 picks share down
     /// to about 136 experts — lands on that truth, where counting the picks
-    /// would have read 40% more misses at the width a placement prices.
+    /// would have read 40% more misses at the width a placement prices. (Far
+    /// outside the widths it was taught at, the link prices instead:
+    /// `a_fit_prices_far_misses_by_the_link_not_its_slope`.)
     #[test]
     fn a_decode_fit_extrapolates_by_distinct_experts_not_picks() {
         let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
@@ -3056,7 +3135,7 @@ mod tests {
             (a + b * m) * LAYERS
         };
         for round in 0..40 {
-            for decodes in 1..=6usize {
+            for decodes in (1..=32usize).step_by(3) {
                 let share = 0.3 + 0.1 * ((round + decodes) % 5) as f64;
                 let resident = (total as f64 * share) as u64;
                 let secs = truth(&p, decodes, resident);

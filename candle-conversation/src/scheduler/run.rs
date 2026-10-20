@@ -920,6 +920,14 @@ impl Scheduler {
                             if self.wave_rate.is_none() {
                                 self.wave_rate = self.take_planner();
                             }
+                            // **The zone grows back while idle too.** Nothing
+                            // forwards to ask for the ground the KV side is not
+                            // using, so an idle card stood at what its last wave
+                            // left it: WhiteWorld (71b3b203a, 2026-10-20) a third
+                            // of its experts resident with nothing running, and
+                            // one decode more priced at 177 ms. Between forwards
+                            // is where the boundary may move.
+                            self.model.reclaim_spare_ground();
                             // Priced as the idle card it is: the residency the
                             // zone holds now, nothing charged (`settle_idle`).
                             if let (Some(rate), Some(zone)) = (
