@@ -681,20 +681,27 @@ impl Scheduler {
                 return None;
             }
             let zone = super::interleave::effective_weight_zone_bytes(0)?;
+            let weights_at = self.memo_weights(&q_lens, &offsets, &seqs, zone);
             // One decode more, and a burst's width more: what the gateway
-            // extrapolates the step from as it places turns here.
-            let at = |more| {
-                r.placed_decode_step_ms_with(
+            // extrapolates the step from as it places turns here, each searched
+            // from the width it traded to last time.
+            let at = |more, hint| {
+                r.placed_decode_step_near(
+                    hint,
                     self.decode_width(),
                     more,
                     full,
                     super::admit_ground::PREFILL_MIN_ADVANCE,
                     CHUNK_SIZE,
                     q_lens.len() as f64,
-                    |rows| self.weights_at_width(&q_lens, &offsets, &seqs, zone, rows),
+                    &weights_at,
                 )
             };
-            Some((at(1), at(super::phase_ring::PLACEMENT_WIDE)))
+            let [_, one_hint, wide_hint] = self.rates_width_hints;
+            Some((
+                at(1, one_hint),
+                at(super::phase_ring::PLACEMENT_WIDE, wide_hint),
+            ))
         });
         // With no backlog standing for long enough to say, the model's figure.
         let drain = self.high_drain.rate();
@@ -733,7 +740,7 @@ impl Scheduler {
             offsets.push(r.context_per_row() as usize);
             seqs.push(usize::MAX);
             let zone = super::interleave::effective_weight_zone_bytes(0)?;
-            let weights_at = |w| self.weights_at_width(&q_lens, &offsets, &seqs, zone, w);
+            let weights_at = self.memo_weights(&q_lens, &offsets, &seqs, zone);
             let stage = self.decode_stage();
             let decode_rows: usize = stage.iter().map(|&(_, _, b)| b.max(1)).sum();
             let decode_pairs: f64 = stage
@@ -749,7 +756,8 @@ impl Scheduler {
                 .map(|(&q, &o)| q as f64 * (o as f64 + q as f64 / 2.0))
                 .sum::<f64>()
                 / cohort_rows.max(1) as f64;
-            let rate = r.placed_prefill_tok_s(
+            let (rate, width) = r.placed_prefill_near(
+                self.rates_width_hints[0],
                 rows,
                 super::admit_ground::PREFILL_MIN_ADVANCE,
                 CHUNK_SIZE,
@@ -760,8 +768,16 @@ impl Scheduler {
                 decode_pairs,
                 weights_at,
             );
-            (rate > 0.0).then_some(rate)
+            Some((rate, width))
         });
+        // The widths the trades settled at, each the next pricing's start.
+        self.rates_width_hints = [
+            traded.map(|(_, w)| w),
+            placed_step.map(|((_, w), _)| w),
+            placed_step.map(|(_, (_, w))| w),
+        ];
+        let traded = traded.map(|(rate, _)| rate).filter(|&rate| rate > 0.0);
+        let placed_step = placed_step.map(|((one, _), (wide, _))| (one, wide));
         let learned = learned.map(|r| super::phase_ring::LearnedRates {
             prefill_tok_s: drain.or(traded).unwrap_or(r.prefill_tok_s),
             high_backlog_tokens: high_backlog,
@@ -886,6 +902,44 @@ impl Scheduler {
         zone: u64,
         rows: usize,
     ) -> u64 {
+        self.weights_at_width_beside(q_lens, offsets, seqs, zone, rows, &self.decode_stage())
+    }
+
+    /// [`Self::weights_at_width`] for one cohort at every width a search asks
+    /// about, each width composed once: a trade's search re-asks the widths
+    /// beside each probe and the searches after it re-ask the same ones, and
+    /// each answer is a tier carved over every layer of every sequence — on
+    /// BlackWorld (036bc5cd3, 2026-10-20) one pricing of the rates took about
+    /// 330 ms of it at 150K depth.
+    fn memo_weights<'s>(
+        &'s self,
+        q_lens: &'s [usize],
+        offsets: &'s [usize],
+        seqs: &'s [usize],
+        zone: u64,
+    ) -> impl Fn(usize) -> u64 + 's {
+        let stage = self.decode_stage();
+        let memo = std::cell::RefCell::new(std::collections::HashMap::new());
+        move |rows| {
+            if let Some(&w) = memo.borrow().get(&rows) {
+                return w;
+            }
+            let w = self.weights_at_width_beside(q_lens, offsets, seqs, zone, rows, &stage);
+            memo.borrow_mut().insert(rows, w);
+            w
+        }
+    }
+
+    /// [`Self::weights_at_width`] beside a decode stage the caller built.
+    fn weights_at_width_beside(
+        &self,
+        q_lens: &[usize],
+        offsets: &[usize],
+        seqs: &[usize],
+        zone: u64,
+        rows: usize,
+        stage: &[(usize, usize, usize)],
+    ) -> u64 {
         let shares = super::admission::share_within(q_lens, rows, CHUNK_SIZE);
         let mut adv = Vec::new();
         let mut off = Vec::new();
@@ -906,7 +960,7 @@ impl Scheduler {
                 &adv,
                 &off,
                 &sq,
-                &self.decode_stage(),
+                stage,
                 self.session.activation_dtype(),
             )
             .unwrap_or(0);

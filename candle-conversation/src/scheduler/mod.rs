@@ -3695,6 +3695,10 @@ pub(crate) struct Scheduler {
     rates_logged_at: Option<Instant>,
     /// When the learned rates were last priced (`publish_learned_rates`).
     rates_priced_at: Option<Instant>,
+    /// The widths the last pricing's three trades settled at — the placed
+    /// prefill's, one decode more's, a burst's — each the next one's start
+    /// (`WaveRate::traded_width_near`).
+    rates_width_hints: [Option<usize>; 3],
     /// The `High` backlog's measured drain per wall second — the prefill rate
     /// a member advertises while one stands (`high_drain`).
     high_drain: high_drain::HighDrain,
@@ -4098,6 +4102,7 @@ impl Scheduler {
             held_fit_claims: None,
             rates_logged_at: None,
             rates_priced_at: None,
+            rates_width_hints: [None; 3],
             high_drain: high_drain::HighDrain::default(),
             turn_content_seen: 0,
             stencil_sampled: HashSet::new(),

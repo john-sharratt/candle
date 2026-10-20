@@ -488,6 +488,70 @@ enum Unsolved {
     /// They did, and the answer was not a cost: noise, or a stalled forward.
     Unphysical,
 }
+/// The largest index in `[lo, hi]` that `pays`, the indices that pay being a
+/// prefix of the range; `None` when none does. With a `hint` the search
+/// gallops out from it and bisects only the bracket it finds, so an answer at
+/// or beside the hint costs a probe or two.
+fn largest_paying(
+    lo: usize,
+    hi: usize,
+    hint: Option<usize>,
+    mut pays: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    if lo > hi {
+        return None;
+    }
+    // A bracket: `ok` pays (or is none), every index above `bad` does not.
+    let (mut ok, mut bad): (Option<usize>, usize) = (None, hi + 1);
+    if let Some(h) = hint.map(|h| h.clamp(lo, hi)) {
+        if pays(h) {
+            ok = Some(h);
+            let mut step = 1;
+            loop {
+                let next = h.saturating_add(step);
+                if next > hi {
+                    break;
+                }
+                if pays(next) {
+                    ok = Some(next);
+                    step *= 2;
+                } else {
+                    bad = next;
+                    break;
+                }
+            }
+        } else {
+            bad = h;
+            let mut step = 1;
+            loop {
+                if h < lo + step {
+                    break;
+                }
+                let next = h - step;
+                if pays(next) {
+                    ok = Some(next);
+                    break;
+                }
+                bad = next;
+                step *= 2;
+            }
+        }
+    }
+    // Bisect strictly between the bracket's ends.
+    let mut a = ok.map_or(lo, |o| o + 1);
+    let mut b = bad;
+    while a < b {
+        let mid = a + (b - a) / 2;
+        if pays(mid) {
+            ok = Some(mid);
+            a = mid + 1;
+        } else {
+            b = mid;
+        }
+    }
+    ok
+}
+
 /// The hit rate at resident `fraction` of the model under exponent `gamma`:
 /// none with nothing resident, all with everything.
 fn hit_at(fraction: f64, gamma: f64) -> f64 {
@@ -1379,12 +1443,42 @@ impl WaveRate {
         routed: usize,
         weights_at: impl Fn(usize) -> u64,
     ) -> usize {
+        self.traded_width_near(
+            None,
+            full,
+            least,
+            chunk,
+            prefill_weight,
+            decodes,
+            routed,
+            weights_at,
+        )
+    }
+
+    /// [`Self::traded_width`], searched outward from `hint` — the width the
+    /// same question was last answered at. The answer is the same; a cohort
+    /// that has barely moved since is found in a probe or two rather than a
+    /// whole bisection, each probe being two tiers composed over every layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn traded_width_near(
+        &self,
+        hint: Option<usize>,
+        full: usize,
+        least: usize,
+        chunk: usize,
+        prefill_weight: f64,
+        decodes: usize,
+        routed: usize,
+        weights_at: impl Fn(usize) -> u64,
+    ) -> usize {
         let least = least.min(full);
         if decodes == 0 || !self.decode_learned() || full <= least {
             return full;
         }
         let chunk = chunk.max(1);
-        let pays = |rows: usize| {
+        let rows_at = |i: usize| (i * chunk).min(full);
+        let pays = |i: usize| {
+            let rows = rows_at(i);
             let before = rows.saturating_sub(chunk);
             self.trade_net(
                 before,
@@ -1397,21 +1491,9 @@ impl WaveRate {
                 routed,
             ) > 1e-12
         };
-        let (mut lo, mut hi) = (least.div_ceil(chunk), full.div_ceil(chunk));
-        let mut width = least;
-        while lo <= hi {
-            let mid = (lo + hi) / 2;
-            let rows = (mid * chunk).min(full);
-            if pays(rows) {
-                width = rows;
-                lo = mid + 1;
-            } else if mid == 0 {
-                break;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        width
+        let (lo, hi) = (least.div_ceil(chunk), full.div_ceil(chunk));
+        let hint = hint.map(|h| h.div_ceil(chunk));
+        largest_paying(lo, hi, hint, pays).map_or(least, rows_at)
     }
 
     /// The decode step a decode placed beside a held cohort would get, in
@@ -1437,6 +1519,7 @@ impl WaveRate {
     /// [`Self::placed_decode_step_ms`] for `more` decodes placed at once — the
     /// step a burst of them would get, each routing its own experts and the
     /// cohort re-traded against all of them.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn placed_decode_step_ms_with(
         &self,
@@ -1448,9 +1531,38 @@ impl WaveRate {
         prefill_weight: f64,
         weights_at: impl Fn(usize) -> u64,
     ) -> f64 {
+        self.placed_decode_step_near(
+            None,
+            decodes,
+            more,
+            full,
+            least,
+            chunk,
+            prefill_weight,
+            weights_at,
+        )
+        .0
+    }
+
+    /// [`Self::placed_decode_step_ms_with`] with the trade searched from
+    /// `hint` ([`Self::traded_width_near`]), and the width it traded to — the
+    /// next search's hint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn placed_decode_step_near(
+        &self,
+        hint: Option<usize>,
+        decodes: usize,
+        more: usize,
+        full: usize,
+        least: usize,
+        chunk: usize,
+        prefill_weight: f64,
+        weights_at: impl Fn(usize) -> u64,
+    ) -> (f64, usize) {
         let decodes = decodes + more;
         let routed = self.routed_for(decodes);
-        let width = self.traded_width(
+        let width = self.traded_width_near(
+            hint,
             full,
             least,
             chunk,
@@ -1459,7 +1571,10 @@ impl WaveRate {
             routed,
             &weights_at,
         );
-        self.decode_step_secs(routed, weights_at(width)) * 1e3
+        (
+            self.decode_step_secs(routed, weights_at(width)) * 1e3,
+            width,
+        )
     }
 
     /// The prefill rate a turn placed here would drain at, in tokens a second,
@@ -1472,6 +1587,7 @@ impl WaveRate {
     /// **At the depth the cohort attends.** Its rows attend `context` positions
     /// each on average and the decodes `decode_pairs` between them, so a deep
     /// prompt is priced as one ([`RateModel::attend_secs_per_pair`]).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn placed_prefill_tok_s(
         &self,
@@ -1485,7 +1601,39 @@ impl WaveRate {
         decode_pairs: f64,
         weights_at: impl Fn(usize) -> u64,
     ) -> f64 {
-        let width = self.traded_width(
+        self.placed_prefill_near(
+            None,
+            full,
+            least,
+            chunk,
+            prefill_weight,
+            decodes,
+            decode_rows,
+            context,
+            decode_pairs,
+            weights_at,
+        )
+        .0
+    }
+
+    /// [`Self::placed_prefill_tok_s`] with the trade searched from `hint`, and
+    /// the width it traded to.
+    #[allow(clippy::too_many_arguments)]
+    pub fn placed_prefill_near(
+        &self,
+        hint: Option<usize>,
+        full: usize,
+        least: usize,
+        chunk: usize,
+        prefill_weight: f64,
+        decodes: usize,
+        decode_rows: usize,
+        context: f64,
+        decode_pairs: f64,
+        weights_at: impl Fn(usize) -> u64,
+    ) -> (f64, usize) {
+        let width = self.traded_width_near(
+            hint,
             full,
             least,
             chunk,
@@ -1499,11 +1647,8 @@ impl WaveRate {
             width as f64 * context + decode_pairs,
             weights_at(width),
         );
-        if secs > 0.0 {
-            width as f64 / secs
-        } else {
-            0.0
-        }
+        let rate = if secs > 0.0 { width as f64 / secs } else { 0.0 };
+        (rate, width)
     }
 
     pub fn try_widen_trading(
@@ -2256,6 +2401,33 @@ mod tests {
     const DECODE_DISLODGE: u64 = 176 * MIB;
     const SLOT: f64 = 1_933_312.0;
     const LAYERS: f64 = 41.0;
+
+    /// **Searched from a hint, the same answer as from nothing.** Every
+    /// threshold of a prefix that pays, every hint in and around the range,
+    /// and none: the gallop finds what the bisection finds, and a hint on the
+    /// answer costs at most two probes.
+    #[test]
+    fn a_hinted_search_finds_what_bisection_finds() {
+        for lo in 0..3usize {
+            for hi in lo..12usize {
+                // `edge` is the first index that does not pay.
+                for edge in lo..=hi + 1 {
+                    let expect = (edge > lo).then(|| edge - 1);
+                    for hint in std::iter::once(None).chain((0..=hi + 2).map(Some)) {
+                        let mut probes = 0;
+                        let got = super::largest_paying(lo, hi, hint, |i| {
+                            probes += 1;
+                            i < edge
+                        });
+                        assert_eq!(got, expect, "lo {lo} hi {hi} edge {edge} hint {hint:?}");
+                        if hint == expect && expect.is_some() {
+                            assert!(probes <= 2, "a hint on the answer took {probes} probes");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// The test planner. Its hit exponent puts the curve through the hit the
     /// old seed (`0.7 × resident fraction`) gave at run 15's residency, so the
