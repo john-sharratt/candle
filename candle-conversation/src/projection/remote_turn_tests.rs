@@ -192,3 +192,61 @@ fn a_repair_tombstone_carries_no_identity() {
     assert!(substrate.is_tombstoned(tl));
     assert_eq!(sp.applied_through(sp.node()), issued);
 }
+
+/// Writer `A`'s commit of turn `turn_index` at `hlc`, as the bytes it ships.
+fn commit(sender: &mut SubstratePersistence, turn_index: u32, hlc: u64) -> Vec<u8> {
+    let sid = decl(turn_index).stream_id().0;
+    let id = at(A, hlc);
+    sender
+        .append_carried(RecordType::Commit, 0, sid, 1, 0, 0, &[], id)
+        .unwrap();
+    sender.read_event(id.origin, id.oseq).unwrap().unwrap()
+}
+
+/// **A released conversation is held complete by its own records.** Its
+/// releaser names its newest commit; a member holding that commit and every
+/// turn up to the one it committed holds the conversation entire, whatever
+/// else of the releaser's it lacks — and one turn short of a chunk, or asked
+/// through a point that is not the conversation's commit, does not.
+#[test]
+fn a_released_conversation_is_held_complete_by_its_own_commit() {
+    let sender_dir = TempDir::new().unwrap();
+    let (_, mut sender) = open(&sender_dir);
+    let first = turn_events(&mut sender, 0, 10, 1);
+    let second = turn_events(&mut sender, 1, 20, 2);
+    let committed = commit(&mut sender, 1, 30);
+    let tl = TimelineId::from_raw(TL).unwrap();
+
+    let whole = TempDir::new().unwrap();
+    let conv = reload(&whole);
+    let all: Vec<&[u8]> = first
+        .iter()
+        .chain(second.iter())
+        .chain(std::iter::once(&committed))
+        .map(Vec::as_slice)
+        .collect();
+    conv.apply_remote(&all, N_LAYERS).unwrap();
+    assert!(
+        conv.holds_complete_through(tl, A, 30),
+        "both turns and the commit"
+    );
+    assert!(
+        !conv.holds_complete_through(tl, A, 31),
+        "not this conversation's commit"
+    );
+    assert_eq!(conv.last_commit_oseq(tl, A), Some(30));
+
+    let short = TempDir::new().unwrap();
+    let conv = reload(&short);
+    let some: Vec<&[u8]> = first[..3]
+        .iter()
+        .chain(second.iter())
+        .chain(std::iter::once(&committed))
+        .map(Vec::as_slice)
+        .collect();
+    conv.apply_remote(&some, N_LAYERS).unwrap();
+    assert!(
+        !conv.holds_complete_through(tl, A, 30),
+        "the first turn a chunk short is a gap below the commit"
+    );
+}

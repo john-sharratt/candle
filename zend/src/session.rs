@@ -1550,6 +1550,17 @@ impl InferenceState {
             if let Link::Stopped(_) = link {
                 join.hold(crate::ingest_cancel::cancelled, report);
             }
+            // A conversation another member lets go is this one's to take once
+            // it holds it complete, and this one's own releases name their
+            // conversations' newest commits (`handover`).
+            if let Some(member) = join.link().member() {
+                crate::handover::install(
+                    member.clone(),
+                    &store,
+                    conv.clone(),
+                    conversation_timeline,
+                );
+            }
             if link == Link::Joined {
                 // Serving from a substrate that is behind is the thing to
                 // avoid (§7.6): ready only once caught up.

@@ -8,7 +8,7 @@
 //! each member's latest raise under `max_members/raise/<node>`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use applied_set::AppliedSet;
 use candle_conversation::persistence::deleted::{DeletedEntry, DeletedKey, DeletedTimeline};
@@ -37,6 +37,9 @@ pub struct ConversationStore {
     conversation: Conversation,
     kv_layers: usize,
     reload: Box<dyn Fn() + Send + Sync>,
+    /// Run after every batch applied and every reload: what the app checks
+    /// against what the substrate now holds (`Self::on_applied`).
+    applied_hook: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl ConversationStore {
@@ -52,7 +55,21 @@ impl ConversationStore {
             conversation,
             kv_layers,
             reload: Box::new(reload),
+            applied_hook: OnceLock::new(),
         })
+    }
+
+    /// Run `hook` after every batch of records from other members is applied
+    /// and after every reload — the moments what this member holds can grow.
+    /// The first hook set is the one kept.
+    pub fn on_applied(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let _ = self.applied_hook.set(Box::new(hook));
+    }
+
+    fn applied_changed(&self) {
+        if let Some(hook) = self.applied_hook.get() {
+            hook();
+        }
     }
 
     /// Replication of this substrate, with the acceptor's votes in its vote
@@ -211,6 +228,7 @@ impl Store for ConversationStore {
                 "records from other members refused — each is fetched again",
             );
         }
+        self.applied_changed();
         Applied { taken, reload }
     }
 
@@ -327,6 +345,7 @@ impl Store for ConversationStore {
 
     fn reload(&self) {
         (self.reload)();
+        self.applied_changed();
     }
 
     fn disk(&self) -> Disk {

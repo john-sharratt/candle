@@ -53,6 +53,45 @@ impl Conversation {
         self.persistence.lock().unwrap().applied_set()
     }
 
+    /// The `oseq` of `timeline`'s newest commit that `origin` wrote — what a
+    /// release names as the point the conversation must be held through
+    /// (`docs/replicated_substrate.md` §2.2). `None` when `origin` has
+    /// committed none of its turns.
+    pub fn last_commit_oseq(&self, timeline: super::ids::TimelineId, origin: u64) -> Option<u64> {
+        let read = self.read();
+        read.turn_streams_of(timeline.raw())
+            .map(|(_, _, rt)| rt.ids.commit)
+            .filter(|c| c.origin == origin && c.oseq > 0)
+            .map(|c| c.oseq)
+            .max()
+    }
+
+    /// Whether this member holds `timeline` complete through `origin`'s
+    /// commit `through`: that commit applied here, and every turn up to the
+    /// one it committed held — placed, so complete, with no gap below it.
+    ///
+    /// **Judged by the conversation's own records, not the origin's lane.** A
+    /// member behind on the releaser's lane as a whole — its KV and snapshots
+    /// of other conversations still arriving — may hold this one entire, and
+    /// then it may take it (§4.4). The commit names the extent; the turns
+    /// below it are what must be here.
+    pub fn holds_complete_through(
+        &self,
+        timeline: super::ids::TimelineId,
+        origin: u64,
+        through: u64,
+    ) -> bool {
+        let read = self.read();
+        let Some(committed) = read
+            .turn_streams_of(timeline.raw())
+            .find(|(_, _, rt)| rt.ids.commit.origin == origin && rt.ids.commit.oseq == through)
+            .map(|(idx, _, _)| idx)
+        else {
+            return false;
+        };
+        (0..=committed.0).all(|i| read.holds_turn(timeline, super::ids::TurnIndex(i)))
+    }
+
     /// Record `(origin, oseq)` as it travels — its header line and payload,
     /// unpadded — from wherever maintenance moved it, or `None` when this
     /// member does not hold it.

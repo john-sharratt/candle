@@ -29,6 +29,7 @@ pub mod conv_overlay;
 pub mod conv_sweep;
 pub mod deletions;
 pub mod fast_path;
+pub mod handover;
 pub mod ingest;
 pub mod ingest_backlog;
 pub mod ingest_cancel;
