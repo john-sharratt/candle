@@ -147,6 +147,21 @@ impl ProcessRam {
         buckets
     }
 
+    /// The `n` allocations holding the most committed bytes, largest first
+    /// (ties by base address). What the commit charge is made of — which on a
+    /// host near its commit limit is the figure that decides whether the next
+    /// allocation fails, resident or not.
+    pub fn largest_committed(&self, n: usize) -> Vec<&Allocation> {
+        let mut v: Vec<&Allocation> = self.allocations.iter().collect();
+        v.sort_by(|a, b| {
+            b.committed
+                .cmp(&a.committed)
+                .then(a.alloc_base.cmp(&b.alloc_base))
+        });
+        v.truncate(n);
+        v
+    }
+
     /// The `n` allocations holding the most resident bytes, largest first
     /// (ties by base address, so the order is stable).
     pub fn largest_resident(&self, n: usize) -> Vec<&Allocation> {

@@ -191,6 +191,80 @@ pub fn abort_on_ctrl_c() {
     });
 }
 
+/// Log this process's committed host memory, allocation by allocation, every
+/// 30 s through the first ten minutes and every ten minutes after.
+///
+/// **The commit charge is what fails first, and nothing else reported it.** On
+/// WhiteWorld (2026-10-20) motherd held ~130 GB committed against a 17 GB
+/// working set, the machine's commit stood 0.5 GB under its limit, and the
+/// process aborted three times in twenty minutes on an allocation it could not
+/// commit — with no panic, since an allocation failure aborts without one, and
+/// stderr detached. The pinned experts and the warm tier explained about 77 GB
+/// of it; this names the rest.
+pub fn spawn_ram_census() {
+    let spawned = std::thread::Builder::new()
+        .name("ram-census".into())
+        .spawn(|| {
+            use candle::vram::process_ram::{ProcessRam, RegionKind};
+            let started = std::time::Instant::now();
+            loop {
+                if let Some(ram) = ProcessRam::capture() {
+                    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+                    let (p, m, i) = (
+                        ram.total(RegionKind::Private),
+                        ram.total(RegionKind::Mapped),
+                        ram.total(RegionKind::Image),
+                    );
+                    let top: Vec<String> = ram
+                        .largest_committed(12)
+                        .iter()
+                        .map(|a| {
+                            format!(
+                                "{:#x} {:?} {:.2}/{:.2} GiB{}",
+                                a.alloc_base,
+                                a.kind,
+                                gib(a.committed),
+                                gib(a.resident),
+                                a.name.as_deref().map_or(String::new(), |n| format!(" {n}"))
+                            )
+                        })
+                        .collect();
+                    let buckets: Vec<String> = ram
+                        .private_by_size()
+                        .iter()
+                        .filter(|b| b.committed >= 1 << 30)
+                        .map(|b| {
+                            format!(
+                                "<={:.2}GiB x{} {:.2}GiB",
+                                gib(b.upper),
+                                b.count,
+                                gib(b.committed)
+                            )
+                        })
+                        .collect();
+                    tracing::info!(
+                        target: "host::ram",
+                        private_committed_gib = format!("{:.2}", gib(p.committed)),
+                        private_resident_gib = format!("{:.2}", gib(p.resident)),
+                        mapped_committed_gib = format!("{:.2}", gib(m.committed)),
+                        image_committed_gib = format!("{:.2}", gib(i.committed)),
+                        largest = %top.join(" | "),
+                        private_buckets = %buckets.join(" | "),
+                        "process committed memory"
+                    );
+                }
+                let every = if started.elapsed() < std::time::Duration::from_secs(600) {
+                    30
+                } else {
+                    600
+                };
+                std::thread::sleep(std::time::Duration::from_secs(every));
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the RAM census: {e}");
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

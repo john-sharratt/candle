@@ -952,7 +952,16 @@ impl Scheduler {
         // faster than it was — a 1.4 ms step reads as 1.0, and a sub-millisecond
         // one as zero and is dropped entirely. That bias lands straight on
         // `layer_secs`, which is the estimate this wiring exists to correct.
-        self.observe_decode_forward(seq_ids.len(), fwd_us);
+        //
+        // **Only a step that carried nothing else.** A co-batched step's time is
+        // the decode rows' and the creep slice or glue that rode them; taught as
+        // a decode step, it priced every decode at the creep's cost too — the
+        // published step, the trade's decode side, a burst's placement. On
+        // BlackWorld (d7f850f79, 2026-10-20) 24 decodes priced at 225–575 ms
+        // through heavy-read's co-batched steps.
+        if !self.wave_cobatched {
+            self.observe_decode_forward(seq_ids.len(), fwd_us);
+        }
         self.observe_expert_hit_rate();
 
         // Reads the scored rows back and advances each sequence by what the wave

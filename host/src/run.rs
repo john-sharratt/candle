@@ -169,6 +169,7 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     // context for good; nothing supervises this process, so it relaunches
     // itself (`self_heal.rs`).
     spawn_watchdog(launch.clone(), state_dir.clone(), resumed);
+    crate::process::spawn_ram_census();
     // A no-op without the `profile` feature.
     set_gpu_span_period(GPU_SPAN_PERIOD);
 

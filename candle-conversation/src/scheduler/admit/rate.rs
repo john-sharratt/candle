@@ -484,6 +484,63 @@ enum Unsolved {
     /// They did, and the answer was not a cost: noise, or a stalled forward.
     Unphysical,
 }
+/// The running fit of a decode step's per-layer time against the experts it
+/// had to fetch: `t = a + b·m`, `m` the routed experts a layer did not hold.
+///
+/// **What a missed expert costs is this card's to say.** The model it replaces
+/// took a layer as its compute or its copy, whichever was longer, and put
+/// every step longer than the copy into one constant compute time — so a cost
+/// that grows with the experts routed but is not the bus's, the CPU pool
+/// computing the misses, was flattened into a figure the same at every width.
+/// On WhiteWorld (b1b3dae14, 2026-10-20) the step with sixteen decodes more
+/// priced at 69.3 ms, the same as one more, where twenty-three decodes had
+/// stepped 451–580 ms. The slope here is whatever a miss costs — bus, CPU or
+/// both — learned from the widths the card actually stepped at.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct DecodeFit {
+    mm: f64,
+    m1: f64,
+    one: f64,
+    mt: f64,
+    t1: f64,
+    n: u64,
+}
+
+impl DecodeFit {
+    /// Steps folded in before the fit is believed.
+    const MIN_SAMPLES: u64 = 8;
+    /// The fraction of `Σm²·Σ1` the determinant must reach: the steps must have
+    /// fetched different numbers of experts for a slope to be told from the
+    /// intercept.
+    const MIN_CONDITION: f64 = 1e-3;
+
+    fn observe(&mut self, m: f64, t: f64, alpha: f64) {
+        let keep = 1.0 - alpha.clamp(0.0, 1.0);
+        self.mm = self.mm * keep + m * m;
+        self.m1 = self.m1 * keep + m;
+        self.one = self.one * keep + 1.0;
+        self.mt = self.mt * keep + m * t;
+        self.t1 = self.t1 * keep + t;
+        self.n += 1;
+    }
+
+    /// `(a, b)` — per-layer seconds at no miss, and per missed expert — or
+    /// `None` until the steps have varied enough to separate them, or when the
+    /// answer is not a cost (a negative intercept or slope).
+    fn solve(&self) -> Option<(f64, f64)> {
+        if self.n < Self::MIN_SAMPLES {
+            return None;
+        }
+        let det = self.mm * self.one - self.m1 * self.m1;
+        if !det.is_finite() || det <= self.mm * self.one * Self::MIN_CONDITION {
+            return None;
+        }
+        let b = (self.one * self.mt - self.m1 * self.t1) / det;
+        let a = (self.mm * self.t1 - self.m1 * self.mt) / det;
+        (a.is_finite() && b.is_finite() && a >= 0.0 && b >= 0.0).then_some((a, b))
+    }
+}
+
 /// One candidate for the wave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
@@ -577,6 +634,10 @@ pub struct WaveRate {
     /// The time a MoE layer takes in a decode wave when the bus is not the
     /// limit, learned.
     layer_secs: f64,
+    /// A decode layer's time against the experts it fetched, learned from
+    /// decode-only steps at the widths they ran ([`DecodeFit`]); what prices a
+    /// step once the widths have varied, and `layer_secs` before.
+    decode_fit: DecodeFit,
     /// Dampening: the fraction of each observation an estimate moves by.
     alpha: f64,
     /// Relative rate gain below which an admission is refused as saturated.
@@ -707,6 +768,7 @@ impl WaveRate {
             link_bytes_per_s,
             bw_bytes_per_s: link_bytes_per_s * Self::SEED_FRACTION,
             layer_secs: 1.0 / (decode.initial_tok_per_s * geometry.moe_layers as f64),
+            decode_fit: DecodeFit::default(),
             alpha: Self::DEFAULT_ALPHA,
             min_gain: Self::DEFAULT_MIN_GAIN,
             trades: TradeWindow::default(),
@@ -956,9 +1018,26 @@ impl WaveRate {
 
     /// Projected time of one decode step: every MoE layer takes its own time
     /// or its copy, whichever is longer.
+    ///
+    /// **Once the steps have varied, by what a miss has cost here.** The fit
+    /// ([`DecodeFit`]) prices a layer at its learned time with no miss plus its
+    /// learned cost per missed expert, so a step grows with the experts its
+    /// decodes route however this card serves a miss. Before the widths have
+    /// varied enough to fit, the layer's compute or its copy, whichever is
+    /// longer.
     pub fn decode_step_secs(&self, routed: usize, resident: u64) -> f64 {
-        self.geometry.moe_layers as f64
-            * self.layer_secs.max(self.decode_copy_secs(routed, resident))
+        let per_layer = match self.decode_fit.solve() {
+            Some((a, b)) => a + b * self.decode_misses(routed, resident),
+            None => self.layer_secs.max(self.decode_copy_secs(routed, resident)),
+        };
+        self.geometry.moe_layers as f64 * per_layer
+    }
+
+    /// Experts a layer fetches for decodes routing to `routed` of them with
+    /// `resident` bytes on the card: no more than the layer has, of which the
+    /// streamed fraction it does not hold.
+    fn decode_misses(&self, routed: usize, resident: u64) -> f64 {
+        routed.min(self.geometry.experts_per_layer) as f64 * self.streamed_fraction(resident)
     }
 
     /// Projected decode throughput: `decodes` sequences stepped a second, for a
@@ -2080,6 +2159,13 @@ impl WaveRate {
         }
         let routed = decodes.saturating_mul(self.experts_per_decode(draft));
         let per_layer = forward_secs / self.geometry.moe_layers as f64;
+        // Every step teaches the fit, bus-bound or not: it is the time against
+        // the experts fetched that the fit is of.
+        self.decode_fit.observe(
+            self.decode_misses(routed, resident_bytes),
+            per_layer,
+            self.alpha,
+        );
         if per_layer <= self.decode_copy_secs(routed, resident_bytes) {
             return None;
         }
@@ -4225,6 +4311,60 @@ mod tests {
             placed <= at(FULL),
             "never slower than the cohort as it stands"
         );
+    }
+
+    /// **A step grows with the experts its decodes miss, at what a miss costs
+    /// here.** Steps whose per-layer time is a fixed 1.4 ms plus 0.12 ms per
+    /// missed expert — a cost the bus model alone does not see, the CPU pool's —
+    /// taught at widths 1 to 24 decodes, price a step sixteen decodes wider
+    /// above one decode wider, by the learned slope; taught at one width, the
+    /// step stands as the old model priced it.
+    #[test]
+    fn a_decode_step_grows_with_the_experts_it_misses() {
+        let mut rate = WaveRate::with_link_rate(
+            LINK_3090,
+            ExpertGeometry::QWEN36_35B_A3B,
+            RateModel::default(),
+            DecodeModel::default(),
+        );
+        let resident = RESIDENT_RUN15;
+        let per = rate.experts_per_decode(0);
+        let layers = ExpertGeometry::QWEN36_35B_A3B.moe_layers as f64;
+        let (a, b) = (1.4e-3, 0.12e-3);
+        for _ in 0..4 {
+            for d in 1..=24usize {
+                let m = rate.decode_misses(d * per, resident);
+                rate.observe_decode(d, 0, resident, layers * (a + b * m));
+            }
+        }
+        let one = rate.decode_step_secs(per, resident);
+        let wide = rate.decode_step_secs(17 * per, resident);
+        let want = |d: usize| layers * (a + b * rate.decode_misses(d * per, resident));
+        assert!(
+            (one - want(1)).abs() < 1e-6 * want(1),
+            "{one} against {}",
+            want(1)
+        );
+        assert!(
+            (wide - want(17)).abs() < 1e-6 * want(17),
+            "{wide} against {}",
+            want(17)
+        );
+        assert!(
+            wide > one * 2.0,
+            "sixteen more decodes step slower: {wide} vs {one}"
+        );
+        // One width only: nothing to separate, and the old model stands.
+        let mut flat = WaveRate::with_link_rate(
+            LINK_3090,
+            ExpertGeometry::QWEN36_35B_A3B,
+            RateModel::default(),
+            DecodeModel::default(),
+        );
+        for _ in 0..40 {
+            flat.observe_decode(4, 0, resident, 0.2);
+        }
+        assert!(flat.decode_fit.solve().is_none());
     }
 
     /// **A burst's step grows with the burst.** The step at `PLACEMENT_WIDE`
