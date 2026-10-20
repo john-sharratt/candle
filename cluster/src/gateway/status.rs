@@ -134,6 +134,7 @@ pub struct MemberRow {
     pub prefill_tok_s: Option<u32>,
     pub decode_step_next_us: Option<u32>,
     pub decode_step_wide_us: Option<u32>,
+    pub prefill_tok_s_wide: Option<u32>,
     /// Requests this gateway has handed it and it is still answering (§5.3).
     pub in_flight: u32,
     pub state: &'static str,
@@ -196,6 +197,7 @@ impl MemberRow {
             prefill_tok_s: c.map(|c| c.prefill_tok_s),
             decode_step_next_us: c.map(|c| c.decode_step_next_us),
             decode_step_wide_us: c.map(|c| c.decode_step_wide_us),
+            prefill_tok_s_wide: c.map(|c| c.prefill_tok_s_wide),
             in_flight: m.in_flight,
             state: state_name(m.state()),
             session: m.session,
@@ -306,6 +308,7 @@ mod tests {
             prefill_tok_s: None,
             decode_step_next_us: None,
             decode_step_wide_us: None,
+            prefill_tok_s_wide: None,
             in_flight: 0,
             state: "ready",
             session: 1,

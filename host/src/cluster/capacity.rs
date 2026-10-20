@@ -9,8 +9,9 @@
 //!   wave for [`QUIET`] has nothing in hand, and is idle.
 //! - **`slots_free`** is how many more residences of the newest wave's average
 //!   size fit in what its budget left.
-//! - **`prefill_tok_s`**, **`decode_step_next_us`** and **`decode_step_wide_us`**
-//!   are what the scheduler has learned a turn and a burst of them cost it —
+//! - **`prefill_tok_s`**, **`decode_step_next_us`**, **`decode_step_wide_us`**
+//!   and **`prefill_tok_s_wide`** are what the scheduler has learned a turn and
+//!   a burst of them cost it —
 //!   the gateway places a turn where it would finish soonest
 //!   (`docs/cooperative_admission.md` §2.1); zero until it has learned them.
 
@@ -45,6 +46,9 @@ pub struct Rates {
     /// The decode step with `PLACEMENT_WIDE` rows more than it decodes,
     /// milliseconds: how the step grows as a burst lands.
     pub decode_step_wide_ms: f64,
+    /// The prefill rate with `PLACEMENT_WIDE` rows more than it decodes,
+    /// tokens a second: how prefill slows as a burst lands.
+    pub prefill_tok_s_wide: f64,
     /// Prompt tokens a placed turn would queue behind: those waiting at its
     /// own priority. Background ingest is not among them — a placed turn goes
     /// ahead of it.
@@ -121,6 +125,15 @@ pub fn capacity(
         // and the gateway reads it so.
         decode_step_wide_us: rates.map_or(0, |r| {
             micros(r.decode_step_wide_ms.max(r.decode_step_next_ms))
+        }),
+        // Never above the one-more rate: a wide rate no slower is flat, and the
+        // gateway reads it so.
+        prefill_tok_s_wide: rates.map_or(0, |r| {
+            r.prefill_tok_s_wide
+                .min(r.prefill_tok_s)
+                .max(1.0)
+                .round()
+                .min(f64::from(u32::MAX)) as u32
         }),
     }
 }
@@ -224,6 +237,7 @@ mod tests {
             prefill_tok_s: 2_302.6,
             decode_step_next_ms: 41.53,
             decode_step_wide_ms: 96.25,
+            prefill_tok_s_wide: 640.4,
             high_backlog_tokens: 6_144,
         };
         let c = capacity(
@@ -237,15 +251,17 @@ mod tests {
             (c.prefill_tok_s, c.decode_step_next_us, c.prefill_backlog),
             (2_303, 41_530, 6_144)
         );
-        assert_eq!(c.decode_step_wide_us, 96_250);
+        assert_eq!((c.decode_step_wide_us, c.prefill_tok_s_wide), (96_250, 640));
         assert!(!c.idle, "the ingest still keeps it from admitting now");
-        // A wide step learned below the one-more step is said as flat.
+        // A wide step learned below the one-more step, and a wide rate above
+        // the one-more rate, are said as flat.
         let flat = capacity(
             MemberState::Ready,
             card(None),
             None,
             Some(Rates {
                 decode_step_wide_ms: 30.0,
+                prefill_tok_s_wide: 3_000.0,
                 ..learned
             }),
             machine(),
@@ -254,19 +270,25 @@ mod tests {
             (flat.decode_step_next_us, flat.decode_step_wide_us),
             (41_530, 41_530)
         );
+        assert_eq!(
+            (flat.prefill_tok_s, flat.prefill_tok_s_wide),
+            (2_303, 2_303)
+        );
         let none = capacity(MemberState::Ready, card(None), None, None, machine());
         assert_eq!(
             (
                 none.prefill_tok_s,
                 none.decode_step_next_us,
-                none.decode_step_wide_us
+                none.decode_step_wide_us,
+                none.prefill_tok_s_wide
             ),
-            (0, 0, 0)
+            (0, 0, 0, 0)
         );
         let unmeasured = Rates {
             prefill_tok_s: 0.0,
             decode_step_next_ms: 41.5,
             decode_step_wide_ms: 80.0,
+            prefill_tok_s_wide: 0.0,
             high_backlog_tokens: 0,
         };
         let c = capacity(

@@ -94,21 +94,25 @@ The gateway compares these numbers and nothing else. It models nothing of a
 member's insides; the member that knows its card is the one that says what
 the card can do.
 
-How it is built (protocol 3): `CAPACITY` carries `prefill_backlog` (queued
-prompt tokens), `prefill_tok_s`, `decode_step_next_us` and
-`decode_step_wide_us`. The last three are what the member's admission has
+How it is built (protocol 4): `CAPACITY` carries `prefill_backlog` (queued
+prompt tokens), `prefill_tok_s`, `decode_step_next_us`, `decode_step_wide_us`
+and `prefill_tok_s_wide`. The last four are what the member's admission has
 learned (`phase_ring::learned_rates`): the prefill rate at the width it runs,
-the decode step with one more row, and the decode step with `PLACEMENT_WIDE`
-(16) more rows. The gateway's `Best` estimates each candidate's finish for a
-nominal turn: the backlog, plus 2,048 tokens for each request handed to it
-since its last `CAPACITY` and for this one, at the prefill rate; then 512
-tokens at the step those requests and this one make — on the line through the
-one-more and wide steps, extended past the wide point, and flat when the wide
-step is no slower. A request handed earlier is not charged again: it is queued,
-and in the backlog, or decoding, and in the step. A card that copies every
-routed expert steepens with width, so a burst priced at its idle step alone
-lands whole on it (run 24's shift-decode-2: 48 turns at 41.2 chunks/s, the
-step 70 ms advertised and 450–580 ms delivered). It picks the soonest
+the decode step with one more row, and the decode step and prefill rate with
+`PLACEMENT_WIDE` (16) more rows. The gateway's `Best` estimates each
+candidate's finish for a nominal turn: the backlog, plus 2,048 tokens for each
+request handed to it since its last `CAPACITY` and for this one, at the time
+per token those requests and this one leave it; then 512 tokens at the step
+they make. Both are on the line through the one-more and wide figures — time
+per token for prefill, so the extension never reaches a rate of zero —
+extended past the wide point, and flat when the wide figure is no slower. A
+request handed earlier is not charged again: it is queued, and in the
+backlog, or decoding, and in the step. A card that copies every routed expert
+steepens with width, so a burst priced at its idle step alone lands whole on
+it (run 24's shift-decode-2: 48 turns at 41.2 chunks/s, the step 70 ms
+advertised and 450–580 ms delivered); and a placed turn decodes beside the
+prompts behind it, so prefill slows too (run 35's heavy-read: 24 turns charged
+at an idle 1,771 tok/s that then drained 213–463, all on one member). It picks the soonest
 (`gateway/registry.rs`, `finish_us`). Until every candidate has learned both
 rates, it ranks by power per request as before.
 

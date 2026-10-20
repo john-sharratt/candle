@@ -65,10 +65,17 @@ pub struct Capacity {
     /// alone priced a burst of 24 at the idle step. Zero when unlearned, and
     /// never below `decode_step_next_us` once learned — equal means flat.
     pub decode_step_wide_us: u32,
+    /// Its prefill rate with [`PLACEMENT_WIDE`] rows more than it decodes,
+    /// tokens a second: how prefill slows as a burst lands, since every placed
+    /// turn decodes beside the prompts behind it. A burst of 24 charged at the
+    /// idle rate went to a member advertising 1,771 tok/s that then drained
+    /// 213–463. Zero when unlearned, and never above `prefill_tok_s` once
+    /// learned — equal means flat.
+    pub prefill_tok_s_wide: u32,
 }
 
-/// The rows beyond its decodes at which a member states its wide step
-/// (`Capacity::decode_step_wide_us`).
+/// The rows beyond its decodes at which a member states its wide figures
+/// (`Capacity::decode_step_wide_us`, `Capacity::prefill_tok_s_wide`).
 pub const PLACEMENT_WIDE: u32 = 16;
 
 impl Capacity {
@@ -91,7 +98,8 @@ impl Capacity {
             .bool(self.low_priority)
             .u32(self.prefill_tok_s)
             .u32(self.decode_step_next_us)
-            .u32(self.decode_step_wide_us);
+            .u32(self.decode_step_wide_us)
+            .u32(self.prefill_tok_s_wide);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -113,6 +121,7 @@ impl Capacity {
             prefill_tok_s: r.u32()?,
             decode_step_next_us: r.u32()?,
             decode_step_wide_us: r.u32()?,
+            prefill_tok_s_wide: r.u32()?,
         })
     }
 

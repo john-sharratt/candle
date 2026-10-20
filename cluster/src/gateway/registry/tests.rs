@@ -573,6 +573,70 @@ fn a_burst_prices_the_step_it_makes() {
     assert_eq!(step_with_us(&c, 31), 832_332);
 }
 
+/// **A burst prices the prefill it makes, not the idle rate.** Run 35's
+/// heavy-read at 17:41:16: 24 turns inside 4 ms. BlackWorld idle at 1,771
+/// tok/s with a flat 39.9 ms step; WhiteWorld idle at 255 tok/s, a 208.3 ms
+/// step widening to 961.4 ms — 114.66 s for its first. Charged at the idle
+/// rate BlackWorld's 24th finished at 48.2 s and took all 24, then drained
+/// 213–463 tok/s. Stating 300 tok/s at `PLACEMENT_WIDE` rows more, its `k`-th
+/// turn spends (k + 1) × 2,048 tokens at 0.565 + 2.769 × k / 15 ms each:
+/// the 14th finishes at 105.4 s, the 15th would at 117.1 s, and goes to
+/// WhiteWorld — which takes 3 of the 24.
+#[test]
+fn a_burst_prices_the_prefill_it_makes() {
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    let stated = |prefill_tok_s, prefill_tok_s_wide, next_us, wide_us| Capacity {
+        prefill_tok_s,
+        prefill_tok_s_wide,
+        decode_step_next_us: next_us,
+        decode_step_wide_us: wide_us,
+        ..capacity(MemberState::Ready, 100, true, 64)
+    };
+    let burst = |r: &mut Registry| -> Vec<Pick> {
+        (0..24)
+            .map(|_| {
+                let p = best(r);
+                if let Pick::Member(n) = p {
+                    r.begin("zend", n);
+                }
+                p
+            })
+            .collect()
+    };
+
+    // As run 35 priced it: no wide rate, every turn at the idle one.
+    r.capacity("zend", 1, stated(1_771, 0, 39_869, 39_869));
+    r.capacity("zend", 2, stated(255, 0, 208_265, 961_435));
+    assert!(burst(&mut r).iter().all(|p| *p == Pick::Member(1)));
+
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    r.capacity("zend", 1, stated(1_771, 300, 39_869, 39_869));
+    r.capacity("zend", 2, stated(255, 0, 208_265, 961_435));
+    let picks = burst(&mut r);
+    assert!(picks[..14].iter().all(|p| *p == Pick::Member(1)));
+    assert_eq!(
+        picks[14],
+        Pick::Member(2),
+        "the 15th finishes sooner on node 2"
+    );
+    assert_eq!(picks.iter().filter(|p| **p == Pick::Member(2)).count(), 3);
+
+    // On the line, in time per token: 1 row is the rate, 16 the wide one, 31
+    // twice as far. A wide rate unlearned, or one no slower, is flat.
+    let c = stated(1_000, 250, 1, 1);
+    assert_eq!(token_ns_with(&c, 1), 1_000_000);
+    assert_eq!(token_ns_with(&c, 16), 4_000_000);
+    assert_eq!(token_ns_with(&c, 31), 7_000_000);
+    assert_eq!(token_ns_with(&stated(1_000, 0, 1, 1), 31), 1_000_000);
+    assert_eq!(token_ns_with(&stated(1_000, 1_200, 1, 1), 31), 1_000_000);
+}
+
 /// **Current enough is a conversation dimension** (§4.4). A member lagging on
 /// everyone else's writes still takes a new conversation — it has no history
 /// to be behind on — and does when it finishes soonest; a released one only

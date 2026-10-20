@@ -711,13 +711,14 @@ fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
 fn placement_view(m: &MemberView) -> String {
     let c = capacity_of(m);
     format!(
-        "{:016x} room={} in_flight={} placed={} backlog={} prefill_tok_s={} step_next_us={} step_wide_us={} finish_ms={}",
+        "{:016x} room={} in_flight={} placed={} backlog={} prefill_tok_s={} prefill_wide={} step_next_us={} step_wide_us={} finish_ms={}",
         m.node,
         has_room(m),
         m.in_flight,
         m.placed,
         c.prefill_backlog,
         c.prefill_tok_s,
+        c.prefill_tok_s_wide,
         c.decode_step_next_us,
         c.decode_step_wide_us,
         finish_us(m).map_or_else(|| "-".to_string(), |f| (f / 1000).to_string()),
@@ -727,10 +728,11 @@ fn placement_view(m: &MemberView) -> String {
 /// When a turn placed on `m` now would finish, in microseconds from now, by
 /// what it says a turn costs it (`docs/cooperative_admission.md` §2.1, §3
 /// "earliest advertised finish"): the prefill already queued there, the
-/// turns handed to it and not yet in its queue, and this one, at its
-/// prefill rate; then the reply at the decode step those turns and this one
-/// give it ([`step_with_us`]). `None` until it has learned both rates — a
-/// member is never placed by figures it has not measured.
+/// turns handed to it and not yet in its queue, and this one, at the prefill
+/// rate those turns and this one leave it ([`token_ns_with`]); then the reply
+/// at the decode step they give it ([`step_with_us`]). `None` until it has
+/// learned both rates — a member is never placed by figures it has not
+/// measured.
 fn finish_us(m: &MemberView) -> Option<u64> {
     let c = capacity_of(m);
     if c.prefill_tok_s == 0 || c.decode_step_next_us == 0 {
@@ -740,8 +742,24 @@ fn finish_us(m: &MemberView) -> Option<u64> {
     // prompt that is still waiting: only those still in flight can be.
     let pending = m.placed.min(m.in_flight);
     let tokens = u64::from(c.prefill_backlog) + (u64::from(pending) + 1) * NOMINAL_PROMPT_TOKENS;
-    let prefill_us = tokens * 1_000_000 / u64::from(c.prefill_tok_s);
+    let prefill_us = tokens * token_ns_with(c, pending + 1) / 1000;
     Some(prefill_us + NOMINAL_REPLY_TOKENS * step_with_us(c, pending + 1))
+}
+
+/// The time one prompt token takes with `extra` rows more than `c` reports
+/// decoding, in nanoseconds: its prefill rate at 1 and its wide rate at
+/// [`PLACEMENT_WIDE`], as time per token on the line through them, extended
+/// past the wide point. Time, not rate, is what extends: a falling rate
+/// reaches zero, a growing time per token does not. A wide rate it has not
+/// learned, or one no slower, is flat.
+fn token_ns_with(c: &Capacity, extra: u32) -> u64 {
+    let next = 1_000_000_000 / u64::from(c.prefill_tok_s);
+    if c.prefill_tok_s_wide == 0 || c.prefill_tok_s_wide >= c.prefill_tok_s {
+        return next;
+    }
+    let wide = 1_000_000_000 / u64::from(c.prefill_tok_s_wide);
+    let beyond = u64::from(extra.saturating_sub(1));
+    next + (wide - next) * beyond / u64::from(PLACEMENT_WIDE - 1)
 }
 
 /// The decode step with `extra` rows more than `c` reports decoding, in
