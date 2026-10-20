@@ -675,25 +675,42 @@ pub const NOMINAL_PROMPT_TOKENS: u64 = 2048;
 pub const NOMINAL_REPLY_TOKENS: u64 = 512;
 
 /// The best of `ready` (§5.3): among those with room, or among them all when
-/// none has — the soonest finish when every one of them has said what a turn
-/// costs it ([`finish_us`]), otherwise the largest share by [`rank`].
+/// none has — the soonest finish among those that have said what a turn costs
+/// them ([`finish_us`]). A member that has not learned that yet takes a turn
+/// while it is answering none: one at a time, which is what it learns from. With
+/// none learned, the largest share by [`rank`].
+///
+/// **An unlearned member is probed, not shared into.** It learns only from the
+/// turns it is given, so it must get some; but its share of a burst is a guess.
+/// Ranking every candidate by power whenever one had not learned put 12 of run
+/// 36's 48 heavy-decode turns on WhiteWorld, fresh from a restart, at 25–45 s a
+/// turn against BlackWorld's 10–18 s, and halved the pattern's rate.
 fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
     // Every candidate as the pick saw it, for the placement line below.
     let seen: Vec<String> = ready.iter().map(|m| placement_view(m)).collect();
     let roomy: Vec<&MemberView> = ready.iter().copied().filter(|m| has_room(m)).collect();
     let pool = if roomy.is_empty() { ready } else { roomy };
-    let finishes: Option<Vec<(u64, &MemberView)>> =
-        pool.iter().map(|m| finish_us(m).map(|f| (f, *m))).collect();
-    let (by, pick) = match finishes {
-        Some(f) if !f.is_empty() => (
-            "finish",
-            f.into_iter()
-                .min_by(|(fa, a), (fb, b)| fa.cmp(fb).then(rank(b, a)))
-                .map(|(_, m)| m.node),
-        ),
-        _ => (
+    let finishes: Vec<(u64, &MemberView)> = pool
+        .iter()
+        .filter_map(|m| finish_us(m).map(|f| (f, *m)))
+        .collect();
+    let probe = pool
+        .iter()
+        .copied()
+        .filter(|m| finish_us(m).is_none() && m.in_flight == 0)
+        .max_by(|a, b| rank(a, b));
+    let (by, pick) = match (probe, finishes.is_empty()) {
+        (_, true) => (
             "power",
             pool.into_iter().max_by(|a, b| rank(a, b)).map(|m| m.node),
+        ),
+        (Some(m), false) => ("probe", Some(m.node)),
+        (None, false) => (
+            "finish",
+            finishes
+                .into_iter()
+                .min_by(|(fa, a), (fb, b)| fa.cmp(fb).then(rank(b, a)))
+                .map(|(_, m)| m.node),
         ),
     };
     tracing::info!(

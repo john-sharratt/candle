@@ -1361,7 +1361,9 @@ rates its admission learns from every forward. A turn's finish on a member is:
 The nominal sizes are the same for every member: the gateway sees a request's new
 message, not the prompt a member's projection makes of the conversation. The soonest
 finish wins, among those with room. A member that has not yet learned both rates says
-zero, and while any candidate does, the pick falls back to power per request.
+zero; it takes a turn while it is answering none — one at a time, to learn from — and
+the rest go by finish among those that have. With none learned, the pick is by power per
+request.
 
 ### 5.4 Affinity is a claim the member holds
 

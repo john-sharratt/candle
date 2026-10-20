@@ -113,8 +113,12 @@ it (run 24's shift-decode-2: 48 turns at 41.2 chunks/s, the step 70 ms
 advertised and 450–580 ms delivered); and a placed turn decodes beside the
 prompts behind it, so prefill slows too (run 35's heavy-read: 24 turns charged
 at an idle 1,771 tok/s that then drained 213–463, all on one member). It picks the soonest
-(`gateway/registry.rs`, `finish_us`). Until every candidate has learned both
-rates, it ranks by power per request as before.
+(`gateway/registry.rs`, `finish_us`). A candidate that has not learned both
+rates — one fresh from a restart — is probed: it takes a turn while it is
+answering none, one at a time, which is what it learns from, and every other
+turn goes by finish among those that have. Ranked by power instead, run 36's
+restarted WhiteWorld took 12 of heavy-decode's 48 turns at 25–45 s each
+against BlackWorld's 10–18 s. With none learned, it ranks by power per request.
 
 ### 2.2 A lease per turn, placed among the replicated
 

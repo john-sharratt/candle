@@ -400,8 +400,9 @@ fn learned(r: &mut Registry, n: u64, power: u32, backlog: u32, prefill_tok_s: u3
 /// soonest** (`docs/cooperative_admission.md` §2.1): the fast prefiller with
 /// a backlog against the slower one with none, decided by the arithmetic,
 /// not by power. A turn handed to a member counts as backlog until its next
-/// `CAPACITY`. One member that has learned nothing yet puts the whole pick
-/// back on power.
+/// `CAPACITY`. A member that has learned nothing yet is probed — one turn at
+/// a time — and the rest go by finish among those that have; with none
+/// learned, by power.
 #[test]
 fn a_turn_goes_where_it_finishes_soonest() {
     let mut r = three();
@@ -420,9 +421,60 @@ fn a_turn_goes_where_it_finishes_soonest() {
     r.begin("zend", 3);
     assert_eq!(best(&mut r), Pick::Member(1));
 
-    // Node 2 has not learned a decode yet: every member goes back to power
-    // per request — 100, 300, 200/2.
+    // Node 2 has not learned a decode yet: it takes one turn, to learn from,
+    // and while it answers that one the others go by finish — node 1 at 15.75 s
+    // against node 3's 16.90 s, as before.
     learned(&mut r, 2, 300, 0, 2_000, 0);
+    assert_eq!(best(&mut r), Pick::Member(2), "probed");
+    r.begin("zend", 2);
+    assert_eq!(best(&mut r), Pick::Member(1));
+    r.begin("zend", 1);
+    assert_eq!(best(&mut r), Pick::Member(1), "16.26 s against 16.90 s");
+    r.begin("zend", 1);
+    assert_eq!(best(&mut r), Pick::Member(1), "16.78 s against 16.90 s");
+    r.begin("zend", 1);
+    assert_eq!(best(&mut r), Pick::Member(3), "17.29 s against 16.90 s");
+
+    // None learned: by power per request.
+    let mut r = three();
+    for n in [1, 2, 3] {
+        learned(&mut r, n, 100 * n as u32, 0, 0, 0);
+    }
+    assert_eq!(best(&mut r), Pick::Member(3));
+}
+
+/// **A member fresh from a restart is probed, not handed a share of a burst.**
+/// Run 36's heavy-decode at 19:01:21: BlackWorld learned (2,660 tok/s, a 20.8
+/// ms step widening to 70.2 ms), WhiteWorld restarted with nothing learned.
+/// Ranked by power it took 12 of the 48 at 25–45 s a turn. Probed, it takes
+/// one, and another only once that one is answered.
+#[test]
+fn an_unlearned_member_takes_one_turn_at_a_time() {
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    r.capacity(
+        "zend",
+        1,
+        Capacity {
+            prefill_tok_s: 2_660,
+            prefill_tok_s_wide: 2_660,
+            decode_step_next_us: 20_757,
+            decode_step_wide_us: 70_186,
+            ..capacity(MemberState::Ready, 400, true, 64)
+        },
+    );
+    r.capacity("zend", 2, capacity(MemberState::Ready, 300, true, 64));
+    assert_eq!(best(&mut r), Pick::Member(2), "the probe goes first");
+    let probe = r.begin("zend", 2).expect("admitted");
+    for _ in 0..23 {
+        assert_eq!(best(&mut r), Pick::Member(1));
+        r.begin("zend", 1);
+    }
+
+    // Its turn answered, it is probed again.
+    r.end("zend", 2, probe);
     assert_eq!(best(&mut r), Pick::Member(2));
 }
 
