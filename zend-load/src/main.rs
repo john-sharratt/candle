@@ -29,6 +29,7 @@ mod sample;
 mod sse;
 mod tasks;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -72,6 +73,25 @@ struct Args {
     /// Print every request's measurements, not only each rung's summary.
     #[arg(long)]
     samples: bool,
+    /// Write every answered turn's reply to this folder, one file per turn
+    /// named `<scenario>-c<client>-t<turn>.txt`: what a wrong rewrite said.
+    #[arg(long)]
+    replies: Option<PathBuf>,
+}
+
+/// Write `ran`'s replies under `dir`, named for `scenario`; a reply that cannot
+/// be written is reported and the run goes on.
+fn keep_replies(dir: &Path, scenario: &str, ran: &run::Ran) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("  replies: {} not created: {e}", dir.display());
+        return;
+    }
+    for (client, turn, text) in &ran.replies {
+        let path = dir.join(format!("{scenario}-c{client}-t{turn}.txt"));
+        if let Err(e) = std::fs::write(&path, text) {
+            eprintln!("  replies: {} not written: {e}", path.display());
+        }
+    }
 }
 
 #[tokio::main]
@@ -168,6 +188,9 @@ async fn main() -> Result<()> {
                         println!("  {s}");
                     }
                 }
+                if let Some(dir) = &args.replies {
+                    keep_replies(dir, &scenario.name, ran);
+                }
                 let row = Row::of(&scenario.name, &ran.samples, ran.wall);
                 println!("{row}");
                 rows.push(row);
@@ -202,6 +225,9 @@ async fn main() -> Result<()> {
             for s in &ran.samples {
                 println!("  {s}");
             }
+        }
+        if let Some(dir) = &args.replies {
+            keep_replies(dir, &scenario.name, &ran);
         }
         let row = Row::of(&scenario.name, &ran.samples, ran.wall);
         println!("{row}");

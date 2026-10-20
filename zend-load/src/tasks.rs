@@ -39,6 +39,17 @@ fn after_thinking(reply: &str) -> &str {
     }
 }
 
+/// `reply` with the run's mark line removed from its start. The model copies
+/// the user message it is given, and the mark heads it: a correct rewrite comes
+/// back as the mark and then the story (run 39, every one of sixteen).
+fn after_mark(reply: &str) -> &str {
+    let t = reply.trim_start();
+    match t.find(']') {
+        Some(end) if t.starts_with(&run_mark("")) => &t[end + 1..],
+        _ => t,
+    }
+}
+
 /// The battle-cities files a write task edits, one per client in turn — each
 /// declares a public function, so the edit asked for has a place to go. A
 /// crate's `lib.rs` often declares none (`math`'s is one `pub mod`), and asked
@@ -137,7 +148,7 @@ impl Task {
             Task::Story => {
                 let story = fixtures::story_prompt();
                 let expected = fixtures::story_rewrite_expected(&story, &story_name(client));
-                Some(judge(after_thinking(reply), &expected).passed())
+                Some(judge(after_mark(after_thinking(reply)), &expected).passed())
             }
             Task::Decode | Task::Read | Task::Write => None,
         }
@@ -316,6 +327,11 @@ mod tests {
         assert_eq!(Task::Story.verify(2, &right), Some(true));
         assert_eq!(
             Task::Story.verify(2, &format!("<think>\nrename\n</think>\n\n{right}")),
+            Some(true)
+        );
+        // The model copies the user message whole, mark included.
+        assert_eq!(
+            Task::Story.verify(2, &format!("{}\n\n{right}", mark("zl-3", 2))),
             Some(true)
         );
         let other = fixtures::story_rewrite_expected(&story, &story_name(3));

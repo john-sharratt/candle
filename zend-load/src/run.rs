@@ -12,12 +12,13 @@ use crate::client::{turn, Target};
 use crate::ladder::Scenario;
 use crate::sample::{Outcome, Sample};
 
-/// What a run produced: its samples, its wall time, and the conversation
-/// ids the cleanup deletes.
+/// What a run produced: its samples, its wall time, the conversation ids the
+/// cleanup deletes, and each answered turn's reply as `(client, turn, text)`.
 pub struct Ran {
     pub samples: Vec<Sample>,
     pub wall: Duration,
     pub conversations: Vec<String>,
+    pub replies: Vec<(usize, usize, String)>,
 }
 
 /// Run `scenario` under the run name `run`, each turn given at most `limit`.
@@ -31,6 +32,7 @@ pub async fn run(target: Arc<Target>, scenario: &Scenario, run: &str, limit: Dur
         clients.spawn(async move {
             let mut history = Vec::new();
             let mut samples = Vec::new();
+            let mut replies = Vec::new();
             let mut conversation = String::new();
             for t in 0..scenario.turns {
                 let (body, conv) =
@@ -44,6 +46,7 @@ pub async fn run(target: Arc<Target>, scenario: &Scenario, run: &str, limit: Dur
                 let answered = sample.outcome == Outcome::Answered;
                 if answered {
                     sample.rewrite = scenario.task.verify(client, &content);
+                    replies.push((client, t, content.clone()));
                 }
                 samples.push(sample);
                 if !answered {
@@ -57,14 +60,16 @@ pub async fn run(target: Arc<Target>, scenario: &Scenario, run: &str, limit: Dur
                 history.push(asked);
                 history.push(json!({"role": "assistant", "content": content}));
             }
-            (samples, conversation)
+            (samples, conversation, replies)
         });
     }
     let mut samples = Vec::new();
     let mut conversations = Vec::new();
+    let mut replies = Vec::new();
     while let Some(joined) = clients.join_next().await {
-        if let Ok((s, conv)) = joined {
+        if let Ok((s, conv, r)) = joined {
             samples.extend(s);
+            replies.extend(r);
             if !conv.is_empty() {
                 conversations.push(conv);
             }
@@ -74,5 +79,6 @@ pub async fn run(target: Arc<Target>, scenario: &Scenario, run: &str, limit: Dur
         samples,
         wall: started.elapsed(),
         conversations,
+        replies,
     }
 }
