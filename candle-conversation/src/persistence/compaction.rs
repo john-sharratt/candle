@@ -49,7 +49,7 @@ use super::tombstone_expiry::TombstoneExpiry;
 use super::vfs::{carried, VfsIndex};
 use super::Result;
 use crate::projection::TimelineId;
-use crate::substrate::Substrate;
+use crate::substrate::{IndexPage, Substrate};
 
 /// Bytes staged into the compacted log before an incremental flush to disk —
 /// bounds the write buffer so a whole-store rewrite never holds the entire new
@@ -643,21 +643,33 @@ pub fn collect_live_records(
         // its page leaves a turn that can be borrowed and cannot be indexed.
         // Unlike the signature this is not sig-gated — it belongs to the K/V,
         // and a `TextOnly` turn that keeps its chunks keeps its page.
-        if let Some(payload) = &entry.index_page {
-            out.push(CompactItem::synth(
-                RecordHeader {
-                    record_type: RecordType::TurnIndexPage,
-                    format: 0,
-                    payload_len: payload.bytes().len() as u64,
-                    crc: 0,
-                    stream_id: stream_id.0,
-                    chunk_index: 0,
-                    token_count: 0,
-                    ..RecordHeader::NONE
-                }
-                .with_identity(entry.ids.index_page),
+        // A page held in RAM is written from its bytes; one left in the log is
+        // carried by location, as the turn's K/V is.
+        let page_header = |payload_len: u64| {
+            RecordHeader {
+                record_type: RecordType::TurnIndexPage,
+                format: 0,
+                payload_len,
+                crc: 0,
+                stream_id: stream_id.0,
+                chunk_index: 0,
+                token_count: 0,
+                ..RecordHeader::NONE
+            }
+            .with_identity(entry.ids.index_page)
+        };
+        match &entry.index_page {
+            Some(IndexPage::Resident(payload)) => out.push(CompactItem::synth(
+                page_header(payload.bytes().len() as u64),
                 payload.shared_bytes(),
-            ));
+            )),
+            Some(IndexPage::Stored(loc)) => out.push(CompactItem::raw(
+                page_header(loc.payload_len),
+                loc.segment,
+                loc.offset,
+                loc.record_size,
+            )),
+            None => {}
         }
         if let Some(through) = entry.committed_through {
             out.push(CompactItem::synth(
@@ -1356,7 +1368,13 @@ mod tests {
         assert_eq!(&page[..], &[8, 9]);
         assert!(Arc::ptr_eq(
             page,
-            &entry.index_page.as_ref().unwrap().shared_bytes()
+            &entry
+                .index_page
+                .as_ref()
+                .unwrap()
+                .resident()
+                .unwrap()
+                .shared_bytes()
         ));
     }
 

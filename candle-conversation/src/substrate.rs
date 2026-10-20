@@ -1611,12 +1611,63 @@ pub struct StreamRuntime {
     /// more on a model that indexes every attention layer, so a copy and a
     /// digest per projection were most of what re-injecting a turn cost. See
     /// [`StoredPages`].
-    pub index_page: Option<Arc<StoredPages>>,
+    pub index_page: Option<IndexPage>,
     /// Highest chunk index the stream is durably committed through — the
     /// greatest any `Commit` record stated.
     pub committed_through: Option<u64>,
     /// The record behind each of the values above.
     pub ids: StreamIds,
+}
+
+/// Where a turn's or section's QSA index page is: its bytes, held, or the
+/// record in the log that holds them.
+///
+/// **A page recovered from the log stays in the log.** Every turn's and
+/// section's page was read at recovery and held for the life of the process,
+/// whether its turn was ever projected or not: on WhiteWorld (2026-10-20), a
+/// 260 GB substrate of deep conversations, that was ~60 GB of committed host
+/// memory paged straight back out, and the process aborted three times on
+/// allocations the machine could no longer commit. A recovered page is
+/// located like a snapshot and read when a projection asks for it; one sealed
+/// or received in this process is held, as it was written.
+#[derive(Debug, Clone)]
+pub enum IndexPage {
+    /// The bytes, as this process sealed or received them.
+    Resident(Arc<StoredPages>),
+    /// The record that holds them, read on demand.
+    Stored(RecordLoc),
+}
+
+impl IndexPage {
+    /// The held bytes, for a page this process holds.
+    pub fn resident(&self) -> Option<&Arc<StoredPages>> {
+        match self {
+            Self::Resident(p) => Some(p),
+            Self::Stored(_) => None,
+        }
+    }
+
+    /// The record's location, for a page left in the log.
+    pub fn stored(&self) -> Option<RecordLoc> {
+        match self {
+            Self::Stored(loc) => Some(*loc),
+            Self::Resident(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl IndexPage {
+    /// The page's bytes, held or read from `sp`'s log — what a test compares
+    /// against the bytes the seal wrote.
+    pub(crate) fn read_with(&self, sp: &mut crate::persistence::SubstratePersistence) -> Vec<u8> {
+        match self {
+            Self::Resident(pages) => pages.bytes().to_vec(),
+            Self::Stored(loc) => sp
+                .read_record_payload(loc)
+                .expect("a located page reads back"),
+        }
+    }
 }
 
 impl StreamRuntime {
@@ -4779,7 +4830,39 @@ impl Substrate {
         }
         let entry = self.streams.entry(key);
         if take(&mut entry.ids.index_page, id) {
-            entry.index_page = Some(Arc::new(StoredPages::new(payload)));
+            entry.index_page = Some(IndexPage::Resident(Arc::new(StoredPages::new(payload))));
+        }
+    }
+
+    /// A held page has become durable at `loc`: hold its location instead of
+    /// its bytes. Only the page record `id` itself — a newer page that took the
+    /// stream meanwhile is not the one written, and stays as it is.
+    pub fn settle_index_page(&mut self, stream_id: StreamId, loc: RecordLoc, id: RecordIdentity) {
+        let key = StreamKey::of(stream_id, &id);
+        if self.streams.physical(key).is_none() {
+            return;
+        }
+        let entry = self.streams.entry(key);
+        if entry.ids.index_page == id && matches!(entry.index_page, Some(IndexPage::Resident(_))) {
+            entry.index_page = Some(IndexPage::Stored(loc));
+        }
+    }
+
+    /// [`Self::apply_index_page`] for a page left in the log at `loc` — what
+    /// recovery and a relocation record ([`IndexPage::Stored`]).
+    pub fn apply_index_page_loc(
+        &mut self,
+        stream_id: StreamId,
+        loc: RecordLoc,
+        id: RecordIdentity,
+    ) {
+        let key = StreamKey::of(stream_id, &id);
+        if !self.admits(key, &id) {
+            return;
+        }
+        let entry = self.streams.entry(key);
+        if take(&mut entry.ids.index_page, id) {
+            entry.index_page = Some(IndexPage::Stored(loc));
         }
     }
 
@@ -6049,8 +6132,19 @@ impl Substrate {
             }
             RecordType::TurnIndexPage => {
                 // Opaque QSA index-page bytes — a turn's or a prompt section's; a
-                // re-seal writes the page again.
-                self.apply_index_page(stream_id, entry.record.payload.as_slice(), id);
+                // re-seal writes the page again. **Located, not held**: recovery
+                // leaves the payload in the log (`IndexPage::Stored`), and a
+                // projection reads it when it needs it.
+                self.apply_index_page_loc(
+                    stream_id,
+                    RecordLoc {
+                        segment: entry.segment,
+                        offset: entry.offset,
+                        payload_len: h.payload_len,
+                        record_size: entry.size,
+                    },
+                    id,
+                );
             }
             // Singletons go to the manifest, not the substrate; the
             // header-index chain is consumed by recovery, never here.
@@ -7216,43 +7310,21 @@ impl Substrate {
             .and_then(|s| s.wide_q_sigs.as_deref())
     }
 
-    /// The stored QSA index page for a turn, if any.
+    /// Where a turn's QSA index page is, if it has one — held, or located in
+    /// the log ([`IndexPage`]).
     ///
-    /// What a projection hands the model alongside a borrowed turn's K/V.
+    /// What a projection hands the model alongside a borrowed turn's K/V, read
+    /// through [`crate::Conversation::turn_index_page`] when it is in the log.
     /// `None` means the turn's keys can be borrowed but not indexed — the slot
     /// will hold tokens no cache accounts for.
-    pub fn index_page_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
-        self.streams
-            .get(turn_stream_id(timeline.raw(), index.0))
-            .and_then(|s| s.index_page.as_deref())
-            .map(StoredPages::bytes)
+    pub fn index_page_at(&self, timeline: TimelineId, index: TurnIndex) -> Option<IndexPage> {
+        self.index_page_of(turn_stream_id(timeline.raw(), index.0))
     }
 
-    /// [`Self::index_page_blob`] as held, with its keys — for a caller that
-    /// hands the pages to the model, or keeps them past the substrate lock.
-    pub fn index_page_shared(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-    ) -> Option<Arc<StoredPages>> {
-        self.streams
-            .get(turn_stream_id(timeline.raw(), index.0))
-            .and_then(|s| s.index_page.clone())
-    }
-
-    /// The stored QSA index page for a prompt section, keyed by the section's
-    /// content-addressed stream id — the section counterpart of
-    /// [`Self::index_page_blob`], and what a section restored from the log
-    /// hands the model in place of the page its prefill would have sealed.
-    pub fn section_index_page(&self, stream_id: StreamId) -> Option<&[u8]> {
-        self.streams
-            .get(stream_id)
-            .and_then(|s| s.index_page.as_deref())
-            .map(StoredPages::bytes)
-    }
-
-    /// [`Self::section_index_page`] as held, with its key.
-    pub fn section_index_page_shared(&self, stream_id: StreamId) -> Option<Arc<StoredPages>> {
+    /// Where a stream's QSA index page is — a turn's, or a prompt section's by
+    /// its content-addressed stream id — the page a section restored from the
+    /// log hands the model in place of the one its prefill would have sealed.
+    pub fn index_page_of(&self, stream_id: StreamId) -> Option<IndexPage> {
         self.streams
             .get(stream_id)
             .and_then(|s| s.index_page.clone())

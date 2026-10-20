@@ -1151,12 +1151,19 @@ mod tests {
         }
         {
             let mut substrate = Substrate::new();
-            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             let tl = TimelineId::from_raw(decl.timeline_id).unwrap();
-            let blob = substrate
-                .index_page_blob(tl, TurnIndex(decl.turn_index))
+            let page = substrate
+                .index_page_at(tl, TurnIndex(decl.turn_index))
                 .expect("index page recovered after restart");
-            assert_eq!(blob, payload.as_slice());
+            // Recovered, it is left in the log: located, not held in RAM — and
+            // read back, byte for byte the payload the seal wrote.
+            assert!(
+                page.stored().is_some(),
+                "a recovered page is not held in RAM"
+            );
+            assert_eq!(page.read_with(&mut sp), payload);
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1195,11 +1202,12 @@ mod tests {
         }
         {
             let mut substrate = Substrate::new();
-            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            assert_eq!(
-                substrate.section_index_page(stream_id),
-                Some(payload.as_slice())
-            );
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let page = substrate
+                .index_page_of(stream_id)
+                .expect("section page recovered");
+            assert_eq!(page.read_with(&mut sp), payload);
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1427,12 +1435,13 @@ mod tests {
         }
         {
             let mut substrate = Substrate::new();
-            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             let tl = TimelineId::from_raw(decl.timeline_id).unwrap();
-            assert_eq!(
-                substrate.index_page_blob(tl, TurnIndex(decl.turn_index)),
-                Some(b"second-page".as_slice())
-            );
+            let page = substrate
+                .index_page_at(tl, TurnIndex(decl.turn_index))
+                .expect("index page recovered");
+            assert_eq!(page.read_with(&mut sp), b"second-page".to_vec());
         }
         std::fs::remove_dir_all(&dir).ok();
     }

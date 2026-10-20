@@ -7,6 +7,7 @@
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
+use crate::index_pages::StoredPages;
 use crate::recorded_reply::recorded_reply;
 use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
@@ -4909,17 +4910,35 @@ impl Sequence {
     /// model when it borrows each turn, so two timelines that agree here are the
     /// same context.
     pub fn sealed_turns(&self, timeline: TimelineId) -> Vec<SealedTurn> {
-        let read = self.substrate.read();
-        read.turn_indices(timeline)
-            .filter(|&idx| {
-                !read
-                    .tree_meta_of(timeline, idx)
-                    .is_some_and(|m| m.kind.is_summary())
-            })
-            .map(|idx| SealedTurn {
-                index: idx.0,
-                token_ids: read.token_ids_of(timeline, idx),
-                pages: SealedPages::of(read.index_page_blob(timeline, idx)),
+        // The turns and their ids under the read lock, the pages after it: a
+        // page left in the log is read through the persistence path, which
+        // takes its own locks.
+        let turns: Vec<(TurnIndex, Vec<u32>)> = {
+            let read = self.substrate.read();
+            read.turn_indices(timeline)
+                .filter(|&idx| {
+                    !read
+                        .tree_meta_of(timeline, idx)
+                        .is_some_and(|m| m.kind.is_summary())
+                })
+                .map(|idx| (idx, read.token_ids_of(timeline, idx)))
+                .collect()
+        };
+        turns
+            .into_iter()
+            .map(|(idx, token_ids)| {
+                let page = self
+                    .substrate
+                    .turn_index_page(timeline, idx)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("sealed turn {timeline:?}/{}: {e}", idx.0);
+                        None
+                    });
+                SealedTurn {
+                    index: idx.0,
+                    token_ids,
+                    pages: SealedPages::of(page.as_deref().map(StoredPages::bytes)),
+                }
             })
             .collect()
     }

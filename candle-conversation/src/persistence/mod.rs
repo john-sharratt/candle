@@ -1667,6 +1667,15 @@ impl SubstratePersistence {
         // A relocated `Npc` record is that character's new on-disk home, for
         // exactly the same reason.
         self.track_npc_loc(header, segment, offset, size);
+        // A relocated QSA index page likewise: its copy is where the record is,
+        // and the segment liveness counts it from `metadata_locs`.
+        if header.record_type == RecordType::TurnIndexPage {
+            self.metadata_locs.offer(
+                metadata_key(header),
+                Some(Self::placed_loc(header, segment, offset, size)),
+                header.identity(),
+            );
+        }
         // `Chunk` / `Tokens` are indexed on the substrate, not the manifest, so
         // no `manifest.ingest` — the caller repoints the substrate index.
         if header.record_type != RecordType::HeaderIndex {
@@ -2228,13 +2237,17 @@ impl SubstratePersistence {
     /// The counterpart of [`Self::append_wide_q_sigs`]: both carry a blob that
     /// belongs to a turn and that no amount of re-reading the turn's K/V can
     /// reconstruct, because it was computed from hidden states.
+    ///
+    /// Returns the record's location, which the writer settles the substrate's
+    /// held copy to ([`crate::substrate::Substrate::settle_index_page`]): a
+    /// page is held only until it is durable, then read from the log.
     pub fn append_turn_index_page(
         &mut self,
         stream_id: StreamId,
         payload: &[u8],
         id: RecordIdentity,
-    ) -> Result<()> {
-        self.append_carried(
+    ) -> Result<RecordLoc> {
+        let at = self.append_carried(
             RecordType::TurnIndexPage,
             0,
             stream_id.0,
@@ -2244,7 +2257,7 @@ impl SubstratePersistence {
             payload,
             id,
         )?;
-        Ok(())
+        Ok(at.loc(payload.len() as u64))
     }
 
     /// Append a conversation's recurrent-state snapshot under its snapshot
@@ -3746,6 +3759,73 @@ mod tests {
             substrate.couplings_of(timeline).contains(&0),
             "compaction must carry the coupling forward — without it a tool call \
              and its response stop being one exchange"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A whole-store compaction carries a located index page by location,
+    /// byte for byte.** Recovered pages are left in the log
+    /// ([`crate::substrate::IndexPage::Stored`]); the rewrite copies the record
+    /// verbatim, and the page read after it — and after a reload — is exactly
+    /// the bytes the seal wrote. A page dropped by a rewrite would leave the
+    /// turn borrowable and unindexable.
+    #[test]
+    fn a_located_index_page_survives_compaction_byte_for_byte() {
+        let dir = tmp_dir("index_page_compact");
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 7,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 1,
+            block_start: 0,
+            block_end: 32,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let page: Vec<u8> = (0..9_000u32)
+            .map(|i| (i.wrapping_mul(131) % 253) as u8)
+            .collect();
+        let sid = {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            let sid = sp.declare_stream(&decl).unwrap().value;
+            sp.append_tokens(sid, b"token-bytes").unwrap();
+            sp.commit_stream(sid, 0).unwrap();
+            sp.append_turn_index_page(sid, &page, sp.mint_for(RecordType::TurnIndexPage, sid))
+                .unwrap();
+            sp.commit().unwrap();
+            sid
+        };
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let held = substrate.index_page_of(sid).expect("the page recovers");
+            assert!(held.stored().is_some(), "recovered, the page is located");
+            assert_eq!(held.read_with(&mut sp), page);
+            sp.compact(&mut substrate, None).unwrap();
+            let after = substrate
+                .index_page_of(sid)
+                .expect("the page survives compaction");
+            assert_eq!(
+                after.read_with(&mut sp),
+                page,
+                "the seal's bytes, after compaction"
+            );
+        }
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let reloaded = substrate
+            .index_page_of(sid)
+            .expect("the page survives a reload");
+        assert_eq!(
+            reloaded.read_with(&mut sp),
+            page,
+            "the seal's bytes, after a reload"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -221,11 +221,15 @@ fn windowing_drops_exactly_the_span_or_nothing_at_all() {
 
     let tl = conv.timeline_id();
     let handle = eng.conversation();
+    // Read before the substrate lock: a page on disk is read on demand, and
+    // that read takes the lock itself.
+    let pages = handle
+        .turn_index_page(tl, idx)
+        .expect("the turn's page reads");
     let read = handle.read();
 
     let whole = read.turn_sealed_of(tl, idx).expect("the turn is hot");
     let whole_tokens = whole[0].token_count;
-    let pages = read.index_page_shared(tl, idx);
     let layout = read.turn_layout(tl, idx).expect("layout");
     let span = layout.segments.iter().find_map(|s| match s {
         TurnSegment::Thinking { kv, .. } => *kv,
@@ -302,14 +306,21 @@ fn only_the_newest_turn_keeps_its_reasoning() {
 
     let tl = conv.timeline_id();
     let handle = eng.conversation();
+    let pages_of: Vec<_> = indices
+        .iter()
+        .map(|&idx| {
+            handle
+                .turn_index_page(tl, idx)
+                .expect("the turn's page reads")
+        })
+        .collect();
     let read = handle.read();
     let newest = indices.iter().copied().max().expect("a newest turn");
 
-    for &idx in &indices {
+    for (&idx, pages) in indices.iter().zip(pages_of) {
         let Some(whole) = read.turn_sealed_of(tl, idx) else {
             continue; // demoted out of hot; not this test's subject
         };
-        let pages = read.index_page_shared(tl, idx);
         let (windowed, _) = read
             .turn_sealed_without_thinking(tl, idx, pages)
             .expect("the turn's reasoning windows onto its page boundaries")

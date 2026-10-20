@@ -93,13 +93,14 @@ impl Substrate {
             if let Some(p) = &s.wide_q_sigs {
                 let _ = writeln!(out, "  sigs {} {:?}", id(&ids.wide_q_sigs), hash_bytes(p));
             }
+            // By identity and length, like `tokens`: one member may hold a page's
+            // bytes and another only where they are, and the record is the same.
             if let Some(p) = &s.index_page {
-                let _ = writeln!(
-                    out,
-                    "  index_page {} {:?}",
-                    id(&ids.index_page),
-                    hash_bytes(p.bytes())
-                );
+                let len = match p {
+                    crate::substrate::IndexPage::Resident(pages) => pages.bytes().len() as u64,
+                    crate::substrate::IndexPage::Stored(loc) => loc.payload_len,
+                };
+                let _ = writeln!(out, "  index_page {} len={len}", id(&ids.index_page));
             }
             if let Some(through) = s.committed_through {
                 let _ = writeln!(out, "  committed {through} {}", id(&ids.commit));

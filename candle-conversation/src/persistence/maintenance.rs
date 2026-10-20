@@ -87,7 +87,7 @@ use super::vfs::VfsEventId;
 use super::{
     is_tracked_metadata, metadata_key_parts, PersistenceError, Result, SubstratePersistence,
 };
-use crate::substrate::{StreamKey, StreamRuntime, Substrate};
+use crate::substrate::{IndexPage, StreamKey, StreamRuntime, Substrate};
 
 /// Compact trigger: a sealed segment must be at least this fraction dead
 /// weight before relocating it is worth the I/O (§8).
@@ -326,6 +326,10 @@ pub struct MaintenancePlan {
     chunk_relocs: Vec<(StreamKey, u64, ChunkLoc)>,
     /// `(stream, source_loc)` `Tokens` records to relocate.
     token_relocs: Vec<(StreamKey, RecordLoc)>,
+    /// `(stream, source_loc)` QSA index pages held in the log to relocate —
+    /// carried by location like `Tokens`, since their bytes are not in RAM
+    /// (`IndexPage::Stored`).
+    index_page_relocs: Vec<(StreamKey, RecordLoc)>,
     /// `(snapshot stream, source_loc)` recurrent-state snapshots to relocate.
     snapshot_relocs: Vec<(StreamId, RecordLoc)>,
     /// `(branch stream, source_loc)` prompt branch checkpoints to relocate.
@@ -396,11 +400,12 @@ pub struct MaintenanceRun {
     chunk_updates: Vec<(StreamKey, u64, ChunkLoc, ChunkLoc)>,
     /// Which tail stage [`SubstratePersistence::relocate_tail_batch`] is in.
     /// Tokens, snapshots, branch checkpoints, singletons, characters, file
-    /// events, blobs, then done.
+    /// events, blobs, index pages, then done.
     tail_stage: u8,
     /// How far into the current tail stage the cursor has walked.
     tail_cursor: usize,
     token_updates: Vec<(StreamKey, RecordLoc, RecordLoc)>,
+    index_page_updates: Vec<(StreamKey, RecordLoc, RecordLoc)>,
     snapshot_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
     branch_checkpoint_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
 }
@@ -413,7 +418,8 @@ const TAIL_SINGLETONS: u8 = 3;
 const TAIL_NPCS: u8 = 4;
 const TAIL_VFS: u8 = 5;
 const TAIL_BLOBS: u8 = 6;
-const TAIL_DONE: u8 = 7;
+const TAIL_INDEX_PAGES: u8 = 7;
+const TAIL_DONE: u8 = 8;
 /// Skipped records examined under one hold before the lock is released, so a
 /// stage of nothing-but-superseded entries cannot sit on the lock.
 const TAIL_EXAMINE_CAP: usize = 4096;
@@ -425,6 +431,7 @@ impl MaintenanceRun {
         MaintenanceResult {
             chunk_updates: std::mem::take(&mut self.chunk_updates),
             token_updates: std::mem::take(&mut self.token_updates),
+            index_page_updates: std::mem::take(&mut self.index_page_updates),
             snapshot_updates: std::mem::take(&mut self.snapshot_updates),
             branch_checkpoint_updates: std::mem::take(&mut self.branch_checkpoint_updates),
         }
@@ -439,6 +446,7 @@ pub struct MaintenanceResult {
     chunk_updates: Vec<(StreamKey, u64, ChunkLoc, ChunkLoc)>,
     /// `(stream, old_loc, new_loc)`.
     token_updates: Vec<(StreamKey, RecordLoc, RecordLoc)>,
+    index_page_updates: Vec<(StreamKey, RecordLoc, RecordLoc)>,
     /// `(snapshot stream, old_loc, new_loc)`.
     snapshot_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
     /// `(branch stream, old_loc, new_loc)`.
@@ -472,6 +480,20 @@ impl MaintenanceResult {
             if let Some((loc, id)) = held {
                 if loc == *old {
                     substrate.apply_tokens_loc(key.stream_id, *new, id);
+                }
+            }
+        }
+        for (key, old, new) in &self.index_page_updates {
+            // Same guard: a page rewritten since the plan keeps its newer copy.
+            let held = substrate.stream_at(*key).and_then(|s| {
+                s.index_page
+                    .as_ref()
+                    .and_then(IndexPage::stored)
+                    .map(|loc| (loc, s.ids.index_page))
+            });
+            if let Some((loc, id)) = held {
+                if loc == *old {
+                    substrate.apply_index_page_loc(key.stream_id, *new, id);
                 }
             }
         }
@@ -579,8 +601,11 @@ pub(super) fn gather_resident_set(
             }
             // The index page rides with the turn's K/V: a turn that survives
             // relocation with its chunks but loses its page comes back
-            // borrowable and unindexable.
-            if let Some(p) = &entry.index_page {
+            // borrowable and unindexable. Only a page this process holds is
+            // re-emitted from RAM; one left in the log is relocated, by
+            // location, like the turn's tokens
+            // ([`SubstratePersistence::gather_index_page_relocs`]).
+            if let Some(IndexPage::Resident(p)) = &entry.index_page {
                 out.push(Resident {
                     rt: RecordType::TurnIndexPage,
                     stream_id: stream_id.0,
@@ -938,6 +963,7 @@ impl SubstratePersistence {
         let npc_relocs = self.npc_relocations(&op.targets());
         let vfs_relocs = self.vfs_relocations(substrate, &op.targets());
         let blob_relocs = self.blob_relocations(&op.targets());
+        let index_page_relocs = self.gather_index_page_relocs(substrate, &op.targets());
         let relocs_ms = t_relocs.elapsed().as_millis() as u64;
         // What this op carries off the target segments, by type. The incremental
         // path is the one that actually runs on a busy store — the 143 GB store
@@ -982,6 +1008,7 @@ impl SubstratePersistence {
             npcs = npc_relocs.len(),
             vfs = vfs_relocs.len(),
             blobs = blob_relocs.len(),
+            index_pages = index_page_relocs.len(),
             liveness_ms,
             resident_ms,
             relocs_ms,
@@ -994,6 +1021,7 @@ impl SubstratePersistence {
             resident,
             chunk_relocs,
             token_relocs,
+            index_page_relocs,
             snapshot_relocs,
             branch_checkpoint_relocs,
             singleton_relocs,
@@ -1101,6 +1129,7 @@ impl SubstratePersistence {
             tail_stage: TAIL_TOKENS,
             tail_cursor: 0,
             token_updates: Vec::new(),
+            index_page_updates: Vec::new(),
             snapshot_updates: Vec::new(),
             branch_checkpoint_updates: Vec::new(),
         })
@@ -1391,6 +1420,23 @@ impl SubstratePersistence {
             TAIL_NPCS => self.take_npcs(plan, run, budget),
             TAIL_VFS => self.take_vfs(plan, run, budget),
             TAIL_BLOBS => self.take_blobs(plan, run, budget),
+            TAIL_INDEX_PAGES => {
+                let (n, bytes, done, batch) = Self::take_budgeted(
+                    &plan.index_page_relocs,
+                    &mut run.tail_cursor,
+                    budget,
+                    |(_, old)| old.record_size,
+                    |(key, old)| {
+                        self.metadata_locs.get(&metadata_key_parts(
+                            RecordType::TurnIndexPage,
+                            key.stream_id.0,
+                            key.writer,
+                        )) == Some(old)
+                    },
+                );
+                self.extend_stream_updates(&batch, &mut run.index_page_updates)?;
+                Ok((n, bytes, done))
+            }
             _ => Ok((0, 0, true)),
         }
     }
@@ -1770,6 +1816,7 @@ impl SubstratePersistence {
             resident,
             chunk_relocs,
             token_relocs,
+            index_page_relocs: self.gather_index_page_relocs(substrate, &op.targets()),
             snapshot_relocs,
             branch_checkpoint_relocs,
             singleton_relocs,
@@ -1950,6 +1997,44 @@ impl SubstratePersistence {
             }
         }
         (chunks, tokens, snapshots, branch_checkpoints, singletons)
+    }
+
+    /// QSA index pages held in the log ([`IndexPage::Stored`]) physically inside
+    /// a target segment — relocated by location, as a turn's tokens are, since
+    /// their bytes are not in RAM to re-emit. The resident set's gates: nothing
+    /// of a stream dropped wholesale or an orphan, and a page only where its
+    /// stream keeps its signature records.
+    pub(super) fn gather_index_page_relocs(
+        &self,
+        substrate: &Substrate,
+        targets: &[SegmentId],
+    ) -> Vec<(StreamKey, RecordLoc)> {
+        let tombstoned: HashSet<u64> = substrate
+            .tombstoned_timelines()
+            .iter()
+            .map(|t| t.raw())
+            .collect();
+        let distilled: HashMap<u64, DistillMode> = substrate
+            .distilled_timelines()
+            .iter()
+            .map(|(t, m)| (t.raw(), *m))
+            .collect();
+        let node = self.node();
+        let mut out = Vec::new();
+        for (key, entry) in substrate.all_physical_streams() {
+            let Some(IndexPage::Stored(loc)) = &entry.index_page else {
+                continue;
+            };
+            if !targets.contains(&loc.segment) {
+                continue;
+            }
+            let shed = classify(substrate, key, entry, &tombstoned, &distilled);
+            if shed.dropped_wholesale() || entry.is_orphan(node) || !shed.keep_sig() {
+                continue;
+            }
+            out.push((key, *loc));
+        }
+        out
     }
 
     /// Live record bytes per segment — every record
@@ -2433,6 +2518,106 @@ mod tests {
             decoded.aux,
             vec![0x22u8; 24],
             "relocation carries the model's own state too"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A turn's QSA index page, left in the log, survives a segment's
+    /// maintenance byte for byte.** Recovered, the page is located, not held
+    /// ([`IndexPage::Stored`]); a compaction of the segment holding it relocates
+    /// the record by location and repoints the substrate at the copy, and the
+    /// bytes read there — and after a reload — are exactly the bytes the seal
+    /// wrote, the superseded page's included in none of it.
+    #[test]
+    fn a_located_index_page_relocates_byte_for_byte() {
+        let dir = tmp_dir("index_page_reloc");
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 5150,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 1,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
+        let stale: Vec<u8> = (0..700u32).map(|i| (i % 13) as u8).collect();
+        let page: Vec<u8> = (0..4_099u32)
+            .map(|i| (i.wrapping_mul(37) % 251) as u8)
+            .collect();
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            // Two pages in seg 1: the first is the dead weight that qualifies
+            // the segment for a compaction, the second the live page it carries.
+            sp.append_turn_index_page(sid, &stale, sp.mint_for(RecordType::TurnIndexPage, sid))
+                .unwrap();
+            sp.append_turn_index_page(sid, &page, sp.mint_for(RecordType::TurnIndexPage, sid))
+                .unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+        }
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let held = substrate.index_page_of(sid).expect("the page recovers");
+        let old = held
+            .stored()
+            .expect("recovered, the page is located, not held");
+        assert_eq!(old.segment, SegmentId(1));
+        assert_eq!(
+            held.read_with(&mut sp),
+            page,
+            "the seal's bytes, before relocation"
+        );
+
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("seg 1 carries a superseded page, force-compact qualifies");
+        assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+        let result = sp.execute_maintenance(&plan).unwrap();
+        assert_eq!(
+            result.index_page_updates.len(),
+            1,
+            "the live page, and only it"
+        );
+        let (_, from, to) = result.index_page_updates[0];
+        assert_eq!(from, old);
+        assert_ne!(
+            to.segment,
+            SegmentId(1),
+            "relocated off the compacted segment"
+        );
+        result.apply_to_substrate(&mut substrate);
+        sp.finish_maintenance(&plan).unwrap();
+        assert!(!sealed_log(&dir, 1).exists(), "seg 1 compacted away");
+
+        let moved = substrate
+            .index_page_of(sid)
+            .expect("the page survives the compaction");
+        assert_eq!(moved.stored(), Some(to), "the substrate points at the copy");
+        assert_eq!(
+            moved.read_with(&mut sp),
+            page,
+            "the seal's bytes, after relocation"
+        );
+        drop(sp);
+
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let reloaded = substrate
+            .index_page_of(sid)
+            .expect("the page survives a reload");
+        assert_eq!(
+            reloaded.read_with(&mut sp),
+            page,
+            "the seal's bytes, after a reload"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3021,7 +3206,13 @@ mod tests {
         assert_eq!(&page[..], &[8, 9]);
         assert!(Arc::ptr_eq(
             page,
-            &entry.index_page.as_ref().unwrap().shared_bytes()
+            &entry
+                .index_page
+                .as_ref()
+                .unwrap()
+                .resident()
+                .unwrap()
+                .shared_bytes()
         ));
     }
 
@@ -4274,6 +4465,7 @@ mod tests {
             resident: sp.resident_to_carry(&substrate, &[SegmentId(1)]),
             chunk_relocs: Vec::new(),
             token_relocs: Vec::new(),
+            index_page_relocs: Vec::new(),
             snapshot_relocs: Vec::new(),
             branch_checkpoint_relocs: Vec::new(),
             singleton_relocs: Vec::new(),

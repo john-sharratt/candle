@@ -32,6 +32,7 @@ use super::working_set_observe::{working_set_config, working_set_fresh};
 use super::working_set_pick::{Standing, WorkingSetMembers};
 use crate::cancel::CancelToken;
 use crate::error::ConversationError;
+use crate::index_pages::StoredPages;
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDivergence};
 use crate::persistence::content_hash::{
@@ -64,8 +65,8 @@ use crate::provenance::{
 };
 use crate::scheduler::profile;
 use crate::substrate::{
-    ContentResolver, ProjectionScores, ResidenceIndex, StoredSequence, Substrate, SubstrateRead,
-    SubstrateWrite, TreeNodeMeta, TurnPartWrite, TurnStream,
+    ContentResolver, IndexPage, ProjectionScores, ResidenceIndex, StoredSequence, Substrate,
+    SubstrateRead, SubstrateWrite, TreeNodeMeta, TurnPartWrite, TurnStream,
 };
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
@@ -2638,7 +2639,7 @@ impl Conversation {
         tags: Vec<String>,
     ) -> candle::Result<TurnIndex> {
         use crate::persistence::content_hash::turn_stream_id;
-        let (layout, token_ids, block_range, sigs_blob, index_page) = {
+        let (layout, token_ids, block_range, sigs_blob) = {
             let r = self.read();
             let layout = r
                 .turn_layout(from_tl, from_idx)
@@ -2648,9 +2649,15 @@ impl Conversation {
                 .turn_block_range(from_tl, from_idx)
                 .ok_or_else(|| candle::Error::Msg("adopt_turn: no block range".into()))?;
             let sigs_blob = r.wide_q_sigs_blob(from_tl, from_idx).map(|b| b.to_vec());
-            let index_page = r.index_page_blob(from_tl, from_idx).map(|b| b.to_vec());
-            (layout, token_ids, block_range, sigs_blob, index_page)
+            (layout, token_ids, block_range, sigs_blob)
         };
+        // The turn's index page after the lock: one left in the log is read
+        // through the persistence path. Unreadable is an error, not a turn
+        // adopted without its index rows.
+        let index_page = self
+            .turn_index_page(from_tl, from_idx)
+            .map_err(|e| candle::Error::Msg(format!("adopt_turn: {e}")))?
+            .map(|p| p.bytes().to_vec());
         let sealed = self
             .read()
             .turn_sealed_of(from_tl, from_idx)
@@ -4385,9 +4392,15 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        let mut p = self.persistence.lock().unwrap();
-        p.append_turn_index_page(stream_id, payload, identity)
-            .map_err(|e| candle::Error::Msg(format!("persist index page: {e}")))
+        let loc = self
+            .persistence
+            .lock()
+            .unwrap()
+            .append_turn_index_page(stream_id, payload, identity)
+            .map_err(|e| candle::Error::Msg(format!("persist index page: {e}")))?;
+        // Durable: the substrate holds where it is, not its bytes.
+        self.write().settle_index_page(stream_id, loc, identity);
+        Ok(())
     }
 
     /// Enqueue a turn/section `Tokens` record onto the off-thread writer — the
@@ -4676,6 +4689,78 @@ impl Conversation {
                             return Err(ConversationError::Channel(format!(
                                 "recurrent snapshot for timeline {} is indexed but unreadable: {e}",
                                 timeline.raw()
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A turn's QSA index page — held, or read from the log ([`IndexPage`]).
+    /// `None` when the turn has none; an error when one is indexed and cannot
+    /// be read, since a borrowed turn's K/V without its index rows is a slot
+    /// whose tokens no cache accounts for.
+    pub fn turn_index_page(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Result<Option<Arc<StoredPages>>, ConversationError> {
+        self.read_index_page(turn_stream_id(timeline.raw(), index.0))
+    }
+
+    /// [`Self::turn_index_page`] for any stream — a prompt section's by its
+    /// content-addressed id.
+    ///
+    /// **Read the way a snapshot is** ([`Self::read_recurrent_snapshot`]):
+    /// without the persistence mutex where the record is sealed, and read again
+    /// at the index's new location whenever a read fails because compaction
+    /// moved it. Not held afterwards — the page is the caller's for as long as
+    /// it keeps the `Arc`, and the substrate goes on naming only where it is.
+    pub fn read_index_page(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<Option<Arc<StoredPages>>, ConversationError> {
+        let mut loc = match self.read().index_page_of(stream_id) {
+            None => return Ok(None),
+            Some(IndexPage::Resident(pages)) => return Ok(Some(pages)),
+            Some(IndexPage::Stored(loc)) => loc,
+        };
+        let moved = |stale: RecordLoc| {
+            self.read()
+                .index_page_of(stream_id)
+                .and_then(|p| p.stored())
+                .filter(|now| *now != stale)
+        };
+        for _ in 0..SEALED_READ_ATTEMPTS {
+            let Some(read) = self.sealed.read_record_payload(&loc) else {
+                break;
+            };
+            match read {
+                Ok(bytes) => return Ok(Some(Arc::new(StoredPages::new(bytes)))),
+                Err(_) => match moved(loc) {
+                    Some(now) => loc = now,
+                    None => break,
+                },
+            }
+        }
+        let mut attempt = 0;
+        loop {
+            let read = self
+                .persistence
+                .lock()
+                .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
+                .read_record_payload(&loc);
+            match read {
+                Ok(bytes) => return Ok(Some(Arc::new(StoredPages::new(bytes)))),
+                Err(e) => {
+                    attempt += 1;
+                    match moved(loc) {
+                        Some(now) if attempt < SEALED_READ_ATTEMPTS => loc = now,
+                        _ => {
+                            return Err(ConversationError::Channel(format!(
+                                "QSA index page of stream {} is indexed but unreadable: {e}",
+                                stream_id.0
                             )))
                         }
                     }
@@ -5477,9 +5562,91 @@ mod tests {
             .expect("adopt the fork's turn");
 
         assert_eq!(
-            conv.read().index_page_blob(file, adopted),
-            Some(page.as_slice()),
+            conv.turn_index_page(file, adopted)
+                .expect("the adopted turn's page reads")
+                .map(|p| p.bytes().to_vec()),
+            Some(page.clone()),
             "the adopted turn must carry the fork's index page under its own stream"
+        );
+    }
+
+    /// **A turn whose page is in the log projects as one whose page is held.**
+    /// Once its write lands the substrate holds only where the page is
+    /// ([`IndexPage::Stored`]); the page a projection reads back is the bytes
+    /// the seal wrote, it decodes to the same pages, and adopting the turn
+    /// carries those bytes onto the new stream — the path the index pages have
+    /// failed to travel before, now with them read from disk.
+    #[test]
+    fn a_turn_whose_page_is_on_disk_projects_as_one_held() {
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let fork = TimelineId::from_raw(17).expect("fork timeline id");
+        let file = TimelineId::from_raw(18).expect("file timeline id");
+        conv.register_timeline(fork, layer, group);
+        conv.register_timeline(file, layer, group);
+        conv.mark_timeline_splice_source(fork);
+        let sealed = Arc::new(vec![SealedSequence {
+            chunks: vec![SealedChunk::for_test(1000, 4)],
+            token_count: 4,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }]);
+        let from = conv
+            .record_turn(
+                fork,
+                Role::Assistant,
+                TurnPartWrite {
+                    token_ids: TokenBuffer::from(vec![21, 22, 23, 24]),
+                    token_count: 4,
+                    block_start: 0,
+                    block_end: 1,
+                    sealed_gpu: Some(sealed),
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record the fork's turn");
+        // A real page: two framed pages, so the decode has something to agree on.
+        let page = crate::index_pages::encode(&[(2, vec![7u8; 96]), (2, vec![9u8; 96])]);
+        conv.enqueue_index_page(turn_stream_id(fork.raw(), from.0), page.clone());
+        conv.flush_writer();
+
+        let at = conv
+            .read()
+            .index_page_at(fork, from)
+            .expect("the turn has a page");
+        assert!(
+            at.stored().is_some(),
+            "written, the page is held in the log, not RAM"
+        );
+        let read = conv
+            .turn_index_page(fork, from)
+            .expect("the page reads")
+            .expect("the turn has a page");
+        assert_eq!(
+            read.bytes(),
+            page.as_slice(),
+            "the seal's bytes, read from disk"
+        );
+        assert_eq!(
+            crate::sealed_turn::SealedPages::of(Some(read.bytes())),
+            crate::sealed_turn::SealedPages::of(Some(&page)),
+            "the same pages as the bytes held"
+        );
+
+        let adopted = conv
+            .adopt_turn(fork, from, file, Role::Assistant, tags(&["code"]))
+            .expect("adopt the fork's turn");
+        conv.flush_writer();
+        let carried = conv
+            .turn_index_page(file, adopted)
+            .expect("the adopted page reads")
+            .expect("the adopted turn has a page");
+        assert_eq!(
+            carried.bytes(),
+            page.as_slice(),
+            "adoption carries the bytes read from disk"
         );
     }
 

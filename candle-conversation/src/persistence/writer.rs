@@ -578,14 +578,26 @@ fn process_one(
             payload,
             identity,
         } => {
-            let mut p = persistence.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = p.append_turn_index_page(stream_id, &payload, identity) {
-                tracing::error!(
+            // Append under the persistence lock, then settle the substrate's held
+            // copy to the record's location under the substrate lock — never
+            // nested, the `Snapshot` discipline. From here the page is read
+            // from the log when a projection takes it, not held for the life of
+            // the process.
+            let appended = persistence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append_turn_index_page(stream_id, &payload, identity);
+            match appended {
+                Ok(loc) => substrate
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .settle_index_page(stream_id, loc, identity),
+                Err(e) => tracing::error!(
                     target: "candle_conversation::persistence::writer",
                     stream_id = stream_id.0,
                     "index page append failed: {e} — this turn or section will be \
                      borrowable but unindexable after a restart"
-                );
+                ),
             }
         }
         WriteJob::ProjectionEvents {

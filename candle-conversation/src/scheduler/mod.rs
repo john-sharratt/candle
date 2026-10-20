@@ -8430,14 +8430,11 @@ impl Scheduler {
         //    reach every projection unindexed, and a prefill is the only way
         //    to rebuild it.
         let page = if self.model.carries_positional_state() {
-            let page = conversation
-                .read()
-                .section_index_page_shared(stream_id)
-                .ok_or_else(|| {
-                    ConversationError::Channel(format!(
-                        "section {section_id:?}: persisted without its index page — re-ingest"
-                    ))
-                })?;
+            let page = conversation.read_index_page(stream_id)?.ok_or_else(|| {
+                ConversationError::Channel(format!(
+                    "section {section_id:?}: persisted without its index page — re-ingest"
+                ))
+            })?;
             Some(page)
         } else {
             None
@@ -10438,9 +10435,15 @@ impl Scheduler {
                             // resident copy first, then the turn's stored page,
                             // the same order a projection uses.
                             let key = TurnKey::new(target.timeline, idx);
-                            let page = self.turn_positional.get(&key).cloned().or_else(|| {
-                                conversation.read().index_page_shared(target.timeline, idx)
-                            });
+                            let page = match self.turn_positional.get(&key).cloned() {
+                                Some(pages) => Some(pages),
+                                None => conversation
+                                    .turn_index_page(target.timeline, idx)
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!("memory catch-up: {e}");
+                                        None
+                                    }),
+                            };
                             // The stored page is a framed LIST of pages, and the
                             // model reads one page at a time — see
                             // `index_pages::push_in_order`. However the pages fare,

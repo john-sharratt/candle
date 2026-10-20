@@ -1862,9 +1862,14 @@ fn inject_sealed_turn(
     let t_resolve = Instant::now();
     let fetch = profile::span("inject:turn:fetch_page");
     let resident = ctx.turn_positional.get(&key).cloned();
+    // Before the substrate lock: a page left in the log is read through the
+    // persistence path, which takes its own.
+    let stored = match resident {
+        Some(pages) => Some(pages),
+        None => ctx.conversation.turn_index_page(timeline, index)?,
+    };
     let (sealed, page) = {
         let conv = ctx.conversation.read();
-        let stored = resident.or_else(|| conv.index_page_shared(timeline, index));
         fetch.end();
         let _window = profile::span("inject:turn:window");
         // **"Most recent" is the SLOT's most recent, not each timeline's.**

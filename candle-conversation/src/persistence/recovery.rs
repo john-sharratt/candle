@@ -79,6 +79,11 @@ fn payload_needed(rt: RecordType) -> bool {
             // Blobs likewise: indexed by their hash's prefix from the header,
             // bytes read when asked for.
             | RecordType::Blob
+            // QSA index pages likewise: located from the header, read when a
+            // projection takes the turn or section. Fetched here, every page of
+            // every turn stood in host memory for the life of the process —
+            // ~60 GB on a 260 GB substrate, past what the host could commit.
+            | RecordType::TurnIndexPage
     )
 }
 
