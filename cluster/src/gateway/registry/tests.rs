@@ -540,6 +540,50 @@ fn a_burst_prices_the_step_it_makes() {
     assert_eq!(step_with_us(&c, 31), 832_332);
 }
 
+/// **Current enough is a conversation dimension** (§4.4). A member lagging on
+/// everyone else's writes still takes a new conversation — it has no history
+/// to be behind on — and does when it finishes soonest; a released one only
+/// once it holds its last holder's records; and it answers no catch-up and
+/// takes no round-robin request, which need a member current on everything.
+/// Run 26's heavy-read burst landed while WhiteWorld was lagging behind
+/// BlackWorld's KV writes, and all 48 placements listed BlackWorld alone.
+#[test]
+fn a_lagging_member_is_placed_by_conversation() {
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    // Node 1 is buried in prefill; node 2 is idle but lagging.
+    learned(&mut r, 1, 541, 60_000, 200, 80_000);
+    learned(&mut r, 2, 27, 0, 500, 140_000);
+    r.set_lagging("zend", 2, true);
+    assert_eq!(best(&mut r), Pick::Member(2), "a new conversation");
+    assert_eq!(
+        r.pick("zend", &sticky(), Some("new"), None),
+        Pick::Member(2),
+        "a key nobody holds or let go"
+    );
+    assert_eq!(r.answerer("zend", 3), Some(1), "never the answerer");
+    for _ in 0..4 {
+        assert_eq!(r.pick("zend", &Dispatch::Any, None, None), Pick::Member(1));
+    }
+
+    // Released by node 1 through its record 900: node 2 has applied 1's
+    // records to 500 only, so it goes back to node 1 — then, once node 2
+    // holds them, to node 2.
+    r.released("zend", b"old", 1, 900);
+    r.applied("zend", 2, vec![(1, 500)]);
+    assert_eq!(
+        r.pick("zend", &sticky(), Some("old"), None),
+        Pick::Member(1)
+    );
+    r.applied("zend", 2, vec![(1, 900)]);
+    assert_eq!(
+        r.pick("zend", &sticky(), Some("old"), None),
+        Pick::Member(2)
+    );
+}
+
 /// The canary takes a key let go only once it holds the last holder's writes.
 #[test]
 fn a_canary_lacking_the_last_turn_is_not_handed_the_key() {

@@ -95,6 +95,15 @@ impl MemberView {
         self.ready() && !self.lagging && !self.syncing && !self.closing
     }
 
+    /// Ready and not closing: a conversation may be placed on it (§4.4).
+    /// Current enough is a conversation dimension, not a member one: a new
+    /// conversation has no history to be behind on, and a released one goes
+    /// only where its last holder's records are held ([`Self::holds_through`]).
+    /// A member behind on everyone else's writes is still current for those.
+    pub fn placeable(&self) -> bool {
+        self.ready() && !self.closing
+    }
+
     pub fn info(&self) -> MemberInfo {
         MemberInfo {
             node: self.node,
@@ -430,7 +439,17 @@ impl Registry {
     }
 
     fn best_but(&self, app: &str, except: Option<u64>) -> Option<u64> {
-        best_of(self.ready_but(app, except))
+        best_of(self.placeable_but(app, except))
+    }
+
+    /// The members a conversation may be placed on, but `except`.
+    fn placeable_but(&self, app: &str, except: Option<u64>) -> Vec<&MemberView> {
+        self.apps.get(app).map_or_else(Vec::new, |a| {
+            a.members
+                .values()
+                .filter(|m| m.placeable() && Some(m.node) != except)
+                .collect()
+        })
     }
 
     /// Where a request for sticky `key`, which no member here holds, goes
@@ -446,7 +465,7 @@ impl Registry {
             return self.best(app);
         };
         let (pick, everyone_holds) = {
-            let ready = self.ready(app);
+            let ready = self.placeable_but(app, None);
             let holding: Vec<&MemberView> = ready
                 .iter()
                 .copied()

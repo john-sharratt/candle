@@ -1149,15 +1149,24 @@ Each member has an outbound queue per lane.
   member that cannot keep up.** When the lane passes 256 MiB unsent, the member becomes
   **lagging**:
   - the gateway queues no further live `EVENT`s for it, and counts what it skips;
-  - it routes no new requests to it, so no request can land on a member that missed an
-    event (§6.4);
+  - it is never a catch-up's answerer and takes no request routed round robin: those
+    need a member current on every origin;
+  - **a conversation may still be placed on it — current enough is a conversation
+    dimension, not a member one.** A new conversation has no history to be behind on;
+    a released one goes only to members holding its last holder's records through the
+    handover (`cooperative_admission.md` §2.2), which a lagging member fails exactly
+    while it lacks them. Excluding the member as a whole kept WhiteWorld out of every
+    burst that landed after a busy `.5` heavy-decode: its KV and snapshot writes pass
+    the cap over a 1 Gbps link in seconds (run 26, 2026-10-20: all 48 of heavy-read's
+    placements listed `.5` alone);
   - stream frames already queued are still delivered, so the requests it is serving
     finish rather than fail. Each stream's own flow control bounds them (§4.2).
 
   The member sees the gap through `high_water` and catches up (§7.1), at its link's
   pace. **Once it has drained the lane it receives live events again and is
   syncing** — the state of a member admitted beside one already serving: sent live
-  events throughout, routed no request until its `ACK`s cover what the members serving
+  events throughout, placed conversations as above, routed no other request until its
+  `ACK`s cover what the members serving
   have applied of every origin, within 64 records (`SYNC_SLACK`), as the gateway judges
   from those `ACK`s. Waiting instead for its
   catch-up to reach every origin's `high_water` before sending it live events waits
@@ -4097,7 +4106,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | dispatch | the route table and requests yield the expected member for each class; the `x-tokera-node` override is admin-only; the `Body` key reads ≤ 8 MiB |
 | modes | a route with `cluster:` and no ready member goes to its configured URL; the first ready member switches it; requests in flight to the URL finish there; the last member leaving reverts it; a route without `cluster:` never switches |
 | claims | a new key is claimed by the member that serves it; the claim is announced on every cluster; a gateway lacking the holder answers `409` then `503`; the idle release carries `through`; the catch-up hold releases at `through`; of two simultaneous first claims the higher epoch keeps the key |
-| lagging | an ordered lane past its cap makes the member lagging: no further live events are queued for it and none of its queued stream frames are dropped; no new request is routed to it; once its lane drains it takes live events again and syncs, routed again once in sync — an origin still writing included; its socket is never closed for being slow |
+| lagging | an ordered lane past its cap makes the member lagging: no further live events are queued for it and none of its queued stream frames are dropped; it answers no catch-up and takes no round-robin request, but a new conversation, or a released one whose last holder's records it holds, is still placed on it (`registry/tests.rs` `a_lagging_member_is_placed_by_conversation`); once its lane drains it takes live events again and syncs, routed again once in sync — an origin still writing included; its socket is never closed for being slow |
 | socket drop | an exchange with no response head yet gets a `503`; a body in progress is aborted rather than ended; a tunnelled WebSocket closes `1011`; nothing is replayed on another member |
 | emission | a request's events leave on the request's socket; other events go round robin across sockets, one whole event at a time; with every socket down events stay *unsent*, never queued in memory |
 | retransmit | events in flight on a socket that drops, and only those past its last `RECEIPT`, go back to unsent and leave again in `oseq` order on the next socket admitted; nothing is re-sent that a `RECEIPT` covered |
