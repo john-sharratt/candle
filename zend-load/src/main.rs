@@ -60,7 +60,7 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_value = "decode,read,write")]
     tasks: Vec<String>,
     /// Named patterns to run in place of the ladder: heavy-decode,
-    /// heavy-read, blend, shift.
+    /// heavy-read, blend, shift, story-x16.
     #[arg(long, value_delimiter = ',')]
     patterns: Vec<String>,
     /// The longest one turn may take before it counts as cut.
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     for name in &args.tasks {
         match Task::parse(name) {
             Some(t) => tasks.push(t),
-            None => bail!("no task `{name}`: decode, read or write"),
+            None => bail!("no task `{name}`: decode, read, write or story"),
         }
     }
     let mut scenarios = Vec::new();
@@ -113,8 +113,8 @@ async fn main() -> Result<()> {
             match pattern(name) {
                 Some(p) => patterns.push(p),
                 None => bail!(
-                    "no pattern `{name}`: heavy-decode, heavy-read, blend, shift, ingest or \
-                     ingest-alone"
+                    "no pattern `{name}`: heavy-decode, heavy-read, blend, shift, story-x16, \
+                     ingest or ingest-alone"
                 ),
             }
         }

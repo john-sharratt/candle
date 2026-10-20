@@ -20,6 +20,7 @@ members = [
     "npc-map",
     "npcd",
     "store-events",
+    "story-rewrite",
     "substrate-git",
     "motherd",
     "keep",
@@ -69,6 +70,7 @@ candle-metal-kernels = { path = "./candle-metal-kernels", version = "0.9.1" }
 candle-nn = { path = "./candle-nn", version = "0.9.1" }
 candle-onnx = { path = "./candle-onnx", version = "0.9.1" }
 candle-transformers = { path = "./candle-transformers", version = "0.9.1" }
+story-rewrite = { path = "./story-rewrite" }
 clap = { version = "4.2.4", features = ["derive"] }
 clap-verbosity-flag = "2.2"
 criterion = { version = "0.5.1", default-features = false }

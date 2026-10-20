@@ -2,13 +2,10 @@
 //!
 //! [`ruler_gen`] generates the RULER benchmark tasks (needle retrieval,
 //! variable tracing, common-word extraction) and runs them against a loaded
-//! `ManagedBatchedModel`. `test_helpers` and `utils` (test-only) provide
-//! shared fixtures — `story.md`/`system.md` prompt bodies and a captured
-//! Qwen3-30B-A3B expert routing trace (`fixtures/`) — for exercising the
-//! batched decode/prefill/glue path end to end under `#[test]`.
-/// The checked-in prompt bodies, readable outside `#[cfg(test)]` so a harness in
-/// a crate above this one measures the SAME prompt the gates do.
-pub mod fixtures;
+//! `ManagedBatchedModel`. `test_helpers` and `utils` (test-only) drive the
+//! batched decode/prefill/glue path end to end under `#[test]`, on the
+//! StoryRewrite prompts of the `story-rewrite` crate and a captured
+//! Qwen3-30B-A3B expert routing trace (`fixtures/`).
 /// The gate's summary of what the wave chains did across a decode.
 #[cfg(feature = "cuda")]
 pub(crate) mod graph_report;
@@ -34,14 +31,6 @@ pub mod span_report;
 /// steps.
 #[cfg(feature = "cuda")]
 pub mod span_settle;
-/// The StoryRewrite comparison form: whitespace collapsed, gendered words
-/// neutralised at any word boundary.
-///
-/// Outside `#[cfg(test)]` alongside [`fixtures`], and for the same reason: a
-/// harness above this crate that validates a rewrite must apply the *same*
-/// normalisation the gates do, or the two disagree about what a correct rewrite
-/// is. Pure string work with no test-only dependencies.
-pub mod story_normalize;
 /// Strata's published single-session speed benchmark, rebuilt request for
 /// request and run through the harness.
 ///
@@ -54,8 +43,9 @@ pub mod test_helpers;
 /// The batched comparison harness: `TestParams`, the config ladder's row type, and the
 /// performance table.
 ///
-/// Readable outside `#[cfg(test)]` for the same reason [`fixtures`] and
-/// [`story_normalize`] are, and it is the strongest instance of that reason. The rows
+/// Readable outside `#[cfg(test)]` for the same reason the StoryRewrite fixtures
+/// live in their own crate (`story-rewrite`), and it is the strongest instance of
+/// that reason. The rows
 /// this harness produces drive `forward_wave` from a clean slate — the *ceiling*. What a
 /// daemon delivers is shaped by admission, per-turn projection, the persistence thread
 /// and accumulated fragmentation, none of which exist in this crate. Those rows are

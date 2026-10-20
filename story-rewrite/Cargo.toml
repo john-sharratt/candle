@@ -1,0 +1,9 @@
+[package]
+name = "story-rewrite"
+version.workspace = true
+edition.workspace = true
+description = "The StoryRewrite workload the forward gates measure: its prompts, its comparison form and its verdict, for every harness that runs it."
+license.workspace = true
+publish = false
+
+[dependencies]

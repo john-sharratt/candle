@@ -42,8 +42,8 @@
 
 use std::time::{Duration, Instant};
 
-use candle_transformers::models::batch_test::fixtures;
-use candle_transformers::models::batch_test::story_normalize::normalize_story;
+use story_rewrite::fixtures;
+use story_rewrite::normalize::normalize_story;
 
 use super::profile::StoryGate;
 use crate::models::ModelBuilder;
@@ -203,13 +203,13 @@ fn strip_think(reply: &str) -> &str {
 /// Judge one reply against its expected rewrite by `gate`; `Err` carries the line
 /// to report.
 ///
-/// `StoryGate::Verbatim` is the forward gate's own rule: `normalize_story`, then a
-/// common-prefix comparison with a 5-char tolerance, read from the same module so
-/// "correct" means here what it means there. `StoryGate::OwnName` asks only that the
-/// session names its own protagonist — see [`StoryGate`].
+/// `StoryGate::Verbatim` is the StoryRewrite verdict every harness shares
+/// (`story_rewrite::judge`), so "correct" means here what it means at the gate and
+/// over HTTP. `StoryGate::OwnName` asks only that the session names its own
+/// protagonist — see [`StoryGate`].
 fn judge(i: usize, name: &str, reply: &str, expected: &str, gate: StoryGate) -> Result<(), String> {
-    let got = normalize_story(strip_think(reply).trim());
-    let want = normalize_story(expected.trim());
+    let reply = strip_think(reply);
+    let got = normalize_story(reply.trim());
     if gate == StoryGate::OwnName {
         if got.contains(name) {
             return Ok(());
@@ -219,17 +219,13 @@ fn judge(i: usize, name: &str, reply: &str, expected: &str, gate: StoryGate) -> 
             "session {i}: its own protagonist {name:?} is absent from the reply\n      got:  {show:?}",
         ));
     }
-    let g: Vec<char> = got.chars().collect();
-    let w: Vec<char> = want.chars().collect();
-    let common = g.iter().zip(w.iter()).take_while(|(a, b)| a == b).count();
-    let min_len = g.len().min(w.len());
-    const TOLERANCE: usize = 5;
-    // An empty or near-empty decode is a failure, not a vacuous pass: with `min_len`
-    // at zero the tolerance would make `required` zero and anything would match.
-    let required = min_len.saturating_sub(TOLERANCE);
-    if min_len >= 16 && common >= required {
+    let verdict = story_rewrite::judge(reply, expected);
+    if verdict.passed() {
         return Ok(());
     }
+    let (common, min_len) = (verdict.common, verdict.compared);
+    let g: Vec<char> = got.chars().collect();
+    let w: Vec<char> = normalize_story(expected.trim()).chars().collect();
     let show = min_len.min(common + 24);
     Err(format!(
         "session {i} (name {name}): matched {common}/{min_len} chars\n      got:  {:?}\n      want: {:?}",

@@ -28,7 +28,6 @@ use crate::models::batch_test::side_compression::{print_side_table, SideCompress
 use crate::models::batch_test::span_report::print_span;
 #[cfg(feature = "cuda")]
 use crate::models::batch_test::span_settle::SpanSettler;
-use crate::models::batch_test::story_normalize::normalize_story;
 #[cfg(feature = "cuda")]
 use crate::models::batch_test::vram_wave_log::VramWaveLog;
 use crate::models::batched_inference::{
@@ -43,6 +42,8 @@ use crate::models::profile::{
 use crate::models::speculative_choice::GreedyChooser;
 use candle::vram::process_ram::ProcessRam;
 use std::cmp::Reverse;
+use story_rewrite::fixtures;
+use story_rewrite::normalize::normalize_story;
 
 /// One prediction figure per hop as `a/b/c/d/e` percentages — `hits / of` each
 /// hop — or `-` when nothing was judged.
@@ -95,13 +96,13 @@ impl DraftBudget {
 /// The story a [`TestMode::StoryRewrite`] prompt asks the model to reproduce
 /// with its character renamed.
 ///
-/// Re-exported from [`super::fixtures`], which is outside `#[cfg(test)]` so that
-/// a harness in a crate above this one measures the same bytes. Kept as a
-/// function here because the gates already call it by this path, and because the
-/// alternative — a second `include_str!` — is a different prompt that merely
-/// looks identical in the source (see the fixtures module note).
+/// Read from [`fixtures`], which is outside the `cuda` gate so that a harness
+/// in a crate above this one measures the same bytes. Kept as a function here
+/// because the gates already call it by this path, and because the alternative —
+/// a second `include_str!` — is a different prompt that merely looks identical in
+/// the source (see the fixtures module note).
 pub fn story_prompt() -> String {
-    super::fixtures::story_prompt()
+    fixtures::story_prompt()
 }
 
 /// Determines the validation strategy for the test harness.
@@ -242,15 +243,12 @@ impl TestParams {
             majority_pass_threshold: None,
             test_mode: TestMode::StoryRewrite,
             suppress_thinking: false,
-            prompt_system: super::fixtures::system_prompt(),
+            prompt_system: fixtures::system_prompt(),
             prompt_user: story_prompt(),
             per_config_prompts: Vec::new(),
             config_labels: Vec::new(),
             stop_on_eos: Vec::new(),
-            names: include_str!("names.md")
-                .lines()
-                .map(|s| s.to_string())
-                .collect(),
+            names: fixtures::session_names(),
             generate_token_count,
             top_rung_token_count: None,
             tokenizer,

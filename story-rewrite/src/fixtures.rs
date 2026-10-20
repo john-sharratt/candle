@@ -1,11 +1,11 @@
 //! The checked-in prompt bodies, available outside `#[cfg(test)]`.
 //!
-//! These live here rather than in [`super::utils`] because they have two kinds of
-//! consumer. The forward gates reach them from inside this crate's test build,
-//! and measurement harnesses in crates *above* this one — which cannot see a
-//! `#[cfg(test)]` module — need the identical bytes: a throughput figure from one
-//! prompt is not comparable to a throughput figure from another, however similar
-//! the two look.
+//! These live outside the gate harness (`candle-transformers`' `batch_test`,
+//! built only with `cuda`) because they have more than one consumer: the forward
+//! gates, the conversation engine's probe, and `zend-load`, which sends them over
+//! HTTP and builds no model at all. Each needs the identical bytes: a throughput
+//! figure from one prompt is not comparable to a throughput figure from another,
+//! however similar the two look.
 //!
 //! **One definition, deliberately.** `story_prompt` normalises the file's line
 //! endings once. `story.md` is checked in with CRLF on Windows, and a prompt

@@ -43,6 +43,9 @@ pub struct Sample {
     pub text_chunks: usize,
     /// The tools the turn ran, in the order it started them.
     pub tools: Vec<String>,
+    /// Whether the reply was the turn's correct output, for a task that has
+    /// one (`Task::verify`).
+    pub rewrite: Option<bool>,
 }
 
 impl Sample {
@@ -87,6 +90,7 @@ impl Sample {
             longest_silence: longest,
             text_chunks,
             tools,
+            rewrite: None,
         }
     }
 
@@ -103,6 +107,7 @@ impl Sample {
             longest_silence: ended,
             text_chunks: 0,
             tools: Vec::new(),
+            rewrite: None,
         }
     }
 }
@@ -123,7 +128,12 @@ impl fmt::Display for Sample {
             self.total.as_secs_f64(),
             self.text_chunks,
             self.tools.join(" "),
-        )
+        )?;
+        match self.rewrite {
+            Some(true) => write!(f, ", rewrite ok"),
+            Some(false) => write!(f, ", rewrite WRONG"),
+            None => Ok(()),
+        }
     }
 }
 

@@ -26,6 +26,9 @@ pub struct Row {
     /// Text chunks per second of wall time, across every request.
     pub text_rate: f64,
     pub wall: Duration,
+    /// Of the answered turns with a correct output to check, how many gave it,
+    /// and how many were checked.
+    pub correct: (usize, usize),
 }
 
 /// The 50th and 95th percentiles and the maximum, nearest rank.
@@ -79,6 +82,10 @@ impl Row {
             silence: Spread::of(samples.iter().map(|s| s.longest_silence).collect()),
             text_rate: chunks as f64 / wall.as_secs_f64().max(1e-9),
             wall,
+            correct: (
+                samples.iter().filter(|s| s.rewrite == Some(true)).count(),
+                samples.iter().filter(|s| s.rewrite.is_some()).count(),
+            ),
         }
     }
 }
@@ -113,6 +120,9 @@ impl fmt::Display for Row {
             secs(self.wall),
             members.join(", "),
         )?;
+        if self.correct.1 > 0 {
+            write!(f, " | rewrite ok {}/{}", self.correct.0, self.correct.1)?;
+        }
         if let Some(m) = &self.first_failure {
             write!(f, "\n               first failure: {m}")?;
         }
@@ -140,6 +150,7 @@ mod tests {
             longest_silence: s(silence),
             text_chunks: 50,
             tools: Vec::new(),
+            rewrite: None,
         }
     }
 
@@ -179,5 +190,24 @@ mod tests {
         assert_eq!(row.first_text.p50, s(4));
         assert_eq!(row.silence.max, s(9));
         assert_eq!(row.text_rate, 10.0);
+        assert_eq!(row.correct, (0, 0));
+        assert!(!row.to_string().contains("rewrite"));
+    }
+
+    /// Turns with a correct output to check are counted, and the row says how
+    /// many gave it.
+    #[test]
+    fn a_row_counts_its_correct_rewrites() {
+        let mut samples = vec![
+            sample("BlackWorld", Outcome::Answered, Some(2), 3),
+            sample("BlackWorld", Outcome::Answered, Some(2), 3),
+            sample("WhiteWorld", Outcome::Answered, Some(2), 3),
+        ];
+        samples[0].rewrite = Some(true);
+        samples[1].rewrite = Some(false);
+        samples[2].rewrite = Some(true);
+        let row = Row::of("story-x16", &samples, s(20));
+        assert_eq!(row.correct, (2, 3));
+        assert!(row.to_string().contains("| rewrite ok 2/3"));
     }
 }

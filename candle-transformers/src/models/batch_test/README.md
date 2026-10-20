@@ -23,14 +23,12 @@ quantization formats, and a pure-Rust RULER task generator.
 | `utils.rs` | `TestParams`/`TestConfig`/`TestMode` — drives N parallel batched sessions through a shared prompt with per-session name substitution, then validates the divergent output per session and reports a `t/s` / compression comparison table across `KvMode`s (F32/F16/R16/C0…C9). |
 | `test_helpers.rs` | `#[cfg(test)]`-only HF download plumbing: `hf_get`/`api`/`ResilientApi` (IPv4-only resolver + HTTP-Range resume, for networks where IPv6 TLS to the HF CDN resets mid-handshake), `load_hf_tokenizer`, `download_hf_gguf`, `open_gguf`. |
 | `ruler_gen.rs` | Pure-Rust generator + in-process evaluator for four RULER task types (`RulerTask`): `niah_single_1`, `niah_multikey_2`, `vt` (variable tracing), `cwe` (common-word extraction). `RulerDataSource::Generated` builds samples procedurally; `RulerDataSource::Jsonl` loads canonical RULER-format JSONL. |
-| `story.md` | The user-turn story text ("The Backyard Astronaut") used by `TestParams::new` as the default `prompt_user` — the body the model must rewrite per session. |
-| `system.md` | The default `prompt_system`: instructs the model to deterministically replace every occurrence of "Marcus" (and case variants) with a per-session name, changing nothing else — this is the `StoryRewrite` `TestMode`. |
-| `names.md` | 99 newline-separated first names, one assigned per test session, used both to build each session's rewrite target and to check that adjacent sessions produce genuinely distinct output (catches KV cross-contamination). |
+| `story-rewrite` (crate) | The `StoryRewrite` workload, in a crate of its own so harnesses that build no model — `zend-load`, over HTTP — send the same bytes: `story.md` (the user-turn story, "The Backyard Astronaut", the default `prompt_user`), `system.md` (the default `prompt_system`: replace "Marcus" and its case variants with a per-session name, change nothing else), `names.md` (99 first names, one per session, which also catch KV cross-contamination between adjacent sessions), the comparison form (`normalize`), and the verdict (`judge`). |
 | `fixtures/routing_trace_qwen3_30b.bin.gz` | Captured Qwen3-30B-A3B MoE expert-routing trace (`candle-transformers/src/models/routing_capture.rs::FIXTURE_PATH`), written by a focused capture test and read by the offline Markov-expert-prediction evaluator — see `docs/archived/markov_expert_prediction_eval.md`. |
 
 ## Key types & entry points
 
-- `TestParams::new` / `new_with_defaults` — builds the shared prompt/name/tokenizer bundle from `system.md`/`story.md`/`names.md`.
+- `TestParams::new` / `new_with_defaults` — builds the shared prompt/name/tokenizer bundle from the `story-rewrite` crate's `fixtures`.
 - `TestMode` — `StoryRewrite` (default, requires instruction-following, 3B+ models), `NameGreeting` (small-model-friendly), `CoherenceCheck` (lossy-format sanity), `Skip` (throughput-only, no validation).
 - `ruler_gen::generate_ruler_samples`, `run_ruler_eval`, `run_ruler_benchmark`, `run_ruler_continuous`, `sweep_parallelism` — RULER sample generation and batched-inference evaluation against a `ManagedBatchedModel`.
 

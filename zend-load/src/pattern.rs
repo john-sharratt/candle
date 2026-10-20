@@ -9,6 +9,13 @@
 //! | `heavy-read` | 24 zen-code readers |
 //! | `blend` | 12 passthrough chats and 12 readers, at once |
 //! | `shift` | a 24-client decode wave; 60 s in, a 24-client read burst beside it; 180 s in, a second decode wave |
+//! | `story-x16` | the forward gate's ×16 StoryRewrite: 16 passthrough clients at once, one turn each, every reply checked |
+//!
+//! `story-x16` is the gate's shape served: sixteen sessions arriving together
+//! prefill together and then decode together, with no projection and no tools,
+//! so its rate against the gate's ×16 figure on the same bytes is what serving
+//! costs. Point `--gateway` at one member's own listener to compare a card with
+//! its own gate.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,13 +43,13 @@ pub struct Pattern {
     pub parts: Vec<Part>,
 }
 
-fn part(name: &str, task: Task, clients: usize, start_s: u64) -> Part {
+fn part(name: &str, task: Task, clients: usize, turns: usize, start_s: u64) -> Part {
     Part {
         scenario: Scenario {
             name: name.to_string(),
             task,
             clients,
-            turns: 2,
+            turns,
             max_tokens: task.max_tokens(),
         },
         start: Duration::from_secs(start_s),
@@ -52,17 +59,18 @@ fn part(name: &str, task: Task, clients: usize, start_s: u64) -> Part {
 /// The pattern called `name`.
 pub fn pattern(name: &str) -> Option<Pattern> {
     let parts = match name {
-        "heavy-decode" => vec![part("heavy-decode", Task::Decode, 24, 0)],
-        "heavy-read" => vec![part("heavy-read", Task::Read, 24, 0)],
+        "heavy-decode" => vec![part("heavy-decode", Task::Decode, 24, 2, 0)],
+        "heavy-read" => vec![part("heavy-read", Task::Read, 24, 2, 0)],
         "blend" => vec![
-            part("blend-chat", Task::Decode, 12, 0),
-            part("blend-read", Task::Read, 12, 0),
+            part("blend-chat", Task::Decode, 12, 2, 0),
+            part("blend-read", Task::Read, 12, 2, 0),
         ],
         "shift" => vec![
-            part("shift-decode-1", Task::Decode, 24, 0),
-            part("shift-read", Task::Read, 24, 60),
-            part("shift-decode-2", Task::Decode, 24, 180),
+            part("shift-decode-1", Task::Decode, 24, 2, 0),
+            part("shift-read", Task::Read, 24, 2, 60),
+            part("shift-decode-2", Task::Decode, 24, 2, 180),
         ],
+        "story-x16" => vec![part("story-x16", Task::Story, 16, 1, 0)],
         _ => return None,
     };
     Some(Pattern {
@@ -139,6 +147,15 @@ mod tests {
             ]
         );
         assert_eq!(shape("heavy-read").len(), 1);
+        assert_eq!(
+            shape("story-x16"),
+            vec![("story-x16".to_string(), Task::Story, 16, 0)]
+        );
+        assert_eq!(
+            pattern("story-x16").unwrap().parts[0].scenario.turns,
+            1,
+            "the gate runs one turn per session"
+        );
         assert!(pattern("everything").is_none());
     }
 }

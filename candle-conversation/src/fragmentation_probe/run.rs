@@ -55,9 +55,9 @@ use std::time::{Duration, Instant};
 
 use candle::Device;
 use candle_nn::kv_cache::{region_stats, REGION_BYTES};
-use candle_transformers::models::batch_test::fixtures;
 use candle_transformers::models::expert_lre::grow_tally;
 use candle_transformers::models::profile::pipeline_snapshot_and_reset;
+use story_rewrite::fixtures;
 
 use super::batch::{no_think, run_story_batch, BatchTiming};
 use super::grow_window::GrowWindow;

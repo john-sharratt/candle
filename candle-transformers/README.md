@@ -37,7 +37,8 @@ cache that keeps expert weight streaming ahead of the batch.
 | `src/models/expert_lre/` | The MoE expert pipeline: background-thread expert cache with mmap→VRAM DMA, score-based eviction, and Markov transition-based prefetch (see below). |
 | `src/models/prefill_utils.rs` | Paged-prefill entry points (`paged_prefill_batched`, `paged_prefill_flat`) — the custom INT8/BF16 paged-attention prefill kernels, with a per-sequence CPU/flash-attn fallback for non-chunked caches. |
 | `src/models/kv_cache_utils.rs`, `kv_collect_utils.rs`, `causal_mask_cache.rs`, `rope_tables.rs` | Shared batched-inference plumbing: `KvCaches`/`SequenceContext`, RoPE table precomputation, causal mask caching. |
-| `src/models/batch_test/` | Fixtures and helpers for integration tests: `story.md`/`system.md`/`names.md` prompts, a captured Qwen3-30B-A3B routing trace, RULER-style long-context generators (`ruler_gen.rs`), HF-download test helpers. |
+| `src/models/batch_test/` | Helpers for integration tests: a captured Qwen3-30B-A3B routing trace, RULER-style long-context generators (`ruler_gen.rs`), HF-download test helpers. |
+| `../story-rewrite/` (crate) | The StoryRewrite workload every harness runs: `story.md`/`system.md`/`names.md` prompts, the comparison form, and the verdict — a crate of its own, so a harness over HTTP sends the gate's bytes without building a model. |
 | `src/generation/` | `LogitsProcessor` and `Sampling` (argmax, temperature, top-k, top-p, top-k-then-top-p, Gumbel-softmax) — token sampling shared by every model driver. |
 | `src/pipelines/` | Thin end-user pipeline scaffolding (text generation). |
 | `src/quantized_nn.rs`, `src/quantized_var_builder.rs` | `Module` impls and `VarBuilder` backed by GGUF-quantized tensors, used by the `quantized_*` model variants and the batched engine's int8/qmatmul path. |

@@ -6,14 +6,37 @@
 //! battle-cities crate, never candle, made in the conversation's overlay with
 //! `file_edit` and shown as a diff, then built with `cargo check` on an agent —
 //! told never to commit or push, so nothing reaches a branch or origin.
+//! **Story** is the forward gate's own workload sent over HTTP: the StoryRewrite
+//! system prompt and story with the session's name, one turn, through
+//! `passthrough` — no projection, no tools — so a pattern of them measures what
+//! serving costs against the gate's figure on the same bytes, and says whether
+//! each reply is the rewrite.
 
 use serde_json::{json, Value};
+use story_rewrite::{fixtures, judge};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Task {
     Decode,
     Read,
     Write,
+    Story,
+}
+
+/// Session `client`'s StoryRewrite name, as the gate assigns it.
+fn story_name(client: usize) -> String {
+    let names = fixtures::session_names();
+    names[client % names.len()].clone()
+}
+
+/// `reply` with a leading `<think>…</think>` block removed: the rewrite is
+/// what follows it.
+fn after_thinking(reply: &str) -> &str {
+    let t = reply.trim_start();
+    match t.find("</think>") {
+        Some(end) if t.starts_with("<think>") => &t[end + "</think>".len()..],
+        _ => t,
+    }
 }
 
 /// The battle-cities files a write task edits, one per client in turn — each
@@ -82,6 +105,7 @@ impl Task {
             "decode" => Some(Task::Decode),
             "read" => Some(Task::Read),
             "write" => Some(Task::Write),
+            "story" => Some(Task::Story),
             _ => None,
         }
     }
@@ -91,14 +115,31 @@ impl Task {
             Task::Decode => "decode",
             Task::Read => "read",
             Task::Write => "write",
+            Task::Story => "story",
         }
     }
 
+    /// The most a turn may decode. A story rewrite is the story again, about
+    /// 550 tokens; the model ends it itself well inside this.
     pub fn max_tokens(self) -> usize {
         match self {
             Task::Decode => 256,
-            Task::Read => 1024,
+            Task::Read | Task::Story => 1024,
             Task::Write => 2048,
+        }
+    }
+
+    /// Whether `client`'s reply is the turn's correct output, for a task that
+    /// has one: a story turn's rewrite, by the gate's verdict. `None` for the
+    /// others.
+    pub fn verify(self, client: usize, reply: &str) -> Option<bool> {
+        match self {
+            Task::Story => {
+                let story = fixtures::story_prompt();
+                let expected = fixtures::story_rewrite_expected(&story, &story_name(client));
+                Some(judge(after_thinking(reply), &expected).passed())
+            }
+            Task::Decode | Task::Read | Task::Write => None,
         }
     }
 
@@ -155,6 +196,34 @@ impl Task {
                     "messages": [{"role": "user", "content": ask}],
                 });
                 (body, conv_id)
+            }
+            Task::Story => {
+                // The gate's bytes, and the run's mark ahead of the story: a
+                // passthrough conversation is keyed by its opening, so without it
+                // a second run would resume the first's instead of prefilling,
+                // and the cleanup finds a run's conversations by it.
+                let name = story_name(client);
+                let story = fixtures::story_prompt();
+                let body = json!({
+                    "model": "passthrough",
+                    "stream": true,
+                    "max_tokens": max_tokens,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": fixtures::system_prompt().replace("{INSERT_NAME}", &name),
+                        },
+                        {
+                            "role": "user",
+                            "content": format!(
+                                "{}\n\n{}",
+                                mark(run, client),
+                                fixtures::story_rewrite_prompt(&story, &name)
+                            ),
+                        },
+                    ],
+                });
+                (body, String::new())
             }
             Task::Write => {
                 let conv_id = format!("{run}-w{client}");
@@ -217,6 +286,42 @@ mod tests {
         assert_eq!(messages[0]["content"], "You are a storyteller.");
         assert_eq!(messages[3]["content"], "Continue the story.");
         assert!(mark("zl-1", 5).starts_with(&run_mark("zl-1")));
+    }
+
+    /// A story turn sends the gate's system prompt and story under the session's
+    /// gate name, marked for the run; the expected rewrite passes, with or
+    /// without a thinking block ahead of it, and another session's fails.
+    #[test]
+    fn a_story_turn_is_the_gates_and_judged_by_it() {
+        let (body, conv) = Task::Story.body("zl-3", 2, 0, &[], 1024);
+        assert!(conv.is_empty());
+        assert_eq!(body["model"], "passthrough");
+        let name = story_name(2);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(
+            system,
+            fixtures::system_prompt().replace("{INSERT_NAME}", &name)
+        );
+        let user = body["messages"][1]["content"].as_str().unwrap();
+        let story = fixtures::story_prompt();
+        assert_eq!(
+            user,
+            format!(
+                "{}\n\n{}",
+                mark("zl-3", 2),
+                fixtures::story_rewrite_prompt(&story, &name)
+            )
+        );
+        let right = fixtures::story_rewrite_expected(&story, &name);
+        assert_eq!(Task::Story.verify(2, &right), Some(true));
+        assert_eq!(
+            Task::Story.verify(2, &format!("<think>\nrename\n</think>\n\n{right}")),
+            Some(true)
+        );
+        let other = fixtures::story_rewrite_expected(&story, &story_name(3));
+        assert_eq!(Task::Story.verify(2, &other), Some(false));
+        assert_eq!(Task::Decode.verify(2, &right), None);
+        assert_eq!(Task::parse("story"), Some(Task::Story));
     }
 
     /// A write turn names its own conversation, edits a battle-cities crate —

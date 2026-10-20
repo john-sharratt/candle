@@ -42,6 +42,9 @@ pub async fn run(target: Arc<Target>, scenario: &Scenario, run: &str, limit: Dur
                 sample.client = client;
                 sample.turn = t;
                 let answered = sample.outcome == Outcome::Answered;
+                if answered {
+                    sample.rewrite = scenario.task.verify(client, &content);
+                }
                 samples.push(sample);
                 if !answered {
                     break;
