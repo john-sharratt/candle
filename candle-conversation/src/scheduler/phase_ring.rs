@@ -494,6 +494,12 @@ pub struct LearnedRates {
     /// Prefill tokens a second at the width admission is running now, at the
     /// residency the wave stands at.
     pub prefill_tok_s: f64,
+    /// Prefill tokens a second with [`PLACEMENT_WIDE`] decoding turns more beside
+    /// the cohort — the rate a burst's own prompts drain at once its turns
+    /// decode here, which the rate at the width now does not say: BlackWorld
+    /// (ed4d8c781, 2026-10-20) advertised 1,771 tok/s as 24 turns arrived and
+    /// drained them at 213–463.
+    pub prefill_tok_s_plus_wide: f64,
     /// A decode step's time at the current decode rows, and with one row more —
     /// what one more decoding turn costs every decode on this card.
     pub decode_step_ms: f64,
@@ -639,8 +645,12 @@ fn save_learned_rates(rates: &LearnedRates) {
 fn format_learned_rates(r: &LearnedRates) -> String {
     format!(
         "prefill_tok_s {}\ndecode_step_ms {}\ndecode_step_ms_plus_one {}\n\
-         decode_step_ms_plus_wide {}\n",
-        r.prefill_tok_s, r.decode_step_ms, r.decode_step_ms_plus_one, r.decode_step_ms_plus_wide
+         decode_step_ms_plus_wide {}\nprefill_tok_s_plus_wide {}\n",
+        r.prefill_tok_s,
+        r.decode_step_ms,
+        r.decode_step_ms_plus_one,
+        r.decode_step_ms_plus_wide,
+        r.prefill_tok_s_plus_wide
     )
 }
 
@@ -655,8 +665,11 @@ fn parse_learned_rates(text: &str) -> Option<LearnedRates> {
             .filter(|v| v.is_finite() && *v > 0.0)
     };
     let plus_one = get("decode_step_ms_plus_one")?;
+    let prefill = get("prefill_tok_s")?;
     Some(LearnedRates {
-        prefill_tok_s: get("prefill_tok_s")?,
+        prefill_tok_s: prefill,
+        // An older store has no wide prefill rate: the rate now, the flattest.
+        prefill_tok_s_plus_wide: get("prefill_tok_s_plus_wide").unwrap_or(prefill),
         decode_step_ms: get("decode_step_ms")?,
         decode_step_ms_plus_one: plus_one,
         // A store an older build wrote has no wide step: the one-more step, the
@@ -788,6 +801,7 @@ mod tests {
     fn a_kept_store_reads_back_its_rates_and_no_backlog() {
         let r = LearnedRates {
             prefill_tok_s: 703.5,
+            prefill_tok_s_plus_wide: 310.0,
             decode_step_ms: 107.6,
             decode_step_ms_plus_one: 112.25,
             decode_step_ms_plus_wide: 240.0,
@@ -964,6 +978,7 @@ mod tests {
     fn published_rates_read_back_with_their_age() {
         let rates = LearnedRates {
             prefill_tok_s: 1234.5,
+            prefill_tok_s_plus_wide: 400.0,
             decode_step_ms: 80.0,
             decode_step_ms_plus_one: 82.5,
             decode_step_ms_plus_wide: 210.0,

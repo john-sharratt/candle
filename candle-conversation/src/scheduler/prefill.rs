@@ -698,7 +698,7 @@ impl Scheduler {
                     &weights_at,
                 )
             };
-            let [_, one_hint, wide_hint] = self.rates_width_hints;
+            let [_, one_hint, wide_hint, _] = self.rates_width_hints;
             Some((
                 at(1, one_hint),
                 at(super::phase_ring::PLACEMENT_WIDE, wide_hint),
@@ -757,30 +757,43 @@ impl Scheduler {
                 .map(|(&q, &o)| q as f64 * (o as f64 + q as f64 / 2.0))
                 .sum::<f64>()
                 / cohort_rows.max(1) as f64;
-            let (rate, width) = r.placed_prefill_near(
-                self.rates_width_hints[0],
-                rows,
-                super::admit_ground::PREFILL_MIN_ADVANCE,
-                CHUNK_SIZE,
-                q_lens.len() as f64,
-                self.decode_width(),
-                decode_rows,
-                context,
-                decode_pairs,
-                weights_at,
-            );
-            Some((rate, width))
+            let at = |more: usize, hint: Option<usize>| {
+                // `more` placed turns decoding beside the cohort, each a row at
+                // the depth this card's prompts attend.
+                r.placed_prefill_near(
+                    hint,
+                    rows,
+                    super::admit_ground::PREFILL_MIN_ADVANCE,
+                    CHUNK_SIZE,
+                    q_lens.len() as f64,
+                    self.decode_width() + more,
+                    decode_rows + more,
+                    context,
+                    decode_pairs + more as f64 * r.context_per_row(),
+                    &weights_at,
+                )
+            };
+            // The rate now, and the rate a burst's own turns leave once they
+            // decode here: what the gateway bends a burst's prefill by, as it
+            // bends its step by the wide step.
+            Some((
+                at(0, self.rates_width_hints[0]),
+                at(super::phase_ring::PLACEMENT_WIDE, self.rates_width_hints[3]),
+            ))
         });
         // The widths the trades settled at, each the next pricing's start.
         self.rates_width_hints = [
-            traded.map(|(_, w)| w),
+            traded.map(|((_, w), _)| w),
             placed_step.map(|((_, w), _)| w),
             placed_step.map(|(_, (_, w))| w),
+            traded.map(|(_, (_, w))| w),
         ];
-        let traded = traded.map(|(rate, _)| rate).filter(|&rate| rate > 0.0);
+        let traded_wide = traded.map(|(_, (rate, _))| rate).filter(|&rate| rate > 0.0);
+        let traded = traded.map(|((rate, _), _)| rate).filter(|&rate| rate > 0.0);
         let placed_step = placed_step.map(|((one, _), (wide, _))| (one, wide));
         let learned = learned.map(|r| super::phase_ring::LearnedRates {
             prefill_tok_s: drain.or(traded).unwrap_or(r.prefill_tok_s),
+            prefill_tok_s_plus_wide: traded_wide.unwrap_or(r.prefill_tok_s_plus_wide),
             high_backlog_tokens: high_backlog,
             decode_step_ms_plus_one: placed_step.map_or(r.decode_step_ms_plus_one, |(one, _)| one),
             decode_step_ms_plus_wide: placed_step
@@ -872,6 +885,7 @@ impl Scheduler {
                     target: "candle_conversation::scheduler::admission",
                     rows,
                     prefill_tok_s = r.prefill_tok_s.round() as u64,
+                    prefill_tok_s_plus_wide = r.prefill_tok_s_plus_wide.round() as u64,
                     high_backlog_tokens = r.high_backlog_tokens,
                     decode_step_ms = format!("{:.1}", r.decode_step_ms),
                     decode_step_ms_plus_one = format!("{:.1}", r.decode_step_ms_plus_one),

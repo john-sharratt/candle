@@ -3704,7 +3704,7 @@ pub(crate) struct Scheduler {
     /// The widths the last pricing's three trades settled at — the placed
     /// prefill's, one decode more's, a burst's — each the next one's start
     /// (`WaveRate::traded_width_near`).
-    rates_width_hints: [Option<usize>; 3],
+    rates_width_hints: [Option<usize>; 4],
     /// Since when each idle slot has been idle (`slot_idle`), as the rates'
     /// pricing last saw — what a keep trade for idle conversations' KV will
     /// be judged on, measured first.
@@ -4117,7 +4117,7 @@ impl Scheduler {
             held_fit_claims: None,
             rates_logged_at: None,
             rates_priced_at: None,
-            rates_width_hints: [None; 3],
+            rates_width_hints: [None; 4],
             idle_since: HashMap::new(),
             high_drain: high_drain::HighDrain::default(),
             turn_content_seen: 0,

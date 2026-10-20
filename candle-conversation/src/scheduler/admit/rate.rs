@@ -1127,6 +1127,9 @@ impl WaveRate {
         let step = |routed: usize| self.decode_step_secs(routed, self.resident_now) * 1e3;
         Some(super::super::phase_ring::LearnedRates {
             prefill_tok_s: self.rate(prefill_rows.max(1), self.resident_now),
+            // The scheduler prices the wide rate (`placed_prefill_near`); the
+            // model's own is the rate now.
+            prefill_tok_s_plus_wide: self.rate(prefill_rows.max(1), self.resident_now),
             decode_step_ms: step(self.routed_per_layer),
             decode_step_ms_plus_one: step(
                 self.routed_per_layer
