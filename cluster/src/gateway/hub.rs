@@ -610,6 +610,12 @@ impl Hub {
                 }
                 self.to_others(app, node, Frame::Unclaim(u));
             }
+            // The member holds these keys complete: each one's next turn may
+            // go to it (`docs/cooperative_admission.md` §2.2). The gateway's
+            // own — no other member reads it.
+            Frame::Complete(c) => {
+                self.state().registry.completed(app, node, &c.keys);
+            }
             Frame::Coord(c) => {
                 let state = CoordState::decode(&c.state).ok_or_else(|| {
                     Close::new(

@@ -264,6 +264,18 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
             B::header(17, 0, 0).u32(1).u8(0xee).0,
         ),
         (
+            Frame::Complete(Complete {
+                keys: vec![b"ab".to_vec(), b"c".to_vec()],
+            }),
+            B::header(18, 0, 0)
+                .u32(2)
+                .u32(2)
+                .raw(b"ab")
+                .u32(1)
+                .raw(b"c")
+                .0,
+        ),
+        (
             Frame::Prepare(Prepare {
                 key: b"w".to_vec(),
                 ballot: ballot(),

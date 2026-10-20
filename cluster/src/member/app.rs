@@ -7,7 +7,7 @@
 //! [`Upgrader`]; a socket that admitted the member below the floor carries
 //! nothing else (§3.5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,8 +26,8 @@ use crate::coord::{CoordState, UpgradeView};
 use crate::dial::{dial, Attempt, Connect, Stopped};
 use crate::dispatch::RouteTable;
 use crate::frame::{
-    Admit, BuildId, Capacity, Claim, Coord, Epoch, Frame, Hello, MemberInfo, MemberState, Members,
-    ModelId, RepoAd, Routes, Unclaim,
+    Admit, BuildId, Capacity, Claim, Complete, Coord, Epoch, Frame, Hello, MemberInfo, MemberState,
+    Members, ModelId, RepoAd, Routes, Unclaim,
 };
 use crate::handshake::{GroupKey, HandshakeError, PROTO};
 use crate::replicate::{Phase, Replication, Replicator};
@@ -137,10 +137,28 @@ pub struct AppMember {
     /// Told each key another member takes from this one
     /// ([`AppMember::on_release`]).
     released: OnceLock<ReleaseHook>,
+    /// Told each key another member lets go, with the point its next holder
+    /// must hold it through ([`AppMember::on_unclaim`]).
+    unclaimed: OnceLock<UnclaimHook>,
+    /// The `oseq` of a key's own last state record in this member's origin
+    /// ([`AppMember::key_through`]).
+    key_through: OnceLock<KeyThroughHook>,
+    /// Keys let go that this member reported holding complete, re-sent whole on
+    /// every admission until each is next claimed ([`AppMember::report_complete`]).
+    reported: Mutex<BTreeSet<Vec<u8>>>,
 }
 
 /// What an app does when another member takes a key from its member.
 pub type ReleaseHook = Box<dyn Fn(&[u8]) + Send + Sync>;
+
+/// What an app does when another member lets a key go: the key, its last
+/// holder, and the `oseq` in that holder's origin its next holder must hold
+/// the key's records through.
+pub type UnclaimHook = Box<dyn Fn(&[u8], u64, u64) + Send + Sync>;
+
+/// The `oseq` of a key's own last state record in this member's origin, when
+/// the app can name one.
+pub type KeyThroughHook = Box<dyn Fn(&[u8]) -> Option<u64> + Send + Sync>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -203,7 +221,56 @@ impl AppMember {
             upgrader: OnceLock::new(),
             rejected: AtomicBool::new(false),
             released: OnceLock::new(),
+            unclaimed: OnceLock::new(),
+            key_through: OnceLock::new(),
+            reported: Mutex::new(BTreeSet::new()),
         })
+    }
+
+    /// Call `hook` with each key another member lets go, its last holder and
+    /// the `UNCLAIM`'s `through`: what an app awaits before it reports the key
+    /// complete ([`Self::report_complete`]). The first hook set is kept.
+    pub fn on_unclaim(&self, hook: UnclaimHook) {
+        let _ = self.unclaimed.set(hook);
+    }
+
+    /// Name a key's own last state record when this member lets the key go:
+    /// its `UNCLAIM` then carries that `oseq`, not the member's whole origin, so
+    /// a member holding that conversation may take its next turn whatever else
+    /// of this one's it lacks (`docs/cooperative_admission.md` §2.2). A key the
+    /// hook names nothing for goes with the origin's `oseq`. The first hook set
+    /// is kept.
+    pub fn key_through(&self, hook: KeyThroughHook) {
+        let _ = self.key_through.set(hook);
+    }
+
+    /// The `oseq` a key let go is announced with: its own, when the app names
+    /// one, otherwise `fallback`.
+    fn through_for(&self, key: &[u8], fallback: u64) -> u64 {
+        self.key_through
+            .get()
+            .and_then(|hook| hook(key))
+            .unwrap_or(fallback)
+    }
+
+    /// Report `keys`, each let go by another member, as held complete here:
+    /// sent now as `COMPLETE`, those not already reported, and again on every
+    /// admission, until each is next claimed by anyone.
+    pub fn report_complete(&self, keys: Vec<Vec<u8>>) {
+        let fresh: Vec<Vec<u8>> = {
+            let mut reported = lock(&self.reported);
+            keys.into_iter()
+                .filter(|k| reported.insert(k.clone()))
+                .collect()
+        };
+        if !fresh.is_empty() {
+            self.announce(Frame::Complete(Complete { keys: fresh }));
+        }
+    }
+
+    /// The keys reported complete and not claimed since.
+    pub fn reported_complete(&self) -> Vec<Vec<u8>> {
+        lock(&self.reported).iter().cloned().collect()
     }
 
     /// Call `hook` with each key another member takes that this member held or
@@ -476,6 +543,12 @@ impl AppMember {
             for (key, epoch) in lock(&self.claims).own() {
                 let _ = handle.control(Frame::Claim(Claim { key, epoch }));
             }
+            // A gateway that admits this member again has forgotten what it
+            // reported: each key still unclaimed goes to it whole.
+            let reported = self.reported_complete();
+            if !reported.is_empty() {
+                let _ = handle.control(Frame::Complete(Complete { keys: reported }));
+            }
         }
         lock(&self.sockets)[c] = Some(handle.clone());
         if let Some(r) = self.replicator.as_ref().filter(|_| !upgrading) {
@@ -569,12 +642,20 @@ impl AppMember {
                 lock(&self.members)[c] = Some(m);
             }
             Frame::Claim(claim) => {
+                // Claimed again: whatever this member reported of it is for a
+                // release that is over.
+                lock(&self.reported).remove(&claim.key);
                 let lost = lock(&self.claims).heard(&claim.key, claim.epoch);
                 if lost {
                     self.lost(&claim.key);
                 }
             }
-            Frame::Unclaim(u) => lock(&self.claims).heard_release(&u.key, u.epoch),
+            Frame::Unclaim(u) => {
+                lock(&self.claims).heard_release(&u.key, u.epoch);
+                if let Some(hook) = self.unclaimed.get() {
+                    hook(&u.key, u.epoch.node, u.through);
+                }
+            }
             // Build traffic is the process's upgrades' (§3.9).
             f @ (Frame::BuildOffer(_)
             | Frame::BuildHave(_)
@@ -723,7 +804,7 @@ impl AppMember {
             self.announce(Frame::Unclaim(Unclaim {
                 key: key.clone(),
                 epoch: *epoch,
-                through,
+                through: self.through_for(key, through),
             }));
         }
         gone.len()
@@ -776,7 +857,7 @@ impl AppMember {
         self.announce(Frame::Unclaim(Unclaim {
             key: key.to_vec(),
             epoch,
-            through,
+            through: self.through_for(key, through),
         }));
     }
 
@@ -818,7 +899,7 @@ impl AppMember {
         self.announce(Frame::Unclaim(Unclaim {
             key: key.to_vec(),
             epoch,
-            through: self.own_through(),
+            through: self.through_for(key, self.own_through()),
         }));
     }
 
@@ -949,6 +1030,53 @@ mod tests {
         drop(member.use_claim(b"c-1"));
         assert_eq!(member.holder_of(b"c-1"), Some(1));
         assert!(lock(&told).is_empty());
+    }
+
+    /// **Completeness is reported once per release, and ends with the next
+    /// claim.** Another member's release reaches the app with its holder and
+    /// its point; a key reported complete stays reported — re-sent on every
+    /// admission — until anyone claims it again, and reporting it twice sends
+    /// nothing new. A key let go here goes with the point the app names for it,
+    /// or the origin's when it names none.
+    #[test]
+    fn a_key_reported_complete_stays_reported_until_it_is_claimed() {
+        /// A release heard: its key, its last holder and its point.
+        type Heard = Vec<(Vec<u8>, u64, u64)>;
+        let member = alone();
+        let heard: Arc<Mutex<Heard>> = Arc::default();
+        let into = Arc::clone(&heard);
+        member.on_unclaim(Box::new(move |key, by, through| {
+            lock(&into).push((key.to_vec(), by, through));
+        }));
+        let gone = Unclaim {
+            key: b"c-1".to_vec(),
+            epoch: Epoch { ms: 5, node: 2 },
+            through: 900,
+        };
+        member.on_frame(0, Frame::Unclaim(gone), false);
+        assert_eq!(*lock(&heard), vec![(b"c-1".to_vec(), 2, 900)]);
+
+        member.report_complete(vec![b"c-1".to_vec(), b"c-2".to_vec()]);
+        member.report_complete(vec![b"c-1".to_vec()]);
+        assert_eq!(
+            member.reported_complete(),
+            vec![b"c-1".to_vec(), b"c-2".to_vec()]
+        );
+        let taken = Claim {
+            key: b"c-1".to_vec(),
+            epoch: Epoch { ms: 6, node: 3 },
+        };
+        member.on_frame(0, Frame::Claim(taken), false);
+        assert_eq!(member.reported_complete(), vec![b"c-2".to_vec()]);
+
+        assert_eq!(member.through_for(b"c-9", 40), 40, "no hook: the origin's");
+        member.key_through(Box::new(|key| (key == b"c-9").then_some(7)));
+        assert_eq!(member.through_for(b"c-9", 40), 7);
+        assert_eq!(
+            member.through_for(b"c-8", 40),
+            40,
+            "named nothing: the origin's"
+        );
     }
 
     /// A socket that died and was admitted again is admitted. The close that

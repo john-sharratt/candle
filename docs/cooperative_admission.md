@@ -136,17 +136,29 @@ How it is built:
   host's sticky check); a turn uses it from submit until its last record is
   written (`zend::turn_claims`), because a dialogue turn outlives a client that
   goes away. When the last use ends the claim goes as `UNCLAIM`, its `through`
-  this member's own `oseq` then — covering the turn. npcd and the agent keep
-  their claims until idle: their work runs on after the request that started
-  it.
+  the `oseq` of the conversation's own last state record — its newest commit —
+  as the app names it (`AppMember::key_through`), or this member's whole
+  origin's when the app names none. npcd and the agent keep their claims until
+  idle: their work runs on after the request that started it.
+- **Current enough is a conversation dimension.** Every member hears every
+  release (`AppMember::on_unclaim`) and awaits the key: once it has applied
+  every record of that conversation through the release's point and holds
+  every turn of it whole — no gap turn (`remote/completeness.rs`) — it reports
+  the key in `COMPLETE` (`AppMember::report_complete`). A key stays reported,
+  re-sent whole on every admission, until anyone claims it again. A member
+  behind on everything else the releaser wrote may take the conversation all
+  the same; one missing any of the conversation's own records, K/V included,
+  may not — a turn with missing K/V is a gap, never rebuilt from its tokens.
 - **The gateway places the next request among those holding the turn.** It
-  keeps each key's last release (who, through which `oseq`) and each member's
-  applied set from its `ACK`s. A request for a key nobody holds goes `Best`
-  among the routable members that hold the releaser's records through that
-  `oseq` — the releaser itself always does — and the canary takes it only if it
-  does. With none holding it the request goes among them all, which is the most
-  anyone has (§2.4). A release every routable member already holds is
-  forgotten.
+  keeps each key's last release (who, through which `oseq`, and the members
+  that reported it complete since) and each member's applied set from its
+  `ACK`s. A request for a key nobody holds goes `Best` among the placeable
+  members that reported it complete, or that hold the releaser's records
+  through that `oseq` — the releaser itself always does — and the canary takes
+  it only if it does. With none holding it the request goes among them all,
+  which is the most anyone has (§2.4). A release every placeable member already
+  holds is forgotten, and a new release forgets the reports made against the
+  one before.
 - **A member forgets what it no longer holds.** Every way a claim stops being
   this member's — its last use, idleness, a lease handed back, another member's
   later claim — calls the app's release hook (`AppMember::on_release`). zend

@@ -24,7 +24,7 @@ use crate::frame::{name, Frame};
 use crate::pipe::{Message, PipeClosed, PipeRx, PipeTx};
 
 /// The protocol version this build speaks.
-pub const PROTO: u16 = 3;
+pub const PROTO: u16 = 4;
 
 /// A handshake with no frame from the peer for this long is dead, as a session
 /// with no frame for this long is (§3.2).

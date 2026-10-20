@@ -349,6 +349,39 @@ fn a_released_key_goes_to_a_member_holding_its_last_turn() {
     );
 }
 
+/// **A member reporting a key complete may take it, whatever else of its last
+/// holder's it lacks** (`COMPLETE`, `docs/cooperative_admission.md` §2.2).
+/// Node 2 has applied node 1's records only to 100, far short of the release
+/// at 500 — but it holds the conversation `c` names complete, and says so.
+/// A report for a key with no release standing is ignored, and a new release
+/// forgets the reports made against the one before.
+#[test]
+fn a_member_holding_a_released_key_complete_may_take_it() {
+    let mut r = three();
+    r.released("zend", b"c", 1, 500);
+    r.applied("zend", 2, vec![(1, 100)]);
+    r.applied("zend", 3, vec![(1, 100)]);
+    // Node 1 (power 100) is the only member holding it.
+    assert_eq!(r.pick("zend", &sticky(), Some("c"), None), Pick::Member(1));
+    r.completed("zend", 2, &[b"c".to_vec(), b"never-released".to_vec()]);
+    assert_eq!(
+        r.pick("zend", &sticky(), Some("c"), None),
+        Pick::Member(2),
+        "node 2, the most powerful, now holds it complete"
+    );
+    assert!(
+        !r.apps["zend"]
+            .handovers
+            .contains_key(b"never-released".as_slice()),
+        "a report for a key nobody let go makes no handover"
+    );
+
+    // Released again, through a later record: node 2's report was for the
+    // release before.
+    r.released("zend", b"c", 1, 900);
+    assert_eq!(r.pick("zend", &sticky(), Some("c"), None), Pick::Member(1));
+}
+
 /// Set node `n`'s learned rates, its backlog and its decodes on `r`.
 fn learned(r: &mut Registry, n: u64, power: u32, backlog: u32, prefill_tok_s: u32, next_us: u32) {
     r.capacity(

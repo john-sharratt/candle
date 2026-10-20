@@ -150,8 +150,10 @@ impl Claim {
     }
 }
 
-/// The claim taken at `epoch` is let go; its holder's own `oseq` was
-/// `through` when it let go (§5.4).
+/// The claim taken at `epoch` is let go (§5.4). `through` is the `oseq` of the
+/// key's own last state record in its holder's origin — the newest commit of
+/// the conversation it names — so a member holding the key's records through
+/// it may take the key's next turn, whatever else of the holder's it lacks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unclaim {
     pub key: Vec<u8>,
@@ -171,6 +173,29 @@ impl Unclaim {
             key: r.blob_vec()?,
             epoch: Epoch::read(r)?,
             through: r.u64()?,
+        })
+    }
+}
+
+/// Keys let go that this member now holds complete (`docs/cooperative_admission.md`
+/// §2.2): every record of each one's conversation through its `UNCLAIM`'s
+/// `through`, and every turn of it whole. Sent as each turns complete, and
+/// whole again on every admission, until the key is next claimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Complete {
+    pub keys: Vec<Vec<u8>>,
+}
+
+impl Complete {
+    pub fn write(&self, w: &mut Writer) {
+        w.list(&self.keys, |w, k| {
+            w.blob(k);
+        });
+    }
+
+    pub fn read(r: &mut Reader) -> Result<Self, WireError> {
+        Ok(Self {
+            keys: r.list(|r| r.blob_vec())?,
         })
     }
 }
