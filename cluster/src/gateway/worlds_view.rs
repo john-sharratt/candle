@@ -199,6 +199,8 @@ mod tests {
             decode_step_next_us: None,
             decode_step_wide_us: None,
             prefill_tok_s_wide: None,
+            prompt_tokens: None,
+            reply_tokens: None,
             in_flight: 0,
             state,
             session: 1,

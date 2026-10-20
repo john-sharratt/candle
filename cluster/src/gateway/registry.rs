@@ -664,15 +664,53 @@ impl Registry {
     }
 }
 
-/// The prefill a turn brings, in tokens, as the gateway reckons it: a
-/// request carries only its new message, and the prompt a member prefills is
-/// what its projection makes of the conversation — a figure the gateway does
-/// not see. The same for every member, so it weighs each one's backlog and
-/// prefill rate alike.
+/// The prefill a turn brings, in tokens, when no candidate has said what the
+/// turns it begins bring ([`TurnSize`]).
 pub const NOMINAL_PROMPT_TOKENS: u64 = 2048;
 
-/// The reply a turn decodes, in tokens, as the gateway reckons it.
+/// The reply a turn decodes, in tokens, when no candidate has said.
 pub const NOMINAL_REPLY_TOKENS: u64 = 512;
+
+/// The size a placement prices a turn at: its prompt and its reply, in tokens.
+///
+/// **One size for every candidate.** A request carries only its new message;
+/// the prompt a member prefills is what its projection makes of the
+/// conversation, the same on whichever member serves it. So the size is the
+/// turn's, not the member's: the mean of what the candidates report the turns
+/// they begin bring (`Capacity::prompt_tokens`, `reply_tokens`), applied to
+/// them all. Priced at each member's own, one that had served only short turns
+/// would look cheap for every turn. A fixed nominal priced heavy-decode's
+/// 30-token prompts as 2,048, and its 256-token replies as 512, against a
+/// card whose wide prefill rate was steep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnSize {
+    pub prompt: u64,
+    pub reply: u64,
+}
+
+impl TurnSize {
+    /// The mean of what `pool` reports, each figure over the candidates that
+    /// report one; the nominal where none does.
+    pub fn of(pool: &[&MemberView]) -> TurnSize {
+        let mean = |f: fn(&Capacity) -> u32, nominal: u64| {
+            let said: Vec<u64> = pool
+                .iter()
+                .filter_map(|m| m.capacity.as_ref())
+                .map(|c| u64::from(f(c)))
+                .filter(|&v| v > 0)
+                .collect();
+            if said.is_empty() {
+                nominal
+            } else {
+                said.iter().sum::<u64>() / said.len() as u64
+            }
+        };
+        TurnSize {
+            prompt: mean(|c| c.prompt_tokens, NOMINAL_PROMPT_TOKENS),
+            reply: mean(|c| c.reply_tokens, NOMINAL_REPLY_TOKENS),
+        }
+    }
+}
 
 /// The best of `ready` (§5.3): among those with room, or among them all when
 /// none has — the soonest finish among those that have said what a turn costs
@@ -686,18 +724,19 @@ pub const NOMINAL_REPLY_TOKENS: u64 = 512;
 /// 36's 48 heavy-decode turns on WhiteWorld, fresh from a restart, at 25–45 s a
 /// turn against BlackWorld's 10–18 s, and halved the pattern's rate.
 fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
+    let size = TurnSize::of(&ready);
     // Every candidate as the pick saw it, for the placement line below.
-    let seen: Vec<String> = ready.iter().map(|m| placement_view(m)).collect();
+    let seen: Vec<String> = ready.iter().map(|m| placement_view(m, size)).collect();
     let roomy: Vec<&MemberView> = ready.iter().copied().filter(|m| has_room(m)).collect();
     let pool = if roomy.is_empty() { ready } else { roomy };
     let finishes: Vec<(u64, &MemberView)> = pool
         .iter()
-        .filter_map(|m| finish_us(m).map(|f| (f, *m)))
+        .filter_map(|m| finish_us(m, size).map(|f| (f, *m)))
         .collect();
     let probe = pool
         .iter()
         .copied()
-        .filter(|m| finish_us(m).is_none() && m.in_flight == 0)
+        .filter(|m| finish_us(m, size).is_none() && m.in_flight == 0)
         .max_by(|a, b| rank(a, b));
     let (by, pick) = match (probe, finishes.is_empty()) {
         (_, true) => (
@@ -717,6 +756,8 @@ fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
         target: "cluster::gateway::placement",
         picked = %pick.map_or_else(|| "none".to_string(), |n| format!("{n:016x}")),
         by,
+        prompt = size.prompt,
+        reply = size.reply,
         candidates = %seen.join("; "),
         "placed"
     );
@@ -724,8 +765,9 @@ fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
 }
 
 /// One candidate as a placement weighed it: its node, whether it had room,
-/// its requests in flight, the figures it advertised, and the finish they give.
-fn placement_view(m: &MemberView) -> String {
+/// its requests in flight, the figures it advertised, and the finish they give
+/// a turn of `size`.
+fn placement_view(m: &MemberView, size: TurnSize) -> String {
     let c = capacity_of(m);
     format!(
         "{:016x} room={} in_flight={} placed={} backlog={} prefill_tok_s={} prefill_wide={} step_next_us={} step_wide_us={} finish_ms={}",
@@ -738,7 +780,7 @@ fn placement_view(m: &MemberView) -> String {
         c.prefill_tok_s_wide,
         c.decode_step_next_us,
         c.decode_step_wide_us,
-        finish_us(m).map_or_else(|| "-".to_string(), |f| (f / 1000).to_string()),
+        finish_us(m, size).map_or_else(|| "-".to_string(), |f| (f / 1000).to_string()),
     )
 }
 
@@ -747,10 +789,10 @@ fn placement_view(m: &MemberView) -> String {
 /// "earliest advertised finish"): the prefill already queued there, the
 /// turns handed to it and not yet in its queue, and this one, at the prefill
 /// rate those turns and this one leave it ([`token_ns_with`]); then the reply
-/// at the decode step they give it ([`step_with_us`]). `None` until it has
-/// learned both rates — a member is never placed by figures it has not
-/// measured.
-fn finish_us(m: &MemberView) -> Option<u64> {
+/// at the decode step they give it ([`step_with_us`]) — each turn of `size`.
+/// `None` until it has learned both rates — a member is never placed by
+/// figures it has not measured.
+fn finish_us(m: &MemberView, size: TurnSize) -> Option<u64> {
     let c = capacity_of(m);
     if c.prefill_tok_s == 0 || c.decode_step_next_us == 0 {
         return None;
@@ -758,9 +800,9 @@ fn finish_us(m: &MemberView) -> Option<u64> {
     // A request handed since the report and already answered brought no
     // prompt that is still waiting: only those still in flight can be.
     let pending = m.placed.min(m.in_flight);
-    let tokens = u64::from(c.prefill_backlog) + (u64::from(pending) + 1) * NOMINAL_PROMPT_TOKENS;
+    let tokens = u64::from(c.prefill_backlog) + (u64::from(pending) + 1) * size.prompt;
     let prefill_us = tokens * token_ns_with(c, pending + 1) / 1000;
-    Some(prefill_us + NOMINAL_REPLY_TOKENS * step_with_us(c, pending + 1))
+    Some(prefill_us + size.reply * step_with_us(c, pending + 1))
 }
 
 /// The time one prompt token takes with `extra` rows more than `c` reports

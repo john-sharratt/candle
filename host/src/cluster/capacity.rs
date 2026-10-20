@@ -49,6 +49,10 @@ pub struct Rates {
     /// The prefill rate with `PLACEMENT_WIDE` rows more than it decodes,
     /// tokens a second: how prefill slows as a burst lands.
     pub prefill_tok_s_wide: f64,
+    /// The mean prompt of the turns the scheduler has begun, and the mean reply
+    /// such a turn decodes, in tokens; zero until learned.
+    pub prompt_tokens: f64,
+    pub reply_tokens: f64,
     /// Prompt tokens a placed turn would queue behind: those waiting at its
     /// own priority. Background ingest is not among them — a placed turn goes
     /// ahead of it.
@@ -135,6 +139,17 @@ pub fn capacity(
                 .round()
                 .min(f64::from(u32::MAX)) as u32
         }),
+        prompt_tokens: rates.map_or(0, |r| tokens(r.prompt_tokens)),
+        reply_tokens: rates.map_or(0, |r| tokens(r.reply_tokens)),
+    }
+}
+
+/// A token count as the frame's whole tokens; zero for a figure not learned.
+fn tokens(n: f64) -> u32 {
+    if n.is_finite() && n > 0.0 {
+        n.round().min(f64::from(u32::MAX)) as u32
+    } else {
+        0
     }
 }
 
@@ -238,6 +253,8 @@ mod tests {
             decode_step_next_ms: 41.53,
             decode_step_wide_ms: 96.25,
             prefill_tok_s_wide: 640.4,
+            prompt_tokens: 3_100.4,
+            reply_tokens: 409.6,
             high_backlog_tokens: 6_144,
         };
         let c = capacity(
@@ -252,6 +269,7 @@ mod tests {
             (2_303, 41_530, 6_144)
         );
         assert_eq!((c.decode_step_wide_us, c.prefill_tok_s_wide), (96_250, 640));
+        assert_eq!((c.prompt_tokens, c.reply_tokens), (3_100, 410));
         assert!(!c.idle, "the ingest still keeps it from admitting now");
         // A wide step learned below the one-more step, and a wide rate above
         // the one-more rate, are said as flat.
@@ -289,6 +307,8 @@ mod tests {
             decode_step_next_ms: 41.5,
             decode_step_wide_ms: 80.0,
             prefill_tok_s_wide: 0.0,
+            prompt_tokens: 0.0,
+            reply_tokens: 0.0,
             high_backlog_tokens: 0,
         };
         let c = capacity(
@@ -299,5 +319,15 @@ mod tests {
             machine(),
         );
         assert_eq!((c.prefill_tok_s, c.decode_step_next_us), (0, 0));
+    }
+
+    /// A turn size is said in whole tokens, and one not learned — zero, or not
+    /// a number — is said as zero, which the gateway reads as unknown.
+    #[test]
+    fn turn_sizes_are_whole_tokens_or_zero() {
+        assert_eq!(tokens(2_047.6), 2_048);
+        assert_eq!(tokens(0.0), 0);
+        assert_eq!(tokens(-3.0), 0);
+        assert_eq!(tokens(f64::NAN), 0);
     }
 }

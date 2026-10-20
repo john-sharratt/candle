@@ -443,6 +443,63 @@ fn a_turn_goes_where_it_finishes_soonest() {
     assert_eq!(best(&mut r), Pick::Member(3));
 }
 
+/// **A turn is priced at the size of the turns arriving, the same on every
+/// candidate.** Heavy-decode's turns bring ~30-token prompts and 256-token
+/// replies; at the nominal 2,048/512 a card with a steep wide prefill rate looked
+/// three times dearer than it was. The size is the mean of what the candidates
+/// report, the nominal where none reports — never one member's own.
+#[test]
+fn a_turn_is_priced_at_the_size_the_members_report() {
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    let stated = |prompt, reply| Capacity {
+        prefill_tok_s: 1_000,
+        decode_step_next_us: 40_000,
+        prompt_tokens: prompt,
+        reply_tokens: reply,
+        ..capacity(MemberState::Ready, 100, true, 64)
+    };
+    r.capacity("zend", 1, stated(0, 0));
+    r.capacity("zend", 2, stated(0, 0));
+    let pool = |r: &Registry| -> TurnSize {
+        let views: Vec<&MemberView> = [1, 2].iter().filter_map(|&n| r.member("zend", n)).collect();
+        TurnSize::of(&views)
+    };
+    assert_eq!(
+        pool(&r),
+        TurnSize {
+            prompt: NOMINAL_PROMPT_TOKENS,
+            reply: NOMINAL_REPLY_TOKENS
+        },
+        "none said: the nominal"
+    );
+    r.capacity("zend", 1, stated(30, 256));
+    assert_eq!(
+        pool(&r),
+        TurnSize {
+            prompt: 30,
+            reply: 256
+        },
+        "one said"
+    );
+    r.capacity("zend", 2, stated(90, 512));
+    assert_eq!(
+        pool(&r),
+        TurnSize {
+            prompt: 60,
+            reply: 384
+        },
+        "the mean"
+    );
+
+    // Each candidate's finish is priced at that one size: this turn's 60-token
+    // prompt at 1,000 tok/s, then 384 steps of 40 ms.
+    let m = r.member("zend", 1).unwrap();
+    assert_eq!(finish_us(m, pool(&r)), Some(60_000 + 384 * 40_000));
+}
+
 /// **A member fresh from a restart is probed, not handed a share of a burst.**
 /// Run 36's heavy-decode at 19:01:21: BlackWorld learned (2,660 tok/s, a 20.8
 /// ms step widening to 70.2 ms), WhiteWorld restarted with nothing learned.

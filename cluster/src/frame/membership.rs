@@ -72,6 +72,12 @@ pub struct Capacity {
     /// 213–463. Zero when unlearned, and never above `prefill_tok_s` once
     /// learned — equal means flat.
     pub prefill_tok_s_wide: u32,
+    /// The mean prompt, in tokens, of the turns its scheduler has begun, and the
+    /// mean reply such a turn decodes before its next prompt: the sizes of the
+    /// work actually arriving, which a placement prices a turn at in place of a
+    /// fixed nominal. Zero until learned.
+    pub prompt_tokens: u32,
+    pub reply_tokens: u32,
 }
 
 /// The rows beyond its decodes at which a member states its wide figures
@@ -99,7 +105,9 @@ impl Capacity {
             .u32(self.prefill_tok_s)
             .u32(self.decode_step_next_us)
             .u32(self.decode_step_wide_us)
-            .u32(self.prefill_tok_s_wide);
+            .u32(self.prefill_tok_s_wide)
+            .u32(self.prompt_tokens)
+            .u32(self.reply_tokens);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -122,6 +130,8 @@ impl Capacity {
             decode_step_next_us: r.u32()?,
             decode_step_wide_us: r.u32()?,
             prefill_tok_s_wide: r.u32()?,
+            prompt_tokens: r.u32()?,
+            reply_tokens: r.u32()?,
         })
     }
 

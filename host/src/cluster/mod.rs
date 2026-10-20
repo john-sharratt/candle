@@ -370,6 +370,8 @@ impl Cluster {
                     decode_step_next_ms: r.decode_step_ms_plus_one,
                     decode_step_wide_ms: r.decode_step_ms_plus_wide,
                     prefill_tok_s_wide: r.prefill_tok_s_plus_wide,
+                    prompt_tokens: r.prompt_tokens,
+                    reply_tokens: r.reply_tokens,
                     high_backlog_tokens: r.high_backlog_tokens,
                 });
                 capacity(state, telemetry.capacity(), wave, rates, measure())

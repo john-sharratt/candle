@@ -100,7 +100,11 @@ and `prefill_tok_s_wide`. The last four are what the member's admission has
 learned (`phase_ring::learned_rates`): the prefill rate at the width it runs,
 the decode step with one more row, and the decode step and prefill rate with
 `PLACEMENT_WIDE` (16) more rows. The gateway's `Best` estimates each
-candidate's finish for a nominal turn: the backlog, plus 2,048 tokens for each
+candidate's finish for a turn of the size the members report (protocol 5:
+`CAPACITY`'s `prompt_tokens` and `reply_tokens`, the mean prompt of the turns a
+member's scheduler begins and the reply such a turn decodes — one size for every
+candidate, the mean of what they report, 2,048 and 512 where none has learned
+one): the backlog, plus one prompt for each
 request handed to it since its last `CAPACITY` and for this one, at the time
 per token those requests and this one leave it; then 512 tokens at the step
 they make. Both are on the line through the one-more and wide figures — time
