@@ -585,6 +585,31 @@ pub fn keep_learned_rates_at(path: PathBuf) {
     }
 }
 
+/// Where the learned model is kept: beside the published rates, under its own
+/// name. `None` with no store.
+fn learned_model_path() -> Option<PathBuf> {
+    let store = LEARNED_STORE.get()?;
+    let s = store.lock().ok()?;
+    Some(s.0.with_file_name("learned_model"))
+}
+
+/// Keep the rate model's learned state (`WaveRate::export_learned`) for the
+/// next start. Best effort, like the rates beside it.
+pub fn keep_learned_model(text: &str) {
+    let Some(path) = learned_model_path() else {
+        return;
+    };
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// The learned state a previous run kept, for the rate model to start from.
+pub fn kept_learned_model() -> Option<String> {
+    std::fs::read_to_string(learned_model_path()?).ok()
+}
+
 /// Write `rates` to the store, once a [`LEARNED_SAVE_EVERY`]; nothing without
 /// one. Best effort: a store that cannot be written costs the next start its
 /// head start, not this run anything.

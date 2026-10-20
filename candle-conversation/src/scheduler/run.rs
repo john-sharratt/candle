@@ -902,9 +902,28 @@ impl Scheduler {
                         Err(flume::RecvTimeoutError::Disconnected) => break,
                     }
                 } else {
-                    match self.rx.recv() {
+                    // **Priced while idle too.** Its reader takes the rates every
+                    // period whether or not this member runs anything, and an idle
+                    // member that only priced inside its quanta published what a
+                    // loaded run last left it — WhiteWorld's 208 ms step for a whole
+                    // run of 87 turns it was never placed (ed4d8c781, 2026-10-20).
+                    // So the wait ends each period to price the state it is in.
+                    let period = super::phase_ring::rates_read_period()
+                        .unwrap_or(super::prefill::RATES_LOG_EVERY);
+                    match self.rx.recv_timeout(period) {
                         Ok(req) => req,
-                        Err(_) => break, // Engine dropped.
+                        Err(flume::RecvTimeoutError::Timeout) => {
+                            self.step_census
+                                .spend(super::step_census::Activity::Idle, t_idle.elapsed());
+                            self.wave_stats
+                                .add_idle(t_idle.elapsed().as_millis() as u64);
+                            if self.wave_rate.is_none() {
+                                self.wave_rate = self.take_planner();
+                            }
+                            self.publish_learned_rates();
+                            continue;
+                        }
+                        Err(flume::RecvTimeoutError::Disconnected) => break,
                     }
                 };
                 self.step_census

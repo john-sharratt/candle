@@ -120,7 +120,7 @@ const MID_SWEEP_RETRIES: u32 = 4;
 
 /// How often the learned rates are logged — and, with no reader registered
 /// (`phase_ring::rates_read_every`), how often they are priced at all.
-const RATES_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+pub(super) const RATES_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The rows a cohort of `rows` that needs `need` bytes of tier and KV shrinks
 /// to, to fit `ground`: scaled by the shortfall and a margin for the staircase
@@ -829,6 +829,10 @@ impl Scheduler {
             .is_none_or(|t| now.duration_since(t) >= RATES_LOG_EVERY)
         {
             self.rates_logged_at = Some(now);
+            // And the model behind them, for the next start (`export_learned`).
+            if let Some(r) = self.wave_rate.as_ref() {
+                super::phase_ring::keep_learned_model(&r.export_learned());
+            }
             let ((copy, compute, attend), context, (hit_model, fit)) = self
                 .wave_rate
                 .as_ref()
@@ -2251,7 +2255,7 @@ impl Scheduler {
     ///
     /// `None` while the model cannot describe its weight side — see
     /// [`ManagedBatchedModel::weight_plan`].
-    fn take_planner(&mut self) -> Option<admit::WaveRate> {
+    pub(super) fn take_planner(&mut self) -> Option<admit::WaveRate> {
         if self.wave_rate.is_none() {
             // **The refusal names itself.** `WeightPlan::from_stats` declines a partial
             // gauge set outright — any of `moe_layers`, `total_experts`,
@@ -2324,12 +2328,19 @@ impl Scheduler {
                     return None;
                 }
             };
+            // What a previous run learned of this card, when it ran this model:
+            // the figures it publishes are then priced from the start, for the
+            // state this member is in, rather than seeded or kept stale.
+            let mut rate = rate;
+            let restored = super::phase_ring::kept_learned_model()
+                .is_some_and(|text| rate.import_learned(&text));
             tracing::info!(
                 target: "candle_conversation::scheduler::admission",
                 moe_layers = p.moe_layers,
                 experts_per_layer = p.experts_per_layer,
                 slot_mib = p.slot_bytes >> 20,
                 link_gbps = rate.link_bytes_per_s() / 1e9,
+                restored,
                 "wave rate planner armed",
             );
             self.wave_rate = Some(rate);

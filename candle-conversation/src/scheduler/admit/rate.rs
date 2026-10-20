@@ -2565,6 +2565,152 @@ impl WaveRate {
         self.fit.solve(self.link_bytes_per_s).is_some()
     }
 
+    /// What this model has learned about the card, as text a restart can read
+    /// back ([`Self::import_learned`]): the copy rate, the layer time, the hit
+    /// exponent, the forward and decode fits and the depths they were taught
+    /// at — what it would take a run of forwards to learn again, and not what
+    /// one pass judged.
+    ///
+    /// **Kept as the model, not as its figures.** The figures a member
+    /// published last were priced at the state it stood in then — a loaded
+    /// card, wide and deep — and kept as figures they are what a restarted
+    /// member advertises until it runs a forward. An idle one never does: on
+    /// WhiteWorld (ed4d8c781, 2026-10-20) its kept 208 ms step and 961 ms burst
+    /// stood for a whole run, priced it out of all 87 turns, and so nothing
+    /// came to correct them. Kept as the model, the figures are priced afresh
+    /// for the state the member is in.
+    pub fn export_learned(&self) -> String {
+        let g = &self.geometry;
+        let m = &self.model;
+        let mut out = format!(
+            "geometry {} {} {}\nbw {}\nlayer {}\nhit_exponent {}\nmodel {} {} {} {}\n\
+             context_per_row {}\ndecode_context {}\nsamples {} {} {}\n",
+            g.moe_layers,
+            g.experts_per_layer,
+            g.slot_bytes,
+            self.bw_bytes_per_s,
+            self.layer_secs,
+            self.decode.hit_exponent,
+            m.fixed_secs,
+            m.overhead_secs,
+            m.compute_secs_per_token,
+            m.attend_secs_per_pair,
+            self.context_per_row,
+            self.decode_context,
+            self.samples,
+            self.decode_samples,
+            self.hit_samples,
+        );
+        let row = |v: &[f64]| {
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        out.push_str(&format!(
+            "fit {} {} {}\n",
+            self.fit.n,
+            row(&self.fit.gram.concat()),
+            row(&self.fit.rhs)
+        ));
+        let d = &self.decode_fit;
+        out.push_str(&format!(
+            "decode_fit {} {} {} {}\n",
+            d.n,
+            d.tt,
+            row(&d.xx.concat()),
+            row(&d.xt)
+        ));
+        out
+    }
+
+    /// Take back what [`Self::export_learned`] wrote — `false`, and nothing
+    /// changed, when it is unreadable or was learned on another model's
+    /// geometry. The link's measured rate is this run's, and stays.
+    pub fn import_learned(&mut self, text: &str) -> bool {
+        let mut fields: std::collections::HashMap<&str, Vec<&str>> = Default::default();
+        for line in text.lines() {
+            let mut words = line.split_whitespace();
+            if let Some(key) = words.next() {
+                fields.insert(key, words.collect());
+            }
+        }
+        let nums = |key: &str| -> Option<Vec<f64>> {
+            fields
+                .get(key)?
+                .iter()
+                .map(|w| w.parse::<f64>().ok())
+                .collect()
+        };
+        let Some(g) = nums("geometry") else {
+            return false;
+        };
+        let geo = &self.geometry;
+        if g != [
+            geo.moe_layers as f64,
+            geo.experts_per_layer as f64,
+            geo.slot_bytes as f64,
+        ] {
+            return false;
+        }
+        let one = |key: &str| nums(key).and_then(|v| v.first().copied());
+        let (Some(bw), Some(layer), Some(hit), Some(model), Some(ctx), Some(dctx), Some(samples)) = (
+            one("bw"),
+            one("layer"),
+            one("hit_exponent"),
+            nums("model"),
+            one("context_per_row"),
+            one("decode_context"),
+            nums("samples"),
+        ) else {
+            return false;
+        };
+        let (Some(fit), Some(dfit)) = (nums("fit"), nums("decode_fit")) else {
+            return false;
+        };
+        if model.len() != 4
+            || samples.len() != 3
+            || fit.len() != 1 + 16 + 4
+            || dfit.len() != 2 + 25 + 5
+        {
+            return false;
+        }
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(bw) || !positive(layer) || !positive(hit) {
+            return false;
+        }
+        self.bw_bytes_per_s = bw.min(self.link_bytes_per_s);
+        self.layer_secs = layer;
+        self.decode.hit_exponent = hit;
+        self.model.fixed_secs = model[0];
+        self.model.overhead_secs = model[1];
+        self.model.compute_secs_per_token = model[2];
+        self.model.attend_secs_per_pair = model[3];
+        self.context_per_row = ctx;
+        self.decode_context = dctx;
+        self.samples = samples[0] as u64;
+        self.decode_samples = samples[1] as u64;
+        self.hit_samples = samples[2] as u64;
+        self.fit.n = fit[0] as u64;
+        for i in 0..4 {
+            for j in 0..4 {
+                self.fit.gram[i][j] = fit[1 + i * 4 + j];
+            }
+            self.fit.rhs[i] = fit[17 + i];
+        }
+        let d = &mut self.decode_fit;
+        d.n = dfit[0] as u64;
+        d.tt = dfit[1];
+        for i in 0..5 {
+            for j in 0..5 {
+                d.xx[i][j] = dfit[2 + i * 5 + j];
+            }
+            d.xt[i] = dfit[27 + i];
+        }
+        d.cached = Some(d.compute());
+        true
+    }
+
     /// How long the decode fit remembers a step: the minute the published
     /// rates are logged at and a measured step bound stays fresh within.
     const FIT_MEMORY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -2800,6 +2946,54 @@ mod tests {
         }
         let (aa, ab, ac, ad) = alone.solve_all().expect("the widths varied");
         assert!(approx(aa, a, 1e-6) && approx(ab, b, 1e-6) && ac == 0.0 && ad == 0.0);
+    }
+
+    /// **What a run learned, a restart starts from.** A model taught its card
+    /// and kept as text prices the same steps once read back into a fresh
+    /// one — and one learned on another model's geometry is refused, leaving
+    /// the fresh model as it was.
+    #[test]
+    fn a_learned_model_kept_and_restored_prices_as_it_did() {
+        let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
+        let mut taught = planner_learned(LINK_4090_MOBILE, BW_RUN15);
+        for round in 0..40 {
+            for decodes in 1..=6usize {
+                let share = 0.3 + 0.1 * ((round + decodes) % 5) as f64;
+                let resident = (total as f64 * share) as u64;
+                let m = taught.distinct_routed(decodes * 8) * taught.streamed_fraction(resident);
+                let q = decodes as f64 * (20_000.0 + 10_000.0 * (round % 4) as f64);
+                let secs = (0.25e-3 + 0.05e-3 * m + 2e-9 * q) * LAYERS;
+                taught.observe_decode_at(decodes, 0, resident, secs, q);
+            }
+        }
+        let resident = (total as f64 * 0.6) as u64;
+        let kept = taught.export_learned();
+        let mut restored = planner(LINK_4090_MOBILE);
+        assert!(restored.import_learned(&kept));
+        assert!(approx(
+            restored.decode_step_secs(24 * 8, resident),
+            taught.decode_step_secs(24 * 8, resident),
+            1e-9
+        ));
+        assert!(approx(
+            restored.rate(4_096, resident),
+            taught.rate(4_096, resident),
+            1e-9
+        ));
+        assert_eq!(restored.decode_samples(), taught.decode_samples());
+
+        let mut other = WaveRate::with_link_rate(
+            LINK_4090_MOBILE,
+            ExpertGeometry {
+                moe_layers: 7,
+                ..ExpertGeometry::QWEN36_35B_A3B
+            },
+            RateModel::default(),
+            DecodeModel::default(),
+        );
+        let before = other.export_learned();
+        assert!(!other.import_learned(&kept), "another geometry's learning");
+        assert_eq!(other.export_learned(), before, "left as it was");
     }
 
     /// **The decodes' own attention is the fit's to price, not its fixed
