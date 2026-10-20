@@ -926,7 +926,10 @@ impl Scheduler {
                             // left it: WhiteWorld (71b3b203a, 2026-10-20) a third
                             // of its experts resident with nothing running, and
                             // one decode more priced at 177 ms. Between forwards
-                            // is where the boundary may move.
+                            // is where the boundary may move, and this wake comes
+                            // once a rates period at most — a request ends the
+                            // wait without it — so the boundary is not asked to
+                            // move faster than the rates are read.
                             self.model.reclaim_spare_ground();
                             // Priced as the idle card it is: the residency the
                             // zone holds now, nothing charged (`settle_idle`).
