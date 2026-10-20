@@ -629,6 +629,7 @@ impl Scheduler {
             return;
         }
         self.rates_priced_at = Some(now);
+        self.observe_idle_slots(now);
         // **At the width a placed turn would run at, not the width running
         // now.** A forward streams its experts whatever its width, so the rate
         // at a narrow width says almost nothing about the card under the load
@@ -809,6 +810,7 @@ impl Scheduler {
                 });
             let decode_fit = fit.map(|(a, b)| format!("a={:.3}ms b={:.4}ms", a * 1e3, b * 1e3));
             let steps = self.step_census.take(now);
+            let idle = self.idle_census(now);
             match learned {
                 Some(r) => tracing::info!(
                     target: "candle_conversation::scheduler::admission",
@@ -834,6 +836,7 @@ impl Scheduler {
                     hit_model = format!("{hit_model:.3}"),
                     decode_fit,
                     steps,
+                    idle,
                     prefill_samples = samples,
                     decode_samples,
                     "learned rates published"

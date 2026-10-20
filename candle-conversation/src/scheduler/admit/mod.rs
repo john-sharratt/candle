@@ -168,6 +168,13 @@ pub(crate) trait Ground {
     /// `Low`.
     fn outranks_active(&self, prio: DecodePriority) -> bool;
 
+    /// Running decodes of `prio`'s band or above: the ones an outranking
+    /// offer of `prio` still trades against. The default, every running
+    /// decode, is a ground with one band.
+    fn decodes_at_or_above(&self, _prio: DecodePriority) -> usize {
+        self.decodes_active()
+    }
+
     /// The weight waiting prompts put on prefill throughput when a turn is
     /// judged on the trade against decode ([`rate::WaveRate::try_widen_trading`],
     /// whose other weight is the decodes running): one per prompt waiting, each
@@ -453,12 +460,37 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                 // they finish. A turn they yield to is judged on the row cap
                 // alone (`WaveRate::try_outranking`), and a cap refusal re-offers
                 // it as a join like a rate refusal does.
+                //
+                // **Outranking orders the queue; it does not exempt the trade.**
+                // The decodes of its own band and above are not the lower band's
+                // and did not take the residency it spends, and they step slower
+                // for every byte of it — so an outranking turn is traded against
+                // them, as any turn is against the decodes running. Judged on the
+                // cap alone, every `High` tool result in a heavy-read was admitted
+                // while a `Low` pass ran: on BlackWorld (e00cb4300, 2026-10-20)
+                // all 46 admissions of four minutes outranked, none was refused,
+                // and the expert zone stood 6.4 GB under the residency the
+                // decodes were held to while their step went 98 → 614 ms.
                 Kind::Prefill if ground.outranks_active(prio) => {
-                    match rate.try_outranking(cost.rows, after) {
+                    let peers = ground.decodes_at_or_above(prio);
+                    let verdict = if cost.rows > 0 && peers > 0 {
+                        rate.try_widen_trading(
+                            cost.rows,
+                            before,
+                            after,
+                            ground.prefill_weight(prio),
+                            peers as f64,
+                        )
+                    } else {
+                        rate.try_outranking(cost.rows, after)
+                    };
+                    match verdict {
                         rate::Admit::Admitted { .. } => true,
-                        rate::Admit::Refused(r @ rate::Refusal::Cap { .. })
-                            if cost.rows > 0 && ground.close_rows() =>
-                        {
+                        rate::Admit::Refused(
+                            r @ (rate::Refusal::Cap { .. }
+                            | rate::Refusal::Saturated { .. }
+                            | rate::Refusal::Worse { .. }),
+                        ) if cost.rows > 0 && ground.close_rows() => {
                             log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
                             continue;
                         }
@@ -841,6 +873,28 @@ mod tests {
         peer.prefill_prio = DecodePriority::High;
         let got = fill_once(&mut peer);
         assert_eq!(got.prefills, 0, "among equals the floor still holds");
+    }
+
+    /// **Outranking orders the queue; it does not exempt the trade.** A `High`
+    /// turn ahead of running `Low` work is still traded against the decodes it
+    /// does not outrank, which its residency slows; with none running there
+    /// is nothing to trade, and it is judged on the cap and the prefill floor
+    /// as before.
+    #[test]
+    fn an_outranking_turn_is_traded_against_the_decodes_it_does_not_outrank() {
+        let trades = |decodes: usize| {
+            let mut f = Fake::new(Vec::new(), vec![REGION], FLOOR + 8 * REGION);
+            f.active = 14;
+            f.decodes_active = decodes;
+            f.running_band = Some(DecodePriority::Low);
+            f.prefill_prio = DecodePriority::High;
+            f.prefill_floor = FLOOR - 8 * REGION;
+            let mut rate = planner();
+            fill(&mut f, &mut rate);
+            rate.take_trades().judged
+        };
+        assert_eq!(trades(0), 0, "no decode to slow: nothing traded");
+        assert_eq!(trades(4), 1, "beside decodes it does not outrank, traded");
     }
 
     /// **A turn whose rows do not pay joins the cohort instead of waiting for

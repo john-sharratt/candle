@@ -597,6 +597,10 @@ impl Ground for AdmitPass<'_> {
         self.sched.lower_band_active(prio)
     }
 
+    fn decodes_at_or_above(&self, prio: DecodePriority) -> usize {
+        self.sched.decodes_at_or_above(prio)
+    }
+
     /// Every waiting prompt — queued work and pending submissions, of every
     /// band — counted `1 + age` with its age **in sweeps**, the time one
     /// prefill cohort takes as measured: a prompt that has waited a whole sweep
@@ -1418,6 +1422,16 @@ impl Scheduler {
             .filter(|(_, s)| !s.finished)
             .any(|(&id, _)| below(self.decode_priority_or_high(id)));
         prefills || sections || decodes
+    }
+
+    /// Running decodes of `prio`'s band or above — the ones a `prio` prompt
+    /// does not outrank, whose steps the residency it spends still slows.
+    pub(super) fn decodes_at_or_above(&self, prio: DecodePriority) -> usize {
+        self.active_decodes
+            .iter()
+            .filter(|(_, s)| !s.finished)
+            .filter(|(&id, _)| rank(self.decode_priority_or_high(id)) >= rank(prio))
+            .count()
     }
 }
 

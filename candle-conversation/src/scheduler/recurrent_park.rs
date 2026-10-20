@@ -87,6 +87,45 @@ impl Scheduler {
         }
     }
 
+    /// Note which slots are idle now and since when, keeping the earliest
+    /// time each was seen idle and forgetting a slot that ran again.
+    pub(super) fn observe_idle_slots(&mut self, now: Instant) {
+        let idle: Vec<SequenceId> = self
+            .slot_conversations
+            .keys()
+            .copied()
+            .filter(|&s| self.slot_idle(s))
+            .collect();
+        self.idle_since.retain(|s, _| idle.contains(s));
+        for slot in idle {
+            self.idle_since.entry(slot).or_insert(now);
+        }
+    }
+
+    /// The idle slots as last observed: how many, the tokens of K/V they
+    /// hold, and how long they have stood idle — the median and the longest.
+    pub(super) fn idle_census(&self, now: Instant) -> String {
+        let mut idle: Vec<Duration> = self
+            .idle_since
+            .values()
+            .map(|&t| now.saturating_duration_since(t))
+            .collect();
+        idle.sort();
+        let tokens: usize = self
+            .idle_since
+            .keys()
+            .map(|s| self.session.sequence_offset(s.0).unwrap_or(0))
+            .sum();
+        let at = |q: usize| idle.get(q).map_or(0, |d| d.as_secs());
+        format!(
+            "slots={} tokens={} p50={}s max={}s",
+            idle.len(),
+            tokens,
+            at(idle.len() / 2),
+            at(idle.len().saturating_sub(1)),
+        )
+    }
+
     /// Whether nothing is running or waiting on `slot`: no turn view carved
     /// from it, no decode or prefill of its own, no section ingest, and no
     /// ephemeral fork waiting for it.

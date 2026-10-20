@@ -2742,8 +2742,13 @@ impl WaveStats {
                     + t.refused_rate
                     + t.refused_full;
                 if offered > 0 {
+                    // `res` against the prefill floor admission refuses at, and
+                    // the residency the decodes are held to beside it: the
+                    // prefill floor alone read 18.7–26.8 GB "above" 3.8 GB while
+                    // the zone stood 6.4 GB under its 28.5 GB hold (BlackWorld,
+                    // e00cb4300, 2026-10-20).
                     s.push_str(&format!(
-                        " | admit ok={} out={} floor={} cap={} rate={} full={} res={}MiB/{}MiB",
+                        " | admit ok={} out={} floor={} cap={} rate={} full={} res={}MiB/{}MiB hold={}MiB",
                         t.offers_admitted,
                         t.outranking,
                         t.refused_floor,
@@ -2752,6 +2757,7 @@ impl WaveStats {
                         t.refused_full,
                         t.last_after >> 20,
                         t.last_floor >> 20,
+                        interleave::optimal_weight_bytes().unwrap_or(0) >> 20,
                     ));
                 }
                 if t.judged > 0 {
@@ -3699,6 +3705,10 @@ pub(crate) struct Scheduler {
     /// prefill's, one decode more's, a burst's — each the next one's start
     /// (`WaveRate::traded_width_near`).
     rates_width_hints: [Option<usize>; 3],
+    /// Since when each idle slot has been idle (`slot_idle`), as the rates'
+    /// pricing last saw — what a keep trade for idle conversations' KV will
+    /// be judged on, measured first.
+    idle_since: HashMap<SequenceId, Instant>,
     /// The `High` backlog's measured drain per wall second — the prefill rate
     /// a member advertises while one stands (`high_drain`).
     high_drain: high_drain::HighDrain,
@@ -4103,6 +4113,7 @@ impl Scheduler {
             rates_logged_at: None,
             rates_priced_at: None,
             rates_width_hints: [None; 3],
+            idle_since: HashMap::new(),
             high_drain: high_drain::HighDrain::default(),
             turn_content_seen: 0,
             stencil_sampled: HashSet::new(),
