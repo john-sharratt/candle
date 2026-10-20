@@ -832,6 +832,9 @@ impl WaveRate {
                 self.routed_per_layer
                     .saturating_add(self.experts_per_decode(0)),
             ),
+            decode_step_ms_plus_wide: step(self.routed_per_layer.saturating_add(
+                self.experts_per_decode(0) * super::super::phase_ring::PLACEMENT_WIDE,
+            )),
             // The scheduler fills it in: the rate model sees no queue.
             high_backlog_tokens: 0,
         })
@@ -1293,6 +1296,7 @@ impl WaveRate {
     /// the residency that width leaves. What a member advertises as its next
     /// step, so a wide cohort holding the weights down is priced at the width
     /// a placed decode would narrow it to, not at the width it stands at.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn placed_decode_step_ms(
         &self,
@@ -1303,7 +1307,24 @@ impl WaveRate {
         prefill_weight: f64,
         weights_at: impl Fn(usize) -> u64,
     ) -> f64 {
-        let decodes = decodes + 1;
+        self.placed_decode_step_ms_with(decodes, 1, full, least, chunk, prefill_weight, weights_at)
+    }
+
+    /// [`Self::placed_decode_step_ms`] for `more` decodes placed at once — the
+    /// step a burst of them would get, each routing its own experts and the
+    /// cohort re-traded against all of them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn placed_decode_step_ms_with(
+        &self,
+        decodes: usize,
+        more: usize,
+        full: usize,
+        least: usize,
+        chunk: usize,
+        prefill_weight: f64,
+        weights_at: impl Fn(usize) -> u64,
+    ) -> f64 {
+        let decodes = decodes + more;
         let routed = self.routed_for(decodes);
         let width = self.traded_width(
             full,
@@ -4204,6 +4225,26 @@ mod tests {
             placed <= at(FULL),
             "never slower than the cohort as it stands"
         );
+    }
+
+    /// **A burst's step grows with the burst.** The step at `PLACEMENT_WIDE`
+    /// decodes more re-trades the cohort against all of them and routes all
+    /// their experts, so it is never below the one-more step, and more placed
+    /// at once never step faster than fewer.
+    #[test]
+    fn a_burst_s_step_is_never_below_one_more() {
+        let (rate, weights_at) = traded();
+        let wide = crate::scheduler::phase_ring::PLACEMENT_WIDE;
+        let one = rate.placed_decode_step_ms(2, FULL, LEAST, CHUNK, 1.0, &weights_at);
+        let at =
+            |more| rate.placed_decode_step_ms_with(2, more, FULL, LEAST, CHUNK, 1.0, &weights_at);
+        assert!((at(1) - one).abs() < 1e-12, "one more is the one-more step");
+        let mut last = one;
+        for more in [2, 4, 8, wide] {
+            let s = at(more);
+            assert!(s >= last - 1e-12, "{more} more stepped {s} ms after {last}");
+            last = s;
+        }
     }
 
     /// **A prompt placed beside decodes is priced at the width the trade gives

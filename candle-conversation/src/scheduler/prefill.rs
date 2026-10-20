@@ -649,14 +649,20 @@ impl Scheduler {
                 return None;
             }
             let zone = super::interleave::effective_weight_zone_bytes(0)?;
-            Some(r.placed_decode_step_ms(
-                self.decode_width(),
-                full,
-                super::admit_ground::PREFILL_MIN_ADVANCE,
-                CHUNK_SIZE,
-                q_lens.len() as f64,
-                |rows| self.weights_at_width(&q_lens, &offsets, &seqs, zone, rows),
-            ))
+            // One decode more, and a burst's width more: what the gateway
+            // extrapolates the step from as it places turns here.
+            let at = |more| {
+                r.placed_decode_step_ms_with(
+                    self.decode_width(),
+                    more,
+                    full,
+                    super::admit_ground::PREFILL_MIN_ADVANCE,
+                    CHUNK_SIZE,
+                    q_lens.len() as f64,
+                    |rows| self.weights_at_width(&q_lens, &offsets, &seqs, zone, rows),
+                )
+            };
+            Some((at(1), at(super::phase_ring::PLACEMENT_WIDE)))
         });
         // **The rate a placed turn's prompt drains at, measured while a `High`
         // backlog stands** — the backlog it joins and the decodes beside it
@@ -738,7 +744,9 @@ impl Scheduler {
         let learned = learned.map(|r| super::phase_ring::LearnedRates {
             prefill_tok_s: drain.or(traded).unwrap_or(r.prefill_tok_s),
             high_backlog_tokens: high_backlog,
-            decode_step_ms_plus_one: placed_step.unwrap_or(r.decode_step_ms_plus_one),
+            decode_step_ms_plus_one: placed_step.map_or(r.decode_step_ms_plus_one, |(one, _)| one),
+            decode_step_ms_plus_wide: placed_step
+                .map_or(r.decode_step_ms_plus_wide, |(_, wide)| wide),
             ..r
         });
         if let Some(rates) = learned {
@@ -761,6 +769,7 @@ impl Scheduler {
                     high_backlog_tokens = r.high_backlog_tokens,
                     decode_step_ms = format!("{:.1}", r.decode_step_ms),
                     decode_step_ms_plus_one = format!("{:.1}", r.decode_step_ms_plus_one),
+                    decode_step_ms_plus_wide = format!("{:.1}", r.decode_step_ms_plus_wide),
                     prefill_from = if drain.is_some() {
                         "high drain"
                     } else if traded.is_some() {

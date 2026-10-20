@@ -481,6 +481,11 @@ pub fn snapshot_waves() -> Vec<WaveSnapshot> {
         .collect()
 }
 
+/// The decoding turns more that [`LearnedRates::decode_step_ms_plus_wide`]
+/// prices the step at: the width of a placement burst the gateway extrapolates
+/// from (`docs/cooperative_admission.md` §2).
+pub const PLACEMENT_WIDE: usize = 16;
+
 /// What this card does now, as admission's rate model has learned it — what a
 /// cluster member advertises for the gateway to place a turn by (the earliest
 /// declared finish, `docs/cooperative_admission.md` §2).
@@ -493,6 +498,13 @@ pub struct LearnedRates {
     /// what one more decoding turn costs every decode on this card.
     pub decode_step_ms: f64,
     pub decode_step_ms_plus_one: f64,
+    /// The step with [`PLACEMENT_WIDE`] decoding turns more — how the step grows
+    /// with the turns a burst places here, which the one-more step cannot say.
+    /// On a card whose every routed expert is copied the step climbs steeply
+    /// with width: WhiteWorld (f93524ebc, 2026-10-20) advertised 70.5 ms for
+    /// one more and stepped 451–580 ms at 23 decodes, and a burst priced at the
+    /// one-more step placed all 48 of its turns there.
+    pub decode_step_ms_plus_wide: f64,
     /// Prompt tokens waiting at `High` — the dialogue band a placed turn takes —
     /// that it would queue behind: admitted `High` prefills' remaining rows,
     /// queued `High` turns and `High` submissions not yet carved. Background
@@ -585,8 +597,9 @@ fn save_learned_rates(rates: &LearnedRates) {
 /// absent from an older file rather than breaking it.
 fn format_learned_rates(r: &LearnedRates) -> String {
     format!(
-        "prefill_tok_s {}\ndecode_step_ms {}\ndecode_step_ms_plus_one {}\n",
-        r.prefill_tok_s, r.decode_step_ms, r.decode_step_ms_plus_one
+        "prefill_tok_s {}\ndecode_step_ms {}\ndecode_step_ms_plus_one {}\n\
+         decode_step_ms_plus_wide {}\n",
+        r.prefill_tok_s, r.decode_step_ms, r.decode_step_ms_plus_one, r.decode_step_ms_plus_wide
     )
 }
 
@@ -600,10 +613,14 @@ fn parse_learned_rates(text: &str) -> Option<LearnedRates> {
             .and_then(|(_, v)| v.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
     };
+    let plus_one = get("decode_step_ms_plus_one")?;
     Some(LearnedRates {
         prefill_tok_s: get("prefill_tok_s")?,
         decode_step_ms: get("decode_step_ms")?,
-        decode_step_ms_plus_one: get("decode_step_ms_plus_one")?,
+        decode_step_ms_plus_one: plus_one,
+        // A store an older build wrote has no wide step: the one-more step, the
+        // flattest the width could be, until the first publish replaces it.
+        decode_step_ms_plus_wide: get("decode_step_ms_plus_wide").unwrap_or(plus_one),
         high_backlog_tokens: 0,
     })
 }
@@ -732,6 +749,7 @@ mod tests {
             prefill_tok_s: 703.5,
             decode_step_ms: 107.6,
             decode_step_ms_plus_one: 112.25,
+            decode_step_ms_plus_wide: 240.0,
             high_backlog_tokens: 3_545,
         };
         let back = parse_learned_rates(&format_learned_rates(&r)).expect("sound");
@@ -754,6 +772,11 @@ mod tests {
         // A line added later is ignored by this reader, not fatal to it.
         let newer = format!("{}some_new_rate 5\n", format_learned_rates(&r));
         assert!(parse_learned_rates(&newer).is_some());
+        // A store an older build wrote has no wide step: it reads as the
+        // one-more step, not as a missing store.
+        let older = "prefill_tok_s 700\ndecode_step_ms 100\ndecode_step_ms_plus_one 110\n";
+        let back = parse_learned_rates(older).expect("an older store still seeds");
+        assert_eq!(back.decode_step_ms_plus_wide, 110.0);
     }
 
     /// The phase / wave / migrate rings are process-global, and the harness runs
@@ -902,6 +925,7 @@ mod tests {
             prefill_tok_s: 1234.5,
             decode_step_ms: 80.0,
             decode_step_ms_plus_one: 82.5,
+            decode_step_ms_plus_wide: 210.0,
             high_backlog_tokens: 4096,
         };
         publish_learned_rates(rates);
