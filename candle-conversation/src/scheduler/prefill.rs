@@ -848,6 +848,15 @@ impl Scheduler {
                     d * 1e12
                 )
             });
+            // What the fit has seen, answered or not: whether a missing answer
+            // is the data's (too few steps, too little spread) or the solver's.
+            let fit_seen = self.wave_rate.as_ref().map(|r| {
+                let (n, [m, r_sd, p], why) = r.decode_fit_report();
+                format!(
+                    "n={n} sd_m={m:.2} sd_r={r_sd:.1} sd_p={p:.2}{}",
+                    why.map_or(String::new(), |w| format!(" none={w:?}"))
+                )
+            });
             let steps = self.step_census.take(now);
             let idle = self.idle_census(now);
             match learned {
@@ -880,6 +889,7 @@ impl Scheduler {
                     context_per_row = context.round() as u64,
                     hit_model = format!("{hit_model:.3}"),
                     decode_fit,
+                    fit_seen,
                     steps,
                     idle,
                     prefill_samples = samples,

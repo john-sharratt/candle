@@ -589,11 +589,22 @@ fn hit_at(fraction: f64, gamma: f64) -> f64 {
 /// by subtracting an estimate learned from the decode-only steps it lacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct DecodeFit {
-    /// The normal equations over `[1, m, r, p]` — `XᵀX` and `Xᵀt` — with `p`
-    /// in millions of pairs so the sums stay within a few orders of the rest.
+    /// The normal equations over `[1, m, r, p]` — `XᵀX`, `Xᵀt` and `tᵀt` — with
+    /// `p` in millions of pairs so the sums stay within a few orders of the
+    /// rest.
     xx: [[f64; 4]; 4],
     xt: [f64; 4],
+    tt: f64,
     n: u64,
+}
+
+/// Why the decode fit gave no answer, for the line that reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitWhy {
+    /// Fewer steps than it believes from.
+    Samples,
+    /// No subset of its columns both conditioned and came out a cost.
+    Unseparated,
 }
 
 impl DecodeFit {
@@ -606,6 +617,7 @@ impl DecodeFit {
     /// The pairs column's unit.
     const PAIRS: f64 = 1e6;
 
+    /// Fold one step in, the sums so far kept `1 − alpha` of their weight.
     fn observe(&mut self, m: f64, r: f64, p: f64, t: f64, alpha: f64) {
         let keep = 1.0 - alpha.clamp(0.0, 1.0);
         let x = [1.0, m, r, p / Self::PAIRS];
@@ -615,48 +627,95 @@ impl DecodeFit {
             }
             self.xt[i] = self.xt[i] * keep + x[i] * t;
         }
+        self.tt = self.tt * keep + t * t;
         self.n += 1;
     }
 
     /// `(a, b)` — per-layer seconds at no miss, and per missed expert — or
-    /// `None` until the steps have varied enough to separate them, or when the
-    /// answer is not a cost (a negative coefficient).
+    /// `None` until the steps have varied enough to separate them.
     fn solve(&self) -> Option<(f64, f64)> {
         self.solve_all().map(|(a, b, _, _)| (a, b))
     }
 
     /// `(a, b, c, d)`: `c` per creep row through a layer, `d` per pair it
-    /// attends there. A creep column the steps did not vary apart from the
-    /// others is left out (its coefficient zero) — rows and pairs move together
-    /// at one depth, and either then carries the creep — and with a creep
-    /// present that neither column separates, there is no answer: the decode's
-    /// coefficients would be holding the creep's cost.
+    /// attends there.
     fn solve_all(&self) -> Option<(f64, f64, f64, f64)> {
+        self.answer().ok()
+    }
+
+    /// The fit, or why there is none.
+    ///
+    /// **Non-negative least squares over its columns' subsets.** A cost cannot
+    /// be negative, and the columns the steps did not vary apart from the
+    /// others say nothing; so of the subsets that keep the fixed term and the
+    /// misses,
+    /// condition, and come out non-negative, the one that leaves the least
+    /// residual is the answer, each left-out column's coefficient zero. With a
+    /// creep in the steps a subset must keep a creep column: without one the
+    /// decode's coefficients would be holding the creep's cost.
+    fn answer(&self) -> Result<(f64, f64, f64, f64), FitWhy> {
         if self.n < Self::MIN_SAMPLES {
-            return None;
+            return Err(FitWhy::Samples);
         }
         let present = |i: usize| self.xx[i][i] > f64::EPSILON * self.xx[0][0].max(1.0);
         let creep = present(2) || present(3);
-        let tries: &[&[usize]] = if creep {
-            &[&[0, 1, 2, 3], &[0, 1, 3], &[0, 1, 2]]
-        } else {
-            &[&[0, 1]]
-        };
-        for cols in tries {
+        let mut best: Option<(f64, [f64; 4])> = None;
+        // The fixed term and the misses always: a fit that cannot say what a
+        // miss costs is no answer, and the physical model prices it instead —
+        // one width's steps fitted as a flat layer time priced every dislodge
+        // free and every wider placement no slower.
+        for mask in 0u8..4 {
+            let cols: Vec<usize> = [0, 1]
+                .into_iter()
+                .chain((2..4).filter(|&c| mask & (1 << (c - 2)) != 0))
+                .collect();
             if cols.iter().any(|&c| c >= 2 && !present(c)) {
                 continue;
             }
-            if let Some(coef) = self.solve_cols(cols) {
-                let mut out = [0.0; 4];
-                for (&c, v) in cols.iter().zip(coef) {
-                    out[c] = v;
-                }
-                if out.iter().all(|v| v.is_finite() && *v >= 0.0) {
-                    return Some((out[0], out[1], out[2], out[3] / Self::PAIRS));
-                }
+            if creep && !cols.iter().any(|&c| c >= 2) {
+                continue;
+            }
+            let Some(coef) = self.solve_cols(&cols) else {
+                continue;
+            };
+            let mut x = [0.0; 4];
+            for (&c, v) in cols.iter().zip(&coef) {
+                x[c] = *v;
+            }
+            if !x.iter().all(|v| v.is_finite() && *v >= 0.0) {
+                continue;
+            }
+            let rss = self.residual(&x);
+            if best.is_none_or(|(b, _)| rss < b) {
+                best = Some((rss, x));
             }
         }
-        None
+        best.map(|(_, x)| (x[0], x[1], x[2], x[3] / Self::PAIRS))
+            .ok_or(FitWhy::Unseparated)
+    }
+
+    /// The residual sum of squares `x` leaves: `tᵀt − 2xᵀXᵀt + xᵀXᵀXx`.
+    fn residual(&self, x: &[f64; 4]) -> f64 {
+        let mut xxx = 0.0;
+        for i in 0..4 {
+            for j in 0..4 {
+                xxx += x[i] * self.xx[i][j] * x[j];
+            }
+        }
+        let xxt: f64 = (0..4).map(|i| x[i] * self.xt[i]).sum();
+        self.tt - 2.0 * xxt + xxx
+    }
+
+    /// What the fit has seen, for the line that reports it: its steps and the
+    /// spread of each column — the standard deviation of `m`, `r` and `p`
+    /// (pairs in millions) over the weight it holds.
+    fn spread(&self) -> (u64, [f64; 3]) {
+        let w = self.xx[0][0].max(f64::MIN_POSITIVE);
+        let sd = |i: usize| {
+            let mean = self.xx[0][i] / w;
+            (self.xx[i][i] / w - mean * mean).max(0.0).sqrt()
+        };
+        (self.n, [sd(1), sd(2), sd(3)])
     }
 
     /// Least squares over `cols` by elimination on the normal equations,
@@ -789,6 +848,8 @@ pub struct WaveRate {
     /// decode-only steps at the widths they ran ([`DecodeFit`]); what prices a
     /// step once the widths have varied, and `layer_secs` before.
     decode_fit: DecodeFit,
+    /// When the decode fit last learned, for its forgetting in time.
+    decode_fit_at: Option<std::time::Instant>,
     /// Dampening: the fraction of each observation an estimate moves by.
     alpha: f64,
     /// Relative rate gain below which an admission is refused as saturated.
@@ -920,6 +981,7 @@ impl WaveRate {
             bw_bytes_per_s: link_bytes_per_s * Self::SEED_FRACTION,
             layer_secs: 1.0 / (decode.initial_tok_per_s * geometry.moe_layers as f64),
             decode_fit: DecodeFit::default(),
+            decode_fit_at: None,
             alpha: Self::DEFAULT_ALPHA,
             min_gain: Self::DEFAULT_MIN_GAIN,
             trades: TradeWindow::default(),
@@ -2458,6 +2520,37 @@ impl WaveRate {
         self.fit.solve(self.link_bytes_per_s).is_some()
     }
 
+    /// How long the decode fit remembers a step: the minute the published
+    /// rates are logged at and a measured step bound stays fresh within.
+    const FIT_MEMORY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The weight the decode fit's sums lose to the step it folds in now:
+    /// what [`Self::FIT_MEMORY`] forgets of them since the last one.
+    ///
+    /// **Forgotten in time, not in steps.** At the per-step dampening the
+    /// other estimates use, the fit remembered its last seven steps — a few
+    /// seconds of a phase stepping hundreds a minute, over which no step
+    /// fetched a different number of experts from the rest, so it never
+    /// conditioned: on BlackWorld (192818c31, 2026-10-20) a whole heavy-read
+    /// of co-batched steps left it unsolved.
+    fn fit_alpha(&mut self) -> f64 {
+        let now = std::time::Instant::now();
+        let alpha = self.decode_fit_at.map_or(0.0, |then| {
+            let dt = now.saturating_duration_since(then).as_secs_f64();
+            1.0 - (-dt / Self::FIT_MEMORY.as_secs_f64()).exp()
+        });
+        self.decode_fit_at = Some(now);
+        alpha
+    }
+
+    /// The decode fit's state for the rates line: its steps, its columns'
+    /// spread (misses, creep rows, creep pairs in millions), and why it has
+    /// no answer when it has none.
+    pub fn decode_fit_report(&self) -> (u64, [f64; 3], Option<FitWhy>) {
+        let (n, sd) = self.decode_fit.spread();
+        (n, sd, self.decode_fit.answer().err())
+    }
+
     /// Learn the decode fit from one co-batched forward: `decodes` sequences
     /// stepped beside a creep of `creep_layer_rows` rows-through-layers, in
     /// `forward_secs` with `resident_bytes` of experts on the card. Only the
@@ -2478,12 +2571,13 @@ impl WaveRate {
         }
         let layers = self.geometry.moe_layers.max(1) as f64;
         let routed = decodes.saturating_mul(self.experts_per_decode(0));
+        let fit_alpha = self.fit_alpha();
         self.decode_fit.observe(
             self.decode_misses(routed, resident_bytes),
             creep_layer_rows as f64 / layers,
             creep_layer_pairs / layers,
             forward_secs / layers,
-            self.alpha,
+            fit_alpha,
         );
     }
 
@@ -2510,6 +2604,7 @@ impl WaveRate {
         }
         let routed = decodes.saturating_mul(self.experts_per_decode(draft));
         let per_layer = forward_secs / self.geometry.moe_layers as f64;
+        let fit_alpha = self.fit_alpha();
         // Every step teaches the fit, bus-bound or not: it is the time against
         // the experts fetched that the fit is of.
         self.decode_fit.observe(
@@ -2517,7 +2612,7 @@ impl WaveRate {
             0.0,
             0.0,
             per_layer,
-            self.alpha,
+            fit_alpha,
         );
         if per_layer <= self.decode_copy_secs(routed, resident_bytes) {
             return None;
