@@ -209,6 +209,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 low_priority: true,
                 prefill_tok_s: 2300,
                 decode_step_next_us: 41_500,
+                decode_step_wide_us: 96_250,
             }),
             B::header(11, 0, 0)
                 .u8(0)
@@ -229,6 +230,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u8(1)
                 .u32(2300)
                 .u32(41_500)
+                .u32(96_250)
                 .0,
         ),
         (

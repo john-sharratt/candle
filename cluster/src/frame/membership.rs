@@ -59,7 +59,17 @@ pub struct Capacity {
     /// agent.
     pub prefill_tok_s: u32,
     pub decode_step_next_us: u32,
+    /// Its decode step with [`PLACEMENT_WIDE`] rows more than it decodes, in
+    /// microseconds: how the step grows as a burst lands. A card that copies
+    /// every routed expert grows steeply with width, and the one-more-row step
+    /// alone priced a burst of 24 at the idle step. Zero when unlearned, and
+    /// never below `decode_step_next_us` once learned — equal means flat.
+    pub decode_step_wide_us: u32,
 }
+
+/// The rows beyond its decodes at which a member states its wide step
+/// (`Capacity::decode_step_wide_us`).
+pub const PLACEMENT_WIDE: u32 = 16;
 
 impl Capacity {
     pub fn write(&self, w: &mut Writer) {
@@ -80,7 +90,8 @@ impl Capacity {
             })
             .bool(self.low_priority)
             .u32(self.prefill_tok_s)
-            .u32(self.decode_step_next_us);
+            .u32(self.decode_step_next_us)
+            .u32(self.decode_step_wide_us);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -101,6 +112,7 @@ impl Capacity {
             low_priority: r.bool()?,
             prefill_tok_s: r.u32()?,
             decode_step_next_us: r.u32()?,
+            decode_step_wide_us: r.u32()?,
         })
     }
 

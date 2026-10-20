@@ -59,6 +59,7 @@ fn mix() -> Vec<Frame> {
             low_priority: false,
             prefill_tok_s: 4800,
             decode_step_next_us: 18_000,
+            decode_step_wide_us: 31_000,
         }),
         Frame::Prepare(Prepare {
             key: b"world/w1".to_vec(),

@@ -475,6 +475,71 @@ fn an_answered_request_is_not_charged_a_prompt() {
     assert_eq!(best(&mut r), Pick::Member(1));
 }
 
+/// **A burst prices the step it makes, not the idle one.** Run 24's
+/// shift-decode-2 at 01:34:12, with the steps each member states at one row
+/// and at `PLACEMENT_WIDE` rows more. BlackWorld: 48,918 tokens queued at 704
+/// tok/s, a 363.8 ms step widening to 420.0 ms — 258.67 s. WhiteWorld: idle at
+/// 256 tok/s, a 70.5 ms step widening to 451.4 ms, so its `k`-th turn finishes
+/// in 8 × (k + 1) s of prefill and 512 steps at 70.5 + 380.9 × k / 15 ms.
+/// Priced at the idle step alone it took all 24; priced on the line it takes
+/// 11 (the 11th at 254.1 s, the 12th at 275.1 s), and the 12th goes to
+/// BlackWorld.
+#[test]
+fn a_burst_prices_the_step_it_makes() {
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    let stated = |backlog, prefill_tok_s, next_us, wide_us| Capacity {
+        prefill_backlog: backlog,
+        prefill_tok_s,
+        decode_step_next_us: next_us,
+        decode_step_wide_us: wide_us,
+        ..capacity(MemberState::Ready, 100, true, 64)
+    };
+    r.capacity("zend", 1, stated(48_918, 704, 363_828, 420_000));
+    r.capacity("zend", 2, stated(0, 256, 70_508, 451_420));
+    let picks: Vec<Pick> = (0..12)
+        .map(|_| {
+            let p = best(&mut r);
+            if let Pick::Member(n) = p {
+                r.begin("zend", n);
+            }
+            p
+        })
+        .collect();
+    assert!(picks[..11].iter().all(|p| *p == Pick::Member(2)));
+    assert_eq!(
+        picks[11],
+        Pick::Member(1),
+        "the 12th finishes sooner on node 1"
+    );
+
+    // A wide step it has not learned, or one no slower, is flat: the idle
+    // step prices every turn, as before.
+    r.capacity("zend", 2, stated(0, 256, 70_508, 0));
+    let c = r
+        .member("zend", 2)
+        .and_then(|m| m.capacity.clone())
+        .unwrap();
+    assert_eq!(step_with_us(&c, 24), 70_508);
+    r.capacity("zend", 2, stated(0, 256, 70_508, 60_000));
+    let c = r
+        .member("zend", 2)
+        .and_then(|m| m.capacity.clone())
+        .unwrap();
+    assert_eq!(step_with_us(&c, 24), 70_508);
+    // On the line: one row is the next step, 16 the wide one, 31 twice as far.
+    r.capacity("zend", 2, stated(0, 256, 70_508, 451_420));
+    let c = r
+        .member("zend", 2)
+        .and_then(|m| m.capacity.clone())
+        .unwrap();
+    assert_eq!(step_with_us(&c, 1), 70_508);
+    assert_eq!(step_with_us(&c, 16), 451_420);
+    assert_eq!(step_with_us(&c, 31), 832_332);
+}
+
 /// The canary takes a key let go only once it holds the last holder's writes.
 #[test]
 fn a_canary_lacking_the_last_turn_is_not_handed_the_key() {

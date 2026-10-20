@@ -9,10 +9,10 @@
 //!   wave for [`QUIET`] has nothing in hand, and is idle.
 //! - **`slots_free`** is how many more residences of the newest wave's average
 //!   size fit in what its budget left.
-//! - **`prefill_tok_s`** and **`decode_step_next_us`** are what the scheduler
-//!   has learned a turn costs it — the gateway places a turn where it would
-//!   finish soonest (`docs/cooperative_admission.md` §2.1); zero until it has
-//!   learned them.
+//! - **`prefill_tok_s`**, **`decode_step_next_us`** and **`decode_step_wide_us`**
+//!   are what the scheduler has learned a turn and a burst of them cost it —
+//!   the gateway places a turn where it would finish soonest
+//!   (`docs/cooperative_admission.md` §2.1); zero until it has learned them.
 
 use cluster::frame::{Capacity, MemberState};
 use cluster::machine::Machine;
@@ -42,6 +42,9 @@ pub struct Rates {
     pub prefill_tok_s: f64,
     /// The decode step with one row more than it decodes, milliseconds.
     pub decode_step_next_ms: f64,
+    /// The decode step with `PLACEMENT_WIDE` rows more than it decodes,
+    /// milliseconds: how the step grows as a burst lands.
+    pub decode_step_wide_ms: f64,
     /// Prompt tokens a placed turn would queue behind: those waiting at its
     /// own priority. Background ingest is not among them — a placed turn goes
     /// ahead of it.
@@ -113,12 +116,18 @@ pub fn capacity(
         prefill_tok_s: rates.map_or(0, |r| {
             r.prefill_tok_s.round().min(f64::from(u32::MAX)) as u32
         }),
-        decode_step_next_us: rates.map_or(0, |r| {
-            (r.decode_step_next_ms * 1000.0)
-                .round()
-                .min(f64::from(u32::MAX)) as u32
+        decode_step_next_us: rates.map_or(0, |r| micros(r.decode_step_next_ms)),
+        // Never below the one-more-row step: a wide step no slower is flat,
+        // and the gateway reads it so.
+        decode_step_wide_us: rates.map_or(0, |r| {
+            micros(r.decode_step_wide_ms.max(r.decode_step_next_ms))
         }),
     }
+}
+
+/// Milliseconds as the frame's whole microseconds.
+fn micros(ms: f64) -> u32 {
+    (ms * 1000.0).round().min(f64::from(u32::MAX)) as u32
 }
 
 #[cfg(test)]
@@ -214,6 +223,7 @@ mod tests {
         let learned = Rates {
             prefill_tok_s: 2_302.6,
             decode_step_next_ms: 41.53,
+            decode_step_wide_ms: 96.25,
             high_backlog_tokens: 6_144,
         };
         let c = capacity(
@@ -227,12 +237,36 @@ mod tests {
             (c.prefill_tok_s, c.decode_step_next_us, c.prefill_backlog),
             (2_303, 41_530, 6_144)
         );
+        assert_eq!(c.decode_step_wide_us, 96_250);
         assert!(!c.idle, "the ingest still keeps it from admitting now");
+        // A wide step learned below the one-more step is said as flat.
+        let flat = capacity(
+            MemberState::Ready,
+            card(None),
+            None,
+            Some(Rates {
+                decode_step_wide_ms: 30.0,
+                ..learned
+            }),
+            machine(),
+        );
+        assert_eq!(
+            (flat.decode_step_next_us, flat.decode_step_wide_us),
+            (41_530, 41_530)
+        );
         let none = capacity(MemberState::Ready, card(None), None, None, machine());
-        assert_eq!((none.prefill_tok_s, none.decode_step_next_us), (0, 0));
+        assert_eq!(
+            (
+                none.prefill_tok_s,
+                none.decode_step_next_us,
+                none.decode_step_wide_us
+            ),
+            (0, 0, 0)
+        );
         let unmeasured = Rates {
             prefill_tok_s: 0.0,
             decode_step_next_ms: 41.5,
+            decode_step_wide_ms: 80.0,
             high_backlog_tokens: 0,
         };
         let c = capacity(

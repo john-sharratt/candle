@@ -94,15 +94,21 @@ The gateway compares these numbers and nothing else. It models nothing of a
 member's insides; the member that knows its card is the one that says what
 the card can do.
 
-How it is built (protocol 2): `CAPACITY` carries `prefill_backlog` (queued
-prompt tokens), `prefill_tok_s` and `decode_step_next_us`. The last two are
-what the member's admission has learned (`phase_ring::learned_rates`): the
-prefill rate at the width it runs, and the decode step with one more row. The
-gateway's `Best` estimates each candidate's finish for a nominal turn: the
-backlog, plus 2,048 tokens for each request handed to it since its last
-`CAPACITY` and for this one, at the prefill rate; then 512 tokens at the
-one-more-row step. A request handed earlier is not charged again: it is queued,
-and in the backlog, or decoding, and in the step. It picks the soonest
+How it is built (protocol 3): `CAPACITY` carries `prefill_backlog` (queued
+prompt tokens), `prefill_tok_s`, `decode_step_next_us` and
+`decode_step_wide_us`. The last three are what the member's admission has
+learned (`phase_ring::learned_rates`): the prefill rate at the width it runs,
+the decode step with one more row, and the decode step with `PLACEMENT_WIDE`
+(16) more rows. The gateway's `Best` estimates each candidate's finish for a
+nominal turn: the backlog, plus 2,048 tokens for each request handed to it
+since its last `CAPACITY` and for this one, at the prefill rate; then 512
+tokens at the step those requests and this one make — on the line through the
+one-more and wide steps, extended past the wide point, and flat when the wide
+step is no slower. A request handed earlier is not charged again: it is queued,
+and in the backlog, or decoding, and in the step. A card that copies every
+routed expert steepens with width, so a burst priced at its idle step alone
+lands whole on it (run 24's shift-decode-2: 48 turns at 41.2 chunks/s, the
+step 70 ms advertised and 450–580 ms delivered). It picks the soonest
 (`gateway/registry.rs`, `finish_us`). Until every candidate has learned both
 rates, it ranks by power per request as before.
 

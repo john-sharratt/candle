@@ -26,7 +26,7 @@ pub use builds::{BuildArtifacts, BuildChunk, BuildFetch, Verdict, VerdictResult,
 pub use consensus::{Accepted, AcceptedValue, Nack, Prepare, Promise, Propose, Release};
 pub use handshake::{Admit, Challenge, Hello, Prove};
 pub use kind::{Kind, Lane, FLAG_ADDRESSED, FLAG_CATCHUP, FLAG_TIEBREAK};
-pub use membership::{Capacity, Claim, Coord, Members, Routes, Unclaim};
+pub use membership::{Capacity, Claim, Coord, Members, Routes, Unclaim, PLACEMENT_WIDE};
 pub use packing::{read_applied, write_applied};
 pub use peering::{AcmeCert, AcmeChallenge, CertLine, PeerHello};
 pub use pulse::Pulse;
