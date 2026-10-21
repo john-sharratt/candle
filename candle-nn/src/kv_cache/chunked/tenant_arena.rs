@@ -877,9 +877,6 @@ pub fn arena_top_rank(device: &Device, tenant: SlotTenant) -> Option<usize> {
         .max()
 }
 
-/// Regions `tenant`'s arenas on `device` hold, every stride together — what that
-/// tenant denies the rest of the span.
-#[cfg(feature = "cuda")]
 /// Arenas every span tenant on `device` could give back by packing its own slots
 /// downward — each stride's topmost arenas whose live slots fit in the free slots
 /// below them. What says a tenant's arenas are sparse, wherever they stand: a
@@ -899,6 +896,9 @@ pub fn tenant_freeable_arenas(device: &Device) -> usize {
         .sum()
 }
 
+/// Regions `tenant`'s arenas on `device` hold, every stride together — what that
+/// tenant denies the rest of the span.
+#[cfg(feature = "cuda")]
 pub fn arena_regions(device: &Device, tenant: SlotTenant) -> usize {
     let DeviceLocation::Cuda { gpu_id } = device.location() else {
         return 0;
