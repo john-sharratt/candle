@@ -1,11 +1,9 @@
 //! **Speculation swept by width, one width per process.**
 //!
-//! The production ladder (`draft_ladder::QWEN38_FLASH_NEXT_DRAFT`) was measured
-//! on one card, the 72 GB one, on the rewrite to width 8; its second bracket,
-//! budget 2 to width 16 and nothing wider, is the lineage's inherited row, not a
-//! measurement of this checkpoint. Every width here is its own `#[test]`, so a
-//! sweep driver runs them one process at a time, widest last, and stops once
-//! speculation stops paying.
+//! What `models::qwen38_flash_next_sweep` is fitted from: each card's draft
+//! ceiling at each wave width, measured on that card. Every width here is its
+//! own `#[test]`, so a sweep driver runs them one process at a time, widest
+//! last, and stops once speculation stops paying.
 //!
 //! At a width, one load: budget 0, then 1, 2, … up to the head's ceiling, stopping
 //! at the first budget slower than the one before it, then budget 0 again. The

@@ -49,6 +49,7 @@ pub mod debertav2;
 pub mod decode_utils;
 pub mod deepseek2;
 pub mod delta_net;
+pub mod draft_blend;
 pub mod draft_depth;
 pub mod draft_ladder;
 /// The cohort draft walk drives a `BatchedInferenceSession`, so it shares
@@ -197,6 +198,7 @@ pub mod quantized_t5;
 pub mod qwen2;
 pub mod qwen2_moe;
 pub mod qwen3;
+pub mod qwen38_flash_next_sweep;
 // The hybrid DeltaNet/attention lineage: it drives the batched wave engine and
 // the streaming expert cache, both CUDA-only. `delta_net` itself stays
 // unconditional — its reference recurrence runs anywhere.

@@ -325,72 +325,8 @@ const QWEN38_27B_BRACKETS: &[(usize, usize)] = &[(16, 4)];
 /// The lineage's chosen cost, unmeasured here as there.
 pub const QWEN38_27B_DRAFT: DraftLadder = DraftLadder::new(QWEN38_27B_BRACKETS, LINEAGE_TOKEN_COST);
 
-/// Qwen3.8-Flash-Next (`qwen4exp`). Its NextN head is a full routed block of
-/// the same architecture, folded into the artifact as `blk.48`.
-///
-/// **Measured** by `quantized_qwen38_moe::tests::test_speculative_decode`, on
-/// the RTX PRO 5000 (72 GB), 255 generated tokens, StoryRewrite, every budget
-/// character-identical to the baseline:
-///
-/// | budget | accepted/step | t/s ×1 | t/s ×4 |
-/// |---|---|---|---|
-/// | 0 | 1.00 | 29.6 | 82.2 |
-/// | 1 | 1.99 | 43.6 | 118.2 |
-/// | 2 | 3.00 | 57.1 | 160.4 |
-/// | 3 | 3.98 | 72.8 | 188.1 |
-/// | 4 | 4.90 | 82.2 | 216.0 |
-///
-/// It had not turned over by 4 — acceptance is still ~98% of the block at the
-/// head's own ceiling, because a rewrite task is largely predictable from the
-/// context both the trunk and the head are reading. So the bracket sits at the
-/// deepest measured point rather than at an inferred optimum.
-///
-/// **Budget 4 is carried to width 8, the widest it has been measured at** by
-/// `test_speculative_ladder` on the 72 GB card: 4.90 accepted/step at widths 1
-/// and 4, 4.72 per sequence at 8. The second bracket is the lineage's own, which
-/// the sibling rows back. A verify block's rewind costs each DeltaNet layer
-/// only its fixed timeline (`docs/deltanet_timeline.md`), so a wider row is a
-/// throughput question to measure, not a memory one.
-///
-/// **These are ceilings, not the depth a sequence drafts at.** Each sequence
-/// drafts the depth that buys it the most tokens per second at its own
-/// acceptance, clipped here ([`super::draft_depth`]): the rewrite above fills
-/// the block, but free continuation accepts ~2.1 per step (`docs/performance.md`
-/// §3.6), and drafting it deep pays the head's walk and a wider verify for
-/// tokens the walk throws away.
-///
-/// **One sequence alone drafts up to 4, like a wave of eight.** Deeper pays
-/// only on text the head can copy, and no ceiling may pass 7: a block is the
-/// drafts plus the row they follow, and it must fit each DeltaNet layer's
-/// 8-row timeline to be partially acceptable (`docs/deltanet_timeline.md`).
-/// Measured on the 72 GB card (one load, three warm runs, 2026-10-06), each
-/// depth drafted on every step, free continuation:
-///
-/// | task | depth | accepted / step | ms / step | t/s |
-/// |---|---|---:|---:|---:|
-/// | essay (`profile_single_session_essay`) | 1 | 1.68 | 20.7 | 81 |
-/// | | 2 | 2.22 | 22.9 | 97 |
-/// | | 3 | 2.12 | 25.4 | 84 |
-///
-/// and under the depth rule (2026-10-07) at ceiling 4: rewrite 4.90 accepted /
-/// step at 236 t/s, essay 2.14 at 88. On free continuation the rule settles
-/// near 2, so the one-session rate is quoted at the depth real text drafts at.
-///
-/// **A one-session ceiling of 5 loses** (Strata's benchmark, 2026-10-07): 3.0–3.45
-/// accepted / step against ~3.07 at 4, for ~2 ms more per step — 143.2 / 140.1 /
-/// 110.3 t/s at 4K / 32K / 128K against 148.0 / 145.2 / 122.2.
-///
-/// **The token cost, 0.125, is the essay's measured `c / T0` and tuned on both
-/// tasks.** A drafted token costs `1.4 / 16.5 ≈ 0.085` of the step on the
-/// rewrite's ~1.3K-token context and `2.3 / 18.4 ≈ 0.125` on the essay's ~4.3K —
-/// its walk step and its verify row both attend over the context. Swept as
-/// (rewrite, essay) t/s under an earlier form of the depth rule whose unreached
-/// positions aged three times as fast: 0.085 → (313, 83), 0.125 → (324, 88),
-/// 0.15 → (313, 87), 0.2 → (290, 96) — run-to-run spread on the essay is a few
-/// per cent, as each run writes a slightly different essay.
-const QWEN38_FLASH_NEXT_BRACKETS: &[(usize, usize)] = &[(8, 4), (16, 2)];
-pub const QWEN38_FLASH_NEXT_DRAFT: DraftLadder =
-    DraftLadder::new(QWEN38_FLASH_NEXT_BRACKETS, 0.125);
+// Qwen3.8-Flash-Next draws its ceiling from its own sweep on each card, blended
+// by VRAM — `super::qwen38_flash_next_sweep`, not a bracket row here.
 
 #[cfg(test)]
 mod tests {
@@ -408,7 +344,6 @@ mod tests {
             ("35B-A3B", QWEN35_35B_A3B_DRAFT),
             ("3.6-35B-A3B", QWEN36_35B_A3B_DRAFT),
             ("27B", QWEN38_27B_DRAFT),
-            ("Flash-Next", QWEN38_FLASH_NEXT_DRAFT),
         ] {
             if let Err(e) = ladder.check() {
                 panic!("{name} ladder is malformed: {e}");
@@ -429,7 +364,6 @@ mod tests {
             ("35B-A3B", QWEN35_35B_A3B_DRAFT),
             ("3.6-35B-A3B", QWEN36_35B_A3B_DRAFT),
             ("27B", QWEN38_27B_DRAFT),
-            ("Flash-Next", QWEN38_FLASH_NEXT_DRAFT),
         ] {
             for width in 1..=64 {
                 assert!(

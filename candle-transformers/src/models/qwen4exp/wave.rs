@@ -79,7 +79,7 @@ use crate::models::delta_net::{
     DeltaNetSeq, ExportedLayerState, LayerKind, RecurrentCompaction, RecurrentStateStore, SeqSpan,
     StagedSnapshot, ZGate, TIMELINE_ROWS,
 };
-use crate::models::draft_ladder::QWEN38_FLASH_NEXT_DRAFT;
+use crate::models::draft_blend::{blend, DraftTable};
 use crate::models::expert_lre::{
     PipelineStats, WeightPlan, WeightPlanning, LOOK_AHEAD_HOPS, LOOK_AHEAD_MAX_TOKENS, STAGED_HOPS,
 };
@@ -94,6 +94,7 @@ use crate::models::qsa_selection::QsaSelection;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::split_block_rows;
+use crate::models::qwen38_flash_next_sweep as flash_next_sweep;
 use crate::models::residency_rows::residency_decode_rows;
 use crate::models::residual_rows::{CreepResidual, ResidualArena, ResidualIn};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
@@ -146,6 +147,10 @@ pub struct Qwen4ExpBatched {
     /// `pub(super)` so the draft head's own module can reach the engine it runs
     /// against — the head is part of this model, not a consumer of it.
     pub(super) model: Qwen4ExpGpu,
+    /// The draft ceiling at each wave width on this card: the swept rows
+    /// blended by its VRAM, resolved once at load
+    /// ([`crate::models::qwen38_flash_next_sweep`]).
+    draft: DraftTable,
     /// Per-sequence GDN state (S + conv tails), wave-atomic.
     pub(super) recurrent: RwLock<HashMap<usize, RecurrentStateStore>>,
     /// Per-sequence PLE state (conv history + hash window) — the third
@@ -1745,8 +1750,17 @@ impl Qwen4ExpBatched {
         // The indexer rotates with the attention's own rungs at the same rotary
         // width, as the reference does.
         let index_rope = FactoredRope::over(&rope, &model.device)?;
+        // The card's total VRAM picks its place between the swept cards, read
+        // once: a context bind per step would cost the decode loop.
+        let (_, total) = model.device.mem_get_info()?;
+        let draft = DraftTable::new(blend(
+            &flash_next_sweep::CARD_24GB,
+            &flash_next_sweep::CARD_72GB,
+            (total / (1 << 20)) as u64,
+        ));
         Ok(Self {
             model,
+            draft,
             recurrent: RwLock::new(HashMap::new()),
             seeds: RwLock::new(SeedStore::new()),
             seed_spares: RwLock::new(SeedStore::new()),
@@ -2747,7 +2761,7 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Ok(true)
     }
 
-    /// This checkpoint's ladder, gated on the head actually being loaded — a
+    /// This card's swept ceiling, gated on the head actually being loaded — a
     /// conversion without the NextN tensors would otherwise pay a drafting call
     /// on every wave that can only return nothing.
     fn draft_budget(&self, width: usize) -> usize {
@@ -2757,13 +2771,13 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         // Bounded by the timeline: a block of `k` drafts verifies `k + 1` rows,
         // and a block deeper than each DeltaNet layer's timeline is refused
         // (`begin_verify`). The rewind costs no memory a deeper block adds to,
-        // so depth is otherwise the ladder's alone.
-        QWEN38_FLASH_NEXT_DRAFT.budget(width).min(TIMELINE_ROWS - 1)
+        // so depth is otherwise the sweep's alone.
+        self.draft.budget(width).min(TIMELINE_ROWS - 1)
     }
 
-    /// The checkpoint's measured drafted-token cost — see its ladder.
+    /// The checkpoint's measured drafted-token cost.
     fn draft_token_cost(&self) -> f32 {
-        QWEN38_FLASH_NEXT_DRAFT.token_cost()
+        flash_next_sweep::TOKEN_COST
     }
 
     /// Draft with the checkpoint's own NextN head, for the whole cohort in one
