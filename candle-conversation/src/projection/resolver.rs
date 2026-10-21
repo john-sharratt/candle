@@ -17,6 +17,7 @@ use maintenance_op::Pass;
 
 use super::belief_files::{assemble_file_scans, scan_file_scans};
 use super::belief_scan_split::GROUP_SCAN_SPLIT;
+use super::held_index_pages::HeldIndexPages;
 use super::ids::{
     process_timeline_allocator, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId,
     TurnIndex, TurnKey,
@@ -415,6 +416,9 @@ pub struct Conversation {
     /// epoch, it reruns only when a stream, blob or tombstone actually changed —
     /// about once per sealed turn.
     gallery_cache: Arc<Mutex<HashMap<GalleryKey, (u64, BeliefGallery)>>>,
+    /// The index pages a live slot holds, found again by their record rather
+    /// than read off the log at every reprojection — see [`HeldIndexPages`].
+    held_index_pages: Arc<Mutex<HeldIndexPages>>,
     /// How this workspace's prompt sections came to be resident since it was
     /// opened: restored from the redo log, or prefilled. A restart on an
     /// unchanged prompt restores every one; a prefill there is a section the
@@ -589,6 +593,7 @@ impl Conversation {
             sealed,
             branch_checkpoint: Arc::new(Mutex::new(None)),
             gallery_cache: Arc::new(Mutex::new(HashMap::new())),
+            held_index_pages: Arc::default(),
             section_loads: Arc::default(),
             read_only: false,
             conv_state_writes: Arc::default(),
@@ -647,6 +652,7 @@ impl Conversation {
             sealed,
             branch_checkpoint: Arc::new(Mutex::new(None)),
             gallery_cache: Arc::new(Mutex::new(HashMap::new())),
+            held_index_pages: Arc::default(),
             section_loads: Arc::default(),
             read_only,
             conv_state_writes: Arc::default(),
@@ -4728,17 +4734,53 @@ impl Conversation {
     /// **Read the way a snapshot is** ([`Self::read_recurrent_snapshot`]):
     /// without the persistence mutex where the record is sealed, and read again
     /// at the index's new location whenever a read fails because compaction
-    /// moved it. Not held afterwards — the page is the caller's for as long as
-    /// it keeps the `Arc`, and the substrate goes on naming only where it is.
+    /// moved it. The substrate goes on naming only where the page is; the bytes
+    /// are the caller's for as long as it keeps the `Arc`, and while any caller
+    /// does, a read of the same record finds them without the log
+    /// ([`HeldIndexPages`]).
     pub fn read_index_page(
         &self,
         stream_id: StreamId,
     ) -> Result<Option<Arc<StoredPages>>, ConversationError> {
-        let mut loc = match self.read().index_page_of(stream_id) {
+        let (loc, id) = match self.read().index_page_record_of(stream_id) {
             None => return Ok(None),
-            Some(IndexPage::Resident(pages)) => return Ok(Some(pages)),
-            Some(IndexPage::Stored(loc)) => loc,
+            Some((IndexPage::Resident(pages), _)) => return Ok(Some(pages)),
+            Some((IndexPage::Stored(loc), id)) => (loc, id),
         };
+        let held = self
+            .held_index_pages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(stream_id, id);
+        if let Some(page) = held {
+            return Ok(Some(page));
+        }
+        let page = Arc::new(StoredPages::new(
+            self.read_stored_index_page(stream_id, loc)?,
+        ));
+        // Held under the record it was read for only if the substrate still
+        // names that record: the read follows the page wherever it moved, and a
+        // newer page that took the stream meanwhile is not the record `id` names.
+        let still = self
+            .read()
+            .index_page_record_of(stream_id)
+            .is_some_and(|(_, now)| now == id);
+        if still {
+            self.held_index_pages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .hold(stream_id, id, &page);
+        }
+        Ok(Some(page))
+    }
+
+    /// The bytes of the index page `stream_id` keeps in the log, read first at
+    /// `loc` and again wherever compaction moved it.
+    fn read_stored_index_page(
+        &self,
+        stream_id: StreamId,
+        mut loc: RecordLoc,
+    ) -> Result<Vec<u8>, ConversationError> {
         let moved = |stale: RecordLoc| {
             self.read()
                 .index_page_of(stream_id)
@@ -4746,11 +4788,14 @@ impl Conversation {
                 .filter(|now| *now != stale)
         };
         for _ in 0..SEALED_READ_ATTEMPTS {
-            let Some(read) = self.sealed.read_record_payload(&loc) else {
+            let read_span = profile::span("index_page:sealed_read");
+            let read = self.sealed.read_record_payload(&loc);
+            read_span.end();
+            let Some(read) = read else {
                 break;
             };
             match read {
-                Ok(bytes) => return Ok(Some(Arc::new(StoredPages::new(bytes)))),
+                Ok(bytes) => return Ok(bytes),
                 Err(_) => match moved(loc) {
                     Some(now) => loc = now,
                     None => break,
@@ -4759,13 +4804,15 @@ impl Conversation {
         }
         let mut attempt = 0;
         loop {
+            let read_span = profile::span("index_page:persistence_read");
             let read = self
                 .persistence
                 .lock()
                 .map_err(|_| ConversationError::Channel("persistence lock poisoned".into()))?
                 .read_record_payload(&loc);
+            read_span.end();
             match read {
-                Ok(bytes) => return Ok(Some(Arc::new(StoredPages::new(bytes)))),
+                Ok(bytes) => return Ok(bytes),
                 Err(e) => {
                     attempt += 1;
                     match moved(loc) {
@@ -5661,6 +5708,95 @@ mod tests {
             page.as_slice(),
             "adoption carries the bytes read from disk"
         );
+    }
+
+    /// **A page a slot holds is not read off the log again.**
+    ///
+    /// A reprojection re-injects every turn behind the first piece that
+    /// changed, and each one read its page from the log — 3,590 reads in a
+    /// 56 s turn, 7.1 s of its rebuilds. While a caller holds the bytes a read
+    /// produced, the same record hands back that very allocation; once the
+    /// last holder lets go, the next read goes to the log; and a new page for
+    /// the stream is read fresh, though the old one is still held.
+    #[test]
+    fn a_held_page_is_read_from_the_log_once() {
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).expect("layer id");
+        let group = GroupId::from_raw(1).expect("group id");
+        let tl = TimelineId::from_raw(27).expect("timeline id");
+        conv.register_timeline(tl, layer, group);
+        let sealed = Arc::new(vec![SealedSequence {
+            chunks: vec![SealedChunk::for_test(1000, 4)],
+            token_count: 4,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }]);
+        let idx = conv
+            .record_turn(
+                tl,
+                Role::Assistant,
+                TurnPartWrite {
+                    token_ids: TokenBuffer::from(vec![31, 32, 33, 34]),
+                    token_count: 4,
+                    block_start: 0,
+                    block_end: 1,
+                    sealed_gpu: Some(sealed),
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .expect("record the turn");
+        let stream = turn_stream_id(tl.raw(), idx.0);
+        let first = crate::index_pages::encode(&[(2, vec![7u8; 96])]);
+        conv.enqueue_index_page(stream, first.clone());
+        conv.flush_writer();
+        assert!(
+            conv.read()
+                .index_page_at(tl, idx)
+                .and_then(|p| p.stored())
+                .is_some(),
+            "the page is in the log, not RAM"
+        );
+
+        let held = conv
+            .turn_index_page(tl, idx)
+            .expect("the page reads")
+            .expect("the turn has a page");
+        let again = conv
+            .turn_index_page(tl, idx)
+            .expect("the page reads")
+            .expect("the turn has a page");
+        assert!(
+            Arc::ptr_eq(&held, &again),
+            "a held page is handed back, not read again"
+        );
+        assert_eq!(again.bytes(), first.as_slice());
+
+        drop(again);
+        drop(held);
+        let fresh = conv
+            .turn_index_page(tl, idx)
+            .expect("the page reads")
+            .expect("the turn has a page");
+        assert_eq!(
+            fresh.bytes(),
+            first.as_slice(),
+            "with no holder left, the page is read from the log again"
+        );
+
+        let second = crate::index_pages::encode(&[(2, vec![9u8; 96])]);
+        conv.enqueue_index_page(stream, second.clone());
+        conv.flush_writer();
+        let newer = conv
+            .turn_index_page(tl, idx)
+            .expect("the page reads")
+            .expect("the turn has a page");
+        assert_eq!(
+            newer.bytes(),
+            second.as_slice(),
+            "a new page for the stream is read, though the old one is still held"
+        );
+        assert!(!Arc::ptr_eq(&newer, &fresh));
     }
 
     /// **An ephemeral conversation takes its directory with it.**

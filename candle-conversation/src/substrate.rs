@@ -86,6 +86,7 @@ use crate::projection::{
     TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
 };
 use crate::provenance::{decode_wide_sigs_for_scoring, WideQSig};
+use crate::scheduler::profile;
 use crate::summary_tree::exchange::Couplings;
 use crate::summary_tree::{
     select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
@@ -6786,7 +6787,10 @@ impl Substrate {
         let Some(stored) = pages.as_deref() else {
             return Ok(Some((full, pages)));
         };
-        let Some(filtered) = stored.without_span(span.range()) else {
+        let filter_span = profile::span("window:filter_pages");
+        let filtered = stored.without_span(span.range());
+        filter_span.end();
+        let Some(filtered) = filtered else {
             // The boundaries, not just the fact that the span missed them. The
             // question a refusal always raises is WHICH cut was missing, and
             // that is read straight off the two positions the span sits between.
@@ -6806,6 +6810,7 @@ impl Substrate {
             )));
         };
 
+        let _g = profile::span("window:sealed_tokens");
         let total = full.first().map_or(0, |s| s.token_count);
         let head = window_sealed_tokens(&full, 0, span.offset as usize);
         let tail = window_sealed_tokens(&full, span.end() as usize, total);
@@ -7328,6 +7333,15 @@ impl Substrate {
         self.streams
             .get(stream_id)
             .and_then(|s| s.index_page.clone())
+    }
+
+    /// [`Self::index_page_of`] with the identity of the record that holds the
+    /// page — what a reader keys the bytes it read by, since a relocated copy
+    /// keeps it and a new page for the stream does not.
+    pub fn index_page_record_of(&self, stream_id: StreamId) -> Option<(IndexPage, RecordIdentity)> {
+        self.streams
+            .get(stream_id)
+            .and_then(|s| s.index_page.clone().map(|page| (page, s.ids.index_page)))
     }
 
     /// A sealed turn's gather-scope tags, as persisted on its `TurnDecl`.

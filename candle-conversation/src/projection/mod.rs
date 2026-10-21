@@ -204,6 +204,7 @@ mod belief_scan_split;
 mod builder;
 mod error;
 pub(crate) mod event;
+mod held_index_pages;
 mod ids;
 pub mod layer_toggle;
 pub mod operation;

@@ -122,6 +122,10 @@ pub(super) struct PlacedPiece {
     /// The glue-island cache key's running prefix hash after the piece, so a
     /// walk resumed here keys its islands exactly as a whole walk would.
     prefix_h: DefaultHasher,
+    /// The index page the piece was placed with, held while the slot holds the
+    /// piece: a rebuild that re-walks the turn finds the page again without
+    /// reading the log (`HeldIndexPages`), and a cut or a freed slot lets it go.
+    page: Option<Arc<StoredPages>>,
 }
 
 #[cfg(test)]
@@ -134,8 +138,26 @@ impl PlacedPiece {
             blocks_after,
             pos_after: (blocks_after * 32) as u32,
             prefix_h: DefaultHasher::new(),
+            page: None,
         }
     }
+}
+
+/// Cut the record of what the slot holds back to its first `keep` pieces, and
+/// hand back the index pages the cut pieces held.
+///
+/// **The caller keeps them until its walk ends.** A rebuild re-places most of
+/// what it cuts — every turn behind the first piece that changed — and a page
+/// still held is found again by its record instead of read off the log
+/// (`HeldIndexPages`). Dropped at the cut, every one of them was read again:
+/// 8,778 log reads in a 155 s turn on BlackWorld (2026-10-21).
+fn cut_placed(state: &mut SlotState, keep: usize) -> Vec<Arc<StoredPages>> {
+    let from = keep.min(state.placed_pieces.len());
+    state
+        .placed_pieces
+        .drain(from..)
+        .filter_map(|p| p.page)
+        .collect()
 }
 
 /// Where the system prompt ends in a slot `placed` describes: the position
@@ -1011,7 +1033,8 @@ pub(super) fn apply_segments_build(
         first_new = ?pieces.get(keep).map(piece_label),
         "apply_segments: kept prefix"
     );
-    state.placed_pieces.truncate(keep);
+    // Held until the walk ends, then dropped once it has taken what it needs.
+    let cut_pages = cut_placed(state, keep);
     let t_cut = Instant::now();
     let cut_span = profile::span("apply:cut_to_kept");
     let mut prefix_h = DefaultHasher::new();
@@ -1296,17 +1319,21 @@ pub(super) fn apply_segments_build(
         // What the slot holds after this piece, for the next rebuild to keep.
         // The deferred user message is prefilled after the walk and never
         // part of a kept prefix.
+        let page = walker.placed_page.take();
         if !matches!(pieces[i], AssembledPiece::DeferredUser(_)) {
             state.placed_pieces.push(PlacedPiece {
                 identity: identities[i],
                 blocks_after: content_block_count_of(ctx, parent_id)?,
                 pos_after: walker.logical_pos,
                 prefix_h: prefix_h.clone(),
+                page,
             });
         }
         walk_us[kind] += t_piece.elapsed().as_micros() as u64;
         walked[kind] += 1;
     }
+    // Every re-placed piece now holds its own page; the rest leave with this.
+    drop(cut_pages);
     let t_ranges = Instant::now();
     walker.ranges.flush();
     let ranges_us = t_ranges.elapsed().as_micros() as u64;
@@ -1470,6 +1497,9 @@ struct SegmentWalker<'c> {
     turn_resolve_us: u64,
     turn_inject_us: u64,
     turn_pages_us: u64,
+    /// The index page the piece being walked was placed with, taken into its
+    /// [`PlacedPiece`] when the piece is recorded.
+    placed_page: Option<Arc<StoredPages>>,
 }
 
 impl<'c> SegmentWalker<'c> {
@@ -1495,6 +1525,7 @@ impl<'c> SegmentWalker<'c> {
             turn_resolve_us: 0,
             turn_inject_us: 0,
             turn_pages_us: 0,
+            placed_page: None,
         }
     }
 
@@ -1866,10 +1897,18 @@ fn inject_sealed_turn(
     // persistence path, which takes its own.
     let stored = match resident {
         Some(pages) => Some(pages),
-        None => ctx.conversation.turn_index_page(timeline, index)?,
+        None => {
+            let _g = profile::span("inject:turn:page_not_resident");
+            ctx.conversation.turn_index_page(timeline, index)?
+        }
     };
+    // The page as stored, before any windowing filters it: what the placed
+    // piece holds, so the next rebuild finds it again by its record.
+    let held_page = stored.clone();
     let (sealed, page) = {
+        let lock = profile::span("inject:turn:substrate_read_lock");
         let conv = ctx.conversation.read();
+        lock.end();
         fetch.end();
         let _window = profile::span("inject:turn:window");
         // **"Most recent" is the SLOT's most recent, not each timeline's.**
@@ -1893,10 +1932,14 @@ fn inject_sealed_turn(
         // reasoning. Single-timeline projections are unaffected: there the
         // target IS the only timeline, which is the case this rule was written
         // for and still behaves exactly as before.
+        let newest_span = profile::span("inject:turn:newest_index");
         let newest = conv.turn_indices(timeline).max();
+        newest_span.end();
         if keeps_reasoning(ctx.slot_target.map(|t| t.timeline), timeline, newest, index) {
+            let _g = profile::span("inject:turn:sealed_whole");
             (conv.turn_sealed_of(timeline, index), stored)
         } else {
+            let _g = profile::span("inject:turn:without_thinking");
             // An `Err` here is a turn whose reasoning cannot be windowed. It is
             // propagated rather than skipped: injecting it whole would show the
             // reasoning the projection was asked to remove, and skipping it would
@@ -2114,6 +2157,7 @@ fn inject_sealed_turn(
     walker.sealed_turns += 1;
     walker.sealed_tokens += injected.tokens;
     walker.record_sealed(injected.tokens);
+    walker.placed_page = held_page;
     Ok(())
 }
 
@@ -3196,6 +3240,33 @@ mod tests {
         assert!(none.sections.is_empty() && none.turns.is_empty());
     }
 
+    /// A cut keeps the leading pieces with their pages and hands back the
+    /// pages of the pieces it removed, so the walk that re-places them finds
+    /// them still held; a cut past the end removes nothing.
+    #[test]
+    fn a_cut_hands_back_the_pages_of_the_pieces_it_removed() {
+        let page = |b: u8| Arc::new(StoredPages::new(vec![b; 4]));
+        let (a, b, c) = (page(1), page(2), page(3));
+        let mut state = SlotState::default();
+        for (i, p) in [Some(&a), None, Some(&b), Some(&c)].into_iter().enumerate() {
+            let mut piece = PlacedPiece::ending_at(i + 1);
+            piece.page = p.cloned();
+            state.placed_pieces.push(piece);
+        }
+
+        let cut = cut_placed(&mut state, 2);
+        assert_eq!(state.placed_pieces.len(), 2);
+        assert!(Arc::ptr_eq(
+            state.placed_pieces[0].page.as_ref().unwrap(),
+            &a
+        ));
+        assert_eq!(cut.len(), 2, "the glue piece held no page");
+        assert!(Arc::ptr_eq(&cut[0], &b) && Arc::ptr_eq(&cut[1], &c));
+
+        assert!(cut_placed(&mut state, 9).is_empty());
+        assert_eq!(state.placed_pieces.len(), 2);
+    }
+
     /// The system prompt is the leading run of sections and the glue between
     /// them, and ends where the slot stood after the last of them — not at the
     /// first section, and not past a turn.
@@ -3208,6 +3279,7 @@ mod tests {
                     blocks_after: 0,
                     pos_after,
                     prefix_h: DefaultHasher::new(),
+                    page: None,
                 })
                 .collect()
         };
