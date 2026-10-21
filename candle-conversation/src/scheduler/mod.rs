@@ -140,7 +140,7 @@ use crate::turn::Role;
 use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
 use crate::turn_text::TurnText;
 use crate::{FinishReason, SubstrateReloadStatus, TurnStats};
-use admit::pass_budget::{RateWidth, RefusedWidth};
+use admit::pass_budget::{RateWidth, RefusedDepth, RefusedWidth};
 use first_sample::PrefillEnd;
 
 use candle::cuda_backend::graph::CaptureStats;
@@ -3409,6 +3409,10 @@ pub(crate) struct Scheduler {
     /// [`RefusedWidth`]. [`Self::prefill_pass_budget`] is bounded by it until
     /// the ground a tier can be placed in grows ([`Self::settle_refused_width`]).
     refused_width: Option<RefusedWidth>,
+    /// The deepest a decode step drafts since the partition refused a deeper
+    /// one — see [`RefusedDepth`]. Bounds the model's draft ceiling until the
+    /// ground a tier can be placed in grows by what the refused step was short.
+    refused_depth: Option<RefusedDepth>,
     /// Per-turn view ownership: `view_id → ViewState`.
     ///
     /// Populated when [`SchedulerRequest::SubmitTurn`] creates a view
@@ -4076,6 +4080,7 @@ impl Scheduler {
             max_prefill_pass_tokens,
             rate_width: None,
             refused_width: None,
+            refused_depth: None,
             slot_conversations: HashMap::new(),
             detached: Detached::default(),
             slot_targets: HashMap::new(),
@@ -10238,6 +10243,46 @@ impl Scheduler {
                 self.refused_width = None;
             }
         }
+        if let Some(d) = self.refused_depth {
+            if self.frontier_tier_bytes().is_none_or(|g| d.lapsed(g)) {
+                self.refused_depth = None;
+            }
+        }
+    }
+
+    /// A decode step drafting `depth` was refused its working memory: draft
+    /// the next one shallower until the ground comes back. `false` when it
+    /// drafted nothing, so there is no shallower step and it retries as it is.
+    ///
+    /// A refusal that names no shortfall (a full span, an outgrown arena) waits
+    /// for a region back: a byte freed is not the step fitting.
+    pub(super) fn note_refused_depth(&mut self, depth: usize, err: &candle::Error) -> bool {
+        let ground = self.frontier_tier_bytes().unwrap_or(0);
+        let short = candle_nn::kv_cache::tier_refusal_shortfall(err)
+            .unwrap_or(candle_nn::kv_cache::REGION_BYTES);
+        match RefusedDepth::after(depth, ground, short) {
+            Some(d) => {
+                if self.refused_depth.is_none_or(|was| was.depth != d.depth) {
+                    tracing::warn!(
+                        refused_depth = depth,
+                        next_depth = d.depth,
+                        ground_mib = ground / (1024 * 1024),
+                        short_mib = short / (1024 * 1024),
+                        "the partition refused a speculative step — drafting the next one shallower",
+                    );
+                }
+                self.refused_depth = Some(d);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The model's draft ceiling at `width`, bounded by a depth the partition
+    /// has refused since ground last freed.
+    pub(super) fn draft_ceiling(&self, width: usize) -> usize {
+        let ceiling = self.model.draft_budget(width);
+        self.refused_depth.map_or(ceiling, |d| ceiling.min(d.depth))
     }
 
     /// The ground a wave's tier can stand on: the regions between the arena
@@ -12207,17 +12252,35 @@ impl Scheduler {
             if !tail_index_page.is_empty() {
                 // In order: each piece the turn spanned keeps its own width.
                 // Sealed a moment ago and handed over once, so keyed here.
+                //
+                // **A refused page is ground, and the turn waits for it rather
+                // than decoding over K/V nothing indexes.** The pages are the
+                // turn's own, freed with the old view a moment ago, so relief
+                // can find them again. Decoding on regardless refused the turn's
+                // first select past the gap — and failed every turn that rode
+                // its decode step. Measured on the RTX 3090 (run 42,
+                // 2026-10-21): 3 of 14 index slots refused with the span full,
+                // a slot 14,171 tokens short, and two shift turns failed.
                 for (_tokens, page) in tail_index_page.iter() {
                     let key = PieceKey::of(page);
-                    if let Err(e) = self.model.push_positional_state(parent_id.0, page, &key) {
-                        tracing::warn!(
-                            slot = parent_id.0,
-                            tail_token_count,
-                            "reproject: the turn's index page was refused ({e}); this slot \
-                             holds the turn's K/V with nothing indexing it"
-                        );
-                        break;
-                    }
+                    let pushed = match self.model.push_positional_state(parent_id.0, page, &key) {
+                        Err(e) if candle_nn::kv_cache::is_span_full(&e) => {
+                            self.relieve_vram_pressure(
+                                "reproject index",
+                                prefill::VramPhase::Decode,
+                                prefill::ReliefNeed::Now,
+                            );
+                            self.model.push_positional_state(parent_id.0, page, &key)
+                        }
+                        pushed => pushed,
+                    };
+                    let refused: Result<(), ConversationError> = pushed.map(|_| ()).map_err(|e| {
+                        ConversationError::Channel(format!(
+                            "reproject: the turn's index page was refused ({e}); the slot \
+                             would hold the turn's K/V with nothing indexing it"
+                        ))
+                    });
+                    or_abandon!(self, view_id, parent_id, decode_state, false, refused);
                 }
             } else if self.model.carries_positional_state() {
                 tracing::warn!(

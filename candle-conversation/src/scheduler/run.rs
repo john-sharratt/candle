@@ -349,16 +349,28 @@ impl Scheduler {
                 let queued = !self.prefill_queue.is_empty() || !self.pending_submits.is_empty();
                 let width = self.decode_width();
                 let t_step = Instant::now();
-                let (committed_before, decoding) = self.decode_tokens_committed();
+                let decoding_before = self.decode_tokens_committed();
                 self.batch_decode_step();
                 // Tokens a decoding row commits a step: one without a draft,
                 // its accepted drafts and one more with — what a reply's tokens
                 // are divided by to price its steps (`LearnedRates::tokens_per_step`).
-                if decoding > 0 {
-                    let (committed_after, _) = self.decode_tokens_committed();
-                    self.tokens_per_step.add_value(
-                        committed_after.saturating_sub(committed_before) as f64 / decoding as f64,
-                    );
+                //
+                // **The same rows on both sides of the step.** Summed over the
+                // rows still decoding after it, a turn that finished in the step
+                // left with all its tokens and the step read as committing
+                // fewer — none at all through WhiteWorld's minute of ending turns
+                // (3cccc3fcb, 2026-10-21: 0.00 after 3.38).
+                if !decoding_before.is_empty() {
+                    let committed: usize = decoding_before
+                        .iter()
+                        .map(|&(id, before)| {
+                            self.active_decodes
+                                .get(&id)
+                                .map_or(0, |s| s.generated_tokens.len().saturating_sub(before))
+                        })
+                        .sum();
+                    self.tokens_per_step
+                        .add_value(committed as f64 / decoding_before.len() as f64);
                 }
                 let step = t_step.elapsed();
                 profile::record(
@@ -1575,13 +1587,13 @@ impl Scheduler {
         self.step_census.spend(activity, t.elapsed());
     }
 
-    /// The tokens the running decodes have committed between them, and how many
-    /// are decoding.
-    fn decode_tokens_committed(&self) -> (usize, usize) {
+    /// Each running decode and the tokens it has committed so far.
+    fn decode_tokens_committed(&self) -> Vec<(SequenceId, usize)> {
         self.active_decodes
-            .values()
-            .filter(|s| !s.finished)
-            .fold((0, 0), |(t, n), s| (t + s.generated_tokens.len(), n + 1))
+            .iter()
+            .filter(|(_, s)| !s.finished)
+            .map(|(&id, s)| (id, s.generated_tokens.len()))
+            .collect()
     }
 
     /// Clean up finished turns — their seals — filed with the census.

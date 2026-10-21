@@ -181,6 +181,42 @@ impl RefusedWidth {
     }
 }
 
+/// The deepest a decode step may draft since the partition refused a deeper
+/// one: a speculative step's verify rows are its working memory, so a step
+/// that does not fit drafts shallower — half at a time, down to a plain row —
+/// instead of running the same depth again until its turns fail. Measured on
+/// the RTX 3090 (run 42, 2026-10-20): seven draft and verify waves refused
+/// 16–100 MiB short beside live KV, retried at the same depth 1,024 times, and
+/// failed every turn they carried.
+///
+/// Halving, because a step's rows are its decodes times one plus its depth and
+/// a quarter off a depth of three is nothing. It lapses as [`RefusedWidth`]
+/// does, once the ground has grown by what the refused step was short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefusedDepth {
+    pub depth: usize,
+    pub ground: usize,
+    pub short: usize,
+}
+
+impl RefusedDepth {
+    /// The depth after a step drafting `refused_depth` was refused `short`
+    /// bytes over `ground` — `None` when it drafted nothing, so there is no
+    /// shallower step to take.
+    pub(crate) fn after(refused_depth: usize, ground: usize, short: usize) -> Option<Self> {
+        (refused_depth > 0).then_some(Self {
+            depth: refused_depth / 2,
+            ground,
+            short,
+        })
+    }
+
+    /// See [`RefusedWidth::lapsed`].
+    pub(crate) fn lapsed(&self, ground: usize) -> bool {
+        ground >= self.ground.saturating_add(self.short)
+    }
+}
+
 /// The ground a wave's tier can stand on, in bytes: the `total − live_watermark`
 /// regions of `region` bytes between the arena frontier and the weight floor,
 /// and `cedeable` more the weight side would concede past it. Holes below the
@@ -201,9 +237,22 @@ pub(crate) fn frontier_tier_ground(
 mod tests {
     use super::{
         frontier_tier_ground, kv_token_cap, prefill_group_budget, prefill_pass_budget, RateWidth,
-        RefusedWidth,
+        RefusedDepth, RefusedWidth,
     };
     use candle_nn::kv_cache::CHUNK_SIZE;
+
+    /// A refused draft halves to a plain row and no further, and holds until
+    /// the shortfall is given back.
+    #[test]
+    fn a_refused_draft_depth_halves_to_a_plain_row() {
+        let d = RefusedDepth::after(4, 1_000, 300).unwrap();
+        assert_eq!(d.depth, 2);
+        assert_eq!(RefusedDepth::after(3, 1_000, 300).unwrap().depth, 1);
+        assert_eq!(RefusedDepth::after(1, 1_000, 300).unwrap().depth, 0);
+        assert!(RefusedDepth::after(0, 1_000, 300).is_none());
+        assert!(!d.lapsed(1_299));
+        assert!(d.lapsed(1_300));
+    }
 
     /// The measured refusal: 1,468 rows against 1,293.0 MB of ground. The next
     /// wave is a quarter narrower, and the one after that narrower again.

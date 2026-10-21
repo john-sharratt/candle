@@ -772,7 +772,10 @@ impl Scheduler {
         // its guard keeps to a plain row drafts nothing and must not set that
         // depth, or one such turn keeps the whole wave drafting at the ceiling
         // for proposals that are all thrown away.
-        let ceiling = self.model.draft_budget(seq_ids.len());
+        // A depth the partition refused since ground last freed bounds it
+        // (`RefusedDepth`): a step that does not fit drafts shallower.
+        self.settle_refused_width();
+        let ceiling = self.draft_ceiling(seq_ids.len());
         let token_cost = self.model.draft_token_cost();
         let depths: Vec<usize> = seq_ids
             .iter()
@@ -799,6 +802,9 @@ impl Scheduler {
                     || is_expert_stall(&e)
                     || is_arena_exhausted(&e) =>
             {
+                if !is_expert_stall(&e) {
+                    self.note_refused_depth(budget, &e);
+                }
                 self.retry_step(&seq_ids, "decode draft", &e);
                 return;
             }
@@ -902,6 +908,9 @@ impl Scheduler {
                     || is_expert_stall(&e)
                     || is_arena_exhausted(&e)
                 {
+                    if !is_expert_stall(&e) {
+                        self.note_refused_depth(budget, &e);
+                    }
                     self.retry_step(&seq_ids, "decode forward", &e);
                 } else {
                     self.fail_all_decodes(&seq_ids, &format!("decode forward failed: {e}"));
