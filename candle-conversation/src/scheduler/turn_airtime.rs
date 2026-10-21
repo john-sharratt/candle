@@ -160,7 +160,14 @@ impl SegmentMean {
     const WEIGHT: f64 = 0.1;
 
     pub(super) fn add(&mut self, tokens: usize) {
-        let t = tokens as f64;
+        self.add_value(tokens as f64);
+    }
+
+    /// Fold in one measurement that need not be whole.
+    pub(super) fn add_value(&mut self, t: f64) {
+        if !t.is_finite() {
+            return;
+        }
         self.mean = Some(match self.mean {
             None => t,
             Some(m) => m + Self::WEIGHT * (t - m),

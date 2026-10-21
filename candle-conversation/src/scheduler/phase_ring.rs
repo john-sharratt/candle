@@ -521,6 +521,12 @@ pub struct LearnedRates {
     /// turns arrive rather than set at the gateway. Zero until one has been.
     pub prompt_tokens: f64,
     pub reply_tokens: f64,
+    /// The tokens a decoding row commits each step: one without a draft, its
+    /// accepted drafts and one more with. A reply of `reply_tokens` takes
+    /// `reply_tokens / tokens_per_step` steps here — priced as one a token, a
+    /// card that speculates would read slower the more speculation helps it.
+    /// Zero until measured.
+    pub tokens_per_step: f64,
 }
 
 /// The newest [`LearnedRates`] the scheduler published, and when.
@@ -684,6 +690,7 @@ fn parse_learned_rates(text: &str) -> Option<LearnedRates> {
         // The sizes belong to the run that served them, as the backlog does.
         prompt_tokens: 0.0,
         reply_tokens: 0.0,
+        tokens_per_step: 0.0,
     })
 }
 
@@ -816,6 +823,7 @@ mod tests {
             high_backlog_tokens: 3_545,
             prompt_tokens: 0.0,
             reply_tokens: 0.0,
+            tokens_per_step: 0.0,
         };
         let back = parse_learned_rates(&format_learned_rates(&r)).expect("sound");
         assert_eq!(
@@ -995,6 +1003,7 @@ mod tests {
             high_backlog_tokens: 4096,
             prompt_tokens: 1800.0,
             reply_tokens: 240.0,
+            tokens_per_step: 2.5,
         };
         publish_learned_rates(rates);
         let (read, age) = learned_rates().expect("published");

@@ -3821,6 +3821,8 @@ pub(crate) struct Scheduler {
     /// The mean prompt of the turns this card has begun — what a turn placed
     /// here is priced at, learned from the turns it is sent rather than set.
     prompt_mean: turn_airtime::SegmentMean,
+    /// The tokens a decoding row commits a step (`run_decode_until_budget`).
+    tokens_per_step: turn_airtime::SegmentMean,
     /// Every step by what it carried, reported with the learned rates
     /// (`step_census`).
     step_census: step_census::StepCensus,
@@ -4153,6 +4155,7 @@ impl Scheduler {
             creep_airtime: turn_airtime::AirtimeRate::default(),
             segment_mean: turn_airtime::SegmentMean::default(),
             prompt_mean: turn_airtime::SegmentMean::default(),
+            tokens_per_step: turn_airtime::SegmentMean::default(),
             step_census: step_census::StepCensus::default(),
             high_backlog_rows: 0,
             wave_section_advanced: false,

@@ -969,7 +969,7 @@ impl Scheduler {
             .map(|&s| self.session.sequence_offset(s.0).unwrap_or(0) as f64)
             .sum();
         if !self.wave_cobatched {
-            self.observe_decode_forward(seq_ids.len(), fwd_us, positions);
+            self.observe_decode_forward(seq_ids.len(), fwd_us, positions, wave_rows);
         } else {
             self.observe_decode_beside(
                 seq_ids.len(),
@@ -977,6 +977,7 @@ impl Scheduler {
                 self.wave_step_creep_layer_rows,
                 self.wave_step_creep_layer_pairs,
                 positions,
+                wave_rows,
             );
         }
         self.observe_expert_hit_rate();

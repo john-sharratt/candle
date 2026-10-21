@@ -825,6 +825,7 @@ impl Scheduler {
             high_backlog_tokens: high_backlog,
             prompt_tokens: self.prompt_mean.tokens().unwrap_or(0.0),
             reply_tokens: self.segment_mean.tokens().unwrap_or(0.0),
+            tokens_per_step: self.tokens_per_step.tokens().unwrap_or(0.0),
             // **The placed figures as multiples of the step now.** The solve
             // prices them at the zone less the composed cohort's tier, a
             // residency the step now is not read at, and the hit falls steeply
@@ -941,6 +942,9 @@ impl Scheduler {
                     prefill_tok_s = r.prefill_tok_s.round() as u64,
                     prefill_tok_s_plus_wide = r.prefill_tok_s_plus_wide.round() as u64,
                     high_backlog_tokens = r.high_backlog_tokens,
+                    prompt_tokens = r.prompt_tokens.round() as u64,
+                    reply_tokens = r.reply_tokens.round() as u64,
+                    tokens_per_step = format!("{:.2}", r.tokens_per_step),
                     decode_step_ms = format!("{:.1}", r.decode_step_ms),
                     decode_step_ms_plus_one = format!("{:.1}", r.decode_step_ms_plus_one),
                     decode_step_ms_plus_wide = format!("{:.1}", r.decode_step_ms_plus_wide),

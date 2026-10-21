@@ -1337,6 +1337,7 @@ impl Scheduler {
         creep_layer_rows: usize,
         creep_layer_pairs: f64,
         positions: f64,
+        rows: usize,
     ) {
         if decodes == 0 || us == 0 {
             return;
@@ -1350,6 +1351,7 @@ impl Scheduler {
                 creep_layer_rows,
                 creep_layer_pairs,
                 positions,
+                rows,
             );
         }
     }
@@ -1357,10 +1359,16 @@ impl Scheduler {
     /// Fold one completed decode forward into the planner.
     ///
     /// A bus-bound step says nothing about the layer time, and the model drops
-    /// it; only a compute-bound one teaches anything. `draft: 0` prices the
-    /// unspeculated row — a verify block was priced by the speculative driver
-    /// when it was staged.
-    pub(super) fn observe_decode_forward(&mut self, decodes: usize, us: u64, positions: f64) {
+    /// it; only a compute-bound one teaches anything. `rows` is every row the
+    /// step scored — a drafted decode's whole verify block — so the misses the
+    /// fit learns are the ones the step routed.
+    pub(super) fn observe_decode_forward(
+        &mut self,
+        decodes: usize,
+        us: u64,
+        positions: f64,
+        rows: usize,
+    ) {
         if decodes == 0 || us == 0 {
             return;
         }
@@ -1369,7 +1377,7 @@ impl Scheduler {
         self.wave_forwards += 1;
         let resident = residency_now(self.standing_ground_bytes());
         if let Some(rate) = self.wave_rate.as_mut() {
-            rate.observe_decode_at(decodes, 0, resident, us as f64 / 1e6, positions);
+            rate.observe_decode_at(decodes, rows, resident, us as f64 / 1e6, positions);
         }
     }
 

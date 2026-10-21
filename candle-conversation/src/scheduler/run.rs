@@ -349,7 +349,17 @@ impl Scheduler {
                 let queued = !self.prefill_queue.is_empty() || !self.pending_submits.is_empty();
                 let width = self.decode_width();
                 let t_step = Instant::now();
+                let (committed_before, decoding) = self.decode_tokens_committed();
                 self.batch_decode_step();
+                // Tokens a decoding row commits a step: one without a draft,
+                // its accepted drafts and one more with — what a reply's tokens
+                // are divided by to price its steps (`LearnedRates::tokens_per_step`).
+                if decoding > 0 {
+                    let (committed_after, _) = self.decode_tokens_committed();
+                    self.tokens_per_step.add_value(
+                        committed_after.saturating_sub(committed_before) as f64 / decoding as f64,
+                    );
+                }
                 let step = t_step.elapsed();
                 profile::record(
                     if self.wave_cobatched {
@@ -1563,6 +1573,15 @@ impl Scheduler {
         let t = Instant::now();
         work(self);
         self.step_census.spend(activity, t.elapsed());
+    }
+
+    /// The tokens the running decodes have committed between them, and how many
+    /// are decoding.
+    fn decode_tokens_committed(&self) -> (usize, usize) {
+        self.active_decodes
+            .values()
+            .filter(|s| !s.finished)
+            .fold((0, 0), |(t, n), s| (t + s.generated_tokens.len(), n + 1))
     }
 
     /// Clean up finished turns — their seals — filed with the census.

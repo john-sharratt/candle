@@ -1166,6 +1166,7 @@ impl WaveRate {
             high_backlog_tokens: 0,
             prompt_tokens: 0.0,
             reply_tokens: 0.0,
+            tokens_per_step: 0.0,
         })
     }
 
@@ -2838,13 +2839,14 @@ impl WaveRate {
         creep_layer_rows: usize,
         creep_layer_pairs: f64,
         positions: f64,
+        rows: usize,
     ) {
         if decodes == 0 || creep_layer_rows == 0 || !forward_secs.is_finite() || forward_secs <= 0.0
         {
             return;
         }
         let layers = self.geometry.moe_layers.max(1) as f64;
-        let routed = decodes.saturating_mul(self.experts_per_decode(0));
+        let routed = rows.max(decodes).saturating_mul(self.experts_per_decode(0));
         let fit_alpha = self.fit_alpha();
         self.learn_decode_context(decodes, positions);
         self.decode_fit.observe(
@@ -2877,7 +2879,13 @@ impl WaveRate {
         forward_secs: f64,
     ) -> Option<f64> {
         let positions = decodes as f64 * self.decode_context;
-        self.observe_decode_at(decodes, draft, resident_bytes, forward_secs, positions)
+        self.observe_decode_at(
+            decodes,
+            decodes * (1 + draft),
+            resident_bytes,
+            forward_secs,
+            positions,
+        )
     }
 
     /// [`Self::observe_decode`] with the positions its decode rows attended —
@@ -2885,7 +2893,7 @@ impl WaveRate {
     pub fn observe_decode_at(
         &mut self,
         decodes: usize,
-        draft: usize,
+        rows: usize,
         resident_bytes: u64,
         forward_secs: f64,
         positions: f64,
@@ -2893,7 +2901,10 @@ impl WaveRate {
         if decodes == 0 || !forward_secs.is_finite() || forward_secs <= 0.0 {
             return None;
         }
-        let routed = decodes.saturating_mul(self.experts_per_decode(draft));
+        // Every row the step scored routes its own top-k: a drafted decode's
+        // verify block is 1 + k rows, and counted as one it read the misses a
+        // speculative step paid as a plain step's.
+        let routed = rows.max(decodes).saturating_mul(self.experts_per_decode(0));
         let per_layer = forward_secs / self.geometry.moe_layers as f64;
         let fit_alpha = self.fit_alpha();
         self.learn_decode_context(decodes, positions);
@@ -3068,7 +3079,7 @@ mod tests {
                 let m = taught.distinct_routed(decodes * 8) * taught.streamed_fraction(resident);
                 let q = decodes as f64 * (20_000.0 + 10_000.0 * (round % 4) as f64);
                 let secs = (0.25e-3 + 0.05e-3 * m + 2e-9 * q) * LAYERS;
-                taught.observe_decode_at(decodes, 0, resident, secs, q);
+                taught.observe_decode_at(decodes, decodes, resident, secs, q);
             }
         }
         let resident = (total as f64 * 0.6) as u64;
