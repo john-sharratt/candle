@@ -35,6 +35,9 @@ pub enum Unit<'a> {
     File(&'a str),
     /// A `repo_map` folder, by its directory.
     Folder(&'a str),
+    /// A unit of a layer built on another, by its subject — read once, never
+    /// continued, and never a chain link.
+    Layer(&'a str),
 }
 
 impl Unit<'_> {
@@ -42,6 +45,7 @@ impl Unit<'_> {
         match self {
             Unit::File(path) => is_link_file(path),
             Unit::Folder(dir) => is_link_dir(dir),
+            Unit::Layer(_) => false,
         }
     }
 }

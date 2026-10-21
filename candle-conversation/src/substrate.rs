@@ -509,6 +509,15 @@ pub struct Substrate {
     /// Marked via [`Self::mark_layer_append_only`]; NOT keyed on `summarize`, which
     /// `--disable-summariser` also clears on dialogue.
     append_only_layers: HashSet<LayerId>,
+
+    /// Groups of LOWER layers an append-only layer's projections still score
+    /// and select across conversations — the layers it compounds on. An ingest
+    /// unit that analyses a file draws the analyses below it of OTHER files by
+    /// provenance, while its own layer stays self-local: a sibling unit of the
+    /// same layer is never retrieved into it. A layer absent here is wholly
+    /// self-local, as every append-only layer was before. Transient, set from
+    /// the ingest setup each session ([`Self::set_ingest_sees`]).
+    ingest_sees: HashMap<LayerId, HashSet<GroupId>>,
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
@@ -940,6 +949,11 @@ impl ProjectionScores {
     /// Number of scored turns.
     pub fn turn_count(&self) -> usize {
         self.turns.len()
+    }
+
+    /// Every scored turn and its score, in no order.
+    pub fn turn_scores(&self) -> impl Iterator<Item = (TurnKey, f32)> + '_ {
+        self.turns.iter().map(|(k, s)| (*k, *s))
     }
 
     /// Number of scored sections.
@@ -1833,6 +1847,24 @@ impl Substrate {
     /// is untouched. See [`Self::mark_layer_append_only`].
     pub fn is_append_only_layer(&self, layer: LayerId) -> bool {
         self.append_only_layers.contains(&layer)
+    }
+
+    /// Let projections targeting the append-only `layer` score and select
+    /// `groups` — groups of the layers below it — across conversations instead
+    /// of self-local. See [`Self::ingest_sees`].
+    pub fn set_ingest_sees(&mut self, layer: LayerId, groups: HashSet<GroupId>) {
+        self.ingest_sees.insert(layer, groups);
+    }
+
+    /// Whether a projection targeting `layer` reads `group` self-local: every
+    /// group when the layer is append-only, but those of the layers it compounds
+    /// on ([`Self::set_ingest_sees`]). Never true for a dialogue target.
+    pub fn is_self_local_group(&self, layer: LayerId, group: GroupId) -> bool {
+        self.append_only_layers.contains(&layer)
+            && !self
+                .ingest_sees
+                .get(&layer)
+                .is_some_and(|groups| groups.contains(&group))
     }
 
     /// Place `sealed` into the residence slot's hot tier and push the
@@ -8079,6 +8111,33 @@ mod tests {
     /// return the same id — two "different" timelines then share their turns.
     fn unshared_timeline(n: u64) -> TimelineId {
         TimelineId::from_raw((1 << 62) | n).expect("non-zero timeline id")
+    }
+
+    /// **An append-only layer reads every group self-local, but those of the
+    /// layers it compounds on.** A unit of an analysis layer retrieves the
+    /// analyses below it of other files; its own layer's siblings, and every
+    /// group it was not given, stay masked to it. A dialogue layer is never
+    /// self-local.
+    #[test]
+    fn a_compounding_layer_reads_only_its_lower_groups_across_conversations() {
+        let mut sub = Substrate::new();
+        let (dialogue, ingest) = (LayerId::for_test(1), LayerId::for_test(2));
+        let (own, lower, other) = (
+            GroupId::for_test(3),
+            GroupId::for_test(4),
+            GroupId::for_test(5),
+        );
+        assert!(!sub.is_self_local_group(dialogue, lower));
+        sub.mark_layer_append_only(ingest);
+        assert!(
+            sub.is_self_local_group(ingest, lower),
+            "wholly self-local by default"
+        );
+        sub.set_ingest_sees(ingest, [lower].into_iter().collect());
+        assert!(!sub.is_self_local_group(ingest, lower));
+        assert!(sub.is_self_local_group(ingest, own));
+        assert!(sub.is_self_local_group(ingest, other));
+        assert!(!sub.is_self_local_group(dialogue, own));
     }
 
     fn make_timeline() -> (LayerId, GroupId, TimelineId, Substrate) {

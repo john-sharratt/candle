@@ -19,7 +19,7 @@ pub mod walk;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::projection::TimelineId;
+use candle_conversation::projection::{GroupId, TimelineId};
 use candle_conversation::{ConversationEngine, Sequence};
 use zend_vfs::Workspace;
 
@@ -29,6 +29,8 @@ use self::tie::{backfill_commits, retie};
 use self::walk::{walk, Corpus, FileItem, RepoBranches, TreeCache};
 use crate::code_read::{self, is_upload_path, FileJob};
 use crate::ingest::IngestMode;
+use crate::layers::plan::Below;
+use crate::layers::{Ground, LayerRun, LayerSpec};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::{self, UnitJob};
@@ -61,6 +63,11 @@ pub struct LayerPass<'a> {
     pub scope: IngestScope,
     /// The layer's prefilled template its units' conversations fork from.
     pub base: &'a Mutex<Sequence>,
+    /// How a [`IngestMode::Derived`] layer's units are read.
+    pub spec: Option<&'a LayerSpec>,
+    /// The scoped groups of the layers of units below a derived layer, by
+    /// layer name — what its units may retrieve, on their branches.
+    pub sees: &'a [(String, GroupId)],
 }
 
 /// What the branch ingest keeps between passes.
@@ -85,6 +92,8 @@ impl BranchIngest {
         let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
         let mut corpora: HashMap<IngestScope, (Corpus, Vec<String>)> = HashMap::new();
         let mut changed = false;
+        // What stands in each layer, carried up to the layers built on it.
+        let mut ground = Ground::default();
         for layer in layers {
             if crate::ingest_cancel::cancelled() {
                 break;
@@ -100,9 +109,32 @@ impl BranchIngest {
                 .map(String::as_str)
                 .collect();
             changed |= match layer.mode {
-                IngestMode::Files => self.files(ctx, layer, corpus, &held_back, progress)?,
+                IngestMode::Files => {
+                    let above: Vec<&LayerPass<'_>> = layers
+                        .iter()
+                        .filter(|l| l.mode == IngestMode::Derived)
+                        .collect();
+                    let read = Reading {
+                        corpus,
+                        held_back: &held_back,
+                        progress,
+                        above: &above,
+                    };
+                    self.files(ctx, layer, &read, &mut ground)?
+                }
                 IngestMode::Folders => units(ctx, layer, corpus, &held_back, progress)?,
                 IngestMode::Raw => false,
+                IngestMode::Derived => match layer.spec {
+                    Some(spec) => {
+                        let run = LayerRun {
+                            spec,
+                            base: layer.base,
+                            sees: layer.sees,
+                        };
+                        crate::layers::pass_layer(ctx, &run, &mut ground)?
+                    }
+                    None => false,
+                },
             };
         }
         trees.retain_tips(&repos);
@@ -113,10 +145,10 @@ impl BranchIngest {
         &self,
         ctx: &RefreshContext<'_>,
         layer: &LayerPass<'_>,
-        corpus: &Corpus,
-        held_back: &[&str],
-        progress: &Arc<LoadProgress>,
+        read: &Reading<'_>,
+        ground: &mut Ground,
     ) -> anyhow::Result<bool> {
+        let (corpus, held_back, progress) = (read.corpus, read.held_back, read.progress);
         // A file found to be binary is never read, so it is not a unit: its
         // path's older versions must not wait on it as their replacement.
         let binary = self.binary.lock().unwrap().clone();
@@ -171,12 +203,97 @@ impl BranchIngest {
             tombstoned = p.tombstone.len(),
             "planned the layer against every branch",
         );
+        // Stale units above go now, before anything is read: a file being read
+        // again has no current reading, and every unit built on its old one —
+        // and on anything that depended on it — is tombstoned in this sweep,
+        // not once the pass reaches its layer.
+        ground_files(
+            ctx, layer.name, &files, &retained, held_back, corpus, ground,
+        );
+        for upper in read.above {
+            if let Some(spec) = upper.spec {
+                let run = LayerRun {
+                    spec,
+                    base: upper.base,
+                    sees: upper.sees,
+                };
+                crate::layers::sweep_layer(ctx, &run, ground);
+            }
+        }
         if !jobs.is_empty() {
             let keys: HashSet<String> = retain.iter().map(|k| k.to_string()).collect();
             code_read::ingest_jobs(ctx, &jobs, &keys, progress, layer.base, &self.binary)?;
         }
+        ground_files(
+            ctx, layer.name, &files, &retained, held_back, corpus, ground,
+        );
         Ok(!jobs.is_empty() || !p.tombstone.is_empty())
     }
+}
+
+/// What the `code_reading` pass reads with: its corpus, the repositories held
+/// back this pass, the progress sink, and the layers of units above it, swept
+/// before it reads.
+struct Reading<'a> {
+    corpus: &'a Corpus,
+    held_back: &'a [&'a str],
+    progress: &'a Arc<LoadProgress>,
+    above: &'a [&'a LayerPass<'a>],
+}
+
+/// Leave what `code_reading` holds current in `ground`, for the layers built
+/// on it: every file version a branch holds, the files within the depth bound,
+/// and each committed file read whose version a branch still holds — read
+/// again after this pass's pool, so what it just read stands too. A file of a
+/// repository held back this pass stands as it was: nothing looked for it.
+///
+/// Built afresh each time — the sweep before the pool and the pass after it
+/// both call it — so a version is never listed twice.
+fn ground_files(
+    ctx: &RefreshContext<'_>,
+    layer: &str,
+    files: &[&FileItem],
+    retained: &[&FileItem],
+    held_back: &[&str],
+    corpus: &Corpus,
+    ground: &mut Ground,
+) {
+    ground.live.clear();
+    for f in retained {
+        ground
+            .live
+            .entry(f.file.path.clone())
+            .or_default()
+            .push((f.key.clone(), f.branches.clone()));
+    }
+    // Every other file a branch holds is a version an analysis can depend on.
+    for (path, versions) in &corpus.retain.unread {
+        ground
+            .live
+            .entry(path.clone())
+            .or_default()
+            .extend(versions.iter().cloned());
+    }
+    ground.ingest = files.iter().map(|f| f.key.clone()).collect();
+    let on: HashMap<&str, &FileItem> = retained.iter().map(|f| (f.key.as_str(), *f)).collect();
+    let standing = code_read::committed(ctx.engine)
+        .into_iter()
+        .filter_map(|c| {
+            let found = on.get(c.key.as_str());
+            if found.is_none() && !in_repos(&c.subject, held_back) {
+                return None;
+            }
+            Some(Below {
+                file_key: Some(c.key.clone()),
+                key: c.key,
+                subject: c.subject,
+                timeline: Some(c.timeline),
+                branches: found.map(|f| f.branches.clone()).unwrap_or_default(),
+                at: found.map(|f| f.at.to_string()),
+            })
+        })
+        .collect();
+    ground.standing.insert(layer.to_string(), standing);
 }
 
 /// `items` less the files found to be binary.

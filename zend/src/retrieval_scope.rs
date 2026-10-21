@@ -28,7 +28,7 @@ mod index;
 mod kept;
 mod tree_scope;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -66,6 +66,8 @@ type ScopeKey = (u64, Vec<(String, Oid)>);
 struct Scope {
     files: Arc<HashSet<TimelineId>>,
     folders: Arc<HashSet<TimelineId>>,
+    /// Each layer of files' units, by its group.
+    derived: Arc<HashMap<GroupId, Arc<HashSet<TimelineId>>>>,
 }
 
 /// One repository a conversation reads at a base.
@@ -84,6 +86,9 @@ pub struct RetrievalScope {
     /// The `repo_map` group and the scope its retained units were walked
     /// under — the ingest scope at full depth.
     folders: Option<(GroupId, IngestScope)>,
+    /// The groups of the layers of units built on each file's reading
+    /// (`crate::layers`): a unit is in scope when its file version is.
+    derived: Vec<GroupId>,
     index: RwLock<Arc<IngestIndex>>,
     /// Set when a unit commits: the index no longer holds all that is
     /// committed.
@@ -103,6 +108,7 @@ impl RetrievalScope {
         Self {
             files_group,
             folders,
+            derived: Vec::new(),
             index: RwLock::new(Arc::default()),
             stale: AtomicBool::new(false),
             rebuilt: Mutex::new(None),
@@ -110,6 +116,13 @@ impl RetrievalScope {
             shared: Mutex::new(Kept::new(KEPT_SCOPES)),
             hints: Mutex::new(Hints::default()),
         }
+    }
+
+    /// Scope the groups of the layers of units built on each file's reading
+    /// too.
+    pub fn with_derived(mut self, groups: Vec<GroupId>) -> Self {
+        self.derived = groups;
+        self
     }
 
     /// A unit committed: the next turn rebuilds the index.
@@ -138,6 +151,10 @@ impl RetrievalScope {
         }
         if let Some((group, _)) = &self.folders {
             e.set_retrieval_scope(target, *group, scope.folders);
+        }
+        for group in &self.derived {
+            let allowed = scope.derived.get(group).cloned().unwrap_or_default();
+            e.set_retrieval_scope(target, *group, allowed);
         }
     }
 
@@ -243,6 +260,7 @@ impl RetrievalScope {
         }
         let mut in_files: HashSet<TimelineId> = index.uploads().iter().copied().collect();
         let mut in_folders = HashSet::new();
+        let mut in_derived: HashMap<GroupId, HashSet<TimelineId>> = HashMap::new();
         for repo in &repos {
             let Some(of_tree) = self.tree_scope(index, repo) else {
                 continue;
@@ -267,10 +285,23 @@ impl RetrievalScope {
                     .filter(|(dir, _)| !changed_dirs.contains(*dir))
                     .map(|(_, tl)| *tl),
             );
+            // A unit of a layer of files is in scope when its file version is,
+            // and out with the file when the conversation changed it.
+            for (path, group, tl) in &of_tree.derived {
+                if !changed.contains(path.as_str()) {
+                    in_derived.entry(*group).or_default().insert(*tl);
+                }
+            }
         }
         let scope = Scope {
             files: Arc::new(in_files),
             folders: Arc::new(in_folders),
+            derived: Arc::new(
+                in_derived
+                    .into_iter()
+                    .map(|(g, tls)| (g, Arc::new(tls)))
+                    .collect(),
+            ),
         };
         if unchanged {
             self.shared.lock().unwrap().insert(key, scope.clone());

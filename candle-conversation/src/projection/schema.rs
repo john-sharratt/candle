@@ -912,6 +912,11 @@ pub struct LayerSchema {
     /// live schema has to be appended, and without a rank an appended layer
     /// could only ever sit on top, invisible to everything declared before it.
     pub rank: i32,
+    /// How the layer is populated by its host's ingest (`ingest:` in YAML),
+    /// carried through unread: what a unit is, what it is asked and what it
+    /// builds on are the host's to interpret, never the projection's. `None`
+    /// for a layer the host fills some other way, or not at all.
+    pub ingest: Option<serde_yaml::Value>,
 }
 
 /// How strongly a layer's decode is favoured over a co-running background

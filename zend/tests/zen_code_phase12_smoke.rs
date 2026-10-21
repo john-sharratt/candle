@@ -292,6 +292,8 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         tool_ctx,
         retrieval: &retrieval,
         chain_end: None,
+        think_for: None,
+        dialogue: None,
     };
     let layers = [
         LayerPass {
@@ -299,12 +301,16 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
             mode: IngestMode::Folders,
             scope: scope.clone(),
             base: &repo_map_base,
+            spec: None,
+            sees: &[],
         },
         LayerPass {
             name: "code_reading",
             mode: IngestMode::Files,
             scope: scope.clone(),
             base: &code_read_base,
+            spec: None,
+            sees: &[],
         },
     ];
     let changed = BranchIngest::default()

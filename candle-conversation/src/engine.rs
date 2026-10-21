@@ -1032,6 +1032,13 @@ impl ConversationEngine {
         self.conversation.mark_layer_append_only(layer);
     }
 
+    /// Let an append-only `layer`'s projections draw `groups` — groups of the
+    /// layers it compounds on — across conversations, its own layer staying
+    /// self-local. See [`crate::substrate::Substrate::set_ingest_sees`].
+    pub fn set_ingest_sees(&self, layer: LayerId, groups: std::collections::HashSet<GroupId>) {
+        self.conversation.set_ingest_sees(layer, groups);
+    }
+
     /// Re-arm the score-normalization warm-up so the next projection re-learns
     /// per-file hit levels — call after an ingest reconcile mints fresh timelines
     /// the prior warm never scanned. See
@@ -1592,6 +1599,22 @@ impl ConversationEngine {
     /// created. `None` for a timeline this engine does not hold.
     pub fn timeline_target(&self, timeline: TimelineId) -> Option<(LayerId, GroupId)> {
         self.conversation.timeline_target(timeline)
+    }
+
+    /// The wall-clock milliseconds each declared turn of `timeline` was written
+    /// at, in turn order — read from the hybrid logical clock its declaration
+    /// carries, so a turn replicated from another member keeps the time it was
+    /// written there.
+    pub fn timeline_turn_wall_ms(&self, timeline: TimelineId) -> Vec<(TurnIndex, u64)> {
+        let read = self.conversation.read();
+        read.turn_streams_of(timeline.raw())
+            .map(|(turn, _, rt)| {
+                (
+                    turn,
+                    crate::persistence::identity::wall_ms(rt.ids.decl.stamp().hlc),
+                )
+            })
+            .collect()
     }
 
     /// Both halves of every turn in `timeline`, in order — `(user, assistant)`,

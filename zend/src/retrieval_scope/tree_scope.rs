@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use candle_conversation::projection::TimelineId;
+use candle_conversation::projection::{GroupId, TimelineId};
 use zend_vfs::vfs::Tree;
 
 use super::index::IngestIndex;
@@ -18,6 +18,9 @@ use crate::repo_scan::types::ModuleHint;
 pub struct TreeScope {
     pub files: HashMap<String, TimelineId>,
     pub folders: HashMap<String, TimelineId>,
+    /// Each unit of a layer of files of a file version this tree holds: its
+    /// file (repository-relative), its group, its conversation.
+    pub derived: Vec<(String, GroupId, TimelineId)>,
 }
 
 impl TreeScope {
@@ -34,8 +37,12 @@ impl TreeScope {
     ) -> Self {
         let mut out = Self::default();
         for (path, blob, _) in tree.files() {
-            if let Some(tl) = index.get(&file_key(&format!("{repo}/{path}"), blob)) {
+            let key = file_key(&format!("{repo}/{path}"), blob);
+            if let Some(tl) = index.get(&key) {
                 out.files.insert(path.to_string(), tl);
+            }
+            for (group, tl) in index.derived_of(&key) {
+                out.derived.push((path.to_string(), *group, *tl));
             }
         }
         let Some(scope) = folder_scope else {

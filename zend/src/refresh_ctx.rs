@@ -9,8 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use candle_conversation::projection::{Builder, TimelineId};
-use candle_conversation::stencil::TriggerRegistry;
+use candle_conversation::projection::{Builder, GroupId, TimelineId};
+use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use zend_tools::ToolContext;
 
@@ -55,4 +55,24 @@ pub struct RefreshContext<'a> {
     /// unit's parent before its reading starts, so its turns are projected
     /// with the chain already in context. `None` when there is no chain.
     pub chain_end: Option<TimelineId>,
+    /// The steering for each thinking level, for a unit of a layer that thinks
+    /// (`crate::layers`) — the same registry a dialogue turn at that level
+    /// runs under. `None` falls back to [`Self::think_triggers`].
+    pub think_for: Option<ThinkFor>,
+    /// The live dialogue a day layer reads: its group, and the conversation
+    /// that writes titles, which is no dialogue. `None` when there is none.
+    pub dialogue: Option<(GroupId, Option<TimelineId>)>,
+}
+
+/// The steering for a thinking level.
+pub type ThinkFor = Arc<dyn Fn(ThinkMode) -> Arc<TriggerRegistry> + Send + Sync>;
+
+impl RefreshContext<'_> {
+    /// The steering a turn thinking at `mode` runs under.
+    pub fn triggers_for(&self, mode: ThinkMode) -> Arc<TriggerRegistry> {
+        match &self.think_for {
+            Some(f) => f(mode),
+            None => Arc::clone(&self.think_triggers),
+        }
+    }
 }

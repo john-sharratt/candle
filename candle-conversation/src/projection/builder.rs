@@ -1409,6 +1409,7 @@ impl Builder {
                 on_corrupt_turn: CorruptTurnPolicy::DropTurn,
                 ingest_unit: None,
                 in_tool_rounds: true,
+                ingest: None,
             }],
         };
         validate(&schema).expect("synthetic schema must always be valid");

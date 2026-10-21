@@ -77,6 +77,11 @@ pub struct UnitItem {
 pub struct Units {
     pub files: Vec<FileItem>,
     pub units: Vec<UnitItem>,
+    /// Every other file a branch holds — one the scope reads none of, a
+    /// manifest with no extension, an image — by path, each version with its
+    /// key and branches. Nothing reads these; an analysis that depends on one
+    /// is keyed by its version, so an edit to it reaches the analysis.
+    pub unread: std::collections::BTreeMap<String, Vec<(String, Vec<String>)>>,
 }
 
 /// A layer's corpus: the units it reads, and the units it keeps.
@@ -145,6 +150,7 @@ pub fn walk(
             Ok(of_repo) => {
                 retain.files.extend(of_repo.files);
                 retain.units.extend(of_repo.units);
+                retain.unread.extend(of_repo.unread);
             }
             Err(e) => {
                 tracing::warn!(
@@ -184,7 +190,11 @@ fn within(all: &Units, scope: &IngestScope) -> Units {
         .filter(|u| dirs.contains(&u.unit.dir))
         .cloned()
         .collect();
-    Units { files, units }
+    Units {
+        files,
+        units,
+        unread: Default::default(),
+    }
 }
 
 /// One repository's units on every branch, or the error that kept one of its
@@ -215,6 +225,18 @@ fn walk_repo(
                 })
             })
             .collect();
+        for (path, blob, size) in tree.files() {
+            if scope.admits(&repo.name, path, size).is_some() {
+                continue;
+            }
+            let path = format!("{}/{path}", repo.name);
+            let key = file_key(&path, blob);
+            let versions = corpus.unread.entry(path).or_default();
+            match versions.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, on)) => on.push(branch.clone()),
+                None => versions.push((key, vec![branch.clone()])),
+            }
+        }
         let hints = &mut cache.hints;
         let mut hint_of = |f: &TreeFile| {
             let name = f.path.rsplit('/').next().unwrap_or(&f.path);

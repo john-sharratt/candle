@@ -1,9 +1,10 @@
 //! Structure-derived load-plan resolution.
 //!
-//! `projection.yaml` is purely declarative — it describes the runtime projection
-//! (layers, collections, selection rules) and never how those get populated. This
-//! module DERIVES the load plan from that declared structure; nothing about
-//! loading is annotated in the schema.
+//! `projection.yaml` describes the runtime projection (layers, collections,
+//! selection rules). This module DERIVES the load plan from that declared
+//! structure. The one thing about loading a layer may state is an `ingest:`
+//! block — what its units are, what they build on and what they are asked
+//! (`crate::layers::spec`) — which the projection itself never reads.
 //!
 //! Two kinds of sink are derived:
 //!
@@ -12,9 +13,10 @@
 //!   excluded. The rest resolve by convention: the built-in `repo_map`
 //!   (every folder of every repository's branches) and `code_reading` (every
 //!   file of them) pipelines are recognised by name — both ingested from the
-//!   branches (`crate::branch_ingest`); every other turn-sink layer reads
-//!   ChatML records from a folder named after it (`<name>/`) in the workspace
-//!   folder.
+//!   branches (`crate::branch_ingest`); a layer that declares an `ingest:`
+//!   block is built from the layers below it, one hidden conversation per unit
+//!   (`crate::layers`); every other turn-sink layer, in a mind, reads ChatML
+//!   records from a folder named after it (`<name>/`) in the workspace folder.
 //! * **Section-collection sinks** ([`section_sinks`]) — an empty collection in a
 //!   layer's system prompt, other than the registry-backed `tools`. Each is filled
 //!   with calibrated sections from a folder named after it (`<name>s/`).
@@ -47,6 +49,10 @@ pub enum IngestMode {
     Files,
     /// Hold ChatML records directly from the content folder.
     Raw,
+    /// Build one unit per unit of a layer below, each a hidden conversation
+    /// asked the layer's own question (`crate::layers`) — every layer that
+    /// declares an `ingest:` block.
+    Derived,
 }
 
 /// One turn-sink layer resolved from the schema: identity, the group it populates,
@@ -65,6 +71,9 @@ pub struct IngestLayer {
     /// Noun for the startup loading screen's absolute readout ("N / M <unit>").
     /// From the layer's `ingest_unit:` in projection.yaml, else a mode default.
     pub unit: String,
+    /// How a [`IngestMode::Derived`] layer's units are read; `None` for every
+    /// other mode.
+    pub spec: Option<std::sync::Arc<crate::layers::LayerSpec>>,
 }
 
 /// A raw-ChatML layer's live state, held between refreshes and keyed by layer
@@ -102,8 +111,9 @@ fn is_live_conversation(layer: &LayerSchema) -> bool {
 /// under `workspace` (the workspace folder), in schema order. Skips the live
 /// conversation layer and any layer with no group to populate. The built-in
 /// `repo_map` / `code_reading` pipelines always resolve (they walk the
-/// repositories); every other non-live layer is a raw ChatML sink **only in a
-/// mind, and only if a folder named after it exists**.
+/// repositories), and so does every layer declaring an `ingest:` block
+/// ([`IngestMode::Derived`]); every other non-live layer is a raw ChatML sink
+/// **only in a mind, and only if a folder named after it exists**.
 ///
 /// The mind gate matters: a coding-agent workspace is an arbitrary user project
 /// whose directories (`bug_analysis/`, `daily_history/`, …) must never be read as
@@ -131,9 +141,20 @@ pub fn ingest_layers(
             continue;
         };
         let override_dir = dirs.get(&layer.name);
+        // A layer that declares how its units are read is read that way, in any
+        // workspace: its units are built from the layers below it, never from a
+        // folder of the user's project.
+        let spec = match crate::layers::LayerSpec::of(layer) {
+            Ok(spec) => spec.map(std::sync::Arc::new),
+            Err(e) => {
+                tracing::error!("{e:#} — the layer is not ingested");
+                continue;
+            }
+        };
         let (mode, default_folder, base_display) = match layer.name.as_str() {
             "repo_map" => (IngestMode::Folders, "", "Scanning repositories"),
             "code_reading" => (IngestMode::Files, "", "Reading code"),
+            _ if spec.is_some() => (IngestMode::Derived, "", "Analysing"),
             other => {
                 if !is_mind {
                     continue;
@@ -155,6 +176,7 @@ pub fn ingest_layers(
         let display = match (mode, override_dir) {
             (IngestMode::Raw, None) => format!("Loading {}", layer.name),
             (IngestMode::Raw, Some(d)) => format!("Loading {} ({d})", layer.name),
+            (IngestMode::Derived, _) => format!("{base_display} ({})", layer.name),
             (_, None) => base_display.to_string(),
             (_, Some(d)) => format!("{base_display} ({d})"),
         };
@@ -165,6 +187,7 @@ pub fn ingest_layers(
                 IngestMode::Folders => "folders",
                 IngestMode::Files => "files",
                 IngestMode::Raw => "files",
+                IngestMode::Derived => "units",
             }
             .to_string()
         });
@@ -175,6 +198,7 @@ pub fn ingest_layers(
             folder,
             display,
             unit,
+            spec,
         });
     }
     out

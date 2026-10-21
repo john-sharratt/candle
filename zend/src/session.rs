@@ -32,9 +32,9 @@ use candle_conversation::models::{Dialect, Model, StrataTokens};
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::persistence::{content_hash, OpenProgressHook, OpenStage, SUBSTRATE_DIR};
 use candle_conversation::projection::{
-    self, Builder, Conversation, DecodePriority, GroupSchema, LayerId, Reserved, SectionId,
-    SectionLoads, SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema, TimelineId,
-    TurnIndex, WorkingSetShare,
+    self, Builder, Conversation, DecodePriority, GroupId, GroupSchema, LayerId, Reserved,
+    SectionId, SectionLoads, SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema,
+    TimelineId, TurnIndex, WorkingSetShare,
 };
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
@@ -121,6 +121,10 @@ pub const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.ya
 /// means the worker can't keep up; further jobs are dropped (labels are
 /// best-effort), which is preferable to unbounded growth under a burst.
 const TITLER_QUEUE_DEPTH: usize = 256;
+
+/// How often a pass is asked for so a day layer reads a day that closed
+/// (`crate::layers::days`): no branch move announces midnight.
+const DAY_LAYER_WAKE_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Work item for the titler worker thread.
 enum TitleJob {
@@ -490,6 +494,50 @@ fn turn_triggers(state: &InferenceState, think_mode: ThinkMode) -> Arc<TriggerRe
     }
 }
 
+/// What each layer of units compounds on: every other layer of units below
+/// it in the schema's stack, by name, with its group and whether that group is
+/// scoped by branch (a layer of files) or not (a layer of days). A disabled
+/// layer is out of service: it compounds on nothing and nothing on it.
+type LayerSees = Vec<(String, Vec<(String, GroupId, bool)>)>;
+
+fn layer_sees(builder: &Builder, layers: &[IngestLayer], disabled: &HashSet<String>) -> LayerSees {
+    let schema = builder.schema();
+    let rank = |name: &str| {
+        schema
+            .layers
+            .iter()
+            .find(|l| l.name == name)
+            .map(|l| l.rank)
+    };
+    let derived: Vec<(&IngestLayer, i32, GroupId, bool)> = layers
+        .iter()
+        .filter(|il| il.mode == IngestMode::Derived && !disabled.contains(&il.name))
+        .filter_map(|il| {
+            let scoped = il
+                .spec
+                .as_ref()
+                .is_some_and(|s| s.unit == crate::layers::UnitKind::File);
+            Some((
+                il,
+                rank(&il.name)?,
+                builder.id_for_group(&il.group)?,
+                scoped,
+            ))
+        })
+        .collect();
+    derived
+        .iter()
+        .map(|(il, r, _, _)| {
+            let below = derived
+                .iter()
+                .filter(|(other, other_rank, _, _)| other.name != il.name && other_rank < r)
+                .map(|(other, _, group, scoped)| (other.name.clone(), *group, *scoped))
+                .collect();
+            (il.name.clone(), below)
+        })
+        .collect()
+}
+
 /// Render the answer's held tool-call object for the client stream.  The GUI
 /// renders tool cards from `<tool_call>…</tool_call>` tags, but Qwen3 frequently
 /// emits the JSON object bare (no wrapper).  When `held` is a recognized tool call
@@ -587,6 +635,9 @@ struct InferenceState {
     /// The branch layers this boot ingests — `repo_map` and `code_reading`,
     /// less any `--disable-layer` names — with the scope each is walked under.
     branch_layers: Vec<(IngestLayer, IngestScope)>,
+    /// For each layer of units, the scoped groups of the layers of units below
+    /// it, by layer name — what its units retrieve on their own branches.
+    layer_sees: HashMap<String, Vec<(String, GroupId)>>,
     /// The branch ingest's state between passes (`crate::branch_ingest`).
     branch_ingest: BranchIngest,
     /// Which ingested units each conversation may retrieve
@@ -2639,6 +2690,9 @@ impl InferenceState {
                 // are prefilled and its content hash written in the same commit,
                 // so a conversation is either absent or complete.
                 IngestMode::Raw => {}
+                IngestMode::Derived => {
+                    crate::layers::run::retire_crashed_partials(&engine, &il.name)
+                }
             }
             // `--wipe-layer <name>`: tombstone EVERY conversation in this layer,
             // not just crashed partials — a targeted alternative to
@@ -2652,6 +2706,15 @@ impl InferenceState {
                 match il.mode {
                     IngestMode::Folders => crate::repo_scan::wipe_layer(&engine),
                     IngestMode::Files => crate::code_read::wipe_layer(&engine),
+                    IngestMode::Derived => {
+                        let e = engine.lock().unwrap();
+                        let all = crate::layers::run::all_of(&e, &il.name);
+                        let wiped = all
+                            .iter()
+                            .filter(|tl| e.tombstone_timeline(**tl).is_ok())
+                            .count();
+                        tracing::info!(layer = %il.name, wiped, "--wipe-layer: every unit of the layer tombstoned");
+                    }
                     IngestMode::Raw => tracing::warn!(
                         layer = %il.name,
                         "--wipe-layer: raw layers are not wipeable this way — use \
@@ -2691,6 +2754,7 @@ impl InferenceState {
         let mut branch_layers: Vec<(IngestLayer, IngestScope)> = Vec::new();
         let mut files_group = None;
         let mut folders_group = None;
+        let mut derived_groups = Vec::new();
         for il in &ingest_layers {
             if il.mode == IngestMode::Raw {
                 continue;
@@ -2698,7 +2762,14 @@ impl InferenceState {
             let group = proj_builder_refresh
                 .id_for_group(&il.group)
                 .ok_or_else(|| anyhow::anyhow!("projection schema missing '{}' group", il.group))?;
-            engine.lock().unwrap().mark_group_scoped(group);
+            // A day layer's units are of no branch, so its group is not scoped.
+            let of_files = il
+                .spec
+                .as_ref()
+                .is_none_or(|s| s.unit == crate::layers::UnitKind::File);
+            if of_files {
+                engine.lock().unwrap().mark_group_scoped(group);
+            }
             if disabled_layers.contains(&il.name) {
                 continue;
             }
@@ -2710,11 +2781,40 @@ impl InferenceState {
                 // folder must stay retrievable. A key found for a folder never
                 // ingested simply matches nothing.
                 IngestMode::Folders => folders_group = Some((group, scope.full_depth())),
-                IngestMode::Raw => {}
+                IngestMode::Derived if of_files => derived_groups.push(group),
+                IngestMode::Raw | IngestMode::Derived => {}
             }
             branch_layers.push((il.clone(), scope));
         }
-        let retrieval_scope = RetrievalScope::new(files_group, folders_group);
+        let retrieval_scope =
+            RetrievalScope::new(files_group, folders_group).with_derived(derived_groups);
+        // Each layer of units compounds on the layers of units below it: their
+        // groups are what its units retrieve across conversations
+        // (`Substrate::set_ingest_sees`), the scoped ones on the unit's own
+        // branches (`layer_sees`).
+        let layer_sees = layer_sees(&proj_builder_refresh, &ingest_layers, &disabled_layers);
+        for (name, sees) in &layer_sees {
+            let (Some(layer), groups) = (
+                proj_builder_refresh.id_for_layer(name),
+                sees.iter()
+                    .map(|(_, g, _)| *g)
+                    .collect::<HashSet<GroupId>>(),
+            ) else {
+                continue;
+            };
+            engine.lock().unwrap().set_ingest_sees(layer, groups);
+        }
+        let layer_sees: HashMap<String, Vec<(String, GroupId)>> = layer_sees
+            .into_iter()
+            .map(|(name, sees)| {
+                let scoped = sees
+                    .into_iter()
+                    .filter(|(_, _, scoped)| *scoped)
+                    .map(|(l, g, _)| (l, g))
+                    .collect();
+                (name, scoped)
+            })
+            .collect();
         retrieval_scope.refresh(&engine);
 
         // Cooperative shutdown during the (long) startup ingest: if a Ctrl-C
@@ -2782,6 +2882,7 @@ impl InferenceState {
             ingest_convs: Mutex::new(ingest_convs),
             ingest_layers,
             branch_layers,
+            layer_sees,
             branch_ingest: BranchIngest::default(),
             retrieval_scope,
             ingest_wake: OnceLock::new(),
@@ -2868,6 +2969,18 @@ impl InferenceState {
             ),
             retrieval: &self.retrieval_scope,
             chain_end: *self.chain_end.lock().unwrap(),
+            think_for: Some({
+                let steering = self.think_steering.clone();
+                let stencil = Arc::clone(&self.tool_stencil);
+                Arc::new(move |mode: ThinkMode| match &steering {
+                    Some(ts) => ts.registry_for(&stencil, mode),
+                    None => Arc::clone(&stencil),
+                })
+            }),
+            dialogue: self
+                .refresh_builder
+                .id_for_group("primary_conversation")
+                .map(|group| (group, Some(self.titler_timeline))),
         }
     }
 
@@ -2881,6 +2994,12 @@ impl InferenceState {
                     mode: il.mode,
                     scope: scope.clone(),
                     base: self.ingest_base(&il.name)?,
+                    spec: il.spec.as_deref(),
+                    sees: self
+                        .layer_sees
+                        .get(&il.name)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
                 })
             })
             .collect()
@@ -4609,7 +4728,7 @@ fn run_inference_stream(
             // wake the ingest worker, which reads branches from those refs.
             if results.iter().any(|r| moves_branches(&r.call.name)) {
                 if let Some(wake) = state.ingest_wake.get() {
-                    wake.notify_one();
+                    crate::ingest_worker::request(wake);
                 }
             }
             // A round that changed code releases the working set's locks, after
@@ -7052,9 +7171,36 @@ impl ZendSession {
                             if let Some(repositories) = state.repositories.as_ref() {
                                 let on_change: Arc<dyn Fn() + Send + Sync> = {
                                     let wake = Arc::clone(&wake);
-                                    Arc::new(move || wake.notify_one())
+                                    Arc::new(move || crate::ingest_worker::request(&wake))
                                 };
                                 repositories.on_change(on_change);
+                            }
+                            // A day layer's unit is a day once it is over, which
+                            // no branch move announces: ask for a pass now and then
+                            // so a day that closed is read. A pass that finds
+                            // nothing new to read costs its plans.
+                            let has_days = state.ingest_layers.iter().any(|l| {
+                                l.spec
+                                    .as_ref()
+                                    .is_some_and(|s| s.unit == crate::layers::UnitKind::Day)
+                            });
+                            if has_days {
+                                let wake = Arc::clone(&wake);
+                                tokio::spawn(async move {
+                                    let mut every = tokio::time::interval(DAY_LAYER_WAKE_EVERY);
+                                    every.tick().await;
+                                    loop {
+                                        every.tick().await;
+                                        if crate::ingest_cancel::cancelled() {
+                                            return;
+                                        }
+                                        // A wake, not a request: a day closing is no
+                                        // work for the layers below, so a pass in
+                                        // flight is not stopped for it — the next
+                                        // pass reads the day.
+                                        wake.notify_one();
+                                    }
+                                });
                             }
                         }
                         // The engine is up — only NOW mark ready and unblock
@@ -7877,8 +8023,33 @@ mod projection_schema_tests {
             vec![
                 ("repo_map", IngestMode::Folders, ""),
                 ("code_reading", IngestMode::Files, ""),
+                ("static_analysis", IngestMode::Derived, ""),
+                ("dependency_analysis", IngestMode::Derived, ""),
+                ("architectural_analysis", IngestMode::Derived, ""),
+                ("critical_analysis", IngestMode::Derived, ""),
+                ("bug_analysis", IngestMode::Derived, ""),
+                ("daily_history", IngestMode::Derived, ""),
+                ("dream_log", IngestMode::Derived, ""),
             ],
             "derived turn-sinks: {got:?}"
+        );
+        // Each layer of units builds on the one below it, files up from the
+        // reading and days up from the dialogue.
+        let after: Vec<(&str, Option<&str>)> = layers
+            .iter()
+            .filter_map(|l| Some((l.name.as_str(), l.spec.as_ref()?.after.as_deref())))
+            .collect();
+        assert_eq!(
+            after,
+            vec![
+                ("static_analysis", Some("code_reading")),
+                ("dependency_analysis", Some("static_analysis")),
+                ("architectural_analysis", Some("dependency_analysis")),
+                ("critical_analysis", Some("architectural_analysis")),
+                ("bug_analysis", Some("critical_analysis")),
+                ("daily_history", None),
+                ("dream_log", Some("daily_history")),
+            ]
         );
         // The live dialogue layer is never a turn-sink.
         assert!(
@@ -7938,26 +8109,25 @@ mod projection_schema_tests {
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(ws.join("bug_analysis")).unwrap();
 
-        // Not a mind (no projection.yaml): the built-in pipelines only; the
-        // colliding `bug_analysis/` folder is never a raw sink.
+        // Not a mind (no projection.yaml): the colliding `bug_analysis/` folder
+        // is never a raw sink — the layer is built from the layers below it.
         let coding = crate::ingest::ingest_layers(builder.schema(), &ws, &HashMap::new());
-        assert_eq!(
-            coding.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
-            vec!["repo_map", "code_reading"],
-            "coding workspace must ingest only the built-in pipelines"
-        );
         assert!(
             !coding.iter().any(|l| l.mode == IngestMode::Raw),
             "no raw sinks in a coding-agent workspace"
         );
+        assert!(coding
+            .iter()
+            .any(|l| l.name == "bug_analysis" && l.mode == IngestMode::Derived));
 
-        // Make it a mind: now the same folder IS drawn as a raw sink.
+        // Not in a mind either: a layer that declares how its units are read
+        // is read that way, whatever folder shares its name.
         std::fs::write(ws.join("projection.yaml"), "layers: []").unwrap();
         let mind = crate::ingest::ingest_layers(builder.schema(), &ws, &HashMap::new());
         assert!(
             mind.iter()
-                .any(|l| l.name == "bug_analysis" && l.mode == IngestMode::Raw),
-            "a mind draws its bug_analysis/ folder as a raw sink"
+                .any(|l| l.name == "bug_analysis" && l.mode == IngestMode::Derived),
+            "a declared layer of units is never a mind's raw sink"
         );
 
         let _ = std::fs::remove_dir_all(&ws);

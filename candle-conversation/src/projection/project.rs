@@ -1848,7 +1848,7 @@ pub fn run_with_sink<R: ContentResolver>(
     // unbounded-selected turns), use that as a max_tokens cap in FlexItem so
     // that flexbox_distribute automatically redistributes surplus to groups that
     // are still hungry. Then run bounded selection once per group.
-    let turn_budget = schema
+    let own_window = schema
         .layers
         .iter()
         .find(|l| l.id == target.layer)
@@ -1870,11 +1870,42 @@ pub fn run_with_sink<R: ContentResolver>(
         })
         .collect();
 
+    // **An ingest conversation compounding on the layers below it sees each at
+    // its own window**, as a dialogue does — not all of them sliced from its
+    // own. Its own group asks for nothing (it is kept whole), so its window
+    // was the whole pie for every layer below: one layer below took all 8k, two
+    // shared it, and a fourth layer up was left a sliver per layer, under the
+    // size of one unit — the higher the layer, the less it compounded. The
+    // budget is the windows of the layers it draws on, each capped at its own
+    // below. An ingest target with no layer to draw on (`code_reading`, whose
+    // `repo_map` below is a working set) keeps its own window, as before.
+    let compounding = resolver.target_is_ingest_self();
+    let below_windows: usize = flex_layer_indices
+        .iter()
+        .map(|&li| visible_layers[li])
+        .filter(|l| l.id != target.layer)
+        .map(|l| l.window)
+        .sum();
+    let turn_budget = if compounding {
+        own_window.max(below_windows)
+    } else {
+        own_window
+    };
+
     // Natural token consumption per group (unbounded selection result).
     let natural_tokens: HashMap<GroupId, usize> = group_states
         .iter()
         .filter(|gs| flexed(gs))
         .map(|gs| {
+            // An ingest conversation's own group is kept whole whatever its
+            // budget (the bounded pass below), so it asks the window for
+            // nothing: priced at its size, a unit whose lineage is a whole
+            // file's reading took nearly all of an 8k window and left the layers
+            // it compounds on a sliver — the units of other files it should
+            // draw on scored in the hundreds and were dropped for want of room.
+            if gs.ingest_self {
+                return (gs.schema.id, 0);
+            }
             // Priced per EXCHANGE — what emitting the candidate actually costs —
             // so the flexbox natural cap matches the tokens the group emits.
             let tokens: usize = gs
@@ -1916,7 +1947,10 @@ pub fn run_with_sink<R: ContentResolver>(
                 turn_budget,
                 layer_mass,
             );
-            let nat = layer_natural[slot];
+            let mut nat = layer_natural[slot];
+            if compounding && visible_layers[li].id != target.layer {
+                nat = nat.min(visible_layers[li].window);
+            }
             item.max_tokens = Some(item.max_tokens.map_or(nat, |m| m.min(nat)));
             item
         })

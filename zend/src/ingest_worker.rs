@@ -16,6 +16,25 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+/// Raised by every request for a pass, lowered as a pass begins: a request
+/// that arrived while one runs. The layers built on others read it between
+/// units ([`preempted`]) and stop, so the pass ends and the next one starts
+/// from the bottom — a moved branch is read into the layers that read the
+/// branches before any layer above them reads another unit.
+static PREEMPT: AtomicBool = AtomicBool::new(false);
+
+/// Ask for a pass through `wake`: what every caller holding the worker's
+/// `Notify` calls, so a pass in flight learns it is wanted again.
+pub fn request(wake: &Notify) {
+    PREEMPT.store(true, Ordering::SeqCst);
+    wake.notify_one();
+}
+
+/// Whether a pass was asked for since this one began.
+pub fn preempted() -> bool {
+    PREEMPT.load(Ordering::SeqCst)
+}
+
 /// A running ingest worker. Dropping this without calling [`stop`](Self::stop)
 /// leaves the task running detached — always call `stop` during shutdown.
 pub struct IngestWorker {
@@ -55,6 +74,7 @@ pub fn spawn(
             if stop_loop.load(Ordering::Relaxed) || crate::ingest_cancel::cancelled() {
                 break;
             }
+            PREEMPT.store(false, Ordering::SeqCst);
             let started = std::time::Instant::now();
             let p = Arc::clone(&pass);
             if tokio::task::spawn_blocking(move || p()).await.is_err() {
@@ -87,7 +107,7 @@ impl IngestWorker {
     /// Ask for a pass. Cheap and synchronous — callable from anywhere,
     /// including a blocking-pool callback.
     pub fn wake(&self) {
-        self.wake.notify_one();
+        request(&self.wake);
     }
 
     /// Stop after the in-flight pass reaches its next unit boundary, and join.

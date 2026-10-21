@@ -3,11 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use candle_conversation::projection::TimelineId;
+use candle_conversation::projection::{GroupId, TimelineId};
 use candle_conversation::ConversationEngine;
 
 use crate::branch_ingest::keys::CONTENT_KEY;
 use crate::code_read::{is_upload_path, PATH_KEY};
+use crate::layers::keys::FILE_KEY;
 
 /// Every committed ingest conversation, by content key.
 #[derive(Debug, Default)]
@@ -15,6 +16,9 @@ pub struct IngestIndex {
     by_key: HashMap<String, TimelineId>,
     /// Every committed upload's conversation: uploads are in every scope.
     uploads: Vec<TimelineId>,
+    /// Every committed unit of a layer of files, by the `code_reading` key of
+    /// the file version it is of, with the group it is in.
+    derived: HashMap<String, Vec<(GroupId, TimelineId)>>,
     /// Bumped on every rebuild, so what was worked out against an older
     /// index is never served against this one.
     generation: u64,
@@ -34,9 +38,19 @@ impl IngestIndex {
             .filter(|(tl, path)| is_upload_path(path) && committed.contains(tl))
             .map(|(tl, _)| tl)
             .collect();
+        let mut derived: HashMap<String, Vec<(GroupId, TimelineId)>> = HashMap::new();
+        for (timeline, file_key) in engine.conversations_with_metadata_key(FILE_KEY) {
+            if !committed.contains(&timeline) {
+                continue;
+            }
+            if let Some((_, group)) = engine.timeline_target(timeline) {
+                derived.entry(file_key).or_default().push((group, timeline));
+            }
+        }
         Self {
             by_key,
             uploads,
+            derived,
             generation,
         }
     }
@@ -51,6 +65,7 @@ impl IngestIndex {
         Self {
             by_key,
             uploads,
+            derived: HashMap::new(),
             generation,
         }
     }
@@ -58,6 +73,11 @@ impl IngestIndex {
     /// The conversation committed under `key`.
     pub fn get(&self, key: &str) -> Option<TimelineId> {
         self.by_key.get(key).copied()
+    }
+
+    /// Every committed unit of a layer of files of the file version `file_key`.
+    pub fn derived_of(&self, file_key: &str) -> &[(GroupId, TimelineId)] {
+        self.derived.get(file_key).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Every committed upload's conversation.

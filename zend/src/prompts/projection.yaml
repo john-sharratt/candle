@@ -846,6 +846,20 @@ layers:
     description: |
       Code artifacts defined per file (Phase 3).  Structs, traits, functions,
       enums, type aliases.  One turn per file.
+    ingest_unit: files
+    # One unit per file, continuing the file's own reading (`zend::layers`):
+    # the reading is this conversation's opening, so the file is in context.
+    ingest:
+      unit: file
+      after: code_reading
+      prompt: |
+        You have no tools in this conversation: answer from what you have read above.
+        List every code artifact `<<path>>` in the `<<repo>>` repository defines, which
+        you have read above: each struct, enum, trait, type alias, function, method,
+        constant and macro, by its exact name, with its kind, its signature where it
+        has one, and one line on what it is for. Group methods under the type they
+        belong to. Name only what this file defines — nothing it imports or uses —
+        and invent nothing.
     window: 8000
     score_threshold: 0.0
     budget:
@@ -894,6 +908,32 @@ layers:
     description: |
       Per-file dependency mapping (Phase 4).  Direct imports, transitive
       deps, implicit couplings.  Crucial for cross-cutting questions.
+    ingest_unit: files
+    # `edges`: the answer's closing section names the files this one depends
+    # on, and a change to one of them makes this file's units stale in every
+    # layer from here up (`zend::layers::plan`).
+    ingest:
+      unit: file
+      after: static_analysis
+      edges: true
+      prompt: |
+        You have no tools in this conversation: answer from what you have read above.
+        What do the structs, traits and functions in `<<path>>` in the `<<repo>>`
+        repository depend on? For each dependency, name the source file and the
+        specific artifact, and say whether it is direct (an import or call),
+        transitive (through an intermediate), or implicit (a shared resource,
+        convention or assumption). Use what you have read of this file and its
+        artifacts above, and the analyses of other files you can see.
+
+        End your answer with a section exactly like this one, one workspace path per
+        line — the repository, then the path inside it — for every file of this
+        workspace this file depends on, and nothing else:
+
+        DEPENDS ON:
+        - <<repo>>/path/to/file
+
+        If it depends on no other file of the workspace, write the heading with
+        nothing under it.
     window: 8000
     score_threshold: 0.0
     budget:
@@ -941,6 +981,18 @@ layers:
     description: |
       Why each artifact exists, what role it plays, what assumptions it
       encodes (Phase 5).
+    ingest_unit: files
+    ingest:
+      unit: file
+      after: dependency_analysis
+      prompt: |
+        You have no tools in this conversation: answer from what you have read above.
+        Reason about the purpose and architectural significance of everything in
+        `<<path>>` in the `<<repo>>` repository. Why does it exist? What role does it
+        play in the system? What design decisions does it embody, and what
+        assumptions does it encode? Ground it in what you have read of this file,
+        its artifacts and its dependencies above, and in the analyses you can see of
+        the files around it.
     window: 8000
     score_threshold: 0.0
     budget:
@@ -993,6 +1045,18 @@ layers:
     description: |
       Risks, smells, performance concerns, security gaps, missing error
       handling (Phase 6).
+    ingest_unit: files
+    ingest:
+      unit: file
+      after: architectural_analysis
+      prompt: |
+        You have no tools in this conversation: answer from what you have read above.
+        Evaluate everything in `<<path>>` in the `<<repo>>` repository: what is good
+        about it and what is bad. Identify code-quality issues, architectural risks,
+        performance concerns, security vulnerabilities, maintainability problems,
+        missing error handling, implicit assumptions that could break, and
+        opportunities for improvement. Name each by where it is — the artifact, and
+        the lines where you can — and give the reason.
     window: 8000
     score_threshold: 0.0
     budget:
@@ -1044,6 +1108,17 @@ layers:
     description: |
       Concrete bugs and failure modes per file with severity + fix
       suggestion (Phase 7).
+    ingest_unit: files
+    ingest:
+      unit: file
+      after: critical_analysis
+      prompt: |
+        You have no tools in this conversation: answer from what you have read above.
+        Find the concrete bugs in `<<path>>` in the `<<repo>>` repository: places where
+        the code does the wrong thing, or will under an input or a state it can
+        meet. For each, give where it is (the artifact and the lines), how it fails,
+        what triggers it, how severe it is, and a fix. Report only bugs you can point
+        to in the code you have read; if you find none, say so.
     window: 8000
     score_threshold: 0.0
     budget:
@@ -1094,6 +1169,18 @@ layers:
   - name: daily_history
     description: |
       Per-day converged summaries of prior developer conversations.
+    ingest_unit: days
+    # One unit per closed day of dialogue, read from the day's conversations.
+    ingest:
+      unit: day
+      prompt: |
+        Here is the developer dialogue of <<day>>:
+
+        <<transcript>>
+        Write the history of that day: what was worked on, the decisions made, the
+        questions answered and the facts established — names, numbers and files as
+        they were given — as prose, in the order it happened. Record only what the
+        dialogue holds.
     window: 8000
     score_threshold: 0.0
     budget:
@@ -1144,6 +1231,17 @@ layers:
   - name: dream_log
     description: |
       Speculative exploration logs from the overnight dream phase.
+    ingest_unit: days
+    # One unit per day, continuing that day's history.
+    ingest:
+      unit: day
+      after: daily_history
+      prompt: |
+        You have the history of <<day>> above. Explore it speculatively: take the
+        threads of that day — and the critical and bug analyses of the code you can
+        see — most worth thinking past, and ask what if. For each, set out the idea,
+        the mechanism by which it would work, and what it would change. Say plainly
+        that it is speculation.
     window: 8000
     score_threshold: 0.0
     budget:

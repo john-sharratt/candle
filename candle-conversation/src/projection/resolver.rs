@@ -827,6 +827,13 @@ impl Conversation {
         self.inner.write().unwrap().mark_layer_append_only(layer);
     }
 
+    /// Let projections targeting the append-only `layer` draw `groups` of the
+    /// layers below it across conversations. See
+    /// [`crate::substrate::Substrate::set_ingest_sees`].
+    pub fn set_ingest_sees(&self, layer: LayerId, groups: HashSet<GroupId>) {
+        self.inner.write().unwrap().set_ingest_sees(layer, groups);
+    }
+
     /// Register a layer's [`CorruptTurnPolicy`] (from the projection schema),
     /// consulted at reload to decide whether an unrecoverable turn drops its whole
     /// conversation or just the turn. See
@@ -2314,6 +2321,9 @@ impl Conversation {
             // `Substrate::scoped_timelines_for_group` — so an out-of-scope
             // conversation is never scanned, and never teaches the group's
             // hit levels on this target's behalf.
+            // A layer the target compounds on is scored across conversations
+            // like a dialogue's, its own layer still self-local.
+            let self_local = self_local && sub.is_self_local_group(target.layer, group.id);
             let mut timelines: Vec<TimelineId> = if self_local || group.id == target.group {
                 vec![target.timeline]
             } else {
@@ -5280,7 +5290,10 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         // ingest layer (code_reading/repo_map), EVERY group is masked the same way
         // so a scope summary is grounded only in its own scope — the multi-timeline
         // scan (cross-file retrieval) belongs to dialogue, not ingest generation.
-        if group == self.target.group || self.read.is_append_only_layer(self.target.layer) {
+        // The exception is a layer that compounds on those below it: their groups
+        // are retrieved across conversations, its own stays masked
+        // (`Substrate::is_self_local_group`).
+        if group == self.target.group || self.read.is_self_local_group(self.target.layer, group) {
             // "My own history" spans the fork lineage: a conversation forked
             // from another continues it, so the ancestors' turns are its own
             // opening, oldest first. Each key keeps its own timeline, so

@@ -590,6 +590,10 @@ struct YamlLayer {
     /// default in the ingest driver; non-ingest layers ignore it.
     #[serde(default)]
     ingest_unit: Option<String>,
+    /// The host ingest's own description of how the layer is filled — see
+    /// [`LayerSchema::ingest`]. Passed through unread.
+    #[serde(default)]
+    ingest: Option<serde_yaml::Value>,
     /// Whether the layer's turns project into tool rounds — see
     /// [`LayerSchema::in_tool_rounds`]. Omitted → `true`.
     #[serde(default)]
@@ -1176,6 +1180,7 @@ fn build(
             // Its declaration index unless it says otherwise — the stack every
             // schema had before a layer could declare its place in it.
             rank: yl.rank.unwrap_or(layers.len() as i32),
+            ingest: yl.ingest.clone(),
         });
     }
 

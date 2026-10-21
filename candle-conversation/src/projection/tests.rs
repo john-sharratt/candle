@@ -1110,6 +1110,95 @@ fn ingest_self_projection_keeps_its_own_turns_past_the_window() {
     assert_eq!(indices, [0, 1, 2, 3], "every own turn is projected");
 }
 
+/// A layer below an ingest target, and the target layer with a window far
+/// smaller than its own lineage — an analysis unit continuing a file's whole
+/// reading, compounding on the analyses below it.
+const COMPOUNDING_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+layers:
+  - name: lower
+    window: 3000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: below
+        score_threshold: 0.6
+        selection: { kind: top_k, k: 4 }
+  - name: upper
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: own
+        score_threshold: 0.6
+        selection: { kind: top_k, k: 4 }
+"#;
+
+/// **An ingest target compounding on a layer below sees it at that layer's
+/// window**, not a slice of its own. The target's own turns — 16000 tokens of
+/// lineage — are kept whole and ask the budget for nothing; its window is
+/// 1000; the layer below holds two strong 1200-token units, which its own
+/// 3000-token window fits. Priced from the target's window, with its own turns
+/// taking their share, the units below were dropped for want of room.
+#[test]
+fn an_ingest_target_draws_the_layer_below_at_that_layers_window() {
+    let b = Builder::from_yaml(COMPOUNDING_YAML).unwrap();
+    let upper = b.id_for_layer("upper").unwrap();
+    let own = b.id_for_group("own").unwrap();
+    let below = b.id_for_group("below").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let own_turns: Vec<TurnIndex> = (0..4).map(|_| resolver.append(own)).collect();
+    let b0 = resolver.append(below);
+    let b1 = resolver.append(below);
+    let resolver = own_turns
+        .iter()
+        .fold(resolver, |r, &i| {
+            r.with_score(own, i, 0.0).with_tokens(own, i, 4000)
+        })
+        .with_score(below, b0, 0.9)
+        .with_tokens(below, b0, 1200)
+        .with_score(below, b1, 0.8)
+        .with_tokens(below, b1, 1200)
+        .as_ingest_self();
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: upper,
+            group: own,
+            timeline: MockResolver::timeline_of(own),
+        },
+        &resolver,
+    );
+    let drawn: Vec<u32> = proj
+        .sealed_turns()
+        .filter(|t| t.group() == below)
+        .map(|t| t.index().0)
+        .collect();
+    assert_eq!(drawn, [0, 1], "both units below are drawn: {drawn:?}");
+    let own_kept = proj.sealed_turns().filter(|t| t.group() == own).count();
+    assert_eq!(own_kept, 4, "the target's own turns are kept whole");
+}
+
 /// The same schema and the same zero-scored turns, but the target is NOT an
 /// ingest layer — retrieval, where a turn must earn its slot. The band applies
 /// exactly as before, so dialogue pulling this content back is untouched.

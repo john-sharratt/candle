@@ -4053,6 +4053,31 @@ impl Sequence {
         if self.config.disable_reprojection {
             return None;
         }
+        Some(self.recompute_projection_event(stats))
+    }
+
+    /// What the just-sealed turn's own signature scores each candidate
+    /// conversation at — its best turn, every conversation the belief scan
+    /// offered this target — highest first. The selection keeps only those
+    /// over their group's threshold; this is the whole field, for a caller
+    /// asking why something it expected was not brought in.
+    pub fn last_turn_candidate_scores(&self) -> Vec<(TimelineId, f32)> {
+        let mut best: std::collections::HashMap<TimelineId, f32> = std::collections::HashMap::new();
+        for (key, score) in self.last_turn_belief_scores().turn_scores() {
+            let e = best.entry(key.timeline).or_insert(f32::MIN);
+            *e = e.max(score);
+        }
+        let mut out: Vec<(TimelineId, f32)> = best.into_iter().collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        out
+    }
+
+    /// [`Self::projection_event`] for any conversation, reprojecting or not: the
+    /// projection a just-sealed turn's own signature selects. For a caller that
+    /// must see what a one-turn ingest conversation drew in — the layers built
+    /// on others are only as good as the units of other files their provenance
+    /// brings — where no live reprojection ever records it.
+    pub fn recompute_projection_event(&self, stats: &crate::stats::TurnStats) -> ProjectionEvent {
         let scores = self.last_turn_belief_scores();
         let resolver = self.substrate.read_for_scored(self.target, &scores);
         let projection = self.projection.project_with_selection(
@@ -4089,7 +4114,7 @@ impl Sequence {
             self.projection.schema(),
             |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
         );
-        Some(ev)
+        ev
     }
 
     /// Snapshot the handles the interactive projection probe needs into a
