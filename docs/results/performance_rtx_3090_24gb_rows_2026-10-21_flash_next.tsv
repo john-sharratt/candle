@@ -1,0 +1,12 @@
+test	label	depth	prompt_tokens	mode	int8	contexts	valid	prefill_tps	decode_tps	quantized_pct	compress	peak_tokens
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	BF16	prec	1	✓	276.4	71.9	-	-	905
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	BF16	prec	4	✓	958.0	238.3	-	-	3662
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	BF16	prec	8	✓	1398.8	326.4	-	-	7284
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	BF16	prec	16	✓	1855.0	342.5	-	-	14554
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	BF16	prec	1	✓	319.6	93.4	-	-	905
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	C0	prec	2	✓	593.1	163.6	100.0	2.20	1850
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	C5	prec	2	✓	595.2	157.4	100.0	3.81	1850
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	C5	prec	8	✓	1511.6	309.3	100.0	3.81	7284
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	C8	prec	2	✓	576.1	132.3	100.0	4.91	1850
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	C10	prec	2	✓	577.6	106.8	100.0	5.94	1466
+models::quantized_qwen38_moe::tests::test_parallel_batched_forwarding	Qwen3.8-Flash-Next-Q3_KO		-	C10	prec	8	✓	1419.9	196.5	100.0	5.90	5748
