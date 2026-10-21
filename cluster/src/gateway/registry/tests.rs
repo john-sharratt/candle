@@ -500,6 +500,38 @@ fn a_turn_is_priced_at_the_size_the_members_report() {
     assert_eq!(finish_us(m, pool(&r)), Some(60_000 + 384 * 40_000));
 }
 
+/// **A reply takes the steps it takes on that card.** A card committing 2.5
+/// tokens a step decodes a 500-token reply in 200 steps; priced at a token a
+/// step it looked 2.5 times slower and lost the pick to an equal card that does
+/// not speculate. Unlearned, a step is a token.
+#[test]
+fn a_speculating_card_is_priced_at_the_steps_its_reply_takes() {
+    let mut r = Registry::new();
+    for n in [1, 2] {
+        r.join(member(n, n));
+    }
+    let stated = |milli| Capacity {
+        prefill_tok_s: 1_000,
+        decode_step_next_us: 40_000,
+        prompt_tokens: 100,
+        reply_tokens: 500,
+        tokens_per_step_milli: milli,
+        ..capacity(MemberState::Ready, 100, true, 64)
+    };
+    r.capacity("zend", 1, stated(0));
+    r.capacity("zend", 2, stated(2_500));
+    assert_eq!(best(&mut r), Pick::Member(2));
+
+    let size = TurnSize {
+        prompt: 100,
+        reply: 500,
+    };
+    let unlearned = r.member("zend", 1).unwrap();
+    let speculating = r.member("zend", 2).unwrap();
+    assert_eq!(finish_us(unlearned, size), Some(100_000 + 500 * 40_000));
+    assert_eq!(finish_us(speculating, size), Some(100_000 + 200 * 40_000));
+}
+
 /// **A member fresh from a restart is probed, not handed a share of a burst.**
 /// Run 36's heavy-decode at 19:01:21: BlackWorld learned (2,660 tok/s, a 20.8
 /// ms step widening to 70.2 ms), WhiteWorld restarted with nothing learned.

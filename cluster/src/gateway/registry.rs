@@ -770,7 +770,7 @@ fn best_of(ready: Vec<&MemberView>) -> Option<u64> {
 fn placement_view(m: &MemberView, size: TurnSize) -> String {
     let c = capacity_of(m);
     format!(
-        "{:016x} room={} in_flight={} placed={} backlog={} prefill_tok_s={} prefill_wide={} step_next_us={} step_wide_us={} finish_ms={}",
+        "{:016x} room={} in_flight={} placed={} backlog={} prefill_tok_s={} prefill_wide={} step_next_us={} step_wide_us={} tok_per_step_milli={} finish_ms={}",
         m.node,
         has_room(m),
         m.in_flight,
@@ -780,6 +780,7 @@ fn placement_view(m: &MemberView, size: TurnSize) -> String {
         c.prefill_tok_s_wide,
         c.decode_step_next_us,
         c.decode_step_wide_us,
+        c.tokens_per_step_milli,
         finish_us(m, size).map_or_else(|| "-".to_string(), |f| (f / 1000).to_string()),
     )
 }
@@ -789,9 +790,10 @@ fn placement_view(m: &MemberView, size: TurnSize) -> String {
 /// "earliest advertised finish"): the prefill already queued there, the
 /// turns handed to it and not yet in its queue, and this one, at the prefill
 /// rate those turns and this one leave it ([`token_ns_with`]); then the reply
-/// at the decode step they give it ([`step_with_us`]) — each turn of `size`.
-/// `None` until it has learned both rates — a member is never placed by
-/// figures it has not measured.
+/// at the decode step they give it ([`step_with_us`]), over as many steps as
+/// the reply takes at the tokens a step commits there ([`reply_steps`]) — each
+/// turn of `size`. `None` until it has learned both rates — a member is never
+/// placed by figures it has not measured.
 fn finish_us(m: &MemberView, size: TurnSize) -> Option<u64> {
     let c = capacity_of(m);
     if c.prefill_tok_s == 0 || c.decode_step_next_us == 0 {
@@ -802,7 +804,19 @@ fn finish_us(m: &MemberView, size: TurnSize) -> Option<u64> {
     let pending = m.placed.min(m.in_flight);
     let tokens = u64::from(c.prefill_backlog) + (u64::from(pending) + 1) * size.prompt;
     let prefill_us = tokens * token_ns_with(c, pending + 1) / 1000;
-    Some(prefill_us + size.reply * step_with_us(c, pending + 1))
+    Some(prefill_us + reply_steps(c, size.reply) * step_with_us(c, pending + 1))
+}
+
+/// The steps a reply of `reply` tokens takes on `c`: one a token, or fewer
+/// where it speculates (`Capacity::tokens_per_step_milli`). **Per card, not
+/// pooled**: what a step commits is the card's, where the turn's size is the
+/// turn's. Priced at a token a step, a card committing 2.6 looked 2.6 times
+/// slower than it decoded, and took fewer turns the more speculation helped it.
+fn reply_steps(c: &Capacity, reply: u64) -> u64 {
+    match u64::from(c.tokens_per_step_milli) {
+        0 => reply,
+        milli => (reply * 1000).div_ceil(milli.max(1000)),
+    }
 }
 
 /// The time one prompt token takes with `extra` rows more than `c` reports

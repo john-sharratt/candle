@@ -372,6 +372,7 @@ impl Cluster {
                     prefill_tok_s_wide: r.prefill_tok_s_plus_wide,
                     prompt_tokens: r.prompt_tokens,
                     reply_tokens: r.reply_tokens,
+                    tokens_per_step: r.tokens_per_step,
                     high_backlog_tokens: r.high_backlog_tokens,
                 });
                 capacity(state, telemetry.capacity(), wave, rates, measure())

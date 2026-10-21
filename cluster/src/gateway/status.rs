@@ -137,6 +137,7 @@ pub struct MemberRow {
     pub prefill_tok_s_wide: Option<u32>,
     pub prompt_tokens: Option<u32>,
     pub reply_tokens: Option<u32>,
+    pub tokens_per_step_milli: Option<u32>,
     /// Requests this gateway has handed it and it is still answering (§5.3).
     pub in_flight: u32,
     pub state: &'static str,
@@ -202,6 +203,7 @@ impl MemberRow {
             prefill_tok_s_wide: c.map(|c| c.prefill_tok_s_wide),
             prompt_tokens: c.map(|c| c.prompt_tokens),
             reply_tokens: c.map(|c| c.reply_tokens),
+            tokens_per_step_milli: c.map(|c| c.tokens_per_step_milli),
             in_flight: m.in_flight,
             state: state_name(m.state()),
             session: m.session,
@@ -315,6 +317,7 @@ mod tests {
             prefill_tok_s_wide: None,
             prompt_tokens: None,
             reply_tokens: None,
+            tokens_per_step_milli: None,
             in_flight: 0,
             state: "ready",
             session: 1,

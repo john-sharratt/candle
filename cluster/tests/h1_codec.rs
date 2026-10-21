@@ -63,6 +63,7 @@ fn mix() -> Vec<Frame> {
             prefill_tok_s_wide: 1_900,
             prompt_tokens: 2_700,
             reply_tokens: 380,
+            tokens_per_step_milli: 1_000,
         }),
         Frame::Prepare(Prepare {
             key: b"world/w1".to_vec(),

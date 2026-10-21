@@ -106,8 +106,11 @@ member's scheduler begins and the reply such a turn decodes — one size for eve
 candidate, the mean of what they report, 2,048 and 512 where none has learned
 one): the backlog, plus one prompt for each
 request handed to it since its last `CAPACITY` and for this one, at the time
-per token those requests and this one leave it; then 512 tokens at the step
-they make. Both are on the line through the one-more and wide figures — time
+per token those requests and this one leave it; then the reply at the step
+they make, over as many steps as the reply takes at the tokens a step commits
+on that card (`tokens_per_step_milli`, above a token where it speculates; a
+token when unlearned) — per card, since what a step commits is the card's
+where the turn's size is the turn's. Both are on the line through the one-more and wide figures — time
 per token for prefill, so the extension never reaches a rate of zero —
 extended past the wide point, and flat when the wide figure is no slower. A
 request handed earlier is not charged again: it is queued, and in the

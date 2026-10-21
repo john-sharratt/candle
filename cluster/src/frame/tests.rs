@@ -213,6 +213,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 prefill_tok_s_wide: 640,
                 prompt_tokens: 3_100,
                 reply_tokens: 410,
+                tokens_per_step_milli: 2_650,
             }),
             B::header(11, 0, 0)
                 .u8(0)
@@ -237,6 +238,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u32(640)
                 .u32(3_100)
                 .u32(410)
+                .u32(2_650)
                 .0,
         ),
         (

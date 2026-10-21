@@ -53,6 +53,9 @@ pub struct Rates {
     /// such a turn decodes, in tokens; zero until learned.
     pub prompt_tokens: f64,
     pub reply_tokens: f64,
+    /// Tokens a decoding sequence commits a step, above 1 where it speculates;
+    /// zero until learned.
+    pub tokens_per_step: f64,
     /// Prompt tokens a placed turn would queue behind: those waiting at its
     /// own priority. Background ingest is not among them — a placed turn goes
     /// ahead of it.
@@ -141,6 +144,7 @@ pub fn capacity(
         }),
         prompt_tokens: rates.map_or(0, |r| tokens(r.prompt_tokens)),
         reply_tokens: rates.map_or(0, |r| tokens(r.reply_tokens)),
+        tokens_per_step_milli: rates.map_or(0, |r| tokens(r.tokens_per_step * 1000.0)),
     }
 }
 
@@ -255,6 +259,7 @@ mod tests {
             prefill_tok_s_wide: 640.4,
             prompt_tokens: 3_100.4,
             reply_tokens: 409.6,
+            tokens_per_step: 2.6504,
             high_backlog_tokens: 6_144,
         };
         let c = capacity(
@@ -270,6 +275,7 @@ mod tests {
         );
         assert_eq!((c.decode_step_wide_us, c.prefill_tok_s_wide), (96_250, 640));
         assert_eq!((c.prompt_tokens, c.reply_tokens), (3_100, 410));
+        assert_eq!(c.tokens_per_step_milli, 2_650);
         assert!(!c.idle, "the ingest still keeps it from admitting now");
         // A wide step learned below the one-more step, and a wide rate above
         // the one-more rate, are said as flat.
@@ -309,6 +315,7 @@ mod tests {
             prefill_tok_s_wide: 0.0,
             prompt_tokens: 0.0,
             reply_tokens: 0.0,
+            tokens_per_step: 0.0,
             high_backlog_tokens: 0,
         };
         let c = capacity(

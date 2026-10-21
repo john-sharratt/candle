@@ -78,6 +78,10 @@ pub struct Capacity {
     /// fixed nominal. Zero until learned.
     pub prompt_tokens: u32,
     pub reply_tokens: u32,
+    /// Tokens a decoding sequence commits a step on this card, in thousandths:
+    /// above 1000 where it speculates. A reply of `reply_tokens` takes that many
+    /// fewer steps, which the step time alone does not say. Zero until learned.
+    pub tokens_per_step_milli: u32,
 }
 
 /// The rows beyond its decodes at which a member states its wide figures
@@ -107,7 +111,8 @@ impl Capacity {
             .u32(self.decode_step_wide_us)
             .u32(self.prefill_tok_s_wide)
             .u32(self.prompt_tokens)
-            .u32(self.reply_tokens);
+            .u32(self.reply_tokens)
+            .u32(self.tokens_per_step_milli);
     }
 
     pub fn read(r: &mut Reader) -> Result<Self, WireError> {
@@ -132,6 +137,7 @@ impl Capacity {
             prefill_tok_s_wide: r.u32()?,
             prompt_tokens: r.u32()?,
             reply_tokens: r.u32()?,
+            tokens_per_step_milli: r.u32()?,
         })
     }
 

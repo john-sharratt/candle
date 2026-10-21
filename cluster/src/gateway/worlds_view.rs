@@ -201,6 +201,7 @@ mod tests {
             prefill_tok_s_wide: None,
             prompt_tokens: None,
             reply_tokens: None,
+            tokens_per_step_milli: None,
             in_flight: 0,
             state,
             session: 1,
