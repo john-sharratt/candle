@@ -1514,6 +1514,19 @@ impl Conversation {
         // attributably. One line per scan.
         let groups = GROUP_SCAN_SPLIT.take();
         let arena = scan_split::take();
+        // The same split in the profile table, where it sits beside the
+        // reprojection that waits on it.
+        let us = Duration::from_micros;
+        profile::record("beliefs:groups:select", us(groups.select_us));
+        profile::record("beliefs:groups:assemble", us(groups.assemble_us));
+        profile::record("beliefs:groups:score", us(groups.score_us));
+        profile::record("beliefs:groups:normalize", us(groups.normalize_us));
+        profile::record("beliefs:arena:index", us(arena.index_us));
+        profile::record("beliefs:arena:upload", us(arena.upload_us));
+        profile::record("beliefs:arena:kernel", us(arena.kernel_us));
+        profile::record("beliefs:arena:readback", us(arena.readback_us));
+        profile::record("beliefs:arena:rows", us(arena.rows_us));
+        profile::record("beliefs:arena:tally", us(arena.tally_us));
         tracing::debug!(
             target: "candle_conversation::provenance",
             probe_windows = probe.len(),
@@ -3395,7 +3408,9 @@ impl Conversation {
         if keys.is_empty() {
             return Vec::new();
         }
+        let lock_wait = profile::span("cold:persistence_lock");
         let mut p = self.persistence.lock().unwrap();
+        lock_wait.end();
         let substrate = self.read();
         keys.iter()
             .map(|&key| {

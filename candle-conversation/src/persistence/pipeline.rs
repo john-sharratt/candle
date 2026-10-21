@@ -238,6 +238,7 @@ pub fn run_pipeline(
     if chunk_batch.total_bytes == 0 {
         return Ok(PipelineStats::default());
     }
+    let t_run = Instant::now();
 
     let unit_plan = super::chunk_plan::plan_units(chunk_batch, UNIT_BYTES);
     let n_units = unit_plan.units.len();
@@ -405,7 +406,9 @@ pub fn run_pipeline(
 
     // Every record's golden, checked where its bytes now are, before the
     // staging that holds them goes back.
+    let t_golden = Instant::now();
     let _mismatched = verify_goldens(device, staging_base, &goldens)?;
+    profile::record("cold:golden", t_golden.elapsed());
 
     // The staging goes back to the held ground fenced on the stream, so the
     // next holder of its range waits for this batch's copies and migrate;
@@ -415,6 +418,11 @@ pub fn run_pipeline(
 
     let total_ms = t_total.elapsed().as_millis() as u64;
     let reads_ms = reads_done_at_ms.load(Ordering::Relaxed);
+    // The run beside its allocator stages: whether a cold load's time went to
+    // the disk, the scatter, or the fixed cost of standing a run up.
+    profile::record("cold:run", t_run.elapsed());
+    profile::record("cold:reads", Duration::from_millis(reads_ms));
+    profile::record("cold:migrate", Duration::from_millis(migrate_ms));
     Ok(PipelineStats {
         reads_ms,
         alloc_ms: alloc_brk.alloc_ms,

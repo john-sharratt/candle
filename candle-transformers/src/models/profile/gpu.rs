@@ -94,7 +94,7 @@ pub fn begin_gpu_span_forward(bulk: bool) {
 pub(super) fn span_weight(bulk: bool, n: u32, period: u32) -> u32 {
     if bulk {
         1
-    } else if n % period == 0 {
+    } else if n.is_multiple_of(period) {
         period
     } else {
         0

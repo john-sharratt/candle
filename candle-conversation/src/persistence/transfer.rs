@@ -32,6 +32,7 @@ mod cuda_impl {
     use crate::persistence::segment::SegmentId;
     use crate::persistence::streams::{StreamId, TurnDecl};
     use crate::persistence::SubstratePersistence;
+    use crate::scheduler::profile;
     use crate::substrate::Substrate;
 
     fn cuda_device(device: &Device) -> Result<&candle::CudaDevice> {
@@ -325,6 +326,9 @@ mod cuda_impl {
         let _dev = cuda_device(device)?;
 
         let t_total = Instant::now();
+        // The whole stream, so the gap between it and its pipeline runs is the
+        // per-stream cost: planning, slots, segment handles, the final record.
+        let _stream_span = profile::span("cold:stream");
 
         // Build the chunk plan up front, sized to the stager's ACTUAL pinned
         // buffer so large turns (>64 MB) partition into batches that each fit —

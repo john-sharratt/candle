@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use candle::cuda_backend::cudarc::driver::result::memcpy_dtoh_async;
+#[cfg(feature = "profile")]
+use candle::cuda_backend::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::cuda_backend::staged::segment;
 use candle::cuda_backend::Held;
@@ -665,6 +667,11 @@ impl GalleryArena {
             let (p_pos_map, _g6) = d_idx.pos_map.device_ptr(&stream);
             let p_out_case = room;
             let p_out_vote = room + (n_out * std::mem::size_of::<i32>()) as u64;
+            // The kernel's own device time, apart from whatever the shared
+            // stream had queued ahead of it — the wall-clock sync below counts
+            // both.
+            #[cfg(feature = "profile")]
+            let ev_start = stream.record_event(Some(CU_EVENT_DEFAULT)).ok();
             let mut launched = false;
             for &backend in &candidates {
                 match backend {
@@ -696,6 +703,13 @@ impl GalleryArena {
                             )
                         };
                         if rc == 0 {
+                            profile::record(
+                                match backend {
+                                    PagedBackend::Bmma => "arena:backend_bmma",
+                                    _ => "arena:backend_imma",
+                                },
+                                Duration::ZERO,
+                            );
                             launched = true;
                             break;
                         }
@@ -764,6 +778,7 @@ impl GalleryArena {
                                 stream.cu_stream() as *mut c_void,
                             );
                         }
+                        profile::record("arena:backend_scalar", Duration::ZERO);
                         launched = true;
                         break;
                     }
@@ -775,11 +790,19 @@ impl GalleryArena {
                 ));
             }
             profile::record("arena:launch_enqueue", t_kernel.elapsed());
+            #[cfg(feature = "profile")]
+            let ev_stop = stream.record_event(Some(CU_EVENT_DEFAULT)).ok();
             let t_sync = Instant::now();
             stream
                 .synchronize()
                 .map_err(|e| candle::Error::Msg(format!("paged scan: synchronize: {e}")))?;
             profile::record("arena:launch_sync", t_sync.elapsed());
+            #[cfg(feature = "profile")]
+            if let (Some(start), Some(stop)) = (&ev_start, &ev_stop) {
+                if let Ok(ms) = start.elapsed_ms(stop) {
+                    profile::record("arena:kernel_gpu", Duration::from_secs_f32(ms / 1000.0));
+                }
+            }
 
             let t_readback = Instant::now();
             // SAFETY: both ranges are this launch's outputs inside the scratch,
@@ -1449,18 +1472,19 @@ mod tests {
         }
     }
 
-    /// Adversarial BMMA-vs-scalar parity over a large randomized corpus that
+    /// Adversarial tensor-vs-scalar parity over a large randomized corpus that
     /// hits every structural edge at once: 1-token exchanges, case-id GAPS
     /// (empty cases), windows supplied in DESCENDING case order (exercises the
-    /// build_index sort the BMMA dense-rank relies on), out-of-range cases
-    /// (dropped), seam sub-windows of one multi-page turn split across cases,
-    /// segments that straddle 64-token chunk boundaries, and probe/token counts
-    /// that are not multiples of the 8/32/64 tile shapes. The two backends'
-    /// integer statistics are identical by construction and the float finalize
-    /// is shared, so the votes must be bit-for-bit equal. Skips without CUDA
-    /// or on hardware without b1 BMMA.
+    /// build_index sort the tensor backends' dense-rank relies on), out-of-range
+    /// cases (dropped), seam sub-windows of one multi-page turn split across
+    /// cases, segments that straddle 64-token chunk boundaries, and probe/token
+    /// counts that are not multiples of the 8/32/64 tile shapes — up to probes
+    /// of several query tiles. The backends' integer statistics are identical by
+    /// construction and the float finalize is shared, so the votes must be
+    /// bit-for-bit equal. Each tensor backend the device has is checked: b1 BMMA
+    /// on Ada, INT8 IMMA on Ampere and later — Blackwell has only the latter.
     #[test]
-    fn bmma_matches_scalar_on_adversarial_corpus() {
+    fn tensor_backends_match_scalar_on_adversarial_corpus() {
         let device = match Device::new_cuda(0) {
             Ok(d) => d,
             Err(_) => return,
@@ -1468,9 +1492,10 @@ mod tests {
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let (has_bmma, has_imma) = arena.tensor_caps();
-        if !has_bmma || !has_imma {
-            return; // needs both tensor backends for the 3-way comparison
-        }
+        assert!(
+            has_bmma || has_imma,
+            "a CUDA device here has at least one tensor backend"
+        );
 
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
         // Turn lengths spanning page boundaries and tile tails.
@@ -1538,8 +1563,9 @@ mod tests {
             segs.push(PagedSegment { windows, n_cases });
         }
 
-        // Probes exercising tile tails: 1, 9, and 100 query tokens.
-        let probes_owned: Vec<Vec<WideQSig>> = [1usize, 9, 100]
+        // Probes exercising tile tails: 1, 9 and 100 query tokens, and 161 —
+        // six query tiles, the last holding one row.
+        let probes_owned: Vec<Vec<WideQSig>> = [1usize, 9, 100, 161]
             .iter()
             .map(|&n| (0..n).map(|_| rand_sig(&mut rng)).collect())
             .collect();
@@ -1560,17 +1586,30 @@ mod tests {
                         "probe {pi} case {ci}: scalar {s} vs auto {b} must be bit-identical"
                     );
                 }
-                // The INT8 (IMMA) backend — the Blackwell production path,
-                // parity-proven here on Ada — must also match bit-for-bit.
-                let imma = arena
-                    .scan_weighted_imma(&segs, &[probe.as_slice()], weights)
-                    .unwrap();
-                for (ci, (s, m)) in scalar[0].iter().zip(&imma[0]).enumerate() {
-                    assert_eq!(
-                        s.to_bits(),
-                        m.to_bits(),
-                        "probe {pi} case {ci}: scalar {s} vs IMMA {m} must be bit-identical"
-                    );
+                if has_bmma {
+                    let bmma = arena
+                        .scan_weighted_bmma(&segs, &[probe.as_slice()], weights)
+                        .unwrap();
+                    for (ci, (s, m)) in scalar[0].iter().zip(&bmma[0]).enumerate() {
+                        assert_eq!(
+                            s.to_bits(),
+                            m.to_bits(),
+                            "probe {pi} case {ci}: scalar {s} vs BMMA {m} must be bit-identical"
+                        );
+                    }
+                }
+                // The INT8 (IMMA) backend — the Blackwell production path.
+                if has_imma {
+                    let imma = arena
+                        .scan_weighted_imma(&segs, &[probe.as_slice()], weights)
+                        .unwrap();
+                    for (ci, (s, m)) in scalar[0].iter().zip(&imma[0]).enumerate() {
+                        assert_eq!(
+                            s.to_bits(),
+                            m.to_bits(),
+                            "probe {pi} case {ci}: scalar {s} vs IMMA {m} must be bit-identical"
+                        );
+                    }
                 }
             }
         }
