@@ -1,11 +1,13 @@
 //! Per-slot projection assembler — rebuilds the slot's prefix K/V for each
-//! projection, keeping whatever leading run of it the slot already holds.
+//! projection, keeping every piece of it the slot already holds.
 //!
-//! Snapshots the slot's writer tail, cuts the slot back to the end of the
-//! longest run of pieces it already holds exactly as this projection would
-//! build them ([`super::piece_identity`]; nothing, when the first piece
-//! differs), then walks the rest of the [`assemble_pieces`] output in logical
-//! order, building the slot's chunk list IN PLACE:
+//! Snapshots the slot's writer tail and aligns the pieces the slot holds with
+//! the ones this projection wants ([`super::piece_splice`]). A sealed piece the
+//! slot holds stays where it is, wherever the projection changed around it: the
+//! slot is cut after the last held piece still wanted, each change before that
+//! is spliced in where it falls — K/V, per-position state and token log
+//! together — and the rest of the [`assemble_pieces`] output is walked onto the
+//! tail in logical order, building the slot's chunk list IN PLACE:
 //!
 //! - `Section` / `Turn` — resolve the substrate entry's per-layer sealed K/V and
 //!   Arc-clone it onto the slot.
@@ -21,12 +23,14 @@
 //! walker logical_pos`) guards it. The in-flight user message is deferred to
 //! prefill after the gaps are filled; the writer tail is re-attached at the end.
 //!
-//! A kept piece is kept only when its chained identity — the piece and every
-//! piece before it — matches what the slot's last complete assembly placed, so
-//! the assembled K/V always reflects the exact segment sequence the resolver
-//! selected this call. Glue islands are cached separately, keyed by the same
-//! prefix identity.
+//! A sealed piece is kept by its own identity, since its K/V is the same
+//! wherever it sits; a forwarded one — glue, the live message — only while its
+//! chained identity, the piece and every piece before it, matches what the slot
+//! placed, since its K/V was computed against all of that. The assembled K/V
+//! therefore always reflects the exact segment sequence the resolver selected
+//! this call. Glue islands are cached separately, keyed by the prefix identity.
 
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::Hasher;
@@ -34,11 +38,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle::{Device, Tensor};
-use candle_nn::kv_cache::{SealedSequence, WriterTail};
+use candle_nn::kv_cache::{ArenaLocation, SealedSequence, WriterTail, CHUNK_SIZE};
 use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, PendingGlue, WINDOW_DIVERGENCE_MARKER,
 };
 use candle_transformers::models::expert_lre::is_expert_stall;
+use candle_transformers::models::piece_key::PieceKey;
+use candle_transformers::models::positional_piece::PositionalPiece;
 use candle_transformers::models::sealed_injection::SealedInjection;
 
 use crate::conversation::slice_per_layer_sealed;
@@ -53,8 +59,9 @@ use crate::projection::{
 use crate::scheduler::injected_piece::InjectedPiece;
 use crate::scheduler::pending_ranges::PendingRanges;
 use crate::scheduler::piece_identity::{
-    chained_identities, fit_kept_prefix, kept_prefix, piece_label, PieceReads,
+    alignment_identities, chained_identities, piece_label, PieceReads,
 };
+use crate::scheduler::piece_splice::{plan_splice, HeldPiece, PieceKind, SplicePlan, WantedPiece};
 use crate::scheduler::profile;
 use crate::scheduler::projection_identity::section_content_stamp;
 use crate::scheduler::section_pages::SectionPages;
@@ -110,54 +117,83 @@ pub(super) struct SlotState {
     pub(super) placed_pieces: Vec<PlacedPiece>,
 }
 
-/// One piece an assembly placed, and the slot as it stood right after it.
+/// One piece an assembly placed: what it is, what it occupies, and the slot as
+/// it stood right after it.
 #[derive(Clone)]
 pub(super) struct PlacedPiece {
-    /// The piece's identity chained through every piece before it.
+    /// The piece's alignment identity (`piece_identity::alignment_identities`):
+    /// a sealed piece's own, a forwarded piece's chained.
     identity: u64,
-    /// The slot's block count after the piece — where a kept prefix is cut.
+    kind: PieceKind,
+    /// Blocks and positions the piece occupies.
+    blocks: usize,
+    tokens: u32,
+    /// The slot's block count after the piece — where a cut after it lands.
     blocks_after: usize,
     /// The slot's logical position after the piece.
     pos_after: u32,
-    /// The glue-island cache key's running prefix hash after the piece, so a
-    /// walk resumed here keys its islands exactly as a whole walk would.
+    /// The piece's contribution to the glue-island cache's running prefix hash.
+    contrib: u64,
+    /// The running prefix hash after the piece, so a walk resumed here keys
+    /// its islands exactly as a whole walk would.
     prefix_h: DefaultHasher,
+    /// The turn or section the piece is, for writing back where it sits when a
+    /// splice moves it; `None` for glue and turn halves, which record none.
+    range: Option<PieceRange>,
     /// The index page the piece was placed with, held while the slot holds the
     /// piece: a rebuild that re-walks the turn finds the page again without
     /// reading the log (`HeldIndexPages`), and a cut or a freed slot lets it go.
     page: Option<Arc<StoredPages>>,
 }
 
+/// Which substrate range a placed piece's position is written to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PieceRange {
+    Turn(TimelineId, TurnIndex),
+    Section(SectionId),
+}
+
 #[cfg(test)]
 impl PlacedPiece {
+    /// Where the record says the slot stood after the piece: its block and
+    /// position ends, and the running prefix hash there.
+    pub(super) fn ends(&self) -> (usize, u32, u64) {
+        (self.blocks_after, self.pos_after, self.prefix_h.finish())
+    }
+
     /// A record of one piece the slot holds through `blocks_after` — for tests
     /// that need a kept prefix on record without walking an assembly.
     pub(super) fn ending_at(blocks_after: usize) -> Self {
         Self {
             identity: 1,
+            kind: PieceKind::Sealed,
+            blocks: blocks_after,
+            tokens: (blocks_after * 32) as u32,
             blocks_after,
             pos_after: (blocks_after * 32) as u32,
+            contrib: 0,
             prefix_h: DefaultHasher::new(),
+            range: None,
             page: None,
         }
     }
 }
 
-/// Cut the record of what the slot holds back to its first `keep` pieces, and
-/// hand back the index pages the cut pieces held.
-///
-/// **The caller keeps them until its walk ends.** A rebuild re-places most of
-/// what it cuts — every turn behind the first piece that changed — and a page
-/// still held is found again by its record instead of read off the log
-/// (`HeldIndexPages`). Dropped at the cut, every one of them was read again:
-/// 8,778 log reads in a 155 s turn on BlackWorld (2026-10-21).
-fn cut_placed(state: &mut SlotState, keep: usize) -> Vec<Arc<StoredPages>> {
-    let from = keep.min(state.placed_pieces.len());
-    state
-        .placed_pieces
-        .drain(from..)
-        .filter_map(|p| p.page)
-        .collect()
+/// Lay `records` end to end from the slot's start: each one's cumulative
+/// block and position ends, and the running prefix hash folded over the
+/// contributions before it. A splice moves every piece after it, and this is
+/// where the records learn where they now stand.
+fn restack(records: &mut [PlacedPiece]) {
+    let (mut blocks, mut pos) = (0usize, 0u32);
+    let mut prefix_h = DefaultHasher::new();
+    for r in records {
+        blocks += r.blocks;
+        pos += r.tokens;
+        prefix_h.write_u64(r.contrib);
+        r.blocks_after = blocks;
+        r.pos_after = pos;
+        r.prefix_h = prefix_h.clone();
+    }
 }
 
 /// Where the system prompt ends in a slot `placed` describes: the position
@@ -880,6 +916,246 @@ fn content_block_count_of(
         })
 }
 
+/// Cut the slot after its first `keep` held pieces — K/V, per-position state
+/// and token log together. Keeping nothing truncates to nothing, and the
+/// per-position state goes with the K/V: pages left from the previous assembly
+/// would sit at positions this one does not have.
+fn cut_slot(
+    ctx: &mut ApplyContext<'_>,
+    held: &[PlacedPiece],
+    keep: usize,
+) -> Result<(), ConversationError> {
+    let parent_id = ctx.parent_id;
+    match keep.checked_sub(1).map(|i| &held[i]) {
+        None => {
+            ctx.session
+                .truncate_sequence_to_blocks(parent_id.0, 0)
+                .map_err(ConversationError::Model)?;
+            ctx.model
+                .reset_positional_state(parent_id.0)
+                .map_err(ConversationError::Model)?;
+            if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
+                entry.clear();
+            }
+        }
+        Some(last) => {
+            ctx.session
+                .truncate_sequence_to_blocks(parent_id.0, last.blocks_after)
+                .map_err(ConversationError::Model)?;
+            ctx.model
+                .truncate_positional_state(parent_id.0, last.pos_after as usize)
+                .map_err(ConversationError::Model)?;
+            if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
+                entry.truncate(last.pos_after as usize);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Where held piece `i` starts: the block and position the piece before it
+/// ends at.
+fn held_edge(held: &[PlacedPiece], i: usize) -> (usize, usize) {
+    i.checked_sub(1).map_or((0, 0), |j| {
+        (held[j].blocks_after, held[j].pos_after as usize)
+    })
+}
+
+/// Apply `plan`'s edits and return the records of the pieces before
+/// `plan.walk_from`, in the projection's order, laid end to end where they now
+/// stand.
+///
+/// Back to front, so each edit's blocks and positions are the slot's as it
+/// stood. An edit evicts its held pieces' K/V, walks its wanted pieces in at
+/// their place ([`InsertCursor`]), and then replaces the per-position state and
+/// token log the held pieces covered with what the wanted ones brought, in one
+/// splice each. Every piece from the first edit on has moved, so its substrate
+/// range is written again once all of them stand where they will.
+fn splice_edits(
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    plan: &SplicePlan,
+    held: &[PlacedPiece],
+    pieces: &[AssembledPiece],
+    aligned: &[(u64, PieceKind)],
+) -> Result<Vec<PlacedPiece>, ConversationError> {
+    let parent_id = ctx.parent_id;
+    let mut put_in: HashMap<usize, PlacedPiece> = HashMap::new();
+    for edit in plan.edits.iter().rev() {
+        let (from_block, from_pos) = held_edge(held, edit.held.start);
+        let (to_block, to_pos) = held_edge(held, edit.held.end);
+        if to_block > from_block {
+            ctx.session
+                .splice_sealed(
+                    parent_id.0,
+                    from_block,
+                    to_block,
+                    &no_kv(ctx.session.num_layers()),
+                )
+                .map_err(ConversationError::Model)?;
+        }
+        walker.insert = Some(InsertCursor {
+            block: from_block,
+            positional: Vec::new(),
+            tokens: Vec::new(),
+        });
+        for w in edit.wanted.clone() {
+            let block_before = walker.insert.as_ref().map_or(from_block, |c| c.block);
+            let pos_before = walker.logical_pos;
+            let contrib = walk_sealed_piece(ctx, walker, &pieces[w])?;
+            let blocks = walker.insert.as_ref().map_or(block_before, |c| c.block) - block_before;
+            put_in.insert(
+                w,
+                PlacedPiece {
+                    identity: aligned[w].0,
+                    kind: aligned[w].1,
+                    blocks,
+                    tokens: walker.logical_pos - pos_before,
+                    blocks_after: 0,
+                    pos_after: 0,
+                    contrib,
+                    prefix_h: DefaultHasher::new(),
+                    range: placed_range(&pieces[w], blocks),
+                    page: walker.placed_page.take(),
+                },
+            );
+        }
+        let cursor = walker.insert.take().ok_or_else(|| {
+            ConversationError::Channel("apply_segments: the edit lost its cursor".into())
+        })?;
+        ctx.model
+            .splice_positional_state(parent_id.0, from_pos, to_pos, &cursor.positional)
+            .map_err(ConversationError::Model)?;
+        if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
+            if to_pos <= entry.len() {
+                entry.splice(from_pos..to_pos, cursor.tokens);
+            }
+        }
+    }
+    let mut records = plan
+        .keeps
+        .iter()
+        .enumerate()
+        .map(|(w, kept)| match kept {
+            Some(h) => Ok(held[*h].clone()),
+            None => put_in.remove(&w).ok_or_else(|| {
+                ConversationError::Channel(format!(
+                    "apply_segments: piece {w} is neither kept nor put in by the splice plan"
+                ))
+            }),
+        })
+        .collect::<Result<Vec<PlacedPiece>, ConversationError>>()?;
+    restack(&mut records);
+    if let Some(first) = plan.edits.first() {
+        for r in &records[first.wanted.start..] {
+            record_range(walker, r);
+        }
+    }
+    Ok(records)
+}
+
+/// An empty piece on each of `layers` layers — what a splice that only evicts
+/// puts in.
+fn no_kv(layers: usize) -> Vec<SealedSequence> {
+    (0..layers)
+        .map(|_| SealedSequence {
+            chunks: Vec::new(),
+            token_count: 0,
+            chunk_size: CHUNK_SIZE,
+            location: ArenaLocation::Gpu,
+        })
+        .collect()
+}
+
+/// Walk one sealed piece onto the slot where the walk is placing, and return
+/// its contribution to the running prefix hash: its kind, what identifies it,
+/// and the tokens it actually placed — a skipped piece hashes as a zero-length
+/// placement, distinct from an injected one.
+fn walk_sealed_piece(
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    piece: &AssembledPiece,
+) -> Result<u64, ConversationError> {
+    let pos_before = walker.logical_pos;
+    let t = Instant::now();
+    let mut c = DefaultHasher::new();
+    match piece {
+        AssembledPiece::Section(id) => {
+            let _g = profile::span("apply:inject_section");
+            inject_sealed_section(ctx, walker, *id)?;
+            c.write_u8(2);
+            c.write_u32(id.raw());
+            // Content stamp: the section's stored token Arc — STABLE across
+            // calls (an accessor-minted Arc like `section_sealed_of`'s would
+            // differ every reproject and defeat the cache); a re-seal replaces
+            // the stored Arc, moving the hash.
+            let toks = ctx.conversation.read().section_tokens_of(*id);
+            c.write_u64(Arc::as_ptr(&toks) as u64);
+            c.write_u64(toks.len() as u64);
+        }
+        AssembledPiece::Turn {
+            group,
+            index,
+            role,
+            timeline,
+        } => {
+            let _g = profile::span("apply:inject_turn");
+            inject_sealed_turn(ctx, walker, *timeline, *group, *index, *role)?;
+            c.write_u8(3);
+            c.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
+            c.write_u32(index.0);
+            c.write_u8(*role as u8);
+        }
+        AssembledPiece::TurnHalf {
+            group,
+            index,
+            timeline,
+        } => {
+            inject_sealed_turn_half(ctx, walker, *timeline, *group, *index)?;
+            c.write_u8(4);
+            c.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
+            c.write_u32(index.0);
+        }
+        AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) => {
+            return Err(ConversationError::Channel(format!(
+                "apply_segments: {} is forwarded, not sealed — only a sealed piece is \
+                 placed this way",
+                piece_label(piece)
+            )));
+        }
+    }
+    super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
+    c.write_u32(walker.logical_pos - pos_before);
+    Ok(c.finish())
+}
+
+/// The substrate range a placed piece writes where it sits: a turn's or a
+/// section's, once it placed any K/V. Glue and turn halves record none.
+fn placed_range(piece: &AssembledPiece, blocks: usize) -> Option<PieceRange> {
+    if blocks == 0 {
+        return None;
+    }
+    match piece {
+        AssembledPiece::Turn {
+            timeline: Some(tl),
+            index,
+            ..
+        } => Some(PieceRange::Turn(*tl, *index)),
+        AssembledPiece::Section(id) => Some(PieceRange::Section(*id)),
+        _ => None,
+    }
+}
+
+/// Write where `r` now sits back to the substrate, with the walk's other ranges.
+fn record_range(walker: &mut SegmentWalker, r: &PlacedPiece) {
+    let (start, end) = ((r.blocks_after - r.blocks) as u64, r.blocks_after as u64);
+    match r.range {
+        Some(PieceRange::Turn(tl, idx)) => walker.ranges.turn((tl, idx, start, end)),
+        Some(PieceRange::Section(sid)) => walker.ranges.section((sid, start, end)),
+        None => {}
+    }
+}
+
 /// Build phase: snapshot the writer tail, truncate, then walk the segments —
 /// injecting the sealed prefix and collecting all glue as the new region with
 /// each column's TRUE logical position. Reserves the glue writer chunk but does
@@ -946,15 +1222,15 @@ pub(super) fn apply_segments_build(
     let bakes = |tl: TimelineId, idx: TurnIndex| !unbaked.contains(&(tl, idx));
     let pieces = assemble_pieces_with(new_segments, ctx.boundary_markers, &bakes);
 
-    // ── Keep the prefix this slot already holds ─────────────────────────────
-    // Each piece's identity, chained through the pieces before it, against what
-    // the slot's last complete assembly placed: the longest run that matches is
-    // already in the slot, exactly as this walk would build it, so the slot is
-    // cut back to the end of that run — K/V, index and token log together — and
-    // only the rest is walked. A projection whose selection moved at the end
-    // costs the end, not the whole prefix (`super::piece_identity`).
+    // ── Keep every piece this slot already holds ────────────────────────────
+    // Each piece's alignment identity — a sealed piece's own, a forwarded one's
+    // chained through the pieces before it — against what the slot's last
+    // complete assembly placed (`super::piece_identity`). The slot is cut after
+    // the last held piece still wanted, each change before that is spliced in
+    // where it falls, and only the rest is walked (`super::piece_splice`): a
+    // projection that changed one piece costs that piece, wherever it is.
     let t_identities = Instant::now();
-    let identities = {
+    let aligned = {
         let _g = profile::span("apply:identities");
         let read = ctx.conversation.read();
         let slot_timeline = ctx.slot_target.map(|t| t.timeline);
@@ -981,34 +1257,42 @@ pub(super) fn apply_segments_build(
                 glue_bridge_window(next)
             }
         };
-        chained_identities(
-            &pieces,
-            &PieceReads {
-                whole: &whole,
-                section_stamp: &stamp,
-                bridge: &bridge,
-            },
-        )
+        let reads = PieceReads {
+            whole: &whole,
+            section_stamp: &stamp,
+            bridge: &bridge,
+        };
+        alignment_identities(&pieces, &chained_identities(&pieces, &reads), &reads)
     };
     let identities_us = t_identities.elapsed().as_micros() as u64;
     // A record is trusted only while the slot still reaches its end: anything
-    // that cut the slot shorter since has taken the kept pieces with it.
+    // that cut the slot shorter since has taken the kept pieces with it. The
+    // records live until the rebuild ends, and with them every page they hold:
+    // a piece re-placed finds its page still held (`HeldIndexPages`).
     let slot_blocks = block_count_of(ctx, parent_id)?;
-    let placed_ids: Vec<u64> = state
-        .placed_pieces
+    let held_records: Vec<PlacedPiece> = std::mem::take(&mut state.placed_pieces);
+    let trusted = held_records
         .iter()
         .take_while(|p| p.blocks_after <= slot_blocks)
-        .map(|p| p.identity)
+        .count();
+    let held: Vec<HeldPiece> = held_records[..trusted]
+        .iter()
+        .map(|r| HeldPiece {
+            identity: r.identity,
+            kind: r.kind,
+            end_pos: r.pos_after as usize,
+        })
         .collect();
-    // The run must also end where the model can cut its per-position state:
-    // that state may be grouped more coarsely than the pieces (one index page
-    // over a whole injected prefix), and a cut inside a group is refused.
-    let placed_ends: Vec<u32> = state.placed_pieces.iter().map(|p| p.pos_after).collect();
-    let keep = fit_kept_prefix(
-        &placed_ends,
-        kept_prefix(&placed_ids, &identities, &pieces),
-        |pos| ctx.model.positional_cut_floor(parent_id.0, pos),
-    )
+    let wanted: Vec<WantedPiece> = aligned
+        .iter()
+        .map(|&(identity, kind)| WantedPiece { identity, kind })
+        .collect();
+    // Every splice and the cut must land where the model can cut its
+    // per-position state: that state may be grouped more coarsely than the
+    // pieces (one index page over a whole injected prefix).
+    let plan = plan_splice(&held, &wanted, |pos| {
+        ctx.model.positional_cut_floor(parent_id.0, pos)
+    })
     .map_err(ConversationError::Model)?;
     // Every piece this rebuild projects, in order — the context the turn reads,
     // turn by turn (`timeline:index`). What a "the model answered about the
@@ -1021,59 +1305,45 @@ pub(super) fn apply_segments_build(
         pieces = %pieces.iter().map(piece_label).collect::<Vec<_>>().join(" "),
         "apply_segments: projected pieces"
     );
-    // Where the prefix stopped matching, and what stands there now — the one
-    // fact that says why a rebuild cost what it did.
+    // What the rebuild keeps, splices and walks, and what stands where the walk
+    // starts — the facts that say why a rebuild cost what it did.
     tracing::debug!(
         target: "candle_conversation::scheduler::reproject",
         slot = parent_id.0,
-        placed = state.placed_pieces.len(),
-        trusted = placed_ids.len(),
-        kept = keep,
+        placed = held_records.len(),
+        trusted,
+        kept = plan.kept(),
+        edits = plan.edits.len(),
+        inserted = plan.inserted(),
+        evicted = plan.evicted(),
+        cut_after = plan.cut_after,
+        walk_from = plan.walk_from,
         pieces = pieces.len(),
-        first_new = ?pieces.get(keep).map(piece_label),
-        "apply_segments: kept prefix"
+        first_walked = ?pieces.get(plan.walk_from).map(piece_label),
+        "apply_segments: splice plan"
     );
-    // Held until the walk ends, then dropped once it has taken what it needs.
-    let cut_pages = cut_placed(state, keep);
     let t_cut = Instant::now();
     let cut_span = profile::span("apply:cut_to_kept");
-    let mut prefix_h = DefaultHasher::new();
-    match state.placed_pieces.last() {
-        None => {
-            // Nothing to keep: truncate the slot. Its per-position state goes
-            // with the K/V — the walk re-injects every piece from position 0,
-            // and pages left from the previous assembly would sit at positions
-            // this one does not have.
-            ctx.session
-                .truncate_sequence_to_blocks(parent_id.0, 0)
-                .map_err(ConversationError::Model)?;
-            ctx.model
-                .reset_positional_state(parent_id.0)
-                .map_err(ConversationError::Model)?;
-            if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
-                entry.clear();
-            }
-        }
-        Some(last) => {
-            ctx.session
-                .truncate_sequence_to_blocks(parent_id.0, last.blocks_after)
-                .map_err(ConversationError::Model)?;
-            ctx.model
-                .truncate_positional_state(parent_id.0, last.pos_after as usize)
-                .map_err(ConversationError::Model)?;
-            if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
-                entry.truncate(last.pos_after as usize);
-            }
-            walker.logical_pos = last.pos_after;
-            // Every piece ends on a complete region — a sealed inject or a
-            // reserved gap — so the next one starts a fresh writer chunk.
-            walker.last_was_sealed = true;
-            prefix_h = last.prefix_h.clone();
-        }
-    }
-    walker.kept_pieces = keep;
+    cut_slot(ctx, &held_records, plan.cut_after)?;
     cut_span.end();
     let cut_us = t_cut.elapsed().as_micros() as u64;
+    let t_splice = Instant::now();
+    let splice_span = profile::span("apply:splice_edits");
+    let records = splice_edits(ctx, &mut walker, &plan, &held_records, &pieces, &aligned)?;
+    splice_span.end();
+    let splice_us = t_splice.elapsed().as_micros() as u64;
+    let mut prefix_h = records
+        .last()
+        .map_or_else(DefaultHasher::new, |r| r.prefix_h.clone());
+    let mut content_before = records.last().map_or(0, |r| r.blocks_after);
+    if let Some(last) = records.last() {
+        walker.logical_pos = last.pos_after;
+        // Every piece ends on a complete region — a sealed inject or a
+        // reserved gap — so the next one starts a fresh writer chunk.
+        walker.last_was_sealed = true;
+    }
+    walker.kept_pieces = plan.kept();
+    state.placed_pieces = records;
     // Per piece kind: microseconds walked and pieces walked.
     let mut walk_us = [0u64; 3];
     let mut walked = [0usize; 3];
@@ -1088,8 +1358,10 @@ pub(super) fn apply_segments_build(
     // (a skipped not-hot section hashes as a zero-length placement, distinct
     // from an injected one), and — for sections, whose content can re-seal
     // under the same id — the sealed unit's `Arc` identity (a reseal mints a
-    // new Arc, forcing a conservative recompute). Resumed from the kept prefix's
-    // end, where it stood when that piece was placed.
+    // new Arc, forcing a conservative recompute). Each piece's contribution is
+    // folded in as one value (`PlacedPiece::contrib`), so after a splice the hash
+    // is folded again over the pieces as they now stand (`restack`), and the
+    // walk resumes from the last of them.
     let mut islands: Vec<PlannedIsland> = Vec::new();
     // The convention assert below names only the slot; this names the first
     // piece (or the kept-prefix restore) after which the two counts parted.
@@ -1110,16 +1382,19 @@ pub(super) fn apply_segments_build(
                     slot_offset = off,
                     logical_pos = walker.logical_pos,
                     blocks = ?ctx.session.sequence_block_count(parent_id.0),
-                    kept = keep,
+                    kept = plan.kept(),
+                    edits = plan.edits.len(),
                     at = %at(),
                     "apply_segments: slot offset and walker position parted"
                 );
             }
         };
-    check_drift(ctx, &walker, &|| "kept prefix".to_string());
-    for i in keep..pieces.len() {
+    check_drift(ctx, &walker, &|| "kept and spliced pieces".to_string());
+    for i in plan.walk_from..pieces.len() {
         let pos_before = walker.logical_pos;
         let t_piece = Instant::now();
+        // This piece's contribution to the running prefix hash.
+        let mut contrib = 0u64;
         let kind = match &pieces[i] {
             AssembledPiece::Section(_) => 0,
             AssembledPiece::Turn { .. } | AssembledPiece::TurnHalf { .. } => 1,
@@ -1258,59 +1533,21 @@ pub(super) fn apply_segments_build(
                     });
                 }
                 // The island is itself part of every LATER island's prefix.
-                prefix_h.write_u8(1);
+                let mut c = DefaultHasher::new();
+                c.write_u8(1);
                 for &t in tokens.iter() {
-                    prefix_h.write_u32(t);
+                    c.write_u32(t);
                 }
-                prefix_h.write_u32(fwd);
+                c.write_u32(fwd);
+                contrib = c.finish();
             }
-            AssembledPiece::Section(id) => {
-                let _g = profile::span("apply:inject_section");
-                let t = Instant::now();
-                inject_sealed_section(ctx, &mut walker, *id)?;
-                super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
-                prefix_h.write_u8(2);
-                prefix_h.write_u32(id.raw());
-                // Content stamp: the section's stored token Arc — STABLE across
-                // calls (an accessor-minted Arc like `section_sealed_of`'s would
-                // differ every reproject and defeat the cache); a re-seal
-                // replaces the stored Arc, moving the hash.
-                let toks = ctx.conversation.read().section_tokens_of(*id);
-                prefix_h.write_u64(Arc::as_ptr(&toks) as u64);
-                prefix_h.write_u64(toks.len() as u64);
-                prefix_h.write_u32(walker.logical_pos - pos_before);
-            }
-            AssembledPiece::Turn {
-                group,
-                index,
-                role,
-                timeline,
-            } => {
-                let _g = profile::span("apply:inject_turn");
-                let t = Instant::now();
-                inject_sealed_turn(ctx, &mut walker, *timeline, *group, *index, *role)?;
-                super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
-                prefix_h.write_u8(3);
-                prefix_h.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
-                prefix_h.write_u32(index.0);
-                prefix_h.write_u8(*role as u8);
-                prefix_h.write_u32(walker.logical_pos - pos_before);
+            AssembledPiece::Section(_)
+            | AssembledPiece::Turn { .. }
+            | AssembledPiece::TurnHalf { .. } => {
+                contrib = walk_sealed_piece(ctx, &mut walker, &pieces[i])?;
             }
             AssembledPiece::DeferredUser(tokens) => {
                 walker.deferred_user = Some(tokens.clone());
-            }
-            AssembledPiece::TurnHalf {
-                group,
-                index,
-                timeline,
-            } => {
-                let t = Instant::now();
-                inject_sealed_turn_half(ctx, &mut walker, *timeline, *group, *index)?;
-                super::drain_add_us(&super::DRAIN_ELEVATE_US, t.elapsed().as_micros() as u64);
-                prefix_h.write_u8(4);
-                prefix_h.write_u64(timeline.map(|t| t.raw()).unwrap_or(0));
-                prefix_h.write_u32(index.0);
-                prefix_h.write_u32(walker.logical_pos - pos_before);
             }
         }
         check_drift(ctx, &walker, &|| {
@@ -1321,11 +1558,20 @@ pub(super) fn apply_segments_build(
         // part of a kept prefix.
         let page = walker.placed_page.take();
         if !matches!(pieces[i], AssembledPiece::DeferredUser(_)) {
+            prefix_h.write_u64(contrib);
+            let blocks_after = content_block_count_of(ctx, parent_id)?;
+            let blocks = blocks_after.saturating_sub(content_before);
+            content_before = blocks_after;
             state.placed_pieces.push(PlacedPiece {
-                identity: identities[i],
-                blocks_after: content_block_count_of(ctx, parent_id)?,
+                identity: aligned[i].0,
+                kind: aligned[i].1,
+                blocks,
+                tokens: walker.logical_pos - pos_before,
+                blocks_after,
                 pos_after: walker.logical_pos,
+                contrib,
                 prefix_h: prefix_h.clone(),
+                range: placed_range(&pieces[i], blocks),
                 page,
             });
         }
@@ -1333,17 +1579,21 @@ pub(super) fn apply_segments_build(
         walked[kind] += 1;
     }
     // Every re-placed piece now holds its own page; the rest leave with this.
-    drop(cut_pages);
+    drop(held_records);
     let t_ranges = Instant::now();
     walker.ranges.flush();
     let ranges_us = t_ranges.elapsed().as_micros() as u64;
-    // What the rebuild cost, by what it walked — a kept prefix is free, and every
-    // piece past it is re-injected.
+    // What the rebuild cost, by what it walked — a kept piece is free, a spliced
+    // one costs itself, and every piece walked onto the tail is re-injected.
     tracing::debug!(
         target: "candle_conversation::scheduler::reproject",
         slot = parent_id.0,
         identities_us,
         cut_us,
+        splice_us,
+        edits = plan.edits.len(),
+        inserted = plan.inserted(),
+        evicted = plan.evicted(),
         sections_us = walk_us[0],
         sections = walked[0],
         turns_us = walk_us[1],
@@ -1354,7 +1604,8 @@ pub(super) fn apply_segments_build(
         turn_resolve_us = walker.turn_resolve_us,
         turn_inject_us = walker.turn_inject_us,
         turn_pages_us = walker.turn_pages_us,
-        kept = keep,
+        kept = plan.kept(),
+        held_pages = state.placed_pieces.iter().filter(|p| p.page.is_some()).count(),
         "apply split"
     );
 
@@ -1500,6 +1751,19 @@ struct SegmentWalker<'c> {
     /// The index page the piece being walked was placed with, taken into its
     /// [`PlacedPiece`] when the piece is recorded.
     placed_page: Option<Arc<StoredPages>>,
+    /// Where a splice is putting pieces in, while one is (`apply_edit`); the
+    /// slot's tail otherwise.
+    insert: Option<InsertCursor>,
+}
+
+/// An edit's insertion point and what its pieces bring that is placed after
+/// them all: the per-position state and the token log, spliced in one go once
+/// the edit's last piece is in.
+struct InsertCursor {
+    /// The block the next piece's K/V goes in at.
+    block: usize,
+    positional: Vec<PositionalPiece>,
+    tokens: Vec<u32>,
 }
 
 impl<'c> SegmentWalker<'c> {
@@ -1526,6 +1790,7 @@ impl<'c> SegmentWalker<'c> {
             turn_inject_us: 0,
             turn_pages_us: 0,
             placed_page: None,
+            insert: None,
         }
     }
 
@@ -1668,7 +1933,7 @@ fn inject_sealed_section(
         }
     };
     let what = InjectedPiece::Section(sid);
-    let Some(injected) = inject_arc_sealed(ctx.session, parent_id, &sealed, &what)? else {
+    let Some(injected) = place_sealed(ctx, walker, &sealed, &what)? else {
         walker.skipped_sections += 1;
         return Ok(());
     };
@@ -1747,11 +2012,8 @@ fn inject_sealed_section(
     // path cheap; the index cannot be borrowed the same way, because its keys
     // come from hidden states this slot never computed.
     if let Some(page) = page {
-        match ctx
-            .model
-            .push_positional_state(parent_id.0, page.bytes(), &page.whole_key())
-        {
-            Ok(_) => walker.pages_pushed += 1,
+        match place_page(ctx, walker, page.bytes(), &page.whole_key()) {
+            Ok(()) => walker.pages_pushed += 1,
             Err(e) => tracing::warn!(
                 "apply_projection: section {} index page refused: {e}",
                 sid.raw()
@@ -1764,7 +2026,7 @@ fn inject_sealed_section(
         // stays unindexed, which is the truth about it: nothing indexed it, and
         // a query landing there finds no candidates.
         let tokens = injected.tokens;
-        if let Err(e) = ctx.model.push_positional_gap(parent_id.0, tokens) {
+        if let Err(e) = place_gap(ctx, walker, tokens) {
             tracing::warn!(
                 "apply_projection: section {} has no index page and the slot could not be \
                  advanced past its {tokens} token(s) ({e}) — pages injected after it will be \
@@ -1781,16 +2043,20 @@ fn inject_sealed_section(
         }
     }
 
-    // Written with the walk's other ranges, under one write lock (see the turn path).
-    let (start_block, end_block) = injected.range;
-    walker
-        .ranges
-        .section((sid, start_block as u64, end_block as u64));
+    // Written with the walk's other ranges, under one write lock (see the turn
+    // path). A piece an edit puts in is written once the rebuild has placed
+    // everything, since the edits before it move it.
+    if walker.insert.is_none() {
+        let (start_block, end_block) = injected.range;
+        walker
+            .ranges
+            .section((sid, start_block as u64, end_block as u64));
+    }
 
     #[cfg(feature = "context-dump")]
     {
         let toks = ctx.conversation.read().section_tokens_of(sid);
-        log_injected_tokens(ctx, &toks[..injected.tokens.min(toks.len())]);
+        log_placed_tokens(ctx, walker, &toks[..injected.tokens.min(toks.len())]);
     }
     walker.sealed_sections += 1;
     walker.sealed_tokens += injected.tokens;
@@ -2028,7 +2294,7 @@ fn inject_sealed_turn(
     }
     let what = InjectedPiece::Turn(timeline, index);
     let t_inject = Instant::now();
-    let injected = inject_arc_sealed(ctx.session, parent_id, &sealed, &what)?;
+    let injected = place_sealed(ctx, walker, &sealed, &what)?;
     walker.turn_inject_us += t_inject.elapsed().as_micros() as u64;
     let Some(injected) = injected else {
         walker.skipped_turns += 1;
@@ -2067,19 +2333,30 @@ fn inject_sealed_turn(
         // is a wrong answer rather than a missing one. The `page.is_none()`
         // branch below already advances for exactly this reason; these two
         // failure exits did not.
-        let model: &(dyn ManagedBatchedModel + Send) = &**ctx.model;
-        let carries = model.carries_positional_state();
+        let carries = ctx.model.carries_positional_state();
         let mut advanced = true;
         let _push = profile::span("inject:turn:push_pages");
-        let pushed = index_pages::push_in_order(
-            &blob,
-            |p, key| model.push_positional_state(parent_id.0, p, key).map(|_| ()),
-            |gap| {
-                if carries {
-                    advanced = model.push_positional_gap(parent_id.0, gap).is_ok();
-                }
-            },
-        );
+        // Both callbacks place through the walk, and the walk calls them in
+        // turn, never together — so one cell lends them the walk and context,
+        // for this scope.
+        let pushed = {
+            let placing = RefCell::new((&mut *ctx, &mut *walker));
+            index_pages::push_in_order(
+                &blob,
+                |p, key| {
+                    let mut placing = placing.borrow_mut();
+                    let (c, w) = &mut *placing;
+                    place_page(c, w, p, key)
+                },
+                |gap| {
+                    if carries {
+                        let mut placing = placing.borrow_mut();
+                        let (c, w) = &mut *placing;
+                        advanced = place_gap(c, w, gap).is_ok();
+                    }
+                },
+            )
+        };
         match pushed {
             Ok(pushed) => {
                 walker.pages_pushed += pushed.pages;
@@ -2110,7 +2387,7 @@ fn inject_sealed_turn(
                 );
                 if carries {
                     // Nothing was pushed, so the whole injected width is the gap.
-                    let _ = model.push_positional_gap(parent_id.0, injected.tokens);
+                    let _ = place_gap(ctx, walker, injected.tokens);
                 }
             }
         }
@@ -2119,7 +2396,7 @@ fn inject_sealed_turn(
         // way, so the slot has to be advanced past it or the next page is placed
         // short of where its K/V actually sits.
         let tokens = injected.tokens;
-        let declared = ctx.model.push_positional_gap(parent_id.0, tokens);
+        let declared = place_gap(ctx, walker, tokens);
         // A cut turn's pages were left out above and reported with the cut.
         if !injected.was_cut() || declared.is_err() {
             tracing::warn!(
@@ -2137,10 +2414,14 @@ fn inject_sealed_turn(
     // Recorded on the walker and written once the walk ends, under one write
     // lock for every turn it placed: a write lock per turn queued each one
     // behind whatever reader held the substrate — the persistence thread mid-pass.
-    let (start_block, end_block) = injected.range;
-    walker
-        .ranges
-        .turn((timeline, index, start_block as u64, end_block as u64));
+    // A turn an edit puts in is written once the rebuild has placed everything,
+    // since the edits before it move it.
+    if walker.insert.is_none() {
+        let (start_block, end_block) = injected.range;
+        walker
+            .ranges
+            .turn((timeline, index, start_block as u64, end_block as u64));
+    }
 
     // The slot's token log is a `context-dump` diagnostic; without the feature
     // the turn's ids are not read at all — copying them was a full turn's worth
@@ -2152,7 +2433,7 @@ fn inject_sealed_turn(
             .read()
             .assistant_token_ids_of(timeline, index)
             .to_vec();
-        log_injected_tokens(ctx, &toks);
+        log_placed_tokens(ctx, walker, &toks);
     }
     walker.sealed_turns += 1;
     walker.sealed_tokens += injected.tokens;
@@ -2201,7 +2482,7 @@ fn inject_sealed_turn_half(
         }
     };
     let what = InjectedPiece::TurnHalf(timeline, index);
-    let Some(injected) = inject_arc_sealed(ctx.session, parent_id, &sealed, &what)? else {
+    let Some(injected) = place_sealed(ctx, walker, &sealed, &what)? else {
         walker.skipped_turns += 1;
         return Ok(());
     };
@@ -2223,7 +2504,7 @@ fn inject_sealed_turn_half(
     // placed its width short of where its K/V sits.
     if ctx.model.carries_positional_state() {
         let tokens = injected.tokens;
-        let advanced = ctx.model.push_positional_gap(parent_id.0, tokens);
+        let advanced = place_gap(ctx, walker, tokens);
         tracing::warn!(
             advanced = advanced.is_ok(),
             "apply_projection: turn-half {}/{} carries no index page — a half is not a \
@@ -2279,6 +2560,78 @@ fn inject_arc_sealed(
         .inject_sealed_at_tail(parent_id.0, sealed)
         .map(Some)
         .map_err(ConversationError::Model)
+}
+
+/// Put a sealed piece's K/V where the walk is placing: onto the slot's tail, or
+/// in at the open edit's insertion point, which then moves past it.
+fn place_sealed(
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    sealed: &Arc<Vec<SealedSequence>>,
+    what: &InjectedPiece,
+) -> Result<Option<SealedInjection>, ConversationError> {
+    let Some(cursor) = walker.insert.as_mut() else {
+        return inject_arc_sealed(ctx.session, ctx.parent_id, sealed, what);
+    };
+    let _g = profile::span("inject:splice_sealed");
+    let n_layers = ctx.session.num_layers();
+    if sealed.len() != n_layers {
+        tracing::warn!(
+            "apply_projection: {what} has {} layers, expected {}; skipping",
+            sealed.len(),
+            n_layers,
+        );
+        return Ok(None);
+    }
+    let placed = ctx
+        .session
+        .splice_sealed(ctx.parent_id.0, cursor.block, cursor.block, sealed)
+        .map_err(ConversationError::Model)?;
+    cursor.block = placed.range.1;
+    Ok(Some(placed))
+}
+
+/// Hand a piece's page to the model where the walk is placing. Inside an edit
+/// it is queued for the edit's one splice of per-position state, once the
+/// model has said it reads it — so a page refused at the tail is refused here.
+fn place_page(
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    bytes: &[u8],
+    key: &PieceKey,
+) -> candle::Result<()> {
+    match walker.insert.as_mut() {
+        None => ctx
+            .model
+            .push_positional_state(ctx.parent_id.0, bytes, key)
+            .map(|_| ()),
+        Some(cursor) => {
+            ctx.model.positional_lift_bytes(bytes, key)?;
+            cursor.positional.push(PositionalPiece::Page {
+                bytes: Arc::from(bytes),
+                key: *key,
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Advance the per-position state over `tokens` no page covers, where the walk
+/// is placing.
+fn place_gap(
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    tokens: usize,
+) -> candle::Result<()> {
+    match walker.insert.as_mut() {
+        None => ctx.model.push_positional_gap(ctx.parent_id.0, tokens),
+        Some(cursor) => {
+            if tokens > 0 {
+                cursor.positional.push(PositionalPiece::Gap(tokens));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Name a piece the session cut to its layers' common prefix: which piece,
@@ -2995,6 +3348,16 @@ fn log_injected_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) {
     super::Scheduler::record_slot_tokens(ctx.slot_tokens, ctx.parent_id, tokens);
 }
 
+/// [`log_injected_tokens`] where the walk is placing: inside an edit the
+/// tokens go in with the edit's splice of the log, at its position.
+#[cfg_attr(not(feature = "context-dump"), allow(dead_code))]
+fn log_placed_tokens(ctx: &mut ApplyContext<'_>, walker: &mut SegmentWalker, tokens: &[u32]) {
+    match walker.insert.as_mut() {
+        None => log_injected_tokens(ctx, tokens),
+        Some(cursor) => cursor.tokens.extend_from_slice(tokens),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3240,31 +3603,32 @@ mod tests {
         assert!(none.sections.is_empty() && none.turns.is_empty());
     }
 
-    /// A cut keeps the leading pieces with their pages and hands back the
-    /// pages of the pieces it removed, so the walk that re-places them finds
-    /// them still held; a cut past the end removes nothing.
+    /// **Records laid end to end learn where they now stand.** After a splice
+    /// the pieces keep their own widths and contributions and nothing else:
+    /// each one's ends are the sums of the widths before it, and its prefix
+    /// hash is the fold of the contributions through it — what a walk placing
+    /// them in this order would have recorded.
     #[test]
-    fn a_cut_hands_back_the_pages_of_the_pieces_it_removed() {
-        let page = |b: u8| Arc::new(StoredPages::new(vec![b; 4]));
-        let (a, b, c) = (page(1), page(2), page(3));
-        let mut state = SlotState::default();
-        for (i, p) in [Some(&a), None, Some(&b), Some(&c)].into_iter().enumerate() {
-            let mut piece = PlacedPiece::ending_at(i + 1);
-            piece.page = p.cloned();
-            state.placed_pieces.push(piece);
+    fn restacked_records_end_where_their_widths_put_them() {
+        let piece = |blocks: usize, tokens: u32, contrib: u64| {
+            let mut p = PlacedPiece::ending_at(99);
+            p.blocks = blocks;
+            p.tokens = tokens;
+            p.contrib = contrib;
+            p
+        };
+        let mut records = vec![piece(2, 40, 11), piece(1, 7, 22), piece(3, 70, 33)];
+        restack(&mut records);
+        let ends: Vec<(usize, u32)> = records
+            .iter()
+            .map(|r| (r.blocks_after, r.pos_after))
+            .collect();
+        assert_eq!(ends, [(2, 40), (3, 47), (6, 117)]);
+        let mut walked = DefaultHasher::new();
+        for (r, c) in records.iter().zip([11u64, 22, 33]) {
+            walked.write_u64(c);
+            assert_eq!(r.prefix_h.finish(), walked.finish());
         }
-
-        let cut = cut_placed(&mut state, 2);
-        assert_eq!(state.placed_pieces.len(), 2);
-        assert!(Arc::ptr_eq(
-            state.placed_pieces[0].page.as_ref().unwrap(),
-            &a
-        ));
-        assert_eq!(cut.len(), 2, "the glue piece held no page");
-        assert!(Arc::ptr_eq(&cut[0], &b) && Arc::ptr_eq(&cut[1], &c));
-
-        assert!(cut_placed(&mut state, 9).is_empty());
-        assert_eq!(state.placed_pieces.len(), 2);
     }
 
     /// The system prompt is the leading run of sections and the glue between
@@ -3275,11 +3639,8 @@ mod tests {
         let placed_at = |ends: &[u32]| -> Vec<PlacedPiece> {
             ends.iter()
                 .map(|&pos_after| PlacedPiece {
-                    identity: 1,
-                    blocks_after: 0,
                     pos_after,
-                    prefix_h: DefaultHasher::new(),
-                    page: None,
+                    ..PlacedPiece::ending_at(0)
                 })
                 .collect()
         };

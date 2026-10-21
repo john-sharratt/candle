@@ -1294,6 +1294,36 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
+    /// Replace the sealed chunks `[start, end)` with `windows`, leaving every
+    /// chunk outside the range where it stands, in order; the GPU buffer is
+    /// cleared because the layout changed.
+    ///
+    /// **Sealed history only.** The range must lie below the writer boundary:
+    /// chunks there are Arc-shared prefix that nothing writes into, so moving
+    /// them is metadata, and every position after the splice is re-derived from
+    /// cumulative usage when the slot is next read. The boundary moves by the
+    /// change in count, so the writer region keeps exactly its chunks.
+    pub(crate) fn splice_sealed_chunks(
+        &mut self,
+        start: usize,
+        end: usize,
+        windows: Vec<ChunkWindow>,
+    ) -> candle::Result<()> {
+        if start > end || end > self.writer_start_idx {
+            candle::bail!(
+                "splice_sealed_chunks: [{start}, {end}) is not sealed history below the \
+                 writer boundary {} ({} chunks)",
+                self.writer_start_idx,
+                self.chunks.len()
+            );
+        }
+        let inserted = windows.len();
+        self.chunks.splice(start..end, windows);
+        self.writer_start_idx = self.writer_start_idx - (end - start) + inserted;
+        self.gpu_chunks.as_mut().clear();
+        Ok(())
+    }
+
     /// Drain all chunks from index `at` onward into a `Vec`.  GPU buffer is
     /// cleared because chunk count changes.
     pub(crate) fn split_off_chunks(&mut self, at: usize) -> Vec<ChunkWindow> {

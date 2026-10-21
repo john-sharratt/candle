@@ -33,6 +33,7 @@ use crate::models::delta_net::TIMELINE_ROWS;
 use crate::models::kv_cache_utils::{new_kv_caches, KvCaches};
 use crate::models::layer_parallel;
 use crate::models::piece_key::PieceKey;
+use crate::models::positional_piece::PositionalPiece;
 use crate::models::residual_rows::CreepResidual;
 use crate::models::rope_schedule::RungSelect;
 use crate::models::sealed_injection::{reconcile_sealed_prefix, SealedInjection};
@@ -1636,6 +1637,109 @@ impl BatchedInferenceSession {
         };
         Ok(SealedInjection {
             range,
+            tokens: tokens_added,
+            cut_chunks,
+            cut_tokens,
+        })
+    }
+
+    /// Replace the sealed blocks `[start, end)` of `seq_idx` with
+    /// `sealed_per_layer` on every layer, leaving every block outside the range
+    /// where it stands — the mid-sequence counterpart of
+    /// [`Self::inject_sealed_at_tail`], and as pure: no DMA, no kernel.
+    ///
+    /// What lets a rebuild put a changed piece where the projection placed it
+    /// without re-injecting every unchanged piece after it: each block's RoPE
+    /// base is the cumulative usage before it, so the blocks after the range
+    /// move with the splice. An empty piece evicts the range; an empty range
+    /// inserts.
+    ///
+    /// The source is reconciled as an injection's is, the per-layer loop is
+    /// atomic — a failure puts back every layer already spliced — and the
+    /// sequence's logical offset moves by the tokens inserted less the tokens
+    /// removed. The returned range is where the inserted chunks now sit.
+    pub fn splice_sealed(
+        &mut self,
+        seq_idx: usize,
+        start: usize,
+        end: usize,
+        sealed_per_layer: &[candle_nn::kv_cache::SealedSequence],
+    ) -> Result<SealedInjection> {
+        if sealed_per_layer.len() != self.backings.len() {
+            candle::bail!(
+                "splice_sealed: got {} layers but session has {} backings",
+                sealed_per_layer.len(),
+                self.backings.len()
+            );
+        }
+        let reconciled = reconcile_sealed_prefix(sealed_per_layer);
+        let (source, cut_chunks): (&[candle_nn::kv_cache::SealedSequence], usize) =
+            match reconciled.as_deref() {
+                Some(fixed) => {
+                    let cut = sealed_per_layer
+                        .iter()
+                        .zip(fixed.iter())
+                        .map(|(s, f)| s.chunks.len() - f.chunks.len())
+                        .max()
+                        .unwrap_or(0);
+                    (fixed, cut)
+                }
+                None => (sealed_per_layer, 0),
+            };
+        // What the range holds now, per layer: the tokens it gives up, and what
+        // a failed splice puts back.
+        let removed = self.snapshot_sequence_blocks(seq_idx, start, end)?;
+        let removed_tokens = removed.first().map_or(0, |s| s.token_count);
+        let offset = match self.sequences.get(seq_idx) {
+            Some(Some(state)) => state.offset,
+            _ => candle::bail!("splice_sealed: sequence {seq_idx} not allocated"),
+        };
+        if removed_tokens > offset {
+            candle::bail!(
+                "splice_sealed: [{start}, {end}) holds {removed_tokens} tokens but sequence \
+                 {seq_idx} stands at {offset}"
+            );
+        }
+        for (done, (backing, sealed)) in self.backings.iter().zip(source.iter()).enumerate() {
+            if let Err(e) = backing.splice_sequence_blocks(seq_idx, start, end, sealed) {
+                for ((b, put), took) in self
+                    .backings
+                    .iter()
+                    .zip(&removed)
+                    .zip(source.iter())
+                    .take(done)
+                {
+                    let _ =
+                        b.splice_sequence_blocks(seq_idx, start, start + took.chunks.len(), put);
+                }
+                return Err(e);
+            }
+        }
+        let tokens_added: usize = source
+            .first()
+            .map(|s| s.chunks.iter().map(|c| c.token_count as usize).sum())
+            .unwrap_or(0);
+        if let Some(Some(state)) = self.sequences.get_mut(seq_idx) {
+            state.offset = offset - removed_tokens + tokens_added;
+        }
+        let cut_tokens = if cut_chunks == 0 {
+            0
+        } else {
+            sealed_per_layer
+                .iter()
+                .map(|s| {
+                    s.chunks
+                        .iter()
+                        .map(|c| c.token_count as usize)
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(tokens_added)
+        };
+        let inserted = source.first().map_or(0, |s| s.chunks.len());
+        Ok(SealedInjection {
+            range: (start, start + inserted),
             tokens: tokens_added,
             cut_chunks,
             cut_tokens,
@@ -5072,6 +5176,27 @@ pub trait ManagedBatchedModel {
     /// [`Self::positional_cut_floor`] accepts. No-op for a model with no such
     /// state.
     fn truncate_positional_state(&self, _seq: usize, _tokens: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Replace `seq`'s per-position state for positions `[from, to)` with
+    /// `pieces`, placed from `from` on, and move everything after `to` by the
+    /// change in width — paired with
+    /// [`BatchedInferenceSession::splice_sealed`] putting those pieces' K/V in
+    /// place, so a rebuild changes a piece in the middle of a slot without
+    /// re-placing the pieces after it.
+    ///
+    /// Only a slot holding injected state alone splices: the rebuild cuts the
+    /// live tail first ([`Self::truncate_positional_state`]). `from` and `to`
+    /// are each a boundary [`Self::positional_cut_floor`] returns unchanged.
+    /// No-op for a model with no such state.
+    fn splice_positional_state(
+        &self,
+        _seq: usize,
+        _from: usize,
+        _to: usize,
+        _pieces: &[PositionalPiece],
+    ) -> Result<()> {
         Ok(())
     }
 

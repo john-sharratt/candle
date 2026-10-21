@@ -2242,8 +2242,6 @@ impl ChunkedKvBacking {
         batch_idx: usize,
         sealed: &SealedSequence,
     ) -> Result<(usize, usize)> {
-        use super::types::ChunkWindow;
-
         let batch = self.batch_capacity();
         if batch_idx >= batch {
             candle::bail!(
@@ -2294,25 +2292,7 @@ impl ChunkedKvBacking {
         // advance the writer boundary past them so subsequent writes
         // never land in their physical positions.
         slot.set_writer_start_idx(block_start + n);
-        let windows: Vec<ChunkWindow> = sealed
-            .chunks
-            .iter()
-            .map(|sc| ChunkWindow {
-                gids: sc.gids.clone(),
-                usage: sc.token_count as u32,
-                offset: sc.offset,
-                k_pal: Arc::clone(&sc.k_pal),
-                v_pal: Arc::clone(&sc.v_pal),
-                k_scale: Arc::clone(&sc.k_scale),
-                v_scale: Arc::clone(&sc.v_scale),
-                k_fmt: Arc::clone(&sc.k_fmt),
-                v_fmt: Arc::clone(&sc.v_fmt),
-                // Injected chunk Arc-shares the sealed chunk's GIDs, so its
-                // resident record stays valid — share the handle into the slot.
-                meta: sc.meta.clone(),
-            })
-            .collect();
-        slot.extend_chunks(windows);
+        slot.extend_chunks(sealed_windows(sealed));
         // The injection changed the slot's chunk layout out from under the
         // cached device-side slot-state (GpuChunks). The cache's count-mismatch
         // detection catches a GROWN table, but a same-count window replacement
@@ -2328,6 +2308,77 @@ impl ChunkedKvBacking {
 
         Ok((block_start, block_end))
     }
+
+    /// Replace the sealed blocks `[start, end)` of the sequence at `batch_idx`
+    /// with `sealed`'s chunks, leaving every block outside the range where it
+    /// stands. Returns the block the inserted chunks end at.
+    ///
+    /// The mid-sequence counterpart of [`Self::inject_sealed_at_tail`], and as
+    /// pure: no kernel, no DMA, Arc-shared gids. With `sealed` empty it evicts
+    /// the range; with `start == end` it inserts. A rebuild uses it to put a
+    /// changed piece where the projection placed it without re-injecting the
+    /// unchanged pieces after it — every later block's RoPE base is cumulative
+    /// usage, so it moves with them. The caller moves the sequence's logical
+    /// offset by the change in tokens.
+    pub fn splice_sequence_blocks(
+        &self,
+        batch_idx: usize,
+        start: usize,
+        end: usize,
+        sealed: &SealedSequence,
+    ) -> Result<usize> {
+        let held = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            state
+                .sequences
+                .get(batch_idx)
+                .and_then(|s| s.as_ref())
+                .map(|s| s.block_count())
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "splice_sequence_blocks: slot {batch_idx} not allocated"
+                    ))
+                })?
+        };
+        let n = sealed.chunks.len();
+        self.ensure_max_blocks(held.saturating_sub(end.saturating_sub(start)) + n)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let slot = state.sequences[batch_idx].as_mut().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "splice_sequence_blocks: slot {batch_idx} not allocated"
+            ))
+        })?;
+        slot.splice_sealed_chunks(start, end, sealed_windows(sealed))?;
+        Ok(start + n)
+    }
+}
+
+/// `sealed`'s chunks as windows a slot holds: Arc-shared gids, the chunk's own
+/// fill, and its resident record — the injected chunk names the sealed chunk's
+/// gids, so the record stays valid.
+fn sealed_windows(sealed: &SealedSequence) -> Vec<ChunkWindow> {
+    sealed
+        .chunks
+        .iter()
+        .map(|sc| ChunkWindow {
+            gids: sc.gids.clone(),
+            usage: sc.token_count as u32,
+            offset: sc.offset,
+            k_pal: Arc::clone(&sc.k_pal),
+            v_pal: Arc::clone(&sc.v_pal),
+            k_scale: Arc::clone(&sc.k_scale),
+            v_scale: Arc::clone(&sc.v_scale),
+            k_fmt: Arc::clone(&sc.k_fmt),
+            v_fmt: Arc::clone(&sc.v_fmt),
+            meta: sc.meta.clone(),
+        })
+        .collect()
 }
 
 // The deleted `cow_partial_tail_if_shared` machinery lived here.

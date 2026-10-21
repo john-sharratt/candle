@@ -152,6 +152,7 @@ pub mod profile;
 // on purpose: the semantics live with the architecture that has them
 // (`qwen4exp::qsa_select`), the tensors the kernels read live here.
 pub mod piece_key;
+pub mod positional_piece;
 pub mod qsa_selection;
 /// Choosing an expert weight format from the card the model lands on.
 pub mod quant_ladder;
@@ -245,6 +246,8 @@ pub mod slot_header;
 pub mod slot_state;
 pub mod snac;
 pub mod speculative_choice;
+#[cfg(all(test, feature = "cuda"))]
+mod splice_sealed_tests;
 pub mod stable_diffusion;
 pub mod stable_lm;
 /// Running a group of input projections that share one operand, splitting the

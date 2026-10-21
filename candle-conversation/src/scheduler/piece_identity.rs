@@ -1,14 +1,13 @@
-//! What each piece of an assembled slot IS, chained through every piece before
-//! it — the key a rebuild uses to keep the prefix it shares with the slot's
-//! last assembly and re-inject only what follows.
+//! What each piece of an assembled slot IS — the key a rebuild aligns the
+//! pieces the slot holds with the ones a projection wants by
+//! (`super::piece_splice`), so it keeps every piece it already holds.
 //!
-//! A slot is rebuilt whenever its projection's selection moves, and most moves
-//! change a few pieces near the end: a working-set file dropping out of
-//! provenance, the dialogue's newest turn. Truncating to zero and re-injecting
-//! the whole prefix made every such rebuild cost the full prefix — measured at
-//! ~1 s a rebuild with 230 turns ahead of the dialogue, every ~64 tokens. Two
-//! assemblies whose chained identities agree through piece `i` built the same
-//! slot through piece `i`, so a rebuild can keep exactly that much.
+//! A sealed piece is named by itself, since its K/V is the same wherever it
+//! sits. A forwarded piece — glue, the live user message — is named by its
+//! identity chained through every piece before it: two assemblies whose
+//! chained identities agree through piece `i` built the same slot through
+//! piece `i`, which is the only condition under which K/V the slot computed
+//! there is still right.
 //!
 //! Every input the walk reads from a piece is in its identity:
 //! - a section's id and its stored content;
@@ -21,6 +20,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
+use super::piece_splice::PieceKind;
 use super::projection_assembler::AssembledPiece;
 use crate::projection::{SectionId, TimelineId, TurnIndex};
 
@@ -57,47 +57,35 @@ pub(super) fn chained_identities(pieces: &[AssembledPiece], reads: &PieceReads<'
     out
 }
 
-/// How many leading pieces a rebuild can keep: the longest run whose chained
-/// identities match what the slot's last complete assembly placed. Stops at
-/// the deferred user message, which is never part of a kept prefix.
-pub(super) fn kept_prefix(placed: &[u64], identities: &[u64], pieces: &[AssembledPiece]) -> usize {
-    placed
-        .iter()
-        .zip(identities)
-        .zip(pieces)
-        .take_while(|((was, now), piece)| {
-            was == now && !matches!(piece, AssembledPiece::DeferredUser(_))
-        })
-        .count()
-}
-
-/// Shrink a kept run of `keep` pieces until the position it ends at is one the
-/// model can cut its per-position state back to.
+/// Each piece's identity for aligning one assembly with another
+/// (`super::piece_splice`), and what its K/V is to the slot.
 ///
-/// `pos_after[i]` is where placed piece `i` ends, and `floor(pos)` is the
-/// largest position at or before `pos` the model accepts as a cut. The model
-/// may group its state more coarsely than the pieces — one index page over a
-/// slot's whole injected prefix — and a run that ends inside such a group keeps
-/// only the pieces that end at or before the group's start. Each round keeps
-/// strictly fewer pieces, so the walk ends; at worst it keeps none and the
-/// rebuild re-injects everything.
-pub(super) fn fit_kept_prefix<E>(
-    pos_after: &[u32],
-    mut keep: usize,
-    floor: impl Fn(usize) -> Result<usize, E>,
-) -> Result<usize, E> {
-    while keep > 0 {
-        let end = pos_after[keep - 1] as usize;
-        let cut = floor(end)?;
-        if cut == end {
-            break;
-        }
-        keep = pos_after[..keep]
-            .iter()
-            .take_while(|&&p| p as usize <= cut)
-            .count();
-    }
-    Ok(keep)
+/// A sealed piece — section, turn, turn half — is borrowed K/V that may sit
+/// anywhere, so it is named by what it is alone: the same piece wherever the
+/// projection puts it. A forwarded piece — glue, the live user message — is
+/// K/V the slot computed against everything before it, so it keeps its
+/// `chained` identity and matches only where all that is unchanged.
+pub(super) fn alignment_identities(
+    pieces: &[AssembledPiece],
+    chained: &[u64],
+    reads: &PieceReads<'_>,
+) -> Vec<(u64, PieceKind)> {
+    pieces
+        .iter()
+        .zip(chained)
+        .map(|(piece, &chain)| match piece {
+            AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) => {
+                (chain, PieceKind::Forwarded)
+            }
+            AssembledPiece::Section(_)
+            | AssembledPiece::Turn { .. }
+            | AssembledPiece::TurnHalf { .. } => {
+                let mut own = DefaultHasher::new();
+                write_piece(&mut own, piece, reads);
+                (own.finish(), PieceKind::Sealed)
+            }
+        })
+        .collect()
 }
 
 /// A piece as a log names it: its kind and what identifies it.
@@ -237,7 +225,42 @@ mod tests {
         for i in 2..before.len() {
             assert_ne!(before[i], after[i], "piece {i}");
         }
-        assert_eq!(kept_prefix(&before, &after, &changed), 2);
+    }
+
+    fn aligned(pieces: &[AssembledPiece]) -> Vec<(u64, PieceKind)> {
+        let whole = |tl: TimelineId, idx: TurnIndex| tl.raw() == 9 && idx.0 == 7;
+        let stamp = |id: SectionId| (u64::from(id.raw()) * 31, 5usize);
+        let bridge = |next: Option<&AssembledPiece>| match next {
+            Some(AssembledPiece::Turn { .. }) => 16,
+            _ => 0,
+        };
+        let reads = PieceReads {
+            whole: &whole,
+            section_stamp: &stamp,
+            bridge: &bridge,
+        };
+        alignment_identities(pieces, &chained_identities(pieces, &reads), &reads)
+    }
+
+    /// **A sealed piece is the same piece wherever it stands**, so a change in
+    /// front of it does not make it new — what lets a rebuild keep it. Glue and
+    /// the live message keep their chained identities: computed against what
+    /// precedes them, they are new whenever that is.
+    #[test]
+    fn a_sealed_piece_aligns_by_itself_and_a_forwarded_one_by_its_chain() {
+        let before = aligned(&base());
+        let mut changed = base();
+        changed[0] = section(2);
+        let after = aligned(&changed);
+        for i in [1, 2, 4] {
+            assert_eq!(before[i], after[i], "sealed piece {i} kept its identity");
+            assert_eq!(before[i].1, PieceKind::Sealed);
+        }
+        for i in [3, 5] {
+            assert_ne!(before[i].0, after[i].0, "forwarded piece {i} is new");
+            assert_eq!(before[i].1, PieceKind::Forwarded);
+        }
+        assert_ne!(before[0], after[0]);
     }
 
     /// A glue run that bridges into a turn attends that turn, so replacing the
@@ -253,7 +276,6 @@ mod tests {
             before[3], after[3],
             "the glue bridged into the replaced turn"
         );
-        assert_eq!(kept_prefix(&before, &after, &changed), 3);
     }
 
     /// The same turn is a different piece once it stops being the slot's newest
@@ -265,63 +287,6 @@ mod tests {
         let windowed = ids_with(&pieces, &|_, _| false);
         assert_eq!(whole[0], windowed[0]);
         assert_ne!(whole[1], windowed[1]);
-    }
-
-    /// Positions a model can cut at, given its groups as `[start, end)` ranges:
-    /// the start of the group a position falls inside, else the position.
-    fn floor_in(groups: &'static [(usize, usize)]) -> impl Fn(usize) -> Result<usize, ()> {
-        move |pos| {
-            Ok(groups
-                .iter()
-                .find(|&&(start, end)| start < pos && pos < end)
-                .map_or(pos, |&(start, _)| start))
-        }
-    }
-
-    /// The case that failed live: a dialogue base whose whole injected prefix
-    /// is one page, 0..1338, and a question whose projection first differs
-    /// after the 3-token opening. The run cannot end at 3, so nothing is kept.
-    #[test]
-    fn a_run_ending_inside_a_page_keeps_nothing_before_it() {
-        let ends = [3, 120, 1338, 1400];
-        assert_eq!(fit_kept_prefix(&ends, 1, floor_in(&[(0, 1338)])), Ok(0));
-    }
-
-    #[test]
-    fn a_run_ending_on_a_page_boundary_is_kept_whole() {
-        let ends = [3, 120, 1338, 1400];
-        assert_eq!(fit_kept_prefix(&ends, 3, floor_in(&[(0, 1338)])), Ok(3));
-        assert_eq!(fit_kept_prefix(&ends, 4, floor_in(&[(0, 1338)])), Ok(4));
-        assert_eq!(fit_kept_prefix(&ends, 2, floor_in(&[])), Ok(2));
-        assert_eq!(fit_kept_prefix(&ends, 0, floor_in(&[(0, 1338)])), Ok(0));
-    }
-
-    /// The floor lands on a position that ends no piece, so the run steps back
-    /// to the last piece before it — which may itself sit inside an earlier
-    /// group and step back again.
-    #[test]
-    fn a_run_steps_back_until_its_end_is_a_cut_the_model_accepts() {
-        let ends = [10, 40, 70, 100];
-        // Groups 0..50 and 50..100: an end at 70 floors to 50, which ends no
-        // piece; the last piece before it ends at 40, inside 0..50, so the run
-        // steps back again, to nothing.
-        assert_eq!(
-            fit_kept_prefix(&ends, 3, floor_in(&[(0, 50), (50, 100)])),
-            Ok(0)
-        );
-        // With groups 0..40 and 40..100 the second step lands on 40 exactly.
-        assert_eq!(
-            fit_kept_prefix(&ends, 3, floor_in(&[(0, 40), (40, 100)])),
-            Ok(2)
-        );
-    }
-
-    #[test]
-    fn a_failing_floor_is_returned() {
-        assert_eq!(
-            fit_kept_prefix(&[5], 1, |_| Err("lock poisoned")),
-            Err("lock poisoned")
-        );
     }
 
     #[test]
@@ -338,15 +303,5 @@ mod tests {
                 "user[2]"
             ]
         );
-    }
-
-    /// Everything matching still stops at the deferred user message, which is
-    /// prefilled fresh after every rebuild.
-    #[test]
-    fn the_kept_prefix_stops_at_the_deferred_user_message() {
-        let same = ids(&base());
-        assert_eq!(kept_prefix(&same, &same, &base()), 5);
-        assert_eq!(kept_prefix(&same[..3], &same, &base()), 3);
-        assert_eq!(kept_prefix(&[], &same, &base()), 0);
     }
 }

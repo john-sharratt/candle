@@ -2136,7 +2136,7 @@ mod tests {
     /// onto the dst slot's block table without moving bytes.
     mod inject_tests {
         use super::*;
-        use crate::kv_cache::chunked::CHUNK_SIZE;
+        use crate::kv_cache::chunked::{SealedSequence, CHUNK_SIZE};
 
         #[test]
         fn test_inject_sealed_at_tail_appends_chunks() {
@@ -2218,6 +2218,108 @@ mod tests {
                 assert_eq!(a.token_count, b.token_count, "chunk {i} usage");
             }
             assert_eq!(resealed.token_count, sealed.token_count);
+        }
+
+        /// A sealed piece of `usages` tokens per chunk, recorded off a slot of
+        /// its own — each piece's usages are distinct, so a slot's chunk order
+        /// reads straight off its usages.
+        fn piece(backing: &ChunkedKvBacking, usages: &[u32]) -> SealedSequence {
+            let src = backing.alloc_sequence().expect("alloc src");
+            let tokens: usize = usages.iter().map(|&u| u as usize).sum();
+            backing.ensure_for_offset(src, 0, tokens).unwrap();
+            {
+                let mut state = backing.state.write().expect("lock");
+                let seq = state.sequences[src].as_mut().expect("seq");
+                for (c, &u) in seq.chunks_slice_mut().iter_mut().zip(usages) {
+                    c.usage = u;
+                }
+            }
+            backing.record_turn(src).expect("record_turn")
+        }
+
+        fn usages_of(backing: &ChunkedKvBacking, seq: usize) -> Vec<u32> {
+            let state = backing.state.read().expect("lock");
+            let s = state.sequences[seq].as_ref().expect("seq");
+            s.chunks_slice().iter().map(|c| c.usage).collect()
+        }
+
+        fn writer_start_of(backing: &ChunkedKvBacking, seq: usize) -> usize {
+            let state = backing.state.read().expect("lock");
+            state.sequences[seq]
+                .as_ref()
+                .expect("seq")
+                .writer_start_idx()
+        }
+
+        /// `[a | b | c]` with `b` replaced by `d`: `a` and `c` stand where they
+        /// were in order, `d` takes `b`'s place, the writer boundary moves by the
+        /// change in count, and `c`'s RoPE base follows the new cumulative usage.
+        #[test]
+        fn a_splice_replaces_the_middle_and_leaves_both_sides() {
+            let backing = create_test_backing();
+            let a = piece(&backing, &[CHUNK_SIZE as u32, 5]);
+            let b = piece(&backing, &[7]);
+            let c = piece(&backing, &[3]);
+            let d = piece(&backing, &[CHUNK_SIZE as u32, 11]);
+            let dst = backing.alloc_sequence().expect("alloc dst");
+            for p in [&a, &b, &c] {
+                backing.inject_sealed_at_tail(dst, p).expect("inject");
+            }
+            assert_eq!(usages_of(&backing, dst), [32, 5, 7, 3]);
+
+            let end = backing
+                .splice_sequence_blocks(dst, 2, 3, &d)
+                .expect("splice");
+            assert_eq!(end, 4, "d's two chunks end at block 4");
+            assert_eq!(usages_of(&backing, dst), [32, 5, 32, 11, 3]);
+            assert_eq!(writer_start_of(&backing, dst), 5);
+            let state = backing.state.read().expect("lock");
+            let s = state.sequences[dst].as_ref().expect("seq");
+            assert_eq!(s.rope_pos(4), 32 + 5 + 32 + 11, "c moved with the splice");
+        }
+
+        /// An empty piece evicts the range; an empty range inserts.
+        #[test]
+        fn a_splice_evicts_and_inserts_anywhere() {
+            let backing = create_test_backing();
+            let a = piece(&backing, &[5]);
+            let b = piece(&backing, &[7]);
+            let c = piece(&backing, &[3]);
+            let dst = backing.alloc_sequence().expect("alloc dst");
+            for p in [&a, &b, &c] {
+                backing.inject_sealed_at_tail(dst, p).expect("inject");
+            }
+            let none = SealedSequence {
+                chunks: Vec::new(),
+                token_count: 0,
+                chunk_size: CHUNK_SIZE,
+                location: crate::kv_cache::chunked::ArenaLocation::Cpu,
+            };
+            assert_eq!(backing.splice_sequence_blocks(dst, 1, 2, &none).unwrap(), 1);
+            assert_eq!(usages_of(&backing, dst), [5, 3]);
+            assert_eq!(writer_start_of(&backing, dst), 2);
+
+            assert_eq!(backing.splice_sequence_blocks(dst, 0, 0, &b).unwrap(), 1);
+            assert_eq!(usages_of(&backing, dst), [7, 5, 3]);
+            assert_eq!(writer_start_of(&backing, dst), 3);
+        }
+
+        /// The writer's chunks are not sealed history, and a splice refuses
+        /// them rather than moving chunks a kernel writes into.
+        #[test]
+        fn a_splice_refuses_the_writer_region() {
+            let backing = create_test_backing();
+            let a = piece(&backing, &[5]);
+            let dst = backing.alloc_sequence().expect("alloc dst");
+            backing.inject_sealed_at_tail(dst, &a).expect("inject");
+            backing.ensure_for_offset(dst, 5, 5 + CHUNK_SIZE).unwrap();
+            let held = usages_of(&backing, dst).len();
+            assert!(held > 1, "a writer chunk past the sealed one");
+            let err = backing
+                .splice_sequence_blocks(dst, 0, held, &a)
+                .expect_err("the writer region is not sealed history");
+            assert!(err.to_string().contains("writer boundary"), "{err}");
+            assert_eq!(usages_of(&backing, dst).len(), held, "nothing moved");
         }
     }
 }

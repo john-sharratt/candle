@@ -52,7 +52,7 @@ use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
 use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{
-    compact_index_caches, select_layer, selection_stride, IndexCache, IndexSnapshot,
+    compact_index_caches, select_layer, selection_stride, IndexCache, IndexSnapshot, SplicePiece,
 };
 use super::paged_index;
 use super::paged_index::SealedIndex;
@@ -87,6 +87,7 @@ use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
 use crate::models::operand_guard::expect_dense_view;
 use crate::models::piece_key::PieceKey;
+use crate::models::positional_piece::PositionalPiece;
 use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::profile::{pipeline_record, profile_now, span, ProfileSnapshot};
@@ -660,6 +661,69 @@ impl Qwen4ExpBatched {
         }
         if let Ok(mut retired) = self.retired.write() {
             retired.insert(seq, dropped);
+        }
+        Ok(())
+    }
+
+    /// Splice `seq`'s index: on every layer, replace `[from, to)` with `pieces`
+    /// and move the pages after it ([`IndexCache::splice_pages`]). Every layer
+    /// is asked first, so a refusal changes none of them; the pages taken out
+    /// are retired with the cut's (see the `retired` field).
+    ///
+    /// A layer takes a piece's page where the piece has one for it and skips it
+    /// where it has none, as [`Self::push_positional_state`] does; a gap moves
+    /// every layer, as [`Self::push_positional_gap`] does.
+    #[cfg(feature = "cuda")]
+    pub fn splice_positional_state(
+        &self,
+        seq: usize,
+        from: usize,
+        to: usize,
+        pieces: &[PositionalPiece],
+    ) -> Result<()> {
+        let cfg = &self.model.cfg;
+        let want = cfg.kv_layers().total();
+        let ratios = self.attention_ratios();
+        // Resolved before the lock is taken: a placement is a launch.
+        let resolved: Vec<Option<Vec<Option<Arc<ResidentPage>>>>> = pieces
+            .iter()
+            .map(|p| match p {
+                PositionalPiece::Page { bytes, key } => self.resident_pages(bytes, key).map(Some),
+                PositionalPiece::Gap(_) => Ok(None),
+            })
+            .collect::<Result<_>>()?;
+        let mut taken: Vec<Arc<ResidentPage>> = Vec::new();
+        {
+            let mut map = self
+                .index
+                .write()
+                .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+            let caches = map.entry(seq).or_default();
+            if caches.is_empty() {
+                for _ in 0..want {
+                    caches.push(IndexCache::new(cfg.indexer.head_dim, &self.model.device)?);
+                }
+            }
+            for c in caches.iter() {
+                c.check_splice(from, to)?;
+            }
+            for (li, (c, &ratio)) in caches.iter_mut().zip(ratios.iter()).enumerate() {
+                let layer: Vec<SplicePiece> = pieces
+                    .iter()
+                    .zip(&resolved)
+                    .filter_map(|(piece, pages)| match (piece, pages) {
+                        (PositionalPiece::Gap(tokens), _) => Some(SplicePiece::Gap(*tokens)),
+                        (PositionalPiece::Page { .. }, Some(layers)) => {
+                            layers.get(li).cloned().flatten().map(SplicePiece::Page)
+                        }
+                        (PositionalPiece::Page { .. }, None) => None,
+                    })
+                    .collect();
+                taken.extend(c.splice_pages(from, to, layer, ratio)?);
+            }
+        }
+        if let Ok(mut retired) = self.retired.write() {
+            retired.entry(seq).or_default().extend(taken);
         }
         Ok(())
     }
@@ -2673,6 +2737,16 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn truncate_positional_state(&self, seq: usize, tokens: usize) -> Result<()> {
         Qwen4ExpBatched::truncate_positional_state(self, seq, tokens)
+    }
+
+    fn splice_positional_state(
+        &self,
+        seq: usize,
+        from: usize,
+        to: usize,
+        pieces: &[PositionalPiece],
+    ) -> Result<()> {
+        Qwen4ExpBatched::splice_positional_state(self, seq, from, to, pieces)
     }
 
     fn seal_positional_state(&self, seq: usize) -> Result<Option<Vec<u8>>> {

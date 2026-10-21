@@ -53,6 +53,7 @@ mod pending_ranges;
 pub mod phase_ring;
 mod phase_split;
 mod piece_identity;
+mod piece_splice;
 mod prefill;
 mod prefill_wait;
 pub(crate) mod profile;
@@ -12684,6 +12685,7 @@ mod tests {
     use candle_transformers::models::batched_inference::{
         BatchedConfig, BatchedInferenceSession, KvLayers, ManagedBatchedModel, WaveResult,
     };
+    use candle_transformers::models::positional_piece::PositionalPiece;
     use candle_transformers::models::wave_driver::{StepOutcome, StepSpec};
     use std::str::FromStr;
     use std::time::Duration;
@@ -12998,6 +13000,9 @@ mod tests {
         /// What the scheduler installed ahead of each sequence's borrowed K/V,
         /// in order.
         pushed: Arc<Mutex<HashMap<usize, Vec<Pushed>>>>,
+        /// Each sequence's per-position state as it now stands — pushed, cut,
+        /// reset and spliced — for comparing what two slots built.
+        ledger: Arc<Mutex<HashMap<usize, PositionalLedger>>>,
     }
 
     /// One piece installed ahead of borrowed K/V.
@@ -13012,6 +13017,8 @@ mod tests {
     /// The prefix of a page in the double's own format — the stand-in for a
     /// container version the build reads.
     const TOY_PAGE: &[u8] = b"TOYPAGE";
+
+    use self::positional_ledger::PositionalLedger;
 
     impl RecurrentProbe {
         fn get(&self, seq: usize) -> Option<ToyState> {
@@ -13194,6 +13201,7 @@ mod tests {
             self.probe.index.lock().unwrap().remove(&seq);
             self.probe.pages.lock().unwrap().remove(&seq);
             self.probe.seeded.lock().unwrap().remove(&seq);
+            self.probe.ledger.lock().unwrap().remove(&seq);
             Ok(())
         }
 
@@ -13262,13 +13270,51 @@ mod tests {
                 .entry(seq)
                 .or_default()
                 .push(Pushed::Page(blob.to_vec()));
+            self.probe
+                .ledger
+                .lock()
+                .unwrap()
+                .entry(seq)
+                .or_default()
+                .push_page(blob);
             Ok(true)
         }
 
         fn push_positional_gap(&self, seq: usize, tokens: usize) -> candle::Result<()> {
             let mut pushed = self.probe.pushed.lock().unwrap();
             pushed.entry(seq).or_default().push(Pushed::Gap(tokens));
+            self.probe
+                .ledger
+                .lock()
+                .unwrap()
+                .entry(seq)
+                .or_default()
+                .push_gap(tokens);
             Ok(())
+        }
+
+        /// Reads only its own format, as a push does.
+        fn positional_lift_bytes(&self, page: &[u8], _key: &PieceKey) -> candle::Result<usize> {
+            if !page.starts_with(TOY_PAGE) {
+                candle::bail!("toy page: a format this double does not read");
+            }
+            Ok(0)
+        }
+
+        fn splice_positional_state(
+            &self,
+            seq: usize,
+            from: usize,
+            to: usize,
+            pieces: &[PositionalPiece],
+        ) -> candle::Result<()> {
+            self.probe
+                .ledger
+                .lock()
+                .unwrap()
+                .entry(seq)
+                .or_default()
+                .splice(from, to, pieces)
         }
 
         /// Close the live tail into a page, returning the width it covered.
@@ -13303,12 +13349,20 @@ mod tests {
 
         fn reset_positional_state(&self, seq: usize) -> candle::Result<()> {
             self.probe.pages.lock().unwrap().remove(&seq);
+            self.probe.ledger.lock().unwrap().remove(&seq);
             Ok(())
         }
 
         /// Keep the closed pages that fit within `tokens` and drop the live
         /// tail — the shape the real cut has.
         fn truncate_positional_state(&self, seq: usize, tokens: usize) -> candle::Result<()> {
+            self.probe
+                .ledger
+                .lock()
+                .unwrap()
+                .entry(seq)
+                .or_default()
+                .truncate(tokens)?;
             let mut pages = self.probe.pages.lock().unwrap();
             let entry = pages.entry(seq).or_default();
             let mut covered = 0usize;
@@ -16394,10 +16448,12 @@ mod tests {
     }
 
     mod faulted_turn;
+    mod positional_ledger;
     mod refused_decode_tier;
     mod reproject_abandoned;
     mod speculation_exits;
     mod speculation_in_a_grammar;
+    mod splice_rebuild;
 
     // —— admission (`admit_ground::AdmitPass`) ———————————————————————————————
 

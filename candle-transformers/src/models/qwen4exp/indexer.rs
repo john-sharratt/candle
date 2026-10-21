@@ -270,6 +270,15 @@ pub struct IndexCache {
     prompt_end: usize,
 }
 
+/// One thing [`IndexCache::splice_pages`] puts in place.
+#[derive(Debug, Clone)]
+pub enum SplicePiece {
+    /// An injected piece's page on this layer.
+    Page(Arc<ResidentPage>),
+    /// Tokens injected with no rows on this layer — a span nothing indexed.
+    Gap(usize),
+}
+
 /// One injected page and where it sits.
 #[derive(Debug, Clone)]
 struct PlacedPage {
@@ -990,6 +999,101 @@ impl IndexCache {
         // A prompt is a prefix: a cut below its end keeps only what it kept.
         self.prompt_end = self.prompt_end.min(pos);
         Ok(self.pages.drain(keep..).map(|p| p.page).collect())
+    }
+
+    /// Replace the injected pages covering `[from, to)` with `pieces`, placed
+    /// from `from` on, and move every page after `to` by the change in width.
+    /// Returns the pages taken out.
+    ///
+    /// The mid-prefix counterpart of [`Self::truncate_to`] and
+    /// [`Self::push_page`], and as cheap: recording only. A page's rows are
+    /// rotated to its `base` as the scorer reads them, so moving a page is
+    /// changing a number — which is what lets a rebuild change one piece of a
+    /// slot without re-placing the pieces after it.
+    ///
+    /// Only an injected prefix splices: refused once the sequence holds live
+    /// rows, as a page is. A page is atomic, so `from` and `to` must each fall
+    /// on a page boundary ([`Self::cut_floor`] returns them unchanged); pages
+    /// starting in `[from, to)` are the ones taken out.
+    pub fn splice_pages(
+        &mut self,
+        from: usize,
+        to: usize,
+        pieces: Vec<SplicePiece>,
+        ratio: usize,
+    ) -> Result<Vec<Arc<ResidentPage>>> {
+        self.check_splice(from, to)?;
+        let lo = self.pages.partition_point(|p| p.base < from);
+        let hi = self.pages.partition_point(|p| p.base < to);
+        let mut base = from;
+        let mut placed = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            match piece {
+                SplicePiece::Page(page) => {
+                    let tokens = page.tokens(ratio);
+                    placed.push(PlacedPage { page, base, tokens });
+                    base += tokens;
+                }
+                SplicePiece::Gap(tokens) => base += tokens,
+            }
+        }
+        // Every position from `to` on moves to `base + (pos - to)`.
+        let moved = |pos: usize| base + (pos - to);
+        let after: Vec<PlacedPage> = self.pages.drain(hi..).collect();
+        let taken: Vec<Arc<ResidentPage>> = self.pages.drain(lo..).map(|p| p.page).collect();
+        self.pages.extend(placed);
+        self.pages.extend(after.into_iter().map(|p| PlacedPage {
+            base: moved(p.base),
+            ..p
+        }));
+        self.page_rows.truncate(1);
+        let mut rows = 0usize;
+        for p in &self.pages {
+            rows += p.page.rows();
+            self.page_rows.push(rows);
+        }
+        self.tail_base = moved(self.tail_base);
+        // The prompt is a prefix: it moves with what follows the splice, and a
+        // splice inside it keeps only what the splice left before it.
+        if self.prompt_end >= to {
+            self.prompt_end = moved(self.prompt_end);
+        } else if self.prompt_end > from {
+            self.prompt_end = from;
+        }
+        Ok(taken)
+    }
+
+    /// Whether [`Self::splice_pages`] would accept `[from, to)`: an injected
+    /// prefix with no live rows, a range inside what is placed, and both ends
+    /// on page boundaries. A caller splicing several caches asks every one
+    /// before changing any, so a refusal leaves them all as they stood.
+    pub fn check_splice(&self, from: usize, to: usize) -> Result<()> {
+        if self.n_blocks != 0 || self.n_open != 0 {
+            candle::bail!(
+                "qsa index: a splice after {} live block(s) and {} carried row(s) — only an \
+                 injected prefix can be spliced",
+                self.n_blocks,
+                self.n_open,
+            );
+        }
+        if from > to || to > self.tail_base {
+            candle::bail!(
+                "qsa index: a splice of {from}..{to} reaches past the {} token(s) placed",
+                self.tail_base,
+            );
+        }
+        if let Some(p) = self.pages.iter().find(|p| {
+            let end = p.base + p.tokens;
+            (p.base < from && from < end) || (p.base < to && to < end)
+        }) {
+            candle::bail!(
+                "qsa index: a splice of {from}..{to} cuts the page covering {}..{} — pages are \
+                 atomic, so a splice must land on page boundaries",
+                p.base,
+                p.base + p.tokens,
+            );
+        }
+        Ok(())
     }
 
     /// Blocks this span would complete, and the rows it would leave open.
@@ -3063,6 +3167,127 @@ mod tests {
         assert_eq!(without.candidates_at(6, ratio), pre_rows);
         // The answer's last token: all rows of both retained pages.
         assert_eq!(without.candidates_at(15, ratio), without.page_row_span());
+    }
+
+    /// A page `w` tokens wide at `ratio`, as [`caged`] builds them.
+    fn width_page(w: usize, ratio: usize) -> SplicePiece {
+        let rows = w.div_ceil(ratio);
+        SplicePiece::Page(zero_page(rows, w - (rows - 1) * ratio, 4, &Device::Cpu))
+    }
+
+    /// Two caches resolve every position the same way: the same span, the same
+    /// candidates at every position, and every row starting at the same place.
+    fn assert_same_walk(spliced: &IndexCache, built: &IndexCache, ratio: usize) {
+        assert_eq!(spliced.next_base(), built.next_base(), "tail");
+        assert_eq!(spliced.page_count(), built.page_count(), "pages");
+        assert_eq!(spliced.page_row_span(), built.page_row_span(), "rows");
+        for pos in 0..built.next_base() {
+            assert_eq!(
+                spliced.candidates_at(pos, ratio),
+                built.candidates_at(pos, ratio),
+                "candidates at {pos}"
+            );
+        }
+        for row in 0..built.page_row_span() {
+            assert_eq!(
+                spliced.block_start(row, ratio),
+                built.block_start(row, ratio),
+                "row {row}"
+            );
+        }
+    }
+
+    /// **A splice is a build of the same pages.** Replacing the middle page of
+    /// `[7 | 3 | 9]` with a 5-token one resolves every position exactly as a
+    /// cache built `[7 | 5 | 9]` does: the page after the splice moved with it,
+    /// and nothing before it did.
+    #[test]
+    fn a_page_spliced_into_the_middle_walks_as_if_built_there() {
+        const RATIO: usize = 4;
+        let mut c = caged(&[7, 3, 9], RATIO);
+        let taken = c
+            .splice_pages(7, 10, vec![width_page(5, RATIO)], RATIO)
+            .expect("splice");
+        assert_eq!(taken.len(), 1, "the 3-token page came out");
+        assert_same_walk(&c, &caged(&[7, 5, 9], RATIO), RATIO);
+    }
+
+    /// Evicting, inserting at the front and inserting at the end are the same
+    /// operation, and each walks as the pages built in that order do.
+    #[test]
+    fn a_splice_evicts_and_inserts_anywhere() {
+        const RATIO: usize = 4;
+        let mut c = caged(&[7, 3, 9], RATIO);
+        c.splice_pages(7, 10, Vec::new(), RATIO).expect("evict");
+        assert_same_walk(&c, &caged(&[7, 9], RATIO), RATIO);
+
+        c.splice_pages(0, 0, vec![width_page(6, RATIO)], RATIO)
+            .expect("insert at the front");
+        assert_same_walk(&c, &caged(&[6, 7, 9], RATIO), RATIO);
+
+        c.splice_pages(22, 22, vec![width_page(2, RATIO)], RATIO)
+            .expect("insert at the end");
+        assert_same_walk(&c, &caged(&[6, 7, 9, 2], RATIO), RATIO);
+    }
+
+    /// A span inserted with no rows moves the pages after it and indexes
+    /// nothing — the splice's version of [`IndexCache::skip_to`].
+    #[test]
+    fn a_spliced_gap_moves_what_follows_and_indexes_nothing() {
+        const RATIO: usize = 4;
+        let mut c = caged(&[7, 9], RATIO);
+        c.splice_pages(7, 7, vec![SplicePiece::Gap(5)], RATIO)
+            .expect("gap");
+        assert_eq!(c.next_base(), 21);
+        assert_eq!(c.page_row_span(), caged(&[7, 9], RATIO).page_row_span());
+        let first_of_second = caged(&[7], RATIO).page_row_span();
+        assert_eq!(
+            c.block_start(first_of_second, RATIO),
+            12,
+            "the second page starts past the gap, where its K/V does"
+        );
+    }
+
+    /// A splice that would cut a page, reach past the placed tokens, or follow
+    /// live rows is refused, and changes nothing.
+    #[test]
+    fn a_splice_off_a_page_boundary_is_refused() {
+        const RATIO: usize = 4;
+        let mut c = caged(&[7, 3, 9], RATIO);
+        assert!(
+            c.splice_pages(3, 10, Vec::new(), RATIO).is_err(),
+            "3 is inside 0..7"
+        );
+        assert!(
+            c.splice_pages(7, 12, Vec::new(), RATIO).is_err(),
+            "12 is inside 10..19"
+        );
+        assert!(
+            c.splice_pages(19, 25, Vec::new(), RATIO).is_err(),
+            "past the tail"
+        );
+        assert_same_walk(&c, &caged(&[7, 3, 9], RATIO), RATIO);
+
+        c.n_blocks = 1;
+        assert!(
+            c.splice_pages(7, 10, Vec::new(), RATIO).is_err(),
+            "a splice after live rows was accepted"
+        );
+    }
+
+    /// The prompt end moves with the pages after a splice before it, and is
+    /// left alone by one after it.
+    #[test]
+    fn the_prompt_end_moves_with_the_pages_it_follows() {
+        const RATIO: usize = 4;
+        let mut c = caged(&[7, 3, 9], RATIO);
+        c.set_prompt_end(10);
+        c.splice_pages(0, 7, vec![width_page(2, RATIO)], RATIO)
+            .expect("splice before the prompt end");
+        assert_eq!(c.prompt_end(), 5);
+        c.splice_pages(5, 14, Vec::new(), RATIO)
+            .expect("splice after it");
+        assert_eq!(c.prompt_end(), 5);
     }
 
     /// An empty cache, a single page, and a page narrower than `ratio` — the
