@@ -34,14 +34,18 @@ type Committed = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 static COMMITTED: OnceLock<Committed> = OnceLock::new();
 
-/// How often a finished turn looks for its commit before letting its claim go.
+/// How often a finished turn looks for its commit at first, while the writer
+/// is likely to land it any moment.
 const COMMIT_POLL: Duration = Duration::from_millis(20);
 
-/// The longest a finished turn holds its claim waiting for its commit. The
-/// persistence writer commits a sealed turn in milliseconds; past this the
-/// writer is stalled, and the claim goes anyway — a conversation held for ever
-/// is worse than one handed on a turn short.
-const COMMIT_WAIT: Duration = Duration::from_secs(30);
+/// How long it looks that often before it settles to [`COMMIT_POLL_SLOW`].
+const COMMIT_POLL_FAST_FOR: Duration = Duration::from_secs(2);
+
+/// How often it looks once the writer is plainly behind.
+const COMMIT_POLL_SLOW: Duration = Duration::from_millis(250);
+
+/// How often a turn still waiting says so.
+const COMMIT_WARN_EVERY: Duration = Duration::from_secs(30);
 
 /// Answer [`release`]'s question with `committed`: whether the conversation
 /// a claim key names has every turn this member declared committed.
@@ -56,22 +60,37 @@ pub fn committed_by(committed: impl Fn(&str) -> bool + Send + Sync + 'static) {
 /// with the commit before — the previous turn's — as its `through`, and a
 /// member holding everything through that took the conversation while the new
 /// turn's snapshot had already reached it (`own_turns_committed`).
+///
+/// **It waits as long as the writer takes, and never gives up.** Under load the
+/// writer's queue runs past half a minute (run 41: eight turns, on both
+/// members); a release on a deadline named the previous commit again, which is
+/// the race this exists to close. Holding the claim longer costs only where the
+/// next turn may be placed — this member keeps serving the conversation — so
+/// the wait is unbounded and says so every [`COMMIT_WARN_EVERY`]. The caller
+/// ends the reply's stream first, so no client waits on it.
 pub async fn release(claim: Option<ClaimUse>, key: &str) {
     let Some(claim) = claim else {
         return;
     };
     if let Some(committed) = COMMITTED.get() {
-        let deadline = Instant::now() + COMMIT_WAIT;
+        let started = Instant::now();
+        let mut warned = started;
         while !committed(key) {
-            if Instant::now() >= deadline {
+            let waited = started.elapsed();
+            if warned.elapsed() >= COMMIT_WARN_EVERY {
+                warned = Instant::now();
                 tracing::warn!(
                     key,
-                    waited_s = COMMIT_WAIT.as_secs(),
-                    "a finished turn's commit never came; its claim goes without it"
+                    waited_s = waited.as_secs(),
+                    "a finished turn still waits for its commit; its claim is held until it lands"
                 );
-                break;
             }
-            sleep(COMMIT_POLL).await;
+            sleep(if waited < COMMIT_POLL_FAST_FOR {
+                COMMIT_POLL
+            } else {
+                COMMIT_POLL_SLOW
+            })
+            .await;
         }
     }
     drop(claim);

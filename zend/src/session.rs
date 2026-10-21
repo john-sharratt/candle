@@ -7396,6 +7396,10 @@ impl ZendSession {
                 );
                 relay_live(&mut ts, &tx, &live, &conv_id).await;
                 live_turns.end(&conv_id, &live);
+                // The reply is over: its stream ends now, and the claim waits on
+                // the turn's commit behind it, where no client waits.
+                drop(ts);
+                drop(tx);
                 turn_claims::release(claim, &conv_id).await;
             } else {
                 tx.send(Ok(StreamItem::Status("Model unavailable.".into())))

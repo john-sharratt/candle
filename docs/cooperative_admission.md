@@ -150,7 +150,15 @@ How it is built:
   (`AppMember::follow_use`). A request uses it until its response body ends (the
   host's sticky check); a turn uses it from submit until its last record is
   written (`zend::turn_claims`), because a dialogue turn outlives a client that
-  goes away. When the last use ends the claim goes as `UNCLAIM`, its `through`
+  goes away. Its last record is its `Commit`, which the persistence writer
+  writes when the turn goes cold — not at its seal — so a finished turn holds
+  the claim, its reply's stream already closed, until that lands, however long
+  it takes. A conversation whose slot stays live between tool rounds pins its
+  newest turn hot, and that turn goes cold only when a persistence pass finds
+  it unpinned: under load its handover waits seconds to minutes. Released
+  sooner, the claim named the previous turn's commit, and a member holding
+  only that took the conversation while the newer turn's snapshot had already
+  reached it. When the last use ends the claim goes as `UNCLAIM`, its `through`
   the `oseq` of the conversation's own last state record — its newest commit —
   as the app names it (`AppMember::key_through`), or this member's whole
   origin's when the app names none. npcd and the agent keep their claims until
