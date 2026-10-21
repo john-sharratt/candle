@@ -44,8 +44,9 @@ const COMMIT_POLL_FAST_FOR: Duration = Duration::from_secs(2);
 /// How often it looks once the writer is plainly behind.
 const COMMIT_POLL_SLOW: Duration = Duration::from_millis(250);
 
-/// How often a turn still waiting says so.
-const COMMIT_WARN_EVERY: Duration = Duration::from_secs(30);
+/// How long a turn waits before it says it is waiting — once, and again when its
+/// commit lands.
+const COMMIT_WAIT_NOTED: Duration = Duration::from_secs(30);
 
 /// Answer [`release`]'s question with `committed`: whether the conversation
 /// a claim key names has every turn this member declared committed.
@@ -66,23 +67,25 @@ pub fn committed_by(committed: impl Fn(&str) -> bool + Send + Sync + 'static) {
 /// members); a release on a deadline named the previous commit again, which is
 /// the race this exists to close. Holding the claim longer costs only where the
 /// next turn may be placed — this member keeps serving the conversation — so
-/// the wait is unbounded and says so every [`COMMIT_WARN_EVERY`]. The caller
-/// ends the reply's stream first, so no client waits on it.
+/// the wait is unbounded. A wait past [`COMMIT_WAIT_NOTED`] says so once, and
+/// once more with its length when the commit lands — a line every 30 s per turn
+/// was 957 lines in one run. The caller ends the reply's stream first, so no
+/// client waits on it.
 pub async fn release(claim: Option<ClaimUse>, key: &str) {
     let Some(claim) = claim else {
         return;
     };
     if let Some(committed) = COMMITTED.get() {
         let started = Instant::now();
-        let mut warned = started;
+        let mut noted = false;
         while !committed(key) {
             let waited = started.elapsed();
-            if warned.elapsed() >= COMMIT_WARN_EVERY {
-                warned = Instant::now();
+            if !noted && waited >= COMMIT_WAIT_NOTED {
+                noted = true;
                 tracing::warn!(
                     key,
                     waited_s = waited.as_secs(),
-                    "a finished turn still waits for its commit; its claim is held until it lands"
+                    "a finished turn waits for its commit; its claim is held until it lands"
                 );
             }
             sleep(if waited < COMMIT_POLL_FAST_FOR {
@@ -91,6 +94,13 @@ pub async fn release(claim: Option<ClaimUse>, key: &str) {
                 COMMIT_POLL_SLOW
             })
             .await;
+        }
+        if noted {
+            tracing::info!(
+                key,
+                waited_s = started.elapsed().as_secs(),
+                "a finished turn's commit landed; its claim goes"
+            );
         }
     }
     drop(claim);
