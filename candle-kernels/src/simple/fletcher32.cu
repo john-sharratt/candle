@@ -29,7 +29,7 @@
 // (N < sqrt(2^64 / 65535) ≈ 1.67e7 words).
 //
 //   Grid:  (n_records, 1, 1)
-//   Block: (FLETCHER_BLOCK, 1, 1)   — a power of two
+//   Block: (FLETCHER_BLOCK, 1, 1)   — a multiple of the warp size
 //
 // An empty record (len == 0) yields checksum 0, matching the CPU reference.
 
@@ -37,7 +37,25 @@
 #include <cuda_runtime.h>
 
 #define FLETCHER_BLOCK 256
+#define FLETCHER_WARPS (FLETCHER_BLOCK / 32)
 #define FLETCHER_MOD 65535u
+
+// One word w at index m into both sums.
+__device__ __forceinline__ void fletcher_word(
+    uint64_t& acc1, uint64_t& acc2, uint64_t w, int64_t m, int64_t N
+) {
+    acc1 += w;
+    acc2 += (uint64_t)(N - m) * w;
+}
+
+// Sum `v` across the warp; lane 0 holds the total.
+__device__ __forceinline__ uint64_t fletcher_warp_sum(uint64_t v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    return v;
+}
 
 __global__ void fletcher32_kernel(
     const int64_t* __restrict__ src_ptrs,
@@ -60,19 +78,35 @@ __global__ void fletcher32_kernel(
     uint64_t acc2 = 0;
 
     if ((((uintptr_t)base) & 1u) == 0) {
-        // Fast path: 2-byte aligned → coalesced 16-bit loads across the warp.
+        // 2-byte aligned. The body is read 16 bytes — eight words — per load
+        // from the first 16-byte boundary; the words before it and after the
+        // last whole vector are read one at a time.
         const uint16_t* __restrict__ w16 = (const uint16_t*)base;
-        for (int64_t m = t; m < nfull; m += stride) {
-            uint64_t w = w16[m];
-            acc1 += w;
-            acc2 += (uint64_t)(N - m) * w;
+        int64_t head = (int64_t)(((16u - ((uintptr_t)base & 15u)) & 15u) >> 1);
+        if (head > nfull) head = nfull;
+        for (int64_t m = t; m < head; m += stride) {
+            fletcher_word(acc1, acc2, w16[m], m, N);
+        }
+        const uint4* __restrict__ vec = (const uint4*)(w16 + head);
+        const int64_t nvec = (nfull - head) >> 3;
+        for (int64_t k = t; k < nvec; k += stride) {
+            const uint4 q = vec[k];
+            const int64_t m0 = head + (k << 3);
+            const uint32_t parts[4] = {q.x, q.y, q.z, q.w};
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                fletcher_word(acc1, acc2, parts[i] & 0xffffu, m0 + 2 * i, N);
+                fletcher_word(acc1, acc2, parts[i] >> 16, m0 + 2 * i + 1, N);
+            }
+        }
+        for (int64_t m = head + (nvec << 3) + t; m < nfull; m += stride) {
+            fletcher_word(acc1, acc2, w16[m], m, N);
         }
     } else {
         // Unaligned: assemble each little-endian word from bytes.
         for (int64_t m = t; m < nfull; m += stride) {
             uint64_t w = (uint64_t)base[2 * m] | ((uint64_t)base[2 * m + 1] << 8);
-            acc1 += w;
-            acc2 += (uint64_t)(N - m) * w;
+            fletcher_word(acc1, acc2, w, m, N);
         }
     }
 
@@ -83,23 +117,28 @@ __global__ void fletcher32_kernel(
         acc2 += w;
     }
 
-    // Block-reduce the two sums.
-    __shared__ uint64_t s1[FLETCHER_BLOCK];
-    __shared__ uint64_t s2[FLETCHER_BLOCK];
-    s1[t] = acc1;
-    s2[t] = acc2;
-    __syncthreads();
-    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
-        if (t < off) {
-            s1[t] += s1[t + off];
-            s2[t] += s2[t + off];
-        }
-        __syncthreads();
+    // Reduce within each warp by shuffle, then across the block's warps.
+    __shared__ uint64_t s1[FLETCHER_WARPS];
+    __shared__ uint64_t s2[FLETCHER_WARPS];
+    acc1 = fletcher_warp_sum(acc1);
+    acc2 = fletcher_warp_sum(acc2);
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    if (lane == 0) {
+        s1[warp] = acc1;
+        s2[warp] = acc2;
     }
-
+    __syncthreads();
     if (t == 0) {
-        uint32_t sum1 = (uint32_t)(s1[0] % FLETCHER_MOD);
-        uint32_t sum2 = (uint32_t)(s2[0] % FLETCHER_MOD);
+        uint64_t total1 = 0;
+        uint64_t total2 = 0;
+        #pragma unroll
+        for (int i = 0; i < FLETCHER_WARPS; ++i) {
+            total1 += s1[i];
+            total2 += s2[i];
+        }
+        uint32_t sum1 = (uint32_t)(total1 % FLETCHER_MOD);
+        uint32_t sum2 = (uint32_t)(total2 % FLETCHER_MOD);
         out[r] = (sum2 << 16) | sum1;
     }
 }

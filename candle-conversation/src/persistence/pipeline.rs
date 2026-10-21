@@ -38,12 +38,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use candle::cuda_backend::{Held, WrapErr};
 use candle::Device;
-use candle_nn::kv_cache::{kv_migrate, BlockAllocSpec, ChunkedKvBacking, KvFormat, MigrationPlan};
+use candle_nn::kv_cache::{
+    fletcher32_golden, kv_migrate, BlockAllocSpec, ChunkedKvBacking, GoldenRecord, KvFormat,
+    MigrationPlan,
+};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 
 use super::chunk_plan::{ChunkBatch, SourceLog, UnitPlan, UNIT_BYTES};
@@ -51,6 +54,7 @@ use super::cold_load::ColdLoadStager;
 use super::record::{decode_record, ChunkPayload};
 use super::segment::SegmentId;
 use super::SubstratePersistence;
+use crate::scheduler::profile;
 use candle::direct_io::DirectFile;
 
 /// Cross-thread raw pointer to the pinned scratch's base. Bundled into
@@ -103,8 +107,8 @@ struct UnitDone {
 /// anchored records have been alloc'd.
 struct UnitWork {
     unit_idx: u32,
-    /// Records anchored at this unit (i.e. `last_unit == unit_idx`)
-    /// — they're ready to migrate now.
+    /// Records of every layer whose last record landed in this unit —
+    /// allocated, so ready to migrate.
     records: Vec<RecordMigrate>,
 }
 
@@ -132,6 +136,15 @@ struct AllocBreakdown {
     pool_us: u64,
     register_us: u64,
     gpu_push_us: u64,
+}
+
+/// A record's stored golden and where its K/V bytes sit in the GPU staging,
+/// checked on the device once the batch has landed ([`verify_goldens`]).
+struct GoldenCheck {
+    chunk_idx: u32,
+    stored: u32,
+    src_offset: i64,
+    len: i64,
 }
 
 /// One alloc'd record ready for the migrate plan.
@@ -292,65 +305,68 @@ pub fn run_pipeline(
     // from allocator/dispatcher latency.
     let reads_done_at_ms = Arc::new(AtomicU64::new(0));
 
-    let ((htod_ms, migrate_ms), alloc_brk): ((u64, u64), AllocBreakdown) =
-        std::thread::scope(|s| {
-            // ── Reader pool ────────────────────────────────────────────
-            for handle_idx in 0..n_readers {
-                let work_rx = work_rx.clone();
-                let done_tx = done_tx.clone();
-                let reads_done_at_ms = Arc::clone(&reads_done_at_ms);
-                s.spawn(move || {
-                    while let Ok(work) = work_rx.recv() {
-                        let direct = match work.source {
-                            SourceLog::Active => persistence.active_direct_file(),
-                            SourceLog::Sealed(id) => match sealed.get(&id) {
-                                Some(d) => d.as_ref(),
-                                // Every `Sealed(id)` in the plan gets a handle
-                                // opened up front by `load_stream_into_hot`; a
-                                // miss is a bug, but propagate it as a read
-                                // error rather than panicking the reader thread.
-                                None => {
-                                    let _ = done_tx.send(UnitDone {
-                                        unit_idx: work.unit_idx,
-                                        error: Some(candle::Error::Msg(format!(
-                                            "pipeline: no open handle for sealed segment {id}"
-                                        ))),
-                                    });
-                                    continue;
-                                }
-                            },
-                            SourceLog::Inherited(i) => persistence.inherited_direct_file(i),
-                        };
-                        // SAFETY: per-unit dest regions are disjoint
-                        // (units are byte ranges, not overlapping). No
-                        // other thread writes to this region until
-                        // UnitDone is sent. Going through `slice_mut`
-                        // (rather than `pinned_ptr.0.add(...)`) keeps the
-                        // closure's capture as the whole PinnedPtr.
-                        let dest = unsafe { pinned_ptr.slice_mut(work.dest_offset, work.length) };
-                        let result = direct.read_at_with_handle(handle_idx, work.file_offset, dest);
-                        // Record this reader's completion time. The
-                        // pipeline-level `reads_ms` is the max of all
-                        // readers' completion times — i.e. when the
-                        // last disk read returned.
-                        let now_ms = t_total.elapsed().as_millis() as u64;
-                        reads_done_at_ms.fetch_max(now_ms, Ordering::Relaxed);
-                        let _ = done_tx.send(UnitDone {
-                            unit_idx: work.unit_idx,
-                            error: result
-                                .err()
-                                .map(|e| candle::Error::Msg(format!("pipeline read: {e}"))),
-                        });
-                    }
-                });
-            }
-            drop(done_tx);
+    let ((htod_ms, migrate_ms), (alloc_brk, goldens)): (
+        (u64, u64),
+        (AllocBreakdown, Vec<GoldenCheck>),
+    ) = std::thread::scope(|s| {
+        // ── Reader pool ────────────────────────────────────────────
+        for handle_idx in 0..n_readers {
+            let work_rx = work_rx.clone();
+            let done_tx = done_tx.clone();
+            let reads_done_at_ms = Arc::clone(&reads_done_at_ms);
+            s.spawn(move || {
+                while let Ok(work) = work_rx.recv() {
+                    let direct = match work.source {
+                        SourceLog::Active => persistence.active_direct_file(),
+                        SourceLog::Sealed(id) => match sealed.get(&id) {
+                            Some(d) => d.as_ref(),
+                            // Every `Sealed(id)` in the plan gets a handle
+                            // opened up front by `load_stream_into_hot`; a
+                            // miss is a bug, but propagate it as a read
+                            // error rather than panicking the reader thread.
+                            None => {
+                                let _ = done_tx.send(UnitDone {
+                                    unit_idx: work.unit_idx,
+                                    error: Some(candle::Error::Msg(format!(
+                                        "pipeline: no open handle for sealed segment {id}"
+                                    ))),
+                                });
+                                continue;
+                            }
+                        },
+                        SourceLog::Inherited(i) => persistence.inherited_direct_file(i),
+                    };
+                    // SAFETY: per-unit dest regions are disjoint
+                    // (units are byte ranges, not overlapping). No
+                    // other thread writes to this region until
+                    // UnitDone is sent. Going through `slice_mut`
+                    // (rather than `pinned_ptr.0.add(...)`) keeps the
+                    // closure's capture as the whole PinnedPtr.
+                    let dest = unsafe { pinned_ptr.slice_mut(work.dest_offset, work.length) };
+                    let result = direct.read_at_with_handle(handle_idx, work.file_offset, dest);
+                    // Record this reader's completion time. The
+                    // pipeline-level `reads_ms` is the max of all
+                    // readers' completion times — i.e. when the
+                    // last disk read returned.
+                    let now_ms = t_total.elapsed().as_millis() as u64;
+                    reads_done_at_ms.fetch_max(now_ms, Ordering::Relaxed);
+                    let _ = done_tx.send(UnitDone {
+                        unit_idx: work.unit_idx,
+                        error: result
+                            .err()
+                            .map(|e| candle::Error::Msg(format!("pipeline read: {e}"))),
+                    });
+                }
+            });
+        }
+        drop(done_tx);
 
-            // Shared immutable references for both allocator & dispatcher.
-            let unit_plan_ref: &UnitPlan = &unit_plan;
+        // Shared immutable references for both allocator & dispatcher.
+        let unit_plan_ref: &UnitPlan = &unit_plan;
 
-            // ── Allocator ──────────────────────────────────────────────
-            let alloc_handle = s.spawn(move || -> candle::Result<AllocBreakdown> {
+        // ── Allocator ──────────────────────────────────────────────
+        let alloc_handle = s.spawn(
+            move || -> candle::Result<(AllocBreakdown, Vec<GoldenCheck>)> {
                 allocator_worker(
                     backings,
                     chunk_batch,
@@ -363,28 +379,33 @@ pub fn run_pipeline(
                     done_rx,
                     dispatch_tx,
                 )
-            });
+            },
+        );
 
-            // ── Main thread: GPU dispatcher ────────────────────────────
-            let dispatcher_result = dispatcher_main(
-                device,
-                &stream,
-                pinned_ptr,
-                unit_plan_ref,
-                staging_base,
-                &mut staging,
-                dispatch_rx,
-            );
+        // ── Main thread: GPU dispatcher ────────────────────────────
+        let dispatcher_result = dispatcher_main(
+            device,
+            &stream,
+            pinned_ptr,
+            unit_plan_ref,
+            staging_base,
+            &mut staging,
+            dispatch_rx,
+        );
 
-            let alloc_result = alloc_handle
-                .join()
-                .unwrap_or_else(|_| Err(candle::Error::Msg("pipeline allocator panicked".into())));
+        let alloc_result = alloc_handle
+            .join()
+            .unwrap_or_else(|_| Err(candle::Error::Msg("pipeline allocator panicked".into())));
 
-            match (dispatcher_result, alloc_result) {
-                (Ok(ms), Ok(brk)) => Ok((ms, brk)),
-                (Err(e), _) | (_, Err(e)) => Err(e),
-            }
-        })?;
+        match (dispatcher_result, alloc_result) {
+            (Ok(ms), Ok(brk)) => Ok((ms, brk)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        }
+    })?;
+
+    // Every record's golden, checked where its bytes now are, before the
+    // staging that holds them goes back.
+    let _mismatched = verify_goldens(device, staging_base, &goldens)?;
 
     // The staging goes back to the held ground fenced on the stream, so the
     // next holder of its range waits for this batch's copies and migrate;
@@ -412,6 +433,53 @@ pub fn run_pipeline(
     })
 }
 
+/// Recompute each record's golden over its K/V bytes in the GPU staging, in
+/// one launch, and compare with the golden stored with it.
+///
+/// **Checked on the device, after the copy.** The golden was taken on the GPU
+/// before the bytes ever left it; recomputing it over the bytes that came back
+/// — read off disk, copied host to device — catches corruption on either leg,
+/// where a host recompute saw only the disk's. And it does not cost the
+/// pipeline's allocator thread a pass over every byte: measured on BlackWorld
+/// (2026-10-22) that host pass was a quarter of the allocator's time, on the
+/// thread every cold load waits behind.
+///
+/// Non-fatal, as it always was: a mismatch warns (possible on-disk or transfer
+/// corruption) and the load still lands, so a latency-sensitive projection never
+/// fails on it. Returns the chunks that mismatched.
+fn verify_goldens(
+    device: &Device,
+    staging_base: i64,
+    checks: &[GoldenCheck],
+) -> candle::Result<Vec<u32>> {
+    if checks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let records: Vec<GoldenRecord> = checks
+        .iter()
+        .map(|c| GoldenRecord {
+            src_ptr: staging_base + c.src_offset,
+            byte_len: c.len,
+        })
+        .collect();
+    let recomputed = fletcher32_golden(device, &records)?;
+    let mut mismatched = Vec::new();
+    for (check, got) in checks.iter().zip(recomputed) {
+        if got != check.stored {
+            tracing::warn!(
+                target: "candle_conversation::persistence::golden",
+                chunk_idx = check.chunk_idx,
+                stored = check.stored,
+                recomputed = got,
+                "chunk golden mismatch on cold-load into VRAM — possible on-disk or \
+                 transfer corruption"
+            );
+            mismatched.push(check.chunk_idx);
+        }
+    }
+    Ok(mismatched)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn allocator_worker(
     backings: &[ChunkedKvBacking],
@@ -424,7 +492,7 @@ fn allocator_worker(
     mut record_wait_count: Vec<u32>,
     done_rx: Receiver<UnitDone>,
     dispatch_tx: Sender<UnitWork>,
-) -> candle::Result<AllocBreakdown> {
+) -> candle::Result<(AllocBreakdown, Vec<GoldenCheck>)> {
     let n_layers = backings.len();
 
     // A CUDA context is CURRENT PER THREAD, and this runs on a spawned worker.
@@ -470,6 +538,29 @@ fn allocator_worker(
     let mut pool_us: u64 = 0;
     let mut register_us: u64 = 0;
     let mut gpu_push_us: u64 = 0;
+    let mut goldens: Vec<GoldenCheck> = Vec::with_capacity(chunk_batch.records.len());
+
+    // Each layer's records still to land, and the specs of those that have,
+    // beside their staging offsets: a layer is allocated in ONE bulk call the
+    // moment its last record lands. Records lie on disk in layer-major order,
+    // so layers complete one after another as the reads progress and the
+    // allocation still overlaps them — where allocating every unit's ready
+    // records at once split a layer across as many calls as units it spans,
+    // each paying the arena walk, the metadata push and the record upload for
+    // one or two blocks.
+    let mut layer_pending: Vec<usize> = vec![0; n_layers];
+    for rec in &chunk_batch.records {
+        let layer = (rec.chunk_idx as usize) / chunks_per_layer;
+        if layer >= n_layers {
+            return Err(candle::Error::Msg(format!(
+                "pipeline: chunk_idx {} routes to layer {} but only {} layers",
+                rec.chunk_idx, layer, n_layers
+            )));
+        }
+        layer_pending[layer] += 1;
+    }
+    let mut per_layer: Vec<(Vec<BlockAllocSpec>, Vec<i64>)> =
+        (0..n_layers).map(|_| (Vec::new(), Vec::new())).collect();
 
     while units_received < total_units {
         let done = done_rx
@@ -495,13 +586,8 @@ fn allocator_worker(
         let mut records_to_dispatch: Vec<RecordMigrate> = Vec::new();
 
         if !ready.is_empty() {
-            // Group ready records by layer for batched alloc. Per-unit
-            // dispatch keeps the alloc work overlapped with subsequent
-            // reads on the allocator thread — measured empirically to
-            // beat end-of-batch deferral (lost pipelining + per-spec
-            // re-clones outweighed the per-call overhead saving).
-            let mut per_layer: Vec<Vec<(usize, BlockAllocSpec, i64)>> =
-                (0..n_layers).map(|_| Vec::new()).collect();
+            // Layers whose last record landed in this unit.
+            let mut completed: Vec<usize> = Vec::new();
 
             // ── Sub-timer: decode + spec construction ────────────
             let t_decode = Instant::now();
@@ -518,33 +604,18 @@ fn allocator_worker(
                 let payload_buf_offset = rec.buf_offset + header_bytes;
                 let (meta, kv_range) = ChunkPayload::decode_with_kv_range(payload)
                     .map_err(|e| candle::Error::Msg(format!("pipeline payload: {e}")))?;
-                // Read-into-VRAM golden check at the consumption point: the KV
-                // bytes were just read off disk and are about to scatter into GPU
-                // arenas. Recompute the golden and compare to the stored value —
-                // NON-fatal: a mismatch warns (possible on-disk / read-path
-                // corruption) but still loads, so the latency-sensitive cold-load
-                // never hard-fails on it.
-                let recomputed =
-                    candle::fletcher::fletcher32(&payload[kv_range.start..kv_range.end]);
-                if recomputed != header.crc {
-                    tracing::warn!(
-                        target: "candle_conversation::persistence::golden",
-                        chunk_idx = rec.chunk_idx,
-                        stored = header.crc,
-                        recomputed,
-                        "chunk golden mismatch on cold-load into VRAM — possible on-disk/read corruption"
-                    );
-                }
                 let src_offset = (payload_buf_offset + kv_range.start) as i64;
+                // The golden is checked on the device once the batch has
+                // landed in the staging ([`verify_goldens`]).
+                goldens.push(GoldenCheck {
+                    chunk_idx: rec.chunk_idx as u32,
+                    stored: header.crc,
+                    src_offset,
+                    len: kv_range.len() as i64,
+                });
 
                 let layer = (rec.chunk_idx as usize) / chunks_per_layer;
                 let block_idx = (rec.chunk_idx as usize) % chunks_per_layer;
-                if layer >= n_layers {
-                    return Err(candle::Error::Msg(format!(
-                        "pipeline: chunk_idx {} routes to layer {} but only {} layers",
-                        rec.chunk_idx, layer, n_layers
-                    )));
-                }
 
                 let k_formats: candle::Result<Vec<KvFormat>> = meta
                     .k_formats
@@ -577,18 +648,18 @@ fn allocator_worker(
                     usage: rec.token_count as u32,
                 };
 
-                per_layer[layer].push((r_idx, spec, src_offset));
+                per_layer[layer].0.push(spec);
+                per_layer[layer].1.push(src_offset);
+                layer_pending[layer] -= 1;
+                if layer_pending[layer] == 0 {
+                    completed.push(layer);
+                }
             }
             decode_us += t_decode.elapsed().as_micros() as u64;
 
-            // ── Per-layer alloc + resolve dst ptrs ───────────────
-            for (li, layer_recs) in per_layer.iter().enumerate() {
-                if layer_recs.is_empty() {
-                    continue;
-                }
-                let specs: Vec<BlockAllocSpec> =
-                    layer_recs.iter().map(|(_, s, _)| s.clone()).collect();
-
+            // ── Completed layers: alloc + resolve dst ptrs ───────
+            for li in completed {
+                let (specs, src_offsets) = std::mem::take(&mut per_layer[li]);
                 let t_bulk = Instant::now();
                 let (hgids, arena_info) = backings[li].alloc_sealed_blocks_bulk(
                     slots[li],
@@ -610,9 +681,9 @@ fn allocator_worker(
                 resolve_ptrs_us += t_resolve.elapsed().as_micros() as u64;
                 n_resolve_calls += 1;
 
-                for ((_, _, src_offset), dst_ptrs) in layer_recs.iter().zip(dst_ptrs_per_rec) {
+                for (&src_offset, dst_ptrs) in src_offsets.iter().zip(dst_ptrs_per_rec) {
                     records_to_dispatch.push(RecordMigrate {
-                        src_offset: *src_offset,
+                        src_offset,
                         dst_ptrs,
                     });
                 }
@@ -630,19 +701,33 @@ fn allocator_worker(
         });
     }
 
+    // The allocator's stages in the one table that accounts for a whole wave,
+    // filed once per batch rather than timed per chunk.
+    let us = Duration::from_micros;
+    profile::record("cold:alloc_stage", us(alloc_us_accum));
+    profile::record("cold:decode", us(decode_us));
+    profile::record("cold:bulk_alloc", us(bulk_alloc_us));
+    profile::record("cold:bulk_alloc:pool", us(pool_us));
+    profile::record("cold:bulk_alloc:register", us(register_us));
+    profile::record("cold:bulk_alloc:gpu_push", us(gpu_push_us));
+    profile::record("cold:resolve_ptrs", us(resolve_ptrs_us));
+
     // Drop dispatch_tx (implicit at function return) signals the
     // dispatcher to exit its recv loop.
-    Ok(AllocBreakdown {
-        alloc_ms: alloc_us_accum / 1000,
-        decode_us,
-        bulk_alloc_us,
-        resolve_ptrs_us,
-        n_bulk_calls,
-        n_resolve_calls,
-        pool_us,
-        register_us,
-        gpu_push_us,
-    })
+    Ok((
+        AllocBreakdown {
+            alloc_ms: alloc_us_accum / 1000,
+            decode_us,
+            bulk_alloc_us,
+            resolve_ptrs_us,
+            n_bulk_calls,
+            n_resolve_calls,
+            pool_us,
+            register_us,
+            gpu_push_us,
+        },
+        goldens,
+    ))
 }
 
 /// Returns `(htod_ms, migrate_ms)` — the two stages this thread owns.
@@ -685,4 +770,56 @@ fn dispatcher_main(
     let migrate_ms = t_migrate.elapsed().as_millis() as u64;
 
     Ok((htod_ms_accum, migrate_ms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{verify_goldens, GoldenCheck};
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::fletcher::fletcher32;
+    use candle::Device;
+
+    /// Records laid out in one staging buffer at odd and even offsets: the
+    /// device check passes the intact ones and names exactly the record whose
+    /// bytes no longer match the golden stored with it.
+    #[test]
+    fn device_golden_check_names_only_the_corrupted_record() {
+        let device = match Device::cuda_if_available(0) {
+            Ok(d @ Device::Cuda(_)) => d,
+            _ => return, // no GPU — skip
+        };
+        let dev = match &device {
+            Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+
+        let staging: Vec<u8> = (0..9000u32).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+        // (chunk_idx, offset, len) — the third is stored with a wrong golden.
+        let spans = [
+            (4u32, 0usize, 2048usize),
+            (9, 2051, 777),
+            (13, 3000, 4096),
+            (21, 7101, 1),
+        ];
+        let checks: Vec<GoldenCheck> = spans
+            .iter()
+            .map(|&(chunk_idx, off, len)| {
+                let golden = fletcher32(&staging[off..off + len]);
+                GoldenCheck {
+                    chunk_idx,
+                    stored: if chunk_idx == 13 { golden ^ 1 } else { golden },
+                    src_offset: off as i64,
+                    len: len as i64,
+                }
+            })
+            .collect();
+
+        let staging_gpu = dev.memcpy_stod(&staging).unwrap();
+        let stream = dev.cuda_stream();
+        let base = staging_gpu.device_ptr(&stream).0 as i64;
+        drop(stream);
+
+        assert_eq!(verify_goldens(&device, base, &checks).unwrap(), vec![13]);
+        assert!(verify_goldens(&device, base, &[]).unwrap().is_empty());
+    }
 }

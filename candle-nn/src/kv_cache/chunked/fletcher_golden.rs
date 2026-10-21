@@ -145,4 +145,53 @@ mod tests {
         // Spot-check the canonical Fletcher-32 vector went through the GPU path.
         assert_eq!(goldens[0], 0xEBE1_9591);
     }
+
+    /// Records starting at every offset within a 16-byte vector and ending on
+    /// both sides of each word / vector boundary: the aligned head, the 16-byte
+    /// body, the tail words, the odd trailing byte, and the byte-assembled
+    /// odd-address path all meet in one launch over one allocation.
+    #[test]
+    fn golden_matches_cpu_reference_at_every_alignment() {
+        let device = match candle::Device::cuda_if_available(0) {
+            Ok(d @ candle::Device::Cuda(_)) => d,
+            _ => return, // no GPU — skip
+        };
+        let dev = match &device {
+            candle::Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+
+        let buf: Vec<u8> = (0..20_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let src_gpu = dev.memcpy_stod(&buf).unwrap();
+        let stream = dev.cuda_stream();
+        let base = src_gpu.device_ptr(&stream).0 as i64;
+        drop(stream);
+
+        let lens = [
+            0usize, 1, 2, 3, 15, 16, 17, 30, 31, 32, 33, 47, 48, 49, 255, 256, 257, 4095, 4097,
+            16_383,
+        ];
+        let spans: Vec<(usize, usize)> = (0..16usize)
+            .flat_map(|off| lens.iter().map(move |&len| (off, len)))
+            .collect();
+        let records: Vec<GoldenRecord> = spans
+            .iter()
+            .map(|&(off, len)| GoldenRecord {
+                src_ptr: base + off as i64,
+                byte_len: len as i64,
+            })
+            .collect();
+
+        let goldens = fletcher32_golden(&device, &records).unwrap();
+        assert_eq!(goldens.len(), spans.len());
+        for (i, &(off, len)) in spans.iter().enumerate() {
+            assert_eq!(
+                goldens[i],
+                fletcher32(&buf[off..off + len]),
+                "offset {off} len {len}: GPU golden != CPU reference"
+            );
+        }
+    }
 }
