@@ -83,9 +83,40 @@ fn layer(
     ground
         .standing
         .insert(spec.layer.clone(), standing(&below, &first.held));
-    if !read || first.queued.is_empty() {
+    if !read {
         return Ok(changed);
     }
+    // A layer reads until nothing is queued in it before the layer above reads
+    // anything: a unit it reads can leave branches its dependencies are not
+    // current on, and each of those queues a unit of its own. It stops when a
+    // pass is asked for, and when a read leaves the plan as it was — a unit
+    // that will not commit is tried again next pass, not here.
+    let mut plan = first;
+    while !plan.queued.is_empty() {
+        let Some(next) = read_queued(ctx, run, ground, &below, &days, &plan)? else {
+            break;
+        };
+        changed = true;
+        let stuck = next.queued == plan.queued;
+        plan = next;
+        if stuck {
+            break;
+        }
+    }
+    Ok(changed)
+}
+
+/// Read what `first` queued and plan the layer again, leaving what stands in
+/// `ground`. `None` when a pass was asked for first and nothing was read.
+fn read_queued(
+    ctx: &RefreshContext<'_>,
+    run: &LayerRun<'_>,
+    ground: &mut Ground,
+    below: &[Below],
+    days: &[DaySource],
+    first: &Plan,
+) -> anyhow::Result<Option<Plan>> {
+    let spec = run.spec;
     if crate::ingest_worker::preempted() || crate::ingest_cancel::cancelled() {
         tracing::info!(
             target: "zend::layers",
@@ -93,7 +124,7 @@ fn layer(
             queued = first.queued.len(),
             "a pass was asked for: the layers below are read first, this one next pass",
         );
-        return Ok(changed);
+        return Ok(None);
     }
     let by_day: HashMap<&str, &DaySource> = days.iter().map(|d| (d.key.as_str(), d)).collect();
     let jobs: Vec<UnitJob> = first
@@ -139,13 +170,12 @@ fn layer(
         known: &known,
     };
     ingest_units(ctx, spec, &jobs, run.base, Some(&files))?;
-    changed = true;
     // What this layer read stands now too, for the layer above.
-    let after = settle(ctx.engine, spec, &below, ground);
+    let after = settle(ctx.engine, spec, below, ground);
     ground
         .standing
-        .insert(spec.layer.clone(), standing(&below, &after.held));
-    Ok(changed)
+        .insert(spec.layer.clone(), standing(below, &after.held));
+    Ok(Some(after))
 }
 
 /// Plan the layer against `below` and tombstone what the plan lets go.

@@ -124,7 +124,11 @@ work below goes the moment that work is found.
 
 `BranchIngest::pass` walks the layers bottom up. It carries what stands in each
 layer (`Ground`) to the next, so a layer is planned against exactly what is
-current below it, after that layer has read what it queued.
+current below it, after that layer has read what it queued. A layer reads until
+nothing is queued in it before the layer above reads: a unit that splits leaves
+branches it is not current on, and their units are read before anything above.
+It stops early when a pass is asked for, and when a read leaves its plan
+unchanged (a unit that would not commit is tried again next pass).
 
 A pass request that arrives while a pass runs raises `ingest_worker::PREEMPT`.
 A layer of units checks it between units and stops, and the next pass starts
