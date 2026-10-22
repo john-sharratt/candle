@@ -30,10 +30,17 @@ A layer is built from the layers below it when it declares an `ingest:` block:
   `after`, the unit builds on that layer's unit for the same day.
 - **Thinking** is the layer's own `thinking_effort` dial, the level a dialogue
   turn on the layer would use. Nothing caps a unit's thinking or answer.
-- **Tools.** A unit has none. It answers from its lineage and from the layers
-  below it, and the tool-call opener is banned in its turn: a model that knows
-  the call format from its history otherwise reaches for `file_read` instead
-  of answering, and that call would be committed as the unit.
+- **Tools.** A layer may give its units read-only tools (`tools:` in the
+  block); every analysis layer gives `file_read`, `file_list`, `file_search` and
+  `file_grep` (`READ_ONLY_TOOLS`). They read the workspace at the commit of the
+  unit's file, the catalog is pinned to exactly them, a call of any other is
+  refused rather than run, and a layer naming anything else is refused when the
+  schema loads. A unit reads for as many rounds as it needs; a closing round
+  (after `MAX_TOOL_ROUNDS`, a backstop) bans the tool-call opener so it answers
+  in prose. A layer with no tools gets that closing round alone.
+- **The spec is part of what a unit stands on.** Each unit records a digest of
+  its layer's prompt, tools, thinking and edges; one built under another is
+  stale, so changing a layer's question rebuilds it and the layers above.
 - **Placeholders** are `<<name>>`, not `{name}`: the whole schema is a template
   whose `{ident}` must be a template variable.
 
@@ -135,8 +142,14 @@ preempt: a day closing is no work for the layers below.
   layer up.
 - Many long-lived branches multiply units: a file gets one analysis per
   distinct set of dependency versions across the branches that hold it.
-- The upper layers think at `deep` and `exhaustive`. On a 24 GB card at depth
-  1, a layer of 24 units takes 15–60 minutes.
+- The upper layers think at `deep` and `exhaustive`, and read with their
+  tools. On a 24 GB card at depth 1, a layer of 24 units takes about an hour
+  (dependency) to two and a half hours (bug).
+- Every unit inherits its lower units' whole conversations, their tool reads
+  included: an upper unit's lineage reaches the inherited-chain cap. On a 64 GB
+  host the first tool-using upper layer once failed every unit on a
+  driver-level out-of-memory (pinned host memory) and did not on a fresh
+  process; host-memory admission is the engine's, and unproven here.
 
 ## Tied to a branch
 
