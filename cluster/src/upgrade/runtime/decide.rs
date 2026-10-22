@@ -6,8 +6,12 @@
 //!
 //! 1. **Admitted below the floor** — the floor's build, at once, with no lease:
 //!    an upgrading member serves nothing the app would lose (§3.5). One whose
-//!    install of that build already failed here installs nothing, and waits to
-//!    be closed 4410 with the reason.
+//!    install of that build already failed here takes instead the newest build
+//!    at or above the floor that every app it serves certified and it never
+//!    refused, with no lease either. With none, it installs nothing until one
+//!    certifies. The refusal is this member's alone — the group never hears of
+//!    it — so waiting on the floor it was admitted under would wait until its
+//!    socket happened to close, however many builds above it certified.
 //! 2. **A forced rollout naming it** — the latest `rollout/<app>/<n>` of any
 //!    app it serves whose targets include it, while it is not on that build
 //!    yet, under one of the rollout's `parallel` leases (§3.11). Being named
@@ -93,7 +97,16 @@ pub fn target(f: &Facts) -> Option<Target> {
     let running = own.build();
     if let Some(floor) = &f.upgrading {
         if f.refused.contains(&build_name(floor)) {
-            return None;
+            return f
+                .known
+                .iter()
+                .filter(|b| !b.is_local() && b.count >= floor.count && **b != running)
+                .filter(|b| f.certified(b) && !f.refused.contains(&build_name(b)))
+                .max_by_key(|b| b.count)
+                .map(|b| Target {
+                    build: b.clone(),
+                    lease: Lease::None,
+                });
         }
         if *floor != running {
             return Some(Target {
@@ -220,6 +233,37 @@ mod tests {
         f.refused.insert("12-h12".into());
         assert_eq!(target(&f), None);
         assert_eq!(prefetch(&f), None);
+    }
+
+    /// Below a floor whose build failed here, the newest build at or above the
+    /// floor that certified and was never refused is installed instead, with
+    /// no lease — not nothing for as long as the socket stays open. A build
+    /// below the floor, one not certified, or one refused too is not.
+    #[test]
+    fn a_refused_floor_gives_way_to_a_newer_certified_build() {
+        let mut f = facts(10, "");
+        f.upgrading = Some(b(12));
+        f.refused.insert("12-h12".into());
+        f.known = vec![b(11), b(12), b(13), b(14)];
+        for n in [11, 12, 13] {
+            f.verdicts
+                .insert(("zend".into(), format!("{n}-h{n}")), Settled::Pass);
+        }
+        assert_eq!(
+            target(&f),
+            Some(Target {
+                build: b(13),
+                lease: Lease::None
+            }),
+            "14 has not certified, 11 is below the floor"
+        );
+        f.verdicts
+            .insert(("zend".into(), "14-h14".into()), Settled::Pass);
+        assert_eq!(target(&f).map(|t| t.build), Some(b(14)));
+        f.refused.insert("14-h14".into());
+        assert_eq!(target(&f).map(|t| t.build), Some(b(13)));
+        f.refused.insert("13-h13".into());
+        assert_eq!(target(&f), None, "nothing above the floor is left to take");
     }
 
     /// A certified build is installed under `upgrade/<app>`; one not
