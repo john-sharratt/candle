@@ -505,12 +505,12 @@ fn ask(
             }
         }
         let Some(tools) = tools.as_ref().filter(|_| !steps.is_empty()) else {
-            return answer_of(&resp.text);
+            return answer_of(&resp.text, round, &resp.stats.finish);
         };
         let results = tool_round::run(tools, only_given(steps, &spec.tools));
         let response = format_tool_responses(&results);
         if response.is_blank() {
-            return answer_of(&resp.text);
+            return answer_of(&resp.text, round, &resp.stats.finish);
         }
         // The round-trip is certain now: couple the call turn to the
         // response that answers it, by its own sealed index.
@@ -524,10 +524,14 @@ fn ask(
 }
 
 /// The unit's answer: what it said, its thinking set aside.
-fn answer_of(text: &str) -> anyhow::Result<String> {
+fn answer_of(text: &str, round: usize, finish: &impl std::fmt::Debug) -> anyhow::Result<String> {
     let answer = after_thinking(text).trim().to_string();
     if answer.is_empty() {
-        anyhow::bail!("the unit answered nothing");
+        anyhow::bail!(
+            "the unit answered nothing (round {round}, finish {finish:?}, {} chars written, thinking {})",
+            text.len(),
+            if text.contains("</think>") { "closed" } else { "never closed" },
+        );
     }
     Ok(answer)
 }
