@@ -397,6 +397,10 @@ fn unit_selection(spec: &LayerSpec) -> SelectionState {
             FORCE_TOOL_SELECTOR,
             spec.tools.join(&FORCE_TOOL_SEPARATOR.to_string()),
         );
+    } else {
+        // Left to the schema's default the tool block is projected, and a
+        // unit shown a catalog reaches for it.
+        selection.set_optional(TOOLS_ENABLED_SELECTOR, OptionalState::Absent);
     }
     selection
 }
@@ -670,7 +674,10 @@ mod tests {
         let s = unit_selection(&spec("deep"));
         assert_eq!(s.get("thinking_effort"), Some("deep"));
         assert_ne!(s.optional(NO_THINK_SELECTOR), Some(OptionalState::Present));
-        assert_eq!(s.optional(TOOLS_ENABLED_SELECTOR), None);
+        assert_eq!(
+            s.optional(TOOLS_ENABLED_SELECTOR),
+            Some(OptionalState::Absent)
+        );
         let off = unit_selection(&spec("off"));
         assert_eq!(
             off.optional(NO_THINK_SELECTOR),

@@ -290,38 +290,66 @@ fn dialogue_days(ctx: &RefreshContext<'_>) -> Vec<DaySource> {
     closed_days(&convs, &day_of(now))
 }
 
-/// The most of one turn's half a day's transcript shows, in characters.
-const TURN_CHARS: usize = 1_500;
-
 /// The most of a whole day's transcript a unit is shown, in characters — a
 /// day's dialogue can run to far more than one context; what is past this is
 /// named, not shown.
 const DAY_CHARS: usize = 48_000;
 
+/// The least of one turn's half the transcript shows when the day is too long
+/// to share [`DAY_CHARS`] out further.
+const MIN_HALF_CHARS: usize = 400;
+
 /// The day's dialogue as its unit reads it: each conversation by its title,
 /// each turn's question and answer, the answer's thinking set aside.
 fn transcript(engine: &ConversationEngine, day: &DaySource) -> String {
-    let mut out = String::new();
-    let mut left = 0usize;
+    let mut convs = Vec::new();
     for (tl, turns) in &day.turns {
         let texts = engine.conversation_texts(*tl);
         let title = engine
             .conversation_label_of(*tl)
             .or_else(|| engine.conversation_conv_id(*tl))
             .unwrap_or_else(|| format!("conversation {}", tl.raw()));
+        let halves = turns
+            .iter()
+            .filter_map(|t| texts.get(t.0 as usize))
+            .map(|(user, assistant)| {
+                let answer = match assistant.rfind("</think>") {
+                    Some(i) => &assistant[i + "</think>".len()..],
+                    None => assistant.as_str(),
+                };
+                (user.trim().to_string(), answer.trim().to_string())
+            })
+            .collect::<Vec<_>>();
+        convs.push((title, halves));
+    }
+    render(&convs)
+}
+
+/// The conversations rendered within [`DAY_CHARS`]: every turn's half shown
+/// up to one shared cap, so a short half leaves its room to the long ones.
+fn render(convs: &[(String, Vec<(String, String)>)]) -> String {
+    // Lengths in bytes, as `DAY_CHARS` is held to: a cut by characters is no
+    // longer than one by bytes. The framing — titles, labels, cut marks — is
+    // set aside first.
+    let lens = convs
+        .iter()
+        .flat_map(|(_, h)| h.iter())
+        .flat_map(|(u, a)| [u.len(), a.len()])
+        .collect::<Vec<_>>();
+    let framing = convs
+        .iter()
+        .map(|(t, h)| t.len() + 5 + h.len() * (20 + 2 * '…'.len_utf8()))
+        .sum::<usize>();
+    let cap = half_cap(&lens, DAY_CHARS.saturating_sub(framing)).max(MIN_HALF_CHARS);
+    let mut out = String::new();
+    let mut left = 0usize;
+    for (title, halves) in convs {
         let mut block = format!("## {title}\n");
-        for t in turns {
-            let Some((user, assistant)) = texts.get(t.0 as usize) else {
-                continue;
-            };
-            let answer = match assistant.rfind("</think>") {
-                Some(i) => &assistant[i + "</think>".len()..],
-                None => assistant.as_str(),
-            };
+        for (user, answer) in halves {
             block.push_str(&format!(
                 "User: {}\nAssistant: {}\n",
-                clip(user.trim(), TURN_CHARS),
-                clip(answer.trim(), TURN_CHARS)
+                clip(user, cap),
+                clip(answer, cap)
             ));
         }
         if out.len() + block.len() > DAY_CHARS {
@@ -339,6 +367,24 @@ fn transcript(engine: &ConversationEngine, day: &DaySource) -> String {
     out
 }
 
+/// The largest cap with every length cut to it summing within `budget`.
+fn half_cap(lens: &[usize], budget: usize) -> usize {
+    let fits = |c: usize| lens.iter().map(|&l| l.min(c)).sum::<usize>() <= budget;
+    let (mut lo, mut hi) = (0, lens.iter().copied().max().unwrap_or(0));
+    if fits(hi) {
+        return hi;
+    }
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 /// `s` cut to at most `max` characters, on a character boundary.
 fn clip(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
@@ -350,6 +396,25 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_short_half_leaves_its_room_to_the_long_ones() {
+        assert_eq!(half_cap(&[10, 100, 1000], 2000), 1000);
+        assert_eq!(half_cap(&[10, 100, 1000], 500), 390);
+        assert_eq!(half_cap(&[], 500), 0);
+    }
+
+    #[test]
+    fn a_long_day_shares_its_transcript_out() {
+        let long = "x".repeat(40_000);
+        let convs = vec![(
+            "c".to_string(),
+            vec![("q".to_string(), long.clone()), ("q".to_string(), long)],
+        )];
+        let out = render(&convs);
+        assert!(out.len() <= DAY_CHARS + 64, "{}", out.len());
+        assert_eq!(out.matches("Assistant: ").count(), 2);
+    }
 
     fn tl(n: u64) -> TimelineId {
         TimelineId::from_raw(n).unwrap()
