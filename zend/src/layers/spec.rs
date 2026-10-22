@@ -20,6 +20,21 @@ use candle_conversation::projection::LayerSchema;
 use candle_conversation::stencil::ThinkMode;
 use serde::Deserialize;
 
+/// The tools a unit may be given: they read the workspace at the unit's own
+/// commit and change nothing. A unit is an analysis of what the branches hold,
+/// so a tool that writes, runs or reaches the network has no place in one.
+pub const READ_ONLY_TOOLS: [&str; 4] = ["file_read", "file_list", "file_search", "file_grep"];
+
+/// Refuse a layer naming any tool outside [`READ_ONLY_TOOLS`].
+fn check_tools(layer: &str, tools: &[String]) -> anyhow::Result<()> {
+    match tools.iter().find(|t| !READ_ONLY_TOOLS.contains(&t.as_str())) {
+        Some(t) => anyhow::bail!(
+            "layer '{layer}': `{t}` is not a read-only tool — a unit may call only {READ_ONLY_TOOLS:?}"
+        ),
+        None => Ok(()),
+    }
+}
+
 /// What one unit of a layer is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +56,8 @@ struct Raw {
     prompt: String,
     #[serde(default)]
     edges: bool,
+    #[serde(default)]
+    tools: Vec<String>,
 }
 
 /// A layer populated by its own units, each a hidden conversation.
@@ -59,6 +76,10 @@ pub struct LayerSpec {
     /// Whether the answer names the files the unit's file depends on — the
     /// edges a change is followed along to its dependents.
     pub edges: bool,
+    /// The tools a unit may call to check what it needs — read-only, from
+    /// [`READ_ONLY_TOOLS`]. Empty: the unit answers from its lineage and the
+    /// layers below it alone.
+    pub tools: Vec<String>,
     /// The layer's `thinking_effort` dial, as the selection names it.
     pub effort: String,
 }
@@ -71,6 +92,7 @@ impl LayerSpec {
         };
         let raw: Raw = serde_yaml::from_value(value.clone())
             .map_err(|e| anyhow::anyhow!("layer '{}': its `ingest:` block: {e}", layer.name))?;
+        check_tools(&layer.name, &raw.tools)?;
         if raw.unit == UnitKind::File && raw.after.is_none() {
             anyhow::bail!(
                 "layer '{}': a file unit builds on a layer below it — name it in `after:`",
@@ -83,6 +105,7 @@ impl LayerSpec {
             after: raw.after,
             prompt: raw.prompt,
             edges: raw.edges,
+            tools: raw.tools,
             effort: layer
                 .dials
                 .get("thinking_effort")
@@ -132,6 +155,7 @@ mod tests {
             prompt: "Read `<<path>>` of `<<repo>>` (<<file>>) on <<day>>: <<transcript>>".into(),
             edges: false,
             effort: "deep".into(),
+            tools: Vec::new(),
         }
     }
 
@@ -157,5 +181,31 @@ mod tests {
         let mut s = spec(UnitKind::File);
         s.effort = "off".into();
         assert_eq!(s.think_mode(), ThinkMode::Off);
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+
+    /// Every tool a unit may be given is a registered tool — a renamed one
+    /// fails here rather than leaving units with a catalog naming nothing.
+    #[test]
+    fn every_read_only_tool_is_registered() {
+        for name in READ_ONLY_TOOLS {
+            assert!(
+                zend_tools::registry::find(name).is_some(),
+                "{name} is not a tool"
+            );
+        }
+    }
+
+    /// A layer naming a tool that writes is refused when the schema loads.
+    #[test]
+    fn a_layer_naming_a_writing_tool_is_refused() {
+        let tools = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(check_tools("static_analysis", &tools(&["file_read", "file_edit"])).is_err());
+        assert!(check_tools("static_analysis", &tools(&READ_ONLY_TOOLS)).is_ok());
+        assert!(check_tools("static_analysis", &[]).is_ok());
     }
 }

@@ -852,8 +852,9 @@ layers:
     ingest:
       unit: file
       after: code_reading
+      tools: [file_read, file_list, file_search, file_grep]
       prompt: |
-        You have no tools in this conversation: answer from what you have read above.
+        You may read the workspace with file_read, file_list, file_search and file_grep to check what you need, then answer.
         List every code artifact `<<path>>` in the `<<repo>>` repository defines, which
         you have read above: each struct, enum, trait, type alias, function, method,
         constant and macro, by its exact name, with its kind, its signature where it
@@ -916,14 +917,19 @@ layers:
       unit: file
       after: static_analysis
       edges: true
+      tools: [file_read, file_list, file_search, file_grep]
       prompt: |
-        You have no tools in this conversation: answer from what you have read above.
+        You may read the workspace with file_read, file_list, file_search and file_grep to check what you need, then answer.
         What do the structs, traits and functions in `<<path>>` in the `<<repo>>`
         repository depend on? For each dependency, name the source file and the
         specific artifact, and say whether it is direct (an import or call),
         transitive (through an intermediate), or implicit (a shared resource,
         convention or assumption). Use what you have read of this file and its
         artifacts above, and the analyses of other files you can see.
+
+        A document depends on the files whose behaviour it describes or relies
+        on: when one of them changes, the document can become wrong, so they
+        count as implicit dependencies, just as an imported module does for code.
 
         End your answer with a section exactly like this one, one workspace path per
         line — the repository, then the path inside it — for every file of this
@@ -985,8 +991,9 @@ layers:
     ingest:
       unit: file
       after: dependency_analysis
+      tools: [file_read, file_list, file_search, file_grep]
       prompt: |
-        You have no tools in this conversation: answer from what you have read above.
+        You may read the workspace with file_read, file_list, file_search and file_grep to check what you need, then answer.
         Reason about the purpose and architectural significance of everything in
         `<<path>>` in the `<<repo>>` repository. Why does it exist? What role does it
         play in the system? What design decisions does it embody, and what
@@ -1049,8 +1056,9 @@ layers:
     ingest:
       unit: file
       after: architectural_analysis
+      tools: [file_read, file_list, file_search, file_grep]
       prompt: |
-        You have no tools in this conversation: answer from what you have read above.
+        You may read the workspace with file_read, file_list, file_search and file_grep to check what you need, then answer.
         Evaluate everything in `<<path>>` in the `<<repo>>` repository: what is good
         about it and what is bad. Identify code-quality issues, architectural risks,
         performance concerns, security vulnerabilities, maintainability problems,
@@ -1112,8 +1120,9 @@ layers:
     ingest:
       unit: file
       after: critical_analysis
+      tools: [file_read, file_list, file_search, file_grep]
       prompt: |
-        You have no tools in this conversation: answer from what you have read above.
+        You may read the workspace with file_read, file_list, file_search and file_grep to check what you need, then answer.
         Find the concrete bugs in `<<path>>` in the `<<repo>>` repository: places where
         the code does the wrong thing, or will under an input or a state it can
         meet. For each, give where it is (the artifact and the lines), how it fails,

@@ -54,6 +54,9 @@ pub struct Done {
     /// Each file it depends on, at the version it was built against.
     pub deps: Vec<(String, String)>,
     pub stamp: VersionStamp,
+    /// The spec it was built under ([`super::keys::SPEC_KEY`]); `None` for one
+    /// built before that was recorded.
+    pub spec: Option<String>,
     /// The model's bits per weight, when recorded.
     pub quant: Option<u32>,
 }
@@ -115,6 +118,7 @@ pub fn plan(
     committed: &[Done],
     live: &LiveFiles,
     ingest: &dyn Fn(&Below) -> bool,
+    spec: &str,
 ) -> Plan {
     let by_key: HashMap<&str, usize> = below
         .iter()
@@ -124,9 +128,11 @@ pub fn plan(
     let mut tombstone = Vec::new();
     let mut on: HashMap<usize, Vec<&Done>> = HashMap::new();
     for done in committed {
+        // Built under another spec — another question, other tools, other
+        // thinking — the unit answers something the layer no longer asks.
         match by_key.get(done.after.as_str()) {
-            Some(&i) => on.entry(i).or_default().push(done),
-            None => tombstone.push(done.timeline),
+            Some(&i) if done.spec.as_deref() == Some(spec) => on.entry(i).or_default().push(done),
+            _ => tombstone.push(done.timeline),
         }
     }
     let mut held = Vec::new();
@@ -271,6 +277,7 @@ mod tests {
                 hlc: n,
                 origin: 0,
             },
+            spec: Some("s".into()),
             quant: None,
         }
     }
@@ -302,6 +309,7 @@ mod tests {
             &[done(10, "a@1", &[("d", "d@1")])],
             &live(&[("d", "d@1", &["main"])]),
             ALL,
+            "s",
         );
         assert_eq!(
             p.held,
@@ -320,7 +328,7 @@ mod tests {
     #[test]
     fn a_unit_on_a_version_that_moved_on_goes_at_once() {
         let b = [below("a@2", "a", 2)];
-        let p = plan(&b, &[done(10, "a@1", &[])], &LiveFiles::new(), ALL);
+        let p = plan(&b, &[done(10, "a@1", &[])], &LiveFiles::new(), ALL, "s");
         assert!(p.held.is_empty());
         assert_eq!(p.tombstone, [tl(10)]);
         assert_eq!(queued(&p), [0]);
@@ -336,6 +344,7 @@ mod tests {
             &[done(10, "a@1", &[("d", "d@1")])],
             &live(&[("d", "d@2", &["main"])]),
             ALL,
+            "s",
         );
         assert_eq!(p.tombstone, [tl(10)]);
         assert_eq!(queued(&p), [0]);
@@ -351,6 +360,7 @@ mod tests {
             &[done(10, "a@1", &[("d", "d@1")])],
             &live(&[("d", "d@1", &["main"]), ("d", "d@2", &["topic"])]),
             ALL,
+            "s",
         );
         assert_eq!(p.held.len(), 1);
         assert!(p.tombstone.is_empty());
@@ -360,7 +370,7 @@ mod tests {
     /// redone has no unit below it this pass, so it goes and none is read.
     #[test]
     fn with_nothing_below_the_unit_goes_and_none_is_read() {
-        let p = plan(&[], &[done(10, "a@1", &[])], &LiveFiles::new(), ALL);
+        let p = plan(&[], &[done(10, "a@1", &[])], &LiveFiles::new(), ALL, "s");
         assert_eq!(p.tombstone, [tl(10)]);
         assert!(p.queued.is_empty());
     }
@@ -374,6 +384,7 @@ mod tests {
             &[done(12, "a@1", &[]), done(11, "a@1", &[])],
             &LiveFiles::new(),
             ALL,
+            "s",
         );
         assert_eq!(p.held[0].timeline, tl(11));
         assert_eq!(p.tombstone, [tl(12)]);
@@ -387,7 +398,7 @@ mod tests {
         let b = [below("a@1", "a", 1)];
         let l = live(&[("d", "d@9", &["topic"])]);
         let chosen = dep_version(&l, "d", &b[0].branches).unwrap();
-        let p = plan(&b, &[done(10, "a@1", &[("d", &chosen)])], &l, ALL);
+        let p = plan(&b, &[done(10, "a@1", &[("d", &chosen)])], &l, ALL, "s");
         assert_eq!(p.held.len(), 1);
         assert!(p.tombstone.is_empty() && p.queued.is_empty());
     }
@@ -401,7 +412,7 @@ mod tests {
         let mut b = below("a@1", "a", 1);
         b.branches = vec!["main".into(), "topic".into()];
         let l = live(&[("d", "d@1", &["main"]), ("d", "d@2", &["topic"])]);
-        let p = plan(&[b], &[done(10, "a@1", &[("d", "d@1")])], &l, ALL);
+        let p = plan(&[b], &[done(10, "a@1", &[("d", "d@1")])], &l, ALL, "s");
         assert_eq!(p.held.len(), 1);
         assert_eq!(p.held[0].branches, ["main".to_string()]);
         assert!(p.tombstone.is_empty());
@@ -419,9 +430,25 @@ mod tests {
         ];
         let mut b2 = below("a@1", "a", 1);
         b2.branches = vec!["main".into(), "topic".into()];
-        let p = plan(&[b2], &both, &l, ALL);
+        let p = plan(&[b2], &both, &l, ALL, "s");
         assert_eq!(p.held.len(), 2);
         assert!(p.queued.is_empty() && p.tombstone.is_empty());
+    }
+
+    /// **A layer whose question changes is asked again.** A unit built under
+    /// another spec — another prompt, other tools, other thinking — goes, and
+    /// the unit below it is read again; one with no spec recorded goes too.
+    #[test]
+    fn a_unit_built_under_another_spec_goes() {
+        let b = [below("a@1", "a", 1)];
+        let mut old = done(10, "a@1", &[]);
+        old.spec = Some("before".into());
+        let mut none = done(11, "a@1", &[]);
+        none.spec = None;
+        let p = plan(&b, &[old, none], &LiveFiles::new(), ALL, "s");
+        assert!(p.held.is_empty());
+        assert_eq!(p.tombstone, [tl(10), tl(11)]);
+        assert_eq!(queued(&p), [0]);
     }
 
     /// A unit current on no branch left to it goes: one there first already
@@ -434,6 +461,7 @@ mod tests {
             &[done(11, "a@1", &[]), done(12, "a@1", &[])],
             &LiveFiles::new(),
             ALL,
+            "s",
         );
         assert_eq!(p.held.len(), 1);
         assert_eq!(p.held[0].timeline, tl(11));
@@ -445,7 +473,13 @@ mod tests {
     fn past_the_depth_bound_a_unit_is_kept_but_never_read() {
         let b = [below("a@1", "a", 1), below("b@1", "b", 2)];
         let in_scope: &dyn Fn(&Below) -> bool = &|b| b.subject == "a";
-        let p = plan(&b, &[done(10, "b@1", &[])], &LiveFiles::new(), in_scope);
+        let p = plan(
+            &b,
+            &[done(10, "b@1", &[])],
+            &LiveFiles::new(),
+            in_scope,
+            "s",
+        );
         assert_eq!(p.held[0].below, 1);
         assert_eq!(queued(&p), [0]);
     }

@@ -163,7 +163,13 @@ fn settle(
             .is_some_and(|k| ground.ingest.contains(k)),
         UnitKind::Day => true,
     };
-    let p = plan(below, &done, &ground.live, &in_scope);
+    let p = plan(
+        below,
+        &done,
+        &ground.live,
+        &in_scope,
+        &super::keys::spec_digest(spec),
+    );
     // A committed unit whose chain stopped part-way is stale too.
     let mut gone: Vec<TimelineId> = p.tombstone.clone();
     gone.extend(broken.iter().copied().filter(|tl| is_keyed(engine, *tl)));

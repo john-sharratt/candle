@@ -35,6 +35,11 @@ pub const FILE_KEY: &str = "file_key";
 /// is stale.
 pub const DEPS_KEY: &str = "deps";
 
+/// A digest of what the layer asks its units — its question, its tools, its
+/// thinking, whether it names edges. A unit built under another is stale: a
+/// layer whose question changes is asked again.
+pub const SPEC_KEY: &str = "spec";
+
 /// Bumped when what a unit of every layer means changes, so each is built
 /// again.
 pub const UNIT_KEY_VERSION: u32 = 1;
@@ -44,6 +49,25 @@ pub fn unit_key(layer: &str, after: &str) -> String {
     let digest = Sha256::digest(after.as_bytes());
     let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
     format!("u{UNIT_KEY_VERSION}:{layer}:{hex}")
+}
+
+/// [`SPEC_KEY`]'s value for `spec`.
+pub fn spec_digest(spec: &super::spec::LayerSpec) -> String {
+    let mut h = Sha256::new();
+    h.update(
+        format!(
+            "{UNIT_KEY_VERSION}\n{:?}\n{}\n{}\n",
+            spec.unit, spec.effort, spec.edges
+        )
+        .as_bytes(),
+    );
+    h.update(spec.tools.join(",").as_bytes());
+    h.update(b"\n");
+    h.update(spec.prompt.as_bytes());
+    h.finalize()[..12]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// [`DEPS_KEY`]'s value for `deps`, sorted so the same set is written alike.

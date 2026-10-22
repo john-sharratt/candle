@@ -14,15 +14,16 @@ use std::sync::{Arc, Mutex};
 
 use candle_conversation::chain_health::chain_break;
 use candle_conversation::projection::{
-    GroupId, OptionalState, SelectionState, TimelineId, NO_THINK_SELECTOR,
+    GroupId, OptionalState, SelectionState, TimelineId, FORCE_TOOL_SELECTOR, FORCE_TOOL_SEPARATOR,
+    NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::ThinkMode;
 use candle_conversation::{ConversationEngine, Sequence, TurnOptions, TurnText};
 
 use super::edges::edges;
 use super::keys::{
-    deps_value, parse_deps, AFTER_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY, DEPS_KEY, FILE_KEY,
-    LAYER_KEY, QUANT_KEY, SUBJECT_KEY,
+    deps_value, parse_deps, spec_digest, AFTER_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY,
+    DEPS_KEY, FILE_KEY, LAYER_KEY, QUANT_KEY, SPEC_KEY, SUBJECT_KEY,
 };
 use super::plan::{dep_version, Done, LiveFiles};
 use super::spec::LayerSpec;
@@ -31,6 +32,10 @@ use crate::ingest_lease::{self, Share};
 use crate::ingest_report::Failures;
 use crate::ingest_snapshots::{finished, Unit};
 use crate::refresh_ctx::RefreshContext;
+use crate::tool_round::{self, Step};
+use crate::tools::{format_tool_responses, ToolResult};
+use zend_tools::ToolContext;
+use zend_vfs::Oid;
 
 /// Units read concurrently. A unit's conversation inherits its file's whole
 /// reading as its lineage — the same context `code_reading`'s own workers
@@ -103,6 +108,7 @@ pub fn committed(engine: &Mutex<ConversationEngine>, layer: &str) -> (Vec<Done>,
             stamp: substrate
                 .first_turn_stamp(timeline.raw())
                 .unwrap_or_default(),
+            spec: meta.get(SPEC_KEY).cloned(),
             quant: meta.get(QUANT_KEY).and_then(|q| q.parse().ok()),
         });
     }
@@ -327,6 +333,7 @@ fn read_one(
     tags.insert(SUBJECT_KEY.to_string(), job.subject.clone());
     tags.insert(AFTER_KEY.to_string(), job.after.clone());
     tags.insert(CONTENT_KEY.to_string(), key);
+    tags.insert(SPEC_KEY.to_string(), spec_digest(spec));
     if spec.edges {
         tags.insert(DEPS_KEY.to_string(), deps_value(&deps));
     }
@@ -370,73 +377,151 @@ fn is_committed(engine: &Mutex<ConversationEngine>, key: &str) -> bool {
         .is_empty()
 }
 
-/// The selection a unit's turn runs under: no tools — every unit answers from
-/// what its lineage and the layers below it hold — and the layer's thinking.
+/// Tool rounds a unit may run before it is made to answer on what it has read
+/// — a backstop for a model that keeps reading, as `code_read`'s
+/// `MAX_FILE_READ_ROUNDS` is; an ordinary unit answers well before it.
+pub const MAX_TOOL_ROUNDS: usize = 16;
+
+/// The selection a unit's turns run under: the layer's thinking, and its
+/// read-only tools when it has any — the catalog pinned to exactly those, so
+/// nothing else is ever offered. A unit with none has the tool block left out.
 fn unit_selection(spec: &LayerSpec) -> SelectionState {
     let mut selection = SelectionState::new();
     selection.select("thinking_effort", &spec.effort);
     if spec.think_mode() == ThinkMode::Off {
         selection.set_optional(NO_THINK_SELECTOR, OptionalState::Present);
     }
+    if !spec.tools.is_empty() {
+        selection.set_optional(TOOLS_ENABLED_SELECTOR, OptionalState::Present);
+        selection.select(
+            FORCE_TOOL_SELECTOR,
+            spec.tools.join(&FORCE_TOOL_SEPARATOR.to_string()),
+        );
+    }
     selection
 }
 
-/// Ask the unit its question, and answer with what it said once its thinking
-/// is set aside.
+/// The tools a unit's calls run against: file stores reading the commit its
+/// file was found on, so what it reads is the version it analyses.
+fn unit_tools(ctx: &RefreshContext<'_>, job: &UnitJob) -> Arc<ToolContext> {
+    let at = job.at.as_deref().and_then(|at| Oid::parse(at).ok());
+    let repo = crate::repo_path::split(&job.subject).0;
+    match at.and_then(|at| ctx.tool_ctx.files.fresh_at(repo, &at)) {
+        Some(files) => Arc::new(ctx.tool_ctx.with_files(Arc::new(files), "")),
+        None => Arc::clone(&ctx.tool_ctx),
+    }
+}
+
+/// `steps` with every call of a tool the unit was not given refused, not run.
+fn only_given(steps: Vec<Step>, tools: &[String]) -> Vec<Step> {
+    steps
+        .into_iter()
+        .map(|step| match step {
+            Step::Run(call) if !tools.contains(&call.name) => Step::Refuse(ToolResult {
+                response: serde_json::json!({
+                    "error": "not_available",
+                    "detail": format!(
+                        "`{}` is not available here; this conversation may call only {}",
+                        call.name,
+                        tools.join(", ")
+                    ),
+                }),
+                call,
+            }),
+            other => other,
+        })
+        .collect()
+}
+
+/// Ask the unit its question — reading with its tools for as many rounds as it
+/// needs — and answer with what it said once it stopped calling them, its
+/// thinking set aside.
 fn ask(
     ctx: &RefreshContext<'_>,
     spec: &LayerSpec,
     job: &UnitJob,
     conv: &mut Sequence,
 ) -> anyhow::Result<String> {
-    if crate::ingest_cancel::cancelled() {
-        anyhow::bail!("shutdown cancelled the unit");
-    }
-    // A unit has no tools, so it may not open a call: one that finds its file
-    // missing from what it read — a reading below that never read it — says
-    // so in prose rather than committing a call nothing will run, as
-    // `code_read`'s closing round forces its answer.
-    let mut sampling = conv.default_sampling();
-    if sampling.tool_call_open_token_id >= 0 {
-        sampling
-            .banned_tokens
-            .push(sampling.tool_call_open_token_id);
-    }
-    let options = TurnOptions {
-        sampling: Some(sampling),
-        selection: unit_selection(spec),
-        triggers: ctx.triggers_for(spec.think_mode()),
-        tags: vec![spec.layer.clone(), job.subject.clone()],
-        ..Default::default()
-    };
-    let handle = conv
-        .submit_turn_with_options(TurnText::from(job.prompt.clone()), options)
-        .map_err(|e| anyhow::anyhow!("submit_turn: {e}"))?;
-    let resp = handle
-        .wait_cancellable(crate::ingest_cancel::token())
-        .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-    conv.finish_turn(handle, &resp)
-        .map_err(|e| anyhow::anyhow!("finish_turn: {e}"))?;
-    // What the unit's projection drew in — kept on its turn as a dialogue
-    // turn's is, and named in the log: the layers compound only if their
-    // provenance brings the right units of OTHER files in, which the unit's
-    // own lineage never shows.
-    {
-        let event = conv.recompute_projection_event(&resp.stats);
-        let candidates = conv.last_turn_candidate_scores();
-        log_provenance(
-            ctx.engine,
-            spec,
-            job,
-            conv.timeline_id(),
-            &event,
-            &candidates,
-        );
-        if let Err(e) = conv.persist_projection_events(std::slice::from_ref(&event)) {
-            tracing::debug!(target: "zend::layers", "the unit's projection was not kept: {e:#}");
+    let selection = unit_selection(spec);
+    let tools = (!spec.tools.is_empty()).then(|| unit_tools(ctx, job));
+    let rounds = if tools.is_some() { MAX_TOOL_ROUNDS } else { 0 };
+    let mut message = TurnText::from(job.prompt.clone());
+    for round in 0..=rounds {
+        if crate::ingest_cancel::cancelled() {
+            anyhow::bail!("shutdown cancelled the unit");
         }
+        // The last round — the only one, for a unit with no tools — may not
+        // open a call: it answers in prose on what it has, rather than
+        // committing a call nothing will run.
+        let closing = round == rounds;
+        let mut sampling = conv.default_sampling();
+        if closing && sampling.tool_call_open_token_id >= 0 {
+            sampling
+                .banned_tokens
+                .push(sampling.tool_call_open_token_id);
+        }
+        let options = TurnOptions {
+            sampling: Some(sampling),
+            selection: selection.clone(),
+            triggers: ctx.triggers_for(spec.think_mode()),
+            tags: vec![spec.layer.clone(), job.subject.clone()],
+            ..Default::default()
+        };
+        let handle = conv
+            .submit_turn_with_options(message, options)
+            .map_err(|e| anyhow::anyhow!("submit_turn: {e}"))?;
+        let resp = handle
+            .wait_cancellable(crate::ingest_cancel::token())
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+        let steps = if closing {
+            Vec::new()
+        } else {
+            tool_round::plan(&resp.answer)
+        };
+        let call_idx = resp.seal.as_ref().and_then(|s| s.turn_index);
+        conv.finish_turn(handle, &resp)
+            .map_err(|e| anyhow::anyhow!("finish_turn: {e}"))?;
+        // What the question drew in — kept on its turn as a dialogue turn's
+        // is, and named in the log: the layers compound only if their
+        // provenance brings the right units of OTHER files in, which the
+        // unit's own lineage never shows.
+        if round == 0 {
+            let event = conv.recompute_projection_event(&resp.stats);
+            let candidates = conv.last_turn_candidate_scores();
+            log_provenance(
+                ctx.engine,
+                spec,
+                job,
+                conv.timeline_id(),
+                &event,
+                &candidates,
+            );
+            if let Err(e) = conv.persist_projection_events(std::slice::from_ref(&event)) {
+                tracing::debug!(target: "zend::layers", "the unit's projection was not kept: {e:#}");
+            }
+        }
+        let Some(tools) = tools.as_ref().filter(|_| !steps.is_empty()) else {
+            return answer_of(&resp.text);
+        };
+        let results = tool_round::run(tools, only_given(steps, &spec.tools));
+        let response = format_tool_responses(&results);
+        if response.is_blank() {
+            return answer_of(&resp.text);
+        }
+        // The round-trip is certain now: couple the call turn to the
+        // response that answers it, by its own sealed index.
+        if let Some(idx) = call_idx {
+            conv.couple_turn(idx)
+                .map_err(|e| anyhow::anyhow!("couple_turn: {e}"))?;
+        }
+        message = response;
     }
-    let answer = after_thinking(&resp.text).trim().to_string();
+    unreachable!("the closing round always answers")
+}
+
+/// The unit's answer: what it said, its thinking set aside.
+fn answer_of(text: &str) -> anyhow::Result<String> {
+    let answer = after_thinking(text).trim().to_string();
     if answer.is_empty() {
         anyhow::bail!("the unit answered nothing");
     }
@@ -574,24 +659,52 @@ mod tests {
             prompt: String::new(),
             edges: false,
             effort: effort.into(),
+            tools: Vec::new(),
         }
     }
 
-    /// A unit runs at its layer's thinking level, with no tools; only an `off`
-    /// layer carries the no-think switch.
+    /// A unit runs at its layer's thinking level; one given no tools has the
+    /// tool block left out, and only an `off` layer carries the no-think switch.
     #[test]
     fn a_unit_thinks_at_its_layers_level_with_no_tools() {
         let s = unit_selection(&spec("deep"));
         assert_eq!(s.get("thinking_effort"), Some("deep"));
         assert_ne!(s.optional(NO_THINK_SELECTOR), Some(OptionalState::Present));
-        assert_eq!(
-            s.optional(candle_conversation::projection::TOOLS_ENABLED_SELECTOR),
-            None
-        );
+        assert_eq!(s.optional(TOOLS_ENABLED_SELECTOR), None);
         let off = unit_selection(&spec("off"));
         assert_eq!(
             off.optional(NO_THINK_SELECTOR),
             Some(OptionalState::Present)
         );
+    }
+
+    /// A unit given tools sees exactly those, pinned in the catalog.
+    #[test]
+    fn a_unit_given_tools_sees_exactly_them() {
+        let mut s = spec("deep");
+        s.tools = vec!["file_read".into(), "file_grep".into()];
+        let sel = unit_selection(&s);
+        assert_eq!(
+            sel.optional(TOOLS_ENABLED_SELECTOR),
+            Some(OptionalState::Present)
+        );
+        assert_eq!(sel.get(FORCE_TOOL_SELECTOR), Some("file_read,file_grep"));
+    }
+
+    /// A call of a tool the unit was not given is refused, never run; a call
+    /// of one it was given runs.
+    #[test]
+    fn a_call_outside_the_units_tools_is_refused() {
+        let call = |name: &str| crate::tools::ToolCall {
+            name: name.into(),
+            arguments: serde_json::json!({}),
+        };
+        let steps = vec![Step::Run(call("file_read")), Step::Run(call("file_edit"))];
+        let out = only_given(steps, &["file_read".to_string()]);
+        assert!(matches!(&out[0], Step::Run(c) if c.name == "file_read"));
+        match &out[1] {
+            Step::Refuse(r) => assert_eq!(r.response["error"], "not_available"),
+            other => panic!("file_edit was not refused: {other:?}"),
+        }
     }
 }
