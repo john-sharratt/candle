@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use candle::gpu_poison::{is_gpu_poisoned, root_fault};
 use candle_conversation::relief_trace;
-use cluster::launch::LaunchSpec;
+use cluster::launch::{LaunchSpec, AFTER_PID};
 
 #[cfg(test)]
 use web::log_file::is_resuming;
@@ -168,6 +168,14 @@ fn mark_resume(state_dir: &Path) {
     }
 }
 
+/// The launch that replaces process `pid`: the same one, waiting for `pid` to
+/// exit before it loads ([`AFTER_PID`]). This process still holds its
+/// listening ports when it starts the relaunch, so a successor that bound
+/// straight away found them taken and exited too, leaving nothing serving.
+fn successor(spec: &LaunchSpec, pid: u32) -> LaunchSpec {
+    spec.with_args(&[AFTER_PID.flag, &pid.to_string()])
+}
+
 /// Spawn the background thread that polls `candle::gpu_poison::is_gpu_poisoned`
 /// and, on the transition, relaunches an identical process before exiting
 /// this one. `state_dir` is where the log lives, and with it the restart
@@ -214,7 +222,7 @@ pub fn spawn_watchdog(spec: LaunchSpec, state_dir: PathBuf, resumed: bool) {
             // Brief pause so the root log line reaches the file/console sinks
             // before the hard exit.
             std::thread::sleep(Duration::from_millis(80));
-            match spec.command().spawn() {
+            match successor(&spec, std::process::id()).command().spawn() {
                 Ok(child) => tracing::error!(pid = child.id(), "relaunched — exiting"),
                 Err(e) => {
                     // Nothing else can bring the daemon back. Exit anyway:
@@ -231,6 +239,8 @@ pub fn spawn_watchdog(spec: LaunchSpec, state_dir: PathBuf, resumed: bool) {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
 
     /// A fast poisoning (well inside the window) accumulates toward the cap.
@@ -323,6 +333,26 @@ mod tests {
         assert_eq!(
             relaunch_decision(Duration::from_secs(120), carried_attempts(true, &dir)),
             RelaunchDecision::GiveUp
+        );
+    }
+
+    /// The relaunch waits for the process it replaces: it carries that
+    /// process's id, so it binds only once the old listeners are gone.
+    #[test]
+    fn the_successor_waits_for_its_predecessor() {
+        let spec = LaunchSpec {
+            exe: PathBuf::from("motherd.exe"),
+            args: vec!["--config".into(), "m.yaml".into()],
+            cwd: PathBuf::from("."),
+        };
+        let next = successor(&spec, 4242);
+        assert_eq!(next.exe, spec.exe);
+        assert_eq!(
+            next.args,
+            ["--config", "m.yaml", "--after-pid", "4242"]
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
         );
     }
 
