@@ -120,11 +120,28 @@ pub fn plan(
     ingest: &dyn Fn(&Below) -> bool,
     spec: &str,
 ) -> Plan {
-    let by_key: HashMap<&str, usize> = below
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.key.as_str(), i))
-        .collect();
+    plan_holding(below, committed, live, ingest, spec, &|_| false)
+}
+
+/// [`plan`], with `frozen` naming the paths of repositories held back this
+/// pass: nothing looked at their branches, so a dependency on one is taken as
+/// current rather than as gone.
+pub fn plan_holding(
+    below: &[Below],
+    committed: &[Done],
+    live: &LiveFiles,
+    ingest: &dyn Fn(&Below) -> bool,
+    spec: &str,
+    frozen: &dyn Fn(&str) -> bool,
+) -> Plan {
+    // A key below twice (two copies of one reading, before the layer below
+    // lets one go) is one unit below: the first is planned, the second
+    // skipped, so nothing is built twice on it.
+    let mut by_key: HashMap<&str, usize> = HashMap::new();
+    for (i, b) in below.iter().enumerate() {
+        by_key.entry(b.key.as_str()).or_insert(i);
+    }
+    let current = |d: &Done, branches: &[String]| deps_current(d, branches, live, frozen);
     let mut tombstone = Vec::new();
     let mut on: HashMap<usize, Vec<&Done>> = HashMap::new();
     for done in committed {
@@ -138,15 +155,31 @@ pub fn plan(
     let mut held = Vec::new();
     let mut queued = Vec::new();
     for (i, b) in below.iter().enumerate() {
+        if by_key.get(b.key.as_str()) != Some(&i) {
+            continue; // a second copy of a unit below planned already
+        }
         let mut candidates = on.remove(&i).unwrap_or_default();
         let all_quant = candidates_quants(&candidates);
         candidates.sort_by_key(|d| holder_rank(d, all_quant));
+        if b.branches.is_empty() && b.file_key.is_some() {
+            // A file of no branch is one whose repository was held back this
+            // pass: nothing looked at its branches or at the files it depends
+            // on, so nothing here is known to have moved. Every unit on it
+            // stands as it is, and nothing is read for it.
+            held.extend(candidates.into_iter().map(|d| Held {
+                below: i,
+                timeline: d.timeline,
+                key: d.key.clone(),
+                branches: Vec::new(),
+            }));
+            continue;
+        }
         if b.branches.is_empty() {
             // Of no branch: a dependency is judged at the version any branch
             // holds, and the first unit current at it stands.
             let mut holder = None;
             for d in candidates {
-                if holder.is_none() && deps_current(d, &[], live) {
+                if holder.is_none() && current(d, &[]) {
                     holder = Some(d);
                 } else {
                     tombstone.push(d.timeline);
@@ -171,7 +204,7 @@ pub fn plan(
         for d in candidates {
             let ok: Vec<String> = left
                 .iter()
-                .filter(|br| deps_current(d, std::slice::from_ref(*br), live))
+                .filter(|br| current(d, std::slice::from_ref(*br)))
                 .cloned()
                 .collect();
             if ok.is_empty() {
@@ -211,10 +244,15 @@ pub fn plan(
 /// branches, while the choice falls back to any version when none of them
 /// holds the file — a unit depending on such a file was stale the moment it
 /// committed, and read again every pass.
-fn deps_current(done: &Done, branches: &[String], live: &LiveFiles) -> bool {
-    done.deps
-        .iter()
-        .all(|(path, key)| dep_version(live, path, branches).as_deref() == Some(key))
+fn deps_current(
+    done: &Done,
+    branches: &[String],
+    live: &LiveFiles,
+    frozen: &dyn Fn(&str) -> bool,
+) -> bool {
+    done.deps.iter().all(|(path, key)| {
+        frozen(path) || dep_version(live, path, branches).as_deref() == Some(key)
+    })
 }
 
 /// Whether every unit records its model's quantization — the holder rule's
@@ -496,5 +534,53 @@ mod tests {
             Some("d@1")
         );
         assert_eq!(dep_version(&l, "missing", &[]), None);
+    }
+
+    /// A file of a repository held back this pass has no branches and none of
+    /// its dependencies in `live`: every unit on it stands untouched, split
+    /// ones included, and nothing is read for it.
+    #[test]
+    fn a_held_back_repositorys_units_stand_unjudged() {
+        let mut b = below("a@1", "a", 1);
+        b.branches.clear();
+        let p = plan(
+            &[b],
+            &[
+                done(10, "a@1", &[("d", "d@1")]),
+                done(11, "a@1", &[("d", "d@2")]),
+            ],
+            &LiveFiles::new(),
+            ALL,
+            "s",
+        );
+        assert_eq!(p.held.len(), 2);
+        assert!(p.tombstone.is_empty());
+        assert!(p.queued.is_empty());
+    }
+
+    /// A dependency in a repository held back this pass is not in `live`; it
+    /// is taken as current, not as gone.
+    #[test]
+    fn a_dependency_in_a_held_back_repository_is_current() {
+        let b = [below("a@1", "x/a", 1)];
+        let units = [done(10, "a@1", &[("y/d", "d@1")])];
+        let gone = plan(&b, &units, &LiveFiles::new(), ALL, "s");
+        assert_eq!(gone.tombstone, [tl(10)]);
+        let frozen = plan_holding(&b, &units, &LiveFiles::new(), ALL, "s", &|p| {
+            p.starts_with("y/")
+        });
+        assert_eq!(frozen.held.len(), 1);
+        assert!(frozen.tombstone.is_empty());
+    }
+
+    /// Two copies of one unit below are one unit: nothing is built twice.
+    #[test]
+    fn a_unit_below_listed_twice_is_planned_once() {
+        let b = [below("a@1", "a", 1), below("a@1", "a", 2)];
+        let p = plan(&b, &[], &LiveFiles::new(), ALL, "s");
+        assert_eq!(queued(&p), [0]);
+        let p = plan(&b, &[done(10, "a@1", &[])], &LiveFiles::new(), ALL, "s");
+        assert_eq!(p.held.len(), 1);
+        assert!(p.queued.is_empty());
     }
 }

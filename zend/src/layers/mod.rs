@@ -28,5 +28,5 @@ pub mod plan;
 pub mod run;
 pub mod spec;
 
-pub use pass::{pass_layer, sweep_layer, Ground, LayerRun};
+pub use pass::{pass_layer, sweep_layer, Ground, LayerRun, Reach};
 pub use spec::{LayerSpec, UnitKind};

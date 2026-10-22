@@ -26,6 +26,10 @@ pub(crate) struct SealedProbe {
     pub tags: Vec<String>,
     /// The turn's stream id, so a replay of the same turn folds nothing twice.
     pub source: u64,
+    /// Whether the scan teaches the scopes the turn belongs to: the
+    /// once-per-turn learning point for a dialogue turn; read-only for a
+    /// record of what a turn drew in.
+    pub observe: bool,
 }
 
 impl Scheduler {
@@ -43,9 +47,13 @@ impl Scheduler {
             target,
             &sealed.probe,
             (!sealed.probe_q.is_empty()).then_some(sealed.probe_q.as_slice()),
-            Observe::Yes {
-                tags: &sealed.tags,
-                source: sealed.source,
+            if sealed.observe {
+                Observe::Yes {
+                    tags: &sealed.tags,
+                    source: sealed.source,
+                }
+            } else {
+                Observe::No
             },
             self.gallery_arena.as_deref(),
         );
@@ -90,6 +98,7 @@ mod tests {
             probe_q: (0..5).map(|_| sig(0xABAB_ABAB_ABAB_ABAB)).collect(),
             tags: vec!["tool".to_string()],
             source: 0x5EA1,
+            observe: true,
         };
         let later: Vec<WideQSig> = (0..6).map(|_| sig(0x5555_5555_5555_5555)).collect();
 
@@ -124,6 +133,7 @@ mod tests {
                 probe_q: sealed.probe_q.clone(),
                 tags: sealed.tags.clone(),
                 source: sealed.source,
+                observe: true,
             },
             response_tx: tx,
         });

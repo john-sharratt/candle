@@ -7169,9 +7169,20 @@ impl ZendSession {
                             // once too: the follower has run since the load, and
                             // a move in between is reported to no one.
                             if let Some(repositories) = state.repositories.as_ref() {
+                                // The wake on registering does not preempt: the
+                                // startup pass woken above is the pass it asks
+                                // for, and stopping it would read no layer above
+                                // the branches until a second one.
                                 let on_change: Arc<dyn Fn() + Send + Sync> = {
                                     let wake = Arc::clone(&wake);
-                                    Arc::new(move || crate::ingest_worker::request(&wake))
+                                    let registered = AtomicBool::new(false);
+                                    Arc::new(move || {
+                                        if registered.swap(true, Ordering::SeqCst) {
+                                            crate::ingest_worker::request(&wake);
+                                        } else {
+                                            wake.notify_one();
+                                        }
+                                    })
                                 };
                                 repositories.on_change(on_change);
                             }

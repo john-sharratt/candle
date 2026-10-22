@@ -18,18 +18,18 @@ use candle_conversation::projection::{
     NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::ThinkMode;
-use candle_conversation::{ConversationEngine, Sequence, TurnOptions, TurnText};
+use candle_conversation::{ConversationEngine, FinishReason, Sequence, TurnOptions, TurnText};
 
 use super::edges::edges;
 use super::keys::{
     deps_value, parse_deps, spec_digest, AFTER_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY,
-    DEPS_KEY, FILE_KEY, LAYER_KEY, QUANT_KEY, SPEC_KEY, SUBJECT_KEY,
+    DEPS_KEY, FILE_KEY, JOB_KEY, LAYER_KEY, QUANT_KEY, SPEC_KEY, SUBJECT_KEY,
 };
 use super::plan::{dep_version, Done, LiveFiles};
 use super::spec::LayerSpec;
 use crate::branch_ingest::keys::branches_value;
 use crate::ingest_lease::{self, Share};
-use crate::ingest_report::Failures;
+use crate::ingest_report::{Failures, IngestReport};
 use crate::ingest_snapshots::{finished, Unit};
 use crate::refresh_ctx::RefreshContext;
 use crate::tool_round::{self, Step};
@@ -152,15 +152,16 @@ pub struct EdgeFiles<'a> {
     pub known: &'a [&'a str],
 }
 
-/// Read `jobs` for `spec`'s layer, forking each off `base`. Answers how many
-/// failed; each failure is retried by a later pass.
+/// Read `jobs` for `spec`'s layer, forking each off `base`. Answers the
+/// round's report, which the caller publishes merged with its other rounds;
+/// each failure is retried by a later pass.
 pub fn ingest_units(
     ctx: &RefreshContext<'_>,
     spec: &LayerSpec,
     jobs: &[UnitJob],
     base: &Mutex<Sequence>,
     files: Option<&EdgeFiles<'_>>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<IngestReport> {
     let total = jobs.len();
     tracing::info!(
         target: "zend::layers",
@@ -235,8 +236,7 @@ pub fn ingest_units(
             tracing::info!(target: "zend::layers", layer = %spec.layer, units = total, "the layer's units read");
         }
     }
-    crate::ingest_report::publish(&spec.layer, report);
-    Ok(n_failed)
+    Ok(report)
 }
 
 /// Read one unit: lease it, mint its conversation, ask it, commit it.
@@ -309,11 +309,27 @@ fn read_one(
         .first()
         .map(std::slice::from_ref)
         .unwrap_or(&[]);
+    // Only a file that branch holds is an edge: a name found on some other
+    // branch alone would key the unit by a version its own branch never had,
+    // and every edit there would rebuild it for nothing.
     let deps: Vec<(String, String)> = match files {
-        Some(f) if spec.edges => edges(&answer, &job.subject, f.known)
-            .into_iter()
-            .filter_map(|path| dep_version(f.live, path, seen_from).map(|k| (path.to_string(), k)))
-            .collect(),
+        Some(f) if spec.edges => {
+            let on_branch = |path: &str| {
+                seen_from.is_empty()
+                    || f.live.get(path).is_some_and(|versions| {
+                        versions
+                            .iter()
+                            .any(|(_, on)| on.iter().any(|b| seen_from.contains(b)))
+                    })
+            };
+            edges(&answer, &job.subject, f.known)
+                .into_iter()
+                .filter(|path| on_branch(path))
+                .filter_map(|path| {
+                    dep_version(f.live, path, seen_from).map(|k| (path.to_string(), k))
+                })
+                .collect()
+        }
         _ => Vec::new(),
     };
     // A unit that names its dependencies is keyed by them too: read again
@@ -334,6 +350,7 @@ fn read_one(
     tags.insert(AFTER_KEY.to_string(), job.after.clone());
     tags.insert(CONTENT_KEY.to_string(), key);
     tags.insert(SPEC_KEY.to_string(), spec_digest(spec));
+    tags.insert(JOB_KEY.to_string(), job.key.clone());
     if spec.edges {
         tags.insert(DEPS_KEY.to_string(), deps_value(&deps));
     }
@@ -368,13 +385,19 @@ fn read_one(
     Ok(())
 }
 
-/// Whether a unit is committed under `key`.
+/// Whether a unit leased under `key` is committed — under that key, or, for
+/// an edges layer, under the key of what it depended on, which records the
+/// lease's as [`JOB_KEY`].
 fn is_committed(engine: &Mutex<ConversationEngine>, key: &str) -> bool {
-    !engine
-        .lock()
-        .unwrap()
-        .find_conversations_by_metadata(CONTENT_KEY, key)
-        .is_empty()
+    let e = engine.lock().unwrap();
+    [CONTENT_KEY, JOB_KEY].iter().any(|field| {
+        e.find_conversations_by_metadata(field, key)
+            .iter()
+            .any(|tl| {
+                e.conversation_metadata(*tl)
+                    .is_some_and(|m| m.contains_key(CONTENT_KEY))
+            })
+    })
 }
 
 /// Tool rounds a unit may run before it is made to answer on what it has read
@@ -490,8 +513,7 @@ fn ask(
         // provenance brings the right units of OTHER files in, which the
         // unit's own lineage never shows.
         if round == 0 {
-            let event = conv.recompute_projection_event(&resp.stats);
-            let candidates = conv.last_turn_candidate_scores();
+            let (event, candidates) = conv.unit_projection(&resp.stats);
             log_provenance(
                 ctx.engine,
                 spec,
@@ -504,13 +526,18 @@ fn ask(
                 tracing::debug!(target: "zend::layers", "the unit's projection was not kept: {e:#}");
             }
         }
+        if closing && !tool_round::plan(&resp.answer).is_empty() {
+            // The opener could not be banned (the model has no single token
+            // for it): a call nothing will run is no answer.
+            anyhow::bail!("the unit's closing round called a tool (round {round})");
+        }
         let Some(tools) = tools.as_ref().filter(|_| !steps.is_empty()) else {
             return answer_of(&resp.text, round, &resp.stats.finish);
         };
         let results = tool_round::run(tools, only_given(steps, &spec.tools));
         let response = format_tool_responses(&results);
         if response.is_blank() {
-            return answer_of(&resp.text, round, &resp.stats.finish);
+            anyhow::bail!("the unit's tool calls answered nothing (round {round})");
         }
         // The round-trip is certain now: couple the call turn to the
         // response that answers it, by its own sealed index.
@@ -523,14 +550,27 @@ fn ask(
     unreachable!("the closing round always answers")
 }
 
-/// The unit's answer: what it said, its thinking set aside.
-fn answer_of(text: &str, round: usize, finish: &impl std::fmt::Debug) -> anyhow::Result<String> {
+/// The unit's answer: what it said, its thinking set aside. A turn that spent
+/// its budget, or stopped inside its thinking, has not answered — what it
+/// wrote is reasoning, or an answer cut short, and it is read again.
+fn answer_of(text: &str, round: usize, finish: &FinishReason) -> anyhow::Result<String> {
+    let unclosed = match (text.rfind("<think>"), text.rfind("</think>")) {
+        (Some(open), Some(close)) => open > close,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if *finish == FinishReason::Length || unclosed {
+        anyhow::bail!(
+            "the unit stopped before it answered (round {round}, finish {finish:?}, {} chars written, thinking {})",
+            text.len(),
+            if unclosed { "never closed" } else { "closed" },
+        );
+    }
     let answer = after_thinking(text).trim().to_string();
     if answer.is_empty() {
         anyhow::bail!(
-            "the unit answered nothing (round {round}, finish {finish:?}, {} chars written, thinking {})",
+            "the unit answered nothing (round {round}, finish {finish:?}, {} chars written)",
             text.len(),
-            if text.contains("</think>") { "closed" } else { "never closed" },
         );
     }
     Ok(answer)
@@ -657,6 +697,22 @@ mod tests {
             "\nIt reads."
         );
         assert_eq!(after_thinking("It reads."), "It reads.");
+    }
+
+    /// Reasoning that never closed, or an answer cut off by the budget, is
+    /// no answer: the unit is read again rather than committed.
+    #[test]
+    fn an_unclosed_thought_or_a_spent_budget_is_no_answer() {
+        let stop = FinishReason::Stop;
+        assert_eq!(
+            answer_of("<think>a</think>It reads.", 0, &stop).unwrap(),
+            "It reads."
+        );
+        assert!(answer_of("<think>still thinking", 0, &stop).is_err());
+        assert!(answer_of("<think>a</think>x<think>again", 0, &stop).is_err());
+        assert!(answer_of("<think>a</think>It rea", 0, &FinishReason::Length).is_err());
+        assert!(answer_of("<think>a</think>  ", 0, &stop).is_err());
+        assert_eq!(answer_of("No thinking.", 0, &stop).unwrap(), "No thinking.");
     }
 
     fn spec(effort: &str) -> LayerSpec {

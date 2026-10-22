@@ -24,26 +24,41 @@ pub fn edges<'k>(answer: &str, own: &str, known: &[&'k str]) -> Vec<&'k str> {
     let Some(start) = lines.iter().rposition(|l| is_heading(l)) else {
         return Vec::new();
     };
+    let repo = own.split('/').next().unwrap_or("");
     let mut out = BTreeSet::new();
     for line in &lines[start + 1..] {
         let t = line.trim();
         if t.is_empty() {
             continue;
         }
-        let Some(item) = t
-            .strip_prefix("- ")
-            .or_else(|| t.strip_prefix("* "))
-            .or_else(|| t.strip_prefix('-'))
-        else {
+        let Some(item) = bullet(t) else {
             break; // the list ended
         };
-        if let Some(path) = resolve(clean(item), known) {
+        if let Some(path) = resolve(clean(item), repo, known) {
             if path != own {
                 out.insert(path);
             }
         }
     }
     out.into_iter().collect()
+}
+
+/// A list item's text: after `- `, `* `, `-`, or a number (`1.`, `1)`).
+fn bullet(line: &str) -> Option<&str> {
+    if let Some(item) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix('-'))
+    {
+        return Some(item);
+    }
+    let digits = line.find(|c: char| !c.is_ascii_digit())?;
+    if digits == 0 {
+        return None;
+    }
+    line[digits..]
+        .strip_prefix(". ")
+        .or_else(|| line[digits..].strip_prefix(") "))
 }
 
 fn is_heading(line: &str) -> bool {
@@ -58,23 +73,42 @@ fn is_heading(line: &str) -> bool {
     t.eq_ignore_ascii_case(HEADING)
 }
 
-/// The path an item names: its first word, without quoting or a trailing
-/// remark.
+/// The path an item names: a Markdown link's target, else its first word,
+/// without quoting, a line number (`:12`, `:12-30`) or a trailing remark.
 fn clean(item: &str) -> &str {
-    let item = item.trim().trim_start_matches(['`', '"', '\'', '*']);
+    let item = item.trim();
+    let item = match (item.find("]("), item.starts_with('[')) {
+        (Some(i), true) => &item[i + 2..],
+        _ => item,
+    };
+    let item = item.trim_start_matches(['`', '"', '\'', '*']);
     let end = item
         .find(|c: char| {
-            c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '*' | ',' | ';' | ')' | '(')
+            c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '*' | ',' | ';' | ')' | '(' | '#')
         })
         .unwrap_or(item.len());
-    item[..end]
-        .trim_end_matches(['.', ':'])
-        .trim_start_matches("./")
+    let path = item[..end].trim_end_matches(['.', ':']);
+    // `path:12` and `path:12-30` name lines of the file.
+    let path = match path.rsplit_once(':') {
+        Some((p, lines))
+            if !lines.is_empty() && lines.chars().all(|c| c.is_ascii_digit() || c == '-') =>
+        {
+            p
+        }
+        _ => path,
+    };
+    path.trim_start_matches("./")
 }
 
-fn resolve<'k>(name: &str, known: &[&'k str]) -> Option<&'k str> {
+/// The known file `name` is: itself, else the one file in the unit's own
+/// repository `repo` it names, else the one file anywhere that ends with it.
+fn resolve<'k>(name: &str, repo: &str, known: &[&'k str]) -> Option<&'k str> {
     if name.is_empty() {
         return None;
+    }
+    let in_repo = format!("{repo}/{name}");
+    if let Some(k) = known.iter().find(|k| **k == in_repo) {
+        return Some(k);
     }
     if let Some(k) = known.iter().find(|k| **k == name) {
         return Some(k);
@@ -114,6 +148,22 @@ mod tests {
     fn an_ambiguous_name_and_trailing_prose_are_dropped() {
         let answer = "**Depends on:**\n* src/lib.rs\n* candle/zend/src/tools.rs\n\nThat is all.\n- candle/zend/src/session.rs";
         assert_eq!(edges(answer, "x", KNOWN), ["candle/zend/src/tools.rs"]);
+    }
+
+    /// Numbered items, Markdown links and line numbers name files too, and a
+    /// name inside the unit's own repository is taken from it first.
+    #[test]
+    fn numbered_links_and_line_numbers_name_their_files() {
+        let answer = "DEPENDS ON:\n1. candle/zend/src/session.rs:12-30\n2) [tools](candle/zend/src/tools.rs)\n\
+                      3. `zend/src/lib.rs:4`\n";
+        assert_eq!(
+            edges(answer, "candle/host/Cargo.toml", KNOWN),
+            [
+                "candle/zend/src/lib.rs",
+                "candle/zend/src/session.rs",
+                "candle/zend/src/tools.rs"
+            ]
+        );
     }
 
     #[test]

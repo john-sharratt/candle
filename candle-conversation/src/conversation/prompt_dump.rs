@@ -231,7 +231,7 @@ impl Sequence {
         if self.config.disable_reprojection {
             return None;
         }
-        let scores = self.last_turn_belief_scores();
+        let scores = self.last_turn_belief_scores(true);
         let resolver = self.substrate.read_for_scored(self.target, &scores);
         let projection = self.projection.project_with_selection(
             self.target,

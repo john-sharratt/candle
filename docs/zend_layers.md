@@ -120,6 +120,23 @@ Every pass first sweeps every layer, planning and tombstoning without reading,
 before the layers below read anything (`sweep_layer`): a unit made stale by
 work below goes the moment that work is found.
 
+**What a pass cannot see, it does not judge.**
+- **A held-back repository:** its tree could not be listed this pass, so its
+  units stand untouched, and a dependency on one of its files counts as
+  current. No layer that names edges reads that pass, since an edge into the
+  held-back repository could not be keyed.
+- **A layer below that was not planned:** it is disabled, or the pass stopped
+  short of it. The layer above is left as it is rather than read as empty.
+
+**An answer is only an answer when it finished.** A unit whose thinking never
+closed, whose turn spent its budget, or whose closing round still called a
+tool is a failure, read again next pass. Each unit is tried once a pass.
+
+**Dependencies are the unit's branch's.** A name resolves first inside the
+unit's own repository. It counts as an edge only if the branch the unit is
+recorded for holds that file. Numbered items, Markdown links and `path:12`
+forms are read as well as bullets.
+
 ## Lower layers first
 
 `BranchIngest::pass` walks the layers bottom up. It carries what stands in each
@@ -129,6 +146,13 @@ nothing is queued in it before the layer above reads: a unit that splits leaves
 branches it is not current on, and their units are read before anything above.
 It stops early when a pass is asked for, and when a read leaves its plan
 unchanged (a unit that would not commit is tried again next pass).
+
+**The default branch goes first, all the way up.** The pass climbs the layers
+twice. The first climb reads only units on a repository's default branch
+(`main`, else `master`) and units of no branch (the days). The second climb
+reads every other branch's units, bottom up again. Lower layers still go
+first on every branch, but `main` is analysed to the top before any other
+branch's units are read in any layer (`layers::Reach`).
 
 A pass request that arrives while a pass runs raises `ingest_worker::PREEMPT`.
 A layer of units checks it between units and stops, and the next pass starts
@@ -158,10 +182,25 @@ preempt: a day closing is no work for the layers below.
 ## Tied to a branch
 
 A unit of a file layer carries its file's branches, and its group is scoped the
-way `code_reading`'s is. A dialogue retrieves an analysis only when its base
-tree holds the file version the analysis is of (`RetrievalScope::with_derived`).
-A unit retrieves from the layers below only what stands on one of its own
-branches. Day layers are of no branch and are not scoped.
+way `code_reading`'s is.
+
+**What a dialogue retrieves** (`RetrievalScope::with_derived`): an analysis is
+in scope when the base tree holds both the file version it is of and the
+versions of the files in the same repository that it depends on. It leaves
+scope when the conversation changes its file or one of those dependencies.
+
+**What a unit retrieves from the layers below:**
+- In its own repository: what stands on one of its own branches.
+- In another repository: what stands on that repository's default branch. A
+  branch name means nothing across repositories.
+- For a day unit, which is of no branch: what stands on each repository's
+  default branch.
+
+A unit's own lineage is never offered back to it as a candidate.
+
+**Engine side.** A unit's projection record is one read-only scan, which
+teaches no score level that dialogue retrieval reads. Only a layer that
+compounds on a layer below draws that layer's window into its budget.
 
 ## Testing it small
 

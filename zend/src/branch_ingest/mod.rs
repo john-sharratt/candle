@@ -30,7 +30,7 @@ use self::walk::{walk, Corpus, FileItem, RepoBranches, TreeCache};
 use crate::code_read::{self, is_upload_path, FileJob};
 use crate::ingest::IngestMode;
 use crate::layers::plan::Below;
-use crate::layers::{Ground, LayerRun, LayerSpec};
+use crate::layers::{Ground, LayerRun, LayerSpec, Reach};
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::{self, UnitJob};
@@ -93,7 +93,17 @@ impl BranchIngest {
         let mut corpora: HashMap<IngestScope, (Corpus, Vec<String>)> = HashMap::new();
         let mut changed = false;
         // What stands in each layer, carried up to the layers built on it.
-        let mut ground = Ground::default();
+        let mut ground = Ground {
+            defaults: repos
+                .iter()
+                .filter_map(|r| {
+                    r.tips
+                        .first()
+                        .map(|t| (r.name.clone(), t.name.as_str().to_string()))
+                })
+                .collect(),
+            ..Ground::default()
+        };
         for layer in layers {
             if crate::ingest_cancel::cancelled() {
                 break;
@@ -131,11 +141,27 @@ impl BranchIngest {
                             base: layer.base,
                             sees: layer.sees,
                         };
-                        crate::layers::pass_layer(ctx, &run, &mut ground)?
+                        crate::layers::pass_layer(ctx, &run, &mut ground, Reach::Default)?
                     }
                     None => false,
                 },
             };
+        }
+        // The default branch has been read all the way up; every other
+        // branch's units now, bottom up again, each layer planned afresh
+        // against what its layer below holds after this climb.
+        for layer in layers.iter().filter(|l| l.mode == IngestMode::Derived) {
+            if crate::ingest_cancel::cancelled() {
+                break;
+            }
+            if let Some(spec) = layer.spec {
+                let run = LayerRun {
+                    spec,
+                    base: layer.base,
+                    sees: layer.sees,
+                };
+                changed |= crate::layers::pass_layer(ctx, &run, &mut ground, Reach::All)?;
+            }
         }
         trees.retain_tips(&repos);
         Ok(changed)
@@ -259,6 +285,7 @@ fn ground_files(
     ground: &mut Ground,
 ) {
     ground.live.clear();
+    ground.held_back = held_back.iter().map(|r| r.to_string()).collect();
     for f in retained {
         ground
             .live

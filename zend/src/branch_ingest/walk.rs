@@ -24,6 +24,12 @@ use super::units::{dir_of, folder_units, FolderUnit, TreeFile};
 /// the walk, so a unit on one of them is read from it.
 const PREFERRED: [&str; 2] = ["main", "master"];
 
+/// Whether `branch` is a repository's default branch — the one whose units
+/// every layer reads first.
+pub fn is_default_branch(branch: &str) -> bool {
+    PREFERRED.contains(&branch)
+}
+
 /// One git repository's record branches, preferred first.
 pub struct RepoBranches {
     pub name: String,

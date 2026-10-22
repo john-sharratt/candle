@@ -1267,6 +1267,13 @@ pub trait ContentResolver {
         false
     }
 
+    /// Whether an ingest target draws on `group` across conversations — a
+    /// group of a layer below it that it compounds on
+    /// ([`Substrate::set_ingest_sees`]). Default `false`.
+    fn compounds_on(&self, _group: GroupId) -> bool {
+        false
+    }
+
     /// Whether `turn` carries one of `tags` — the scope a tagged turn group
     /// admits (see [`crate::projection::Builder::set_group_tags`]).
     ///
@@ -1852,8 +1859,13 @@ impl Substrate {
     /// Let projections targeting the append-only `layer` score and select
     /// `groups` — groups of the layers below it — across conversations instead
     /// of self-local. See [`Self::ingest_sees`].
+    /// An empty set clears the layer's: it reads every group self-local again.
     pub fn set_ingest_sees(&mut self, layer: LayerId, groups: HashSet<GroupId>) {
-        self.ingest_sees.insert(layer, groups);
+        if groups.is_empty() {
+            self.ingest_sees.remove(&layer);
+        } else {
+            self.ingest_sees.insert(layer, groups);
+        }
     }
 
     /// Whether a projection targeting `layer` reads `group` self-local: every

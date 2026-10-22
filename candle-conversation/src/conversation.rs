@@ -3958,7 +3958,7 @@ impl Sequence {
     /// galleries + scorer, but the probe is the finished turn's stored signature
     /// rather than a live gather. Empty when the turn has no signature (nothing
     /// to score against).
-    fn last_turn_belief_scores(&self) -> ProjectionScores {
+    fn last_turn_belief_scores(&self, observe: bool) -> ProjectionScores {
         let empty = ProjectionScores::new();
         let timeline = self.target.timeline;
         let (probe, q_span, tags, source) = {
@@ -4016,6 +4016,7 @@ impl Sequence {
                 probe_q,
                 tags,
                 source,
+                observe,
             },
             response_tx: tx,
         });
@@ -4053,33 +4054,39 @@ impl Sequence {
         if self.config.disable_reprojection {
             return None;
         }
-        Some(self.recompute_projection_event(stats))
+        Some(self.projection_event_scored(stats, &self.last_turn_belief_scores(true)))
     }
 
-    /// What the just-sealed turn's own signature scores each candidate
-    /// conversation at — its best turn, every conversation the belief scan
-    /// offered this target — highest first. The selection keeps only those
-    /// over their group's threshold; this is the whole field, for a caller
-    /// asking why something it expected was not brought in.
-    pub fn last_turn_candidate_scores(&self) -> Vec<(TimelineId, f32)> {
+    /// What a one-turn ingest unit's just-sealed turn drew in — the
+    /// projection its own signature selects, for a caller that must see what
+    /// it drew where no live reprojection ever records it — and what that
+    /// signature scored each candidate conversation at (its best turn),
+    /// highest first, the whole field the selection kept its few from.
+    ///
+    /// One scan, read-only: it is a record of the turn, not evidence about any
+    /// scope, so it teaches no score level the dialogue's retrieval reads.
+    pub fn unit_projection(
+        &self,
+        stats: &crate::stats::TurnStats,
+    ) -> (ProjectionEvent, Vec<(TimelineId, f32)>) {
+        let scores = self.last_turn_belief_scores(false);
         let mut best: std::collections::HashMap<TimelineId, f32> = std::collections::HashMap::new();
-        for (key, score) in self.last_turn_belief_scores().turn_scores() {
+        for (key, score) in scores.turn_scores() {
             let e = best.entry(key.timeline).or_insert(f32::MIN);
             *e = e.max(score);
         }
-        let mut out: Vec<(TimelineId, f32)> = best.into_iter().collect();
-        out.sort_by(|a, b| b.1.total_cmp(&a.1));
-        out
+        let mut candidates: Vec<(TimelineId, f32)> = best.into_iter().collect();
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        (self.projection_event_scored(stats, &scores), candidates)
     }
 
-    /// [`Self::projection_event`] for any conversation, reprojecting or not: the
-    /// projection a just-sealed turn's own signature selects. For a caller that
-    /// must see what a one-turn ingest conversation drew in — the layers built
-    /// on others are only as good as the units of other files their provenance
-    /// brings — where no live reprojection ever records it.
-    pub fn recompute_projection_event(&self, stats: &crate::stats::TurnStats) -> ProjectionEvent {
-        let scores = self.last_turn_belief_scores();
-        let resolver = self.substrate.read_for_scored(self.target, &scores);
+    /// The [`ProjectionEvent`] the just-sealed turn's `scores` select.
+    fn projection_event_scored(
+        &self,
+        stats: &crate::stats::TurnStats,
+        scores: &ProjectionScores,
+    ) -> ProjectionEvent {
+        let resolver = self.substrate.read_for_scored(self.target, scores);
         let projection = self.projection.project_with_selection(
             self.target,
             &resolver,

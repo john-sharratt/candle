@@ -58,6 +58,8 @@ struct MockResolver {
     couplings: HashMap<u32, HashSet<u32>>,
     /// Stands in for "the projection target is an append-only ingest layer".
     ingest_self: bool,
+    /// The groups an ingest target compounds on (`compounds_on`).
+    compounds: HashSet<u32>,
     /// (group_raw, turn_raw) → the gather-scope tags the turn was written with,
     /// backing `turn_carries`. A turn absent here carries none.
     turn_tags: HashMap<(u32, u32), Vec<String>>,
@@ -84,6 +86,12 @@ impl MockResolver {
     /// conversation is generating its own content, not retrieving.
     fn as_ingest_self(mut self) -> Self {
         self.ingest_self = true;
+        self
+    }
+
+    /// Mark `group` as one the ingest target compounds on.
+    fn compounding_on(mut self, group: GroupId) -> Self {
+        self.compounds.insert(group.raw());
         self
     }
 
@@ -173,6 +181,10 @@ impl MockResolver {
 impl ContentResolver for MockResolver {
     fn target_is_ingest_self(&self) -> bool {
         self.ingest_self
+    }
+
+    fn compounds_on(&self, group: GroupId) -> bool {
+        self.ingest_self && self.compounds.contains(&group.raw())
     }
 
     fn group_turns(&self, group: GroupId) -> Vec<TurnKey> {
@@ -1179,7 +1191,8 @@ fn an_ingest_target_draws_the_layer_below_at_that_layers_window() {
         .with_tokens(below, b0, 1200)
         .with_score(below, b1, 0.8)
         .with_tokens(below, b1, 1200)
-        .as_ingest_self();
+        .as_ingest_self()
+        .compounding_on(below);
 
     let proj = b.project(
         ProjectionTarget {

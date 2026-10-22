@@ -8,7 +8,17 @@ use candle_conversation::ConversationEngine;
 
 use crate::branch_ingest::keys::CONTENT_KEY;
 use crate::code_read::{is_upload_path, PATH_KEY};
-use crate::layers::keys::FILE_KEY;
+use crate::layers::keys::{parse_deps, DEPS_KEY, FILE_KEY};
+
+/// A committed unit of a layer of files.
+#[derive(Debug, Clone)]
+pub struct DerivedUnit {
+    pub group: GroupId,
+    pub timeline: TimelineId,
+    /// Each file it depends on (workspace-relative), at the `code_reading`
+    /// key of the version it was built against.
+    pub deps: Vec<(String, String)>,
+}
 
 /// Every committed ingest conversation, by content key.
 #[derive(Debug, Default)]
@@ -18,7 +28,7 @@ pub struct IngestIndex {
     uploads: Vec<TimelineId>,
     /// Every committed unit of a layer of files, by the `code_reading` key of
     /// the file version it is of, with the group it is in.
-    derived: HashMap<String, Vec<(GroupId, TimelineId)>>,
+    derived: HashMap<String, Vec<DerivedUnit>>,
     /// Bumped on every rebuild, so what was worked out against an older
     /// index is never served against this one.
     generation: u64,
@@ -38,13 +48,21 @@ impl IngestIndex {
             .filter(|(tl, path)| is_upload_path(path) && committed.contains(tl))
             .map(|(tl, _)| tl)
             .collect();
-        let mut derived: HashMap<String, Vec<(GroupId, TimelineId)>> = HashMap::new();
+        let mut derived: HashMap<String, Vec<DerivedUnit>> = HashMap::new();
         for (timeline, file_key) in engine.conversations_with_metadata_key(FILE_KEY) {
             if !committed.contains(&timeline) {
                 continue;
             }
             if let Some((_, group)) = engine.timeline_target(timeline) {
-                derived.entry(file_key).or_default().push((group, timeline));
+                let deps = engine
+                    .conversation_metadata(timeline)
+                    .and_then(|m| m.get(DEPS_KEY).map(|v| parse_deps(v)))
+                    .unwrap_or_default();
+                derived.entry(file_key).or_default().push(DerivedUnit {
+                    group,
+                    timeline,
+                    deps,
+                });
             }
         }
         Self {
@@ -76,7 +94,7 @@ impl IngestIndex {
     }
 
     /// Every committed unit of a layer of files of the file version `file_key`.
-    pub fn derived_of(&self, file_key: &str) -> &[(GroupId, TimelineId)] {
+    pub fn derived_of(&self, file_key: &str) -> &[DerivedUnit] {
         self.derived.get(file_key).map(Vec::as_slice).unwrap_or(&[])
     }
 

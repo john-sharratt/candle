@@ -2326,6 +2326,14 @@ impl Conversation {
             let self_local = self_local && sub.is_self_local_group(target.layer, group.id);
             let mut timelines: Vec<TimelineId> = if self_local || group.id == target.group {
                 vec![target.timeline]
+            } else if sub.is_append_only_layer(target.layer) {
+                // A compounded group never offers the target's own lineage:
+                // it is the target's opening already (`compounding_lineage`).
+                let lineage: HashSet<TimelineId> =
+                    sub.inherited_chain(target.timeline).into_iter().collect();
+                sub.scoped_timelines_for_group(group.id, target.timeline)
+                    .filter(|tl| !lineage.contains(tl))
+                    .collect()
             } else {
                 sub.scoped_timelines_for_group(group.id, target.timeline)
                     .collect()
@@ -5314,8 +5322,21 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         }
         // The same scope the belief scan applied: what was never scored for
         // this target is never selected for it either.
+        // An append-only target's own lineage is never a candidate: a layer it
+        // compounds on can hold it (a day's history is the day's dream log's
+        // opening), and offered again it would be emitted twice and take the
+        // window of the units it was there to draw on.
+        let lineage: HashSet<TimelineId> = if self.read.is_append_only_layer(self.target.layer) {
+            self.read
+                .inherited_chain(self.target.timeline)
+                .into_iter()
+                .collect()
+        } else {
+            HashSet::new()
+        };
         self.read
             .scoped_timelines_for_group(group, self.target.timeline)
+            .filter(|tl| !lineage.contains(tl))
             .flat_map(turns_of)
             .collect()
     }
@@ -5387,6 +5408,11 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 
     fn target_is_ingest_self(&self) -> bool {
         self.read.is_append_only_layer(self.target.layer)
+    }
+
+    fn compounds_on(&self, group: GroupId) -> bool {
+        self.read.is_append_only_layer(self.target.layer)
+            && !self.read.is_self_local_group(self.target.layer, group)
     }
 
     fn turn_kind(&self, turn: TurnKey) -> TurnKind {

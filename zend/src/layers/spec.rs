@@ -25,6 +25,10 @@ use serde::Deserialize;
 /// so a tool that writes, runs or reaches the network has no place in one.
 pub const READ_ONLY_TOOLS: [&str; 4] = ["file_read", "file_list", "file_search", "file_grep"];
 
+/// The thinking levels a layer's `thinking_effort` dial may name — those
+/// [`LayerSpec::think_mode`] steers by.
+const EFFORTS: [&str; 5] = ["off", "quick", "balanced", "deep", "exhaustive"];
+
 /// Refuse a layer naming any tool outside [`READ_ONLY_TOOLS`].
 fn check_tools(layer: &str, tools: &[String]) -> anyhow::Result<()> {
     match tools.iter().find(|t| !READ_ONLY_TOOLS.contains(&t.as_str())) {
@@ -93,6 +97,17 @@ impl LayerSpec {
         let raw: Raw = serde_yaml::from_value(value.clone())
             .map_err(|e| anyhow::anyhow!("layer '{}': its `ingest:` block: {e}", layer.name))?;
         check_tools(&layer.name, &raw.tools)?;
+        let effort = layer
+            .dials
+            .get("thinking_effort")
+            .unwrap_or("balanced")
+            .to_string();
+        if !EFFORTS.contains(&effort.as_str()) {
+            anyhow::bail!(
+                "layer '{}': thinking_effort `{effort}` is none of {EFFORTS:?}",
+                layer.name
+            );
+        }
         if raw.unit == UnitKind::File && raw.after.is_none() {
             anyhow::bail!(
                 "layer '{}': a file unit builds on a layer below it — name it in `after:`",
@@ -106,11 +121,7 @@ impl LayerSpec {
             prompt: raw.prompt,
             edges: raw.edges,
             tools: raw.tools,
-            effort: layer
-                .dials
-                .get("thinking_effort")
-                .unwrap_or("balanced")
-                .to_string(),
+            effort,
         }))
     }
 

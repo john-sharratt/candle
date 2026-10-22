@@ -53,6 +53,17 @@ impl IngestReport {
     pub fn is_incomplete(&self) -> bool {
         self.aborted || self.n_failed > 0
     }
+
+    /// Fold a later round of the same pass into this one: one report for a
+    /// pass read in several rounds, so a clean last round does not hide a
+    /// failed first.
+    pub fn merge(&mut self, later: IngestReport) {
+        self.n_units += later.n_units;
+        self.n_failed += later.n_failed;
+        self.aborted |= later.aborted;
+        let room = MAX_RETAINED.saturating_sub(self.failures.len());
+        self.failures.extend(later.failures.into_iter().take(room));
+    }
 }
 
 /// Live collector shared by the pass's workers.

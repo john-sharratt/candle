@@ -1878,13 +1878,21 @@ pub fn run_with_sink<R: ContentResolver>(
     // size of one unit — the higher the layer, the less it compounded. The
     // budget is the windows of the layers it draws on, each capped at its own
     // below. An ingest target with no layer to draw on (`code_reading`, whose
-    // `repo_map` below is a working set) keeps its own window, as before.
-    let compounding = resolver.target_is_ingest_self();
+    // `repo_map` below is a working set) keeps its own window, as before; a
+    // layer below it reads self-local (one it does not compound on) adds
+    // nothing to the budget.
+    let compounded = |li: usize| {
+        visible_layers[li].id != target.layer
+            && group_states
+                .iter()
+                .any(|gs| gs.layer_idx == li && flexed(gs) && resolver.compounds_on(gs.schema.id))
+    };
+    let compounding =
+        resolver.target_is_ingest_self() && flex_layer_indices.iter().any(|&li| compounded(li));
     let below_windows: usize = flex_layer_indices
         .iter()
-        .map(|&li| visible_layers[li])
-        .filter(|l| l.id != target.layer)
-        .map(|l| l.window)
+        .filter(|&&li| compounded(li))
+        .map(|&li| visible_layers[li].window)
         .sum();
     let turn_budget = if compounding {
         own_window.max(below_windows)

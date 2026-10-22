@@ -40,6 +40,11 @@ pub const DEPS_KEY: &str = "deps";
 /// layer whose question changes is asked again.
 pub const SPEC_KEY: &str = "spec";
 
+/// The key the unit was leased under. An edges layer commits under a key of
+/// what it depended on, known only once it has answered, so a member that
+/// waited on the lease finds the unit committed by this one.
+pub const JOB_KEY: &str = "job";
+
 /// Bumped when what a unit of every layer means changes, so each is built
 /// again.
 pub const UNIT_KEY_VERSION: u32 = 1;

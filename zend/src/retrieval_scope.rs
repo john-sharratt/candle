@@ -286,10 +286,17 @@ impl RetrievalScope {
                     .map(|(_, tl)| *tl),
             );
             // A unit of a layer of files is in scope when its file version is,
-            // and out with the file when the conversation changed it.
-            for (path, group, tl) in &of_tree.derived {
-                if !changed.contains(path.as_str()) {
-                    in_derived.entry(*group).or_default().insert(*tl);
+            // and out when the conversation changed its file or a file it
+            // depends on.
+            for unit in &of_tree.derived {
+                let touched = std::iter::once(&unit.path)
+                    .chain(&unit.deps)
+                    .any(|p| changed.contains(p.as_str()));
+                if !touched {
+                    in_derived
+                        .entry(unit.group)
+                        .or_default()
+                        .insert(unit.timeline);
                 }
             }
         }
