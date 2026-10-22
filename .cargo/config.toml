@@ -20,3 +20,16 @@ rustflags = [
 
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "target-feature=-avx,-avx2"]
+
+# The cluster ships one binary to every member, so an x86-64 build targets the
+# CPU level every member has, never the one it happened to be built on: a
+# `native` build from a Core Ultra used instructions the i7-10700K lacks, and
+# died at start on it with an illegal instruction (0xc000001d). x86-64-v3 is
+# AVX2, FMA, F16C and BMI2 — what candle-core's compile-time paths gate on.
+# Newer instructions (AVX-VNNI, AVX-512) are chosen at runtime where they
+# matter (`expert_lre::cpu_pool::kernel`).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
