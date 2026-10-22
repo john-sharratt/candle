@@ -30,6 +30,7 @@
 use rayon::prelude::*;
 
 use super::fusion::FusionMode;
+use super::popcount::group_agreement;
 use super::WideQSig;
 
 /// Layer groups in a folded signature — **structural, not tuned**.
@@ -66,27 +67,6 @@ pub fn heads_per_group(n_heads: usize) -> usize {
 /// tokens) — and, being magnitude- not position-keyed, generalizes to content
 /// windows where the relevant reference is a sparse needle among boilerplate.
 pub(super) const NEEDLE_KEEP_FRAC: f32 = 0.25;
-
-/// Sign-agreement between two layer-group signatures = `popcount(XNOR)` over the
-/// group's words. Fast-paths the locked 8-word (4-head × 128-bit) group width so
-/// it vectorizes; falls back to a generic loop for other widths.
-#[inline]
-pub(super) fn group_agreement(a: &[u64], b: &[u64]) -> u32 {
-    if a.len() == 8 && b.len() == 8 {
-        let mut s = 0u32;
-        for k in 0..8 {
-            s += (!(a[k] ^ b[k])).count_ones();
-        }
-        s
-    } else {
-        let n = a.len().min(b.len());
-        let mut s = 0u32;
-        for k in 0..n {
-            s += (!(a[k] ^ b[k])).count_ones();
-        }
-        s
-    }
-}
 
 /// Score `n_cases` corpus cases against a `query` window of folded provenance
 /// signatures via `z × margin` late-fusion voting over the signature's layer-groups.

@@ -67,12 +67,11 @@ trait CpuBF16<const ARR: usize> {
 
 use half::{bf16, f16};
 
+// x86: the AVX kernels are always compiled, each with its own
+// `target_feature`, and run where the CPU reports AVX and F16C; the binary's
+// own baseline is below AVX (`.cargo/config.toml`).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[cfg(target_feature = "avx2")]
-pub mod avx;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[cfg(target_feature = "avx2")]
-pub use avx::{CurrentCpu, CurrentCpuBF16, CurrentCpuF16};
+mod avx;
 
 #[cfg(target_arch = "wasm32")]
 #[cfg(target_feature = "simd128")]
@@ -88,10 +87,49 @@ pub mod neon;
 #[cfg(target_feature = "neon")]
 pub use neon::CurrentCpu;
 
-#[cfg(any(
-    target_feature = "neon",
-    target_feature = "avx2",
-    target_feature = "simd128"
+/// `*c = Σ a[i]·b[i]` over `k` f32s.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+pub(crate) unsafe fn vec_dot_f32(a_row: *const f32, b_row: *const f32, c: *mut f32, k: usize) {
+    if avx::available() {
+        return avx::vec_dot_f32(a_row, b_row, c, k);
+    }
+    scalar::vec_dot_f32(a_row, b_row, c, k)
+}
+
+/// `*b = Σ row[i]` over `k` f32s.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+pub(crate) unsafe fn vec_sum(row: *const f32, b: *mut f32, k: usize) {
+    if avx::available() {
+        return avx::vec_sum(row, b, k);
+    }
+    scalar::vec_sum(row, b, k)
+}
+
+/// `*c = Σ a[i]·b[i]` over `k` f16s, accumulated in f32.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+pub(crate) unsafe fn vec_dot_f16(a_row: *const f16, b_row: *const f16, c: *mut f32, k: usize) {
+    if avx::available() {
+        return avx::vec_dot_f16(a_row, b_row, c, k);
+    }
+    scalar::vec_dot_f16(a_row, b_row, c, k)
+}
+
+/// `*c = Σ a[i]·b[i]` over `k` bf16s, accumulated in f32.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+pub(crate) unsafe fn vec_dot_bf16(a_row: *const bf16, b_row: *const bf16, c: *mut f32, k: usize) {
+    if avx::available() {
+        return avx::vec_dot_bf16(a_row, b_row, c, k);
+    }
+    scalar::vec_dot_bf16(a_row, b_row, c, k)
+}
+
+#[cfg(all(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    any(target_feature = "neon", target_feature = "simd128")
 ))]
 #[inline(always)]
 pub(crate) unsafe fn vec_dot_f32(a_row: *const f32, b_row: *const f32, c: *mut f32, k: usize) {
@@ -118,23 +156,9 @@ pub(crate) unsafe fn vec_dot_f32(a_row: *const f32, b_row: *const f32, c: *mut f
     }
 }
 
-#[cfg(not(any(
-    target_feature = "neon",
-    target_feature = "avx2",
-    target_feature = "simd128"
-)))]
-#[inline(always)]
-pub(crate) unsafe fn vec_dot_f32(a_row: *const f32, b_row: *const f32, c: *mut f32, k: usize) {
-    // leftovers
-    for i in 0..k {
-        *c += *a_row.add(i) * (*b_row.add(i));
-    }
-}
-
-#[cfg(any(
-    target_feature = "neon",
-    target_feature = "avx2",
-    target_feature = "simd128"
+#[cfg(all(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    any(target_feature = "neon", target_feature = "simd128")
 ))]
 #[inline(always)]
 pub(crate) unsafe fn vec_sum(row: *const f32, b: *mut f32, k: usize) {
@@ -158,93 +182,102 @@ pub(crate) unsafe fn vec_sum(row: *const f32, b: *mut f32, k: usize) {
     }
 }
 
-#[cfg(not(any(
-    target_feature = "neon",
-    target_feature = "avx2",
-    target_feature = "simd128"
-)))]
-#[inline(always)]
-pub(crate) unsafe fn vec_sum(row: *const f32, b: *mut f32, k: usize) {
-    *b = 0f32;
-    for i in 0..k {
-        *b += *row.add(i)
-    }
-}
+#[cfg(all(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    not(any(target_feature = "neon", target_feature = "simd128"))
+))]
+pub(crate) use scalar::{vec_dot_f32, vec_sum};
 
-#[cfg(target_feature = "avx2")]
-#[inline(always)]
-pub(crate) unsafe fn vec_dot_f16(a_row: *const f16, b_row: *const f16, c: *mut f32, k: usize) {
-    let mut sumf = 0.0f32;
-    let np = k & !(CurrentCpuF16::STEP - 1);
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) use scalar::{vec_dot_bf16, vec_dot_f16};
 
-    let mut sum = CurrentCpuF16::zero_array();
-    let mut ax = CurrentCpuF16::zero_array();
-    let mut ay = CurrentCpuF16::zero_array();
+/// The portable loops: what a CPU without a vector path runs.
+#[allow(dead_code)]
+mod scalar {
+    use half::{bf16, f16};
 
-    for i in (0..np).step_by(CurrentCpuF16::STEP) {
-        for j in 0..CurrentCpuF16::n() {
-            ax[j] = CurrentCpuF16::load(a_row.add(i + j * CurrentCpuF16::EPR));
-            ay[j] = CurrentCpuF16::load(b_row.add(i + j * CurrentCpuF16::EPR));
-
-            sum[j] = CurrentCpuF16::vec_fma(sum[j], ax[j], ay[j]);
+    #[inline(always)]
+    pub(crate) unsafe fn vec_dot_f32(a_row: *const f32, b_row: *const f32, c: *mut f32, k: usize) {
+        for i in 0..k {
+            *c += *a_row.add(i) * (*b_row.add(i));
         }
     }
 
-    CurrentCpuF16::vec_reduce(sum, &mut sumf);
-
-    // leftovers
-    for i in np..k {
-        sumf += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
-    }
-    *c = sumf;
-}
-
-#[cfg(target_feature = "avx2")]
-#[inline(always)]
-pub(crate) unsafe fn vec_dot_bf16(a_row: *const bf16, b_row: *const bf16, c: *mut f32, k: usize) {
-    let mut sumf = 0.0f32;
-    let np = k & !(CurrentCpuBF16::STEP - 1);
-
-    let mut sum = CurrentCpuBF16::zero_array();
-    let mut ax = CurrentCpuBF16::zero_array();
-    let mut ay = CurrentCpuBF16::zero_array();
-
-    for i in (0..np).step_by(CurrentCpuBF16::STEP) {
-        for j in 0..CurrentCpuBF16::n() {
-            ax[j] = CurrentCpuBF16::load(a_row.add(i + j * CurrentCpuBF16::EPR));
-            ay[j] = CurrentCpuBF16::load(b_row.add(i + j * CurrentCpuBF16::EPR));
-
-            sum[j] = CurrentCpuBF16::vec_fma(sum[j], ax[j], ay[j]);
+    #[inline(always)]
+    pub(crate) unsafe fn vec_sum(row: *const f32, b: *mut f32, k: usize) {
+        *b = 0f32;
+        for i in 0..k {
+            *b += *row.add(i)
         }
     }
 
-    CurrentCpuBF16::vec_reduce(sum, &mut sumf);
-
-    // leftovers
-    for i in np..k {
-        sumf += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
+    #[inline(always)]
+    pub(crate) unsafe fn vec_dot_f16(a_row: *const f16, b_row: *const f16, c: *mut f32, k: usize) {
+        let mut sum = 0.0;
+        for i in 0..k {
+            sum += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
+        }
+        *c = sum;
     }
-    *c = sumf;
+
+    #[inline(always)]
+    pub(crate) unsafe fn vec_dot_bf16(
+        a_row: *const bf16,
+        b_row: *const bf16,
+        c: *mut f32,
+        k: usize,
+    ) {
+        let mut sum = 0.0;
+        for i in 0..k {
+            sum += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
+        }
+        *c = sum;
+    }
 }
 
-#[cfg(not(target_feature = "avx2"))]
-#[inline(always)]
-pub(crate) unsafe fn vec_dot_f16(a_row: *const f16, b_row: *const f16, c: *mut f32, k: usize) {
-    // leftovers
-    let mut sum = 0.0;
-    for i in 0..k {
-        sum += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
-    }
-    *c = sum;
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(not(target_feature = "avx2"))]
-#[inline(always)]
-pub(crate) unsafe fn vec_dot_bf16(a_row: *const bf16, b_row: *const bf16, c: *mut f32, k: usize) {
-    // leftovers
-    let mut sum = 0.0;
-    for i in 0..k {
-        sum += (*a_row.add(i)).to_f32() * (*b_row.add(i)).to_f32();
+    fn f32s(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32 * 0.37 + seed).sin() * 3.0).round() / 4.0)
+            .collect()
     }
-    *c = sum;
+
+    /// Each kernel against the plain sum of products, at widths that cover a
+    /// whole step, leftovers only, and both. The values are multiples of 1/4
+    /// with small sums, so every order of addition is exact and the vector and
+    /// scalar paths must agree to the bit.
+    #[test]
+    fn every_kernel_equals_the_plain_sum() {
+        for k in [0, 5, 32, 33, 100, 257] {
+            let (a, b) = (f32s(k, 0.1), f32s(k, 1.3));
+            let want: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+
+            let mut got = 0.0;
+            unsafe { vec_dot_f32(a.as_ptr(), b.as_ptr(), &mut got, k) };
+            assert_eq!(got, want, "f32 dot, k={k}");
+
+            let mut s = 0.0;
+            unsafe { vec_sum(a.as_ptr(), &mut s, k) };
+            assert_eq!(s, a.iter().sum::<f32>(), "sum, k={k}");
+
+            let (ah, bh): (Vec<f16>, Vec<f16>) = (
+                a.iter().map(|&v| f16::from_f32(v)).collect(),
+                b.iter().map(|&v| f16::from_f32(v)).collect(),
+            );
+            let mut got = 0.0;
+            unsafe { vec_dot_f16(ah.as_ptr(), bh.as_ptr(), &mut got, k) };
+            assert_eq!(got, want, "f16 dot, k={k}");
+
+            let (ab, bb): (Vec<bf16>, Vec<bf16>) = (
+                a.iter().map(|&v| bf16::from_f32(v)).collect(),
+                b.iter().map(|&v| bf16::from_f32(v)).collect(),
+            );
+            let mut got = 0.0;
+            unsafe { vec_dot_bf16(ab.as_ptr(), bb.as_ptr(), &mut got, k) };
+            assert_eq!(got, want, "bf16 dot, k={k}");
+        }
+    }
 }

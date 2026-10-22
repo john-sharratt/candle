@@ -14,7 +14,8 @@
 
 use rayon::prelude::*;
 
-use super::scan::{group_agreement, heads_per_group, needle_gate_tally, FOLD_GROUPS};
+use super::popcount::group_agreement;
+use super::scan::{heads_per_group, needle_gate_tally, FOLD_GROUPS};
 use super::WideQSig;
 
 /// A gallery packed into one contiguous buffer, scan-ready.

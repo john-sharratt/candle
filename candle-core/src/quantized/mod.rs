@@ -4,7 +4,7 @@ use k_quants::*;
 use std::borrow::Cow;
 use std::marker::PhantomData;
 
-#[cfg(target_feature = "avx2")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod avx;
 pub mod decode_rows;
 mod dummy_cuda;

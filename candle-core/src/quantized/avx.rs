@@ -1,3 +1,12 @@
+//! The quantized dot products in AVX2 + FMA, chosen at runtime.
+//!
+//! The binary is built for a CPU level every cluster member has
+//! (`.cargo/config.toml`), below AVX2, so every routine here carries its own
+//! `target_feature` and `k_quants` calls them only where [`available`]; a CPU
+//! without them runs the portable loops beside each call site.
+
+use std::sync::LazyLock;
+
 use super::k_quants::{
     BlockQ2_K, BlockQ3_K, BlockQ4_0, BlockQ4_K, BlockQ5_K, BlockQ6_K, BlockQ8_0, BlockQ8_K, QK8_0,
     QK_K,
@@ -10,20 +19,32 @@ use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-#[inline(always)]
+/// Whether this CPU runs these routines — asked once.
+static AVAILABLE: LazyLock<bool> =
+    LazyLock::new(|| is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"));
+
+/// Whether this CPU runs the AVX2 + FMA dot products.
+pub(crate) fn available() -> bool {
+    *AVAILABLE
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn sum_i16_pairs_float(x: __m256i) -> __m256 {
     let ones = _mm256_set1_epi16(1);
     let summed_pairs = _mm256_madd_epi16(ones, x);
     _mm256_cvtepi32_ps(summed_pairs)
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn mul_sum_us8_pairs_float(ax: __m256i, sy: __m256i) -> __m256 {
     let dot = _mm256_maddubs_epi16(ax, sy);
     sum_i16_pairs_float(dot)
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn hsum_float_8(x: __m256) -> f32 {
     let res = _mm256_extractf128_ps(x, 1);
     let res = _mm_add_ps(res, _mm256_castps256_ps128(x));
@@ -32,7 +53,8 @@ pub(crate) unsafe fn hsum_float_8(x: __m256) -> f32 {
     _mm_cvtss_f32(res)
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn bytes_from_nibbles_32(rsi: *const u8) -> __m256i {
     let tmp = _mm_loadu_si128(rsi as *const __m128i);
     let bytes = _mm256_insertf128_si256::<1>(_mm256_castsi128_si256(tmp), _mm_srli_epi16(tmp, 4));
@@ -40,14 +62,16 @@ pub(crate) unsafe fn bytes_from_nibbles_32(rsi: *const u8) -> __m256i {
     _mm256_and_si256(low_mask, bytes)
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn mul_sum_i8_pairs_float(x: __m256i, y: __m256i) -> __m256 {
     let ax = _mm256_sign_epi8(x, x);
     let sy = _mm256_sign_epi8(y, x);
     mul_sum_us8_pairs_float(ax, sy)
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK8_0),
@@ -68,7 +92,8 @@ pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) ->
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK8_0),
@@ -87,7 +112,8 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn get_scale_shuffle(i: usize) -> __m128i {
     const K_SHUFFLE: [u8; 128] = [
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
@@ -99,7 +125,8 @@ unsafe fn get_scale_shuffle(i: usize) -> __m128i {
     _mm_loadu_si128((K_SHUFFLE.as_ptr() as *const __m128i).add(i))
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn get_scale_shuffle_k4(i: usize) -> __m256i {
     const K_SHUFFLE: [u8; 256] = [
         0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
@@ -116,7 +143,8 @@ unsafe fn get_scale_shuffle_k4(i: usize) -> __m256i {
     _mm256_loadu_si256((K_SHUFFLE.as_ptr() as *const __m256i).add(i))
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn get_scale_shuffle_q3k(i: usize) -> __m256i {
     const K_SHUFFLE: [u8; 128] = [
         0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
@@ -128,7 +156,8 @@ unsafe fn get_scale_shuffle_q3k(i: usize) -> __m256i {
     _mm256_loadu_si256((K_SHUFFLE.as_ptr() as *const __m256i).add(i))
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
@@ -216,12 +245,14 @@ pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6_K], ys: &[BlockQ8_K]) -> f
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn mm256_set_m128i(a: __m128i, b: __m128i) -> __m256i {
     _mm256_insertf128_si256(_mm256_castsi128_si256(b), a, 1)
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
@@ -304,7 +335,8 @@ pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2_K], ys: &[BlockQ8_K]) -> f
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
@@ -440,7 +472,8 @@ pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3_K], ys: &[BlockQ8_K]) -> f
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
@@ -525,7 +558,8 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4_K], ys: &[BlockQ8_K]) -> f
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
@@ -638,7 +672,8 @@ pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5_K], ys: &[BlockQ8_K]) -> f
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),

@@ -27,6 +27,7 @@ pub mod gallery_arena;
 pub mod gather;
 pub mod gpu;
 pub mod packed;
+mod popcount;
 pub mod raw_store;
 pub mod scan;
 pub mod selection;
