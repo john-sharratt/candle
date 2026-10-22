@@ -1590,6 +1590,13 @@ fn leftmost_normal_in(tree_meta: &BTreeMap<TurnIndex, TreeNodeMeta>, idx: TurnIn
     }
 }
 
+/// [`Substrate::held_payload_bytes`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeldPayloadBytes {
+    pub wide_q_sigs: u64,
+    pub projection_events: u64,
+}
+
 /// Per-stream in-RAM runtime state — built by replaying the redo log
 /// on startup and updated on every fresh append.
 ///
@@ -2491,6 +2498,22 @@ impl Substrate {
             .iter()
             .map(|idx| self.residence[idx.0].byte_size)
             .sum()
+    }
+
+    /// Host bytes held by the per-turn payloads the substrate keeps resident
+    /// whole, rebuilt from the redo log at open: each stream's wide-Q
+    /// signature window and its projection events. These sit outside the warm
+    /// KV budget and grow with the corpus. O(streams), for the memory report.
+    pub fn held_payload_bytes(&self) -> HeldPayloadBytes {
+        let mut held = HeldPayloadBytes::default();
+        for (_, stream) in self.streams.iter_physical() {
+            held.wide_q_sigs += stream.wide_q_sigs.as_ref().map_or(0, |b| b.len() as u64);
+            held.projection_events += stream
+                .projection_events
+                .as_ref()
+                .map_or(0, |b| b.len() as u64);
+        }
+        held
     }
 
     /// Count of hot residences awaiting a warm copy — the cheap COUNT companion to

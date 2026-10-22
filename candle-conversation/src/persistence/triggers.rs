@@ -119,6 +119,15 @@ impl PersistenceTriggers {
             .map(|(_, t)| t.warm_resident_bytes())
             .sum()
     }
+
+    /// Host bytes of the per-turn payloads held whole outside the warm
+    /// budget, summed.
+    pub fn held_payload_bytes(&self) -> u64 {
+        self.members
+            .iter()
+            .map(|(_, t)| t.held_payload_bytes())
+            .sum()
+    }
 }
 
 #[cfg(test)]

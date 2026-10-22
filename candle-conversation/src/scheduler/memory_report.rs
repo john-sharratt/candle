@@ -442,6 +442,10 @@ pub struct WarmSection {
     pub pinned_undrainable_bytes: u64,
     /// Bytes held by warm copies — the one host-side quantity admission can shrink.
     pub resident_bytes: u64,
+    /// Host bytes of the per-turn payloads the substrate holds whole — wide-Q
+    /// signature windows and projection events — outside the warm budget and
+    /// growing with the corpus.
+    pub held_payload_bytes: u64,
 }
 
 /// Host RAM through the budget model (`candle::vram::host_ram_budget`).
@@ -648,6 +652,7 @@ impl Scheduler {
             pending_warm_bytes: self.persist_triggers.pending_warm_bytes(),
             pinned_undrainable_bytes: self.persist_triggers.pinned_undrainable_bytes(),
             resident_bytes: self.persist_triggers.warm_resident_bytes(),
+            held_payload_bytes: self.persist_triggers.held_payload_bytes(),
         };
 
         // ── Host RAM ────────────────────────────────────────────────────────
@@ -916,6 +921,7 @@ mod tests {
                 pending_warm_bytes: 8,
                 pinned_undrainable_bytes: 9,
                 resident_bytes: 10,
+                held_payload_bytes: 11,
             },
             host: HostSection {
                 total_bytes: 32,

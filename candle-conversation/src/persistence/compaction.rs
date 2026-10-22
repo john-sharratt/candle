@@ -1303,6 +1303,7 @@ mod tests {
     #[test]
     fn the_live_list_shares_the_substrates_blobs() {
         use crate::persistence::streams::{StreamDecl, TurnDecl};
+        use crate::substrate::HeldPayloadBytes;
         let decl = StreamDecl::Turn(TurnDecl {
             timeline_id: 6,
             turn_index: 0,
@@ -1327,6 +1328,14 @@ mod tests {
         substrate.apply_projection_events(sid, vec![1, 2, 3], none);
         substrate.apply_wide_q_sigs(sid, vec![4, 5, 6, 7], none);
         substrate.apply_index_page(sid, vec![8, 9], none);
+        // The payloads held whole are what the memory report counts.
+        assert_eq!(
+            substrate.held_payload_bytes(),
+            HeldPayloadBytes {
+                wide_q_sigs: 4,
+                projection_events: 3,
+            }
+        );
 
         let live = collect_live_records(
             &manifest,

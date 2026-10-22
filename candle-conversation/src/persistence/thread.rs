@@ -112,6 +112,9 @@ pub struct BacklogGauge {
     warm_residents: Arc<AtomicU64>,
     /// Byte size of the purge population, stamped alongside `warm_residents`.
     warm_resident_bytes: Arc<AtomicU64>,
+    /// Host bytes of the per-turn payloads held whole outside the warm budget
+    /// (`Substrate::held_payload_bytes`), stamped alongside `warm_residents`.
+    held_payload_bytes: Arc<AtomicU64>,
     /// Called whenever the drainable deficit falls — see
     /// [`PersistenceTrigger::on_backlog_fall`].
     on_fall: Arc<OnceLock<BacklogWaker>>,
@@ -145,9 +148,11 @@ impl BacklogGauge {
     }
 
     /// Record the warm-resident population (see `warm_residents`).
-    fn stamp_residents(&self, n: u64, bytes: u64) {
+    fn stamp_residents(&self, n: u64, bytes: u64, held_payload: u64) {
         self.warm_residents.store(n, Ordering::Relaxed);
         self.warm_resident_bytes.store(bytes, Ordering::Relaxed);
+        self.held_payload_bytes
+            .store(held_payload, Ordering::Relaxed);
     }
 }
 
@@ -227,6 +232,12 @@ impl PersistenceTrigger {
     /// Bytes held by warm copies, as of the last persistence pass.
     pub fn warm_resident_bytes(&self) -> u64 {
         self.backlog.warm_resident_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Host bytes of the per-turn payloads held whole outside the warm budget,
+    /// as of the last persistence pass.
+    pub fn held_payload_bytes(&self) -> u64 {
+        self.backlog.held_payload_bytes.load(Ordering::Relaxed)
     }
 
     /// Test-only no-op trigger. Holds senders whose receivers are dropped
@@ -1564,11 +1575,16 @@ fn run_pass(
     // and that one-word difference is exactly what produced the recursive-read
     // self-deadlock in `inject_sealed_turn`. Too sharp an edge to leave implicit
     // directly above a `conversation.write()`.
-    let (warm_resident, warm_bytes) = {
+    let (warm_resident, warm_bytes, held) = {
         let read = conversation.read();
-        (read.warm_resident_count(), read.warm_resident_bytes())
+        let held = read.held_payload_bytes();
+        (
+            read.warm_resident_count(),
+            read.warm_resident_bytes(),
+            held.wide_q_sigs + held.projection_events,
+        )
     };
-    backlog.stamp_residents(warm_resident as u64, warm_bytes);
+    backlog.stamp_residents(warm_resident as u64, warm_bytes, held);
     if warm_resident > 0 {
         let mut sys = System::new();
         sys.refresh_memory();
