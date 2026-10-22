@@ -28,6 +28,7 @@ use cluster::gateway::Hub;
 use cluster::handshake::GroupKey;
 use cluster::member::{AppMember, Identity, Link};
 use cluster::pipe::memory::{pair, MemoryRx, MemoryTx};
+use host::cluster::in_flight::InFlight;
 use host::cluster::serve::serve;
 use host::cluster::store::ConversationStore;
 use host::guard::dispatch_table;
@@ -276,10 +277,19 @@ async fn member(gw: &Gw, store: Store, world: &str, cast: &[u64]) -> Member {
         open: open.clone(),
     };
     let replicator = app.replicator().cloned();
+    // One count for the member, shared by every socket it serves, as the
+    // member's cluster holds it.
+    let in_flight = InFlight::default();
     let run = app.clone();
     tokio::spawn(async move {
         run.run(0, connector, move |conn| {
-            serve(router.clone(), conn, 0, replicator.clone())
+            serve(
+                router.clone(),
+                conn,
+                0,
+                replicator.clone(),
+                in_flight.clone(),
+            )
         })
         .await;
     });
