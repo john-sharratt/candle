@@ -16,12 +16,16 @@ const MS_PER_MINUTE: u64 = 60_000;
 /// What the model is asked once the stretch is on the table.
 ///
 /// The call is shown nowhere else, so the question says what each part of it is.
-pub const WRITE_QUESTION: &str = "Write it up with journal_write. `claims` is what this \
-stretch established, one thing each — what the user asked for, each file or result read and \
-what it showed, each decision, each change made — so a stretch of several steps is several \
-claims, as many as it took to get there, up to twelve. Each claim's `text` is one short \
-sentence, and `cite` the number of the turn it rests on (`also_cite` for a second). A tool result you read is cited by its \
-number; so is what the user said, and so is a call you made. Something you worked out and did \
+pub const WRITE_QUESTION: &str = "Write it up with journal_write. For `claims`, go through \
+the numbered turns in order and write a claim for each one that established something: what \
+the user asked for, each tool result and what it showed — a file's line numbers, a definition, \
+a test's outcome — each decision, each change made, and what you concluded and told the user. \
+One thing per claim, so a stretch of several steps is several claims, up to twelve; a stretch \
+that read a file and answered from it is at least a claim for the request, one for what the \
+file showed, and one for the answer. Each claim's `text` is one short, specific sentence — \
+names, paths and numbers as they were — and `cite` the number of the turn it rests on \
+(`also_cite` for a second). A tool result you read is cited by its number; so is what the user \
+said, and so is a call you made. Something you worked out and did \
 not see in a result still cites the turn that led you to it. Only a claim that is itself one \
 fact about the workspace — that a file exists or not, which blob a file is at, which commit a \
 branch is on — takes `typed`, with `subject` `file:<repo>/<path>` and `attribute` `exists` or \
@@ -30,9 +34,8 @@ a file says, or what a result showed, takes none. `intend` is what you mean to d
 as short lines, at most three. `open` is what is still unsettled — a failing test, a question \
 the user has not answered, a step not done: its `text`, and `relates` — `new` for something \
 you were not carrying, `restates N` to say an open item again, `resolves N` when it has been \
-settled. Keep the whole entry brief, and put nothing in that did not happen: a conclusion you \
-only worked out is written as one, and a result that may have changed since is written as it \
-was when you read it.";
+settled. Put nothing in that did not happen: a conclusion you only worked out is written as \
+one, and a result that may have changed since is written as it was when you read it.";
 
 /// Offered after [`WRITE_QUESTION`] once the journal holds an entry.
 pub const SKIP_QUESTION: &str = "If nothing in this stretch is worth adding to your journal — \
