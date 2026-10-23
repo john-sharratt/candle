@@ -5045,8 +5045,9 @@ fn begin_journal_draft(
 }
 
 /// The desk a draft of `timeline`'s journal puts its questions through: forks
-/// of the conversation's slot, each answer held to one call of the dialect's
-/// own shape, the reasoning block written closed, decoded greedily.
+/// of the conversation's slot, each answer held to one call of the offered ones
+/// in the dialect's own shape, the reasoning block written closed, decoded
+/// greedily.
 fn journal_desk(
     state: &Arc<InferenceState>,
     timeline: TimelineId,
@@ -5061,9 +5062,12 @@ fn journal_desk(
         ToolCallEnvelope::for_dialect(&dialect).marker
     );
     let compiling = Arc::clone(state);
-    let compile: Compile = Arc::new(move |spec: &Value| {
-        let spec: ToolSpec = serde_json::from_value(spec.clone())?;
-        let tree = compile_action_loop(&[spec], &env, 1, &close, None)?;
+    let compile: Compile = Arc::new(move |specs: &[Value]| {
+        let specs = specs
+            .iter()
+            .map(|spec| serde_json::from_value(spec.clone()))
+            .collect::<Result<Vec<ToolSpec>, _>>()?;
+        let tree = compile_action_loop(&specs, &env, 1, &close, None)?;
         let compiled = compiling.engine.lock().unwrap().compile_stencil(&tree)?;
         Ok(Arc::new(compiled))
     });
@@ -5112,7 +5116,6 @@ fn spawn_journal_draft(
             entry = ?record.entry,
             rounds = record.rounds,
             took_ms = record.took_ms,
-            gate_ms = record.gate_ms,
             write_ms = record.write_ms,
             detail = ?record.detail,
             checks = ?record.checks,

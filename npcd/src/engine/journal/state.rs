@@ -1,4 +1,4 @@
-//! A character's journal, and when a stretch of its window is worth asking about.
+//! A character's journal, and when a stretch of its window is due a draft.
 //!
 //! What the journal holds is [`Journal`]'s. What is the character's is the
 //! cadence: a draft every [`EVERY_TURNS`] turns of its window, staggered across
@@ -28,10 +28,6 @@ pub struct Waiting {
     pub turns: usize,
     pub from_ms: u64,
     pub to_ms: u64,
-    /// Whether the journal holds no entry at all. The character's prompt has no
-    /// journal section then, so there is nothing for it to weigh a stretch
-    /// against and the stretch is written up without asking.
-    pub empty: bool,
 }
 
 #[derive(Debug)]
@@ -101,9 +97,9 @@ impl JournalState {
         self.stranded.extend(window.after(floor).cloned());
     }
 
-    /// The stretch a draft would be about now, when one is worth asking about:
-    /// the turns the window holds past what the journal covers, and any a
-    /// roll-over stranded, once enough have landed or the window is nearly full.
+    /// The stretch a draft would be about now, when one is due: the turns the
+    /// window holds past what the journal covers, and any a roll-over stranded,
+    /// once enough have landed or the window is nearly full.
     pub fn waiting(&self, window: &Window) -> Option<Waiting> {
         if !self.due(window) {
             return None;
@@ -114,7 +110,6 @@ impl JournalState {
             turns: turns.len(),
             from_ms: first.at_ms,
             to_ms: last.at_ms,
-            empty: self.journal.entries().next().is_none(),
         })
     }
 
@@ -238,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn a_no_is_final_for_its_stretch_and_the_next_draft_starts_after_it() {
+    fn a_skip_is_final_for_its_stretch_and_the_next_draft_starts_after_it() {
         let mut w = Window::with_default_cap();
         let mut s = JournalState::new(0);
         said(&mut w, 20);
@@ -322,7 +317,6 @@ mod tests {
         said(&mut w, EVERY_TURNS);
         let waiting = s.waiting(&w).expect("a stretch has landed");
         assert_eq!(waiting.turns as u64, EVERY_TURNS + 3);
-        assert!(waiting.empty);
     }
 
     #[test]

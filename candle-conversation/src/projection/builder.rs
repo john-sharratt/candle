@@ -476,6 +476,14 @@ impl Builder {
         }
     }
 
+    /// This builder, held to the target's own conversation ([`Schema::focus`]):
+    /// what a question about the conversation itself is projected under.
+    pub fn focused(&self) -> Builder {
+        let mut focused = self.clone();
+        focused.schema.focus = true;
+        focused
+    }
+
     /// Resolve a layer's YAML `name:` string to its id.
     /// Returns `None` for unknown names or when constructed via
     /// [`Builder::from_schema`] (which has no name maps).
@@ -1316,6 +1324,7 @@ impl Builder {
             // A single-section schema leaves the model's rungs to each
             // sequence's reach.
             min_yarn_factor: None,
+            focus: false,
             system_prompt: SystemPromptSchema {
                 items: vec![SystemPromptItem::Section(SectionSchema {
                     id: section_id,

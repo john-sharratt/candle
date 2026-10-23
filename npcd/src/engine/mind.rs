@@ -97,7 +97,7 @@ use crate::engine::tools::{self, for_mode, Mode};
 use crate::engine::window::Speaker;
 
 mod ask;
-pub use ask::Answer;
+pub use ask::{Answer, Put};
 
 /// How many completed exchanges the GPU sequence carries per turn.
 ///
@@ -1215,8 +1215,8 @@ impl Minds {
     /// the sections that are new, remove the ones that have aged out, and record
     /// the entries in the conversation's metadata so a restart can rebuild them.
     ///
-    /// The sections are not waited on. They seal in the background and the next
-    /// turn reads them, or the stand-in member until they have.
+    /// The sections are not waited on. They seal in the background, and each
+    /// joins the prompt from the first turn after it has.
     pub async fn keep_journal(&self, npc_id: u64, prompt: &JournalPrompt) -> anyhow::Result<()> {
         self.hold_journal(npc_id, prompt, &[]).await
     }
@@ -1867,9 +1867,11 @@ impl Minds {
     /// to do and written down, and what it can do where it stands.
     ///
     /// Its mission and journal sections are brought in line with what the
-    /// character holds first, waiting up to [`SEAL_WAIT`] for what was just
-    /// submitted to seal, because which member each collection selects depends on
-    /// what has: the sealed sections, or a stand-in until they have. The journal
+    /// character holds first. A mission waits up to [`SEAL_WAIT`] for wording
+    /// just submitted to seal, because until it has the turn reads the mission's
+    /// stand-in member. A journal does not wait: the turn pins the journal
+    /// sections that have sealed, and an entry still sealing joins a later turn,
+    /// while the turns it was written from are still in the window. The journal
     /// record is written to the conversation's metadata as well, so a journal
     /// carried into a new day is the one a restart restores.
     ///
@@ -1909,7 +1911,7 @@ impl Minds {
                 identity::JOURNAL,
                 &journal_wants(persona.journal),
                 &journal_sweep(persona.journal),
-                Some(SEAL_WAIT),
+                None,
                 tokio::time::sleep,
             )
             .await;

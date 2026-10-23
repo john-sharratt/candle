@@ -43,7 +43,7 @@ use candle_conversation::{
 use journal_core::journal::Holds;
 use journal_core::record::DraftRecord;
 use journal_core::section::JournalPrompt;
-use journal_core::workflow::{Outcome as Drafted, Timing};
+use journal_core::workflow::Outcome as Drafted;
 
 /// The marker a prefilled turn's projection is recorded against.
 ///
@@ -82,7 +82,6 @@ use crate::engine::compose;
 use crate::engine::driver::{self, Metronome};
 use crate::engine::environment::{self, Reach};
 use crate::engine::event::{Event, EventKind, Salience};
-use crate::engine::guardian::view::Reply;
 use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
 use crate::engine::ingest;
@@ -3308,51 +3307,28 @@ impl Runtime {
             .unwrap_or_default()
     }
 
-    /// Act on the guardian's answer to whether the stretch waiting is worth a
-    /// journal entry. `false` when there is no stretch to act on: another draft
-    /// is running, or the stretch was taken since the question was put.
-    ///
-    /// A no covers the stretch, so it is not asked about again; a yes drafts it,
-    /// as a task of its own. The time the answer took is carried into the record
-    /// of the draft either way.
-    pub fn decide_journal(self: &Arc<Self>, npc_id: u64, worth: bool, reply: &Reply) -> bool {
+    /// Start a draft of the stretch waiting in `npc_id`'s journal, as a task of
+    /// its own. `false` when there is no stretch to draft: another draft is
+    /// running, or the stretch was taken since the guardian looked.
+    pub fn draft_journal(self: &Arc<Self>, npc_id: u64) -> bool {
         let Some(due) = self.scheduler.journal_begin(npc_id) else {
             return false;
         };
-        if worth {
-            self.spawn_journal(npc_id, due, reply.ms);
-        } else {
-            let mut held = due.state.lock().unwrap();
-            let state = held.journal_mut();
-            state.nothing_to_write(&due.span);
-            let why = if reply.reason.trim().is_empty() {
-                "the character judged the stretch not worth an entry".to_string()
-            } else {
-                reply.reason.trim().to_string()
-            };
-            state.record(
-                DraftRecord::of(&due.span, Duration::ZERO, &Drafted::Nothing { why }).timed(
-                    Timing {
-                        gate_ms: reply.ms,
-                        write_ms: 0,
-                    },
-                ),
-            );
-        }
+        self.spawn_journal(npc_id, due);
         true
     }
 
-    /// Write a journal entry for the stretch in `due`, as a task of its own.
-    /// `gate_ms` is how long the question that asked for it took.
+    /// Draft the stretch in `due` as a task of its own: one answer writes the
+    /// entry or, once the journal holds one, skips the stretch with a reason.
     ///
     /// Nobody waits on it: the character carries on turn by turn while the draft
     /// runs in conversations of its own. A runtime with no executor to spawn on
     /// cannot draft, and says so, handing the stretch back to be covered later.
-    pub fn spawn_journal(self: &Arc<Self>, npc_id: u64, due: Due, gate_ms: u64) {
+    pub fn spawn_journal(self: &Arc<Self>, npc_id: u64, due: Due) {
         match &self.spawner {
             Some(handle) => {
                 let rt = Arc::clone(self);
-                handle.spawn(async move { rt.journal_now(npc_id, due, gate_ms).await });
+                handle.spawn(async move { rt.journal_now(npc_id, due).await });
             }
             None => {
                 due.state.lock().unwrap().journal_mut().abandon();
@@ -3364,7 +3340,7 @@ impl Runtime {
     /// Draft one journal entry and log how it ended. Logged, never returned: an
     /// entry that did not land costs an entry, and the same turns are covered
     /// again at the next draft.
-    async fn journal_now(&self, npc_id: u64, due: Due, gate_ms: u64) {
+    async fn journal_now(&self, npc_id: u64, due: Due) {
         let started = Instant::now();
         let not_started = |why: String| {
             let mut held = due.state.lock().unwrap();
@@ -3386,10 +3362,12 @@ impl Runtime {
             .journal(npc_id, &who.as_persona(), &within, &due, &world)
             .await;
         match &drafted {
-            Ok((outcome, timing)) => due.state.lock().unwrap().journal_mut().record(
-                DraftRecord::of(&due.span, started.elapsed(), outcome)
-                    .timed(Timing { gate_ms, ..*timing }),
-            ),
+            Ok((outcome, timing)) => due
+                .state
+                .lock()
+                .unwrap()
+                .journal_mut()
+                .record(DraftRecord::of(&due.span, started.elapsed(), outcome).timed(*timing)),
             Err(e) => {
                 tracing::warn!("npc {npc_id}: the journal entry could not start — {e:#}");
                 not_started(format!("{e:#}"));

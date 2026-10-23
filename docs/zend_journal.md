@@ -28,7 +28,7 @@ The journal fills the same gap and avoids each cause of that failure:
 | Written in the reply's voice, so they read as history | Framed as the model's own **dated notes**, in a section of the system prompt, never as turns |
 | Nothing tied a sentence to where it came from | Every claim **cites turn parts**; the kind of claim (saw, did, heard, concluded) is derived by the server from what it cites, never from the wording |
 | Nothing checked a sentence against the world | Typed claims about the **workspace** are checked against it when the entry is kept, and corrected or demoted when they are wrong |
-| Compressed every exchange, needed or not | A **gate** asks whether a stretch needs an entry at all; a `no` is final for that stretch |
+| Compressed every exchange, needed or not | Once the journal holds an entry, the draft may answer **`journal_skip`** instead of writing; a skip is final for that stretch |
 
 The real turns stay in the substrate, and provenance still retrieves them. The
 journal adds what selection cannot: a short, always-present record of what the
@@ -43,10 +43,10 @@ no engine dependency, so it builds and tests in seconds:
 |---|---|
 | `entry.rs` | `Entry`, `Claim`, `Kind`, `Item`; the prose an entry renders to |
 | `verify.rs` | the server's check: citations, kind, perishability, typed claims against a `World`, open-item rules |
-| `tools.rs` | the `journal_write` call as flat `{name, params}` JSON a stencil `ToolSpec` reads, and reading an answer back |
+| `tools.rs` | the `journal_write` and `journal_skip` calls as flat `{name, params}` JSON a stencil `ToolSpec` reads, and reading an answer back |
 | `repeats.rs` | what the journal already says, dropped before a keep (70% word overlap) |
-| `ask.rs` | the question a stretch is put as, and a refused answer sent back with its reason |
-| `workflow.rs` | `run`: the write (at most `MAX_ROUNDS`, 4, answers), the check, the keep, against a `Desk` |
+| `ask.rs` | the question a stretch is put as, the skip offered beside an entry, and a refused answer sent back with its reason |
+| `workflow.rs` | `run`: write or skip in one answer (at most `MAX_ROUNDS`, 4, answers), the check, the keep, against a `Desk` |
 | `journal.rs` | `Journal`: entries, open items, coverage, ids; the `Holds` trait a caller's state implements |
 | `section.rs` | the journal as system-prompt sections, and the metadata record a restart rebuilds from |
 | `record.rs` | what each draft did, and the API's view |
@@ -167,32 +167,41 @@ items.
 (`zend/src/journal/desk.rs`). Each question runs on an ephemeral fork of the
 live slot:
 
-- it reuses the K/V the dialogue already holds, so the stretch being asked
-  about costs nothing to prefill;
-- it reads under the selection the conversation's last round ran under, journal
-  included;
+- it is projected under **`AskScope::Conversation`**
+  (`projection::Schema::focus`): the system prompt with its journal, the
+  dialogue's own turns, and from other layers only the working-set members the
+  dialogue was served and still holds locked. What its rounds retrieved from
+  other layers — project files, priming chains, history — is left out, so the
+  entry is written from the session and not from material it only had beside
+  it, and the fork carries fewer tokens;
+- it reuses the K/V the dialogue already holds for the prefix the two share,
+  so the stretch being asked about costs nothing to prefill;
 - nothing is written back, neither the question nor the answer;
 - the scheduler parks the fork until any turn in flight ends, so a draft never
   runs inside a turn.
 
-Each answer is held to one call of the dialect's own shape, the reasoning block
-written closed, decoded greedily (`zend/src/journal/draft.rs`):
+The answer is held to one call of the dialect's own shape, the reasoning block
+written closed, decoded greedily (`zend/src/journal/draft.rs`, which runs
+`journal_core::workflow::run`, the same workflow npcd runs):
 
 1. **Nothing citable** is a mechanical `Nothing`; the model is not asked.
-2. **The gate:** one `journal_gate` call — `answer` `yes` or `no`, and a
-   `reason` — judged against the journal already in the prompt. A journal that
-   holds no entry is not asked: there is nothing to weigh the stretch against.
-   A `no` covers the stretch.
-3. **The write:** one `journal_write` call under the per-draft grammar, whose
-   `cite` enum holds the stretch's citable parts, at most four answers; a
-   refused answer is asked again with the refusal appended. What the journal
+2. **Write or skip, in one answer:** one call under the per-draft grammar —
+   `journal_write`, whose `cite` enum holds the stretch's citable parts, or,
+   once the journal holds an entry to weigh the stretch against,
+   `journal_skip` with a one-sentence `reason`. A skip covers the stretch with
+   its reason. At most four answers; a refused write is asked again with the
+   refusal appended, and may still be answered with a skip. What the journal
    already says is dropped, and an entry of nothing else covers the stretch as
-   a `no` would.
-4. **The keep:** ids are staged, the record is written to the conversation's
+   a skip would.
+3. **The keep:** ids are staged, the record is written to the conversation's
    metadata, and only then is the entry in memory — a record that fails to
    write leaves the journal as it was. The sections follow at the next round.
 
-`journal_write` and `journal_gate` are never in the dialogue's tool catalog.
+Deciding in the write's own answer means the model weighs the stretch with its
+parts numbered in front of it, and a stretch worth writing costs one answer on
+one fork rather than a question on one fork and an answer on another.
+
+`journal_write` and `journal_skip` are never in the dialogue's tool catalog.
 They exist only as answer grammars, so the model cannot write an entry on a live
 turn.
 
@@ -218,12 +227,12 @@ draft starts when either holds:
 - **`EVERY_TURNS` (16)** turns have sealed since the last draft was handed a
   stretch.
 - **Selection pressure:** the round's projection left out a turn of this
-  conversation that no entry and no `no` covers. The projection event a round
+  conversation that no entry and no skip covers. The projection event a round
   records already names every turn it selected, so the signal costs nothing. A
   turn is looked at before the session loses sight of it.
 
 At most one draft runs per conversation (single flight). A draft's stretch is
-every part after `covered_to`. A `no` or a kept entry moves `covered_to` to the
+every part after `covered_to`. A skip or a kept entry moves `covered_to` to the
 end of the stretch. An abandoned draft leaves it where it was, so the next draft
 retries those turns.
 
@@ -255,7 +264,8 @@ them.
 - `GET /v1/conversations/:id/journal` returns the entries (stored form, span and
   rendered text), the open items, `covered_to` and `looked_to` (parts), whether
   a draft is running, and the last 16 draft records. Each record carries
-  `gate_ms`, `write_ms`, the result, and each claim's verdict and kind.
+  `took_ms`, `write_ms`, the result (a skip's reason as its `detail`), and each
+  claim's verdict and kind.
 - `POST /v1/conversations/:id/journal/draft` drafts now over whatever is not
   covered: 202 with the turns it covers, or 409 — `nothing_to_draft` while a
   draft runs or when nothing is new, `not_open` when the conversation is not
@@ -276,14 +286,15 @@ them.
 | `journal-core/` | the journal's logic (§2) |
 | `candle-conversation` `conversation/carried.rs` | `Carried`, the section reconcile |
 | `candle-conversation` `scheduler/ephemeral_fork.rs` | a fork's band |
+| `candle-conversation` `conversation/ephemeral_turn.rs` | `AskScope`: a fork projected whole or focused on its conversation |
+| `candle-conversation` `projection/` (`Schema::focus`) | the focused projection: own turns and locked working-set members only |
 | `zend/src/journal/origin.rs` | the dialogue's turns as citable parts |
 | `zend/src/journal/state.rs` | `SessionJournal`: a journal and its cadence |
 | `zend/src/journal/pressure.rs` | selection pressure from the projection event |
 | `zend/src/journal/style.rs` | `CODING`: UTC dates and a coding session's words |
-| `zend/src/journal/gate.rs` | the `journal_gate` call |
 | `zend/src/journal/world.rs` | `ConversationFiles`: the workspace typed claims are checked against |
-| `zend/src/journal/desk.rs` | `ZendDesk`: questions on forks at `Normal`, the record write |
-| `zend/src/journal/draft.rs` | one draft: the gate, then the write |
+| `zend/src/journal/desk.rs` | `ZendDesk`: the draft's question on a focused fork at `Normal`, the record write |
+| `zend/src/journal/draft.rs` | one draft and its record |
 | `zend/src/journal/carry.rs` | the schema install, the wanted sections, the round's selection |
 | `zend/src/journal/record.rs` | the metadata record |
 | `zend/src/journal/registry.rs` | `Journals`: every dialogue's journal, and what a draft forks from |
@@ -312,9 +323,12 @@ Built alongside the code, each building block testable alone:
   and blob, a changed file, a branch's head and name, and every question it
   cannot answer.
 - **Cadence:** every-16, selection pressure, single flight, and `covered_to`
-  after a keep, a `no` and an abandon; a restored journal carries on.
-- **Draft:** gate skipped on an empty journal, a yes, a no, an unreadable or
-  unaskable gate, a write refused out of rounds.
+  after a keep, a skip and an abandon; a restored journal carries on.
+- **Draft:** an empty journal offered the write alone; a journal with an entry
+  offered the skip in the same answer; a skip covering the stretch with its
+  reason; an unaskable draft; a write refused out of rounds.
+- **Focused projection:** the locked working-set members kept and the
+  momentum-held ones dropped; no group taken from another layer.
 - **Band:** a fork made at each band decodes at it, a turn view on it too, a
   parked request keeps its band, and the band goes with the fork.
 - **Prompt:** the embedded schema declares the journal, the install scopes it,
@@ -323,7 +337,7 @@ Built alongside the code, each building block testable alone:
 
 Only a live coding session can say:
 
-- how often the gate says `no`;
+- how often the model skips;
 - how much a draft slows the user's next round;
 - whether five entries are enough for a long task;
 - whether the model actually uses the open items and `(re-check)` marks.
@@ -345,8 +359,10 @@ Settled with the user on 2026-10-23:
    (§12).
 3. **Drafts run at `Normal`**, below the user's coding tasks and above the
    background layers (§5.1).
-4. **The gate stays.** A `no` is cheap, and it stops the journal filling with
-   "nothing new".
+4. **A draft may decline.** Once the journal holds an entry, a draft may skip
+   the stretch, which stops the journal filling with "nothing new". Settled on
+   2026-10-24: the decline is offered in the write's own answer, on one focused
+   fork, rather than as a separate question first.
 5. **No idle trigger** (§6).
 6. **Private to its conversation** and tombstoned with it; no layer reads it
    (§7).

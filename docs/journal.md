@@ -109,26 +109,29 @@ draws the same verdict; nothing promises bit-identical replay of the model.
 
 ## 2. Drafting
 
-Drafting runs **on the character's own live conversation**, asked the way the
-guardian asks (`Minds::ask`, through `Sequence::ask_unsealed`). The character reads
-its own system prompt and the same selected history it reads when it acts, so the
-stretch being written about is already in its KV cache and a question costs only
-its own tokens. There is no drafting conversation: nothing is opened, nothing is
-tombstoned, and no stance or tool selection is swapped. Neither the question nor
-its answer is written back to the live conversation; the entry reaches the
-character only through the journal section collection once it has been kept (§6).
+Drafting runs **on an ephemeral fork of the character's own live conversation**
+(`Minds::ask_under`, through `UnsealedAsker::ask`), projected under
+`AskScope::Conversation`: the character's system prompt with its journal, and its
+own turns, and from other layers only the working-set members it was served
+(`projection::Schema::focus`). What its turns retrieved from elsewhere is left out,
+so the entry is written from what the character lived and not from material it
+only had beside it, and the fork carries fewer tokens. The prefix it shares with
+the live slot is borrowed, so the stretch is already in the KV cache and a
+question costs only its own tokens. There is no drafting conversation: nothing is
+opened, nothing is tombstoned, and no stance or tool selection is swapped. Neither
+the question nor its answer is written back to the live conversation; the entry
+reaches the character only through the journal section collection once it has
+been kept (§6).
 
-Whether to draft is the guardian's call. On each scan the `journal` module asks
-the character whether the stretch waiting (`JournalState::waiting`) needs an entry
-given what happened and what its journal already says (the journal is in its
-system prompt). `Runtime::decide_journal` acts on the answer: a yes spawns the
-draft, a no closes the stretch (`nothing_to_write`) and records the character's
-reason as a `nothing` draft. The manual route (§7) and the pulse's forced draft
-skip the question.
+The guardian starts drafts. On each scan the `journal` module sees whether a
+stretch is due (`JournalState::waiting`), and `Runtime::draft_journal` begins and
+spawns the draft. Nothing is asked first: whether the stretch is worth an entry is
+decided inside the draft, by the same answer that would write it (§3). The manual
+route (§7) starts a draft the same way.
 
-Each question is put under a stencilled one-call grammar. The turn opens inside
-the grammar, so a reasoning block is unrepresentable and the answer is exactly one
-call. The write's grammar depends on the stretch (its `cite` enum holds that
+The draft's question is put under a stencilled one-call grammar. The turn opens
+inside the grammar, so a reasoning block is unrepresentable and the answer is
+exactly one call. The grammar depends on the stretch (its `cite` enum holds that
 stretch's turns), so it is compiled the first time the write is asked and reused
 for the rest of the draft.
 
@@ -136,8 +139,9 @@ A draft:
 
 * is **single-flight per character** — `JournalState::pending` is set by `begin`
   and a second trigger while one is running is not given a span;
-* cannot reach the world: `journal_write` is not in the act catalog, `act::parse`
-  never accepts it on a live turn, and its call exists only as an answer grammar;
+* cannot reach the world: neither `journal_write` nor `journal_skip` is in the act
+  catalog, `act::parse` never accepts them on a live turn, and their calls exist
+  only as an answer grammar;
 * **holds the character's conversation lock for each decode**, as the guardian
   does, so a draft is put between the character's turns and never inside one. The
   character can wait on a draft for the length of one decode; the draft takes the
@@ -154,38 +158,36 @@ The drafts' queries are not distinguished from the character's own in the pulse.
 
 `workflow::run(desk, state, span, world) -> (Outcome, Timing)`. Plain Rust; each
 model decision is a closed question held to a grammar. It is written against the
-`Desk` trait (`gate`, `write`, `keep`), so the whole workflow runs in tests against
-a script and `EngineDesk` is only plumbing.
+`Desk` trait (`write`, `keep`), so the whole workflow runs in tests against a
+script and `EngineDesk` is only plumbing. The workflow is `journal_core`'s and
+zend runs the same one (`docs/zend_journal.md`).
 
 **Step 0.** A span with no citable turns is a mechanical `Nothing`; the model is
 not asked.
 
-**Step 1 — the gate.** An `answer` call with `value` in `yes` / `no` and a required
-`reason`. The question names the stretch ("your last *n* turns, from … to …") and
-does not repeat it: the character reads the turns where it already holds them. It
-is relative to the journal already in the system prompt. One attempt: the grammar
-leaves nothing to retry.
+**Step 1 — write or skip, in one answer.** The question carries the numbered
+stretch and describes `journal_write` part by part (the call is not shown anywhere
+else). Once the journal holds an entry, it also offers `journal_skip` with a
+required one-sentence `reason`, for a stretch that adds nothing to what the
+journal — in the system prompt — already says. The answer is held to the
+per-draft `tools::draft_specs` grammar: exactly one call, of either. At most
+`MAX_ROUNDS` (4) answers, every round offering the same calls.
 
-* The gate is always asked and its answer is the model's own: nothing forces a
-  `yes`, however many `no`s have come before.
-* A `no` is final for its stretch: `covered_to` moves to the end of the span, so
-  the next draft is asked only about what has happened since. A draft starts once
-  `EVERY_TURNS` (16) new turns have landed since the last look, never on each turn.
-* The reason is kept: `Outcome::Nothing { why }` and the draft record's `detail`.
-
-**Step 2 — the write.** If the gate said yes, a second question carries the
-numbered stretch and describes `journal_write` part by part (the call is not shown
-anywhere else), and is held to the per-draft `write_spec` grammar: exactly one
-`journal_write` call. At most `MAX_ROUNDS` (4) answers.
-
+* An empty journal is not offered the skip: there is nothing to weigh the stretch
+  against, and a `journal_skip` written anyway is refused by name.
+* A skip is final for its stretch: `covered_to` moves to the end of the span, so
+  the next draft is about what has happened since. Its reason is kept, as
+  `Outcome::Nothing { why }` and the draft record's `detail`.
+* Deciding in the write's own answer means the character decides with the
+  stretch numbered in front of it, and a stretch worth writing costs one answer,
+  not a question and then an answer.
 * `journal_write` is the entry, verified per §1. **Write is terminal**: a write
   that passes is kept and the draft ends; the model is never asked whether it is
   finished.
 * A write that is refused, or a decode that does not read, is asked again with the
   previous answer and the refusal reason appended, because each question is put
-  afresh and the character otherwise would not know what to change.
-* There is no read and no decline: the character's open items and newest entries
-  are in its prompt, and a gate that said yes has committed to an entry.
+  afresh and the character otherwise would not know what to change. A refused
+  write may still be answered with a skip.
 
 **Outcome.** `Wrote{entry, notes, rounds}`, `Nothing{why}`, or `Abandoned(Abandon)`
 where `Abandon` is `Asking` (the model could not be asked), `Refused` (refused
@@ -195,9 +197,8 @@ turns again. `abandon()` is idempotent, so a dropped future that never reached t
 end of `run` is settled by the runtime's own `settle` and cannot leave `pending`
 set.
 
-**Timing.** `run` also returns `Timing{gate_ms, write_ms}`: the time asking the
-gate and the time on every answer to the write, refused ones included. The draft
-record carries both beside `took_ms`.
+**Timing.** `run` also returns `Timing{write_ms}`: the time on every answer,
+refused ones included. The draft record carries it beside `took_ms`.
 
 ## 4. What the world can say
 
@@ -228,7 +229,7 @@ Per character, on the `Inbox` beside the window and the day
 | `entries` | the newest `IN_PROMPT` (5) kept entries, newest last: the ones the prompt carries |
 | `next_entry`, `next_item` | id counters; `written()` is `next_entry - 1`, every entry ever kept, including those aged out |
 | `open` | live unresolved items, at most `MAX_OPEN` (6) |
-| `covered_to` | the last window turn id settled by a kept entry or a gate `no`; an abandoned draft leaves it |
+| `covered_to` | the last window turn id settled by a kept entry or a skip; an abandoned draft leaves it |
 | `looked_to` | the last turn id a draft in flight was handed; set by `begin` |
 | `pending` | single-flight flag |
 
@@ -254,14 +255,14 @@ Neither holds while a draft is pending. The first draft of a run waits
 `EVERY_TURNS + npc_id % EVERY_TURNS` turns, so the cast does not draft in the
 same tick.
 
-A draft's span is every turn after `covered_to`, not after `looked_to`. A gate
-`no` moves `covered_to` past the stretch; an abandoned draft leaves it behind, is
+A draft's span is every turn after `covered_to`, not after `looked_to`. A skip
+moves `covered_to` past the stretch; an abandoned draft leaves it behind, is
 not retried until new turns land, and the next span is then the longer stretch
 that includes the one not written.
 
 **Day rollover.** `Scheduler::roll_day` strands the unwritten turns
 (`JournalState::strand`) **before** it clears the window, so a day's last stretch
-is still waiting afterwards and the guardian asks about it like any other.
+is still waiting afterwards and the guardian drafts it like any other.
 
 **Chapters: a new conversation with each mission.** A mission closed — reported,
 rejected or called off — turns the body's chapter (`Missions::chapter`, kept with
@@ -280,7 +281,7 @@ turn re-read it; the chapter ends with the work.
 claim or intention that nearly repeats one held in the journal or earlier in the
 same entry (≥ 70% of their distinct words shared), or a new open item that repeats
 one still open, is dropped; an entry with nothing left is not kept and covers its
-stretch as a gate `no` would. The same "Did: I have written the draft" had been
+stretch as a skip would. The same "Did: I have written the draft" had been
 kept entry after entry and read back four times a turn.
 
 ## 6. Persistence and injection
@@ -290,9 +291,11 @@ built the way the mission is. `projection.yaml` declares `journal_intro` (the
 framing: this is your own record of an earlier time), a `journal` collection
 (`always_visible`, `sections: []`) and `journal_none` (`depends_on_absent` on the
 collection), so a character with no entries reads "journal is empty". At install
-(`identity::install`) the collection gets a Named selector and a stand-in member;
-`carry_journal` selects the stand-in while nothing is sealed under it and every
-member once something is.
+(`identity::install`) the collection gets a Named selector and no member of its
+own; `carry_journal` pins exactly the journal sections that have sealed. A turn
+does not wait for a section to seal: a new entry joins the prompt from the first
+turn after it has, and until then the turns it was written from are still in the
+window. While nothing has sealed, `journal_none` shows.
 
 * **One section per entry** (`journal/<id>`), the newest `IN_PROMPT` (5) of them,
   and one for the open items (`journal/open`, absent when nothing is open).
@@ -392,9 +395,9 @@ exactly those tokens. `token_count` and `text` at the top level are the pieces j
 show as two pieces. 404 `no_conversation` for a character with no live conversation.
 
 `drafts` holds the last 16 (`KEPT_DRAFTS`) as `DraftRecord`s: the turns covered,
-`took_ms` split into `gate_ms` and `write_ms`, `result` (`wrote`, `nothing`,
+`took_ms` and the `write_ms` of it, `result` (`wrote`, `nothing`,
 `abandoned` or `not_started`), a `detail` saying why when there is no entry (the
-character's own reason for a gate `no`), the `entry` id, `rounds`, and `checks` — each
+character's own reason for a skip), the `entry` id, `rounds`, and `checks` — each
 claim's verdict (`kept`, `corrected`, `demoted`, `superseded`) and `kind`. The
 log is in memory only and starts empty on each run.
 
@@ -402,9 +405,8 @@ log is in memory only and starts empty on each run.
 
 * A mind without a `journal` collection in its projection journals nothing, and is
   not an error: a draft against such a mind is abandoned with a warning.
-* Without a `guardian.yaml` carrying `kind: journal`, or with `enabled: false`, no
-  one asks whether a stretch needs an entry, so nothing is journaled except by the
-  manual route.
+* Without a `guardian.yaml` carrying `kind: journal`, or with `enabled: false`,
+  nothing starts a draft, so nothing is journaled except by the manual route.
 * A draft is asked on the character's own conversation, which reads the journal of
   that character and of no one else.
 * A crash after a day roll-over opens the new conversation but before its first
@@ -418,24 +420,26 @@ log is in memory only and starts empty on each run.
 Covered by unit and scripted-`Desk` tests: window ids and origins; cadence, the
 eviction trigger and the stagger; the `Carried` reconcile plan (submit, remove,
 resubmit after a failed seal, sweep); the journal record round trip; the guardian
-journal module's question and judgement; the citation enum and refusal; kind derivation; perishability; typed-claim
-correction, demotion and dedup; the open-item cap and `resolves`; the gate
-answered `no` any number of times; `covered_to` on a keep, a `no` and an abandonment; restore
+journal module starting a draft without a question; the citation enum and refusal; kind derivation; perishability; typed-claim
+correction, demotion and dedup; the open-item cap and `resolves`; the skip offered
+only beside an entry, read with its reason, refused by name when not offered, and
+still open after a refused write; `covered_to` on a keep, a skip and an abandonment; restore
 resetting `covered_to`; `written()` surviving eviction from memory; single-flight
 through `begin`; stranding at day roll-over; the census; the `Snapshot` reads;
-`journal_write` absent from the world catalog and refused as unknown by
-`act::parse`; the write question's wording; a refused attempt coming back
-with its reason.
+`journal_write` and `journal_skip` absent from the world catalog and refused as
+unknown by `act::parse`; the drafting grammar compiling under both call shapes;
+the write question's wording; a refused attempt coming back with its reason; the
+journal pinning exactly its sealed sections; a focused projection keeping the
+locked working-set members only and taking no group from another layer.
 
 npcd has no engine-level test harness, so `Minds::prepare`, `keep_journal`,
-`restore_journal` and `Runtime::decide_journal` need a live run. Only a live run
+`restore_journal` and `Runtime::draft_journal` need a live run. Only a live run
 can say:
 
 * the KV cost of submitting and removing journal sections between turns;
-* what the gate costs: it is asked on the live conversation under
-  `ask_unsealed`, and its latency is measured in seconds, not tokens;
+* what a draft costs on its focused fork, in seconds and in context tokens;
 * how long a decode holds the character's lock, and whether the character
   noticeably waits on a draft;
-* whether the character answers the gate with `no` too often or too rarely;
+* whether the character skips too often or too rarely;
 * the order equal-score groups are emitted in;
 * the real stencil compile cost of the per-draft grammar.

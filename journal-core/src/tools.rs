@@ -1,11 +1,17 @@
-//! The journal's one call, the grammar it is held to, and how an answer is read
+//! The journal's calls, the grammar they are held to, and how an answer is read
 //! back.
 //!
-//! **`journal_write` is never in a catalog of things that can be done.** It
-//! reaches nothing. It is the shape an answer takes when the writer is asked for
-//! its entry — the question describes it and the grammar forces it — and a
-//! caller that put it in its live tool catalog would start accepting it on an
-//! ordinary turn.
+//! A draft is answered with one call: `journal_write`, the entry, or — when the
+//! journal already holds an entry to weigh the stretch against —
+//! `journal_skip`, the reason there is nothing to add. Asking both in one turn
+//! means the writer decides with the stretch in front of it, and a stretch
+//! worth writing costs one answer, not a question and then an answer.
+//!
+//! **Neither call is ever in a catalog of things that can be done.** They reach
+//! nothing. They are the shapes an answer takes when the writer is asked for its
+//! entry — the question describes them and the grammar forces one — and a
+//! caller that put them in its live tool catalog would start accepting them on
+//! an ordinary turn.
 //!
 //! # The grammar
 //!
@@ -39,6 +45,18 @@ use crate::verify::{Draft, DraftClaim, DraftOpen, Relates};
 
 /// The entry itself.
 pub const WRITE: &str = "journal_write";
+/// Nothing to add, and why.
+pub const SKIP: &str = "journal_skip";
+
+/// What one answer to a draft said.
+#[derive(Debug, PartialEq)]
+pub enum Answer {
+    /// An entry, still to be checked.
+    Write(Draft),
+    /// The stretch adds nothing to the journal, for this reason — empty when
+    /// none was given.
+    Skip(String),
+}
 
 fn text(name: &str, required: bool) -> Value {
     json!({ "name": name, "type": "string", "required": required })
@@ -110,6 +128,22 @@ pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<Value> {
             list_of("open", false, 0, item),
         ],
     }))
+}
+
+/// The `journal_skip` call: one sentence on why the stretch adds nothing.
+pub fn skip_spec() -> Value {
+    json!({ "name": SKIP, "params": [text("reason", true)] })
+}
+
+/// The calls a draft's answer may be, in the flat `{name, params}` form: the
+/// write, and the skip when `may_skip`. `None` when nothing can be cited, as
+/// for [`write_spec`].
+pub fn draft_specs(citable: &[u64], open: &[Item], may_skip: bool) -> Option<Vec<Value>> {
+    let mut specs = vec![write_spec(citable, open)?];
+    if may_skip {
+        specs.push(skip_spec());
+    }
+    Some(specs)
 }
 
 /// The call's name and arguments, from whichever shape was written.
@@ -277,23 +311,87 @@ fn draft_of(args: &Map<String, Value>) -> Result<Draft, String> {
     })
 }
 
-/// Read one answer. The error is worded for the model, which is shown it with
-/// its refused attempt and writes again.
-pub fn parse(answer: &str) -> Result<Draft, String> {
+/// Read one answer, which may be a `journal_skip` only when `may_skip`. The
+/// error is worded for the model, which is shown it with its refused attempt
+/// and answers again.
+pub fn parse(answer: &str, may_skip: bool) -> Result<Answer, String> {
     let (name, args) =
         arguments(answer).ok_or_else(|| "That was not a journal_write call.".to_string())?;
-    if name != WRITE {
-        return Err(format!(
+    match name.as_str() {
+        WRITE => draft_of(&args).map(Answer::Write),
+        SKIP if may_skip => Ok(Answer::Skip(
+            args.get("reason").and_then(text_of).unwrap_or_default(),
+        )),
+        _ => Err(format!(
             "There is no call named `{name}` here; write with journal_write."
-        ));
+        )),
     }
-    draft_of(&args)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::entry::testing::item;
+
+    /// An answer read as an entry, where a skip is not on offer.
+    fn parse(said: &str) -> Result<Draft, String> {
+        match super::parse(said, false)? {
+            Answer::Write(draft) => Ok(draft),
+            Answer::Skip(why) => panic!("a skip that was not on offer was read: {why}"),
+        }
+    }
+
+    const SKIP_SAID: &str =
+        r#"{"name": "journal_skip", "arguments": {"reason": "Already in entry 2."}}"#;
+
+    #[test]
+    fn a_skip_on_offer_is_read_with_its_reason() {
+        assert_eq!(
+            super::parse(SKIP_SAID, true),
+            Ok(Answer::Skip("Already in entry 2.".into()))
+        );
+        let bare = r#"{"name": "journal_skip", "arguments": {}}"#;
+        assert_eq!(super::parse(bare, true), Ok(Answer::Skip(String::new())));
+    }
+
+    #[test]
+    fn a_skip_not_on_offer_is_refused_by_name() {
+        assert_eq!(
+            super::parse(SKIP_SAID, false),
+            Err("There is no call named `journal_skip` here; write with journal_write.".into())
+        );
+    }
+
+    #[test]
+    fn a_write_is_read_whether_or_not_a_skip_is_on_offer() {
+        let said =
+            r#"{"name": "journal_write", "arguments": {"claims": [{"text": "a", "cite": "4"}]}}"#;
+        for may_skip in [false, true] {
+            assert!(
+                matches!(super::parse(said, may_skip), Ok(Answer::Write(_))),
+                "{may_skip}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_skip_call_asks_one_required_reason() {
+        assert_eq!(
+            skip_spec(),
+            json!({
+                "name": "journal_skip",
+                "params": [{ "name": "reason", "type": "string", "required": true }],
+            })
+        );
+    }
+
+    #[test]
+    fn a_draft_offers_the_write_and_the_skip_only_when_asked_to() {
+        let write = write_spec(&[1], &[]).unwrap();
+        assert_eq!(draft_specs(&[1], &[], false), Some(vec![write.clone()]));
+        assert_eq!(draft_specs(&[1], &[], true), Some(vec![write, skip_spec()]));
+        assert_eq!(draft_specs(&[], &[], true), None);
+    }
 
     fn param<'a>(spec: &'a Value, name: &str) -> &'a Value {
         spec["params"]

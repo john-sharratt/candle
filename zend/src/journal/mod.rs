@@ -12,10 +12,9 @@
 //! | [`state`] | a session's journal and its cadence |
 //! | [`pressure`] | whether the projection has started leaving out unread turns |
 //! | [`style`] | the UTC dates and coding words an entry reads in |
-//! | [`gate`] | whether a stretch is worth an entry |
 //! | [`world`] | the workspace a typed claim is checked against |
-//! | [`desk`] | the questions put to the dialogue's own fork, at `Normal` |
-//! | [`draft`] | one draft: the gate, then the write |
+//! | [`desk`] | the draft's question put to a focused fork of the dialogue, at `Normal` |
+//! | [`draft`] | one draft — write or skip in one answer — and its record |
 //! | [`carry`] | the journal as the system prompt carries it |
 //! | [`record`] | the record a restart rebuilds the journal from |
 //! | [`registry`] | every dialogue's journal, by conversation |
@@ -27,7 +26,6 @@
 pub mod carry;
 pub mod desk;
 pub mod draft;
-pub mod gate;
 pub mod origin;
 pub mod pressure;
 pub mod record;

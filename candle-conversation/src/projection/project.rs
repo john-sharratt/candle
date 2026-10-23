@@ -107,6 +107,7 @@ use super::schema::{
 use super::selection::{apply_selection, trim_to_budget_low_score_first};
 use super::swap_cap::{cap_new_members, SwapCap};
 use super::working_set_pick;
+use super::working_set_pick::Standing;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{NodeId, SelectionDiagnostics, SelectionOrigin};
 
@@ -1291,6 +1292,14 @@ pub fn run_with_sink<R: ContentResolver>(
             if layer_is_target && group.id != target.group {
                 continue;
             }
+            // A focused projection takes nothing from another layer but the
+            // working-set members it was served (`Schema::focus`).
+            if schema.focus
+                && !layer_is_target
+                && !matches!(group.selection, SelectionRule::WorkingSet { .. })
+            {
+                continue;
+            }
 
             // A working-set group is filled from the target's working set once
             // every group has been walked (Step 4b) — the folder groups' share
@@ -1732,9 +1741,17 @@ pub fn run_with_sink<R: ContentResolver>(
             .iter_mut()
             .filter(|gs| gs.working_set.is_some())
         {
-            let Some(members) = resolver.working_set_members(gs.schema.id) else {
+            let Some(mut members) = resolver.working_set_members(gs.schema.id) else {
                 continue;
             };
+            // Focused, only what the conversation was served: a locked member
+            // is a promise it may still be reading from, an unlocked one is
+            // provenance (`Schema::focus`).
+            if schema.focus {
+                members
+                    .members
+                    .retain(|(_, standing)| matches!(standing, Standing::Locked));
+            }
             for p in working_set_pick::pick(&members) {
                 for key in resolver.timeline_turns(p.timeline) {
                     selection_scores.set_turn(key, p.score, true);

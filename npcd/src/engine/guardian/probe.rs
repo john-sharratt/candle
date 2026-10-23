@@ -37,7 +37,7 @@ pub trait Probe: Send + Sync {
     fn recent_acts(&self, npc_id: u64, limit: usize) -> Vec<String>;
 
     /// The stretch of a character's life its journal does not cover yet, once
-    /// there is enough of it to be worth asking about.
+    /// it is due a draft.
     fn journal(&self, npc_id: u64) -> Option<Waiting>;
 
     /// Put a question to a character; what it said.
@@ -47,10 +47,9 @@ pub trait Probe: Send + Sync {
         question: &Question,
     ) -> impl Future<Output = anyhow::Result<Reply>> + Send;
 
-    /// Act on the character's answer about its journal: close the stretch when
-    /// it is not worth an entry, start writing it up when it is. Whether a
-    /// stretch was still there to act on.
-    fn decide_journal(&self, npc_id: u64, worth: bool, reply: &Reply) -> bool;
+    /// Start a draft of the stretch waiting in a character's journal. Whether a
+    /// stretch was still there to draft.
+    fn draft_journal(&self, npc_id: u64) -> bool;
 
     /// Put a thought into a character's head, as its own.
     fn think(&self, npc_id: u64, text: String) -> impl Future<Output = bool> + Send;
@@ -161,8 +160,8 @@ impl Probe for RuntimeProbe {
         })
     }
 
-    fn decide_journal(&self, npc_id: u64, worth: bool, reply: &Reply) -> bool {
-        self.0.decide_journal(npc_id, worth, reply)
+    fn draft_journal(&self, npc_id: u64) -> bool {
+        self.0.draft_journal(npc_id)
     }
 
     async fn think(&self, npc_id: u64, text: String) -> bool {

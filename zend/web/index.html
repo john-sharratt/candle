@@ -3075,7 +3075,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function buildJournalDraft(d) {
     const tone = { wrote: '#7fb07a', nothing: '#9a9490', abandoned: '#e0938a', not_started: '#e0938a' }[d.result] || '#9a9490';
     const when = 'turns ' + Math.floor((d.from_turn - 1) / 2) + '–' + Math.floor((d.to_turn - 1) / 2);
-    const time = (d.gate_ms ? 'gate ' + d.gate_ms + ' ms · ' : '') + 'write ' + d.write_ms + ' ms';
+    const time = 'write ' + d.write_ms + ' ms';
     return h('div', { style: 'padding:6px 2px; border-top:1px solid #2e2b27; font-size:0.7rem; color:#b8b2ac;' },
       h('div', { style: 'display:flex; gap:8px;' },
         h('span', { style: 'color:' + tone + '; font-weight:650;' }, d.result + (d.entry ? ' #' + d.entry : '')),

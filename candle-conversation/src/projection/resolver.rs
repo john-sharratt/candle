@@ -1508,7 +1508,15 @@ impl Conversation {
         let t_groups = Instant::now();
         let _groups_span = profile::span("beliefs:groups");
         GROUP_SCAN_SPLIT.take();
-        for layer in &schema.layers {
+        // A focused projection scans no other layer (`Schema::focus`): it takes
+        // nothing from them but locked working-set members, and a scan would
+        // feed their momentum and hit levels from a question that is not the
+        // conversation's own.
+        for layer in schema
+            .layers
+            .iter()
+            .filter(|l| !schema.focus || l.id == target.layer)
+        {
             candidates.extend(self.score_belief_groups(
                 layer,
                 target,

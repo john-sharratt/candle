@@ -607,7 +607,8 @@ pub async fn journal(
 }
 
 /// `POST /v1/npc/:nid/journal/draft` — draft an entry now, without waiting for
-/// the cadence or for the guardian to ask whether one is needed.
+/// the cadence. The draft may still skip the stretch, as any draft may once the
+/// journal holds an entry.
 ///
 /// Answers 202 with the turns the draft covers; how it ends shows in the
 /// journal's `drafts`. 409 while a draft is already running or when nothing has
@@ -636,7 +637,7 @@ pub async fn journal_draft(
         "to_turn": due.span.to_turn,
         "turns": due.span.turns.len(),
     });
-    rt.spawn_journal(nid, due, 0);
+    rt.spawn_journal(nid, due);
     (StatusCode::ACCEPTED, Json(covers)).into_response()
 }
 

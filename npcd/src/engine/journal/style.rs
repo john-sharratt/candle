@@ -26,6 +26,11 @@ entry brief, and put nothing in that did not happen: a conclusion you only worke
 written as one, and something that may have changed since you looked is written as it was \
 when you looked.";
 
+/// Offered after [`WRITE_QUESTION`] once the journal holds an entry.
+pub const SKIP_QUESTION: &str = "If nothing in it is worth adding to your journal — your \
+journal already holds it, or nothing happened that matters to you — answer with journal_skip \
+instead, and its `reason` in one short sentence.";
+
 /// The span an entry covers: `[14 Jun 2187, 14:20–14:41]`, or both ends in full
 /// when it crosses midnight.
 fn span(from_ms: u64, to_ms: u64) -> String {
@@ -66,6 +71,7 @@ pub const NPC: Style = Style {
     clock,
     stretch,
     write_question: WRITE_QUESTION,
+    skip_question: SKIP_QUESTION,
 };
 
 #[cfg(test)]
@@ -208,6 +214,8 @@ mod tests {
             text.contains("\n   14:23 (background) You: reflect — I feel uneasy"),
             "{text}"
         );
-        assert!(ask::writing(&span, &NPC, None).ends_with(WRITE_QUESTION));
+        assert!(ask::writing(&span, &NPC, false, None).ends_with(WRITE_QUESTION));
+        assert!(ask::writing(&span, &NPC, true, None)
+            .ends_with(&format!("{WRITE_QUESTION} {SKIP_QUESTION}")));
     }
 }

@@ -431,7 +431,7 @@
             opened: [{ id: 1, text: 'Does the parity test pass on the 3090?' }],
             resolved: [],
           }],
-          drafts: [{ from_turn: 1, to_turn: 32, turns: 32, took_ms: 2400, gate_ms: 0, write_ms: 2400, result: 'wrote', detail: null, entry: 1, rounds: 1, checks: [] }],
+          drafts: [{ from_turn: 1, to_turn: 32, turns: 32, took_ms: 2400, write_ms: 2400, result: 'wrote', detail: null, entry: 1, rounds: 1, checks: [] }],
         };
       }
       return this._journals[convId];

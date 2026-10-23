@@ -82,8 +82,8 @@ pub struct NpcView {
     /// The acts it took most recently, rendered as the pulse feed shows them,
     /// oldest first.
     pub recent_acts: Vec<String>,
-    /// The stretch of its life its journal does not cover yet, once there is
-    /// enough of it to be worth asking about.
+    /// The stretch of its life its journal does not cover yet, once it is due a
+    /// draft.
     pub journal: Option<Waiting>,
 }
 
@@ -145,9 +145,6 @@ pub enum Verdict {
     /// The character has dealt with this step and it is not signed off: it
     /// carried it out, or tried and could not.
     TickStep(String, StepOutcome),
-    /// The character said whether the stretch its journal does not cover is
-    /// worth an entry.
-    Journal {
-        worth: bool,
-    },
+    /// The stretch its journal does not cover is due a draft.
+    Journal,
 }

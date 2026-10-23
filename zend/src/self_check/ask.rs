@@ -20,7 +20,7 @@ use std::sync::Arc;
 use candle_conversation::projection::DecodePriority;
 use candle_conversation::stencil::{StencilTree, StencilTreeBuilder};
 use candle_conversation::{
-    ConversationEngine, SamplingConfig, SequenceConfig, TurnOptions, UnsealedAsker,
+    AskScope, ConversationEngine, SamplingConfig, SequenceConfig, TurnOptions, UnsealedAsker,
 };
 use futures::future::try_join_all;
 
@@ -97,7 +97,11 @@ impl Asker {
             let asker = self.base.clone();
             // A maintenance pass: on a live daemon it runs beneath every
             // conversation anybody is waiting on.
-            async move { asker.ask(&q.text, DecodePriority::Low, options).await }
+            async move {
+                asker
+                    .ask(&q.text, DecodePriority::Low, AskScope::Whole, options)
+                    .await
+            }
         }))
         .await?;
         let answers = questions

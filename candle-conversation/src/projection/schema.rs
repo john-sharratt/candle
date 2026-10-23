@@ -1412,6 +1412,20 @@ pub struct Schema {
     /// model loads (`ModelBuilder::min_rope_factor`), which refuses a factor
     /// that no rung of the model's schedule reaches.
     pub min_yarn_factor: Option<f32>,
+    /// A projection held to the target's own conversation: the system prompt,
+    /// the target group's turns, and from every other layer only the
+    /// working-set members the conversation was *served* — the locked ones,
+    /// promises it was given and may still be reading from. Nothing is gathered
+    /// from another layer, unlocked working-set members are left out, and no
+    /// other layer is scanned, so the projection teaches nothing back (no
+    /// momentum, no hit levels).
+    ///
+    /// **Not a YAML field.** Set at runtime on a copy of a builder by
+    /// [`super::Builder::focused`], for a question put beside a conversation
+    /// about the conversation itself — a journal draft — where what the
+    /// conversation retrieved from elsewhere is only distraction, and placed
+    /// reading would be taken for its own history.
+    pub focus: bool,
 }
 
 impl Schema {

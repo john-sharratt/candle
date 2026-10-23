@@ -1195,6 +1195,7 @@ fn build(
         system_prompt,
         free_tool_calls_from_penalties: raw.free_tool_calls_from_penalties,
         min_yarn_factor: raw.rope.min_yarn_factor,
+        focus: false,
     };
     Ok((schema, maps))
 }

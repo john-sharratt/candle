@@ -38,13 +38,11 @@ pub struct DraftRecord {
     pub to_turn: u64,
     pub turns: usize,
     pub took_ms: u64,
-    /// Of `took_ms`, asking whether the stretch was worth an entry.
-    pub gate_ms: u64,
     /// Of `took_ms`, asking for the entry.
     pub write_ms: u64,
     pub result: Ending,
     /// Why it ended without an entry, when it did: the writer's own reason for a
-    /// no, or what went wrong.
+    /// skip, or what went wrong.
     pub detail: Option<String>,
     /// The id of the entry it kept.
     pub entry: Option<u64>,
@@ -78,7 +76,6 @@ impl DraftRecord {
             to_turn: span.to_turn,
             turns: span.turns.len(),
             took_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
-            gate_ms: 0,
             write_ms: 0,
             result: Ending::Nothing,
             detail: None,
@@ -113,7 +110,6 @@ impl DraftRecord {
     /// This record with where its time went.
     pub fn timed(self, timing: Timing) -> Self {
         Self {
-            gate_ms: timing.gate_ms,
             write_ms: timing.write_ms,
             ..self
         }
@@ -268,16 +264,12 @@ mod tests {
 
     #[test]
     fn a_draft_says_where_its_time_went() {
-        let r = DraftRecord::of(&span(), Duration::from_millis(900), &nothing("x")).timed(Timing {
-            gate_ms: 300,
-            write_ms: 600,
-        });
-        assert_eq!((r.took_ms, r.gate_ms, r.write_ms), (900, 300, 600));
+        let r = DraftRecord::of(&span(), Duration::from_millis(900), &nothing("x"))
+            .timed(Timing { write_ms: 600 });
+        assert_eq!((r.took_ms, r.write_ms), (900, 600));
         let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(
-            (v["gate_ms"].clone(), v["write_ms"].clone()),
-            (json!(300), json!(600))
-        );
+        assert_eq!(v["write_ms"], json!(600));
+        assert!(v.get("gate_ms").is_none(), "{v}");
     }
 
     #[test]

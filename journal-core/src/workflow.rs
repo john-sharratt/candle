@@ -1,22 +1,24 @@
 //! One draft, start to finish: the write, the check, the keep.
 //!
-//! [`run`] is everything that happens between "this stretch is worth an entry"
-//! and "the journal has, or has not, a new entry", and it is deterministic: the
-//! model is asked for the entry, every answer is read by [`tools::parse`] and
-//! checked by [`verify`], and the same answers always draw the same outcome. It
-//! is written against [`Desk`] — where the question is put and an entry is kept
-//! — so the whole workflow runs in tests against a script, and each product's
-//! engine-backed desk is only the plumbing underneath. Whether a stretch is worth
-//! an entry is not decided here: the caller asks, and starts a draft on a yes.
+//! [`run`] is everything that happens between "a stretch is waiting" and "the
+//! journal has, or has not, a new entry", and it is deterministic: the model is
+//! asked for the entry, every answer is read by [`tools::parse`] and checked by
+//! [`verify`], and the same answers always draw the same outcome. It is written
+//! against [`Desk`] — where the question is put and an entry is kept — so the
+//! whole workflow runs in tests against a script, and each product's
+//! engine-backed desk is only the plumbing underneath.
 //!
 //! # The shape of a draft
 //!
 //! 1. A stretch with nothing a claim could rest on is not written about at all.
 //! 2. The write, at most [`MAX_ROUNDS`] answers. The grammar holds each answer to
-//!    one `journal_write` call, so the only ways a round fails are a call the
-//!    check refuses and a decode that does not parse. Either is sent back with
-//!    the refused answer and the reason, and a draft that passes is kept. Keeping
-//!    ends the draft; the model is never asked whether it is finished.
+//!    one call: `journal_write`, or — once the journal holds an entry to weigh
+//!    the stretch against — `journal_skip`. A skip covers the stretch with its
+//!    reason and ends the draft, so whether the stretch is worth an entry is
+//!    decided in the same answer that would write it. A write the check refuses
+//!    and a decode that does not parse are sent back with the refused answer and
+//!    the reason, and a draft that passes is kept. Keeping ends the draft; the
+//!    model is never asked whether it is finished.
 //!
 //! # What the state sees
 //!
@@ -37,7 +39,7 @@ use crate::repeats;
 use crate::section::JournalPrompt;
 use crate::span::Span;
 use crate::style::Style;
-use crate::tools;
+use crate::tools::{self, Answer};
 use crate::verify::{verify, Note, Verified, World};
 
 /// Answers the write may take before the draft is given up.
@@ -45,11 +47,12 @@ pub const MAX_ROUNDS: usize = 4;
 
 /// Where a draft's question is put and its entry is kept.
 pub trait Desk: Send {
-    /// Ask for the entry, held to one call of `spec` (the flat `{name, params}`
-    /// tool form), and return the decode as it came back.
+    /// Ask for the entry, held to one call of any of `specs` (each the flat
+    /// `{name, params}` tool form), and return the decode as it came back.
+    /// Every round of one draft offers the same `specs`.
     fn write(
         &mut self,
-        spec: &Value,
+        specs: &[Value],
         question: &str,
     ) -> impl Future<Output = anyhow::Result<String>> + Send;
 
@@ -77,9 +80,9 @@ pub enum Outcome {
         notes: Vec<Note>,
         rounds: usize,
     },
-    /// There was nothing worth writing, and this is why. The workflow itself
-    /// reaches this for a stretch nothing can be cited from and for an entry
-    /// that only repeats the journal; a gate's "no" is recorded by its caller.
+    /// There was nothing worth writing, and this is why: a stretch nothing can
+    /// be cited from, the writer's own `journal_skip`, or an entry that only
+    /// repeats the journal.
     Nothing { why: String },
     /// The draft did not finish; the same turns are covered again next time.
     Abandoned(Abandon),
@@ -88,12 +91,12 @@ pub enum Outcome {
 /// Where a draft's time went.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timing {
-    /// Asking whether the stretch was worth an entry. The caller asks, so the
-    /// workflow leaves this at zero and the caller fills it in.
-    pub gate_ms: u64,
     /// Every answer to the write, refused ones included.
     pub write_ms: u64,
 }
+
+/// What a skip that gave no reason is recorded with.
+pub const SKIPPED: &str = "the writer judged the stretch adds nothing to the journal";
 
 fn hold<S: Holds>(state: &Mutex<S>) -> MutexGuard<'_, S> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -129,8 +132,14 @@ async fn draft<D: Desk, S: Holds>(
     style: &Style,
     timing: &mut Timing,
 ) -> Outcome {
-    let open = hold(state).journal().open().to_vec();
-    let Some(spec) = tools::write_spec(&span.citable_ids(), &open) else {
+    let (open, may_skip) = {
+        let held = hold(state);
+        let journal = held.journal();
+        let open = journal.open().to_vec();
+        let may_skip = journal.entries().next().is_some();
+        (open, may_skip)
+    };
+    let Some(specs) = tools::draft_specs(&span.citable_ids(), &open, may_skip) else {
         hold(state).journal_mut().nothing_to_write(span);
         return Outcome::Nothing {
             why: "nothing in the stretch was something a claim could rest on".to_string(),
@@ -138,37 +147,60 @@ async fn draft<D: Desk, S: Holds>(
     };
 
     let started = Instant::now();
-    let outcome = write(desk, state, span, world, style, &spec, &open).await;
+    let asked = Asked {
+        specs: &specs,
+        open: &open,
+        may_skip,
+    };
+    let outcome = write(desk, state, span, world, style, &asked).await;
     timing.write_ms = millis(started);
     outcome
 }
 
-/// Ask for the entry until one passes the check or the rounds run out.
+/// What every round of one draft offers.
+struct Asked<'a> {
+    specs: &'a [Value],
+    open: &'a [Item],
+    may_skip: bool,
+}
+
+/// Ask for the entry until one passes the check, the writer skips, or the
+/// rounds run out.
 async fn write<D: Desk, S: Holds>(
     desk: &mut D,
     state: &Mutex<S>,
     span: &Span,
     world: &(dyn World + Sync),
     style: &Style,
-    spec: &Value,
-    open: &[Item],
+    asked: &Asked<'_>,
 ) -> Outcome {
+    let open = asked.open;
     let mut refused: Option<(String, String)> = None;
     for round in 1..=MAX_ROUNDS {
         let question = ask::writing(
             span,
             style,
+            asked.may_skip,
             refused
                 .as_ref()
                 .map(|(answer, reason)| (answer.as_str(), reason.as_str())),
         );
-        let answer = match desk.write(spec, &question).await {
+        let answer = match desk.write(asked.specs, &question).await {
             Ok(answer) => answer,
             Err(e) => return Outcome::Abandoned(Abandon::Asking(e.to_string())),
         };
-        let reason = match tools::parse(&answer) {
+        let reason = match tools::parse(&answer, asked.may_skip) {
             Err(reason) => reason,
-            Ok(written) => match verify(written, span, open, world) {
+            Ok(Answer::Skip(why)) => {
+                hold(state).journal_mut().nothing_to_write(span);
+                let why = if why.is_empty() {
+                    SKIPPED.to_string()
+                } else {
+                    why
+                };
+                return Outcome::Nothing { why };
+            }
+            Ok(Answer::Write(written)) => match verify(written, span, open, world) {
                 Ok(verified) => {
                     // What the journal already says is not kept again; an
                     // entry of nothing else covers its stretch as a gate's
@@ -247,7 +279,7 @@ mod tests {
     struct Script {
         writes: VecDeque<anyhow::Result<String>>,
         write_asked: Vec<String>,
-        specs: Vec<Value>,
+        specs: Vec<Vec<Value>>,
         kept: Vec<JournalPrompt>,
         refuse_keeping: bool,
     }
@@ -265,9 +297,9 @@ mod tests {
     }
 
     impl Desk for Script {
-        async fn write(&mut self, spec: &Value, question: &str) -> anyhow::Result<String> {
+        async fn write(&mut self, specs: &[Value], question: &str) -> anyhow::Result<String> {
             self.write_asked.push(question.to_string());
-            self.specs.push(spec.clone());
+            self.specs.push(specs.to_vec());
             self.writes
                 .pop_front()
                 .unwrap_or_else(|| Err(anyhow::anyhow!("the script ran out")))
@@ -336,10 +368,117 @@ mod tests {
         let mut desk = Script::new(&[WRITE]);
         run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
         let first = &desk.write_asked[0];
-        assert_eq!(first, &ask::writing(&span, &PLAIN, None));
+        assert_eq!(first, &ask::writing(&span, &PLAIN, false, None));
         assert!(first.contains("#1 ") && first.contains("#2 "), "{first}");
         assert!(first.contains("(background)"), "{first}");
-        assert_eq!(desk.specs[0], tools::write_spec(&[1, 2], &[]).unwrap());
+        assert_eq!(
+            desk.specs[0],
+            vec![tools::write_spec(&[1, 2], &[]).unwrap()],
+            "an empty journal has nothing to weigh the stretch against, so no skip"
+        );
+    }
+
+    /// A journal holding one entry, and a stretch after it.
+    async fn after_an_entry() -> (Mutex<Journal>, Span) {
+        let (state, first) = started(turns());
+        run(
+            &mut Script::new(&[WRITE]),
+            &state,
+            &first,
+            &Fake::default(),
+            &PLAIN,
+        )
+        .await;
+        let second = hold(&state)
+            .begin(
+                vec![turn(4, 4_000, Some(Kind::Did), "You: tell — to Pax: bye")],
+                4,
+            )
+            .unwrap();
+        (state, second)
+    }
+
+    const SKIP: &str =
+        r#"{"name": "journal_skip", "arguments": {"reason": "Entry 1 already says it."}}"#;
+
+    #[tokio::test]
+    async fn a_journal_with_an_entry_offers_the_skip_beside_the_write() {
+        let (state, span) = after_an_entry().await;
+        let mut desk = Script::new(&[SKIP]);
+        run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        assert_eq!(
+            desk.specs[0],
+            vec![
+                tools::write_spec(&[4], hold(&state).open()).unwrap(),
+                tools::skip_spec()
+            ]
+        );
+        assert_eq!(desk.write_asked[0], ask::writing(&span, &PLAIN, true, None));
+    }
+
+    #[tokio::test]
+    async fn a_skip_covers_the_stretch_with_its_reason_in_one_answer() {
+        let (state, span) = after_an_entry().await;
+        let mut desk = Script::new(&[SKIP]);
+        let (outcome, _) = run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        let Outcome::Nothing { why } = outcome else {
+            panic!("expected a skip, got {outcome:?}");
+        };
+        assert_eq!(why, "Entry 1 already says it.");
+        assert_eq!(desk.write_asked.len(), 1);
+        assert_eq!(desk.kept.len(), 0);
+        let state = hold(&state);
+        assert_eq!(state.covered_to(), 4);
+        assert!(!state.pending());
+        assert_eq!(state.written(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_skip_without_a_reason_is_recorded_with_one() {
+        let (state, span) = after_an_entry().await;
+        let bare = r#"{"name": "journal_skip", "arguments": {"reason": " "}}"#;
+        let (outcome, _) = run(
+            &mut Script::new(&[bare]),
+            &state,
+            &span,
+            &Fake::default(),
+            &PLAIN,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, Outcome::Nothing { why } if why == SKIPPED),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skip_from_an_empty_journal_is_refused_and_asked_again() {
+        let mut desk = Script::new(&[SKIP, WRITE]);
+        let (outcome, _) = drafted(&mut desk, turns()).await;
+        assert!(
+            matches!(outcome, Outcome::Wrote { rounds: 2, .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            desk.write_asked[1].contains("no call named `journal_skip`"),
+            "{}",
+            desk.write_asked[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_may_still_be_answered_with_a_skip() {
+        let (state, span) = after_an_entry().await;
+        let scenery =
+            r#"{"name": "journal_write", "arguments": {"claims": [{"text": "x", "cite": "9"}]}}"#;
+        let mut desk = Script::new(&[scenery, SKIP]);
+        let (outcome, _) = run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        assert!(matches!(outcome, Outcome::Nothing { .. }), "{outcome:?}");
+        assert_eq!(
+            desk.specs[0], desk.specs[1],
+            "every round offers the same calls"
+        );
+        assert!(desk.write_asked[1].contains("Or skip it with journal_skip."));
     }
 
     #[tokio::test]

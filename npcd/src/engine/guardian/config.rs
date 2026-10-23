@@ -13,7 +13,7 @@
 //!     no_progress_secs: 300
 //!   - kind: step_tracker
 //!     confirmations: 2
-//!   - kind: journal       # asks when a stretch needs a journal entry
+//!   - kind: journal       # starts a journal draft when a stretch is due one
 //! escalation: [nudge, restate, refresh, flag]
 //! ```
 //!

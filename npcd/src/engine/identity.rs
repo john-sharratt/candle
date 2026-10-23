@@ -44,9 +44,11 @@
 //! What a character has written down is held the same way: one section per kept
 //! entry (the newest five) and one for the open items, submitted to its own
 //! conversation as `journal/<entry id>` and `journal/open`, and selected by
-//! [`carry_journal`] under `journal_intro`. `journal_none` shows when it holds
-//! none. The collection's fixed member stands in until the sections have sealed.
-//! See [`crate::engine::journal::section`].
+//! [`carry_journal`] under `journal_intro`. The collection has no member of its
+//! own: a turn pins exactly the sections that have sealed, so `journal_none`
+//! shows while none has, and a new entry joins the prompt from the first turn
+//! after its section seals — until then the turns it was written from are still
+//! in the window. See [`crate::engine::journal::section`].
 //!
 //! # A dream reads a different floor
 //!
@@ -98,11 +100,6 @@ pub const GENERIC: &str = "generic";
 const DREAMING: &str = "dreaming";
 
 const CARRYING_ID: &str = "carrying";
-
-/// The fixed member of the `journal` collection, read under `journal_intro`'s
-/// heading while the entries submitted to the conversation are still sealing.
-const JOURNAL_STAND_IN: &str = "\
-Entries you wrote down earlier, which are being brought back to you.";
 
 /// The name a character's mission wording is submitted under, in the `mission`
 /// collection of its own conversation.
@@ -364,17 +361,11 @@ pub fn carry_mission(selection: &mut SelectionState, sealed: bool) {
     selection.select(MISSION, name);
 }
 
-/// Select what the turn reads under `journal_intro`'s heading and hide
-/// `journal_none`: the sections of the journal that have `sealed`, or the fixed
-/// [`JOURNAL_STAND_IN`] member while none has. Not called for a character that has
-/// written nothing: an unpinned `journal` collection emits nothing, which is what
-/// shows `journal_none`.
+/// Pin the journal sections that have `sealed` for the turn to read under
+/// `journal_intro`'s heading. With none sealed the collection pins nothing and
+/// emits nothing, which is what shows `journal_none`.
 pub fn carry_journal(selection: &mut SelectionState, sealed: &[String]) {
-    if sealed.is_empty() {
-        selection.select(JOURNAL, member(JOURNAL, CARRYING_ID));
-    } else {
-        selection.select_all(JOURNAL, sealed.iter().map(String::as_str));
-    }
+    selection.select_all(JOURNAL, sealed.iter().map(String::as_str));
 }
 
 /// The name one part of a world is installed and selected under.
@@ -454,7 +445,8 @@ pub fn install(
     }
 
     // Optional for the same reason: a schema with no `journal` has no
-    // `journal_none` to hide.
+    // `journal_none` to hide. It installs no member: it holds nothing but the
+    // conversation's own sections.
     if builder.id_for_system_collection(JOURNAL).is_some() {
         builder
             .set_collection_selection(
@@ -464,7 +456,6 @@ pub fn install(
                 },
             )
             .map_err(|e| anyhow::anyhow!("scoping `{JOURNAL}` to its members: {e}"))?;
-        add(builder, JOURNAL, CARRYING_ID, JOURNAL_STAND_IN)?;
     }
 
     let mut out = Installed::default();
@@ -789,14 +780,20 @@ mod tests {
         assert_eq!(sel.get(MISSION), Some(MISSION_SECTION));
     }
 
-    /// **A journal selects the sections that have sealed, or its stand-in until one
-    /// has; a character with nothing written pins nothing.** Pinning nothing is
-    /// what lets `journal_none` show.
+    /// **A journal pins exactly the sections that have sealed, and no member of
+    /// its own.** Pinning nothing is what lets `journal_none` show.
     #[test]
-    fn a_journal_selects_what_has_sealed_and_stands_in_until_then() {
+    fn a_journal_pins_exactly_what_has_sealed() {
+        use candle_conversation::projection::SystemPromptItem;
         let mut b = schema(&[ANCHOR, WHO, SETTING, BUILDING, JOURNAL]);
         install(&mut b, &Authored::default(), &BTreeMap::new()).unwrap();
-        assert!(b.id_for_system_section("journal/carrying").is_some());
+        assert!(
+            b.schema().system_prompt.items.iter().any(|i| matches!(
+                i,
+                SystemPromptItem::Collection(c) if c.name == JOURNAL && c.sections.is_empty()
+            )),
+            "the journal holds no member of its own"
+        );
 
         let mut sel =
             installed().selection_for(7, "maker", "battle-cities", VAULT, Deliberation::None);
@@ -805,19 +802,28 @@ mod tests {
             "nothing written pins nothing"
         );
         carry_journal(&mut sel, &[]);
-        assert_eq!(sel.members(JOURNAL), ["journal/carrying"]);
+        assert!(
+            sel.members(JOURNAL).is_empty(),
+            "nothing sealed pins nothing"
+        );
         carry_journal(
             &mut sel,
             &["journal/3".to_string(), "journal/open".to_string()],
         );
         assert_eq!(sel.members(JOURNAL), ["journal/3", "journal/open"]);
+        carry_journal(&mut sel, &["journal/4".to_string()]);
+        assert_eq!(
+            sel.members(JOURNAL),
+            ["journal/4"],
+            "replaced, not added to"
+        );
     }
 
     #[test]
     fn a_schema_with_no_journal_collection_still_installs() {
         let mut b = schema(&FOUR);
         install(&mut b, &Authored::default(), &BTreeMap::new()).unwrap();
-        assert!(b.id_for_system_section("journal/carrying").is_none());
+        assert!(b.id_for_system_collection(JOURNAL).is_none());
     }
 
     #[test]

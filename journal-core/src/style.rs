@@ -40,6 +40,10 @@ pub struct Style {
     /// What the writer is asked once the stretch is on the table: the call, and
     /// what each part of it is.
     pub write_question: &'static str,
+    /// Follows `write_question` when the journal already holds an entry: that
+    /// `journal_skip`, with a reason, is the answer when the stretch adds
+    /// nothing to it.
+    pub skip_question: &'static str,
 }
 
 #[cfg(test)]
@@ -75,5 +79,6 @@ pub(crate) mod testing {
         clock,
         stretch,
         write_question: "Write it up with journal_write.",
+        skip_question: "Or skip it with journal_skip.",
     };
 }

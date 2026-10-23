@@ -24,6 +24,20 @@ use crate::scheduler::{ProjectionInputs, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
 use crate::turn::TurnOptions;
 
+/// What a question beside a conversation is projected under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskScope {
+    /// Everything the conversation's own turn would be: its system prompt,
+    /// its history, and what it retrieves from every other layer.
+    Whole,
+    /// The conversation alone ([`crate::projection::Schema::focus`]): its
+    /// system prompt and its own turns, and from other layers only the
+    /// working-set members it was served. For a question about the
+    /// conversation itself, which what it retrieved from elsewhere would only
+    /// distract.
+    Conversation,
+}
+
 /// Puts questions to one conversation without borrowing it.
 #[derive(Clone)]
 pub struct UnsealedAsker {
@@ -51,11 +65,12 @@ impl UnsealedAsker {
     ///
     /// The question decodes at `band`, whatever the conversation's own layer
     /// decodes at: how urgent a question beside a conversation is belongs to
-    /// whoever asks it.
+    /// whoever asks it. It is projected under `scope`.
     pub async fn ask(
         &self,
         question: &str,
         band: DecodePriority,
+        scope: AskScope,
         options: TurnOptions,
     ) -> crate::Result<TurnResponse> {
         let (tx, rx) = flume::bounded(1);
@@ -77,8 +92,15 @@ impl UnsealedAsker {
         };
 
         let handle = {
+            let projection = {
+                let state = self.state.lock().unwrap();
+                match scope {
+                    AskScope::Whole => Arc::clone(&state.projection),
+                    AskScope::Conversation => Arc::new(state.projection.focused()),
+                }
+            };
             let inputs = ProjectionInputs {
-                projection: Arc::clone(&self.state.lock().unwrap().projection),
+                projection,
                 selection: options.selection.clone(),
             };
             let message = TurnText::from(question);
@@ -96,10 +118,11 @@ impl Sequence {
         &mut self,
         question: &str,
         band: DecodePriority,
+        scope: AskScope,
         options: TurnOptions,
     ) -> crate::Result<TurnResponse> {
         let asker = self.unsealed_asker();
-        asker.ask(question, band, options).await
+        asker.ask(question, band, scope, options).await
     }
 }
 

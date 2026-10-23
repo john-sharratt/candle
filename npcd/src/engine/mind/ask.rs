@@ -3,8 +3,9 @@
 //! The question runs on an ephemeral fork of the character's live slot
 //! ([`Sequence::ask_unsealed`]), so it reuses the K/V and projection caches the
 //! live slot already holds: the character reads its own system prompt and the
-//! same selected history it reads when it acts, then answers under a one-call
-//! grammar. Nothing is written back —
+//! same selected history it reads when it acts — or, under
+//! [`AskScope::Conversation`], its own turns without what it retrieved from
+//! elsewhere — then answers under a one-call grammar. Nothing is written back —
 //! not the question, not the answer — so asking never changes what the character
 //! remembers. The question is put between the character's turns and never inside
 //! one, but it does not wait for the character's lock to arrange that: the
@@ -18,7 +19,7 @@ use serde_json::{json, Value};
 
 use candle_conversation::projection::DecodePriority;
 use candle_conversation::stencil::{Param, StencilTree, ToolSpec};
-use candle_conversation::TurnOptions;
+use candle_conversation::{AskScope, TurnOptions};
 
 use super::{compile_calls, Minds};
 use crate::engine::act;
@@ -31,6 +32,14 @@ pub const ANSWER_TOOL: &str = "answer";
 
 /// Enough for a paragraph of free-text answer and a reason of similar length.
 const ANSWER_TOKENS: usize = 640;
+
+/// How a question is put: what it is projected under, the grammar its answer is
+/// held to, and where the answer is cut.
+pub struct Put {
+    pub scope: AskScope,
+    pub tree: Arc<StencilTree>,
+    pub max_tokens: usize,
+}
 
 /// What a character said when asked.
 #[derive(Debug, Clone, Serialize)]
@@ -80,11 +89,12 @@ pub fn read_answer(raw: &str) -> Option<(String, Option<String>)> {
 }
 
 impl Minds {
-    /// Compile `spec` into the one-call grammar a question is answered under.
+    /// Compile `specs` into the grammar a question is answered under: exactly
+    /// one call, of any of them.
     ///
     /// Errors when the checkpoint has no tool-call grammar to force an answer
     /// with.
-    pub fn answer_tree(&self, spec: ToolSpec) -> anyhow::Result<Arc<StencilTree>> {
+    pub fn answer_tree(&self, specs: &[ToolSpec]) -> anyhow::Result<Arc<StencilTree>> {
         if !self.grammar_ok {
             anyhow::bail!(
                 "this checkpoint has no tool-call grammar, so an answer cannot be forced"
@@ -94,7 +104,7 @@ impl Minds {
             .engine
             .lock()
             .map_err(|_| anyhow::anyhow!("engine lock poisoned"))?;
-        compile_calls(&engine, &self.base_config, &[spec], 1, None)
+        compile_calls(&engine, &self.base_config, specs, 1, None)
     }
 
     /// Ask `npc_id` a question and return what it answered.
@@ -111,9 +121,14 @@ impl Minds {
         choices: &[String],
     ) -> anyhow::Result<Answer> {
         let started = Instant::now();
-        let tree = self.answer_tree(answer_spec(choices)?)?;
+        let tree = self.answer_tree(&[answer_spec(choices)?])?;
+        let put = Put {
+            scope: AskScope::Whole,
+            tree,
+            max_tokens: ANSWER_TOKENS,
+        };
         let text = self
-            .ask_under(npc_id, persona, within, question, tree, ANSWER_TOKENS)
+            .ask_under(npc_id, persona, within, question, put)
             .await?;
         let (answer, reason) = read_answer(&text)
             .ok_or_else(|| anyhow::anyhow!("no answer call in the reply: {}", text.trim()))?;
@@ -125,20 +140,24 @@ impl Minds {
         })
     }
 
-    /// Put `question` to `npc_id` on its live conversation and return the raw
-    /// decode, held to `tree` and cut at `max_tokens`.
+    /// Put `question` to `npc_id` on its live conversation as `put` says, and
+    /// return the raw decode.
     ///
-    /// The caller reads the reply: it is the call `tree` was compiled from, as the
-    /// dialect writes it.
+    /// The caller reads the reply: it is the call `put.tree` was compiled from,
+    /// as the dialect writes it.
     pub async fn ask_under(
         &self,
         npc_id: u64,
         persona: &Persona<'_>,
         within: &Within,
         question: &str,
-        tree: Arc<StencilTree>,
-        max_tokens: usize,
+        put: Put,
     ) -> anyhow::Result<String> {
+        let Put {
+            scope,
+            tree,
+            max_tokens,
+        } = put;
         let conversation = self
             .live
             .lock()
@@ -177,7 +196,9 @@ impl Minds {
         // A question beside the character's own line — the guardian's, a journal
         // draft's — is background to it and to every conversation a person is
         // waiting on, and above the layers that only maintain themselves.
-        let response = asker.ask(question, DecodePriority::Normal, options).await?;
+        let response = asker
+            .ask(question, DecodePriority::Normal, scope, options)
+            .await?;
         let ask_ms = asked.elapsed().as_millis();
         let stats = &response.stats;
         tracing::info!(

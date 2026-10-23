@@ -33,6 +33,11 @@ settled. Keep the whole entry brief, and put nothing in that did not happen: a c
 only worked out is written as one, and a result that may have changed since is written as it \
 was when you read it.";
 
+/// Offered after [`WRITE_QUESTION`] once the journal holds an entry.
+pub const SKIP_QUESTION: &str = "If nothing in this stretch is worth adding to your journal — \
+what it established is already in an entry, or it settled nothing — answer with journal_skip \
+instead, and its `reason` in one short sentence.";
+
 /// `HH:MM` of the wall-clock instant `ms`, UTC.
 fn clock(ms: u64) -> String {
     let minutes = (ms % MS_PER_DAY) / MS_PER_MINUTE;
@@ -77,6 +82,7 @@ pub const CODING: Style = Style {
     clock,
     stretch,
     write_question: WRITE_QUESTION,
+    skip_question: SKIP_QUESTION,
 };
 
 #[cfg(test)]

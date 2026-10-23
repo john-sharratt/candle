@@ -328,6 +328,58 @@ fn the_working_set_sits_ahead_of_the_dialogue_in_every_round() {
     }
 }
 
+/// **A focused projection keeps only what the conversation was served.** The
+/// locked members stay, in the set's order; the ones there by momentum go.
+#[test]
+fn a_focused_projection_keeps_the_locked_members_only() {
+    let f = fixture();
+    let r = WsResolver::default()
+        .with_conversation(DIALOGUE, f.conversation, 2, 10)
+        .with_conversation(10, f.scopes, 2, 50)
+        .with_conversation(12, f.scopes, 1, 50)
+        .with_conversation(20, f.structure, 1, 50)
+        .provenance(f.structure, 20, 9_000.0)
+        .provenance(f.scopes, 10, 9_000.0)
+        .lock(f.scopes, 12);
+    assert_eq!(
+        emitted(&f.b, f.target, &r),
+        vec![(20, 1), (10, 2), (12, 1), (DIALOGUE, 2)],
+        "unfocused, everything"
+    );
+    assert_eq!(
+        emitted(&f.b.focused(), f.target, &r),
+        vec![(12, 1), (DIALOGUE, 2)],
+        "focused, the served file and the conversation"
+    );
+}
+
+/// **A focused projection takes nothing else from another layer**: a layer's
+/// ordinary group is left out entirely, while the dialogue's own selection is
+/// what it always was.
+#[test]
+fn a_focused_projection_takes_no_other_group_from_another_layer() {
+    let yaml = WS_YAML.replace(
+        "  - name: dialogue\n",
+        "  - name: history\n    window: 2000\n    summary: *summary\n    groups:\n      - id: days\n        selection: { kind: conversation, recent: 4, historical_top_k: 0 }\n\n  - name: dialogue\n",
+    );
+    assert_ne!(yaml, WS_YAML, "the history layer was added");
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let conversation = b.id_for_group("conversation").unwrap();
+    let days = b.id_for_group("days").unwrap();
+    let target = ProjectionTarget {
+        layer: b.id_for_layer("dialogue").unwrap(),
+        group: conversation,
+        timeline: tl(DIALOGUE),
+    };
+    let r = WsResolver::default()
+        .with_conversation(DIALOGUE, conversation, 6, 10)
+        .with_conversation(50, days, 2, 10);
+    let unfocused = emitted(&b, target, &r);
+    assert!(unfocused.contains(&(50, 2)), "{unfocused:?}");
+    assert_eq!(emitted(&b.focused(), target, &r), vec![(DIALOGUE, 4)]);
+    assert!(!b.schema().focus && b.focused().schema().focus);
+}
+
 /// A target whose layer declares no working set — every ingest conversation —
 /// selects nothing into a working-set group, whatever the resolver holds.
 #[test]

@@ -220,7 +220,7 @@ use std::sync::{Arc, Mutex};
 mod carried;
 pub use carried::{Carried, Want};
 mod ephemeral_turn;
-pub use ephemeral_turn::UnsealedAsker;
+pub use ephemeral_turn::{AskScope, UnsealedAsker};
 mod prompt_dump;
 mod submitted_sections;
 

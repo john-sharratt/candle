@@ -12,7 +12,7 @@ use crate::engine::guardian::log::GuardianLog;
 use crate::engine::guardian::module::Module;
 use crate::engine::guardian::nudge;
 use crate::engine::guardian::probe::Probe;
-use crate::engine::guardian::view::{Concern, MissionView, NpcView, Reply, Verdict};
+use crate::engine::guardian::view::{Concern, MissionView, NpcView, Verdict};
 
 type Mark = (String, usize, usize);
 
@@ -128,15 +128,15 @@ impl Guardian {
                             .push(npc_id, "tick", format!("{}: {step}", outcome.as_str()));
                     }
                 }
-                Verdict::Journal { worth } => {
-                    let reply = reply.unwrap_or_else(|| Reply {
-                        answer: String::new(),
-                        reason: String::new(),
-                        ms: 0,
-                    });
-                    if probe.decide_journal(npc_id, worth, &reply) {
-                        let kind = if worth { "journal" } else { "journal_skip" };
-                        self.log.push(npc_id, kind, reply.reason);
+                Verdict::Journal => {
+                    if let Some(waiting) = &view.journal {
+                        if probe.draft_journal(npc_id) {
+                            self.log.push(
+                                npc_id,
+                                "journal",
+                                format!("drafting {} turn(s)", waiting.turns),
+                            );
+                        }
                     }
                 }
             }
@@ -199,7 +199,7 @@ mod tests {
     use super::*;
     use crate::engine::guardian::builder::GuardianBuilder;
     use crate::engine::guardian::modules::{Drift, Journal, Looping, StepTracker};
-    use crate::engine::guardian::view::{Question, Station, Step};
+    use crate::engine::guardian::view::{Question, Reply, Station, Step};
     use crate::engine::journal::state::Waiting;
     use crate::engine::mission::StepOutcome;
 
@@ -215,7 +215,7 @@ mod tests {
         ticked: Mutex<Vec<(String, StepOutcome)>>,
         acts: Mutex<Vec<String>>,
         waiting: Mutex<Option<Waiting>>,
-        decided: Mutex<Vec<(bool, String)>>,
+        drafted: Mutex<usize>,
     }
 
     impl Cast {
@@ -290,11 +290,8 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("no scripted answer"))
             }
         }
-        fn decide_journal(&self, _: u64, worth: bool, reply: &Reply) -> bool {
-            self.decided
-                .lock()
-                .unwrap()
-                .push((worth, reply.reason.clone()));
+        fn draft_journal(&self, _: u64) -> bool {
+            *self.drafted.lock().unwrap() += 1;
             true
         }
         fn think(&self, _: u64, text: String) -> impl Future<Output = bool> + Send {
@@ -503,58 +500,28 @@ mod tests {
             turns: 16,
             from_ms: 0,
             to_ms: 60_000,
-            empty: false,
         }
     }
 
     #[tokio::test]
-    async fn a_stretch_the_character_says_needs_an_entry_is_sent_to_be_written() {
+    async fn a_stretch_due_a_draft_is_drafted_without_a_question() {
         let cast = Cast::default();
         *cast.waiting.lock().unwrap() = Some(a_stretch());
-        cast.answers("not in your journal yet", "yes");
         let mut g = guardian(vec![Box::new(Journal)], vec![Rung::Nudge]);
         g.scan(&cast, secs(0)).await;
-        assert_eq!(
-            *cast.decided.lock().unwrap(),
-            vec![(true, "because".to_string())]
-        );
+        assert_eq!(*cast.drafted.lock().unwrap(), 1);
+        let records = g.log().records();
         assert_eq!(kinds(&g), vec!["journal"]);
+        assert_eq!(records[0].detail, "drafting 16 turn(s)");
         assert!(cast.thoughts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn a_stretch_with_no_entry_to_weigh_it_against_is_written_without_asking() {
-        let cast = Cast::default();
-        *cast.waiting.lock().unwrap() = Some(Waiting {
-            empty: true,
-            ..a_stretch()
-        });
-        let mut g = guardian(vec![Box::new(Journal)], vec![Rung::Nudge]);
-        g.scan(&cast, secs(0)).await;
-        assert_eq!(*cast.decided.lock().unwrap(), vec![(true, String::new())]);
-        assert_eq!(kinds(&g), vec!["journal"]);
-    }
-
-    #[tokio::test]
-    async fn a_stretch_the_character_says_does_not_is_closed_with_its_reason() {
-        let cast = Cast::default();
-        *cast.waiting.lock().unwrap() = Some(a_stretch());
-        cast.answers("not in your journal yet", "no");
-        let mut g = guardian(vec![Box::new(Journal)], vec![Rung::Nudge]);
-        g.scan(&cast, secs(0)).await;
-        assert_eq!(
-            *cast.decided.lock().unwrap(),
-            vec![(false, "because".to_string())]
-        );
-        assert_eq!(kinds(&g), vec!["journal_skip"]);
-    }
-
-    #[tokio::test]
-    async fn a_journal_that_covers_everything_is_not_asked_about() {
+    async fn a_journal_that_covers_everything_is_not_drafted() {
         let cast = Cast::default();
         let mut g = guardian(vec![Box::new(Journal)], vec![Rung::Nudge]);
         g.scan(&cast, secs(0)).await;
-        assert!(cast.decided.lock().unwrap().is_empty());
+        assert_eq!(*cast.drafted.lock().unwrap(), 0);
         assert!(kinds(&g).is_empty());
     }
 

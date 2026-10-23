@@ -3,8 +3,9 @@
 //! The question carries the stretch as text, because a claim cites a turn by
 //! number and the live history is not numbered. Each turn the writer may rely on
 //! carries its number; a turn it may not rely on is shown without one, marked as
-//! background, so it is context and cannot be cited. Whether a stretch is worth
-//! an entry is not asked here.
+//! background, so it is context and cannot be cited. When the journal already
+//! holds an entry, the same question offers `journal_skip` for a stretch that
+//! adds nothing to it.
 
 use crate::span::Span;
 use crate::style::Style;
@@ -23,13 +24,23 @@ pub fn stretch(span: &Span, style: &Style) -> String {
     out
 }
 
-/// The writing question: the stretch with its turn numbers, then what is asked.
+/// The writing question: the stretch with its turn numbers, then what is asked
+/// — with the skip offered when `may_skip`.
 ///
 /// After a refused attempt `refused` holds that attempt as it was written and why
 /// it was refused, because each question is put afresh and the writer would
 /// otherwise not know what to change.
-pub fn writing(span: &Span, style: &Style, refused: Option<(&str, &str)>) -> String {
+pub fn writing(
+    span: &Span,
+    style: &Style,
+    may_skip: bool,
+    refused: Option<(&str, &str)>,
+) -> String {
     let mut out = format!("{}\n\n{}", stretch(span, style), style.write_question);
+    if may_skip {
+        out.push(' ');
+        out.push_str(style.skip_question);
+    }
     if let Some((attempt, why)) = refused {
         out.push_str(&format!(
             "\n\nYou tried this:\n{}\n\nIt was refused: {why}\nWrite it again with that put right.",
@@ -68,7 +79,7 @@ mod tests {
 
     #[test]
     fn the_writing_question_is_the_stretch_then_the_call() {
-        let asked = writing(&span(), &PLAIN, None);
+        let asked = writing(&span(), &PLAIN, false, None);
         assert_eq!(
             asked,
             format!(
@@ -79,10 +90,23 @@ mod tests {
     }
 
     #[test]
+    fn the_skip_is_offered_after_the_write_when_it_may_be_taken() {
+        let asked = writing(&span(), &PLAIN, true, None);
+        assert_eq!(
+            asked,
+            format!(
+                "{}\n\nWrite it up with journal_write. Or skip it with journal_skip.",
+                stretch(&span(), &PLAIN)
+            )
+        );
+    }
+
+    #[test]
     fn a_refused_attempt_comes_back_with_its_reason() {
         let asked = writing(
             &span(),
             &PLAIN,
+            false,
             Some((" {\"name\": \"journal_write\"} ", "Claim 1 cites turn 3.")),
         );
         assert!(
