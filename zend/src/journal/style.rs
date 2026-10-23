@@ -17,8 +17,10 @@ const MS_PER_MINUTE: u64 = 60_000;
 ///
 /// The call is shown nowhere else, so the question says what each part of it is.
 pub const WRITE_QUESTION: &str = "Write it up with journal_write. `claims` is what this \
-stretch established, one thing each: its `text` in one short sentence, and `cite`, the number \
-of the turn it rests on (`also_cite` for a second). A tool result you read is cited by its \
+stretch established, one thing each — what the user asked for, each file or result read and \
+what it showed, each decision, each change made — so a stretch of several steps is several \
+claims, as many as it took to get there, up to twelve. Each claim's `text` is one short \
+sentence, and `cite` the number of the turn it rests on (`also_cite` for a second). A tool result you read is cited by its \
 number; so is what the user said, and so is a call you made. Something you worked out and did \
 not see in a result still cites the turn that led you to it. If a claim is about the workspace \
 — whether a file exists, which blob a file is at, which commit a branch is on — add `typed`, \
