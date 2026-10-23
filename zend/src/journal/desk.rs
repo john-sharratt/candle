@@ -97,8 +97,8 @@ impl Desk for ZendDesk {
         let answer = self.asking.ask(question, tree).await?;
         tracing::info!(
             target: "zend::journal",
-            question = %question,
-            answer = %answer,
+            question = ?question,
+            answer = ?answer,
             "journal draft answered",
         );
         Ok(answer)

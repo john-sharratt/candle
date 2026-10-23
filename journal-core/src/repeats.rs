@@ -8,8 +8,13 @@
 //! — the character read its own repetition as the state of the world. A claim or
 //! intention that says nearly what a held entry (or an earlier line of the same
 //! entry) says is dropped, and so is a new open item that says what one still
-//! open says. "Nearly" is word overlap: the share of the two lines' distinct
-//! words they have in common.
+//! open says. "Nearly" is word overlap — the share of the two lines' distinct
+//! words they have in common — between lines that name the same identifiers.
+//!
+//! **An identifier is what a line is about.** "Found MAX_INTEND at verify.rs:20"
+//! and "Found MAX_CLAIMS at verify.rs:19" share nearly every word and say two
+//! different things, so a line naming an identifier the other does not — a
+//! constant, a path, a line number, a value — is never its repeat.
 
 use std::collections::BTreeSet;
 
@@ -18,17 +23,46 @@ use crate::entry::{Entry, Item};
 /// The word overlap at or above which two lines say the same thing.
 const SAME: f32 = 0.7;
 
-/// The words a line is compared on: lower case, letters and digits only, the
-/// short connective words left out.
-fn words(s: &str) -> BTreeSet<String> {
-    s.split(|c: char| !c.is_alphanumeric())
+/// A line as it is compared.
+struct Line {
+    /// Lower case, letters and digits only, the short connective words left out.
+    words: BTreeSet<String>,
+    /// The identifiers it names, lower case.
+    names: BTreeSet<String>,
+}
+
+/// Whether `token` names something rather than saying something: it holds a
+/// digit, an underscore or a path separator, or a capital after its first
+/// letter.
+fn is_name(token: &str) -> bool {
+    token
+        .chars()
+        .any(|c| c.is_ascii_digit() || c == '_' || c == '/')
+        || token.chars().skip(1).any(char::is_uppercase)
+        || token.trim_matches('.').contains('.')
+}
+
+fn line(s: &str) -> Line {
+    let words = s
+        .split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() > 2)
         .map(str::to_lowercase)
-        .collect()
+        .collect();
+    let names = s
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '/' | '.' | ':' | '-')))
+        .map(|t| t.trim_matches(|c| matches!(c, '.' | ':')))
+        .filter(|t| is_name(t))
+        .map(str::to_lowercase)
+        .collect();
+    Line { words, names }
 }
 
 /// Whether `a` and `b` say the same thing.
-fn same(a: &BTreeSet<String>, b: &BTreeSet<String>) -> bool {
+fn same(a: &Line, b: &Line) -> bool {
+    if a.names != b.names {
+        return false;
+    }
+    let (a, b) = (&a.words, &b.words);
     if a.is_empty() || b.is_empty() {
         return a == b;
     }
@@ -42,12 +76,12 @@ fn same(a: &BTreeSet<String>, b: &BTreeSet<String>) -> bool {
 pub fn drop_repeats(mut entry: Entry, held: &[Entry], open: &[Item]) -> (Entry, usize) {
     let before = entry.claims.len() + entry.intend.len() + entry.opened.len();
 
-    let mut said: Vec<BTreeSet<String>> = held
+    let mut said: Vec<Line> = held
         .iter()
-        .flat_map(|e| e.claims.iter().map(|c| words(&c.text)))
+        .flat_map(|e| e.claims.iter().map(|c| line(&c.text)))
         .collect();
     entry.claims.retain(|c| {
-        let w = words(&c.text);
+        let w = line(&c.text);
         let fresh = !said.iter().any(|s| same(s, &w));
         if fresh {
             said.push(w);
@@ -55,12 +89,12 @@ pub fn drop_repeats(mut entry: Entry, held: &[Entry], open: &[Item]) -> (Entry, 
         fresh
     });
 
-    let mut meant: Vec<BTreeSet<String>> = held
+    let mut meant: Vec<Line> = held
         .iter()
-        .flat_map(|e| e.intend.iter().map(|i| words(i)))
+        .flat_map(|e| e.intend.iter().map(|i| line(i)))
         .collect();
     entry.intend.retain(|i| {
-        let w = words(i);
+        let w = line(i);
         let fresh = !meant.iter().any(|s| same(s, &w));
         if fresh {
             meant.push(w);
@@ -70,12 +104,12 @@ pub fn drop_repeats(mut entry: Entry, held: &[Entry], open: &[Item]) -> (Entry, 
 
     // A restated item keeps its id and is the writer saying where it stands
     // now; only a new one that is already open is a repeat.
-    let mut standing: Vec<BTreeSet<String>> = open.iter().map(|i| words(&i.text)).collect();
+    let mut standing: Vec<Line> = open.iter().map(|i| line(&i.text)).collect();
     entry.opened.retain(|i| {
         if i.id != 0 {
             return true;
         }
-        let w = words(&i.text);
+        let w = line(&i.text);
         let fresh = !standing.iter().any(|s| same(s, &w));
         if fresh {
             standing.push(w);
@@ -182,6 +216,47 @@ mod tests {
         );
         assert_eq!(dropped, 1);
         assert!(!says_anything(&kept));
+    }
+
+    /// The live failure: the second question differed from the first only in
+    /// the constant it was about, and was dropped as a repeat of it.
+    #[test]
+    fn lines_about_different_identifiers_are_not_repeats() {
+        let held = [entry(
+            &["User asked me to find where MAX_CLAIMS is defined in journal-core with file_grep."],
+            &[],
+            &[],
+        )];
+        let fresh = entry(
+            &[
+                "User asked me to find where MAX_INTEND is defined in journal-core with file_grep.",
+                "User asked me to find where MAX_CLAIMS is defined in journal-core with file_grep",
+            ],
+            &[],
+            &[],
+        );
+        let (kept, dropped) = drop_repeats(fresh, &held, &[]);
+        let claims: Vec<&str> = kept.claims.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            claims,
+            ["User asked me to find where MAX_INTEND is defined in journal-core with file_grep."]
+        );
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn a_line_number_or_a_path_is_an_identifier_and_a_capitalised_word_is_not() {
+        let names = |s: &str| line(s).names.into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            names("Read verify.rs:19, then journal-core/src/ask.rs. It said 12."),
+            ["12", "journal-core/src/ask.rs", "verify.rs:19"]
+        );
+        assert_eq!(names("The gate refused the draft."), Vec::<String>::new());
+        assert_eq!(names("ToolSpec is read by zend."), ["toolspec"]);
+        let a = line("The parity test at scan.rs:40 failed.");
+        let b = line("The parity test at scan.rs:41 failed.");
+        assert!(!same(&a, &b));
+        assert!(same(&a, &line("the parity test at scan.rs:40 failed")));
     }
 
     #[test]
