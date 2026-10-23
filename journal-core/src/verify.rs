@@ -100,7 +100,8 @@ pub enum Verdict {
     Corrected,
     /// The world had no answer; the claim stands as prose.
     Demoted,
-    /// A later claim about the same subject and attribute replaced it.
+    /// A later claim about the same subject and attribute took its typed fact
+    /// over: it stands as prose, or is gone when the fact was all it said.
     Superseded,
 }
 
@@ -138,8 +139,19 @@ fn derive_kind(span: &Span, cite: &[u64]) -> Kind {
         .unwrap_or(Kind::Inferred)
 }
 
+/// A yes-or-no value as one word: `yes` is `true` and `no` is `false`, so a
+/// claim the world confirms is not "corrected" into the word it already meant.
+fn truth(v: &str) -> String {
+    let v = v.trim().to_lowercase();
+    match v.as_str() {
+        "yes" => "true".to_string(),
+        "no" => "false".to_string(),
+        _ => v,
+    }
+}
+
 fn same(a: &str, b: &str) -> bool {
-    a.trim().eq_ignore_ascii_case(b.trim())
+    truth(a) == truth(b)
 }
 
 /// Check a draft against the span it is about, the items open now, and the
@@ -204,7 +216,9 @@ pub fn verify(
                 }
             }
         }
-        // A newer claim about the same thing replaces the older one.
+        // A newer claim about the same thing takes the typed fact over. An
+        // older claim that was only that fact — its text the world's
+        // correction — goes; one that says more keeps what it says, as prose.
         if let Some(t) = &claim.typed {
             let key = (t.subject.to_lowercase(), t.attribute.to_lowercase());
             let at = claims.iter().position(|(_, o)| {
@@ -213,7 +227,12 @@ pub fn verify(
                 })
             });
             if let Some(i) = at {
-                let (older, _) = claims.remove(i);
+                let older = claims[i].0;
+                if claims[i].1.corrected {
+                    claims.remove(i);
+                } else {
+                    claims[i].1.typed = None;
+                }
                 if let Some(note) = notes.iter_mut().find(|note| note.claim == older) {
                     note.verdict = Verdict::Superseded;
                 }
@@ -560,6 +579,69 @@ mod tests {
             .notes
             .iter()
             .any(|n| n.claim == 0 && n.verdict == Verdict::Superseded));
+    }
+
+    /// The live failure: every claim of an entry carried the same typed fact,
+    /// and each newer one wiped out the older claim's sentence.
+    #[test]
+    fn claims_sharing_a_typed_fact_keep_their_sentences_and_the_newest_keeps_the_fact() {
+        let world = Fake::default().with("file:repo/mod.rs", "exists", "true");
+        let said = |text: &str, cite: u64| DraftClaim {
+            text: text.into(),
+            cite: vec![cite],
+            typed: Some(Typed {
+                subject: "file:repo/mod.rs".into(),
+                attribute: "exists".into(),
+                value: "true".into(),
+            }),
+        };
+        let v = verify(
+            Draft {
+                claims: vec![
+                    said("The grep found SKIP_QUESTION in style.rs.", 1),
+                    said("It asks for journal_skip with a reason.", 2),
+                ],
+                ..Default::default()
+            },
+            &span(),
+            &[],
+            &world,
+        )
+        .unwrap();
+        let texts: Vec<_> = v.entry.claims.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "The grep found SKIP_QUESTION in style.rs.",
+                "It asks for journal_skip with a reason."
+            ]
+        );
+        assert!(v.entry.claims[0].typed.is_none(), "the fact moved on");
+        assert!(v.entry.claims[1].typed.is_some(), "the newest holds it");
+        let verdicts: Vec<_> = v.notes.iter().map(|n| n.verdict).collect();
+        assert_eq!(verdicts, [Verdict::Superseded, Verdict::Kept]);
+    }
+
+    #[test]
+    fn yes_and_no_mean_true_and_false_to_the_check() {
+        let world = Fake::default()
+            .with("file:a", "exists", "true")
+            .with("file:b", "exists", "false");
+        let v = verify(
+            Draft {
+                claims: vec![
+                    typed("file:a", "exists", "Yes", &[1]),
+                    typed("file:b", "exists", "no", &[2]),
+                ],
+                ..Default::default()
+            },
+            &span(),
+            &[],
+            &world,
+        )
+        .unwrap();
+        assert!(v.entry.claims.iter().all(|c| !c.corrected));
+        assert!(v.notes.iter().all(|n| n.verdict == Verdict::Kept));
     }
 
     fn open_items() -> Vec<Item> {

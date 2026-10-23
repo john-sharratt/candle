@@ -17,9 +17,9 @@ use crate::clock::{day_of, stamp, WorldTime};
 pub const WRITE_QUESTION: &str = "Write it up with journal_write. `claims` is what happened, \
 one thing each: its `text` in one short sentence, and `cite`, the number of the turn it rests \
 on (`also_cite` for a second). Something you worked out and did not see or hear still cites \
-the turn that led you to it. If a claim is a fact that can be looked up — what a gauge read, \
-whose turn it is, where something is — add `typed`, with its `subject`, `attribute` and \
-`value`. `intend` is what you mean to do next, as short lines, at most three. `open` is what \
+the turn that led you to it. Only a claim that is itself one fact that can be looked up — what \
+a gauge read, whose turn it is, where something is — takes `typed`, with its `subject`, \
+`attribute` and `value`; any other claim takes none. `intend` is what you mean to do next, as short lines, at most three. `open` is what \
 is still unsettled: its `text`, and `relates` — `new` for something you were not carrying, \
 `restates N` to say an open item again, `resolves N` when it has been settled. Keep the whole \
 entry brief, and put nothing in that did not happen: a conclusion you only worked out is \

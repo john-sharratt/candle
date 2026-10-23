@@ -22,10 +22,11 @@ what it showed, each decision, each change made — so a stretch of several step
 claims, as many as it took to get there, up to twelve. Each claim's `text` is one short \
 sentence, and `cite` the number of the turn it rests on (`also_cite` for a second). A tool result you read is cited by its \
 number; so is what the user said, and so is a call you made. Something you worked out and did \
-not see in a result still cites the turn that led you to it. If a claim is about the workspace \
-— whether a file exists, which blob a file is at, which commit a branch is on — add `typed`, \
-with `subject` `file:<repo>/<path>` and `attribute` `exists` or `blob`, or `subject` \
-`branch:<repo>` and `attribute` `head`, and the `value`. `intend` is what you mean to do next, \
+not see in a result still cites the turn that led you to it. Only a claim that is itself one \
+fact about the workspace — that a file exists or not, which blob a file is at, which commit a \
+branch is on — takes `typed`, with `subject` `file:<repo>/<path>` and `attribute` `exists` or \
+`blob`, or `subject` `branch:<repo>` and `attribute` `head`, and the `value`; a claim about what \
+a file says, or what a result showed, takes none. `intend` is what you mean to do next, \
 as short lines, at most three. `open` is what is still unsettled — a failing test, a question \
 the user has not answered, a step not done: its `text`, and `relates` — `new` for something \
 you were not carrying, `restates N` to say an open item again, `resolves N` when it has been \

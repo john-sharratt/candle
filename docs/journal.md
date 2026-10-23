@@ -93,10 +93,14 @@ and has no `unsure` option: the journal is deterministic.
   not stop having been done; anything else about the world may stop being so
   without the character noticing. A perishable line renders with `(re-check)`.
 * **Typed claims** `{subject, attribute, value}` are checked at commit against
-  what the world reads now (§4), compared without regard to case. A match is
-  kept. A mismatch is replaced by what the world says and marked `corrected`. A
-  claim the world cannot answer (`None`) is demoted to prose.
-* **Dedup**: typed claims are unique per `(subject, attribute)`; the newest wins.
+  what the world reads now (§4), compared without regard to case, with `yes` and
+  `no` read as `true` and `false`. A match is kept. A mismatch is replaced by what
+  the world says and marked `corrected`. A claim the world cannot answer (`None`)
+  is demoted to prose. Only a claim that is itself one such fact is asked to
+  carry `typed`.
+* **Dedup**: typed facts are unique per `(subject, attribute)`; the newest claim
+  keeps the fact. An older claim is `superseded`: it stays as prose without its
+  `typed`, unless it was only the fact — a correction's text — when it goes.
 * **Open items**: `restates` and `resolves` must name an item that is open, and an
   item may not be both in one entry. At most `MAX_OPEN` (6) items are open; past
   that the oldest is dropped.
