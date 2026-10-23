@@ -713,6 +713,12 @@ impl<S: VoteStore> Paxos<S> {
         keys
     }
 
+    /// Every lease this member's acceptor still counts at `now`, by holder,
+    /// with the term it has left.
+    pub fn running_leases(&self, now: Millis) -> Vec<(u64, Duration)> {
+        self.acceptor.running_leases(now)
+    }
+
     /// The leases this member holds at `now`.
     pub fn held(&self, now: Millis) -> Vec<Vec<u8>> {
         self.held

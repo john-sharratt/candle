@@ -199,6 +199,24 @@ impl<S: VoteStore> Acceptor<S> {
         Ok(idle.len())
     }
 
+    /// Every lease this acceptor has accepted and still counts at `now`: its
+    /// holder, and how long its term has left on this acceptor's clock.
+    pub fn running_leases(&self, now: Millis) -> Vec<(u64, Duration)> {
+        self.leases
+            .iter()
+            .filter(|(_, (end, _))| now < *end)
+            .filter_map(|(key, (end, _))| {
+                let accepted = self.votes.get(key)?.accepted.as_ref()?;
+                match Value::decode(&accepted.value) {
+                    Ok(Value::Lease { holder, .. }) => {
+                        Some((holder, Duration::from_millis(end.0 - now.0)))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// The vote held for `key`, for tests and the status page.
     pub fn vote(&self, key: &[u8]) -> Option<&Vote> {
         self.votes.get(key)
@@ -312,6 +330,26 @@ mod tests {
             a.prepare(b"x", b(3, 2), at(35)).unwrap(),
             PrepareReply::Promise(None)
         );
+    }
+
+    /// The running leases name each holder with the term it has left; a
+    /// decision, an expired lease and a released one are not among them.
+    #[test]
+    fn running_leases_are_the_unexpired_ones_by_holder() {
+        let mut a = Acceptor::open(MemoryVotes::new(), at(0)).unwrap();
+        a.propose(b"w1", b(1, 4), &lease(4, 30), at(10)).unwrap();
+        a.propose(b"w2", b(1, 7), &lease(7, 20), at(10)).unwrap();
+        a.propose(b"d", b(1, 7), b"\0x", at(10)).unwrap();
+        a.propose(b"w3", b(1, 9), &lease(9, 30), at(10)).unwrap();
+        a.release(b"w3", b(1, 9), at(12)).unwrap();
+        let mut running = a.running_leases(at(15));
+        running.sort();
+        assert_eq!(
+            running,
+            [(4, Duration::from_secs(25)), (7, Duration::from_secs(15))]
+        );
+        assert_eq!(a.running_leases(at(30)), [(4, Duration::from_secs(10))]);
+        assert!(a.running_leases(at(40)).is_empty());
     }
 
     #[test]

@@ -1712,10 +1712,17 @@ among the members of the app.
   - after **5 minutes** short it **proposes** the lower value — `max(ready, 2)` — in its
     log and in `/v1/status` (`cluster.apps.<app>.replication.quorum.downgrade`, with how
     long the group has been short and how long until the write);
-  - after **20 minutes** short it **executes**: writes the *set*. That is the longest
-    term any lease is taken for (the upgrade install's, `READY_WITHIN` + 5 min; a world
-    lease is 30 s). An absent member cannot renew without a quorum, so by then every
-    lease it held has run out on every acceptor and none is granted twice;
+  - it **executes** — writes the *set* — as soon as no lease can be granted twice:
+    - **down to two, through the voting gateway** (one cluster, and a reply flagged as
+      the tie-break seen on its socket in the last 10 minutes): once the leases its own
+      acceptor holds for members not ready have lapsed — at once with none, within a
+      world lease's 30 s with one. The gateway answered every round, so it accepted
+      every lease and decision the old group was asked for, and every quorum of the
+      lowered group — two members, or one and the gateway — holds an acceptor that
+      reports such a lease for its whole term;
+    - **otherwise after 20 minutes** short, the longest term any lease is taken for
+      (the upgrade install's, `READY_WITHIN` + 5 min). An absent member cannot renew
+      without a quorum, so by then every lease it held has run out on every acceptor;
   - **never below two**, where the voting gateway's tie-break completes a majority,
     so one member and the gateway decide but a lone member never does;
   - **only from a member that sees the whole group**: joined, in no fault, not drained,

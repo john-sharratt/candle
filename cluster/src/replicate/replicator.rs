@@ -211,6 +211,8 @@ pub(super) struct State {
     /// Whether the group has stayed short of `max_members`, and what is
     /// proposed for it (§5.9).
     pub governor: Governor,
+    /// When a reply flagged as the gateway's tie-break vote last arrived.
+    pub voter_seen: Option<Instant>,
     pub stats: Stats,
 }
 
@@ -404,6 +406,7 @@ impl Replicator {
                 last_rejoin: None,
                 coord_sent: None,
                 governor: Governor::default(),
+                voter_seen: None,
                 stats: Stats::default(),
             }),
             send_wake: Notify::new(),
@@ -663,7 +666,7 @@ impl Replicator {
             quorum: QuorumView {
                 max_members: s.max_members,
                 ready,
-                downgrade: s.governor.view(Instant::now(), s.max_members, ready),
+                downgrade: s.governor.view(Instant::now()),
             },
         }
     }

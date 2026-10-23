@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::lease::LeaseEvent;
-use super::quorum_governor::Step;
+use super::quorum_governor::{Look, Step};
 use super::replicator::{Phase, Rejoin, Replicator, State};
 use crate::consensus::Out;
 use crate::frame::{Frame, MemberState};
@@ -30,6 +30,11 @@ pub const REJOIN_WAIT: Duration = Duration::from_secs(10);
 /// How long a member left cut off for want of a quorum waits to try again.
 pub const REJOIN_RETRY: Duration = Duration::from_secs(5);
 
+/// How recently a tie-break reply must have arrived on this member's socket
+/// for its gateway to count as the voter every round passes through. Leases
+/// renew every 10 s, so a live group hears from the voter far more often.
+const VOTER_FRESH: Duration = Duration::from_secs(10 * 60);
+
 fn generation_key(k: u64) -> Vec<u8> {
     format!("gen/{k}").into_bytes()
 }
@@ -37,6 +42,17 @@ fn generation_key(k: u64) -> Vec<u8> {
 impl Replicator {
     /// A Paxos frame from another member.
     pub(super) fn paxos_frame(self: &Arc<Self>, frame: &Frame) {
+        // A reply flagged as the tie-break says this member's gateway is the
+        // voter, which every round passes through (`super::quorum_governor`).
+        let from_voter = match frame {
+            Frame::Promise(p) => p.tiebreak,
+            Frame::Nack(n) => n.tiebreak,
+            Frame::Accepted(a) => a.tiebreak,
+            _ => false,
+        };
+        if from_voter {
+            self.state().voter_seen = Some(Instant::now());
+        }
         // Another member handing a lease back says how far its writes reach,
         // for whoever takes the lease next (§9.6).
         if let Frame::Release(r) = frame {
@@ -322,12 +338,33 @@ impl Replicator {
     /// Look at the group once for the governor (`super::quorum_governor`), and
     /// write the lower `max_members` it asks for.
     async fn govern_quorum(self: &Arc<Self>) {
-        let ready = self.ready_members();
+        let ready_nodes = self.ready_nodes();
+        let ready = ready_nodes.len() as u32;
+        // The leases this member's acceptor still counts for members that are
+        // not ready: what a lowering to the floor waits for.
+        let absent_lease_left = {
+            let now = self.now();
+            self.paxos
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .running_leases(now)
+                .into_iter()
+                .filter(|(holder, _)| *holder != self.node && !ready_nodes.contains(holder))
+                .map(|(_, left)| left)
+                .max()
+        };
         let step = {
             let mut s = self.state();
-            let eligible = Self::sees_whole_group(&s);
-            let max = s.max_members;
-            s.governor.observe(Instant::now(), max, ready, eligible)
+            let look = Look {
+                now: Instant::now(),
+                max: s.max_members,
+                ready,
+                eligible: Self::sees_whole_group(&s),
+                one_gateway: s.sockets.len() == 1
+                    && s.voter_seen.is_some_and(|at| at.elapsed() <= VOTER_FRESH),
+                absent_lease_left,
+            };
+            s.governor.observe(look)
         };
         match step {
             Step::Hold => {}
@@ -356,7 +393,8 @@ impl Replicator {
                     from,
                     to,
                     ready,
-                    "the group stayed short past the longest lease: max_members lowered"
+                    "the group stayed short and the absent members' leases have lapsed: \
+                     max_members lowered"
                 );
                 let store = self.store.clone();
                 let _ = tokio::task::spawn_blocking(move || store.set_max_members(to)).await;
@@ -365,9 +403,15 @@ impl Replicator {
         }
     }
 
+    /// How many distinct ready members are visible at once across every
+    /// cluster, this one included when it is ready.
+    pub(super) fn ready_members(&self) -> u32 {
+        self.ready_nodes().len() as u32
+    }
+
     /// The distinct ready members visible at once across every cluster, this
     /// one included when it is ready.
-    pub(super) fn ready_members(&self) -> u32 {
+    fn ready_nodes(&self) -> BTreeSet<u64> {
         let s = self.state();
         let mut ready: BTreeSet<u64> = s
             .members
@@ -380,6 +424,6 @@ impl Replicator {
         if s.phase == Phase::Joined && s.ready.iter().any(|r| *r) {
             ready.insert(self.node);
         }
-        ready.len() as u32
+        ready
     }
 }
