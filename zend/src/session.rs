@@ -49,9 +49,9 @@ use candle_conversation::RecoveredMessage;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
-    Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers, OptionalState,
-    ProjectionEvent, SamplingConfig, SelectionState, Sequence, ThinkSteering, TokenDecoder,
-    TurnEvent, TurnHandle, TurnResponse, UnsealedAsker,
+    Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers, Linking,
+    OptionalState, ProjectionEvent, SamplingConfig, SelectionState, Sequence, ThinkSteering,
+    TokenDecoder, TurnEvent, TurnHandle, TurnResponse, UnsealedAsker,
 };
 use host::download::ensure_model_pack;
 use host::process::fatal;
@@ -4953,6 +4953,7 @@ async fn carry_journal(
             conv,
             JOURNAL,
             &carry::wants(&prompt),
+            Linking::Chain,
             &prompt.sweep(),
             None,
             tokio::time::sleep,

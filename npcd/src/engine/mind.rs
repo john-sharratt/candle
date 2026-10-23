@@ -62,8 +62,8 @@ use candle_conversation::stencil::{
     ToolCallEnvelope, ToolSpec, TreeSpec,
 };
 use candle_conversation::{
-    Carried, ConversationEngine, PromptDump, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
-    UnsealedAsker, Want,
+    Carried, ConversationEngine, Linking, PromptDump, SamplingConfig, Sequence, SequenceConfig,
+    TurnOptions, UnsealedAsker, Want,
 };
 use journal_core::journal::Holds;
 use journal_core::section::{self, entry_section, JournalPrompt, Kept, META_KEPT};
@@ -1253,6 +1253,7 @@ impl Minds {
                 sequence,
                 identity::JOURNAL,
                 &journal_wants(Some(prompt)),
+                Linking::Chain,
                 &sweep,
                 None,
                 tokio::time::sleep,
@@ -1900,6 +1901,7 @@ impl Minds {
                 &mut live.sequence,
                 identity::MISSION,
                 &mission.into_iter().collect::<Vec<_>>(),
+                Linking::Apart,
                 &[identity::MISSION_SECTION],
                 Some(SEAL_WAIT),
                 tokio::time::sleep,
@@ -1911,6 +1913,7 @@ impl Minds {
                 &mut live.sequence,
                 identity::JOURNAL,
                 &journal_wants(persona.journal),
+                Linking::Chain,
                 &journal_sweep(persona.journal),
                 None,
                 tokio::time::sleep,

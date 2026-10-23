@@ -486,6 +486,13 @@ pub(crate) enum SchedulerRequest {
         /// closing tags) which the slot always carries.  Drives
         /// section-quantize policy selection at seal time.
         in_collection: bool,
+        /// The recurrent state at the section's first token — the state the
+        /// prefix leaves behind. Staged on the scratch slot before the prefill,
+        /// so the section's recurrence continues from its prefix rather than
+        /// starting from zero, and with it every layer the recurrence feeds,
+        /// which is what the section's K/V is computed from. `None` for a model
+        /// that carries no recurrent state.
+        start: Option<SharedState>,
         response_tx: Sender<Result<SealResult, ConversationError>>,
     },
 
@@ -561,8 +568,12 @@ pub(crate) enum SchedulerRequest {
     /// Replies `Ok(None)` when the model carries no recurrent state, so the
     /// caller can ask unconditionally and pay nothing on a plain transformer.
     BranchCheckpointPass {
-        /// The branch's complete ordered token stream — every sealed section of
-        /// the system prompt under one selector assignment, concatenated.
+        /// The state the stream continues from: `None` for a stream that starts
+        /// the prompt, the state at its first token for one that continues it.
+        start: Option<SharedState>,
+        /// The ordered token stream — every sealed section of the system prompt
+        /// under one selector assignment, concatenated, or the sections a
+        /// continuation runs on from `start`.
         tokens: TokenBuffer,
         response_tx: Sender<Result<Option<ExportedState>, ConversationError>>,
     },
@@ -2250,6 +2261,8 @@ pub(super) struct QueuedSection {
     pub(super) address: ContentAddress,
     pub(super) debug_name: String,
     pub(super) in_collection: bool,
+    /// See [`SchedulerRequest::IngestSection::start`].
+    pub(super) start: Option<SharedState>,
     pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
 }
 
@@ -4965,6 +4978,7 @@ impl Scheduler {
                 address,
                 debug_name,
                 in_collection,
+                start,
                 response_tx,
             } => {
                 let section = QueuedSection {
@@ -4975,6 +4989,7 @@ impl Scheduler {
                     address,
                     debug_name,
                     in_collection,
+                    start,
                     response_tx,
                 };
                 if section.tokens.is_empty() {
@@ -5182,10 +5197,11 @@ impl Scheduler {
             }
 
             SchedulerRequest::BranchCheckpointPass {
+                start,
                 tokens,
                 response_tx,
             } => {
-                let result = self.handle_branch_checkpoint_pass(&tokens);
+                let result = self.handle_branch_checkpoint_pass(start.as_ref(), &tokens);
                 let _ = response_tx.send(result);
                 true
             }
@@ -5246,39 +5262,11 @@ impl Scheduler {
                 let mut installed = false;
                 let mut first_err = None;
                 for sequence_id in sequence_ids {
-                    if !state.layers.is_empty() {
-                        match self
-                            .model
-                            .stage_recurrent(
-                                sequence_id.0,
-                                state.schedule_hash,
-                                Arc::clone(&state.layers),
-                            )
-                            .map_err(ConversationError::Model)
-                        {
-                            Ok(did) => installed |= did,
-                            Err(e) => {
-                                if first_err.is_none() {
-                                    first_err = Some(e);
-                                }
-                            }
-                        }
-                    }
-                    // The aux blob is installed even when the layers were
-                    // refused: the two classes validate independently, and a
-                    // schedule-hash mismatch on the delta-rule rows says nothing
-                    // about whether this model can read these bytes.
-                    if !state.aux.is_empty() {
-                        match self
-                            .model
-                            .restore_aux_state(sequence_id.0, &state.aux)
-                            .map_err(ConversationError::Model)
-                        {
-                            Ok(did) => installed |= did,
-                            Err(e) => {
-                                if first_err.is_none() {
-                                    first_err = Some(e);
-                                }
+                    match self.stage_state(sequence_id.0, &state) {
+                        Ok(did) => installed |= did,
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
                             }
                         }
                     }
@@ -8635,6 +8623,14 @@ impl Scheduler {
         s: QueuedSection,
     ) -> Result<(), Box<(QueuedSection, ConversationError)>> {
         if !s.tokens.is_empty() {
+            // The prefix's state first, so the claim below takes it as the
+            // slot's store instead of building one from zero.
+            if let Some(start) = &s.start {
+                if let Err(e) = self.stage_state(s.sequence_id.0, start) {
+                    let _ = s.response_tx.send(Err(e));
+                    return Ok(());
+                }
+            }
             if let Err(e) = self.model.claim_carried_state(s.sequence_id.0) {
                 return Err(Box::new((s, ConversationError::Model(e))));
             }
@@ -10125,8 +10121,13 @@ impl Scheduler {
     /// The chunking is not an optimisation: one forward over a whole 2,000-token
     /// prompt is a transient activation spike large enough to page, which is the
     /// same reason `build_section_batch` bounds its own per-forward budget.
+    ///
+    /// With `start`, the stream continues from that state: it is staged on the
+    /// slot before the first token, so what comes back is the state after the
+    /// prefix `start` describes and then `tokens`.
     fn handle_branch_checkpoint_pass(
         &mut self,
+        start: Option<&SharedState>,
         tokens: &[u32],
     ) -> Result<Option<ExportedState>, ConversationError> {
         if !self.model.carries_recurrent_state() {
@@ -10139,12 +10140,48 @@ impl Scheduler {
             .session
             .create_sequence()
             .map_err(ConversationError::Model)?;
-        let result = self
-            .prefill_tokens_on(seq, tokens)
+        let staged = match start {
+            Some(state) => self.stage_state(seq, state).map(|_| ()),
+            None => Ok(()),
+        };
+        let result = staged
+            .and_then(|()| self.prefill_tokens_on(seq, tokens))
             .and_then(|()| self.export_state_of(seq));
         let _ = self.model.release_sequence(seq);
         let _ = self.session.free_sequence(seq);
         result
+    }
+
+    /// Stage `state` on `seq`, for the slot to take as its own the first time
+    /// its state is wanted. Both classes are attempted whatever happens to the
+    /// other — they validate independently, and a schedule-hash mismatch on the
+    /// delta-rule rows says nothing about whether this model can read the aux
+    /// bytes — and the first error is returned. `Ok(false)` when the model took
+    /// neither.
+    fn stage_state(&self, seq: usize, state: &SharedState) -> Result<bool, ConversationError> {
+        let mut staged = false;
+        let mut first_err = None;
+        if !state.layers.is_empty() {
+            match self
+                .model
+                .stage_recurrent(seq, state.schedule_hash, Arc::clone(&state.layers))
+            {
+                Ok(did) => staged |= did,
+                Err(e) => first_err = Some(ConversationError::Model(e)),
+            }
+        }
+        if !state.aux.is_empty() {
+            match self.model.restore_aux_state(seq, &state.aux) {
+                Ok(did) => staged |= did,
+                Err(e) => {
+                    first_err.get_or_insert(ConversationError::Model(e));
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(staged),
+        }
     }
 
     /// Both classes of a sequence's recurrent state, from one export.
@@ -14358,7 +14395,7 @@ mod tests {
     fn the_branch_checkpoint_pass_returns_state_the_tokens_produced() {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(&[1, 2, 3, 4])
+            .handle_branch_checkpoint_pass(None, &[1, 2, 3, 4])
             .expect("pass ran")
             .expect("a model that carries state returns some");
         assert_eq!(state.schedule_hash, DummyRecurrentModel::SCHEDULE_HASH);
@@ -14383,7 +14420,7 @@ mod tests {
         let before = probe.len();
         for _ in 0..4 {
             sched
-                .handle_branch_checkpoint_pass(&[7, 7, 7])
+                .handle_branch_checkpoint_pass(None, &[7, 7, 7])
                 .expect("pass ran");
         }
         assert_eq!(
@@ -14404,7 +14441,7 @@ mod tests {
         let (mut sched, _tx) = make_test_scheduler();
         assert!(
             sched
-                .handle_branch_checkpoint_pass(&[1, 2, 3])
+                .handle_branch_checkpoint_pass(None, &[1, 2, 3])
                 .expect("pass ran")
                 .is_none(),
             "a model with no recurrent state must not run a prefill for a \
@@ -14424,7 +14461,7 @@ mod tests {
 
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(&[5, 6, 7, 8])
+            .handle_branch_checkpoint_pass(None, &[5, 6, 7, 8])
             .expect("pass ran")
             .expect("state");
         let computed = state.layers.clone();
@@ -14481,7 +14518,7 @@ mod tests {
     fn a_branch_checkpoint_under_a_foreign_schedule_is_refused() {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(&[3, 1, 4])
+            .handle_branch_checkpoint_pass(None, &[3, 1, 4])
             .expect("pass ran")
             .expect("state");
         let slot = sched.session.create_sequence().expect("slot");
@@ -14500,7 +14537,7 @@ mod tests {
     fn install_recurrent_state_request_installs_onto_the_named_slot() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(&[2, 4, 6])
+            .handle_branch_checkpoint_pass(None, &[2, 4, 6])
             .expect("pass ran")
             .expect("state");
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
@@ -14514,6 +14551,85 @@ mod tests {
         assert!(
             rx.recv().expect("reply").expect("install"),
             "the install reported that no state was carried"
+        );
+        assert!(probe.get(slot.0).is_some(), "the slot has no state");
+    }
+
+    /// **A pass continued from a prefix's state runs on from it** — what a
+    /// chain of sections relies on: an entry sealed from the state the entries
+    /// before it leave is computed after them, not from zero. The toy
+    /// recurrence advances per forward (`s ← 2s + t·k`), so four tokens and
+    /// then five land on `2·4k + 5k = 13k`, and five from zero on `5k`. Exact
+    /// in f32, so compared without tolerance. Both recurrences carry over: the
+    /// index stands at all nine tokens.
+    #[test]
+    fn a_pass_continued_from_a_state_runs_on_from_it() {
+        let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
+        let head = sched
+            .handle_branch_checkpoint_pass(None, &[1, 2, 3, 4])
+            .expect("pass ran")
+            .expect("state");
+        let continued = sched
+            .handle_branch_checkpoint_pass(Some(&SharedState::from(&head)), &[5, 6, 7, 8, 9])
+            .expect("pass ran")
+            .expect("state");
+        let cells = |s: &ExportedState| -> Vec<f32> {
+            s.layers
+                .iter()
+                .flat_map(|l| l.state.chunks_exact(4))
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        };
+        let expected: Vec<f32> = (1..=8).map(|k| 13.0 * k as f32).collect();
+        assert_eq!(
+            cells(&continued),
+            expected,
+            "the continuation lost the prefix's state"
+        );
+        let index = ToyIndex::decode(&continued.aux).expect("the aux blob is this model's");
+        assert_eq!(index.tokens, 9, "the index did not carry over");
+    }
+
+    /// **A section seal starts from the state it is given.** Staged before the
+    /// slot claims its carried state, so the claim takes it as the slot's store
+    /// rather than building one from zero — the state a prefill then runs on.
+    #[test]
+    fn a_section_seal_starts_from_the_state_it_is_given() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let start = sched
+            .handle_branch_checkpoint_pass(None, &[2, 4, 6])
+            .expect("pass ran")
+            .expect("state");
+        let slot = SequenceId(sched.session.create_sequence().expect("slot"));
+        let (response_tx, _rx) = flume::bounded(1);
+        let queued = QueuedSection {
+            sequence_id: slot,
+            section_id: SectionId::new(1),
+            prefix_section_ids: Vec::new(),
+            tokens: TokenBuffer::from(vec![1u32; 4]),
+            address: ContentAddress::default(),
+            debug_name: "s".into(),
+            in_collection: true,
+            start: Some(SharedState::from(&start)),
+            response_tx,
+        };
+        assert!(
+            sched.begin_section(queued).is_ok(),
+            "the section was refused"
+        );
+        let (_, held) = sched
+            .model
+            .export_recurrent(slot.0)
+            .expect("export")
+            .expect("the slot holds a state");
+        assert_eq!(
+            held.iter().map(|l| l.state.clone()).collect::<Vec<_>>(),
+            start
+                .layers
+                .iter()
+                .map(|l| l.state.clone())
+                .collect::<Vec<_>>(),
+            "the slot's state before its prefill is not the one it was given"
         );
         assert!(probe.get(slot.0).is_some(), "the slot has no state");
     }
@@ -14537,7 +14653,7 @@ mod tests {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
         let tokens = [1u32, 2, 3, 4, 5, 6, 7];
         let state = sched
-            .handle_branch_checkpoint_pass(&tokens)
+            .handle_branch_checkpoint_pass(None, &tokens)
             .expect("pass ran")
             .expect("state");
         assert!(!state.layers.is_empty(), "no delta-rule layers");
@@ -14571,7 +14687,7 @@ mod tests {
             let n = (2 * TOY_INDEX_RATIO + extra) as usize;
             let tokens: Vec<u32> = (0..n as u32).collect();
             let state = sched
-                .handle_branch_checkpoint_pass(&tokens)
+                .handle_branch_checkpoint_pass(None, &tokens)
                 .expect("pass ran")
                 .expect("state");
 
@@ -14601,7 +14717,7 @@ mod tests {
     fn install_recurrent_state_request_installs_the_aux_blob_too() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(&[2, 4, 6, 8, 10])
+            .handle_branch_checkpoint_pass(None, &[2, 4, 6, 8, 10])
             .expect("pass ran")
             .expect("state");
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
@@ -14709,7 +14825,7 @@ mod tests {
         let before = probe.index.lock().unwrap().len();
         for _ in 0..4 {
             sched
-                .handle_branch_checkpoint_pass(&[7, 7, 7])
+                .handle_branch_checkpoint_pass(None, &[7, 7, 7])
                 .expect("pass ran");
         }
         assert_eq!(
@@ -14729,7 +14845,7 @@ mod tests {
     fn install_recurrent_state_request_installs_onto_every_named_slot() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(&[2, 4, 6])
+            .handle_branch_checkpoint_pass(None, &[2, 4, 6])
             .expect("pass ran")
             .expect("state");
         let slots: Vec<SequenceId> = (0..3)
@@ -16735,6 +16851,7 @@ mod tests {
             address: ContentAddress::default(),
             debug_name: "s".into(),
             in_collection: false,
+            start: None,
             response_tx,
         }));
         (slot, response_rx)

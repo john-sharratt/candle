@@ -143,6 +143,15 @@ timeline.
   no placeholder: the prompt never shows a journal heading without the entries
   under it. (A placeholder member was tried and dropped: a reply that read it
   instead of the entries, asked what its journal held, made them up.)
+- **The sections are a chain.** Each is sealed as the continuation of the ones
+  before it (`Sequence::submit_section`'s `after`): its K/V attends to them,
+  and its recurrence runs on from the state they leave — itself run on from
+  the state the prompt before the collection leaves, kept once for every
+  conversation on the prompt. Read straight after them, an entry is computed
+  as it is read. A new entry seals the entry and the closing section; the
+  oldest ageing out, or a forgotten entry, reseals everything after it
+  (`Linking::Chain`), and its address names what it continues, so a restart
+  restores the right one. A round pins only the chain's sealed beginning.
 - **At the head of every round** the conversation's sections are reconciled with
   its journal (`carry_journal`). Nothing waits for a seal: a new entry joins the
   prompt the first round after its section seals, and until then the turns it

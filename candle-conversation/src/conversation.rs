@@ -15,7 +15,7 @@ use candle_transformers::models::delta_net::ExportedLayerState;
 use crate::persistence::content_hash::{
     hash_tokens, section_stream_id, turn_stream_id, ContentChain, ContentHash,
 };
-use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
+use crate::persistence::record::BranchCheckpointPayload;
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
     decode_events, decode_points, from_projection_with_origins, Builder, Conversation, Observe,
@@ -23,7 +23,6 @@ use crate::projection::{
     SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::provenance::{decode_wide_sigs, WideQSig};
-use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
     note_branch_checkpoint_computed, note_branch_checkpoint_installed, ProjectionInputs,
@@ -218,12 +217,14 @@ use flume::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 mod carried;
-pub use carried::{Carried, Want};
+pub use carried::{Carried, Linking, Want};
 mod ephemeral_turn;
 pub use ephemeral_turn::{AskScope, UnsealedAsker};
+mod prefix_state;
 mod prompt_dump;
 mod submitted_sections;
 
+use prefix_state::{checkpoint, shared, state_after};
 pub use prompt_dump::{PieceKind, PromptDump, PromptPiece};
 use submitted_sections::SubmittedSections;
 pub use submitted_sections::{SectionRef, SectionState};
@@ -683,20 +684,8 @@ pub(crate) fn install_branch_states(
     for (_, payload, sequence_ids) in groups {
         // The scheduler installs from a shared slice, so the layers are
         // materialised once for the whole group rather than per slot.
-        let layers: Arc<[ExportedLayerState]> = payload
-            .layers
-            .iter()
-            .map(|l| ExportedLayerState {
-                layer_index: l.layer_index,
-                n_v_heads: l.n_v_heads,
-                d_v: l.d_v,
-                d_k: l.d_k,
-                state: l.state.clone(),
-                conv_channels: l.conv_channels,
-                conv_tail_cols: l.conv_tail_cols,
-                conv_tail: l.conv_tail.clone(),
-            })
-            .collect();
+        let state = shared(&payload);
+        let layers = Arc::clone(&state.layers);
         let n_layers = layers.len();
         let n_slots = sequence_ids.len();
         // A transplanted state is never recomputed by the slot that receives it,
@@ -721,11 +710,7 @@ pub(crate) fn install_branch_states(
         scheduler_tx
             .send(SchedulerRequest::InstallRecurrentState {
                 sequence_ids,
-                state: SharedState {
-                    schedule_hash: payload.schedule_hash,
-                    layers,
-                    aux: payload.aux.clone().into(),
-                },
+                state,
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -1385,51 +1370,21 @@ impl Sequence {
         if tokens.is_empty() {
             return Ok(None);
         }
-        match self.substrate.read_branch_checkpoint(prefix) {
-            // Already durable — and hand the decoded payload straight back
-            // rather than dropping it. `read_branch_checkpoint` reads the whole
-            // ~63 MiB record off the log and decodes it; returning `None` here
-            // made `restore_branch_checkpoint` read and decode the identical
-            // record a moment later, so every conversation opened on an
-            // already-checkpointed branch — the steady state, and the entire
-            // point of the cache — paid the cost twice under the persistence
-            // lock.
-            Ok(Some(p)) => return Ok(Some((prefix, Some(p)))),
-            Ok(None) => {}
-            Err(e) => {
-                // Present but unreadable: recompute over it rather than leaving
-                // the branch without one.
-                tracing::warn!("branch checkpoint unreadable, recomputing: {e}");
-            }
-        }
-
-        let (tx, rx) = flume::bounded(1);
-        self.scheduler_tx
-            .send(SchedulerRequest::BranchCheckpointPass {
-                tokens: TokenBuffer::from(tokens),
-                response_tx: tx,
-            })
-            .map_err(|_| ConversationError::SchedulerGone)?;
-        match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
-            Ok(Some(state)) => {
-                let payload = Arc::new(BranchCheckpointPayload {
-                    prefix_hash: prefix,
-                    schedule_hash: state.schedule_hash,
-                    layers: state.layers.into_iter().map(SnapshotLayer::from).collect(),
-                    aux: state.aux,
-                });
-                self.substrate
-                    .enqueue_branch_checkpoint(prefix, payload.clone());
-                // Hold it decoded: the conversations opened next are on this
-                // same branch, and the durable record they would otherwise read
-                // is only just being written.
-                self.substrate.memo_branch_checkpoint(prefix, &payload);
-                note_branch_checkpoint_computed();
-                tracing::info!("computed the prompt branch checkpoint");
+        // An already-durable checkpoint comes back decoded rather than being
+        // dropped: `read_branch_checkpoint` reads the whole ~63 MiB record off
+        // the log, and returning `None` here made `restore_branch_checkpoint`
+        // read and decode the identical record a moment later.
+        match checkpoint(&self.scheduler_tx, &self.substrate, prefix, tokens) {
+            Ok(Some((payload, computed))) => {
+                if computed {
+                    note_branch_checkpoint_computed();
+                    tracing::info!("computed the prompt branch checkpoint");
+                }
                 Ok(Some((prefix, Some(payload))))
             }
             // The model carries no recurrent state after all.
             Ok(None) => Ok(None),
+            Err(ConversationError::SchedulerGone) => Err(ConversationError::SchedulerGone),
             Err(e) => {
                 tracing::warn!(
                     "branch checkpoint pass failed ({e}) — the first turn will start \
@@ -1825,6 +1780,24 @@ impl Sequence {
         // right shape.  `fork()` would also mint a timeline (and write
         // a manifest record per section under any future persistence
         // layer), which is wasted effort here.
+        //
+        // A collection's members all start their recurrence from the state the
+        // prompt before the collection leaves — one state for the batch, kept
+        // under that prefix for every conversation on the prompt — so a member
+        // is computed as it is read, straight after that prefix. They do not
+        // attend to one another, and do not continue one another's state: a
+        // projection picks among them.
+        let start = if in_collection && !to_ingest.is_empty() {
+            let system = &self.projection.schema().system_prompt;
+            let prompt: Vec<SectionId> = prefix_section_ids
+                .iter()
+                .copied()
+                .filter(|&id| !system.is_collection_member(id))
+                .collect();
+            state_after(&self.scheduler_tx, &self.substrate, &prompt)?
+        } else {
+            None
+        };
         let mut slot_ids: Vec<SequenceId> = Vec::with_capacity(to_ingest.len());
         for _ in 0..to_ingest.len() {
             match self.alloc_scratch_slot() {
@@ -1862,6 +1835,7 @@ impl Sequence {
                     address: item.address,
                     debug_name: item.debug_name,
                     in_collection,
+                    start: start.clone(),
                     response_tx: tx,
                 })
                 .is_err()

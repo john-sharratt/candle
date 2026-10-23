@@ -305,7 +305,12 @@ turn after it has, and until then the turns it was written from are still in the
 window. While nothing has sealed, `journal_none` shows.
 
 * **One section per entry** (`journal/<id>`), the newest `IN_PROMPT` (5) of them,
-  and one for the open items (`journal/open`, absent when nothing is open).
+  and one for the open items (`journal/open`), which closes the journal. They are
+  a **chain**: each is sealed after the ones before it — attending to them, its
+  recurrence running on from the state they leave — so read in order it is
+  computed as it is read (`docs/deltanet_state_persistence.md` §11a.3b-i). A new
+  entry reseals itself and the closing section; one ageing out reseals what
+  follows it; a turn pins only the chain's sealed beginning.
   `Minds::prepare` reconciles them before each turn through the same `Carried`
   reconcile the mission uses (`mind/carried.rs`): what the prompt wants and is not
   yet held is submitted and sealed; a section the prompt no longer wants is

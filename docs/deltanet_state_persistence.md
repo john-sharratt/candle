@@ -2826,6 +2826,35 @@ becomes the thing that makes the pass affordable at all.
 it wrong produces a conversation that starts with a *plausible* prompt state
 rather than an obviously-empty one — the failure mode that reads fine.
 
+#### 11a.3b-i Collection members seal from the state at the collection
+
+The same mismatch degrades the sealed section's K/V, not only the state it
+ends on: every layer above the first recurrent one is computed from hidden
+states the recurrence produced, and a recurrence started from zero mid-prompt
+produces the wrong ones. Collection members now seal from the state the prompt
+before the collection leaves (`conversation/prefix_state.rs`):
+
+- `IngestSection::start` is staged on the scratch slot before the prefill (the
+  same `stage_recurrent` the branch-checkpoint install uses), so the slot's
+  claim takes it as its store.
+- The state at a collection is a checkpoint over the ordered non-member
+  sections before it, computed by `BranchCheckpointPass` and kept in the same
+  store under its content prefix — one per collection prefix, shared by every
+  conversation on the prompt. A schema collection's batch (the tool catalog, a
+  tree's embedded collection) computes it once for all its members.
+- Members do not continue one another: a projection picks among them.
+- A conversation's own **chained** sections — a journal's entries — continue
+  the ones before them: sealed against them (attention) and from the state they
+  leave (`BranchCheckpointPass::start` runs the predecessors on from the
+  collection's state; not kept, since those states are one conversation's).
+  `Carried`'s `Linking::Chain` reseals every link after one that changed, and
+  pins only the chain's sealed beginning.
+
+Plain (non-collection) sections still seal with the recurrence from zero: the
+state before each needs a checkpoint per distinct prefix, a persisted ~63 MiB
+each and a growing prefill on first build, which is a cost decision not yet
+taken.
+
 ### 11a.3c P8.1 and P10.3 were implementable and were still not done
 
 Both could have been written blind. Neither should be, and the reason is the

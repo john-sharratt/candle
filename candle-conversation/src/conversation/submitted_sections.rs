@@ -18,15 +18,17 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use flume::Sender;
 
+use super::prefix_state::{chain_of, continue_state, state_after};
 use super::{alloc_scratch_slot_on, Sequence};
 use crate::error::ConversationError;
 use crate::persistence::content_hash::{
-    hash_tokens, owned_section_prefix, section_stream_id, ContentChain,
+    hash_tokens, owned_section_prefix, section_stream_id, ContentHash,
 };
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::projection::{
     prefix_before_collection, Builder, CollectionId, Conversation, SectionId, TimelineId,
 };
+use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::SchedulerRequest;
 use crate::token_buffer::TokenBuffer;
 
@@ -227,7 +229,11 @@ struct SealJob {
     section: SectionId,
     name: String,
     content: String,
+    /// The schema's sections before the collection.
     prefix: Vec<SectionId>,
+    /// This conversation's sections the section continues, in order — see
+    /// [`Sequence::submit_section`].
+    after: Vec<SectionRef>,
     settled: Arc<Settled>,
 }
 
@@ -264,10 +270,50 @@ impl SealJob {
         }
     }
 
+    /// The sections the section is sealed against, in order: the schema's
+    /// prefix, then the sections it continues — once each of those has sealed.
+    fn sealed_prefix(&self) -> crate::Result<Vec<SectionId>> {
+        let mut ids = self.prefix.clone();
+        for before in &self.after {
+            before.wait().map_err(|e| {
+                ConversationError::Other(format!(
+                    "section {:?} continues {:?}, which did not seal: {e}",
+                    self.name,
+                    before.name()
+                ))
+            })?;
+            ids.push(before.section_id());
+        }
+        Ok(ids)
+    }
+
+    /// The recurrent state at the section's first token: the state after the
+    /// schema's prefix — kept for every conversation on this prompt — run on
+    /// through the sections it continues, which are this conversation's alone.
+    fn start_state(&self) -> crate::Result<Option<SharedState>> {
+        let at_collection =
+            state_after(&self.scheduler_tx, &self.substrate, &self.prompt_prefix())?;
+        let after: Vec<SectionId> = self.after.iter().map(SectionRef::section_id).collect();
+        continue_state(&self.scheduler_tx, &self.substrate, at_collection, &after)
+    }
+
+    /// The schema's prefix sections a recurrence runs through: collection
+    /// members left out, as the content address leaves them out, because a
+    /// projection picks among them at runtime.
+    fn prompt_prefix(&self) -> Vec<SectionId> {
+        let system = &self.schema.schema().system_prompt;
+        self.prefix
+            .iter()
+            .copied()
+            .filter(|&id| !system.is_collection_member(id))
+            .collect()
+    }
+
     /// Seal the section into the substrate, restoring it from the persisted
     /// stream when the same content was sealed under this address before.
     /// Returns the block count and the stream it lives in.
     fn seal(&self) -> crate::Result<(usize, StreamId)> {
+        let sealed_prefix = self.sealed_prefix()?;
         let encoding = self
             .tokenizer
             .encode(self.content.as_str(), false)
@@ -309,6 +355,7 @@ impl SealJob {
         }
 
         self.substrate.record_section_loads(0, 1);
+        let start = self.start_state()?;
         let slot = alloc_scratch_slot_on(&self.scheduler_tx, &self.substrate)?;
         let (tx, rx) = flume::bounded(1);
         let sent = self
@@ -316,11 +363,12 @@ impl SealJob {
             .send(SchedulerRequest::IngestSection {
                 sequence_id: slot,
                 section_id: self.section,
-                prefix_section_ids: self.prefix.clone(),
+                prefix_section_ids: sealed_prefix,
                 tokens,
                 address,
                 debug_name: format!("conv/{}/{}", self.owner.raw(), self.name),
                 in_collection: true,
+                start,
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone);
@@ -332,22 +380,14 @@ impl SealJob {
         Ok((seal.block_to.saturating_sub(seal.block_from), stream))
     }
 
-    /// The content hash of the sections this one seals against — the same
-    /// chain a section of the schema's collection is addressed under.
-    fn prefix_hash(&self) -> crate::persistence::content_hash::ContentHash {
-        let mut chain = ContentChain::new();
-        let view = self.substrate.read();
-        for &pid in &self.prefix {
-            if self.schema.schema().system_prompt.is_collection_member(pid) {
-                continue;
-            }
-            let tokens = view.section_tokens_of(pid);
-            if tokens.is_empty() {
-                continue;
-            }
-            chain.push_section(&tokens);
-        }
-        chain.prefix()
+    /// The content hash of the sections this one seals against — the chain a
+    /// section of the schema's collection is addressed under, then the sections
+    /// it continues, so a section sealed after other sections is a different
+    /// section from the same text sealed after none, or after others.
+    fn prefix_hash(&self) -> ContentHash {
+        let mut ids = self.prompt_prefix();
+        ids.extend(self.after.iter().map(SectionRef::section_id));
+        chain_of(&self.substrate, &ids).0
     }
 
     /// Release a section that was removed or tombstoned while it was sealing.
@@ -388,12 +428,23 @@ impl Sequence {
     /// submitting a name again replaces the earlier section. The collection must
     /// be a top-level collection of the system prompt, not one inside a section
     /// tree.
+    ///
+    /// `after` names the sections of this conversation the new one continues,
+    /// in order — the entries of a journal before this one. It is sealed once
+    /// they have sealed, against them as well as the prompt before the
+    /// collection: it attends to them, and its recurrence runs on from the
+    /// state they leave, so read straight after them it is computed as it is
+    /// read. Empty for a section that stands alone; it still starts from the
+    /// state the prompt before the collection leaves. A section's address
+    /// includes what it continues, so the same text after other sections is
+    /// sealed afresh.
     pub fn submit_section(
         &mut self,
         collection: &str,
         name: &str,
         content: &str,
         priority: f32,
+        after: &[SectionRef],
     ) -> crate::Result<SectionRef> {
         if content.is_empty() {
             return Err(ConversationError::Other(format!(
@@ -448,6 +499,7 @@ impl Sequence {
             name: name.to_string(),
             content: content.to_string(),
             prefix,
+            after: after.to_vec(),
             settled: Arc::clone(&settled),
         };
         if let Err(e) = std::thread::Builder::new()
