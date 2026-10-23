@@ -62,8 +62,8 @@ use candle_conversation::stencil::{
     ToolCallEnvelope, ToolSpec, TreeSpec,
 };
 use candle_conversation::{
-    ConversationEngine, PromptDump, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
-    UnsealedAsker,
+    Carried, ConversationEngine, PromptDump, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
+    UnsealedAsker, Want,
 };
 use journal_core::journal::Holds;
 use journal_core::section::{self, entry_section, JournalPrompt, Kept, META_KEPT};
@@ -97,9 +97,7 @@ use crate::engine::tools::{self, for_mode, Mode};
 use crate::engine::window::Speaker;
 
 mod ask;
-mod carried;
 pub use ask::Answer;
-use carried::{Carried, Want};
 
 /// How many completed exchanges the GPU sequence carries per turn.
 ///
@@ -1257,6 +1255,7 @@ impl Minds {
                 &journal_wants(Some(prompt)),
                 &sweep,
                 None,
+                tokio::time::sleep,
             )
             .await;
         self.record_journal(npc_id, &mut live, prompt.record())
@@ -1900,6 +1899,7 @@ impl Minds {
                 &mission.into_iter().collect::<Vec<_>>(),
                 &[identity::MISSION_SECTION],
                 Some(SEAL_WAIT),
+                tokio::time::sleep,
             )
             .await;
         let journal_sealed = live
@@ -1910,6 +1910,7 @@ impl Minds {
                 &journal_wants(persona.journal),
                 &journal_sweep(persona.journal),
                 Some(SEAL_WAIT),
+                tokio::time::sleep,
             )
             .await;
         if let Some(journal) = persona.journal {

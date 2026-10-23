@@ -1,22 +1,24 @@
 //! The sections of one collection a conversation holds, kept in line with what
-//! the character should be carrying.
+//! it should be carrying.
 //!
-//! A character's mission and its journal are both collections of sections
-//! submitted to its own conversation. Submitted text is sealed and persisted
-//! with the conversation but cannot be read back, so what was submitted is held
-//! here, beside the sequence, and [`Carried::reconcile`] compares it with what
-//! the character should carry now: a section is submitted when it is missing or
-//! its text changed, resubmitted when it failed to seal, and removed when it is
-//! no longer wanted. Text that has not changed costs nothing per turn.
+//! A collection of sections submitted to a conversation's own timeline — an npcd
+//! character's mission and journal, a zend session's journal — is sealed and
+//! persisted with the conversation, but submitted text cannot be read back, so
+//! what was submitted is held here, beside the sequence, and
+//! [`Carried::reconcile`] compares it with what the conversation should carry
+//! now: a section is submitted when it is missing or its text changed,
+//! resubmitted when it failed to seal, and removed when it is no longer wanted.
+//! Text that has not changed costs nothing per turn.
 //!
 //! Streams an earlier run sealed for the conversation are invisible to a fresh
 //! `Carried`, so the first reconcile of a rejoined conversation also removes the
 //! names the caller says may be stale.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
-use candle_conversation::{SectionRef, SectionState, Sequence};
+use super::{SectionRef, SectionState, Sequence};
 
 /// How often a wait for a seal looks at the section's state.
 const SEAL_POLL: Duration = Duration::from_millis(20);
@@ -104,15 +106,22 @@ impl Carried {
     ///
     /// With `wait`, a submitted section is given that long to seal, because its
     /// text is meant to be in the prompt of the turn that follows; past it the
-    /// section is left out of the answer and the stand-in member is read instead.
-    pub async fn reconcile(
+    /// section is left out of the answer and the caller's stand-in is read
+    /// instead. The crate runs on no async runtime of its own, so the wait
+    /// sleeps through the caller's `sleep`.
+    pub async fn reconcile<S, F>(
         &mut self,
         sequence: &mut Sequence,
         collection: &str,
         wanted: &[Want<'_>],
         sweep: &[&str],
         wait: Option<Duration>,
-    ) -> Vec<String> {
+        sleep: S,
+    ) -> Vec<String>
+    where
+        S: Fn(Duration) -> F,
+        F: Future<Output = ()>,
+    {
         let standing: Vec<Standing<'_>> = self
             .held
             .iter()
@@ -168,7 +177,7 @@ impl Carried {
                     }
                     SectionState::Removed => break,
                     SectionState::Pending => match deadline {
-                        Some(at) if Instant::now() < at => tokio::time::sleep(SEAL_POLL).await,
+                        Some(at) if Instant::now() < at => sleep(SEAL_POLL).await,
                         _ => break,
                     },
                 }

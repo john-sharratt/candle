@@ -125,8 +125,8 @@ pub use config::{
     SchedulerConfig, SequenceConfig,
 };
 pub use conversation::{
-    ChainRound, GlueMarkers, PieceKind, PromptDump, PromptPiece, SectionRef, SectionState,
-    Sequence, UnsealedAsker,
+    Carried, ChainRound, GlueMarkers, PieceKind, PromptDump, PromptPiece, SectionRef, SectionState,
+    Sequence, UnsealedAsker, Want,
 };
 pub use engine::{
     ConversationEngine, EngineAttacher, SubstrateReloadStatus, SubstrateReloader, ThinkSteering,

@@ -217,6 +217,8 @@ use crate::turn_text::{encode_pieces, TurnText};
 use flume::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+mod carried;
+pub use carried::{Carried, Want};
 mod ephemeral_turn;
 pub use ephemeral_turn::UnsealedAsker;
 mod prompt_dump;
