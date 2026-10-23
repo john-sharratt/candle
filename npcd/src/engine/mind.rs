@@ -1313,6 +1313,7 @@ impl Minds {
                 entries: Vec::new(),
                 open: Vec::new(),
                 next_item: 1,
+                covered_to: 0,
             },
             &NPC,
         );

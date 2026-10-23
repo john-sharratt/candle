@@ -186,7 +186,10 @@ written closed, decoded greedily (`zend/src/journal/draft.rs`, which runs
 
 1. **Nothing citable** is a mechanical `Nothing`; the model is not asked.
 2. **Write or skip, in one answer:** one call under the per-draft grammar —
-   `journal_write`, whose `cite` enum holds the stretch's citable parts, or,
+   `journal_write`, whose `cite` enum holds the stretch's citable parts and
+   whose `claims` hold at least one per two citable parts (at most six are
+   insisted on: decoded greedily, a writer offered "another claim or close"
+   closed after one, the request, however the question asked), or,
    once the journal holds an entry to weigh the stretch against,
    `journal_skip` with a one-sentence `reason`. A skip covers the stretch with
    its reason. At most four answers; a refused write is asked again with the
@@ -247,8 +250,10 @@ them.
 - **A submitted section's text cannot be read back from the substrate**, so the
   entries are also kept as JSON in the conversation's metadata (`journal.kept`).
   This is the record a restart, or the member a conversation is handed to,
-  rebuilds from; `covered_to` is restored to the last part the newest entries
-  cover. A member that lets a conversation go (`turn_claims`) drops its journal
+  rebuilds from. It carries `covered_to`, so a stretch a draft skipped — or
+  found only repeats in — after the newest entry stays covered across a
+  restart: a draft that ends with nothing to keep writes the record too, and
+  one whose record cannot be written is abandoned like a failed keep. A member that lets a conversation go (`turn_claims`) drops its journal
   and reads the record again when it next holds the conversation.
 - **A forgotten entry** leaves the record at once and its section at the
   conversation's next round. One a restart left sealed is never selected — the

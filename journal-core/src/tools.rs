@@ -80,8 +80,24 @@ fn object(name: &str, required: bool, properties: Vec<Value>) -> Value {
     json!({ "name": name, "type": "object", "required": required, "properties": properties })
 }
 
+/// The fewest claims an entry about `citable` turns is held to: one for every
+/// two of them, at least one and at most [`CLAIM_FLOOR_MAX`].
+///
+/// **The grammar asks for them because the question alone does not.** Decoded
+/// greedily, a writer offered "another claim, or close the list" closes it:
+/// live drafts over a request, a file read and an answer kept one claim — the
+/// request — however the question asked for one per step. A floor of half the
+/// citable turns is what a stretch of steps establishes at the least, since
+/// each step is a call and its result.
+pub fn claim_floor(citable: usize) -> usize {
+    citable.div_ceil(2).clamp(1, CLAIM_FLOOR_MAX)
+}
+
+/// The most claims the grammar insists on, however long the stretch.
+pub const CLAIM_FLOOR_MAX: usize = 6;
+
 /// The `journal_write` call, for the stretch whose turns are `citable` and with
-/// `open` items standing.
+/// `open` items standing. It holds at least [`claim_floor`] claims.
 ///
 /// `None` when nothing in the stretch can be cited: there is no entry to write,
 /// and a `cite` with no value to choose would be a grammar that cannot be
@@ -123,7 +139,7 @@ pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<Value> {
     Some(json!({
         "name": WRITE,
         "params": [
-            list_of("claims", true, 1, claim),
+            list_of("claims", true, claim_floor(citable.len()), claim),
             list_of("intend", false, 0, text("", true)),
             list_of("open", false, 0, item),
         ],
@@ -442,6 +458,17 @@ mod tests {
             .map(|p| p["min_items"].as_u64().unwrap())
             .collect();
         assert_eq!(min, [1, 0, 0]);
+    }
+
+    #[test]
+    fn the_claim_floor_is_half_the_citable_turns_from_one_to_six() {
+        let floors: Vec<usize> = [0, 1, 2, 3, 4, 6, 7, 12, 13, 64]
+            .into_iter()
+            .map(claim_floor)
+            .collect();
+        assert_eq!(floors, [1, 1, 1, 2, 2, 3, 4, 6, 6, 6]);
+        let spec = write_spec(&[49, 50, 51, 52], &[]).unwrap();
+        assert_eq!(param(&spec, "claims")["min_items"], 2);
     }
 
     #[test]

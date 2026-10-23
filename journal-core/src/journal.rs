@@ -218,7 +218,17 @@ impl Journal {
             entries: self.entries.iter().cloned().collect(),
             open: self.open.clone(),
             next_item: self.next_item,
+            covered_to: self.covered_to,
         }
+    }
+
+    /// The journal as a conversation should hold it once `span` is settled
+    /// with nothing written: the same sections, and a record that says the
+    /// stretch is covered.
+    pub fn prompt_covering(&self, span: &Span, style: &Style) -> JournalPrompt {
+        let mut next = self.clone();
+        next.covered_to = next.covered_to.max(span.to_turn);
+        next.prompt(style)
     }
 
     /// The journal as a conversation should hold it now.
@@ -272,6 +282,7 @@ mod tests {
     use super::*;
     use crate::entry::testing::{entry_to, item};
     use crate::entry::Kind;
+    use crate::section::restore;
     use crate::span::testing::turn;
     use crate::style::testing::PLAIN;
     use crate::workflow::Outcome;
@@ -491,6 +502,7 @@ mod tests {
             entries: vec![a, b],
             open: vec![item(9, "open one")],
             next_item: 12,
+            covered_to: 7,
         };
         let mut j = Journal::restore(kept, 0);
         assert_eq!(j.covered_to(), 0, "the caller says what is covered");
@@ -512,10 +524,32 @@ mod tests {
             entries: vec![entry_to(40)],
             open: Vec::new(),
             next_item: 1,
+            covered_to: 52,
         };
-        let j = Journal::restore(kept.clone(), kept.covered_to());
-        assert_eq!((j.covered_to(), j.looked_to()), (40, 40));
+        let j = Journal::restore(kept.clone(), kept.covered_to);
+        assert_eq!((j.covered_to(), j.looked_to()), (52, 52));
         assert!(!j.pending());
+    }
+
+    #[test]
+    fn a_stretch_settled_with_nothing_is_in_the_record() {
+        let mut j = Journal::new();
+        j.kept(entry_to(40));
+        let span = j
+            .begin(
+                vec![
+                    turn(41, 41, Some(Kind::Did), "a"),
+                    turn(52, 52, Some(Kind::Did), "b"),
+                ],
+                52,
+            )
+            .unwrap();
+        let covering = j.prompt_covering(&span, &PLAIN);
+        assert_eq!(j.covered_to(), 40, "nothing moves until the record is kept");
+        assert_eq!(restore(covering.record()).unwrap().covered_to, 52);
+        assert_eq!(covering.sections, j.prompt(&PLAIN).sections);
+        j.nothing_to_write(&span);
+        assert_eq!(j.prompt(&PLAIN), covering);
     }
 
     #[test]

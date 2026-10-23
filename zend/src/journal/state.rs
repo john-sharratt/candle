@@ -41,9 +41,10 @@ impl SessionJournal {
     }
 
     /// Rebuild from the record the conversation's metadata held. Part numbers
-    /// are the conversation's own, so what the entries covered stays covered.
+    /// are the conversation's own, so what the record says is covered — by an
+    /// entry or by a draft that found nothing to add — stays covered.
     pub fn restore(kept: Kept) -> Self {
-        let covered_to = kept.covered_to();
+        let covered_to = kept.covered_to;
         Self {
             journal: Journal::restore(kept, covered_to),
         }
@@ -182,10 +183,15 @@ mod tests {
             }],
             open: vec![],
             next_item: 1,
+            covered_to: reply_part(33),
         };
         let j = SessionJournal::restore(kept);
-        assert_eq!(j.first_uncovered_turn(), 31);
-        assert_eq!(j.fresh_turns(40), 10);
+        assert_eq!(
+            j.first_uncovered_turn(),
+            34,
+            "a stretch skipped after the newest entry stays covered"
+        );
+        assert_eq!(j.fresh_turns(40), 7);
         assert_eq!(j.journal().written(), 4);
         assert!(!j.journal().pending());
     }

@@ -44,7 +44,7 @@ mod tests {
 
     use journal_core::entry::{Entry, Kind};
     use journal_core::record::Ending;
-    use journal_core::section::JournalPrompt;
+    use journal_core::section::{restore, JournalPrompt};
     use journal_core::span::SpanTurn;
     use journal_core::tools::{SKIP, WRITE};
     use serde_json::Value;
@@ -190,11 +190,16 @@ mod tests {
         let record = draft(&mut desk, &state, &span, &Silent).await;
         assert_eq!(record.result, Ending::Nothing);
         assert_eq!(record.detail.as_deref(), Some("Already written."));
-        assert!(desk.kept.is_empty());
         let j = state.lock().unwrap();
         assert_eq!(j.journal().covered_to(), reply_part(1));
         assert!(!j.journal().pending());
         assert_eq!(j.journal().drafts().last().unwrap(), &record);
+        let recorded = restore(desk.kept[0].record()).unwrap();
+        assert_eq!(
+            SessionJournal::restore(recorded).first_uncovered_turn(),
+            2,
+            "a restart does not draft the skipped stretch again"
+        );
     }
 
     #[tokio::test]

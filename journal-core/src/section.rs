@@ -53,17 +53,16 @@ pub struct Kept {
     pub entries: Vec<Entry>,
     pub open: Vec<Item>,
     pub next_item: u64,
+    /// The last turn settled — by a kept entry, or by a draft that found
+    /// nothing to add. Not the entries' own coverage: a stretch skipped after
+    /// the newest entry is settled too, and a restart must not draft it again.
+    pub covered_to: u64,
 }
 
 impl Kept {
     /// The newest entry's id, zero when there is none.
     pub fn newest(&self) -> u64 {
         self.entries.iter().map(|e| e.id).max().unwrap_or(0)
-    }
-
-    /// The last turn the kept entries cover, zero when there is none.
-    pub fn covered_to(&self) -> u64 {
-        self.entries.iter().map(|e| e.to_turn).max().unwrap_or(0)
     }
 }
 
@@ -165,6 +164,7 @@ mod tests {
             entries: ids.iter().map(|id| entry_with_claim(*id)).collect(),
             open,
             next_item: 9,
+            covered_to: 0,
         }
     }
 
@@ -215,12 +215,17 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_entry_is_the_highest_id_and_coverage_its_last_turn() {
-        let mut k = kept(&[4, 9, 6], vec![]);
-        assert_eq!(k.newest(), 9);
-        k.entries[1].to_turn = 30;
-        assert_eq!(k.covered_to(), 30);
-        let none = kept(&[], vec![]);
-        assert_eq!((none.newest(), none.covered_to()), (0, 0));
+    fn the_newest_entry_is_the_highest_id() {
+        assert_eq!(kept(&[4, 9, 6], vec![]).newest(), 9);
+        assert_eq!(kept(&[], vec![]).newest(), 0);
+    }
+
+    #[test]
+    fn coverage_past_the_entries_reads_back() {
+        let k = Kept {
+            covered_to: 72,
+            ..kept(&[3], vec![])
+        };
+        assert_eq!(restore(JournalPrompt::of(&k, &PLAIN).record()), Some(k));
     }
 }

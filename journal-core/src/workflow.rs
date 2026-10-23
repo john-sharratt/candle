@@ -140,10 +140,8 @@ async fn draft<D: Desk, S: Holds>(
         (open, may_skip)
     };
     let Some(specs) = tools::draft_specs(&span.citable_ids(), &open, may_skip) else {
-        hold(state).journal_mut().nothing_to_write(span);
-        return Outcome::Nothing {
-            why: "nothing in the stretch was something a claim could rest on".to_string(),
-        };
+        let why = "nothing in the stretch was something a claim could rest on".to_string();
+        return settle(desk, state, span, style, why).await;
     };
 
     let started = Instant::now();
@@ -192,29 +190,26 @@ async fn write<D: Desk, S: Holds>(
         let reason = match tools::parse(&answer, asked.may_skip) {
             Err(reason) => reason,
             Ok(Answer::Skip(why)) => {
-                hold(state).journal_mut().nothing_to_write(span);
                 let why = if why.is_empty() {
                     SKIPPED.to_string()
                 } else {
                     why
                 };
-                return Outcome::Nothing { why };
+                return settle(desk, state, span, style, why).await;
             }
             Ok(Answer::Write(written)) => match verify(written, span, open, world) {
                 Ok(verified) => {
                     // What the journal already says is not kept again; an
-                    // entry of nothing else covers its stretch as a gate's
-                    // "no" would.
+                    // entry of nothing else covers its stretch as a skip
+                    // would.
                     let held: Vec<Entry> = hold(state).journal().entries().cloned().collect();
                     let (entry, dropped) = repeats::drop_repeats(verified.entry, &held, open);
                     if !repeats::says_anything(&entry) {
-                        hold(state).journal_mut().nothing_to_write(span);
-                        return Outcome::Nothing {
-                            why: format!(
-                                "everything it would have said ({dropped} line(s)) is already in \
-                                 the journal"
-                            ),
-                        };
+                        let why = format!(
+                            "everything it would have said ({dropped} line(s)) is already in the \
+                             journal"
+                        );
+                        return settle(desk, state, span, style, why).await;
                     }
                     let verified = Verified {
                         entry,
@@ -229,6 +224,24 @@ async fn write<D: Desk, S: Holds>(
     }
     let (_, reason) = refused.unwrap_or_default();
     Outcome::Abandoned(Abandon::Refused(reason))
+}
+
+/// Settle `span` with nothing written, for `why`: the record first, so a
+/// restart does not draft the stretch again, then memory — a record that fails
+/// to write leaves the state as it was.
+async fn settle<D: Desk, S: Holds>(
+    desk: &mut D,
+    state: &Mutex<S>,
+    span: &Span,
+    style: &Style,
+    why: String,
+) -> Outcome {
+    let prompt = hold(state).journal().prompt_covering(span, style);
+    if let Err(e) = desk.keep(&prompt).await {
+        return Outcome::Abandoned(Abandon::Keeping(e.to_string()));
+    }
+    hold(state).journal_mut().nothing_to_write(span);
+    Outcome::Nothing { why }
 }
 
 /// Keep a verified entry: ids first, then the substrate, then memory — so a
@@ -265,6 +278,7 @@ mod tests {
     use super::*;
     use crate::entry::Kind;
     use crate::journal::Journal;
+    use crate::section::restore;
     use crate::span::testing::turn;
     use crate::span::SpanTurn;
     use crate::style::testing::PLAIN;
@@ -426,11 +440,31 @@ mod tests {
         };
         assert_eq!(why, "Entry 1 already says it.");
         assert_eq!(desk.write_asked.len(), 1);
-        assert_eq!(desk.kept.len(), 0);
         let state = hold(&state);
         assert_eq!(state.covered_to(), 4);
         assert!(!state.pending());
         assert_eq!(state.written(), 1);
+        assert_eq!(
+            desk.kept,
+            [state.prompt(&PLAIN)],
+            "the record says the stretch is covered, so a restart does not draft it again"
+        );
+        assert_eq!(restore(desk.kept[0].record()).unwrap().covered_to, 4);
+    }
+
+    #[tokio::test]
+    async fn a_skip_whose_record_cannot_be_kept_covers_nothing() {
+        let (state, span) = after_an_entry().await;
+        let mut desk = Script::new(&[SKIP]);
+        desk.refuse_keeping = true;
+        let (outcome, _) = run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        assert!(
+            matches!(outcome, Outcome::Abandoned(Abandon::Keeping(_))),
+            "{outcome:?}"
+        );
+        let state = hold(&state);
+        assert_eq!(state.covered_to(), 3, "the stretch is drafted again");
+        assert!(!state.pending());
     }
 
     #[tokio::test]
@@ -587,10 +621,10 @@ mod tests {
             panic!("expected nothing new, got {outcome:?}");
         };
         assert!(why.contains("already in the journal"), "{why}");
-        assert!(desk.kept.is_empty());
         let state = hold(&state);
         assert_eq!(state.covered_to(), 4);
         assert_eq!(state.written(), 1);
+        assert_eq!(desk.kept, [state.prompt(&PLAIN)], "only the coverage moved");
     }
 
     #[tokio::test]

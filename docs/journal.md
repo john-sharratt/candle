@@ -105,7 +105,10 @@ and has no `unsure` option: the journal is deterministic.
   item may not be both in one entry. At most `MAX_OPEN` (6) items are open; past
   that the oldest is dropped.
 * **Limits**: at most `MAX_CLAIMS` (12) claims and `MAX_INTEND` (3) intentions.
-  An entry with nothing in it is refused (`Empty`).
+  An entry with nothing in it is refused (`Empty`). The grammar holds `claims` to
+  at least `tools::claim_floor` — one per two citable turns, from one to
+  `CLAIM_FLOOR_MAX` (6) — because a writer decoded greedily closes the list
+  after its first claim whatever the question asks.
 
 Every verdict (kept, corrected, demoted, superseded, refused) is reported on the
 `Outcome`. The same output against the same span, open items and world always
@@ -328,7 +331,10 @@ window. While nothing has sealed, `journal_none` shows.
 
 A submitted section's text cannot be read back from the substrate, so the same
 entries are kept as JSON in the day conversation's metadata: `journal.of`
-(the character's id) and `journal.kept` (entries, open items, `next_item`).
+(the character's id) and `journal.kept` (entries, open items, `next_item`,
+`covered_to`). A draft that ends with nothing to keep writes it too, through the
+`Desk`'s keep, so the coverage a skip moved is in the record; npcd restores
+`covered_to` as 0 regardless, its window's ids starting afresh each run.
 `Minds::record_journal` rewrites it when it changed. The record lives in the
 conversation's metadata, so tombstoning the conversation drops it.
 

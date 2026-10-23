@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                ("claims", true, 1),
+                ("claims", true, 2),
                 ("intend", false, 0),
                 ("open", false, 0)
             ]

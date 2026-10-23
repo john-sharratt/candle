@@ -37,6 +37,7 @@ mod tests {
                 text: "rerun".into(),
             }],
             next_item: 3,
+            covered_to: 12,
         };
         let metadata = metadata_of(&JournalPrompt::of(&kept, &CODING));
         assert_eq!(kept_in(&metadata), Some(kept));

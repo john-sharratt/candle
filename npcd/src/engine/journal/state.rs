@@ -354,6 +354,7 @@ mod tests {
             }],
             open: Vec::new(),
             next_item: 1,
+            covered_to: 140,
         };
         let mut s = JournalState::restore(0, kept);
         assert_eq!(s.journal().written(), 3);

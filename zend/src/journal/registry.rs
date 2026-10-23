@@ -123,6 +123,7 @@ mod tests {
             }],
             open: vec![],
             next_item: 1,
+            covered_to: 8,
         }
     }
 
