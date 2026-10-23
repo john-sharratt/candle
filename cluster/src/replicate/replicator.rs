@@ -27,6 +27,7 @@ use super::catchup::{Progress, Purpose, Requester, FETCH_WINDOW};
 use super::fault::Fault;
 use super::lease::{LeaseEvent, Term, EVENTS_KEPT};
 use super::pulse::PULSES_KEPT;
+use super::quorum_governor::{Downgrade, Governor};
 use super::store::Store;
 use super::watch::GapWatch;
 use crate::consensus::votes::VoteStore;
@@ -207,6 +208,9 @@ pub(super) struct State {
     pub last_rejoin: Option<u64>,
     /// The last `COORD` sent, and when (§12.1).
     pub coord_sent: Option<(Vec<u8>, Instant)>,
+    /// Whether the group has stayed short of `max_members`, and what is
+    /// proposed for it (§5.9).
+    pub governor: Governor,
     pub stats: Stats,
 }
 
@@ -271,6 +275,17 @@ pub struct ReplicationView {
     /// The counters, under their own key: flattened, `stats.catchups` (a
     /// count) overwrote the `catchups` list above.
     pub stats: Stats,
+    pub quorum: QuorumView,
+}
+
+/// The group's size as this member counts it, and a downgrade under way
+/// (§5.9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuorumView {
+    pub max_members: u32,
+    /// The distinct ready members seen now, this one included.
+    pub ready: u32,
+    pub downgrade: Option<Downgrade>,
 }
 
 /// What a member replicates through: its substrate, and its acceptor opened
@@ -388,6 +403,7 @@ impl Replicator {
                 drained: false,
                 last_rejoin: None,
                 coord_sent: None,
+                governor: Governor::default(),
                 stats: Stats::default(),
             }),
             send_wake: Notify::new(),
@@ -625,6 +641,7 @@ impl Replicator {
     }
 
     pub fn view(&self) -> ReplicationView {
+        let ready = self.ready_members();
         let s = self.state();
         let (unsent, in_flight) = s.outbox.counts();
         ReplicationView {
@@ -643,6 +660,11 @@ impl Replicator {
                 .collect(),
             answering: s.answering.len(),
             stats: s.stats.clone(),
+            quorum: QuorumView {
+                max_members: s.max_members,
+                ready,
+                downgrade: s.governor.view(Instant::now(), s.max_members, ready),
+            },
         }
     }
 

@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::lease::LeaseEvent;
-use super::replicator::{Phase, Rejoin, Replicator};
+use super::quorum_governor::Step;
+use super::replicator::{Phase, Rejoin, Replicator, State};
 use crate::consensus::Out;
 use crate::frame::{Frame, MemberState};
 
@@ -299,14 +300,74 @@ impl Replicator {
         else {
             return;
         };
-        let mut s = self.state();
-        s.max_members = max_members;
-        s.generation = generation;
+        {
+            let mut s = self.state();
+            s.max_members = max_members;
+            s.generation = generation;
+        }
+        self.govern_quorum().await;
+    }
+
+    /// Whether this member sees the whole group: joined, in no fault, not
+    /// drained, and admitted and ready on every cluster it is configured for.
+    /// Only such a member lowers `max_members` (§5.9).
+    fn sees_whole_group(s: &State) -> bool {
+        s.phase == Phase::Joined
+            && s.fault.is_none()
+            && !s.drained
+            && s.sockets.iter().all(Option::is_some)
+            && s.ready.iter().all(|r| *r)
+    }
+
+    /// Look at the group once for the governor (`super::quorum_governor`), and
+    /// write the lower `max_members` it asks for.
+    async fn govern_quorum(self: &Arc<Self>) {
+        let ready = self.ready_members();
+        let step = {
+            let mut s = self.state();
+            let eligible = Self::sees_whole_group(&s);
+            let max = s.max_members;
+            s.governor.observe(Instant::now(), max, ready, eligible)
+        };
+        match step {
+            Step::Hold => {}
+            Step::Propose {
+                from,
+                to,
+                executes_in,
+            } => tracing::warn!(
+                node = self.node,
+                from,
+                to,
+                ready,
+                executes_in_s = executes_in.as_secs(),
+                "the group has stayed short of max_members: lowering it unless the members return"
+            ),
+            Step::Withdraw { to } => tracing::info!(
+                node = self.node,
+                to,
+                ready,
+                "the group is whole again, or this member no longer sees all of it: \
+                 max_members stays"
+            ),
+            Step::Execute { from, to } => {
+                tracing::warn!(
+                    node = self.node,
+                    from,
+                    to,
+                    ready,
+                    "the group stayed short past the longest lease: max_members lowered"
+                );
+                let store = self.store.clone();
+                let _ = tokio::task::spawn_blocking(move || store.set_max_members(to)).await;
+                self.state().max_members = to;
+            }
+        }
     }
 
     /// The distinct ready members visible at once across every cluster, this
     /// one included when it is ready.
-    fn ready_members(&self) -> u32 {
+    pub(super) fn ready_members(&self) -> u32 {
         let s = self.state();
         let mut ready: BTreeSet<u64> = s
             .members

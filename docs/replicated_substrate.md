@@ -1703,6 +1703,31 @@ among the members of the app.
   Lowering is for retiring machines for good, and for a deployment that knowingly
   accepts less safety: for example two members that should keep electing when either
   is down.
+- **It is lowered by itself when the group stays short**
+  (`cluster/src/replicate/quorum_governor.rs`). A member left with fewer ready members
+  than `max_members` — a laptop gone off the network, a machine retired without a
+  *set* — would otherwise leave the rest unable to decide anything: no generation for a
+  member that wrote cut off, no verdict, no rollout, no lease. Each member watches the
+  ready members its gateways report:
+  - after **5 minutes** short it **proposes** the lower value — `max(ready, 2)` — in its
+    log and in `/v1/status` (`cluster.apps.<app>.replication.quorum.downgrade`, with how
+    long the group has been short and how long until the write);
+  - after **20 minutes** short it **executes**: writes the *set*. That is the longest
+    term any lease is taken for (the upgrade install's, `READY_WITHIN` + 5 min; a world
+    lease is 30 s). An absent member cannot renew without a quorum, so by then every
+    lease it held has run out on every acceptor and none is granted twice;
+  - **never below two**, where the voting gateway's tie-break completes a majority,
+    so one member and the gateway decide but a lone member never does;
+  - **only from a member that sees the whole group**: joined, in no fault, not drained,
+    and admitted and ready on every cluster it is configured for. A member cut off from
+    a gateway sees part of the group, and lowering from a partial view would let both
+    sides of a partition decide;
+  - a member's return withdraws a proposal, and once it is seen ready again the usual
+    *raise* puts the value back.
+
+  A value the absent members accepted and never relayed to the rest can be lost by the
+  lowering. With one gateway that is the tie-break acceptor for every round, every
+  proposal reaches it, and a later round adopts what it accepted.
 
 **Two primitives, one implementation** in the `cluster` crate, on the substrate:
 
