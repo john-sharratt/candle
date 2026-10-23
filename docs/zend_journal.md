@@ -131,19 +131,22 @@ before `system_close`:
 - `journal`: a collection with `sections: []`.
 
 `journal::carry::install` scopes the collection to the members a conversation
-names (`SelectionRule::Named`) and gives it one schema member, the stand-in
-`journal/carrying`. The sections themselves are the conversation's: one per
-entry (`journal/<id>`) for the newest `IN_PROMPT` (5) entries, plus
-`journal/open` while any item is open, submitted to its own timeline.
+names (`SelectionRule::Named`). It has no member of its own: the sections are
+the conversation's — one per entry (`journal/<id>`) for the newest `IN_PROMPT`
+(5) entries, plus `journal/open` while any item is open — submitted to its own
+timeline.
 
-- **A conversation that has written nothing pins nothing**, so neither the
-  collection nor its intro emits, and every other layer's prompt reads exactly
-  as if no journal were declared. There is no `journal_none`: an empty journal
-  costs nothing anywhere.
+- **A round pins exactly the sections that have sealed.** A conversation that
+  has written nothing, or whose sections are all still sealing, pins none, so
+  neither the collection nor its intro emits, and every other layer's prompt
+  reads exactly as if no journal were declared. There is no `journal_none` and
+  no placeholder: the prompt never shows a journal heading without the entries
+  under it. (A placeholder member was tried and dropped: a reply that read it
+  instead of the entries, asked what its journal held, made them up.)
 - **At the head of every round** the conversation's sections are reconciled with
-  its journal (`carry_journal`) and the round pins the ones that have sealed, or
-  the stand-in while none has. Nothing waits for a seal: a new entry joins the
-  prompt the round after its section seals.
+  its journal (`carry_journal`). Nothing waits for a seal: a new entry joins the
+  prompt the first round after its section seals, and until then the turns it
+  was written from are still in the conversation.
 - **Last before the close**, so a new entry changes nothing above it.
 - The collection is not a section sink: `ingest::section_sinks` never fills it
   from a `journals/` folder.

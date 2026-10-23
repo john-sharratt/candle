@@ -1258,8 +1258,8 @@ impl InferenceState {
             "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
         );
         // The journal collection selects each conversation's own sections by
-        // name, and reads its stand-in while they seal; installed before the
-        // base conversation is built so the stand-in seals into the frame.
+        // name; scoped before the base conversation is built, so no projection
+        // ever reads it any other way.
         let journaling = carry::install(&mut proj_builder)
             .map_err(|e| anyhow::anyhow!("journal install: {e}"))?;
         tracing::info!(journaling, "journal collection installed");
@@ -4927,10 +4927,11 @@ fn journal_record(state: &InferenceState, timeline: TimelineId) -> Option<Kept> 
 }
 
 /// Bring the conversation's journal sections in line with its journal, and pin
-/// what the round reads of them in `selection`.
+/// the ones that have sealed in `selection`.
 ///
-/// Nothing waits for a section to seal: a round reads the sections that have,
-/// and a new entry joins the prompt the round after its section seals.
+/// Nothing waits for a section to seal: a round reads the journal as it last
+/// sealed, and a new entry joins the prompt the first round after its section
+/// seals (`journal::carry`).
 async fn carry_journal(
     state: &InferenceState,
     conv_id: &str,
@@ -4957,7 +4958,7 @@ async fn carry_journal(
             tokio::time::sleep,
         )
         .await;
-    carry::select(selection, !prompt.is_empty(), &sealed);
+    carry::select(selection, &sealed);
 }
 
 /// When a journal draft starts.

@@ -7,30 +7,25 @@
 //! and persisted with it, invisible to every other conversation and tombstoned
 //! with it.
 //!
-//! The collection selects its members by name. A conversation that has written
-//! nothing pins none, so neither the collection nor its intro emits, and every
-//! other layer's prompt reads exactly as it would with no journal declared. One
-//! that has written something pins the sections that have sealed, or the
-//! [`STAND_IN`] member while none has.
+//! The collection selects its members by name, and a round pins exactly the
+//! sections that have sealed. A conversation that has written nothing — or
+//! whose sections are all still sealing — pins none, so neither the collection
+//! nor its intro emits: the prompt shows the journal as it last sealed, never a
+//! heading with nothing under it. A new entry joins the prompt from the first
+//! round after its section seals; until then the turns it was written from are
+//! still in the conversation.
 
 use candle_conversation::projection::{Builder, SelectionRule};
 use candle_conversation::{SelectionState, Want};
 use journal_core::section::{JournalPrompt, JOURNAL};
 
-/// The schema member read under the journal's intro while the conversation's
-/// own sections are still sealing.
-pub const STAND_IN: &str = "journal/carrying";
-
-const STAND_IN_TEXT: &str = "Entries you wrote down earlier in this session, which are being \
-brought back to you.";
-
-/// Scope the schema's `journal` collection to the members a conversation names,
-/// and give it its stand-in. `false` when the schema declares no journal: the
-/// dialogue then journals nothing, which is not an error.
+/// Scope the schema's `journal` collection to the members a conversation
+/// names. `false` when the schema declares no journal: the dialogue then
+/// journals nothing, which is not an error.
 pub fn install(builder: &mut Builder) -> anyhow::Result<bool> {
-    let Some(collection) = builder.id_for_system_collection(JOURNAL) else {
+    if builder.id_for_system_collection(JOURNAL).is_none() {
         return Ok(false);
-    };
+    }
     builder
         .set_collection_selection(
             JOURNAL,
@@ -39,9 +34,6 @@ pub fn install(builder: &mut Builder) -> anyhow::Result<bool> {
             },
         )
         .map_err(|e| anyhow::anyhow!("scoping `{JOURNAL}` to its members: {e}"))?;
-    builder
-        .add_section_to_collection(collection, STAND_IN.to_string(), STAND_IN_TEXT, 100.0)
-        .map_err(|e| anyhow::anyhow!("installing `{STAND_IN}`: {e}"))?;
     Ok(true)
 }
 
@@ -57,22 +49,15 @@ pub fn wants(prompt: &JournalPrompt) -> Vec<Want<'_>> {
         .collect()
 }
 
-/// Pin what a turn reads of the journal: nothing while nothing is written, the
-/// sections that have `sealed` once something is, or the stand-in until one has.
-pub fn select(selection: &mut SelectionState, written: bool, sealed: &[String]) {
-    if !written {
-        return;
-    }
-    if sealed.is_empty() {
-        selection.select(JOURNAL, STAND_IN.to_string());
-    } else {
-        selection.select_all(JOURNAL, sealed.iter().map(String::as_str));
-    }
+/// Pin the journal sections that have `sealed` for a round to read.
+pub fn select(selection: &mut SelectionState, sealed: &[String]) {
+    selection.select_all(JOURNAL, sealed.iter().map(String::as_str));
 }
 
 #[cfg(test)]
 mod tests {
     use candle_conversation::models::Dialect;
+    use candle_conversation::projection::SystemPromptItem;
     use journal_core::entry::Item;
     use journal_core::section::{Kept, OPEN_SECTION};
 
@@ -89,12 +74,20 @@ mod tests {
         .unwrap()
     }
 
+    /// The journal has no member of its own: it holds nothing but each
+    /// conversation's sections.
     #[test]
-    fn the_dialogue_schema_declares_a_journal_scoped_by_name_with_its_stand_in() {
+    fn the_dialogue_schema_declares_a_memberless_journal_scoped_by_name() {
         let mut b = schema();
         assert!(install(&mut b).unwrap());
-        assert!(b.id_for_system_section(STAND_IN).is_some());
         assert!(b.id_for_system_section("journal_intro").is_some());
+        assert!(
+            b.schema().system_prompt.items.iter().any(|item| matches!(
+                item,
+                SystemPromptItem::Collection(c) if c.name == JOURNAL && c.sections.is_empty()
+            )),
+            "no member of its own"
+        );
     }
 
     #[test]
@@ -110,24 +103,20 @@ mod tests {
         )
         .unwrap();
         assert!(!install(&mut b).unwrap());
-        assert!(b.id_for_system_section(STAND_IN).is_none());
     }
 
+    /// A round pins exactly what has sealed; with nothing sealed it pins
+    /// nothing, and the journal does not emit.
     #[test]
-    fn nothing_written_pins_nothing() {
+    fn a_round_pins_exactly_the_sealed_sections() {
         let mut sel = SelectionState::default();
-        select(&mut sel, false, &[]);
+        select(&mut sel, &[]);
         assert!(sel.members(JOURNAL).is_empty());
-    }
-
-    #[test]
-    fn a_written_journal_reads_its_stand_in_until_a_section_seals() {
-        let mut sel = SelectionState::default();
-        select(&mut sel, true, &[]);
-        assert_eq!(sel.members(JOURNAL), [STAND_IN]);
         let sealed = ["journal/3".to_string(), OPEN_SECTION.to_string()];
-        select(&mut sel, true, &sealed);
+        select(&mut sel, &sealed);
         assert_eq!(sel.members(JOURNAL), ["journal/3", "journal/open"]);
+        select(&mut sel, &[]);
+        assert!(sel.members(JOURNAL).is_empty(), "replaced, not added to");
     }
 
     #[test]
