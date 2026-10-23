@@ -532,7 +532,7 @@ fn ask(
             anyhow::bail!("the unit's closing round called a tool (round {round})");
         }
         let Some(tools) = tools.as_ref().filter(|_| !steps.is_empty()) else {
-            return answer_of(&resp.text, round, &resp.stats.finish);
+            return answer_of(&resp.answer, round, &resp.stats.finish);
         };
         let results = tool_round::run(tools, only_given(steps, &spec.tools));
         let response = format_tool_responses(&results);
@@ -553,28 +553,71 @@ fn ask(
 /// The unit's answer: what it said, its thinking set aside. A turn that spent
 /// its budget, or stopped inside its thinking, has not answered — what it
 /// wrote is reasoning, or an answer cut short, and it is read again.
-fn answer_of(text: &str, round: usize, finish: &FinishReason) -> anyhow::Result<String> {
-    let unclosed = match (text.rfind("<think>"), text.rfind("</think>")) {
-        (Some(open), Some(close)) => open > close,
-        (Some(_), None) => true,
-        _ => false,
-    };
+fn answer_of(written: &TurnText, round: usize, finish: &FinishReason) -> anyhow::Result<String> {
+    let chars: usize = written.pieces().iter().map(|p| p.text.len()).sum();
+    let (unclosed, answer) = split_thinking(written);
     if *finish == FinishReason::Length || unclosed {
         anyhow::bail!(
-            "the unit stopped before it answered (round {round}, finish {finish:?}, {} chars written, thinking {})",
-            text.len(),
+            "the unit stopped before it answered (round {round}, finish {finish:?}, {chars} chars written, thinking {})",
             if unclosed { "never closed" } else { "closed" },
         );
     }
-    let answer = after_thinking(text).trim().to_string();
+    let answer = answer.trim().to_string();
     if answer.is_empty() {
         anyhow::bail!(
-            "the unit answered nothing (round {round}, finish {finish:?}, {} chars written)",
-            text.len(),
+            "the unit answered nothing (round {round}, finish {finish:?}, {chars} chars written)"
         );
     }
     Ok(answer)
 }
+
+/// Whether `written` stopped inside its thinking, and what it said past it.
+///
+/// **Only the model's own tags bound the thinking.** `<think>` and `</think>`
+/// are control tokens; the same characters in ordinary text are a quotation —
+/// an analysis of a file that handles reasoning blocks quotes them — and are
+/// part of the answer. Read as plain text, a quoted `<think>` made a finished
+/// answer look unclosed and failed the unit, and a quoted `</think>` cut every
+/// word before it out of the answer.
+fn split_thinking(written: &TurnText) -> (bool, String) {
+    let mut open = false;
+    let mut after = String::new();
+    for piece in written.pieces() {
+        if piece.literal {
+            if !open {
+                after.push_str(&piece.text);
+            }
+            continue;
+        }
+        // The answer is what follows the model's last `</think>`: an open tag
+        // starts a block, a close ends it and starts the answer afresh.
+        let mut rest = piece.text.as_str();
+        loop {
+            match (rest.find(THINK_OPEN), rest.find(THINK_CLOSE)) {
+                (Some(o), c) if c.is_none_or(|c| o < c) => {
+                    open = true;
+                    rest = &rest[o + THINK_OPEN.len()..];
+                }
+                (_, Some(c)) => {
+                    open = false;
+                    after.clear();
+                    rest = &rest[c + THINK_CLOSE.len()..];
+                }
+                (None, None) => {
+                    if !open {
+                        after.push_str(rest);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    (open, after)
+}
+
+/// The reasoning block's tags, as the model writes them.
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
 
 /// Name, in the log, every turn `event` selected from outside the unit's own
 /// lineage — the units of other files (or days) its provenance brought in —
@@ -678,25 +721,29 @@ fn log_provenance(
     );
 }
 
-/// `text` past its thinking block, when it has one.
-fn after_thinking(text: &str) -> &str {
-    match text.rfind("</think>") {
-        Some(i) => &text[i + "</think>".len()..],
-        None => text,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A turn as the model writes it: its thinking tags are markup, and
+    /// everything it says in words is literal.
+    fn turn(thought: &str, said: &str) -> TurnText {
+        TurnText::markup("<think>")
+            .then_literal(thought)
+            .then_markup("</think>")
+            .then_literal(said)
+    }
+
     #[test]
     fn the_answer_is_what_follows_the_thinking() {
         assert_eq!(
-            after_thinking("<think>hmm</think>\nIt reads."),
-            "\nIt reads."
+            split_thinking(&turn("hmm", "\nIt reads.")),
+            (false, "\nIt reads.".to_string())
         );
-        assert_eq!(after_thinking("It reads."), "It reads.");
+        assert_eq!(
+            split_thinking(&TurnText::literal("It reads.")),
+            (false, "It reads.".to_string())
+        );
     }
 
     /// Reasoning that never closed, or an answer cut off by the budget, is
@@ -705,14 +752,38 @@ mod tests {
     fn an_unclosed_thought_or_a_spent_budget_is_no_answer() {
         let stop = FinishReason::Stop;
         assert_eq!(
-            answer_of("<think>a</think>It reads.", 0, &stop).unwrap(),
+            answer_of(&turn("a", "It reads."), 0, &stop).unwrap(),
             "It reads."
         );
-        assert!(answer_of("<think>still thinking", 0, &stop).is_err());
-        assert!(answer_of("<think>a</think>x<think>again", 0, &stop).is_err());
-        assert!(answer_of("<think>a</think>It rea", 0, &FinishReason::Length).is_err());
-        assert!(answer_of("<think>a</think>  ", 0, &stop).is_err());
-        assert_eq!(answer_of("No thinking.", 0, &stop).unwrap(), "No thinking.");
+        let still = TurnText::markup("<think>").then_literal("still thinking");
+        assert!(answer_of(&still, 0, &stop).is_err());
+        let again = turn("a", "x").then_markup("<think>").then_literal("again");
+        assert!(answer_of(&again, 0, &stop).is_err());
+        assert!(answer_of(&turn("a", "It rea"), 0, &FinishReason::Length).is_err());
+        assert!(answer_of(&turn("a", "  "), 0, &stop).is_err());
+        assert_eq!(
+            answer_of(&TurnText::literal("No thinking."), 0, &stop).unwrap(),
+            "No thinking."
+        );
+    }
+
+    /// The tags an answer quotes are words, not thinking: a file that handles
+    /// reasoning blocks is described with `<think>` and `</think>` in it, and
+    /// that answer is whole and closed — not failed as unclosed, nor cut at
+    /// the quoted close.
+    #[test]
+    fn quoted_think_tags_are_part_of_the_answer() {
+        let said = "The parser opens on `<think>` and closes on `</think>`; \
+                    a reply ending in `<think>` stays open.";
+        assert_eq!(
+            split_thinking(&turn("read the file", said)),
+            (false, said.to_string())
+        );
+        let quoted_in_thought = turn("it handles `</think>` tags", "It parses tags.");
+        assert_eq!(
+            split_thinking(&quoted_in_thought),
+            (false, "It parses tags.".to_string())
+        );
     }
 
     fn spec(effort: &str) -> LayerSpec {
