@@ -1,11 +1,11 @@
 //! The journal's one call, the grammar it is held to, and how an answer is read
 //! back.
 //!
-//! **Deliberately not in [`crate::engine::tools::CATALOG`].** That catalog is
-//! what a character may *do*; `journal_write` reaches nothing. It is the shape an
-//! answer takes when the character is asked to write its entry — the question
-//! describes it and the grammar forces it — and in the catalog `act::parse` would
-//! start accepting it on a live turn.
+//! **`journal_write` is never in a catalog of things that can be done.** It
+//! reaches nothing. It is the shape an answer takes when the writer is asked for
+//! its entry — the question describes it and the grammar forces it — and a
+//! caller that put it in its live tool catalog would start accepting it on an
+//! ordinary turn.
 //!
 //! # The grammar
 //!
@@ -13,11 +13,13 @@
 //! the stretch being written up — the turns a claim may cite, and the items that
 //! are open to restate or settle. A claim cannot cite a turn that is not there,
 //! and an item that is not open cannot be settled, because neither is a thing the
-//! grammar offers.
+//! grammar offers. It is the flat `{name, params}` JSON a
+//! `candle_conversation::stencil::ToolSpec` deserializes from, so this crate
+//! needs no engine.
 //!
 //! # Why `cite` is one value and not a list
 //!
-//! The grammar guides an object inside an array, and one array level. An array
+//! A grammar guides an object inside an array, and one array level. An array
 //! inside an array element decodes free. A claim is an element of `claims`, so
 //! its citations are `cite` and an optional `also_cite` — two guided enums —
 //! rather than a list the model would write unconstrained.
@@ -27,56 +29,37 @@
 //! [`parse`] reads whichever call shape the dialect wrote. The JSON block is
 //! grammar-guided all the way down; the function block writes raw values, so an
 //! array or object there is JSON text inside an element and the same checks run
-//! on it — [`verify`](crate::engine::journal::verify) is the net either way.
+//! on it — [`crate::verify`] is the net either way.
 
-use candle_conversation::stencil::{Param as CallParam, ParamType, ToolSpec};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
-use crate::engine::act::escape_control_in_strings;
-use crate::engine::journal::entry::{Item, Typed};
-use crate::engine::journal::verify::{Draft, DraftClaim, DraftOpen, Relates};
+use crate::entry::{Item, Typed};
+use crate::json_repair::escape_control_in_strings;
+use crate::verify::{Draft, DraftClaim, DraftOpen, Relates};
 
 /// The entry itself.
 pub const WRITE: &str = "journal_write";
 
-fn field(name: &str, ty: ParamType, required: bool) -> CallParam {
-    CallParam {
-        name: name.to_string(),
-        ty,
-        required,
-        enum_values: None,
-        items: None,
-        min_items: 0,
-        max_items: None,
-        properties: None,
-        nullable: false,
-        minimum: None,
-        max_tokens: None,
-        requires: Vec::new(),
-        shapes: Vec::new(),
-    }
+fn text(name: &str, required: bool) -> Value {
+    json!({ "name": name, "type": "string", "required": required })
 }
 
-fn choice(name: &str, required: bool, values: Vec<String>) -> CallParam {
-    CallParam {
-        enum_values: Some(values),
-        ..field(name, ParamType::String, required)
-    }
+fn choice(name: &str, required: bool, values: &[String]) -> Value {
+    json!({ "name": name, "type": "string", "required": required, "enum": values })
 }
 
-fn list_of(name: &str, required: bool, min_items: usize, item: CallParam) -> CallParam {
-    CallParam {
-        items: Some(Box::new(item)),
-        min_items,
-        ..field(name, ParamType::Array, required)
-    }
+fn list_of(name: &str, required: bool, min_items: usize, item: Value) -> Value {
+    json!({
+        "name": name,
+        "type": "array",
+        "required": required,
+        "min_items": min_items,
+        "items": item,
+    })
 }
 
-fn object(name: &str, required: bool, properties: Vec<CallParam>) -> CallParam {
-    CallParam {
-        properties: Some(properties),
-        ..field(name, ParamType::Object, required)
-    }
+fn object(name: &str, required: bool, properties: Vec<Value>) -> Value {
+    json!({ "name": name, "type": "object", "required": required, "properties": properties })
 }
 
 /// The `journal_write` call, for the stretch whose turns are `citable` and with
@@ -85,7 +68,7 @@ fn object(name: &str, required: bool, properties: Vec<CallParam>) -> CallParam {
 /// `None` when nothing in the stretch can be cited: there is no entry to write,
 /// and a `cite` with no value to choose would be a grammar that cannot be
 /// satisfied.
-pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<ToolSpec> {
+pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<Value> {
     if citable.is_empty() {
         return None;
     }
@@ -100,16 +83,16 @@ pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<ToolSpec> {
         "",
         true,
         vec![
-            field("text", ParamType::String, true),
-            choice("cite", true, ids.clone()),
-            choice("also_cite", false, ids),
+            text("text", true),
+            choice("cite", true, &ids),
+            choice("also_cite", false, &ids),
             object(
                 "typed",
                 false,
                 vec![
-                    field("subject", ParamType::String, true),
-                    field("attribute", ParamType::String, true),
-                    field("value", ParamType::String, true),
+                    text("subject", true),
+                    text("attribute", true),
+                    text("value", true),
                 ],
             ),
         ],
@@ -117,24 +100,20 @@ pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<ToolSpec> {
     let item = object(
         "",
         true,
-        vec![
-            field("text", ParamType::String, true),
-            choice("relates", true, relations),
-        ],
+        vec![text("text", true), choice("relates", true, &relations)],
     );
-    Some(ToolSpec {
-        name: WRITE.to_string(),
-        params: vec![
+    Some(json!({
+        "name": WRITE,
+        "params": [
             list_of("claims", true, 1, claim),
-            list_of("intend", false, 0, field("", ParamType::String, true)),
+            list_of("intend", false, 0, text("", true)),
             list_of("open", false, 0, item),
         ],
-    })
+    }))
 }
 
-/// The call's name and arguments, from whichever shape was written. Also how
-/// the mission generator reads its answer (`engine::mission_gen::answer`).
-pub(crate) fn arguments(answer: &str) -> Option<(String, Map<String, Value>)> {
+/// The call's name and arguments, from whichever shape was written.
+pub fn arguments(answer: &str) -> Option<(String, Map<String, Value>)> {
     json_call(answer).or_else(|| element_call(answer))
 }
 
@@ -313,45 +292,41 @@ pub fn parse(answer: &str) -> Result<Draft, String> {
 
 #[cfg(test)]
 mod tests {
-    use candle_conversation::stencil::{compile_tool_call_tree, ToolCallEnvelope};
-
     use super::*;
-    use crate::engine::act::{self, Rejected};
-    use crate::engine::tools::CATALOG;
+    use crate::entry::testing::item;
 
-    fn item(id: u64, text: &str) -> Item {
-        Item {
-            id,
-            text: text.into(),
-        }
+    fn param<'a>(spec: &'a Value, name: &str) -> &'a Value {
+        spec["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()
     }
 
-    #[test]
-    fn the_journal_call_is_not_one_the_world_accepts() {
-        assert!(
-            CATALOG.iter().all(|c| c.name != WRITE),
-            "`{WRITE}` must not be in the world catalog: `act::parse` would accept it live"
-        );
-    }
-
-    #[test]
-    fn a_live_turn_that_makes_the_journal_call_acts_on_nothing() {
-        let parsed = act::parse(&format!(r#"{{"tool": "{WRITE}"}}"#));
-        assert!(parsed.acts.is_empty(), "`{WRITE}` became an act");
-        assert!(
-            matches!(&parsed.rejected[..], [Rejected::UnknownTool { tool }] if tool == WRITE),
-            "`{WRITE}` was not refused as unknown: {:?}",
-            parsed.rejected
-        );
+    fn property<'a>(object: &'a Value, name: &str) -> &'a Value {
+        object["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()
     }
 
     #[test]
     fn the_write_call_takes_claims_then_intend_then_open() {
-        let write = write_spec(&[1, 2], &[]).unwrap();
-        let names: Vec<(&str, bool)> = write
-            .params
+        let spec = write_spec(&[1, 2], &[]).unwrap();
+        assert_eq!(spec["name"], WRITE);
+        let names: Vec<(&str, bool)> = spec["params"]
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|p| (p.name.as_str(), p.required))
+            .map(|p| {
+                (
+                    p["name"].as_str().unwrap(),
+                    p["required"].as_bool().unwrap(),
+                )
+            })
             .collect();
         assert_eq!(
             names,
@@ -361,8 +336,13 @@ mod tests {
 
     #[test]
     fn an_entry_cannot_be_written_without_a_claim() {
-        let write = write_spec(&[1, 2], &[]).unwrap();
-        let min: Vec<usize> = write.params.iter().map(|p| p.min_items).collect();
+        let spec = write_spec(&[1, 2], &[]).unwrap();
+        let min: Vec<u64> = spec["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["min_items"].as_u64().unwrap())
+            .collect();
         assert_eq!(min, [1, 0, 0]);
     }
 
@@ -373,94 +353,41 @@ mod tests {
 
     #[test]
     fn cite_offers_exactly_the_turns_of_the_stretch() {
-        let write = write_spec(&[7, 9, 12], &[]).unwrap();
-        let claims = write.params.iter().find(|p| p.name == "claims").unwrap();
-        let element = claims.items.as_ref().unwrap();
-        let props = element.properties.as_ref().unwrap();
-        let ids = ["7", "9", "12"].map(String::from);
+        let spec = write_spec(&[7, 9, 12], &[]).unwrap();
+        let element = &param(&spec, "claims")["items"];
         for key in ["cite", "also_cite"] {
-            let p = props.iter().find(|p| p.name == key).unwrap();
-            assert_eq!(p.enum_values.as_deref(), Some(&ids[..]), "{key}");
+            assert_eq!(
+                property(element, key)["enum"],
+                json!(["7", "9", "12"]),
+                "{key}"
+            );
         }
-        assert!(props.iter().find(|p| p.name == "cite").unwrap().required);
-        assert!(
-            !props
-                .iter()
-                .find(|p| p.name == "also_cite")
-                .unwrap()
-                .required
-        );
-        assert!(!props.iter().find(|p| p.name == "typed").unwrap().required);
+        assert_eq!(property(element, "cite")["required"], true);
+        assert_eq!(property(element, "also_cite")["required"], false);
+        assert_eq!(property(element, "typed")["required"], false);
     }
 
     #[test]
     fn relates_offers_new_and_restating_or_settling_each_open_item_only() {
-        let open = [item(3, "the valve"), item(5, "the roster")];
-        let write = write_spec(&[1], &open).unwrap();
-        let list = write.params.iter().find(|p| p.name == "open").unwrap();
-        let element = list.items.as_ref().unwrap();
-        let relates = element
-            .properties
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|p| p.name == "relates")
-            .unwrap();
+        let spec = write_spec(&[1], &[item(3, "the valve"), item(5, "the roster")]).unwrap();
+        let relates = property(&param(&spec, "open")["items"], "relates");
         assert_eq!(
-            relates.enum_values.as_deref().unwrap(),
-            [
+            relates["enum"],
+            json!([
                 "new",
                 "restates 3",
                 "resolves 3",
                 "restates 5",
                 "resolves 5"
-            ]
+            ])
         );
     }
 
     #[test]
     fn with_nothing_open_the_only_relation_is_new() {
-        let write = write_spec(&[1], &[]).unwrap();
-        let list = write.params.iter().find(|p| p.name == "open").unwrap();
-        let relates = list
-            .items
-            .as_ref()
-            .unwrap()
-            .properties
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|p| p.name == "relates")
-            .unwrap();
-        assert_eq!(relates.enum_values.as_deref().unwrap(), ["new"]);
-    }
-
-    #[test]
-    fn the_writing_grammar_compiles_under_both_call_shapes() {
-        let citable: Vec<u64> = (1..=16).collect();
-        let open: Vec<Item> = (1..=6).map(|i| item(i, "something")).collect();
-        for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
-            let spec = write_spec(&citable, &open).unwrap();
-            compile_tool_call_tree(&[spec], &env).expect("the writing grammar compiles");
-        }
-    }
-
-    /// The writing grammar is built once per draft, with the largest span and the
-    /// most open items a draft can have. It has to stay a size that is cheap to
-    /// compile — an array level is unrolled 64 times, so what one element costs
-    /// is multiplied.
-    #[test]
-    fn the_writing_grammar_stays_small_at_its_largest() {
-        let citable: Vec<u64> = (1..=64).collect();
-        let open: Vec<Item> = (1..=6).map(|i| item(i, "something")).collect();
-        let spec = write_spec(&citable, &open).unwrap();
-        let tree = compile_tool_call_tree(&[spec], &ToolCallEnvelope::qwen3()).unwrap();
-        let nodes = tree.nodes.len();
-        assert!(
-            nodes < 10_000,
-            "{nodes} nodes: an array element that costs this much, times 64 levels, is a compile \
-             that is not worth a journal entry"
-        );
+        let spec = write_spec(&[1], &[]).unwrap();
+        let relates = property(&param(&spec, "open")["items"], "relates");
+        assert_eq!(relates["enum"], json!(["new"]));
     }
 
     #[test]
@@ -476,9 +403,7 @@ mod tests {
                      {"text": "the roster", "relates": "resolves 5"},
                      {"text": "the lift", "relates": "new"}]
         }}"#;
-        let Ok(draft) = parse(said) else {
-            panic!("did not read as a write");
-        };
+        let draft = parse(said).expect("reads as a write");
         assert_eq!(draft.claims.len(), 2);
         assert_eq!(draft.claims[0].cite, vec![12]);
         assert_eq!(draft.claims[0].typed, None);
@@ -505,9 +430,7 @@ mod tests {
             <parameter=claims>\n[{\"text\": \"The lift stopped.\", \"cite\": \"4\"}]</parameter>\n\
             <parameter=intend>\n[\"take the stairs\"]</parameter>\n\
             </function>\n</tool_call>";
-        let Ok(draft) = parse(said) else {
-            panic!("did not read as a write");
-        };
+        let draft = parse(said).expect("reads as a write");
         assert_eq!(draft.claims[0].text, "The lift stopped.");
         assert_eq!(draft.claims[0].cite, vec![4]);
         assert_eq!(draft.intend, vec!["take the stairs".to_string()]);
@@ -517,36 +440,25 @@ mod tests {
     fn a_turn_may_be_written_as_a_number() {
         let said =
             r#"{"name": "journal_write", "arguments": {"claims": [{"text": "a", "cite": 4}]}}"#;
-        let Ok(draft) = parse(said) else {
-            panic!("did not read as a write");
-        };
-        assert_eq!(draft.claims[0].cite, vec![4]);
+        assert_eq!(parse(said).unwrap().claims[0].cite, vec![4]);
     }
 
     #[test]
     fn a_repeated_turn_is_cited_once() {
         let said = r#"{"name": "journal_write", "arguments": {"claims": [{"text": "a", "cite": "4", "also_cite": "4"}]}}"#;
-        let Ok(draft) = parse(said) else {
-            panic!("did not read as a write");
-        };
-        assert_eq!(draft.claims[0].cite, vec![4]);
+        assert_eq!(parse(said).unwrap().claims[0].cite, vec![4]);
     }
 
     #[test]
     fn a_raw_newline_inside_a_claim_is_repaired_not_refused() {
         let said = "{\"name\": \"journal_write\", \"arguments\": {\"claims\": [{\"text\": \"line one\nline two\", \"cite\": \"4\"}]}}";
-        let Ok(draft) = parse(said) else {
-            panic!("did not read as a write");
-        };
-        assert_eq!(draft.claims[0].text, "line one\nline two");
+        assert_eq!(parse(said).unwrap().claims[0].text, "line one\nline two");
     }
 
     #[test]
     fn a_write_with_only_open_items_is_a_draft() {
         let said = r#"{"name": "journal_write", "arguments": {"open": [{"text": "the lift", "relates": "new"}]}}"#;
-        let Ok(draft) = parse(said) else {
-            panic!("did not read as a write");
-        };
+        let draft = parse(said).unwrap();
         assert!(draft.claims.is_empty());
         assert_eq!(draft.open.len(), 1);
     }

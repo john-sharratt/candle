@@ -18,8 +18,8 @@ use serde_json::{Map, Value};
 
 use super::answer::{choice, contains, quotes_in, single_quoted, text, text_within, Fields};
 use super::corpus::Corpus;
-use crate::engine::journal::tools::arguments;
 use crate::sim::operations::Operation;
+use journal_core::tools::arguments;
 
 /// The call the table reads a draft with.
 pub const READING: &str = "reading";

@@ -1,11 +1,11 @@
 //! What a journal entry says that the journal already says — taken out before
 //! the entry is kept.
 //!
-//! **A journal that repeats itself is a loop the character reads back.** The
-//! check in [`super::verify`] dedups typed claims within one entry and nothing
-//! else, so "Did: I have written the draft" and "the record is absent" were kept
-//! entry after entry, and every turn's prompt carried the same line four times —
-//! the character read its own repetition as the state of the world. A claim or
+//! **A journal that repeats itself is a loop its writer reads back.** The check
+//! in [`crate::verify`] dedups typed claims within one entry and nothing else,
+//! so "Did: I have written the draft" and "the record is absent" were kept entry
+//! after entry in npcd, and every turn's prompt carried the same line four times
+//! — the character read its own repetition as the state of the world. A claim or
 //! intention that says nearly what a held entry (or an earlier line of the same
 //! entry) says is dropped, and so is a new open item that says what one still
 //! open says. "Nearly" is word overlap: the share of the two lines' distinct
@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use super::entry::{Entry, Item};
+use crate::entry::{Entry, Item};
 
 /// The word overlap at or above which two lines say the same thing.
 const SAME: f32 = 0.7;
@@ -68,7 +68,7 @@ pub fn drop_repeats(mut entry: Entry, held: &[Entry], open: &[Item]) -> (Entry, 
         fresh
     });
 
-    // A restated item keeps its id and is the character saying where it stands
+    // A restated item keeps its id and is the writer saying where it stands
     // now; only a new one that is already open is a repeat.
     let mut standing: Vec<BTreeSet<String>> = open.iter().map(|i| words(&i.text)).collect();
     entry.opened.retain(|i| {
@@ -98,18 +98,8 @@ pub fn says_anything(entry: &Entry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::journal::entry::{Claim, Kind};
-
-    fn claim(text: &str) -> Claim {
-        Claim {
-            text: text.into(),
-            cite: vec![1],
-            kind: Kind::Did,
-            perishable: false,
-            typed: None,
-            corrected: false,
-        }
-    }
+    use crate::entry::testing::claim;
+    use crate::entry::Kind;
 
     fn entry(claims: &[&str], intend: &[&str], opened: &[&str]) -> Entry {
         Entry {
@@ -118,7 +108,7 @@ mod tests {
             to_turn: 2,
             from_ms: 0,
             to_ms: 0,
-            claims: claims.iter().map(|c| claim(c)).collect(),
+            claims: claims.iter().map(|c| claim(c, Kind::Did)).collect(),
             intend: intend.iter().map(|s| s.to_string()).collect(),
             opened: opened
                 .iter()
@@ -192,5 +182,27 @@ mod tests {
         );
         assert_eq!(dropped, 1);
         assert!(!says_anything(&kept));
+    }
+
+    #[test]
+    fn a_restated_item_is_never_a_repeat() {
+        let open = [Item {
+            id: 4,
+            text: "Is the east door jammed?".into(),
+        }];
+        let mut e = entry(&[], &[], &[]);
+        e.opened = vec![Item {
+            id: 4,
+            text: "Is the east door jammed?".into(),
+        }];
+        let (kept, dropped) = drop_repeats(e, &[], &open);
+        assert_eq!((kept.opened.len(), dropped), (1, 0));
+    }
+
+    #[test]
+    fn a_settling_only_entry_still_says_something() {
+        let mut e = entry(&[], &[], &[]);
+        e.resolved = vec![2];
+        assert!(says_anything(&e));
     }
 }

@@ -35,6 +35,7 @@
 //! instead of calling the tool, nothing happens", enforced rather than merely
 //! requested.
 
+use journal_core::json_repair::escape_control_in_strings;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -215,97 +216,6 @@ fn looks_like_call(line: &str) -> bool {
 /// taught a format the trigger token never appears in.
 const CALL_OPEN: &str = "<tool_call>";
 const CALL_CLOSE: &str = "</tool_call>";
-
-/// Escape raw control characters that appear **inside** a JSON string.
-///
-/// # The failure this exists for
-///
-/// The grammar's free-text span ends at the first unescaped `"`
-/// (`stencil::Terminator::JsonString`) and excludes nothing else, so a model
-/// filling a string argument may emit a literal newline. JSON forbids that —
-/// a control character in a string must be escaped — so `serde_json` refuses
-/// the object, and because [`parse`] walks *lines* (the `<tool_call>` envelope
-/// spans them) the object arrives cut in two as well.
-///
-/// One character did this every turn for hours. The grammar had steered it
-/// correctly — right tool, right addressee — and the first byte of its `about`
-/// was a newline, so what came back was *"That did not come out as a call. One
-/// JSON object on a line, nothing else"*, which it could not act on because it
-/// had done exactly that. Each rejection then became another event in its
-/// window: 947 seen against its neighbours' 506.
-///
-/// # Why repairing here is not papering over it
-///
-/// The model's **content** is right and only its encoding is wrong, and the
-/// repair is exact rather than a guess: JSON defines the escape for every
-/// control character, so a raw one has one correct reading and no other. This
-/// recovers what was meant, byte for byte, and it is the same leniency any
-/// parser applies to a producer it does not control.
-///
-/// It is not the whole answer. The span should not be able to emit an
-/// unescapable byte in the first place, and that lives in the stencil's
-/// free-text mask — a shared change with its own blast radius. This makes the
-/// engine correct today and does not depend on that landing.
-///
-/// Outside a string a newline is structural — it is what separates one call
-/// from the next — so only the inside is touched. Borrowed and untouched when
-/// there is nothing to escape, which is every ordinary decode.
-pub(crate) fn escape_control_in_strings(s: &str) -> std::borrow::Cow<'_, str> {
-    if !needs_repair(s) {
-        return std::borrow::Cow::Borrowed(s);
-    }
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut out = String::with_capacity(s.len() + 16);
-    for c in s.chars() {
-        if escaped {
-            escaped = false;
-            out.push(c);
-            continue;
-        }
-        match c {
-            '\\' if in_string => {
-                escaped = true;
-                out.push(c);
-            }
-            '"' => {
-                in_string = !in_string;
-                out.push(c);
-            }
-            // The whole point: a control character inside a string, written as
-            // the escape JSON requires.
-            c if in_string && (c as u32) < 0x20 => match c {
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                other => out.push_str(&format!("\\u{:04x}", other as u32)),
-            },
-            c => out.push(c),
-        }
-    }
-    std::borrow::Cow::Owned(out)
-}
-
-/// Whether any control character actually sits inside a string.
-///
-/// The scan above rewrites nothing when this is false, so an ordinary decode —
-/// which is all of them — pays one pass and no allocation.
-fn needs_repair(s: &str) -> bool {
-    let (mut in_string, mut escaped) = (false, false);
-    for c in s.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            c if in_string && (c as u32) < 0x20 => return true,
-            _ => {}
-        }
-    }
-    false
-}
 
 /// One call's JSON, from either shape a character may emit.
 ///
@@ -841,16 +751,6 @@ mod tests {
         );
         assert_eq!(p.rejected, Vec::new(), "{:?}", p.rejected);
         assert_eq!(p.acts[0].args["intent"], "he said \"go\"\nand went");
-    }
-
-    /// The ordinary decode — every one of them — pays a scan and no allocation.
-    #[test]
-    fn a_clean_decode_is_not_rewritten() {
-        let clean = "{\"name\": \"shout\", \"arguments\": {\"intent\": \"nothing to repair\"}}";
-        assert!(matches!(
-            escape_control_in_strings(clean),
-            std::borrow::Cow::Borrowed(_)
-        ));
     }
 
     /// **The shape the stencil emits parses.**

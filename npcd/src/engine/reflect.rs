@@ -62,9 +62,9 @@ use candle_conversation::stencil::{
     ThinkMode, ThinkSteerEnvelope, ToolCallEnvelope, ToolSpec,
 };
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
+use journal_core::json_repair::escape_control_in_strings;
 use serde::Serialize;
 
-use crate::engine::act::escape_control_in_strings;
 use crate::engine::dreams;
 use crate::engine::identity;
 use crate::engine::mind::Projected;

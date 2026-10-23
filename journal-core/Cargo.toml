@@ -1,0 +1,17 @@
+[package]
+name = "journal-core"
+version = "0.1.0"
+edition = "2021"
+description = "A journal's entries, their server-side check, the write grammar and the draft workflow, shared by npcd and zend"
+
+# No engine dependency. `candle-conversation` is a CUDA build, and nothing here
+# touches a model: the write grammar is handed over as the flat `{name, params}`
+# JSON a `stencil::ToolSpec` deserializes from, and the question is put through
+# the caller's `Desk`. So the crate builds and tests in seconds.
+[dependencies]
+anyhow     = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

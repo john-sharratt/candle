@@ -28,9 +28,9 @@ use super::corpus::Corpus;
 use super::material;
 use super::reading;
 use super::run::{reading_prompt, READING_TOKENS, THINK};
-use crate::engine::journal::tools::arguments;
 use crate::engine::mind::Minds;
 use crate::engine::prose::{decode_call_thought, CallAsk};
+use journal_core::tools::arguments;
 
 const MIND: &str = "D:/prog/mind";
 const WORLD: &str = "battle-cities";

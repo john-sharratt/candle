@@ -3,19 +3,17 @@
 //! A [`Draft`] is only what the model supplies — claim text, the turns each claim
 //! rests on, and how each open item relates to what is already open. [`verify`]
 //! turns it into an [`Entry`] or refuses it, and decides everything the model is
-//! not trusted to say: how a claim came to be known ([`Kind`], read off the cited
-//! turns' [`Origin`], never off wording), whether it can go stale, and — for a
-//! claim the world can be asked about — whether the world agrees.
+//! not trusted to say: how a claim came to be known ([`Kind`], read off the
+//! cited turns' evidence, never off wording), whether it can go stale, and — for
+//! a claim the world can be asked about — whether the world agrees.
 //!
 //! The same draft against the same span, open items and world always draws the
 //! same verdict. Nothing here samples.
 
 use std::collections::BTreeSet;
 
-use crate::engine::body;
-use crate::engine::journal::entry::{Claim, Entry, Item, Kind, Typed};
-use crate::engine::journal::state::Span;
-use crate::engine::window::Origin;
+use crate::entry::{Claim, Entry, Item, Kind, Typed};
+use crate::span::Span;
 
 /// Claims one entry may carry.
 pub const MAX_CLAIMS: usize = 12;
@@ -82,8 +80,8 @@ impl Refusal {
             }
             Refusal::EmptyText { what } => format!("A {what} has no text."),
             Refusal::NotCitable { claim, turn } => format!(
-                "Claim {} cites turn {turn}, which is not something a claim can rest on \
-                 (scenery, standing instructions and your own reflections are not evidence).",
+                "Claim {} cites turn {turn}, which is not something a claim can rest on: cite \
+                 only the numbered turns of the stretch.",
                 claim + 1
             ),
             Refusal::NotOpen { id } => format!("Item #{id} is not open."),
@@ -94,7 +92,7 @@ impl Refusal {
     }
 }
 
-/// What the check decided about one claim, for the pulse.
+/// What the check decided about one claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Kept,
@@ -104,6 +102,18 @@ pub enum Verdict {
     Demoted,
     /// A later claim about the same subject and attribute replaced it.
     Superseded,
+}
+
+impl Verdict {
+    /// The name it is shown under.
+    pub fn name(self) -> &'static str {
+        match self {
+            Verdict::Kept => "kept",
+            Verdict::Corrected => "corrected",
+            Verdict::Demoted => "demoted",
+            Verdict::Superseded => "superseded",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,32 +130,11 @@ pub struct Verified {
     pub notes: Vec<Note>,
 }
 
-/// How one turn supports a claim that cites it.
-fn evidence(origin: &Origin) -> Kind {
-    match origin {
-        Origin::Event { tag, .. } => match *tag {
-            "speech" | "message" | "announcement" | "operator" => Kind::Heard,
-            _ => Kind::Observed,
-        },
-        // A tool whose line is something the world told the character, rather
-        // than the character's own act being recorded.
-        Origin::Act { verb } if body::answers(verb) => Kind::Observed,
-        Origin::Act { .. } => Kind::Did,
-    }
-}
-
 /// The strongest support among the cited turns; none is a conclusion.
 fn derive_kind(span: &Span, cite: &[u64]) -> Kind {
-    let rank = |k: Kind| match k {
-        Kind::Observed => 3,
-        Kind::Heard => 2,
-        Kind::Did => 1,
-        Kind::Inferred => 0,
-    };
     cite.iter()
-        .filter_map(|id| span.turn(*id))
-        .map(|t| evidence(&t.origin))
-        .max_by_key(|k| rank(*k))
+        .filter_map(|id| span.turn(*id)?.evidence)
+        .max_by_key(|k| k.rank())
         .unwrap_or(Kind::Inferred)
 }
 
@@ -298,22 +287,23 @@ pub fn verify(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::event::{Event, EventKind, Salience};
-    use crate::engine::journal::state::JournalState;
-    use crate::engine::window::Window;
+pub(crate) mod testing {
     use std::collections::BTreeMap;
 
+    use super::World;
+
+    /// A world that answers from a table, case-blind.
     #[derive(Default)]
-    struct Fake(BTreeMap<(String, String), String>);
+    pub struct Fake(BTreeMap<(String, String), String>);
+
     impl Fake {
-        fn with(mut self, s: &str, a: &str, v: &str) -> Self {
+        pub fn with(mut self, s: &str, a: &str, v: &str) -> Self {
             self.0
                 .insert((s.to_lowercase(), a.to_lowercase()), v.into());
             self
         }
     }
+
     impl World for Fake {
         fn read(&self, subject: &str, attribute: &str) -> Option<String> {
             self.0
@@ -321,44 +311,26 @@ mod tests {
                 .cloned()
         }
     }
+}
 
-    fn at(w: &mut Window, kind: EventKind, ms: u64) -> u64 {
-        w.push_event(&Event::new(0, ms, Salience::NORMAL, kind))
-    }
+#[cfg(test)]
+mod tests {
+    use super::testing::Fake;
+    use super::*;
+    use crate::span::testing::turn;
 
-    /// Turns: 1 speech (Heard), 2 situation (Observed), 3 own `tell`
-    /// (Did), 4 `read` answer (Observed), 5 ambient scenery (uncitable),
-    /// 6 own `reflect` (uncitable).
+    /// Turns: 1 heard, 2 observed, 3 own act, 4 a tool answer (observed),
+    /// 5 scenery (uncitable), 6 own reflection (uncitable).
     fn span() -> Span {
-        let mut w = Window::with_default_cap();
-        at(
-            &mut w,
-            EventKind::Speech {
-                speaker: "Pax".into(),
-                text: "Fabricator 5 is lost.".into(),
-                to: Default::default(),
-            },
-            10,
-        );
-        at(
-            &mut w,
-            EventKind::Situation {
-                text: "You are in the foundry.".into(),
-            },
-            20,
-        );
-        w.push_npc("tell — to Pax: on my way", 30);
-        w.push_npc("read — the board says: shields are down", 40);
-        w.push_event(&Event::new(
-            0,
-            50,
-            Salience::IDLE,
-            EventKind::Description {
-                text: "The conduit hums.".into(),
-            },
-        ));
-        w.push_npc("reflect — thinking", 60);
-        JournalState::new(0).begin(&w).unwrap()
+        Span::of(vec![
+            turn(1, 10, Some(Kind::Heard), "Pax: Fabricator 5 is lost."),
+            turn(2, 20, Some(Kind::Observed), "You are in the foundry."),
+            turn(3, 30, Some(Kind::Did), "You: tell Pax: on my way"),
+            turn(4, 40, Some(Kind::Observed), "You: read — shields are down"),
+            turn(5, 50, None, "The conduit hums."),
+            turn(6, 60, None, "You: reflect — thinking"),
+        ])
+        .unwrap()
     }
 
     fn claim(text: &str, cite: &[u64]) -> DraftClaim {
@@ -417,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn what_a_character_did_does_not_go_stale_and_everything_else_can() {
+    fn what_was_done_does_not_go_stale_and_everything_else_can() {
         assert!(!one(claim("I told Pax.", &[3])).perishable);
         assert!(one(claim("The room is quiet.", &[2])).perishable);
         assert!(one(claim("Pax is worried.", &[1])).perishable);
@@ -425,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_may_not_rest_on_scenery_or_its_own_reflection_or_a_turn_outside_the_span() {
+    fn a_claim_may_not_rest_on_a_turn_with_no_evidence_or_outside_the_span() {
         for turn in [5, 6, 99] {
             assert_eq!(
                 run(Draft {
@@ -685,16 +657,12 @@ mod tests {
 
     #[test]
     fn the_entry_carries_the_span_it_was_drafted_from() {
-        let s = span();
         let v = run(Draft {
             intend: vec!["Go to the foundry.".into()],
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(
-            (v.entry.from_turn, v.entry.to_turn),
-            (s.from_turn, s.to_turn)
-        );
+        assert_eq!((v.entry.from_turn, v.entry.to_turn), (1, 6));
         assert_eq!((v.entry.from_ms, v.entry.to_ms), (10, 60));
         assert_eq!(v.entry.id, 0, "the state assigns the id at keep");
     }
@@ -710,5 +678,18 @@ mod tests {
         let a = verify(d.clone(), &span(), &[], &world);
         let b = verify(d, &span(), &[], &world);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn each_verdict_has_a_name() {
+        let names: Vec<&str> = [
+            Verdict::Kept,
+            Verdict::Corrected,
+            Verdict::Demoted,
+            Verdict::Superseded,
+        ]
+        .map(Verdict::name)
+        .to_vec();
+        assert_eq!(names, ["kept", "corrected", "demoted", "superseded"]);
     }
 }

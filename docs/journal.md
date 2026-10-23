@@ -10,23 +10,33 @@ something longer than the tail and more careful than the tail: a short, dated,
 checked record of what it saw, heard, did and left open, written off the main
 line and read back in the system prompt.
 
-This document is authoritative over the code in `npcd/src/engine/journal/`.
+This document is authoritative over the code in `journal-core/src/` and
+`npcd/src/engine/journal/`. The journal's logic is the `journal-core` crate,
+which zend's coding sessions keep their journals with too
+(`docs/zend_journal.md`); npcd supplies what is the character's.
 
 | File | Concern |
 |---|---|
-| `entry.rs` | `Entry`, `Claim`, `Kind`, `Item`; the prose an entry renders to |
-| `verify.rs` | the server's half: citation check, kind, perishability, typed-claim check, open-item rules |
-| `tools.rs` | the `journal_write` call and the grammar it is held to; reading an answer back |
-| `ask.rs` | what the character is asked to write about a stretch |
-| `workflow.rs` | `run`: the write, the check, the keep, against a `Desk` |
-| `desk.rs` | `EngineDesk`: the question put to the live conversation and the real keep |
-| `state.rs` | per-character `JournalState`: cadence, coverage, open items |
-| `section.rs` | the journal as the sections of a system prompt, and the metadata record a restart rebuilds from |
+| `journal-core/src/entry.rs` | `Entry`, `Claim`, `Kind`, `Item`; the prose an entry renders to |
+| `journal-core/src/verify.rs` | the server's half: citation check, kind, perishability, typed-claim check, open-item rules |
+| `journal-core/src/tools.rs` | the `journal_write` call and the grammar it is held to; reading an answer back |
+| `journal-core/src/repeats.rs` | what the journal already says, dropped before a keep |
+| `journal-core/src/ask.rs` | the question a stretch is put as |
+| `journal-core/src/workflow.rs` | `run`: the write, the check, the keep, against a `Desk` |
+| `journal-core/src/journal.rs` | `Journal`: entries, open items, coverage, ids |
+| `journal-core/src/section.rs` | the journal as the sections of a system prompt, and the metadata record a restart rebuilds from |
+| `journal-core/src/record.rs` | what each draft did, and the API's view |
+| `journal-core/src/style.rs` | `Style`: the wording an entry renders in |
+| `npcd/.../style.rs` | the world calendar and the character's voice |
+| `npcd/.../origin.rs` | a window turn as a stretch holds it, and what a claim citing it rests on |
+| `npcd/.../state.rs` | per-character `JournalState`: the window cadence and the stranded turns, around a `Journal` |
+| `npcd/.../desk.rs` | `EngineDesk`: the question put to the live conversation and the real keep |
+| `npcd/.../section.rs` | `META_OF`: which conversation holds a character's journal |
+| `npcd/.../world.rs` | `Snapshot`: what the sim can say about a claim |
 
 The question of whether a stretch needs an entry at all is not here: it is the
 guardian's `journal` module (`guardian/modules/journal.rs`,
 `docs/npcd_guardian.md`), one of the background questions it puts to a character.
-| `world.rs` | `Snapshot`: what the sim can say about a claim |
 
 ## 1. Shape
 

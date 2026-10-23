@@ -40,6 +40,10 @@ use candle_conversation::projection::{
 use candle_conversation::{
     ConversationEngine, LoadPhase, Sequence, SequenceConfig, TurnEvent, TurnHandle, TurnResponse,
 };
+use journal_core::journal::Holds;
+use journal_core::record::DraftRecord;
+use journal_core::section::JournalPrompt;
+use journal_core::workflow::{Outcome as Drafted, Timing};
 
 /// The marker a prefilled turn's projection is recorded against.
 ///
@@ -83,9 +87,6 @@ use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
 use crate::engine::ingest;
 use crate::engine::invoke_body::Invokable;
-use crate::engine::journal::record::DraftRecord;
-use crate::engine::journal::section::JournalPrompt;
-use crate::engine::journal::workflow::{Outcome as Drafted, Timing};
 use crate::engine::journal::world::Snapshot;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
@@ -3321,7 +3322,8 @@ impl Runtime {
         if worth {
             self.spawn_journal(npc_id, due, reply.ms);
         } else {
-            let mut state = due.state.lock().unwrap();
+            let mut held = due.state.lock().unwrap();
+            let state = held.journal_mut();
             state.nothing_to_write(&due.span);
             let why = if reply.reason.trim().is_empty() {
                 "the character judged the stretch not worth an entry".to_string()
@@ -3353,7 +3355,7 @@ impl Runtime {
                 handle.spawn(async move { rt.journal_now(npc_id, due, gate_ms).await });
             }
             None => {
-                due.state.lock().unwrap().abandon();
+                due.state.lock().unwrap().journal_mut().abandon();
                 tracing::warn!("npc {npc_id}: no executor to write a journal entry on");
             }
         }
@@ -3365,7 +3367,8 @@ impl Runtime {
     async fn journal_now(&self, npc_id: u64, due: Due, gate_ms: u64) {
         let started = Instant::now();
         let not_started = |why: String| {
-            let mut state = due.state.lock().unwrap();
+            let mut held = due.state.lock().unwrap();
+            let state = held.journal_mut();
             state.abandon();
             state.record(DraftRecord::not_started(&due.span, started.elapsed(), why));
         };
@@ -3383,7 +3386,7 @@ impl Runtime {
             .journal(npc_id, &who.as_persona(), &within, &due, &world)
             .await;
         match &drafted {
-            Ok((outcome, timing)) => due.state.lock().unwrap().record(
+            Ok((outcome, timing)) => due.state.lock().unwrap().journal_mut().record(
                 DraftRecord::of(&due.span, started.elapsed(), outcome)
                     .timed(Timing { gate_ms, ..*timing }),
             ),
@@ -5743,7 +5746,7 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 let kept = minds.restore_journal(id);
                 tracing::info!(
                     "npc {id}: journal restored, {} entr(ies)",
-                    kept.entries().count()
+                    kept.journal().entries().count()
                 );
                 rt.scheduler.set_journal(id, kept);
                 journal_restored = true;

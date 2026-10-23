@@ -3,11 +3,14 @@
 use std::time::Duration;
 
 use serde::Serialize;
+use serde_json::{json, Value};
 
-use crate::engine::journal::entry::Entry;
-use crate::engine::journal::state::{JournalState, Span};
-use crate::engine::journal::verify::{Note, Verdict};
-use crate::engine::journal::workflow::{Abandon, Outcome, Timing};
+use crate::entry::Entry;
+use crate::journal::Journal;
+use crate::span::Span;
+use crate::style::Style;
+use crate::verify::Note;
+use crate::workflow::{Abandon, Outcome, Timing};
 
 /// How a draft ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -16,11 +19,11 @@ pub enum Ending {
     Wrote,
     Nothing,
     Abandoned,
-    /// The draft never began: no model to ask or no character to ask for.
+    /// The draft never began: nothing to ask, or nobody to ask it of.
     NotStarted,
 }
 
-/// One claim's check, as the pulse shows it.
+/// One claim's check, as an inspector shows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Check {
     pub claim: usize,
@@ -40,8 +43,8 @@ pub struct DraftRecord {
     /// Of `took_ms`, asking for the entry.
     pub write_ms: u64,
     pub result: Ending,
-    /// Why it ended without an entry, when it did: the character's own reason for
-    /// a no, or what went wrong.
+    /// Why it ended without an entry, when it did: the writer's own reason for a
+    /// no, or what went wrong.
     pub detail: Option<String>,
     /// The id of the entry it kept.
     pub entry: Option<u64>,
@@ -49,21 +52,12 @@ pub struct DraftRecord {
     pub checks: Vec<Check>,
 }
 
-fn verdict_name(v: Verdict) -> &'static str {
-    match v {
-        Verdict::Kept => "kept",
-        Verdict::Corrected => "corrected",
-        Verdict::Demoted => "demoted",
-        Verdict::Superseded => "superseded",
-    }
-}
-
 fn checks(notes: &[Note]) -> Vec<Check> {
     notes
         .iter()
         .map(|n| Check {
             claim: n.claim,
-            verdict: verdict_name(n.verdict),
+            verdict: n.verdict.name(),
             kind: n.kind.name(),
         })
         .collect()
@@ -83,7 +77,7 @@ impl DraftRecord {
             from_turn: span.from_turn,
             to_turn: span.to_turn,
             turns: span.turns.len(),
-            took_ms: took.as_millis() as u64,
+            took_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
             gate_ms: 0,
             write_ms: 0,
             result: Ending::Nothing,
@@ -134,68 +128,40 @@ impl DraftRecord {
     }
 }
 
-/// The entry as the API shows it: its stored form, its span and how it reads in
-/// the prompt.
-pub fn shown(entry: &Entry) -> serde_json::Value {
+/// The entry as an inspector shows it: its stored form, its span and how it
+/// reads in the prompt.
+pub fn shown(entry: &Entry, style: &Style) -> Value {
     let mut v = serde_json::to_value(entry).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
-        o.insert("span".into(), entry.span().into());
-        o.insert("text".into(), entry.render().into());
+        o.insert("span".into(), entry.span(style).into());
+        o.insert("text".into(), entry.render(style).into());
     }
     v
 }
 
-/// Everything the journal API says about one character's journal.
-pub fn view(state: &JournalState) -> serde_json::Value {
-    let in_prompt: Vec<u64> = state.entries().map(|e| e.id).collect();
-    serde_json::json!({
-        "written": state.written(),
+/// Everything an inspector is told about one journal.
+pub fn view(journal: &Journal, style: &Style) -> Value {
+    let in_prompt: Vec<u64> = journal.entries().map(|e| e.id).collect();
+    json!({
+        "written": journal.written(),
         "in_prompt": in_prompt,
-        "covered_to": state.covered_to(),
-        "looked_to": state.looked_to(),
-        "drafting": state.pending(),
-        "open": state.open(),
-        "entries": state.entries().map(shown).collect::<Vec<_>>(),
-        "drafts": state.drafts().collect::<Vec<_>>(),
+        "covered_to": journal.covered_to(),
+        "looked_to": journal.looked_to(),
+        "drafting": journal.pending(),
+        "open": journal.open(),
+        "entries": journal.entries().map(|e| shown(e, style)).collect::<Vec<_>>(),
+        "drafts": journal.drafts().collect::<Vec<_>>(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::journal::entry::Kind;
-    use crate::engine::journal::state::IN_PROMPT;
-
-    #[test]
-    fn the_view_names_what_the_prompt_shows_and_what_drafts_did() {
-        let mut s = JournalState::new(0);
-        let e = s.kept(entry(0));
-        s.record(DraftRecord::of(&span(), Duration::ZERO, &nothing("quiet")));
-        let v = view(&s);
-        assert_eq!(v["written"], 1);
-        assert_eq!(v["in_prompt"], serde_json::json!([e.id]));
-        assert_eq!(v["entries"][0]["id"], e.id);
-        assert_eq!(v["drafts"][0]["result"], "nothing");
-        assert_eq!(v["drafting"], false);
-    }
-
-    #[test]
-    fn an_empty_journal_shows_no_entries_and_nothing_in_the_prompt() {
-        let v = view(&JournalState::new(3));
-        assert_eq!(v["written"], 0);
-        assert_eq!(v["in_prompt"], serde_json::json!([]));
-        assert_eq!(v["entries"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn the_prompt_holds_only_the_newest_entries() {
-        let mut s = JournalState::new(0);
-        for _ in 0..(IN_PROMPT + 2) {
-            s.kept(entry(0));
-        }
-        let ids = view(&s)["in_prompt"].as_array().unwrap().len();
-        assert_eq!(ids, IN_PROMPT);
-    }
+    use crate::entry::testing::entry as entry_at;
+    use crate::entry::Kind;
+    use crate::journal::IN_PROMPT;
+    use crate::style::testing::PLAIN;
+    use crate::verify::Verdict;
 
     fn nothing(why: &str) -> Outcome {
         Outcome::Nothing { why: why.into() }
@@ -213,16 +179,43 @@ mod tests {
 
     fn entry(id: u64) -> Entry {
         Entry {
-            id,
-            from_turn: 3,
-            to_turn: 9,
-            from_ms: 0,
-            to_ms: 1,
-            claims: vec![],
             intend: vec!["find Pax".into()],
-            opened: vec![],
-            resolved: vec![],
+            ..entry_at(id)
         }
+    }
+
+    #[test]
+    fn the_view_names_what_the_prompt_shows_and_what_drafts_did() {
+        let mut j = Journal::new();
+        let e = j.kept(entry(0));
+        j.record(DraftRecord::of(&span(), Duration::ZERO, &nothing("quiet")));
+        let v = view(&j, &PLAIN);
+        assert_eq!(v["written"], 1);
+        assert_eq!(v["in_prompt"], json!([e.id]));
+        assert_eq!(v["entries"][0]["id"], e.id);
+        assert_eq!(v["entries"][0]["text"], e.render(&PLAIN));
+        assert_eq!(v["drafts"][0]["result"], "nothing");
+        assert_eq!(v["drafting"], false);
+        assert_eq!(v["covered_to"], 9);
+    }
+
+    #[test]
+    fn an_empty_journal_shows_no_entries_and_nothing_in_the_prompt() {
+        let v = view(&Journal::new(), &PLAIN);
+        assert_eq!(v["written"], 0);
+        assert_eq!(v["in_prompt"], json!([]));
+        assert_eq!(v["entries"], json!([]));
+        assert_eq!(v["open"], json!([]));
+    }
+
+    #[test]
+    fn the_prompt_holds_only_the_newest_entries() {
+        let mut j = Journal::new();
+        for _ in 0..(IN_PROMPT + 2) {
+            j.kept(entry(0));
+        }
+        let ids = view(&j, &PLAIN)["in_prompt"].as_array().unwrap().len();
+        assert_eq!(ids, IN_PROMPT);
     }
 
     #[test]
@@ -266,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_no_records_nothing_kept_and_the_reason() {
+    fn a_no_records_nothing_kept_and_the_reason() {
         let r = DraftRecord::of(&span(), Duration::ZERO, &nothing("Already in my journal."));
         assert_eq!(r.result, Ending::Nothing);
         assert!(r.entry.is_none());
@@ -283,7 +276,7 @@ mod tests {
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
             (v["gate_ms"].clone(), v["write_ms"].clone()),
-            (300.into(), 600.into())
+            (json!(300), json!(600))
         );
     }
 
@@ -294,9 +287,18 @@ mod tests {
                 .detail
                 .unwrap()
         };
-        assert!(said(Abandon::Asking("down".into())).contains("down"));
-        assert!(said(Abandon::Refused("empty".into())).contains("empty"));
-        assert!(said(Abandon::Keeping("disk".into())).contains("disk"));
+        assert_eq!(
+            said(Abandon::Asking("down".into())),
+            "could not ask the model: down"
+        );
+        assert_eq!(
+            said(Abandon::Refused("empty".into())),
+            "refused until out of rounds: empty"
+        );
+        assert_eq!(
+            said(Abandon::Keeping("disk".into())),
+            "keeping the entry failed: disk"
+        );
     }
 
     #[test]
@@ -304,20 +306,14 @@ mod tests {
         let r = DraftRecord::not_started(&span(), Duration::ZERO, "no persona");
         assert_eq!(r.result, Ending::NotStarted);
         assert_eq!(r.detail.as_deref(), Some("no persona"));
-    }
-
-    #[test]
-    fn the_wire_form_uses_snake_case_results() {
-        let r = DraftRecord::not_started(&span(), Duration::ZERO, "x");
-        let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v["result"], "not_started");
+        assert_eq!(serde_json::to_value(&r).unwrap()["result"], "not_started");
     }
 
     #[test]
     fn a_shown_entry_carries_its_span_and_prompt_text() {
-        let v = shown(&entry(4));
+        let v = shown(&entry(4), &PLAIN);
         assert_eq!(v["id"], 4);
-        assert_eq!(v["text"], entry(4).render());
-        assert_eq!(v["span"], entry(4).span());
+        assert_eq!(v["text"], entry(4).render(&PLAIN));
+        assert_eq!(v["span"], entry(4).span(&PLAIN));
     }
 }

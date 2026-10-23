@@ -42,13 +42,15 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use journal_core::journal::Holds;
+use journal_core::section::JournalPrompt;
+use journal_core::span::Span;
 use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::engine::event::{Event, EventKind, Salience};
 use crate::engine::journal::closing;
-use crate::engine::journal::section::JournalPrompt;
-use crate::engine::journal::state::{JournalState, Span, Waiting};
+use crate::engine::journal::state::{JournalState, Waiting};
 use crate::engine::mission::Mission;
 use crate::engine::sleep::{DayAction, DayTracker};
 use crate::engine::window::Window;
@@ -1217,7 +1219,7 @@ impl Scheduler {
     /// and the journal as it now reads, or `None` for a character nobody has woken.
     pub fn journal_forget(&self, npc_id: u64, ids: &[u64]) -> Option<(Vec<u64>, JournalPrompt)> {
         self.journal_of_mut(npc_id, |j| {
-            let gone = j.forget(ids);
+            let gone = j.journal_mut().forget(ids);
             (gone, j.prompt())
         })
     }
@@ -1233,7 +1235,9 @@ impl Scheduler {
         at_ms: u64,
     ) -> Option<JournalPrompt> {
         self.journal_of_mut(npc_id, |j| {
-            j.keep_closing(closing::closing_entry(mission, at_ms, j.covered_to()));
+            let journal = j.journal_mut();
+            let covered_to = journal.covered_to();
+            journal.keep_closing(closing::closing_entry(mission, at_ms, covered_to));
             j.prompt()
         })
     }
@@ -1289,7 +1293,8 @@ impl Scheduler {
                 // literal live to the end of the statement, so a second `lock()`
                 // there would wait on the first.
                 let (journal_written, journal_open, journal_drafting) = {
-                    let j = i.journal.lock().unwrap();
+                    let held = i.journal.lock().unwrap();
+                    let j = held.journal();
                     (j.written(), j.open().len(), j.pending())
                 };
                 Census {
@@ -1363,8 +1368,9 @@ pub type Shared = Arc<Scheduler>;
 
 #[cfg(test)]
 mod tests {
+    use journal_core::entry::{Entry, Item};
+
     use super::*;
-    use crate::engine::journal::entry::{Entry, Item};
     use crate::engine::journal::state::EVERY_TURNS;
 
     fn sched() -> Scheduler {
@@ -1894,7 +1900,7 @@ mod tests {
         let due = s.journal_begin(0).unwrap();
         assert_eq!(due.span.turns.len(), EVERY_TURNS as usize);
         assert!(s.journal_waiting(0).is_none(), "one draft at a time");
-        due.state.lock().unwrap().abandon();
+        due.state.lock().unwrap().journal_mut().abandon();
         assert!(
             s.journal_waiting(0).is_none(),
             "an abandoned draft is not retried until new turns land"
@@ -1917,7 +1923,7 @@ mod tests {
         let due = s.journal_begin(0).expect("three turns are enough to force");
         assert_eq!(due.span.turns.len(), 3);
         assert!(s.journal_begin(0).is_none(), "one draft at a time");
-        assert_eq!(s.journal_of(0, |j| j.pending()), Some(true));
+        assert_eq!(s.journal_of(0, |j| j.journal().pending()), Some(true));
         assert!(s.journal_begin(99).is_none());
     }
 
@@ -1925,8 +1931,8 @@ mod tests {
     fn a_journal_is_read_in_place_and_a_stranger_has_none() {
         let s = sched();
         s.wake(0, 0, 0);
-        assert_eq!(s.journal_of(0, |j| j.written()), Some(0));
-        assert_eq!(s.journal_of(99, |j| j.written()), None);
+        assert_eq!(s.journal_of(0, |j| j.journal().written()), Some(0));
+        assert_eq!(s.journal_of(99, |j| j.journal().written()), None);
     }
 
     #[test]
@@ -1966,8 +1972,8 @@ mod tests {
             }],
             resolved: vec![],
         };
-        writing = due.state.lock().unwrap().stage(writing);
-        due.state.lock().unwrap().kept(writing);
+        writing = due.state.lock().unwrap().journal().stage(writing);
+        due.state.lock().unwrap().journal_mut().kept(writing);
         let row = &s.census()[0];
         assert_eq!(
             (row.journal_written, row.journal_open, row.journal_drafting),
@@ -1980,7 +1986,7 @@ mod tests {
         let s = sched();
         s.wake(0, 0, 0);
         let mut restored = JournalState::new(0);
-        restored.kept(Entry {
+        restored.journal_mut().kept(Entry {
             id: 0,
             from_turn: 1,
             to_turn: 2,
@@ -1998,7 +2004,7 @@ mod tests {
             due.span.from_turn, 3,
             "the span starts after what is already written"
         );
-        assert_eq!(due.state.lock().unwrap().entries().count(), 1);
+        assert_eq!(due.state.lock().unwrap().journal().entries().count(), 1);
     }
 
     #[test]

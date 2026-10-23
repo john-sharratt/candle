@@ -25,7 +25,6 @@ use super::reading;
 use super::step;
 use super::target::{self, Kind, Target};
 use crate::api::now_ms;
-use crate::engine::journal::tools::arguments;
 use crate::engine::mind::Minds;
 use crate::engine::mission::{time_step_text, Mission, Todo};
 use crate::engine::prose::{self, decode_call, CallAsk};
@@ -37,6 +36,7 @@ use crate::prose::Request;
 use crate::sim::operations::Operation;
 use crate::sim::shelf::Shelf;
 use crate::world::Hosted;
+use journal_core::tools::arguments;
 
 /// The most tokens one answer may run to. The table's reading and its faults
 /// run to a thousand words between them, and an answer cut off by the cap is not a

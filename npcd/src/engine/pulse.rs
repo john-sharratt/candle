@@ -34,7 +34,7 @@ use web::auth::{Identity, Role};
 
 use crate::api::{err, owner_of, Authored};
 use crate::engine::event::{Addressed, Event, EventKind, Salience};
-use crate::engine::journal::record;
+use crate::engine::journal::state::JournalState;
 use crate::engine::runtime::Runtime;
 use crate::engine::slash;
 use crate::engine::survey::Survey;
@@ -596,7 +596,7 @@ pub async fn journal(
     let Some(rt) = s.runtime.as_ref() else {
         return no_scheduler();
     };
-    match rt.scheduler.journal_of(nid, record::view) {
+    match rt.scheduler.journal_of(nid, JournalState::view) {
         Some(view) => Json(view).into_response(),
         None => err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -688,7 +688,7 @@ pub async fn journal_forget(
             &e.to_string(),
         );
     }
-    match rt.scheduler.journal_of(nid, record::view) {
+    match rt.scheduler.journal_of(nid, JournalState::view) {
         Some(view) => Json(view).into_response(),
         None => err(
             StatusCode::SERVICE_UNAVAILABLE,

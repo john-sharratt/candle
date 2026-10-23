@@ -10,7 +10,8 @@
 //! badly — Makers once told each other for hours that there was nothing left to
 //! report — is not what the next chapter opens on; the work is.
 
-use super::entry::{Claim, Entry, Kind};
+use journal_core::entry::{Claim, Entry, Kind};
+
 use crate::engine::mission::{Mission, Outcome};
 
 /// The longest a line of the closing entry runs, in characters.

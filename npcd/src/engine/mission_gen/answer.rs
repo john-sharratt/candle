@@ -34,8 +34,8 @@ use super::leakage;
 use super::material::{belongs, cut, strip_calls, ANCHOR_WORDS, ONLY_EVENT_YEARS};
 use super::research;
 use super::target::{Kind, Subject, Target};
-use crate::engine::journal::tools::arguments;
 use crate::engine::life;
+use journal_core::tools::arguments;
 
 /// The call that declines.
 pub const NOTHING: &str = "no_mission";

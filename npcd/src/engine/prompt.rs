@@ -32,8 +32,8 @@
 //! the model to try to reach one.
 
 use candle_conversation::stencil::{CallStyle, ToolCallEnvelope};
+use journal_core::section::JournalPrompt;
 
-use crate::engine::journal::section::JournalPrompt;
 use crate::engine::mission::MissionPrompt;
 use crate::engine::tools::{one_line, Mode, Tool};
 

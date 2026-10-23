@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use crate::engine::journal::verify::World;
+use journal_core::verify::World;
+
 use crate::sim::tower::Tower;
 
 /// Subject the tower's own state is read under.

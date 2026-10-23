@@ -17,6 +17,7 @@ members = [
     "candle-wasm-examples/*",
     "candle-wasm-tests",
     "host",
+    "journal-core",
     "npc-map",
     "npcd",
     "store-events",

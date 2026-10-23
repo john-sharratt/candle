@@ -15,6 +15,9 @@ anyhow     = { workspace = true }
 # points this way and never back, because a world does not know it is being
 # perceived by a language model.
 npc-map    = { path = "../npc-map" }
+# A character's journal — entries, their check, the write grammar, the draft —
+# shared with zend, whose coding sessions keep one the same way.
+journal-core = { path = "../journal-core" }
 # The image guest hands back PNG bytes, and they ride in the JSON response
 # beside the seed that produced them — an operator who liked a draw needs the
 # seed to ask for it again, and a header is a worse place for it than the body.

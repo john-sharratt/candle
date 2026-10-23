@@ -65,6 +65,10 @@ use candle_conversation::{
     ConversationEngine, PromptDump, SamplingConfig, Sequence, SequenceConfig, TurnOptions,
     UnsealedAsker,
 };
+use journal_core::journal::Holds;
+use journal_core::section::{self, entry_section, JournalPrompt, Kept, META_KEPT};
+use journal_core::verify::World;
+use journal_core::workflow::{self, Outcome, Timing};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -75,10 +79,9 @@ use crate::engine::event::Event;
 use crate::engine::identity;
 use crate::engine::invoke_body::Invokable;
 use crate::engine::journal::desk::EngineDesk;
-use crate::engine::journal::section::{self, entry_section, JournalPrompt, META_KEPT, META_OF};
+use crate::engine::journal::section::META_OF;
 use crate::engine::journal::state::JournalState;
-use crate::engine::journal::verify::World;
-use crate::engine::journal::workflow;
+use crate::engine::journal::style::NPC;
 use crate::engine::layers;
 use crate::engine::narration;
 use crate::engine::narrator;
@@ -145,10 +148,7 @@ fn journal_wants(prompt: Option<&JournalPrompt>) -> Vec<Want<'_>> {
 
 /// The journal sections a conversation that did not see them leave may still hold.
 fn journal_sweep(prompt: Option<&JournalPrompt>) -> Vec<&str> {
-    prompt
-        .and_then(|p| p.aged_out.as_deref())
-        .into_iter()
-        .collect()
+    prompt.map(JournalPrompt::sweep).unwrap_or_default()
 }
 
 /// A character's live conversation.
@@ -1204,13 +1204,13 @@ impl Minds {
         within: &tools::Within,
         due: &Due,
         world: &(dyn World + Sync),
-    ) -> anyhow::Result<(workflow::Outcome, workflow::Timing)> {
+    ) -> anyhow::Result<(Outcome, Timing)> {
         if self.projected().is_none() {
-            due.state.lock().unwrap().abandon();
+            due.state.lock().unwrap().journal_mut().abandon();
             anyhow::bail!("no schema, so no journal collection to write to");
         }
         let mut desk = EngineDesk::new(self, npc_id, persona, within);
-        Ok(workflow::run(&mut desk, &due.state, &due.span, world).await)
+        Ok(workflow::run(&mut desk, &*due.state, &due.span, world, &NPC).await)
     }
 
     /// Hold `prompt` in the character's live conversation as its journal: submit
@@ -1296,7 +1296,7 @@ impl Minds {
             .max_by_key(|k| k.newest());
         drop(engine);
         match kept {
-            Some(k) => JournalState::restore(npc_id, k.entries, k.open, k.next_item),
+            Some(k) => JournalState::restore(npc_id, k),
             None => JournalState::new(npc_id),
         }
     }
@@ -1309,11 +1309,14 @@ impl Minds {
     /// is empty selects none, and an entry written later replaces the section of
     /// the same name. They are tombstoned with the conversation.
     pub fn forget_journal(&self, npc_id: u64) -> usize {
-        let empty = JournalPrompt::of(&section::Kept {
-            entries: Vec::new(),
-            open: Vec::new(),
-            next_item: 1,
-        });
+        let empty = JournalPrompt::of(
+            &Kept {
+                entries: Vec::new(),
+                open: Vec::new(),
+                next_item: 1,
+            },
+            &NPC,
+        );
         let engine = self.engine.lock().unwrap();
         let mut emptied = 0;
         for timeline in engine.find_conversations_by_metadata(META_OF, &npc_id.to_string()) {
