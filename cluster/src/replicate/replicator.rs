@@ -19,11 +19,11 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, watch, Notify};
+use tokio::sync::{broadcast, mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use super::answering::Answering;
-use super::catchup::{Progress, Purpose, Requester};
+use super::catchup::{Progress, Purpose, Requester, FETCH_WINDOW};
 use super::fault::Fault;
 use super::lease::{LeaseEvent, Term, EVENTS_KEPT};
 use super::pulse::PULSES_KEPT;
@@ -54,15 +54,86 @@ pub enum Phase {
     Reloading,
 }
 
+/// Bytes of records arrived and not yet applied past which the next waits:
+/// twice a catch-up's fetch window, so a full window and the batch being
+/// applied beside it fit — the gateway sizes a member's catch-up lane the
+/// same way (`gateway::hub::CATCHUP_CAP`).
+///
+/// **The queue is bounded so the socket is.** Unbounded, a member applying
+/// slower than records arrived took them off the socket regardless and held
+/// them in memory: WhiteWorld's zend, behind the cluster's layer ingest,
+/// committed past twice its RAM and paged until its socket runtime went
+/// seconds unpolled. Bounded, the member stops reading the session's
+/// incoming queue, the session's reader stops reading the socket, and the
+/// gateway holds what it cannot send — its lane, its lagging and catch-up,
+/// the mechanism built for a member that cannot keep up.
+pub const ARRIVALS_CAP: usize = 2 * FETCH_WINDOW as usize;
+
+/// The unit [`ARRIVALS_CAP`] is counted in, so its permits fit a `u32`.
+const ROOM_UNIT: usize = 1024;
+
+/// [`ARRIVALS_CAP`] in [`ROOM_UNIT`]s.
+const ROOM_PERMITS: usize = ARRIVALS_CAP / ROOM_UNIT;
+
+/// The permits a record of `len` bytes holds while it waits to be applied.
+/// One larger than the whole cap counts as the cap, so it waits for an empty
+/// queue rather than for ever.
+fn room_for(len: usize) -> u32 {
+    len.div_ceil(ROOM_UNIT).clamp(1, ROOM_PERMITS) as u32
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::*;
+
+    /// A record holds its size in units, at least one, and never more than
+    /// the whole budget — so even an empty record counts, and one larger
+    /// than the cap waits for an empty queue rather than for ever.
+    #[test]
+    fn a_record_holds_its_size_within_the_budget() {
+        assert_eq!(room_for(0), 1);
+        assert_eq!(room_for(1), 1);
+        assert_eq!(room_for(ROOM_UNIT), 1);
+        assert_eq!(room_for(ROOM_UNIT + 1), 2);
+        assert_eq!(room_for(59 * 1024), 59);
+        assert_eq!(room_for(ARRIVALS_CAP * 4), ROOM_PERMITS as u32);
+        assert_eq!(ROOM_PERMITS, 131_072, "twice a 64 MiB fetch window, in KiB");
+    }
+
+    /// The budget holds: once it is spent, the next record waits until a
+    /// queued one is applied and gives its share back.
+    #[tokio::test]
+    async fn a_full_budget_holds_the_next_record_until_room_is_given_back() {
+        let room = Arc::new(Semaphore::new(ROOM_PERMITS));
+        let full = room
+            .clone()
+            .acquire_many_owned(ROOM_PERMITS as u32)
+            .await
+            .unwrap();
+        let next = room.clone().acquire_many_owned(room_for(4096));
+        tokio::pin!(next);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut next)
+                .await
+                .is_err(),
+            "the next record waits while the budget is spent"
+        );
+        drop(full);
+        assert!(next.await.is_ok(), "applied records give their room back");
+    }
+}
+
 /// Something that arrived for the requester's side, in arrival order: a
 /// record, or a catch-up reply. They go through one queue so a `DONE` is
 /// handled only after every record ahead of it is applied.
 pub(super) enum Arrival {
-    /// The `seq`-th record to arrive, counted from one.
+    /// The `seq`-th record to arrive, counted from one, holding its bytes'
+    /// share of [`ARRIVALS_CAP`] until it is applied.
     Event {
         c: usize,
         whole: Whole,
         seq: u64,
+        room: OwnedSemaphorePermit,
     },
     Headers {
         c: usize,
@@ -229,8 +300,12 @@ pub struct Replicator {
     pub(super) send_wake: Notify,
     /// Wakes a request's flush waiting on receipts.
     pub(super) receipts: Notify,
+    /// Every arrival, in order. Unbounded in count: what bounds it is
+    /// `room`, the bytes of records not yet applied.
     pub(super) arrivals: mpsc::UnboundedSender<Arrival>,
     arrivals_rx: Mutex<Option<mpsc::UnboundedReceiver<Arrival>>>,
+    /// [`ARRIVALS_CAP`], in [`ROOM_UNIT`]s, less what queued records hold.
+    room: Arc<Semaphore>,
     /// Records that have arrived, and through which of them every one has
     /// been applied: a request a gateway routes here is served only once
     /// every record that arrived before it is applied (§6.4).
@@ -319,6 +394,7 @@ impl Replicator {
             receipts: Notify::new(),
             arrivals,
             arrivals_rx: Mutex::new(Some(rx)),
+            room: Arc::new(Semaphore::new(ROOM_PERMITS)),
             received: AtomicU64::new(0),
             applied_upto: watch::channel(0).0,
             tasks: Mutex::new(Vec::new()),
@@ -442,10 +518,23 @@ impl Replicator {
         self.send_wake.notify_one();
     }
 
-    /// A record arrived on socket `c`.
-    pub fn event(&self, c: usize, whole: Whole) {
+    /// A record arrived on socket `c`: queued to be applied once its bytes
+    /// fit in [`ARRIVALS_CAP`] beside what is already waiting. The wait is the
+    /// back pressure — the caller stops reading its socket for as long.
+    pub async fn event(&self, c: usize, whole: Whole) {
+        let room = self
+            .room
+            .clone()
+            .acquire_many_owned(room_for(whole.bytes.len()))
+            .await
+            .expect("the arrivals budget is never closed");
         let seq = self.received.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.arrivals.send(Arrival::Event { c, whole, seq });
+        let _ = self.arrivals.send(Arrival::Event {
+            c,
+            whole,
+            seq,
+            room,
+        });
     }
 
     /// Resolves once every record that arrived before this call is applied:

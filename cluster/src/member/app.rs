@@ -598,8 +598,12 @@ impl AppMember {
                         None => streams(conn),
                     },
                     Some(Incoming::Event { whole, .. }) => {
+                        // Awaited: while the records waiting to be applied
+                        // fill their budget, this loop stops taking frames,
+                        // so the session stops reading the socket and the
+                        // gateway holds what it cannot send.
                         if let Some(r) = self.replicator.as_ref().filter(|_| !upgrading) {
-                            r.event(c, whole);
+                            r.event(c, whole).await;
                         }
                     }
                     None => break (&mut ended).await.unwrap_or(Ended::Dropped),

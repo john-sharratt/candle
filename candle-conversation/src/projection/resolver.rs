@@ -748,14 +748,19 @@ impl Conversation {
     /// the order a reload takes them in — once each for the whole batch, so a
     /// projection sees the batch whole or not at all and no read nests inside
     /// the held guard.
+    ///
+    /// **Every record is checked before either lock is taken.** The check
+    /// reads every payload byte and touches no state; run under the write
+    /// lock, it held every projection behind a full pass over the batch.
     pub fn apply_remote(
         &self,
         records: &[&[u8]],
         n_layers: usize,
     ) -> PersistenceResult<RemoteBatch> {
+        let checks = SubstratePersistence::check_remote(records);
         let mut p = self.persistence.lock().unwrap();
         let mut view = self.write();
-        p.apply_remote(&mut view, records, n_layers)
+        p.apply_remote_checked(&mut view, records, &checks, n_layers)
     }
 
     /// Allocate a fresh [`TimelineId`] and register it against

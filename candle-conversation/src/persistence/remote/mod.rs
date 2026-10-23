@@ -17,4 +17,4 @@ mod outcome;
 
 pub use completeness::turn_is_complete;
 pub use incoming::Incoming;
-pub use outcome::{Refusal, RemoteBatch, RemoteOutcome};
+pub use outcome::{Checked, Refusal, RemoteBatch, RemoteOutcome};

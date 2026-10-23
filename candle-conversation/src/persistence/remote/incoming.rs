@@ -6,11 +6,9 @@
 use serde_json::Value;
 
 use super::super::content_hash::ContentHasher;
-use super::super::record::{
-    crc32, decode_header, padded_record_len, recompute_chunk_golden, RecordHeader, RecordType,
-};
+use super::super::record::{crc32, decode_header, padded_record_len, RecordHeader, RecordType};
 use super::super::{PersistenceError, Result};
-use super::outcome::Refusal;
+use super::outcome::{Checked, Refusal};
 
 /// See the module docs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,23 +59,21 @@ impl Incoming {
     }
 
     /// Check the payload against what its header says of it: the `digest`
-    /// over the whole payload, and the CRC — for a `Chunk`, the golden its
-    /// writer took over the K/V bytes, when it took one.
-    pub fn verify(&self) -> std::result::Result<(), Refusal> {
+    /// over the whole payload, and for any record but a `Chunk` its CRC.
+    ///
+    /// **A `Chunk`'s golden is not recomputed here.** The digest has already
+    /// read every byte of the payload and proved it is what its writer wrote,
+    /// and the golden — the writer's checksum over the K/V bytes — is checked
+    /// on the device when the chunk is loaded (`persistence::pipeline`). A
+    /// second pass over every K/V byte of every replicated chunk proved
+    /// nothing the first had not.
+    pub fn verify(&self) -> Checked {
         let mut hasher = ContentHasher::new();
         hasher.update(&self.payload);
         if hasher.finish() != self.header.digest {
             return Err(Refusal::Digest);
         }
-        if self.header.record_type == RecordType::Chunk {
-            if self.header.crc != 0 {
-                let golden = recompute_chunk_golden(&self.payload)
-                    .map_err(|e| Refusal::Malformed(e.to_string()))?;
-                if golden != self.header.crc {
-                    return Err(Refusal::Checksum);
-                }
-            }
-        } else if crc32(&self.payload) != self.header.crc {
+        if self.header.record_type != RecordType::Chunk && crc32(&self.payload) != self.header.crc {
             return Err(Refusal::Checksum);
         }
         Ok(())

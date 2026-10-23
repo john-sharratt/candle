@@ -11,7 +11,7 @@ use super::super::walker::WalkEntry;
 use super::super::{blob, record_snapshot_loc, vfs, Result, SubstratePersistence};
 use super::adopt::adopt_complete_turns;
 use super::incoming::Incoming;
-use super::outcome::{Refusal, RemoteBatch, RemoteOutcome};
+use super::outcome::{Checked, Refusal, RemoteBatch, RemoteOutcome};
 use crate::substrate::{StreamKey, Substrate};
 
 /// Whether the record declares a turn. A turn's declaration is written even
@@ -54,16 +54,52 @@ impl SubstratePersistence {
     ///
     /// A refused record leaves the batch going; an error writing one stops
     /// it.
+    ///
+    /// The checks of [`Self::check_remote`] run first; a caller holding locks
+    /// readers wait on runs them before it takes them and hands them to
+    /// [`Self::apply_remote_checked`].
     pub fn apply_remote(
         &mut self,
         substrate: &mut Substrate,
         records: &[&[u8]],
         n_layers: usize,
     ) -> Result<RemoteBatch> {
+        let checks = Self::check_remote(records);
+        self.apply_remote_checked(substrate, records, &checks, n_layers)
+    }
+
+    /// Whether each of `records` is what its writer wrote — its digest, and
+    /// its CRC for any type but a chunk ([`Incoming::verify`]). Reads every
+    /// payload byte and touches no state, so it needs no lock: verifying
+    /// under the substrate's write lock held every reader of the substrate
+    /// behind a full pass over every byte the batch carried.
+    pub fn check_remote(records: &[&[u8]]) -> Vec<Checked> {
+        records
+            .iter()
+            .map(|bytes| match Incoming::parse(bytes) {
+                Ok(incoming) => incoming.verify(),
+                Err(e) => Err(Refusal::Malformed(e.to_string())),
+            })
+            .collect()
+    }
+
+    /// [`Self::apply_remote`] with each record's [`Self::check_remote`]
+    /// result already in hand, one per record and in order. A record that
+    /// failed its check is refused where the check stands in the decision —
+    /// after the duplicate, dominated and superseded cases, which hold
+    /// whatever its bytes — so the outcomes are what checking in place gave.
+    pub fn apply_remote_checked(
+        &mut self,
+        substrate: &mut Substrate,
+        records: &[&[u8]],
+        checks: &[Checked],
+        n_layers: usize,
+    ) -> Result<RemoteBatch> {
+        debug_assert_eq!(records.len(), checks.len());
         let mut outcomes = Vec::with_capacity(records.len());
         let mut turns = BTreeSet::new();
-        for bytes in records {
-            outcomes.push(self.apply_one(substrate, bytes, &mut turns)?);
+        for (bytes, checked) in records.iter().zip(checks) {
+            outcomes.push(self.apply_one(substrate, bytes, checked, &mut turns)?);
         }
         let reload = substrate.take_reload_due();
         let adopted = if reload {
@@ -82,6 +118,7 @@ impl SubstratePersistence {
         &mut self,
         substrate: &mut Substrate,
         bytes: &[u8],
+        checked: &Checked,
         turns: &mut BTreeSet<StreamKey>,
     ) -> Result<RemoteOutcome> {
         let incoming = match Incoming::parse(bytes) {
@@ -122,8 +159,8 @@ impl SubstratePersistence {
             self.mark_applied(&id);
             return Ok(RemoteOutcome::Superseded);
         }
-        if let Err(refusal) = incoming.verify() {
-            return Ok(RemoteOutcome::Refused(refusal));
+        if let Err(refusal) = checked {
+            return Ok(RemoteOutcome::Refused(refusal.clone()));
         }
         let at = self.append_carried(
             h.record_type,

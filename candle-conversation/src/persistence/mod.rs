@@ -1446,6 +1446,35 @@ impl SubstratePersistence {
         } else {
             self.minter.mint_for(record_type, stream_id)
         };
+        // Write-boundary validation of this member's own seal: recompute the
+        // chunk's golden over the host bytes about to be written and compare
+        // it with the golden the seal computed on the GPU, before the DtoH
+        // copy. A mismatch means the copy or host handling corrupted the KV
+        // bytes — a real byte-movement fault. Log it (a rebuild regenerates
+        // the substrate; this proves the pipeline) and still write what we
+        // have. A record carried with its identity already decided — another
+        // member's, checked by its digest on arrival, or a rewrite of bytes
+        // this store already holds — has no copy of its own to prove, and the
+        // golden is checked again on the device when the chunk is loaded.
+        if record_type == RecordType::Chunk && golden != 0 {
+            match crate::persistence::record::recompute_chunk_golden(payload) {
+                Ok(recomputed) if recomputed != golden => tracing::error!(
+                    target: "candle_conversation::persistence::golden",
+                    stream_id,
+                    chunk_index,
+                    golden,
+                    recomputed,
+                    "chunk golden mismatch before write — KV bytes changed between GPU seal and disk (DtoH/host corruption)"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::error!(
+                    target: "candle_conversation::persistence::golden",
+                    stream_id,
+                    chunk_index,
+                    "chunk payload undecodable before write: {e}"
+                ),
+            }
+        }
         self.append_carried(
             record_type,
             format,
@@ -1493,31 +1522,6 @@ impl SubstratePersistence {
             ..RecordHeader::NONE
         }
         .with_identity(identity);
-        // Write-boundary validation: recompute the chunk's golden over the host
-        // bytes we are about to write and compare against the golden the seal
-        // computed on the GPU (before the DtoH copy). A mismatch means the copy
-        // or host handling corrupted the KV bytes — a real byte-movement fault.
-        // Log it (a rebuild regenerates the substrate; this proves the pipeline)
-        // and still write what we have.
-        if record_type == RecordType::Chunk && golden != 0 {
-            match crate::persistence::record::recompute_chunk_golden(payload) {
-                Ok(recomputed) if recomputed != golden => tracing::error!(
-                    target: "candle_conversation::persistence::golden",
-                    stream_id,
-                    chunk_index,
-                    golden,
-                    recomputed,
-                    "chunk golden mismatch before write — KV bytes changed between GPU seal and disk (DtoH/host corruption)"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::error!(
-                    target: "candle_conversation::persistence::golden",
-                    stream_id,
-                    chunk_index,
-                    "chunk payload undecodable before write: {e}"
-                ),
-            }
-        }
         let (written, bytes) = encode_record_written(&header, payload);
         let (segment, offset) = self.segments.stage(&bytes);
         let size = bytes.len() as u64;

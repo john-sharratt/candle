@@ -37,9 +37,21 @@ impl Replicator {
                 }
             }
             let mut records = Vec::new();
+            // Each record's share of the arrivals budget, given back once the
+            // batch holding it is applied — so the room it frees is room in
+            // memory, and a waiting `event` reads its socket again.
+            let mut rooms = Vec::new();
             for arrival in queue {
                 match arrival {
-                    Arrival::Event { c, whole, seq } => records.push((c, whole, seq)),
+                    Arrival::Event {
+                        c,
+                        whole,
+                        seq,
+                        room,
+                    } => {
+                        records.push((c, whole, seq));
+                        rooms.push(room);
+                    }
                     Arrival::Headers { c, headers } => {
                         self.apply_batch(take(&mut records)).await;
                         self.headers(c, headers).await;
@@ -51,6 +63,7 @@ impl Replicator {
                 }
             }
             self.apply_batch(records).await;
+            drop(rooms);
         }
     }
 

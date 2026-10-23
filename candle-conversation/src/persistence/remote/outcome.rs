@@ -5,6 +5,10 @@ use super::super::appended::Appended;
 use super::super::record::RecordType;
 use crate::projection::{TimelineId, TurnIndex};
 
+/// A remote record's check before it is applied
+/// (`SubstratePersistence::check_remote`): passed, or why it is refused.
+pub type Checked = Result<(), Refusal>;
+
 /// Why a remote record was refused. A refused record is neither written nor
 /// marked applied, so a catch-up fetches it again.
 #[derive(Clone, Debug, PartialEq, Eq)]
