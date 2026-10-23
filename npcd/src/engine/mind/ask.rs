@@ -16,6 +16,7 @@ use std::time::Instant;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use candle_conversation::projection::DecodePriority;
 use candle_conversation::stencil::{Param, StencilTree, ToolSpec};
 use candle_conversation::TurnOptions;
 
@@ -173,7 +174,10 @@ impl Minds {
             ..Default::default()
         };
         let asked = Instant::now();
-        let response = asker.ask(question, options).await?;
+        // A question beside the character's own line — the guardian's, a journal
+        // draft's — is background to it and to every conversation a person is
+        // waiting on, and above the layers that only maintain themselves.
+        let response = asker.ask(question, DecodePriority::Normal, options).await?;
         let ask_ms = asked.elapsed().as_millis();
         let stats = &response.stats;
         tracing::info!(

@@ -18,16 +18,22 @@
 //! A request that arrives while a turn runs on the parent is parked and answered
 //! at the turn boundary, so a caller needs no lock on the conversation to ask: it
 //! gets the state as of the end of the turn in flight.
+//!
+//! The fork decodes at the band its asker names, not at its parent's: a
+//! journal draft put beside a coding session is background to it, and a
+//! self-check of a reply about to be shown is not.
 
 use flume::Sender;
 
 use super::Scheduler;
 use crate::error::ConversationError;
+use crate::projection::DecodePriority;
 use crate::sequence_handle::SequenceId;
 
 /// A fork request waiting for its parent's turn to end.
 pub(super) struct ParkedFork {
     parent: SequenceId,
+    band: DecodePriority,
     response_tx: Sender<Result<SequenceId, ConversationError>>,
 }
 
@@ -47,16 +53,18 @@ impl Scheduler {
     pub(super) fn request_ephemeral_fork(
         &mut self,
         parent: SequenceId,
+        band: DecodePriority,
         response_tx: Sender<Result<SequenceId, ConversationError>>,
     ) {
         if self.slot_conversations.contains_key(&parent) && self.turn_in_flight(parent) {
             self.parked_forks.push(ParkedFork {
                 parent,
+                band,
                 response_tx,
             });
             return;
         }
-        let _ = response_tx.send(self.fork_ephemeral_sequence(parent));
+        let _ = response_tx.send(self.fork_ephemeral_sequence(parent, band));
     }
 
     /// Answer every parked request whose parent has no turn in flight, and fail
@@ -79,11 +87,11 @@ impl Scheduler {
             }
             let _ = fork
                 .response_tx
-                .send(self.fork_ephemeral_sequence(fork.parent));
+                .send(self.fork_ephemeral_sequence(fork.parent, fork.band));
         }
     }
 
-    /// Fork `parent` into an ephemeral slot.
+    /// Fork `parent` into an ephemeral slot that decodes at `band`.
     ///
     /// Refused while a turn is in flight on `parent`: its view is borrowing the
     /// blocks the fork would carve, and what the slot holds mid-turn is not a
@@ -92,6 +100,7 @@ impl Scheduler {
     pub(super) fn fork_ephemeral_sequence(
         &mut self,
         parent: SequenceId,
+        band: DecodePriority,
     ) -> Result<SequenceId, ConversationError> {
         let conversation = self
             .slot_conversations
@@ -120,6 +129,7 @@ impl Scheduler {
             self.slot_projection_state.insert(child, forked);
         }
         self.ephemeral_slots.insert(child);
+        self.slot_bands.insert(child, band);
         Ok(child)
     }
 }

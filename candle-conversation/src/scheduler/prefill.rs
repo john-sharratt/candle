@@ -3054,7 +3054,8 @@ impl Scheduler {
     ///
     /// A summary probe decodes on a scratch slot bound to the conversation it
     /// compresses, so its target is that conversation's layer — the dialogue's,
-    /// `High`. It is background to that dialogue, so it runs at `Normal`.
+    /// `High`. It is background to that dialogue, so it runs at `Normal`. An
+    /// ephemeral fork runs at the band its asker named.
     pub(super) fn decode_layer_priority(&self, sid: SequenceId) -> Option<DecodePriority> {
         if self
             .active_decodes
@@ -3064,6 +3065,9 @@ impl Scheduler {
             return Some(DecodePriority::Normal);
         }
         let slot = self.owning_slot(sid);
+        if let Some(band) = self.slot_bands.get(&slot) {
+            return Some(*band);
+        }
         let target = self.slot_targets.get(&slot)?;
         let builder = self.timeline_projections.get(&target.timeline)?;
         builder

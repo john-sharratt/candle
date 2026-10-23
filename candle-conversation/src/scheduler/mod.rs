@@ -121,7 +121,9 @@ use crate::projection::{
     ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
     TimelineId, TurnId, TurnIndex, TurnKey,
 };
-use crate::projection::{CollectionWarm, GalleryPreload, GroupId, LayerId, Schema, SubstrateRef};
+use crate::projection::{
+    CollectionWarm, DecodePriority, GalleryPreload, GroupId, LayerId, Schema, SubstrateRef,
+};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
     GalleryArena, WideQSig,
@@ -234,8 +236,13 @@ pub(crate) enum SchedulerRequest {
     /// seals nothing. While a turn runs on `parent` the request is parked and
     /// answered at the turn boundary; it fails if `parent` is freed first.
     /// Used by `Sequence::ask_unsealed`.
+    ///
+    /// The fork decodes at `band`, not at its parent's layer priority: a
+    /// question put beside a conversation is the asker's work, and how urgent
+    /// it is is the asker's to say.
     ForkEphemeralSequence {
         parent: SequenceId,
+        band: DecodePriority,
         response_tx: Sender<Result<SequenceId, ConversationError>>,
     },
 
@@ -3485,6 +3492,11 @@ pub(crate) struct Scheduler {
     /// [`Self::ephemeral_sigs`] for the caller to retrieve via `ProbeWideSigs`.
     ephemeral_slots: std::collections::HashSet<SequenceId>,
 
+    /// The band an ephemeral fork decodes at
+    /// ([`SchedulerRequest::ForkEphemeralSequence`]), in place of its target
+    /// layer's `decode_priority`. Dropped when the slot is freed.
+    slot_bands: HashMap<SequenceId, DecodePriority>,
+
     /// Wide-Q window gathered for each ephemeral slot's turn at completion, keyed
     /// by the parent slot. Drained by the `ProbeWideSigs` request; dropped on
     /// `FreeSequence`.
@@ -4086,6 +4098,7 @@ impl Scheduler {
             detached: Detached::default(),
             slot_targets: HashMap::new(),
             ephemeral_slots: std::collections::HashSet::new(),
+            slot_bands: HashMap::new(),
             ephemeral_sigs: HashMap::new(),
             turn_views: HashMap::new(),
             turn_groups: HashMap::new(),
@@ -4322,9 +4335,10 @@ impl Scheduler {
 
             SchedulerRequest::ForkEphemeralSequence {
                 parent,
+                band,
                 response_tx,
             } => {
-                self.request_ephemeral_fork(parent, response_tx);
+                self.request_ephemeral_fork(parent, band, response_tx);
                 true
             }
 
@@ -4842,6 +4856,7 @@ impl Scheduler {
                 let freed_conversation = self.slot_conversations.remove(&sequence_id);
                 let freed_target = self.slot_targets.remove(&sequence_id);
                 self.ephemeral_slots.remove(&sequence_id);
+                self.slot_bands.remove(&sequence_id);
                 self.ephemeral_sigs.remove(&sequence_id);
                 self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
@@ -7910,8 +7925,7 @@ impl Scheduler {
         // each turn's seal and `Done`.
         let mut sealing: Vec<FinishedTurn> = Vec::with_capacity(finished_seq_ids.len());
         for seq_id in finished_seq_ids {
-            let high =
-                self.decode_priority_or_high(seq_id) == crate::projection::DecodePriority::High;
+            let high = self.decode_priority_or_high(seq_id) == DecodePriority::High;
             if let Some(state) = self.active_decodes.remove(&seq_id) {
                 // The slot's ground is back, so an admission that did not fit
                 // before may fit now.
@@ -17400,12 +17414,63 @@ mod tests {
         scheduler: &mut Scheduler,
         parent: SequenceId,
     ) -> Result<SequenceId, ConversationError> {
+        fork_request_at(scheduler, parent, DecodePriority::Normal)
+    }
+
+    fn fork_request_at(
+        scheduler: &mut Scheduler,
+        parent: SequenceId,
+        band: DecodePriority,
+    ) -> Result<SequenceId, ConversationError> {
         let (tx, rx) = flume::bounded(1);
         scheduler.handle_request(SchedulerRequest::ForkEphemeralSequence {
             parent,
+            band,
             response_tx: tx,
         });
         rx.recv().expect("scheduler reply")
+    }
+
+    /// **A fork decodes at the band its asker named**, whatever its parent's
+    /// layer decodes at, and the band goes when the fork is freed.
+    #[test]
+    fn an_ephemeral_fork_decodes_at_the_band_it_was_asked_at() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let before = scheduler.decode_layer_priority(parent);
+
+        for band in [
+            DecodePriority::Low,
+            DecodePriority::Normal,
+            DecodePriority::High,
+        ] {
+            let child = fork_request_at(&mut scheduler, parent, band).expect("fork");
+            assert_eq!(scheduler.decode_layer_priority(child), Some(band));
+            assert_eq!(scheduler.decode_priority_or_high(child), band);
+            assert_eq!(
+                scheduler.decode_layer_priority(parent),
+                before,
+                "the parent keeps its own band"
+            );
+            scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: child });
+            assert!(!scheduler.slot_bands.contains_key(&child));
+        }
+    }
+
+    /// **A turn run on the fork decodes at the fork's band**: the view's band is
+    /// its owning slot's.
+    #[test]
+    fn a_turn_on_an_ephemeral_fork_decodes_at_the_forks_band() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let child = fork_request_at(&mut scheduler, parent, DecodePriority::Low).expect("fork");
+        let view = start_turn_on(&mut scheduler, child);
+        assert_eq!(
+            scheduler.decode_layer_priority(view),
+            Some(DecodePriority::Low)
+        );
     }
 
     /// **An ephemeral fork starts from the live slot's caches and its model
@@ -17518,6 +17583,7 @@ mod tests {
         let (tx, rx) = flume::bounded(1);
         scheduler.handle_request(SchedulerRequest::ForkEphemeralSequence {
             parent,
+            band: DecodePriority::Low,
             response_tx: tx,
         });
         rx
@@ -17533,7 +17599,7 @@ mod tests {
         start_turn_on(&mut scheduler, parent);
 
         let err = scheduler
-            .fork_ephemeral_sequence(parent)
+            .fork_ephemeral_sequence(parent, DecodePriority::Normal)
             .expect_err("refused");
         assert!(
             matches!(err, ConversationError::TurnInFlight { .. }),
@@ -17564,6 +17630,11 @@ mod tests {
             .expect("fork");
         assert!(scheduler.ephemeral_slots.contains(&child));
         assert!(scheduler.parked_forks.is_empty());
+        assert_eq!(
+            scheduler.decode_layer_priority(child),
+            Some(DecodePriority::Low),
+            "a parked request keeps the band it was asked at"
+        );
     }
 
     /// **Two requests parked on one parent get a fork each.**

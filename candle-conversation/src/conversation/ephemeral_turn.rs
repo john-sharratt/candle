@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use super::{AskState, Sequence, TurnSubmitter, TurnText};
 use crate::error::ConversationError;
 use crate::handle::TurnResponse;
-use crate::projection::SelectionState;
+use crate::projection::{DecodePriority, SelectionState};
 use crate::scheduler::{ProjectionInputs, SchedulerRequest};
 use crate::sequence_handle::SequenceId;
 use crate::turn::TurnOptions;
@@ -48,12 +48,22 @@ impl UnsealedAsker {
     /// the slot's K/V and copies its recurrent state and projection caches, so the
     /// projection keeps the prefix already placed instead of rebuilding it. When a
     /// turn is running on the conversation the fork waits for it to end.
-    pub async fn ask(&self, question: &str, options: TurnOptions) -> crate::Result<TurnResponse> {
+    ///
+    /// The question decodes at `band`, whatever the conversation's own layer
+    /// decodes at: how urgent a question beside a conversation is belongs to
+    /// whoever asks it.
+    pub async fn ask(
+        &self,
+        question: &str,
+        band: DecodePriority,
+        options: TurnOptions,
+    ) -> crate::Result<TurnResponse> {
         let (tx, rx) = flume::bounded(1);
         self.submitter
             .scheduler_tx
             .send(SchedulerRequest::ForkEphemeralSequence {
                 parent: self.id,
+                band,
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
@@ -85,10 +95,11 @@ impl Sequence {
     pub async fn ask_unsealed(
         &mut self,
         question: &str,
+        band: DecodePriority,
         options: TurnOptions,
     ) -> crate::Result<TurnResponse> {
         let asker = self.unsealed_asker();
-        asker.ask(question, options).await
+        asker.ask(question, band, options).await
     }
 }
 

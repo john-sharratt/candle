@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use candle_conversation::projection::DecodePriority;
 use candle_conversation::stencil::{StencilTree, StencilTreeBuilder};
 use candle_conversation::{
     ConversationEngine, SamplingConfig, SequenceConfig, TurnOptions, UnsealedAsker,
@@ -94,7 +95,9 @@ impl Asker {
                 ..Default::default()
             };
             let asker = self.base.clone();
-            async move { asker.ask(&q.text, options).await }
+            // A maintenance pass: on a live daemon it runs beneath every
+            // conversation anybody is waiting on.
+            async move { asker.ask(&q.text, DecodePriority::Low, options).await }
         }))
         .await?;
         let answers = questions
