@@ -222,14 +222,7 @@ pub fn join(
     upgrader.register(&agent.member);
     let tls = tls_connector()?;
     for (c, target) in joining.targets.into_iter().enumerate() {
-        agent.dial(
-            c,
-            Dial {
-                target: Arc::new(target),
-                app: APP,
-                tls: tls.clone(),
-            },
-        );
+        agent.dial(c, Dial::new(Arc::new(target), APP, tls.clone()));
     }
     Ok(agent.member)
 }

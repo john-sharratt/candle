@@ -58,9 +58,12 @@ pub struct HostArgs {
 
     /// A gateway to join as a cluster member (`docs/replicated_substrate.md`
     /// §3.2): `https://code.tokera.com`, or `https://192.168.0.5:9443` with
-    /// `--cluster-name`. Repeatable, one per gateway. Each tenant dials each
-    /// one, and while joined its requests are routed by the cluster. Absent,
-    /// the daemon runs standalone and opens no socket.
+    /// `--cluster-name` — or several URLs for the one gateway, space-separated
+    /// and best first, which each socket fails over between:
+    /// `"https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"`.
+    /// Repeatable, one per gateway. Each tenant dials each one, and while
+    /// joined its requests are routed by the cluster. Absent, the daemon runs
+    /// standalone and opens no socket.
     #[arg(long = "cluster", value_name = "URL")]
     pub clusters: Vec<String>,
 
@@ -300,7 +303,7 @@ mod tests {
         let settings = flags.cluster("m5".into()).unwrap().expect("a cluster");
         assert_eq!(settings.targets.len(), 2);
         assert_eq!(
-            settings.targets[1].tls_name.as_deref(),
+            settings.targets[1].endpoints[0].tls_name.as_deref(),
             Some("code.tokera.com")
         );
         assert_eq!(settings.affinity_idle, Duration::from_secs(300));
@@ -319,6 +322,29 @@ mod tests {
             ..HostArgs::default()
         };
         assert!(clusterless.cluster("m".into()).is_err());
+    }
+
+    /// One `clusters:` entry naming several URLs is one gateway reached by
+    /// each, best first — not one cluster per URL.
+    #[test]
+    fn a_cluster_of_several_urls_is_one_gateway() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = tmp.path().join("group.key");
+        std::fs::write(&key, "ab".repeat(32)).unwrap();
+        let yaml: HostArgs = serde_yaml::from_str(&format!(
+            "clusters: [\"https://gateway.tokera.local:9443 https://gateway.tokera.com:9443\"]\n\
+             cluster_name: tokera.com\ngroup_key: '{}'\n",
+            key.to_string_lossy()
+        ))
+        .unwrap();
+        let settings = yaml.cluster("m".into()).unwrap().expect("a cluster");
+        assert_eq!(settings.targets.len(), 1);
+        let hosts: Vec<&str> = settings.targets[0]
+            .endpoints
+            .iter()
+            .map(|e| e.host.as_str())
+            .collect();
+        assert_eq!(hosts, ["gateway.tokera.local", "gateway.tokera.com"]);
     }
 
     /// `--keep-builds` reads the same from the flag and the YAML, and

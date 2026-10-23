@@ -80,15 +80,9 @@ async fn join(cluster: ClusterJoin, state: &Path) -> anyhow::Result<()> {
     }
     let tls = tls_connector()?;
     let stopped = member
-        .run(
-            0,
-            Dial {
-                target: Arc::new(target),
-                app: KEEP,
-                tls,
-            },
-            |conn| conn.reset(),
-        )
+        .run(0, Dial::new(Arc::new(target), KEEP, tls), |conn| {
+            conn.reset()
+        })
         .await;
     eprintln!("keep: left the cluster: {stopped:?}");
     Ok(())

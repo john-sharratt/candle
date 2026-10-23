@@ -278,8 +278,8 @@ New host flags (`host/src/cli.rs`), also accepted in `motherd.yaml`'s `host:` se
 
 | Flag | Meaning |
 |---|---|
-| `--cluster <url>` | One gateway: `https://code.tokera.com` (internet) or `https://192.168.0.5:9443` (LAN), a host name or an IP. **Repeatable** — one per gateway, for high availability. Absent: the daemon runs standalone, as today, and never opens a socket. |
-| `--cluster-name <host>` | The name a gateway's certificate is verified against when its `--cluster` names an IP; default: the URL's host. |
+| `--cluster <urls>` | One gateway, as one or more URLs separated by spaces, in priority order — the ways this machine reaches that gateway (*paths*, below): `https://gateway.tokera.local:9443 https://gateway.tokera.com:9443` dials the LAN name first and the internet name when it fails. Each URL is a host name or an IP. **Repeatable** — one per gateway, for high availability. Never two `--cluster`s for one gateway: each would replace the other's socket (4409, §3.4). Absent: the daemon runs standalone, as today, and never opens a socket. |
+| `--cluster-name <host>` | The name a gateway's certificate is verified against, whichever path dials it; default: each URL's host. |
 | `--group-key <file>` | The group key file (§13.1). Required with `--cluster`. |
 | `--tombstone-retention <days>` | How long a tombstone record stays in this member's log before it shrinks to an entry in the deleted set (§6.8); default 30. Disk only: it changes no result, so members need not agree on it. |
 | `--cluster-quorum-max <n>` | Write `cluster/max_members = n` as a *set* at startup, lowering the quorum's base (§5.9). For retiring machines for good, or knowingly running with less safety. |
@@ -301,6 +301,31 @@ reconnect every member in the same millisecond. An admission resets `d`. Keep-al
 `PING` every 15 s each way; 45 s without any frame from the peer closes the socket as
 dead, with 1001 (Cloudflare's idle timeout is far longer than 15 s). The handshake
 holds to the same 45 s: a peer silent that long mid-handshake is closed 4400.
+
+**Paths.** A cluster's URLs, in order, are its *endpoints*. Each endpoint's host is
+resolved afresh at every dial, and every address it resolves to is one *path*: a name
+with two A records (`gateway.tokera.local` → `.4` and `.5`) is two paths of equal rank,
+and a later endpoint ranks below every path of an earlier one. A socket runs on one path
+at a time. The gateway sees a member by its node alone, so a socket that comes back on
+another path is the same member, its old socket replaced (4409).
+
+- **Dialling.** One dial tries the paths in rank order, skipping those cooling down, and
+  takes the first that completes TCP, TLS and the WebSocket handshake within 10 s. The
+  cooling paths are tried last, so a member never refuses to dial. Only when every path
+  fails does the dial fail, and the reconnect delay above applies.
+- **What cools a path.** A path that fails to connect, drops mid-handshake, or carries a
+  session that ends dead (45 s without a frame) takes a strike. A path *connecting and
+  then going silent* is the fault this catches: a link that passes the handshake and
+  stalls under bulk traffic. Its cooldown is 30 s, doubling per consecutive strike, capped
+  at 30 min. A session that lasts 10 min clears its path's strikes. A dropped transport or
+  a close the gateway sent is no strike: a gateway restart is not the path's fault.
+- **Returning.** While a socket runs on a path below the best endpoint, every 60 s it
+  probes the best-ranked path of a better endpoint not cooling (TCP and TLS). When the
+  probe succeeds, the socket closes itself 1001, "returning to a better path", and the
+  reconnect dials that path first. A failed probe is a strike. Paths of one endpoint are
+  equals: a socket never leaves one A record for another that is still well.
+- **Each socket keeps its own.** The zend and npcd sockets judge their paths apart: a
+  bulk stall on zend's says nothing of npcd's.
 
 ### 3.3 Handshake
 
@@ -3994,8 +4019,10 @@ The key only ever keys an HMAC (§3.3). It is never sent and never logged.
 
 - Over the internet, the link is `wss` through Cloudflare, and the member verifies the
   certificate.
-- On the LAN, the member dials `https://<ip>:9443` and verifies the certificate by
-  `--cluster-name`.
+- On the LAN, the member dials `https://<ip>:9443`, or a LAN name, and verifies the
+  certificate by `--cluster-name`.
+- One `--cluster` may list both, LAN first (§3.2, paths): the member stays on the LAN
+  while it works and falls back to the internet when it does not.
 - The hop from Cloudflare to the gateway is the existing LAN HTTP hop.
 
 ### 13.4 Gateways peer with each other: certificates and shared secrets

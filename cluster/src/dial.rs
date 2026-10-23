@@ -23,6 +23,10 @@ pub trait Connect: Send {
     type Tx: PipeTx;
     type Rx: PipeRx;
     fn connect(&mut self) -> impl Future<Output = Result<(Self::Tx, Self::Rx), String>> + Send;
+
+    /// How the attempt on the last transport [`connect`](Self::connect) opened
+    /// came to: a connector with several ways to the cluster judges them by it.
+    fn ended(&mut self, _attempt: &Attempt) {}
 }
 
 /// Why a dial loop stopped.
@@ -84,6 +88,7 @@ where
                 }
             },
         };
+        connector.ended(&attempt);
         let (after, close) = attempt.after();
         let wait = backoff.after(after, &mut rng);
         attempted(&attempt, wait);

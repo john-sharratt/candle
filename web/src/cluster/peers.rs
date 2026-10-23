@@ -119,12 +119,8 @@ pub fn dial_all(peering: &Arc<Peering>, peers: &[Peer]) -> Result<()> {
     let tls = tls_connector()?;
     for p in peers {
         let target = Arc::new(Target::parse(&p.url, p.name.as_deref())?);
-        let secure = target.tls_name.is_some();
-        let connector = Dial {
-            target: target.clone(),
-            app: GATEWAY_APP,
-            tls: tls.clone(),
-        };
+        let secure = target.secure();
+        let connector = Dial::new(target.clone(), GATEWAY_APP, tls.clone());
         let peering = peering.clone();
         let url = p.url.clone();
         tokio::spawn(async move {

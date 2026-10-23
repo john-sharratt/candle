@@ -385,11 +385,7 @@ impl Cluster {
         }
         self.upgrader.register(&member);
         for (c, target) in self.targets.iter().enumerate() {
-            let dial = Dial {
-                target: target.clone(),
-                app: link.app,
-                tls: self.tls.clone(),
-            };
+            let dial = Dial::new(target.clone(), link.app, self.tls.clone());
             let cluster = self.clone();
             let member = member.clone();
             let replicator = member.replicator().cloned();
@@ -480,14 +476,7 @@ fn start_agent(
         Arc::clone(&jobs),
     );
     for (c, target) in targets.iter().enumerate() {
-        agent.dial(
-            c,
-            Dial {
-                target: Arc::clone(target),
-                app: AGENT_APP,
-                tls: tls.clone(),
-            },
-        );
+        agent.dial(c, Dial::new(Arc::clone(target), AGENT_APP, tls.clone()));
     }
     tracing::info!(node = %format!("{node:016x}"), "joined the cluster's agents in process");
     Ok(jobs)
