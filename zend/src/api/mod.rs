@@ -27,6 +27,7 @@ mod chat_frames;
 mod compressed;
 pub mod conversations;
 pub mod files;
+pub mod journal;
 pub mod models;
 pub mod projections;
 mod repo_map;
@@ -213,6 +214,24 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             conversation(),
             post(projections::context),
         )
+        .route(
+            "/v1/conversations/:id/journal",
+            Role::Unauthenticated,
+            conversation(),
+            get(journal::get),
+        )
+        .route(
+            "/v1/conversations/:id/journal/draft",
+            Role::Unauthenticated,
+            conversation(),
+            post(journal::draft),
+        )
+        .route(
+            "/v1/conversations/:id/journal/:eid",
+            Role::Unauthenticated,
+            conversation(),
+            delete(journal::forget),
+        )
 }
 
 #[cfg(test)]
@@ -260,6 +279,9 @@ mod tests {
                     "/v1/conversations/:id/projection-context",
                     "unauthenticated"
                 ),
+                ("/v1/conversations/:id/journal", "unauthenticated"),
+                ("/v1/conversations/:id/journal/draft", "unauthenticated"),
+                ("/v1/conversations/:id/journal/:eid", "unauthenticated"),
             ]
         );
     }
@@ -288,6 +310,9 @@ mod tests {
             ("GET", "/v1/conversations/c-1/live"),
             ("GET", "/v1/conversations/c-1/projections/3/4"),
             ("POST", "/v1/conversations/c-1/projection-context"),
+            ("GET", "/v1/conversations/c-1/journal"),
+            ("POST", "/v1/conversations/c-1/journal/draft"),
+            ("DELETE", "/v1/conversations/c-1/journal/5"),
         ] {
             assert_eq!(
                 table.dispatch(method, path),

@@ -405,6 +405,53 @@
     },
     deleteFile(convId, fileId) { return delay(60); },
 
+    // ── the working journal (GET/POST/DELETE …/journal) ────────────────────
+    // One entry and one open item per conversation, held in memory; forgetting
+    // the entry empties the list as the daemon's would.
+    _journals: {},
+    _journalOf(convId) {
+      if (!this._journals[convId]) {
+        this._journals[convId] = {
+          written: 1,
+          in_prompt: [1],
+          covered_to: 32,
+          looked_to: 32,
+          drafting: false,
+          open: [{ id: 1, text: 'Does the parity test pass on the 3090?' }],
+          entries: [{
+            id: 1, from_turn: 1, to_turn: 32, from_ms: 0, to_ms: 0,
+            span: '[2026-10-23 14:20–14:41 UTC]',
+            text: '',
+            claims: [
+              { text: 'The user asked for the scan to stop stalling.', cite: [1], kind: 'heard', perishable: true, typed: null, corrected: false },
+              { text: 'scan.rs failed its parity test.', cite: [3], kind: 'observed', perishable: true, typed: null, corrected: false },
+              { text: 'Bounded the loop in scan.rs.', cite: [6], kind: 'did', perishable: false, typed: null, corrected: false },
+            ],
+            intend: ['Rerun the parity test'],
+            opened: [{ id: 1, text: 'Does the parity test pass on the 3090?' }],
+            resolved: [],
+          }],
+          drafts: [{ from_turn: 1, to_turn: 32, turns: 32, took_ms: 2400, gate_ms: 0, write_ms: 2400, result: 'wrote', detail: null, entry: 1, rounds: 1, checks: [] }],
+        };
+      }
+      return this._journals[convId];
+    },
+    async getJournal(convId) {
+      await delay(60);
+      return JSON.parse(JSON.stringify(this._journalOf(convId)));
+    },
+    async forgetJournalEntry(convId, entryId) {
+      await delay(60);
+      const j = this._journalOf(convId);
+      j.entries = j.entries.filter((e) => e.id !== Number(entryId));
+      j.in_prompt = j.entries.map((e) => e.id);
+      return JSON.parse(JSON.stringify(j));
+    },
+    async draftJournal(convId) {
+      await delay(60);
+      throw new Error('a draft is already running, or nothing has happened since the journal last looked');
+    },
+
     // ── Projection events ──────────────────────────────────────────────────
     // One event per decode: the decode-span throughput plus the composition of
     // the materialized context provenance selected, bucketed by category. Shape

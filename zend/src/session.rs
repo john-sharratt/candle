@@ -36,7 +36,9 @@ use candle_conversation::projection::{
     SectionId, SectionLoads, SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema,
     TimelineId, TurnIndex, WorkingSetShare,
 };
-use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
+use candle_conversation::stencil::{
+    compile_action_loop, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
 use candle_conversation::working_set::marks::RELEASE_TAG;
@@ -47,13 +49,17 @@ use candle_conversation::RecoveredMessage;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
-    ConversationEngine, ConversationError, EngineSource, GlueMarkers, OptionalState,
+    Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers, OptionalState,
     ProjectionEvent, SamplingConfig, SelectionState, Sequence, ThinkSteering, TokenDecoder,
-    TurnEvent, TurnHandle, TurnResponse,
+    TurnEvent, TurnHandle, TurnResponse, UnsealedAsker,
 };
 use host::download::ensure_model_pack;
 use host::process::fatal;
-use serde_json::Value;
+use journal_core::journal::Holds;
+use journal_core::record::view as journal_view;
+use journal_core::section::{JournalPrompt, Kept, JOURNAL};
+use journal_core::span::Span;
+use serde_json::{json, Value};
 use web::auth::Roles;
 use zend_tools::state::Secrets;
 use zend_vfs::{RepoFiles, Workspace};
@@ -82,6 +88,13 @@ use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
+use crate::journal::desk::{Asking, Compile, Record, ZendDesk};
+use crate::journal::record::{kept_in, metadata_of};
+use crate::journal::registry::{Journals, Open};
+use crate::journal::state::SessionJournal;
+use crate::journal::style::CODING;
+use crate::journal::world::ConversationFiles;
+use crate::journal::{carry, draft, origin, pressure};
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
@@ -280,6 +293,9 @@ struct ConvState {
     /// the conversation's events have been read back, and while unread
     /// nothing is saved.
     mirror: Arc<Mutex<Mirror>>,
+    /// The journal sections this conversation holds, reconciled with its
+    /// journal at the head of every round (`docs/zend_journal.md`).
+    journal: Carried,
 }
 
 /// Metadata keys carrying the composer dials a conversation last ran under.
@@ -715,6 +731,11 @@ struct InferenceState {
     /// Moved by every conversation delete, so a reply running on the deleted
     /// conversation ends mid-round rather than at its next one.
     deletions: Deletions,
+    /// Whether the schema declares a journal (`journal::carry::install`). A
+    /// workspace schema without one journals nothing.
+    journaling: bool,
+    /// Every dialogue's journal (`docs/zend_journal.md`).
+    journals: Journals,
 }
 
 // The titler uses this plain system prompt (not the projection schema), so the
@@ -1104,11 +1125,14 @@ impl InferenceState {
             map.remove(key)
         };
         drop(released);
+        // Its next turn may be another member's, so its journal is read again
+        // from the record when this member next holds it.
+        self.journals.forget(key);
         self.passthrough.forget(key);
     }
 
     fn sweep_idle_conversations(&self, now: Instant) -> usize {
-        let mut released: Vec<Arc<ConvLock<ConvState>>> = Vec::new();
+        let mut released: Vec<(String, Arc<ConvLock<ConvState>>)> = Vec::new();
         {
             let mut map = self.conversations.lock().unwrap();
             let mut used = self.conv_used.lock().unwrap();
@@ -1123,7 +1147,7 @@ impl InferenceState {
                         true
                     }
                     Sweep::Release => {
-                        released.push(Arc::clone(conv));
+                        released.push((conv_id.clone(), Arc::clone(conv)));
                         false
                     }
                 }
@@ -1131,6 +1155,11 @@ impl InferenceState {
             // A clock outlives its conversation when the conversation leaves
             // the map another way — deleted, or evicted after a failed turn.
             used.retain(|conv_id, _| map.contains_key(conv_id));
+        }
+        // A released conversation's slot goes with it, and so does the asker a
+        // draft would have put its questions through.
+        for (conv_id, _) in &released {
+            self.journals.closed(conv_id);
         }
         released.len()
     }
@@ -1228,6 +1257,12 @@ impl InferenceState {
             n_tools = tool_sections.len(),
             "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
         );
+        // The journal collection selects each conversation's own sections by
+        // name, and reads its stand-in while they seal; installed before the
+        // base conversation is built so the stand-in seals into the frame.
+        let journaling = carry::install(&mut proj_builder)
+            .map_err(|e| anyhow::anyhow!("journal install: {e}"))?;
+        tracing::info!(journaling, "journal collection installed");
 
         // Structure-derived section-collection population. Each empty section
         // collection (e.g. `response`, `mood`) is filled from its content folder
@@ -2903,6 +2938,8 @@ impl InferenceState {
             think_steering,
             passthrough: PassthroughCache::new(),
             deletions: Deletions::default(),
+            journaling,
+            journals: Journals::default(),
         });
         // A conversation is this member's for one turn at a time, and what it
         // keeps of one goes when the conversation does.
@@ -3701,6 +3738,9 @@ fn run_inference_stream(
                             identity: stored_identity.clone(),
                             files,
                             mirror,
+                            // An earlier run may have left this conversation's
+                            // sections: the first reconcile looks for them.
+                            journal: Carried::new(false),
                         }));
                         minted_guard = Some(Arc::clone(&arc).try_lock_owned().expect(
                             "a freshly minted conversation's lock cannot be held by \
@@ -3788,6 +3828,18 @@ fn run_inference_stream(
             })
             .await
             .expect("seed_recurrent_from_lineage task panicked");
+        }
+        // What a draft of this conversation's journal is put through, so one can
+        // start without its lock: the asker its questions fork from, and the
+        // files its claims are checked against.
+        if minted && state.journaling {
+            let open = Open {
+                asker: cs.conv.unsealed_asker(),
+                files: Arc::clone(&cs.files),
+            };
+            state
+                .journals
+                .opened(&conv_id, open, || journal_record(&state, timeline));
         }
 
         // Persist the conv_id ↔ timeline mapping *after* `fork_resuming`
@@ -4132,6 +4184,17 @@ fn run_inference_stream(
                 release_working_set(&state, timeline).await;
                 marks.push(RELEASE_TAG.to_string());
             }
+            // A tool round's user message is the previous turn's results;
+            // it projects without the worked demonstration, which there
+            // becomes the question the model answers (`tool_round_selection`).
+            let mut round_selection = if iteration == 0 {
+                selection.clone()
+            } else {
+                tool_round_selection(&selection)
+            };
+            if state.journaling {
+                carry_journal(&state, &conv_id, timeline, &mut cs, &mut round_selection).await;
+            }
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: Some(this_turn),
@@ -4143,14 +4206,7 @@ fn run_inference_stream(
                 } else {
                     None
                 },
-                // A tool round's user message is the previous turn's results;
-                // it projects without the worked demonstration, which there
-                // becomes the question the model answers (`tool_round_selection`).
-                selection: if iteration == 0 {
-                    selection.clone()
-                } else {
-                    tool_round_selection(&selection)
-                },
+                selection: round_selection,
                 triggers: turn_triggers(&state, think_mode),
                 tags: std::mem::take(&mut marks),
                 ..Default::default()
@@ -4484,6 +4540,7 @@ fn run_inference_stream(
                     // sets its own before its first turn.
                     drop(cs);
                     state.conversations.lock().unwrap().remove(&conv_id);
+                    state.journals.closed(&conv_id);
                     state.engine.lock().unwrap().clear_retrieval_scope(timeline);
                     return;
                 }
@@ -4584,7 +4641,12 @@ fn run_inference_stream(
             // reflects what provenance materialized for this turn (finish_turn
             // refreshed the BDP scores). Stream it so the GUI drops a timeline
             // dot the moment the turn seals — no separate fetch needed.
+            // Which of this conversation's turns it selected is also what tells
+            // the journal whether the dialogue has started losing sight of turns
+            // no entry covers.
+            let mut selected_turns: Option<Vec<u32>> = None;
             if let Some(event) = cs.conv.projection_event(&resp.stats) {
+                selected_turns = Some(pressure::selected_turns(&event, timeline));
                 let seq = PROJ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let out = ProjectionEventOut::answer(seq, event);
                 turn_events.push(out.clone());
@@ -4625,6 +4687,28 @@ fn run_inference_stream(
             let conversation = state.engine.lock().unwrap().conversation();
             if let Err(e) = conversation.commit_persistence() {
                 tracing::warn!(conv_id = %conv_id, "persistence commit error: {e}");
+            }
+
+            // The sealed turn may make a draft due. The draft runs on its own,
+            // on forks of this conversation at `Normal`; this reply does not
+            // wait for it.
+            if state.journaling {
+                if let Some(newest) = resp.seal.as_ref().and_then(|s| s.turn_index) {
+                    let cadence = Cadence::Due {
+                        newest,
+                        selected: selected_turns.as_deref(),
+                    };
+                    if let Ok(span) = begin_journal_draft(&state, &conv_id, timeline, cadence) {
+                        tracing::info!(
+                            target: "zend::journal",
+                            conv_id = %conv_id,
+                            from_part = span.from_turn,
+                            to_part = span.to_turn,
+                            parts = span.turns.len(),
+                            "journal draft started",
+                        );
+                    }
+                }
             }
 
             if is_final {
@@ -4830,6 +4914,210 @@ fn round_releases(state: &InferenceState, results: &[ToolResult]) -> bool {
         .working_set
         .as_ref()
         .is_some_and(|config| results.iter().any(|r| releases(config, &r.call.name)))
+}
+
+/// The journal `timeline`'s metadata records, if it records one.
+fn journal_record(state: &InferenceState, timeline: TimelineId) -> Option<Kept> {
+    let metadata = state
+        .engine
+        .lock()
+        .unwrap()
+        .conversation_metadata(timeline)?;
+    kept_in(&metadata)
+}
+
+/// Bring the conversation's journal sections in line with its journal, and pin
+/// what the round reads of them in `selection`.
+///
+/// Nothing waits for a section to seal: a round reads the sections that have,
+/// and a new entry joins the prompt the round after its section seals.
+async fn carry_journal(
+    state: &InferenceState,
+    conv_id: &str,
+    timeline: TimelineId,
+    cs: &mut ConvState,
+    selection: &mut SelectionState,
+) {
+    let journal = state
+        .journals
+        .of(conv_id, || journal_record(state, timeline));
+    let prompt = journal.lock().unwrap().journal().prompt(&CODING);
+    let ConvState {
+        conv,
+        journal: carried,
+        ..
+    } = cs;
+    let sealed = carried
+        .reconcile(
+            conv,
+            JOURNAL,
+            &carry::wants(&prompt),
+            &prompt.sweep(),
+            None,
+            tokio::time::sleep,
+        )
+        .await;
+    carry::select(selection, !prompt.is_empty(), &sealed);
+}
+
+/// When a journal draft starts.
+#[derive(Clone, Copy)]
+enum Cadence<'a> {
+    /// Turn `newest` has sealed, and its round's projection selected
+    /// `selected` of the conversation's turns: start one if the cadence or the
+    /// selection pressure asks for it.
+    Due {
+        newest: u32,
+        selected: Option<&'a [u32]>,
+    },
+    /// Start one now over whatever is not covered (`POST …/journal/draft`).
+    Now,
+}
+
+/// Why no journal draft started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoDraft {
+    /// The conversation is not open on this member, so there is no live slot
+    /// to fork the draft's questions from.
+    NotOpen,
+    /// The cadence does not ask for one yet.
+    NotDue,
+    /// A draft is already running, or nothing has happened since the last.
+    NothingNew,
+}
+
+/// Start a journal draft of `conv_id` if `cadence` calls for one, and return
+/// the stretch it covers. The draft runs as a task of its own.
+fn begin_journal_draft(
+    state: &Arc<InferenceState>,
+    conv_id: &str,
+    timeline: TimelineId,
+    cadence: Cadence<'_>,
+) -> Result<Span, NoDraft> {
+    let open = state.journals.open(conv_id).ok_or(NoDraft::NotOpen)?;
+    let journal = state
+        .journals
+        .of(conv_id, || journal_record(state, timeline));
+    let covered = {
+        let held = journal.lock().unwrap();
+        if let Cadence::Due { newest, selected } = cadence {
+            let pressed = selected
+                .is_some_and(|s| pressure::left_out(s, held.first_uncovered_turn(), newest));
+            if !held.due(newest, pressed) {
+                return Err(NoDraft::NotDue);
+            }
+        }
+        if held.journal().pending() {
+            return Err(NoDraft::NothingNew);
+        }
+        held.journal().covered_to()
+    };
+    let history = state
+        .base_conv
+        .lock()
+        .unwrap()
+        .recovered_history(timeline, false);
+    let newest = match cadence {
+        Cadence::Due { newest, .. } => newest,
+        Cadence::Now => history
+            .iter()
+            .map(|m| m.turn)
+            .max()
+            .ok_or(NoDraft::NothingNew)?,
+    };
+    let written = state.engine.lock().unwrap().timeline_turn_wall_ms(timeline);
+    let parts = origin::parts_after(&history, &written, covered);
+    let span = journal
+        .lock()
+        .unwrap()
+        .begin(parts, newest)
+        .ok_or(NoDraft::NothingNew)?;
+    spawn_journal_draft(
+        Arc::clone(state),
+        conv_id.to_string(),
+        timeline,
+        open,
+        journal,
+        span.clone(),
+    );
+    Ok(span)
+}
+
+/// The desk a draft of `timeline`'s journal puts its questions through: forks
+/// of the conversation's slot, each answer held to one call of the dialect's
+/// own shape, the reasoning block written closed, decoded greedily.
+fn journal_desk(
+    state: &Arc<InferenceState>,
+    timeline: TimelineId,
+    asker: UnsealedAsker,
+) -> ZendDesk {
+    let dialect = state.refresh_config.dialect.clone();
+    let env = ToolCallEnvelope::for_assistant_calls(&dialect);
+    let close = ToolCallEnvelope::turn_close(&dialect);
+    let prefill = format!(
+        "{}{}",
+        dialect.no_think_block,
+        ToolCallEnvelope::for_dialect(&dialect).marker
+    );
+    let compiling = Arc::clone(state);
+    let compile: Compile = Arc::new(move |spec: &Value| {
+        let spec: ToolSpec = serde_json::from_value(spec.clone())?;
+        let tree = compile_action_loop(&[spec], &env, 1, &close, None)?;
+        let compiled = compiling.engine.lock().unwrap().compile_stencil(&tree)?;
+        Ok(Arc::new(compiled))
+    });
+    let mut sampling = state.refresh_config.sampling.clone();
+    sampling.temperature = 0.0;
+    let recording = Arc::clone(state);
+    let record: Record = Box::new(move |prompt: &JournalPrompt| {
+        recording
+            .engine
+            .lock()
+            .unwrap()
+            .set_conversation_metadata_many(timeline, &metadata_of(prompt))
+            .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"))
+    });
+    ZendDesk::new(
+        Asking {
+            asker,
+            compile,
+            prefill,
+            sampling,
+        },
+        record,
+    )
+}
+
+/// Run one journal draft over `span` as a task of its own, and log how it
+/// ended. Its record is the journal's too, for the API.
+fn spawn_journal_draft(
+    state: Arc<InferenceState>,
+    conv_id: String,
+    timeline: TimelineId,
+    open: Open,
+    journal: Arc<Mutex<SessionJournal>>,
+    span: Span,
+) {
+    tokio::spawn(async move {
+        let mut desk = journal_desk(&state, timeline, open.asker);
+        let world = ConversationFiles::of(open.files);
+        let record = draft::draft(&mut desk, &journal, &span, &world).await;
+        tracing::info!(
+            target: "zend::journal",
+            conv_id = %conv_id,
+            from_part = record.from_turn,
+            to_part = record.to_turn,
+            result = ?record.result,
+            entry = ?record.entry,
+            rounds = record.rounds,
+            took_ms = record.took_ms,
+            gate_ms = record.gate_ms,
+            write_ms = record.write_ms,
+            detail = ?record.detail,
+            checks = ?record.checks,
+            "journal draft ended",
+        );
+    });
 }
 
 /// Release `timeline`'s working-set locks into provenance
@@ -6446,11 +6734,79 @@ impl ZendSession {
         let result = state.engine.lock().unwrap().tombstone_timeline(timeline);
         if result.is_ok() {
             state.conversations.lock().unwrap().remove(conv_id);
+            state.journals.forget(conv_id);
             // After the tombstone, so a turn woken by it finds its timeline
             // tombstoned.
             state.deletions.deleted();
         }
         Some(result)
+    }
+
+    /// `GET /v1/conversations/{id}/journal`: the journal's entries as the
+    /// prompt reads them, its open items, what it covers, and its recent drafts.
+    /// A conversation that has written nothing has an empty one. `None` while
+    /// the model is not loaded.
+    pub fn journal(&self, conv_id: &str) -> Option<Value> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = conversation_timeline(conv_id);
+        let view = match state.journals.get(conv_id) {
+            Some(journal) => journal_view(journal.lock().unwrap().journal(), &CODING),
+            None => {
+                let held = journal_record(&state, timeline)
+                    .map_or_else(SessionJournal::new, SessionJournal::restore);
+                journal_view(held.journal(), &CODING)
+            }
+        };
+        Some(view)
+    }
+
+    /// `POST /v1/conversations/{id}/journal/draft`: draft an entry now, over
+    /// whatever the journal does not cover, without waiting for the cadence.
+    /// Answers the stretch it covers; how it ends shows in the journal's
+    /// drafts. `None` while the model is not loaded.
+    pub fn journal_draft(&self, conv_id: &str) -> Option<Result<Value, NoDraft>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = conversation_timeline(conv_id);
+        Some(
+            begin_journal_draft(&state, conv_id, timeline, Cadence::Now).map(|span| {
+                json!({
+                    "from_turn": origin::turn_of(span.from_turn),
+                    "to_turn": origin::turn_of(span.to_turn),
+                    "parts": span.turns.len(),
+                })
+            }),
+        )
+    }
+
+    /// `DELETE /v1/conversations/{id}/journal/{eid}`: forget one entry. It
+    /// leaves the journal and its record at once, and its section leaves the
+    /// conversation's prompt at the next round. Answers the journal as it now
+    /// reads; `Some(Ok(None))` when no entry by that number is held (only the
+    /// newest few are). `None` while the model is not loaded.
+    pub fn journal_forget(
+        &self,
+        conv_id: &str,
+        entry: u64,
+    ) -> Option<anyhow::Result<Option<Value>>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = conversation_timeline(conv_id);
+        let journal = state
+            .journals
+            .of(conv_id, || journal_record(&state, timeline));
+        let prompt = {
+            let mut held = journal.lock().unwrap();
+            if held.journal_mut().forget(&[entry]).is_empty() {
+                return Some(Ok(None));
+            }
+            held.journal().prompt(&CODING)
+        };
+        let recorded = state
+            .engine
+            .lock()
+            .unwrap()
+            .set_conversation_metadata_many(timeline, &metadata_of(&prompt))
+            .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"));
+        Some(recorded.map(|()| Some(journal_view(journal.lock().unwrap().journal(), &CODING))))
     }
 
     /// Tombstone a timeline by its RAW id — the derived-layer counterpart to

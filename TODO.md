@@ -5,8 +5,10 @@
   `in_context`. Find where `repeated_call` is raised for a served call and make
   the GUI show the `in_context` reply.
 - [ ] **Remove the thinking blocks from `repo_map` and `code_reading` ingestion.**
-- [ ] **Implement the journal tool.** It matters for anchoring the model as a
-  session runs.
+- [x] **Implement the journal tool.** It matters for anchoring the model as a
+  session runs. Built as `docs/zend_journal.md`; how often the gate says no,
+  what a draft costs the next round, and whether five entries carry a long task
+  are for live sessions to say.
 - [ ] **Tune decode performance.** Inference decode runs at about half the speed
   it should.
 - [x] **Turns don't finish while the substrate is compacting.** The resident

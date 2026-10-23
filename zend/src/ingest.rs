@@ -26,6 +26,7 @@ use std::path::Path;
 
 use candle_conversation::projection::{LayerSchema, Schema, SelectionRule, SystemPromptItem};
 use candle_conversation::Sequence;
+use journal_core::section::JOURNAL;
 
 use crate::raw_read::RawState;
 
@@ -205,8 +206,9 @@ pub fn ingest_layers(
 }
 
 /// Derive the section-collection sinks: empty collections (other than the
-/// registry-backed `tools`) in the shared system prompt, in declaration order.
-/// Each is filled from `<collection-name>s/`.
+/// registry-backed `tools`, the identity collections and the per-conversation
+/// `journal`) in the shared system prompt, in declaration order. Each is filled
+/// from `<collection-name>s/`.
 pub fn section_sinks(schema: &Schema) -> Vec<SectionSink> {
     let mut out = Vec::new();
     for item in &schema.system_prompt.items {
@@ -216,6 +218,7 @@ pub fn section_sinks(schema: &Schema) -> Vec<SectionSink> {
         if c.name == TOOLS_COLLECTION
             || c.name == IDENTITY_COLLECTION
             || c.name == IDENTITY_ANCHOR_COLLECTION
+            || c.name == JOURNAL
             || !c.sections.is_empty()
         {
             continue;
@@ -253,7 +256,31 @@ fn pluralize(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::pluralize;
+    use candle_conversation::models::Dialect;
+    use candle_conversation::projection::Builder;
+
+    use super::*;
+    use crate::session::PROJECTION_SCHEMA_TEMPLATE;
+
+    /// **A journal is no folder of sections.** Its members are each
+    /// conversation's own, submitted as entries are written; loading a
+    /// `journals/` folder into it would put one set in every conversation.
+    #[test]
+    fn the_journal_is_never_filled_from_a_folder() {
+        let builder = Builder::from_yaml_with_vars_and_dialect(
+            PROJECTION_SCHEMA_TEMPLATE,
+            &[("workspace", "demo")],
+            Some(&Dialect::chat_ml()),
+        )
+        .unwrap();
+        assert!(builder.id_for_system_collection(JOURNAL).is_some());
+        let sinks = section_sinks(builder.schema());
+        assert!(
+            sinks.iter().all(|s| s.collection != JOURNAL),
+            "{:?}",
+            sinks.iter().map(|s| &s.collection).collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn pluralizes_collection_folders() {

@@ -556,6 +556,28 @@ system_prompt:
       dialect: tool_block_close
       depends_on: tools
 
+    # ── WHAT THIS SESSION HAS WRITTEN DOWN (per conversation · daemon-filled) ──
+    # The dialogue's working journal (`docs/zend_journal.md`): one section per
+    # kept entry, its newest five, and one for what is still open. zend submits
+    # them to the conversation's own timeline as entries are written, so they
+    # are sealed, persisted and tombstoned with it and no other conversation
+    # sees them. The collection selects by name (`journal::carry::install`):
+    # a conversation that has written nothing pins nothing, so neither this
+    # intro nor the collection emits, and every other layer's prompt reads as
+    # if the journal were not declared.
+    #
+    # Last before the close, so a new entry changes nothing above it.
+    - kind: section
+      id: journal_intro
+      depends_on: journal
+      content: |+
+        From your journal for this session, as you wrote it. Each entry is notes you took on a stretch of this conversation, dated, with every line under how you came to know it: "Saw:" a tool result, "User said:" the user, "Did:" a call you made, "Concluded, not seen:" something you worked out. Anything marked (re-check) may have changed since you wrote it — read it again before you rely on it. The turns themselves are still in this conversation; the journal is what you took from them.
+
+    - kind: collection
+      name: journal
+      selection: { kind: always_visible }
+      sections: []
+
     - kind: template
       id: system_close
       dialect: system_end

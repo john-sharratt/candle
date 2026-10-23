@@ -50,6 +50,9 @@ candle              = { workspace = true, features = ["cuda"] }
 candle-conversation = { path = "../candle-conversation", features = ["hub"] }
 zend-tools          = { path = "../zend-tools" }
 zend-vfs            = { path = "../zend-vfs" }
+# A dialogue's working journal — entries, their check, the write grammar, the
+# draft — shared with npcd (`docs/zend_journal.md`).
+journal-core        = { path = "../journal-core" }
 regex               = "1"
 tokenizers          = { workspace = true }
 

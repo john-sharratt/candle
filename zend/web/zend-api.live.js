@@ -384,6 +384,27 @@
       return fetch('/v1/conversations/' + enc(convId) + '/files/' + enc(fileId), { method: 'DELETE' }).then(() => {});
     },
 
+    // ── the conversation's working journal (docs/zend_journal.md §8) ───────
+    // Read-only from here: every line in it is one the daemon cited and
+    // checked, so an entry can be forgotten but not edited.
+    getJournal(convId) {
+      return getJSON('/v1/conversations/' + enc(convId) + '/journal');
+    },
+    // Resolves to the journal as it now reads.
+    async forgetJournalEntry(convId, entryId) {
+      const r = await fetch('/v1/conversations/' + enc(convId) + '/journal/' + Number(entryId), { method: 'DELETE' });
+      if (!r.ok) throw new Error('DELETE journal entry -> ' + r.status);
+      return r.json();
+    },
+    // Resolves to the turns the draft covers, or rejects with the daemon's
+    // reason (a draft already running, nothing new, the conversation not open).
+    async draftJournal(convId) {
+      const r = await fetch('/v1/conversations/' + enc(convId) + '/journal/draft', { method: 'POST' });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.message || ('POST journal draft -> ' + r.status));
+      return body;
+    },
+
     // ── not yet implemented (per-phase) ────────────────────────────────────
     mkProjEvent: ni('mkProjEvent'),
   };
