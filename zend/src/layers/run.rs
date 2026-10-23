@@ -594,11 +594,16 @@ fn split_thinking(written: &TurnText) -> (bool, String) {
         let mut rest = piece.text.as_str();
         loop {
             match (rest.find(THINK_OPEN), rest.find(THINK_CLOSE)) {
-                (Some(o), c) if c.is_none_or(|c| o < c) => {
+                (Some(o), Some(c)) if c < o => {
+                    open = false;
+                    after.clear();
+                    rest = &rest[c + THINK_CLOSE.len()..];
+                }
+                (Some(o), _) => {
                     open = true;
                     rest = &rest[o + THINK_OPEN.len()..];
                 }
-                (_, Some(c)) => {
+                (None, Some(c)) => {
                     open = false;
                     after.clear();
                     rest = &rest[c + THINK_CLOSE.len()..];
