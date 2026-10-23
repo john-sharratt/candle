@@ -94,7 +94,14 @@ impl Desk for ZendDesk {
                 tree
             }
         };
-        self.asking.ask(question, tree).await
+        let answer = self.asking.ask(question, tree).await?;
+        tracing::info!(
+            target: "zend::journal",
+            question = %question,
+            answer = %answer,
+            "journal draft answered",
+        );
+        Ok(answer)
     }
 
     fn keep(&mut self, prompt: &JournalPrompt) -> impl Future<Output = anyhow::Result<()>> + Send {
