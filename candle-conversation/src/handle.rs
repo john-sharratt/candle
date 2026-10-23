@@ -1,5 +1,6 @@
 use crate::cancel::CancelToken;
 use crate::error::ConversationError;
+use crate::scheduler::exported_state::ExportedState;
 use crate::token_buffer::TokenBuffer;
 use crate::turn_text::TurnText;
 use crate::TurnStats;
@@ -286,6 +287,11 @@ pub struct SealResult {
     /// `turn_count - 1`: the async summariser appends its node turns to
     /// the same timeline, so counting races.
     pub turn_index: Option<u32>,
+    /// The recurrent state the section's prefill ended on, for a section that
+    /// was given the state it starts from — the state a section continuing it
+    /// starts from in turn. `None` for a turn, for a section given no start,
+    /// and for a model with no recurrent state.
+    pub end_state: Option<ExportedState>,
 }
 
 /// Complete response from a turn.

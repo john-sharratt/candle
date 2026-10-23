@@ -2287,6 +2287,9 @@ pub(super) struct ActiveSectionIngest {
     /// `SealAction::Section` — see that variant's docstring for the
     /// quantize-policy implications.
     pub(super) in_collection: bool,
+    /// Whether the seal hands back the state the prefill ended on — set for a
+    /// section that was given the state it starts from.
+    pub(super) export_end: bool,
     pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
     pub(super) error: Option<ConversationError>,
 }
@@ -5858,6 +5861,7 @@ impl Scheduler {
                 address,
                 "summary_system_prompt".to_string(),
                 false,
+                false,
             )?;
             Ok(())
         })();
@@ -8679,6 +8683,7 @@ impl Scheduler {
             address: s.address,
             debug_name: s.debug_name,
             in_collection: s.in_collection,
+            export_end: s.start.is_some(),
             response_tx: s.response_tx,
             error: None,
         });
@@ -8904,6 +8909,7 @@ impl Scheduler {
         address: ContentAddress,
         debug_name: String,
         in_collection: bool,
+        export_end: bool,
     ) -> Result<SealResult, ConversationError> {
         #[cfg(feature = "context-dump")]
         if tracing::enabled!(
@@ -9003,6 +9009,13 @@ impl Scheduler {
             }
         }
 
+        // A section that began from its prefix's state hands back the state it
+        // ended on, before the slot is reused: the start of a section that
+        // continues it.
+        let mut seal = seal;
+        if export_end {
+            seal.end_state = self.export_state_of(sequence_id.0)?;
+        }
         Ok(seal)
     }
 
@@ -10070,6 +10083,7 @@ impl Scheduler {
             turn_token_count,
             chunk_size,
             turn_index: recorded_turn_index,
+            end_state: None,
         }))
     }
 
@@ -14617,6 +14631,10 @@ mod tests {
             sched.begin_section(queued).is_ok(),
             "the section was refused"
         );
+        assert!(
+            sched.active_section_ingests[0].export_end,
+            "a section given its start must hand back its end, the start of what continues it"
+        );
         let (_, held) = sched
             .model
             .export_recurrent(slot.0)
@@ -16877,6 +16895,10 @@ mod tests {
 
         assert!(sched.section_queue.is_empty(), "admission took it");
         assert_eq!(sched.active_section_ingests.len(), 1, "and it is in flight");
+        assert!(
+            !sched.active_section_ingests[0].export_end,
+            "a section given no start has no end state anyone asked for"
+        );
     }
 
     /// **A section batch's device OOM is retried, any other error fails it.**

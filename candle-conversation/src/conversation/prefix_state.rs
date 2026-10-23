@@ -16,7 +16,7 @@
 //! a state without keeping it, for a chain of a conversation's own sections
 //! whose states belong to that conversation alone.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 
@@ -124,6 +124,35 @@ pub(crate) fn chain_of(
     (chain.prefix(), tokens)
 }
 
+/// How many states [`state_after`] holds decoded in this process. One per
+/// collection prefix a seal asks after — a handful per prompt — each the size
+/// of a checkpoint.
+const HELD_STATES: usize = 8;
+
+/// The states [`state_after`] last served, newest last. The checkpoint store
+/// memoises one record and re-reads any other off the log — a ~63 MiB decode
+/// under the persistence lock — while a journal asks after its collection's
+/// prefix every time an entry seals.
+static HELD: Mutex<Vec<(ContentHash, SharedState)>> = Mutex::new(Vec::new());
+
+/// `state` as the one held under `prefix`, newest, past the cap dropping the
+/// oldest.
+fn hold(prefix: ContentHash, state: SharedState) {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    held.retain(|(p, _)| *p != prefix);
+    held.push((prefix, state));
+    if held.len() > HELD_STATES {
+        held.remove(0);
+    }
+}
+
+fn held(prefix: ContentHash) -> Option<SharedState> {
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    held.iter()
+        .find(|(p, _)| *p == prefix)
+        .map(|(_, s)| s.clone())
+}
+
 /// The state after the sealed `sections`, in order — `Ok(None)` before any
 /// token, where the state is zero, and for a model with no recurrent state.
 pub(crate) fn state_after(
@@ -135,7 +164,14 @@ pub(crate) fn state_after(
     if tokens.is_empty() {
         return Ok(None);
     }
-    Ok(checkpoint(scheduler_tx, substrate, prefix, tokens)?.map(|(p, _)| shared(&p)))
+    if let Some(state) = held(prefix) {
+        return Ok(Some(state));
+    }
+    let state = checkpoint(scheduler_tx, substrate, prefix, tokens)?.map(|(p, _)| shared(&p));
+    if let Some(state) = &state {
+        hold(prefix, state.clone());
+    }
+    Ok(state)
 }
 
 /// The state after `start` and then the sealed `sections`, computed now and

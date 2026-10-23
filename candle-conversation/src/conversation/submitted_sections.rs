@@ -50,6 +50,10 @@ pub enum SectionState {
 struct Settled {
     state: Mutex<SectionState>,
     changed: Condvar,
+    /// The recurrent state the section's seal ended on, when its prefill ran
+    /// here: where a section continuing it starts. Absent for one restored from
+    /// the log, whose successor works its start out instead.
+    end: Mutex<Option<SharedState>>,
 }
 
 impl Settled {
@@ -57,6 +61,7 @@ impl Settled {
         Arc::new(Self {
             state: Mutex::new(SectionState::Pending),
             changed: Condvar::new(),
+            end: Mutex::new(None),
         })
     }
 
@@ -117,6 +122,12 @@ impl SectionRef {
     /// Where the section is now.
     pub fn state(&self) -> SectionState {
         self.settled.get()
+    }
+
+    /// The recurrent state the section's prefill ended on, when it was sealed
+    /// in this process — see [`Settled::end`].
+    fn end_state(&self) -> Option<SharedState> {
+        self.settled.end.lock().unwrap().clone()
     }
 
     /// Block until the section is sealed, returning its block count. Fails when
@@ -287,10 +298,16 @@ impl SealJob {
         Ok(ids)
     }
 
-    /// The recurrent state at the section's first token: the state after the
-    /// schema's prefix — kept for every conversation on this prompt — run on
-    /// through the sections it continues, which are this conversation's alone.
+    /// The recurrent state at the section's first token. The section it
+    /// continues directly ended on exactly that state when it was sealed here,
+    /// and hands it over. Otherwise — it was restored from the log, or there is
+    /// nothing before — it is the state after the schema's prefix, kept for
+    /// every conversation on this prompt, run on through the sections it
+    /// continues, which are this conversation's alone.
     fn start_state(&self) -> crate::Result<Option<SharedState>> {
+        if let Some(handed) = self.after.last().and_then(SectionRef::end_state) {
+            return Ok(Some(handed));
+        }
         let at_collection =
             state_after(&self.scheduler_tx, &self.substrate, &self.prompt_prefix())?;
         let after: Vec<SectionId> = self.after.iter().map(SectionRef::section_id).collect();
@@ -377,6 +394,7 @@ impl SealJob {
             .scheduler_tx
             .send(SchedulerRequest::FreeSequence { sequence_id: slot });
         let seal = sealed?;
+        *self.settled.end.lock().unwrap() = seal.end_state.as_ref().map(SharedState::from);
         Ok((seal.block_to.saturating_sub(seal.block_from), stream))
     }
 

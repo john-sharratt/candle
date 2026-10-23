@@ -3246,6 +3246,7 @@ impl Scheduler {
                 s.address,
                 s.debug_name,
                 s.in_collection,
+                s.export_end,
             );
             let _ = s.response_tx.send(result);
             // swap_remove pulled the last element into i; don't increment.
