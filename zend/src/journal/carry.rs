@@ -59,7 +59,7 @@ mod tests {
     use candle_conversation::models::Dialect;
     use candle_conversation::projection::SystemPromptItem;
     use journal_core::entry::Item;
-    use journal_core::section::{Kept, OPEN_SECTION};
+    use journal_core::section::{render_open, Kept, OPEN_SECTION};
 
     use super::*;
     use crate::journal::style::CODING;
@@ -136,6 +136,7 @@ mod tests {
         let w = wants(&prompt);
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].name, OPEN_SECTION);
-        assert_eq!(w[0].text, "Still open:\n#1 rerun");
+        assert_eq!(w[0].text, render_open(&kept.open, &CODING));
+        assert!(w[0].text.starts_with("Still open:\n#1 rerun\n\n"));
     }
 }

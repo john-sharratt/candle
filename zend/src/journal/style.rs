@@ -63,6 +63,16 @@ fn span(from_ms: u64, to_ms: u64) -> String {
     }
 }
 
+/// The UTC day of `ms`: `2026-10-23`.
+fn day(ms: u64) -> String {
+    day_of(ms)
+}
+
+/// The UTC hour `ms` falls in: `14:00 UTC`.
+fn hour(ms: u64) -> String {
+    format!("{:02}:00 UTC", (ms % MS_PER_DAY) / 3_600_000)
+}
+
 fn stretch(from_ms: u64, to_ms: u64) -> String {
     format!(
         "This stretch of the session, {}, as numbered turns:",
@@ -72,7 +82,10 @@ fn stretch(from_ms: u64, to_ms: u64) -> String {
 
 /// The wording a coding session's journal is kept in.
 pub const CODING: Style = Style {
+    entry: "Entry",
     span,
+    day,
+    hour,
     saw: "Saw:",
     heard: "User said:",
     did: "Did:",
@@ -83,6 +96,9 @@ pub const CODING: Style = Style {
     corrected: " (the workspace read differently than first written)",
     recheck: " (re-check)",
     open_heading: "Still open:",
+    nothing_open: "Still open: nothing.",
+    end: "That is the whole of your journal. Anything else you know of this conversation comes \
+from its turns or from what was retrieved for it, not from your journal.",
     clock,
     stretch,
     write_question: WRITE_QUESTION,
@@ -151,25 +167,32 @@ mod tests {
             text: "Does the 3090 build pass?".into(),
         }];
         assert_eq!(
-            e.render(&CODING),
-            "[2026-10-23 14:20–14:41 UTC]\n\
-             Saw:\n- cargo test failed in scan.rs. (re-check)\n\
-             User said:\n- Asked for the BDP fix first. (re-check)\n\
-             Did:\n- Edited scan.rs to bound the loop.\n\
-             Concluded, not seen:\n- The race is in the reclaim path. (re-check)\n\
+            e.render(None, &CODING),
+            "2026-10-23, 14:00 UTC\n\
+             Entry 1\n\
+             - Saw: cargo test failed in scan.rs. (re-check)\n\
+             - User said: Asked for the BDP fix first. (re-check)\n\
+             - Did: Edited scan.rs to bound the loop.\n\
+             - Concluded, not seen: The race is in the reclaim path. (re-check)\n\
              Left open:\n- #2 Does the 3090 build pass?"
         );
     }
 
     #[test]
-    fn the_open_items_are_headed_as_still_open() {
+    fn the_journal_ends_with_what_is_still_open_and_where_it_stops() {
         let open = [Item {
             id: 4,
             text: "Rerun the gate".into(),
         }];
+        let end = "That is the whole of your journal. Anything else you know of this conversation \
+                   comes from its turns or from what was retrieved for it, not from your journal.";
         assert_eq!(
-            render_open(&open, &CODING).as_deref(),
-            Some("Still open:\n#4 Rerun the gate")
+            render_open(&open, &CODING),
+            format!("Still open:\n#4 Rerun the gate\n\n{end}")
+        );
+        assert_eq!(
+            render_open(&[], &CODING),
+            format!("Still open: nothing.\n\n{end}")
         );
     }
 

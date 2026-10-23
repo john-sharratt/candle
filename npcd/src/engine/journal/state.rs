@@ -389,9 +389,9 @@ mod tests {
     fn the_prompt_and_the_view_are_rendered_in_the_characters_voice() {
         let mut s = JournalState::new(0);
         let kept = s.journal_mut().kept(entry_to(4));
-        assert_eq!(s.prompt().sections[0].text, kept.render(&NPC));
+        assert_eq!(s.prompt().sections[0].text, kept.render(None, &NPC));
         let view = s.view();
         assert_eq!(view["written"], 1);
-        assert_eq!(view["entries"][0]["text"], kept.render(&NPC));
+        assert_eq!(view["entries"][0]["text"], kept.render(None, &NPC));
     }
 }

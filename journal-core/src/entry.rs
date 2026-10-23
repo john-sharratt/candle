@@ -103,18 +103,46 @@ pub struct Entry {
     pub resolved: Vec<u64>,
 }
 
-/// The order claims are grouped in when an entry is read back.
-const KINDS: [Kind; 4] = [Kind::Observed, Kind::Heard, Kind::Did, Kind::Inferred];
-
 impl Entry {
     /// The span the entry covers, as `style` writes it.
     pub fn span(&self, style: &Style) -> String {
         (style.span)(self.from_ms, self.to_ms)
     }
 
-    /// The entry as the writer reads it back.
-    pub fn render(&self, style: &Style) -> String {
-        let mut out = self.span(style);
+    /// When the entry is read after `before` — the entry above it in the
+    /// journal, `None` for the first — the line that marks the time moving on:
+    /// the day and hour when the day changed, the hour alone when only the hour
+    /// did, nothing when neither did. Coarse on purpose: a journal reads as one
+    /// running list, dated where the date moves.
+    pub fn when(&self, before: Option<&Entry>, style: &Style) -> Option<String> {
+        let (day, hour) = ((style.day)(self.from_ms), (style.hour)(self.from_ms));
+        match before.map(|b| ((style.day)(b.from_ms), (style.hour)(b.from_ms))) {
+            Some((d, h)) if d == day && h == hour => None,
+            Some((d, _)) if d == day => Some(hour),
+            _ => Some(format!("{day}, {hour}")),
+        }
+    }
+
+    /// The entry as the writer reads it back after `before` (see
+    /// [`Self::when`]): the time line when the time moved on, its number, then
+    /// its claims in the order the turns they rest on happened, each under how
+    /// it came to be known.
+    ///
+    /// **In order, not grouped by kind.** Grouped, an entry read its results
+    /// before the request that led to them, and a writer asked what happened
+    /// told it in that order.
+    pub fn render(&self, before: Option<&Entry>, style: &Style) -> String {
+        let mut out = String::new();
+        if let Some(when) = self.when(before, style) {
+            out.push_str(&when);
+            out.push('\n');
+        }
+        out.push_str(&format!("{} {}", style.entry, self.id));
+        let mut claims: Vec<&Claim> = self.claims.iter().collect();
+        claims.sort_by_key(|c| c.cite.iter().min().copied().unwrap_or(u64::MAX));
+        for c in claims {
+            out.push_str(&format!("\n- {} {}", c.kind.heading(style), c.line(style)));
+        }
         let mut section = |title: &str, lines: Vec<String>| {
             if lines.is_empty() {
                 return;
@@ -126,15 +154,6 @@ impl Entry {
                 out.push_str(&l);
             }
         };
-        for kind in KINDS {
-            let lines: Vec<String> = self
-                .claims
-                .iter()
-                .filter(|c| c.kind == kind)
-                .map(|c| c.line(style))
-                .collect();
-            section(kind.heading(style), lines);
-        }
         section(style.meaning_to, self.intend.clone());
         section(
             style.left_open,
@@ -215,27 +234,70 @@ mod tests {
     use super::*;
     use crate::style::testing::PLAIN;
 
+    /// The order claims of each kind are strongest first in.
+    const KINDS: [Kind; 4] = [Kind::Observed, Kind::Heard, Kind::Did, Kind::Inferred];
+
+    fn citing(text: &str, kind: Kind, cite: &[u64]) -> Claim {
+        Claim {
+            cite: cite.to_vec(),
+            ..claim(text, kind)
+        }
+    }
+
     #[test]
     fn the_span_is_written_by_the_style() {
         assert_eq!(entry(1).span(&PLAIN), "[100–200]");
     }
 
     #[test]
-    fn claims_are_grouped_by_how_they_came_to_be_known() {
-        let mut e = entry(1);
+    fn claims_read_in_the_order_they_happened_each_under_how_it_was_known() {
+        let mut e = entry(3);
         e.claims = vec![
-            claim("Somebody is stealing power.", Kind::Inferred),
-            claim("The tower holds 40 ore.", Kind::Observed),
-            claim("I told Pax I was coming.", Kind::Did),
-            claim("Pax says the east door is jammed.", Kind::Heard),
+            citing("Somebody is stealing power.", Kind::Inferred, &[9]),
+            citing("The tower holds 40 ore.", Kind::Observed, &[5, 2]),
+            citing("I told Pax I was coming.", Kind::Did, &[7]),
+            citing("Pax says the east door is jammed.", Kind::Heard, &[1]),
         ];
         assert_eq!(
-            e.render(&PLAIN),
-            "[100–200]\n\
-             Saw:\n- The tower holds 40 ore.\n\
-             Heard:\n- Pax says the east door is jammed.\n\
-             Did:\n- I told Pax I was coming.\n\
-             Concluded:\n- Somebody is stealing power."
+            e.render(None, &PLAIN),
+            "d0, h1\n\
+             Entry 3\n\
+             - Heard: Pax says the east door is jammed.\n\
+             - Saw: The tower holds 40 ore.\n\
+             - Did: I told Pax I was coming.\n\
+             - Concluded: Somebody is stealing power."
+        );
+    }
+
+    fn at(id: u64, from_ms: u64) -> Entry {
+        Entry {
+            from_ms,
+            to_ms: from_ms,
+            ..entry(id)
+        }
+    }
+
+    /// The journal is one running list, dated only where the date moves: the
+    /// day and hour for the first entry and on a new day, the hour alone on a
+    /// new hour, and nothing within the hour.
+    #[test]
+    fn an_entry_is_dated_only_where_the_day_or_hour_moved() {
+        let (a, b, c, d) = (at(1, 1_100), at(2, 1_150), at(3, 1_250), at(4, 2_050));
+        let heads: Vec<String> = [
+            a.render(None, &PLAIN),
+            b.render(Some(&a), &PLAIN),
+            c.render(Some(&b), &PLAIN),
+            d.render(Some(&c), &PLAIN),
+        ]
+        .into();
+        assert_eq!(
+            heads,
+            [
+                "d1, h11\nEntry 1",
+                "Entry 2",
+                "h12\nEntry 3",
+                "d2, h20\nEntry 4"
+            ]
         );
     }
 
@@ -247,8 +309,8 @@ mod tests {
         c.corrected = true;
         e.claims = vec![c];
         assert!(e
-            .render(&PLAIN)
-            .contains("- Fabricator 5 is running. (corrected) (re-check)"));
+            .render(None, &PLAIN)
+            .contains("- Saw: Fabricator 5 is running. (corrected) (re-check)"));
     }
 
     #[test]
@@ -260,7 +322,7 @@ mod tests {
             text: "Who holds the shield decision?".into(),
         }];
         e.resolved = vec![2, 3];
-        let r = e.render(&PLAIN);
+        let r = e.render(None, &PLAIN);
         assert!(r.contains("Meaning to:\n- Ask Pax about the door."));
         assert!(r.contains("Left open:\n- #4 Who holds the shield decision?"));
         assert!(r.ends_with("Settled:\n- #2\n- #3"));
@@ -268,7 +330,7 @@ mod tests {
 
     #[test]
     fn an_empty_section_is_left_out() {
-        assert_eq!(entry(1).render(&PLAIN), "[100–200]");
+        assert_eq!(entry(1).render(None, &PLAIN), "d0, h1\nEntry 1");
     }
 
     #[test]

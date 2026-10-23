@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(state.open().len(), 1);
         assert_eq!(desk.kept.len(), 1);
         assert_eq!(desk.kept[0], state.prompt(&PLAIN));
-        assert_eq!(desk.kept[0].sections[0].text, entry.render(&PLAIN));
+        assert_eq!(desk.kept[0].sections[0].text, entry.render(None, &PLAIN));
     }
 
     #[tokio::test]

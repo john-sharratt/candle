@@ -125,12 +125,12 @@ impl DraftRecord {
 }
 
 /// The entry as an inspector shows it: its stored form, its span and how it
-/// reads in the prompt.
-pub fn shown(entry: &Entry, style: &Style) -> Value {
+/// reads in the prompt, below `before`.
+pub fn shown(entry: &Entry, before: Option<&Entry>, style: &Style) -> Value {
     let mut v = serde_json::to_value(entry).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
         o.insert("span".into(), entry.span(style).into());
-        o.insert("text".into(), entry.render(style).into());
+        o.insert("text".into(), entry.render(before, style).into());
     }
     v
 }
@@ -138,6 +138,12 @@ pub fn shown(entry: &Entry, style: &Style) -> Value {
 /// Everything an inspector is told about one journal.
 pub fn view(journal: &Journal, style: &Style) -> Value {
     let in_prompt: Vec<u64> = journal.entries().map(|e| e.id).collect();
+    let held: Vec<&Entry> = journal.entries().collect();
+    let entries: Vec<Value> = held
+        .iter()
+        .enumerate()
+        .map(|(i, e)| shown(e, i.checked_sub(1).map(|b| held[b]), style))
+        .collect();
     json!({
         "written": journal.written(),
         "in_prompt": in_prompt,
@@ -145,7 +151,7 @@ pub fn view(journal: &Journal, style: &Style) -> Value {
         "looked_to": journal.looked_to(),
         "drafting": journal.pending(),
         "open": journal.open(),
-        "entries": journal.entries().map(|e| shown(e, style)).collect::<Vec<_>>(),
+        "entries": entries,
         "drafts": journal.drafts().collect::<Vec<_>>(),
     })
 }
@@ -189,7 +195,7 @@ mod tests {
         assert_eq!(v["written"], 1);
         assert_eq!(v["in_prompt"], json!([e.id]));
         assert_eq!(v["entries"][0]["id"], e.id);
-        assert_eq!(v["entries"][0]["text"], e.render(&PLAIN));
+        assert_eq!(v["entries"][0]["text"], e.render(None, &PLAIN));
         assert_eq!(v["drafts"][0]["result"], "nothing");
         assert_eq!(v["drafting"], false);
         assert_eq!(v["covered_to"], 9);
@@ -303,9 +309,9 @@ mod tests {
 
     #[test]
     fn a_shown_entry_carries_its_span_and_prompt_text() {
-        let v = shown(&entry(4), &PLAIN);
+        let v = shown(&entry(4), None, &PLAIN);
         assert_eq!(v["id"], 4);
-        assert_eq!(v["text"], entry(4).render(&PLAIN));
+        assert_eq!(v["text"], entry(4).render(None, &PLAIN));
         assert_eq!(v["span"], entry(4).span(&PLAIN));
     }
 }

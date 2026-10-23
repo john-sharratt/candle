@@ -47,6 +47,17 @@ fn clock(at_ms: u64) -> String {
     WorldTime::of(at_ms).clock()
 }
 
+/// The world's day `at_ms` falls on: `14 Jun 2187`.
+fn day(at_ms: u64) -> String {
+    WorldTime::of(at_ms).date()
+}
+
+/// The world's hour `at_ms` falls in: `14:00`.
+fn hour(at_ms: u64) -> String {
+    let clock = WorldTime::of(at_ms).clock();
+    format!("{}:00", clock.split(':').next().unwrap_or("00"))
+}
+
 fn stretch(from_ms: u64, to_ms: u64) -> String {
     format!(
         "What happened to you, from {} to {}:",
@@ -57,7 +68,10 @@ fn stretch(from_ms: u64, to_ms: u64) -> String {
 
 /// The wording a character's journal is kept in.
 pub const NPC: Style = Style {
+    entry: "Entry",
     span,
+    day,
+    hour,
     saw: "Saw:",
     heard: "Heard:",
     did: "Did:",
@@ -68,6 +82,8 @@ pub const NPC: Style = Style {
     corrected: " (the world read differently than I first wrote)",
     recheck: " (re-check)",
     open_heading: "What you have left open:",
+    nothing_open: "What you have left open: nothing.",
+    end: "That is the whole of your journal.",
     clock,
     stretch,
     write_question: WRITE_QUESTION,
@@ -126,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn claims_are_grouped_by_how_they_came_to_be_known() {
+    fn claims_read_in_order_each_under_how_it_came_to_be_known() {
         let mut e = entry(1);
         e.claims = vec![
             claim("Somebody is stealing power.", Kind::Inferred),
@@ -135,12 +151,13 @@ mod tests {
             claim("The tower holds 40 ore.", Kind::Observed),
         ];
         assert_eq!(
-            e.render(&NPC),
-            "[4 Jan 1970, 14:20–14:41]\n\
-             Saw:\n- The tower holds 40 ore.\n\
-             Heard:\n- Pax says the east door is jammed.\n\
-             Did:\n- I told Pax I was coming.\n\
-             Concluded, not seen or heard:\n- Somebody is stealing power."
+            e.render(None, &NPC),
+            "4 Jan 1970, 14:00\n\
+             Entry 1\n\
+             - Concluded, not seen or heard: Somebody is stealing power.\n\
+             - Did: I told Pax I was coming.\n\
+             - Heard: Pax says the east door is jammed.\n\
+             - Saw: The tower holds 40 ore."
         );
     }
 
@@ -151,8 +168,9 @@ mod tests {
         c.perishable = true;
         c.corrected = true;
         e.claims = vec![c];
-        assert!(e.render(&NPC).contains(
-            "- Fabricator 5 is running. (the world read differently than I first wrote) (re-check)"
+        assert!(e.render(None, &NPC).contains(
+            "- Saw: Fabricator 5 is running. (the world read differently than I first wrote) \
+             (re-check)"
         ));
     }
 
@@ -165,7 +183,7 @@ mod tests {
             text: "Who holds the shield decision?".into(),
         }];
         e.resolved = vec![2, 3];
-        let r = e.render(&NPC);
+        let r = e.render(None, &NPC);
         assert!(r.contains("Meaning to:\n- Ask Pax about the door."));
         assert!(r.contains("Left open:\n- #4 Who holds the shield decision?"));
         assert!(r.ends_with("Settled:\n- #2\n- #3"));
@@ -178,8 +196,12 @@ mod tests {
             text: " who holds it? ".into(),
         }];
         assert_eq!(
-            render_open(&open, &NPC).as_deref(),
-            Some("What you have left open:\n#2 who holds it?")
+            render_open(&open, &NPC),
+            "What you have left open:\n#2 who holds it?\n\nThat is the whole of your journal."
+        );
+        assert_eq!(
+            render_open(&[], &NPC),
+            "What you have left open: nothing.\n\nThat is the whole of your journal."
         );
     }
 

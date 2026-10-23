@@ -154,8 +154,16 @@ timeline.
 **The framing is what keeps it from reading as history.** It names the sections
 as notes the model wrote, each line under how it came to be known, and says
 that `(re-check)` lines may have changed. Sealed K/V cannot be re-rendered at
-gather time, so each entry carries an absolute time
-(`[2026-10-23 14:20–14:41 UTC]`), never "twenty minutes ago".
+gather time, so time is absolute, never "twenty minutes ago". The journal reads
+as one running list, dated only where the date moves: `2026-10-23, 14:00 UTC`
+above the first entry and above one that starts a new day, `15:00 UTC` above one
+that starts a new hour, nothing within the hour. Each entry is `Entry N`, then
+its claims in the order the parts they cite happened, each labelled with how it
+was known (`- Saw: …`, `- User said: …`). The last section is always
+`Still open:` — `Still open: nothing.` when nothing is — followed by a line
+saying the journal ends there and that anything else known of the conversation
+comes from its turns, so neither silence nor the rest of the context is taken
+for something written down.
 
 **Budget.** The system prompt has none; the journal is bounded by its shape —
 five entries of at most twelve short claims, three intentions and six open

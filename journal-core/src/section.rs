@@ -35,16 +35,19 @@ pub fn entry_section(id: u64) -> String {
     format!("{JOURNAL}/{id}")
 }
 
-/// The open items as their section reads, or `None` when nothing is open.
-pub fn render_open(items: &[Item], style: &Style) -> Option<String> {
-    if items.is_empty() {
-        return None;
-    }
-    let lines: Vec<String> = items
-        .iter()
-        .map(|i| format!("#{} {}", i.id, i.text.trim()))
-        .collect();
-    Some(format!("{}\n{}", style.open_heading, lines.join("\n")))
+/// The journal's last section: the open items — or that nothing is open — and
+/// the line that says the journal ends there.
+pub fn render_open(items: &[Item], style: &Style) -> String {
+    let open = if items.is_empty() {
+        style.nothing_open.to_string()
+    } else {
+        let lines: Vec<String> = items
+            .iter()
+            .map(|i| format!("#{} {}", i.id, i.text.trim()))
+            .collect();
+        format!("{}\n{}", style.open_heading, lines.join("\n"))
+    };
+    format!("{open}\n\n{}", style.end)
 }
 
 /// What a journal keeps across a restart.
@@ -76,7 +79,9 @@ pub struct Section {
 /// The journal as a conversation should hold it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalPrompt {
-    /// The sections to hold, oldest entry first, the open items last.
+    /// The sections to hold, oldest entry first, the open items last — that
+    /// section present, even with nothing open, whenever there is a journal at
+    /// all, because it is where the journal says it ends.
     pub sections: Vec<Section>,
     /// The section of the entry that has just left the newest [`IN_PROMPT`],
     /// which a conversation that did not see it leave may still hold.
@@ -86,20 +91,21 @@ pub struct JournalPrompt {
 
 impl JournalPrompt {
     /// The sections for `kept`, whose entries are the newest ones, rendered in
-    /// `style`.
+    /// `style`, each dated against the one above it.
     pub fn of(kept: &Kept, style: &Style) -> Self {
         let mut sections: Vec<Section> = kept
             .entries
             .iter()
-            .map(|e| Section {
+            .enumerate()
+            .map(|(i, e)| Section {
                 name: entry_section(e.id),
-                text: e.render(style),
+                text: e.render(i.checked_sub(1).map(|b| &kept.entries[b]), style),
             })
             .collect();
-        if let Some(text) = render_open(&kept.open, style) {
+        if !(kept.entries.is_empty() && kept.open.is_empty()) {
             sections.push(Section {
                 name: OPEN_SECTION.to_string(),
-                text,
+                text: render_open(&kept.open, style),
             });
         }
         let aged_out = kept
@@ -180,15 +186,22 @@ mod tests {
         let p = JournalPrompt::of(&kept(&[3, 4], vec![item(2, " who holds it? ")]), &PLAIN);
         let names: Vec<&str> = p.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["journal/3", "journal/4", "journal/open"]);
-        assert_eq!(p.sections[0].text, entry_with_claim(3).render(&PLAIN));
-        assert_eq!(p.sections[2].text, "Open:\n#2 who holds it?");
+        assert_eq!(p.sections[0].text, entry_with_claim(3).render(None, &PLAIN));
+        assert_eq!(
+            p.sections[1].text,
+            entry_with_claim(4).render(Some(&entry_with_claim(3)), &PLAIN)
+        );
+        assert_eq!(p.sections[2].text, "Open:\n#2 who holds it?\n\nEnd.");
     }
 
+    /// The live failure: with no open section, a writer asked what was still
+    /// open invented an answer.
     #[test]
-    fn nothing_open_is_no_section_rather_than_an_empty_one() {
+    fn nothing_open_is_said_and_the_journal_says_where_it_ends() {
         let p = JournalPrompt::of(&kept(&[1], vec![]), &PLAIN);
-        assert_eq!(p.sections.len(), 1);
-        assert_eq!(render_open(&[], &PLAIN), None);
+        let names: Vec<&str> = p.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["journal/1", "journal/open"]);
+        assert_eq!(p.sections[1].text, "Open: nothing.\n\nEnd.");
     }
 
     #[test]

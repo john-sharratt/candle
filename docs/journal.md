@@ -316,9 +316,14 @@ window. While nothing has sealed, `journal_none` shows.
   exactly when its conversation is. A day roll-over or `retire_superseded`
   tombstones the old day conversation; `prepare` writes the journal into the new
   one on its first turn, so the journal is carried across days.
-* **Sealed KV cannot be re-rendered at gather time**, so an entry's time is baked
-  in as an absolute stamp (`[14 Jun 2187, 14:20–14:41]`, or both ends in full
-  across midnight), never "twenty minutes ago". The date is the world's own
+* **Sealed KV cannot be re-rendered at gather time**, so time is absolute, never
+  "twenty minutes ago". The journal is one running list dated where the date
+  moves (`Entry::when`): `14 Jun 2187, 14:00` above the first entry and above one
+  starting a new day, `15:00` above one starting a new hour. Each entry is
+  `Entry N` and its claims in the order the turns they cite happened, each
+  labelled with how it was known. The open-items section always closes the
+  journal — "nothing" when nothing is open — with a line saying the journal ends
+  there. The date is the world's own
   calendar, year offset included (`clock::WorldTime`), so a world set 217 years
   ahead stamps 2187, not 1970. Anything marked `(re-check)` may have
   changed, and a line under "Concluded, not seen or heard" was worked out, not
