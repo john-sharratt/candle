@@ -216,6 +216,32 @@ fn next_page(response: &Value) -> Option<u64> {
     response.get("paging")?.get("next_page")?.as_u64()
 }
 
+/// Tell the turn answering `results` that it is the last of its request:
+/// the round cap's closing turn. Every result stays what it was — the calls
+/// ran — and the last one carries a `notice` saying no further call runs.
+/// Without it the closing turn planned another round of greps, could not
+/// write the call, and ended on "Grep checks to confirm nothing stale
+/// remains:" with nothing said to the user (measured 2026-10-24).
+pub fn cap_notice(results: &mut [ToolResult]) {
+    let Some(last) = results.last_mut() else {
+        return;
+    };
+    let notice = Value::String(
+        "This was the last tool round this request allows: no further tool call will run. \
+         Answer the user now — say what was done, and what remains undone."
+            .to_string(),
+    );
+    match &mut last.response {
+        Value::Object(map) => {
+            map.insert("notice".to_string(), notice);
+        }
+        other => {
+            let result = other.take();
+            *other = json!({"result": result, "notice": notice});
+        }
+    }
+}
+
 /// The result every call gets in the round that closes the loop.
 fn closing_notice(call: &ToolCall) -> Value {
     json!({
@@ -270,6 +296,31 @@ mod tests {
             },
             response,
         }
+    }
+
+    /// **The round cap's last results say no further call runs**, on the last
+    /// result only, and every result keeps what its call returned — a value
+    /// that is no object is kept under `result`.
+    #[test]
+    fn the_cap_notice_rides_the_last_result_and_keeps_every_answer() {
+        let mut results = vec![
+            result("file_read", json!({}), json!({"text": "a"})),
+            result("file_edit", json!({}), json!({"replacements": 1})),
+        ];
+        cap_notice(&mut results);
+        assert_eq!(results[0].response, json!({"text": "a"}));
+        assert_eq!(results[1].response["replacements"], 1);
+        assert!(results[1].response["notice"]
+            .as_str()
+            .unwrap()
+            .starts_with("This was the last tool round"));
+
+        let mut bare = vec![result("calculator", json!({}), json!(42))];
+        cap_notice(&mut bare);
+        assert_eq!(bare[0].response["result"], 42);
+        assert!(bare[0].response["notice"].is_string());
+
+        cap_notice(&mut []);
     }
 
     /// **The closing answer bans the call and is bounded above the think

@@ -4921,6 +4921,7 @@ fn run_inference_stream(
                     iteration,
                     "the next turn is the last the round cap allows — it answers without tools",
                 );
+                repeat_guard::cap_notice(&mut results);
                 closing = true;
             }
             // Each result measured as its own block of the turn it is about to
