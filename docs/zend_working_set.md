@@ -6,7 +6,7 @@
 
 ## 1. The idea
 
-Every dialogue carries a **working set**: a voluntary token budget (80K, with
+Every dialogue carries a **working set**: a voluntary token budget (10K, with
 locks on top under a 150K ceiling of their own) of
 already-ingested `code_reading` files and `repo_map` folders, projected ahead of
 its own turns as **one sequence in the order its members entered**. The unit is
@@ -185,8 +185,19 @@ deleted.
 budget (conversation `1f283ffd`): every decode materialized 321K–350K tokens,
 ~215K–248K of it provenance the scan had pulled in on momentum — with the one
 file the model had actually asked for, the paper, ~125K tokens from the
-question. At 80K a decode with a young dialogue sits near 150K materialized,
-and every `file_read` lock adds to that rather than displacing it.
+question. Smaller budgets were measured on the same conversation:
+
+| Voluntary budget | What filled it on a question about the paper | Effect |
+|---|---|---|
+| 80K | ~70K of test files (`kernel_layout_tests.rs` 32K, `decode_layout_exact.rs` 15K, …), the same on every question and on both probes | the neighbours the model then misattributed facts between |
+| 40K | one 32K test file, ranked first on every question | — |
+| 10K | the seeds' folders and small files | the most efficient reading of the paper (two read rounds, no grep detour), every criterion clean; 55–67K materialized on the tour, 123–143K on the paper |
+
+The scan cannot rank files against each other (its votes are standardised per
+file, so every file's best exchange looks alike, and a large file with few
+exchanges looks strongest), so what a large voluntary budget holds is largely
+arbitrary. At 10K the working set is the seeds, and what the model reads itself
+comes in on top as locks.
 
 **No link of the dialogue's own chain is ever a member.** The chain is projected
 as the conversation's opening already; admitted on momentum it emitted twice —
@@ -203,7 +214,7 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
 ```yaml
   - name: dialogue
     working_set:
-      budget_tokens: 80000       # seeds + provenance, folders and files together
+      budget_tokens: 10000       # seeds + provenance, folders and files together
       lock_tokens: 150000        # the locks, on top of budget_tokens
       folder_tokens: 10000       # repo_map's share of budget_tokens
       beta: 0.2                  # per-file momentum leak (§4.3)
@@ -580,9 +591,9 @@ audit of "what did the fast path promise this conversation" a direct answer.
 ## 5. Constraints and cost
 
 - **Context length.** Flash-Next is trained to 262,144 positions; progressive
-  YaRN (`qwen4exp/rope.rs`) carries it ×2 to 524,288. 80K voluntary + 150K of
-  locks + the dialogue's 116K (which includes the 100K lineage cap) is ~346K at
-  the most, leaving ~178K before the slot climbs to ×4. A slot's rung follows its deepest position, so **a dialogue past
+  YaRN (`qwen4exp/rope.rs`) carries it ×2 to 524,288. 10K voluntary + 150K of
+  locks + the dialogue's 116K (which includes the 100K lineage cap) is ~276K at
+  the most, leaving ~248K before the slot climbs to ×4. A slot's rung follows its deepest position, so **a dialogue past
   262K runs factor 2 at every position, its own turns included** — the working
   set changes the whole conversation's rotation, not just its reach. The
   shipped schema's `rope: min_yarn_factor: 2` puts every dialogue on ×2 from
@@ -607,7 +618,7 @@ audit of "what did the fast path promise this conversation" a direct answer.
   enabled, the draft head must be checked to rotate by the slot's rung past
   262K, or its drafts will be rejected at depth.
 
-Budget ships at 80K voluntary + 150K of locks (D10); the §7 measurement watches
+Budget ships at 10K voluntary + 150K of locks (D10); the §7 measurement watches
 these numbers.
 
 ## 6. Code map
@@ -692,7 +703,7 @@ these numbers.
 | D7 | Provenance unit | Whole files and folders. |
 | D8 | Seed list | §4.2 draft, to be edited. |
 | D9 | Fade rate | Per-file momentum at β 0.2, leaking by its own value. |
-| D10 | Default budget | 80K voluntary, locks on top up to 150K. The 250K it replaced held 215K–248K of momentum provenance per decode (measured 2026-10-24) and put a decode at 321K–350K materialized; at 80K a young dialogue's decode sits near 150K, and the model's own reads add to it. |
+| D10 | Default budget | 10K voluntary, locks on top up to 150K. Measured 2026-10-24 on one conversation at 250K, 80K, 40K and 10K (§4.1): above 10K the budget filled with test files the scan cannot tell apart from relevant ones; at 10K the conversation read best and materialized least. |
 | D11 | Momentum store | In `WorkingSet`, not the belief carry; in-memory. |
 | D12 | Restart | Served calls are marked on their turn (`working_set:lock:<tl>`, `working_set:release:<tl>`, `working_set:release`) through the existing persisted turn tags, which every gather-scope reader ignores; locks rebuild from the marks. Momentum rebuilds from the scan. |
 | D13 | Folder vs file budget | `folder_tokens` slice for `repo_map`, the rest for `code_reading`. |
