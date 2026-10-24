@@ -294,17 +294,25 @@ defaults.
 **Momentum is per file and leaks by its own value**:
 `m ← (1 − β)·m + fresh`, where `fresh` is the file's **rank** in its group's
 scan this reprojection (`working_set_observe::ranked_fresh`): each file's best
-raw vote is ranked, separately for the trailing probe and the question probe,
-down to rank 8, and a file both place gets `1000` divided by the worse of its
-two ranks. A file only one probe places gets nothing — the trailing window
-alone is whatever the turn last wrote, JSON listings through tool rounds, and
-it crowned ~70K tokens of test files beside a question about a paper
-(measured 2026-10-24). A file that scored nothing gets nothing.
-A rank needs no learned hit level and does not grow with the group, so it
-cannot inflate: fed the normalised scores, whose band runs ~1000× over on short
-probes, momentum took a one-off match at 643,768 — six hundred full hits — and
-an object-detection demo entered the working set of a conversation about a
-paper (measured 2026-10-24). A file the dialogue keeps attending to settles at
+**normalised** exchange score is ranked, separately for the trailing probe and
+the question probe, down to rank 8, and a file both place gets `1000` divided
+by the worse of its two ranks. A file only one probe places gets nothing — the
+trailing window alone is whatever the turn last wrote, JSON listings through
+tool rounds, and it crowned ~70K tokens of test files beside a question about
+a paper (measured 2026-10-24). A file that scored nothing gets nothing.
+
+Normalised, not raw, because a raw vote is `z × margin` inside the file's own
+competition (`belief_files::competitions`): it says how far one exchange stands
+out from the file's other exchanges, not how well the file answers the probe,
+and a file of many exchanges draws more maxima. Ranked raw, the same plotting
+script, `Cargo.toml` and benchmark tests held the provenance budget on every
+question of a conversation about the paper (conversation 4bdaf691,
+2026-10-25). Each exchange's learned hit level divides out a file that scores
+high whatever is asked. Ranked, not taken by magnitude, because that band runs
+~1000× over on short probes: fed the normalised magnitudes, momentum took a
+one-off match at 643,768 — six hundred full hits — and an object-detection demo
+entered the working set of a conversation about a paper (measured 2026-10-24).
+A rank does not grow with the group, so it cannot inflate. A file the dialogue keeps attending to settles at
 `1000/β` while it leads; one left alone decays geometrically. Below `min_momentum` (config, default 100 — the
 noise floor `code_reading/scopes` gates at today, `projection.yaml:821`) a file
 is dropped from the map, and only files at or above it are provenance
@@ -321,7 +329,7 @@ agentic flow is every round.
 `observe` runs once per reprojection, right after the belief scan
 (`reproject_view_prepare`): `score_beliefs` records, for each working-set group
 — not belief-driven but still scanned (`GroupSchema::is_scanned`) — every
-conversation's best raw vote per probe on its `ProjectionScores`, and the ranks
+conversation's best normalised exchange score per probe on its `ProjectionScores`, and the ranks
 are handed to the dialogue's `WorkingSet` under the substrate write lock. The turn's opening projection is
 not scanned (it reads zero scores), so it projects the momentum as it stood —
 which is what an opening should see. Momentum ranks only who enters and who is

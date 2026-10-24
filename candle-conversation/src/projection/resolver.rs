@@ -2429,6 +2429,10 @@ impl Conversation {
             // teach only the first).
             let pool_scope = ScopeKey::pool(group.id.raw() as u64);
             let mut pool_raw: Vec<(ChildKey, f32)> = Vec::new();
+            // Each file's exchanges as normalized, per probe — what a working
+            // set ranks its files by.
+            let mut normed_tail_per_file: Vec<Vec<f32>> = Vec::with_capacity(files.len());
+            let mut normed_q_per_file: Vec<Vec<f32>> = Vec::with_capacity(files.len());
             for (fi, (f, fresh)) in files.iter().zip(&fresh_per_file).enumerate() {
                 let timeline = f.timeline;
                 // `belief_files::competitions` pools exactly the files of one
@@ -2485,6 +2489,10 @@ impl Conversation {
                     }
                     (normed, normed_q)
                 };
+                normed_tail_per_file.push(normed.iter().map(|(_, s)| *s).collect());
+                if let Some(nq) = &normed_q {
+                    normed_q_per_file.push(nq.iter().map(|(_, s)| *s).collect());
+                }
                 let mut fused: Vec<f32> = (0..f.n_slots)
                     .map(|slot| {
                         let t = normed.get(slot).map(|(_, s)| *s).unwrap_or(0.0);
@@ -2551,17 +2559,27 @@ impl Conversation {
                 let question = q_raw.as_deref().and_then(scan_stats);
                 scores.set_group_scan(group.id, GroupScan { tail, question });
             }
+            // A working set ranks its files by their best NORMALIZED exchange:
+            // a raw vote is z × margin inside the file's own competition, so it
+            // measures how far one exchange stands out from its siblings, and
+            // a file of many exchanges draws more maxima. Ranked raw, the same
+            // plotting script and test files led every question in a
+            // conversation about a paper. Each exchange's learned hit level
+            // divides out the file that scores high whatever is asked.
             if group.is_working_set() {
                 let best_of = |per_file: &[Vec<f32>]| -> Vec<(TimelineId, f32)> {
                     files
                         .iter()
                         .zip(per_file)
-                        .map(|(f, votes)| (f.timeline, votes.iter().copied().fold(0.0, f32::max)))
+                        .map(|(f, scores)| (f.timeline, scores.iter().copied().fold(0.0, f32::max)))
                         .collect()
                 };
                 scores.push_working_set_raw(RawBest {
-                    tail: best_of(&mass_base_per_file),
-                    question: q_base_per_file.as_deref().map(best_of).unwrap_or_default(),
+                    tail: best_of(&normed_tail_per_file),
+                    question: match normed_q_per_file.len() == files.len() {
+                        true => best_of(&normed_q_per_file),
+                        false => Vec::new(),
+                    },
                 });
             }
             // Where this group's scan time went, and what it walked to spend it.

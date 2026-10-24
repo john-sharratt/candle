@@ -23,7 +23,8 @@ pub fn working_set_config(schema: &Schema, target: ProjectionTarget) -> Option<&
         .and_then(|l| l.working_set.as_ref())
 }
 
-/// One working-set group's scan, per probe: each conversation's best raw vote.
+/// One working-set group's scan, per probe: each conversation's best
+/// normalized exchange score.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RawBest {
     pub tail: Vec<(TimelineId, f32)>,
