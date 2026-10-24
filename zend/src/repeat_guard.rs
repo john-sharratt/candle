@@ -154,10 +154,19 @@ impl RepeatGuard {
     /// mutation becomes a `repeated_call` notice. A mutating call is never one,
     /// and any in the round clears the counts after it is screened.
     ///
+    /// A mutating call its tool refused changed nothing, so it is screened
+    /// like a read: a turn sent the same ambiguous `file_edit` nine rounds
+    /// running, each answered "occurs 9 times — include more of the lines, or
+    /// set `replace_all`", and the guard never fired because every one counted
+    /// as a mutation and cleared the counts.
+    ///
     /// A round is compared with the rounds before it, never with itself, so
     /// identical calls batched into one round all run — and all count.
     pub fn screen(&mut self, results: &mut [ToolResult]) -> Verdict {
-        let mutating: Vec<bool> = results.iter().map(|r| mutates(&r.call)).collect();
+        let mutating: Vec<bool> = results
+            .iter()
+            .map(|r| mutates(&r.call) && r.response.get("error").is_none())
+            .collect();
         let repeated: Vec<bool> = results
             .iter()
             .zip(&mutating)
@@ -420,6 +429,28 @@ mod tests {
         let mut fourth = vec![missing()];
         guard.screen(&mut fourth);
         assert_eq!(fourth[0].response["error"], "repeated_call");
+    }
+
+    /// **A refused mutation is screened like a read**: the same ambiguous
+    /// `file_edit`, refused the same way each round, is a notice on its fourth
+    /// occurrence, and the loop closes after [`STOP_AFTER`] such rounds.
+    #[test]
+    fn a_refused_edit_repeated_is_a_notice_and_closes_the_loop() {
+        let mut guard = RepeatGuard::new();
+        let ambiguous = || {
+            vec![result(
+                "file_edit",
+                json!({"repo": "candle", "path": "docs/a.md",
+                       "old_text": "W_warm_max", "new_text": "B_out"}),
+                json!({"error": "ambiguous", "detail": "`old_text` occurs 9 times"}),
+            )]
+        };
+        passes(&mut guard, ambiguous, NOTICE_FROM - 1);
+        let mut fourth = ambiguous();
+        assert_eq!(guard.screen(&mut fourth), Verdict::Continue);
+        assert_eq!(fourth[0].response["error"], "repeated_call");
+        let mut fifth = ambiguous();
+        assert_eq!(guard.screen(&mut fifth), Verdict::Close);
     }
 
     /// **A repeat of a paged call names the next page** — the step a model
