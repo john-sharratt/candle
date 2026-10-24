@@ -344,25 +344,14 @@ const DIAL_TOOLS_KEY: &str = "dial_tools";
 
 /// The most tool rounds one turn runs before the daemon stops feeding it.
 ///
-/// The bound matters because nothing else provides one — a client that closes
-/// its tab no longer ends the turn (that is deliberate: the work finishes and
-/// seals so a reload finds it done), so a model calling a tool every round
-/// would otherwise decode, seal and dispatch forever, holding the
-/// conversation's lock and the card with nobody waiting on the result.
-///
-/// **Reaching it closes the loop; it never just stops.** A long job reaches it
-/// too: measured 2026-10-24, a turn revising a 1,400-line paper made ~60
-/// edits over 31 rounds, every one landing, and the turn ended on its last
-/// call's results with nothing said to the user. The round before the cap is
-/// answered by a closing turn ([`closes_at_cap`]), as the repeat guard's is:
-/// no tool call, a bounded answer saying what was done and what remains.
+/// A backstop, not a budget: it sits far above any real workflow, and a turn
+/// that reaches it is a model that has stopped making progress rather than one
+/// doing a long job. The bound matters because nothing else provides one — a
+/// client that closes its tab no longer ends the turn (that is deliberate: the
+/// work finishes and seals so a reload finds it done), so a model calling a
+/// tool every round would otherwise decode, seal and dispatch forever, holding
+/// the conversation's lock and the card with nobody waiting on the result.
 const MAX_TOOL_ROUNDS: usize = 32;
-
-/// Whether the results of round `iteration` are the last a turn may answer
-/// under [`MAX_TOOL_ROUNDS`] — so the turn answering them must close the loop.
-fn closes_at_cap(iteration: usize) -> bool {
-    iteration + 2 >= MAX_TOOL_ROUNDS
-}
 
 /// The dials `selection` and `tools_mode` express, as the metadata bag stores
 /// them. A selector the turn left unset is stored empty, so "ran without this
@@ -4190,13 +4179,11 @@ fn run_inference_stream(
         // closing round is the last, and no call it makes runs.
         let mut closing = false;
         for iteration in start_iteration.. {
-            // The closing turn the cap gives runs below it ([`closes_at_cap`]);
-            // a turn resumed at or past the cap ends here.
             if iteration >= MAX_TOOL_ROUNDS {
                 tracing::warn!(
                     conv_id = %conv_id,
                     iteration,
-                    "tool loop resumed past its round cap — ending the turn on the answer already streamed",
+                    "tool loop hit its round cap — ending the turn on the answer already streamed",
                 );
                 break;
             }
@@ -4912,14 +4899,6 @@ fn run_inference_stream(
                      result — the next turn answers without tools",
                     repeat_guard::STOP_AFTER,
                     repeat_guard::NOTICE_FROM - 1,
-                );
-                closing = true;
-            }
-            if !closing && closes_at_cap(iteration) {
-                tracing::warn!(
-                    conv_id = %conv_id,
-                    iteration,
-                    "the next turn is the last the round cap allows — it answers without tools",
                 );
                 closing = true;
             }
@@ -8890,23 +8869,6 @@ mod held_tail_tests {
     #[test]
     fn empty_tail_emits_nothing() {
         assert!(render_held_tail("   \n  ").is_none());
-    }
-}
-
-#[cfg(test)]
-mod round_cap_tests {
-    use super::{closes_at_cap, MAX_TOOL_ROUNDS};
-
-    /// **The round cap closes the loop rather than stopping it**: the results
-    /// of the round before the cap are answered by a closing turn, which still
-    /// runs under the cap, and no earlier round's are.
-    #[test]
-    fn the_last_answerable_round_is_closed() {
-        assert!(!closes_at_cap(0));
-        assert!(!closes_at_cap(MAX_TOOL_ROUNDS - 3));
-        assert!(closes_at_cap(MAX_TOOL_ROUNDS - 2));
-        let closing_turn = MAX_TOOL_ROUNDS - 2 + 1;
-        assert!(closing_turn < MAX_TOOL_ROUNDS, "the closing turn runs");
     }
 }
 

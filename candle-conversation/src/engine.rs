@@ -1340,25 +1340,6 @@ impl ConversationEngine {
             .mark_group_follows_working_set(group);
     }
 
-    /// Close `timeline` with `text` wherever it is projected as a working-set
-    /// member (`Substrate::set_unit_closer`) — what it is about, said after
-    /// what it said. Tokenized once, here.
-    pub fn set_unit_closer(
-        &self,
-        timeline: TimelineId,
-        text: &str,
-    ) -> Result<(), ConversationError> {
-        let encoded = self
-            .core
-            .tokenizer
-            .encode(text, false)
-            .map_err(|e| ConversationError::Tokenizer(e.to_string()))?;
-        self.conversation
-            .write()
-            .set_unit_closer(timeline, Arc::new(encoded.get_ids().to_vec()));
-        Ok(())
-    }
-
     /// Record which share of a dialogue's working-set budget `group`'s
     /// conversations draw on — what the schema's `working_set` selection rule
     /// declares for it. A conversation in no such group is never a working-set

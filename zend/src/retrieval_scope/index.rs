@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use candle_conversation::projection::{GroupId, TimelineId};
 use candle_conversation::ConversationEngine;
 
-use crate::branch_ingest::keys::{file_key_path, CONTENT_KEY};
+use crate::branch_ingest::keys::CONTENT_KEY;
 use crate::code_read::{is_upload_path, PATH_KEY};
 use crate::layers::keys::{parse_deps, DEPS_KEY, FILE_KEY};
 
@@ -101,13 +101,6 @@ impl IngestIndex {
     /// Every committed upload's conversation.
     pub fn uploads(&self) -> &[TimelineId] {
         &self.uploads
-    }
-
-    /// Every committed file reading, with the workspace-relative path it read.
-    pub fn files(&self) -> impl Iterator<Item = (&str, TimelineId)> + '_ {
-        self.by_key
-            .iter()
-            .filter_map(|(key, &tl)| file_key_path(key).map(|path| (path, tl)))
     }
 
     pub fn generation(&self) -> u64 {

@@ -2,13 +2,11 @@
 //! (`docs/zend_working_set.md` §4.4, §7 "Selection").
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::builder::Builder;
 use super::ids::{GroupId, TimelineId, TurnIndex, TurnKey};
 use super::project::{
-    OptionalState, ProjectionMode, ProjectionSegment, ProjectionTarget, SealedKind, SelectionState,
-    TOOL_ROUND_SELECTOR,
+    OptionalState, ProjectionMode, ProjectionTarget, SelectionState, TOOL_ROUND_SELECTOR,
 };
 use super::working_set_pick::{Standing, WorkingSetMembers, PINNED_SCORE};
 use crate::substrate::ContentResolver;
@@ -77,8 +75,6 @@ struct WsResolver {
     /// Every turn answers "carries none of these tags" — what a turn holding
     /// only working-set marks answers a tag-scoped group.
     carries_nothing: bool,
-    /// timeline → the tokens that close it as a member.
-    closers: HashMap<u64, Arc<Vec<u32>>>,
 }
 
 const DIALOGUE: u64 = 1;
@@ -146,10 +142,6 @@ impl ContentResolver for WsResolver {
 
     fn working_set_members(&self, group: GroupId) -> Option<WorkingSetMembers> {
         self.members.get(&group).cloned()
-    }
-
-    fn unit_closer(&self, timeline: TimelineId) -> Option<Arc<Vec<u32>>> {
-        self.closers.get(&timeline.raw()).cloned()
     }
 
     fn timeline_turns(&self, timeline: TimelineId) -> Vec<TurnKey> {
@@ -357,43 +349,6 @@ fn the_working_set_sits_between_the_chain_and_the_dialogues_own_turns() {
     assert_eq!(
         emitted(&f.b, f.target, &r),
         vec![(CHAIN, 1), (20, 1), (31, 1), (30, 1), (DIALOGUE, 1)],
-    );
-}
-
-/// **Each member ends on its own name**: its closer follows its last turn, so
-/// the next member's request never directly follows what this one said. A
-/// member with no closer, and every turn outside the working set, get none.
-#[test]
-fn each_member_is_followed_by_its_closer() {
-    let f = fixture();
-    let mut r = WsResolver::default()
-        .with_conversation(DIALOGUE, f.conversation, 1, 10)
-        .with_conversation(30, f.scopes, 2, 100)
-        .with_conversation(31, f.scopes, 1, 100)
-        .with_conversation(32, f.scopes, 1, 100)
-        .provenance(f.scopes, 30, 900.0)
-        .provenance(f.scopes, 31, 900.0)
-        .lock(f.scopes, 32);
-    r.closers.insert(30, Arc::new(vec![7, 30]));
-    r.closers.insert(32, Arc::new(vec![7, 32]));
-    r.closers.insert(DIALOGUE, Arc::new(vec![7, 1]));
-    let proj = f.b.project(f.target, &r);
-    let shape: Vec<String> = proj
-        .segments
-        .iter()
-        .filter_map(|s| match s {
-            ProjectionSegment::Sealed(SealedKind::Turn(t, _)) => {
-                Some(format!("t{}", t.timeline.unwrap().raw()))
-            }
-            ProjectionSegment::Generated { tokens, identity } if identity.name == "unit_closer" => {
-                Some(format!("end{}", tokens[1]))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        shape,
-        vec!["t30", "t30", "end30", "t31", "t32", "end32", "t1"],
     );
 }
 

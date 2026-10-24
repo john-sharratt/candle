@@ -243,12 +243,6 @@ pub struct Substrate {
     /// at engine setup.
     follows_working_set: HashSet<GroupId>,
 
-    /// The tokens that close a conversation when it is projected as a
-    /// working-set member — `end of <what it read>` — so what the unit says
-    /// is followed by the name of what it is about, not by the next unit's.
-    /// In-memory only; the daemon sets them from its ingest index.
-    unit_closers: HashMap<TimelineId, Arc<Vec<u32>>>,
-
     /// Which share of a dialogue's working-set budget each working-set group's
     /// conversations draw on — the schema's `selection: { kind: working_set,
     /// share }`. A conversation in no such group is never a working-set
@@ -1254,12 +1248,6 @@ pub trait ContentResolver {
     /// The order statistics of a turn group's raw scores this projection;
     /// `None` when the group was not scanned (default: no scan behind it).
     fn group_scan(&self, _group: GroupId) -> Option<GroupScan> {
-        None
-    }
-
-    /// The tokens that close `timeline` where it is projected as a
-    /// working-set member (`Substrate::set_unit_closer`); `None` for none.
-    fn unit_closer(&self, _timeline: TimelineId) -> Option<Arc<Vec<u32>>> {
         None
     }
 
@@ -3735,17 +3723,6 @@ impl Substrate {
     /// Idempotent.
     pub fn mark_group_follows_working_set(&mut self, group: GroupId) {
         self.follows_working_set.insert(group);
-    }
-
-    /// Close `timeline` with `tokens` wherever it is projected as a
-    /// working-set member. Replaces any closer it had.
-    pub fn set_unit_closer(&mut self, timeline: TimelineId, tokens: Arc<Vec<u32>>) {
-        self.unit_closers.insert(timeline, tokens);
-    }
-
-    /// The tokens that close `timeline` as a working-set member, if any.
-    pub fn unit_closer(&self, timeline: TimelineId) -> Option<Arc<Vec<u32>>> {
-        self.unit_closers.get(&timeline).cloned()
     }
 
     /// `target`'s locked working-set members.
@@ -8014,10 +7991,6 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         self.scores.group_scan(group)
     }
 
-    fn unit_closer(&self, timeline: TimelineId) -> Option<Arc<Vec<u32>>> {
-        self.substrate.unit_closer(timeline)
-    }
-
     fn collection_attention_mass(&self, collection: u32) -> f32 {
         self.scores.collection_mass(collection)
     }
@@ -8144,10 +8117,6 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
 
     fn group_scan(&self, group: GroupId) -> Option<GroupScan> {
         self.scores_or_empty().group_scan(group)
-    }
-
-    fn unit_closer(&self, timeline: TimelineId) -> Option<Arc<Vec<u32>>> {
-        self.guard.unit_closer(timeline)
     }
 
     fn collection_attention_mass(&self, collection: u32) -> f32 {

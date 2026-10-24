@@ -5417,10 +5417,6 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         self.read.scores_or_empty().group_scan(group)
     }
 
-    fn unit_closer(&self, timeline: TimelineId) -> Option<Arc<Vec<u32>>> {
-        self.read.unit_closer(timeline)
-    }
-
     fn collection_attention_mass(&self, collection: u32) -> f32 {
         self.read.scores_or_empty().collection_mass(collection)
     }
