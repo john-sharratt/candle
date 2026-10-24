@@ -410,10 +410,32 @@ function replication(c) {
     const what = typeof k.purpose === "string" ? k.purpose : Object.keys(k.purpose)[0];
     const say = who
       ? `catch-up (${esc(what)}) ${who}: ${k.fetched.toLocaleString()} of ${k.wanted.toLocaleString()} records · ${bytes(k.fetched_bytes)} of ${bytes(k.wanted_bytes)}${k.skipped ? ` · ${k.skipped.toLocaleString()} held already` : ""}`
-      : `catch-up (${esc(what)}) asked — no member has answered yet`;
-    rows.push(`<div class="row">${bar(who ? pct(k.fetched, k.wanted) : 0)}<span>${say}</span></div>`);
+      : `catch-up (${esc(what)}) ${waitingSay(k.waiting)}`;
+    rows.push(`<div class="row">${bar(who ? pct(k.fetched, k.wanted) : waitingPct(k.waiting))}<span>${say}</span></div>`);
   }
   return rows.length ? `<div class="repl">${rows.join("")}</div>` : "";
+}
+
+// A catch-up nobody has answered: what it waits on and when that ends — the
+// member's own loading line (`host::cluster::view::catchup_detail`). A bare
+// "no member has answered yet" at 0 % read as a dead member.
+function waitingSay(w) {
+  if (!w) return "asked — no member has answered yet";
+  const who = w.lost ? "no member that holds what this one lacks is up" : "waiting for the member asked to answer";
+  const next = Math.max(0, w.quiet_s - w.silent_s);
+  const then = !w.ask
+    ? `asking again in ${next} s`
+    : w.ask.n >= w.ask.of
+      ? `serving on what this member holds in ${next} s`
+      : `asking again in ${next} s (ask ${w.ask.n} of ${w.ask.of}; after ${w.ask.of} unanswered it serves on what it holds)`;
+  return `${who} — ${then}`;
+}
+
+// Seconds waited toward serving anyway, for an admission catch-up nobody answers.
+function waitingPct(w) {
+  if (!w || !w.ask) return 0;
+  const waited = (w.ask.n - 1) * w.quiet_s + Math.min(w.silent_s, w.quiet_s);
+  return pct(waited, w.ask.of * w.quiet_s);
 }
 
 function memberLine(m, s, operate) {

@@ -29,6 +29,7 @@ use super::lease::{LeaseEvent, Term, EVENTS_KEPT};
 use super::pulse::PULSES_KEPT;
 use super::quorum_governor::{Downgrade, Governor};
 use super::store::Store;
+use super::tick::{ADMISSION_QUIET_LIMIT, QUIET};
 use super::watch::GapWatch;
 use crate::consensus::votes::VoteStore;
 use crate::consensus::{Config, Millis, Paxos};
@@ -235,6 +236,35 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Every catch-up in progress as the loading page and `/v1/status` show
+    /// it, at `now`.
+    pub fn catchup_views(&self, now: Instant) -> Vec<CatchupView> {
+        self.catchups
+            .iter()
+            .map(|(request, r)| {
+                let progress = r.progress().clone();
+                let waiting = progress.answerer.is_none().then(|| Waiting {
+                    silent_s: self
+                        .heard
+                        .get(request)
+                        .map_or(0, |at| now.saturating_duration_since(*at).as_secs()),
+                    quiet_s: QUIET.as_secs(),
+                    lost: self.lost.contains(request),
+                    ask: (r.purpose == Purpose::Admission).then(|| Ask {
+                        n: self.admission_quiet.get(r.socket).copied().unwrap_or(0) + 1,
+                        of: ADMISSION_QUIET_LIMIT,
+                    }),
+                });
+                CatchupView {
+                    cluster: r.socket,
+                    purpose: r.purpose,
+                    progress,
+                    waiting,
+                }
+            })
+            .collect()
+    }
+
     pub fn next_request(&mut self) -> u64 {
         self.next_request += 1;
         self.next_request
@@ -281,6 +311,36 @@ pub struct CatchupView {
     pub purpose: Purpose,
     #[serde(flatten)]
     pub progress: Progress,
+    /// What it waits on while no member has answered it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<Waiting>,
+}
+
+/// A catch-up no member has answered yet: how long it has been silent, when
+/// silence ends it, and what then. Shown so a member starting alone reads as
+/// waiting on a deadline — measured 2026-10-24: "asked — no member has
+/// answered yet" at 0 % for a minute read as a dead daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiting {
+    /// Seconds since anything was last heard of it.
+    pub silent_s: u64,
+    /// Seconds of silence after which it is dropped (`tick::QUIET`).
+    pub quiet_s: u64,
+    /// The gateway said no member can answer what this member lacks: those
+    /// holding it are away (`LOST`).
+    pub lost: bool,
+    /// An admission catch-up's ask: which one this is, and after how many
+    /// unanswered asks the member serves on what it holds
+    /// (`tick::ADMISSION_QUIET_LIMIT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<Ask>,
+}
+
+/// The `n`-th ask of at most `of`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ask {
+    pub n: u32,
+    pub of: u32,
 }
 
 /// What `/v1/status`'s `cluster` block shows of replication.
@@ -684,15 +744,7 @@ impl Replicator {
 
     /// Every catch-up in progress.
     pub fn catchups(&self) -> Vec<CatchupView> {
-        self.state()
-            .catchups
-            .values()
-            .map(|r| CatchupView {
-                cluster: r.socket,
-                purpose: r.purpose,
-                progress: r.progress().clone(),
-            })
-            .collect()
+        self.state().catchup_views(Instant::now())
     }
 
     pub fn view(&self) -> ReplicationView {
@@ -704,15 +756,7 @@ impl Replicator {
             generation: s.generation,
             unsent,
             in_flight,
-            catchups: s
-                .catchups
-                .values()
-                .map(|r| CatchupView {
-                    cluster: r.socket,
-                    purpose: r.purpose,
-                    progress: r.progress().clone(),
-                })
-                .collect(),
+            catchups: s.catchup_views(Instant::now()),
             answering: s.answering.len(),
             waiting_to_apply: waiting(self.room.available_permits()),
             stats: s.stats.clone(),

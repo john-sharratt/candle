@@ -36,7 +36,8 @@ pub use lease::{LeaseEvent, LEASE_TTL, RENEW_EVERY};
 pub use memory::{digest, MemoryRecord, MemoryStore, Stamp};
 pub use quorum_governor::{Downgrade, EXECUTE_AFTER, FLOOR as QUORUM_FLOOR, PROPOSE_AFTER};
 pub use replicator::{
-    AppCoordFn, CatchupView, Phase, QuorumView, Replication, ReplicationView, Replicator, Stats,
+    AppCoordFn, Ask, CatchupView, Phase, QuorumView, Replication, ReplicationView, Replicator,
+    Stats, Waiting,
 };
 pub use send::{FLUSH_WAIT, GRACE};
 pub use store::{Applied, Disk, Listing, Store, Tap, Tombstones, GEN_DETACHED};

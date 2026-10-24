@@ -9,7 +9,7 @@ use candle_conversation::models::identity::ModelKey;
 use cluster::coord::UpgradeView;
 use cluster::frame::{BuildId, ModelId};
 use cluster::member::{ClusterView, Link};
-use cluster::replicate::CatchupView;
+use cluster::replicate::{CatchupView, Waiting};
 use cluster::upgrade::decisions::build_name;
 use serde_json::{json, Map, Value};
 
@@ -38,18 +38,57 @@ pub fn link_name(link: &Link) -> (&'static str, Option<String>) {
     }
 }
 
-/// The `catchup` step's progress: records and bytes fetched against what the
-/// headers listed.
+/// The `catchup` step's progress: records fetched against what the headers
+/// listed — or, while every catch-up waits for an answer, seconds waited
+/// against the seconds after which an admission catch-up stops waiting and
+/// the member serves on what it holds, so the bar moves toward a point it
+/// will reach.
 pub fn catchup_progress(catchups: &[CatchupView]) -> (u64, u64) {
-    catchups.iter().fold((0, 0), |(done, total), c| {
+    let records = catchups.iter().fold((0, 0), |(done, total), c| {
         (done + c.progress.fetched, total + c.progress.wanted)
-    })
+    });
+    if records.1 > 0 {
+        return records;
+    }
+    catchups
+        .iter()
+        .filter_map(|c| {
+            let w = c.waiting?;
+            let ask = w.ask?;
+            let waited = u64::from(ask.n - 1) * w.quiet_s + w.silent_s.min(w.quiet_s);
+            Some((waited, u64::from(ask.of) * w.quiet_s))
+        })
+        .fold((0, 0), |(done, total), (d, t)| (done + d, total + t))
+}
+
+/// What a catch-up nobody has answered waits on, and what happens when.
+fn waiting_detail(w: &Waiting) -> String {
+    let who = if w.lost {
+        "no member that holds what this one lacks is up"
+    } else {
+        "waiting for the member asked to answer"
+    };
+    let next = w.quiet_s.saturating_sub(w.silent_s);
+    let then = match w.ask {
+        Some(ask) if ask.n >= ask.of => {
+            format!("serving on what this member holds in {next} s")
+        }
+        Some(ask) => format!(
+            "asking again in {next} s (ask {} of {}; after {} unanswered it serves on what it \
+             holds)",
+            ask.n, ask.of, ask.of
+        ),
+        None => format!("asking again in {next} s"),
+    };
+    format!("{who} — {then}")
 }
 
 /// The `catchup` step's detail: per catch-up, records and bytes fetched
 /// against the total the headers listed, records skipped as already held, and
-/// which member is answering. One no member has answered says so: "0 of 0
-/// records" read as a catch-up with nothing left to do.
+/// which member is answering. One no member has answered says what it waits
+/// on and when that ends ([`Waiting`]): "0 of 0 records" read as a catch-up
+/// with nothing left to do, and "no member has answered yet" at 0 % for a
+/// minute as a dead daemon.
 pub fn catchup_detail(catchups: &[CatchupView]) -> String {
     if catchups.is_empty() {
         return "waiting to be asked for what this member lacks".into();
@@ -59,7 +98,10 @@ pub fn catchup_detail(catchups: &[CatchupView]) -> String {
         .map(|c| {
             let p = &c.progress;
             if p.answerer.is_none() && p.wanted == 0 {
-                return "asked — no member has answered yet".to_string();
+                return match &c.waiting {
+                    Some(w) => waiting_detail(w),
+                    None => "asked — no member has answered yet".to_string(),
+                };
             }
             let mut line = format!(
                 "{} of {} records, {} of {} MiB",
@@ -164,7 +206,7 @@ mod tests {
 
     use super::*;
     use cluster::close::{Close, CloseCode};
-    use cluster::replicate::{Progress, Purpose};
+    use cluster::replicate::{Ask, Progress, Purpose};
 
     fn view(url: &str, state: &'static str) -> ClusterView {
         ClusterView {
@@ -206,6 +248,7 @@ mod tests {
                 left: 0,
                 answerer: Some(0xab),
             },
+            waiting: None,
         };
         assert_eq!(
             catchup_detail(from_ref(&c)),
@@ -214,23 +257,71 @@ mod tests {
         assert_eq!(catchup_progress(&[c.clone(), c]), (60, 240));
     }
 
-    /// **A catch-up nobody has answered is not one with nothing to do.** Its
-    /// "0 of 0 records" read as finished on a member whose every catch-up was
-    /// going unanswered.
-    #[test]
-    fn an_unanswered_catch_up_says_so() {
-        let c = CatchupView {
+    fn unanswered(purpose: Purpose, waiting: Waiting) -> CatchupView {
+        CatchupView {
             cluster: 0,
-            purpose: Purpose::Admission,
+            purpose,
             progress: Progress::default(),
-        };
+            waiting: Some(waiting),
+        }
+    }
+
+    fn admission_wait(silent_s: u64, lost: bool, n: u32) -> Waiting {
+        Waiting {
+            silent_s,
+            quiet_s: 30,
+            lost,
+            ask: Some(Ask { n, of: 2 }),
+        }
+    }
+
+    /// **A catch-up nobody has answered says what it waits on and when that
+    /// ends.** "asked — no member has answered yet" at 0 % for a minute read
+    /// as a dead daemon while a member started alone.
+    #[test]
+    fn an_unanswered_catch_up_says_what_it_waits_on_and_until_when() {
+        let first = unanswered(Purpose::Admission, admission_wait(7, true, 1));
         assert_eq!(
-            catchup_detail(from_ref(&c)),
-            "asked — no member has answered yet"
+            catchup_detail(from_ref(&first)),
+            "no member that holds what this one lacks is up — asking again in 23 s (ask 1 of 2; \
+             after 2 unanswered it serves on what it holds)"
+        );
+        let last = unanswered(Purpose::Admission, admission_wait(25, true, 2));
+        assert_eq!(
+            catchup_detail(from_ref(&last)),
+            "no member that holds what this one lacks is up — serving on what this member holds \
+             in 5 s"
+        );
+        let gap = unanswered(
+            Purpose::Gap(3),
+            Waiting {
+                silent_s: 10,
+                quiet_s: 30,
+                lost: false,
+                ask: None,
+            },
+        );
+        assert_eq!(
+            catchup_detail(from_ref(&gap)),
+            "waiting for the member asked to answer — asking again in 20 s"
         );
         assert_eq!(
             catchup_detail(&[]),
             "waiting to be asked for what this member lacks"
+        );
+    }
+
+    /// **While nobody answers, the bar moves toward serving anyway**: the
+    /// seconds waited across every ask, against every ask's quiet.
+    #[test]
+    fn an_unanswered_admission_moves_the_bar_toward_serving() {
+        let first = unanswered(Purpose::Admission, admission_wait(15, true, 1));
+        assert_eq!(catchup_progress(from_ref(&first)), (15, 60));
+        let last = unanswered(Purpose::Admission, admission_wait(45, true, 2));
+        assert_eq!(
+            catchup_progress(from_ref(&last)),
+            (60, 60),
+            "silence capped at the quiet"
         );
     }
 

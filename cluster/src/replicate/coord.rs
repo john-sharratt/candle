@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::fault::floor;
-use super::replicator::{CatchupView, Replicator};
+use super::replicator::Replicator;
 use crate::coord::{
     AppliedLine, ClaimLine, ClusterLine, CommandLine, CoordState, DeferredView, DiskView,
     FaultView, GenView, KeyLine, OutboxView, PaxosView, TombstoneView,
@@ -142,15 +142,7 @@ impl Replicator {
                 })
                 .collect(),
             outbox: OutboxView { unsent, in_flight },
-            catchups: s
-                .catchups
-                .values()
-                .map(|r| CatchupView {
-                    cluster: r.socket,
-                    purpose: r.purpose,
-                    progress: r.progress().clone(),
-                })
-                .collect(),
+            catchups: s.catchup_views(Instant::now()),
             tombstones: TombstoneView {
                 held: tombstones.held,
                 waiting_age: tombstones.swept,

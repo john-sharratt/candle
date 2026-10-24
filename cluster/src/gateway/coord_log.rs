@@ -263,6 +263,7 @@ mod tests {
                 skipped: 3,
                 ..Progress::default()
             },
+            waiting: None,
         };
         let mut before = joined();
         before.catchups = vec![line(0, Purpose::Admission)];
