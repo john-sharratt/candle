@@ -45,6 +45,12 @@ pub fn closing_entry(mission: &Mission, at_ms: u64, covered_to: u64) -> Entry {
         Some(r) => format!("Reported it not done: {}", clip(&r.notes)),
         None => "It was called off before it was reported.".to_string(),
     }));
+    let ended = match &mission.report {
+        Some(r) if r.outcome == Outcome::Pass => "reported done",
+        Some(_) => "reported not done",
+        None => "called off",
+    };
+    let summary = format!("Handed in {} — {ended}.", clip(&ask).trim_end_matches('.'));
     if let Some(year) = mission.year {
         claims.push(did(format!(
             "Worked in {year}, at a time machine; back in the present since."
@@ -56,6 +62,7 @@ pub fn closing_entry(mission: &Mission, at_ms: u64, covered_to: u64) -> Entry {
         to_turn: covered_to,
         from_ms: at_ms,
         to_ms: at_ms,
+        summary,
         claims,
         intend: Vec::new(),
         opened: Vec::new(),
@@ -131,6 +138,10 @@ mod tests {
             .iter()
             .all(|c| c.kind == Kind::Did && !c.perishable));
         assert_eq!((e.from_turn, e.to_turn), (41, 41), "it covers no turns");
+        assert_eq!(
+            e.summary,
+            "Handed in Write Shooter's life: 3082-06-15, \"The Last Calibration\" — reported done."
+        );
     }
 
     #[test]
@@ -140,6 +151,7 @@ mod tests {
             e.claims.last().map(|c| c.text.as_str()),
             Some("It was called off before it was reported.")
         );
+        assert!(e.summary.ends_with("— called off."), "{}", e.summary);
     }
 
     #[test]

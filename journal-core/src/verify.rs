@@ -52,6 +52,8 @@ pub struct DraftOpen {
 /// An entry as the model wrote it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Draft {
+    /// The task or step the stretch was, in one sentence.
+    pub summary: String,
     pub claims: Vec<DraftClaim>,
     pub intend: Vec<String>,
     pub open: Vec<DraftOpen>,
@@ -287,6 +289,10 @@ pub fn verify(
     if claims.is_empty() && intend.is_empty() && opened.is_empty() && resolved.is_empty() {
         return Err(Refusal::Empty);
     }
+    let summary = draft.summary.trim().to_string();
+    if summary.is_empty() {
+        return Err(Refusal::EmptyText { what: "summary" });
+    }
     Ok(Verified {
         entry: Entry {
             id: 0,
@@ -294,6 +300,7 @@ pub fn verify(
             to_turn: span.to_turn,
             from_ms: span.from_ms,
             to_ms: span.to_ms,
+            summary,
             claims,
             intend,
             opened,
@@ -370,8 +377,46 @@ mod tests {
         }
     }
 
+    /// [`super::verify`] with a summary filled in for a draft that left it
+    /// out, so each test states only what it is about.
+    fn verify(
+        mut d: Draft,
+        span: &Span,
+        open: &[Item],
+        world: &dyn World,
+    ) -> Result<Verified, Refusal> {
+        if d.summary.is_empty() {
+            d.summary = "A step.".into();
+        }
+        super::verify(d, span, open, world)
+    }
+
     fn run(d: Draft) -> Result<Verified, Refusal> {
         verify(d, &span(), &[], &Fake::default())
+    }
+
+    #[test]
+    fn an_entry_without_a_summary_is_refused_and_one_with_it_keeps_it() {
+        let d = Draft {
+            summary: "  ".into(),
+            claims: vec![claim("I saw the room.", &[2])],
+            ..Default::default()
+        };
+        assert_eq!(
+            super::verify(d.clone(), &span(), &[], &Fake::default()),
+            Err(Refusal::EmptyText { what: "summary" })
+        );
+        let kept = super::verify(
+            Draft {
+                summary: " Looked round the foundry. ".into(),
+                ..d
+            },
+            &span(),
+            &[],
+            &Fake::default(),
+        )
+        .unwrap();
+        assert_eq!(kept.entry.summary, "Looked round the foundry.");
     }
 
     fn one(c: DraftClaim) -> Claim {

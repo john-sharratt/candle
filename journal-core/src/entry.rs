@@ -88,6 +88,11 @@ pub struct Item {
 }
 
 /// A stretch of turns, as the writer kept it.
+///
+/// It reads two ways. In the prompt it is one line — its number and its
+/// `summary` ([`Self::render`]), so the journal stays short however long it
+/// gets. Asked for, it is everything: the summary, the cited claims, what is
+/// meant next and what it opened and settled ([`Self::detail`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub id: u64,
@@ -95,6 +100,9 @@ pub struct Entry {
     pub to_turn: u64,
     pub from_ms: u64,
     pub to_ms: u64,
+    /// The task or step the stretch was, in one sentence: the entry as the
+    /// prompt reads it.
+    pub summary: String,
     pub claims: Vec<Claim>,
     pub intend: Vec<String>,
     /// Items this entry opened.
@@ -123,21 +131,33 @@ impl Entry {
         }
     }
 
-    /// The entry as the writer reads it back after `before` (see
-    /// [`Self::when`]): the time line when the time moved on, its number, then
-    /// its claims in the order the turns they rest on happened, each under how
-    /// it came to be known.
+    /// The entry as the prompt reads it after `before` (see [`Self::when`]):
+    /// the time line when the time moved on, then one line — its number and
+    /// its summary.
+    pub fn render(&self, before: Option<&Entry>, style: &Style) -> String {
+        let line = format!("{} {} — {}", style.entry, self.id, self.summary.trim());
+        match self.when(before, style) {
+            Some(when) => format!("{when}\n{line}"),
+            None => line,
+        }
+    }
+
+    /// Everything the entry holds, as the journal's tools show it: its number,
+    /// span and summary, then its claims in the order the turns they rest on
+    /// happened, each under how it came to be known, then what is meant next
+    /// and what it opened and settled.
     ///
     /// **In order, not grouped by kind.** Grouped, an entry read its results
     /// before the request that led to them, and a writer asked what happened
     /// told it in that order.
-    pub fn render(&self, before: Option<&Entry>, style: &Style) -> String {
-        let mut out = String::new();
-        if let Some(when) = self.when(before, style) {
-            out.push_str(&when);
-            out.push('\n');
-        }
-        out.push_str(&format!("{} {}", style.entry, self.id));
+    pub fn detail(&self, style: &Style) -> String {
+        let mut out = format!(
+            "{} {} {}\n{}",
+            style.entry,
+            self.id,
+            self.span(style),
+            self.summary.trim()
+        );
         let mut claims: Vec<&Claim> = self.claims.iter().collect();
         claims.sort_by_key(|c| c.cite.iter().min().copied().unwrap_or(u64::MAX));
         for c in claims {
@@ -210,6 +230,7 @@ pub(crate) mod testing {
             to_turn: 9,
             from_ms: 100,
             to_ms: 200,
+            summary: format!("Step {id}."),
             claims: vec![],
             intend: vec![],
             opened: vec![],
@@ -254,8 +275,21 @@ mod tests {
         assert_eq!(entry(1).span(&PLAIN), "[100–200]");
     }
 
+    /// In the prompt an entry is one line, whatever it holds.
     #[test]
-    fn claims_read_in_the_order_they_happened_each_under_how_it_was_known() {
+    fn the_prompt_reads_an_entry_as_its_number_and_summary() {
+        let mut e = entry(3);
+        e.summary = " Fixed the scan's race. ".into();
+        e.claims = vec![citing("The tower holds 40 ore.", Kind::Observed, &[2])];
+        e.intend = vec!["Ask Pax.".into()];
+        assert_eq!(
+            e.render(None, &PLAIN),
+            "d0, h1\nEntry 3 — Fixed the scan's race."
+        );
+    }
+
+    #[test]
+    fn the_detail_reads_claims_in_the_order_they_happened_each_under_how_it_was_known() {
         let mut e = entry(3);
         e.claims = vec![
             citing("Somebody is stealing power.", Kind::Inferred, &[9]),
@@ -264,9 +298,9 @@ mod tests {
             citing("Pax says the east door is jammed.", Kind::Heard, &[1]),
         ];
         assert_eq!(
-            e.render(None, &PLAIN),
-            "d0, h1\n\
-             Entry 3\n\
+            e.detail(&PLAIN),
+            "Entry 3 [100–200]\n\
+             Step 3.\n\
              - Heard: Pax says the east door is jammed.\n\
              - Saw: The tower holds 40 ore.\n\
              - Did: I told Pax I was coming.\n\
@@ -298,10 +332,10 @@ mod tests {
         assert_eq!(
             heads,
             [
-                "d1, h11\nEntry 1",
-                "Entry 2",
-                "h12\nEntry 3",
-                "d2, h20\nEntry 4"
+                "d1, h11\nEntry 1 — Step 1.",
+                "Entry 2 — Step 2.",
+                "h12\nEntry 3 — Step 3.",
+                "d2, h20\nEntry 4 — Step 4."
             ]
         );
     }
@@ -318,7 +352,7 @@ mod tests {
             value: "idle".into(),
         });
         e.claims = vec![c];
-        let r = e.render(None, &PLAIN);
+        let r = e.detail(&PLAIN);
         assert!(
             r.contains(
                 "- Saw: Fabricator 5 is running. (reads fabricator 5 mode as idle) (re-check)"
@@ -336,15 +370,15 @@ mod tests {
             text: "Who holds the shield decision?".into(),
         }];
         e.resolved = vec![2, 3];
-        let r = e.render(None, &PLAIN);
+        let r = e.detail(&PLAIN);
         assert!(r.contains("Meaning to:\n- Ask Pax about the door."));
         assert!(r.contains("Left open:\n- #4 Who holds the shield decision?"));
         assert!(r.ends_with("Settled:\n- #2\n- #3"));
     }
 
     #[test]
-    fn an_empty_section_is_left_out() {
-        assert_eq!(entry(1).render(None, &PLAIN), "d0, h1\nEntry 1");
+    fn an_empty_section_is_left_out_of_the_detail() {
+        assert_eq!(entry(1).detail(&PLAIN), "Entry 1 [100–200]\nStep 1.");
     }
 
     #[test]

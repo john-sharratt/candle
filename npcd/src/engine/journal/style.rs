@@ -19,7 +19,10 @@ one thing each: its `text` in one short sentence, and `cite`, the number of the 
 on (`also_cite` for a second). Something you worked out and did not see or hear still cites \
 the turn that led you to it. Only a claim that is itself one fact that can be looked up — what \
 a gauge read, whose turn it is, where something is — takes `typed`, with its `subject`, \
-`attribute` and `value`; any other claim takes none. `intend` is what you mean to do next, as short lines, at most three. `open` is what \
+`attribute` and `value`; any other claim takes none. `summary` is what you were doing in this \
+stretch and where it got to, in one short sentence: it is the line your journal shows, and the \
+claims are kept behind it. `intend` is what you mean to do next, as short lines, at most three. \
+`open` is what \
 is still unsettled: its `text`, and `relates` — `new` for something you were not carrying, \
 `restates N` to say an open item again, `resolves N` when it has been settled. Keep the whole \
 entry brief, and put nothing in that did not happen: a conclusion you only worked out is \
@@ -27,9 +30,14 @@ written as one, and something that may have changed since you looked is written 
 when you looked.";
 
 /// Offered after [`WRITE_QUESTION`] once the journal holds an entry.
-pub const SKIP_QUESTION: &str = "If nothing in it is worth adding to your journal — your \
-journal already holds it, or nothing happened that matters to you — answer with journal_skip \
-instead, and its `reason` in one short sentence.";
+///
+/// A new entry is a step change; anything else is more of what the latest
+/// entry is about, and a skip files it under that entry.
+pub const SKIP_QUESTION: &str = "Write an entry only for a step change: something new asked of \
+you, a new errand begun, or a real step in it taken — something found, done, decided or \
+refused. If this stretch is more of what your latest entry is about — more walking, looking or \
+talking around the same thing — answer with journal_skip instead, its `reason` in one short \
+sentence; the stretch is filed under that entry.";
 
 /// The span an entry covers: `[14 Jun 2187, 14:20–14:41]`, or both ends in full
 /// when it crosses midnight.
@@ -121,6 +129,7 @@ mod tests {
             to_turn: 9,
             from_ms: DAY_MS * 3 + 14 * H + 20 * M,
             to_ms: DAY_MS * 3 + 14 * H + 41 * M,
+            summary: "Went to see Pax.".into(),
             claims: vec![],
             intend: vec![],
             opened: vec![],
@@ -152,8 +161,13 @@ mod tests {
         ];
         assert_eq!(
             e.render(None, &NPC),
-            "4 Jan 1970, 14:00\n\
-             Entry 1\n\
+            "4 Jan 1970, 14:00\nEntry 1 — Went to see Pax.",
+            "the journal shows one line"
+        );
+        assert_eq!(
+            e.detail(&NPC),
+            "Entry 1 [4 Jan 1970, 14:20–14:41]\n\
+             Went to see Pax.\n\
              - Concluded, not seen or heard: Somebody is stealing power.\n\
              - Did: I told Pax I was coming.\n\
              - Heard: Pax says the east door is jammed.\n\
@@ -173,7 +187,7 @@ mod tests {
             value: "idle".into(),
         });
         e.claims = vec![c];
-        assert!(e.render(None, &NPC).contains(
+        assert!(e.detail(&NPC).contains(
             "- Saw: Fabricator 5 is running. (the world reads fabricator 5 mode as idle) \
              (re-check)"
         ));
@@ -188,7 +202,7 @@ mod tests {
             text: "Who holds the shield decision?".into(),
         }];
         e.resolved = vec![2, 3];
-        let r = e.render(None, &NPC);
+        let r = e.detail(&NPC);
         assert!(r.contains("Meaning to:\n- Ask Pax about the door."));
         assert!(r.contains("Left open:\n- #4 Who holds the shield decision?"));
         assert!(r.ends_with("Settled:\n- #2\n- #3"));

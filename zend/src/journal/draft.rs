@@ -102,6 +102,7 @@ mod tests {
     const WRITTEN: &str = r#"{"name": "journal_write", "arguments": {
         "claims": [{"text": "The user asked for the scan fix.", "cite": "1"},
                    {"text": "scan.rs fails its parity test.", "cite": "3"}],
+        "summary": "Took on the scan fix; its parity test fails.",
         "open": [{"text": "Does the fix hold on the 3090?", "relates": "new"}]}}"#;
 
     /// Turn 0: the user's question, the reply's call; turn 1: the result, the
@@ -141,6 +142,7 @@ mod tests {
             to_turn: 0,
             from_ms: 0,
             to_ms: 0,
+            summary: "Started on the scan.".into(),
             claims: vec![],
             intend: vec!["Look at the scan".into()],
             opened: vec![],

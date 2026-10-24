@@ -116,6 +116,7 @@ mod tests {
                 to_turn: 8,
                 from_ms: 0,
                 to_ms: 0,
+                summary: "Went on.".into(),
                 claims: vec![],
                 intend: vec!["go on".into()],
                 opened: vec![],

@@ -30,17 +30,25 @@ not see in a result still cites the turn that led you to it. Only a claim that i
 fact about the workspace — that a file exists or not, which blob a file is at, which commit a \
 branch is on — takes `typed`, with `subject` `file:<repo>/<path>` and `attribute` `exists` or \
 `blob`, or `subject` `branch:<repo>` and `attribute` `head`, and the `value`; a claim about what \
-a file says, or what a result showed, takes none. `intend` is what you mean to do next, \
-as short lines, at most three. `open` is what is still unsettled — a failing test, a question \
+a file says, or what a result showed, takes none. `summary` is the task or step this stretch \
+was, in one short sentence — what was being done and where it got to, not each read: it is the \
+line your journal shows, and the claims are kept behind it. `intend` is what you mean to do \
+next, as short lines, at most three. `open` is what is still unsettled — a failing test, a question \
 the user has not answered, a step not done: its `text`, and `relates` — `new` for something \
 you were not carrying, `restates N` to say an open item again, `resolves N` when it has been \
 settled. Put nothing in that did not happen: a conclusion you only worked out is written as \
 one, and a result that may have changed since is written as it was when you read it.";
 
 /// Offered after [`WRITE_QUESTION`] once the journal holds an entry.
-pub const SKIP_QUESTION: &str = "If nothing in this stretch is worth adding to your journal — \
-what it established is already in an entry, or it settled nothing — answer with journal_skip \
-instead, and its `reason` in one short sentence.";
+///
+/// A new entry is a step change; anything else is more of the task the latest
+/// entry is about, and a skip files it under that entry.
+pub const SKIP_QUESTION: &str = "Write an entry only for a step change: the user asking for \
+something new, a new task begun, or a major step in the task done — a fix made, a cause found, \
+a test passing or failing, a decision taken. If this stretch is more of the task your latest \
+entry is about — more reading, more searching, more of the same step — answer with \
+journal_skip instead, its `reason` in one short sentence; the stretch is filed under that \
+entry.";
 
 /// `HH:MM` of the wall-clock instant `ms`, UTC.
 fn clock(ms: u64) -> String {
@@ -133,6 +141,7 @@ mod tests {
             to_turn: 9,
             from_ms: OCT_23_1420,
             to_ms: OCT_23_1420 + 21 * MS_PER_MINUTE,
+            summary: "Fixed the scan's race.".into(),
             claims: vec![],
             intend: vec![],
             opened: vec![],
@@ -168,8 +177,13 @@ mod tests {
         }];
         assert_eq!(
             e.render(None, &CODING),
-            "2026-10-23, 14:00 UTC\n\
-             Entry 1\n\
+            "2026-10-23, 14:00 UTC\nEntry 1 — Fixed the scan's race.",
+            "the journal shows one line"
+        );
+        assert_eq!(
+            e.detail(&CODING),
+            "Entry 1 [2026-10-23 14:20–14:41 UTC]\n\
+             Fixed the scan's race.\n\
              - Saw: cargo test failed in scan.rs. (re-check)\n\
              - User said: Asked for the BDP fix first. (re-check)\n\
              - Did: Edited scan.rs to bound the loop.\n\

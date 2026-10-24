@@ -110,6 +110,7 @@ mod tests {
             to_turn: part,
             from_ms: 0,
             to_ms: 1,
+            summary: "Went on.".into(),
             claims: vec![],
             intend: vec!["carry on".into()],
             opened: vec![],

@@ -140,6 +140,7 @@ pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<Value> {
         "name": WRITE,
         "params": [
             list_of("claims", true, claim_floor(citable.len()), claim),
+            text("summary", true),
             list_of("intend", false, 0, text("", true)),
             list_of("open", false, 0, item),
         ],
@@ -320,7 +321,9 @@ fn draft_of(args: &Map<String, Value>) -> Result<Draft, String> {
         None | Some(Value::Null) => Vec::new(),
         Some(v) => items_of(v)?,
     };
+    let summary = args.get("summary").and_then(text_of).unwrap_or_default();
     Ok(Draft {
+        summary,
         claims,
         intend,
         open,
@@ -428,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn the_write_call_takes_claims_then_intend_then_open() {
+    fn the_write_call_takes_claims_then_a_summary_then_intend_then_open() {
         let spec = write_spec(&[1, 2], &[]).unwrap();
         assert_eq!(spec["name"], WRITE);
         let names: Vec<(&str, bool)> = spec["params"]
@@ -444,7 +447,12 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            [("claims", true), ("intend", false), ("open", false)]
+            [
+                ("claims", true),
+                ("summary", true),
+                ("intend", false),
+                ("open", false)
+            ]
         );
     }
 
@@ -455,9 +463,9 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|p| p["min_items"].as_u64().unwrap())
+            .filter_map(|p| p["min_items"].as_u64())
             .collect();
-        assert_eq!(min, [1, 0, 0]);
+        assert_eq!(min, [1, 0, 0], "claims, intend, open");
     }
 
     #[test]

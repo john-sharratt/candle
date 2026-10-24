@@ -143,6 +143,7 @@ mod tests {
             names,
             [
                 ("claims", true, 2),
+                ("summary", true, 0),
                 ("intend", false, 0),
                 ("open", false, 0)
             ]
@@ -155,7 +156,7 @@ mod tests {
             cite.enum_values.as_deref(),
             Some(&["7", "9", "12"].map(String::from)[..])
         );
-        let open = write.params[2].items.as_ref().unwrap();
+        let open = write.params[3].items.as_ref().unwrap();
         let relates = open
             .properties
             .as_ref()

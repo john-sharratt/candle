@@ -184,10 +184,17 @@ impl Journal {
         entry
     }
 
-    /// The stretch held nothing worth writing. The verdict is final for those
-    /// turns: `covered_to` moves past them, so the next draft is asked only about
-    /// what has happened since.
+    /// The stretch was no step of its own — more of the task the latest entry
+    /// is about — so it is that entry's: its span runs on to the stretch's
+    /// end, and the turns are found under it. The verdict is final for those
+    /// turns: `covered_to` moves past them, so the next draft is asked only
+    /// about what has happened since. With no entry yet the stretch is only
+    /// covered.
     pub fn nothing_to_write(&mut self, span: &Span) {
+        if let Some(latest) = self.entries.back_mut() {
+            latest.to_turn = latest.to_turn.max(span.to_turn);
+            latest.to_ms = latest.to_ms.max(span.to_ms);
+        }
         self.covered_to = self.covered_to.max(span.to_turn);
         self.pending = false;
     }
@@ -223,11 +230,11 @@ impl Journal {
     }
 
     /// The journal as a conversation should hold it once `span` is settled
-    /// with nothing written: the same sections, and a record that says the
-    /// stretch is covered.
+    /// with nothing written ([`Self::nothing_to_write`]): the same lines, and a
+    /// record in which the latest entry runs on over the stretch.
     pub fn prompt_covering(&self, span: &Span, style: &Style) -> JournalPrompt {
         let mut next = self.clone();
-        next.covered_to = next.covered_to.max(span.to_turn);
+        next.nothing_to_write(span);
         next.prompt(style)
     }
 
@@ -546,10 +553,27 @@ mod tests {
             .unwrap();
         let covering = j.prompt_covering(&span, &PLAIN);
         assert_eq!(j.covered_to(), 40, "nothing moves until the record is kept");
-        assert_eq!(restore(covering.record()).unwrap().covered_to, 52);
-        assert_eq!(covering.sections, j.prompt(&PLAIN).sections);
+        let recorded = restore(covering.record()).unwrap();
+        assert_eq!(recorded.covered_to, 52);
+        assert_eq!(
+            recorded.entries[0].to_turn, 52,
+            "the stretch is the latest entry's: its span runs on over it"
+        );
+        assert_eq!(
+            covering.sections,
+            j.prompt(&PLAIN).sections,
+            "the entry's line does not change, so nothing is sealed again"
+        );
         j.nothing_to_write(&span);
         assert_eq!(j.prompt(&PLAIN), covering);
+    }
+
+    #[test]
+    fn a_stretch_settled_before_any_entry_is_only_covered() {
+        let mut j = Journal::new();
+        let span = j.begin(vec![turn(1, 1, Some(Kind::Did), "a")], 1).unwrap();
+        j.nothing_to_write(&span);
+        assert_eq!((j.covered_to(), j.entries().count()), (1, 0));
     }
 
     #[test]

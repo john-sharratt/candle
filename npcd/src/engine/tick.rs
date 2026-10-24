@@ -1964,6 +1964,7 @@ mod tests {
             to_turn: due.span.to_turn,
             from_ms: 0,
             to_ms: 1,
+            summary: "Asked about the shield.".into(),
             claims: vec![],
             intend: vec![],
             opened: vec![Item {
@@ -1992,6 +1993,7 @@ mod tests {
             to_turn: 2,
             from_ms: 0,
             to_ms: 1,
+            summary: "Woke.".into(),
             claims: vec![],
             intend: vec![],
             opened: vec![],

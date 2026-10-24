@@ -124,13 +124,14 @@ impl DraftRecord {
     }
 }
 
-/// The entry as an inspector shows it: its stored form, its span and how it
-/// reads in the prompt, below `before`.
+/// The entry as an inspector shows it: its stored form, its span, its line as
+/// it reads in the prompt below `before`, and everything behind that line.
 pub fn shown(entry: &Entry, before: Option<&Entry>, style: &Style) -> Value {
     let mut v = serde_json::to_value(entry).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
         o.insert("span".into(), entry.span(style).into());
         o.insert("text".into(), entry.render(before, style).into());
+        o.insert("detail".into(), entry.detail(style).into());
     }
     v
 }
@@ -312,6 +313,7 @@ mod tests {
         let v = shown(&entry(4), None, &PLAIN);
         assert_eq!(v["id"], 4);
         assert_eq!(v["text"], entry(4).render(None, &PLAIN));
+        assert_eq!(v["detail"], entry(4).detail(&PLAIN));
         assert_eq!(v["span"], entry(4).span(&PLAIN));
     }
 }

@@ -142,6 +142,7 @@ mod tests {
             to_turn: 2,
             from_ms: 0,
             to_ms: 0,
+            summary: "A step.".into(),
             claims: claims.iter().map(|c| claim(c, Kind::Did)).collect(),
             intend: intend.iter().map(|s| s.to_string()).collect(),
             opened: opened

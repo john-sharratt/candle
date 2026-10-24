@@ -286,8 +286,9 @@ mod tests {
 
     const WRITE: &str = r#"{"name": "journal_write", "arguments": {
         "claims": [{"text": "I told Pax hello.", "cite": "1"}],
+        "summary": "Greeted Pax.",
         "open": [{"text": "Pax owes me an answer", "relates": "new"}]}}"#;
-    const WRITE_SCENERY: &str = r#"{"name": "journal_write", "arguments": {"claims": [{"text": "A light shifted.", "cite": "3"}]}}"#;
+    const WRITE_SCENERY: &str = r#"{"name": "journal_write", "arguments": {"claims": [{"text": "A light shifted.", "cite": "3"}], "summary": "Watched the light."}}"#;
 
     /// A desk that answers from a script and records what it was asked.
     struct Script {
@@ -614,7 +615,7 @@ mod tests {
             )
             .unwrap();
         let again = r#"{"name": "journal_write", "arguments": {
-            "claims": [{"text": "I told Pax hello.", "cite": "4"}]}}"#;
+            "claims": [{"text": "I told Pax hello.", "cite": "4"}], "summary": "Greeted Pax."}}"#;
         let mut desk = Script::new(&[again]);
         let (outcome, _) = run(&mut desk, &state, &second, &Fake::default(), &PLAIN).await;
         let Outcome::Nothing { why } = outcome else {
@@ -709,7 +710,8 @@ mod tests {
     async fn a_claim_the_world_contradicts_is_kept_corrected() {
         let typed = r#"{"name": "journal_write", "arguments": {"claims": [{
             "text": "The build is red.", "cite": "1",
-            "typed": {"subject": "build", "attribute": "status", "value": "red"}}]}}"#;
+            "typed": {"subject": "build", "attribute": "status", "value": "red"}}],
+            "summary": "Checked the build."}}"#;
         let (state, span) = started(turns());
         let world = Fake::default().with("build", "status", "green");
         let (outcome, _) = run(&mut Script::new(&[typed]), &state, &span, &world, &PLAIN).await;

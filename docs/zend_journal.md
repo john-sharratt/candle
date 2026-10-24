@@ -60,10 +60,15 @@ to a claim kind, the `World` typed claims are checked against, its `Style`, its
 
 ## 3. An entry, for coding
 
-An entry covers a stretch of the dialogue. It holds:
+An entry is one **step** of the session — a task taken on, or a major step in
+it — and covers the stretch of the dialogue that step took, which grows while
+the session stays on it (§5). It reads two ways: in the prompt, one line — its
+number and its `summary` (`Entry::render`); asked for, everything below
+(`Entry::detail`). It holds:
 
 | Field | What it holds | Limit |
 |---|---|---|
+| `summary` | the task or step, in one sentence — the line the prompt shows | — |
 | `claims` | what the session established, each with citations and a server-derived kind | `MAX_CLAIMS` 12 |
 | `intend` | what the model means to do next | `MAX_INTEND` 3 |
 | `opened` | items left unresolved, each given an id by the server: a failing test, an unanswered question, a step not yet done | `MAX_OPEN` 6 live |
@@ -166,17 +171,17 @@ that `(re-check)` lines may have changed. Sealed K/V cannot be re-rendered at
 gather time, so time is absolute, never "twenty minutes ago". The journal reads
 as one running list, dated only where the date moves: `2026-10-23, 14:00 UTC`
 above the first entry and above one that starts a new day, `15:00 UTC` above one
-that starts a new hour, nothing within the hour. Each entry is `Entry N`, then
-its claims in the order the parts they cite happened, each labelled with how it
-was known (`- Saw: …`, `- User said: …`). The last section is always
+that starts a new hour, nothing within the hour. Each entry is one line,
+`Entry N — <summary>`; its claims, in the order the parts they cite happened and
+each labelled with how it was known (`- Saw: …`, `- User said: …`), are its
+detail, kept behind the line for the inspector. The last section is always
 `Still open:` — `Still open: nothing.` when nothing is — followed by a line
 saying the journal ends there and that anything else known of the conversation
 comes from its turns, so neither silence nor the rest of the context is taken
 for something written down.
 
 **Budget.** The system prompt has none; the journal is bounded by its shape —
-five entries of at most twelve short claims, three intentions and six open
-items.
+five one-line entries and six open items.
 
 ## 5. Drafting
 
@@ -208,11 +213,18 @@ written closed, decoded greedily (`zend/src/journal/draft.rs`, which runs
    insisted on: decoded greedily, a writer offered "another claim or close"
    closed after one, the request, however the question asked), or,
    once the journal holds an entry to weigh the stretch against,
-   `journal_skip` with a one-sentence `reason`. A skip covers the stretch with
-   its reason. At most four answers; a refused write is asked again with the
-   refusal appended, and may still be answered with a skip. What the journal
-   already says is dropped, and an entry of nothing else covers the stretch as
-   a skip would.
+   `journal_skip` with a one-sentence `reason`. **A new entry is a step
+   change**: the user asking for something new, a new task begun, or a major
+   step done (a fix made, a cause found, a test passing or failing, a
+   decision). More reading, searching or more of the same step is skipped, and
+   **a skip files the stretch under the latest entry**: that entry's span runs
+   on over it (`Journal::nothing_to_write`), so its turns are found under the
+   step they belong to, and its line does not change, so nothing is resealed.
+   The check runs as often as before — the cadence gives the record its
+   resolution — and the gate decides what is a step. At most four answers; a
+   refused write is asked again with the refusal appended, and may still be
+   answered with a skip. What the journal already says is dropped, and an
+   entry of nothing else is filed as a skip is.
 3. **The keep:** ids are staged, the record is written to the conversation's
    metadata, and only then is the entry in memory — a record that fails to
    write leaves the journal as it was. The sections follow at the next round.

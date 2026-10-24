@@ -575,7 +575,7 @@ system_prompt:
 
         This is your journal for this conversation: entries you wrote yourself about earlier stretches of it, kept here so you do not lose them as the conversation grows. It is not the notes tool — the notes tools hold something else, and you never need a tool to read your journal: it is right here. When you are asked what you have written down, what your journal says, or what happened earlier in this conversation, answer from these entries.
 
-        Each entry is dated, and every line sits under how you came to know it: "Saw:" a tool result, "User said:" the user, "Did:" a call you made, "Concluded, not seen:" something you worked out. Anything marked (re-check) may have changed since you wrote it — read it again before you rely on it. "Still open:" is what you have left unfinished.
+        Each entry is one line: its number and the task or step that stretch of the conversation was. The day and hour stand above the entries where they changed. "Still open:" is what you have left unfinished, and the journal ends where it says so.
 
     - kind: collection
       name: journal
