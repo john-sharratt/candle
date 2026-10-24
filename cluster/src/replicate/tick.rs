@@ -37,13 +37,16 @@ pub const QUIET: Duration = Duration::from_secs(30);
 pub const ADMISSION_QUIET_LIMIT: u32 = 2;
 
 /// Whether a catch-up last heard of at `word` has gone quiet at `now`: no word
-/// of it for [`QUIET`], and nothing at all on its socket either (`socket`, its
-/// transport's last read). Over a slow link a reply is still arriving while
-/// its frame is not yet whole, and the gateway says `LOST` when one will not
-/// come — so once told `LOST`, the catch-up's own silence is all that counts.
-pub fn is_quiet(now: Instant, word: Instant, socket: Option<Instant>, lost: bool) -> bool {
+/// of it for [`QUIET`], and no message arriving on its socket either
+/// (`arriving`, the last byte of a message not yet whole). Over a slow link a
+/// reply is still arriving while its frame is not yet whole. An idle socket's
+/// `PING`s are whole messages, so they never hold a catch-up: a request that
+/// will get no answer still goes quiet. The gateway says `LOST` when it knows
+/// one will not come — and once told `LOST`, the catch-up's own silence is all
+/// that counts.
+pub fn is_quiet(now: Instant, word: Instant, arriving: Option<Instant>, lost: bool) -> bool {
     let silent = |at: Instant| now.duration_since(at) >= QUIET;
-    silent(word) && (lost || socket.is_none_or(silent))
+    silent(word) && (lost || arriving.is_none_or(silent))
 }
 
 /// What an admission catch-up that went quiet does next, given how many times
@@ -144,7 +147,7 @@ impl Replicator {
                 s.sockets
                     .get(c)
                     .and_then(Option::as_ref)
-                    .and_then(|h| h.heard())
+                    .and_then(|h| h.mid_message())
                     .map(|at| at.into_std())
             };
             let quiet: Vec<(u64, usize, Purpose)> = s
@@ -243,17 +246,20 @@ mod tests {
     /// **A reply still arriving is not silence.** AlienWorld's gap catch-ups
     /// were dropped every 32 s while BlackWorld's ~3 KB/s kept arriving on the
     /// socket — a listing of any size takes longer than 30 s to arrive whole —
-    /// and asked again from scratch, for ever. Bytes on the socket hold a
-    /// catch-up; once the gateway says `LOST`, its own silence alone drops it.
+    /// and asked again from scratch, for ever. A message part-way across holds
+    /// a catch-up; an idle socket (its pings whole, nothing arriving) does not,
+    /// or one that will get no answer would never be asked again — which held
+    /// AlienWorld's for half an hour when an idle socket's pings counted. Once
+    /// the gateway says `LOST`, its own silence alone drops it.
     #[test]
-    fn a_catch_up_is_quiet_only_when_its_socket_is_silent_too_unless_lost() {
+    fn a_catch_up_is_quiet_only_when_no_message_is_arriving_unless_lost() {
         let t0 = Instant::now();
         let later = t0 + QUIET;
         let just = Duration::from_secs(1);
-        // No word, and nothing on the socket: quiet.
+        // No word, and no message arriving: quiet.
         assert!(is_quiet(later, t0, Some(t0), false));
         assert!(is_quiet(later, t0, None, false));
-        // No word, but bytes arriving: a reply on its way.
+        // No word, but a message arriving: a reply on its way.
         assert!(!is_quiet(later, t0, Some(later - just), false));
         // Told LOST: its silence is all that counts.
         assert!(is_quiet(later, t0, Some(later - just), true));

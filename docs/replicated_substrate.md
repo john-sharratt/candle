@@ -2657,11 +2657,15 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      ends short fetches the record again. A dropped `DONE` would leave its catch-up
      waiting until it went quiet.
    - **Loss is told, not inferred.** A catch-up goes quiet when nothing of it has arrived
-     for 30 s *and* nothing at all has arrived on its socket: over a slow link a reply is
-     still arriving while its frame is not yet whole (§3.2, keep-alive). Counting whole
-     frames alone, AlienWorld's gap catch-ups were dropped every 32 s while BlackWorld's
-     ~3 KB/s kept arriving, asked again from scratch, and never finished. The two losses a
-     dropped frame cannot repair the gateway reports as `LOST`:
+     for 30 s *and* no message is part-way across on its socket: over a slow link a reply
+     is still arriving while its frame is not yet whole (§3.2, keep-alive). A WebSocket's
+     messages do not interleave, so bytes newer than the last whole message are one in
+     progress, while an idle socket's `PING`s arrive whole and hold nothing. Counting
+     whole frames alone, AlienWorld's gap catch-ups were dropped every 32 s while
+     BlackWorld's ~3 KB/s kept arriving, asked again from scratch, and never finished;
+     counting any byte at all, the pings held a catch-up that would never be answered
+     for half an hour. The two losses a dropped frame cannot repair the gateway reports
+     as `LOST`:
      - **No member can answer.** The `CATCHUP` the gateway leaves open (step 2) is
        answered `LOST`.
      - **The answerer left.** The gateway keeps each `CATCHUP` and `FETCH` it hands an

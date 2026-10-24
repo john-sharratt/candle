@@ -10,6 +10,7 @@
 
 mod command;
 mod gauge;
+mod hearing;
 mod lanes;
 mod reader;
 mod stream;
@@ -30,12 +31,13 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use command::Command;
+use hearing::Hearing;
 use stream::{Registry, Shared};
 
 use crate::close::Close;
 use crate::fragment::{split, Whole};
 use crate::frame::{Frame, Open};
-use crate::pipe::{Heard, PipeRx, PipeTx};
+use crate::pipe::{PipeRx, PipeTx};
 
 /// How many arrivals wait for the owner before the reader stops reading.
 const INCOMING_DEPTH: usize = 1024;
@@ -105,14 +107,15 @@ pub struct SessionHandle {
     registry: Registry,
     next_stream: Arc<AtomicU32>,
     gauges: Arc<Gauges>,
-    heard: Heard,
+    hearing: Hearing,
 }
 
 impl SessionHandle {
-    /// When the peer was last heard: a whole frame, or the bytes of one still
-    /// arriving when the transport can tell.
-    pub fn heard(&self) -> Option<Instant> {
-        self.heard.at()
+    /// When a byte last arrived of a message still part-way across, when the
+    /// transport can tell; `None` when none is. An idle socket's `PING`s are
+    /// whole messages, so they never read as one arriving.
+    pub fn mid_message(&self) -> Option<Instant> {
+        self.hearing.mid_message()
     }
 
     /// Whether the session has ended: nothing sent on it is delivered, and
@@ -220,14 +223,14 @@ pub fn start<T: PipeTx, R: PipeRx>(role: Role, tx: T, rx: R) -> Session {
     let (incoming_tx, incoming) = mpsc::channel(INCOMING_DEPTH);
     let (ended_tx, ended) = oneshot::channel();
     let gauges = Arc::new(Gauges::default());
-    let heard = rx.heard().unwrap_or_default();
+    let hearing = Hearing::new(rx.heard());
     tokio::spawn(writer::run(tx, command_rx, gauges.clone()));
     tokio::spawn({
         let commands = commands.clone();
         let registry = registry.clone();
-        let heard = heard.clone();
+        let hearing = hearing.clone();
         async move {
-            let how = reader::run(rx, heard, role, commands, registry, incoming_tx).await;
+            let how = reader::run(rx, hearing, role, commands, registry, incoming_tx).await;
             let _ = ended_tx.send(how);
         }
     });
@@ -238,7 +241,7 @@ pub fn start<T: PipeTx, R: PipeRx>(role: Role, tx: T, rx: R) -> Session {
             registry,
             next_stream: Arc::new(AtomicU32::new(role.first_stream())),
             gauges,
-            heard,
+            hearing,
         },
         incoming,
         ended,

@@ -12,18 +12,19 @@ use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 
 use super::command::Command;
+use super::hearing::Hearing;
 use super::stream::{Registry, Shared, VirtualConn};
 use super::{Ended, Incoming, Role};
 use crate::close::{Close, CloseCode};
 use crate::fragment::Reassembly;
 use crate::frame::{name, Frame};
-use crate::pipe::{Heard, Message, PipeRx};
+use crate::pipe::{Message, PipeRx};
 
 pub const DEAD_AFTER: Duration = Duration::from_secs(45);
 
 pub async fn run<R: PipeRx>(
     mut rx: R,
-    heard: Heard,
+    hearing: Hearing,
     role: Role,
     commands: UnboundedSender<Command>,
     registry: Registry,
@@ -38,7 +39,7 @@ pub async fn run<R: PipeRx>(
         Ended::Refused(close)
     };
     let ended = loop {
-        let message = match heard_within(&mut rx, &heard).await {
+        let message = match heard_within(&mut rx, &hearing).await {
             Err(_) => {
                 // How many frames came before the silence tells a peer that
                 // never spoke from one that stopped.
@@ -145,19 +146,21 @@ pub async fn run<R: PipeRx>(
 /// The next message, unless the peer has gone [`DEAD_AFTER`] without being
 /// heard. A message whose bytes are still arriving keeps the wait going: a
 /// mebibyte fragment over a slow link takes minutes to arrive whole, from a
-/// peer that is alive throughout. A whole message stamps `heard` too, so a
-/// transport that cannot stamp its reads is heard by its messages.
-async fn heard_within<R: PipeRx>(rx: &mut R, heard: &Heard) -> Result<Option<Message>, Elapsed> {
+/// peer that is alive throughout. Each whole message is noted in `hearing`.
+async fn heard_within<R: PipeRx>(
+    rx: &mut R,
+    hearing: &Hearing,
+) -> Result<Option<Message>, Elapsed> {
     let mut wait = DEAD_AFTER;
     loop {
         match timeout(wait, rx.recv()).await {
             Ok(message) => {
                 if message.is_some() {
-                    heard.stamp();
+                    hearing.message();
                 }
                 return Ok(message);
             }
-            Err(elapsed) => match heard.at().map(|at| at.elapsed()) {
+            Err(elapsed) => match hearing.last().map(|at| at.elapsed()) {
                 Some(since) if since < DEAD_AFTER => wait = DEAD_AFTER - since,
                 _ => return Err(elapsed),
             },
