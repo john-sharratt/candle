@@ -187,8 +187,9 @@ system_prompt:
 
                 Gather the context a task needs before you act: read the relevant files, and follow
                 the conventions, frameworks, and libraries the codebase already uses. If you need
-                more information, look it up rather than assuming. If the user asks a simple
-                question that needs no code or files, answer it directly without tools.
+                more information, look it up rather than assuming. If the question is about a
+                specific document or file, read it before giving your view of it. If the user asks
+                a simple question that needs no code or files, answer it directly without tools.
 
         # Binary toggle driven by zend (`set_optional("reasoning_stance", …)`,
         # see api/chat.rs): present ⇔ the turn thinks, the inverse of
@@ -940,11 +941,12 @@ layers:
     groups:
       - id: artifacts
         selection: { kind: top_k, k: 8 }
-        # An analysis of a file is offered only while the dialogue works in
-        # that file — a working-set member it descends from. Measured
-        # 2026-10-24: on a question about a candle paper every unit these
-        # layers projected was a battle-cities analysis, 25–48K tokens a decode,
-        # one taken at belief score 0.
+        # An analysis of a file is offered only while the model works in that
+        # file — a LOCKED working-set member (a file it read) it descends
+        # from. Measured 2026-10-24: on a question about a candle paper every
+        # unit these layers projected was a battle-cities analysis, 25–48K
+        # tokens a decode, one taken at belief score 0; following provenance
+        # too still brought 36–45K of analyses of files nobody had asked for.
         follows_working_set: true
         score_threshold: 1.0  # bimodal: ~80% of inter are zero-score; cuts zero floor, preserves all non-zero hits
         budget:
@@ -1025,7 +1027,9 @@ layers:
       - id: dependencies
         selection: { kind: top_k, k: 6 }
         follows_working_set: true  # see `artifacts`
-        score_threshold: 0.0  # inverted within-layer signal — no useful threshold; TopK handles ranking
+        # Cuts the zero floor: at 0.0 top_k filled from units that scored
+        # nothing at all (measured 2026-10-24, a unit taken at belief 0.0).
+        score_threshold: 1.0
         budget:
           priority: 100
 
@@ -1091,7 +1095,7 @@ layers:
       - id: architecture
         selection: { kind: top_k, k: 5 }
         follows_working_set: true  # see `artifacts`
-        score_threshold: 0.0  # overlapping distributions — no useful threshold; TopK handles ranking
+        score_threshold: 1.0  # cuts the zero floor — see `dependencies`
         budget:
           priority: 100
 

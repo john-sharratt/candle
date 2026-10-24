@@ -3713,20 +3713,23 @@ impl Substrate {
     }
 
     /// Offer `group`'s conversations to a projection only while one of their
-    /// ancestors — or the conversation itself — is a member of the target's
-    /// working set. A unit built on a file's reading forks from that reading,
-    /// so it is offered exactly while the dialogue works in the file: what it
-    /// needs is decided by what it carries, never by how well the unit scores.
+    /// ancestors — or the conversation itself — is LOCKED in the target's
+    /// working set: a file the model read. A unit built on a file's reading
+    /// forks from that reading, so it is offered exactly while the dialogue
+    /// works in the file: what it needs is decided by what the model asked
+    /// for, never by how well the unit scores. Provenance does not count — it
+    /// is the scan's guess, and analyses of guesses filled 36–45K tokens of a
+    /// decode on a question none of them touched (measured 2026-10-24).
     /// Idempotent.
     pub fn mark_group_follows_working_set(&mut self, group: GroupId) {
         self.follows_working_set.insert(group);
     }
 
-    /// `target`'s working-set members, locked or not.
-    fn working_set_member_set(&self, target: TimelineId) -> HashSet<TimelineId> {
+    /// `target`'s locked working-set members.
+    fn working_set_locked_set(&self, target: TimelineId) -> HashSet<TimelineId> {
         self.working_sets
             .get(&target)
-            .map(|ws| ws.members().into_iter().map(|(tl, _)| tl).collect())
+            .map(|ws| ws.pinned().into_iter().collect())
             .unwrap_or_default()
     }
 
@@ -3785,7 +3788,7 @@ impl Substrate {
         let members: Option<HashSet<TimelineId>> = self
             .follows_working_set
             .contains(&group)
-            .then(|| self.working_set_member_set(target));
+            .then(|| self.working_set_locked_set(target));
         self.active_timelines_for_group(group)
             .filter(move |tl| match scope {
                 None => true,
@@ -3803,7 +3806,7 @@ impl Substrate {
     /// [`Self::scoped_timelines_for_group`] applies, for one conversation.
     pub fn scope_offers(&self, group: GroupId, target: TimelineId, timeline: TimelineId) -> bool {
         if self.follows_working_set.contains(&group)
-            && !self.descends_from_any(timeline, &self.working_set_member_set(target))
+            && !self.descends_from_any(timeline, &self.working_set_locked_set(target))
         {
             return false;
         }
@@ -8497,6 +8500,23 @@ mod tests {
 
         sub.working_set_clear(target);
         assert!(offered(&sub).is_empty(), "its file left, so did it");
+    }
+
+    /// Provenance is the scan's guess, not a file the model read: an analysis
+    /// of a provenance member is not offered.
+    #[test]
+    fn a_group_following_the_working_set_ignores_provenance() {
+        let (mut sub, target, reads) = working_set_fixture(1, 10);
+        let analyses = GroupId::for_test(5);
+        sub.mark_group_follows_working_set(analyses);
+        let analysis = TimelineAllocator::new().next();
+        sub.register_timeline(analysis, LayerId::for_test(5), analyses);
+        sub.append_with_blocks(analysis, 10, 0, 1);
+        set_parent(&mut sub, analysis, reads[0]);
+        sub.working_set_seed(target, &[reads[0]], ws_limits(1000), 1000.0);
+        assert!(sub.working_set(target).unwrap().is_member(reads[0]));
+        assert!(!sub.scope_offers(analyses, target, analysis));
+        assert_eq!(sub.scoped_timelines_for_group(analyses, target).count(), 0);
     }
 
     /// A conversation in no working-set group can never be a member.

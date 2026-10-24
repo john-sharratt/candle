@@ -407,15 +407,17 @@ no selector change.
 ### B.5 What a layer needs — structure, not score (measured 2026-10-24)
 
 A layer above a file's reading — `static_analysis` through `bug_analysis`, one
-unit per file — is **needed exactly while the dialogue works in that file**. A
+unit per file — is **needed exactly while the model works in that file**. A
 group declaring `follows_working_set: true` offers a projection only the
-conversations descended from a member of the target's working set
-(`Substrate::mark_group_follows_working_set`, applied in
+conversations descended from a LOCKED member of the target's working set — a
+file the model read (`Substrate::mark_group_follows_working_set`, applied in
 `scoped_timelines_for_group` and `scope_offers`, so the scan and the
 projection's candidates both see it). A unit forks from the unit below it and,
-at the bottom, from the file's reading, so a file in the working set admits its
-whole analysis stack and a file that leaves takes it out. No scan, no working
-set: nothing — the opening projection carries none.
+at the bottom, from the file's reading, so a read file admits its whole
+analysis stack and a released lock takes it out. Provenance does not count: it
+is the scan's guess, and following it still brought 36–45K tokens of analyses
+of files nobody had asked for on the paper question. No read, nothing — the
+opening projection carries none.
 
 Why not a score. Replaying a conversation about the paper (`1f283ffd`, then
 `cbac2859` with every group's raw order statistics on the projection event):

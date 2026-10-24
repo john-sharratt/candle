@@ -1061,10 +1061,10 @@ pub struct GroupSchema {
     /// Never zero: the smallest cap still admits one whole conversation.
     pub max_swaps: NonZeroUsize,
     /// Whether this group offers a projection only the conversations that
-    /// descend from a member of the target's working set
+    /// descend from a locked member of the target's working set
     /// (`Substrate::mark_group_follows_working_set`) — a unit built on a
-    /// file's reading is needed while the dialogue works in that file, and
-    /// not otherwise, however well it scores.
+    /// file's reading is needed while the model works in that file, and not
+    /// otherwise, however well it scores.
     pub follows_working_set: bool,
 }
 

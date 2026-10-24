@@ -3914,6 +3914,15 @@ fn run_inference_stream(
                         .lock()
                         .unwrap()
                         .working_set_clear(timeline);
+                    // Scope it first. A seed or a restored lock is admitted only
+                    // as the conversation's scope offers it, and the scope is
+                    // otherwise first set right before its first submit — after
+                    // this — so every seed and every lock was refused: measured
+                    // 2026-10-24, no dialogue had carried a seed since scoping
+                    // landed.
+                    open_state
+                        .retrieval_scope
+                        .apply(&open_state.engine, timeline, &files);
                     let seeded = seed_working_set(&open_state, timeline, &files, &config);
                     let restored = restore_locks(&open_state.engine.lock().unwrap(), timeline);
                     tracing::info!(
