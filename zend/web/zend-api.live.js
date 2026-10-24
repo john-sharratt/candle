@@ -390,6 +390,16 @@
     getJournal(convId) {
       return getJSON('/v1/conversations/' + enc(convId) + '/journal');
     },
+    // The turns behind one entry, exactly as the dialogue's journal_read pages
+    // them: { entry, from, to, total, text }. Rejects with the daemon's reason
+    // when no text is kept for the entry.
+    async getJournalTurns(convId, entryId, offset, limit) {
+      const q = '?offset=' + Number(offset || 1) + '&limit=' + Number(limit || 200);
+      const r = await fetch('/v1/conversations/' + enc(convId) + '/journal/' + Number(entryId) + '/turns' + q);
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.message || ('GET journal turns -> ' + r.status));
+      return body;
+    },
     // Resolves to the journal as it now reads.
     async forgetJournalEntry(convId, entryId) {
       const r = await fetch('/v1/conversations/' + enc(convId) + '/journal/' + Number(entryId), { method: 'DELETE' });

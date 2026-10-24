@@ -384,10 +384,25 @@ them.
   it now reads, or 404 `no_such_entry`.
 - Log target `zend::journal`: each draft's start, and its end with stretch,
   outcome, timings and verdicts.
-- **GUI:** the Journal pane on the conversation lists the entries, each claim
-  with its kind and whether the workspace corrected it, the open items, and the
-  recent drafts, with a Forget on each entry and a Draft now. Entries are not
-  editable: every line in the journal is one the server cited and checked.
+- `GET /v1/conversations/:id/journal/:eid/turns?offset=&limit=` returns the
+  turns behind one entry exactly as `journal_read` pages them — a folded
+  entry's digest for a folded one — or 404 under the tool's own code
+  (`no_entry_text`) when none is kept.
+- **GUI:** the journal docks at the bottom right of an open conversation, so it
+  costs the chat as little room as it can. Collapsed it is a pill — the
+  journal's icon, how many entries it holds, a dot while a draft or fold runs.
+  Open it is a short card (300 px, at most 46% of the height) that reads as the
+  prompt does: one line per entry, oldest first and scrolled to the newest,
+  dated where the day or hour moves, a tag on a folded day, week, month or
+  year, what is still open below; with Drafts (how recent drafts ended), Draft
+  (draft now), refresh and collapse in its header. Which of the two it is, is
+  the browser's choice and kept. The dock reads the journal on opening a
+  conversation and after each reply, and follows a draft or fold until it ends.
+  Clicking an entry opens the journal modal: its line, everything behind it
+  (its claims in order, or a folded entry's digest), and the turns it was
+  written from as `journal_read` reads them, paged 200 lines at a time, with a
+  Forget. Entries are not editable: every line in the journal is one the server
+  cited and checked.
 
 ## 9. Code layout
 
@@ -411,8 +426,8 @@ them.
 | `journal-core/src/transcript.rs` | `Filed`, the keys, and `Book`: paging and searching the kept turns |
 | `zend-tools/src/tools/journal/` | `journal_read`, `journal_grep`, and the `JournalBook` they read through |
 | `zend/src/journal/registry.rs` | `Journals`: every dialogue's journal, and what a draft forks from |
-| `zend/src/api/journal.rs` | the three routes |
-| `zend/web/index.html` | the Journal pane |
+| `zend/src/api/journal.rs` | the four routes |
+| `zend/web/index.html` | the journal dock and its entry modal |
 | `npcd/src/engine/journal/` | npcd's origin mapping, window cadence, voice, sim `World` and `EngineDesk` |
 
 ## 10. Failure
@@ -453,7 +468,8 @@ Built alongside the code, each building block testable alone:
   parked request keeps its band, and the band goes with the fork.
 - **Prompt:** the embedded schema declares the journal, the install scopes it,
   an empty journal pins nothing, and the journal is never a section sink.
-- **Routes:** the table and the dispatch of the three routes.
+- **Routes:** the table and the dispatch of the four routes; a turns page's
+  defaults and bounds, and a miss under the tool's code.
 
 Only a live coding session can say:
 

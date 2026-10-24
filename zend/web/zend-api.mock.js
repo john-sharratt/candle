@@ -405,36 +405,58 @@
     },
     deleteFile(convId, fileId) { return delay(60); },
 
-    // ── the working journal (GET/POST/DELETE …/journal) ────────────────────
-    // One entry and one open item per conversation, held in memory; forgetting
-    // the entry empties the list as the daemon's would.
+    // ── the working journal (GET/POST/DELETE …/journal, …/turns) ───────────
+    // A folded day and a step after it per conversation, held in memory, in
+    // the shape the daemon answers: `text` is the entry as the prompt reads
+    // it, `detail` what is behind its line. Forgetting removes an entry as the
+    // daemon's would.
     _journals: {},
     _journalOf(convId) {
       if (!this._journals[convId]) {
         this._journals[convId] = {
-          written: 1,
-          in_prompt: [1],
-          covered_to: 32,
-          looked_to: 32,
+          written: 3,
+          in_prompt: [3, 2],
+          covered_to: 40,
+          looked_to: 40,
           drafting: false,
           open: [{ id: 1, text: 'Does the parity test pass on the 3090?' }],
           entries: [{
-            id: 1, from_turn: 1, to_turn: 32, from_ms: 0, to_ms: 0,
+            id: 3, from_turn: 1, to_turn: 28, from_ms: 0, to_ms: 0, period: 'day',
+            span: '[2026-10-22 09:02–17:40 UTC]',
+            summary: 'Chased the scan stall to the reclaim path and bounded the loop.',
+            text: '2026-10-22, 09:00 UTC\nEntry 3 — Chased the scan stall to the reclaim path and bounded the loop.',
+            detail: 'Entry 3 [2026-10-22 09:02–17:40 UTC]\nChased the scan stall to the reclaim path and bounded the loop.\nThe user reported the scan stalling on the 3090. Reading scan.rs showed the reclaim loop never yields; it was bounded to 64 passes. The parity test was not rerun before the day ended.',
+            digest: 'The user reported the scan stalling on the 3090. Reading scan.rs showed the reclaim loop never yields; it was bounded to 64 passes. The parity test was not rerun before the day ended.',
+            claims: [], intend: [], opened: [], resolved: [],
+          }, {
+            id: 2, from_turn: 29, to_turn: 40, from_ms: 0, to_ms: 0, period: 'step',
             span: '[2026-10-23 14:20–14:41 UTC]',
-            text: '',
+            summary: 'Reran the parity test after the scan fix.',
+            text: '2026-10-23, 14:00 UTC\nEntry 2 — Reran the parity test after the scan fix.',
+            detail: 'Entry 2 [2026-10-23 14:20–14:41 UTC]\nReran the parity test after the scan fix.\n- User said: Asked whether the parity test passes now. (re-check)\n- Saw: scan.rs failed its parity test. (re-check)\n- Did: Bounded the loop in scan.rs.\nMeaning to:\n- Rerun the parity test\nLeft open:\n- #1 Does the parity test pass on the 3090?',
             claims: [
-              { text: 'The user asked for the scan to stop stalling.', cite: [1], kind: 'heard', perishable: true, typed: null, corrected: false },
-              { text: 'scan.rs failed its parity test.', cite: [3], kind: 'observed', perishable: true, typed: null, corrected: false },
-              { text: 'Bounded the loop in scan.rs.', cite: [6], kind: 'did', perishable: false, typed: null, corrected: false },
+              { text: 'Asked whether the parity test passes now.', cite: [29], kind: 'heard', perishable: true, typed: null, corrected: false },
+              { text: 'scan.rs failed its parity test.', cite: [31], kind: 'observed', perishable: true, typed: null, corrected: false },
+              { text: 'Bounded the loop in scan.rs.', cite: [34], kind: 'did', perishable: false, typed: null, corrected: false },
             ],
             intend: ['Rerun the parity test'],
             opened: [{ id: 1, text: 'Does the parity test pass on the 3090?' }],
             resolved: [],
           }],
-          drafts: [{ from_turn: 1, to_turn: 32, turns: 32, took_ms: 2400, write_ms: 2400, result: 'wrote', detail: null, entry: 1, rounds: 1, checks: [] }],
+          drafts: [{ from_turn: 29, to_turn: 40, turns: 12, took_ms: 2400, write_ms: 2400, result: 'wrote', detail: null, entry: 2, rounds: 1, checks: [] }],
         };
       }
       return this._journals[convId];
+    },
+    async getJournalTurns(convId, entryId, offset, limit) {
+      await delay(60);
+      const lines = Number(entryId) === 3
+        ? ['#28 17:40 The user reported the scan stalling on the 3090. Reading scan.rs showed the reclaim loop never yields; it was bounded to 64 passes. The parity test was not rerun before the day ended.']
+        : ['#29 14:20 User: does the parity test pass now?', '#30 14:21 You: <tool_call>{"name": "run_command", "arguments": {"cmd": "cargo test parity"}}</tool_call>',
+          '#31 14:24 Tool results: <tool_response>{"exit": 101, "stdout": "test scan::parity ... FAILED"}</tool_response>', '#34 14:39 You: Bounded the reclaim loop in scan.rs to 64 passes.'];
+      const from = Math.max(1, Number(offset || 1));
+      const shown = lines.slice(from - 1, from - 1 + Number(limit || 200));
+      return { entry: Number(entryId), from, to: from + shown.length - 1, total: lines.length, text: shown.join('\n') };
     },
     async getJournal(convId) {
       await delay(60);

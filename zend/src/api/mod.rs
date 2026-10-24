@@ -239,6 +239,12 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             conversation(),
             delete(journal::forget),
         )
+        .route(
+            "/v1/conversations/:id/journal/:eid/turns",
+            Role::Unauthenticated,
+            conversation(),
+            get(journal::turns),
+        )
 }
 
 #[cfg(test)]
@@ -290,6 +296,10 @@ mod tests {
                 ("/v1/conversations/:id/journal", "unauthenticated"),
                 ("/v1/conversations/:id/journal/draft", "unauthenticated"),
                 ("/v1/conversations/:id/journal/:eid", "unauthenticated"),
+                (
+                    "/v1/conversations/:id/journal/:eid/turns",
+                    "unauthenticated"
+                ),
             ]
         );
     }
@@ -322,6 +332,7 @@ mod tests {
             ("GET", "/v1/conversations/c-1/journal"),
             ("POST", "/v1/conversations/c-1/journal/draft"),
             ("DELETE", "/v1/conversations/c-1/journal/5"),
+            ("GET", "/v1/conversations/c-1/journal/5/turns"),
         ] {
             assert_eq!(
                 table.dispatch(method, path),

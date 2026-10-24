@@ -231,6 +231,9 @@
   .z-load-list li.z-load-wait { color: #c9a26a; }
   .z-load-list li.z-load-wait::before { content: '…'; color: #c9a26a; }
   .z-load-detail { font-size: .82rem; color: #5e554c; margin-top: .6rem; min-height: 1.2em; font-variant-numeric: tabular-nums; }
+  /* The journal dock's entries: a row lights as the pointer or the keyboard
+     reaches it, since clicking one opens it. */
+  .z-journal-line:hover, .z-journal-line:focus-visible { background: #2a2623; outline: none; }
   @media (max-width: 1024px) { .z-logs { width: 280px !important; } }
   /* Mobile overrides fire at the same 820px the JS uses for its narrow layout
      (NARROW_W) so there's no dead-band where the layout is narrow but modals/logs
@@ -498,13 +501,20 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     substrateGroupOpen: {},        // group key → open? (default closed/collapsed)
     substrateExpanded: {},         // section key → expanded (show content)?
     filesOpen: false,
-    // The working-journal pane (docs/zend_journal.md §8): the journal of the
+    // The working-journal dock (docs/zend_journal.md §8): the journal of the
     // open conversation as GET …/journal last returned it, keyed by its id so
-    // a switch of conversation is never shown another's.
-    journalOpen: false,
+    // a switch of conversation is never shown another's. The dock sits at the
+    // bottom right of the conversation, a pill when collapsed and a short
+    // scrolling card when open; which of the two is this browser's choice.
+    journalOpen: (function () { try { return localStorage.getItem('zend.journalDock') === 'open'; } catch (_) { return false; } })(),
     journal: null,          // { convId, view } — view is the daemon's JSON
     journalError: null,
     journalNote: null,      // the last draft request's answer, as a line
+    journalDrafts: false,   // the dock shows recent drafts instead of the entries
+    // The entry open in the journal modal: { convId, entry, page, loading,
+    // error } — `page` is the turns behind it as journal_read pages them,
+    // extended as more is asked for.
+    journalEntry: null,
     topMenuOpen: false,   // narrow only: the top-right actions collapsed under a menu button
     dragActive: false,
     lastUploadedId: null,
@@ -547,6 +557,10 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   let streamToken = null;
   let streamConv = null;   // the conversation that stream belongs to
   let savedChatScroll = null, savedSubstrateScroll = null;
+  // The journal dock's list and the journal modal's body, kept across the
+  // full re-render as the chat's scroll is. The list opens at its newest entry.
+  let journalListEl = null, journalEntryEl = null;
+  let journalListAtEnd = true, savedJournalListScroll = 0, savedJournalEntryScroll = null;
   // Follow the bottom while streaming, but the instant the user scrolls UP they
   // take over and we leave the scroll alone until they return to the bottom.
   // `stick` is driven solely by the scroller's own scroll events (buildChat);
@@ -1218,9 +1232,10 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // once the daemon has said what they are.
     const conv = S.conversations.find((c) => c.id === id);
     if (conv) adoptDials(conv.dials);
-    setState({ activeId: id, sidebarDrawer: false, convMenuOpen: false, journalNote: null }, () => { scrollChat(); if (!S.narrow) focusPrompt(); });
-    // An open journal pane follows the conversation it shows.
-    if (S.journalOpen) loadJournal();
+    setState({ activeId: id, sidebarDrawer: false, convMenuOpen: false, journalNote: null, journalEntry: null, journalDrafts: false }, () => { scrollChat(); if (!S.narrow) focusPrompt(); });
+    // The journal dock follows the conversation it shows; collapsed, its pill
+    // still counts the entries.
+    loadJournal();
   }
   // Bring a conversation the page is about to show up to date: a detached
   // reply is picked up again, a conversation never loaded is loaded. Every way
@@ -1661,6 +1676,10 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     patchStream(convId, (m) => { m.streaming = false; });
     S.conversations = S.conversations.map((c) => c.id === convId ? Object.assign({}, c, { streaming: false }) : c);
     render();
+    // A sealed turn may have started a draft: the journal is read again once
+    // the daemon has had a moment to begin it, and followed while it runs
+    // (`loadJournal`).
+    if (convId === S.activeId) setTimeout(() => { if (S.activeId === convId) loadJournal(); }, JOURNAL_FOLLOW_MS);
   }
 
   // ── files / upload ───────────────────────────────────────────────────────
@@ -1937,7 +1956,14 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // Same for the substrate modal's scroll body, so expanding a section in place
     // doesn't jump the panel back to the top.
     if (substrateEl) savedSubstrateScroll = substrateEl.scrollTop;
-    promptEl = chatEl = logEl = filesListEl = substrateEl = null;
+    // And the journal dock's list, which follows its newest entry while the
+    // reader is at the bottom, and the journal modal's body.
+    if (journalListEl) {
+      journalListAtEnd = journalListEl.scrollHeight - journalListEl.scrollTop - journalListEl.clientHeight < 8;
+      savedJournalListScroll = journalListEl.scrollTop;
+    }
+    if (journalEntryEl) savedJournalEntryScroll = journalEntryEl.scrollTop;
+    promptEl = chatEl = logEl = filesListEl = substrateEl = journalListEl = journalEntryEl = null;
 
     const themeFilter = S.theme === 'light' ? 'invert(1) hue-rotate(180deg)' : S.theme === 'vivid' ? 'saturate(1.75) contrast(1.06)' : 'none';
     // The shell is pinned to the visible area. `--zvt`/`--zvh` are the visual
@@ -1964,6 +1990,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       overlays.push(buildSidebarExpanded(true));
     }
     if (S.fileView) overlays.push(buildFileViewer());
+    if (S.journalEntry && S.journalEntry.convId === S.activeId) overlays.push(buildJournalModal());
     if (S.substrateOpen) overlays.push(buildSubstrate());
     if (S.upload) overlays.push(buildUploadModal());
     if (S.confirm) overlays.push(buildConfirmModal());
@@ -1973,6 +2000,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     overlays.forEach((o) => root.appendChild(o));
 
     if (substrateEl && savedSubstrateScroll != null) substrateEl.scrollTop = savedSubstrateScroll;
+    if (journalListEl) journalListEl.scrollTop = journalListAtEnd ? journalListEl.scrollHeight : savedJournalListScroll;
+    if (journalEntryEl && savedJournalEntryScroll != null) journalEntryEl.scrollTop = savedJournalEntryScroll;
 
     if (chatEl) {
       if (stick) chatEl.scrollTop = chatEl.scrollHeight;
@@ -2109,7 +2138,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     dropZone.appendChild(inner);
     dropZone.appendChild(buildTopRight());
     if (S.filesOpen) dropZone.appendChild(buildFilesPane());
-    if (S.journalOpen) dropZone.appendChild(buildJournalPane());
+    // The journal docks on a conversation that is showing, never on the home
+    // page or a conversation still loading.
+    if (!isEmpty && !pending) dropZone.appendChild(buildJournalDock());
     if (S.dragActive) dropZone.appendChild(buildDragOverlay());
 
     return h('div', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; background:#1c1917;' },
@@ -2557,7 +2588,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const filesCount = (conv && conv.files) ? conv.files.length : 0;
     return [
       !S.logsOpen && { key: 'logs', label: 'Logs', icon: ICON.logs, title: 'Show logs', onClick: () => setState({ logsOpen: true, topMenuOpen: false }) },
-      { key: 'files', label: 'Files', icon: ICON.files, active: S.filesOpen, badge: filesCount || null, title: 'Conversation files', onClick: () => setState({ filesOpen: !S.filesOpen, journalOpen: false, topMenuOpen: false }) },
+      { key: 'files', label: 'Files', icon: ICON.files, active: S.filesOpen, badge: filesCount || null, title: 'Conversation files', onClick: () => setState({ filesOpen: !S.filesOpen, topMenuOpen: false }) },
       conv && { key: 'journal', label: 'Journal', icon: ICON.journal, active: S.journalOpen, title: 'What this conversation has written down', onClick: toggleJournal },
       { key: 'perf', label: 'Perf', icon: ICON.perf, href: '/perf', title: 'Wave & pressure telemetry' },
       { key: 'substrate', label: 'Substrate', icon: ICON.substrate, href: '/substrate', title: 'Substrate inspector' },
@@ -3018,59 +3049,150 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       list);
   }
 
-  // ── journal pane ─────────────────────────────────────────────────────────
-  // The open conversation's working journal (docs/zend_journal.md §8): its
-  // entries as the prompt reads them, each claim's kind and whether the
-  // workspace corrected it, what is still open, and how recent drafts ended.
+  // ── journal dock ─────────────────────────────────────────────────────────
+  // The open conversation's working journal (docs/zend_journal.md §8), docked
+  // at the bottom right of the conversation so it costs the chat as little
+  // room as it can: collapsed, a pill counting the entries; open, a short card
+  // that reads as the prompt does — one line per entry, dated where the day or
+  // hour moves, what is still open below — and scrolls. An entry clicked opens
+  // the journal modal: its line, everything behind it, and the turns it was
+  // written from exactly as the dialogue's journal_read pages them.
   // Read-only: every line is one the daemon cited and checked, so an entry can
   // be forgotten, never edited.
-  function toggleJournal() {
-    const opening = !S.journalOpen;
-    setState({ journalOpen: opening, filesOpen: false, topMenuOpen: false, journalNote: null });
-    if (opening) loadJournal();
+  // How soon after a reply, and how often while a draft or fold runs, the
+  // journal is read again.
+  const JOURNAL_FOLLOW_MS = 4000;
+  let journalFollow = null;
+  function setJournalOpen(open) {
+    try { localStorage.setItem('zend.journalDock', open ? 'open' : 'closed'); } catch (_) {}
+    journalListAtEnd = true;
+    setState({ journalOpen: open, topMenuOpen: false, journalNote: null, journalDrafts: false });
+    if (open) loadJournal();
   }
+  function toggleJournal() { setJournalOpen(!S.journalOpen); }
   function loadJournal() {
     const convId = S.activeId;
     if (!convId) return;
-    setState({ journalError: null });
     API.getJournal(convId).then((view) => {
-      if (S.activeId === convId) setState({ journal: { convId, view } });
+      if (S.activeId !== convId) return;
+      setState({ journal: { convId, view }, journalError: null });
+      // A draft or fold in flight: read again shortly, until it has ended.
+      clearTimeout(journalFollow);
+      if (view.drafting) journalFollow = setTimeout(() => { if (S.activeId === convId) loadJournal(); }, JOURNAL_FOLLOW_MS);
     }).catch((e) => {
       if (S.activeId === convId) setState({ journalError: String((e && e.message) || e) });
     });
   }
+  // Open entry `e` in the journal modal and fetch the first page of its turns.
+  function openJournalEntry(e) {
+    const convId = S.activeId;
+    savedJournalEntryScroll = null;
+    setState({ journalEntry: { convId, entry: e, page: null, loading: true, error: null } });
+    API.getJournalTurns(convId, e.id, 1, JOURNAL_PAGE_LINES).then((page) => {
+      const je = S.journalEntry;
+      if (je && je.convId === convId && je.entry.id === e.id) setState({ journalEntry: Object.assign({}, je, { page, loading: false }) });
+    }).catch((err) => {
+      const je = S.journalEntry;
+      if (je && je.convId === convId && je.entry.id === e.id) setState({ journalEntry: Object.assign({}, je, { loading: false, error: String((err && err.message) || err) }) });
+    });
+  }
+  // The next page of the open entry's turns, appended below what is shown.
+  function moreJournalTurns() {
+    const je = S.journalEntry;
+    if (!je || !je.page || je.loading) return;
+    setState({ journalEntry: Object.assign({}, je, { loading: true }) });
+    API.getJournalTurns(je.convId, je.entry.id, je.page.to + 1, JOURNAL_PAGE_LINES).then((next) => {
+      const now = S.journalEntry;
+      if (!now || now.entry.id !== je.entry.id) return;
+      const page = { entry: next.entry, from: now.page.from, to: next.to, total: next.total, text: now.page.text + '\n' + next.text };
+      setState({ journalEntry: Object.assign({}, now, { page, loading: false }) });
+    }).catch((err) => {
+      const now = S.journalEntry;
+      if (now) setState({ journalEntry: Object.assign({}, now, { loading: false, error: String((err && err.message) || err) }) });
+    });
+  }
+  // Lines one page of an entry's turns holds — journal_read's own default.
+  const JOURNAL_PAGE_LINES = 200;
   function forgetJournalEntry(entryId) {
     const convId = S.activeId;
     API.forgetJournalEntry(convId, entryId).then((view) => {
-      if (S.activeId === convId) setState({ journal: { convId, view }, journalError: null });
+      if (S.activeId === convId) setState({ journal: { convId, view }, journalError: null, journalEntry: null });
     }).catch((e) => setState({ journalError: String((e && e.message) || e) }));
   }
   function draftJournalNow() {
     const convId = S.activeId;
     API.draftJournal(convId).then((covers) => {
-      setState({ journalNote: 'Drafting turns ' + covers.from_turn + '–' + covers.to_turn + '. Refresh to see how it ends.' });
+      setState({ journalNote: 'Drafting turns ' + covers.from_turn + '–' + covers.to_turn + '…' });
       loadJournal();
     }).catch((e) => setState({ journalNote: String((e && e.message) || e) }));
   }
-  const KIND_COLORS = { observed: '#7fb07a', heard: '#c98a3e', did: '#7b9bc4', inferred: '#b48ac8' };
-  function journalKind(kind, corrected) {
-    return h('span', { title: corrected ? 'the workspace read differently, and the claim says what it read' : '', style: 'flex-shrink:0; font-size:0.62rem; font-family:ui-monospace,monospace; padding:1px 5px; border-radius:4px; color:#1c1a18; background:' + (KIND_COLORS[kind] || '#9a9490') + ';' }, kind + (corrected ? ' ✎' : ''));
+  // A folded entry's period, as a small tag beside its line: a day, week,
+  // month or year the journal compressed into one entry.
+  function journalPeriodTag(period) {
+    if (!period || period === 'step') return null;
+    return h('span', { title: 'A ' + period + ' of entries, folded into one', style: 'flex-shrink:0; font-size:0.6rem; font-family:ui-monospace,monospace; padding:0 5px; border-radius:4px; color:#c98a3e; border:1px solid #4a3d2c; line-height:1.5;' }, period);
   }
-  function buildJournalEntry(e) {
-    const claims = (e.claims || []).map((c) => h('div', { style: 'display:flex; gap:7px; align-items:baseline; margin-top:4px; font-size:0.76rem; color:#cfc8c0; line-height:1.45;' },
-      journalKind(c.kind, c.corrected),
-      h('span', { class: 'z-selectable' }, c.text + (c.perishable ? ' (re-check)' : ''))));
-    const lines = [];
-    (e.intend || []).forEach((t) => lines.push('Meaning to: ' + t));
-    (e.opened || []).forEach((i) => lines.push('Left open: #' + i.id + ' ' + i.text));
-    (e.resolved || []).forEach((id) => lines.push('Settled: #' + id));
-    return h('div', { class: 'z-journal-entry', style: 'padding:9px 10px; border-radius:8px; background:#24211e; margin-bottom:7px;' },
-      h('div', { style: 'display:flex; align-items:center; gap:8px;' },
-        h('span', { style: 'font-size:0.74rem; font-weight:650; color:#ece8e4;' }, '#' + e.id),
-        h('span', { style: 'flex:1; min-width:0; font-size:0.68rem; color:#7c736a; font-family:ui-monospace,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, e.span || ''),
-        h('button', { onClick: () => forgetJournalEntry(e.id), title: 'Forget this entry: it leaves the journal and the conversation\'s prompt', style: 'font-size:0.68rem; color:#c78d84; background:transparent; border:1px solid #4a3a36; border-radius:6px; padding:2px 7px; cursor:pointer; font-family:inherit;' }, 'Forget')),
-      claims,
-      lines.map((l) => h('div', { class: 'z-selectable', style: 'margin-top:4px; font-size:0.72rem; color:#9a9490;' }, l)));
+  // One entry in the dock, as the prompt reads it: the date line above it when
+  // the day or hour moved, then its number and its line. Clicking opens it.
+  function buildJournalLine(e) {
+    const rows = String(e.text || '').split('\n');
+    const line = rows.pop() || '';
+    const summary = line.replace(/^\S+\s+\d+\s+—\s+/, '') || e.summary || '';
+    const out = rows.map((when) => h('div', { style: 'margin:9px 4px 3px; font-size:0.64rem; letter-spacing:0.02em; color:#7c736a; font-family:ui-monospace,monospace;' }, when));
+    out.push(h('div', {
+      class: 'z-journal-line', role: 'button', tabindex: '0',
+      onClick: () => openJournalEntry(e),
+      onKeyDown: (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openJournalEntry(e); } },
+      title: 'Open entry ' + e.id + ': what is behind its line, and the turns it was written from',
+      style: 'display:flex; gap:7px; align-items:baseline; padding:5px 6px; border-radius:6px; cursor:pointer;',
+    },
+      h('span', { style: 'flex-shrink:0; min-width:1.6em; font-size:0.7rem; font-weight:650; color:#9a9490; font-variant-numeric:tabular-nums;' }, '#' + e.id),
+      h('span', { style: 'flex:1; min-width:0; font-size:0.76rem; color:#d8d2cb; line-height:1.4; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;' }, summary),
+      journalPeriodTag(e.period)));
+    return out;
+  }
+  // The journal modal: the entry's line, everything behind it, and the turns it
+  // was written from as journal_read pages them — a folded entry's digest for
+  // one the calendar folded.
+  function buildJournalModal() {
+    const je = S.journalEntry;
+    const e = je.entry;
+    const close = () => setState({ journalEntry: null });
+    const label = 'font-size:0.68rem; font-weight:650; letter-spacing:0.03em; text-transform:uppercase; color:#7c736a; margin:0 0 6px;';
+    const mono = 'margin:0; padding:11px 13px; border-radius:8px; background:#161412; border:1px solid #2a2724; font-family:ui-monospace,monospace; font-size:12px; line-height:1.6; color:#cdbfae; white-space:pre-wrap; word-break:break-word;';
+    const page = je.page;
+    const turns = [];
+    if (page) {
+      turns.push(h('pre', { class: 'z-selectable', style: mono }, page.text));
+      turns.push(h('div', { style: 'display:flex; align-items:center; gap:10px; margin-top:7px; font-size:0.7rem; color:#7c736a; font-family:ui-monospace,monospace;' },
+        h('span', {}, 'lines ' + page.from + '–' + page.to + ' of ' + page.total),
+        page.to < page.total
+          ? h('button', { onClick: moreJournalTurns, disabled: je.loading, style: 'margin-left:auto; font-size:0.7rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:3px 10px; cursor:pointer; font-family:inherit;' }, je.loading ? 'Loading…' : 'Load ' + Math.min(JOURNAL_PAGE_LINES, page.total - page.to) + ' more')
+          : null));
+    } else if (je.loading) {
+      turns.push(h('div', { style: 'font-size:0.76rem; color:#6a6258;' }, 'Loading…'));
+    }
+    if (je.error) turns.push(h('div', { style: 'margin-top:6px; font-size:0.74rem; color:#e0938a;' }, je.error));
+    const modal = h('div', { class: 'z-modal', onClick: (ev) => ev.stopPropagation(), style: 'width:min(760px,95%); max-height:86vh; display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
+      h('div', { style: 'flex-shrink:0; display:flex; align-items:center; gap:10px; padding:14px 16px; border-bottom:1px solid #2e2b27;' },
+        h('div', { style: 'flex:1; min-width:0;' },
+          h('div', { style: 'display:flex; align-items:center; gap:8px;' },
+            h('span', { style: 'font-size:0.92rem; font-weight:650; color:#ece8e4;' }, 'Entry ' + e.id),
+            journalPeriodTag(e.period)),
+          h('div', { style: 'font-size:0.71rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, e.span || '')),
+        h('button', { onClick: () => forgetJournalEntry(e.id), title: 'Forget this entry: it leaves the journal and the conversation\'s prompt', style: 'flex-shrink:0; font-size:0.74rem; color:#b8867f; background:rgba(200,80,80,0.07); border:1px solid rgba(200,80,80,0.2); border-radius:7px; padding:5px 10px; cursor:pointer; font-family:inherit;' }, 'Forget'),
+        h('button', { onClick: close, title: 'Close', style: closeBtnStyle() }, '×')),
+      h('div', { class: 'zscroll', ref: (el) => { journalEntryEl = el; }, style: 'flex:1; min-height:0; overflow-y:auto; padding:15px 17px; display:flex; flex-direction:column; gap:16px;' },
+        h('div', {},
+          h('div', { style: label }, 'In the journal'),
+          h('div', { class: 'z-selectable', style: 'font-size:0.86rem; color:#ece8e4; line-height:1.5;' }, e.summary || '')),
+        h('div', {},
+          h('div', { style: label }, 'Behind it'),
+          h('pre', { class: 'z-selectable', style: mono }, e.detail || '')),
+        h('div', {},
+          h('div', { style: label, title: 'Exactly what the conversation reads when it calls journal_read on this entry' }, e.period && e.period !== 'step' ? 'Its digest, as journal_read reads it' : 'The turns it was written from, as journal_read reads them'),
+          turns)));
+    return h('div', { class: 'z-modal-ov', onClick: close, style: modalOvStyle(430) }, modal);
   }
   function buildJournalDraft(d) {
     const tone = { wrote: '#7fb07a', nothing: '#9a9490', abandoned: '#e0938a', not_started: '#e0938a' }[d.result] || '#9a9490';
@@ -3083,37 +3205,50 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
         h('span', { style: 'margin-left:auto; color:#6a6258; font-family:ui-monospace,monospace;' }, time)),
       d.detail ? h('div', { class: 'z-selectable', style: 'margin-top:3px; color:#8a827a; line-height:1.4;' }, d.detail) : null);
   }
-  function buildJournalPane() {
+  // The dock at the bottom right of the conversation. Collapsed it is a pill —
+  // the journal's icon, how many entries it holds, a dot while a draft or fold
+  // runs — so it costs the chat almost nothing; open it is a short card of the
+  // journal as the prompt reads it, newest at the bottom, that scrolls.
+  function buildJournalDock() {
     const held = S.journal && S.journal.convId === S.activeId ? S.journal.view : null;
-    const list = h('div', { class: 'zscroll', style: 'flex:1; min-height:0; overflow-y:auto; padding:8px;' });
-    if (S.journalError) list.appendChild(h('div', { style: 'padding:8px; font-size:0.74rem; color:#e0938a;' }, S.journalError));
-    if (S.journalNote) list.appendChild(h('div', { style: 'padding:6px 8px 10px; font-size:0.72rem; color:#c98a3e;' }, S.journalNote));
+    const entries = held ? (held.entries || []) : [];
+    const busy = !!(held && held.drafting);
+    const pill = 'display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cfc8c0; background:#232120; border:1px solid #38342f; border-radius:999px; padding:5px 11px; cursor:pointer; font-family:inherit; box-shadow:0 6px 18px rgba(0,0,0,0.35);';
+    const busyDot = busy ? h('span', { title: 'A draft or fold is running', style: 'width:6px; height:6px; border-radius:50%; background:#c98a3e;' }) : null;
+    const where = 'position:absolute; right:14px; bottom:12px; z-index:36;';
+    if (!S.journalOpen) {
+      return h('div', { class: 'z-journal-dock', style: where },
+        h('button', { onClick: () => setJournalOpen(true), title: 'Show the journal: what this conversation has written down', style: pill, html: ICON.journal + '<span>&nbsp;Journal' + (entries.length ? ' · ' + entries.length : '') + '</span>' }, busyDot));
+    }
+    const list = h('div', { class: 'zscroll z-journal-list', ref: (el) => { journalListEl = el; }, style: 'flex:1; min-height:0; overflow-y:auto; padding:2px 6px 8px;' });
+    if (S.journalError) list.appendChild(h('div', { style: 'padding:6px; font-size:0.72rem; color:#e0938a;' }, S.journalError));
+    if (S.journalNote) list.appendChild(h('div', { style: 'padding:6px; font-size:0.7rem; color:#c98a3e;' }, S.journalNote));
     if (!held) {
-      list.appendChild(h('div', { style: 'padding:1.6rem 1rem; text-align:center; font-size:0.78rem; color:#6a6258;' }, 'Loading…'));
-    } else {
-      const entries = held.entries || [];
-      if (!entries.length) list.appendChild(h('div', { style: 'padding:1.4rem 1rem; text-align:center; font-size:0.78rem; color:#6a6258; line-height:1.55;', html: 'Nothing written down yet.<br>The session journals every sixteen turns.' }));
-      entries.slice().reverse().forEach((e) => list.appendChild(buildJournalEntry(e)));
-      const open = held.open || [];
-      if (open.length) {
-        list.appendChild(h('div', { style: 'margin:10px 2px 4px; font-size:0.72rem; font-weight:650; color:#ece8e4;' }, 'Still open'));
-        open.forEach((i) => list.appendChild(h('div', { class: 'z-selectable', style: 'padding:2px 2px; font-size:0.74rem; color:#cfc8c0;' }, '#' + i.id + ' ' + i.text)));
-      }
+      list.appendChild(h('div', { style: 'padding:1rem; text-align:center; font-size:0.74rem; color:#6a6258;' }, 'Loading…'));
+    } else if (S.journalDrafts) {
       const drafts = held.drafts || [];
-      if (drafts.length) {
-        list.appendChild(h('div', { style: 'margin:12px 2px 4px; font-size:0.72rem; font-weight:650; color:#ece8e4;' }, 'Drafts' + (held.drafting ? ' · one running' : '')));
-        drafts.slice().reverse().forEach((d) => list.appendChild(buildJournalDraft(d)));
+      if (!drafts.length) list.appendChild(h('div', { style: 'padding:1rem; text-align:center; font-size:0.74rem; color:#6a6258;' }, 'No drafts yet this run.'));
+      drafts.slice().reverse().forEach((d) => list.appendChild(buildJournalDraft(d)));
+    } else {
+      if (!entries.length) list.appendChild(h('div', { style: 'padding:1rem; text-align:center; font-size:0.74rem; color:#6a6258; line-height:1.5;', html: 'Nothing written down yet.<br>The session journals every sixteen turns.' }));
+      entries.forEach((e) => buildJournalLine(e).forEach((n) => list.appendChild(n)));
+      const open = held.open || [];
+      if (entries.length || open.length) {
+        list.appendChild(h('div', { style: 'margin:10px 4px 3px; font-size:0.64rem; letter-spacing:0.02em; color:#7c736a; font-family:ui-monospace,monospace;' }, open.length ? 'Still open' : 'Still open: nothing'));
+        open.forEach((i) => list.appendChild(h('div', { class: 'z-selectable', style: 'padding:2px 6px; font-size:0.74rem; color:#cfc8c0; line-height:1.4;' }, '#' + i.id + ' ' + i.text)));
       }
     }
-    const written = held ? held.written : 0;
-    const btn = 'font-size:0.7rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:3px 9px; cursor:pointer; font-family:inherit;';
-    return h('div', { class: 'z-journal', style: 'position:absolute; top:0; right:0; bottom:0; width:340px; z-index:37; display:flex; flex-direction:column; background:#1f1c1a; border-left:1px solid #38342f; box-shadow:-10px 0 30px rgba(0,0,0,0.45);' },
-      h('div', { style: 'flex-shrink:0; display:flex; align-items:center; gap:8px; padding:13px 14px; border-bottom:1px solid #2e2b27;' },
-        h('span', { style: 'font-size:0.85rem; font-weight:650; color:#ece8e4;' }, 'Journal'),
-        h('span', { style: 'font-size:0.7rem; color:#7c736a;' }, written ? written + ' written' : ''),
-        h('button', { onClick: loadJournal, title: 'Read the journal again', style: btn + ' margin-left:auto;' }, 'Refresh'),
-        h('button', { onClick: draftJournalNow, title: 'Write an entry now over whatever is not yet covered', style: btn }, 'Draft now'),
-        h('button', { onClick: () => setState({ journalOpen: false }), title: 'Close', style: closeBtnStyle() }, '×')),
+    const icon = 'flex-shrink:0; font-size:0.68rem; color:#9a9490; background:transparent; border:1px solid transparent; border-radius:6px; padding:2px 6px; cursor:pointer; font-family:inherit;';
+    return h('div', { class: 'z-journal-dock', style: where + ' width:min(300px, calc(100% - 28px)); max-height:min(46vh, 440px); display:flex; flex-direction:column; background:#1f1c1a; border:1px solid #38342f; border-radius:12px; box-shadow:0 12px 34px rgba(0,0,0,0.5); overflow:hidden;' },
+      h('div', { style: 'flex-shrink:0; display:flex; align-items:center; gap:6px; padding:8px 8px 7px 12px; border-bottom:1px solid #2e2b27;' },
+        h('span', { style: 'display:flex; align-items:center; gap:6px; font-size:0.78rem; font-weight:650; color:#ece8e4;', html: ICON.journal + '<span>Journal</span>' }),
+        h('span', { style: 'font-size:0.66rem; color:#7c736a;' }, entries.length ? '' + entries.length : ''),
+        busyDot,
+        h('span', { style: 'flex:1;' }),
+        h('button', { onClick: () => setState({ journalDrafts: !S.journalDrafts }), title: S.journalDrafts ? 'Back to the entries' : 'How recent drafts ended', style: icon + (S.journalDrafts ? ' color:#ece8e4; border-color:#38342f;' : '') }, 'Drafts'),
+        h('button', { onClick: draftJournalNow, title: 'Write an entry now over whatever is not yet covered', style: icon }, 'Draft'),
+        h('button', { onClick: loadJournal, title: 'Read the journal again', style: icon, html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M11.5 7a4.5 4.5 0 1 1-1.3-3.2M11.5 1.8v2.6H8.9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>' }),
+        h('button', { onClick: () => setJournalOpen(false), title: 'Collapse the journal', style: icon, html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M3.5 5.5L7 9l3.5-3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>' })),
       list);
   }
 
@@ -3887,9 +4022,10 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     else if (S.topMenuOpen) setState({ topMenuOpen: false });
     else if (S.openMenu) setState({ openMenu: null });
     else if (S.fileView) setState({ fileView: null });
+    else if (S.journalEntry) setState({ journalEntry: null });
     else if (S.substrateOpen) setState({ substrateOpen: false });
     else if (S.filesOpen) setState({ filesOpen: false });
-    else if (S.journalOpen) setState({ journalOpen: false });
+    else if (S.journalOpen) setJournalOpen(false);
   });
   // Keep focus in the composer when clicking inert chrome, but NEVER
   // suppress the default on interactive controls or on selectable text —

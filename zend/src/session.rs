@@ -62,7 +62,7 @@ use journal_core::journal::Holds;
 use journal_core::record::view as journal_view;
 use journal_core::section::{JournalPrompt, Kept, JOURNAL};
 use journal_core::span::Span;
-use journal_core::transcript::Filed;
+use journal_core::transcript::{Filed, Miss, Page};
 use serde_json::{json, Value};
 use web::auth::Roles;
 use zend_tools::state::Secrets;
@@ -6967,6 +6967,22 @@ impl ZendSession {
                 })
             }),
         )
+    }
+
+    /// `GET /v1/conversations/{id}/journal/{eid}/turns`: the turns behind entry
+    /// `entry` — a step's stretch, a folded entry's digest — exactly as
+    /// `journal_read` pages them, `lines` lines from line `from`. `None` while
+    /// the model is not loaded.
+    pub fn journal_turns(
+        &self,
+        conv_id: &str,
+        entry: u64,
+        from: usize,
+        lines: usize,
+    ) -> Option<Result<Page, Miss>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = conversation_timeline(conv_id);
+        Some(journal_text(&state, timeline).read(entry, from, lines))
     }
 
     /// `GET /v1/conversations/{id}/prompt-tokens`: the tokens the conversation
