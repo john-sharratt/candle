@@ -27,15 +27,22 @@ use journal_core::workflow::Desk;
 use serde_json::Value;
 
 /// Room for a brief entry: a few claims, what is intended, what is open.
-const WRITE_TOKENS: usize = 1024;
+pub const WRITE_TOKENS: usize = 1024;
+
+/// Room for a fold: a one-line summary and a digest of a few paragraphs. A
+/// month's digest runs well past an entry, and an answer cut off by its budget
+/// does not parse.
+pub const FOLD_TOKENS: usize = 3072;
 
 /// Compiles the calls' `{name, params}` forms into the grammar one answer is
 /// held to: exactly one call, of any of them.
 pub type Compile = Arc<dyn Fn(&[Value]) -> anyhow::Result<Arc<StencilTree>> + Send + Sync>;
 
-/// Files a stretch's turns under its entry, then writes the journal's record
-/// where a restart reads it back.
-pub type Record = Box<dyn FnMut(&JournalPrompt, Option<&Filed>) -> anyhow::Result<()> + Send>;
+/// Files a stretch's turns, or a fold's digest, under its entry, ceases the
+/// text of the entries a fold took, then writes the journal's record where a
+/// restart reads it back.
+pub type Record =
+    Box<dyn FnMut(&JournalPrompt, Option<&Filed>, &[u64]) -> anyhow::Result<()> + Send>;
 
 /// How every question of one draft is put.
 pub struct Asking {
@@ -45,6 +52,9 @@ pub struct Asking {
     /// marker, so the grammar starts at the call.
     pub prefill: String,
     pub sampling: SamplingConfig,
+    /// The most an answer may run to: [`WRITE_TOKENS`] for a draft,
+    /// [`FOLD_TOKENS`] for a fold.
+    pub max_tokens: usize,
 }
 
 impl Asking {
@@ -53,7 +63,7 @@ impl Asking {
             assistant_prefill: Some(self.prefill.clone()),
             turn_grammar: Some(tree),
             sampling: Some(self.sampling.clone()),
-            max_tokens: Some(WRITE_TOKENS),
+            max_tokens: Some(self.max_tokens),
             selection: self.asker.selection(),
             ..Default::default()
         };
@@ -110,8 +120,9 @@ impl Desk for ZendDesk {
         &mut self,
         prompt: &JournalPrompt,
         filed: Option<&Filed>,
+        ceased: &[u64],
     ) -> impl Future<Output = anyhow::Result<()>> + Send {
-        let kept = (self.record)(prompt, filed);
+        let kept = (self.record)(prompt, filed, ceased);
         async move { kept }
     }
 }

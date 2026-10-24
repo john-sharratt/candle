@@ -6,9 +6,10 @@
 //! carries is therefore absolute (`14 Jun 2187, 14:20`), never "twenty minutes
 //! ago".
 
+use journal_core::period::{utc_bucket, Period};
 use journal_core::style::Style;
 
-use crate::clock::{day_of, stamp, WorldTime};
+use crate::clock::{day_of, stamp, WorldTime, DAY_MS};
 
 /// What the character is asked once the stretch is on the table.
 ///
@@ -38,6 +39,49 @@ you, a new errand begun, or a real step in it taken — something found, done, d
 refused. If this stretch is more of what your latest entry is about — more walking, looking or \
 talking around the same thing — answer with journal_skip instead, its `reason` in one short \
 sentence; the stretch is filed under that entry.";
+
+/// Asked once the entries of a world period that is over are in front of the
+/// character.
+pub const FOLD_QUESTION: &str = "Fold them into one entry with journal_fold. `summary` is the \
+line your journal will keep for the whole period, in one short sentence: what you were about \
+and where it got to. `digest` is the account kept behind that line: each errand or thing asked \
+of you in the order it came, what you found, did and decided, who you dealt with, and what you \
+left unfinished, in a few short paragraphs. Put nothing in that the entries do not say.";
+
+const MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// The world `period` that `at_ms` falls in, as the fold question names it:
+/// `14 Jun 2187`, `the week of 8 Jun 2187`, `June 2187`, `2187`. The world's
+/// calendar is Gregorian, its weeks starting on Monday.
+fn period_name(period: Period, at_ms: u64) -> String {
+    let time = WorldTime::of(at_ms);
+    match period {
+        Period::Step | Period::Day => time.date(),
+        Period::Week => {
+            // 1970-01-01 was a Thursday: three days on from Monday.
+            let back = (day_of(at_ms) + 3) % 7;
+            format!(
+                "the week of {}",
+                WorldTime::of(at_ms - back * DAY_MS).date()
+            )
+        }
+        Period::Month => format!("{} {}", MONTH_NAMES[time.month as usize - 1], time.year),
+        Period::Year => time.year.to_string(),
+    }
+}
 
 /// The span an entry covers: `[14 Jun 2187, 14:20–14:41]`, or both ends in full
 /// when it crosses midnight.
@@ -97,12 +141,16 @@ pub const NPC: Style = Style {
     stretch,
     write_question: WRITE_QUESTION,
     skip_question: SKIP_QUESTION,
+    bucket: utc_bucket,
+    period_name,
+    fold_question: FOLD_QUESTION,
 };
 
 #[cfg(test)]
 mod tests {
     use journal_core::ask;
     use journal_core::entry::{Claim, Entry, Item, Kind, Typed};
+    use journal_core::period::Period;
     use journal_core::section::render_open;
     use journal_core::span::{Span, SpanTurn};
 
@@ -135,6 +183,8 @@ mod tests {
             intend: vec![],
             opened: vec![],
             resolved: vec![],
+            period: Period::Step,
+            digest: String::new(),
         }
     }
 

@@ -38,6 +38,7 @@ mod tests {
             }],
             next_item: 3,
             covered_to: 12,
+            removed: vec![],
         };
         let metadata = metadata_of(&JournalPrompt::of(&kept, &CODING));
         assert_eq!(kept_in(&metadata), Some(kept));

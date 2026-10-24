@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::period::Period;
 use crate::style::Style;
 
 /// How a claim came to be known, derived from what it cites.
@@ -109,6 +110,14 @@ pub struct Entry {
     pub opened: Vec<Item>,
     /// Ids of open items this entry settled.
     pub resolved: Vec<u64>,
+    /// What it stands for: a stretch of turns, or a day, week, month or year
+    /// of entries folded into one ([`crate::period`]).
+    #[serde(default)]
+    pub period: Period,
+    /// A folded entry's detailed summary of what it folded: what the journal's
+    /// tools read behind its line. Empty for a step, whose detail is its claims.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub digest: String,
 }
 
 impl Entry {
@@ -158,6 +167,10 @@ impl Entry {
             self.span(style),
             self.summary.trim()
         );
+        if !self.digest.trim().is_empty() {
+            out.push('\n');
+            out.push_str(self.digest.trim());
+        }
         let mut claims: Vec<&Claim> = self.claims.iter().collect();
         claims.sort_by_key(|c| c.cite.iter().min().copied().unwrap_or(u64::MAX));
         for c in claims {
@@ -235,6 +248,8 @@ pub(crate) mod testing {
             intend: vec![],
             opened: vec![],
             resolved: vec![],
+            period: Period::Step,
+            digest: String::new(),
         }
     }
 
@@ -374,6 +389,23 @@ mod tests {
         assert!(r.contains("Meaning to:\n- Ask Pax about the door."));
         assert!(r.contains("Left open:\n- #4 Who holds the shield decision?"));
         assert!(r.ends_with("Settled:\n- #2\n- #3"));
+    }
+
+    #[test]
+    fn a_folded_entry_reads_its_digest_behind_its_line() {
+        let mut e = entry(9);
+        e.period = Period::Day;
+        e.summary = "Fixed the scan race and shipped it.".into();
+        e.digest = "Found the race in reclaim; bounded the loop; tests green.".into();
+        assert_eq!(
+            e.detail(&PLAIN),
+            "Entry 9 [100–200]\nFixed the scan race and shipped it.\n\
+             Found the race in reclaim; bounded the loop; tests green."
+        );
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["period"], "day");
+        let step = serde_json::to_value(entry(1)).unwrap();
+        assert!(step.get("digest").is_none(), "a step stores no digest");
     }
 
     #[test]

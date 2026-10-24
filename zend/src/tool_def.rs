@@ -67,6 +67,12 @@ pub struct ToolDef {
     /// up is as ordinary a coding-assistant step as reading a file. A mode that
     /// does not grant the network drops them with the rest of its exclusions.
     ///
+    /// `journal_read` and `journal_grep` are in it because the journal shows
+    /// one line per entry and its intro tells the model the turns behind each
+    /// are a call away: a turn asked about earlier work that was not offered
+    /// them would read the line, and answer from it, as if that were all there
+    /// is.
+    ///
     /// The find tools are there with reading and listing, not left out. A turn
     /// that can only enumerate and read answers "where is this" by guessing a
     /// directory at `file_list` and reading whole files to check, which is what
@@ -1132,10 +1138,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The file tools a coding turn needs whatever the question, and the two web
-    /// tools, project on every turn; nothing else does. A mandatory tool rides on top of the
-    /// belief top-k, so adding one here widens every prompt — the set is pinned
-    /// so that is a deliberate change.
+    /// The file tools a coding turn needs whatever the question, the two web
+    /// tools and the two journal readers project on every turn; nothing else
+    /// does. A mandatory tool rides on top of the belief top-k, so adding one
+    /// here widens every prompt — the set is pinned so that is a deliberate
+    /// change.
     #[test]
     fn the_file_tools_a_coding_turn_needs_are_mandatory() {
         let mut mandatory: Vec<&str> = all()
@@ -1151,6 +1158,8 @@ mod tests {
                 "file_list",
                 "file_read",
                 "file_search",
+                "journal_grep",
+                "journal_read",
                 "web_fetch",
                 "web_search",
                 "write"

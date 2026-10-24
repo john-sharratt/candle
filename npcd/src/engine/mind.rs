@@ -65,6 +65,7 @@ use candle_conversation::{
     Carried, ConversationEngine, Linking, PromptDump, SamplingConfig, Sequence, SequenceConfig,
     TurnOptions, UnsealedAsker, Want,
 };
+use journal_core::folding::{self, Folded};
 use journal_core::journal::Holds;
 use journal_core::section::{self, entry_section, JournalPrompt, Kept, META_KEPT};
 use journal_core::verify::World;
@@ -78,7 +79,7 @@ use crate::engine::dreams;
 use crate::engine::event::Event;
 use crate::engine::identity;
 use crate::engine::invoke_body::Invokable;
-use crate::engine::journal::desk::EngineDesk;
+use crate::engine::journal::desk::{EngineDesk, FOLD_TOKENS, WRITE_TOKENS};
 use crate::engine::journal::section::META_OF;
 use crate::engine::journal::state::JournalState;
 use crate::engine::journal::style::NPC;
@@ -1207,8 +1208,32 @@ impl Minds {
             due.state.lock().unwrap().journal_mut().abandon();
             anyhow::bail!("no schema, so no journal collection to write to");
         }
-        let mut desk = EngineDesk::new(self, npc_id, persona, within);
+        let mut desk = EngineDesk::new(self, npc_id, persona, within, WRITE_TOKENS);
         Ok(workflow::run(&mut desk, &*due.state, &due.span, world, &NPC).await)
+    }
+
+    /// Fold every period of the character's journal that is over at world
+    /// instant `now_ms`, one after another ([`journal_core::folding`]), asked
+    /// of the character as a draft is. Each fold's outcome, in order; the last
+    /// is never [`Folded::Kept`].
+    pub async fn fold_journal<S: Holds>(
+        &self,
+        npc_id: u64,
+        persona: &Persona<'_>,
+        within: &tools::Within,
+        state: &Mutex<S>,
+        now_ms: u64,
+    ) -> Vec<Folded> {
+        let mut desk = EngineDesk::new(self, npc_id, persona, within, FOLD_TOKENS);
+        let mut out = Vec::new();
+        loop {
+            let folded = folding::run(&mut desk, state, now_ms, &NPC).await;
+            let more = matches!(folded, Folded::Kept { .. });
+            out.push(folded);
+            if !more {
+                return out;
+            }
+        }
     }
 
     /// Hold `prompt` in the character's live conversation as its journal: submit
@@ -1315,6 +1340,7 @@ impl Minds {
                 open: Vec::new(),
                 next_item: 1,
                 covered_to: 0,
+                removed: Vec::new(),
             },
             &NPC,
         );

@@ -126,6 +126,7 @@ mod tests {
             open: vec![],
             next_item: 1,
             covered_to: 0,
+            removed: vec![],
         };
         assert!(wants(&JournalPrompt::of(&kept, &CODING)).is_empty());
         kept.open = vec![Item {

@@ -51,10 +51,11 @@ impl JournalText {
             .map_err(|e| anyhow::anyhow!("the journal's turns could not be kept: {e}"))
     }
 
-    /// Every stretch kept, as `(entry, parts)` in key order.
-    fn stretches(&self) -> Vec<(u64, Vec<Part>)> {
+    /// Every stretch kept under `prefix` — the conversation's, or one entry's —
+    /// as `(entry, parts)` in key order.
+    fn stretches(&self, prefix: &str) -> Vec<(u64, Vec<Part>)> {
         self.shared
-            .custom_objects_under(&owner_prefix(&self.owner))
+            .custom_objects_under(prefix)
             .into_iter()
             .filter_map(|(obj, _)| {
                 let entry = entry_of(&self.owner, &obj.key)?;
@@ -96,12 +97,26 @@ fn parts_of(blob: &Value) -> Vec<Part> {
 }
 
 impl JournalBook for JournalText {
+    /// Reads the entry's own stretches alone: an entry with none is a miss of
+    /// that entry, whatever the others hold.
     fn read(&self, entry: u64, from: usize, lines: usize) -> Result<Page, Miss> {
-        Book::new(self.stretches(), &CODING).read(entry, from, lines)
+        let stretches = self.stretches(&entry_prefix(&self.owner, entry));
+        if stretches.is_empty() {
+            return Err(Miss::Entry(entry));
+        }
+        Book::new(stretches, &CODING).read(entry, from, lines)
     }
 
     fn grep(&self, pattern: &str, entry: Option<u64>, max: usize) -> Result<Hits, Miss> {
-        Book::new(self.stretches(), &CODING).grep(pattern, entry, max)
+        let prefix = match entry {
+            Some(e) => entry_prefix(&self.owner, e),
+            None => owner_prefix(&self.owner),
+        };
+        let stretches = self.stretches(&prefix);
+        if let (true, Some(e)) = (stretches.is_empty(), entry) {
+            return Err(Miss::Entry(e));
+        }
+        Book::new(stretches, &CODING).grep(pattern, entry, max)
     }
 }
 
@@ -155,7 +170,8 @@ mod tests {
              fn scan() {}"
         );
         assert_eq!(mine.grep("SCAN", None, 10).unwrap().total, 3);
-        assert_eq!(theirs.read(1, 1, 10), Err(Miss::Nothing));
+        assert_eq!(theirs.read(1, 1, 10), Err(Miss::Entry(1)));
+        assert_eq!(theirs.grep("scan", None, 10), Err(Miss::Nothing));
     }
 
     #[test]
@@ -168,7 +184,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(text.cease_all().unwrap(), 1);
-        assert_eq!(text.read(2, 1, 10), Err(Miss::Nothing));
+        assert_eq!(text.read(2, 1, 10), Err(Miss::Entry(2)));
+        assert_eq!(text.grep("done", None, 10), Err(Miss::Nothing));
         assert_eq!(text.cease_all().unwrap(), 0);
     }
 

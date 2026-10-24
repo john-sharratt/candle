@@ -19,6 +19,7 @@ questions:
 - give me the original wording of the user's first request
 - continue reading entry 6 from line 200
 category: Journal
+mandatory: true
 description: "Read the turns behind one of your journal entries, whole: what the user said, each tool result and what you replied, each turn headed by its number and time. Use it when an entry's one line is not enough — the exact file contents, error or answer from earlier. Pages like file_read: `offset` and `limit` in lines. To find which entry holds something, use journal_grep."
 parameters:
   $schema: http://json-schema.org/draft-07/schema#

@@ -162,7 +162,6 @@ mod tests {
     use super::*;
     use crate::entry::testing::entry as entry_at;
     use crate::entry::Kind;
-    use crate::journal::IN_PROMPT;
     use crate::style::testing::PLAIN;
     use crate::verify::Verdict;
 
@@ -212,13 +211,13 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_holds_only_the_newest_entries() {
+    fn the_prompt_holds_every_entry_the_journal_holds() {
         let mut j = Journal::new();
-        for _ in 0..(IN_PROMPT + 2) {
+        for _ in 0..7 {
             j.kept(entry(0));
         }
         let ids = view(&j, &PLAIN)["in_prompt"].as_array().unwrap().len();
-        assert_eq!(ids, IN_PROMPT);
+        assert_eq!(ids, 7);
     }
 
     #[test]

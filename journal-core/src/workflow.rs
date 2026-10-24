@@ -57,14 +57,16 @@ pub trait Desk: Send {
         question: &str,
     ) -> impl Future<Output = anyhow::Result<String>> + Send;
 
-    /// Keep the journal as it will read once the new entry is in it, and the
-    /// stretch's turns filed under the entry they went into — `None` for a
-    /// stretch no entry takes, before the first. The turns first: the journal's
-    /// record is what says the stretch is covered.
+    /// Keep the journal as it will read once the new entry is in it, the text
+    /// filed under the entry it went into — `None` for a stretch no entry
+    /// takes, before the first — and the text of the entries `ceased` names
+    /// gone, as a fold leaves the entries it took. The text first: the
+    /// journal's record is what says the stretch is covered.
     fn keep(
         &mut self,
         prompt: &JournalPrompt,
         filed: Option<&Filed>,
+        ceased: &[u64],
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
@@ -144,7 +146,7 @@ async fn draft<D: Desk, S: Holds>(
         let held = hold(state);
         let journal = held.journal();
         let open = journal.open().to_vec();
-        let latest = journal.entries().last().cloned();
+        let latest = journal.latest_step().cloned();
         (open, latest)
     };
     let Some(specs) = tools::draft_specs(&span.citable_ids(), &open, latest.is_some()) else {
@@ -167,8 +169,9 @@ async fn draft<D: Desk, S: Holds>(
 struct Asked<'a> {
     specs: &'a [Value],
     open: &'a [Item],
-    /// The entry a skip files the stretch under — `None` before the first,
-    /// when there is nothing to weigh the stretch against and no skip.
+    /// The entry a skip files the stretch under — `None` when the latest entry
+    /// is no step (before the first, or after a fold), when there is nothing
+    /// to weigh the stretch against and no skip.
     latest: Option<&'a Entry>,
 }
 
@@ -249,10 +252,10 @@ async fn settle<D: Desk, S: Holds>(
     let (prompt, filed) = {
         let held = hold(state);
         let journal = held.journal();
-        let filed = journal.entries().last().map(|e| Filed::of(e.id, span));
+        let filed = journal.latest_step().map(|e| Filed::of(e.id, span));
         (journal.prompt_covering(span, style), filed)
     };
-    if let Err(e) = desk.keep(&prompt, filed.as_ref()).await {
+    if let Err(e) = desk.keep(&prompt, filed.as_ref(), &[]).await {
         return Outcome::Abandoned(Abandon::Keeping(e.to_string()));
     }
     hold(state).journal_mut().nothing_to_write(span);
@@ -277,7 +280,7 @@ async fn keep<D: Desk, S: Holds>(
         (staged, prompt)
     };
     let filed = Filed::of(staged.id, span);
-    if let Err(e) = desk.keep(&prompt, Some(&filed)).await {
+    if let Err(e) = desk.keep(&prompt, Some(&filed), &[]).await {
         return Outcome::Abandoned(Abandon::Keeping(e.to_string()));
     }
     let entry = hold(state).journal_mut().kept(staged);
@@ -343,6 +346,7 @@ mod tests {
             &mut self,
             prompt: &JournalPrompt,
             filed: Option<&Filed>,
+            _ceased: &[u64],
         ) -> anyhow::Result<()> {
             if self.refuse_keeping {
                 anyhow::bail!("the substrate said no");

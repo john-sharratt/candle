@@ -1,10 +1,12 @@
 //! What one journal holds, and the bookkeeping of what it covers.
 //!
-//! The journal is the newest [`IN_PROMPT`] entries and the open items: exactly
-//! what its writer reads in its system prompt, and what the substrate holds for
-//! it as sections of its conversation ([`crate::section`]). The rest is
-//! bookkeeping: which turns the journal covers, which have been looked at, and
-//! whether a draft is running.
+//! The journal is its entries and the open items: exactly what its writer reads
+//! in its system prompt, and what the substrate holds for it as sections of its
+//! conversation ([`crate::section`]). It stays short by folding, not by
+//! forgetting: the steps of a day that is over fold into one entry for the day,
+//! a week's days into the week, and so on up to years ([`crate::fold`]). The
+//! rest is bookkeeping: which turns the journal covers, which have been looked
+//! at, and whether a draft or a fold is running.
 //!
 //! **When a draft is due is the caller's.** A character in a game drafts every
 //! sixteen turns of its perception window and before a turn falls off it; a
@@ -14,17 +16,16 @@
 use std::collections::VecDeque;
 
 use crate::entry::{Entry, Item};
+use crate::fold::Fold;
+use crate::period::Period;
 use crate::record::DraftRecord;
-use crate::section::{JournalPrompt, Kept};
+use crate::section::{entry_section, JournalPrompt, Kept};
 use crate::span::{Span, SpanTurn};
 use crate::style::Style;
 
 /// Open items held at once. Past it the oldest is dropped: a list of everything
 /// ever left unfinished is the same problem the journal exists to solve.
 pub const MAX_OPEN: usize = 6;
-/// Entries the journal holds, and its writer reads: when a newer one is kept the
-/// oldest falls out of the prompt and out of the substrate with it.
-pub const IN_PROMPT: usize = 5;
 /// Draft records kept for inspection.
 pub const KEPT_DRAFTS: usize = 16;
 
@@ -47,6 +48,10 @@ pub struct Journal {
     next_entry: u64,
     next_item: u64,
     drafts: VecDeque<DraftRecord>,
+    /// Entries a fold or a forget took whose sections no reconcile has swept
+    /// yet ([`Self::swept`]); kept in the record, so a run that restarts in
+    /// between still names them.
+    removed: Vec<u64>,
 }
 
 impl Default for Journal {
@@ -76,6 +81,7 @@ impl Journal {
             next_entry: 1,
             next_item: 1,
             drafts: VecDeque::new(),
+            removed: Vec::new(),
         }
     }
 
@@ -92,6 +98,7 @@ impl Journal {
             j.apply(e);
         }
         j.open = kept.open;
+        j.removed = kept.removed;
         j.next_item = j.next_item.max(kept.next_item);
         j.covered_to = covered_to;
         j.looked_to = covered_to;
@@ -117,6 +124,62 @@ impl Journal {
 
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter()
+    }
+
+    /// The latest entry when it is a step: the one a skipped stretch runs on
+    /// over ([`Self::nothing_to_write`]).
+    pub fn latest_step(&self) -> Option<&Entry> {
+        self.entries.back().filter(|e| e.period == Period::Step)
+    }
+
+    /// Start a fold: single flight with drafts, so neither works from a
+    /// journal the other is changing. `false` while either is running.
+    pub fn begin_fold(&mut self) -> bool {
+        if self.pending {
+            return false;
+        }
+        self.pending = true;
+        true
+    }
+
+    /// The journal once `staged` — the entry a fold made, under the id
+    /// [`Self::stage`] gave it — has replaced the entries `fold` names, in
+    /// the place the first of them held.
+    fn folded(&self, fold: &Fold, staged: &Entry) -> Self {
+        let mut next = self.clone();
+        let at = next
+            .entries
+            .iter()
+            .position(|e| fold.ids.contains(&e.id))
+            .unwrap_or(next.entries.len());
+        next.entries.retain(|e| !fold.ids.contains(&e.id));
+        next.entries
+            .insert(at.min(next.entries.len()), staged.clone());
+        next.next_entry = next.next_entry.max(staged.id + 1);
+        next.removed.extend(fold.ids.iter().copied());
+        next
+    }
+
+    /// The journal as a conversation should hold it once `staged` has replaced
+    /// the entries `fold` names, for the substrate to take before the state
+    /// does; it names their sections as gone.
+    pub fn prompt_after_fold(&self, fold: &Fold, staged: &Entry, style: &Style) -> JournalPrompt {
+        self.folded(fold, staged).prompt(style)
+    }
+
+    /// A reconcile has swept the sections `prompt` named as removed: they need
+    /// not be named again. Entries removed since that prompt was taken stay.
+    pub fn swept(&mut self, prompt: &JournalPrompt) {
+        self.removed
+            .retain(|id| !prompt.removed.contains(&entry_section(*id)));
+    }
+
+    /// The fold was kept: `staged` replaces the entries `fold` names.
+    pub fn kept_fold(&mut self, fold: &Fold, staged: Entry) {
+        *self = Self {
+            pending: false,
+            ..self.folded(fold, &staged)
+        };
     }
 
     /// Entries ever kept, including those that have left memory.
@@ -167,6 +230,16 @@ impl Journal {
         entry
     }
 
+    /// [`Self::stage`], and the id taken at once: an entry kept while this one
+    /// is still being written down — a closing entry beside a fold in flight
+    /// ([`Self::keep_closing`]) — takes the next. A reservation never kept is
+    /// an id skipped, as an id once used is never reused.
+    pub fn reserve(&mut self, entry: Entry) -> Entry {
+        let entry = self.stage(entry);
+        self.next_entry = self.next_entry.max(entry.id + 1);
+        entry
+    }
+
     /// The draft was written. Assigns the entry its id and any new open item its
     /// id, and returns the entry as kept.
     pub fn kept(&mut self, entry: Entry) -> Entry {
@@ -188,10 +261,10 @@ impl Journal {
     /// is about — so it is that entry's: its span runs on to the stretch's
     /// end, and the turns are found under it. The verdict is final for those
     /// turns: `covered_to` moves past them, so the next draft is asked only
-    /// about what has happened since. With no entry yet the stretch is only
-    /// covered.
+    /// about what has happened since. With no step to run on — no entry yet,
+    /// or only folded ones — the stretch is only covered.
     pub fn nothing_to_write(&mut self, span: &Span) {
-        if let Some(latest) = self.entries.back_mut() {
+        if let Some(latest) = self.entries.back_mut().filter(|e| e.period == Period::Step) {
             latest.to_turn = latest.to_turn.max(span.to_turn);
             latest.to_ms = latest.to_ms.max(span.to_ms);
         }
@@ -216,6 +289,7 @@ impl Journal {
             .filter(|id| ids.contains(id))
             .collect();
         self.entries.retain(|e| !gone.contains(&e.id));
+        self.removed.extend(gone.iter().copied());
         gone
     }
 
@@ -226,6 +300,7 @@ impl Journal {
             open: self.open.clone(),
             next_item: self.next_item,
             covered_to: self.covered_to,
+            removed: self.removed.clone(),
         }
     }
 
@@ -241,6 +316,7 @@ impl Journal {
     /// The journal as a conversation should hold it now.
     pub fn prompt(&self, style: &Style) -> JournalPrompt {
         JournalPrompt::of(&self.snapshot(), style)
+            .without(self.removed.iter().map(|id| entry_section(*id)).collect())
     }
 
     /// The journal as a conversation should hold it once `staged` is kept, for
@@ -276,9 +352,6 @@ impl Journal {
         }
         self.open = self.open_after(&entry);
         self.entries.push_back(entry);
-        while self.entries.len() > IN_PROMPT {
-            self.entries.pop_front();
-        }
     }
 }
 
@@ -289,6 +362,7 @@ mod tests {
     use super::*;
     use crate::entry::testing::{entry_to, item};
     use crate::entry::Kind;
+    use crate::fold;
     use crate::section::restore;
     use crate::span::testing::turn;
     use crate::style::testing::PLAIN;
@@ -465,19 +539,18 @@ mod tests {
     }
 
     #[test]
-    fn only_the_newest_entries_are_held() {
+    fn every_entry_is_held_until_it_folds() {
         let mut j = Journal::new();
-        for n in 0..(IN_PROMPT as u64 + 3) {
+        for n in 0..12 {
             j.kept(entry_to(n + 1));
         }
-        assert_eq!(j.entries().count(), IN_PROMPT);
-        assert_eq!(j.entries().next().unwrap().id, 4);
+        assert_eq!(j.entries().count(), 12);
     }
 
     #[test]
     fn the_prompt_after_a_staged_entry_is_what_the_prompt_is_once_it_is_kept() {
         let mut j = Journal::new();
-        for n in 0..(IN_PROMPT as u64 + 1) {
+        for n in 0..3 {
             j.kept(entry_to(n + 1));
         }
         let staged = j.stage(entry_to(50));
@@ -490,7 +563,127 @@ mod tests {
         );
         j.kept(staged);
         assert_eq!(j.prompt(&PLAIN), after);
-        assert_eq!(after.aged_out.as_deref(), Some("journal/2"));
+        assert!(after.removed.is_empty());
+    }
+
+    /// Steps 1 and 2 of day 1, step 3 of day 2.
+    fn two_days() -> Journal {
+        let mut j = Journal::new();
+        for (to_turn, from_ms, to_ms) in [(3, 1_100, 1_200), (6, 1_500, 1_900), (9, 2_100, 2_200)] {
+            j.kept(Entry {
+                from_ms,
+                to_ms,
+                ..entry_to(to_turn)
+            });
+        }
+        j
+    }
+
+    fn day_one() -> Fold {
+        Fold {
+            into: Period::Day,
+            ids: vec![1, 2],
+        }
+    }
+
+    #[test]
+    fn a_fold_replaces_its_entries_in_their_place_under_the_next_id() {
+        let mut j = two_days();
+        assert!(j.begin_fold());
+        let all: Vec<Entry> = j.entries().cloned().collect();
+        let staged = j.stage(fold::entry(
+            &day_one(),
+            &all,
+            "Day one.".into(),
+            "All of it.".into(),
+        ));
+        assert_eq!(staged.id, 4);
+        let after = j.prompt_after_fold(&day_one(), &staged, &PLAIN);
+        assert_eq!(j.entries().count(), 3, "nothing changes until it is kept");
+        j.kept_fold(&day_one(), staged);
+        let held: Vec<(u64, Period)> = j.entries().map(|e| (e.id, e.period)).collect();
+        assert_eq!(held, [(4, Period::Day), (3, Period::Step)]);
+        assert!(!j.pending());
+        assert_eq!(j.prompt(&PLAIN).sections, after.sections);
+        assert_eq!(after.removed, ["journal/1", "journal/2"]);
+        assert_eq!(j.kept(entry_to(12)).id, 5, "ids keep counting up");
+    }
+
+    /// The review's case: a closing entry kept while a fold is still being
+    /// written down takes the id after the fold's, not the same one.
+    #[test]
+    fn an_entry_kept_beside_a_fold_in_flight_takes_the_next_id() {
+        let mut j = two_days();
+        assert!(j.begin_fold());
+        let all: Vec<Entry> = j.entries().cloned().collect();
+        let staged = j.reserve(fold::entry(
+            &day_one(),
+            &all,
+            "Day one.".into(),
+            "All of it.".into(),
+        ));
+        let closing = j.keep_closing(entry_to(12));
+        assert_eq!((staged.id, closing.id), (4, 5));
+        j.kept_fold(&day_one(), staged);
+        let ids: Vec<u64> = j.entries().map(|e| e.id).collect();
+        assert_eq!(ids, [4, 3, 5], "every id held once");
+    }
+
+    /// The review's case: the sections a fold took are named by every prompt
+    /// — the record included, so a restart still sweeps them — until a
+    /// reconcile has swept them.
+    #[test]
+    fn folded_sections_are_named_until_a_reconcile_sweeps_them() {
+        let mut j = two_days();
+        assert!(j.begin_fold());
+        let all: Vec<Entry> = j.entries().cloned().collect();
+        let staged = j.reserve(fold::entry(
+            &day_one(),
+            &all,
+            "Day one.".into(),
+            "All of it.".into(),
+        ));
+        j.kept_fold(&day_one(), staged);
+        let prompt = j.prompt(&PLAIN);
+        assert_eq!(prompt.sweep(), ["journal/1", "journal/2"]);
+        let restored = Journal::restore(restore(prompt.record()).unwrap(), 0);
+        assert_eq!(restored.prompt(&PLAIN).sweep(), ["journal/1", "journal/2"]);
+
+        j.forget(&[3]);
+        j.swept(&prompt);
+        assert_eq!(
+            j.prompt(&PLAIN).sweep(),
+            ["journal/3"],
+            "what was forgotten after the sweep's prompt is still named"
+        );
+    }
+
+    #[test]
+    fn a_fold_is_single_flight_with_drafts() {
+        let mut j = two_days();
+        j.begin(turns(10, 2), 11).unwrap();
+        assert!(!j.begin_fold(), "a draft is running");
+        j.abandon();
+        assert!(j.begin_fold());
+        assert!(j.begin(turns(10, 2), 11).is_none(), "a fold is running");
+    }
+
+    #[test]
+    fn a_skip_after_a_fold_runs_on_over_no_entry() {
+        let mut j = Journal::new();
+        j.kept(Entry {
+            period: Period::Day,
+            ..entry_to(5)
+        });
+        assert!(j.latest_step().is_none());
+        let span = j.begin(turns(6, 2), 7).unwrap();
+        j.nothing_to_write(&span);
+        assert_eq!(
+            j.entries().next().unwrap().to_turn,
+            5,
+            "a day is not run on"
+        );
+        assert_eq!(j.covered_to(), 7);
     }
 
     #[test]
@@ -510,6 +703,7 @@ mod tests {
             open: vec![item(9, "open one")],
             next_item: 12,
             covered_to: 7,
+            removed: vec![],
         };
         let mut j = Journal::restore(kept, 0);
         assert_eq!(j.covered_to(), 0, "the caller says what is covered");
@@ -532,6 +726,7 @@ mod tests {
             open: Vec::new(),
             next_item: 1,
             covered_to: 52,
+            removed: vec![],
         };
         let j = Journal::restore(kept.clone(), kept.covered_to);
         assert_eq!((j.covered_to(), j.looked_to()), (52, 52));
@@ -580,11 +775,12 @@ mod tests {
     fn the_count_written_survives_entries_leaving_the_journal() {
         let mut j = Journal::new();
         assert_eq!(j.written(), 0);
-        for n in 0..(IN_PROMPT as u64 + 3) {
+        for n in 0..4 {
             j.kept(entry_to(n + 1));
         }
-        assert_eq!(j.written(), IN_PROMPT as u64 + 3);
-        assert_eq!(j.entries().count(), IN_PROMPT);
+        j.forget(&[1, 2]);
+        assert_eq!(j.written(), 4);
+        assert_eq!(j.entries().count(), 2);
     }
 
     #[test]

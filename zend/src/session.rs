@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::client::Agents;
 use agent::jobs::Jobs;
@@ -55,6 +55,9 @@ use candle_conversation::{
 };
 use host::download::ensure_model_pack;
 use host::process::fatal;
+use journal_core::entry::Entry;
+use journal_core::fold;
+use journal_core::folding::{self, Folded};
 use journal_core::journal::Holds;
 use journal_core::record::view as journal_view;
 use journal_core::section::{JournalPrompt, Kept, JOURNAL};
@@ -90,10 +93,10 @@ use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
-use crate::journal::desk::{Asking, Compile, Record, ZendDesk};
+use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
 use crate::journal::record::{kept_in, metadata_of};
 use crate::journal::registry::{Journals, Open};
-use crate::journal::state::SessionJournal;
+use crate::journal::state::{SessionJournal, FOLD_SWEEP_EVERY};
 use crate::journal::style::CODING;
 use crate::journal::text::JournalText;
 use crate::journal::world::ConversationFiles;
@@ -2985,6 +2988,24 @@ impl InferenceState {
                 }
             }
         });
+        // The journals' calendar: every open conversation folds the periods
+        // that have ended since it last looked — a day turning over while
+        // nobody talks to it included.
+        if state.journaling {
+            let folding = Arc::downgrade(&state);
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(FOLD_SWEEP_EVERY);
+                loop {
+                    every.tick().await;
+                    let Some(state) = folding.upgrade() else {
+                        return;
+                    };
+                    for conv_id in state.journals.open_ids() {
+                        begin_journal_folds(&state, &conv_id, conversation_timeline(&conv_id));
+                    }
+                }
+            });
+        }
         Ok(Some(state))
     }
 
@@ -4706,15 +4727,20 @@ fn run_inference_stream(
                         newest,
                         selected: selected_turns.as_deref(),
                     };
-                    if let Ok(span) = begin_journal_draft(&state, &conv_id, timeline, cadence) {
-                        tracing::info!(
+                    match begin_journal_draft(&state, &conv_id, timeline, cadence) {
+                        Ok(span) => tracing::info!(
                             target: "zend::journal",
                             conv_id = %conv_id,
                             from_part = span.from_turn,
                             to_part = span.to_turn,
                             parts = span.turns.len(),
                             "journal draft started",
-                        );
+                        ),
+                        // No draft holds the journal: a period that ended
+                        // since the last round folds now.
+                        Err(_) => {
+                            begin_journal_folds(&state, &conv_id, timeline);
+                        }
                     }
                 }
             }
@@ -4973,6 +4999,7 @@ async fn carry_journal(
             tokio::time::sleep,
         )
         .await;
+    journal.lock().unwrap().journal_mut().swept(&prompt);
     carry::select(selection, &sealed);
 }
 
@@ -5067,6 +5094,7 @@ fn journal_desk(
     state: &Arc<InferenceState>,
     timeline: TimelineId,
     asker: UnsealedAsker,
+    max_tokens: usize,
 ) -> ZendDesk {
     let dialect = state.refresh_config.dialect.clone();
     let env = ToolCallEnvelope::for_assistant_calls(&dialect);
@@ -5089,25 +5117,38 @@ fn journal_desk(
     let mut sampling = state.refresh_config.sampling.clone();
     sampling.temperature = 0.0;
     let recording = Arc::clone(state);
-    let record: Record = Box::new(move |prompt: &JournalPrompt, filed: Option<&Filed>| {
-        let engine = recording.engine.lock().unwrap();
-        let text = JournalText::of(engine.conversation().shared(), timeline);
-        if let Some(filed) = filed {
-            text.file(filed)?;
-        }
-        if let Some(aged) = prompt.aged_out_entry() {
-            text.cease_entry(aged)?;
-        }
-        engine
-            .set_conversation_metadata_many(timeline, &metadata_of(prompt))
-            .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"))
-    });
+    let record: Record = Box::new(
+        move |prompt: &JournalPrompt, filed: Option<&Filed>, ceased: &[u64]| {
+            // The engine's lock is held only to take the handles: the
+            // substrate writes below wait on persistence, and every reader of
+            // the engine would wait behind them.
+            let (conversation, shared) = {
+                let engine = recording.engine.lock().unwrap();
+                (engine.conversation(), engine.conversation().shared())
+            };
+            let text = JournalText::of(shared, timeline);
+            if let Some(filed) = filed {
+                text.file(filed)?;
+            }
+            conversation
+                .set_conversation_metadata_many(timeline, &metadata_of(prompt))
+                .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"))?;
+            // Only once the record no longer holds them: a fold whose record
+            // fails is abandoned with its entries still in the journal, and
+            // their text must still be there to read.
+            for entry in ceased {
+                text.cease_entry(*entry)?;
+            }
+            Ok(())
+        },
+    );
     ZendDesk::new(
         Asking {
             asker,
             compile,
             prefill,
             sampling,
+            max_tokens,
         },
         record,
     )
@@ -5118,7 +5159,7 @@ fn journal_desk(
 fn cease_journal_text(
     engine: &ConversationEngine,
     timeline: TimelineId,
-) -> candle_conversation::Result<()> {
+) -> Result<(), ConversationError> {
     JournalText::of(engine.conversation().shared(), timeline)
         .cease_all()
         .map(|_| ())
@@ -5142,7 +5183,7 @@ fn spawn_journal_draft(
     span: Span,
 ) {
     tokio::spawn(async move {
-        let mut desk = journal_desk(&state, timeline, open.asker);
+        let mut desk = journal_desk(&state, timeline, open.asker, WRITE_TOKENS);
         let world = ConversationFiles::of(open.files);
         let record = draft::draft(&mut desk, &journal, &span, &world).await;
         tracing::info!(
@@ -5159,17 +5200,105 @@ fn spawn_journal_draft(
             checks = ?record.checks,
             "journal draft ended",
         );
-        // The sections follow the record now rather than at the next round's
-        // head, so they are sealing — a chain one link after another — while
-        // the user is still reading the reply, and the next round reads the
-        // entry. A conversation busy in a round is left to that round's own
-        // reconcile, which does the same.
-        let held = state.conversations.lock().unwrap().get(&conv_id).cloned();
-        if let Some(conversation) = held {
-            if let Ok(mut cs) = conversation.try_lock() {
-                let mut unused = SelectionState::default();
-                carry_journal(&state, &conv_id, timeline, &mut cs, &mut unused).await;
+        reconcile_journal_now(&state, &conv_id, timeline).await;
+        // A draft held the journal; a period that ended meanwhile folds now.
+        begin_journal_folds(&state, &conv_id, timeline);
+    });
+}
+
+/// Hand `conv_id`'s journal sections to its conversation now rather than at
+/// the next round's head, so they are sealing — a chain one link after another
+/// — while the user is still reading the reply, and the next round reads them.
+/// A conversation busy in a round is left to that round's own reconcile, which
+/// does the same.
+async fn reconcile_journal_now(state: &Arc<InferenceState>, conv_id: &str, timeline: TimelineId) {
+    let held = state.conversations.lock().unwrap().get(conv_id).cloned();
+    if let Some(conversation) = held {
+        if let Ok(mut cs) = conversation.try_lock() {
+            let mut unused = SelectionState::default();
+            carry_journal(state, conv_id, timeline, &mut cs, &mut unused).await;
+        }
+    }
+}
+
+/// Milliseconds since the Unix epoch, now.
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Start folding `conv_id`'s journal if a period of it has ended, the
+/// conversation is open — the fold asks it, through a fork of its slot — no
+/// draft or fold is running, and no fold was given up on lately
+/// ([`SessionJournal::may_fold`]).
+fn begin_journal_folds(state: &Arc<InferenceState>, conv_id: &str, timeline: TimelineId) {
+    let Some(open) = state.journals.open(conv_id) else {
+        return;
+    };
+    let journal = state
+        .journals
+        .of(conv_id, || journal_record(state, timeline));
+    {
+        let held = journal.lock().unwrap();
+        let entries: Vec<Entry> = held.journal().entries().cloned().collect();
+        if held.journal().pending()
+            || !held.may_fold(Instant::now())
+            || fold::next(&entries, wall_ms(), &CODING).is_none()
+        {
+            return;
+        }
+    }
+    spawn_journal_folds(
+        Arc::clone(state),
+        conv_id.to_string(),
+        timeline,
+        open,
+        journal,
+    );
+}
+
+/// Fold every period of the journal that has ended, one after another, as a
+/// task of its own; then hand the journal to the conversation.
+fn spawn_journal_folds(
+    state: Arc<InferenceState>,
+    conv_id: String,
+    timeline: TimelineId,
+    open: Open,
+    journal: Arc<Mutex<SessionJournal>>,
+) {
+    tokio::spawn(async move {
+        let mut desk = journal_desk(&state, timeline, open.asker, FOLD_TOKENS);
+        let mut folded = 0usize;
+        loop {
+            match folding::run(&mut desk, &journal, wall_ms(), &CODING).await {
+                Folded::Kept { fold, entry } => {
+                    folded += 1;
+                    tracing::info!(
+                        target: "zend::journal",
+                        conv_id = %conv_id,
+                        into = fold.into.name(),
+                        took = ?fold.ids,
+                        entry = entry.id,
+                        summary = %entry.summary,
+                        "journal fold kept",
+                    );
+                }
+                Folded::Nothing => break,
+                Folded::Abandoned(why) => {
+                    tracing::warn!(
+                        target: "zend::journal",
+                        conv_id = %conv_id,
+                        why = ?why,
+                        "journal fold abandoned",
+                    );
+                    journal.lock().unwrap().fold_failed(Instant::now());
+                    break;
+                }
             }
+        }
+        if folded > 0 {
+            reconcile_journal_now(&state, &conv_id, timeline).await;
         }
     });
 }

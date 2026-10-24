@@ -2,9 +2,9 @@
 //! rebuilds it from.
 //!
 //! A journal is a collection of sections of its writer's **own conversation**:
-//! one section per kept entry, the newest [`IN_PROMPT`] of them, and one for the
-//! items left open. They are submitted as entries are written and the section of
-//! an entry that ages out of the newest few is removed, so they are sealed,
+//! one section per entry it holds, and one for the items left open. They are
+//! submitted as entries are written, and the sections of the entries a fold
+//! takes are removed as the folded entry's is submitted, so they are sealed,
 //! persisted and tombstoned with the conversation they belong to.
 //!
 //! # What survives a restart
@@ -18,7 +18,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::entry::{Entry, Item};
-use crate::journal::IN_PROMPT;
 use crate::style::Style;
 
 /// The collection a journal's sections are submitted to.
@@ -60,6 +59,9 @@ pub struct Kept {
     /// nothing to add. Not the entries' own coverage: a stretch skipped after
     /// the newest entry is settled too, and a restart must not draft it again.
     pub covered_to: u64,
+    /// Entries folded or forgotten whose sections no reconcile has swept yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<u64>,
 }
 
 impl Kept {
@@ -83,9 +85,9 @@ pub struct JournalPrompt {
     /// section present, even with nothing open, whenever there is a journal at
     /// all, because it is where the journal says it ends.
     pub sections: Vec<Section>,
-    /// The section of the entry that has just left the newest [`IN_PROMPT`],
-    /// which a conversation that did not see it leave may still hold.
-    pub aged_out: Option<String>,
+    /// The sections of the entries a fold just took, which a conversation that
+    /// did not see them go may still hold.
+    pub removed: Vec<String>,
     record: String,
 }
 
@@ -108,16 +110,16 @@ impl JournalPrompt {
                 text: render_open(&kept.open, style),
             });
         }
-        let aged_out = kept
-            .newest()
-            .checked_sub(IN_PROMPT as u64)
-            .filter(|id| *id >= 1)
-            .map(entry_section);
         Self {
             sections,
-            aged_out,
+            removed: Vec::new(),
             record: serde_json::to_string(kept).unwrap_or_default(),
         }
+    }
+
+    /// This prompt, naming `removed` as the sections that just left it.
+    pub fn without(self, removed: Vec<String>) -> Self {
+        Self { removed, ..self }
     }
 
     /// Whether anything has been written down.
@@ -130,23 +132,12 @@ impl JournalPrompt {
         &self.record
     }
 
-    /// The number of the entry that just aged out, whose kept text
-    /// ([`crate::transcript`]) goes with it.
-    pub fn aged_out_entry(&self) -> Option<u64> {
-        self.aged_out
-            .as_deref()?
-            .strip_prefix(JOURNAL)?
-            .strip_prefix('/')?
-            .parse()
-            .ok()
-    }
-
-    /// The section a conversation that did not see it leave may still hold: the
-    /// entry that just aged out. A fresh reconcile removes it, because streams an
-    /// earlier run sealed are invisible to it. Anything else stale is merely not
-    /// selected — a journal is read by name.
+    /// The sections a conversation that did not see them go may still hold:
+    /// the entries a fold just took. A fresh reconcile removes them, because
+    /// streams an earlier run sealed are invisible to it. Anything else stale
+    /// is merely not selected — a journal is read by name.
     pub fn sweep(&self) -> Vec<&str> {
-        self.aged_out.as_deref().into_iter().collect()
+        self.removed.iter().map(String::as_str).collect()
     }
 }
 
@@ -182,6 +173,7 @@ mod tests {
             open,
             next_item: 9,
             covered_to: 0,
+            removed: vec![],
         }
     }
 
@@ -189,7 +181,7 @@ mod tests {
     fn a_journal_with_nothing_written_holds_no_sections() {
         let p = JournalPrompt::of(&kept(&[], vec![]), &PLAIN);
         assert!(p.is_empty());
-        assert_eq!(p.aged_out, None);
+        assert!(p.removed.is_empty());
     }
 
     #[test]
@@ -216,15 +208,14 @@ mod tests {
     }
 
     #[test]
-    fn the_entry_that_just_left_the_newest_five_is_named_as_aged_out() {
-        let young = JournalPrompt::of(&kept(&[1, 2, 3, 4, 5], vec![]), &PLAIN);
-        assert_eq!(young.aged_out, None);
-        let old = JournalPrompt::of(&kept(&[2, 3, 4, 5, 6], vec![]), &PLAIN);
-        assert_eq!(old.aged_out.as_deref(), Some("journal/1"));
-        assert_eq!(old.sweep(), ["journal/1"]);
-        assert!(young.sweep().is_empty());
-        assert_eq!(old.aged_out_entry(), Some(1));
-        assert_eq!(young.aged_out_entry(), None);
+    fn the_sections_a_fold_took_are_swept() {
+        let p = JournalPrompt::of(&kept(&[7, 8], vec![]), &PLAIN);
+        assert!(
+            p.sweep().is_empty(),
+            "nothing is swept unless a fold took it"
+        );
+        let folded = p.without(vec![entry_section(1), entry_section(2)]);
+        assert_eq!(folded.sweep(), ["journal/1", "journal/2"]);
     }
 
     #[test]

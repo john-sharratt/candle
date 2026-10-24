@@ -8,6 +8,8 @@
 //! dates its stretch on its world's calendar and reads "Heard:" for what a peer
 //! said; a coding assistant dates it in UTC and reads "User said:".
 
+use crate::period::Period;
+
 /// The wording an entry renders with.
 #[derive(Clone, Copy, Debug)]
 pub struct Style {
@@ -62,11 +64,37 @@ pub struct Style {
     /// `journal_skip`, with a reason, is the answer when the stretch adds
     /// nothing to it.
     pub skip_question: &'static str,
+    /// The journal's calendar: which `period` the instant `at_ms` falls in, as
+    /// a number that grows with time ([`crate::period`]).
+    pub bucket: fn(period: Period, at_ms: u64) -> u64,
+    /// The `period` that `at_ms` falls in, named as the fold question names
+    /// it: "Thursday 2026-10-23", "the week of 2026-10-19".
+    pub period_name: fn(period: Period, at_ms: u64) -> String,
+    /// What the writer is asked once the entries of a period that is over are
+    /// on the table: the `journal_fold` call, and what each part of it is.
+    pub fold_question: &'static str,
 }
 
 #[cfg(test)]
 pub(crate) mod testing {
     use super::Style;
+    use crate::period::Period;
+
+    /// A calendar of round numbers: a "day" of 1000 ms, a "week" of 7000, a
+    /// "month" of 30 000, a "year" of 360 000.
+    fn bucket(period: Period, at_ms: u64) -> u64 {
+        match period {
+            Period::Step => at_ms,
+            Period::Day => at_ms / 1_000,
+            Period::Week => at_ms / 7_000,
+            Period::Month => at_ms / 30_000,
+            Period::Year => at_ms / 360_000,
+        }
+    }
+
+    fn period_name(period: Period, at_ms: u64) -> String {
+        format!("{} {}", period.name(), bucket(period, at_ms))
+    }
 
     fn span(from_ms: u64, to_ms: u64) -> String {
         format!("[{from_ms}–{to_ms}]")
@@ -114,5 +142,8 @@ pub(crate) mod testing {
         stretch,
         write_question: "Write it up with journal_write.",
         skip_question: "Or skip it with journal_skip.",
+        bucket,
+        period_name,
+        fold_question: "Fold them with journal_fold.",
     };
 }

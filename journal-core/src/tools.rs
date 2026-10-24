@@ -58,7 +58,7 @@ pub enum Answer {
     Skip(String),
 }
 
-fn text(name: &str, required: bool) -> Value {
+pub(crate) fn text(name: &str, required: bool) -> Value {
     json!({ "name": name, "type": "string", "required": required })
 }
 
@@ -210,7 +210,7 @@ fn element_call(answer: &str) -> Option<(String, Map<String, Value>)> {
     Some((name, args))
 }
 
-fn text_of(v: &Value) -> Option<String> {
+pub(crate) fn text_of(v: &Value) -> Option<String> {
     let s = v.as_str()?.trim();
     (!s.is_empty()).then(|| s.to_string())
 }

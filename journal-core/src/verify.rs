@@ -13,6 +13,7 @@
 use std::collections::BTreeSet;
 
 use crate::entry::{Claim, Entry, Item, Kind, Typed};
+use crate::period::Period;
 use crate::span::Span;
 
 /// Claims one entry may carry.
@@ -305,6 +306,8 @@ pub fn verify(
             intend,
             opened,
             resolved,
+            period: Period::Step,
+            digest: String::new(),
         },
         notes,
     })

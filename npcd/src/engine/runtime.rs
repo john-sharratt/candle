@@ -40,6 +40,7 @@ use candle_conversation::projection::{
 use candle_conversation::{
     ConversationEngine, LoadPhase, Sequence, SequenceConfig, TurnEvent, TurnHandle, TurnResponse,
 };
+use journal_core::folding::Folded;
 use journal_core::journal::Holds;
 use journal_core::record::DraftRecord;
 use journal_core::section::JournalPrompt;
@@ -86,6 +87,7 @@ use crate::engine::guardian::GuardianLog;
 use crate::engine::identity;
 use crate::engine::ingest;
 use crate::engine::invoke_body::Invokable;
+use crate::engine::journal::style::NPC;
 use crate::engine::journal::world::Snapshot;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
@@ -3396,7 +3398,40 @@ impl Runtime {
             Ok((Drafted::Abandoned(why), _)) => {
                 tracing::warn!("npc {npc_id}: the journal entry was not written — {why:?}")
             }
-            Err(_) => {}
+            Err(_) => return,
+        }
+        // A character's time is its own: the newest turn just covered says
+        // which of its world's days, weeks and months are over, and those fold.
+        let folds = minds
+            .fold_journal(
+                npc_id,
+                &who.as_persona(),
+                &within,
+                &due.state,
+                due.span.to_ms,
+            )
+            .await;
+        // Each kept fold was held by `Minds::keep_journal`, whose reconcile
+        // swept the sections it took: they need not be named again.
+        if folds.iter().any(|f| matches!(f, Folded::Kept { .. })) {
+            let mut held = due.state.lock().unwrap();
+            let swept = held.journal().prompt(&NPC);
+            held.journal_mut().swept(&swept);
+        }
+        for folded in folds {
+            match folded {
+                Folded::Kept { fold, entry } => tracing::info!(
+                    "npc {npc_id}: journal {} {:?} folded into entry {} — {}",
+                    fold.into.name(),
+                    fold.ids,
+                    entry.id,
+                    entry.summary,
+                ),
+                Folded::Abandoned(why) => {
+                    tracing::warn!("npc {npc_id}: a journal fold was not kept — {why:?}")
+                }
+                Folded::Nothing => {}
+            }
         }
     }
 

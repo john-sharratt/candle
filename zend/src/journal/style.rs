@@ -6,6 +6,7 @@
 //! therefore carries an absolute time (`[2026-10-23 14:20–14:41 UTC]`), never
 //! "twenty minutes ago".
 
+use journal_core::period::{civil_from_days, utc_bucket, Period};
 use journal_core::style::Style;
 
 use crate::layers::days::day_of;
@@ -49,6 +50,65 @@ a test passing or failing, a decision taken. If this stretch is more of the task
 entry is about — more reading, more searching, more of the same step — answer with \
 journal_skip instead, its `reason` in one short sentence; the stretch is filed under that \
 entry.";
+
+/// Asked once the entries of a period that is over are in front of the
+/// writer. The call is shown nowhere else, so the question says what each part
+/// of it is.
+pub const FOLD_QUESTION: &str = "Fold them into one entry with journal_fold. `summary` is the \
+line your journal will keep for the whole period, in one short sentence: the tasks it was \
+and where they got to. `digest` is the account kept behind that line, for when you need more \
+than it says: each task or request in the order it came, what was found and decided, what was \
+changed — files, names, numbers as they were — what was told to the user, and what was left \
+unfinished, in a few short paragraphs. Put nothing in that the entries do not say.";
+
+const WEEKDAYS: [&str; 7] = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+];
+
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// `2026-10-23` for `days` after 1970-01-01.
+fn civil(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The UTC `period` that `ms` falls in, as the fold question names it.
+fn period_name(period: Period, ms: u64) -> String {
+    let day = (ms / MS_PER_DAY) as i64;
+    // 1970-01-01 was a Thursday: three days on from Monday.
+    let weekday = (day + 3).rem_euclid(7);
+    match period {
+        Period::Step | Period::Day => {
+            format!("{} {}", WEEKDAYS[weekday as usize], civil(day))
+        }
+        Period::Week => format!("the week of Monday {}", civil(day - weekday)),
+        Period::Month => {
+            let (y, m, _) = civil_from_days(day);
+            format!("{} {y}", MONTHS[(m - 1) as usize])
+        }
+        Period::Year => civil_from_days(day).0.to_string(),
+    }
+}
 
 /// `HH:MM` of the wall-clock instant `ms`, UTC.
 fn clock(ms: u64) -> String {
@@ -112,11 +172,15 @@ from its turns or from what was retrieved for it, not from your journal.",
     stretch,
     write_question: WRITE_QUESTION,
     skip_question: SKIP_QUESTION,
+    bucket: utc_bucket,
+    period_name,
+    fold_question: FOLD_QUESTION,
 };
 
 #[cfg(test)]
 mod tests {
     use journal_core::entry::{Claim, Entry, Item, Kind};
+    use journal_core::period::Period;
     use journal_core::section::render_open;
 
     use super::*;
@@ -147,6 +211,8 @@ mod tests {
             intend: vec![],
             opened: vec![],
             resolved: vec![],
+            period: Period::Step,
+            digest: String::new(),
         }
     }
 
@@ -208,6 +274,23 @@ mod tests {
         assert_eq!(
             render_open(&[], &CODING),
             format!("Still open: nothing.\n\n{end}")
+        );
+    }
+
+    #[test]
+    fn a_period_is_named_on_the_utc_calendar() {
+        // 2026-10-23 is a Friday; its week began on Monday the 19th.
+        assert_eq!(period_name(Period::Day, OCT_23_1420), "Friday 2026-10-23");
+        assert_eq!(
+            period_name(Period::Week, OCT_23_1420),
+            "the week of Monday 2026-10-19"
+        );
+        assert_eq!(period_name(Period::Month, OCT_23_1420), "October 2026");
+        assert_eq!(period_name(Period::Year, OCT_23_1420), "2026");
+        let monday = OCT_23_1420 - 4 * MS_PER_DAY;
+        assert_eq!(
+            period_name(Period::Week, monday),
+            "the week of Monday 2026-10-19"
         );
     }
 

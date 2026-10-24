@@ -152,6 +152,7 @@ impl JournalState {
 #[cfg(test)]
 mod tests {
     use journal_core::entry::Entry;
+    use journal_core::period::Period;
 
     use super::*;
     use crate::engine::event::{Event, EventKind, Salience};
@@ -174,6 +175,8 @@ mod tests {
             intend: vec!["carry on".into()],
             opened: vec![],
             resolved: vec![],
+            period: Period::Step,
+            digest: String::new(),
         }
     }
 
@@ -356,6 +359,7 @@ mod tests {
             open: Vec::new(),
             next_item: 1,
             covered_to: 140,
+            removed: Vec::new(),
         };
         let mut s = JournalState::restore(0, kept);
         assert_eq!(s.journal().written(), 3);

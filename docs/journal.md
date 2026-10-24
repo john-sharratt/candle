@@ -233,8 +233,8 @@ Per character, on the `Inbox` beside the window and the day
 
 | Field | Meaning |
 |---|---|
-| `entries` | the newest `IN_PROMPT` (5) kept entries, newest last: the ones the prompt carries |
-| `next_entry`, `next_item` | id counters; `written()` is `next_entry - 1`, every entry ever kept, including those aged out |
+| `entries` | every entry held, in journal order: today's steps and the day, week, month and year entries they have folded into (§5.2); the ones the prompt carries |
+| `next_entry`, `next_item` | id counters; `written()` is `next_entry - 1`, every entry ever kept, including those folded or forgotten |
 | `open` | live unresolved items, at most `MAX_OPEN` (6) |
 | `covered_to` | the last window turn id settled by a kept entry or a skip; an abandoned draft leaves it |
 | `looked_to` | the last turn id a draft in flight was handed; set by `begin` |
@@ -284,6 +284,20 @@ then what carries the work into the new conversation. A conversation that ran fo
 hours had Makers telling each other there was nothing left to report, and every
 turn re-read it; the chapter ends with the work.
 
+### 5.2 Folding on the world's calendar
+
+The journal stays short by folding, not forgetting (`journal_core::period`,
+`fold`, `folding`; the design is `docs/zend_journal.md` §4.2). After each draft,
+`Minds::fold_journal` folds every period of the character's world calendar that
+is over, taking the newest turn the draft covered as now: a world day's steps
+into a **day** entry, a week's days (Monday to Sunday) into a **week**, a
+month's weeks into a **month**, a year's months into a **year**. The character
+writes each fold itself — one `journal_fold` call, a one-line `summary` and a
+detailed `digest` — and the entries folded leave the journal and their sections
+the conversation. A skip runs on only over a step, so after a fold a skipped
+stretch is only covered. A character keeps no text behind its entries, so the
+digest lives in the entry alone.
+
 **Nothing is kept twice** (`journal::repeats`). Between the check and the keep, a
 claim or intention that nearly repeats one held in the journal or earlier in the
 same entry (≥ 70% of their distinct words shared), or a new open item that repeats
@@ -304,18 +318,19 @@ does not wait for a section to seal: a new entry joins the prompt from the first
 turn after it has, and until then the turns it was written from are still in the
 window. While nothing has sealed, `journal_none` shows.
 
-* **One section per entry** (`journal/<id>`), the newest `IN_PROMPT` (5) of them,
-  and one for the open items (`journal/open`), which closes the journal. They are
+* **One section per entry** (`journal/<id>`) the journal holds, and one for the
+  open items (`journal/open`), which closes the journal. They are
   a **chain**: each is sealed after the ones before it — attending to them, its
   recurrence running on from the state they leave — so read in order it is
   computed as it is read (`docs/deltanet_state_persistence.md` §11a.3b-i). A new
-  entry reseals itself and the closing section; one ageing out reseals what
-  follows it; a turn pins only the chain's sealed beginning.
+  entry reseals itself and the closing section; a fold reseals what follows the
+  place it took; a turn pins only the chain's sealed beginning.
   `Minds::prepare` reconciles them before each turn through the same `Carried`
   reconcile the mission uses (`mind/carried.rs`): what the prompt wants and is not
   yet held is submitted and sealed; a section the prompt no longer wants is
-  removed (`remove_section_named`). An entry that falls off the newest five is
-  therefore removed from the conversation.
+  removed (`remove_section_named`). The entries a fold took are therefore removed
+  from the conversation, and the prompt names them so a reconcile that did not
+  see them go sweeps them too.
 * **Sections are the conversation's.** They are sealed and persisted with it and
   released when it is tombstoned (`tombstone_timeline`), so a journal is gone
   exactly when its conversation is. A day roll-over or `retire_superseded`

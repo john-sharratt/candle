@@ -10,6 +10,8 @@
 //! turns' own and stable across restarts, so a journal restored from its record
 //! carries on from the last part its entries covered.
 
+use std::time::{Duration, Instant};
+
 use journal_core::journal::{Holds, Journal};
 use journal_core::section::Kept;
 use journal_core::span::{Span, SpanTurn};
@@ -20,9 +22,21 @@ use crate::journal::origin::{reply_part, turn_of};
 /// draft.
 pub const EVERY_TURNS: u32 = 16;
 
+/// How often open conversations are asked whether a period of their journal
+/// has ended and is due to fold. A conversation's own rounds ask as well; this
+/// is for the day that turns over while it sits open and quiet.
+pub const FOLD_SWEEP_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// How long after a fold was given up on before the same journal folds again.
+/// A fold that failed its rounds would otherwise be asked again on every round
+/// and every sweep — four decodes each time, against the dialogue's slot.
+pub const FOLD_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+
 #[derive(Debug, Default)]
 pub struct SessionJournal {
     journal: Journal,
+    /// When a fold was last given up on, if one was this run.
+    fold_failed_at: Option<Instant>,
 }
 
 impl Holds for SessionJournal {
@@ -47,7 +61,20 @@ impl SessionJournal {
         let covered_to = kept.covered_to;
         Self {
             journal: Journal::restore(kept, covered_to),
+            fold_failed_at: None,
         }
+    }
+
+    /// A fold was given up on at `now`.
+    pub fn fold_failed(&mut self, now: Instant) {
+        self.fold_failed_at = Some(now);
+    }
+
+    /// Whether a fold may start at `now`: none has been given up on within
+    /// [`FOLD_RETRY_AFTER`].
+    pub fn may_fold(&self, now: Instant) -> bool {
+        self.fold_failed_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= FOLD_RETRY_AFTER)
     }
 
     /// Turns sealed since the last draft was handed a stretch, `newest` being
@@ -86,6 +113,7 @@ mod tests {
     use std::ops::RangeInclusive;
 
     use journal_core::entry::{Entry, Kind};
+    use journal_core::period::Period;
 
     use super::*;
     use crate::journal::origin::user_part;
@@ -116,6 +144,8 @@ mod tests {
             intend: vec!["carry on".into()],
             opened: vec![],
             resolved: vec![],
+            period: Period::Step,
+            digest: String::new(),
         }
     }
 
@@ -186,6 +216,7 @@ mod tests {
             open: vec![],
             next_item: 1,
             covered_to: reply_part(33),
+            removed: vec![],
         };
         let j = SessionJournal::restore(kept);
         assert_eq!(
@@ -196,6 +227,16 @@ mod tests {
         assert_eq!(j.fresh_turns(40), 7);
         assert_eq!(j.journal().written(), 4);
         assert!(!j.journal().pending());
+    }
+
+    #[test]
+    fn a_fold_given_up_on_waits_an_hour_before_the_next() {
+        let mut j = SessionJournal::new();
+        let at = Instant::now();
+        assert!(j.may_fold(at));
+        j.fold_failed(at);
+        assert!(!j.may_fold(at + FOLD_RETRY_AFTER - Duration::from_secs(1)));
+        assert!(j.may_fold(at + FOLD_RETRY_AFTER));
     }
 
     #[test]

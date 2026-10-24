@@ -137,9 +137,8 @@ before `system_close`:
 
 `journal::carry::install` scopes the collection to the members a conversation
 names (`SelectionRule::Named`). It has no member of its own: the sections are
-the conversation's — one per entry (`journal/<id>`) for the newest `IN_PROMPT`
-(5) entries, plus `journal/open` while any item is open — submitted to its own
-timeline.
+the conversation's — one per entry the journal holds (`journal/<id>`), plus
+`journal/open` while any item is open — submitted to its own timeline.
 
 - **A round pins exactly the sections that have sealed.** A conversation that
   has written nothing, or whose sections are all still sealing, pins none, so
@@ -153,8 +152,8 @@ timeline.
   and its recurrence runs on from the state they leave — itself run on from
   the state the prompt before the collection leaves, kept once for every
   conversation on the prompt. Read straight after them, an entry is computed
-  as it is read. A new entry seals the entry and the closing section; the
-  oldest ageing out, or a forgotten entry, reseals everything after it
+  as it is read. A new entry seals the entry and the closing section; a
+  fold, or a forgotten entry, reseals everything after it
   (`Linking::Chain`), and its address names what it continues, so a restart
   restores the right one. A round pins only the chain's sealed beginning.
 - **At the head of every round** the conversation's sections are reconciled with
@@ -181,7 +180,40 @@ comes from its turns, so neither silence nor the rest of the context is taken
 for something written down.
 
 **Budget.** The system prompt has none; the journal is bounded by its shape —
-five one-line entries and six open items.
+one line per entry, six open items, and the calendar folding it (§4.2): today's
+steps, this week's days, this month's weeks, this year's months, and a line per
+year before that.
+
+### 4.2 Folding on the calendar
+
+The journal compresses itself as the UTC calendar turns
+(`journal_core::period`, `fold`, `folding`). Once a day is over, its steps —
+each entry belongs to the day it *ended* in, so a step a skip ran on into
+today is today's — fold into one **day** entry; once a week (Monday to
+Sunday) is over, its days fold into a **week**; then a month's weeks into a
+**month**, and a year's months into a **year**, which never folds. The lowest
+level folds first and the earliest period first, one fold at a time, so a
+journal that slept through a month catches up period by period.
+
+The model folds them itself, on a focused fork of the dialogue at `Normal`
+like a draft: every entry of the period is put in front of it whole — a
+step's claims, a folded entry's digest — and the answer is one
+`journal_fold` call, a one-line `summary` the journal keeps for the whole
+period and a `digest`, the detailed account behind it. The folded entry takes
+the next id and the place the first entry it folded held. **It is lossy on
+purpose:** the entries folded leave the journal, their sections are removed and
+their text is ceased (§4.1); the folded entry's digest is filed as the text
+behind it, so `journal_read` on a day entry reads its digest. Open items are the
+journal's, not any entry's, and are untouched.
+
+A fold shares the draft's single flight. It is tried after every round's seal
+when no draft starts, after every draft, and every five minutes over the open
+conversations (`FOLD_SWEEP_EVERY`), so a day that turns over while a
+conversation sits open and quiet folds too. A skip runs on only over a step:
+after a fold the latest entry is a day, and a skipped stretch is only covered.
+
+npcd's characters fold the same way on their world's calendar, after each
+draft, with the newest turn the draft covered as their now.
 
 ### 4.1 The turns behind each entry
 
@@ -197,7 +229,9 @@ a file's contents, an error from back then. Two dialogue tools read them:
   some text, ignoring case, in every entry's turns or one's: each hit names its
   entry, turn and line, to read around with `journal_read`.
 
-The journal intro names them, so the model knows the line is not all there is.
+Both are **mandatory** (`ToolDef::mandatory`), projected on every round the way
+the file tools are, and the journal intro names them, so the model knows the
+line is not all there is and always holds the call that reads behind it.
 Reading and searching are `journal_core::transcript::Book`'s, shared with npcd;
 the tools (`zend-tools/src/tools/journal/`) reach the conversation's text
 through `ToolContext::journal`, which zend sets on every dialogue round.
@@ -213,8 +247,8 @@ conversation's turns — those leave the conversation's window and are tombstone
 with it — but a copy of their words, with no K/V, that lives as long as the
 entry does:
 
-- **Forgetting an entry**, or its ageing out of the newest five, ceases its
-  objects.
+- **Forgetting an entry**, or its folding into a day, week, month or year
+  (§4.2), ceases its objects.
 - **Tombstoning the conversation** ceases all of them.
 - **Archiving the conversation** ceases all of them and keeps the entries: the
   journal can still be read, and nothing runs a tool on an archived
@@ -454,6 +488,13 @@ Settled with the user on 2026-10-23:
    (§7).
 7. **A read-only GUI pane with delete** (§8).
 8. **Only the parent dialogue journals**, not sub-runs or agent jobs (§7).
+9. **The journal folds on the calendar, not by count** (§4.2), settled on
+   2026-10-24: day, week, month and year folds in UTC, each a one-line entry
+   and a detailed digest the tools read, lossy over time; folding replaced
+   keeping the newest five.
+10. **The turns behind each entry are kept as text** for `journal_read` and
+    `journal_grep` (§4.1), settled on 2026-10-24: not the conversation's turns,
+    which leave its window, but a copy living as long as the entry, ceased when
+    it folds or the conversation is tombstoned or archived.
 
-The starting numbers, `EVERY_TURNS` 16 and `IN_PROMPT` 5, are guesses to tune
-in live sessions.
+The starting number `EVERY_TURNS` 16 is a guess to tune in live sessions.

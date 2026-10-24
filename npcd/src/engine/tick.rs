@@ -1369,6 +1369,7 @@ pub type Shared = Arc<Scheduler>;
 #[cfg(test)]
 mod tests {
     use journal_core::entry::{Entry, Item};
+    use journal_core::period::Period;
 
     use super::*;
     use crate::engine::journal::state::EVERY_TURNS;
@@ -1972,6 +1973,8 @@ mod tests {
                 text: "who holds the shield?".into(),
             }],
             resolved: vec![],
+            period: Period::Step,
+            digest: String::new(),
         };
         writing = due.state.lock().unwrap().journal().stage(writing);
         due.state.lock().unwrap().journal_mut().kept(writing);
@@ -1998,6 +2001,8 @@ mod tests {
             intend: vec![],
             opened: vec![],
             resolved: vec![],
+            period: Period::Step,
+            digest: String::new(),
         });
         s.set_journal(0, restored);
         lived(&s, 0, EVERY_TURNS as usize + 2);

@@ -41,8 +41,10 @@
 //! and [`WorldTime`] is the calendar read off it — the only place in the daemon
 //! that turns that number into a year, a date or a clock face. Prose that names
 //! a moment goes through [`stamp`], [`WorldTime::date`] or [`WorldTime::clock`];
-//! nothing else divides by a day.
+//! nothing else divides by a day. The Gregorian arithmetic itself is
+//! `journal_core::period`'s, which the journals fold on as well.
 
+use journal_core::period::{civil_from_days, days_from_civil};
 use serde_json::{json, Map, Value};
 
 /// World-clock milliseconds in one narrative day.
@@ -56,31 +58,6 @@ pub fn day_of(world_ms: u64) -> u64 {
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
-
-/// Days from 1970-01-01 to a proleptic-Gregorian civil date.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// The civil date of a day number counted from 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day)
-}
 
 /// The calendar a world-clock instant reads as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,8 +78,8 @@ impl WorldTime {
         let (year, month, day) = civil_from_days(days);
         Self {
             year,
-            month: month as u32,
-            day: day as u32,
+            month,
+            day,
             hour: (into / 3600) as u32,
             minute: (into % 3600 / 60) as u32,
             second: (into % 60) as u32,

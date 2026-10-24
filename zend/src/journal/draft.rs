@@ -43,6 +43,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use journal_core::entry::{Entry, Kind};
+    use journal_core::period::Period;
     use journal_core::record::Ending;
     use journal_core::section::{restore, JournalPrompt};
     use journal_core::span::SpanTurn;
@@ -89,6 +90,7 @@ mod tests {
             &mut self,
             prompt: &JournalPrompt,
             _filed: Option<&Filed>,
+            _ceased: &[u64],
         ) -> anyhow::Result<()> {
             self.kept.push(prompt.clone());
             Ok(())
@@ -153,6 +155,8 @@ mod tests {
             intend: vec!["Look at the scan".into()],
             opened: vec![],
             resolved: vec![],
+            period: Period::Step,
+            digest: String::new(),
         });
         j
     }

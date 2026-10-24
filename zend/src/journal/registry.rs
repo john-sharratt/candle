@@ -86,6 +86,17 @@ impl Journals {
         self.held.lock().unwrap().get(conv_id)?.open.clone()
     }
 
+    /// Every conversation open now, by id.
+    pub fn open_ids(&self) -> Vec<String> {
+        self.held
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, h)| h.open.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// `conv_id` was released from memory: its journal stays, its asker goes.
     pub fn closed(&self, conv_id: &str) {
         if let Some(held) = self.held.lock().unwrap().get_mut(conv_id) {
@@ -105,6 +116,7 @@ mod tests {
 
     use journal_core::entry::Entry;
     use journal_core::journal::Holds;
+    use journal_core::period::Period;
 
     use super::*;
 
@@ -121,10 +133,13 @@ mod tests {
                 intend: vec!["go on".into()],
                 opened: vec![],
                 resolved: vec![],
+                period: Period::Step,
+                digest: String::new(),
             }],
             open: vec![],
             next_item: 1,
             covered_to: 8,
+            removed: vec![],
         }
     }
 

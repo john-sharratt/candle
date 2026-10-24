@@ -11,6 +11,7 @@
 //! report — is not what the next chapter opens on; the work is.
 
 use journal_core::entry::{Claim, Entry, Kind};
+use journal_core::period::Period;
 
 use crate::engine::mission::{Mission, Outcome};
 
@@ -67,6 +68,8 @@ pub fn closing_entry(mission: &Mission, at_ms: u64, covered_to: u64) -> Entry {
         intend: Vec::new(),
         opened: Vec::new(),
         resolved: Vec::new(),
+        period: Period::Step,
+        digest: String::new(),
     }
 }
 

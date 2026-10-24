@@ -11,8 +11,11 @@
 
 pub mod ask;
 pub mod entry;
+pub mod fold;
+pub mod folding;
 pub mod journal;
 pub mod json_repair;
+pub mod period;
 pub mod record;
 pub mod repeats;
 pub mod section;

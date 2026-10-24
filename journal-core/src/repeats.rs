@@ -134,6 +134,7 @@ mod tests {
     use super::*;
     use crate::entry::testing::claim;
     use crate::entry::Kind;
+    use crate::period::Period;
 
     fn entry(claims: &[&str], intend: &[&str], opened: &[&str]) -> Entry {
         Entry {
@@ -153,6 +154,8 @@ mod tests {
                 })
                 .collect(),
             resolved: Vec::new(),
+            period: Period::Step,
+            digest: String::new(),
         }
     }
 

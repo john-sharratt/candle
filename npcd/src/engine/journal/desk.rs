@@ -30,13 +30,19 @@ use crate::engine::prompt::Persona;
 use crate::engine::tools::Within;
 
 /// Room for a brief entry: a few claims, what is intended, what is open.
-const WRITE_TOKENS: usize = 1024;
+pub const WRITE_TOKENS: usize = 1024;
+
+/// Room for a fold: a one-line summary and a digest of a few paragraphs, which
+/// runs well past an entry. An answer cut off by its budget does not parse.
+pub const FOLD_TOKENS: usize = 3072;
 
 pub struct EngineDesk<'a> {
     minds: &'a Minds,
     npc_id: u64,
     persona: &'a Persona<'a>,
     within: &'a Within,
+    /// The most an answer may run to: [`WRITE_TOKENS`] or [`FOLD_TOKENS`].
+    max_tokens: usize,
     tree: Option<Arc<StencilTree>>,
 }
 
@@ -46,12 +52,14 @@ impl<'a> EngineDesk<'a> {
         npc_id: u64,
         persona: &'a Persona<'a>,
         within: &'a Within,
+        max_tokens: usize,
     ) -> Self {
         Self {
             minds,
             npc_id,
             persona,
             within,
+            max_tokens,
             tree: None,
         }
     }
@@ -78,7 +86,7 @@ impl Desk for EngineDesk<'_> {
         let put = Put {
             scope: AskScope::Conversation,
             tree,
-            max_tokens: WRITE_TOKENS,
+            max_tokens: self.max_tokens,
         };
         self.minds
             .ask_under(self.npc_id, self.persona, self.within, question, put)
@@ -87,7 +95,12 @@ impl Desk for EngineDesk<'_> {
 
     /// A character keeps no text behind its entries: none of its tools reads
     /// it back, so the stretch it was written from is not filed.
-    async fn keep(&mut self, prompt: &JournalPrompt, _filed: Option<&Filed>) -> anyhow::Result<()> {
+    async fn keep(
+        &mut self,
+        prompt: &JournalPrompt,
+        _filed: Option<&Filed>,
+        _ceased: &[u64],
+    ) -> anyhow::Result<()> {
         self.minds.keep_journal(self.npc_id, prompt).await
     }
 }
