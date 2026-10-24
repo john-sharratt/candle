@@ -34,7 +34,9 @@ pub struct Style {
     pub left_open: &'static str,
     /// Heading of the items an entry settled.
     pub settled: &'static str,
-    /// Appended to a claim the check replaced with what the world read.
+    /// Opens what the world read, after a claim whose fact it read differently:
+    /// `" (the workspace reads"` makes `… (the workspace reads file:a exists as
+    /// true)`.
     pub corrected: &'static str,
     /// Appended to a claim that may have stopped being true.
     pub recheck: &'static str,
@@ -99,7 +101,7 @@ pub(crate) mod testing {
         meaning_to: "Meaning to:",
         left_open: "Left open:",
         settled: "Settled:",
-        corrected: " (corrected)",
+        corrected: " (reads",
         recheck: " (re-check)",
         open_heading: "Open:",
         nothing_open: "Open: nothing.",

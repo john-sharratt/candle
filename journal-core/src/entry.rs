@@ -171,10 +171,15 @@ impl Entry {
 }
 
 impl Claim {
+    /// The claim as its line reads: its sentence, what the world read when it
+    /// read the claim's fact differently, and whether it may have changed.
     fn line(&self, style: &Style) -> String {
         let mut s = self.text.trim().to_string();
-        if self.corrected {
-            s.push_str(style.corrected);
+        if let (true, Some(t)) = (self.corrected, &self.typed) {
+            s.push_str(&format!(
+                "{} {} {} as {})",
+                style.corrected, t.subject, t.attribute, t.value
+            ));
         }
         if self.perishable {
             s.push_str(style.recheck);
@@ -302,15 +307,24 @@ mod tests {
     }
 
     #[test]
-    fn a_perishable_claim_asks_to_be_rechecked_and_a_corrected_one_says_so() {
+    fn a_perishable_claim_asks_to_be_rechecked_and_a_corrected_one_carries_the_reading() {
         let mut e = entry(1);
         let mut c = claim("Fabricator 5 is running.", Kind::Observed);
         c.perishable = true;
         c.corrected = true;
+        c.typed = Some(Typed {
+            subject: "fabricator 5".into(),
+            attribute: "mode".into(),
+            value: "idle".into(),
+        });
         e.claims = vec![c];
-        assert!(e
-            .render(None, &PLAIN)
-            .contains("- Saw: Fabricator 5 is running. (corrected) (re-check)"));
+        let r = e.render(None, &PLAIN);
+        assert!(
+            r.contains(
+                "- Saw: Fabricator 5 is running. (reads fabricator 5 mode as idle) (re-check)"
+            ),
+            "{r}"
+        );
     }
 
     #[test]

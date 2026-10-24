@@ -79,7 +79,7 @@ pub const NPC: Style = Style {
     meaning_to: "Meaning to:",
     left_open: "Left open:",
     settled: "Settled:",
-    corrected: " (the world read differently than I first wrote)",
+    corrected: " (the world reads",
     recheck: " (re-check)",
     open_heading: "What you have left open:",
     nothing_open: "What you have left open: nothing.",
@@ -93,7 +93,7 @@ pub const NPC: Style = Style {
 #[cfg(test)]
 mod tests {
     use journal_core::ask;
-    use journal_core::entry::{Claim, Entry, Item, Kind};
+    use journal_core::entry::{Claim, Entry, Item, Kind, Typed};
     use journal_core::section::render_open;
     use journal_core::span::{Span, SpanTurn};
 
@@ -167,9 +167,14 @@ mod tests {
         let mut c = claim("Fabricator 5 is running.", Kind::Observed);
         c.perishable = true;
         c.corrected = true;
+        c.typed = Some(Typed {
+            subject: "fabricator 5".into(),
+            attribute: "mode".into(),
+            value: "idle".into(),
+        });
         e.claims = vec![c];
         assert!(e.render(None, &NPC).contains(
-            "- Saw: Fabricator 5 is running. (the world read differently than I first wrote) \
+            "- Saw: Fabricator 5 is running. (the world reads fabricator 5 mode as idle) \
              (re-check)"
         ));
     }

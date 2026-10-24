@@ -93,7 +93,7 @@ pub const CODING: Style = Style {
     meaning_to: "Meaning to:",
     left_open: "Left open:",
     settled: "Settled:",
-    corrected: " (the workspace read differently than first written)",
+    corrected: " (the workspace reads",
     recheck: " (re-check)",
     open_heading: "Still open:",
     nothing_open: "Still open: nothing.",

@@ -96,12 +96,13 @@ impl Refusal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Kept,
-    /// The world answered differently; the claim now says what the world said.
+    /// The world answered differently; the claim keeps its sentence and
+    /// carries what the world read.
     Corrected,
     /// The world had no answer; the claim stands as prose.
     Demoted,
     /// A later claim about the same subject and attribute took its typed fact
-    /// over: it stands as prose, or is gone when the fact was all it said.
+    /// over: it stands as prose.
     Superseded,
 }
 
@@ -188,7 +189,7 @@ pub fn verify(
                 turn: *turn,
             });
         }
-        let mut kind = derive_kind(span, &c.cite);
+        let kind = derive_kind(span, &c.cite);
         let mut claim = Claim {
             text: c.text.trim().to_string(),
             cite: c.cite,
@@ -201,13 +202,13 @@ pub fn verify(
         if let Some(t) = claim.typed.clone() {
             match world.read(&t.subject, &t.attribute) {
                 Some(actual) if same(&actual, &t.value) => {}
+                // The sentence stays: it is the writer's, and often says more
+                // than the fact it was typed with. The line carries what the
+                // world read beside it (`Claim::line`).
                 Some(actual) => {
-                    claim.text = format!("{} {}: {actual}", t.subject, t.attribute);
                     claim.typed = Some(Typed { value: actual, ..t });
                     claim.corrected = true;
                     claim.perishable = true;
-                    kind = Kind::Observed;
-                    claim.kind = kind;
                     verdict = Verdict::Corrected;
                 }
                 None => {
@@ -216,23 +217,20 @@ pub fn verify(
                 }
             }
         }
-        // A newer claim about the same thing takes the typed fact over. An
-        // older claim that was only that fact — its text the world's
-        // correction — goes; one that says more keeps what it says, as prose.
+        // A newer claim about the same thing takes the typed fact over: an
+        // older one stays, as prose. One the world corrected keeps its
+        // reading, which is part of what its line says.
         if let Some(t) = &claim.typed {
             let key = (t.subject.to_lowercase(), t.attribute.to_lowercase());
             let at = claims.iter().position(|(_, o)| {
-                o.typed.as_ref().is_some_and(|ot| {
-                    (ot.subject.to_lowercase(), ot.attribute.to_lowercase()) == key
-                })
+                !o.corrected
+                    && o.typed.as_ref().is_some_and(|ot| {
+                        (ot.subject.to_lowercase(), ot.attribute.to_lowercase()) == key
+                    })
             });
             if let Some(i) = at {
                 let older = claims[i].0;
-                if claims[i].1.corrected {
-                    claims.remove(i);
-                } else {
-                    claims[i].1.typed = None;
-                }
+                claims[i].1.typed = None;
                 if let Some(note) = notes.iter_mut().find(|note| note.claim == older) {
                     note.verdict = Verdict::Superseded;
                 }
@@ -514,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_claim_the_world_contradicts_is_replaced_by_what_the_world_says() {
+    fn a_typed_claim_the_world_contradicts_keeps_its_sentence_and_carries_the_reading() {
         let world = Fake::default().with("fabricator 5", "mode", "running");
         let v = verify(
             Draft {
@@ -527,15 +525,60 @@ mod tests {
         )
         .unwrap();
         let c = &v.entry.claims[0];
-        assert_eq!(c.text, "fabricator 5 mode: running");
-        assert_eq!(c.typed.as_ref().unwrap().value, "running");
-        assert!(c.corrected);
         assert_eq!(
-            c.kind,
-            Kind::Observed,
-            "the world's reading is an observation"
+            c.text, "fabricator 5 mode is lost",
+            "the writer's sentence stays"
         );
+        assert_eq!(
+            c.typed.as_ref().unwrap().value,
+            "running",
+            "beside the reading"
+        );
+        assert!(c.corrected && c.perishable);
+        assert_eq!(c.kind, Kind::Heard, "its support is still what it cited");
         assert_eq!(v.notes[0].verdict, Verdict::Corrected);
+    }
+
+    /// The live failure: every claim of an entry was typed `exists` with a
+    /// value that was no answer to it — a constant's value, a line number —
+    /// and each correction replaced the claim's sentence with the bare
+    /// reading, so the entry kept one line, "file:… exists: true", of three.
+    #[test]
+    fn misused_typed_facts_never_cost_the_claims_their_sentences() {
+        let world = Fake::default().with("file:c/journal.rs", "exists", "true");
+        let said = |text: &str, value: &str, cite: u64| DraftClaim {
+            text: text.into(),
+            cite: vec![cite],
+            typed: Some(Typed {
+                subject: "file:c/journal.rs".into(),
+                attribute: "exists".into(),
+                value: value.into(),
+            }),
+        };
+        let v = verify(
+            Draft {
+                claims: vec![
+                    said("The user asked where IN_PROMPT is defined.", "IN_PROMPT", 1),
+                    said("file_grep found IN_PROMPT at journal.rs:27.", "27", 2),
+                    said("IN_PROMPT is 5.", "5", 4),
+                ],
+                ..Default::default()
+            },
+            &span(),
+            &[],
+            &world,
+        )
+        .unwrap();
+        let texts: Vec<_> = v.entry.claims.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "The user asked where IN_PROMPT is defined.",
+                "file_grep found IN_PROMPT at journal.rs:27.",
+                "IN_PROMPT is 5."
+            ]
+        );
+        assert!(v.entry.claims.iter().all(|c| c.corrected));
     }
 
     #[test]
@@ -556,8 +599,10 @@ mod tests {
         assert_eq!(v.notes[0].verdict, Verdict::Demoted);
     }
 
+    /// A corrected claim keeps its reading even when a later claim states the
+    /// same fact: the reading is part of what its line says.
     #[test]
-    fn two_typed_claims_about_one_thing_keep_only_the_newer() {
+    fn a_corrected_claim_keeps_its_reading_beside_a_later_claim_of_the_same_fact() {
         let world = Fake::default().with("door", "state", "open");
         let v = verify(
             Draft {
@@ -574,11 +619,17 @@ mod tests {
         )
         .unwrap();
         let texts: Vec<_> = v.entry.claims.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, vec!["Something else.", "Door State is open"]);
-        assert!(v
-            .notes
-            .iter()
-            .any(|n| n.claim == 0 && n.verdict == Verdict::Superseded));
+        assert_eq!(
+            texts,
+            [
+                "door state is jammed",
+                "Something else.",
+                "Door State is open"
+            ]
+        );
+        assert_eq!(v.entry.claims[0].typed.as_ref().unwrap().value, "open");
+        let verdicts: Vec<_> = v.notes.iter().map(|n| n.verdict).collect();
+        assert_eq!(verdicts, [Verdict::Corrected, Verdict::Kept, Verdict::Kept]);
     }
 
     /// The live failure: every claim of an entry carried the same typed fact,
