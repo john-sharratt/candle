@@ -130,6 +130,17 @@ impl JournalPrompt {
         &self.record
     }
 
+    /// The number of the entry that just aged out, whose kept text
+    /// ([`crate::transcript`]) goes with it.
+    pub fn aged_out_entry(&self) -> Option<u64> {
+        self.aged_out
+            .as_deref()?
+            .strip_prefix(JOURNAL)?
+            .strip_prefix('/')?
+            .parse()
+            .ok()
+    }
+
     /// The section a conversation that did not see it leave may still hold: the
     /// entry that just aged out. A fresh reconcile removes it, because streams an
     /// earlier run sealed are invisible to it. Anything else stale is merely not
@@ -212,6 +223,8 @@ mod tests {
         assert_eq!(old.aged_out.as_deref(), Some("journal/1"));
         assert_eq!(old.sweep(), ["journal/1"]);
         assert!(young.sweep().is_empty());
+        assert_eq!(old.aged_out_entry(), Some(1));
+        assert_eq!(young.aged_out_entry(), None);
     }
 
     #[test]

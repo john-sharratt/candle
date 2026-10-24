@@ -213,7 +213,8 @@ conversation's turns — those leave the conversation's window and are tombstone
 with it — but a copy of their words, with no K/V, that lives as long as the
 entry does:
 
-- **Forgetting an entry** ceases its objects.
+- **Forgetting an entry**, or its ageing out of the newest five, ceases its
+  objects.
 - **Tombstoning the conversation** ceases all of them.
 - **Archiving the conversation** ceases all of them and keeps the entries: the
   journal can still be read, and nothing runs a tool on an archived

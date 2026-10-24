@@ -5091,8 +5091,12 @@ fn journal_desk(
     let recording = Arc::clone(state);
     let record: Record = Box::new(move |prompt: &JournalPrompt, filed: Option<&Filed>| {
         let engine = recording.engine.lock().unwrap();
+        let text = JournalText::of(engine.conversation().shared(), timeline);
         if let Some(filed) = filed {
-            JournalText::of(engine.conversation().shared(), timeline).file(filed)?;
+            text.file(filed)?;
+        }
+        if let Some(aged) = prompt.aged_out_entry() {
+            text.cease_entry(aged)?;
         }
         engine
             .set_conversation_metadata_many(timeline, &metadata_of(prompt))
