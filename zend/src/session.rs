@@ -8638,7 +8638,7 @@ mod projection_schema_tests {
             .working_set
             .as_ref()
             .expect("the dialogue declares a working set");
-        assert_eq!(ws.budget_tokens, 80_000);
+        assert_eq!(ws.budget_tokens, 40_000);
         assert_eq!(ws.lock_tokens, 150_000);
         assert_eq!(ws.folder_tokens, 10_000);
         assert_eq!(ws.beta, 0.2);

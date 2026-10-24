@@ -372,8 +372,9 @@ system_prompt:
         conversation begins with an anchor naming it, and items you stop using fade out.
         A tool that answers in_context is telling you that content is already here, under
         the anchor it names: it is your own reading, so use it and say you read it. Before
-        you state a specific name, number, path or quote, or edit something, check its
-        anchor is here; if it isn't, fetch it again. If you remember something that is no
+        you state a specific name, number, path, section or quote, or edit something, check
+        its anchor is here and name the file it is in; if it isn't here, fetch it again.
+        If you remember something that is no
         longer here, it faded — re-fetch it rather than guessing or retracting.
 
     # Two grounding variants under the same `tools` collection gate — exactly
@@ -1395,14 +1396,17 @@ layers:
     # projection; the files it keeps attending to — starting with the seeds —
     # stay by momentum and fade when it stops.
     working_set:
-      # What the set holds voluntarily — seeds and provenance. With the system
-      # prompt, the priming chain and a young dialogue it puts a decode near
-      # 150K materialized. Measured 2026-10-24 at 250K: 321K–350K per decode,
-      # ~215K–248K of it provenance the scan pulled in on momentum.
-      budget_tokens: 80000
+      # What the set holds voluntarily — seeds and provenance. Measured
+      # 2026-10-24 at 250K: 321K–350K per decode, ~215K–248K of it provenance
+      # the scan pulled in on momentum; at 80K the provenance on a question
+      # about a paper was ~70K of test files the question never touched — the
+      # scan's per-file standardisation cannot rank files against each other,
+      # so what fills this budget is largely arbitrary. The model's own reads
+      # sit on top under `lock_tokens`.
+      budget_tokens: 40000
       # The locks sit on top: a read the model makes adds to what it carries
       # and never displaces the provenance around it, up to this ceiling.
-      # 80K + 150K + this layer's 116K window stays clear of the ×2 rung's
+      # 40K + 150K + this layer's 116K window stays clear of the ×2 rung's
       # ceiling of 524,288 (`rope: min_yarn_factor: 2`, §5).
       lock_tokens: 150000
       folder_tokens: 10000       # repo_map's share: pinned + provenance folders
