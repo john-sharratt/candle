@@ -997,6 +997,7 @@ impl ProjectionScores {
         self.sections.clear();
         self.group_mass.clear();
         self.collection_mass.clear();
+        self.group_scan.clear();
         self.locality_boosted.clear();
     }
 

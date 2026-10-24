@@ -5400,6 +5400,10 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         self.read.scores_or_empty().group_mass(group)
     }
 
+    fn group_scan(&self, group: GroupId) -> Option<GroupScan> {
+        self.read.scores_or_empty().group_scan(group)
+    }
+
     fn collection_attention_mass(&self, collection: u32) -> f32 {
         self.read.scores_or_empty().collection_mass(collection)
     }
