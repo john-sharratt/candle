@@ -406,11 +406,14 @@ no selector change.
 
 ### B.5 What a layer needs — open (measured 2026-10-24)
 
-The analysis layers above a file's reading — `static_analysis` through
-`bug_analysis`, one unit per file — project by their scan scores today, and
-those scores do not say whether a layer is needed. Replaying a conversation
-about the paper (`1f283ffd`, then `cbac2859` with every group's raw order
-statistics on the projection event):
+The analysis layers above a file's reading project by their scan scores, and
+those scores do not say whether a layer is needed. `dependency_analysis` is the
+one left; `static_analysis`, `architectural_analysis`, `critical_analysis` and
+`bug_analysis`, with `daily_history` and `dream_log`, were removed from the
+design and their conversations tombstoned on 2026-10-25, to be built again
+another way. Replaying a conversation about the paper (`1f283ffd`, then
+`cbac2859` with every group's raw order statistics on the projection event),
+while they stood:
 
 - every unit the analysis layers projected on the paper question was a
   battle-cities analysis — 25–48K tokens a decode, one taken at belief score 0,

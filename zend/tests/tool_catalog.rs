@@ -137,12 +137,13 @@ fn install_tool_catalog_returns_section_ids_in_registry_order() {
 }
 
 /// The file tools — `file_search`, `file_grep`, `file_read`, `file_list` and
-/// `write` — and the two web tools are marked mandatory on the `tools`
-/// collection, so they project on every turn on top of the belief top-k.
-/// Finding is in the set alongside reading because a turn holding only the read
-/// pair answers "where is this" by guessing, `write` because the edit tool
-/// cannot create a file, and the web pair because a tool shown only by name is
-/// one the model concludes it does not have.
+/// `write` — the two web tools and the journal's two readers are marked
+/// mandatory on the `tools` collection, so they project on every turn on top of
+/// the belief top-k. Finding is in the set alongside reading because a turn
+/// holding only the read pair answers "where is this" by guessing, `write`
+/// because the edit tool cannot create a file, the web pair because a tool
+/// shown only by name is one the model concludes it does not have, and the
+/// journal readers because the journal's entries point at them every round.
 #[test]
 fn install_tool_catalog_marks_the_mandatory_tools() {
     let mut builder = build_test_projection();
@@ -161,6 +162,8 @@ fn install_tool_catalog_marks_the_mandatory_tools() {
             "file_list",
             "file_read",
             "file_search",
+            "journal_grep",
+            "journal_read",
             "web_fetch",
             "web_search",
             "write"
@@ -479,8 +482,6 @@ fn bundled_schema_belief_gates_resolve_from_the_right_source() {
             );
         }
     }
-    assert_eq!(seen.get("bug_analysis/bugs"), Some(&(250.0, 250.0)));
-    assert_eq!(seen.get("dream_log/dreams"), Some(&(100.0, 100.0)));
     for working_set_group in ["repo_map/structure", "code_reading/scopes"] {
         assert!(
             !seen.contains_key(working_set_group),

@@ -8701,32 +8701,30 @@ mod projection_schema_tests {
             vec![
                 ("repo_map", IngestMode::Folders, ""),
                 ("code_reading", IngestMode::Files, ""),
-                ("static_analysis", IngestMode::Derived, ""),
                 ("dependency_analysis", IngestMode::Derived, ""),
-                ("architectural_analysis", IngestMode::Derived, ""),
-                ("critical_analysis", IngestMode::Derived, ""),
-                ("bug_analysis", IngestMode::Derived, ""),
-                ("daily_history", IngestMode::Derived, ""),
-                ("dream_log", IngestMode::Derived, ""),
             ],
             "derived turn-sinks: {got:?}"
         );
-        // Each layer of units builds on the one below it, files up from the
-        // reading and days up from the dialogue.
+        // The dependency analysis builds on each file's reading.
         let after: Vec<(&str, Option<&str>)> = layers
             .iter()
             .filter_map(|l| Some((l.name.as_str(), l.spec.as_ref()?.after.as_deref())))
             .collect();
+        assert_eq!(after, vec![("dependency_analysis", Some("code_reading"))]);
+        // Every layer keeps the id its conversations were persisted under.
+        let ids: Vec<(&str, u32)> = builder
+            .schema()
+            .layers
+            .iter()
+            .map(|l| (l.name.as_str(), l.id.raw()))
+            .collect();
         assert_eq!(
-            after,
+            ids,
             vec![
-                ("static_analysis", Some("code_reading")),
-                ("dependency_analysis", Some("static_analysis")),
-                ("architectural_analysis", Some("dependency_analysis")),
-                ("critical_analysis", Some("architectural_analysis")),
-                ("bug_analysis", Some("critical_analysis")),
-                ("daily_history", None),
-                ("dream_log", Some("daily_history")),
+                ("repo_map", 1),
+                ("code_reading", 2),
+                ("dependency_analysis", 4),
+                ("dialogue", 10),
             ]
         );
         // The live dialogue layer is never a turn-sink.
@@ -8776,7 +8774,7 @@ mod projection_schema_tests {
     }
 
     /// A coding-agent workspace with a folder matching a declared-but-pipeline-fed
-    /// layer name (e.g. `bug_analysis/`) must NOT be ingested as a raw sink; only a
+    /// layer name (e.g. `dependency_analysis/`) must NOT be ingested as a raw sink; only a
     /// mind (a workspace with its own `projection.yaml`) draws raw sinks from its
     /// folders. Guards the folder-name-collision fix.
     #[test]
@@ -8785,9 +8783,9 @@ mod projection_schema_tests {
         let builder = build_projection_builder(Path::new("demo-project"));
         let ws = std::env::temp_dir().join(format!("zend_ingestws_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
-        std::fs::create_dir_all(ws.join("bug_analysis")).unwrap();
+        std::fs::create_dir_all(ws.join("dependency_analysis")).unwrap();
 
-        // Not a mind (no projection.yaml): the colliding `bug_analysis/` folder
+        // Not a mind (no projection.yaml): the colliding `dependency_analysis/` folder
         // is never a raw sink — the layer is built from the layers below it.
         let coding = crate::ingest::ingest_layers(builder.schema(), &ws, &HashMap::new());
         assert!(
@@ -8796,7 +8794,7 @@ mod projection_schema_tests {
         );
         assert!(coding
             .iter()
-            .any(|l| l.name == "bug_analysis" && l.mode == IngestMode::Derived));
+            .any(|l| l.name == "dependency_analysis" && l.mode == IngestMode::Derived));
 
         // Not in a mind either: a layer that declares how its units are read
         // is read that way, whatever folder shares its name.
@@ -8804,7 +8802,7 @@ mod projection_schema_tests {
         let mind = crate::ingest::ingest_layers(builder.schema(), &ws, &HashMap::new());
         assert!(
             mind.iter()
-                .any(|l| l.name == "bug_analysis" && l.mode == IngestMode::Derived),
+                .any(|l| l.name == "dependency_analysis" && l.mode == IngestMode::Derived),
             "a declared layer of units is never a mind's raw sink"
         );
 

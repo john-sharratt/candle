@@ -111,7 +111,7 @@ working set the projection emits (`project.rs` Step 12):
 
 ```
 system prompt
-other layers' groups    (the analysis layers)
+other layers' groups    (dependency_analysis)
 inherited chain         the dialogue group's lineage turns
 repo_map/structure      provenance folders, then pinned       ┐ working set: provenance ≤ budget_tokens,
 code_reading/scopes     provenance files,   then pinned       ┘ locks ≤ lock_tokens on top

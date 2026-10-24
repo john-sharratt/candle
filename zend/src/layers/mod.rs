@@ -1,13 +1,13 @@
-//! The layers built on other layers — `static_analysis` up through
-//! `bug_analysis` on each file's `code_reading`, and `daily_history` and
-//! `dream_log` on each closed day of dialogue — each declared in the
-//! projection schema by an `ingest:` block ([`spec`]) and read by one engine.
+//! The layers built on other layers — a layer of file units on each file's
+//! `code_reading` (the bundled schema's `dependency_analysis`), or of day units
+//! on each closed day of dialogue — each declared in the projection schema by
+//! an `ingest:` block ([`spec`]) and read by one engine.
 //!
 //! A unit of such a layer is one hidden conversation, forked from its layer's
-//! base with the unit it builds on as its lineage: a file's `static_analysis`
-//! continues the file's own reading, its `dependency_analysis` continues that,
-//! and so on up — each layer's question asked of a conversation that has
-//! already read the file and every analysis of it below. **The layers
+//! base with the unit it builds on as its lineage: a file's
+//! `dependency_analysis` continues the file's own reading, and a layer declared
+//! `after` it would continue that — each layer's question asked of a
+//! conversation that has already read the file and every analysis of it below. **The layers
 //! compound**: what a unit retrieves is also the layers below it, of every
 //! file on its branches, by provenance (`Substrate::set_ingest_sees`), while
 //! its own layer stays self-local — a unit never retrieves its siblings.

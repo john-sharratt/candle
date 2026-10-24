@@ -694,8 +694,16 @@ system_prompt:
 
 layers:
 
+  # Every layer and group pins the id its conversations are persisted under
+  # (`persisted_id`, `candle-conversation/src/projection/persisted_ids.rs`):
+  # turn records carry those numbers, so a layer can leave this list without
+  # renumbering the ones after it. A new layer or group takes a number never
+  # used before — the gaps (3, 5–9) are the layers removed 2026-10-25, whose
+  # conversations were tombstoned.
+
   # ── Phase 1 — Repo Map ─────────────────────────────────────────────────────
   - name: repo_map
+    persisted_id: 1
     description: |
       What each directory of the repository IS — one conversation per folder,
       shaped as a tool round-trip (list the folder, read its README / module
@@ -757,6 +765,7 @@ layers:
             nothing.
     groups:
       - id: structure
+        persisted_id: 1
         # Whole folder units from the dialogue's working set: its pinned
         # folders (seeds, then `file_list` locks), then provenance folders by
         # momentum, up to the working set's `folder_tokens`. A folder is only
@@ -798,6 +807,7 @@ layers:
 
   # ── Phase 2 — Code Reading ─────────────────────────────────────────────────
   - name: code_reading
+    persisted_id: 2
     description: |
       One hidden conversation per file, forked from the same base a live
       dialogue turn forks from and driven exactly the same way: real
@@ -868,6 +878,7 @@ layers:
             nothing.
     groups:
       - id: scopes
+        persisted_id: 2
         # Whole files from the dialogue's working set: its pinned files (seeds,
         # then `file_read` locks), then provenance files by momentum, up to
         # what `working_set.budget_tokens` leaves after the folders. Each file
@@ -886,81 +897,21 @@ layers:
           # Concept A.4: cold-scope size floor (see repo_map's note).
           level_prior: { floor_base: 2.0, floor_cap: 16.0 }
 
-  # ── Phase 3 — Static Analysis ──────────────────────────────────────────────
-  - name: static_analysis
+  # ── Dependency Analysis ────────────────────────────────────────────────────
+  - name: dependency_analysis
+    persisted_id: 4
     description: |
-      Code artifacts defined per file (Phase 3).  Structs, traits, functions,
-      enums, type aliases.  One turn per file.
+      Per-file dependency mapping.  Direct imports, transitive deps, implicit
+      couplings.  Crucial for cross-cutting questions.
     ingest_unit: files
+    # `edges`: the answer's closing section names the files this one depends
+    # on, and a change to one of them makes this file's units stale in every
+    # layer from here up (`zend::layers::plan`).
     # One unit per file, continuing the file's own reading (`zend::layers`):
     # the reading is this conversation's opening, so the file is in context.
     ingest:
       unit: file
       after: code_reading
-      tools: [file_read, file_list, file_search, file_grep]
-      prompt: |
-        You may read the workspace with file_read, file_list, file_search and file_grep to check what you need, then answer.
-        List every code artifact `<<path>>` in the `<<repo>>` repository defines, which
-        you have read above: each struct, enum, trait, type alias, function, method,
-        constant and macro, by its exact name, with its kind, its signature where it
-        has one, and one line on what it is for. Group methods under the type they
-        belong to. Name only what this file defines — nothing it imports or uses —
-        and invent nothing.
-    window: 8000
-    score_threshold: 0.0
-    budget:
-      priority: 10
-    # Dial overrides for the shared system prompt when this layer is the
-    # projection target (thinking depth / answer length / tool access).
-    dials:
-      thinking_effort: balanced
-      response_length: standard
-      tools: none
-    summary:
-      turns:
-        max_tokens: 512
-        assistant:
-          system_prompt: |
-            You compress an enumeration of a file's code artifacts into a faithful
-            index. Keep every artifact — structs, traits, functions, enums, type
-            aliases, constants — by its exact name, with its kind and a one-line
-            purpose. Never drop an artifact, never rename one, and never invent one
-            that is not in the enumeration. Stop when every artifact is captured.
-          user_prompt: |
-            Index every artifact above by its exact name, with its kind and a one-line
-            purpose. Omit none, invent none.
-      summaries:
-        max_tokens: 512
-        assistant:
-          system_prompt: |
-            The artifact indexes below are already compressed. Merge them into one
-            index: keep the artifacts by their exact name, kind, and one-line purpose,
-            grouped by the file or module they belong to, dropping only duplicates.
-            Never invent an artifact, kind, file, or module, and add no prose. Stop
-            when the merged index is captured. This is a tree node: near the root it
-            indexes all the analysed files.
-          user_prompt: |
-            Merge the indexes above into one: the artifacts by exact name, kind, and
-            purpose, grouped by file or module, dropping duplicates and adding nothing.
-    groups:
-      - id: artifacts
-        selection: { kind: top_k, k: 8 }
-        score_threshold: 1.0  # bimodal: ~80% of inter are zero-score; cuts zero floor, preserves all non-zero hits
-        budget:
-          priority: 100
-
-  # ── Phase 4 — Dependency Analysis ──────────────────────────────────────────
-  - name: dependency_analysis
-    description: |
-      Per-file dependency mapping (Phase 4).  Direct imports, transitive
-      deps, implicit couplings.  Crucial for cross-cutting questions.
-    ingest_unit: files
-    # `edges`: the answer's closing section names the files this one depends
-    # on, and a change to one of them makes this file's units stale in every
-    # layer from here up (`zend::layers::plan`).
-    ingest:
-      unit: file
-      after: static_analysis
       edges: true
       tools: [file_read, file_list, file_search, file_grep]
       prompt: |
@@ -969,8 +920,8 @@ layers:
         repository depend on? For each dependency, name the source file and the
         specific artifact, and say whether it is direct (an import or call),
         transitive (through an intermediate), or implicit (a shared resource,
-        convention or assumption). Use what you have read of this file and its
-        artifacts above, and the analyses of other files you can see.
+        convention or assumption). Use what you have read of this file above, and
+        the analyses of other files you can see.
 
         A document depends on the files whose behaviour it describes or relies
         on: when one of them changes, the document can become wrong, so they
@@ -1022,321 +973,9 @@ layers:
             dropping duplicates and adding nothing.
     groups:
       - id: dependencies
+        persisted_id: 4
         selection: { kind: top_k, k: 6 }
         score_threshold: 0.0  # inverted within-layer signal — no useful threshold; TopK handles ranking
-        budget:
-          priority: 100
-
-  # ── Phase 5 — Architectural Analysis ───────────────────────────────────────
-  - name: architectural_analysis
-    description: |
-      Why each artifact exists, what role it plays, what assumptions it
-      encodes (Phase 5).
-    ingest_unit: files
-    ingest:
-      unit: file
-      after: dependency_analysis
-      tools: [file_read, file_list, file_search, file_grep]
-      prompt: |
-        You may read the workspace with file_read, file_list, file_search and file_grep to check what you need, then answer.
-        Reason about the purpose and architectural significance of everything in
-        `<<path>>` in the `<<repo>>` repository. Why does it exist? What role does it
-        play in the system? What design decisions does it embody, and what
-        assumptions does it encode? Ground it in what you have read of this file,
-        its artifacts and its dependencies above, and in the analyses you can see of
-        the files around it.
-    window: 8000
-    score_threshold: 0.0
-    budget:
-      priority: 20
-    # Dial overrides for the shared system prompt when this layer is the
-    # projection target (thinking depth / answer length / tool access).
-    dials:
-      thinking_effort: deep
-      response_length: detailed
-      tools: none
-    summary:
-      turns:
-        max_tokens: 384
-        assistant:
-          system_prompt: |
-            You compress an architectural analysis into a shorter, faithful version.
-            Keep what the analysis actually states — its design intent, key decisions,
-            and trade-offs — in the original analytical voice. Add nothing not present:
-            never introduce a decision, motive, or trade-off the analysis does not make.
-            Drop restatement and filler. Stop the moment the reasoning is captured; do
-            not pad. No commentary, headings, lists, or word counts.
-          user_prompt: |
-            Compress the architectural analysis above into a faithful, shorter version:
-            its design intent, key decisions, and trade-offs, in the original voice,
-            adding nothing and stopping when captured.
-      summaries:
-        max_tokens: 384
-        assistant:
-          system_prompt: |
-            The architectural sections below are already compressed. Merge them into
-            one faithful, shorter section in the original analytical voice, keeping the
-            system-level design intent and the decisions that shape the whole, and
-            dropping file-level detail and redundancy. Add nothing not already present.
-            Do not pad; stop the moment it is captured. No commentary, headings, lists,
-            or word counts. This is a tree node: near the root it describes the entire
-            architecture.
-          user_prompt: |
-            Merge the sections above into one faithful, shorter section: the
-            system-level intent and the decisions that shape the whole, dropping
-            file-level detail, adding nothing.
-    groups:
-      - id: architecture
-        selection: { kind: top_k, k: 5 }
-        score_threshold: 0.0  # overlapping distributions — no useful threshold; TopK handles ranking
-        budget:
-          priority: 100
-
-  # ── Phase 6 — Critical Analysis ────────────────────────────────────────────
-  - name: critical_analysis
-    description: |
-      Risks, smells, performance concerns, security gaps, missing error
-      handling (Phase 6).
-    ingest_unit: files
-    ingest:
-      unit: file
-      after: architectural_analysis
-      tools: [file_read, file_list, file_search, file_grep]
-      prompt: |
-        You may read the workspace with file_read, file_list, file_search and file_grep to check what you need, then answer.
-        Evaluate everything in `<<path>>` in the `<<repo>>` repository: what is good
-        about it and what is bad. Identify code-quality issues, architectural risks,
-        performance concerns, security vulnerabilities, maintainability problems,
-        missing error handling, implicit assumptions that could break, and
-        opportunities for improvement. Name each by where it is — the artifact, and
-        the lines where you can — and give the reason.
-    window: 8000
-    score_threshold: 0.0
-    budget:
-      priority: 15
-    # Dial overrides for the shared system prompt when this layer is the
-    # projection target (thinking depth / answer length / tool access).
-    dials:
-      thinking_effort: deep
-      response_length: detailed
-      tools: none
-    summary:
-      turns:
-        max_tokens: 384
-        assistant:
-          system_prompt: |
-            You compress a critical evaluation into a shorter, faithful version. Keep
-            every concrete issue with its specific file/line reference and the reason
-            given, in the original voice. Add nothing not present: never introduce an
-            issue, cause, or severity the critique does not state. Drop generalities.
-            Stop the moment the issues are captured; do not pad. No commentary,
-            headings, lists, or word counts.
-          user_prompt: |
-            Compress the critique above faithfully: each concrete issue with its
-            file/line reference and the reason, dropping generalities, adding nothing,
-            stopping when captured.
-      summaries:
-        max_tokens: 384
-        assistant:
-          system_prompt: |
-            The critique sections below are already compressed. Merge them into one
-            faithful, shorter section in the original voice, keeping the systemic risks
-            and the most severe problems with their references, and dropping minor,
-            local, or redundant issues. Add nothing not already present. Do not pad;
-            stop the moment it is captured. No commentary, headings, lists, or word
-            counts. This is a tree node: near the root it covers the whole critique.
-          user_prompt: |
-            Merge the sections above into one faithful, shorter section: the systemic
-            risks and most severe problems with their references, dropping minor issues,
-            adding nothing.
-    groups:
-      - id: critique
-        selection: { kind: top_k, k: 4 }
-        score_threshold: 1.0  # bimodal: ~70% of inter are zero-score; cuts zero floor, preserves all non-zero hits
-        budget:
-          priority: 100
-
-  # ── Phase 7 — Bug Analysis ─────────────────────────────────────────────────
-  - name: bug_analysis
-    description: |
-      Concrete bugs and failure modes per file with severity + fix
-      suggestion (Phase 7).
-    ingest_unit: files
-    ingest:
-      unit: file
-      after: critical_analysis
-      tools: [file_read, file_list, file_search, file_grep]
-      prompt: |
-        You may read the workspace with file_read, file_list, file_search and file_grep to check what you need, then answer.
-        Find the concrete bugs in `<<path>>` in the `<<repo>>` repository: places where
-        the code does the wrong thing, or will under an input or a state it can
-        meet. For each, give where it is (the artifact and the lines), how it fails,
-        what triggers it, how severe it is, and a fix. Report only bugs you can point
-        to in the code you have read; if you find none, say so.
-    window: 8000
-    score_threshold: 0.0
-    budget:
-      priority: 20
-    # Dial overrides for the shared system prompt when this layer is the
-    # projection target (thinking depth / answer length / tool access).
-    dials:
-      thinking_effort: exhaustive
-      response_length: detailed
-      tools: none
-    summary:
-      turns:
-        max_tokens: 512
-        assistant:
-          system_prompt: |
-            You compress a bug analysis into a shorter, faithful version. Keep every
-            concrete bug exactly — its location (file/line), failure mode, and trigger.
-            Add nothing not present: never introduce a bug, location, or trigger the
-            analysis does not state. Drop speculation and prose; a bug without a
-            location is not kept. Stop the moment the bugs are captured; do not pad. No
-            commentary, headings, or word counts.
-          user_prompt: |
-            Compress the bug analysis above faithfully: each concrete bug with its
-            file/line, failure mode, and trigger, dropping speculation, adding nothing,
-            stopping when captured.
-      summaries:
-        max_tokens: 512
-        assistant:
-          system_prompt: |
-            The bug sections below are already compressed. Merge them into one faithful,
-            shorter section, keeping the dominant failure patterns and the worst
-            concrete bugs with their locations, and dropping minor, local, or redundant
-            bugs. Add nothing not already present. Do not pad; stop the moment it is
-            captured. No commentary, headings, or word counts. This is a tree node:
-            near the root it covers all the bugs found.
-          user_prompt: |
-            Merge the sections above into one faithful, shorter section: the dominant
-            failure patterns and worst concrete bugs with file/line, dropping minor
-            ones, adding nothing.
-    groups:
-      - id: bugs
-        selection: { kind: top_k, k: 4 }
-        score_threshold: 250.0  # intra floor=367 > 250; cuts weakest inter without touching real hits
-        budget:
-          priority: 100
-
-  # ── Daily History ──────────────────────────────────────────────────────────
-  - name: daily_history
-    description: |
-      Per-day converged summaries of prior developer conversations.
-    ingest_unit: days
-    # One unit per closed day of dialogue, read from the day's conversations.
-    ingest:
-      unit: day
-      prompt: |
-        Here is the developer dialogue of <<day>>:
-
-        <<transcript>>
-        Write the history of that day: what was worked on, the decisions made, the
-        questions answered and the facts established — names, numbers and files as
-        they were given — as prose, in the order it happened. Record only what the
-        dialogue holds.
-    window: 8000
-    score_threshold: 0.0
-    budget:
-      priority: 30
-    # Dial overrides for the shared system prompt when this layer is the
-    # projection target (thinking depth / answer length / tool access).
-    dials:
-      thinking_effort: balanced
-      response_length: standard
-      tools: none
-    summary:
-      turns:
-        max_tokens: 512
-        assistant:
-          system_prompt: |
-            You compress a day's developer conversations into a shorter, faithful
-            version, as prose in the original voice. Keep the concrete decisions,
-            answers, and facts — names, numbers, file references. Add nothing not
-            present: never introduce a decision, fact, or number the day did not record.
-            Drop chit-chat. Stop the moment the substance is captured; do not pad. No
-            commentary, headings, lists, or word counts.
-          user_prompt: |
-            Compress the day's history above faithfully, as prose: its decisions,
-            answers, and concrete facts (names, numbers, files), dropping chit-chat,
-            adding nothing, stopping when captured.
-      summaries:
-        max_tokens: 512
-        assistant:
-          system_prompt: |
-            The daily sections below are already compressed. Merge them into one
-            faithful, shorter prose passage in the original voice, keeping the
-            throughlines — the decisions and threads that span days — and dropping
-            per-day specifics and redundancy. Add nothing not already present. Do not
-            pad; stop the moment it is captured. No commentary, headings, lists, or word
-            counts. This is a tree node: near the root it describes the whole period.
-          user_prompt: |
-            Merge the sections above into one faithful, shorter prose passage: the
-            throughlines — decisions and threads spanning days — dropping per-day
-            specifics, adding nothing.
-    groups:
-      - id: days
-        selection: { kind: top_k, k: 4 }
-        score_threshold: 0.0  # overlapping distributions — no useful threshold; TopK handles ranking
-        budget:
-          priority: 100
-
-  # ── Dream Log ──────────────────────────────────────────────────────────────
-  - name: dream_log
-    description: |
-      Speculative exploration logs from the overnight dream phase.
-    ingest_unit: days
-    # One unit per day, continuing that day's history.
-    ingest:
-      unit: day
-      after: daily_history
-      prompt: |
-        You have the history of <<day>> above. Explore it speculatively: take the
-        threads of that day — and the critical and bug analyses of the code you can
-        see — most worth thinking past, and ask what if. For each, set out the idea,
-        the mechanism by which it would work, and what it would change. Say plainly
-        that it is speculation.
-    window: 8000
-    score_threshold: 0.0
-    budget:
-      priority: 10
-    # Dial overrides for the shared system prompt when this layer is the
-    # projection target (thinking depth / answer length / tool access).
-    dials:
-      thinking_effort: deep
-      response_length: comprehensive
-      tools: none
-    summary:
-      turns:
-        max_tokens: 384
-        assistant:
-          system_prompt: |
-            You compress a speculative architectural exploration into a shorter,
-            faithful version. Keep the core what-if, its mechanism, and its key
-            implications, concretely. Add nothing not present: never introduce an idea,
-            mechanism, or consequence the exploration does not raise. Drop hedging and
-            filler. Stop the moment the idea is captured; do not pad. No commentary,
-            headings, lists, or word counts.
-          user_prompt: |
-            Compress the exploration above faithfully: its core idea, mechanism, and key
-            implications, dropping hedging, adding nothing, stopping when captured.
-      summaries:
-        max_tokens: 384
-        assistant:
-          system_prompt: |
-            The speculative sections below are already compressed. Merge them into one
-            faithful, shorter section, keeping the most promising directions and
-            dropping individual explorations, their detail, and redundancy. Add nothing
-            not already present. Do not pad; stop the moment it is captured. No
-            commentary, headings, lists, or word counts. This is a tree node: near the
-            root it covers all the speculation.
-          user_prompt: |
-            Merge the sections above into one faithful, shorter section: the most
-            promising directions, dropping individual explorations, adding nothing.
-    groups:
-      - id: dreams
-        selection: { kind: top_k, k: 3 }
-        score_threshold: 100.0  # cuts near-zero inter cluster (p0-p5=0–20); intra floor=295
         budget:
           priority: 100
 
@@ -1360,6 +999,7 @@ layers:
   # own recent turns and historical recall. Lower the cap and this can follow
   # it down; the two numbers are a pair.
   - name: dialogue
+    persisted_id: 10
     description: |
       The active developer conversation served to the VS Code extension or
       web chat.
@@ -1515,6 +1155,7 @@ layers:
             covering every section and adding nothing.
     groups:
       - id: primary_conversation
+        persisted_id: 10
         selection:
           kind: conversation
           recent: 16            # last 16 turns always shown

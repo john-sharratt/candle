@@ -114,8 +114,9 @@ impl Reserved {
     }
 }
 
-/// Opaque identifier for a layer. Assigned in declaration order at construction
-/// (first layer = `LayerId(1)`).
+/// Opaque identifier for a layer: its `persisted_id` when the schema pins its
+/// ids, otherwise its declaration order (first layer = `LayerId(1)`) — see
+/// `persisted_ids`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LayerId(pub(super) NonZeroU32);
 
@@ -172,8 +173,8 @@ impl LayerId {
 }
 
 /// Opaque identifier for a group. **Globally unique** across all layers in a
-/// schema — not scoped per-layer. Assigned in (layer order × group order) at
-/// construction.
+/// schema — not scoped per-layer. Its `persisted_id` when the schema pins its
+/// ids, otherwise assigned in (layer order × group order) at construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GroupId(pub(super) NonZeroU32);
 

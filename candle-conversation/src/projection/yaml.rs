@@ -74,6 +74,7 @@ use super::adaptive::{
 };
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
+use super::persisted_ids;
 use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
@@ -542,6 +543,10 @@ struct YamlTreeOption {
 #[derive(Deserialize)]
 struct YamlLayer {
     name: String,
+    /// The id this layer's conversations are persisted under — see
+    /// `persisted_ids::assign`.
+    #[serde(default)]
+    persisted_id: Option<u32>,
     #[serde(default)]
     description: String,
     /// Total turn-budget when this layer is the projection target.
@@ -660,6 +665,10 @@ impl From<YamlGatherScope> for GatherScope {
 #[derive(Deserialize)]
 struct YamlGroup {
     id: String,
+    /// The id this group's conversations are persisted under — see
+    /// `persisted_ids::assign`.
+    #[serde(default)]
+    persisted_id: Option<u32>,
     #[serde(default)]
     selection: YamlSelection,
     /// Belief/selection gate. Absent is NOT the same as `0.0`: an absent
@@ -1059,7 +1068,21 @@ fn build(
     let mut collection_alloc = CollectionIdAlloc(0);
 
     let mut layers = Vec::with_capacity(raw.layers.len());
-    let mut global_group_counter: u32 = 0;
+    let layer_ids = persisted_ids::assign(
+        &raw.layers
+            .iter()
+            .map(|l| l.persisted_id)
+            .collect::<Vec<_>>(),
+        "layer",
+    )?;
+    let group_ids = persisted_ids::assign(
+        &raw.layers
+            .iter()
+            .flat_map(|l| l.groups.iter().map(|g| g.persisted_id))
+            .collect::<Vec<_>>(),
+        "group",
+    )?;
+    let mut group_ids = group_ids.into_iter();
 
     // Root of the policy inheritance chain: the schema `default_policy:` resolved
     // against the built-in default. Layers inherit this; collections/groups the layer.
@@ -1082,7 +1105,7 @@ fn build(
     )?;
 
     for (li, yl) in raw.layers.iter().enumerate() {
-        let lid = LayerId::new(li as u32 + 1);
+        let lid = LayerId::new(layer_ids[li]);
         maps.layer_names.insert(yl.name.clone(), lid);
 
         let layer_budget = parse_budget(&yl.name, &yl.budget)?;
@@ -1106,8 +1129,11 @@ fn build(
             if maps.group_names.contains_key(&yg.id) {
                 return Err(ConstructionError::DuplicateGroupName(yg.id.clone()));
             }
-            global_group_counter += 1;
-            let gid = GroupId::new(global_group_counter);
+            let gid = GroupId::new(
+                group_ids
+                    .next()
+                    .expect("persisted_ids::assign numbers every group"),
+            );
             maps.group_names.insert(yg.id.clone(), gid);
 
             if let Some(t) = yg.score_threshold {

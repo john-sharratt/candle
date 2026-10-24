@@ -11,6 +11,7 @@
 //!   ├──────────────────────┼─────────────────────────────────────────────┤
 //!   │ Parse-time           │ YamlParse                                   │
 //!   │   (yaml.rs)          │ DuplicateGroupName                          │
+//!   │                      │ PersistedIds                                │
 //!   │                      │ DuplicateSectionName                        │
 //!   │                      │ UnknownSelectionKind                        │
 //!   │                      │ InvalidPriority      (priority <= 0)        │
@@ -44,6 +45,12 @@ pub enum ConstructionError {
     /// be unique across the whole schema (not per-layer).
     #[error("duplicate group name {0:?} — group ids must be unique across the whole schema")]
     DuplicateGroupName(String),
+
+    /// A schema's `persisted_id`s are unusable: some layers or groups carry one
+    /// and others do not, two share one, one is zero, or one reaches the band
+    /// reserved for the system prompt and the engine.
+    #[error("persisted ids: {0}")]
+    PersistedIds(String),
 
     /// Two sections share the same string name.
     #[error("duplicate section name {0:?} — section ids must be unique")]

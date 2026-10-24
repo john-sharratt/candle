@@ -2656,6 +2656,81 @@ layers:
     );
 }
 
+/// A schema of two layers, each with one group, the layer and group ids as
+/// given (`""` for none).
+fn pinned_yaml(first: (&str, &str), second: (&str, &str)) -> String {
+    let layer = |name: &str, group: &str, ids: (&str, &str)| {
+        format!(
+            r#"
+  - name: {name}
+    {}
+    window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: {group}
+        {}
+        selection: {{ kind: always_visible }}"#,
+            ids.0, ids.1
+        )
+    };
+    format!(
+        r#"
+system_prompt:
+  sections:
+    - id: s1
+      content: "X"
+    - id: stub
+      content: "stub"
+layers:{}{}
+"#,
+        layer("low", "low_g", first),
+        layer("dialogue", "dialogue_g", second)
+    )
+}
+
+/// **Pinned ids are the ids, wherever the layer sits**: a schema that dropped
+/// the layers between these two keeps the dialogue at the numbers its
+/// persisted conversations carry.
+#[test]
+fn yaml_pinned_persisted_ids_survive_removed_layers() {
+    let yaml = pinned_yaml(
+        ("persisted_id: 2", "persisted_id: 2"),
+        ("persisted_id: 10", "persisted_id: 10"),
+    );
+    let builder = Builder::from_yaml(&yaml).unwrap();
+    assert_eq!(builder.id_for_layer("low").unwrap().raw(), 2);
+    assert_eq!(builder.id_for_layer("dialogue").unwrap().raw(), 10);
+    assert_eq!(builder.id_for_group("low_g").unwrap().raw(), 2);
+    assert_eq!(builder.id_for_group("dialogue_g").unwrap().raw(), 10);
+
+    let positional = Builder::from_yaml(&pinned_yaml(("", ""), ("", ""))).unwrap();
+    assert_eq!(positional.id_for_layer("dialogue").unwrap().raw(), 2);
+    assert_eq!(positional.id_for_group("dialogue_g").unwrap().raw(), 2);
+}
+
+/// A schema pinning only some of its layers is refused.
+#[test]
+fn yaml_partly_pinned_persisted_ids_are_an_error() {
+    let yaml = pinned_yaml(
+        ("persisted_id: 2", "persisted_id: 2"),
+        ("", "persisted_id: 10"),
+    );
+    let err = Builder::from_yaml(&yaml).unwrap_err();
+    assert!(
+        matches!(err, super::error::ConstructionError::PersistedIds(_)),
+        "expected PersistedIds, got {err:?}"
+    );
+}
+
 #[test]
 fn yaml_duplicate_section_name_is_error() {
     let yaml = r#"
@@ -4061,13 +4136,7 @@ fn zend_projection_yaml_parses() {
     let expected_layers = [
         "repo_map",
         "code_reading",
-        "static_analysis",
         "dependency_analysis",
-        "architectural_analysis",
-        "critical_analysis",
-        "bug_analysis",
-        "daily_history",
-        "dream_log",
         "dialogue",
     ];
     for name in &expected_layers {
@@ -4103,12 +4172,8 @@ fn zend_projection_yaml_parses() {
     for single in [
         "repo_map",
         "code_reading",
-        "static_analysis",
         "dependency_analysis",
         "dialogue",
-        "bug_analysis",
-        "architectural_analysis",
-        "dream_log",
     ] {
         assert_eq!(
             mode_of(single),
