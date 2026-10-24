@@ -15,6 +15,7 @@
 //! merge of the sealed ones into the schema the conversation projects with.
 
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use flume::Sender;
 
@@ -229,6 +230,22 @@ impl SubmittedSections {
     }
 }
 
+/// A section sealed, and where its time went.
+struct Sealed {
+    blocks: usize,
+    stream: StreamId,
+    /// `restored` from the log, or `prefilled` afresh.
+    how: &'static str,
+    /// Waiting for the sections it continues to seal.
+    waited_ms: u64,
+    /// Working out the state it starts from.
+    start_ms: u64,
+}
+
+fn millis(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Everything the thread sealing one section needs, so it does not borrow the
 /// conversation.
 struct SealJob {
@@ -250,19 +267,36 @@ struct SealJob {
 
 impl SealJob {
     fn run(self) {
+        let started = Instant::now();
         match self.seal() {
-            Ok((blocks, stream)) => {
+            Ok(sealed) => {
+                tracing::info!(
+                    section = %self.name,
+                    how = sealed.how,
+                    continues = self.after.len(),
+                    blocks = sealed.blocks,
+                    waited_ms = sealed.waited_ms,
+                    start_ms = sealed.start_ms,
+                    total_ms = millis(started),
+                    "submitted section sealed",
+                );
                 if self.substrate.owned_section_named(self.owner, &self.name) != Some(self.section)
                 {
                     self.discard();
                     self.settled.remove();
                 } else {
-                    self.settled.settle(SectionState::Ready { blocks });
-                    self.release_superseded(stream);
+                    self.settled.settle(SectionState::Ready {
+                        blocks: sealed.blocks,
+                    });
+                    self.release_superseded(sealed.stream);
                 }
             }
             Err(e) => {
-                tracing::warn!(section = %self.name, "submitted section failed to seal: {e}");
+                tracing::warn!(
+                    section = %self.name,
+                    total_ms = millis(started),
+                    "submitted section failed to seal: {e}"
+                );
                 self.settled.settle(SectionState::Failed(e.to_string()));
             }
         }
@@ -328,9 +362,10 @@ impl SealJob {
 
     /// Seal the section into the substrate, restoring it from the persisted
     /// stream when the same content was sealed under this address before.
-    /// Returns the block count and the stream it lives in.
-    fn seal(&self) -> crate::Result<(usize, StreamId)> {
+    fn seal(&self) -> crate::Result<Sealed> {
+        let waiting = Instant::now();
         let sealed_prefix = self.sealed_prefix()?;
+        let waited_ms = millis(waiting);
         let encoding = self
             .tokenizer
             .encode(self.content.as_str(), false)
@@ -362,7 +397,13 @@ impl SealJob {
             match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
                 Ok(chunks) => {
                     self.substrate.record_section_loads(1, 0);
-                    return Ok((chunks, stream));
+                    return Ok(Sealed {
+                        blocks: chunks,
+                        stream,
+                        how: "restored",
+                        waited_ms,
+                        start_ms: 0,
+                    });
                 }
                 Err(e) => tracing::warn!(
                     section = %self.name,
@@ -372,7 +413,9 @@ impl SealJob {
         }
 
         self.substrate.record_section_loads(0, 1);
+        let starting = Instant::now();
         let start = self.start_state()?;
+        let start_ms = millis(starting);
         let slot = alloc_scratch_slot_on(&self.scheduler_tx, &self.substrate)?;
         let (tx, rx) = flume::bounded(1);
         let sent = self
@@ -395,7 +438,13 @@ impl SealJob {
             .send(SchedulerRequest::FreeSequence { sequence_id: slot });
         let seal = sealed?;
         *self.settled.end.lock().unwrap() = seal.end_state.as_ref().map(SharedState::from);
-        Ok((seal.block_to.saturating_sub(seal.block_from), stream))
+        Ok(Sealed {
+            blocks: seal.block_to.saturating_sub(seal.block_from),
+            stream,
+            how: "prefilled",
+            waited_ms,
+            start_ms,
+        })
     }
 
     /// The content hash of the sections this one seals against — the chain a
