@@ -1330,6 +1330,16 @@ impl ConversationEngine {
         self.conversation.write().mark_group_scoped(group);
     }
 
+    /// Offer `group`'s conversations to a projection only while they descend
+    /// from a member of its target's working set — what the schema's
+    /// `follows_working_set` declares for it. Idempotent; in-memory, so it is
+    /// marked at every setup.
+    pub fn mark_group_follows_working_set(&self, group: GroupId) {
+        self.conversation
+            .write()
+            .mark_group_follows_working_set(group);
+    }
+
     /// Record which share of a dialogue's working-set budget `group`'s
     /// conversations draw on — what the schema's `working_set` selection rule
     /// declares for it. A conversation in no such group is never a working-set

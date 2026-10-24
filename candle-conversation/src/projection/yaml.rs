@@ -685,6 +685,9 @@ struct YamlGroup {
     /// when absent.
     #[serde(default)]
     max_swaps: Option<usize>,
+    /// Offer only conversations descended from a working-set member.
+    #[serde(default)]
+    follows_working_set: bool,
 }
 
 /// YAML shadow of [`SelectionDefault`] — `default: { tag: "…" }`.
@@ -1147,6 +1150,7 @@ fn build(
                         })?
                     }
                 },
+                follows_working_set: yg.follows_working_set,
             });
         }
 

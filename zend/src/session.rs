@@ -2795,6 +2795,12 @@ impl InferenceState {
                     .unwrap()
                     .set_working_set_share(group.id, share);
             }
+            if group.follows_working_set {
+                engine
+                    .lock()
+                    .unwrap()
+                    .mark_group_follows_working_set(group.id);
+            }
         }
 
         let mut branch_layers: Vec<(IngestLayer, IngestScope)> = Vec::new();

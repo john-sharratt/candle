@@ -940,6 +940,12 @@ layers:
     groups:
       - id: artifacts
         selection: { kind: top_k, k: 8 }
+        # An analysis of a file is offered only while the dialogue works in
+        # that file — a working-set member it descends from. Measured
+        # 2026-10-24: on a question about a candle paper every unit these
+        # layers projected was a battle-cities analysis, 25–48K tokens a decode,
+        # one taken at belief score 0.
+        follows_working_set: true
         score_threshold: 1.0  # bimodal: ~80% of inter are zero-score; cuts zero floor, preserves all non-zero hits
         budget:
           priority: 100
@@ -1018,6 +1024,7 @@ layers:
     groups:
       - id: dependencies
         selection: { kind: top_k, k: 6 }
+        follows_working_set: true  # see `artifacts`
         score_threshold: 0.0  # inverted within-layer signal — no useful threshold; TopK handles ranking
         budget:
           priority: 100
@@ -1083,6 +1090,7 @@ layers:
     groups:
       - id: architecture
         selection: { kind: top_k, k: 5 }
+        follows_working_set: true  # see `artifacts`
         score_threshold: 0.0  # overlapping distributions — no useful threshold; TopK handles ranking
         budget:
           priority: 100
@@ -1147,6 +1155,7 @@ layers:
     groups:
       - id: critique
         selection: { kind: top_k, k: 4 }
+        follows_working_set: true  # see `artifacts`
         score_threshold: 1.0  # bimodal: ~70% of inter are zero-score; cuts zero floor, preserves all non-zero hits
         budget:
           priority: 100
@@ -1210,6 +1219,7 @@ layers:
     groups:
       - id: bugs
         selection: { kind: top_k, k: 4 }
+        follows_working_set: true  # see `artifacts`
         score_threshold: 250.0  # intra floor=367 > 250; cuts weakest inter without touching real hits
         budget:
           priority: 100

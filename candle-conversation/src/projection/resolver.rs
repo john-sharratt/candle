@@ -29,7 +29,7 @@ use super::schema::{
     SystemPromptSchema,
 };
 use super::warm_pool;
-use super::working_set_observe::{working_set_config, working_set_fresh};
+use super::working_set_observe::{ranked_fresh, working_set_config, RawBest};
 use super::working_set_pick::{Standing, WorkingSetMembers};
 use crate::cancel::CancelToken;
 use crate::error::ConversationError;
@@ -1421,19 +1421,19 @@ impl Conversation {
     }
 
     /// Fold one reprojection's scan into `target`'s working-set momentum
-    /// (`docs/zend_working_set.md` §4.3). `candidates` is what
-    /// [`Self::score_beliefs`] returned; a target whose layer declares no
-    /// working set learns nothing.
+    /// (`docs/zend_working_set.md` §4.3), each file fed by its rank in the
+    /// scan ([`ranked_fresh`]). `scores` is what [`Self::score_beliefs`]
+    /// returned; a target whose layer declares no working set learns nothing.
     pub fn observe_working_set(
         &self,
         schema: &Schema,
         target: ProjectionTarget,
-        candidates: &[(GroupId, Vec<(TurnKey, f32)>)],
+        scores: &ProjectionScores,
     ) {
         let Some(cfg) = working_set_config(schema, target) else {
             return;
         };
-        let fresh = working_set_fresh(schema, candidates);
+        let fresh = ranked_fresh(scores.working_set_raw());
         self.inner.write().unwrap().working_set_observe(
             target.timeline,
             &fresh,
@@ -2390,12 +2390,9 @@ impl Conversation {
                 None => scan_files(&[probe]),
             };
             let question_scan = question.and_then(|_| scanned.pop());
-            let q_base: Option<Vec<f32>> = question_scan.as_ref().map(|per_file| {
-                per_file
-                    .iter()
-                    .flat_map(|(_, base)| base.iter().copied())
-                    .collect()
-            });
+            let q_base_per_file: Option<Vec<Vec<f32>>> = question_scan
+                .as_ref()
+                .map(|per_file| per_file.iter().map(|(_, base)| base.clone()).collect());
             let fresh_q_per_file: Option<Vec<Vec<f32>>> = question_scan
                 .map(|per_file| per_file.into_iter().map(|(fused, _)| fused).collect());
             let tail_scan = scanned.pop().unwrap_or_default();
@@ -2548,8 +2545,24 @@ impl Conversation {
                 ),
             );
             if let Some(tail) = scan_stats(&group_raw) {
-                let question = q_base.as_deref().and_then(scan_stats);
+                let q_raw: Option<Vec<f32>> = q_base_per_file
+                    .as_ref()
+                    .map(|per_file| per_file.iter().flatten().copied().collect());
+                let question = q_raw.as_deref().and_then(scan_stats);
                 scores.set_group_scan(group.id, GroupScan { tail, question });
+            }
+            if group.is_working_set() {
+                let best_of = |per_file: &[Vec<f32>]| -> Vec<(TimelineId, f32)> {
+                    files
+                        .iter()
+                        .zip(per_file)
+                        .map(|(f, votes)| (f.timeline, votes.iter().copied().fold(0.0, f32::max)))
+                        .collect()
+                };
+                scores.push_working_set_raw(RawBest {
+                    tail: best_of(&mass_base_per_file),
+                    question: q_base_per_file.as_deref().map(best_of).unwrap_or_default(),
+                });
             }
             // Where this group's scan time went, and what it walked to spend it.
             // `assemble_us` is host work proportional to the group's turns;

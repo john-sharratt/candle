@@ -1060,6 +1060,12 @@ pub struct GroupSchema {
     /// momentum, and section collections (the tool catalog) are not capped.
     /// Never zero: the smallest cap still admits one whole conversation.
     pub max_swaps: NonZeroUsize,
+    /// Whether this group offers a projection only the conversations that
+    /// descend from a member of the target's working set
+    /// (`Substrate::mark_group_follows_working_set`) — a unit built on a
+    /// file's reading is needed while the dialogue works in that file, and
+    /// not otherwise, however well it scores.
+    pub follows_working_set: bool,
 }
 
 impl GroupSchema {
@@ -1492,6 +1498,7 @@ mod belief_config_tests {
             locality: None,
             anchor: None,
             max_swaps: DEFAULT_MAX_SWAPS,
+            follows_working_set: false,
         }
     }
 

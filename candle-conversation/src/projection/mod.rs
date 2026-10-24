@@ -222,7 +222,7 @@ mod score;
 mod selection;
 mod swap_cap;
 pub mod warm_pool;
-mod working_set_observe;
+pub(crate) mod working_set_observe;
 mod working_set_pick;
 mod yaml;
 

@@ -81,6 +81,7 @@ use crate::persistence::record::{
 use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::scan_stats::GroupScan;
+use crate::projection::working_set_observe::RawBest;
 use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, LayerId, OwnedSection, OwnedSections,
     ProjectionEvent, ProjectionTarget, SectionId, SystemItem, TimelineAllocator, TimelineId,
@@ -235,6 +236,12 @@ pub struct Substrate {
     /// group offers nothing a target was not given. In-memory only, marked
     /// once at engine setup.
     scoped_groups: HashSet<GroupId>,
+
+    /// Groups whose conversations are offered to a projection only while they
+    /// descend from a member of the target's working set
+    /// ([`Self::mark_group_follows_working_set`]). In-memory only, marked once
+    /// at engine setup.
+    follows_working_set: HashSet<GroupId>,
 
     /// Which share of a dialogue's working-set budget each working-set group's
     /// conversations draw on — the schema's `selection: { kind: working_set,
@@ -898,6 +905,9 @@ pub struct ProjectionScores {
     /// The order statistics of each turn group's raw scores this projection,
     /// keyed by group id — what the group's need is read from.
     group_scan: AHashMap<u32, GroupScan>,
+    /// Each working-set group's conversations with their best raw vote, per
+    /// probe — what working-set momentum is fed from, by rank.
+    working_set_raw: Vec<RawBest>,
     /// Concept C: turns whose score was RAISED by locality drag (selected only
     /// through a neighbor) — stamped `SelectionOrigin::Locality` at selection.
     locality_boosted: AHashSet<TurnKey>,
@@ -972,6 +982,16 @@ impl ProjectionScores {
         self.group_scan.get(&group.raw()).copied()
     }
 
+    /// Record one working-set group's conversations and their best raw votes.
+    pub fn push_working_set_raw(&mut self, raw: RawBest) {
+        self.working_set_raw.push(raw);
+    }
+
+    /// Every working-set group's raw votes this projection.
+    pub fn working_set_raw(&self) -> &[RawBest] {
+        &self.working_set_raw
+    }
+
     /// A collection's attention mass (0 when unscored this projection).
     pub fn collection_mass(&self, collection: u32) -> f32 {
         self.collection_mass
@@ -998,6 +1018,7 @@ impl ProjectionScores {
         self.group_mass.clear();
         self.collection_mass.clear();
         self.group_scan.clear();
+        self.working_set_raw.clear();
         self.locality_boosted.clear();
     }
 
@@ -3691,6 +3712,41 @@ impl Substrate {
         self.scoped_groups.contains(&group)
     }
 
+    /// Offer `group`'s conversations to a projection only while one of their
+    /// ancestors — or the conversation itself — is a member of the target's
+    /// working set. A unit built on a file's reading forks from that reading,
+    /// so it is offered exactly while the dialogue works in the file: what it
+    /// needs is decided by what it carries, never by how well the unit scores.
+    /// Idempotent.
+    pub fn mark_group_follows_working_set(&mut self, group: GroupId) {
+        self.follows_working_set.insert(group);
+    }
+
+    /// `target`'s working-set members, locked or not.
+    fn working_set_member_set(&self, target: TimelineId) -> HashSet<TimelineId> {
+        self.working_sets
+            .get(&target)
+            .map(|ws| ws.members().into_iter().map(|(tl, _)| tl).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether `timeline`, or any conversation it forked from, is in
+    /// `members`. Walks every `forked_from` link, past the chain's token cap.
+    fn descends_from_any(&self, timeline: TimelineId, members: &HashSet<TimelineId>) -> bool {
+        let mut seen = HashSet::new();
+        let mut cursor = Some(timeline);
+        while let Some(tl) = cursor {
+            if members.contains(&tl) {
+                return true;
+            }
+            if !seen.insert(tl) {
+                return false;
+            }
+            cursor = self.parent_timeline(tl);
+        }
+        false
+    }
+
     /// Name the conversations the scoped `group` may offer `target`,
     /// replacing whatever it named before.
     pub fn set_retrieval_scope(
@@ -3712,7 +3768,9 @@ impl Substrate {
 
     /// [`Self::active_timelines_for_group`] as `target` may see it: all of
     /// them for a group that is not scoped, only those `target`'s scope names
-    /// for one that is — and none when it names none.
+    /// for one that is — and none when it names none. A group that follows
+    /// the working set offers, of those, only the ones descended from a
+    /// member of `target`'s.
     pub fn scoped_timelines_for_group(
         &self,
         group: GroupId,
@@ -3724,17 +3782,31 @@ impl Substrate {
                     .get(&target)
                     .and_then(|by_group| by_group.get(&group))
             });
+        let members: Option<HashSet<TimelineId>> = self
+            .follows_working_set
+            .contains(&group)
+            .then(|| self.working_set_member_set(target));
         self.active_timelines_for_group(group)
             .filter(move |tl| match scope {
                 None => true,
                 Some(None) => false,
                 Some(Some(allowed)) => allowed.contains(tl),
             })
+            .filter(move |tl| {
+                members
+                    .as_ref()
+                    .is_none_or(|members| self.descends_from_any(*tl, members))
+            })
     }
 
     /// Whether `group` may offer `timeline` to `target` — the scope test
     /// [`Self::scoped_timelines_for_group`] applies, for one conversation.
     pub fn scope_offers(&self, group: GroupId, target: TimelineId, timeline: TimelineId) -> bool {
+        if self.follows_working_set.contains(&group)
+            && !self.descends_from_any(timeline, &self.working_set_member_set(target))
+        {
+            return false;
+        }
         if !self.scoped_groups.contains(&group) {
             return true;
         }
@@ -8385,6 +8457,46 @@ mod tests {
             .map(|(tl, _)| tl)
             .collect();
         assert_eq!(members, vec![reads[1]]);
+    }
+
+    /// **A group that follows the working set offers what descends from a
+    /// member**: an analysis forked from a file's reading is offered while
+    /// that reading is in the dialogue's working set — however many forks
+    /// down — and not before, nor after it leaves.
+    #[test]
+    fn a_group_following_the_working_set_offers_only_descendants_of_members() {
+        let (mut sub, target, reads) = working_set_fixture(2, 10);
+        let analyses = GroupId::for_test(5);
+        sub.mark_group_follows_working_set(analyses);
+        let alloc = TimelineAllocator::new();
+        let mut chain = |parent: TimelineId| {
+            let tl = alloc.next();
+            sub.register_timeline(tl, LayerId::for_test(5), analyses);
+            sub.append_with_blocks(tl, 10, 0, 1);
+            set_parent(&mut sub, tl, parent);
+            tl
+        };
+        let first = chain(reads[0]);
+        let second = chain(first);
+        let other = chain(reads[1]);
+        let offered = |sub: &Substrate| -> Vec<TimelineId> {
+            let mut v: Vec<TimelineId> = sub.scoped_timelines_for_group(analyses, target).collect();
+            v.sort();
+            v
+        };
+        assert!(offered(&sub).is_empty(), "no working set, nothing offered");
+        assert!(!sub.scope_offers(analyses, target, first));
+
+        sub.working_set_lock(target, reads[0], ws_limits(1000))
+            .unwrap();
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(offered(&sub), expected);
+        assert!(sub.scope_offers(analyses, target, second));
+        assert!(!sub.scope_offers(analyses, target, other));
+
+        sub.working_set_clear(target);
+        assert!(offered(&sub).is_empty(), "its file left, so did it");
     }
 
     /// A conversation in no working-set group can never be a member.

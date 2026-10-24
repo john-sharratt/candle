@@ -404,6 +404,38 @@ no selector change.
   configured selection kind, never on which layer it is — the zend dialogue
   floor (`Sequence`, priority 100, min 50 %) is an instance, not a special case.
 
+### B.5 What a layer needs — structure, not score (measured 2026-10-24)
+
+A layer above a file's reading — `static_analysis` through `bug_analysis`, one
+unit per file — is **needed exactly while the dialogue works in that file**. A
+group declaring `follows_working_set: true` offers a projection only the
+conversations descended from a member of the target's working set
+(`Substrate::mark_group_follows_working_set`, applied in
+`scoped_timelines_for_group` and `scope_offers`, so the scan and the
+projection's candidates both see it). A unit forks from the unit below it and,
+at the bottom, from the file's reading, so a file in the working set admits its
+whole analysis stack and a file that leaves takes it out. No scan, no working
+set: nothing — the opening projection carries none.
+
+Why not a score. Replaying a conversation about the paper (`1f283ffd`, then
+`cbac2859` with every group's raw order statistics on the projection event):
+
+- every unit the analysis layers projected on the paper question was a
+  battle-cities analysis — 25–48K tokens a decode, one taken at belief score 0,
+  one seeding a false path the model later repeated;
+- the raw group tops do not track the question: `dependencies` scored
+  300K–417K on the tour, the paper, the improvements and the edits alike, ~15×
+  `code_reading`. The scan's vote is `z × margin` per probe token with `z`
+  standardised per FILE, so a group's top reflects its gallery's shape —
+  listing-shaped analyses match the JSON tails of tool rounds — not the
+  question;
+- medians and p90s are 0: the vote is winner-take-all with a needle gate, so
+  there is no "typical member" to contrast against.
+
+The same replay fed working-set momentum from the normalised band, which runs
+~1000× over on short probes; momentum now feeds by rank instead
+(`docs/zend_working_set.md` §4.3).
+
 ---
 
 ## 5. Concept C — turn locality
