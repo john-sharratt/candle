@@ -365,7 +365,10 @@ system_prompt:
     # line, and conversation 715e5e23 read that excerpt as all it had — "only the
     # 'begins' line, so I can't get verbatim text for editing" — after one failed
     # edit, and stopped; so the rule says the reply is a pointer, the placed text is
-    # the file's exact text, and a failed edit is retried. A re-fetch
+    # the file's exact text, and a failed edit is retried. With the paper and
+    # docs/performance.md both placed, conversation c77006d1 cited
+    # performance.md's §3.7–§4 as the paper's — the section-number line is for
+    # that. A re-fetch
     # always lands: the fast path answers in_context only by locking the unit,
     # and a locked unit is projected on every decode its reply is
     # (`docs/zend_working_set.md` §4.6). Gated on tools: it tells the model to
@@ -381,7 +384,8 @@ system_prompt:
         reply only points at it; the text under the anchor is the file's exact text, so
         copy from it when you edit. Before you state a specific name, number, path, section
         or quote, or edit something, check its anchor is here and name the file it is in;
-        if it isn't here, fetch it again. If you remember something that is no
+        if it isn't here, fetch it again. Each document numbers its own sections, so two
+        files can both have a §4: a section number means nothing without its file. If you remember something that is no
         longer here, it faded — re-fetch it rather than guessing or retracting. If an edit
         fails, correct it and try again before you report it.
 
