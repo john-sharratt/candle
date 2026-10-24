@@ -183,6 +183,45 @@ for something written down.
 **Budget.** The system prompt has none; the journal is bounded by its shape —
 five one-line entries and six open items.
 
+### 4.1 The turns behind each entry
+
+One line per entry summarises; the turns it was written from are kept, whole,
+for the dialogue to read back when the line is not enough — the exact request,
+a file's contents, an error from back then. Two dialogue tools read them:
+
+- **`journal_read {entry, offset?, limit?}`** pages one entry's turns the way
+  `file_read` pages a file: each turn opens with its number and time
+  (`#7 14:20 User: …`), then runs as it was, 200 lines a page by default and
+  400 at most.
+- **`journal_grep {pattern, entry?, max_results?}`** finds the lines that hold
+  some text, ignoring case, in every entry's turns or one's: each hit names its
+  entry, turn and line, to read around with `journal_read`.
+
+The journal intro names them, so the model knows the line is not all there is.
+Reading and searching are `journal_core::transcript::Book`'s, shared with npcd;
+the tools (`zend-tools/src/tools/journal/`) reach the conversation's text
+through `ToolContext::journal`, which zend sets on every dialogue round.
+
+**Each stretch is filed under the entry it went into** (`transcript::Filed`):
+the entry a draft wrote, or — when the draft skipped the stretch as more of the
+same — the latest entry, whose span runs on over it. A stretch skipped before
+the first entry exists is filed nowhere. Each is one substrate custom object,
+`journal/turns/<timeline>/<entry>/<first part>`, zero-padded so key order is
+entry order and then stretch order, and **written once**: extending an entry
+adds an object beside the ones it holds and rewrites none. The text is not the
+conversation's turns — those leave the conversation's window and are tombstoned
+with it — but a copy of their words, with no K/V, that lives as long as the
+entry does:
+
+- **Forgetting an entry** ceases its objects.
+- **Tombstoning the conversation** ceases all of them.
+- **Archiving the conversation** ceases all of them and keeps the entries: the
+  journal can still be read, and nothing runs a tool on an archived
+  conversation again.
+
+npcd's characters keep no text behind their entries: none of their tools would
+read it.
+
 ## 5. Drafting
 
 **Drafts run on the dialogue's own conversation**, through `UnsealedAsker`
@@ -225,9 +264,11 @@ written closed, decoded greedily (`zend/src/journal/draft.rs`, which runs
    refused write is asked again with the refusal appended, and may still be
    answered with a skip. What the journal already says is dropped, and an
    entry of nothing else is filed as a skip is.
-3. **The keep:** ids are staged, the record is written to the conversation's
-   metadata, and only then is the entry in memory — a record that fails to
-   write leaves the journal as it was. The sections follow at the next round.
+3. **The keep:** ids are staged, the stretch's turns are filed under their
+   entry (§4.1), the record is written to the conversation's metadata, and only
+   then is the entry in memory — a record that fails to write leaves the
+   journal as it was. A skip keeps the same way, filing its stretch under the
+   latest entry. The sections follow at the next round.
 
 Deciding in the write's own answer means the model weighs the stretch with its
 parts numbered in front of it, and a stretch worth writing costs one answer on
@@ -331,6 +372,9 @@ them.
 | `zend/src/journal/draft.rs` | one draft and its record |
 | `zend/src/journal/carry.rs` | the schema install, the wanted sections, the round's selection |
 | `zend/src/journal/record.rs` | the metadata record |
+| `zend/src/journal/text.rs` | `JournalText`: the turns behind each entry as custom objects, and the tools' `JournalBook` |
+| `journal-core/src/transcript.rs` | `Filed`, the keys, and `Book`: paging and searching the kept turns |
+| `zend-tools/src/tools/journal/` | `journal_read`, `journal_grep`, and the `JournalBook` they read through |
 | `zend/src/journal/registry.rs` | `Journals`: every dialogue's journal, and what a draft forks from |
 | `zend/src/api/journal.rs` | the three routes |
 | `zend/web/index.html` | the Journal pane |
@@ -352,7 +396,14 @@ Built alongside the code, each building block testable alone:
 - **`journal-core`**: the scripted-`Desk` workflow, the check, the grammar, the
   record, repeats; npcd keeps passing through the move.
 - **Origin:** each half of a turn maps to its part, citability and kind;
-  reasoning is left out; long parts are clipped.
+  reasoning is left out; long parts are clipped for the draft and kept whole
+  for the text.
+- **Turn text:** keys order by entry then stretch; a read pages lines with each
+  turn's number and time; a search ignores case, counts every hit and returns
+  the first few; a write files under the new entry and a skip under the latest;
+  a filed stretch reads back under its own conversation alone; forgetting an
+  entry ceases its text and ceasing a conversation's leaves nothing; the tools
+  pass their arguments, defaults and bounds through, and name each miss.
 - **Workspace `World`:** against a temporary git repository, a file's existence
   and blob, a changed file, a branch's head and name, and every question it
   cannot answer.

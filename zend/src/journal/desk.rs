@@ -22,6 +22,7 @@ use candle_conversation::projection::DecodePriority;
 use candle_conversation::stencil::StencilTree;
 use candle_conversation::{AskScope, SamplingConfig, TurnOptions, UnsealedAsker};
 use journal_core::section::JournalPrompt;
+use journal_core::transcript::Filed;
 use journal_core::workflow::Desk;
 use serde_json::Value;
 
@@ -32,8 +33,9 @@ const WRITE_TOKENS: usize = 1024;
 /// held to: exactly one call, of any of them.
 pub type Compile = Arc<dyn Fn(&[Value]) -> anyhow::Result<Arc<StencilTree>> + Send + Sync>;
 
-/// Writes the journal's record where a restart reads it back.
-pub type Record = Box<dyn FnMut(&JournalPrompt) -> anyhow::Result<()> + Send>;
+/// Files a stretch's turns under its entry, then writes the journal's record
+/// where a restart reads it back.
+pub type Record = Box<dyn FnMut(&JournalPrompt, Option<&Filed>) -> anyhow::Result<()> + Send>;
 
 /// How every question of one draft is put.
 pub struct Asking {
@@ -104,8 +106,12 @@ impl Desk for ZendDesk {
         Ok(answer)
     }
 
-    fn keep(&mut self, prompt: &JournalPrompt) -> impl Future<Output = anyhow::Result<()>> + Send {
-        let kept = (self.record)(prompt);
+    fn keep(
+        &mut self,
+        prompt: &JournalPrompt,
+        filed: Option<&Filed>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send {
+        let kept = (self.record)(prompt, filed);
         async move { kept }
     }
 }

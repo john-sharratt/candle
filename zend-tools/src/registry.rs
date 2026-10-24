@@ -554,6 +554,24 @@ static ALIAS_GROUPS: &[(&str, &[&str])] = &[
     ),
     ("notes_list", &["list_notes", "note_list", "browse_notes"]),
     (
+        "journal_read",
+        &[
+            "read_journal",
+            "journal_entry",
+            "read_entry",
+            "journal_show",
+        ],
+    ),
+    (
+        "journal_grep",
+        &[
+            "search_journal",
+            "journal_search",
+            "grep_journal",
+            "find_in_journal",
+        ],
+    ),
+    (
         "credential_save",
         &[
             "save_credential",
@@ -998,6 +1016,7 @@ use crate::tools::{
     http_session::{
         HTTP_SESSION_CLOSE, HTTP_SESSION_LIST, HTTP_SESSION_OPEN, HTTP_SESSION_REQUEST,
     },
+    journal::{JOURNAL_GREP, JOURNAL_READ},
     network_diag::{DNS_LOOKUP, HOST_INFO, IP_SCAN, PING_ICMP, PORT_SCAN, TRACE_ROUTE},
     notes::{NOTES_LIST, NOTES_READ, NOTES_SEARCH, NOTES_WRITE},
     random::REGISTRATION as RANDOM,
@@ -1110,6 +1129,9 @@ fn register_all() -> &'static [RegisteredTool] {
         NOTES_READ,
         NOTES_SEARCH,
         NOTES_LIST,
+        // Journal tools (2) — read the conversation's own journal text
+        JOURNAL_READ,
+        JOURNAL_GREP,
         // Credential tools (3) — all high-risk (secrets)
         CREDENTIAL_SAVE.requires(SECRETS),
         CREDENTIAL_LIST.requires(SECRETS),

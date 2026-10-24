@@ -1,4 +1,4 @@
-//! All 95 tool implementations, organised into one module per logical group.
+//! All 97 tool implementations, organised into one module per logical group.
 //!
 //! Each tool module follows the same pattern:
 //! - a `Request` struct (`Deserialize + JsonSchema + Validate`)
@@ -23,6 +23,7 @@
 //! | `hash` | `hash_compute`, `hash_scan` | SHA2/SHA3/BLAKE3/MD5 |
 //! | `hash_state` | `hash_state_{init,update,finalize}` | Streaming hash for large data |
 //! | `http_session` | `http_session_{open,request,list,close}` | reqwest; cookie jar |
+//! | `journal` | `journal_read`, `journal_grep` | The conversation's own journal text, through `ToolContext::journal` |
 //! | `network_diag` | `dns_lookup`, `ping_icmp`, `trace_route`, `port_scan`, `ip_scan`, `host_info` | subprocess |
 //! | `notes` | `notes_{write,read,search,list}` | In-memory KV with FTS |
 //! | `random` | `random` | rand crate; real OS entropy |
@@ -52,6 +53,7 @@ pub mod git;
 pub mod hash;
 pub mod hash_state;
 pub mod http_session;
+pub mod journal;
 pub mod network_diag;
 pub mod notes;
 pub mod random;

@@ -19,6 +19,10 @@ pub struct SpanTurn {
     pub evidence: Option<Kind>,
     /// The turn as the writer is shown it, speaker included.
     pub text: String,
+    /// The turn whole, speaker included, as it is kept behind the entry it
+    /// goes into ([`crate::transcript`]). `text` may be cut short for the
+    /// draft; this never is.
+    pub full: String,
 }
 
 /// A stretch of turns not yet written about.
@@ -68,6 +72,7 @@ pub(crate) mod testing {
             at_ms,
             evidence,
             text: text.to_string(),
+            full: text.to_string(),
         }
     }
 }

@@ -18,6 +18,7 @@
 //! | `subagent_runner` | `Option<Arc<dyn SubagentRunner>>` | Injected by daemon to run nested agent loops |
 //! | `executor` | [`Executor`] | Where `run_command` runs and the repositories' pushes are made: this daemon's sandboxes, or agents — commands reached only through [`ToolContext::executor`] |
 //! | `lineage` | `String` | The conversation the context's jobs belong to, which keeps them on one agent |
+//! | `journal` | `Option<Arc<dyn JournalBook>>` | The conversation's journal text, for `journal_read` and `journal_grep` — reached only through [`ToolContext::journal`] |
 //!
 //! # Grants
 //!
@@ -41,6 +42,7 @@ use std::sync::Arc;
 use crate::executor::Executor;
 use crate::grants::{Capability, Grants, NotPermitted};
 use crate::state::{CredentialStore, HashStateStore, NotesStore, Secrets, SessionRegistry};
+use crate::tools::journal::JournalBook;
 use zend_vfs::{here, GitError, Push, RepoFiles, Workspace};
 
 /// Read-only handle bundle passed by the runner into each tool invocation.
@@ -61,6 +63,8 @@ pub struct ToolContext {
     executor: Option<Arc<dyn Executor>>,
     /// The conversation this context's jobs belong to; empty for none.
     lineage: String,
+    /// `None` for a conversation that keeps no journal.
+    journal: Option<Arc<dyn JournalBook>>,
     grants: Grants,
 }
 
@@ -98,6 +102,7 @@ impl ToolContext {
             subagent_runner: None,
             executor: None,
             lineage: String::new(),
+            journal: None,
             grants: Grants::NONE,
         }
     }
@@ -159,6 +164,17 @@ impl ToolContext {
             lineage: lineage.to_string(),
             ..self.clone()
         }
+    }
+
+    /// The conversation's journal text — `None` when it keeps no journal.
+    pub fn journal(&self) -> Option<&dyn JournalBook> {
+        self.journal.as_deref()
+    }
+
+    /// This context reading `journal` as its conversation's journal text.
+    pub fn with_journal(mut self, journal: Arc<dyn JournalBook>) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     /// Attach the daemon's secrets, read once at startup and shared by every

@@ -234,12 +234,14 @@ mod tests {
                 at_ms: at,
                 evidence: Some(Kind::Heard),
                 text: "Pax: Fabricator 5 is lost.".into(),
+                full: "Pax: Fabricator 5 is lost.".into(),
             },
             SpanTurn {
                 id: 2,
                 at_ms: at + 3 * M,
                 evidence: None,
                 text: "You: reflect — I feel uneasy".into(),
+                full: "You: reflect — I feel uneasy".into(),
             },
         ])
         .unwrap();

@@ -19,5 +19,6 @@ pub mod section;
 pub mod span;
 pub mod style;
 pub mod tools;
+pub mod transcript;
 pub mod verify;
 pub mod workflow;

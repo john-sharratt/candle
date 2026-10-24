@@ -40,6 +40,7 @@ use crate::section::JournalPrompt;
 use crate::span::Span;
 use crate::style::Style;
 use crate::tools::{self, Answer};
+use crate::transcript::Filed;
 use crate::verify::{verify, Note, Verified, World};
 
 /// Answers the write may take before the draft is given up.
@@ -56,8 +57,15 @@ pub trait Desk: Send {
         question: &str,
     ) -> impl Future<Output = anyhow::Result<String>> + Send;
 
-    /// Keep the journal as it will read once the new entry is in it.
-    fn keep(&mut self, prompt: &JournalPrompt) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Keep the journal as it will read once the new entry is in it, and the
+    /// stretch's turns filed under the entry they went into — `None` for a
+    /// stretch no entry takes, before the first. The turns first: the journal's
+    /// record is what says the stretch is covered.
+    fn keep(
+        &mut self,
+        prompt: &JournalPrompt,
+        filed: Option<&Filed>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
 /// Why a draft ended without an entry or a verdict.
@@ -217,7 +225,7 @@ async fn write<D: Desk, S: Holds>(
                         entry,
                         notes: verified.notes,
                     };
-                    return keep(desk, state, verified, style, round).await;
+                    return keep(desk, state, span, verified, style, round).await;
                 }
                 Err(refusal) => refusal.reason(),
             },
@@ -238,8 +246,13 @@ async fn settle<D: Desk, S: Holds>(
     style: &Style,
     why: String,
 ) -> Outcome {
-    let prompt = hold(state).journal().prompt_covering(span, style);
-    if let Err(e) = desk.keep(&prompt).await {
+    let (prompt, filed) = {
+        let held = hold(state);
+        let journal = held.journal();
+        let filed = journal.entries().last().map(|e| Filed::of(e.id, span));
+        (journal.prompt_covering(span, style), filed)
+    };
+    if let Err(e) = desk.keep(&prompt, filed.as_ref()).await {
         return Outcome::Abandoned(Abandon::Keeping(e.to_string()));
     }
     hold(state).journal_mut().nothing_to_write(span);
@@ -251,6 +264,7 @@ async fn settle<D: Desk, S: Holds>(
 async fn keep<D: Desk, S: Holds>(
     desk: &mut D,
     state: &Mutex<S>,
+    span: &Span,
     verified: Verified,
     style: &Style,
     rounds: usize,
@@ -262,7 +276,8 @@ async fn keep<D: Desk, S: Holds>(
         let prompt = held.journal().prompt_after(&staged, style);
         (staged, prompt)
     };
-    if let Err(e) = desk.keep(&prompt).await {
+    let filed = Filed::of(staged.id, span);
+    if let Err(e) = desk.keep(&prompt, Some(&filed)).await {
         return Outcome::Abandoned(Abandon::Keeping(e.to_string()));
     }
     let entry = hold(state).journal_mut().kept(staged);
@@ -298,6 +313,7 @@ mod tests {
         write_asked: Vec<String>,
         specs: Vec<Vec<Value>>,
         kept: Vec<JournalPrompt>,
+        filed: Vec<Option<Filed>>,
         refuse_keeping: bool,
     }
 
@@ -308,6 +324,7 @@ mod tests {
                 write_asked: Vec::new(),
                 specs: Vec::new(),
                 kept: Vec::new(),
+                filed: Vec::new(),
                 refuse_keeping: false,
             }
         }
@@ -322,11 +339,16 @@ mod tests {
                 .unwrap_or_else(|| Err(anyhow::anyhow!("the script ran out")))
         }
 
-        async fn keep(&mut self, prompt: &JournalPrompt) -> anyhow::Result<()> {
+        async fn keep(
+            &mut self,
+            prompt: &JournalPrompt,
+            filed: Option<&Filed>,
+        ) -> anyhow::Result<()> {
             if self.refuse_keeping {
                 anyhow::bail!("the substrate said no");
             }
             self.kept.push(prompt.clone());
+            self.filed.push(filed.cloned());
             Ok(())
         }
     }
@@ -461,6 +483,33 @@ mod tests {
             "the record says the stretch is covered, so a restart does not draft it again"
         );
         assert_eq!(restore(desk.kept[0].record()).unwrap().covered_to, 4);
+    }
+
+    /// What an entry was written from is filed under it, whole; a stretch
+    /// skipped as more of the same is filed under the latest entry beside it.
+    #[tokio::test]
+    async fn each_stretch_is_filed_under_the_entry_it_went_into() {
+        let (state, span) = started(turns());
+        let mut desk = Script::new(&[WRITE]);
+        run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        assert_eq!(desk.filed, [Some(Filed::of(1, &span))]);
+
+        let second = hold(&state)
+            .begin(
+                vec![turn(4, 4_000, Some(Kind::Did), "You: tell — to Pax: bye")],
+                4,
+            )
+            .unwrap();
+        let mut desk = Script::new(&[SKIP]);
+        run(&mut desk, &state, &second, &Fake::default(), &PLAIN).await;
+        assert_eq!(desk.filed, [Some(Filed::of(1, &second))]);
+    }
+
+    #[tokio::test]
+    async fn a_stretch_before_the_first_entry_that_writes_nothing_is_filed_nowhere() {
+        let mut desk = Script::new(&[]);
+        drafted(&mut desk, vec![turn(1, 1, None, "The conduit hums.")]).await;
+        assert_eq!(desk.filed, [None]);
     }
 
     #[tokio::test]

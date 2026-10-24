@@ -21,6 +21,7 @@ use std::sync::Arc;
 use candle_conversation::stencil::{StencilTree, ToolSpec};
 use candle_conversation::AskScope;
 use journal_core::section::JournalPrompt;
+use journal_core::transcript::Filed;
 use journal_core::workflow::Desk;
 use serde_json::Value;
 
@@ -84,7 +85,9 @@ impl Desk for EngineDesk<'_> {
             .await
     }
 
-    async fn keep(&mut self, prompt: &JournalPrompt) -> anyhow::Result<()> {
+    /// A character keeps no text behind its entries: none of its tools reads
+    /// it back, so the stretch it was written from is not filed.
+    async fn keep(&mut self, prompt: &JournalPrompt, _filed: Option<&Filed>) -> anyhow::Result<()> {
         self.minds.keep_journal(self.npc_id, prompt).await
     }
 }

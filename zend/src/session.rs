@@ -59,9 +59,11 @@ use journal_core::journal::Holds;
 use journal_core::record::view as journal_view;
 use journal_core::section::{JournalPrompt, Kept, JOURNAL};
 use journal_core::span::Span;
+use journal_core::transcript::Filed;
 use serde_json::{json, Value};
 use web::auth::Roles;
 use zend_tools::state::Secrets;
+use zend_tools::tools::journal::JournalBook;
 use zend_vfs::{RepoFiles, Workspace};
 
 use crate::api::chat::{
@@ -93,6 +95,7 @@ use crate::journal::record::{kept_in, metadata_of};
 use crate::journal::registry::{Journals, Open};
 use crate::journal::state::SessionJournal;
 use crate::journal::style::CODING;
+use crate::journal::text::JournalText;
 use crate::journal::world::ConversationFiles;
 use crate::journal::{carry, draft, origin, pressure};
 use crate::live_turn::{LiveTurn, LiveTurns};
@@ -4042,7 +4045,12 @@ fn run_inference_stream(
             }
             // The round is finished over the conversation's own files, under
             // the grants of the mode it was held at.
-            let ctx = state.tool_host.context_for(tools_mode, &cs.files, &conv_id);
+            let ctx = state.tool_host.dialogue_context(
+                tools_mode,
+                &cs.files,
+                &conv_id,
+                journal_text(&state, timeline),
+            );
             let dispatched =
                 tokio::task::spawn_blocking(move || run_tool_calls(&ctx, calls, Dispatch::Resumed))
                     .await;
@@ -4786,7 +4794,12 @@ fn run_inference_stream(
             // and carries each result so the cards resolve immediately, before
             // the post-stream hydrate.
             let n_calls = round.len();
-            let ctx = state.tool_host.context_for(tools_mode, &cs.files, &conv_id);
+            let ctx = state.tool_host.dialogue_context(
+                tools_mode,
+                &cs.files,
+                &conv_id,
+                journal_text(&state, timeline),
+            );
             let ran = tokio::task::spawn_blocking(move || tool_round::run(&ctx, round)).await;
             // Whatever the round changed outlives this conversation's state.
             conv_overlay::save(
@@ -5076,11 +5089,12 @@ fn journal_desk(
     let mut sampling = state.refresh_config.sampling.clone();
     sampling.temperature = 0.0;
     let recording = Arc::clone(state);
-    let record: Record = Box::new(move |prompt: &JournalPrompt| {
-        recording
-            .engine
-            .lock()
-            .unwrap()
+    let record: Record = Box::new(move |prompt: &JournalPrompt, filed: Option<&Filed>| {
+        let engine = recording.engine.lock().unwrap();
+        if let Some(filed) = filed {
+            JournalText::of(engine.conversation().shared(), timeline).file(filed)?;
+        }
+        engine
             .set_conversation_metadata_many(timeline, &metadata_of(prompt))
             .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"))
     });
@@ -5093,6 +5107,24 @@ fn journal_desk(
         },
         record,
     )
+}
+
+/// Cease the text behind `timeline`'s journal entries — the conversation was
+/// tombstoned or archived, and nothing reads it again.
+fn cease_journal_text(
+    engine: &ConversationEngine,
+    timeline: TimelineId,
+) -> candle_conversation::Result<()> {
+    JournalText::of(engine.conversation().shared(), timeline)
+        .cease_all()
+        .map(|_| ())
+        .map_err(|e| ConversationError::Other(e.to_string()))
+}
+
+/// `timeline`'s journal text, as its tool calls read it.
+fn journal_text(state: &InferenceState, timeline: TimelineId) -> Arc<dyn JournalBook> {
+    let shared = state.engine.lock().unwrap().conversation().shared();
+    Arc::new(JournalText::of(shared, timeline))
 }
 
 /// Run one journal draft over `span` as a task of its own, and log how it
@@ -6727,15 +6759,18 @@ impl ZendSession {
     /// marks the timeline for `TextOnly` distillation, so the next compaction
     /// sheds its KV chunks + signatures + projections and leaves a read-only
     /// text record. There is no unarchive: distillation is lossy (the KV is
-    /// gone), so an archived conversation can't be resumed. Returns `None` when
-    /// the model isn't loaded yet.
+    /// gone), so an archived conversation can't be resumed. Its journal keeps
+    /// its entries, and the text behind them is ceased: no tool runs on an
+    /// archived conversation again. Returns `None` when the model isn't loaded
+    /// yet.
     pub fn archive_conversation(&self, conv_id: &str) -> Option<candle_conversation::Result<()>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = conversation_timeline(conv_id);
         let engine = state.engine.lock().unwrap();
         let result = engine
             .set_conversation_archived(timeline, true)
-            .and_then(|()| engine.distill_timeline(timeline, DistillMode::TextOnly));
+            .and_then(|()| engine.distill_timeline(timeline, DistillMode::TextOnly))
+            .and_then(|()| cease_journal_text(&engine, timeline));
         Some(result)
     }
 
@@ -6749,7 +6784,12 @@ impl ZendSession {
     pub fn tombstone_conversation(&self, conv_id: &str) -> Option<candle_conversation::Result<()>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = conversation_timeline(conv_id);
-        let result = state.engine.lock().unwrap().tombstone_timeline(timeline);
+        let result = {
+            let engine = state.engine.lock().unwrap();
+            engine
+                .tombstone_timeline(timeline)
+                .and_then(|()| cease_journal_text(&engine, timeline))
+        };
         if result.is_ok() {
             state.conversations.lock().unwrap().remove(conv_id);
             state.journals.forget(conv_id);
@@ -6832,13 +6872,16 @@ impl ZendSession {
             }
             held.journal().prompt(&CODING)
         };
-        let recorded = state
-            .engine
-            .lock()
-            .unwrap()
-            .set_conversation_metadata_many(timeline, &metadata_of(&prompt))
-            .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"));
-        Some(recorded.map(|()| Some(journal_view(journal.lock().unwrap().journal(), &CODING))))
+        let recorded = {
+            let engine = state.engine.lock().unwrap();
+            engine
+                .set_conversation_metadata_many(timeline, &metadata_of(&prompt))
+                .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"))
+                .and_then(|()| {
+                    JournalText::of(engine.conversation().shared(), timeline).cease_entry(entry)
+                })
+        };
+        Some(recorded.map(|_| Some(journal_view(journal.lock().unwrap().journal(), &CODING))))
     }
 
     /// Tombstone a timeline by its RAW id — the derived-layer counterpart to

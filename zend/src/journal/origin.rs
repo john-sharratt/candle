@@ -118,6 +118,7 @@ pub fn parts_after(
                 at_ms: at(message.turn),
                 evidence: Some(kind),
                 text: format!("{who}{}", clipped(&body)),
+                full: format!("{who}{}", body.trim()),
             })
         })
         .collect()
@@ -218,6 +219,25 @@ mod tests {
         assert!(part.text.ends_with('…'), "{}", part.text);
         assert!(!part.text.contains('\n'));
         assert!(part.text.chars().count() <= "Tool results: ".len() + CLIP + 1);
+    }
+
+    /// The part is kept behind its entry whole, its lines as they ran; only
+    /// its reasoning is left out.
+    #[test]
+    fn the_whole_part_is_kept_beside_the_clipped_one() {
+        let long = format!("<tool_response>{}</tool_response>", "line\n".repeat(400));
+        let h = vec![
+            message(Role::User, 0, &long),
+            message(Role::Assistant, 0, "<think>hm</think>\nDone.\n"),
+        ];
+        let parts = parts_after(&h, &[], 0);
+        assert_eq!(parts[0].full, format!("Tool results: {}", long.trim()));
+        assert_eq!(
+            parts[0].full.lines().count(),
+            401,
+            "400 lines and the closing tag"
+        );
+        assert_eq!(parts[1].full, "You: Done.");
     }
 
     #[test]

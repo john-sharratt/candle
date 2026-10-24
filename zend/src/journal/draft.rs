@@ -47,6 +47,7 @@ mod tests {
     use journal_core::section::{restore, JournalPrompt};
     use journal_core::span::SpanTurn;
     use journal_core::tools::{SKIP, WRITE};
+    use journal_core::transcript::Filed;
     use serde_json::Value;
 
     use super::*;
@@ -84,7 +85,11 @@ mod tests {
                 .unwrap_or_else(|| Err(anyhow::anyhow!("the script ran out")))
         }
 
-        async fn keep(&mut self, prompt: &JournalPrompt) -> anyhow::Result<()> {
+        async fn keep(
+            &mut self,
+            prompt: &JournalPrompt,
+            _filed: Option<&Filed>,
+        ) -> anyhow::Result<()> {
             self.kept.push(prompt.clone());
             Ok(())
         }
@@ -113,6 +118,7 @@ mod tests {
             at_ms: id * 1_000,
             evidence: Some(kind),
             text: text.to_string(),
+            full: text.to_string(),
         };
         vec![
             part(user_part(0), Kind::Heard, "User: fix the scan"),

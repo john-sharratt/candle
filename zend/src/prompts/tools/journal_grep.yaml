@@ -1,0 +1,51 @@
+name: journal_grep
+questions:
+- which journal entry mentions the scan race
+- search my journal for the word timeout
+- did we already talk about the config file earlier in this session
+- find where the user first mentioned the deadline
+- when did we look at main.rs before
+- search the session history for that error code
+- which earlier step touched the database schema
+- have I run the tests already in this conversation
+- look back through the journal for the branch name
+- find every place earlier where the user said staging
+- grep the journal for port 8080
+- did anything earlier in the session mention a migration
+- where in the journal did I decide on the cache size
+- what entry was it where the build failed
+- search what was said before for the name Pax
+- find the turn where I read the README
+- locate the earlier mention of the API key rotation
+category: Journal
+description: "Search the turns behind your journal entries for text, ignoring case: which entry and turn said it, and the line. Use it to find something from earlier in this conversation that the journal's one-line entries do not spell out — a path, an error, a name, a decision. Each hit names its entry and line, to read around with journal_read."
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    pattern:
+      description: Text to find, ignoring case. Required.
+      minLength: 1
+      type: string
+    entry:
+      description: "Search only this entry's turns. Default: every entry's."
+      format: uint64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    max_results:
+      description: How many matching lines to return. Default 20, at most 50.
+      format: uint
+      maximum: 50
+      minimum: 1
+      type:
+      - integer
+      - 'null'
+  required:
+  - pattern
+  title: GrepRequest
+  type: object
+examples:
+- search my journal for the timeout error
+- which earlier entry mentions scan.rs
+- find in the journal where the user named the release branch

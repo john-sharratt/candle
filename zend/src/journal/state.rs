@@ -99,6 +99,7 @@ mod tests {
                 at_ms: id * 100,
                 evidence: Some(Kind::Did),
                 text: format!("part {id}"),
+                full: format!("part {id}"),
             })
             .collect()
     }

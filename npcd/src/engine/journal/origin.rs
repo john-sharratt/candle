@@ -31,11 +31,13 @@ pub fn span_turn(turn: &Turn) -> SpanTurn {
         Speaker::Npc => "You: ",
         Speaker::World => "",
     };
+    let text = format!("{who}{}", turn.text.trim());
     SpanTurn {
         id: turn.id,
         at_ms: turn.at_ms,
         evidence: evidence(&turn.origin),
-        text: format!("{who}{}", turn.text.trim()),
+        full: text.clone(),
+        text,
     }
 }
 

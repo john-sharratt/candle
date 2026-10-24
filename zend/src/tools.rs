@@ -46,6 +46,7 @@ use tokio::runtime::Handle;
 use zend_tools::executor::Executor;
 use zend_tools::sandboxes::Sandboxes;
 use zend_tools::state::Secrets;
+use zend_tools::tools::journal::JournalBook;
 use zend_tools::{alias_pins, registry, replay, Replay, ToolContext};
 use zend_vfs::sandbox::programs;
 use zend_vfs::{GitError, RepoFiles, Workspace, JOBS_DIR};
@@ -854,6 +855,22 @@ impl ToolHost {
         lineage: &str,
     ) -> Arc<ToolContext> {
         Arc::new(self.contexts[mode.level() as usize].with_files(Arc::clone(files), lineage))
+    }
+
+    /// [`Self::context_for`] a dialogue's round, whose journal tools read
+    /// `journal`.
+    pub fn dialogue_context(
+        &self,
+        mode: ToolMode,
+        files: &Arc<RepoFiles>,
+        lineage: &str,
+        journal: Arc<dyn JournalBook>,
+    ) -> Arc<ToolContext> {
+        Arc::new(
+            self.contexts[mode.level() as usize]
+                .with_files(Arc::clone(files), lineage)
+                .with_journal(journal),
+        )
     }
 }
 

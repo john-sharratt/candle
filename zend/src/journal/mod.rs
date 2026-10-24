@@ -17,6 +17,7 @@
 //! | [`draft`] | one draft — write or skip in one answer — and its record |
 //! | [`carry`] | the journal as the system prompt carries it |
 //! | [`record`] | the record a restart rebuilds the journal from |
+//! | [`text`] | the turns behind each entry, whole, for `journal_read` and `journal_grep` |
 //! | [`registry`] | every dialogue's journal, by conversation |
 //!
 //! Only a dialogue journals. A journal is private to its conversation: no other
@@ -32,4 +33,5 @@ pub mod record;
 pub mod registry;
 pub mod state;
 pub mod style;
+pub mod text;
 pub mod world;

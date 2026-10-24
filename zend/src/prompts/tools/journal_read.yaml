@@ -1,0 +1,53 @@
+name: journal_read
+questions:
+- what exactly did the user ask for in entry 3
+- show me the turns behind journal entry 5
+- read entry 2 of my journal in full
+- the journal line is too short, I need what happened then
+- what did that file contain when I read it earlier
+- what was the exact error message from before
+- what did I tell the user back then, word for word
+- page through the rest of entry 4
+- open the second page of that journal entry
+- which arguments did I pass to that call earlier in the session
+- recall the test output from the earlier step
+- what did the tool return when I listed the folder before
+- go back to the start of the session and read what was said
+- I wrote an entry about the fix; what did the diff look like
+- read the full text behind the newest entry
+- what were the line numbers I found in that file earlier
+- give me the original wording of the user's first request
+- continue reading entry 6 from line 200
+category: Journal
+description: "Read the turns behind one of your journal entries, whole: what the user said, each tool result and what you replied, each turn headed by its number and time. Use it when an entry's one line is not enough — the exact file contents, error or answer from earlier. Pages like file_read: `offset` and `limit` in lines. To find which entry holds something, use journal_grep."
+parameters:
+  $schema: http://json-schema.org/draft-07/schema#
+  properties:
+    entry:
+      description: 'The number of the journal entry whose turns to read, as the journal shows it: 3 for "Entry 3 — …". Required.'
+      format: uint64
+      minimum: 0
+      type: integer
+    offset:
+      description: First line to show, counted from 1. Default 1.
+      format: uint
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    limit:
+      description: How many lines to show. Default 200, at most 400.
+      format: uint
+      maximum: 400
+      minimum: 1
+      type:
+      - integer
+      - 'null'
+  required:
+  - entry
+  title: ReadRequest
+  type: object
+examples:
+- read the turns behind journal entry 3
+- what exactly did the tool return in entry 2 of my journal
+- show the rest of entry 5 from line 201
