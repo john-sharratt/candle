@@ -284,8 +284,11 @@ defaults.
 `m ← (1 − β)·m + fresh`, where `fresh` is the file's **rank** in its group's
 scan this reprojection (`working_set_observe::ranked_fresh`): each file's best
 raw vote is ranked, separately for the trailing probe and the question probe,
-the best file of a probe gets 1000, the `r`-th `1000/r`, down to rank 8, and a
-file placed by both keeps the better. A file that scored nothing gets nothing.
+down to rank 8, and a file both place gets `1000` divided by the worse of its
+two ranks. A file only one probe places gets nothing — the trailing window
+alone is whatever the turn last wrote, JSON listings through tool rounds, and
+it crowned ~70K tokens of test files beside a question about a paper
+(measured 2026-10-24). A file that scored nothing gets nothing.
 A rank needs no learned hit level and does not grow with the group, so it
 cannot inflate: fed the normalised scores, whose band runs ~1000× over on short
 probes, momentum took a one-off match at 643,768 — six hundred full hits — and
