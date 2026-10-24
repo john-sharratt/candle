@@ -427,12 +427,14 @@ A served call answers
 and nothing else. The reply stands in for a read, so every token it spends is
 paid on every served call; what the status means is said once, in the system
 prompt's `in_context` section, whose id is the status word — the reply recalls
-the rule by the same token rather than restating it. The rule is general: placed
-content begins with an anchor naming it; reason with what is here first; items
-stay while used and fade after; before relying on one, check its anchor is
-present, and if it is not or the model is unsure, call the tool, which answers
-`in_context` when the content is already here and keeps it for as long as that
-answer is in the conversation. It
+the rule by the same token rather than restating it. The rule is general: the
+context changes as the model works; placed content begins with an anchor naming
+it, and items it stops using fade out; before quoting, citing or editing
+something, check its anchor is here and fetch it again if not; a remembered item
+no longer here faded — re-fetch it rather than guessing or retracting. It
+promises no persistence, and it does not say the model never invents things, so
+genuine self-correction still works. A re-fetch always lands: the screen answers
+`in_context` only by locking the unit, and a lock is projected on every decode. It
 names no tool and no format, so a new kind of placed content needs no prompt
 change — the literal anchor arrives in the reply.
 
