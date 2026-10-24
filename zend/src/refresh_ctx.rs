@@ -15,6 +15,7 @@ use candle_conversation::{ConversationEngine, SequenceConfig};
 use zend_tools::ToolContext;
 
 use crate::retrieval_scope::RetrievalScope;
+use crate::types::ToolMode;
 
 /// Refresh-time context.  Borrows the engine's `Mutex` so the
 /// refresh helpers can lock it briefly for the two engine API calls
@@ -55,23 +56,26 @@ pub struct RefreshContext<'a> {
     /// unit's parent before its reading starts, so its turns are projected
     /// with the chain already in context. `None` when there is no chain.
     pub chain_end: Option<TimelineId>,
-    /// The steering for each thinking level, for a unit of a layer that thinks
-    /// (`crate::layers`) — the same registry a dialogue turn at that level
-    /// runs under. `None` falls back to [`Self::think_triggers`].
+    /// The steering for each thinking level and tools mode, for a unit of a
+    /// layer that thinks (`crate::layers`) — the same registry a dialogue turn
+    /// at that level and mode runs under, so a unit whose tools only a wider
+    /// mode's grammar holds can still call them. `None` falls back to
+    /// [`Self::think_triggers`].
     pub think_for: Option<ThinkFor>,
     /// The live dialogue a day layer reads: its group, and the conversation
     /// that writes titles, which is no dialogue. `None` when there is none.
     pub dialogue: Option<(GroupId, Option<TimelineId>)>,
 }
 
-/// The steering for a thinking level.
-pub type ThinkFor = Arc<dyn Fn(ThinkMode) -> Arc<TriggerRegistry> + Send + Sync>;
+/// The steering for a thinking level, over a tools mode's call grammar.
+pub type ThinkFor = Arc<dyn Fn(ThinkMode, ToolMode) -> Arc<TriggerRegistry> + Send + Sync>;
 
 impl RefreshContext<'_> {
-    /// The steering a turn thinking at `mode` runs under.
-    pub fn triggers_for(&self, mode: ThinkMode) -> Arc<TriggerRegistry> {
+    /// The steering a turn thinking at `mode` runs under, its tool calls held
+    /// to `tools`' grammar.
+    pub fn triggers_for(&self, mode: ThinkMode, tools: ToolMode) -> Arc<TriggerRegistry> {
         match &self.think_for {
-            Some(f) => f(mode),
+            Some(f) => f(mode, tools),
             None => Arc::clone(&self.think_triggers),
         }
     }

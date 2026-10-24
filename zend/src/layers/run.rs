@@ -22,7 +22,7 @@ use candle_conversation::{ConversationEngine, FinishReason, Sequence, TurnOption
 
 use super::edges::edges;
 use super::keys::{
-    deps_value, parse_deps, spec_digest, AFTER_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY,
+    deps_value, parse_deps, spec_digest, termed, AFTER_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY,
     DEPS_KEY, FILE_KEY, JOB_KEY, LAYER_KEY, QUANT_KEY, SPEC_KEY, SUBJECT_KEY,
 };
 use super::plan::{dep_version, Done, LiveFiles};
@@ -34,7 +34,7 @@ use crate::ingest_snapshots::{finished, Unit};
 use crate::refresh_ctx::RefreshContext;
 use crate::tool_round::{self, Step};
 use crate::tools::{format_tool_responses, ToolResult};
-use zend_tools::ToolContext;
+use zend_tools::{Capability, Grants, ToolContext};
 use zend_vfs::Oid;
 
 /// Units read concurrently. A unit's conversation inherits its file's whole
@@ -52,6 +52,9 @@ pub const MAX_FAILURES: usize = 16;
 pub struct UnitJob {
     /// The content key it commits under.
     pub key: String,
+    /// The term it is read for, when its layer expires
+    /// ([`super::expiry::Expiry::term`]): part of its key.
+    pub term: Option<u64>,
     /// What it is of.
     pub subject: String,
     /// The key of the unit it builds on.
@@ -75,15 +78,15 @@ pub struct UnitJob {
 pub fn committed(engine: &Mutex<ConversationEngine>, layer: &str) -> (Vec<Done>, Vec<TimelineId>) {
     let e = engine.lock().unwrap();
     let timelines = e.find_conversations_by_metadata(LAYER_KEY, layer);
-    let metas: Vec<(TimelineId, BTreeMap<String, String>)> = timelines
+    let metas: Vec<(TimelineId, BTreeMap<String, String>, Option<u64>)> = timelines
         .into_iter()
-        .filter_map(|tl| Some((tl, e.conversation_metadata(tl)?)))
+        .filter_map(|tl| Some((tl, e.conversation_metadata(tl)?, built_ms(&e, tl))))
         .collect();
     let conv = e.conversation();
     let substrate = conv.read();
     let mut done = Vec::new();
     let mut broken = Vec::new();
-    for (timeline, meta) in metas {
+    for (timeline, meta, built_ms) in metas {
         let (Some(key), Some(subject), Some(after)) = (
             meta.get(CONTENT_KEY),
             meta.get(SUBJECT_KEY),
@@ -110,9 +113,22 @@ pub fn committed(engine: &Mutex<ConversationEngine>, layer: &str) -> (Vec<Done>,
                 .unwrap_or_default(),
             spec: meta.get(SPEC_KEY).cloned(),
             quant: meta.get(QUANT_KEY).and_then(|q| q.parse().ok()),
+            built_ms,
         });
     }
     (done, broken)
+}
+
+/// When `timeline`'s unit was built: the wall time its first turn was written
+/// at — what a layer that expires reads a unit's age by. `None` when no turn
+/// carries one (a legacy stamp).
+fn built_ms(engine: &ConversationEngine, timeline: TimelineId) -> Option<u64> {
+    engine
+        .timeline_turn_wall_ms(timeline)
+        .into_iter()
+        .map(|(_, ms)| ms)
+        .filter(|ms| *ms > 0)
+        .min()
 }
 
 /// Every conversation of `layer` — `--wipe-layer`'s for a layer of units.
@@ -338,7 +354,7 @@ fn read_one(
     let key = if spec.edges {
         super::keys::unit_key(
             &spec.layer,
-            &format!("{}\n{}", job.after, deps_value(&deps)),
+            &termed(&format!("{}\n{}", job.after, deps_value(&deps)), job.term),
         )
     } else {
         job.key.clone()
@@ -406,8 +422,8 @@ fn is_committed(engine: &Mutex<ConversationEngine>, key: &str) -> bool {
 pub const MAX_TOOL_ROUNDS: usize = 16;
 
 /// The selection a unit's turns run under: the layer's thinking, and its
-/// read-only tools when it has any — the catalog pinned to exactly those, so
-/// nothing else is ever offered. A unit with none has the tool block left out.
+/// tools when it has any — the catalog pinned to exactly those, so nothing
+/// else is ever offered. A unit with none has the tool block left out.
 fn unit_selection(spec: &LayerSpec) -> SelectionState {
     let mut selection = SelectionState::new();
     selection.select("thinking_effort", &spec.effort);
@@ -429,13 +445,32 @@ fn unit_selection(spec: &LayerSpec) -> SelectionState {
 }
 
 /// The tools a unit's calls run against: file stores reading the commit its
-/// file was found on, so what it reads is the version it analyses.
-fn unit_tools(ctx: &RefreshContext<'_>, job: &UnitJob) -> Arc<ToolContext> {
+/// file was found on, so what it reads is the version it analyses, under the
+/// grants [`unit_grants`] gives its layer.
+fn unit_tools(ctx: &RefreshContext<'_>, spec: &LayerSpec, job: &UnitJob) -> Arc<ToolContext> {
     let at = job.at.as_deref().and_then(|at| Oid::parse(at).ok());
     let repo = crate::repo_path::split(&job.subject).0;
-    match at.and_then(|at| ctx.tool_ctx.files.fresh_at(repo, &at)) {
-        Some(files) => Arc::new(ctx.tool_ctx.with_files(Arc::new(files), "")),
-        None => Arc::clone(&ctx.tool_ctx),
+    let pinned = at.and_then(|at| ctx.tool_ctx.files.fresh_at(repo, &at));
+    let grants = unit_grants(spec, ctx.tool_ctx.grants());
+    if pinned.is_none() && grants == ctx.tool_ctx.grants() {
+        return Arc::clone(&ctx.tool_ctx);
+    }
+    let tools = match pinned {
+        Some(files) => ctx.tool_ctx.with_files(Arc::new(files), ""),
+        None => (*ctx.tool_ctx).clone(),
+    };
+    Arc::new(tools.granting(grants))
+}
+
+/// The grants a unit of `spec`'s layer runs under: ingest's own (`base`), and
+/// the network for a layer that researches — that alone, so a research tool
+/// can reach the web and nothing it is given can write, run or read a
+/// credential.
+fn unit_grants(spec: &LayerSpec, base: Grants) -> Grants {
+    if spec.researches() {
+        base.with(Capability::Network)
+    } else {
+        base
     }
 }
 
@@ -470,7 +505,7 @@ fn ask(
     conv: &mut Sequence,
 ) -> anyhow::Result<String> {
     let selection = unit_selection(spec);
-    let tools = (!spec.tools.is_empty()).then(|| unit_tools(ctx, job));
+    let tools = (!spec.tools.is_empty()).then(|| unit_tools(ctx, spec, job));
     let rounds = if tools.is_some() { MAX_TOOL_ROUNDS } else { 0 };
     let mut message = TurnText::from(job.prompt.clone());
     for round in 0..=rounds {
@@ -490,7 +525,7 @@ fn ask(
         let options = TurnOptions {
             sampling: Some(sampling),
             selection: selection.clone(),
-            triggers: ctx.triggers_for(spec.think_mode()),
+            triggers: ctx.triggers_for(spec.think_mode(), spec.tool_mode()),
             tags: vec![spec.layer.clone(), job.subject.clone()],
             ..Default::default()
         };
@@ -800,6 +835,22 @@ mod tests {
             edges: false,
             effort: effort.into(),
             tools: Vec::new(),
+            expiry: None,
+        }
+    }
+
+    /// **A researching unit gets the network and nothing else**; a unit of a
+    /// layer that reads only the workspace gets what ingest has.
+    #[test]
+    fn only_a_researching_unit_gets_the_network() {
+        let mut s = spec("deep");
+        s.tools = vec!["file_read".into()];
+        assert_eq!(unit_grants(&s, Grants::NONE), Grants::NONE);
+        s.tools.push("web_search".into());
+        let g = unit_grants(&s, Grants::NONE);
+        assert_eq!(g, Grants::NONE.with(Capability::Network));
+        for cap in Capability::ALL {
+            assert_eq!(g.has(cap), cap == Capability::Network, "{cap}");
         }
     }
 

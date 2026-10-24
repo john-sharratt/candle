@@ -15,25 +15,50 @@
 //! The thinking a unit runs with is the layer's own `thinking_effort` dial —
 //! the same dial a dialogue turn on the layer would read — so one level names
 //! it everywhere and nothing caps it here.
+//!
+//! A layer whose answer depends on the world outside the branches — the
+//! threats currently known against what a file uses — may also name the
+//! research tools ([`RESEARCH_TOOLS`]) and an `expires_days`: its units search
+//! the web, and each is read again within that many days
+//! ([`super::expiry`]).
 
 use candle_conversation::projection::LayerSchema;
 use candle_conversation::stencil::ThinkMode;
 use serde::Deserialize;
 
-/// The tools a unit may be given: they read the workspace at the unit's own
-/// commit and change nothing. A unit is an analysis of what the branches hold,
-/// so a tool that writes, runs or reaches the network has no place in one.
+use super::expiry::Expiry;
+use crate::types::ToolMode;
+
+/// The tools that read the workspace at the unit's own commit and change
+/// nothing. A unit is an analysis of what the branches hold, so a tool that
+/// writes or runs has no place in one.
 pub const READ_ONLY_TOOLS: [&str; 4] = ["file_read", "file_list", "file_search", "file_grep"];
+
+/// The tools that read the web and change nothing: what a layer researching
+/// the world outside the branches may add to [`READ_ONLY_TOOLS`]. A unit given
+/// one runs with the network granted and nothing else
+/// (`super::run::unit_grants`).
+///
+/// **Search, never fetch.** A unit runs unattended over whatever the branches
+/// hold, and anyone who can push a branch writes text it reads. Given the
+/// read-only tools and `web_fetch` together, an instruction planted in a file
+/// could read the workspace and send it out in a URL to any public host.
+/// `web_search` sends only a query, and only to the daemon's configured search
+/// provider, so a unit has no channel to a host of the text's choosing.
+pub const RESEARCH_TOOLS: [&str; 1] = ["web_search"];
 
 /// The thinking levels a layer's `thinking_effort` dial may name — those
 /// [`LayerSpec::think_mode`] steers by.
 const EFFORTS: [&str; 5] = ["off", "quick", "balanced", "deep", "exhaustive"];
 
-/// Refuse a layer naming any tool outside [`READ_ONLY_TOOLS`].
+/// Refuse a layer naming any tool outside [`READ_ONLY_TOOLS`] and
+/// [`RESEARCH_TOOLS`].
 fn check_tools(layer: &str, tools: &[String]) -> anyhow::Result<()> {
-    match tools.iter().find(|t| !READ_ONLY_TOOLS.contains(&t.as_str())) {
+    let allowed = |t: &str| READ_ONLY_TOOLS.contains(&t) || RESEARCH_TOOLS.contains(&t);
+    match tools.iter().find(|t| !allowed(t.as_str())) {
         Some(t) => anyhow::bail!(
-            "layer '{layer}': `{t}` is not a read-only tool — a unit may call only {READ_ONLY_TOOLS:?}"
+            "layer '{layer}': `{t}` is not a unit tool — a unit may call only \
+             {READ_ONLY_TOOLS:?} and {RESEARCH_TOOLS:?}"
         ),
         None => Ok(()),
     }
@@ -62,6 +87,8 @@ struct Raw {
     edges: bool,
     #[serde(default)]
     tools: Vec<String>,
+    #[serde(default)]
+    expires_days: Option<u32>,
 }
 
 /// A layer populated by its own units, each a hidden conversation.
@@ -80,12 +107,16 @@ pub struct LayerSpec {
     /// Whether the answer names the files the unit's file depends on — the
     /// edges a change is followed along to its dependents.
     pub edges: bool,
-    /// The tools a unit may call to check what it needs — read-only, from
-    /// [`READ_ONLY_TOOLS`]. Empty: the unit answers from its lineage and the
-    /// layers below it alone.
+    /// The tools a unit may call to check what it needs — from
+    /// [`READ_ONLY_TOOLS`] and [`RESEARCH_TOOLS`]. Empty: the unit answers from
+    /// its lineage and the layers below it alone.
     pub tools: Vec<String>,
     /// The layer's `thinking_effort` dial, as the selection names it.
     pub effort: String,
+    /// How long each unit stands before it is read again, though nothing it
+    /// was built on moved. `None`: a unit stands while what it was built on
+    /// does.
+    pub expiry: Option<Expiry>,
 }
 
 impl LayerSpec {
@@ -114,6 +145,15 @@ impl LayerSpec {
                 layer.name
             );
         }
+        let expiry = match raw.expires_days {
+            None => None,
+            Some(days) => Some(Expiry::days(days).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "layer '{}': `expires_days: 0` would expire every unit as it is built",
+                    layer.name
+                )
+            })?),
+        };
         Ok(Some(Self {
             layer: layer.name.clone(),
             unit: raw.unit,
@@ -122,7 +162,28 @@ impl LayerSpec {
             edges: raw.edges,
             tools: raw.tools,
             effort,
+            expiry,
         }))
+    }
+
+    /// Whether a unit may reach the web — it was given a research tool.
+    pub fn researches(&self) -> bool {
+        self.tools
+            .iter()
+            .any(|t| RESEARCH_TOOLS.contains(&t.as_str()))
+    }
+
+    /// The tools mode whose call grammar a unit decodes under: the one whose
+    /// catalog holds every tool it was given. Restricted's holds the
+    /// read-only tools and no network tool, so a unit that researches decodes
+    /// under Comprehensive's — its prompt still lists only its own tools, and
+    /// a call of any other is refused unrun (`super::run::only_given`).
+    pub fn tool_mode(&self) -> ToolMode {
+        if self.researches() {
+            ToolMode::Comprehensive
+        } else {
+            ToolMode::Restricted
+        }
     }
 
     /// The steering the layer's thinking dial resolves to.
@@ -167,7 +228,21 @@ mod tests {
             edges: false,
             effort: "deep".into(),
             tools: Vec::new(),
+            expiry: None,
         }
+    }
+
+    /// A unit given a research tool reaches the web and decodes under the
+    /// grammar that holds it; one given only read-only tools does neither.
+    #[test]
+    fn a_research_tool_takes_the_unit_to_the_network_grammar() {
+        let mut s = spec(UnitKind::File);
+        s.tools = vec!["file_read".into(), "file_grep".into()];
+        assert!(!s.researches());
+        assert_eq!(s.tool_mode(), ToolMode::Restricted);
+        s.tools.push("web_search".into());
+        assert!(s.researches());
+        assert_eq!(s.tool_mode(), ToolMode::Comprehensive);
     }
 
     #[test]
@@ -198,25 +273,43 @@ mod tests {
 #[cfg(test)]
 mod tool_tests {
     use super::*;
+    use zend_tools::{registry, Capability};
 
     /// Every tool a unit may be given is a registered tool — a renamed one
     /// fails here rather than leaving units with a catalog naming nothing.
     #[test]
-    fn every_read_only_tool_is_registered() {
-        for name in READ_ONLY_TOOLS {
-            assert!(
-                zend_tools::registry::find(name).is_some(),
-                "{name} is not a tool"
+    fn every_unit_tool_is_registered() {
+        for name in READ_ONLY_TOOLS.iter().chain(&RESEARCH_TOOLS) {
+            assert!(registry::find(name).is_some(), "{name} is not a tool");
+        }
+    }
+
+    /// **A research tool needs the network and nothing else**: the grant a
+    /// researching unit runs under (`super::super::run::unit_grants`) is the
+    /// network alone, so a research tool needing more would be refused.
+    #[test]
+    fn a_research_tool_needs_only_the_network() {
+        for name in RESEARCH_TOOLS {
+            let tool = registry::find(name).unwrap();
+            assert_eq!(
+                tool.requires,
+                [Capability::Network],
+                "{name} needs more than the network"
             );
         }
     }
 
-    /// A layer naming a tool that writes is refused when the schema loads.
+    /// A layer naming a tool that writes is refused when the schema loads; one
+    /// naming the read-only and research tools is not.
     #[test]
     fn a_layer_naming_a_writing_tool_is_refused() {
         let tools = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
         assert!(check_tools("static_analysis", &tools(&["file_read", "file_edit"])).is_err());
+        assert!(check_tools("security_review", &tools(&["web_search", "http_request"])).is_err());
+        // A fetch would give a unit reading the workspace a channel to any host.
+        assert!(check_tools("security_review", &tools(&["file_read", "web_fetch"])).is_err());
         assert!(check_tools("static_analysis", &tools(&READ_ONLY_TOOLS)).is_ok());
+        assert!(check_tools("security_review", &tools(&RESEARCH_TOOLS)).is_ok());
         assert!(check_tools("static_analysis", &[]).is_ok());
     }
 }

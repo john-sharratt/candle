@@ -56,6 +56,16 @@ pub fn unit_key(layer: &str, after: &str) -> String {
     format!("u{UNIT_KEY_VERSION}:{layer}:{hex}")
 }
 
+/// What a unit's key is made from, `built_on`, with the term it is read for
+/// when its layer expires ([`super::expiry::Expiry::term`]) — so a unit read
+/// again once its time is up is keyed apart from the one it replaces.
+pub fn termed(built_on: &str, term: Option<u64>) -> String {
+    match term {
+        Some(term) => format!("{built_on}\n@{term}"),
+        None => built_on.to_string(),
+    }
+}
+
 /// [`SPEC_KEY`]'s value for `spec`.
 pub fn spec_digest(spec: &super::spec::LayerSpec) -> String {
     let mut h = Sha256::new();
@@ -103,6 +113,21 @@ mod tests {
         assert_ne!(a, unit_key("static_analysis", "v2:candle/a.rs@2"));
         assert_ne!(a, unit_key("critical_analysis", "v2:candle/a.rs@1"));
         assert_eq!(a, unit_key("static_analysis", "v2:candle/a.rs@1"));
+    }
+
+    /// A unit of a layer that does not expire is keyed by what it built on
+    /// alone; one that expires by its term too, so two terms are two units.
+    #[test]
+    fn a_term_keys_an_expiring_unit_apart() {
+        assert_eq!(termed("v2:candle/a.rs@1", None), "v2:candle/a.rs@1");
+        assert_eq!(
+            termed("v2:candle/a.rs@1", Some(1_795_478_400_000)),
+            "v2:candle/a.rs@1\n@1795478400000"
+        );
+        let old = unit_key("security_review", &termed("k", Some(1)));
+        let new = unit_key("security_review", &termed("k", Some(2)));
+        assert_ne!(old, new);
+        assert_ne!(old, unit_key("security_review", "k"));
     }
 
     #[test]

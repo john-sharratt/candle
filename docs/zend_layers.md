@@ -1,9 +1,11 @@
 # zend's compounding layers
 
-How the layers above `code_reading` are built: `static_analysis`,
-`dependency_analysis`, `architectural_analysis`, `critical_analysis` and
-`bug_analysis` per file, and `daily_history` and `dream_log` per day. The code
-is `zend/src/layers/`, the declarations are the `ingest:` blocks in
+How the layers above `code_reading` are built. zend's schema declares three,
+per file and side by side — `dependency_analysis`, `code_review` and
+`security_review`, each `after: code_reading` — so an edit to a file makes all
+three of its units stale at once and each is read again. The engine also builds
+layers per day (`unit: day`), which zend's schema declares none of. The code is
+`zend/src/layers/`, the declarations are the `ingest:` blocks in
 `zend/src/prompts/projection.yaml`, and the design they come from is
 `docs/coding_assistant.md` §"Trunk Session — Phased Parallel Analysis".
 
@@ -12,14 +14,16 @@ is `zend/src/layers/`, the declarations are the `ingest:` blocks in
 A layer is built from the layers below it when it declares an `ingest:` block:
 
 ```yaml
-- name: dependency_analysis
+- name: security_review
   dials: { thinking_effort: balanced }
   ingest:
     unit: file              # file | day
-    after: static_analysis  # the layer each unit builds on
-    edges: true             # the answer names the files it depends on
+    after: code_reading     # the layer each unit builds on
+    edges: false            # true: the answer names the files it depends on
+    expires_days: 30        # read again within this many days
+    tools: [file_read, file_list, file_search, file_grep, web_search]
     prompt: |
-      What do the structs, traits and functions in `<<path>>` …
+      Review `<<path>>` in the `<<repo>>` repository for security. …
 ```
 
 - **`unit: file`** gives one unit per unit of the `after` layer, all the way
@@ -30,17 +34,40 @@ A layer is built from the layers below it when it declares an `ingest:` block:
   `after`, the unit builds on that layer's unit for the same day.
 - **Thinking** is the layer's own `thinking_effort` dial, the level a dialogue
   turn on the layer would use. Nothing caps a unit's thinking or answer.
-- **Tools.** A layer may give its units read-only tools (`tools:` in the
-  block); every analysis layer gives `file_read`, `file_list`, `file_search` and
-  `file_grep` (`READ_ONLY_TOOLS`). They read the workspace at the commit of the
-  unit's file, the catalog is pinned to exactly them, a call of any other is
-  refused rather than run, and a layer naming anything else is refused when the
-  schema loads. A unit reads for as many rounds as it needs; a closing round
-  (after `MAX_TOOL_ROUNDS`, a backstop) bans the tool-call opener so it answers
-  in prose. A layer with no tools gets that closing round alone.
+- **Tools.** A layer may give its units tools (`tools:` in the block) that
+  change nothing. The read-only tools — `file_read`, `file_list`,
+  `file_search` and `file_grep` (`READ_ONLY_TOOLS`) — read the workspace at the
+  commit of the unit's file. The research tool — `web_search`
+  (`RESEARCH_TOOLS`) — searches the web, for a layer whose answer depends on
+  what is known outside the branches. The catalog is pinned to exactly the layer's
+  tools, a call of any other is refused rather than run, and a layer naming
+  anything else is refused when the schema loads. A unit reads for as many
+  rounds as it needs; a closing round (after `MAX_TOOL_ROUNDS`, a backstop)
+  bans the tool-call opener so it answers in prose. A layer with no tools gets
+  that closing round alone.
+- **A researching unit gets the network and nothing else.** Ingest runs under
+  Restricted's grants, which hold no capability; a unit of a layer naming a
+  research tool runs with `Capability::Network` added and nothing more
+  (`run::unit_grants`), so it can reach the web and still cannot write, run a
+  program or read a credential. Restricted's call grammar does not compile the
+  network tools, so such a unit decodes under Comprehensive's
+  (`LayerSpec::tool_mode`) — its prompt still lists only its own tools.
+  `web_search` also needs the daemon's `tavily_api_key`; without one it answers
+  with an error the unit reports.
+- **Search, never fetch.** A unit runs unattended over whatever the branches
+  hold, so anyone who can push a branch writes text it reads. Given the
+  read-only tools and `web_fetch` together, an instruction planted in a file
+  could read the workspace and send it out in a URL to any public host.
+  `web_search` sends only a query, and only to the configured search provider,
+  so a unit has no channel to a host of the text's choosing; a layer naming
+  `web_fetch` is refused when the schema loads.
+- **Expiry.** `expires_days: N` makes each unit stand at most `N` days though
+  nothing it was built on moved — see [Units that expire](#units-that-expire).
 - **The spec is part of what a unit stands on.** Each unit records a digest of
   its layer's prompt, tools, thinking and edges; one built under another is
-  stale, so changing a layer's question rebuilds it and the layers above.
+  stale, so changing a layer's question rebuilds it and the layers above. The
+  expiry is not in the digest: changing it moves when units expire, and
+  rebuilds none.
 - **Placeholders** are `<<name>>`, not `{name}`: the whole schema is a template
   whose `{ident}` must be a template variable.
 
@@ -50,15 +77,17 @@ Only zend interprets it.
 ## A unit is a conversation
 
 Each unit is a hidden conversation, forked from its layer's base, and its
-lineage is the unit it builds on. A file's `static_analysis` therefore continues
-that file's own reading, `dependency_analysis` continues the static analysis,
-and so on up. Each question is asked of a conversation that has already read
-the file and every analysis of it below. The lineage is the target group, and
-it is selected whole, so the file is always in context.
+lineage is the unit it builds on. A file's `dependency_analysis`, `code_review`
+and `security_review` each continue that file's own reading; a layer declared
+`after` one of them would continue that, and so on up. Each question is asked
+of a conversation that has already read the file and every analysis of it
+below. The lineage is the target group, and it is selected whole, so the file
+is always in context.
 
-**The layers compound.** A unit also retrieves the layers of units below it,
-for every file on its branches, by provenance. Its own layer stays self-local,
-so a unit never retrieves its siblings. This is
+**The layers compound.** A unit also retrieves the layers of units declared
+before it, for every file on its branches, by provenance: a `security_review`
+unit can draw on other files' dependency analyses and code reviews. Its own
+layer stays self-local, so a unit never retrieves its siblings. This is
 `Substrate::set_ingest_sees` / `is_self_local_group`: an append-only target
 reads the groups it was given across conversations, and masks every other group
 to its own timeline as before. `repo_map` and `code_reading` are given none, so
@@ -159,9 +188,48 @@ A layer of units checks it between units and stops, and the next pass starts
 from the bottom, so a moved branch reaches `repo_map` and `code_reading` before
 any layer above them reads another unit.
 
-The day layers have no branch move to wake them, so the session wakes the worker
-every 30 minutes and a day that has closed gets read. That wake does not
-preempt: a day closing is no work for the layers below.
+A layer that changes with time rather than with its branches — a day layer,
+whose day closes at midnight, or a layer whose units expire — has no branch
+move to wake it. While a layer passed this boot is either, the session wakes
+the worker every 30 minutes (`LAYER_CLOCK_EVERY`). That wake does not preempt:
+a day closing or a unit expiring is no work for the layers below.
+
+## Units that expire
+
+`security_review`'s answer depends on what is known against what a file uses,
+which changes while the file does not. With `expires_days: 30` each of its units
+is read again about every thirty days (`layers/expiry.rs`).
+
+**Each file has its own phase, so the layer never churns at once.** Read
+together, a layer's units would all expire together. Instead the period is cut
+at boundaries offset by a digest of the file's path, and a unit stands until a
+boundary of its file after it was built:
+
+- the first units of a layer, built together, expire spread evenly across the
+  period;
+- read again at its boundary, a unit stands exactly one period, so once the
+  layer is under way each file is read again every thirty days and the layer
+  reads a thirtieth of its files a day;
+- a unit stands at least a thirtieth of the period (a day of thirty): one
+  rebuilt just before its boundary — because its file was edited — skips that
+  boundary and stands to the next, rather than being read again within the hour;
+- the phase is a digest, not a random draw, so every member of a cluster finds
+  the same unit expired at the same time and builds it once.
+
+A unit's age is its first turn's wall time, as the substrate records it for
+every turn; nothing extra is written.
+
+**An expired unit stands until its replacement commits.** Unlike a unit whose
+file moved on, it is not wrong, only old: tombstoned first, a pass that stopped
+or a read that failed would leave the file with no unit at all. The planner
+keeps it behind every unit still in its time and queues the file to be read
+again; once the replacement commits it takes the old unit's branches, and the
+old unit, standing for none, goes. Each reading of an expiring unit is keyed by
+the term it is read for — the boundary it will expire at — so the replacement
+is a unit of its own key, never one the expired unit already holds, and every
+member reading within one term leases the same job.
+
+An edit to the file still rebuilds its unit immediately, as for any layer.
 
 ## What it costs
 
@@ -170,9 +238,12 @@ preempt: a day closing is no work for the layers below.
   layer up.
 - Many long-lived branches multiply units: a file gets one analysis per
   distinct set of dependency versions across the branches that hold it.
-- The upper layers think at `deep` and `exhaustive`, and read with their
-  tools. On a 24 GB card at depth 1, a layer of 24 units takes about an hour
-  (dependency) to two and a half hours (bug).
+- An edit to a file reads three units of it, one per layer, each at
+  `balanced`. Before the five-layer stack was removed, on a 24 GB card at
+  depth 1, the dependency layer's 24 units took about an hour.
+- `security_review` searches the web: up to four searches per unit, as its
+  prompt asks, on every read. Its first build searches for every file; after
+  that, a thirtieth of its files a day plus each edited file.
 - Every unit inherits its lower units' whole conversations, their tool reads
   included: an upper unit's lineage reaches the inherited-chain cap. On a 64 GB
   host the first tool-using upper layer once failed every unit on a

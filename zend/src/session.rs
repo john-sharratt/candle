@@ -142,9 +142,12 @@ pub const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.ya
 /// best-effort), which is preferable to unbounded growth under a burst.
 const TITLER_QUEUE_DEPTH: usize = 256;
 
-/// How often a pass is asked for so a day layer reads a day that closed
-/// (`crate::layers::days`): no branch move announces midnight.
-const DAY_LAYER_WAKE_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// How often a pass is asked for while a layer changes with time rather than
+/// with its branches: a day layer reads a day that closed
+/// (`crate::layers::days`), and a layer that expires reads again the units
+/// whose time is up (`crate::layers::expiry`). No branch move announces
+/// either, and a unit stands at most this long past its time.
+const LAYER_CLOCK_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Work item for the titler worker thread.
 enum TitleJob {
@@ -3058,12 +3061,16 @@ impl InferenceState {
             chain_end: *self.chain_end.lock().unwrap(),
             think_for: Some({
                 let steering = self.think_steering.clone();
-                // Ingest reads under Restricted, as its `tool_ctx` above does.
-                let stencil =
-                    Arc::clone(&self.tool_stencils[ToolMode::Restricted.level() as usize]);
-                Arc::new(move |mode: ThinkMode| match &steering {
-                    Some(ts) => ts.registry_for(&stencil, mode),
-                    None => Arc::clone(&stencil),
+                // A unit decodes under the grammar of the mode whose catalog
+                // holds its tools (`LayerSpec::tool_mode`); its grants stay
+                // ingest's, widened only as its layer's tools need.
+                let stencils = self.tool_stencils.clone();
+                Arc::new(move |mode: ThinkMode, tools: ToolMode| {
+                    let stencil = &stencils[tools.level() as usize];
+                    match &steering {
+                        Some(ts) => ts.registry_for(stencil, mode),
+                        None => Arc::clone(stencil),
+                    }
                 })
             }),
             dialogue: self
@@ -7785,7 +7792,8 @@ impl ZendSession {
                         // it (`crate::branch_ingest`), and is followed by the
                         // ingest normalization warm-up; after that it runs when
                         // an origin watcher fetched a moved branch, or a tool
-                        // round published one.
+                        // round published one — and on a clock while a layer
+                        // changes with time.
                         let wake = Arc::new(Notify::new());
                         if !read_only_substrate {
                             let pass_state = Arc::clone(&state);
@@ -7852,29 +7860,31 @@ impl ZendSession {
                                 };
                                 repositories.on_change(on_change);
                             }
-                            // A day layer's unit is a day once it is over, which
-                            // no branch move announces: ask for a pass now and then
-                            // so a day that closed is read. A pass that finds
-                            // nothing new to read costs its plans.
-                            let has_days = state.ingest_layers.iter().any(|l| {
-                                l.spec
-                                    .as_ref()
-                                    .is_some_and(|s| s.unit == crate::layers::UnitKind::Day)
+                            // A day layer's unit is a day once it is over, and a
+                            // unit of a layer that expires goes stale with time;
+                            // no branch move announces either. While a layer
+                            // passed this boot does either, ask for a pass now
+                            // and then. A pass that finds nothing new to read
+                            // costs its plans.
+                            let on_a_clock = state.branch_layers.iter().any(|(l, _)| {
+                                l.spec.as_ref().is_some_and(|s| {
+                                    s.unit == crate::layers::UnitKind::Day || s.expiry.is_some()
+                                })
                             });
-                            if has_days {
+                            if on_a_clock {
                                 let wake = Arc::clone(&wake);
                                 tokio::spawn(async move {
-                                    let mut every = tokio::time::interval(DAY_LAYER_WAKE_EVERY);
+                                    let mut every = tokio::time::interval(LAYER_CLOCK_EVERY);
                                     every.tick().await;
                                     loop {
                                         every.tick().await;
                                         if crate::ingest_cancel::cancelled() {
                                             return;
                                         }
-                                        // A wake, not a request: a day closing is no
-                                        // work for the layers below, so a pass in
-                                        // flight is not stopped for it — the next
-                                        // pass reads the day.
+                                        // A wake, not a request: a day closing or a
+                                        // unit expiring is no work for the layers
+                                        // below, so a pass in flight is not stopped
+                                        // for it — the next pass reads it.
                                         wake.notify_one();
                                     }
                                 });
@@ -8684,6 +8694,7 @@ mod projection_schema_tests {
     #[test]
     fn embedded_turn_sinks_are_derived_from_structure() {
         use crate::ingest::IngestMode;
+        use crate::layers::expiry::DAY_MS;
         let builder = build_projection_builder(Path::new("demo-project"));
         // "demo-project" doesn't exist on disk, so no folder-backed raw sinks
         // resolve — only the two built-in pipelines.
@@ -8702,15 +8713,46 @@ mod projection_schema_tests {
                 ("repo_map", IngestMode::Folders, ""),
                 ("code_reading", IngestMode::Files, ""),
                 ("dependency_analysis", IngestMode::Derived, ""),
+                ("code_review", IngestMode::Derived, ""),
+                ("security_review", IngestMode::Derived, ""),
             ],
             "derived turn-sinks: {got:?}"
         );
-        // The dependency analysis builds on each file's reading.
+        // All three analyses build on each file's reading, side by side: an
+        // edit to the file makes every one of them stale at once.
         let after: Vec<(&str, Option<&str>)> = layers
             .iter()
             .filter_map(|l| Some((l.name.as_str(), l.spec.as_ref()?.after.as_deref())))
             .collect();
-        assert_eq!(after, vec![("dependency_analysis", Some("code_reading"))]);
+        assert_eq!(
+            after,
+            vec![
+                ("dependency_analysis", Some("code_reading")),
+                ("code_review", Some("code_reading")),
+                ("security_review", Some("code_reading")),
+            ]
+        );
+        // Only the security review researches the web, and only its units
+        // expire.
+        let research: Vec<(&str, bool, Option<u64>)> = layers
+            .iter()
+            .filter_map(|l| {
+                let s = l.spec.as_ref()?;
+                Some((
+                    l.name.as_str(),
+                    s.researches(),
+                    s.expiry.map(|e| e.period_ms() / DAY_MS),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            research,
+            vec![
+                ("dependency_analysis", false, None),
+                ("code_review", false, None),
+                ("security_review", true, Some(30)),
+            ]
+        );
         // Every layer keeps the id its conversations were persisted under.
         let ids: Vec<(&str, u32)> = builder
             .schema()
@@ -8724,6 +8766,8 @@ mod projection_schema_tests {
                 ("repo_map", 1),
                 ("code_reading", 2),
                 ("dependency_analysis", 4),
+                ("code_review", 11),
+                ("security_review", 12),
                 ("dialogue", 10),
             ]
         );

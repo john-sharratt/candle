@@ -19,9 +19,18 @@
 //! for the file rather than an analysis of another version. A pass asked for
 //! while a layer above reads stops it between units, so the layers below are
 //! read first ([`crate::ingest_worker::preempted`]).
+//!
+//! **A layer may look outside the branches, and then it expires.** A layer
+//! whose answer depends on what is known about the world — the threats
+//! current against what a file uses — gives its units the research tool and an
+//! `expires_days` ([`spec`]): its units search the web with the network granted
+//! and nothing else, and each is read again about that often, at a boundary of
+//! its own file's phase so the layer never churns at once, standing until its
+//! replacement commits ([`expiry`]).
 
 pub mod days;
 pub mod edges;
+pub mod expiry;
 pub mod keys;
 pub mod pass;
 pub mod plan;

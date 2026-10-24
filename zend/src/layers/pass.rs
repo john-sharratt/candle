@@ -15,8 +15,9 @@ use candle_conversation::projection::{GroupId, TimelineId};
 use candle_conversation::{ConversationEngine, Sequence};
 
 use super::days::{closed_days, day_of, DaySource};
-use super::keys::unit_key;
-use super::plan::{plan_holding, Below, Held, LiveFiles, Plan, Queued};
+use super::expiry::now_ms;
+use super::keys::{termed, unit_key};
+use super::plan::{plan_holding, Below, Done, Held, LiveFiles, Plan, Queued};
 use super::run::{committed, ingest_units, EdgeFiles, UnitJob};
 use super::spec::{LayerSpec, UnitKind};
 use crate::ingest_report::IngestReport;
@@ -168,12 +169,14 @@ fn layer(
     // dependencies are not current on, and each of those queues a unit of its
     // own. Each unit is tried once a pass — one that does not commit is read
     // again next pass — and a pass asked for stops it.
+    let now = now_ms();
     let within = |p: &Plan, ground: &Ground| -> Vec<Queued> {
         p.queued
             .iter()
             .filter(|q| {
                 let b = &below[q.below];
-                reach.takes(q, &b.subject, ground) && !ground.tried.contains(&job_key(spec, b, q))
+                reach.takes(q, &b.subject, ground)
+                    && !ground.tried.contains(&job_key(spec, b, q, now))
             })
             .cloned()
             .collect()
@@ -181,7 +184,8 @@ fn layer(
     let mut queued = within(&first, ground);
     let mut report: Option<IngestReport> = None;
     while !queued.is_empty() {
-        let Some((next, round)) = read_queued(ctx, run, ground, &below, &days, &queued)? else {
+        let Some((next, round)) = read_queued(ctx, run, ground, &below, &days, &queued, now)?
+        else {
             break;
         };
         changed = true;
@@ -190,7 +194,7 @@ fn layer(
             None => report = Some(round),
         }
         for q in queued.iter().filter(|q| next.queued.contains(q)) {
-            ground.tried.insert(job_key(spec, &below[q.below], q));
+            ground.tried.insert(job_key(spec, &below[q.below], q, now));
         }
         queued = within(&next, ground);
     }
@@ -203,13 +207,22 @@ fn layer(
 /// The key a unit is leased under. A layer that names its dependencies can
 /// build several units on one unit below, one per set of branches whose
 /// dependencies differ: each is leased apart by its branches. It commits
-/// under a key of what it depended on (`run::read_one`).
-fn job_key(spec: &LayerSpec, b: &Below, q: &Queued) -> String {
-    if spec.edges {
-        unit_key(&spec.layer, &format!("{}\n{}", b.key, q.branches.join(",")))
+/// under a key of what it depended on (`run::read_one`). A unit of a layer
+/// that expires is leased for the term it is read in at `now`
+/// ([`Expiry::term`](super::expiry::Expiry::term)), so its replacement is
+/// never taken for the unit whose time is up.
+fn job_key(spec: &LayerSpec, b: &Below, q: &Queued, now: u64) -> String {
+    let built_on = if spec.edges {
+        format!("{}\n{}", b.key, q.branches.join(","))
     } else {
-        unit_key(&spec.layer, &b.key)
-    }
+        b.key.clone()
+    };
+    unit_key(&spec.layer, &termed(&built_on, term_of(spec, b, now)))
+}
+
+/// The term a unit on `b` read at `now` stands for, when its layer expires.
+fn term_of(spec: &LayerSpec, b: &Below, now: u64) -> Option<u64> {
+    spec.expiry.map(|e| e.term(&b.subject, now))
 }
 
 /// Read `queued` and plan the layer again, leaving what stands in `ground`.
@@ -221,6 +234,7 @@ fn read_queued(
     below: &[Below],
     days: &[DaySource],
     queued: &[Queued],
+    now: u64,
 ) -> anyhow::Result<Option<(Plan, IngestReport)>> {
     let spec = run.spec;
     if crate::ingest_worker::preempted() || crate::ingest_cancel::cancelled() {
@@ -248,7 +262,8 @@ fn read_queued(
                 }
             };
             UnitJob {
-                key: job_key(spec, b, q),
+                key: job_key(spec, b, q, now),
+                term: term_of(spec, b, now),
                 subject: b.subject.clone(),
                 after: b.key.clone(),
                 parent: b.timeline,
@@ -289,6 +304,11 @@ fn settle(
             .is_some_and(|k| ground.ingest.contains(k)),
         UnitKind::Day => true,
     };
+    let now = now_ms();
+    let expired = |d: &Done| {
+        spec.expiry
+            .is_some_and(|e| e.expired(&d.subject, d.built_ms, now))
+    };
     let p = plan_holding(
         below,
         &done,
@@ -296,6 +316,7 @@ fn settle(
         &in_scope,
         &super::keys::spec_digest(spec),
         &|path| ground.is_held_back(path),
+        &expired,
     );
     // A committed unit whose chain stopped part-way is stale too.
     let mut gone: Vec<TimelineId> = p.tombstone.clone();
@@ -437,11 +458,7 @@ fn dialogue_days(ctx: &RefreshContext<'_>) -> Vec<DaySource> {
         })
         .collect();
     drop(e);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    closed_days(&convs, &day_of(now))
+    closed_days(&convs, &day_of(now_ms()))
 }
 
 /// The most of a whole day's transcript a unit is shown, in characters — a

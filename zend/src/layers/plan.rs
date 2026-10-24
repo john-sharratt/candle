@@ -16,6 +16,13 @@
 //! **A unit is read only once what it builds on stands**, so the layers below
 //! are always done first: a file whose `code_reading` is being read again has
 //! no current unit below it in any higher layer until that read commits.
+//!
+//! **A unit of a layer that expires is read again when it expires**
+//! ([`super::expiry`]), though nothing it was built on moved — and it stands
+//! until its replacement commits. Unlike a unit whose file moved on, it is not
+//! wrong, only old: tombstoned first, a pass that stopped or a read that failed
+//! would leave the file with no unit at all. Its replacement takes its branches
+//! once it commits, and the old one then stands for none and goes.
 
 use std::collections::HashMap;
 
@@ -59,6 +66,9 @@ pub struct Done {
     pub spec: Option<String>,
     /// The model's bits per weight, when recorded.
     pub quant: Option<u32>,
+    /// When it was built — its first turn's wall time — when a turn records
+    /// one.
+    pub built_ms: Option<u64>,
 }
 
 /// Every version of a file some branch holds: path → `(key, branches)`.
@@ -120,12 +130,13 @@ pub fn plan(
     ingest: &dyn Fn(&Below) -> bool,
     spec: &str,
 ) -> Plan {
-    plan_holding(below, committed, live, ingest, spec, &|_| false)
+    plan_holding(below, committed, live, ingest, spec, &|_| false, &|_| false)
 }
 
 /// [`plan`], with `frozen` naming the paths of repositories held back this
-/// pass: nothing looked at their branches, so a dependency on one is taken as
-/// current rather than as gone.
+/// pass — nothing looked at their branches, so a dependency on one is taken as
+/// current rather than as gone — and `expired` the units of a layer that
+/// expires whose time is up.
 pub fn plan_holding(
     below: &[Below],
     committed: &[Done],
@@ -133,6 +144,7 @@ pub fn plan_holding(
     ingest: &dyn Fn(&Below) -> bool,
     spec: &str,
     frozen: &dyn Fn(&str) -> bool,
+    expired: &dyn Fn(&Done) -> bool,
 ) -> Plan {
     // A key below twice (two copies of one reading, before the layer below
     // lets one go) is one unit below: the first is planned, the second
@@ -161,6 +173,9 @@ pub fn plan_holding(
         let mut candidates = on.remove(&i).unwrap_or_default();
         let all_quant = candidates_quants(&candidates);
         candidates.sort_by_key(|d| holder_rank(d, all_quant));
+        // A unit whose time is up holds only what no unit in its time holds:
+        // it stands behind them, the order among each kept (a stable sort).
+        candidates.sort_by_key(|d| expired(d));
         if b.branches.is_empty() && b.file_key.is_some() {
             // A file of no branch is one whose repository was held back this
             // pass: nothing looked at its branches or at the files it depends
@@ -185,22 +200,28 @@ pub fn plan_holding(
                     tombstone.push(d.timeline);
                 }
             }
-            match holder {
-                Some(d) => held.push(Held {
+            // A holder whose time is up stands while its replacement is read.
+            let read = holder.is_none_or(expired);
+            if let Some(d) = holder {
+                held.push(Held {
                     below: i,
                     timeline: d.timeline,
                     key: d.key.clone(),
                     branches: Vec::new(),
-                }),
-                None if ingest(b) => queued.push(Queued {
+                });
+            }
+            if read && ingest(b) {
+                queued.push(Queued {
                     below: i,
                     branches: Vec::new(),
-                }),
-                None => {}
+                });
             }
             continue;
         }
         let mut left: Vec<String> = b.branches.clone();
+        // The branches held only by a unit whose time is up: it stands for
+        // them while they are read again.
+        let mut renew: Vec<String> = Vec::new();
         for d in candidates {
             let ok: Vec<String> = left
                 .iter()
@@ -212,6 +233,9 @@ pub fn plan_holding(
                 continue;
             }
             left.retain(|br| !ok.contains(br));
+            if expired(d) {
+                renew.extend(ok.iter().cloned());
+            }
             held.push(Held {
                 below: i,
                 timeline: d.timeline,
@@ -219,10 +243,18 @@ pub fn plan_holding(
                 branches: ok,
             });
         }
-        if !left.is_empty() && ingest(b) {
+        // Read for every branch no unit in its time stands for, in the order
+        // the unit below names them.
+        let read: Vec<String> = b
+            .branches
+            .iter()
+            .filter(|br| left.contains(br) || renew.contains(br))
+            .cloned()
+            .collect();
+        if !read.is_empty() && ingest(b) {
             queued.push(Queued {
                 below: i,
-                branches: left,
+                branches: read,
             });
         }
     }
@@ -317,6 +349,7 @@ mod tests {
             },
             spec: Some("s".into()),
             quant: None,
+            built_ms: Some(n),
         }
     }
 
@@ -566,11 +599,68 @@ mod tests {
         let units = [done(10, "a@1", &[("y/d", "d@1")])];
         let gone = plan(&b, &units, &LiveFiles::new(), ALL, "s");
         assert_eq!(gone.tombstone, [tl(10)]);
-        let frozen = plan_holding(&b, &units, &LiveFiles::new(), ALL, "s", &|p| {
-            p.starts_with("y/")
-        });
+        let frozen = plan_holding(
+            &b,
+            &units,
+            &LiveFiles::new(),
+            ALL,
+            "s",
+            &|p| p.starts_with("y/"),
+            &|_| false,
+        );
         assert_eq!(frozen.held.len(), 1);
         assert!(frozen.tombstone.is_empty());
+    }
+
+    /// **A unit whose time is up is read again, and stands until its
+    /// replacement commits**; one whose time is not up stands and is not read.
+    #[test]
+    fn an_expired_unit_stands_while_it_is_read_again() {
+        let b = [below("a@1", "a", 1), below("b@1", "b", 2)];
+        let units = [done(10, "a@1", &[]), done(11, "b@1", &[])];
+        let expired: &dyn Fn(&Done) -> bool = &|d| d.timeline == tl(10);
+        let p = plan_holding(&b, &units, &LiveFiles::new(), ALL, "s", &|_| false, expired);
+        assert!(p.tombstone.is_empty());
+        let mut standing: Vec<TimelineId> = p.held.iter().map(|h| h.timeline).collect();
+        standing.sort_by_key(|t| t.raw());
+        assert_eq!(standing, [tl(10), tl(11)]);
+        assert_eq!(
+            p.queued,
+            [Queued {
+                below: 0,
+                branches: vec!["main".into()]
+            }]
+        );
+        // Its replacement committed: the replacement takes its branch, the old
+        // unit stands for none and goes, and nothing is read.
+        let after = [units[0].clone(), units[1].clone(), done(12, "a@1", &[])];
+        let p = plan_holding(&b, &after, &LiveFiles::new(), ALL, "s", &|_| false, expired);
+        assert_eq!(p.tombstone, [tl(10)]);
+        assert!(p.queued.is_empty());
+        let a = p.held.iter().find(|h| h.below == 0).unwrap();
+        assert_eq!(a.timeline, tl(12));
+    }
+
+    /// A day (of no branch) whose unit's time is up keeps it while the day is
+    /// read again.
+    #[test]
+    fn an_expired_unit_of_no_branch_stands_while_it_is_read_again() {
+        let mut day = below("d@1", "2026-10-24", 1);
+        day.branches.clear();
+        day.file_key = None;
+        let units = [done(10, "d@1", &[])];
+        let p = plan_holding(
+            &[day],
+            &units,
+            &LiveFiles::new(),
+            ALL,
+            "s",
+            &|_| false,
+            &|_| true,
+        );
+        assert!(p.tombstone.is_empty());
+        assert_eq!(p.held[0].timeline, tl(10));
+        assert_eq!(queued(&p), [0]);
     }
 
     /// Two copies of one unit below are one unit: nothing is built twice.
