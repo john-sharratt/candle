@@ -75,15 +75,40 @@ async fn h3_relay_fan_out() {
         let mut by_origin: HashMap<u64, Vec<u64>> = HashMap::new();
         for (origin, oseq) in arrivals.iter() {
             assert_ne!(*origin, me, "member {me} was sent its own event {oseq}");
+            // A record an origin writes after its burst — its replicator's own,
+            // a decision it records — is not the burst's, and may land before
+            // the check: only the burst and anything older are judged.
+            if *oseq > tops[*origin as usize - 1] {
+                continue;
+            }
             by_origin.entry(*origin).or_default().push(*oseq);
         }
         for (origin, oseqs) in by_origin {
             let j = origin as usize - 1;
             let want: Vec<u64> = (before[j] + 1..=tops[j]).collect();
-            assert_eq!(
-                oseqs, want,
-                "member {me}: origin {origin}'s events once each, in order"
-            );
+            if oseqs != want {
+                let mut seen = std::collections::HashSet::new();
+                let dup = oseqs.iter().filter(|q| !seen.insert(**q)).count();
+                let missing = want.iter().filter(|q| !seen.contains(*q)).count();
+                let first = oseqs.iter().zip(&want).position(|(a, b)| a != b);
+                let outside: Vec<(usize, u64)> = oseqs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, q)| **q <= before[j] || **q > tops[j])
+                    .map(|(i, q)| (i, *q))
+                    .collect();
+                panic!(
+                    "member {me}: origin {origin}'s events not once each, in order: {} arrived \
+                     of {} wanted, {dup} twice, {missing} missing, first wrong at {first:?} \
+                     ({:?} for {:?}); outside the window ({}..={}): {outside:?}",
+                    oseqs.len(),
+                    want.len(),
+                    first.map(|i| oseqs[i]),
+                    first.map(|i| want[i]),
+                    before[j] + 1,
+                    tops[j],
+                );
+            }
         }
     }
     assert!(

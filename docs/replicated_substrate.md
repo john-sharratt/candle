@@ -1053,6 +1053,7 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 | `FETCH` | `{ request, reply_to, from_node, origin, oseqs }` — ask one member for the records themselves | control |
 | `EVENT` with `flags & ADDRESSED` | a fetched record, carrying `reply_to` | catch-up |
 | `DONE` | `{ request, reply_to }` — the last `HEADERS` of an answer, or the last record of a `FETCH` | catch-up |
+| `LOST` | `{ request, reply_to }` — gateway → requester: catch-up or fetch `request` will get no answer, because no member can answer it yet or its answerer left (§7.2) | control |
 | `HAVE` | `{ request, reply_to, applied set }` — a restarted member's offer (§7.5) | catch-up |
 | `PEER_HELLO`, `ACME_CHALLENGE`, `ACME_ACK`, `ACME_CLEAR`, `ACME_CERT`, `ACME_LEDGER`, `ACME_INVENTORY`, `ACME_ORDERING`, `ACME_DONE`, `ACME_ACCOUNT` | between peer gateways only, never on a member's socket (§13.4) | control |
 
@@ -1106,6 +1107,7 @@ misread, and on an admitted socket closes it 4400.
 | `FETCH` | 65 | `u64 request` · `u64 reply_to` · `u64 from_node` · `u64 origin` · `list<u64> oseqs` |
 | `DONE` | 66 | `u64 request` · `u64 reply_to` |
 | `HAVE` | 67 | `u64 request` · `u64 reply_to` · `applied` |
+| `LOST` | 68 | `u64 request` · `u64 reply_to` |
 | `PEER_HELLO` | 70 | `u64 node` · `build` · `[32] session_key` · `[32] oauth_client` |
 | `ACME_CHALLENGE` | 71 | `str site` · `str token` · `str answer` · `u64 expires_ms` |
 | `ACME_ACK` / `ACME_CLEAR` | 72 / 73 | `str token` |
@@ -1147,7 +1149,7 @@ stream.
 | From a member | To |
 |---|---|
 | `EVENT` (live) | every *other* admitted member of the same app — never back to the sender, never to another app, and not to a member that is upgrading (§3.5), lagging (§4.4) or in fault mode for a full disk (§7.7) |
-| anything carrying `reply_to` that answers a request — `HEADERS`, an addressed `EVENT`, `DONE` | **only** the member `reply_to` names, so catch-up traffic reaches the one member that asked for it |
+| anything carrying `reply_to` that answers a request — `HEADERS`, an addressed `EVENT`, `DONE`, `LOST` | **only** the member `reply_to` names, so catch-up traffic reaches the one member that asked for it |
 | `CATCHUP` | the member `to` names; without `to`, one other ready member of the app, picked round robin (§7.2) |
 | `FETCH` | the member `from_node` names |
 | `HAVE` | every other admitted member of the same app (§7.5) |
@@ -2654,6 +2656,27 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      repaired: the next answer lists from where the requester stands, and a fetch that
      ends short fetches the record again. A dropped `DONE` would leave its catch-up
      waiting until it went quiet.
+   - **Loss is told, not inferred.** A catch-up goes quiet when nothing of it has arrived
+     for 30 s *and* nothing at all has arrived on its socket: over a slow link a reply is
+     still arriving while its frame is not yet whole (§3.2, keep-alive). Counting whole
+     frames alone, AlienWorld's gap catch-ups were dropped every 32 s while BlackWorld's
+     ~3 KB/s kept arriving, asked again from scratch, and never finished. The two losses a
+     dropped frame cannot repair the gateway reports as `LOST`:
+     - **No member can answer.** The `CATCHUP` the gateway leaves open (step 2) is
+       answered `LOST`.
+     - **The answerer left.** The gateway keeps each `CATCHUP` and `FETCH` it hands an
+       answerer until that request's `DONE` passes; when the answerer's socket ends, every
+       request it held open is answered `LOST`, and a `FETCH` naming a member not here is
+       answered `LOST` at once. A newer `CATCHUP` from the same requester to the same
+       answerer replaces the one before, which that answerer cancels.
+
+     A fetch told `LOST` ends as one ending short does: its records are wanted again. A
+     catch-up told `LOST` is timed by its own silence alone, so it is asked again at the
+     quiet's pace, not at once and over and over while no member can answer it.
+
+     `LOST` is a frame kind older members refuse, so members take a build that reads it
+     before any gateway sends it: each gateway's `web` is restarted onto it only after
+     every member runs one.
    - **One answer per requester.** A member far behind lacks everything, so an answer
      lists the whole log, and its fetches run for minutes. A requester
      asks again when its catch-up goes quiet (§7.1), and its gap watch asks again for as

@@ -10,7 +10,7 @@ use std::time::Instant;
 use super::hub::{hex, Hub, CATCHUP_CAP, LAG_CAP};
 use super::registry::Registry;
 use crate::fragment::Whole;
-use crate::frame::{Done, Frame, MemberState, Receipt};
+use crate::frame::{Done, Frame, Lost, MemberState, Receipt};
 use crate::session::SessionHandle;
 
 impl Hub {
@@ -221,6 +221,9 @@ impl Hub {
                             hex(from),
                             format!("catch-up {} asked of {}", c.request, hex(n)),
                         );
+                        self.state()
+                            .open
+                            .asked_catchup(app, n, requester, c.request);
                         self.to_member(app, n, Frame::Catchup(c));
                     }
                     // No member ready to answer, and writes seen here that the
@@ -228,8 +231,9 @@ impl Hub {
                     // still loading. A `DONE` now would tell a newcomer it had
                     // caught up on nothing, and it joined empty for good (an
                     // admission catch-up answered in 15 ms while .5 restarted).
-                    // Left unanswered, the requester asks again once it goes
-                    // quiet, by when a member may answer.
+                    // `LOST` instead: the requester asks again later, by when a
+                    // member may answer — told now, not left to a silence that
+                    // a reply still arriving over a slow link also gives.
                     None if self.state().registry.owed(app, requester, &c.since) => {
                         self.note(
                             app,
@@ -238,6 +242,14 @@ impl Hub {
                                 "catch-up {} left open: no member can answer what it lacks yet",
                                 c.request
                             ),
+                        );
+                        self.to_member(
+                            app,
+                            requester,
+                            Frame::Lost(Lost {
+                                request: c.request,
+                                reply_to: requester,
+                            }),
                         );
                     }
                     // No other member here and nothing seen it lacks: nothing
@@ -258,11 +270,32 @@ impl Hub {
             }
             Frame::Done(d) => {
                 let to = d.reply_to;
+                self.state().open.done(app, to, d.request);
                 self.to_catchup(app, to, Frame::Done(d));
             }
             Frame::Fetch(f) => {
                 let to = f.from_node;
-                self.to_member(app, to, Frame::Fetch(f));
+                let answers = {
+                    let mut s = self.state();
+                    let here = s.sockets.contains_key(&(app.to_string(), to));
+                    if here {
+                        s.open.asked_fetch(app, to, f.reply_to, f.request);
+                    }
+                    here
+                };
+                if answers {
+                    self.to_member(app, to, Frame::Fetch(f));
+                } else {
+                    // Its answerer is gone: nothing will come.
+                    self.to_member(
+                        app,
+                        f.reply_to,
+                        Frame::Lost(Lost {
+                            request: f.request,
+                            reply_to: f.reply_to,
+                        }),
+                    );
+                }
             }
             Frame::Have(h) => {
                 self.note(app, hex(from), "offered what it holds: a resync".into());

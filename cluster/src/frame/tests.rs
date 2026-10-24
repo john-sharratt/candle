@@ -626,6 +626,13 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .0,
         ),
         (
+            Frame::Lost(Lost {
+                request: 1,
+                reply_to: 2,
+            }),
+            B::header(68, 0, 0).u64(1).u64(2).0,
+        ),
+        (
             Frame::PeerHello(PeerHello {
                 node: 0x51,
                 build: build(),
@@ -846,4 +853,6 @@ fn lanes_follow_the_table() {
     assert_eq!(lane(Kind::BuildChunk), vec![Lane::CatchUp]);
     assert_eq!(lane(Kind::Fetch), vec![Lane::Control]);
     assert_eq!(lane(Kind::AcmeCert), vec![Lane::Control]);
+    // A loss is news to act on: never queued behind the catch-up it reports.
+    assert_eq!(lane(Kind::Lost), vec![Lane::Control]);
 }

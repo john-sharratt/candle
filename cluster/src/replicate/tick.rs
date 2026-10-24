@@ -36,6 +36,16 @@ pub const QUIET: Duration = Duration::from_secs(30);
 /// announces it, from whichever member can answer.
 pub const ADMISSION_QUIET_LIMIT: u32 = 2;
 
+/// Whether a catch-up last heard of at `word` has gone quiet at `now`: no word
+/// of it for [`QUIET`], and nothing at all on its socket either (`socket`, its
+/// transport's last read). Over a slow link a reply is still arriving while
+/// its frame is not yet whole, and the gateway says `LOST` when one will not
+/// come — so once told `LOST`, the catch-up's own silence is all that counts.
+pub fn is_quiet(now: Instant, word: Instant, socket: Option<Instant>, lost: bool) -> bool {
+    let silent = |at: Instant| now.duration_since(at) >= QUIET;
+    silent(word) && (lost || socket.is_none_or(silent))
+}
+
 /// What an admission catch-up that went quiet does next, given how many times
 /// it already had: ask again, or stop asking and serve.
 pub fn after_quiet_admission(quiet_before: u32) -> QuietAdmission {
@@ -130,11 +140,21 @@ impl Replicator {
             };
 
             // A catch-up whose answerer went quiet.
+            let socket_heard = |c: usize| {
+                s.sockets
+                    .get(c)
+                    .and_then(Option::as_ref)
+                    .and_then(|h| h.heard())
+                    .map(|at| at.into_std())
+            };
             let quiet: Vec<(u64, usize, Purpose)> = s
                 .heard
                 .iter()
-                .filter(|(_, at)| now.duration_since(**at) >= QUIET)
-                .filter_map(|(id, _)| s.catchups.get(id).map(|r| (*id, r.socket, r.purpose)))
+                .filter_map(|(id, at)| {
+                    let r = s.catchups.get(id)?;
+                    is_quiet(now, *at, socket_heard(r.socket), s.lost.contains(id))
+                        .then_some((*id, r.socket, r.purpose))
+                })
                 .collect();
             for (id, _, _) in &quiet {
                 s.drop_catchup(*id);
@@ -216,7 +236,31 @@ impl Replicator {
 
 #[cfg(test)]
 mod tests {
-    use super::{after_quiet_admission, QuietAdmission, ADMISSION_QUIET_LIMIT};
+    use std::time::{Duration, Instant};
+
+    use super::{after_quiet_admission, is_quiet, QuietAdmission, ADMISSION_QUIET_LIMIT, QUIET};
+
+    /// **A reply still arriving is not silence.** AlienWorld's gap catch-ups
+    /// were dropped every 32 s while BlackWorld's ~3 KB/s kept arriving on the
+    /// socket — a listing of any size takes longer than 30 s to arrive whole —
+    /// and asked again from scratch, for ever. Bytes on the socket hold a
+    /// catch-up; once the gateway says `LOST`, its own silence alone drops it.
+    #[test]
+    fn a_catch_up_is_quiet_only_when_its_socket_is_silent_too_unless_lost() {
+        let t0 = Instant::now();
+        let later = t0 + QUIET;
+        let just = Duration::from_secs(1);
+        // No word, and nothing on the socket: quiet.
+        assert!(is_quiet(later, t0, Some(t0), false));
+        assert!(is_quiet(later, t0, None, false));
+        // No word, but bytes arriving: a reply on its way.
+        assert!(!is_quiet(later, t0, Some(later - just), false));
+        // Told LOST: its silence is all that counts.
+        assert!(is_quiet(later, t0, Some(later - just), true));
+        // A word within QUIET: never quiet.
+        assert!(!is_quiet(later, later - just, None, true));
+        assert!(!is_quiet(later - just, t0, None, false));
+    }
 
     /// The first quiet admission is asked again; the one that reaches the
     /// limit serves.

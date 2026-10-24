@@ -54,6 +54,7 @@ use super::agents::{Choice, Need};
 use super::coord_log::changes;
 use super::load::{Load, Picked};
 use super::log::{CoordLog, Entry};
+use super::open_answers::OpenAnswers;
 use super::paxos_log::paxos_step;
 use super::registry::{MemberView, Pick, Registry};
 use super::status::{
@@ -71,7 +72,7 @@ use crate::close::{Close, CloseCode};
 use crate::coord::{CoordState, UpgradeView};
 use crate::delivery::ReceiptPacer;
 use crate::dispatch::{Dispatch, Mirror, RouteTable};
-use crate::frame::{name, Admit, BuildFetch, BuildId, Frame, Hello, MemberState, Members};
+use crate::frame::{name, Admit, BuildFetch, BuildId, Frame, Hello, Lost, MemberState, Members};
 use crate::handshake::{admit, GroupKey, HandshakeError, ProofLimiter};
 use crate::pipe::{Message, PipeRx, PipeTx};
 use crate::session::{start, Ended, Incoming, Role, SessionHandle, VirtualConn};
@@ -170,6 +171,8 @@ pub(super) struct State {
     held: HeldBuilds,
     /// Spreads `BUILD_FETCH`es naming no member across the holders.
     fetch_rr: usize,
+    /// The catch-ups and fetches handed to an answerer and not yet `DONE`.
+    pub open: OpenAnswers,
 }
 
 pub struct Hub {
@@ -507,11 +510,12 @@ impl Hub {
             }
         };
 
-        let (left, gone) = {
+        let (left, gone, lost) = {
             let mut s = self.state();
             let key = (app.to_string(), node);
             // A replaced session leaving takes nothing of the node's with it.
             let mut gone = Vec::new();
+            let mut lost = Vec::new();
             if s.sockets
                 .get(&key)
                 .is_some_and(|x| x.session == admitted.session)
@@ -521,6 +525,7 @@ impl Hub {
                     s.held.forget(node);
                 }
                 gone = s.upgrades.left(app, node);
+                lost = s.open.left(app, node);
             }
             let locked = s.admission.lock(app).is_some();
             s.admission.left(app, node, admitted.session);
@@ -529,9 +534,22 @@ impl Hub {
             (
                 (s.registry.leave(app, node, admitted.session), cleared),
                 gone,
+                lost,
             )
         };
         self.act(gone);
+        // What it was answering will not be answered: its requesters ask again
+        // now, rather than waiting out a silence.
+        for (requester, request) in lost {
+            self.to_member(
+                app,
+                requester,
+                Frame::Lost(Lost {
+                    request,
+                    reply_to: requester,
+                }),
+            );
+        }
         self.note(app, hex(node), format!("socket closed: {}", describe(&how)));
         if left.1 {
             self.note(
@@ -676,7 +694,7 @@ impl Hub {
                 let to = a.reply_to;
                 self.to_member(app, to, Frame::Accepted(a));
             }
-            f @ (Frame::Members(_) | Frame::Receipt(_) | Frame::Verdict(_)) => {
+            f @ (Frame::Members(_) | Frame::Receipt(_) | Frame::Verdict(_) | Frame::Lost(_)) => {
                 return Err(Close::new(
                     CloseCode::Malformed,
                     format!("{} is the gateway's to send", name(f.kind())),

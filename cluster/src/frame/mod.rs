@@ -32,7 +32,8 @@ pub use peering::{AcmeCert, AcmeChallenge, CertLine, PeerHello};
 pub use pulse::Pulse;
 pub use streams::{Data, Open, Window, MAX_DATA};
 pub use substrate::{
-    Ack, Catchup, Done, Event, Fetch, Gone, Have, Headers, Receipt, RecordHeader, MAX_FRAGMENT,
+    Ack, Catchup, Done, Event, Fetch, Gone, Have, Headers, Lost, Receipt, RecordHeader,
+    MAX_FRAGMENT,
 };
 pub use types::{
     Artifact, Ballot, BuildId, ClaimInfo, Epoch, MemberInfo, MemberState, ModelId, RepoAd,
@@ -94,6 +95,7 @@ pub enum Frame {
     Fetch(Fetch),
     Done(Done),
     Have(Have),
+    Lost(Lost),
     PeerHello(PeerHello),
     AcmeChallenge(AcmeChallenge),
     /// A peer holds the challenge `token` and answers it.
@@ -165,6 +167,7 @@ impl Frame {
             Frame::Fetch(_) => Kind::Fetch,
             Frame::Done(_) => Kind::Done,
             Frame::Have(_) => Kind::Have,
+            Frame::Lost(_) => Kind::Lost,
             Frame::PeerHello(_) => Kind::PeerHello,
             Frame::AcmeChallenge(_) => Kind::AcmeChallenge,
             Frame::AcmeAck { .. } => Kind::AcmeAck,
@@ -288,6 +291,7 @@ impl Frame {
             Frame::Fetch(b) => b.write(&mut w),
             Frame::Done(b) => b.write(&mut w),
             Frame::Have(b) => b.write(&mut w),
+            Frame::Lost(b) => b.write(&mut w),
             Frame::PeerHello(b) => b.write(&mut w),
             Frame::AcmeChallenge(b) => b.write(&mut w),
             Frame::AcmeAck { token } | Frame::AcmeClear { token } => {
@@ -389,6 +393,7 @@ impl Frame {
             Kind::Fetch => Frame::Fetch(Fetch::read(&mut r)?),
             Kind::Done => Frame::Done(Done::read(&mut r)?),
             Kind::Have => Frame::Have(Have::read(&mut r)?),
+            Kind::Lost => Frame::Lost(Lost::read(&mut r)?),
             Kind::PeerHello => Frame::PeerHello(PeerHello::read(&mut r)?),
             Kind::AcmeChallenge => Frame::AcmeChallenge(AcmeChallenge::read(&mut r)?),
             Kind::AcmeAck => Frame::AcmeAck { token: r.str()? },
@@ -452,6 +457,7 @@ pub fn name(kind: Kind) -> &'static str {
         Kind::Fetch => "FETCH",
         Kind::Done => "DONE",
         Kind::Have => "HAVE",
+        Kind::Lost => "LOST",
         Kind::PeerHello => "PEER_HELLO",
         Kind::AcmeChallenge => "ACME_CHALLENGE",
         Kind::AcmeAck => "ACME_ACK",

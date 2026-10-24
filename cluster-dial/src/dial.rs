@@ -315,7 +315,7 @@ impl PipeRx for PathRx {
         }
     }
 
-    fn heard(&self) -> Option<Instant> {
+    fn heard(&self) -> Option<Heard> {
         self.inner.heard()
     }
 }
@@ -478,7 +478,7 @@ mod tests {
         let (_tx, rx) = d.connect().await.expect("the second endpoint answers");
         assert_eq!(on(&d), 1);
         assert!(
-            rx.heard().is_some(),
+            rx.heard().is_some_and(|h| h.at().is_some()),
             "the handshake's reply came through the stamped transport"
         );
         let first = d.target.endpoints[0].port;

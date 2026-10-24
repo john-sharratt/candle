@@ -87,6 +87,7 @@ kinds! {
     Fetch = 65,
     Done = 66,
     Have = 67,
+    Lost = 68,
     PeerHello = 70,
     AcmeChallenge = 71,
     AcmeAck = 72,

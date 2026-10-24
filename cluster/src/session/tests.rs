@@ -216,8 +216,8 @@ impl PipeRx for Trickle {
         self.inner.recv().await
     }
 
-    fn heard(&self) -> Option<tokio::time::Instant> {
-        self.heard.at()
+    fn heard(&self) -> Option<Heard> {
+        Some(self.heard.clone())
     }
 }
 

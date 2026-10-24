@@ -299,6 +299,32 @@ impl Done {
     }
 }
 
+/// Gateway → member: catch-up or fetch `request` will get no answer (§7.2) —
+/// no member can answer it yet, or the member answering it is gone. The
+/// requester learns so now, not from 30 s of silence, which a reply still
+/// arriving over a slow link also gives: silence cannot stand for loss. A
+/// frame dropped at the catch-up lane's cap needs no notice — the `DONE`
+/// that ends every answer is never dropped, and a fetch that ends short asks
+/// again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lost {
+    pub request: u64,
+    pub reply_to: u64,
+}
+
+impl Lost {
+    pub fn write(&self, w: &mut Writer) {
+        w.u64(self.request).u64(self.reply_to);
+    }
+
+    pub fn read(r: &mut Reader) -> Result<Self, WireError> {
+        Ok(Self {
+            request: r.u64()?,
+            reply_to: r.u64()?,
+        })
+    }
+}
+
 /// A restarted member's offer of everything it holds (§7.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Have {

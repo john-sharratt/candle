@@ -17,8 +17,6 @@ pub mod tungstenite;
 
 use std::future::Future;
 
-use tokio::time::Instant;
-
 pub use drain::Drain;
 pub use heard::Heard;
 pub use stamped::Stamped;
@@ -67,10 +65,10 @@ pub trait PipeRx: Send + 'static {
     /// The next message, or `None` once the pipe is gone.
     fn recv(&mut self) -> impl Future<Output = Option<Message>> + Send;
 
-    /// When bytes last arrived from the peer, a message still arriving
-    /// included; `None` when the transport cannot tell, and then only a whole
-    /// message is heard.
-    fn heard(&self) -> Option<Instant> {
+    /// The stamp the transport's reads leave — the bytes of a message still
+    /// arriving included; `None` when the transport cannot tell, and then only
+    /// a whole message is heard.
+    fn heard(&self) -> Option<Heard> {
         None
     }
 }

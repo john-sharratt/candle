@@ -35,7 +35,7 @@ use crate::consensus::{Config, Millis, Paxos};
 use crate::coord::{AppCoord, CommandLine};
 use crate::delivery::Outbox;
 use crate::fragment::Whole;
-use crate::frame::{Catchup, Done, Frame, Headers, Members, Pulse};
+use crate::frame::{Catchup, Done, Frame, Headers, Lost, Members, Pulse};
 use crate::member::AppMember;
 use crate::session::SessionHandle;
 
@@ -180,6 +180,9 @@ pub(super) struct State {
     pub answering: Answering,
     /// Each catch-up's last word from its answerer.
     pub heard: HashMap<u64, Instant>,
+    /// Catch-ups the gateway said will get no answer (`LOST`): timed by
+    /// their silence alone, whatever else their socket carries.
+    pub lost: HashSet<u64>,
     /// Which catch-up each outstanding fetch belongs to.
     pub fetches: HashMap<u64, u64>,
     /// Records some catch-up of this member wants: another lists them as
@@ -230,6 +233,7 @@ impl State {
             }
         }
         self.heard.remove(&id);
+        self.lost.remove(&id);
         self.fetches.retain(|_, owner| *owner != id);
     }
 
@@ -389,6 +393,7 @@ impl Replicator {
                 catchups: BTreeMap::new(),
                 answering: Answering::default(),
                 heard: HashMap::new(),
+                lost: HashSet::new(),
                 fetches: HashMap::new(),
                 claimed: HashSet::new(),
                 restarted: false,
@@ -594,6 +599,7 @@ impl Replicator {
             Frame::Done(done) => {
                 let _ = self.arrivals.send(Arrival::Done { c, done });
             }
+            Frame::Lost(lost) => self.lost(c, lost),
             Frame::Catchup(asked) => self.answer_catchup(c, asked),
             Frame::Fetch(f) => self.answer_fetch(c, f),
             Frame::Have(h) => self.offered(c, h),
@@ -605,6 +611,32 @@ impl Replicator {
             | Frame::Accepted(_)
             | Frame::Release(_)) => self.paxos_frame(&f),
             _ => {}
+        }
+    }
+
+    /// `LOST` (§7.2): `lost.request` will get no answer. A fetch ends as one
+    /// ending short does — its records are wanted again, the way a `DONE`
+    /// short of them is handled. A catch-up is left to its silence alone, so
+    /// it is dropped and asked again at the quiet's pace, not at once and over
+    /// and over while no member can answer it.
+    fn lost(self: &Arc<Self>, c: usize, lost: Lost) {
+        let fetch = {
+            let mut s = self.state();
+            if s.fetches.contains_key(&lost.request) {
+                true
+            } else {
+                if s.catchups.contains_key(&lost.request) {
+                    s.lost.insert(lost.request);
+                }
+                false
+            }
+        };
+        if fetch {
+            let done = Done {
+                request: lost.request,
+                reply_to: self.node,
+            };
+            let _ = self.arrivals.send(Arrival::Done { c, done });
         }
     }
 

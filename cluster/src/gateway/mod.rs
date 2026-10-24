@@ -12,6 +12,7 @@ mod drain;
 mod hub;
 mod load;
 mod log;
+mod open_answers;
 mod paxos_log;
 mod registry;
 mod relay;

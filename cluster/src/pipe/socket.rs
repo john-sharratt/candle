@@ -16,7 +16,6 @@ use std::marker::PhantomData;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 
 use super::{Drain, Heard, Message, PipeClosed, PipeRx, PipeTx};
 use crate::close::Close;
@@ -131,8 +130,8 @@ where
         }
     }
 
-    fn heard(&self) -> Option<Instant> {
-        self.heard.at()
+    fn heard(&self) -> Option<Heard> {
+        Some(self.heard.clone())
     }
 }
 
@@ -171,14 +170,15 @@ mod tests {
             None,
         )
         .await;
-        let (_gtx, mut grx) = split::<Tungstenite, _, _>(gateway, heard);
-        assert_eq!(grx.heard(), None);
+        let (_gtx, mut grx) = split::<Tungstenite, _, _>(gateway, heard.clone());
+        assert_eq!(heard.at(), None);
         // A masked binary frame's header announcing a 16-bit length, and
         // nothing more of it.
         peer.write_all(&[0x82, 0xfe, 0x10]).await.unwrap();
         let whole = tokio::time::timeout(std::time::Duration::from_millis(200), grx.recv()).await;
         assert!(whole.is_err(), "no message is whole yet");
-        assert!(grx.heard().is_some(), "but its bytes have been heard");
+        assert!(heard.at().is_some(), "but its bytes have been heard");
+        assert!(grx.heard().is_some_and(|h| h.at().is_some()));
     }
 
     /// Frames cross a real WebSocket in order both ways, byte for byte; a
