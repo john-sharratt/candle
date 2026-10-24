@@ -214,7 +214,7 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
 ```yaml
   - name: dialogue
     working_set:
-      budget_tokens: 10000       # seeds + provenance, folders and files together
+      budget_tokens: 20000       # seeds + provenance, folders and files together
       lock_tokens: 150000        # the locks, on top of budget_tokens
       folder_tokens: 10000       # repo_map's share of budget_tokens
       beta: 0.2                  # per-file momentum leak (§4.3)

@@ -1420,10 +1420,11 @@ layers:
       # about a paper was ~70K of test files the question never touched — the
       # scan's per-file standardisation cannot rank files against each other,
       # so what fills this budget is largely arbitrary — at 40K one 32K test
-      # file, ranked first on every question, took nearly all of it. 10K holds
-      # the seeds' folders and small files and never a large file the scan
-      # merely guessed at. The model's own reads sit on top under `lock_tokens`.
-      budget_tokens: 10000
+      # file, ranked first on every question, took nearly all of it. Ranked
+      # by normalized score the scan no longer favours the large file, and 20K
+      # holds the seeds' folders and small files with room for what it ranks.
+      # The model's own reads sit on top under `lock_tokens`.
+      budget_tokens: 20000
       # The locks sit on top: a read the model makes adds to what it carries
       # and never displaces the provenance around it, up to this ceiling.
       # 10K + 150K + this layer's 116K window stays clear of the ×2 rung's
