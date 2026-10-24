@@ -406,6 +406,11 @@ system_prompt:
     # tools in this text interface" and asked for the file to be pasted, 2 of 2
     # runs, while the same request for `lenient_json.rs` reasoned "I must call the
     # tool" and did. The tool-aware remedy therefore says the tools EXECUTE.
+    #
+    # The web_search line is conditional on the tools listing it: this section
+    # projects in every tools mode, Restricted offers no network tool, and told
+    # unconditionally to call web_search a Restricted turn spent a whole round on
+    # six refused searches (replays 18 and 20, 2026-10-25).
     - kind: section
       id: grounding
       depends_on_configured: tools
@@ -422,7 +427,8 @@ system_prompt:
         is asked about, never taken from a README, a document or an earlier answer: it
         changes, and a document about it can be wrong.
         A request to research, search, look something up, or cite a source is a request to
-        call web_search (and web_fetch for a page worth reading) before you answer.
+        call web_search (and web_fetch for a page worth reading) before you answer — when
+        your tools list them; when they do not, you cannot check a source, so say so.
         A source you cite is one a tool returned in this conversation, named as it appeared
         there, and written into the answer itself — its title or URL. A bare footnote
         number with no list of what it stands for names nothing. Never make up a value,
