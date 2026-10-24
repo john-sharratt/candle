@@ -119,6 +119,16 @@ code_reading/scopes     provenance files,   then pinned       ┘ locks ≤ lock
 dialogue                its own turns: recent 16 + historical 8, its own 116K window
 ```
 
+**Each member ends on its own name.** A file's reading closes on its reader's
+summary, which describes the file without naming it, and the next member's
+request — naming the next file — follows it directly. Measured 2026-10-24, six
+replays running: a fact from one test file stated, then written into a
+document, as the next file's. Each member is now followed by a generated
+closer, `end of <repo>/<path>` — the line each of its pages already ends on —
+set per reading by the daemon from its ingest index
+(`RetrievalScope::close_units`, `Substrate::set_unit_closer`) and emitted after
+the member's last turn (`project.rs` Step 12).
+
 The working set sits between the conversation's opening and its own turns, so
 the locks — the files the model was just told it has — are next to the turns
 that asked for them. In plain layer order they sat behind every other layer's

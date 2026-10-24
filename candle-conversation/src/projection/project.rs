@@ -2171,8 +2171,36 @@ pub fn run_with_sink<R: ContentResolver>(
         blocks = rest;
     }
 
-    let mut turns: Vec<ResolvedTurn> = vec![];
+    // Past turns emit as a single `Sealed::Turn` segment each.  The
+    // projection engine doesn't know about dialect tokens or boundary
+    // wrapping — the projection assembler owns that concern and
+    // injects `user_start` before / `assistant_end` after every
+    // `Sealed::Turn` from its own pre-tokenised `BoundaryMarkers`
+    // (held on the scheduler, threaded through `ApplyContext`).
+    //
+    // **A working-set member ends on what it is about.** A unit's last turn
+    // is its reader's summary, which describes the file without naming it,
+    // and the next member's request — naming the NEXT file — follows it
+    // directly. Measured 2026-10-24, six replays running: a fact from one
+    // test file stated, and written into a document, as the next file's.
+    // Each member is followed by its closer (`ContentResolver::unit_closer`,
+    // `end of <what it read>`), a generated run like any template's.
+    let mut tail: Vec<ProjectionSegment> = vec![];
     for (gs, layer_id_for_walk, group_turns) in blocks {
+        let closes = gs.working_set.is_some();
+        let mut open: Option<TimelineId> = None;
+        let close = |tail: &mut Vec<ProjectionSegment>, timeline: Option<TimelineId>| {
+            if let Some(tokens) = timeline.and_then(|tl| resolver.unit_closer(tl)) {
+                let position = system_prompt_segments.len() + tail.len();
+                tail.push(ProjectionSegment::Generated {
+                    tokens,
+                    identity: GeneratedIdentity {
+                        name: "unit_closer".to_string(),
+                        position,
+                    },
+                });
+            }
+        };
         for key in group_turns {
             // Ghost summary turns (`record_summary_turn` →
             // `append_with_blocks(0..0)`) are zero-token tree-meta anchors
@@ -2190,7 +2218,11 @@ pub fn run_with_sink<R: ContentResolver>(
             // record; fall back to projector context if the
             // resolver doesn't track origins (e.g. test mocks).
             let origin_layer = resolver.turn_origin(key).unwrap_or(layer_id_for_walk);
-            turns.push(ResolvedTurn {
+            if closes && open.is_some_and(|tl| tl != key.timeline) {
+                close(&mut tail, open);
+            }
+            open = Some(key.timeline);
+            let turn = ResolvedTurn {
                 id: TurnId {
                     layer_id: origin_layer,
                     group_id: gs.schema.id,
@@ -2199,24 +2231,21 @@ pub fn run_with_sink<R: ContentResolver>(
                 // Stamp the conversation ONCE, here, where the target-aware
                 // resolver knows it — so no downstream consumer re-derives it.
                 timeline: Some(key.timeline),
-            });
+            };
+            tail.push(ProjectionSegment::Sealed(SealedKind::Turn(
+                turn,
+                crate::Role::Assistant,
+            )));
+        }
+        if closes {
+            close(&mut tail, open);
         }
     }
 
     let mut segments: Vec<ProjectionSegment> =
-        Vec::with_capacity(system_prompt_segments.len() + turns.len());
+        Vec::with_capacity(system_prompt_segments.len() + tail.len());
     segments.extend(system_prompt_segments);
-    // Past turns emit as a single `Sealed::Turn` segment each.  The
-    // projection engine doesn't know about dialect tokens or boundary
-    // wrapping — the projection assembler owns that concern and
-    // injects `user_start` before / `assistant_end` after every
-    // `Sealed::Turn` from its own pre-tokenised `BoundaryMarkers`
-    // (held on the scheduler, threaded through `ApplyContext`).
-    segments.extend(
-        turns
-            .into_iter()
-            .map(|t| ProjectionSegment::Sealed(SealedKind::Turn(t, crate::Role::Assistant))),
-    );
+    segments.extend(tail);
     Projection {
         segments,
         selections: resolved_selections,

@@ -101,6 +101,15 @@ pub struct RetrievalScope {
     shared: Mutex<Kept<ScopeKey, Scope>>,
     /// Each manifest version's hint — part of a folder's key, as in the walk.
     hints: Mutex<Hints>,
+    /// The file readings whose closer the engine already holds.
+    closed: Mutex<HashSet<TimelineId>>,
+}
+
+/// What closes a file's reading where a dialogue carries it in its working
+/// set — the line each page of it already ends on, said once more after its
+/// reader's summary, which does not name the file.
+pub fn unit_closer_text(path: &str) -> String {
+    format!("end of {path}\n")
 }
 
 impl RetrievalScope {
@@ -115,6 +124,7 @@ impl RetrievalScope {
             trees: Mutex::new(Kept::new(KEPT_TREES)),
             shared: Mutex::new(Kept::new(KEPT_SCOPES)),
             hints: Mutex::new(Hints::default()),
+            closed: Mutex::new(HashSet::new()),
         }
     }
 
@@ -146,6 +156,7 @@ impl RetrievalScope {
         });
         let scope = self.scope_of(&index, files);
         let e = engine.lock().unwrap();
+        self.close_units(&e, &index);
         if let Some(group) = self.files_group {
             e.set_retrieval_scope(target, group, scope.files);
         }
@@ -155,6 +166,23 @@ impl RetrievalScope {
         for group in &self.derived {
             let allowed = scope.derived.get(group).cloned().unwrap_or_default();
             e.set_retrieval_scope(target, *group, allowed);
+        }
+    }
+
+    /// Give the engine the closer of every file reading in `index` it does not
+    /// hold one for yet ([`unit_closer_text`]).
+    fn close_units(&self, engine: &ConversationEngine, index: &IngestIndex) {
+        let mut closed = self.closed.lock().unwrap();
+        for (path, timeline) in index.files() {
+            if closed.contains(&timeline) {
+                continue;
+            }
+            match engine.set_unit_closer(timeline, &unit_closer_text(path)) {
+                Ok(()) => {
+                    closed.insert(timeline);
+                }
+                Err(e) => tracing::warn!(path, "a file reading's closer did not tokenize: {e}"),
+            }
         }
     }
 
@@ -625,6 +653,30 @@ mod tests {
         let scope = scope_of(&rs, &RepoFiles::overlay(ws).unwrap());
         assert!(scope.folders.is_empty());
         assert_eq!(*scope.files, set(&[1, 2, 30]));
+    }
+
+    /// **Each file reading is closed by the path it read**, as its pages end;
+    /// a folder's or a layer unit's key names no file and has no closer here.
+    #[test]
+    fn every_file_reading_and_only_those_has_a_closer() {
+        let index = IngestIndex::of(
+            HashMap::from([
+                (
+                    file_key(
+                        "r/src/b.rs",
+                        &Oid::parse("4b825dc642cb6eb9a060e54bf8d69288fbee4904").unwrap(),
+                    ),
+                    tl(2),
+                ),
+                ("v2:0123abcd".to_string(), tl(10)),
+                ("u1:static_analysis:00ff".to_string(), tl(40)),
+            ]),
+            Vec::new(),
+            1,
+        );
+        let files: Vec<(&str, TimelineId)> = index.files().collect();
+        assert_eq!(files, vec![("r/src/b.rs", tl(2))]);
+        assert_eq!(unit_closer_text("r/src/b.rs"), "end of r/src/b.rs\n");
     }
 
     /// An index whose only committed unit is `key`.
