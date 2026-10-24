@@ -2090,7 +2090,9 @@ pub fn run_with_sink<R: ContentResolver>(
     // ── Step 12: Emit ─────────────────────────────────────────────────────────
     // Groups are emitted in declaration order per layer, but sorted by
     // descending group score within each layer (ties: declaration order).
-    let mut turns: Vec<ResolvedTurn> = vec![];
+    // Each group's turns are gathered into one block first; a target with a
+    // working set then has its blocks reordered (below).
+    let mut blocks: Vec<(&GroupState, LayerId, Vec<TurnKey>)> = Vec::new();
 
     for &li in &surviving_layer_indices {
         let layer_id_for_walk = visible_layers[li].id;
@@ -2134,35 +2136,70 @@ pub fn run_with_sink<R: ContentResolver>(
             if !gs.score_density && gs.working_set.is_none() {
                 group_turns.sort();
             }
+            blocks.push((gs, layer_id_for_walk, group_turns));
+        }
+    }
 
-            for key in group_turns {
-                // Ghost summary turns (`record_summary_turn` →
-                // `append_with_blocks(0..0)`) are zero-token tree-meta anchors
-                // with no K/V in any tier. They must never become a
-                // `Sealed(Turn)` segment: there is nothing to inject, so
-                // emitting one only wastes a window slot and makes the
-                // assembler wrap empty boundary markers around no content
-                // (which then drops at inject time). Skip them at the
-                // projection source so every consumer — the elevate set and the
-                // assembler alike — sees only turns that carry injectable K/V.
-                if resolver.turn_token_count(key) == 0 {
-                    continue;
-                }
-                // Prefer the producer's `layer_id` from the resolver
-                // record; fall back to projector context if the
-                // resolver doesn't track origins (e.g. test mocks).
-                let origin_layer = resolver.turn_origin(key).unwrap_or(layer_id_for_walk);
-                turns.push(ResolvedTurn {
-                    id: TurnId {
-                        layer_id: origin_layer,
-                        group_id: gs.schema.id,
-                        index: key.index,
-                    },
-                    // Stamp the conversation ONCE, here, where the target-aware
-                    // resolver knows it — so no downstream consumer re-derives it.
-                    timeline: Some(key.timeline),
-                });
+    // **A dialogue's working set sits between its opening and its own
+    // turns**: `[other layers][the inherited chain][working set][own turns]`
+    // (`docs/zend_working_set.md` §4.1). The locks — the files the model was
+    // just told it has — are the working set's tail, so they land next to the
+    // conversation that asked for them. In layer order they sat behind every
+    // other layer's groups and the whole inherited chain: measured
+    // 2026-10-24, a locked paper ~130K tokens before the question, which the
+    // model then could not find and called the tool's reply false. What now
+    // sits after the working set changes rarely — the chain never, the
+    // analysis layers only as locks change — so moving it costs no rebuilds.
+    if declares_working_set {
+        let (working_set, mut rest): (Vec<_>, Vec<_>) = blocks
+            .into_iter()
+            .partition(|(gs, _, _)| gs.working_set.is_some());
+        let own_at = rest
+            .iter()
+            .position(|(gs, _, _)| gs.schema.id == target.group);
+        let mut own_tail = None;
+        if let Some(at) = own_at {
+            let (gs, layer, keys) = rest.remove(at);
+            let (lineage, own): (Vec<TurnKey>, Vec<TurnKey>) = keys
+                .into_iter()
+                .partition(|key| key.timeline != target.timeline);
+            rest.push((gs, layer, lineage));
+            own_tail = Some((gs, layer, own));
+        }
+        rest.extend(working_set);
+        rest.extend(own_tail);
+        blocks = rest;
+    }
+
+    let mut turns: Vec<ResolvedTurn> = vec![];
+    for (gs, layer_id_for_walk, group_turns) in blocks {
+        for key in group_turns {
+            // Ghost summary turns (`record_summary_turn` →
+            // `append_with_blocks(0..0)`) are zero-token tree-meta anchors
+            // with no K/V in any tier. They must never become a
+            // `Sealed(Turn)` segment: there is nothing to inject, so
+            // emitting one only wastes a window slot and makes the
+            // assembler wrap empty boundary markers around no content
+            // (which then drops at inject time). Skip them at the
+            // projection source so every consumer — the elevate set and the
+            // assembler alike — sees only turns that carry injectable K/V.
+            if resolver.turn_token_count(key) == 0 {
+                continue;
             }
+            // Prefer the producer's `layer_id` from the resolver
+            // record; fall back to projector context if the
+            // resolver doesn't track origins (e.g. test mocks).
+            let origin_layer = resolver.turn_origin(key).unwrap_or(layer_id_for_walk);
+            turns.push(ResolvedTurn {
+                id: TurnId {
+                    layer_id: origin_layer,
+                    group_id: gs.schema.id,
+                    index: key.index,
+                },
+                // Stamp the conversation ONCE, here, where the target-aware
+                // resolver knows it — so no downstream consumer re-derives it.
+                timeline: Some(key.timeline),
+            });
         }
     }
 

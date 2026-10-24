@@ -106,15 +106,27 @@ Verified in the code. Items 1–6 are live bugs; the design removes each, and
 The working set is **not** part of the dialogue group. Each pinned item is a
 forced member of its **own layer's group** — a file of `code_reading/scopes`, a
 folder of `repo_map/structure` — the turn-group equivalent of a collection's
-`mandatory`. Provenance fills the same groups. Layers already emit in rank order
-ahead of the dialogue, so:
+`mandatory`. Provenance fills the same groups. For a target that declares a
+working set the projection emits (`project.rs` Step 12):
 
 ```
 system prompt
-repo_map/structure      pinned folders + provenance folders   ┐ working set: provenance ≤ budget_tokens,
-code_reading/scopes     pinned files   + provenance files     ┘ locks ≤ lock_tokens on top
-lineage + dialogue      untouched: recent 16 + historical 8, its own 116K window
+other layers' groups    (the analysis layers, following the locks — §B.5 of
+                         docs/provenance_adaptive_projection.md)
+inherited chain         the dialogue group's lineage turns
+repo_map/structure      provenance folders, then pinned       ┐ working set: provenance ≤ budget_tokens,
+code_reading/scopes     provenance files,   then pinned       ┘ locks ≤ lock_tokens on top
+dialogue                its own turns: recent 16 + historical 8, its own 116K window
 ```
+
+The working set sits between the conversation's opening and its own turns, so
+the locks — the files the model was just told it has — are next to the turns
+that asked for them. In plain layer order they sat behind every other layer's
+groups and the whole inherited chain: measured 2026-10-24, a locked paper
+~130K tokens before the question, which the model could not find and called
+the tool's reply false. What now follows the working set changes rarely — the
+chain never, the analysis layers only as locks change — so the move costs no
+rebuilds.
 
 This one move fixes §3.7 (the dialogue's budget no longer carries the working
 set) and §3.8 (the working set is always ahead of the dialogue).

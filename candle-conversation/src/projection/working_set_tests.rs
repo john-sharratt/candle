@@ -329,6 +329,29 @@ fn the_working_set_sits_ahead_of_the_dialogue_in_every_round() {
     }
 }
 
+/// **The working set sits between the dialogue's opening and its own turns**:
+/// the inherited chain first, then the working set — its locks last — then the
+/// conversation itself, so a file the model was just told it has is next to
+/// the turns that asked for it.
+#[test]
+fn the_working_set_sits_between_the_chain_and_the_dialogues_own_turns() {
+    let f = fixture();
+    const CHAIN: u64 = 5;
+    let r = WsResolver::default()
+        .with_conversation(DIALOGUE, f.conversation, 1, 10)
+        .with_conversation(CHAIN, f.conversation, 1, 10)
+        .with_conversation(20, f.structure, 1, 100)
+        .with_conversation(30, f.scopes, 1, 100)
+        .with_conversation(31, f.scopes, 1, 100)
+        .provenance(f.scopes, 31, 900.0)
+        .lock(f.structure, 20)
+        .lock(f.scopes, 30);
+    assert_eq!(
+        emitted(&f.b, f.target, &r),
+        vec![(CHAIN, 1), (20, 1), (31, 1), (30, 1), (DIALOGUE, 1)],
+    );
+}
+
 /// **A focused projection keeps only what the conversation was served.** The
 /// locked members stay, in the set's order; the ones there by momentum go.
 #[test]
