@@ -27,7 +27,8 @@ use crate::persistence::content_hash::{
 };
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::projection::{
-    prefix_before_collection, Builder, CollectionId, Conversation, SectionId, TimelineId,
+    prefix_before_collection, Builder, CollectionId, Conversation, DecodePriority, SectionId,
+    TimelineId,
 };
 use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::SchedulerRequest;
@@ -262,6 +263,9 @@ struct SealJob {
     /// This conversation's sections the section continues, in order — see
     /// [`Sequence::submit_section`].
     after: Vec<SectionRef>,
+    /// The band the conversation decodes at, which its next turn reads the
+    /// section at — see [`SchedulerRequest::IngestSection`]'s `band`.
+    band: DecodePriority,
     settled: Arc<Settled>,
 }
 
@@ -429,6 +433,7 @@ impl SealJob {
                 debug_name: format!("conv/{}/{}", self.owner.raw(), self.name),
                 in_collection: true,
                 start,
+                band: self.band,
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone);
@@ -555,6 +560,14 @@ impl Sequence {
             .ok_or_else(|| ConversationError::Other("owned section ids are exhausted".into()))?;
         self.substrate.register_owned_section(owner, name, section);
 
+        // A layer the schema does not list cannot be decoded at: the protective
+        // `High`, as the scheduler reads an unresolved slot.
+        let band = base
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.id == self.target.layer)
+            .map_or(DecodePriority::High, |l| l.decode_priority);
         let settled = Settled::new();
         let job = SealJob {
             scheduler_tx: self.scheduler_tx.clone(),
@@ -567,6 +580,7 @@ impl Sequence {
             content: content.to_string(),
             prefix,
             after: after.to_vec(),
+            band,
             settled: Arc::clone(&settled),
         };
         if let Err(e) = std::thread::Builder::new()

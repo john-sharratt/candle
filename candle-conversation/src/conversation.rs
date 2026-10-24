@@ -18,9 +18,9 @@ use crate::persistence::content_hash::{
 use crate::persistence::record::BranchCheckpointPayload;
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    decode_events, decode_points, from_projection_with_origins, Builder, Conversation, Observe,
-    ProjectionEvent, ProjectionMode, ProjectionPoint, ProjectionTarget, SectionId, SectionTree,
-    SelectionState, SystemPromptItem, TimelineId, TurnIndex,
+    decode_events, decode_points, from_projection_with_origins, Builder, Conversation,
+    DecodePriority, Observe, ProjectionEvent, ProjectionMode, ProjectionPoint, ProjectionTarget,
+    SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::scheduler::projection_assembler::materialize_conversation;
@@ -1836,6 +1836,7 @@ impl Sequence {
                     debug_name: item.debug_name,
                     in_collection,
                     start: start.clone(),
+                    band: DecodePriority::Low,
                     response_tx: tx,
                 })
                 .is_err()

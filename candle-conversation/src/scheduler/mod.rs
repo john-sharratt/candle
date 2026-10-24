@@ -493,6 +493,12 @@ pub(crate) enum SchedulerRequest {
         /// which is what the section's K/V is computed from. `None` for a model
         /// that carries no recurrent state.
         start: Option<SharedState>,
+        /// The band its forwards run at. A schema's sections are background
+        /// ingest, `Low`. A section a conversation submits for itself — a
+        /// journal entry — is read by that conversation's next turn, so it
+        /// runs at the band the conversation decodes at: a `High` one rides
+        /// `High` groups and pauses an ingest creep, as a prompt does.
+        band: DecodePriority,
         response_tx: Sender<Result<SealResult, ConversationError>>,
     },
 
@@ -2263,6 +2269,8 @@ pub(super) struct QueuedSection {
     pub(super) in_collection: bool,
     /// See [`SchedulerRequest::IngestSection::start`].
     pub(super) start: Option<SharedState>,
+    /// See [`SchedulerRequest::IngestSection::band`].
+    pub(super) band: DecodePriority,
     pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
 }
 
@@ -2290,6 +2298,8 @@ pub(super) struct ActiveSectionIngest {
     /// Whether the seal hands back the state the prefill ended on — set for a
     /// section that was given the state it starts from.
     pub(super) export_end: bool,
+    /// See [`SchedulerRequest::IngestSection::band`].
+    pub(super) band: DecodePriority,
     pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
     pub(super) error: Option<ConversationError>,
 }
@@ -4982,6 +4992,7 @@ impl Scheduler {
                 debug_name,
                 in_collection,
                 start,
+                band,
                 response_tx,
             } => {
                 let section = QueuedSection {
@@ -4993,6 +5004,7 @@ impl Scheduler {
                     debug_name,
                     in_collection,
                     start,
+                    band,
                     response_tx,
                 };
                 if section.tokens.is_empty() {
@@ -8684,6 +8696,7 @@ impl Scheduler {
             debug_name: s.debug_name,
             in_collection: s.in_collection,
             export_end: s.start.is_some(),
+            band: s.band,
             response_tx: s.response_tx,
             error: None,
         });
@@ -14625,6 +14638,7 @@ mod tests {
             debug_name: "s".into(),
             in_collection: true,
             start: Some(SharedState::from(&start)),
+            band: DecodePriority::Low,
             response_tx,
         };
         assert!(
@@ -16870,6 +16884,7 @@ mod tests {
             debug_name: "s".into(),
             in_collection: false,
             start: None,
+            band: DecodePriority::Low,
             response_tx,
         }));
         (slot, response_rx)

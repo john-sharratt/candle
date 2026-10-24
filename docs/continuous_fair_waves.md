@@ -276,9 +276,16 @@ telemetry. It is **not** the cadence of the creep: every decode step is a wave.
   flight. The creep's held residual is a fixed-member-order invariant, so new
   work is never injected mid-sweep — only picked up at the group's sweep
   boundary.
-- **An outranked creep pauses.** A throttled group takes `R` steps to reach its
-  sweep boundary, so a prompt that outranks it — a dialogue's tool result beside
-  an ingest group creeping behind a cast's decodes — would wait all of them. The
+- **An outranked creep pauses.** Every creep step is bounded in time — by the
+  decode cadence, or by the decode-less slice — so a group takes many steps to
+  reach its sweep boundary whether it is throttled or not, and a prompt that
+  outranks it — a dialogue's tool result beside an ingest group — would wait all
+  of them. A section counts at its own band: a schema's sections are `Low`, and
+  a section a conversation submits for itself (a journal entry its next turn
+  reads) runs at the band that conversation decodes at. Measured on `.5`,
+  2026-10-24, before sections had a band: a dialogue's 38-row journal entry
+  waited out a 6,213-row ingest sweep beside four `Low` decodes — a creep no
+  decode throttled, so nothing paused it — then rode the next, 41 s to seal. The
   group is set aside at the layer it reached with its residual, members and rows
   (`scheduler::paused_creep`); the prompt's band forms a group of its own and
   sweeps; the paused group resumes at the same layer once nothing above its band
@@ -290,8 +297,10 @@ telemetry. It is **not** the cadence of the creep: every decode step is a wave.
   every layer of its sweep, so a person's prompt beside eight characters' and
   ingest chunks waits for all of their rows: measured on `.5`, 2026-10-17, a
   10-member, 8,190-row group creeping a layer a step held a dialogue's first
-  token ~24 s. Below `High`, throughput matters more than latency, and the bands
-  and section chunks mix as before.
+  token ~24 s. A waiting `High` section makes the group `High` too, carrying
+  only `High` sections; with no `High` prompt beside it, it runs in the
+  standalone section pass. Below `High`, throughput matters more than latency,
+  and the bands and section chunks mix as before.
 - **A sweep is never restarted.** Its finished layers have taken its rows into
   their carried state — the QSA index, the DeltaNet state, the PLE history — and
   nothing rolls that back; only the K/V is position-addressed, so only the K/V

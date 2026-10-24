@@ -3002,28 +3002,54 @@ impl Scheduler {
         )
     }
 
-    /// Whether a prompt waiting outside the creep in flight outranks it while
-    /// the creep is throttled — the case where letting the creep finish first
-    /// holds the prompt back for `R` steps.
+    /// Whether a prompt or section waiting outside the creep in flight outranks
+    /// it.
+    ///
+    /// Every creep step is bounded in time — by the decode cadence, or by
+    /// [`DECODE_LESS_SLICE`] with nothing decoding — so a group takes many
+    /// steps to reach its sweep boundary whether it is throttled or not, and
+    /// work of a higher band waiting for that boundary waits the whole sweep.
+    /// Measured on `.5` (2026-10-24): a dialogue's journal entry, 38 rows,
+    /// waited out a 6,213-row ingest sweep and then rode the next one — 41 s to
+    /// seal beside four `Low` decodes, where the creep was never throttled.
     pub(super) fn creep_outranked_by_a_waiting_prompt(&self) -> bool {
         let band = self.creep_priority(&self.wave_prefill_members);
-        if self.airtime_ratio_over(band) <= 1 {
-            return false;
-        }
-        self.active_prefills
+        self.waiting_above(band, |seq| {
+            self.wave_prefill_members.iter().any(|m| m.seq_id() == seq)
+                || self.paused_creep.as_ref().is_some_and(|c| c.holds(seq))
+        })
+    }
+
+    /// Whether a prefill or section that can advance, and that `held` does not
+    /// claim, belongs to a band above `band`.
+    fn waiting_above(&self, band: DecodePriority, held: impl Fn(usize) -> bool) -> bool {
+        let above = |p: DecodePriority| rank(p) > rank(band);
+        let prefills = self
+            .active_prefills
             .iter()
             .filter(|p| p.error.is_none() && p.finished.is_none() && p.offset < p.work.tokens.len())
-            .filter(|p| {
-                let seq = p.work.sequence_id.0;
-                !self.wave_prefill_members.iter().any(|m| m.seq_id() == seq)
-                    && !self.paused_creep.as_ref().is_some_and(|c| c.holds(seq))
-            })
-            .any(|p| rank(self.decode_priority_or_high(p.work.sequence_id)) > rank(band))
+            .filter(|p| !held(p.work.sequence_id.0))
+            .any(|p| above(self.decode_priority_or_high(p.work.sequence_id)));
+        let sections = self
+            .active_section_ingests
+            .iter()
+            .filter(|s| s.error.is_none() && s.offset < s.tokens.len())
+            .filter(|s| !held(s.sequence_id.0))
+            .any(|s| above(s.band));
+        prefills || sections
+    }
+
+    /// The band a section ingest in flight runs at — see
+    /// [`SchedulerRequest::IngestSection`]'s `band`. `Low` once it has left.
+    fn section_band(&self, seq_id: usize) -> DecodePriority {
+        self.active_section_ingests
+            .iter()
+            .find(|s| s.sequence_id.0 == seq_id)
+            .map_or(DecodePriority::Low, |s| s.band)
     }
 
     /// The band a creep group runs at: its highest-ranked member's. A dialogue
-    /// prefill runs at its slot's own band; a section chunk is background
-    /// ingest, so it runs at `Low`.
+    /// prefill runs at its slot's own band, a section chunk at its own.
     fn creep_priority(&self, members: &[WaveMember]) -> DecodePriority {
         members
             .iter()
@@ -3031,7 +3057,7 @@ impl Scheduler {
                 WaveMember::Prefill { seq_id, .. } => {
                     self.decode_priority_or_high(SequenceId(*seq_id))
                 }
-                WaveMember::Section { .. } => DecodePriority::Low,
+                WaveMember::Section { seq_id, .. } => self.section_band(*seq_id),
             })
             .max_by_key(|&p| rank(p))
             .unwrap_or(DecodePriority::Low)
@@ -3339,14 +3365,7 @@ impl Scheduler {
         let Some(paused) = self.paused_creep.as_ref() else {
             return false;
         };
-        let above = self.active_prefills.iter().any(|p| {
-            p.error.is_none()
-                && p.finished.is_none()
-                && p.offset < p.work.tokens.len()
-                && !paused.holds(p.work.sequence_id.0)
-                && rank(self.decode_priority_or_high(p.work.sequence_id)) > rank(paused.band)
-        });
-        if above {
+        if self.waiting_above(paused.band, |seq| paused.holds(seq)) {
             return false;
         }
         let Some(p) = self.paused_creep.take() else {
@@ -3493,16 +3512,27 @@ impl Scheduler {
         // on `.5`, 2026-10-17, a 10-member, 8,190-row group creeping at one
         // layer a step held a dialogue's first token ~24 s. Below `High`
         // throughput matters more than latency, and the bands mix.
+        //
+        // A `High` section counts: it is a dialogue's own (a journal entry its
+        // next turn reads), and a group of ingest rows would hold it as long.
+        // With no `High` prompt to ride beside, it runs in the standalone
+        // section pass while this group stays empty.
         let lead = candidates
             .first()
             .map(|p| self.decode_priority_or_high(p.work.sequence_id));
-        let high_only = lead == Some(DecodePriority::High);
+        let high_section = include_sections
+            && self.active_section_ingests.iter().any(|s| {
+                s.band == DecodePriority::High
+                    && s.error.is_none()
+                    && s.offset < s.tokens.len()
+                    && !paused.contains(&s.sequence_id.0)
+            });
+        let high_only = lead == Some(DecodePriority::High) || high_section;
         if high_only {
             candidates.retain(|p| {
                 self.decode_priority_or_high(p.work.sequence_id) == DecodePriority::High
             });
         }
-        let include_sections = include_sections && !high_only;
         for p in candidates {
             if p.error.is_some() || p.finished.is_some() || p.offset >= p.work.tokens.len() {
                 continue;
@@ -3590,6 +3620,7 @@ impl Scheduler {
                 if s.error.is_some()
                     || s.offset >= s.tokens.len()
                     || paused.contains(&s.sequence_id.0)
+                    || (high_only && s.band != DecodePriority::High)
                 {
                     continue;
                 }
@@ -7307,13 +7338,12 @@ layers:
         assert_eq!(seqs, vec![zend_ingest.0, npcd_ingest.0]);
     }
 
-    /// **A dialogue prompt waiting behind a throttled ingest creep finishes
-    /// it.** The ingest group creeps at the cast's ratio (64); the prompt is
-    /// `High`, so the group runs its remaining layers at once and re-forms with
-    /// the prompt next step. A creep that is not throttled — or a waiting prompt
-    /// that does not outrank it — keeps its pace.
+    /// **A dialogue prompt waiting behind an ingest creep outranks it, throttled
+    /// or not.** Every creep step is bounded in time, so an unthrottled group
+    /// still takes many steps to reach its boundary. A waiting prompt that does
+    /// not outrank it leaves it at its pace.
     #[test]
-    fn a_waiting_dialogue_prompt_outranks_a_throttled_ingest_creep() {
+    fn a_waiting_dialogue_prompt_outranks_an_ingest_creep() {
         let (mut sched, _tx) = make_test_scheduler();
         let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
         let cast = SequenceId(sched.session.create_sequence().expect("create"));
@@ -7330,11 +7360,12 @@ layers:
         sched.form_wave_group(false);
         sched.wave_prefill_cursor = 5;
 
-        // No decode outranks the creep: it runs unthrottled and finishes.
+        // Nothing decodes: the creep is unthrottled, and the prompt still
+        // outranks it.
         sched
             .active_prefills
             .push(dialogue_prefill(prompt, vec![1; 8]));
-        assert!(!sched.creep_outranked_by_a_waiting_prompt());
+        assert!(sched.creep_outranked_by_a_waiting_prompt());
 
         // The cast decodes: the ingest creep is throttled, the prompt waits.
         let (state, _rx) = boundary_state();
@@ -7395,8 +7426,75 @@ layers:
         assert_eq!(sched.wave_prefill_members[0].seq_id(), ingest.0);
     }
 
-    /// A section chunk is background whatever slot carries it: alone it runs
-    /// at `Low`, and beside a dialogue prompt it rides at the prompt's band.
+    /// A section in flight on `seq`, at `band`, with `tokens` left to ingest.
+    fn active_section(seq: SequenceId, band: DecodePriority, tokens: usize) -> ActiveSectionIngest {
+        let (response_tx, _rx) = flume::bounded(1);
+        ActiveSectionIngest {
+            sequence_id: seq,
+            section_id: SectionId::new(1),
+            tokens: TokenBuffer::from(vec![1u32; tokens]),
+            offset: 0,
+            seal_block_from: 0,
+            address: ContentAddress::default(),
+            debug_name: "s".into(),
+            in_collection: true,
+            export_end: false,
+            band,
+            response_tx,
+            error: None,
+        }
+    }
+
+    /// **A dialogue's own section outranks an ingest creep, and runs apart
+    /// from ingest rows.** A journal entry its next turn reads was measured
+    /// waiting out a 6,213-row ingest sweep: here it pauses the creep, the group
+    /// formed beside it leaves the ingest prompt out, and the paused creep
+    /// resumes only once the section has run. A `Low` section changes nothing.
+    #[test]
+    fn a_dialogues_section_outranks_an_ingest_creep_and_rides_apart() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let other_ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let section = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, ingest, "ingest", 1);
+        bind(&mut sched, &builder, other_ingest, "ingest", 2);
+        sched
+            .active_prefills
+            .push(dialogue_prefill(ingest, vec![1; 8]));
+        sched.form_wave_group(true);
+        sched.wave_prefill_cursor = 5;
+
+        sched
+            .active_section_ingests
+            .push(active_section(section, DecodePriority::Low, 38));
+        assert!(
+            !sched.creep_outranked_by_a_waiting_prompt(),
+            "a schema's section is background"
+        );
+
+        sched.active_section_ingests[0].band = DecodePriority::High;
+        assert!(sched.creep_outranked_by_a_waiting_prompt());
+        sched.pause_creep();
+        sched
+            .active_prefills
+            .push(dialogue_prefill(other_ingest, vec![1; 8]));
+        assert!(!sched.resume_creep(), "the section is waiting");
+        sched.form_wave_group(true);
+        assert!(
+            sched.wave_prefill_members.is_empty(),
+            "no ingest rides beside it; it runs in the standalone section pass"
+        );
+
+        // The section has sealed.
+        sched.active_section_ingests.clear();
+        assert!(sched.resume_creep());
+        assert_eq!(sched.wave_prefill_members[0].seq_id(), ingest.0);
+    }
+
+    /// A section chunk runs at the band it was submitted at: a schema's alone
+    /// at `Low`, a dialogue's at `High`, and beside a dialogue prompt the group
+    /// rides at the prompt's band.
     #[test]
     fn a_creep_runs_at_its_highest_prompt_and_sections_alone_are_low() {
         let (mut sched, _tx) = make_test_scheduler();
@@ -7411,6 +7509,12 @@ layers:
             seq_id: section.0,
             advance: 32,
         }];
+        assert_eq!(sched.creep_priority(&alone), DecodePriority::Low);
+        sched
+            .active_section_ingests
+            .push(active_section(section, DecodePriority::High, 32));
+        assert_eq!(sched.creep_priority(&alone), DecodePriority::High);
+        sched.active_section_ingests[0].band = DecodePriority::Low;
         assert_eq!(sched.creep_priority(&alone), DecodePriority::Low);
 
         let mixed = [

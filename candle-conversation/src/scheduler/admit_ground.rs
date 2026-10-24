@@ -646,7 +646,8 @@ impl AdmitPass<'_> {
     /// The section band's next candidate: the head of the section queue,
     /// priced as a prefill is — its whole K/V, a recurrent store on a hybrid,
     /// and its rows in the forward's tier. It never decodes. Strictly FIFO and
-    /// never paused: a section has no priority of its own.
+    /// never paused: admission takes every section in this band, and a
+    /// section's own band decides only how it rides the forwards once admitted.
     fn peek_section(&mut self) -> Option<Cost> {
         let s = self.sched.section_queue.front()?;
         let (turn, seq) = (s.tokens.len(), s.sequence_id);
@@ -1438,7 +1439,7 @@ impl Scheduler {
     }
 
     /// Whether a slot in flight — prefilling, ingesting a section, or decoding —
-    /// belongs to a band below `prio`. A section ingest is `Low`.
+    /// belongs to a band below `prio`. A section ingest is at its own band.
     pub(super) fn lower_band_active(&self, prio: DecodePriority) -> bool {
         let below = |p: DecodePriority| rank(p) < rank(prio);
         let prefills = self
@@ -1449,7 +1450,7 @@ impl Scheduler {
         let sections = self
             .active_section_ingests
             .iter()
-            .any(|s| s.error.is_none() && below(DecodePriority::Low));
+            .any(|s| s.error.is_none() && below(s.band));
         let decodes = self
             .active_decodes
             .iter()
