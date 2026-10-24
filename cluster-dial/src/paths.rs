@@ -1,11 +1,16 @@
 //! Which of a cluster's paths to dial, and when to leave one
 //! (`docs/replicated_substrate.md` §3.2, paths). A path is one address an
-//! endpoint resolved to. Paths are ranked by endpoint, then in the order the
-//! endpoint resolved; a fault cools a path for a while, doubling per
-//! consecutive fault.
+//! endpoint resolved to, dialled from one of this machine's addresses. Paths
+//! are ranked by endpoint, then in the order the endpoint resolved, then by
+//! source; a fault cools a path for a while, doubling per consecutive fault.
+//!
+//! A fault also makes its path's source *suspect*: a dead link fails against
+//! every destination, so once it has failed against one, its paths to the
+//! others are dialled after every path from a source that is not suspect.
+//! Only a success from that same source clears it.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -37,12 +42,13 @@ impl Default for Timing {
     }
 }
 
-/// One path: the endpoint's index in its cluster, and an address it resolved
-/// to.
+/// One path: the endpoint's index in its cluster, an address it resolved to,
+/// and the address it is dialled from — `None` when the system chooses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PathId {
     pub endpoint: usize,
     pub addr: SocketAddr,
+    pub source: Option<IpAddr>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -57,6 +63,8 @@ struct Health {
 pub struct Paths {
     timing: Timing,
     health: HashMap<PathId, Health>,
+    /// Sources whose latest outcome was a fault.
+    suspect: HashSet<IpAddr>,
 }
 
 impl Paths {
@@ -64,6 +72,7 @@ impl Paths {
         Self {
             timing,
             health: HashMap::new(),
+            suspect: HashSet::new(),
         }
     }
 
@@ -74,18 +83,31 @@ impl Paths {
             .is_some_and(|until| now < until)
     }
 
-    /// `ranked`, best first, in the order to dial them: the paths not cooling,
-    /// then those cooling. A cooling path is still dialled when nothing else
-    /// answers.
+    /// Whether `p`'s source has failed and not succeeded since.
+    pub fn suspect(&self, p: PathId) -> bool {
+        p.source.is_some_and(|s| self.suspect.contains(&s))
+    }
+
+    /// `ranked`, best first, in the order to dial them: the paths not cooling
+    /// from a source not suspect, then those not cooling from a suspect
+    /// source, then those cooling. A cooling path is still dialled when
+    /// nothing else answers.
     pub fn order(&self, ranked: &[PathId], now: Instant) -> Vec<PathId> {
-        let (well, cooling): (Vec<PathId>, Vec<PathId>) =
-            ranked.iter().partition(|p| !self.cooling(**p, now));
-        well.into_iter().chain(cooling).collect()
+        let tier = |p: &PathId| match (self.cooling(*p, now), self.suspect(*p)) {
+            (false, false) => 0,
+            (false, true) => 1,
+            (true, _) => 2,
+        };
+        let mut order = ranked.to_vec();
+        // Stable: within a tier, the rank holds.
+        order.sort_by_key(tier);
+        order
     }
 
     /// `p` showed a fault: it cools, for longer the more faults it has shown in
-    /// a row. Returns how long.
-    pub fn strike(&mut self, p: PathId, now: Instant) -> Duration {
+    /// a row, and its source turns suspect. Returns how long it cools, and
+    /// whether the source has just turned suspect.
+    pub fn strike(&mut self, p: PathId, now: Instant) -> (Duration, bool) {
         let h = self.health.entry(p).or_default();
         h.strikes = h.strikes.saturating_add(1);
         let doublings = (h.strikes - 1).min(16);
@@ -95,7 +117,14 @@ impl Paths {
             .saturating_mul(1 << doublings)
             .min(self.timing.cool_max);
         h.cool_until = Some(now + cool);
-        cool
+        let turned = p.source.is_some_and(|s| self.suspect.insert(s));
+        (cool, turned)
+    }
+
+    /// A session opened on `p`: its source works. Returns whether that clears
+    /// a suspicion.
+    pub fn connected(&mut self, p: PathId) -> bool {
+        p.source.is_some_and(|s| self.suspect.remove(&s))
     }
 
     /// A session on `p` lasted: its faults are forgotten.
@@ -103,13 +132,12 @@ impl Paths {
         self.health.remove(&p);
     }
 
-    /// The best path not cooling of an endpoint better than `on`'s — where a
-    /// socket on `on` returns to. A path of `on`'s own endpoint is its equal,
-    /// never better.
+    /// The best path of an endpoint better than `on`'s that is not cooling —
+    /// from a source not suspect when there is one — where a socket on `on`
+    /// returns to. A path of `on`'s own endpoint is its equal, never better.
     pub fn better(&self, ranked: &[PathId], on: PathId, now: Instant) -> Option<PathId> {
-        ranked
-            .iter()
-            .copied()
+        self.order(ranked, now)
+            .into_iter()
             .find(|p| p.endpoint < on.endpoint && !self.cooling(*p, now))
     }
 }
@@ -122,6 +150,14 @@ mod tests {
         PathId {
             endpoint,
             addr: SocketAddr::from(([192, 168, 0, last], 9443)),
+            source: None,
+        }
+    }
+
+    fn from(p: PathId, last: u8) -> PathId {
+        PathId {
+            source: Some(IpAddr::from([192, 168, 0, last])),
+            ..p
         }
     }
 
@@ -163,20 +199,20 @@ mod tests {
         let t0 = Instant::now();
         let mut p = Paths::new(timing());
         let a = path(0, 5);
-        let cools: Vec<u64> = (0..6).map(|_| p.strike(a, t0).as_secs()).collect();
+        let cools: Vec<u64> = (0..6).map(|_| p.strike(a, t0).0.as_secs()).collect();
         assert_eq!(cools, [30, 60, 120, 240, 240, 240]);
         assert!(p.cooling(a, t0 + Duration::from_secs(239)));
         assert!(!p.cooling(a, t0 + Duration::from_secs(240)));
 
         p.lasted(a);
         assert!(!p.cooling(a, t0));
-        assert_eq!(p.strike(a, t0).as_secs(), 30);
+        assert_eq!(p.strike(a, t0).0.as_secs(), 30);
 
         // Thousands of faults neither overflow nor pass the cap.
         for _ in 0..10_000 {
             p.strike(a, t0);
         }
-        assert_eq!(p.strike(a, t0).as_secs(), 240);
+        assert_eq!(p.strike(a, t0).0.as_secs(), 240);
     }
 
     #[test]
@@ -201,5 +237,92 @@ mod tests {
             None
         );
         assert_eq!(p.better(&ranked(), path(0, 4), t0), None);
+    }
+
+    /// BlackWorld's two links to one LAN: a fault from .4 against one
+    /// destination puts .4's paths to every other destination behind .5's, and
+    /// a success from .5 does not clear .4 — only one from .4 does.
+    #[test]
+    fn a_failing_source_is_suspect_everywhere_until_it_succeeds_itself() {
+        let t0 = Instant::now();
+        let mut p = Paths::new(timing());
+        let (lan, internet) = (path(0, 6), path(1, 132));
+        let ranked = vec![
+            from(lan, 4),
+            from(lan, 5),
+            from(internet, 4),
+            from(internet, 5),
+        ];
+        assert_eq!(p.order(&ranked, t0), ranked);
+
+        let (_, turned) = p.strike(from(lan, 4), t0);
+        assert!(turned, ".4 turns suspect at its first fault");
+        let (_, again) = p.strike(from(lan, 4), t0);
+        assert!(!again, "and is not reported again while suspect");
+        assert_eq!(
+            p.order(&ranked, t0),
+            [
+                from(lan, 5),
+                from(internet, 5),
+                // Not cooling, yet behind every path from .5.
+                from(internet, 4),
+                from(lan, 4),
+            ]
+        );
+
+        assert!(!p.connected(from(internet, 5)), ".5 was never suspect");
+        assert!(
+            p.suspect(from(internet, 4)),
+            "a success from .5 leaves .4 suspect"
+        );
+
+        assert!(p.connected(from(internet, 4)));
+        assert!(!p.suspect(from(lan, 4)));
+        // The path that faulted still cools; the source is no longer suspect.
+        assert_eq!(
+            p.order(&ranked, t0),
+            [
+                from(lan, 5),
+                from(internet, 4),
+                from(internet, 5),
+                from(lan, 4),
+            ]
+        );
+    }
+
+    /// A path the system routes has no source to suspect.
+    #[test]
+    fn an_unbound_path_is_never_suspect() {
+        let t0 = Instant::now();
+        let mut p = Paths::new(timing());
+        let (_, turned) = p.strike(path(0, 5), t0);
+        assert!(!turned);
+        assert!(!p.suspect(path(0, 4)));
+        assert!(!p.connected(path(0, 5)));
+    }
+
+    /// Returning prefers a better endpoint's path from a source that is not
+    /// suspect.
+    #[test]
+    fn a_return_avoids_a_suspect_source() {
+        let t0 = Instant::now();
+        let mut p = Paths::new(timing());
+        let (lan, internet) = (path(0, 6), path(1, 132));
+        let ranked = vec![from(lan, 4), from(lan, 5), from(internet, 5)];
+        p.strike(
+            from(
+                PathId {
+                    endpoint: 1,
+                    ..path(1, 9)
+                },
+                4,
+            ),
+            t0,
+        );
+        assert_eq!(
+            p.better(&ranked, from(internet, 5), t0),
+            Some(from(lan, 5)),
+            ".4 is suspect: the return goes to the LAN from .5"
+        );
     }
 }

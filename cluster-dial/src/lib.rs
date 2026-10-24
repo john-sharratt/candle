@@ -8,12 +8,14 @@
 //!
 //! A cluster may be reached several ways — a LAN name with two addresses, then
 //! the internet name — and a socket runs on the best of them that works
-//! ([`paths`]).
+//! ([`paths`]); a machine with two links to one network dials from each
+//! ([`sources`]).
 
 pub use cluster::offline;
 
 mod dial;
 pub mod paths;
+pub mod sources;
 mod target;
 
 pub use dial::{Dial, PathRx, RETURNING};

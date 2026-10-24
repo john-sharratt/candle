@@ -18,3 +18,5 @@ rustls-pki-types  = { version = "1", features = ["std"] }
 webpki-roots      = "1"
 tokio             = { version = "1", features = ["net", "time", "sync", "rt", "macros"] }
 tracing           = { workspace = true }
+# This machine's addresses and their netmasks: the sources a dial may bind.
+if-addrs          = "0.15"

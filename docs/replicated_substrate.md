@@ -326,6 +326,24 @@ another path is the same member, its old socket replaced (4409).
   equals: a socket never leaves one A record for another that is still well.
 - **Each socket keeps its own.** The zend and npcd sockets judge their paths apart: a
   bulk stall on zend's says nothing of npcd's.
+- **Sources.** A machine with two links to one network — BlackWorld's wired `.4` and
+  wireless `.5` on one /24 — sends a connection the system routes out of its preferred
+  link whether or not that link works, so a dead preferred link black-holes every
+  connection the machine starts. A path is therefore also *from* an address: each
+  destination is dialled from each of this machine's addresses (up, not loopback, not
+  link-local) of its family — only those on the destination's network when there are
+  any — bound to it, the address the system would choose first. A destination on this
+  machine is dialled unbound, as is any destination with one candidate source: a machine
+  with one link dials as it always has. A fault also makes its path's source **suspect**:
+  its paths to every destination are dialled after every path from a source that is not
+  suspect, until a session opens from that same source — a success from another source
+  clears nothing.
+
+**Seeing a member held back.** A member admitted below the floor takes no traffic and
+replicates nothing until it holds the floor's build (§3.5), so its `/v1/status` says so
+per app under `upgrade`: `below_floor` (the floor's `count-hash`), `step`, `stranded`, and
+`fetching` (`bytes` of `size`, and how often it resumed). A fetch stuck at 0 bytes is a
+member that cannot reach the build, not one that is slow to rejoin.
 
 ### 3.3 Handshake
 

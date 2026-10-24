@@ -1,13 +1,16 @@
 //! The member's cluster as it reports it (`docs/replicated_substrate.md` §7.6):
 //! the `connecting` and `catchup` loading steps' detail, and the `cluster`
 //! block of its own `/v1/status` — per app, the link, every cluster's socket,
-//! and its replication: its own events in flight and unsent, and any catch-up
-//! in progress.
+//! its replication: its own events in flight and unsent, and any catch-up in
+//! progress — and its upgrade: the floor it is held below, and the build it is
+//! fetching to reach it.
 
 use candle_conversation::models::identity::ModelKey;
-use cluster::frame::ModelId;
+use cluster::coord::UpgradeView;
+use cluster::frame::{BuildId, ModelId};
 use cluster::member::{ClusterView, Link};
 use cluster::replicate::CatchupView;
+use cluster::upgrade::decisions::build_name;
 use serde_json::{json, Map, Value};
 
 use super::Cluster;
@@ -111,13 +114,28 @@ pub fn connecting_detail(views: &[ClusterView]) -> String {
         .join("; ")
 }
 
-/// The `cluster` block: per app, its link, node, and every cluster's socket.
+/// An app's upgrade: the floor a gateway admitted it below, when it is — so it
+/// takes no traffic and replicates nothing until it has the floor's build —
+/// the step it is at, why no build can be installed, and how far the build it
+/// is fetching has come.
+pub fn upgrade_block(below: Option<&BuildId>, view: &UpgradeView) -> Value {
+    json!({
+        "below_floor": below.map(build_name),
+        "step": view.step,
+        "stranded": view.stranded,
+        "fetching": view.fetching,
+    })
+}
+
+/// The `cluster` block: per app, its link, node, every cluster's socket, its
+/// replication and its upgrade.
 pub fn status_block(cluster: &Cluster) -> Value {
     let build = cluster.build();
     let apps: Map<String, Value> = cluster
         .links()
         .map(|link| {
             let (state, reason) = link_name(&link.state());
+            let below = link.member().and_then(|m| m.upgrading());
             (
                 link.app().to_string(),
                 json!({
@@ -126,6 +144,10 @@ pub fn status_block(cluster: &Cluster) -> Value {
                     "node": link.member().map(|m| format!("{:016x}", m.node())),
                     "clusters": link.clusters(),
                     "replication": link.replication(),
+                    "upgrade": upgrade_block(
+                        below.as_ref(),
+                        &cluster.upgrader().view(link.app()),
+                    ),
                 }),
             )
         })
@@ -209,6 +231,51 @@ mod tests {
         assert_eq!(
             catchup_detail(&[]),
             "waiting to be asked for what this member lacks"
+        );
+    }
+
+    /// **A member held below the floor says so, and how its fetch is going.**
+    /// WhiteWorld sat `cut_off` on 3585 under a 3593 floor for hours, its
+    /// replication idle and its fetch of the floor's build at 0 bytes, and
+    /// nothing in its status said why.
+    #[test]
+    fn a_member_below_the_floor_shows_the_floor_and_its_fetch() {
+        use cluster::coord::FetchLine;
+
+        let floor = BuildId {
+            count: 3593,
+            hash: "ef604210".into(),
+            local: String::new(),
+        };
+        let view = UpgradeView {
+            step: "upgrading".into(),
+            fetching: Some(FetchLine {
+                build: "3593-ef604210".into(),
+                kind: "motherd".into(),
+                bytes: 0,
+                size: 406_964_736,
+                resumes: 4,
+            }),
+            ..UpgradeView::default()
+        };
+        assert_eq!(
+            upgrade_block(Some(&floor), &view),
+            json!({
+                "below_floor": "3593-ef604210",
+                "step": "upgrading",
+                "stranded": null,
+                "fetching": {
+                    "build": "3593-ef604210",
+                    "kind": "motherd",
+                    "bytes": 0,
+                    "size": 406_964_736,
+                    "resumes": 4,
+                },
+            })
+        );
+        assert_eq!(
+            upgrade_block(None, &UpgradeView::default()),
+            json!({"below_floor": null, "step": "", "stranded": null, "fetching": null})
         );
     }
 

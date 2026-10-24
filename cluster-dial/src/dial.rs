@@ -1,10 +1,11 @@
 //! The connector one app's socket dials its cluster through
 //! (`docs/replicated_substrate.md` §3.2, paths): every address of every
-//! endpoint, best first, skipping the paths cooling; a session judged by how it
-//! ended; and, on a lesser path, a probe of a better one that closes the
-//! session to return to it.
+//! endpoint from each address of this machine's that may reach it, best first,
+//! skipping the paths cooling; a session judged by how it ended; and, on a
+//! lesser path, a probe of a better one that closes the session to return to
+//! it.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use cluster::close::{Close, CloseCode};
@@ -16,7 +17,7 @@ use cluster::pipe::tungstenite::Tungstenite;
 use cluster::pipe::{Message, PipeRx};
 use cluster::session::Ended;
 use rustls_pki_types::ServerName;
-use tokio::net::{lookup_host, TcpStream};
+use tokio::net::{lookup_host, TcpSocket, TcpStream};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
@@ -26,11 +27,15 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::paths::{PathId, Paths, Timing};
+use crate::sources::sources_for;
 use crate::target::{Endpoint, Target};
 use crate::{Io, Socket, MAX_MESSAGE};
 
 /// The reason a socket gives the gateway when it leaves for a better path.
 pub const RETURNING: &str = "returning to a better path";
+
+/// The sources to dial a destination from: [`sources_for`], or a test's.
+type Sources = Arc<dyn Fn(IpAddr) -> Vec<Option<IpAddr>> + Send + Sync>;
 
 /// The session on a path.
 struct On {
@@ -46,6 +51,7 @@ pub struct Dial {
     app: &'static str,
     tls: TlsConnector,
     timing: Timing,
+    sources: Sources,
     paths: Arc<Mutex<Paths>>,
     on: Option<On>,
     /// The path the last session ran on, to log a change of path.
@@ -58,20 +64,22 @@ fn lock(paths: &Mutex<Paths>) -> MutexGuard<'_, Paths> {
 
 impl Dial {
     pub fn new(target: Arc<Target>, app: &'static str, tls: TlsConnector) -> Self {
-        Self::with_timing(target, app, tls, Timing::default())
+        Self::with(target, app, tls, Timing::default(), Arc::new(sources_for))
     }
 
-    fn with_timing(
+    fn with(
         target: Arc<Target>,
         app: &'static str,
         tls: TlsConnector,
         timing: Timing,
+        sources: Sources,
     ) -> Self {
         Self {
             target,
             app,
             tls,
             timing,
+            sources,
             paths: Arc::new(Mutex::new(Paths::new(timing))),
             on: None,
             last: None,
@@ -82,8 +90,8 @@ impl Dial {
         label(&self.target, p)
     }
 
-    /// Every endpoint's addresses, best first, and why any endpoint gave
-    /// none.
+    /// Every endpoint's addresses, each from every source that may reach it,
+    /// best first; and why any endpoint gave none.
     async fn resolve(&self) -> (Vec<PathId>, Vec<String>) {
         let mut ranked = Vec::new();
         let mut failed = Vec::new();
@@ -98,7 +106,13 @@ impl Dial {
                     for addr in addrs {
                         if !seen.contains(&addr) {
                             seen.push(addr);
-                            ranked.push(PathId { endpoint: i, addr });
+                            for source in (self.sources)(addr.ip()) {
+                                ranked.push(PathId {
+                                    endpoint: i,
+                                    addr,
+                                    source,
+                                });
+                            }
                         }
                     }
                     if seen.is_empty() {
@@ -114,7 +128,7 @@ impl Dial {
 
     async fn open(&self, p: PathId) -> Result<Socket, String> {
         let e = &self.target.endpoints[p.endpoint];
-        let stream = transport(&self.tls, e, p.addr).await?;
+        let stream = transport(&self.tls, e, p).await?;
         let request = e
             .socket_url(self.app)
             .into_client_request()
@@ -155,7 +169,7 @@ impl Dial {
                     continue;
                 };
                 let e = &target.endpoints[better.endpoint];
-                match timeout(timing.connect, transport(&tls, e, better.addr)).await {
+                match timeout(timing.connect, transport(&tls, e, better)).await {
                     Ok(Ok(_)) => {
                         tracing::info!(
                             app,
@@ -167,16 +181,18 @@ impl Dial {
                         return;
                     }
                     Ok(Err(why)) => {
-                        let cool = lock(&paths).strike(better, Instant::now());
+                        let (cool, turned) = lock(&paths).strike(better, Instant::now());
                         tracing::debug!(
                             app,
                             path = %label(&target, better),
                             cool_s = cool.as_secs(),
                             "cluster path: the probe of a better path failed: {why}"
                         );
+                        suspected(app, better, turned);
                     }
                     Err(_) => {
-                        lock(&paths).strike(better, Instant::now());
+                        let (_, turned) = lock(&paths).strike(better, Instant::now());
+                        suspected(app, better, turned);
                     }
                 }
             }
@@ -185,18 +201,44 @@ impl Dial {
 }
 
 fn label(target: &Target, p: PathId) -> String {
-    format!("{} ({})", target.endpoints[p.endpoint].url, p.addr)
+    let url = &target.endpoints[p.endpoint].url;
+    match p.source {
+        Some(s) => format!("{url} ({} from {s})", p.addr),
+        None => format!("{url} ({})", p.addr),
+    }
 }
 
-/// TCP to `addr`, and TLS over it verified by `e`'s name.
-async fn transport(
-    tls: &TlsConnector,
-    e: &Endpoint,
-    addr: SocketAddr,
-) -> Result<Box<dyn Io>, String> {
-    let tcp = TcpStream::connect(addr)
-        .await
-        .map_err(|err| format!("{addr}: {err}"))?;
+/// A fault just made `p`'s source suspect: say so, once.
+fn suspected(app: &str, p: PathId, turned: bool) {
+    if let (true, Some(s)) = (turned, p.source) {
+        tracing::warn!(
+            app,
+            source = %s,
+            "cluster path: {s} failed against {}; its paths are dialled last until it succeeds",
+            p.addr
+        );
+    }
+}
+
+/// TCP to `p`'s address — bound to its source, when it has one — and TLS over
+/// it verified by `e`'s name.
+async fn transport(tls: &TlsConnector, e: &Endpoint, p: PathId) -> Result<Box<dyn Io>, String> {
+    let addr = p.addr;
+    let tcp = match p.source {
+        None => TcpStream::connect(addr).await,
+        Some(source) => {
+            let socket = match source {
+                IpAddr::V4(_) => TcpSocket::new_v4(),
+                IpAddr::V6(_) => TcpSocket::new_v6(),
+            }
+            .map_err(|err| format!("a socket for {addr}: {err}"))?;
+            socket
+                .bind(SocketAddr::new(source, 0))
+                .map_err(|err| format!("binding {source}: {err}"))?;
+            socket.connect(addr).await
+        }
+    }
+    .map_err(|err| format!("{addr}: {err}"))?;
     let _ = tcp.set_nodelay(true);
     Ok(match &e.tls_name {
         Some(name) => {
@@ -244,6 +286,9 @@ impl Connect for Dial {
                     if self.last != Some(p) {
                         tracing::info!(app = self.app, path = %self.label(p), "cluster path: dialled");
                     }
+                    if let (true, Some(s)) = (lock(&self.paths).connected(p), p.source) {
+                        tracing::warn!(app = self.app, source = %s, "cluster path: {s} works again");
+                    }
                     self.last = Some(p);
                     let leaving = Arc::new(Notify::new());
                     let probe = self.watch(ranked.clone(), p, leaving.clone());
@@ -258,13 +303,14 @@ impl Connect for Dial {
                 Ok(Err(why)) => why,
                 Err(_) => format!("no answer within {:?}", self.timing.connect),
             };
-            let cool = lock(&self.paths).strike(p, Instant::now());
+            let (cool, turned) = lock(&self.paths).strike(p, Instant::now());
             tracing::debug!(
                 app = self.app,
                 path = %self.label(p),
                 cool_s = cool.as_secs(),
                 "cluster path: could not dial: {why}"
             );
+            suspected(self.app, p, turned);
             failed.push(format!("{}: {why}", self.label(p)));
         }
         Err(failed.join("; "))
@@ -288,13 +334,14 @@ impl Connect for Dial {
             _ => None,
         };
         if let Some(fault) = fault {
-            let cool = paths.strike(on.path, now);
+            let (cool, turned) = paths.strike(on.path, now);
             tracing::warn!(
                 app = self.app,
                 path = %label(&self.target, on.path),
                 cool_s = cool.as_secs(),
                 "cluster path: {fault}; cooling it"
             );
+            suspected(self.app, on.path, turned);
         }
     }
 }
@@ -344,16 +391,22 @@ mod tests {
     }
 
     fn dial(ports: &[u16]) -> Dial {
+        dial_from(ports, vec![None])
+    }
+
+    /// Dialling every destination from `sources`.
+    fn dial_from(ports: &[u16], sources: Vec<Option<IpAddr>>) -> Dial {
         let spec = ports
             .iter()
             .map(|p| format!("http://127.0.0.1:{p}"))
             .collect::<Vec<_>>()
             .join(" ");
-        Dial::with_timing(
+        Dial::with(
             Arc::new(Target::parse(&spec, None).unwrap()),
             "zend",
             tls_connector().unwrap(),
             timing(),
+            Arc::new(move |_| sources.clone()),
         )
     }
 
@@ -373,10 +426,40 @@ mod tests {
             PathId {
                 endpoint: 0,
                 addr: SocketAddr::from(([127, 0, 0, 1], first)),
+                source: None,
             },
             Instant::now(),
         );
         assert!(cooling, "the endpoint that refused is cooling");
+    }
+
+    /// A source that cannot reach — here an address not on this machine, so
+    /// binding it fails — is passed over for the next, and turns suspect; the
+    /// next dial starts from the source that worked.
+    #[tokio::test]
+    async fn a_source_that_cannot_reach_is_passed_over_and_dialled_last() {
+        let (up, _g) = gateway().await;
+        let dead = IpAddr::from([192, 0, 2, 1]);
+        let live = IpAddr::from([127, 0, 0, 1]);
+        let mut d = dial_from(&[up], vec![Some(dead), Some(live)]);
+
+        let _s = d.connect().await.expect("the second source answers");
+        let path = d.on.as_ref().unwrap().path;
+        assert_eq!(path.source, Some(live));
+        let dead_path = PathId {
+            source: Some(dead),
+            ..path
+        };
+        assert!(lock(&d.paths).suspect(dead_path));
+
+        d.ended(&Attempt::Session(Ended::Dropped));
+        let _s = d.connect().await.unwrap();
+        assert_eq!(d.on.as_ref().unwrap().path.source, Some(live));
+        assert!(
+            lock(&d.paths).suspect(dead_path),
+            "a success from another source does not clear it"
+        );
+        assert!(label(&d.target, path).ends_with(&format!("from {live})")));
     }
 
     #[tokio::test]
