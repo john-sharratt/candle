@@ -29,7 +29,7 @@ use super::schema::{
     SystemPromptSchema,
 };
 use super::warm_pool;
-use super::working_set_observe::{ranked_fresh, working_set_config, RawBest};
+use super::working_set_observe::{working_set_config, working_set_fresh};
 use super::working_set_pick::{Standing, WorkingSetMembers};
 use crate::cancel::CancelToken;
 use crate::error::ConversationError;
@@ -1421,19 +1421,19 @@ impl Conversation {
     }
 
     /// Fold one reprojection's scan into `target`'s working-set momentum
-    /// (`docs/zend_working_set.md` §4.3), each file fed by its rank in the
-    /// scan ([`ranked_fresh`]). `scores` is what [`Self::score_beliefs`]
-    /// returned; a target whose layer declares no working set learns nothing.
+    /// (`docs/zend_working_set.md` §4.3). `candidates` is what
+    /// [`Self::score_beliefs`] returned; a target whose layer declares no
+    /// working set learns nothing.
     pub fn observe_working_set(
         &self,
         schema: &Schema,
         target: ProjectionTarget,
-        scores: &ProjectionScores,
+        candidates: &[(GroupId, Vec<(TurnKey, f32)>)],
     ) {
         let Some(cfg) = working_set_config(schema, target) else {
             return;
         };
-        let fresh = ranked_fresh(scores.working_set_raw());
+        let fresh = working_set_fresh(schema, candidates);
         self.inner.write().unwrap().working_set_observe(
             target.timeline,
             &fresh,
@@ -2429,10 +2429,6 @@ impl Conversation {
             // teach only the first).
             let pool_scope = ScopeKey::pool(group.id.raw() as u64);
             let mut pool_raw: Vec<(ChildKey, f32)> = Vec::new();
-            // Each file's exchanges as normalized, per probe — what a working
-            // set ranks its files by.
-            let mut normed_tail_per_file: Vec<Vec<f32>> = Vec::with_capacity(files.len());
-            let mut normed_q_per_file: Vec<Vec<f32>> = Vec::with_capacity(files.len());
             for (fi, (f, fresh)) in files.iter().zip(&fresh_per_file).enumerate() {
                 let timeline = f.timeline;
                 // `belief_files::competitions` pools exactly the files of one
@@ -2489,10 +2485,6 @@ impl Conversation {
                     }
                     (normed, normed_q)
                 };
-                normed_tail_per_file.push(normed.iter().map(|(_, s)| *s).collect());
-                if let Some(nq) = &normed_q {
-                    normed_q_per_file.push(nq.iter().map(|(_, s)| *s).collect());
-                }
                 let mut fused: Vec<f32> = (0..f.n_slots)
                     .map(|slot| {
                         let t = normed.get(slot).map(|(_, s)| *s).unwrap_or(0.0);
@@ -2558,29 +2550,6 @@ impl Conversation {
                     .map(|per_file| per_file.iter().flatten().copied().collect());
                 let question = q_raw.as_deref().and_then(scan_stats);
                 scores.set_group_scan(group.id, GroupScan { tail, question });
-            }
-            // A working set ranks its files by their best NORMALIZED exchange:
-            // a raw vote is z × margin inside the file's own competition, so it
-            // measures how far one exchange stands out from its siblings, and
-            // a file of many exchanges draws more maxima. Ranked raw, the same
-            // plotting script and test files led every question in a
-            // conversation about a paper. Each exchange's learned hit level
-            // divides out the file that scores high whatever is asked.
-            if group.is_working_set() {
-                let best_of = |per_file: &[Vec<f32>]| -> Vec<(TimelineId, f32)> {
-                    files
-                        .iter()
-                        .zip(per_file)
-                        .map(|(f, scores)| (f.timeline, scores.iter().copied().fold(0.0, f32::max)))
-                        .collect()
-                };
-                scores.push_working_set_raw(RawBest {
-                    tail: best_of(&normed_tail_per_file),
-                    question: match normed_q_per_file.len() == files.len() {
-                        true => best_of(&normed_q_per_file),
-                        false => Vec::new(),
-                    },
-                });
             }
             // Where this group's scan time went, and what it walked to spend it.
             // `assemble_us` is host work proportional to the group's turns;

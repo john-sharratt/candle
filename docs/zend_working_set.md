@@ -6,7 +6,7 @@
 
 ## 1. The idea
 
-Every dialogue carries a **working set**: a voluntary token budget (10K, with
+Every dialogue carries a **working set**: a voluntary token budget (150K, with
 locks on top under a 150K ceiling of their own) of
 already-ingested `code_reading` files and `repo_map` folders, projected ahead of
 its own turns as **one sequence in the order its members entered**. The unit is
@@ -111,8 +111,7 @@ working set the projection emits (`project.rs` Step 12):
 
 ```
 system prompt
-other layers' groups    (the analysis layers, following the locks — §B.5 of
-                         docs/provenance_adaptive_projection.md)
+other layers' groups    (the analysis layers)
 inherited chain         the dialogue group's lineage turns
 repo_map/structure      provenance folders, then pinned       ┐ working set: provenance ≤ budget_tokens,
 code_reading/scopes     provenance files,   then pinned       ┘ locks ≤ lock_tokens on top
@@ -124,9 +123,7 @@ the locks — the files the model was just told it has — are next to the turns
 that asked for them. In plain layer order they sat behind every other layer's
 groups and the whole inherited chain: measured 2026-10-24, a locked paper
 ~130K tokens before the question, which the model could not find and called
-the tool's reply false. What now follows the working set changes rarely — the
-chain never, the analysis layers only as locks change — so the move costs no
-rebuilds.
+the tool's reply false.
 
 This one move fixes §3.7 (the dialogue's budget no longer carries the working
 set) and §3.8 (the working set is always ahead of the dialogue).
@@ -181,25 +178,20 @@ deleted.
 - The pinned members of both count against `lock_tokens`, never against
   `budget_tokens`.
 
-**The voluntary budget is small on purpose.** Measured 2026-10-24 at a 250K
-budget (conversation `1f283ffd`): every decode materialized 321K–350K tokens,
-~215K–248K of it provenance the scan had pulled in on momentum — with the one
-file the model had actually asked for, the paper, ~125K tokens from the
-question. Smaller budgets were measured on the same conversation:
+**What fills the voluntary budget today (open, §4.3).** Measured on a
+conversation about the paper, 2026-10-24/25:
 
-| Voluntary budget | What filled it on a question about the paper | Effect |
+| Voluntary budget | What filled it | Effect |
 |---|---|---|
-| 80K | ~70K of test files (`kernel_layout_tests.rs` 32K, `decode_layout_exact.rs` 15K, …), the same on every question and on both probes | the neighbours the model then misattributed facts between |
+| 250K | ~215K–248K of provenance on momentum; 321K–350K materialized per decode | the paper the model asked for sat ~125K tokens from the question |
+| 80K | ~70K of test files (`kernel_layout_tests.rs` 32K, `decode_layout_exact.rs` 15K, …), the same on every question | the model misattributed facts between those files and the paper |
 | 40K | one 32K test file, ranked first on every question | — |
-| 10K | the seeds' folders and small files | the most efficient reading of the paper (two read rounds, no grep detour), every criterion clean; 55–67K materialized on the tour, 123–143K on the paper |
-| 20K, ranked by normalised score (2026-10-25) | `decode_layout_exact.rs` 14.5K, a flash-attn header, a wasm worker, game asset folders | the edit turn regressed to one edit per round and hit the round cap |
+| 20K | `decode_layout_exact.rs`, a flash-attn header, a wasm worker, game asset folders | — |
 
-The scan cannot rank files against each other (its votes are standardised per
-file, so every file's best exchange looks alike, and a large file with few
-exchanges looks strongest), so what a large voluntary budget holds is largely
-arbitrary. Ranking by normalised score (§4.3) stopped one large file leading
-every question but did not make the leaders relevant. At 10K the working set
-is the seeds, and what the model reads itself comes in on top as locks.
+The scan cannot rank files against each other, so what the budget holds is
+largely arbitrary until the scores momentum is fed are made comparable across
+files (§4.3). Shrinking the budget hides that rather than fixing it, and with
+it provenance.
 
 **No link of the dialogue's own chain is ever a member.** The chain is projected
 as the conversation's opening already; admitted on momentum it emitted twice —
@@ -216,7 +208,7 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
 ```yaml
   - name: dialogue
     working_set:
-      budget_tokens: 10000       # seeds + provenance, folders and files together
+      budget_tokens: 150000      # seeds + provenance, folders and files together
       lock_tokens: 150000        # the locks, on top of budget_tokens
       folder_tokens: 10000       # repo_map's share of budget_tokens
       beta: 0.2                  # per-file momentum leak (§4.3)
@@ -294,31 +286,23 @@ An unattended seed falls under the floor after
 defaults.
 
 **Momentum is per file and leaks by its own value**:
-`m ← (1 − β)·m + fresh`, where `fresh` is the file's **rank** in its group's
-scan this reprojection (`working_set_observe::ranked_fresh`): each file's best
-**normalised** exchange score is ranked, separately for the trailing probe and
-the question probe, down to rank 8, and a file both place gets `1000` divided
-by the worse of its two ranks. A file only one probe places gets nothing — the
-trailing window alone is whatever the turn last wrote, JSON listings through
-tool rounds, and it crowned ~70K tokens of test files beside a question about
-a paper (measured 2026-10-24). A file that scored nothing gets nothing.
-
-Normalised, not raw, because a raw vote is `z × margin` inside the file's own
-competition (`belief_files::competitions`): it says how far one exchange stands
-out from the file's other exchanges, not how well the file answers the probe,
-and a file of many exchanges draws more maxima. Ranked raw, the same plotting
-script, `Cargo.toml` and benchmark tests held the provenance budget on every
-question of a conversation about the paper (conversation 4bdaf691,
-2026-10-25). Each exchange's learned hit level divides out a file that scores
-high whatever is asked. Ranked, not taken by magnitude, because that band runs
-~1000× over on short probes: fed the normalised magnitudes, momentum took a
-one-off match at 643,768 — six hundred full hits — and an object-detection demo
-entered the working set of a conversation about a paper (measured 2026-10-24).
-A rank does not grow with the group, so it cannot inflate. A file the dialogue keeps attending to settles at
-`1000/β` while it leads; one left alone decays geometrically. Below `min_momentum` (config, default 100 — the
+`m ← (1 − β)·m + fresh`, where `fresh` is the file's best exchange score this
+reprojection (the scan already produces per-exchange normalised scores; a max
+per timeline is one pass). A file hit steadily settles at `fresh/β`; one left
+alone decays geometrically. Below `min_momentum` (config, default 100 — the
 noise floor `code_reading/scopes` gates at today, `projection.yaml:821`) a file
 is dropped from the map, and only files at or above it are provenance
 candidates, so an idle budget stays empty rather than filling with noise.
+
+**Open: the scores momentum is fed cannot rank files against each other.** A
+raw vote is `z × margin` inside the file's own competition
+(`belief_files::competitions`): it says how far one exchange stands out from
+the file's other exchanges, not how well the file answers the probe. The
+normalised score divides by each exchange's learned level, and its band runs
+~1000× over on short probes — momentum took a one-off match at 643,768
+(measured 2026-10-24). On a conversation about the paper the provenance budget
+filled with test files, a plotting script and game asset folders on every
+question (§4.1).
 
 This is deliberately **not** the RelLeak belief (`belief.rs`). RelLeak leaks by
 the group's leader, which is right for picking three tools and wrong here: a
@@ -329,10 +313,11 @@ records only emitted turns, and it is halved at every submit, which in an
 agentic flow is every round.
 
 `observe` runs once per reprojection, right after the belief scan
-(`reproject_view_prepare`): `score_beliefs` records, for each working-set group
-— not belief-driven but still scanned (`GroupSchema::is_scanned`) — every
-conversation's best normalised exchange score per probe on its `ProjectionScores`, and the ranks
-are handed to the dialogue's `WorkingSet` under the substrate write lock. The turn's opening projection is
+(`reproject_view_prepare`): `score_beliefs` already returns `group_candidates`,
+every scanned group's fresh `(TurnKey, score)` list — a working-set group is
+not belief-driven but is still scanned (`GroupSchema::is_scanned`). For the two
+working-set groups the max per timeline is taken and handed to the dialogue's
+`WorkingSet` under the substrate write lock. The turn's opening projection is
 not scanned (it reads zero scores), so it projects the momentum as it stood —
 which is what an opening should see. Momentum ranks only who enters and who is
 dislodged; it never places anyone.
@@ -479,20 +464,15 @@ back to 1000 and they would never fade. A seed the conversation has edited or
 moved off leaves the way any stale provenance does: the retrieval scope stops
 offering its old conversation.
 
-**The reply is a status, the page's anchor and its first line; the rule lives
-in the system prompt.** A served call for page 3 of a 7-page file answers
+**The reply is a status and the page's anchor; the rule lives in the system
+prompt.** A served call for page 3 of a 7-page file answers
 
 ```json
-{"status":"in_context","anchor":"file=candle/docs/unbounded_agents.md page=3 pages=7","begins":"401  ### 9.2 …"}
+{"status":"in_context","anchor":"file=candle/docs/unbounded_agents.md page=3 pages=7"}
 ```
 
 and nothing else. The anchor is the exact string that page's fence opens with,
-so it occurs once in context; `begins` is the page's first line as the page
-renders it, numbered — the evidence the content exists, and a cue that finds
-the same text in context. Told only the file's anchor, the model answered from
-the paper's body and still told the user the read "returned a status without
-content" (measured 2026-10-24, the page fences ~20K tokens before the
-question). A page the file does not have is not served: the read runs and the
+so it occurs once in context. A page the file does not have is not served: the read runs and the
 tool says so — answered `in_context`, the model was told page 11 of a 7-page
 paper was in front of it. The reply stands in for a read, so every token it spends is
 paid on every served call; what the status means is said once, in the system
@@ -601,9 +581,9 @@ audit of "what did the fast path promise this conversation" a direct answer.
 ## 5. Constraints and cost
 
 - **Context length.** Flash-Next is trained to 262,144 positions; progressive
-  YaRN (`qwen4exp/rope.rs`) carries it ×2 to 524,288. 10K voluntary + 150K of
-  locks + the dialogue's 116K (which includes the 100K lineage cap) is ~276K at
-  the most, leaving ~248K before the slot climbs to ×4. A slot's rung follows its deepest position, so **a dialogue past
+  YaRN (`qwen4exp/rope.rs`) carries it ×2 to 524,288. 150K voluntary + 150K of
+  locks + the dialogue's 116K (which includes the 100K lineage cap) is ~416K at
+  the most, leaving ~108K before the slot climbs to ×4. A slot's rung follows its deepest position, so **a dialogue past
   262K runs factor 2 at every position, its own turns included** — the working
   set changes the whole conversation's rotation, not just its reach. The
   shipped schema's `rope: min_yarn_factor: 2` puts every dialogue on ×2 from
@@ -628,7 +608,7 @@ audit of "what did the fast path promise this conversation" a direct answer.
   enabled, the draft head must be checked to rotate by the slot's rung past
   262K, or its drafts will be rejected at depth.
 
-Budget ships at 10K voluntary + 150K of locks (D10); the §7 measurement watches
+Budget ships at 150K voluntary + 150K of locks (D10); the §7 measurement watches
 these numbers.
 
 ## 6. Code map
@@ -713,7 +693,7 @@ these numbers.
 | D7 | Provenance unit | Whole files and folders. |
 | D8 | Seed list | §4.2 draft, to be edited. |
 | D9 | Fade rate | Per-file momentum at β 0.2, leaking by its own value. |
-| D10 | Default budget | 10K voluntary, locks on top up to 150K. Measured 2026-10-24 on one conversation at 250K, 80K, 40K and 10K (§4.1): above 10K the budget filled with test files the scan cannot tell apart from relevant ones; at 10K the conversation read best and materialized least. |
+| D10 | Default budget | 150K voluntary, locks on top up to 150K. What fills the voluntary budget is arbitrary until the scores momentum is fed rank files against each other (§4.1, §4.3). |
 | D11 | Momentum store | In `WorkingSet`, not the belief carry; in-memory. |
 | D12 | Restart | Served calls are marked on their turn (`working_set:lock:<tl>`, `working_set:release:<tl>`, `working_set:release`) through the existing persisted turn tags, which every gather-scope reader ignores; locks rebuild from the marks. Momentum rebuilds from the scan. |
 | D13 | Folder vs file budget | `folder_tokens` slice for `repo_map`, the rest for `code_reading`. |

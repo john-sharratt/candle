@@ -59,22 +59,10 @@ const FILE_READ: &str = "file_read";
 /// every served call.
 const IN_CONTEXT: &str = "in_context";
 
-/// The answer a served call gets: the status, the anchor of the page it asked
-/// for — `file=<repo>/<path> page=N pages=M`, the exact string that page's
-/// fence opens with ahead of the conversation — and the page's first line as
-/// that page shows it, numbered.
-///
-/// **The page and its first line, not the file alone.** Told only the file's
-/// anchor, the model answered from the paper's body and still told the user
-/// the read "returned a status without content" (measured 2026-10-24, the
-/// page fences ~20K tokens before the question). The first line is the
-/// evidence the content exists, and the cue that finds the same text in
-/// context; the page anchor is a string that occurs exactly once there.
-///
-/// **And the lines the page holds.** With the first line alone, the model
-/// took it for all it had been given — "what it actually surfaced is a single
-/// title line" — and grepped the paper for three rounds; `lines` says the
-/// whole page is in context, `201-400 of 1399`.
+/// The answer a served call gets: the status and the anchor of the page it
+/// asked for — `file=<repo>/<path> page=N pages=M`, the exact string that
+/// page's fence opens with ahead of the conversation, so it occurs exactly
+/// once there.
 ///
 /// **No `error`, and no `detail`.** Both mark a failed call — the GUI renders
 /// either as a red card (`is_error`, `zend/web/index.html`) and the model reads
@@ -85,19 +73,12 @@ const IN_CONTEXT: &str = "in_context";
 /// read, not this conversation. Told it had already read it, the model
 /// searched its own reads, found none, and called the reply false. `in_context`
 /// says what is true: the content is here, at this anchor.
-fn served_response(anchor: String, page: u32, lines: usize, begins: Option<String>) -> Value {
+fn served_response(anchor: String, page: u32, lines: usize) -> Value {
     let pages = page_count(lines);
-    let first = (page - 1) * PAGE_LINES + 1;
-    let last = (page * PAGE_LINES).min(lines as u32).max(first);
-    let mut reply = json!({
+    json!({
         "status": IN_CONTEXT,
         "anchor": format!("{anchor} page={page} pages={pages}"),
-        "lines": format!("{first}-{last} of {lines}"),
-    });
-    if let Some(begins) = begins {
-        reply["begins"] = Value::String(begins);
-    }
-    reply
+    })
 }
 
 /// The page a `file_read` asks for — `1` when it names none, as the tool reads
@@ -112,18 +93,6 @@ fn requested_page(call: &ToolCall) -> u64 {
 /// How many pages a file of `lines` lines reads as.
 fn page_count(lines: usize) -> u32 {
     (lines as u32).div_ceil(PAGE_LINES).max(1)
-}
-
-/// Page `page`'s first line of `text` as the page renders it: its number,
-/// right-aligned to the width of the page's last line number, two spaces, the
-/// line (`zend_tools::tools::file::render::numbered_excerpt`). `None` past the
-/// end.
-fn page_begins(text: &str, page: u32, lines: usize) -> Option<String> {
-    let first = (page - 1) * PAGE_LINES + 1;
-    let last = (page * PAGE_LINES).min(lines as u32);
-    let line = text.split('\n').nth(first as usize - 1)?;
-    let width = last.to_string().len();
-    Some(format!("{first:width$}  {line}"))
 }
 
 /// One call the fast path answered, for the caller to log and to mark on the
@@ -276,15 +245,8 @@ impl Screen<'_> {
             );
             return None;
         };
-        let page = page as u32;
-        let begins = self
-            .files
-            .repo(repo)
-            .ok()
-            .and_then(|r| r.read(rel).ok().flatten())
-            .and_then(|text| page_begins(&text, page, lines));
         Some(Hit {
-            response: served_response(file_anchor(repo, rel), page, lines, begins),
+            response: served_response(file_anchor(repo, rel), page as u32, lines),
             served: Served {
                 tool: FILE_READ,
                 path: key,
@@ -481,28 +443,23 @@ mod tests {
         })
     }
 
-    /// **A served call is a short success naming its page and how it
-    /// begins**, pinned to the byte: the reply stands in for a read, so a note
-    /// that grew back would be paid on every served call. The GUI marks a tool
-    /// card red when the response carries `error` OR `detail` (`is_error`,
-    /// `zend/web/index.html`), and the model reads a failed call as grounds to
-    /// try again — doing the very read the fast path just avoided.
+    /// **A served call is a short success naming its page**, pinned to the
+    /// byte: the reply stands in for a read, so a note that grew back would be
+    /// paid on every served call. The GUI marks a tool card red when the
+    /// response carries `error` OR `detail` (`is_error`, `zend/web/index.html`),
+    /// and the model reads a failed call as grounds to try again — doing the
+    /// very read the fast path just avoided.
     #[test]
-    fn a_served_call_is_the_status_the_page_anchor_and_its_first_line() {
-        let reply = served_response(
-            file_anchor("candle", "Cargo.toml"),
-            1,
-            42,
-            Some("1  [workspace]".to_string()),
-        );
+    fn a_served_call_is_the_status_and_the_page_anchor() {
+        let reply = served_response(file_anchor("candle", "Cargo.toml"), 1, 42);
         assert_eq!(
             serde_json::to_string(&reply).unwrap(),
-            r#"{"status":"in_context","anchor":"file=candle/Cargo.toml page=1 pages=1","lines":"1-42 of 42","begins":"1  [workspace]"}"#
+            r#"{"status":"in_context","anchor":"file=candle/Cargo.toml page=1 pages=1"}"#
         );
-        let bare = served_response(file_anchor("candle", "a.rs"), 2, 450, None);
+        let later = served_response(file_anchor("candle", "a.rs"), 2, 450);
         assert_eq!(
-            serde_json::to_string(&bare).unwrap(),
-            r#"{"status":"in_context","anchor":"file=candle/a.rs page=2 pages=3","lines":"201-400 of 450"}"#
+            serde_json::to_string(&later).unwrap(),
+            r#"{"status":"in_context","anchor":"file=candle/a.rs page=2 pages=3"}"#
         );
     }
 
@@ -513,20 +470,8 @@ mod tests {
         let fence = zend_tools::tools::file::render::numbered_excerpt(
             "candle", "a.rs", 2, 3, 201, 400, 450, "rust", "x",
         );
-        let reply = served_response(file_anchor("candle", "a.rs"), 2, 450, None);
+        let reply = served_response(file_anchor("candle", "a.rs"), 2, 450);
         assert!(fence.contains(reply["anchor"].as_str().unwrap()));
-    }
-
-    /// A page's first line renders as the page shows it: numbered, right-aligned
-    /// to the page's last line number, two spaces before the text. Past the
-    /// file's end there is none.
-    #[test]
-    fn a_pages_first_line_is_numbered_as_the_page_shows_it() {
-        let text: String = (1..=450).map(|n| format!("line {n}\n")).collect();
-        assert_eq!(page_begins(&text, 1, 450).as_deref(), Some("  1  line 1"));
-        assert_eq!(page_begins(&text, 3, 450).as_deref(), Some("401  line 401"));
-        assert_eq!(page_begins("only\n", 1, 1).as_deref(), Some("1  only"));
-        assert_eq!(page_begins("a\nb\n", 2, 2), None);
     }
 
     /// A file's pages, as the tool counts them; a read asking no page asks for

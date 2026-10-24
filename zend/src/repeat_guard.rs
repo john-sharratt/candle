@@ -67,7 +67,7 @@ pub const STOP_AFTER: usize = 2;
 /// The file tools that change the session's files. They write the session
 /// overlay rather than the disk, so they declare no capability, and nothing
 /// else about them says they change anything.
-pub const OVERLAY_WRITERS: [&str; 3] = ["write", "file_edit", "file_delete"];
+const OVERLAY_WRITERS: [&str; 3] = ["write", "file_edit", "file_delete"];
 
 /// Whether `call` changes anything: writes the session's files or the disk (a
 /// repository, a database), or runs a program or code, which can change

@@ -404,23 +404,13 @@ no selector change.
   configured selection kind, never on which layer it is — the zend dialogue
   floor (`Sequence`, priority 100, min 50 %) is an instance, not a special case.
 
-### B.5 What a layer needs — structure, not score (measured 2026-10-24)
+### B.5 What a layer needs — open (measured 2026-10-24)
 
-A layer above a file's reading — `static_analysis` through `bug_analysis`, one
-unit per file — is **needed exactly while the model works in that file**. A
-group declaring `follows_working_set: true` offers a projection only the
-conversations descended from a LOCKED member of the target's working set — a
-file the model read (`Substrate::mark_group_follows_working_set`, applied in
-`scoped_timelines_for_group` and `scope_offers`, so the scan and the
-projection's candidates both see it). A unit forks from the unit below it and,
-at the bottom, from the file's reading, so a read file admits its whole
-analysis stack and a released lock takes it out. Provenance does not count: it
-is the scan's guess, and following it still brought 36–45K tokens of analyses
-of files nobody had asked for on the paper question. No read, nothing — the
-opening projection carries none.
-
-Why not a score. Replaying a conversation about the paper (`1f283ffd`, then
-`cbac2859` with every group's raw order statistics on the projection event):
+The analysis layers above a file's reading — `static_analysis` through
+`bug_analysis`, one unit per file — project by their scan scores today, and
+those scores do not say whether a layer is needed. Replaying a conversation
+about the paper (`1f283ffd`, then `cbac2859` with every group's raw order
+statistics on the projection event):
 
 - every unit the analysis layers projected on the paper question was a
   battle-cities analysis — 25–48K tokens a decode, one taken at belief score 0,
@@ -435,8 +425,9 @@ Why not a score. Replaying a conversation about the paper (`1f283ffd`, then
   there is no "typical member" to contrast against.
 
 The same replay fed working-set momentum from the normalised band, which runs
-~1000× over on short probes; momentum now feeds by rank instead
-(`docs/zend_working_set.md` §4.3).
+~1000× over on short probes (`docs/zend_working_set.md` §4.3). A score that
+measures a layer's need, comparable across groups and independent of their
+size and normalisation, is the open work.
 
 ---
 

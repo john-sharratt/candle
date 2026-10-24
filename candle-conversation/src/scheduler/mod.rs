@@ -11590,7 +11590,7 @@ impl Scheduler {
         let observe_span = profile::span("reproject:observe_working_set");
         policy
             .substrate
-            .observe_working_set(schema, policy.target, &projection_scores);
+            .observe_working_set(schema, policy.target, &group_candidates);
         observe_span.end();
         let observe_us = t_observe.elapsed().as_micros() as u64;
 

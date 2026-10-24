@@ -93,7 +93,6 @@ use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_lease;
-use crate::instruction_guard;
 use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
 use crate::journal::record::{kept_in, metadata_of};
 use crate::journal::registry::{Journals, Open};
@@ -2817,12 +2816,6 @@ impl InferenceState {
                     .unwrap()
                     .set_working_set_share(group.id, share);
             }
-            if group.follows_working_set {
-                engine
-                    .lock()
-                    .unwrap()
-                    .mark_group_follows_working_set(group.id);
-            }
         }
 
         let mut branch_layers: Vec<(IngestLayer, IngestScope)> = Vec::new();
@@ -4638,10 +4631,7 @@ fn run_inference_stream(
             // not be read, which are answered with an error rather than dropped
             // (see `tool_round`), so a broken call is a failed round the model
             // and the GUI both see, not a turn that silently reads as final.
-            // A write to an agent instruction file the user's message did not
-            // name is refused here (`instruction_guard`).
-            let round =
-                instruction_guard::screen(tool_round::plan(&resp.answer), &original_user_message);
+            let round = tool_round::plan(&resp.answer);
             // Force-high-resolution is a capture mode: seal the first turn (the
             // tool invocation) into the substrate as the dataset baseline, but
             // do NOT execute the tools — capture-only, so `code_run` / network
@@ -5003,6 +4993,11 @@ fn run_inference_stream(
         // reaches disk is covered by the scan's own check: an entry whose turn
         // arrived is tombstoned rather than acted on.
         resume::clear_call_turn(&state.engine.lock().unwrap(), timeline);
+
+        // Title generation has already been fired in parallel from
+        // `submit_with_sampling` — it doesn't depend on the main
+        // convo's state, so we don't repeat it here.
+        let _ = original_user_message;
     });
 
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
@@ -8650,7 +8645,7 @@ mod projection_schema_tests {
             .working_set
             .as_ref()
             .expect("the dialogue declares a working set");
-        assert_eq!(ws.budget_tokens, 10_000);
+        assert_eq!(ws.budget_tokens, 150_000);
         assert_eq!(ws.lock_tokens, 150_000);
         assert_eq!(ws.folder_tokens, 10_000);
         assert_eq!(ws.beta, 0.2);

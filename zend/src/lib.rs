@@ -37,7 +37,6 @@ pub mod ingest_lease;
 pub mod ingest_report;
 pub mod ingest_snapshots;
 pub mod ingest_worker;
-pub mod instruction_guard;
 pub mod journal;
 pub mod layers;
 pub mod legacy_uploads;
