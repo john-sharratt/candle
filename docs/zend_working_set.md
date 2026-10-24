@@ -455,14 +455,22 @@ back to 1000 and they would never fade. A seed the conversation has edited or
 moved off leaves the way any stale provenance does: the retrieval scope stops
 offering its old conversation.
 
-**The reply is a status and an anchor; the rule lives in the system prompt.**
-A served call answers
+**The reply is a status, the page's anchor and its first line; the rule lives
+in the system prompt.** A served call for page 3 of a 7-page file answers
 
 ```json
-{"status":"in_context","anchor":"file=candle/Cargo.toml"}
+{"status":"in_context","anchor":"file=candle/docs/unbounded_agents.md page=3 pages=7","begins":"401  ### 9.2 …"}
 ```
 
-and nothing else. The reply stands in for a read, so every token it spends is
+and nothing else. The anchor is the exact string that page's fence opens with,
+so it occurs once in context; `begins` is the page's first line as the page
+renders it, numbered — the evidence the content exists, and a cue that finds
+the same text in context. Told only the file's anchor, the model answered from
+the paper's body and still told the user the read "returned a status without
+content" (measured 2026-10-24, the page fences ~20K tokens before the
+question). A page the file does not have is not served: the read runs and the
+tool says so — answered `in_context`, the model was told page 11 of a 7-page
+paper was in front of it. The reply stands in for a read, so every token it spends is
 paid on every served call; what the status means is said once, in the system
 prompt's `in_context` section, whose id is the status word — the reply recalls
 the rule by the same token rather than restating it. The rule is general: the
