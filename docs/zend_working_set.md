@@ -192,12 +192,14 @@ question. Smaller budgets were measured on the same conversation:
 | 80K | ~70K of test files (`kernel_layout_tests.rs` 32K, `decode_layout_exact.rs` 15K, …), the same on every question and on both probes | the neighbours the model then misattributed facts between |
 | 40K | one 32K test file, ranked first on every question | — |
 | 10K | the seeds' folders and small files | the most efficient reading of the paper (two read rounds, no grep detour), every criterion clean; 55–67K materialized on the tour, 123–143K on the paper |
+| 20K, ranked by normalised score (2026-10-25) | `decode_layout_exact.rs` 14.5K, a flash-attn header, a wasm worker, game asset folders | the edit turn regressed to one edit per round and hit the round cap |
 
 The scan cannot rank files against each other (its votes are standardised per
 file, so every file's best exchange looks alike, and a large file with few
 exchanges looks strongest), so what a large voluntary budget holds is largely
-arbitrary. At 10K the working set is the seeds, and what the model reads itself
-comes in on top as locks.
+arbitrary. Ranking by normalised score (§4.3) stopped one large file leading
+every question but did not make the leaders relevant. At 10K the working set
+is the seeds, and what the model reads itself comes in on top as locks.
 
 **No link of the dialogue's own chain is ever a member.** The chain is projected
 as the conversation's opening already; admitted on momentum it emitted twice —
@@ -214,7 +216,7 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
 ```yaml
   - name: dialogue
     working_set:
-      budget_tokens: 20000       # seeds + provenance, folders and files together
+      budget_tokens: 10000       # seeds + provenance, folders and files together
       lock_tokens: 150000        # the locks, on top of budget_tokens
       folder_tokens: 10000       # repo_map's share of budget_tokens
       beta: 0.2                  # per-file momentum leak (§4.3)
