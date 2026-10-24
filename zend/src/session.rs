@@ -50,8 +50,8 @@ use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
     Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers, Linking,
-    OptionalState, ProjectionEvent, SamplingConfig, SelectionState, Sequence, ThinkSteering,
-    TokenDecoder, TurnEvent, TurnHandle, TurnResponse, UnsealedAsker,
+    OptionalState, ProjectionEvent, PromptDump, SamplingConfig, SelectionState, Sequence,
+    ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse, UnsealedAsker,
 };
 use host::download::ensure_model_pack;
 use host::process::fatal;
@@ -6794,6 +6794,20 @@ impl ZendSession {
                 })
             }),
         )
+    }
+
+    /// `GET /v1/conversations/{id}/prompt-tokens`: the tokens the conversation
+    /// would be given if it decoded now, piece by piece. `Some(None)` when it
+    /// is not open on this member, or does not reproject; `None` while the model
+    /// is not loaded. Waits for a round in flight to end.
+    pub async fn prompt_dump(&self, conv_id: &str) -> Option<Option<PromptDump>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let held = state.conversations.lock().unwrap().get(conv_id).cloned();
+        let Some(conversation) = held else {
+            return Some(None);
+        };
+        let cs = conversation.lock().await;
+        Some(cs.conv.prompt_dump())
     }
 
     /// `DELETE /v1/conversations/{id}/journal/{eid}`: forget one entry. It

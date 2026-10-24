@@ -30,6 +30,7 @@ pub mod files;
 pub mod journal;
 pub mod models;
 pub mod projections;
+pub mod prompt_tokens;
 mod repo_map;
 pub mod substrate;
 
@@ -215,6 +216,12 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             post(projections::context),
         )
         .route(
+            "/v1/conversations/:id/prompt-tokens",
+            Role::Unauthenticated,
+            conversation(),
+            get(prompt_tokens::get),
+        )
+        .route(
             "/v1/conversations/:id/journal",
             Role::Unauthenticated,
             conversation(),
@@ -279,6 +286,7 @@ mod tests {
                     "/v1/conversations/:id/projection-context",
                     "unauthenticated"
                 ),
+                ("/v1/conversations/:id/prompt-tokens", "unauthenticated"),
                 ("/v1/conversations/:id/journal", "unauthenticated"),
                 ("/v1/conversations/:id/journal/draft", "unauthenticated"),
                 ("/v1/conversations/:id/journal/:eid", "unauthenticated"),
@@ -310,6 +318,7 @@ mod tests {
             ("GET", "/v1/conversations/c-1/live"),
             ("GET", "/v1/conversations/c-1/projections/3/4"),
             ("POST", "/v1/conversations/c-1/projection-context"),
+            ("GET", "/v1/conversations/c-1/prompt-tokens"),
             ("GET", "/v1/conversations/c-1/journal"),
             ("POST", "/v1/conversations/c-1/journal/draft"),
             ("DELETE", "/v1/conversations/c-1/journal/5"),
