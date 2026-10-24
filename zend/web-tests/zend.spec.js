@@ -774,6 +774,91 @@ test.describe('1.10 cross-cutting', () => {
   });
 });
 
+// The journal docks at the bottom right of an open conversation
+// (docs/zend_journal.md §8). The mock's journal holds a folded day (#3) and a
+// step after it (#2), with one item open.
+test.describe('1.15 journal dock', () => {
+  function watchErrors(page) {
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(String(e)));
+    page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+    return errors;
+  }
+
+  async function openDock(page) {
+    await page.locator('.z-journal-dock').getByRole('button', { name: /Journal/ }).click();
+    await expect(page.locator('.z-journal-list')).toBeVisible();
+  }
+
+  test('collapsed it is a pill counting the entries; open it reads as the prompt does', async ({ page }) => {
+    const errors = watchErrors(page);
+    await boot(page, { conv: '1' });
+    const dock = page.locator('.z-journal-dock');
+    await expect(dock.getByRole('button', { name: /Journal · 2/ })).toBeVisible();
+    await expect(page.locator('.z-journal-list')).toHaveCount(0);
+
+    await openDock(page);
+    const lines = page.locator('.z-journal-line');
+    await expect(lines).toHaveCount(2);
+    // Oldest first, as the prompt reads it, the folded day tagged.
+    await expect(lines.nth(0)).toContainText('#3');
+    await expect(lines.nth(0)).toContainText('Chased the scan stall');
+    await expect(lines.nth(0)).toContainText('day');
+    await expect(lines.nth(1)).toContainText('#2');
+    await expect(lines.nth(1)).toContainText('Reran the parity test');
+    await expect(page.locator('.z-journal-list')).toContainText('2026-10-23, 14:00 UTC');
+    await expect(page.locator('.z-journal-list')).toContainText('Still open');
+    await expect(page.locator('.z-journal-list')).toContainText('#1 Does the parity test pass on the 3090?');
+    // Nothing of the daemon's drafting machinery is offered.
+    await expect(dock.getByRole('button', { name: /Draft/ })).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
+  test('an entry opens a modal of its line, what is behind it and its turns', async ({ page }) => {
+    const errors = watchErrors(page);
+    await boot(page, { conv: '1' });
+    await openDock(page);
+    await page.locator('.z-journal-line').nth(1).click();
+    const modal = page.locator('.z-modal');
+    await expect(modal).toContainText('Entry 2');
+    await expect(modal).toContainText('In the journal');
+    await expect(modal).toContainText('Reran the parity test after the scan fix.');
+    await expect(modal).toContainText('- Saw: scan.rs failed its parity test.');
+    await expect(modal).toContainText('#31 14:24 Tool results:');
+    await expect(modal).toContainText('lines 1–4 of 4');
+    await expect(modal.getByRole('button', { name: /Load .* more/ })).toHaveCount(0);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.z-modal')).toHaveCount(0);
+    // A folded entry reads its digest.
+    await page.locator('.z-journal-line').nth(0).click();
+    await expect(page.locator('.z-modal')).toContainText('Its digest, as journal_read reads it');
+    await expect(page.locator('.z-modal')).toContainText('#28 17:40 The user reported the scan stalling');
+    expect(errors).toEqual([]);
+  });
+
+  test('a reading that changes nothing leaves the dock as it was', async ({ page }) => {
+    await boot(page, { conv: '1' });
+    await openDock(page);
+    const line = await page.locator('.z-journal-line').first().elementHandle();
+    await page.getByRole('button', { name: 'Refresh the journal' }).click();
+    await page.waitForTimeout(300);
+    expect(await line.evaluate((el) => el.isConnected)).toBe(true);
+  });
+
+  test('collapsed or open is remembered across a reload', async ({ page }) => {
+    await boot(page, { conv: '1' });
+    await openDock(page);
+    await page.reload();
+    await page.waitForFunction(() => window.__ZEND_READY__ === true);
+    await expect(page.locator('.z-journal-list')).toBeVisible();
+    await page.getByRole('button', { name: 'Collapse the journal' }).click();
+    await page.reload();
+    await page.waitForFunction(() => window.__ZEND_READY__ === true);
+    await expect(page.locator('.z-journal-dock').getByRole('button', { name: /Journal · 2/ })).toBeVisible();
+    await expect(page.locator('.z-journal-list')).toHaveCount(0);
+  });
+});
+
 test.describe('1.14 background ingest bar', () => {
   // window.__ZEND_MOCK_INGEST_BACKLOG__ (zend-api.mock.js) simulates a
   // draining backlog: total 5, bumps to 7 on the 3rd status poll (a file

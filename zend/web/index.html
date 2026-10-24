@@ -509,8 +509,6 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     journalOpen: (function () { try { return localStorage.getItem('zend.journalDock') === 'open'; } catch (_) { return false; } })(),
     journal: null,          // { convId, view } — view is the daemon's JSON
     journalError: null,
-    journalNote: null,      // the last draft request's answer, as a line
-    journalDrafts: false,   // the dock shows recent drafts instead of the entries
     // The entry open in the journal modal: { convId, entry, page, loading,
     // error } — `page` is the turns behind it as journal_read pages them,
     // extended as more is asked for.
@@ -1232,7 +1230,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // once the daemon has said what they are.
     const conv = S.conversations.find((c) => c.id === id);
     if (conv) adoptDials(conv.dials);
-    setState({ activeId: id, sidebarDrawer: false, convMenuOpen: false, journalNote: null, journalEntry: null, journalDrafts: false }, () => { scrollChat(); if (!S.narrow) focusPrompt(); });
+    setState({ activeId: id, sidebarDrawer: false, convMenuOpen: false, journalEntry: null }, () => { scrollChat(); if (!S.narrow) focusPrompt(); });
     // The journal dock follows the conversation it shows; collapsed, its pill
     // still counts the entries.
     loadJournal();
@@ -1398,7 +1396,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // The conversation it lands on may never have been opened: load it, rather
     // than show its empty history as the home page.
     if (activeId) openConv(activeId);
-    setState({ activeId, confirm: null, convMenuOpen: false }, focusPrompt);
+    setState({ activeId, confirm: null, convMenuOpen: false, journalEntry: null }, focusPrompt);
+    if (activeId) loadJournal();
   }
   function toggleArchived() {
     const showArchived = !S.showArchived;
@@ -3066,7 +3065,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function setJournalOpen(open) {
     try { localStorage.setItem('zend.journalDock', open ? 'open' : 'closed'); } catch (_) {}
     journalListAtEnd = true;
-    setState({ journalOpen: open, topMenuOpen: false, journalNote: null, journalDrafts: false });
+    setState({ journalOpen: open, topMenuOpen: false });
     if (open) loadJournal();
   }
   function toggleJournal() { setJournalOpen(!S.journalOpen); }
@@ -3075,7 +3074,13 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     if (!convId) return;
     API.getJournal(convId).then((view) => {
       if (S.activeId !== convId) return;
-      setState({ journal: { convId, view }, journalError: null });
+      // Only a journal that changed is drawn again: following a draft reads it
+      // every few seconds, and redrawing the page on each read disturbed
+      // whatever the reader was doing in it.
+      const held = S.journal && S.journal.convId === convId ? S.journal.view : null;
+      if (S.journalError || !held || JSON.stringify(held) !== JSON.stringify(view)) {
+        setState({ journal: { convId, view }, journalError: null });
+      }
       // A draft or fold in flight: read again shortly, until it has ended.
       clearTimeout(journalFollow);
       if (view.drafting) journalFollow = setTimeout(() => { if (S.activeId === convId) loadJournal(); }, JOURNAL_FOLLOW_MS);
@@ -3118,13 +3123,6 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     API.forgetJournalEntry(convId, entryId).then((view) => {
       if (S.activeId === convId) setState({ journal: { convId, view }, journalError: null, journalEntry: null });
     }).catch((e) => setState({ journalError: String((e && e.message) || e) }));
-  }
-  function draftJournalNow() {
-    const convId = S.activeId;
-    API.draftJournal(convId).then((covers) => {
-      setState({ journalNote: 'Drafting turns ' + covers.from_turn + '–' + covers.to_turn + '…' });
-      loadJournal();
-    }).catch((e) => setState({ journalNote: String((e && e.message) || e) }));
   }
   // A folded entry's period, as a small tag beside its line: a day, week,
   // month or year the journal compressed into one entry.
@@ -3194,17 +3192,6 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
           turns)));
     return h('div', { class: 'z-modal-ov', onClick: close, style: modalOvStyle(430) }, modal);
   }
-  function buildJournalDraft(d) {
-    const tone = { wrote: '#7fb07a', nothing: '#9a9490', abandoned: '#e0938a', not_started: '#e0938a' }[d.result] || '#9a9490';
-    const when = 'turns ' + Math.floor((d.from_turn - 1) / 2) + '–' + Math.floor((d.to_turn - 1) / 2);
-    const time = 'write ' + d.write_ms + ' ms';
-    return h('div', { style: 'padding:6px 2px; border-top:1px solid #2e2b27; font-size:0.7rem; color:#b8b2ac;' },
-      h('div', { style: 'display:flex; gap:8px;' },
-        h('span', { style: 'color:' + tone + '; font-weight:650;' }, d.result + (d.entry ? ' #' + d.entry : '')),
-        h('span', { style: 'color:#7c736a; font-family:ui-monospace,monospace;' }, when),
-        h('span', { style: 'margin-left:auto; color:#6a6258; font-family:ui-monospace,monospace;' }, time)),
-      d.detail ? h('div', { class: 'z-selectable', style: 'margin-top:3px; color:#8a827a; line-height:1.4;' }, d.detail) : null);
-  }
   // The dock at the bottom right of the conversation. Collapsed it is a pill —
   // the journal's icon, how many entries it holds, a dot while a draft or fold
   // runs — so it costs the chat almost nothing; open it is a short card of the
@@ -3214,7 +3201,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const entries = held ? (held.entries || []) : [];
     const busy = !!(held && held.drafting);
     const pill = 'display:flex; align-items:center; gap:6px; font-size:0.72rem; color:#cfc8c0; background:#232120; border:1px solid #38342f; border-radius:999px; padding:5px 11px; cursor:pointer; font-family:inherit; box-shadow:0 6px 18px rgba(0,0,0,0.35);';
-    const busyDot = busy ? h('span', { title: 'A draft or fold is running', style: 'width:6px; height:6px; border-radius:50%; background:#c98a3e;' }) : null;
+    const busyDot = busy ? h('span', { title: 'Writing to the journal…', style: 'width:6px; height:6px; border-radius:50%; background:#c98a3e;' }) : null;
     const where = 'position:absolute; right:14px; bottom:12px; z-index:36;';
     if (!S.journalOpen) {
       return h('div', { class: 'z-journal-dock', style: where },
@@ -3222,13 +3209,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     }
     const list = h('div', { class: 'zscroll z-journal-list', ref: (el) => { journalListEl = el; }, style: 'flex:1; min-height:0; overflow-y:auto; padding:2px 6px 8px;' });
     if (S.journalError) list.appendChild(h('div', { style: 'padding:6px; font-size:0.72rem; color:#e0938a;' }, S.journalError));
-    if (S.journalNote) list.appendChild(h('div', { style: 'padding:6px; font-size:0.7rem; color:#c98a3e;' }, S.journalNote));
     if (!held) {
       list.appendChild(h('div', { style: 'padding:1rem; text-align:center; font-size:0.74rem; color:#6a6258;' }, 'Loading…'));
-    } else if (S.journalDrafts) {
-      const drafts = held.drafts || [];
-      if (!drafts.length) list.appendChild(h('div', { style: 'padding:1rem; text-align:center; font-size:0.74rem; color:#6a6258;' }, 'No drafts yet this run.'));
-      drafts.slice().reverse().forEach((d) => list.appendChild(buildJournalDraft(d)));
     } else {
       if (!entries.length) list.appendChild(h('div', { style: 'padding:1rem; text-align:center; font-size:0.74rem; color:#6a6258; line-height:1.5;', html: 'Nothing written down yet.<br>The session journals every sixteen turns.' }));
       entries.forEach((e) => buildJournalLine(e).forEach((n) => list.appendChild(n)));
@@ -3245,10 +3227,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
         h('span', { style: 'font-size:0.66rem; color:#7c736a;' }, entries.length ? '' + entries.length : ''),
         busyDot,
         h('span', { style: 'flex:1;' }),
-        h('button', { onClick: () => setState({ journalDrafts: !S.journalDrafts }), title: S.journalDrafts ? 'Back to the entries' : 'How recent drafts ended', style: icon + (S.journalDrafts ? ' color:#ece8e4; border-color:#38342f;' : '') }, 'Drafts'),
-        h('button', { onClick: draftJournalNow, title: 'Write an entry now over whatever is not yet covered', style: icon }, 'Draft'),
-        h('button', { onClick: loadJournal, title: 'Read the journal again', style: icon, html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M11.5 7a4.5 4.5 0 1 1-1.3-3.2M11.5 1.8v2.6H8.9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>' }),
-        h('button', { onClick: () => setJournalOpen(false), title: 'Collapse the journal', style: icon, html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M3.5 5.5L7 9l3.5-3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>' })),
+        h('button', { onClick: loadJournal, title: 'Read the journal again', 'aria-label': 'Refresh the journal', style: icon, html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M11.5 7a4.5 4.5 0 1 1-1.3-3.2M11.5 1.8v2.6H8.9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>' }),
+        h('button', { onClick: () => setJournalOpen(false), title: 'Collapse the journal', 'aria-label': 'Collapse the journal', style: icon, html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M3.5 5.5L7 9l3.5-3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>' })),
       list);
   }
 
@@ -4138,6 +4118,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       }
       // Before the first render, so a restored conversation shows loading.
       if (S.activeId && !S.loaded[S.activeId]) hydrateIfNeeded(S.activeId);
+      // A restored conversation's journal, so the dock counts its entries and
+      // opens on them if it was left open.
+      if (S.activeId) loadJournal();
       render();
       focusPrompt();
       window.__ZEND_READY__ = true;
