@@ -11,7 +11,10 @@ host:
   host: 192.168.0.237
   port: 8081
   tls_port: 8444
-  clusters: ["https://gateway.tokera.com:9443"]
+  # One cluster reached by two paths, best first: blackworld on the LAN
+  # (gateway.tokera.local → .4 and .5 through this machine's hosts file),
+  # then the internet.
+  clusters: ["https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"]
   cluster_name: tokera.com
   group_key: web/secrets/group.key
   agent: motherd/agent.laptop.yaml
