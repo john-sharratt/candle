@@ -123,9 +123,10 @@ use crate::tools::{
 };
 use crate::turn_claims;
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
+use crate::working_set::promises::{self, Release};
 use crate::working_set::restore::restore_locks;
 use crate::working_set::seeds::Seeding;
-use crate::working_set::{dialogue_config, releases, round_marks};
+use crate::working_set::{dialogue_config, round_marks};
 use crate::workspace::UPLOADS_REPO;
 
 mod replay;
@@ -302,6 +303,10 @@ struct ConvState {
     /// The journal sections this conversation holds, reconciled with its
     /// journal at the head of every round (`docs/zend_journal.md`).
     journal: Carried,
+    /// The working-set promises a decode found ended — locks whose replies its
+    /// projection left out — marked on the next turn this conversation submits,
+    /// whichever request that is (`working_set::promises`).
+    promise_marks: Vec<String>,
 }
 
 /// Metadata keys carrying the composer dials a conversation last ran under.
@@ -3765,6 +3770,7 @@ fn run_inference_stream(
                             // An earlier run may have left this conversation's
                             // sections: the first reconcile looks for them.
                             journal: Carried::new(false),
+                            promise_marks: Vec::new(),
                         }));
                         minted_guard = Some(Arc::clone(&arc).try_lock_owned().expect(
                             "a freshly minted conversation's lock cannot be held by \
@@ -4094,12 +4100,8 @@ fn run_inference_stream(
                 }
             };
             // A resumed round never passed the screen, but it can still have
-            // written: then its locks go, exactly as a live round's would.
-            let released = round_releases(&state, &results);
-            if released {
-                release_working_set(&state, timeline).await;
-            }
-            marks.extend(round_marks(&[], released));
+            // written: then what it wrote ends, exactly as a live round's would.
+            marks.extend(end_written_promises(&state, timeline, &results).await);
             let text = format_tool_responses(&results);
             if text.is_blank() {
                 tracing::warn!(
@@ -4206,13 +4208,6 @@ fn run_inference_stream(
                 };
                 repeat_guard::closing_answer(&mut this_turn, open);
             }
-            // A real user turn starts a new task, so the reads the last one
-            // was promised go back into provenance and the seeds re-resolve.
-            // A resumed turn enters at 1 and is never taken for one.
-            if iteration == 0 && state.working_set.is_some() {
-                release_working_set(&state, timeline).await;
-                marks.push(RELEASE_TAG.to_string());
-            }
             // A tool round's user message is the previous turn's results;
             // it projects without the worked demonstration, which there
             // becomes the question the model answers (`tool_round_selection`).
@@ -4237,7 +4232,12 @@ fn run_inference_stream(
                 },
                 selection: round_selection,
                 triggers: turn_triggers(&state, think_mode),
-                tags: std::mem::take(&mut marks),
+                // The promises the last decode found ended come first: they
+                // ended before this round's reads were served.
+                tags: std::mem::take(&mut cs.promise_marks)
+                    .into_iter()
+                    .chain(std::mem::take(&mut marks))
+                    .collect(),
                 ..Default::default()
             };
             // What this turn may retrieve from the branch layers: the units its
@@ -4681,6 +4681,24 @@ fn run_inference_stream(
                 turn_events.push(out.clone());
                 let _ = tx.send(Ok(StreamItem::Projection(out))).await;
             }
+            // A served read's lock stands while the reply that promised it is
+            // read: once this decode's projection left that reply out, the
+            // promise is no longer in view and its lock ends — marked on the
+            // next turn the conversation submits.
+            if let (Some(config), Some(selected), Some(current)) = (
+                state.working_set.as_ref(),
+                selected_turns.as_deref(),
+                resp.seal.as_ref().and_then(|s| s.turn_index),
+            ) {
+                let engine = state.engine.lock().unwrap();
+                let gone = promises::departed(&engine, timeline, selected, current);
+                cs.promise_marks.extend(promises::release(
+                    &engine,
+                    timeline,
+                    &gone,
+                    config.released_momentum(),
+                ));
+            }
 
             // Persist this turn's events to the substrate redo log so the
             // timeline survives a browser reload AND a daemon restart. Keyed to
@@ -4854,14 +4872,10 @@ fn run_inference_stream(
                     crate::ingest_worker::request(wake);
                 }
             }
-            // A round that changed code releases the working set's locks, after
-            // the reads it served before its first write — so the results
-            // turn's marks read in the order the round ran.
-            let released = round_releases(&state, &results);
-            if released {
-                release_working_set(&state, timeline).await;
-            }
-            marks.extend(round_marks(&served, released));
+            // The reads the round served, then what its writes ended — so the
+            // results turn's marks read in the order the round ran.
+            marks.extend(round_marks(&served));
+            marks.extend(end_written_promises(&state, timeline, &results).await);
             if repeat_guard.screen(&mut results) == Verdict::Close {
                 tracing::warn!(
                     conv_id = %conv_id,
@@ -4946,13 +4960,42 @@ fn run_inference_stream(
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-/// Whether a dispatched round made a call that releases the working set's
-/// locks — anything that may change what a later read returns.
-fn round_releases(state: &InferenceState, results: &[ToolResult]) -> bool {
-    state
-        .working_set
-        .as_ref()
-        .is_some_and(|config| results.iter().any(|r| releases(config, &r.call.name)))
+/// End the working-set promises a dispatched round's writes broke, and return
+/// the marks that record it: the lock on each file a write named, or every
+/// lock after a call whose effects cannot be named (`working_set::promises`).
+async fn end_written_promises(
+    state: &Arc<InferenceState>,
+    timeline: TimelineId,
+    results: &[ToolResult],
+) -> Vec<String> {
+    let Some(config) = state.working_set.clone() else {
+        return Vec::new();
+    };
+    match promises::round_release(&config, results, &state.workspace) {
+        Release::Nothing => Vec::new(),
+        Release::All => {
+            release_working_set(state, timeline).await;
+            vec![RELEASE_TAG.to_string()]
+        }
+        Release::Files(files) => {
+            // On the blocking pool, as every release is: the engine lock can be
+            // held by a wave.
+            let state = Arc::clone(state);
+            tokio::task::spawn_blocking(move || {
+                let engine = state.engine.lock().unwrap();
+                let held = promises::holding(&engine, timeline, &files);
+                promises::release(&engine, timeline, &held, config.released_momentum())
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    timeline = timeline.raw(),
+                    "ending the written files' locks panicked: {e}"
+                );
+                Vec::new()
+            })
+        }
+    }
 }
 
 /// The journal `timeline`'s metadata records, if it records one.

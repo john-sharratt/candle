@@ -3606,6 +3606,19 @@ impl Substrate {
         }
     }
 
+    /// Release `read`'s lock alone in `target`'s working set
+    /// ([`WorkingSet::release_one`]). Returns whether it was locked.
+    pub fn working_set_release_one(
+        &mut self,
+        target: TimelineId,
+        read: TimelineId,
+        released: f32,
+    ) -> bool {
+        self.working_sets
+            .get_mut(&target)
+            .is_some_and(|ws| ws.release_one(read, released))
+    }
+
     /// Fold one reprojection's per-file fresh scores into `target`'s working
     /// set ([`WorkingSet::observe`]).
     pub fn working_set_observe(

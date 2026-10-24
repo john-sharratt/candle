@@ -355,8 +355,8 @@ system_prompt:
         work, and reason with what is here first. Items stay while you use them and fade
         when you stop. Before relying on an item, check its anchor is present; if it is
         not, or you are unsure, call the tool that would fetch it. A tool may answer
-        in_context with the anchor to look for: the content is already here and will stay
-        for this task.
+        in_context with the anchor to look for: the content is already here, and stays for
+        as long as that answer is in this conversation.
 
     # Two grounding variants under the same `tools` collection gate — exactly
     # one emits per projection: the tool-aware remedy when tools are configured,

@@ -262,6 +262,24 @@ impl WorkingSet {
         self.insert_at = self.members.len();
     }
 
+    /// One lock becomes provenance where it stands, at `released` momentum (or
+    /// what it already had, if that is higher) — the promise behind it has
+    /// ended: the reply that made it has left the dialogue's projection, or the
+    /// file it holds was changed. Every other lock stands, and nothing moves.
+    /// Returns whether `timeline` was locked.
+    pub fn release_one(&mut self, timeline: TimelineId, released: f32) -> bool {
+        let Some(at) = self
+            .position(timeline)
+            .filter(|&at| self.members[at].locked)
+        else {
+            return false;
+        };
+        self.members[at].locked = false;
+        let entry = self.momentum.entry(timeline).or_insert(0.0);
+        *entry = entry.max(released);
+        true
+    }
+
     /// Fold one reprojection in.
     ///
     /// 1. Momentum: `m ← (1 − β)·m + fresh` for every conversation that is not
@@ -533,6 +551,25 @@ mod tests {
         assert_eq!(ws.insertion_point(), 3);
         ws.lock(tl(4), cand(4), limits(1_000)).unwrap();
         assert_eq!(order(&ws), vec![1, 3, 2, 4]);
+    }
+
+    /// **One lock released ends only its own promise**: it becomes provenance
+    /// in place, at the released momentum, every other lock stands, and the
+    /// insertion point does not move. Releasing what is not locked does nothing.
+    #[test]
+    fn releasing_one_lock_leaves_the_others_standing_and_nothing_moving() {
+        let mut ws = WorkingSet::default();
+        observe(&mut ws, &[(1, 900.0)], 1_000);
+        ws.lock(tl(2), cand(2), limits(1_000)).unwrap();
+        ws.lock(tl(3), cand(3), limits(1_000)).unwrap();
+        let point = ws.insertion_point();
+        assert!(ws.release_one(tl(2), 5_000.0));
+        assert_eq!(order(&ws), vec![1, 3, 2]);
+        assert_eq!(ws.pinned(), vec![tl(3)]);
+        assert_eq!(ws.momentum_of(tl(2)), Some(5_000.0));
+        assert_eq!(ws.insertion_point(), point);
+        assert!(!ws.release_one(tl(2), 5_000.0), "already released");
+        assert!(!ws.release_one(tl(1), 5_000.0), "provenance is no lock");
     }
 
     /// **A lock dislodges the weakest provenance**, and the gap closes.

@@ -103,6 +103,17 @@ pub fn file_key(path: &str, blob: &Oid) -> String {
     format!("v{KEY_VERSION}:{path}@{blob}")
 }
 
+/// The workspace-relative path a [`file_key`] names — `candle/zend/src/main.rs`
+/// out of `v2:candle/zend/src/main.rs@3f73f872…`. `None` for a key that is not a
+/// file's.
+pub fn file_key_path(key: &str) -> Option<&str> {
+    let rest = match key.strip_prefix('v').and_then(|r| r.split_once(':')) {
+        Some((n, rest)) if n.parse::<u32>().is_ok() => rest,
+        _ => key,
+    };
+    rest.rsplit_once('@').map(|(path, _)| path)
+}
+
 /// What a folder's listing turn shows: how many entries the folder holds,
 /// and the entries on the listing's first page, workspace-relative, a folder
 /// ending in `/`.
@@ -175,6 +186,20 @@ mod tests {
             file_key("candle/zend/src/main.rs", &oid(A)),
             "v2:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
+    }
+
+    /// A file key's path reads back out of it, whatever version wrote it; a
+    /// folder's digest key names no path.
+    #[test]
+    fn a_file_keys_path_reads_back_out_of_it() {
+        let key = file_key("candle/docs/unbounded_agents.md", &oid(A));
+        assert_eq!(file_key_path(&key), Some("candle/docs/unbounded_agents.md"));
+        assert_eq!(
+            file_key_path("candle/a@b@c"),
+            Some("candle/a@b"),
+            "an unversioned key"
+        );
+        assert_eq!(file_key_path("v2:0123abcd"), None);
     }
 
     /// The exact digests — computed independently of this code over the

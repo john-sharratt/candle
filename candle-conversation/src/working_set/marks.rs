@@ -3,10 +3,12 @@
 //!
 //! The turn that carries a tool round's results is tagged with what the round
 //! did to the working set, in the order it happened: one [`lock_tag`] per call
-//! the fast path served, and [`RELEASE_TAG`] where the locks were released. A
-//! real user turn carries [`RELEASE_TAG`] too. The history is then the record
-//! of every promise made to the model, and a restart rebuilds the locks from it
-//! instead of re-deciding them.
+//! the fast path served, one [`release_one_tag`] per lock whose promise ended
+//! — its reply left the dialogue's projection, or the file it holds was
+//! written — and [`RELEASE_TAG`] where every lock was released, after a call
+//! whose effects are unknown. The history is then the record of every promise
+//! made to the model, and a restart rebuilds the locks from it instead of
+//! re-deciding them.
 //!
 //! **The marks are not gather scope.** A turn's tags also say which tag-scoped
 //! gallery it belongs to, and "no tags" is what makes a turn ordinary dialogue.
@@ -21,12 +23,21 @@ const MARK_PREFIX: &str = "working_set:";
 /// The prefix of a lock mark; the conversation's raw timeline id follows.
 const LOCK_PREFIX: &str = "working_set:lock:";
 
-/// The mark for "the locks were released here".
+/// The mark for "every lock was released here".
 pub const RELEASE_TAG: &str = "working_set:release";
+
+/// The prefix of a one-lock release mark; the conversation's raw timeline id
+/// follows.
+const RELEASE_ONE_PREFIX: &str = "working_set:release:";
 
 /// The mark for a call served by pinning `timeline`.
 pub fn lock_tag(timeline: TimelineId) -> String {
     format!("{LOCK_PREFIX}{}", timeline.raw())
+}
+
+/// The mark for "the lock on `timeline` alone was released here".
+pub fn release_one_tag(timeline: TimelineId) -> String {
+    format!("{RELEASE_ONE_PREFIX}{}", timeline.raw())
 }
 
 /// Whether `tag` is a working-set mark rather than a gather scope.
@@ -50,6 +61,7 @@ pub fn is_dialogue(tags: &[String]) -> bool {
 pub enum Mark {
     Lock(TimelineId),
     Release,
+    ReleaseOne(TimelineId),
 }
 
 /// The mark `tag` is, if it is one this build understands.
@@ -57,24 +69,40 @@ pub fn parse(tag: &str) -> Option<Mark> {
     if tag == RELEASE_TAG {
         return Some(Mark::Release);
     }
+    if let Some(raw) = tag.strip_prefix(RELEASE_ONE_PREFIX) {
+        return TimelineId::from_raw(raw.parse().ok()?).map(Mark::ReleaseOne);
+    }
     let raw = tag.strip_prefix(LOCK_PREFIX)?.parse().ok()?;
     TimelineId::from_raw(raw).map(Mark::Lock)
 }
 
 /// The locks standing at the end of a conversation whose turns carry `turns`
-/// (oldest first, each its tag list): the lock marks after the last release,
-/// in order, each conversation once.
+/// (oldest first, each its tag list): the lock marks not released since, in
+/// the order first served, each conversation once.
 pub fn standing_locks<'a>(turns: impl IntoIterator<Item = &'a [String]>) -> Vec<TimelineId> {
-    let mut locks: Vec<TimelineId> = Vec::new();
-    for tags in turns {
+    promised_locks(turns.into_iter().enumerate())
+        .into_iter()
+        .map(|(tl, _)| tl)
+        .collect()
+}
+
+/// [`standing_locks`], each with the turn that carries its promise: the
+/// latest turn whose marks lock it, as `turns` names it (oldest first, each
+/// its key and tag list). A lock served again later is promised by the later
+/// reply — the earlier one may leave the projection while it still stands.
+pub fn promised_locks<'a, K: Copy>(
+    turns: impl IntoIterator<Item = (K, &'a [String])>,
+) -> Vec<(TimelineId, K)> {
+    let mut locks: Vec<(TimelineId, K)> = Vec::new();
+    for (turn, tags) in turns {
         for mark in tags.iter().filter_map(|t| parse(t)) {
             match mark {
                 Mark::Release => locks.clear(),
-                Mark::Lock(tl) => {
-                    if !locks.contains(&tl) {
-                        locks.push(tl);
-                    }
-                }
+                Mark::ReleaseOne(tl) => locks.retain(|(held, _)| *held != tl),
+                Mark::Lock(tl) => match locks.iter_mut().find(|(held, _)| *held == tl) {
+                    Some(held) => held.1 = turn,
+                    None => locks.push((tl, turn)),
+                },
             }
         }
     }
@@ -132,6 +160,39 @@ mod tests {
         ];
         let locks = standing_locks(turns.iter().map(|t| t.as_slice()));
         assert_eq!(locks, vec![tl(2), tl(3), tl(4)]);
+    }
+
+    /// A one-lock release ends only that lock; the others stand, and a lock
+    /// served again after its release stands again.
+    #[test]
+    fn a_one_lock_release_ends_only_its_own_lock() {
+        assert_eq!(release_one_tag(tl(7)), "working_set:release:7");
+        assert_eq!(
+            parse("working_set:release:7"),
+            Some(Mark::ReleaseOne(tl(7)))
+        );
+        let turns = [
+            tags(&["working_set:lock:1", "working_set:lock:2"]),
+            tags(&["working_set:release:1"]),
+            tags(&["working_set:lock:3"]),
+            tags(&["working_set:release:3", "working_set:lock:3"]),
+        ];
+        let locks = standing_locks(turns.iter().map(|t| t.as_slice()));
+        assert_eq!(locks, vec![tl(2), tl(3)]);
+    }
+
+    /// Each standing lock comes with the turn whose reply promised it, the
+    /// latest when it was served more than once.
+    #[test]
+    fn each_lock_is_promised_by_the_latest_turn_that_served_it() {
+        let turns = [
+            (10u32, tags(&["working_set:lock:1"])),
+            (11, tags(&["working_set:lock:2"])),
+            (12, tags(&[])),
+            (13, tags(&["working_set:lock:1"])),
+        ];
+        let promised = promised_locks(turns.iter().map(|(i, t)| (*i, t.as_slice())));
+        assert_eq!(promised, vec![(tl(1), 13), (tl(2), 11)]);
     }
 
     /// Reads served before a round's first write precede its release in the

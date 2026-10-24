@@ -1250,6 +1250,19 @@ impl ConversationEngine {
             .working_set_release(target, released);
     }
 
+    /// Release `read`'s lock alone in `target`'s working set at `released`
+    /// momentum — its promise has ended. Returns whether it was locked.
+    pub fn working_set_release_one(
+        &self,
+        target: TimelineId,
+        read: TimelineId,
+        released: f32,
+    ) -> bool {
+        self.conversation
+            .write()
+            .working_set_release_one(target, read, released)
+    }
+
     /// A copy of `target`'s working set, when it has one.
     pub fn working_set(&self, target: TimelineId) -> Option<WorkingSet> {
         self.conversation.read().working_set(target).cloned()
@@ -1264,12 +1277,21 @@ impl ConversationEngine {
     /// Every turn's tags on `timeline`, oldest first — the record the working
     /// set's locks are rebuilt from.
     pub fn turn_tag_lists(&self, timeline: TimelineId) -> Vec<Vec<String>> {
+        self.indexed_turn_tags(timeline)
+            .into_iter()
+            .map(|(_, tags)| tags)
+            .collect()
+    }
+
+    /// Every turn's index and tags on `timeline`, oldest first — what says
+    /// which turn carries each working-set lock.
+    pub fn indexed_turn_tags(&self, timeline: TimelineId) -> Vec<(TurnIndex, Vec<String>)> {
         let view = self.conversation.read();
         let mut indices: Vec<_> = view.turn_indices(timeline).collect();
         indices.sort_by_key(|i| i.0);
         indices
             .into_iter()
-            .map(|idx| view.turn_tags(timeline, idx))
+            .map(|idx| (idx, view.turn_tags(timeline, idx)))
             .collect()
     }
 

@@ -1,16 +1,18 @@
 //! The dialogue's working set, as the daemon drives it
-//! (`docs/zend_working_set.md`): which calls release it, what it is seeded
-//! with, and how its locks come back after a restart.
+//! (`docs/zend_working_set.md`): which calls release it, how long a served
+//! read's lock stands ([`promises`]), what it is seeded with, and how its locks
+//! come back after a restart.
 //!
 //! The state and the projection rule live in `candle_conversation`; this is
 //! the part that knows about tools, repositories and turns.
 
+pub mod promises;
 pub mod restore;
 pub mod seeds;
 
 use anyhow::bail;
 use candle_conversation::projection::{LayerId, Schema, TimelineId};
-use candle_conversation::working_set::marks::{lock_tag, RELEASE_TAG};
+use candle_conversation::working_set::marks::lock_tag;
 use candle_conversation::working_set::WorkingSetConfig;
 use zend_tools::registry;
 
@@ -44,17 +46,13 @@ pub fn dialogue_config(
     Ok(Some(config))
 }
 
-/// The marks the turn carrying a round's results gets: one lock per call the
-/// working set served, in the order served, then the release when the round
-/// made a `release_on` call. Served calls always precede the round's first
-/// write, so replaying the marks releases them too — exactly as the live round
-/// did.
-pub fn round_marks(served: &[TimelineId], released: bool) -> Vec<String> {
-    let mut marks: Vec<String> = served.iter().map(|&tl| lock_tag(tl)).collect();
-    if released {
-        marks.push(RELEASE_TAG.to_string());
-    }
-    marks
+/// The lock marks the turn carrying a round's results gets: one per call the
+/// working set served, in the order served. What the round's writes ended
+/// follows them ([`promises::Release`]): served calls always precede the
+/// round's first write, so replaying the marks ends them too — exactly as the
+/// live round did.
+pub fn round_marks(served: &[TimelineId]) -> Vec<String> {
+    served.iter().map(|&tl| lock_tag(tl)).collect()
 }
 
 /// Whether a call to `tool` — under any name the registry answers to —
@@ -91,24 +89,19 @@ mod tests {
         }
     }
 
-    /// The results turn carries a lock per served call, in order, then the
-    /// release when the round wrote; a round that did neither carries nothing.
+    /// The results turn carries a lock per served call, in order; a round that
+    /// served nothing carries none.
     #[test]
-    fn a_rounds_marks_are_its_locks_then_its_release() {
+    fn a_rounds_marks_are_its_locks_in_order() {
         let tl = |raw: u64| TimelineId::from_raw(raw).unwrap();
         assert_eq!(
-            round_marks(&[tl(7), tl(3)], true),
+            round_marks(&[tl(7), tl(3)]),
             vec![
                 "working_set:lock:7".to_string(),
                 "working_set:lock:3".to_string(),
-                "working_set:release".to_string(),
             ]
         );
-        assert_eq!(
-            round_marks(&[tl(7)], false),
-            vec!["working_set:lock:7".to_string()]
-        );
-        assert!(round_marks(&[], false).is_empty());
+        assert!(round_marks(&[]).is_empty());
     }
 
     /// A write releases under its own name and under any alias; a read never.

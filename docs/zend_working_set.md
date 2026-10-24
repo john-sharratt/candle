@@ -14,11 +14,11 @@ moves between tiers without changing shape or place.
 
 1. **Locks** — files the model asked for with `file_read` that the corpus
    already holds whole. The call is answered `in_context` and the content is
-   pinned for the rest of the task. A `file_list` is never served: it runs and
-   its listing is prefilled (§4.5).
+   pinned for as long as that reply is in the dialogue's projection (§4.6). A
+   `file_list` is never served: it runs and its listing is prefilled (§4.5).
 2. **Provenance** — the files the conversation keeps attending to, by a
-   per-file momentum score. A lock released at the end of a task becomes
-   provenance where it stands.
+   per-file momentum score. A released lock becomes provenance where it
+   stands.
 3. **Seeds** — documents, folders and files named in `projection.yaml` that a
    conversation starts out attending to: its first provenance, at the momentum
    of one full-strength hit (1000), fading like any other file it stops
@@ -40,9 +40,11 @@ its place until it leaves, and the gap closes at once. A newcomer that needs
 room dislodges the weakest provenance — a lock always, new provenance only when
 it is clearly stronger; nothing dislodges a lock. When a lock cannot fit beside
 the locks already held, the tool call runs for real — the fast path is an
-optimisation, and running out of it costs a read, never correctness. A real
-user turn, or a round that changes code, releases the locks into provenance, so
-a continuous agentic flow keeps getting the fast path.
+optimisation, and running out of it costs a read, never correctness. A lock is
+released into provenance when the reply that promised it leaves the dialogue's
+projection, when the file it holds is written, or when a call runs whose
+effects cannot be named — never by a new user message, because the promise is
+still being read.
 
 **Ingestion is not changed.** The belief scan already scores every exchange of
 every ingested file; the working set only reads those scores.
@@ -237,7 +239,8 @@ set at setup from each `working_set` rule's `share`). Every operation:
 |---|---|
 | `lock` | A member is locked **where it stands**. A newcomer dislodges the weakest provenance (lowest momentum; on a tie the one nearest the insertion point) until it fits, then enters just before the insertion point. A lock never dislodges a lock: one that cannot fit is refused (`Refusal::Full`). |
 | `observe` | Momentum decays for everything not locked; a conversation under `min_momentum` leaves the map and, if a member, the sequence — the gap closes. An unlocked member its scope no longer offers leaves too. Then the strongest non-members try to enter at the insertion point (which moves past them), each dislodging only provenance it beats by `DISLODGE_MARGIN` (×1.5) — without the margin two files near the floor trade places every reprojection and each trade rebuilds everything to its right. |
-| `release` | Every lock becomes provenance **in place**, at momentum `max(m, 1000/β)`, and the insertion point moves to the end — the next task's members enter beside the dialogue. Nothing moves. |
+| `release` | Every lock becomes provenance **in place**, at momentum `max(m, 1000/β)`, and the insertion point moves to the end — the next members enter beside the dialogue. Nothing moves. |
+| `release_one` | One lock becomes provenance **in place**, at momentum `max(m, 1000/β)`; every other lock stands. Nothing moves. |
 | `seed` | At open, in list order: each seed gains `seed_momentum` (1000) and enters at the insertion point while the budget has room — seeds dislodge nothing. One that misses for room stays a candidate. |
 | `restore_lock` | A lock the history records, put back before the insertion point whatever it costs (§4.8). |
 | `remove` | A tombstoned conversation leaves; the gap closes. |
@@ -371,25 +374,48 @@ card it runs on (§5).
 
 ### 4.6 Release
 
-A lock is released by:
+**A lock lives as long as the reply that promised it.** The served reply is a
+turn of the dialogue, and the model reads it on every decode that turn is
+projected; a real read's text lives exactly as long. So a lock is released
+(`zend::working_set::promises`) by:
 
-- **a real user turn** — `iteration == 0` in `run_inference_stream`, before the
-  scope is applied and the turn submitted (`session.rs:~3472`). A resumed turn
-  starts its loop at 1 (`session.rs:3388`), so it is never mistaken for one;
-- **a dispatched round containing a `release_on` call** — checked on the round's
-  results, beside the existing branch-move scan (`session.rs:3967`), **and** on
-  the resumed-round dispatch (`session.rs:3333-3389`, `Dispatch::Resumed`),
-  which runs a round interrupted by a restart without passing the screen.
+- **its reply leaving the dialogue's projection** — after each decode's
+  projection, every standing lock whose promising turn precedes the turn being
+  answered and is not among the turns selected is released alone
+  (`promises::departed`, `release_one`). The model no longer reads the promise,
+  so ending it breaks nothing;
+- **a write naming the file it holds** — `write`, `file_edit` or
+  `file_delete`, whose call carries its path, release the locks whose
+  conversation read that path (`promises::round_release` →
+  `Release::Files`, `promises::holding`). The model's own write is in its
+  history beside the reply;
+- **a `release_on` call whose effects cannot be named** — a command, a git
+  write, a code run, or a write whose path cannot be read off its call — which
+  may have changed any file: every lock goes (`Release::All`, `release`).
 
-Release turns every lock into provenance **where it stands** and gives it
-momentum `1000/β` — the settled level of a file hit at full strength every
-reprojection — so a file the model keeps working in stays, and one read once
-decays out over the following reprojections. The insertion point moves to the
-end, so the next task's members enter beside the dialogue and nothing already
-in the set moves. Seeds are not touched: re-seeding at every release — and a real
-user turn is one — would lift them back to 1000 each turn and they would never
-fade. A seed the conversation has edited or moved off leaves the way any stale
-provenance does: the retrieval scope stops offering its old conversation.
+Both write checks run on the round's results, beside the branch-move scan,
+**and** on the resumed-round dispatch (`Dispatch::Resumed`), which runs a round
+interrupted by a restart without passing the screen.
+
+**A new user message releases nothing.** It once released every lock, on the
+reasoning that a new message starts a new task. It does not end the old
+replies: measured 2026-10-24 (conversation `6e8ad6ea`), the model was served a
+paper, critiqued it from the pinned content, and was asked about the critique on
+a later message. The lock had been released at that message, the paper faded out
+over the next reprojections, and the `in_context` reply stayed in view — so the
+model found its own quotations of a paper it could no longer see, called its
+earlier critique fabricated and refused to use the file. Its own `file_read`
+then answered `in_context` again, with nothing behind it.
+
+A released lock becomes provenance **where it stands** at momentum `1000/β` —
+the settled level of a file hit at full strength every reprojection — so a file
+the model keeps working in stays, and one read once decays out over the
+following reprojections. A full release also moves the insertion point to the
+end, so the next members enter beside the dialogue and nothing already in the
+set moves. Seeds are not touched: re-seeding at every release would lift them
+back to 1000 and they would never fade. A seed the conversation has edited or
+moved off leaves the way any stale provenance does: the retrieval scope stops
+offering its old conversation.
 
 **The reply is a status and an anchor; the rule lives in the system prompt.**
 A served call answers
@@ -405,7 +431,8 @@ the rule by the same token rather than restating it. The rule is general: placed
 content begins with an anchor naming it; reason with what is here first; items
 stay while used and fade after; before relying on one, check its anchor is
 present, and if it is not or the model is unsure, call the tool, which answers
-`in_context` when the content is already here and keeps it for the task. It
+`in_context` when the content is already here and keeps it for as long as that
+answer is in the conversation. It
 names no tool and no format, so a new kind of placed content needs no prompt
 change — the literal anchor arrives in the reply.
 
@@ -452,10 +479,18 @@ results tags that turn with what the round did, in the order it happened
 
 - `working_set:lock:<timeline>` — one per call the screen served, naming the
   exact conversation it pinned;
-- `working_set:release` — on a real user turn, and on the turn carrying the
-  results of a round that made a `release_on` call. A round's reads served
-  *before* its first write come first in the list, then the release, so
-  replaying the list in order releases them too, exactly as the live round did.
+- `working_set:release:<timeline>` — one lock ended alone: its reply left the
+  projection, or a write named its file. A departure is marked on the next turn
+  the dialogue submits (`ConvState::promise_marks`, carried until a submit
+  takes them), ahead of that turn's own marks;
+- `working_set:release` — on the turn carrying the results of a round that made
+  a `release_on` call whose effects cannot be named.
+
+A round's reads served *before* its first write come first in the list, then
+what the write ended, so replaying the list in order ends them too, exactly as
+the live round did. A promise's turn is the **latest** turn that served it: a
+file served again re-promises it, so its lock departs with the newer reply
+(`marks::promised_locks`).
 
 **The marks are not gather scope.** A turn's tags also name the tag-scoped
 galleries it belongs to, and a turn with no tags is what ordinary dialogue is:
@@ -467,8 +502,9 @@ policy declares tags, and never the target group, so no dialogue selection
 changes.
 
 **Rebuild.** Apply every mark from the dialogue's first turn forward in order:
-a lock admits its conversation with the next lock sequence, a release clears —
-so what stands is the locks after the last release (`marks::standing_locks`,
+a lock admits its conversation with the next lock sequence, a release clears,
+a release-one drops its own lock — so what stands is exactly the promises the
+model is still reading (`marks::standing_locks`,
 `zend::working_set::restore`). A timeline tombstoned since is dropped (§4.5).
 Momentum starts empty; the seeds re-enter it at the seeding momentum.
 
@@ -521,9 +557,9 @@ Budget ships at 250K (D10); the §7 measurement watches these numbers.
 
 | Piece | Where |
 |---|---|
-| `WorkingSet`: seed / lock / restore / release / observe / provenance, per-file momentum | `candle-conversation/src/working_set/state.rs` |
+| `WorkingSet`: seed / lock / restore / release / release_one / observe / provenance, per-file momentum | `candle-conversation/src/working_set/state.rs` |
 | `WorkingSetConfig` (the `working_set:` block) | `candle-conversation/src/working_set/config.rs` |
-| The marks, `is_dialogue` / `gather_tags`, `standing_locks` | `candle-conversation/src/working_set/marks.rs` |
+| The marks, `is_dialogue` / `gather_tags`, `promised_locks`, `standing_locks` | `candle-conversation/src/working_set/marks.rs` |
 | Per-dialogue sets on the substrate; `tombstone_timeline` drops from every set; eviction skips every dialogue's pins | `candle-conversation/src/substrate.rs` (`working_set_*`, `evict_hot_to_free`) |
 | `observe` after the scan | `scheduler/mod.rs` (`reproject_view_prepare`), `Conversation::observe_working_set`, `projection/working_set_observe.rs` |
 | `working_set` selection rule, `WorkingSetShare` | `projection/schema.rs`, `projection/yaml.rs` |
@@ -533,15 +569,17 @@ Budget ships at 250K (D10); the §7 measurement watches these numbers.
 | Screen: lock, first-write split, reworded reply | `zend/src/fast_path.rs` |
 | Coverage check, cached per chain | `zend/src/fast_path/coverage.rs` |
 | Registry check of `release_on`, alias-aware release, `round_marks` | `zend/src/working_set.rs` |
+| How long a promise lasts: departure from the projection, per-file write release | `zend/src/working_set/promises.rs` |
 | Seed resolution | `zend/src/working_set/seeds.rs` |
 | Locks restored from the marks | `zend/src/working_set/restore.rs` |
-| Open, release on a user turn and on `release_on` rounds (live and resumed), marks on the results turn | `zend/src/session.rs` (`run_inference_stream`, `release_working_set`) |
+| Open, departures after each projection, write release on rounds (live and resumed), marks on the next turn | `zend/src/session.rs` (`run_inference_stream`, `end_written_promises`) |
 | Layer config | `zend/src/prompts/projection.yaml` |
 
 ## 7. Tests (CPU unless marked)
 
 - `WorkingSet`: lock admits until full, then refuses without evicting; release
-  clears locks and sets momentum `1000/β`; `observe` settles a steady file at
+  clears locks and sets momentum `1000/β`; release_one ends one lock and leaves
+  the others standing and nothing moving; `observe` settles a steady file at
   `fresh/β` and decays an idle one; a file below `min_momentum` leaves the map
   and is never a candidate; ties go to the later lock; a tombstoned timeline
   leaves every tier.
@@ -559,18 +597,20 @@ Budget ships at 250K (D10); the §7 measurement watches these numbers.
 - Hot: a pinned turn with no hot K/V fails `apply_projection`; a provenance turn
   with none is dropped as today; `evict_hot_to_free` never frees a residence
   pinned by another dialogue's working set.
-- Release: user turn releases, a tool-response continuation does not, a
-  resumed turn does not, a `release_on` round does (live and resumed); the
-  seeds are left to fade.
-- The served reply carries no `error`/`detail` and scopes its promise to the
-  current task (exact string).
+- Release: a promise stands while its reply is in view and departs when the
+  projection leaves it out; the turn being answered is never departed; a write
+  naming a file ends only that file's lock, a command ends them all, a read
+  ends none; the seeds are left to fade.
+- The served reply carries no `error`/`detail` (exact string).
+- A file key's path reads back out of it (`file_key_path`).
 - Config: an unknown `release_on` name fails the load.
 - Marks: a round with served calls marks its results turn with a lock per
-  served call in order; a user turn and a `release_on` round's results turn
-  carry the release; reads served before a round's first write precede its
-  release; a dialogue turn carrying only marks is still dialogue.
-- Rebuild: locks come back from the marks after the last release, and none from
-  before it; a served lock is restored even when a fresh screen would now refuse
+  served call in order; a `release_on` round's results turn carries the
+  release; reads served before a round's first write precede its release; a
+  dialogue turn carrying only marks is still dialogue.
+- Rebuild: locks come back from the marks after the last release, less every
+  release-one since; none from before it; a re-served file's promise sits on
+  its latest serving turn; a served lock is restored even when a fresh screen would now refuse
   it; a tombstoned timeline is dropped; lock order matches mark order.
 - The tags change no dialogue selection (a projection with and without them is
   identical).
@@ -586,7 +626,7 @@ Budget ships at 250K (D10); the §7 measurement watches these numbers.
 | D1 | Past the 262K trained length | Progressive YaRN ×2 reaches 524,288; the schema floors every sequence at ×2 (`rope: min_yarn_factor: 2`). |
 | D2 | What release does to locks | Demote to provenance with momentum `1000/β` (the settled level of a full-strength hit). |
 | D3 | Tie-break | Most recently locked wins. |
-| D4 | Which calls release | File writes, git writes, `run_command`, `code_run`, `code_session_exec` — registry-checked names. |
+| D4 | Which calls release | File writes (the written file's lock alone), git writes, `run_command`, `code_run`, `code_session_exec` (every lock) — registry-checked names. Plus the promising reply leaving the projection; never a user message. |
 | D5 | Where the working set sits | Its own layers' groups, which already emit ahead of the dialogue. |
 | D6 | Tool rounds | `in_tool_rounds: true`; ingestion unchanged. |
 | D7 | Provenance unit | Whole files and folders. |
@@ -594,9 +634,9 @@ Budget ships at 250K (D10); the §7 measurement watches these numbers.
 | D9 | Fade rate | Per-file momentum at β 0.2, leaking by its own value. |
 | D10 | Default budget | 250K — with the 116K window, ~158K clear of the ×2 ceiling before YaRN climbs to ×4; measured alongside. |
 | D11 | Momentum store | In `WorkingSet`, not the belief carry; in-memory. |
-| D12 | Restart | Served calls are marked on their turn (`working_set:lock:<tl>`, `working_set:release`) through the existing persisted turn tags, which every gather-scope reader ignores; locks rebuild from the marks since the last release. Momentum rebuilds from the scan. |
+| D12 | Restart | Served calls are marked on their turn (`working_set:lock:<tl>`, `working_set:release:<tl>`, `working_set:release`) through the existing persisted turn tags, which every gather-scope reader ignores; locks rebuild from the marks. Momentum rebuilds from the scan. |
 | D13 | Folder vs file budget | `folder_tokens` slice for `repo_map`, the rest for `code_reading`. |
-| D14 | A released file decaying out under an `in_context` reply | The system prompt's `in_context` rule says placed content fades when unused and to check its anchor before relying on it; a re-read re-locks it cheaply. |
+| D14 | A released file decaying out under an `in_context` reply | Cannot happen for a reply in view: the lock lasts as long as the reply is projected (§4.6). Only a write or an unnameable call ends one early, and the model's own call sits beside the reply; the system prompt's rule still says to check the anchor before relying on placed content. |
 | D15 | "Complete read" without touching ingestion | Derived from the chain's own `file_read` pages and responses, cached per timeline. |
 | D16 | A pinned file that cannot be made hot | An error, never a silent drop; eviction protects every dialogue's pins. |
 | D17 | Provenance floor | `min_momentum: 100`, the noise floor `code_reading` already gates at. |
@@ -606,8 +646,8 @@ Budget ships at 250K (D10); the §7 measurement watches these numbers.
 - **No persistence of momentum.** It is a ranking, and rebuilds from the scan
   within a few reprojections.
 - **No cross-group ranking.** Two budgets instead of a common score scale.
-- **No rewriting of old replies.** A released file's `in_context` stays as it
-  was sealed; the system prompt's rule (D14) carries the scope instead.
+- **No rewriting of old replies.** An `in_context` stays as it was sealed; its
+  lock lasts as long as it is read instead (D14).
 
 ## 10. Build order
 

@@ -44,7 +44,7 @@ use zend_vfs::{Oid, RepoFiles, Workspace};
 use crate::branch_ingest::keys::{file_key, CONTENT_KEY, LINES_KEY};
 use crate::code_read::chain_finished;
 use crate::tool_round::Step;
-use crate::tools::ToolResult;
+use crate::tools::{ToolCall, ToolResult};
 use crate::working_set::releases;
 use coverage::Coverage;
 
@@ -116,24 +116,14 @@ pub fn normalise(path: &str, repo_dir: &Path) -> String {
         .to_string()
 }
 
-/// The `repo` and `path` arguments of a `file_read` call, when it has both.
-fn read_target(step: &Step) -> Option<(&str, &str)> {
-    match step {
-        Step::Run(call) if call.name == FILE_READ => Some((
-            call.arguments.get("repo")?.as_str()?,
-            call.arguments.get("path")?.as_str()?,
-        )),
-        _ => None,
-    }
-}
-
-/// The workspace-relative path `code_reading` keys a `file_read`'s file
-/// under — the repository, then the normalised path inside it — with the
-/// repository and inner path beside it. `None` for a repository the workspace
-/// does not list: the call then runs for real and the tool refuses it, rather
-/// than this reading whatever an unchecked name joins to.
-fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, String)> {
-    let (repo, path) = read_target(step)?;
+/// The workspace-relative path a call's `repo` and `path` arguments name — the
+/// repository, then the normalised path inside it — with the repository and
+/// inner path beside it. `None` for a call without both, or for a repository
+/// the workspace does not list: a read then runs for real and the tool refuses
+/// it, rather than this reading whatever an unchecked name joins to.
+fn file_target(call: &ToolCall, workspace: &Workspace) -> Option<(String, String, String)> {
+    let repo = call.arguments.get("repo")?.as_str()?;
+    let path = call.arguments.get("path")?.as_str()?;
     // A repository read from the substrate has no folder: an absolute path
     // into it names where it would sit under the workspace.
     let dir = match workspace.repo(repo)?.folder() {
@@ -142,6 +132,22 @@ fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, Strin
     };
     let rel = normalise(path, &dir);
     Some((format!("{repo}/{rel}"), repo.to_string(), rel))
+}
+
+/// The workspace-relative path `call` names (`candle/README.md`), keyed the way
+/// `code_reading` keys the file it read — what a write is matched against the
+/// locks with.
+pub fn call_file_key(call: &ToolCall, workspace: &Workspace) -> Option<String> {
+    file_target(call, workspace).map(|(key, _, _)| key)
+}
+
+/// The workspace-relative path `code_reading` keys a `file_read`'s file under,
+/// with the repository and inner path beside it.
+fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, String)> {
+    match step {
+        Step::Run(call) if call.name == FILE_READ => file_target(call, workspace),
+        _ => None,
+    }
 }
 
 /// The finished, complete `code_reading` conversation that read `rel` in
@@ -404,7 +410,7 @@ mod tests {
     }
 
     fn call(name: &str, args: serde_json::Value) -> Step {
-        Step::Run(crate::tools::ToolCall {
+        Step::Run(ToolCall {
             name: name.to_string(),
             arguments: args,
         })
@@ -462,26 +468,34 @@ mod tests {
             FILE_READ,
             json!({"repo": "candle", "path": "zend/src/main.rs"}),
         );
-        assert_eq!(read_target(&step), Some(("candle", "zend/src/main.rs")));
+        assert_eq!(
+            read_key(&step, &workspace()).map(|(key, _, _)| key),
+            Some("candle/zend/src/main.rs".to_string())
+        );
     }
 
     /// Only `file_read` is content-addressed. Another tool naming a `path` —
-    /// `write`, say — must never be served from an earlier read of that file.
+    /// `write`, say — must never be served from an earlier read of that file;
+    /// its path is still read off it, for the lock it ends.
     #[test]
     fn another_tool_with_a_path_is_not_a_candidate() {
-        let step = call(
-            "write",
-            json!({"repo": "candle", "path": "zend/src/main.rs"}),
+        let write = ToolCall {
+            name: "write".to_string(),
+            arguments: json!({"repo": "candle", "path": "./zend/src/main.rs"}),
+        };
+        assert_eq!(read_key(&Step::Run(write.clone()), &workspace()), None);
+        assert_eq!(
+            call_file_key(&write, &workspace()),
+            Some("candle/zend/src/main.rs".to_string())
         );
-        assert_eq!(read_target(&step), None);
     }
 
     #[test]
     fn a_file_read_without_a_path_or_repo_is_not_a_candidate() {
         let step = call(FILE_READ, json!({"start": 1, "end": 200}));
-        assert_eq!(read_target(&step), None);
+        assert_eq!(read_key(&step, &workspace()), None);
         let step = call(FILE_READ, json!({"path": "zend/src/main.rs"}));
-        assert_eq!(read_target(&step), None);
+        assert_eq!(read_key(&step, &workspace()), None);
     }
 
     /// **A file is keyed as the conversation's store holds it, and never once
@@ -557,12 +571,12 @@ mod tests {
     #[test]
     fn an_already_answered_step_is_not_a_candidate() {
         let step = Step::Served(ToolResult {
-            call: crate::tools::ToolCall {
+            call: ToolCall {
                 name: FILE_READ.to_string(),
                 arguments: json!({"repo": "candle", "path": "a.rs"}),
             },
             response: json!({}),
         });
-        assert_eq!(read_target(&step), None);
+        assert_eq!(read_key(&step, &workspace()), None);
     }
 }
