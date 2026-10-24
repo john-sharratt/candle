@@ -10,7 +10,7 @@ use super::*;
 use crate::close::{Close, CloseCode};
 use crate::frame::{BuildId, Frame, Hello, Open, Receipt};
 use crate::pipe::memory::{pair, End, MemoryRx, MemoryTx};
-use crate::pipe::Message;
+use crate::pipe::{Heard, Message, PipeRx};
 
 fn sessions(cap: usize) -> (Session, Session) {
     let (g, m) = pair(cap);
@@ -203,6 +203,53 @@ async fn an_idle_session_stays_alive_on_its_pings() {
     assert!(member.ended.try_recv().is_err());
     let out = gateway.handle.open("").unwrap();
     assert_eq!(accept(&mut member).await.id(), out.id());
+}
+
+/// A transport that reports its reads: a message still arriving stamps it.
+struct Trickle {
+    inner: MemoryRx,
+    heard: Heard,
+}
+
+impl PipeRx for Trickle {
+    async fn recv(&mut self) -> Option<Message> {
+        self.inner.recv().await
+    }
+
+    fn heard(&self) -> Option<tokio::time::Instant> {
+        self.heard.at()
+    }
+}
+
+/// **A peer still sending a message is alive.** A mebibyte fragment over a
+/// link of a few kilobytes a second takes minutes to arrive whole; a session
+/// that counted only whole messages closed such a socket as dead every 45 s,
+/// and the catch-up it carried started over on each redial and never finished.
+/// Bytes arriving keep it; 45 s of none still ends it.
+#[tokio::test(start_paused = true)]
+async fn a_peer_still_sending_a_message_is_alive_until_its_bytes_stop() {
+    let (
+        ours,
+        End {
+            tx: _peer_tx,
+            rx: _peer_rx,
+        },
+    ) = pair(1 << 20);
+    let heard = Heard::new();
+    let rx = Trickle {
+        inner: ours.rx,
+        heard: heard.clone(),
+    };
+    let mut s = start(Role::Member, ours.tx, rx);
+    // Bytes every 10 s for 150 s, and no whole message.
+    for _ in 0..15 {
+        heard.stamp();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    assert!(s.ended.try_recv().is_err(), "alive while its bytes arrive");
+    let last = tokio::time::Instant::now() - Duration::from_secs(10);
+    assert_eq!(s.ended.await.unwrap(), Ended::Dead);
+    assert_eq!(tokio::time::Instant::now() - last, DEAD_AFTER);
 }
 
 /// A peer that sends nothing for 45 s is dead: the session closes 1001.

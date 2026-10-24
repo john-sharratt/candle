@@ -9,13 +9,17 @@
 //! member's dialled socket.
 
 pub mod drain;
+pub mod heard;
 pub mod memory;
 pub mod socket;
 pub mod tungstenite;
 
 use std::future::Future;
 
+use tokio::time::Instant;
+
 pub use drain::Drain;
+pub use heard::Heard;
 
 use crate::close::Close;
 
@@ -60,4 +64,11 @@ pub trait PipeTx: Send + 'static {
 pub trait PipeRx: Send + 'static {
     /// The next message, or `None` once the pipe is gone.
     fn recv(&mut self) -> impl Future<Output = Option<Message>> + Send;
+
+    /// When bytes last arrived from the peer, a message still arriving
+    /// included; `None` when the transport cannot tell, and then only a whole
+    /// message is heard.
+    fn heard(&self) -> Option<Instant> {
+        None
+    }
 }

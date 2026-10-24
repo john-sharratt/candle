@@ -4,10 +4,13 @@
 //! are ranked by endpoint, then in the order the endpoint resolved, then by
 //! source; a fault cools a path for a while, doubling per consecutive fault.
 //!
-//! A fault also makes its path's source *suspect*: a dead link fails against
-//! every destination, so once it has failed against one, its paths to the
-//! others are dialled after every path from a source that is not suspect.
-//! Only a success from that same source clears it.
+//! A failure to *reach* — the bind or the TCP connect failing — also makes its
+//! path's source *suspect*: a dead link fails against every destination, so
+//! once it has failed against one, its paths to the others are dialled after
+//! every path from a source that is not suspect. Only a success from that same
+//! source clears it. A fault after the connect — TLS, the handshakes, a session
+//! gone silent — is the far end's or the path's, never the source's: the
+//! source reached.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -51,6 +54,26 @@ pub struct PathId {
     pub source: Option<IpAddr>,
 }
 
+/// Which part of a path failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// The bind or the TCP connect: the source did not reach.
+    Reach,
+    /// Anything after the connect.
+    After,
+}
+
+/// What a fault did to its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Struck {
+    /// How long the path cools.
+    pub cool: Duration,
+    /// The path had no fault standing: this is its first in a row.
+    pub first: bool,
+    /// Its source has just turned suspect.
+    pub suspect: bool,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct Health {
     /// Consecutive faults.
@@ -90,25 +113,34 @@ impl Paths {
 
     /// `ranked`, best first, in the order to dial them: the paths not cooling
     /// from a source not suspect, then those not cooling from a suspect
-    /// source, then those cooling. A cooling path is still dialled when
-    /// nothing else answers.
+    /// source, then those cooling, the soonest out of its cooldown first. A
+    /// cooling path is still dialled when nothing else answers — and by the
+    /// time the paths ahead of it have timed out, the one nearest the end of
+    /// its cooldown is the likeliest to answer.
     pub fn order(&self, ranked: &[PathId], now: Instant) -> Vec<PathId> {
-        let tier = |p: &PathId| match (self.cooling(*p, now), self.suspect(*p)) {
-            (false, false) => 0,
-            (false, true) => 1,
-            (true, _) => 2,
+        let until = |p: &PathId| {
+            self.health
+                .get(p)
+                .and_then(|h| h.cool_until)
+                .filter(|until| now < *until)
+        };
+        let key = |p: &PathId| match (until(p), self.suspect(*p)) {
+            (None, false) => (0, None),
+            (None, true) => (1, None),
+            (Some(until), _) => (2, Some(until)),
         };
         let mut order = ranked.to_vec();
-        // Stable: within a tier, the rank holds.
-        order.sort_by_key(tier);
+        // Stable: within a tier, and between cooldowns ending together, the
+        // rank holds.
+        order.sort_by_key(key);
         order
     }
 
     /// `p` showed a fault: it cools, for longer the more faults it has shown in
-    /// a row, and its source turns suspect. Returns how long it cools, and
-    /// whether the source has just turned suspect.
-    pub fn strike(&mut self, p: PathId, now: Instant) -> (Duration, bool) {
+    /// a row, and a failure to reach makes its source suspect.
+    pub fn strike(&mut self, p: PathId, now: Instant, fault: Fault) -> Struck {
         let h = self.health.entry(p).or_default();
+        let first = h.strikes == 0;
         h.strikes = h.strikes.saturating_add(1);
         let doublings = (h.strikes - 1).min(16);
         let cool = self
@@ -117,8 +149,12 @@ impl Paths {
             .saturating_mul(1 << doublings)
             .min(self.timing.cool_max);
         h.cool_until = Some(now + cool);
-        let turned = p.source.is_some_and(|s| self.suspect.insert(s));
-        (cool, turned)
+        let suspect = fault == Fault::Reach && p.source.is_some_and(|s| self.suspect.insert(s));
+        Struck {
+            cool,
+            first,
+            suspect,
+        }
     }
 
     /// A session opened on `p`: its source works. Returns whether that clears
@@ -181,17 +217,42 @@ mod tests {
         let mut p = Paths::new(timing());
         assert_eq!(p.order(&ranked(), t0), ranked());
 
-        p.strike(path(0, 4), t0);
+        p.strike(path(0, 4), t0, Fault::Reach);
         assert_eq!(
             p.order(&ranked(), t0),
             [path(0, 5), path(1, 132), path(0, 4)]
         );
-        // Every path cooling: still every one dialled, best first.
-        p.strike(path(0, 5), t0);
-        p.strike(path(1, 132), t0);
+        // Every path cooling for as long: still every one dialled, best first.
+        p.strike(path(0, 5), t0, Fault::After);
+        p.strike(path(1, 132), t0, Fault::After);
         assert_eq!(p.order(&ranked(), t0), ranked());
         // The cooldown passes.
         assert_eq!(p.order(&ranked(), t0 + Duration::from_secs(30)), ranked());
+    }
+
+    /// AlienWorld at 00:51:23: every path cooling — the internet name for 4 s
+    /// more, .4 for longer, .5 just struck for 120 s. Rank order dialled .4
+    /// first, whose 10 s timeout ran past the internet name's cooldown, and then
+    /// .5. The soonest out of its cooldown goes first.
+    #[test]
+    fn cooling_paths_are_dialled_soonest_out_first() {
+        let t0 = Instant::now();
+        let mut p = Paths::new(Timing {
+            cool_first: Duration::from_secs(4),
+            cool_max: Duration::from_secs(3600),
+            ..Timing::default()
+        });
+        p.strike(path(1, 132), t0, Fault::After); // 4 s
+        for _ in 0..4 {
+            p.strike(path(0, 4), t0, Fault::Reach); // 32 s
+        }
+        for _ in 0..5 {
+            p.strike(path(0, 5), t0, Fault::After); // 64 s
+        }
+        assert_eq!(
+            p.order(&ranked(), t0),
+            [path(1, 132), path(0, 4), path(0, 5)]
+        );
     }
 
     #[test]
@@ -199,20 +260,36 @@ mod tests {
         let t0 = Instant::now();
         let mut p = Paths::new(timing());
         let a = path(0, 5);
-        let cools: Vec<u64> = (0..6).map(|_| p.strike(a, t0).0.as_secs()).collect();
-        assert_eq!(cools, [30, 60, 120, 240, 240, 240]);
+        let struck: Vec<(u64, bool)> = (0..6)
+            .map(|_| {
+                let s = p.strike(a, t0, Fault::After);
+                (s.cool.as_secs(), s.first)
+            })
+            .collect();
+        assert_eq!(
+            struck,
+            [
+                (30, true),
+                (60, false),
+                (120, false),
+                (240, false),
+                (240, false),
+                (240, false)
+            ]
+        );
         assert!(p.cooling(a, t0 + Duration::from_secs(239)));
         assert!(!p.cooling(a, t0 + Duration::from_secs(240)));
 
         p.lasted(a);
         assert!(!p.cooling(a, t0));
-        assert_eq!(p.strike(a, t0).0.as_secs(), 30);
+        let again = p.strike(a, t0, Fault::After);
+        assert_eq!((again.cool.as_secs(), again.first), (30, true));
 
         // Thousands of faults neither overflow nor pass the cap.
         for _ in 0..10_000 {
-            p.strike(a, t0);
+            p.strike(a, t0, Fault::After);
         }
-        assert_eq!(p.strike(a, t0).0.as_secs(), 240);
+        assert_eq!(p.strike(a, t0, Fault::After).cool.as_secs(), 240);
     }
 
     #[test]
@@ -222,10 +299,10 @@ mod tests {
         // On the internet path: the LAN's first address is better.
         assert_eq!(p.better(&ranked(), path(1, 132), t0), Some(path(0, 4)));
         // .4 cooling: .5 is.
-        p.strike(path(0, 4), t0);
+        p.strike(path(0, 4), t0, Fault::Reach);
         assert_eq!(p.better(&ranked(), path(1, 132), t0), Some(path(0, 5)));
         // Both cooling: nowhere to return to, until one has cooled.
-        p.strike(path(0, 5), t0);
+        p.strike(path(0, 5), t0, Fault::Reach);
         assert_eq!(p.better(&ranked(), path(1, 132), t0), None);
         assert_eq!(
             p.better(&ranked(), path(1, 132), t0 + Duration::from_secs(30)),
@@ -255,10 +332,14 @@ mod tests {
         ];
         assert_eq!(p.order(&ranked, t0), ranked);
 
-        let (_, turned) = p.strike(from(lan, 4), t0);
-        assert!(turned, ".4 turns suspect at its first fault");
-        let (_, again) = p.strike(from(lan, 4), t0);
-        assert!(!again, "and is not reported again while suspect");
+        assert!(
+            p.strike(from(lan, 4), t0, Fault::Reach).suspect,
+            ".4 turns suspect at its first failure to reach"
+        );
+        assert!(
+            !p.strike(from(lan, 4), t0, Fault::Reach).suspect,
+            "and is not reported again while suspect"
+        );
         assert_eq!(
             p.order(&ranked, t0),
             [
@@ -295,10 +376,28 @@ mod tests {
     fn an_unbound_path_is_never_suspect() {
         let t0 = Instant::now();
         let mut p = Paths::new(timing());
-        let (_, turned) = p.strike(path(0, 5), t0);
-        assert!(!turned);
+        assert!(!p.strike(path(0, 5), t0, Fault::Reach).suspect);
         assert!(!p.suspect(path(0, 4)));
         assert!(!p.connected(path(0, 5)));
+    }
+
+    /// AlienWorld's Wi-Fi, 192.168.0.237, carried a session to the internet
+    /// name that went silent because the gateway's sending stalled — and was
+    /// made suspect for it, putting its Hyper-V address, which reaches
+    /// nothing, first. A fault after the connect cools the path and leaves the
+    /// source alone: it reached.
+    #[test]
+    fn a_fault_after_the_connect_never_makes_its_source_suspect() {
+        let t0 = Instant::now();
+        let mut p = Paths::new(timing());
+        let wifi = PathId {
+            source: Some(IpAddr::from([192, 168, 0, 237])),
+            ..path(1, 132)
+        };
+        let struck = p.strike(wifi, t0, Fault::After);
+        assert!(!struck.suspect);
+        assert!(p.cooling(wifi, t0));
+        assert!(!p.suspect(wifi));
     }
 
     /// Returning prefers a better endpoint's path from a source that is not
@@ -318,6 +417,7 @@ mod tests {
                 4,
             ),
             t0,
+            Fault::Reach,
         );
         assert_eq!(
             p.better(&ranked, from(internet, 5), t0),

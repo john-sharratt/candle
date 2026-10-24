@@ -16,6 +16,7 @@ pub use cluster::offline;
 mod dial;
 pub mod paths;
 pub mod sources;
+mod stamped;
 mod target;
 
 pub use dial::{Dial, PathRx, RETURNING};

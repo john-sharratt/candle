@@ -1,13 +1,14 @@
 //! The session's reader: decodes each frame and hands it on — stream frames to
 //! their connection, `PING` to a `PONG`, `EVENT` fragments to reassembly, and
-//! everything else to the session's owner. A socket with no frame for 45 s is
-//! dead (§3.2); a frame that fails to decode, a handshake frame after
-//! admission, or a stream opened out of turn is a protocol violation, closed
-//! 4400.
+//! everything else to the session's owner. A socket with nothing from the peer
+//! for 45 s — no frame, and no bytes of one still arriving — is dead (§3.2); a
+//! frame that fails to decode, a handshake frame after admission, or a stream
+//! opened out of turn is a protocol violation, closed 4400.
 
 use std::time::Duration;
 
 use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 
 use super::command::Command;
@@ -36,7 +37,7 @@ pub async fn run<R: PipeRx>(
         Ended::Refused(close)
     };
     let ended = loop {
-        let message = match timeout(DEAD_AFTER, rx.recv()).await {
+        let message = match heard_within(&mut rx).await {
             Err(_) => {
                 // How many frames came before the silence tells a peer that
                 // never spoke from one that stopped.
@@ -138,4 +139,21 @@ pub async fn run<R: PipeRx>(
         stream.reset();
     }
     ended
+}
+
+/// The next message, unless the peer has gone [`DEAD_AFTER`] without being
+/// heard. A message whose bytes are still arriving keeps the wait going: a
+/// mebibyte fragment over a slow link takes minutes to arrive whole, from a
+/// peer that is alive throughout.
+async fn heard_within<R: PipeRx>(rx: &mut R) -> Result<Option<Message>, Elapsed> {
+    let mut wait = DEAD_AFTER;
+    loop {
+        match timeout(wait, rx.recv()).await {
+            Ok(message) => return Ok(message),
+            Err(elapsed) => match rx.heard().map(|at| at.elapsed()) {
+                Some(since) if since < DEAD_AFTER => wait = DEAD_AFTER - since,
+                _ => return Err(elapsed),
+            },
+        }
+    }
 }

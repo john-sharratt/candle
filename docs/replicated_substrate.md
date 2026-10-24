@@ -298,8 +298,13 @@ admitted. It is *ready* (§7.2) once caught up through any of them.
 its cluster again. The member's other sockets are unaffected. Delay `d` starts at 250 ms and doubles per consecutive failure, **capped at
 8 s**; each wait is drawn uniformly from `[d/2, d]` so a gateway restart does not
 reconnect every member in the same millisecond. An admission resets `d`. Keep-alive: a
-`PING` every 15 s each way; 45 s without any frame from the peer closes the socket as
-dead, with 1001 (Cloudflare's idle timeout is far longer than 15 s). The handshake
+`PING` every 15 s each way; 45 s without hearing from the peer closes the socket as dead,
+with 1001 (Cloudflare's idle timeout is far longer than 15 s). Hearing is a frame, or the
+bytes of one still arriving: a `PING` waits behind a mebibyte fragment, which over a link
+of a few kilobytes a second takes minutes to arrive whole, from a peer alive throughout.
+Counting only whole frames closed such a socket every 45 s, and the catch-up it carried
+started over on each redial and never finished. A transport that cannot report its reads
+counts whole frames. The handshake
 holds to the same 45 s: a peer silent that long mid-handshake is closed 4400.
 
 **Paths.** A cluster's URLs, in order, are its *endpoints*. Each endpoint's host is
@@ -310,9 +315,12 @@ at a time. The gateway sees a member by its node alone, so a socket that comes b
 another path is the same member, its old socket replaced (4409).
 
 - **Dialling.** One dial tries the paths in rank order, skipping those cooling down, and
-  takes the first that completes TCP, TLS and the WebSocket handshake within 10 s. The
-  cooling paths are tried last, so a member never refuses to dial. Only when every path
-  fails does the dial fail, and the reconnect delay above applies.
+  takes the first that completes TCP, TLS and the WebSocket handshake, each within 10 s.
+  The cooling paths are tried last, the soonest out of its cooldown first: by the time the
+  paths ahead have timed out, it is the likeliest to answer. So a member never refuses to
+  dial. Only when every path fails does the dial fail, and the reconnect delay above
+  applies. Every dial is logged with its path; a path that was well failing to dial is
+  logged as a warning, a failing one again only at debug.
 - **What cools a path.** A path that fails to connect, drops mid-handshake, or carries a
   session that ends dead (45 s without a frame) takes a strike. A path *connecting and
   then going silent* is the fault this catches: a link that passes the handshake and
@@ -334,10 +342,12 @@ another path is the same member, its old socket replaced (4409).
   link-local) of its family — only those on the destination's network when there are
   any — bound to it, the address the system would choose first. A destination on this
   machine is dialled unbound, as is any destination with one candidate source: a machine
-  with one link dials as it always has. A fault also makes its path's source **suspect**:
-  its paths to every destination are dialled after every path from a source that is not
-  suspect, until a session opens from that same source — a success from another source
-  clears nothing.
+  with one link dials as it always has. A failure to *reach* — the bind or the TCP connect
+  failing — also makes its path's source **suspect**: its paths to every destination are
+  dialled after every path from a source that is not suspect, until a session opens from
+  that same source — a success from another source clears nothing. A fault after the
+  connect — TLS, a handshake, a session gone silent — cools only its path: the source
+  reached, and the stall is the far end's.
 
 **Seeing a member held back.** A member admitted below the floor takes no traffic and
 replicates nothing until it holds the floor's build (§3.5), so its `/v1/status` says so

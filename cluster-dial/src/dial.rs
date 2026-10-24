@@ -7,6 +7,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use cluster::close::{Close, CloseCode};
 use cluster::dial::{Attempt, Connect};
@@ -14,7 +15,7 @@ use cluster::handshake::HandshakeError;
 use cluster::offline;
 use cluster::pipe::socket::{split, SocketRx, SocketTx};
 use cluster::pipe::tungstenite::Tungstenite;
-use cluster::pipe::{Message, PipeRx};
+use cluster::pipe::{Heard, Message, PipeRx};
 use cluster::session::Ended;
 use rustls_pki_types::ServerName;
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
@@ -26,8 +27,9 @@ use tokio_tungstenite::client_async_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-use crate::paths::{PathId, Paths, Timing};
+use crate::paths::{Fault, PathId, Paths, Timing};
 use crate::sources::sources_for;
+use crate::stamped::Stamped;
 use crate::target::{Endpoint, Target};
 use crate::{Io, Socket, MAX_MESSAGE};
 
@@ -54,8 +56,6 @@ pub struct Dial {
     sources: Sources,
     paths: Arc<Mutex<Paths>>,
     on: Option<On>,
-    /// The path the last session ran on, to log a change of path.
-    last: Option<PathId>,
 }
 
 fn lock(paths: &Mutex<Paths>) -> MutexGuard<'_, Paths> {
@@ -82,7 +82,6 @@ impl Dial {
             sources,
             paths: Arc::new(Mutex::new(Paths::new(timing))),
             on: None,
-            last: None,
         }
     }
 
@@ -126,22 +125,27 @@ impl Dial {
         (ranked, failed)
     }
 
-    async fn open(&self, p: PathId) -> Result<Socket, String> {
+    /// The socket on `p`, and the stamp its reads leave.
+    async fn open(&self, p: PathId) -> Result<(Socket, Heard), Failed> {
         let e = &self.target.endpoints[p.endpoint];
-        let stream = transport(&self.tls, e, p).await?;
+        let heard = Heard::new();
+        let stream = transport(&self.tls, e, p, heard.clone(), self.timing.connect).await?;
         let request = e
             .socket_url(self.app)
             .into_client_request()
-            .map_err(|e| e.to_string())?;
+            .map_err(|err| Failed::after(err.to_string()))?;
         let config = WebSocketConfig {
             max_message_size: Some(MAX_MESSAGE),
             max_frame_size: Some(MAX_MESSAGE),
             ..WebSocketConfig::default()
         };
-        let (ws, _) = client_async_with_config(request, stream, Some(config))
-            .await
-            .map_err(|err| format!("the WebSocket handshake: {err}"))?;
-        Ok(ws)
+        let handshake = client_async_with_config(request, stream, Some(config));
+        let (ws, _) = match timeout(self.timing.connect, handshake).await {
+            Ok(Ok(ws)) => ws,
+            Ok(Err(err)) => return Err(Failed::after(format!("the WebSocket handshake: {err}"))),
+            Err(_) => return Err(Failed::after(no_answer("the WebSocket handshake"))),
+        };
+        Ok((ws, heard))
     }
 
     /// Start a session's watch for a better path, when there is one to have.
@@ -169,8 +173,8 @@ impl Dial {
                     continue;
                 };
                 let e = &target.endpoints[better.endpoint];
-                match timeout(timing.connect, transport(&tls, e, better)).await {
-                    Ok(Ok(_)) => {
+                match transport(&tls, e, better, Heard::new(), timing.connect).await {
+                    Ok(_) => {
                         tracing::info!(
                             app,
                             from = %label(&target, on),
@@ -180,19 +184,16 @@ impl Dial {
                         leaving.notify_one();
                         return;
                     }
-                    Ok(Err(why)) => {
-                        let (cool, turned) = lock(&paths).strike(better, Instant::now());
+                    Err(failed) => {
+                        let struck = lock(&paths).strike(better, Instant::now(), failed.fault);
                         tracing::debug!(
                             app,
                             path = %label(&target, better),
-                            cool_s = cool.as_secs(),
-                            "cluster path: the probe of a better path failed: {why}"
+                            cool_s = struck.cool.as_secs(),
+                            "cluster path: the probe of a better path failed: {}",
+                            failed.why
                         );
-                        suspected(app, better, turned);
-                    }
-                    Err(_) => {
-                        let (_, turned) = lock(&paths).strike(better, Instant::now());
-                        suspected(app, better, turned);
+                        suspected(app, better, struck.suspect);
                     }
                 }
             }
@@ -214,51 +215,96 @@ fn suspected(app: &str, p: PathId, turned: bool) {
         tracing::warn!(
             app,
             source = %s,
-            "cluster path: {s} failed against {}; its paths are dialled last until it succeeds",
+            "cluster path: {s} could not reach {}; its paths are dialled last until it succeeds",
             p.addr
         );
     }
 }
 
-/// TCP to `p`'s address — bound to its source, when it has one — and TLS over
-/// it verified by `e`'s name.
-async fn transport(tls: &TlsConnector, e: &Endpoint, p: PathId) -> Result<Box<dyn Io>, String> {
-    let addr = p.addr;
-    let tcp = match p.source {
-        None => TcpStream::connect(addr).await,
-        Some(source) => {
-            let socket = match source {
-                IpAddr::V4(_) => TcpSocket::new_v4(),
-                IpAddr::V6(_) => TcpSocket::new_v6(),
-            }
-            .map_err(|err| format!("a socket for {addr}: {err}"))?;
-            socket
-                .bind(SocketAddr::new(source, 0))
-                .map_err(|err| format!("binding {source}: {err}"))?;
-            socket.connect(addr).await
+/// Why a path failed, and which part of it.
+struct Failed {
+    fault: Fault,
+    why: String,
+}
+
+impl Failed {
+    fn reach(why: String) -> Self {
+        Self {
+            fault: Fault::Reach,
+            why,
         }
     }
-    .map_err(|err| format!("{addr}: {err}"))?;
+
+    fn after(why: String) -> Self {
+        Self {
+            fault: Fault::After,
+            why,
+        }
+    }
+}
+
+fn no_answer(what: &str) -> String {
+    format!("{what}: no answer in time")
+}
+
+/// TCP to `p`'s address — bound to its source, when it has one — within
+/// `within`: a failure here is the source's failure to reach.
+async fn reach(p: PathId, within: Duration) -> Result<TcpStream, Failed> {
+    let addr = p.addr;
+    let connecting = async {
+        match p.source {
+            None => TcpStream::connect(addr).await,
+            Some(source) => {
+                let socket = match source {
+                    IpAddr::V4(_) => TcpSocket::new_v4(),
+                    IpAddr::V6(_) => TcpSocket::new_v6(),
+                }?;
+                socket.bind(SocketAddr::new(source, 0))?;
+                socket.connect(addr).await
+            }
+        }
+    };
+    match timeout(within, connecting).await {
+        Ok(Ok(tcp)) => Ok(tcp),
+        Ok(Err(err)) => Err(Failed::reach(format!("{addr}: {err}"))),
+        Err(_) => Err(Failed::reach(no_answer(&addr.to_string()))),
+    }
+}
+
+/// The transport on `p`: TCP, its reads stamping `heard`, and TLS over it
+/// verified by `e`'s name, each within `within`.
+async fn transport(
+    tls: &TlsConnector,
+    e: &Endpoint,
+    p: PathId,
+    heard: Heard,
+    within: Duration,
+) -> Result<Box<dyn Io>, Failed> {
+    let tcp = reach(p, within).await?;
     let _ = tcp.set_nodelay(true);
+    let stamped = Stamped::new(tcp, heard);
     Ok(match &e.tls_name {
         Some(name) => {
-            let name = ServerName::try_from(name.clone())
-                .map_err(|err| format!("`{name}` cannot name a certificate: {err}"))?;
-            Box::new(
-                tls.connect(name, tcp)
-                    .await
-                    .map_err(|err| format!("TLS with {}: {err}", e.url))?,
-            )
+            let name = ServerName::try_from(name.clone()).map_err(|err| {
+                Failed::after(format!("`{name}` cannot name a certificate: {err}"))
+            })?;
+            match timeout(within, tls.connect(name, stamped)).await {
+                Ok(Ok(s)) => Box::new(s),
+                Ok(Err(err)) => return Err(Failed::after(format!("TLS with {}: {err}", e.url))),
+                Err(_) => return Err(Failed::after(no_answer(&format!("TLS with {}", e.url)))),
+            }
         }
-        None => Box::new(tcp),
+        None => Box::new(stamped),
     })
 }
 
 /// A session's receiving half: the socket's, until the session leaves for a
-/// better path, when it reads as the gateway's close.
+/// better path, when it reads as the gateway's close. It reports the
+/// transport's reads, so a message still arriving keeps the session alive.
 pub struct PathRx {
     inner: SocketRx<Socket, Tungstenite>,
     leaving: Arc<Notify>,
+    heard: Heard,
 }
 
 impl PipeRx for PathRx {
@@ -269,6 +315,10 @@ impl PipeRx for PathRx {
                 Some(Message::Close(Close::new(CloseCode::GoingAway, RETURNING)))
             }
         }
+    }
+
+    fn heard(&self) -> Option<Instant> {
+        self.heard.at()
     }
 }
 
@@ -281,15 +331,12 @@ impl Connect for Dial {
         let (ranked, mut failed) = self.resolve().await;
         let order = lock(&self.paths).order(&ranked, Instant::now());
         for p in order {
-            let why = match timeout(self.timing.connect, self.open(p)).await {
-                Ok(Ok(ws)) => {
-                    if self.last != Some(p) {
-                        tracing::info!(app = self.app, path = %self.label(p), "cluster path: dialled");
-                    }
+            let failure = match self.open(p).await {
+                Ok((ws, heard)) => {
+                    tracing::info!(app = self.app, path = %self.label(p), "cluster path: dialled");
                     if let (true, Some(s)) = (lock(&self.paths).connected(p), p.source) {
                         tracing::warn!(app = self.app, source = %s, "cluster path: {s} works again");
                     }
-                    self.last = Some(p);
                     let leaving = Arc::new(Notify::new());
                     let probe = self.watch(ranked.clone(), p, leaving.clone());
                     self.on = Some(On {
@@ -298,20 +345,38 @@ impl Connect for Dial {
                         probe,
                     });
                     let (tx, rx) = split::<Tungstenite, _, _>(ws);
-                    return Ok((tx, PathRx { inner: rx, leaving }));
+                    return Ok((
+                        tx,
+                        PathRx {
+                            inner: rx,
+                            leaving,
+                            heard,
+                        },
+                    ));
                 }
-                Ok(Err(why)) => why,
-                Err(_) => format!("no answer within {:?}", self.timing.connect),
+                Err(failure) => failure,
             };
-            let (cool, turned) = lock(&self.paths).strike(p, Instant::now());
-            tracing::debug!(
-                app = self.app,
-                path = %self.label(p),
-                cool_s = cool.as_secs(),
-                "cluster path: could not dial: {why}"
-            );
-            suspected(self.app, p, turned);
-            failed.push(format!("{}: {why}", self.label(p)));
+            let struck = lock(&self.paths).strike(p, Instant::now(), failure.fault);
+            // A path that was well failing is news; one already failing is not.
+            if struck.first {
+                tracing::warn!(
+                    app = self.app,
+                    path = %self.label(p),
+                    cool_s = struck.cool.as_secs(),
+                    "cluster path: could not dial: {}; cooling it",
+                    failure.why
+                );
+            } else {
+                tracing::debug!(
+                    app = self.app,
+                    path = %self.label(p),
+                    cool_s = struck.cool.as_secs(),
+                    "cluster path: could not dial: {}",
+                    failure.why
+                );
+            }
+            suspected(self.app, p, struck.suspect);
+            failed.push(format!("{}: {}", self.label(p), failure.why));
         }
         Err(failed.join("; "))
     }
@@ -334,14 +399,14 @@ impl Connect for Dial {
             _ => None,
         };
         if let Some(fault) = fault {
-            let (cool, turned) = paths.strike(on.path, now);
+            // The session connected: whatever stalled it, its source reached.
+            let struck = paths.strike(on.path, now, Fault::After);
             tracing::warn!(
                 app = self.app,
                 path = %label(&self.target, on.path),
-                cool_s = cool.as_secs(),
+                cool_s = struck.cool.as_secs(),
                 "cluster path: {fault}; cooling it"
             );
-            suspected(self.app, on.path, turned);
         }
     }
 }
@@ -419,8 +484,12 @@ mod tests {
         let dead = closed_port().await;
         let (up, _g) = gateway().await;
         let mut d = dial(&[dead, up]);
-        let _session = d.connect().await.expect("the second endpoint answers");
+        let (_tx, rx) = d.connect().await.expect("the second endpoint answers");
         assert_eq!(on(&d), 1);
+        assert!(
+            rx.heard().is_some(),
+            "the handshake's reply came through the stamped transport"
+        );
         let first = d.target.endpoints[0].port;
         let cooling = lock(&d.paths).cooling(
             PathId {
