@@ -523,13 +523,18 @@ fn turn_sampling(
 }
 
 /// The triggers a chat turn decodes under: any `<tool_call>` the model emits is
-/// forced to the catalog's exact JSON shape (name ∈ catalog, required params in
-/// order, valid JSON), and atop that the `<think>` block is steered per the
+/// forced to the exact JSON shape of a tool `tools_mode` offers (name ∈ that
+/// mode's catalog, required params in order, valid JSON), and atop that the `<think>` block is steered per the
 /// effort dial, replacing the `<think>` trigger atomically.
-fn turn_triggers(state: &InferenceState, think_mode: ThinkMode) -> Arc<TriggerRegistry> {
+fn turn_triggers(
+    state: &InferenceState,
+    think_mode: ThinkMode,
+    tools_mode: ToolMode,
+) -> Arc<TriggerRegistry> {
+    let stencil = &state.tool_stencils[tools_mode.level() as usize];
     match &state.think_steering {
-        Some(ts) => ts.registry_for(&state.tool_stencil, think_mode),
-        None => Arc::clone(&state.tool_stencil),
+        Some(ts) => ts.registry_for(stencil, think_mode),
+        None => Arc::clone(stencil),
     }
 }
 
@@ -733,11 +738,12 @@ struct InferenceState {
     /// §7); `None` when the workspace names none. Stopped by
     /// `ZendSession::shutdown` before the drain.
     repositories: Option<Repositories>,
-    /// Constrained-decoding stencil for the whole tool catalog, keyed by the
-    /// `<tool_call>` trigger token.  Passed on every user turn so a tool call
-    /// the model emits is forced to the catalog's exact JSON shape.  Compiled
-    /// once at startup from `zend_tools::registry`.
-    tool_stencil: Arc<TriggerRegistry>,
+    /// Constrained-decoding stencils, one per tools mode (indexed by
+    /// [`ToolMode::level`]), each keyed by the `<tool_call>` trigger token and
+    /// compiled once at startup from the tools that mode offers
+    /// ([`crate::tools::catalog_for`]). A turn decodes under its mode's, so a
+    /// tool call is forced to an offered tool's exact JSON shape.
+    tool_stencils: [Arc<TriggerRegistry>; ToolMode::ALL.len()],
     /// Per-effort-dial thinking-block steering trees, compiled once at startup.
     /// `None` when the tokenizer has no single `<think>`/`</think>` token.  Each
     /// turn replaces the `<think>` trigger with the dial's tree (see
@@ -1535,21 +1541,25 @@ impl InferenceState {
             );
         }
 
-        // Compile the whole tool catalog into one constrained-decoding stencil,
-        // keyed by the `<tool_call>` trigger.  Passed on every user turn so any
-        // tool call the model starts is forced to the catalog's exact shape.
-        // Only arm the stencil for tools that were actually installed into the
-        // dialogue prompt. A tool-free projection installs none — it gets an empty
-        // `TriggerRegistry` (never fires) rather than compiling a stencil, which
-        // rejects an empty catalog.
+        // Compile each tools mode's catalog into its own constrained-decoding
+        // stencil, keyed by the `<tool_call>` trigger, so any tool call a turn
+        // starts is forced to the exact shape of a tool its mode offers. Only
+        // arm a stencil for tools that were actually installed into the
+        // dialogue prompt. A tool-free projection, or a mode that offers
+        // nothing, gets an empty `TriggerRegistry` (never fires) rather than a
+        // compiled stencil, which rejects an empty catalog.
         let t_compile = Instant::now();
-        let tool_stencil = if tool_sections.is_empty() {
-            Arc::new(TriggerRegistry::new())
-        } else {
+        let compile = |mode: ToolMode| -> anyhow::Result<Arc<TriggerRegistry>> {
+            let specs = crate::tools::catalog_for(mode);
+            if tool_sections.is_empty() || specs.is_empty() {
+                return Ok(Arc::new(TriggerRegistry::new()));
+            }
             engine
-                .compile_tool_stencil(crate::tools::tool_catalog())
-                .map_err(|e| anyhow::anyhow!("tool stencil compile: {e}"))?
+                .compile_tool_stencil(&specs)
+                .map_err(|e| anyhow::anyhow!("{} tool stencil compile: {e}", mode.id()))
         };
+        let [none, restricted, comprehensive] = ToolMode::ALL.map(compile);
+        let tool_stencils = [none?, restricted?, comprehensive?];
         // The thinking-block steering trees (one per non-off effort dial),
         // compiled once and reused across turns alongside the tool-call base.
         let think_steering = engine
@@ -2963,7 +2973,7 @@ impl InferenceState {
             repositories,
             workspace,
             base_branches,
-            tool_stencil,
+            tool_stencils,
             think_steering,
             passthrough: PassthroughCache::new(),
             deletions: Deletions::default(),
@@ -3044,7 +3054,7 @@ impl InferenceState {
             formatted_prompt: &self.formatted_prompt,
             // `Off`, as repo_map's folder summaries run: a file read is a tool
             // round and a description, with no reasoning block between them.
-            think_triggers: turn_triggers(self, ThinkMode::Off),
+            think_triggers: turn_triggers(self, ThinkMode::Off, ToolMode::Restricted),
             // Ingest reads; it runs no job, so it belongs to no lineage.
             tool_ctx: self.tool_host.context_for(
                 ToolMode::Restricted,
@@ -3055,7 +3065,9 @@ impl InferenceState {
             chain_end: *self.chain_end.lock().unwrap(),
             think_for: Some({
                 let steering = self.think_steering.clone();
-                let stencil = Arc::clone(&self.tool_stencil);
+                // Ingest reads under Restricted, as its `tool_ctx` above does.
+                let stencil =
+                    Arc::clone(&self.tool_stencils[ToolMode::Restricted.level() as usize]);
                 Arc::new(move |mode: ThinkMode| match &steering {
                     Some(ts) => ts.registry_for(&stencil, mode),
                     None => Arc::clone(&stencil),
@@ -4260,7 +4272,7 @@ fn run_inference_stream(
                     None
                 },
                 selection: round_selection,
-                triggers: turn_triggers(&state, think_mode),
+                triggers: turn_triggers(&state, think_mode, tools_mode),
                 // The promises the last decode found ended come first: they
                 // ended before this round's reads were served.
                 tags: std::mem::take(&mut cs.promise_marks)

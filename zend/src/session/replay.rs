@@ -351,7 +351,11 @@ impl ZendSession {
                         &state.think_closer_phrase,
                         0,
                     )),
-                    triggers: turn_triggers(&state, think_mode_from_selection(&selection)),
+                    triggers: turn_triggers(
+                        &state,
+                        think_mode_from_selection(&selection),
+                        spec.tools_mode,
+                    ),
                     selection,
                     recorded_turn: Some(sealed.token_ids.clone()),
                     ..Default::default()
@@ -389,7 +393,7 @@ impl ZendSession {
                     &state.think_closer_phrase,
                     seed,
                 )),
-                triggers: turn_triggers(&state, think_mode),
+                triggers: turn_triggers(&state, think_mode, spec.tools_mode),
                 selection,
                 ..Default::default()
             };

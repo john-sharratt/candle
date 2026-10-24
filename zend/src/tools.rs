@@ -506,6 +506,20 @@ pub fn tool_catalog() -> &'static [ToolSpec] {
     })
 }
 
+/// The specs of [`tool_catalog`] that `mode` offers, aliases included: what a
+/// turn in `mode` compiles its tool stencil from. The grammar admits only the
+/// names it was compiled from, so a turn cannot decode a call to a tool its
+/// mode does not offer. Compiled from the whole catalog, a Restricted turn
+/// spent a round on six `web_search` calls, every one refused.
+pub fn catalog_for(mode: ToolMode) -> Vec<ToolSpec> {
+    let offered = offered_tool_names(mode);
+    tool_catalog()
+        .iter()
+        .filter(|spec| registry::find(&spec.name).is_some_and(|tool| offered.contains(tool.name)))
+        .cloned()
+        .collect()
+}
+
 /// `parameters` with each field `name` fixes narrowed to its one value.
 fn pinned(name: &str, parameters: &Value) -> Value {
     let mut narrowed = parameters.clone();
@@ -918,6 +932,25 @@ mod tests {
         assert_eq!(values("delete_tag", "kind"), vec!["tag"]);
         assert_eq!(values("delete_tag", "action"), vec!["delete"]);
         assert!(values("git_commit", "from").len() > 1);
+    }
+
+    /// **A mode's catalog is exactly the tools it offers, aliases and all**:
+    /// Restricted compiles the file tools under every name they answer to and
+    /// no network tool, Comprehensive the whole catalog, None nothing.
+    #[test]
+    fn a_modes_catalog_is_the_tools_it_offers() {
+        let names = |mode: ToolMode| -> Vec<String> {
+            catalog_for(mode).into_iter().map(|s| s.name).collect()
+        };
+        let restricted = names(ToolMode::Restricted);
+        for name in ["write", "file_write", "file_edit", "file_read", "git_log"] {
+            assert!(restricted.iter().any(|n| n == name), "{name} missing");
+        }
+        for name in ["web_search", "web_fetch", "run_command", "git_commit"] {
+            assert!(!restricted.iter().any(|n| n == name), "{name} compiled");
+        }
+        assert_eq!(names(ToolMode::Comprehensive).len(), tool_catalog().len());
+        assert!(names(ToolMode::None).is_empty());
     }
 
     /// **Dispatch holds an alias to its name** for a call that did not come
