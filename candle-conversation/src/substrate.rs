@@ -85,7 +85,7 @@ use crate::projection::{
     ProjectionEvent, ProjectionTarget, SectionId, SystemItem, TimelineAllocator, TimelineId,
     TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
 };
-use crate::provenance::{decode_wide_sigs_for_scoring, WideQSig};
+use crate::provenance::SigWindow;
 use crate::scheduler::profile;
 use crate::summary_tree::exchange::Couplings;
 use crate::summary_tree::{
@@ -110,38 +110,6 @@ pub use turn_placement::RestoredTurn;
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
-/// Per-session turn / section store and the single source of truth for KV
-/// residence across hot (VRAM), warm (RAM), and cold (disk) tiers.
-///
-/// The substrate is the workspace-shared directory of *what* turns exist —
-/// timelines, indices, role/text/tokens/sigs — plus the per-turn
-/// [`SequenceResidence`] that records *where* each turn's KV bytes live
-/// right now. Sections are pinned (no LRU) and held in their own table.
-///
-/// # Residence layout
-///
-/// [`Self::residence`] is a `Vec<SequenceResidence>` slab. Each
-/// [`TurnEntryData`] and [`SectionEntryData`] carries a
-/// [`ResidenceIndex`] into that slab — there is exactly one slot per
-/// turn / per section, allocated at append time and never moved.
-///
-/// LRU is tracked by two [`std::collections::LinkedList`] of
-/// [`ResidenceIndex`] values — [`Self::hot_lru`] and
-/// [`Self::warm_lru`]. MRU is at the front; eviction pops the back.
-/// A residence appears on the hot list iff `hot.is_some()`, ditto
-/// warm. Position in the list **is** the recency information — no
-/// timestamps, no clock.
-/// Per-stream memoized decode of wide-Q signature blobs. The belief scan would
-/// otherwise `decode_wide_sigs` the whole (static) gallery on every reprojection
-/// — tens of ms of repeated work on a corpus that doesn't change between
-/// reprojections. Invalidation is **incremental**: a blob write evicts only that
-/// stream's entry (see [`Substrate::set_wide_q_sigs_blob`]), so one turn seal
-/// doesn't churn the whole gallery. `None` value = decoded to nothing (absent or
-/// empty window), cached so repeated misses don't re-parse.
-type SigCache = HashMap<StreamId, Option<Arc<Vec<WideQSig>>>>;
-
-/// Per-stream memo of a turn's self-referencing sub-window seam offsets (sorted,
-/// deduped). See [`Substrate::decoded_seams`].
 /// What the belief scans read from a turn's projection-events blob, decoded
 /// from its JSON once: the seams of its self-referencing sub-windows, sorted
 /// and deduped, and per section collection the section its latest projection
@@ -179,6 +147,27 @@ fn digest_events(events: &[ProjectionEvent]) -> EventsDigest {
     }
 }
 
+/// Per-session turn / section store and the single source of truth for KV
+/// residence across hot (VRAM), warm (RAM), and cold (disk) tiers.
+///
+/// The substrate is the workspace-shared directory of *what* turns exist —
+/// timelines, indices, role/text/tokens/sigs — plus the per-turn
+/// [`SequenceResidence`] that records *where* each turn's KV bytes live
+/// right now. Sections are pinned (no LRU) and held in their own table.
+///
+/// # Residence layout
+///
+/// [`Self::residence`] is a `Vec<SequenceResidence>` slab. Each
+/// [`TurnEntryData`] and [`SectionEntryData`] carries a
+/// [`ResidenceIndex`] into that slab — there is exactly one slot per
+/// turn / per section, allocated at append time and never moved.
+///
+/// LRU is tracked by two [`std::collections::LinkedList`] of
+/// [`ResidenceIndex`] values — [`Self::hot_lru`] and
+/// [`Self::warm_lru`]. MRU is at the front; eviction pops the back.
+/// A residence appears on the hot list iff `hot.is_some()`, ditto
+/// warm. Position in the list **is** the recency information — no
+/// timestamps, no clock.
 #[derive(Debug, Default)]
 pub struct Substrate {
     /// Per-turn KV residence slab. Indexed by [`ResidenceIndex`];
@@ -336,13 +325,6 @@ pub struct Substrate {
     /// once per change instead of on every reprojection (see
     /// [`Self::gallery_epoch`]).
     gallery_epoch: u64,
-
-    /// Interior-mutable per-stream memo of decoded wide-Q windows for the belief
-    /// scan — filled lazily under a read lock, so a session's reprojections
-    /// decode the static gallery once instead of every scan, and invalidated
-    /// per-stream on a blob write so one turn seal doesn't churn the whole
-    /// gallery. See [`Self::decoded_wide_sig`].
-    sig_cache: Mutex<SigCache>,
 
     /// Interior-mutable per-stream memo of what the belief scans read from a
     /// turn's projection-events blob — its seams and its selections — decoded
@@ -4220,51 +4202,19 @@ impl Substrate {
         self.gallery_epoch
     }
 
-    /// Decoded wide-Q window for `stream_id`, memoized across reprojections.
+    /// `stream_id`'s stored wide-Q window, sized and fingerprinted but not
+    /// decoded — it shares the stream's encoded buffer. `None` when the stream
+    /// has no signature, an empty one, or one a scan must not read (see
+    /// [`SigWindow::new`]).
     ///
-    /// The belief scan reads the same static gallery on every reprojection;
-    /// re-`decode_wide_sigs`-ing all of it each time is the single largest
-    /// repeated cost of the scan. This returns a shared [`Arc`] of the decoded
-    /// window, decoding on first touch and serving the memo thereafter. `None`
-    /// when the stream has no signature or an empty one. Interior-mutable: safe
-    /// to call under a read lock (a blob write evicts the stale entry under a
-    /// write lock, so a read never observes a stale window).
-    pub fn decoded_wide_sig(&self, stream_id: StreamId) -> Option<Arc<Vec<WideQSig>>> {
-        // Fast path — a cached decode. Scoped so the lock releases before the
-        // decode below. `unwrap_or_else(into_inner)` recovers a poisoned mutex:
-        // the memo holds only plain data, so a panic elsewhere can't corrupt it.
-        {
-            let cache = self.sig_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(hit) = cache.get(&stream_id) {
-                return hit.clone();
-            }
-        }
-        // Decode OUTSIDE the lock so a slow decode never blocks another reader's
-        // cache hit; a concurrent miss on the same stream just decodes twice
-        // (harmless — the value is identical, insert is last-writer-wins).
-        let decoded = self
-            .streams
+    /// Nothing decoded is kept: a gallery resident on the device needs only the
+    /// window's length and fingerprint, and a caller that needs the tokens
+    /// decodes them for as long as it uses them ([`SigWindow::decode`]).
+    pub fn wide_sig_window(&self, stream_id: StreamId) -> Option<SigWindow> {
+        self.streams
             .get(stream_id)
-            .and_then(|e| e.wide_q_sigs.as_ref())
-            .and_then(|b| decode_wide_sigs_for_scoring(b))
-            .filter(|w| !w.is_empty())
-            .map(Arc::new);
-        self.sig_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(stream_id, decoded.clone());
-        decoded
-    }
-
-    /// Evict `stream_id`'s decoded-window memo — the **incremental** invalidation
-    /// used when its blob is (re)written, so one turn seal re-decodes only that
-    /// one window on the next scan instead of churning the whole gallery.
-    #[inline]
-    fn evict_decoded_wide_sig(&mut self, stream_id: StreamId) {
-        self.sig_cache
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&stream_id);
+            .and_then(|e| e.wide_q_sigs.clone())
+            .and_then(SigWindow::new)
     }
 
     /// A turn's self-referencing sub-window seam offsets (the `start_token`s of
@@ -4297,8 +4247,9 @@ impl Substrate {
                 return hit.clone();
             }
         }
-        // Decode OUTSIDE the lock (mirrors `decoded_wide_sig`): a concurrent miss
-        // on the same stream just decodes twice — harmless, the value is identical.
+        // Decode OUTSIDE the lock so a slow decode never blocks another reader's
+        // hit: a concurrent miss on the same stream just decodes twice —
+        // harmless, the value is identical.
         let events = self
             .streams
             .get(stream_id)
@@ -4618,10 +4569,6 @@ impl Substrate {
         if ids.is_empty() {
             return;
         }
-        let sigs = self.sig_cache.get_mut().unwrap_or_else(|e| e.into_inner());
-        for sid in ids {
-            sigs.remove(sid);
-        }
         let events = self
             .events_cache
             .get_mut()
@@ -4880,8 +4827,6 @@ impl Substrate {
         }
         entry.wide_q_sigs = Some(payload.into());
         self.gallery_epoch += 1;
-        let logical = self.streams.logical_id(key);
-        self.evict_decoded_wide_sig(logical);
     }
 
     /// Record the QSA index page of a turn or a prompt section, record `id` —
@@ -7360,11 +7305,6 @@ impl Substrate {
         self.owned_sections.clear_ownership();
         self.timeline_token_totals.clear();
         self.section_token_total = 0;
-        // Drop the whole decoded-signature memo — stream ids may be reused.
-        self.sig_cache
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
         self.gallery_epoch += 1;
     }
 
@@ -11536,12 +11476,12 @@ mod tests {
         assert!(admits(&["ardh", "low-fen"], &["low-fen"]));
     }
 
-    /// The decoded-signature memo serves a stable `Arc` on repeat reads, and
-    /// invalidates when the underlying blob changes (gallery generation bump) so
-    /// a re-sealed turn never reads a stale decoded window.
+    /// A stream's window is its stored blob: repeat reads carry one fingerprint,
+    /// a rewritten blob reads back as the new window under a new fingerprint,
+    /// and an absent or empty window is `None`.
     #[test]
-    fn decoded_wide_sig_caches_and_invalidates_on_blob_change() {
-        use crate::provenance::encode_wide_sigs;
+    fn wide_sig_window_reads_the_stored_blob() {
+        use crate::provenance::{encode_wide_sigs, WideQSig};
         let mut sub = Substrate::new();
         let sid = turn_stream_id(1, 0);
         let sig_a = WideQSig {
@@ -11550,28 +11490,39 @@ mod tests {
         };
         sub.set_wide_q_sigs_blob(sid, encode_wide_sigs(std::slice::from_ref(&sig_a)));
 
-        let w1 = sub.decoded_wide_sig(sid).expect("decoded");
-        assert_eq!(w1.as_slice(), std::slice::from_ref(&sig_a));
-        // Second read is served from the memo — same allocation.
-        let w2 = sub.decoded_wide_sig(sid).expect("decoded");
-        assert!(Arc::ptr_eq(&w1, &w2), "repeat read must hit the cache");
+        let w1 = sub.wide_sig_window(sid).expect("window");
+        assert_eq!(w1.decode(), vec![sig_a]);
+        let w2 = sub.wide_sig_window(sid).expect("window");
+        assert_eq!(
+            w1.fingerprint(),
+            w2.fingerprint(),
+            "one blob, one fingerprint"
+        );
 
-        // Overwriting the blob bumps the generation and invalidates the memo.
         let sig_b = WideQSig {
             n_heads: 12,
             words: vec![0x5555_5555_5555_5555; 24],
         };
         sub.set_wide_q_sigs_blob(sid, encode_wide_sigs(std::slice::from_ref(&sig_b)));
-        let w3 = sub.decoded_wide_sig(sid).expect("decoded");
+        let w3 = sub.wide_sig_window(sid).expect("window");
         assert_eq!(
-            w3.as_slice(),
-            std::slice::from_ref(&sig_b),
-            "cache must re-decode after the blob changed"
+            w3.decode(),
+            vec![sig_b],
+            "the rewritten blob is what reads back"
         );
-        assert!(!Arc::ptr_eq(&w1, &w3), "must not serve the stale window");
+        assert_ne!(
+            w1.fingerprint(),
+            w3.fingerprint(),
+            "a rewrite must re-upload"
+        );
 
-        // An absent stream (and an empty window) resolve to None.
-        assert!(sub.decoded_wide_sig(turn_stream_id(1, 99)).is_none());
+        assert!(
+            sub.wide_sig_window(turn_stream_id(1, 99)).is_none(),
+            "absent"
+        );
+        let empty = turn_stream_id(1, 1);
+        sub.set_wide_q_sigs_blob(empty, encode_wide_sigs(&[]));
+        assert!(sub.wide_sig_window(empty).is_none(), "empty");
     }
 
     /// **Every change a belief gallery is assembled from moves the epoch, and
@@ -11580,7 +11531,7 @@ mod tests {
     /// turn still voting, or a new exemplar missing — silently.
     #[test]
     fn the_gallery_epoch_moves_on_every_change_and_never_on_a_read() {
-        use crate::provenance::encode_wide_sigs;
+        use crate::provenance::{encode_wide_sigs, WideQSig};
         let (_, _, timeline, mut sub) = make_timeline();
         let sid = turn_stream_id(timeline.raw(), 0);
         let sig = WideQSig {
@@ -11601,7 +11552,7 @@ mod tests {
 
         // Reads leave it alone.
         let before = sub.gallery_epoch();
-        let _ = sub.decoded_wide_sig(sid);
+        let _ = sub.wide_sig_window(sid);
         let _ = sub.all_streams().count();
         assert_eq!(
             sub.gallery_epoch(),
@@ -11721,12 +11672,11 @@ mod tests {
         assert!(tagged(&sub).is_empty());
     }
 
-    /// Invalidation is per-stream: rewriting one turn's sig evicts only that
-    /// turn's decoded window and leaves every other memo intact — so a single
-    /// seal never churns the whole gallery (the point of incremental eviction).
+    /// Rewriting one turn's signature changes only that turn's fingerprint, so
+    /// a single seal re-uploads one window rather than the whole gallery.
     #[test]
-    fn decoded_wide_sig_eviction_is_per_stream() {
-        use crate::provenance::encode_wide_sigs;
+    fn a_rewrite_changes_only_its_own_windows_fingerprint() {
+        use crate::provenance::{encode_wide_sigs, WideQSig};
         let sig = |fill: u64| WideQSig {
             n_heads: 12,
             words: vec![fill; 24],
@@ -11736,24 +11686,12 @@ mod tests {
         let sid_b = turn_stream_id(1, 1);
         sub.set_wide_q_sigs_blob(sid_a, encode_wide_sigs(&[sig(0xAAAA_AAAA_AAAA_AAAA)]));
         sub.set_wide_q_sigs_blob(sid_b, encode_wide_sigs(&[sig(0x5555_5555_5555_5555)]));
+        let fp = |sub: &Substrate, sid| sub.wide_sig_window(sid).expect("window").fingerprint();
+        let (a1, b1) = (fp(&sub, sid_a), fp(&sub, sid_b));
 
-        // Warm both windows.
-        let a1 = sub.decoded_wide_sig(sid_a).expect("a");
-        let b1 = sub.decoded_wide_sig(sid_b).expect("b");
-
-        // Rewrite A's blob — evicts A's memo only.
         sub.set_wide_q_sigs_blob(sid_a, encode_wide_sigs(&[sig(0xFFFF_FFFF_FFFF_FFFF)]));
-        let a2 = sub.decoded_wide_sig(sid_a).expect("a");
-        let b2 = sub.decoded_wide_sig(sid_b).expect("b");
-
-        assert!(
-            !Arc::ptr_eq(&a1, &a2),
-            "A re-decoded after its own blob change"
-        );
-        assert!(
-            Arc::ptr_eq(&b1, &b2),
-            "B's memo must survive A's eviction — no whole-gallery churn"
-        );
+        assert_ne!(a1, fp(&sub, sid_a), "A's rewrite must re-upload A");
+        assert_eq!(b1, fp(&sub, sid_b), "B is untouched by A's rewrite");
     }
 
     /// Archive flag defaults to `false`, can be toggled, and the

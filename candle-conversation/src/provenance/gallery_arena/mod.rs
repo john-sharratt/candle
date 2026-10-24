@@ -12,9 +12,10 @@
 //!
 //! The arena is a **device-level** resource (one per GPU, scheduler-owned): its
 //! residency map is keyed by the global [`StreamId`] of a turn, so every
-//! conversation on the device shares it. The warm/cold tiers already exist — the
-//! substrate `wide_q_sigs` blob and its `decoded_wide_sig` `Arc` memo — so the
-//! arena owns only the hot VRAM tier and rebuilds an evicted turn on demand.
+//! conversation on the device shares it. The warm/cold tier already exists — the
+//! substrate's encoded `wide_q_sigs` blob, read through a
+//! [`SigWindow`](super::SigWindow) — so the arena owns only the hot VRAM tier
+//! and rebuilds an evicted turn on demand, decoding it for the upload only.
 
 pub(crate) mod eviction;
 mod page_io;
@@ -22,9 +23,11 @@ mod pages;
 mod probe_rows;
 mod scan;
 pub mod scan_split;
+mod turn_sigs;
 
 pub use pages::{page_u64, pages_for, transpose_to_pages, PAGE_TOKENS};
 pub use scan::{PagedSegment, PagedWindow};
+pub use turn_sigs::TurnSigs;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,7 +42,6 @@ use candle_nn::kv_cache::{
 
 use crate::persistence::streams::StreamId;
 
-use super::WideQSig;
 use eviction::{index_cache_evictions, past_keep, Resident};
 
 /// Max distinct segment-set indices cached at once — a handful of belief groups
@@ -259,7 +261,7 @@ impl GalleryArena {
     /// own keep rule (`evict_past_keep_locked`, run before anything is admitted), so
     /// reaching a refusal is the KV side having no region to spare for a gallery
     /// that is already inside its budget.
-    fn alloc_and_upload(&self, sigs: &[WideQSig]) -> Result<PageRun> {
+    fn alloc_and_upload(&self, sigs: TurnSigs<'_>) -> Result<PageRun> {
         let n_pages = pages_for(sigs.len());
         if n_pages == 0 {
             return Ok(PageRun { slots: Vec::new() });
@@ -271,7 +273,8 @@ impl GalleryArena {
             n_pages,
         )?;
         let stride_words = slots[0].stride() / std::mem::size_of::<u64>();
-        let host_pages = transpose_to_pages(sigs, self.wpt, self.n_groups, stride_words);
+        let host_pages = sigs
+            .with_decoded(|sigs| transpose_to_pages(sigs, self.wpt, self.n_groups, stride_words));
         page_io::write_pages(&self.device, &slots, &host_pages)?;
         Ok(PageRun { slots })
     }
@@ -289,15 +292,15 @@ impl GalleryArena {
         &self,
         res: &mut HashMap<StreamId, ResidentTurn>,
         sid: StreamId,
-        sigs: &[WideQSig],
+        sigs: TurnSigs<'_>,
         fingerprint: u64,
         pin: bool,
     ) -> Result<(Vec<u64>, u64)> {
         debug_assert!(
-            sigs.first().map(|s| s.words.len()).unwrap_or(self.wpt) == self.wpt,
+            sigs.first_width().unwrap_or(self.wpt) == self.wpt,
             "gallery sig width {} != arena wpt {} — folded-geometry mismatch (wrong \
              head_dim?); every token would be dropped and the scan silently zeroed",
-            sigs.first().map(|s| s.words.len()).unwrap_or(0),
+            sigs.first_width().unwrap_or(0),
             self.wpt
         );
         // Keep the arena under its own ceiling before admitting anything new.
@@ -330,7 +333,7 @@ impl GalleryArena {
         &self,
         res: &mut HashMap<StreamId, ResidentTurn>,
         sid: StreamId,
-        sigs: &[WideQSig],
+        sigs: TurnSigs<'_>,
         fingerprint: u64,
         pin: bool,
         lru: u64,
@@ -373,16 +376,17 @@ impl GalleryArena {
     /// Ensure a turn is resident under `fingerprint`, returning its pages' device
     /// addresses (page order). A matching fingerprint is a hit (no upload); a
     /// mismatch (or absence) frees any stale pages and re-uploads exactly this
-    /// turn — the delta a seal produces. `sigs` must be the turn's full window.
+    /// turn — the delta a seal produces. `sigs` must be the turn's full window;
+    /// a stored window is decoded only on the miss.
     /// Does NOT pin — used off the scan hot path (and by tests).
-    pub fn ensure_resident(
+    pub fn ensure_resident<'a>(
         &self,
         sid: StreamId,
-        sigs: &[WideQSig],
+        sigs: impl Into<TurnSigs<'a>>,
         fingerprint: u64,
     ) -> Result<Vec<u64>> {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
-        self.ensure_locked(&mut res, sid, sigs, fingerprint, false)
+        self.ensure_locked(&mut res, sid, sigs.into(), fingerprint, false)
             .map(|(addrs, _)| addrs)
     }
 
@@ -390,14 +394,14 @@ impl GalleryArena {
     /// the duration of a scan. Every pin must be balanced by an
     /// [`unpin`](Self::unpin). Used by the paged scan's index builder, which
     /// records the run id to validate a later reuse of its index.
-    pub(super) fn scan_ensure(
+    pub(super) fn scan_ensure<'a>(
         &self,
         sid: StreamId,
-        sigs: &[WideQSig],
+        sigs: impl Into<TurnSigs<'a>>,
         fingerprint: u64,
     ) -> Result<(Vec<u64>, u64)> {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
-        self.ensure_locked(&mut res, sid, sigs, fingerprint, true)
+        self.ensure_locked(&mut res, sid, sigs.into(), fingerprint, true)
     }
 
     /// Release one pin taken by [`scan_ensure`](Self::scan_ensure).
@@ -726,6 +730,7 @@ impl GalleryArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provenance::WideQSig;
     use candle::Device;
 
     fn sig(fill: u64) -> WideQSig {

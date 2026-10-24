@@ -1,9 +1,8 @@
 //! [`Conversation`] — the workspace-shared substrate handle, and
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
-use std::collections::hash_map::DefaultHasher;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -62,7 +61,7 @@ use crate::provenance::gallery_arena::{scan_split, PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
     decode_wide_sigs_for_scoring, score_slots_fused, score_slots_grouped, score_slots_weighted,
-    FusionMode, GalleryArena, WideQSig,
+    FusionMode, GalleryArena, SigWindow, WideQSig,
 };
 use crate::scheduler::profile;
 use crate::substrate::{
@@ -279,9 +278,9 @@ pub(super) fn subwindow_bounds(len: usize, seams: &[usize]) -> Vec<(usize, usize
     bounds
 }
 
-/// A collection's belief gallery: each member's wide-Q window, the slot it
-/// votes for, and its stream id (the window's arena residency key).
-pub type BeliefGallery = (Vec<Arc<Vec<WideQSig>>>, Vec<usize>, Vec<StreamId>);
+/// A collection's belief gallery: each member's stored wide-Q window, the slot
+/// it votes for, and its stream id (the window's arena residency key).
+pub type BeliefGallery = (Vec<SigWindow>, Vec<usize>, Vec<StreamId>);
 
 /// What [`Conversation::preload_galleries`] loaded.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -522,28 +521,6 @@ impl Drop for TempDirGuard {
             }
         }
     }
-}
-
-/// Per-turn residency fingerprint for a decoded sig window: the memo's stable
-/// `Arc` identity + length + a content sample. The `decoded_wide_sig` memo
-/// serves an `Arc` whose identity changes only when the turn's blob is
-/// rewritten (and keeps unchanged Arcs alive), so the pointer is a cheap
-/// content key — a seal bumps it, a reprojection against unchanged turns does
-/// not. The word sample is the ABA guard: if a re-seal or substrate reset
-/// frees an Arc and the allocator reuses the address with the same window
-/// structure, the sampled words still differ, so stale arena pages are never
-/// served. Shared by the group and collection scans.
-pub(super) fn sig_fingerprint(arc: &Arc<Vec<WideQSig>>) -> u64 {
-    let mut h = DefaultHasher::new();
-    (Arc::as_ptr(arc) as usize).hash(&mut h);
-    arc.len().hash(&mut h);
-    if let Some(first) = arc.first().and_then(|s| s.words.first()) {
-        first.hash(&mut h);
-    }
-    if let Some(last) = arc.last().and_then(|s| s.words.last()) {
-        last.hash(&mut h);
-    }
-    h.finish()
 }
 
 impl Default for Conversation {
@@ -971,7 +948,7 @@ impl Conversation {
                 return gallery.clone();
             }
         }
-        let mut windows: Vec<Arc<Vec<WideQSig>>> = Vec::new();
+        let mut windows: Vec<SigWindow> = Vec::new();
         let mut slots: Vec<usize> = Vec::new();
         let mut sids: Vec<StreamId> = Vec::new();
         // A tagged collection admits only turns in a gather scope, which the
@@ -1004,10 +981,10 @@ impl Conversation {
             if !in_scope {
                 continue;
             }
-            // Cached decode: the static gallery is decoded once per session
-            // (invalidated when a turn's sig blob changes), not re-parsed on every
-            // reprojection. `None` covers absent or empty windows.
-            let Some(window) = sub.decoded_wide_sig(sid) else {
+            // The stored window, not decoded: the scan decodes only the turns
+            // it has to upload or score on the host. `None` covers absent,
+            // empty and unreadable windows.
+            let Some(window) = sub.wide_sig_window(sid) else {
                 continue;
             };
             let slot = d.tags.iter().find_map(|t| slot_of(t)).or_else(|| {
@@ -1030,10 +1007,11 @@ impl Conversation {
     }
 
     /// Load everything a projection's belief scan reads before it first runs:
-    /// every scanned turn group's signature windows decoded (and their events
+    /// every scanned turn group's signature windows gathered (and their events
     /// digested), every section collection's gallery assembled, and all of them
     /// resident on `arena` under the fingerprints the scan itself takes — so
-    /// the scan finds them all and uploads nothing.
+    /// the scan finds them all and uploads nothing. Each window is decoded only
+    /// for its upload; nothing decoded outlives it.
     ///
     /// Without it the first projection after a start paid for all of that
     /// inline, ahead of its first token: measured at ~515 ms decoding and
@@ -1049,7 +1027,7 @@ impl Conversation {
         schema: &Schema,
         arena: Option<&GalleryArena>,
     ) -> GalleryPreload {
-        let mut windows: Vec<(StreamId, Arc<Vec<WideQSig>>)> = Vec::new();
+        let mut windows: Vec<(StreamId, SigWindow)> = Vec::new();
         let mut preload = GalleryPreload::default();
         {
             let sub = self.inner.read().unwrap();
@@ -1078,14 +1056,14 @@ impl Conversation {
             return preload;
         };
         let mut seen: HashSet<StreamId> = HashSet::new();
-        for (sid, sigs) in windows {
+        for (sid, window) in windows {
             if !seen.insert(sid) {
                 continue;
             }
-            match arena.ensure_resident(sid, &sigs, sig_fingerprint(&sigs)) {
+            match arena.ensure_resident(sid, &window, window.fingerprint()) {
                 Ok(_) => {
                     preload.resident += 1;
-                    preload.tokens += sigs.len();
+                    preload.tokens += window.len();
                 }
                 Err(e) => tracing::warn!(
                     target: "candle_conversation::provenance",
@@ -1212,6 +1190,9 @@ impl Conversation {
             // and the UNGATED additive sum the Concept B mass keys on (the gate
             // deliberately removes the concentrated spike mass must see —
             // results doc §25).
+            // The host path reads decoded windows: decoded on its first use in
+            // this pass, shared by both probes, and dropped with the pass.
+            let host_windows: OnceCell<Vec<Vec<WideQSig>>> = OnceCell::new();
             let scan_probe = |p: &[WideQSig]| -> (Vec<f32>, Vec<f32>) {
                 let ranged: Vec<(usize, Range<usize>)> = (0..windows.len())
                     .map(|i| (i, 0..windows[i].len()))
@@ -1225,8 +1206,8 @@ impl Conversation {
                             .iter()
                             .map(|(i, r)| PagedWindow {
                                 sid: sids[*i],
-                                fingerprint: sig_fingerprint(&windows[*i]),
-                                turn: windows[*i].as_slice(),
+                                fingerprint: windows[*i].fingerprint(),
+                                turn: (&windows[*i]).into(),
                                 start: r.start,
                                 end: r.end,
                                 case: slots[*i],
@@ -1287,9 +1268,11 @@ impl Conversation {
                 gpu_fresh.unwrap_or_else(|| {
                     // Same narrowing on the CPU path: slice each window to its
                     // phase range so both backends score the identical region.
+                    let decoded = host_windows
+                        .get_or_init(|| windows.iter().map(SigWindow::decode).collect());
                     let wref: Vec<&[WideQSig]> = ranged
                         .iter()
-                        .map(|(i, r)| &windows[*i].as_slice()[r.clone()])
+                        .map(|(i, r)| &decoded[*i][r.clone()])
                         .collect();
                     // Shadows the gallery-wide slot list: `wref` holds only the
                     // windows the lens kept, so its cases must line up with it.
@@ -1795,13 +1778,13 @@ impl Conversation {
             // Every planned exemplar's whole-turn signature, in plan order — the
             // order the levels fold them in, which the asymmetric EWMA is not
             // indifferent to.
-            let probes: Vec<(u64, Arc<Vec<WideQSig>>)> = {
+            let probes: Vec<(u64, Vec<WideQSig>)> = {
                 let sub = self.inner.read().unwrap();
                 plan.iter()
                     .flat_map(|(_, keys)| keys.iter())
                     .filter_map(|(tl, idx)| {
                         let sid = turn_stream_id(*tl, *idx);
-                        sub.decoded_wide_sig(sid).map(|sig| (sid.0, sig))
+                        sub.wide_sig_window(sid).map(|w| (sid.0, w.decode()))
                     })
                     .filter(|(_, sig)| !sig.is_empty())
                     .collect()
@@ -1865,7 +1848,7 @@ impl Conversation {
     fn fold_warm_probes(
         &self,
         taught: &SectionCollection,
-        probes: &[(u64, Arc<Vec<WideQSig>>)],
+        probes: &[(u64, Vec<WideQSig>)],
         arena: Option<&GalleryArena>,
     ) -> Option<bool> {
         let n = taught.sections.len();
@@ -1897,8 +1880,8 @@ impl Conversation {
                         .zip(&slots)
                         .map(|((w, sid), &case)| PagedWindow {
                             sid: *sid,
-                            fingerprint: sig_fingerprint(w),
-                            turn: w.as_slice(),
+                            fingerprint: w.fingerprint(),
+                            turn: w.into(),
                             start: 0,
                             end: w.len(),
                             case,
@@ -1953,7 +1936,8 @@ impl Conversation {
         let raw = match gpu {
             Some(raw) => raw,
             None => {
-                let gallery: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+                let decoded: Vec<Vec<WideQSig>> = windows.iter().map(SigWindow::decode).collect();
+                let gallery: Vec<&[WideQSig]> = decoded.iter().map(Vec::as_slice).collect();
                 let mut raw = Vec::with_capacity(queries.len());
                 for query in &queries {
                     if self.ingest_cancelled() {
@@ -2179,11 +2163,17 @@ impl Conversation {
             let _g = profile::span("warm:assemble");
             let sub = self.inner.read().unwrap();
             let count = sub.turn_count(tl);
-            let sigs: Vec<(u64, Arc<Vec<WideQSig>>)> = (0..count)
+            // A handful of self-probes is enough: the asymmetric EWMA (alpha_up
+            // 0.30) is ~94% converged after 8 observes, and each already scores
+            // against ALL the file's exchanges, so this caps the warm cost without
+            // materially moving the level. Only those are decoded.
+            let sigs: Vec<(u64, Vec<WideQSig>)> = (0..count)
                 .filter_map(|i| {
                     let sid = turn_stream_id(tl.raw(), i);
-                    sub.decoded_wide_sig(sid).map(|s| (sid.0, s))
+                    sub.wide_sig_window(sid).map(|w| (sid.0, w))
                 })
+                .take(WARM_INGEST_PROBES_PER_TIMELINE)
+                .map(|(source, w)| (source, w.decode()))
                 .collect();
             let (files, _) = assemble_file_scans(&sub, vec![tl]);
             (sigs, files)
@@ -2191,13 +2181,8 @@ impl Conversation {
         let Some(file) = files.first().filter(|f| f.n_slots > 1) else {
             return;
         };
-        // A handful of self-probes is enough: the asymmetric EWMA (alpha_up
-        // 0.30) is ~94% converged after 8 observes, and each already scores
-        // against ALL the file's exchanges, so this caps the warm cost without
-        // materially moving the level.
         let probes: Vec<(u64, &[WideQSig])> = sigs
             .iter()
-            .take(WARM_INGEST_PROBES_PER_TIMELINE)
             .filter(|(_, sig)| !sig.is_empty())
             .map(|(source, sig)| (*source, sig.as_slice()))
             .collect();
@@ -2292,8 +2277,8 @@ impl Conversation {
         // hold it across `scan_weighted` — blocking EVERY substrate writer for
         // the scan's whole duration, most importantly the persistence thread's
         // install-warm (the same starvation the wave loop's livelock guard
-        // documents). Nothing in Phase B needs it: `decoded_wide_sig` and
-        // `decoded_seams` hand back `Arc`s and `couplings_of` returns by value,
+        // documents). Nothing in Phase B needs it: `wide_sig_window` and
+        // `decoded_seams` hand back shared buffers and `couplings_of` returns by value,
         // so the scan borrows owned data, not the substrate. The borrow checker
         // is what keeps this honest — if Phase B ever grows a substrate access,
         // the `drop(sub)` below stops compiling rather than silently re-extending

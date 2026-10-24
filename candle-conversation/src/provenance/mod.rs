@@ -31,6 +31,7 @@ mod popcount;
 pub mod raw_store;
 pub mod scan;
 pub mod selection;
+pub mod sig_window;
 pub mod wide_sig;
 
 pub use belief::{ToolBelief, DEFAULT_LEAK_BETA};
@@ -48,6 +49,7 @@ pub use scan::{
     score_provenance_late_fusion_grouped, score_provenance_late_fusion_weighted, FOLD_GROUPS,
 };
 pub use selection::{GroupBudget, SectionPolicy, SectionSelector};
+pub use sig_window::SigWindow;
 pub use wide_sig::{
     active_fold, decode_wide_sigs, decode_wide_sigs_for_scoring, encode_wide_sigs,
     encode_wide_sigs_with, fold_fits, fold_provenance, fold_provenance_checked,

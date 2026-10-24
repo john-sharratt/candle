@@ -345,18 +345,18 @@ const WIDE_VERSION_CURRENT: u8 = b'5';
 const WIDE_HEADER: usize = 20;
 
 /// Everything one record's header carries.
-struct WideHeader {
-    header_len: usize,
-    n_tokens: usize,
-    n_heads: u16,
-    wph: usize,
+pub(super) struct WideHeader {
+    pub(super) header_len: usize,
+    pub(super) n_tokens: usize,
+    pub(super) n_heads: u16,
+    pub(super) wph: usize,
     /// The fold that produced these signatures.
-    params: FoldParams,
+    pub(super) params: FoldParams,
 }
 
 /// Parse one encoded record's header. `None` for a foreign or unknown-version
 /// blob.
-fn parse_wide_header(bytes: &[u8]) -> Option<WideHeader> {
+pub(super) fn parse_wide_header(bytes: &[u8]) -> Option<WideHeader> {
     if bytes.len() < 4 || &bytes[0..3] != WIDE_MAGIC_PREFIX {
         return None;
     }
@@ -536,19 +536,30 @@ pub fn decode_wide_sigs(bytes: &[u8]) -> Option<Vec<WideQSig>> {
 /// inferred from its shape rather than stamped — and compares equal to anything.
 pub fn decode_wide_sigs_checked(bytes: &[u8], expected: FoldParams) -> Option<Vec<WideQSig>> {
     let h = parse_wide_header(bytes)?;
-    let got = h.params;
-    let both_stated = got.group_sizes[0] != 0 && expected.group_sizes[0] != 0;
-    if both_stated && got.group_sizes != expected.group_sizes {
-        tracing::warn!(
-            "PROVENANCE FOLD MISMATCH: record folded over layer groups {:?} but \
-             this build folds {:?} — refusing to score rather than return a \
-             confident number over incomparable bits",
-            got.group_sizes,
-            expected.group_sizes,
-        );
+    if !fold_admits(h.params, expected) {
+        warn_fold_mismatch(h.params, expected);
         return None;
     }
     decode_wide_sigs(bytes)
+}
+
+/// Whether a record folded as `got` may be scored by a process folding as
+/// `expected` — the comparison [`decode_wide_sigs_checked`] makes: group sizes
+/// only, `0` in either first group meaning "unstated".
+pub(super) fn fold_admits(got: FoldParams, expected: FoldParams) -> bool {
+    let both_stated = got.group_sizes[0] != 0 && expected.group_sizes[0] != 0;
+    !both_stated || got.group_sizes == expected.group_sizes
+}
+
+/// The warning a refused record's fold raises.
+pub(super) fn warn_fold_mismatch(got: FoldParams, expected: FoldParams) {
+    tracing::warn!(
+        "PROVENANCE FOLD MISMATCH: record folded over layer groups {:?} but \
+         this build folds {:?} — refusing to score rather than return a \
+         confident number over incomparable bits",
+        got.group_sizes,
+        expected.group_sizes,
+    );
 }
 
 #[cfg(test)]

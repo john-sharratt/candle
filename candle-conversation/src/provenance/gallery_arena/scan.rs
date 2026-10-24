@@ -35,7 +35,7 @@ use super::super::WideQSig;
 use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
 use super::scan_split::{self, LaunchTiming};
-use super::GalleryArena;
+use super::{GalleryArena, TurnSigs};
 
 /// A sub-window of a resident turn that contributes to a scan: `[start, end)`
 /// tokens of the turn identified by `sid`/`fingerprint`, voting for `case`.
@@ -43,7 +43,7 @@ pub struct PagedWindow<'a> {
     pub sid: StreamId,
     pub fingerprint: u64,
     /// The WHOLE turn window (for residency); the scan reads `[start, end)`.
-    pub turn: &'a [WideQSig],
+    pub turn: TurnSigs<'a>,
     pub start: usize,
     pub end: usize,
     pub case: usize,
@@ -157,8 +157,9 @@ fn launch_failure(rc: i32) -> (&'static str, i32) {
 /// turn's pages gives it a new one, so the cache can't serve stale device
 /// addresses. (2) This 64-bit
 /// SipHash covers logical changes to the scan; a caller MUST vary `w.fingerprint`
-/// whenever the turn's content changes (the resolver's `fp_of` folds in the
-/// decoded-sig `Arc` len + a content sample), and `turn.len()` is hashed directly
+/// whenever the turn's content changes
+/// ([`SigWindow::fingerprint`](super::super::SigWindow::fingerprint) folds in the
+/// stored buffer's address + a content sample), and `turn.len()` is hashed directly
 /// so a length change alone (which shifts `pos_map`) also invalidates. A 64-bit
 /// hash collision under an unchanged generation could serve a wrong index — a
 /// ~2⁻⁶⁴ event we accept, the standard content-address trade.
@@ -237,7 +238,7 @@ impl GalleryArena {
                 };
                 for t in w.start..w.end.min(w.turn.len()) {
                     // Uniform width only (mirror the reference's admission guard).
-                    if w.turn[t].words.len() != wpt {
+                    if !w.turn.token_has_width(t, wpt) {
                         continue;
                     }
                     let page = base + t / PAGE_TOKENS;
@@ -886,7 +887,7 @@ mod tests {
                     PagedWindow {
                         sid: turn_stream_id(7, 0),
                         fingerprint: 70,
-                        turn: &a,
+                        turn: (&a).into(),
                         start: 0,
                         end: 40,
                         case: 0,
@@ -894,7 +895,7 @@ mod tests {
                     PagedWindow {
                         sid: turn_stream_id(7, 1),
                         fingerprint: 71,
-                        turn: &b,
+                        turn: (&b).into(),
                         start: 0,
                         end: 9,
                         case: 1,
@@ -906,7 +907,7 @@ mod tests {
                 windows: vec![PagedWindow {
                     sid: turn_stream_id(8, 0),
                     fingerprint: 80,
-                    turn: &a,
+                    turn: (&a).into(),
                     start: 5,
                     end: 30,
                     case: 0,
@@ -968,7 +969,7 @@ mod tests {
                     windows: vec![PagedWindow {
                         sid: turn_stream_id(9, 0),
                         fingerprint: 90,
-                        turn: &a,
+                        turn: (&a).into(),
                         start: 0,
                         end: 40,
                         case: 0,
@@ -980,7 +981,7 @@ mod tests {
                         PagedWindow {
                             sid: turn_stream_id(10, 0),
                             fingerprint: 100,
-                            turn: &b,
+                            turn: (&b).into(),
                             start: 0,
                             end: 6,
                             case: 0,
@@ -988,7 +989,7 @@ mod tests {
                         PagedWindow {
                             sid: turn_stream_id(10, 0),
                             fingerprint: 100,
-                            turn: &b,
+                            turn: (&b).into(),
                             start: 6,
                             end: 12,
                             case: 1,
@@ -1062,7 +1063,7 @@ mod tests {
                     PagedWindow {
                         sid: turn_stream_id(1, 0),
                         fingerprint: 10,
-                        turn: &a0,
+                        turn: (&a0).into(),
                         start: 0,
                         end: 3,
                         case: 0,
@@ -1070,7 +1071,7 @@ mod tests {
                     PagedWindow {
                         sid: turn_stream_id(1, 1),
                         fingerprint: 11,
-                        turn: &a1,
+                        turn: (&a1).into(),
                         start: 0,
                         end: 2,
                         case: 1,
@@ -1084,7 +1085,7 @@ mod tests {
                     PagedWindow {
                         sid: turn_stream_id(2, 0),
                         fingerprint: 20,
-                        turn: &b0,
+                        turn: (&b0).into(),
                         start: 0,
                         end: 20,
                         case: 0,
@@ -1092,7 +1093,7 @@ mod tests {
                     PagedWindow {
                         sid: turn_stream_id(2, 0),
                         fingerprint: 20,
-                        turn: &b0,
+                        turn: (&b0).into(),
                         start: 20,
                         end: 40,
                         case: 1,
@@ -1104,7 +1105,7 @@ mod tests {
                 windows: vec![PagedWindow {
                     sid: turn_stream_id(3, 0),
                     fingerprint: 30,
-                    turn: &c0,
+                    turn: (&c0).into(),
                     start: 0,
                     end: 33,
                     case: 0,
@@ -1209,7 +1210,7 @@ mod tests {
                     PagedWindow {
                         sid: turn_stream_id(9, 0),
                         fingerprint: 1,
-                        turn: &t0,
+                        turn: (&t0).into(),
                         start: 0,
                         end: 50,
                         case: 0,
@@ -1217,7 +1218,7 @@ mod tests {
                     PagedWindow {
                         sid: turn_stream_id(9, 1),
                         fingerprint: 2,
-                        turn: &t1,
+                        turn: (&t1).into(),
                         start: 0,
                         end: 12,
                         case: 1,
@@ -1229,7 +1230,7 @@ mod tests {
                 windows: vec![PagedWindow {
                     sid: turn_stream_id(9, 2),
                     fingerprint: 3,
-                    turn: &t2,
+                    turn: (&t2).into(),
                     start: 0,
                     end: 7,
                     case: 0,
@@ -1287,7 +1288,7 @@ mod tests {
             windows: vec![PagedWindow {
                 sid: turn_stream_id(7, 0),
                 fingerprint: 1,
-                turn: &a,
+                turn: (&a).into(),
                 start: 0,
                 end: 20,
                 case: 0,
@@ -1298,7 +1299,7 @@ mod tests {
             windows: vec![PagedWindow {
                 sid: turn_stream_id(8, 0),
                 fingerprint: 2,
-                turn: &b,
+                turn: (&b).into(),
                 start: 0,
                 end: 15,
                 case: 0,
@@ -1347,7 +1348,7 @@ mod tests {
             windows: vec![PagedWindow {
                 sid: turn_stream_id(7, 0),
                 fingerprint: 1,
-                turn: &a,
+                turn: (&a).into(),
                 start: 0,
                 end: 20,
                 case: 0,
@@ -1419,7 +1420,7 @@ mod tests {
             .map(|(i, turn)| PagedWindow {
                 sid: turn_stream_id(40 + i as u64, 0),
                 fingerprint: 100 + i as u64,
-                turn,
+                turn: turn.into(),
                 start: 0,
                 end: turn.len(),
                 case: i,
@@ -1525,7 +1526,7 @@ mod tests {
                     windows.push(PagedWindow {
                         sid: turn_stream_id(500 + si as u64, ti as u32),
                         fingerprint: (si * 100 + ti) as u64,
-                        turn: t,
+                        turn: t.into(),
                         start: 0,
                         end: mid,
                         case,
@@ -1533,7 +1534,7 @@ mod tests {
                     windows.push(PagedWindow {
                         sid: turn_stream_id(500 + si as u64, ti as u32),
                         fingerprint: (si * 100 + ti) as u64,
-                        turn: t,
+                        turn: t.into(),
                         start: mid,
                         end: t.len(),
                         case: case.saturating_sub(1),
@@ -1542,7 +1543,7 @@ mod tests {
                     windows.push(PagedWindow {
                         sid: turn_stream_id(500 + si as u64, ti as u32),
                         fingerprint: (si * 100 + ti) as u64,
-                        turn: t,
+                        turn: t.into(),
                         start: 0,
                         end: t.len(),
                         case,
@@ -1554,7 +1555,7 @@ mod tests {
             windows.push(PagedWindow {
                 sid: turn_stream_id(500 + si as u64, (next_turn % turns.len()) as u32),
                 fingerprint: (si * 100 + next_turn % turns.len()) as u64,
-                turn: tdrop,
+                turn: tdrop.into(),
                 start: 0,
                 end: tdrop.len().min(4),
                 case: n_cases + 3,
@@ -1649,7 +1650,7 @@ mod tests {
                         windows.push(PagedWindow {
                             sid: turn_stream_id(7_000, ti as u32),
                             fingerprint: ti as u64,
-                            turn: &turns[ti],
+                            turn: (&turns[ti]).into(),
                             start: 0,
                             end: TURN_TOKENS,
                             case,
@@ -1729,7 +1730,7 @@ mod tests {
                         PagedWindow {
                             sid: turn_stream_id(9_000, ti as u32),
                             fingerprint: ti as u64,
-                            turn: &turns[ti],
+                            turn: (&turns[ti]).into(),
                             start,
                             end: start + 2,
                             case,

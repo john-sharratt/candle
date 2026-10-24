@@ -10,18 +10,18 @@
 //! proportional to its turns, so the warm-up assembles it once for all of its
 //! self-probes instead of once per probe.
 
+use std::cell::OnceCell;
 use std::ops::Range;
-use std::sync::Arc;
 
 use super::ids::{TimelineId, TurnIndex};
-use super::resolver::{sig_fingerprint, subwindow_bounds};
+use super::resolver::subwindow_bounds;
 use super::schema::GroupSchema;
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::streams::StreamId;
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
-    score_slots_grouped, score_slots_weighted, FusionMode, GalleryArena, WideQSig,
+    score_slots_grouped, score_slots_weighted, FusionMode, GalleryArena, SigWindow, WideQSig,
 };
 use crate::substrate::Substrate;
 use crate::summary_tree::exchange::{exchanges, over_normals};
@@ -35,8 +35,8 @@ pub(crate) struct FileScan {
     /// Each exchange's span of `arc_turn`.
     pub ex_ranges: Vec<Range<usize>>,
     pub n_slots: usize,
-    /// The signature windows referenced by `windows`, kept alive for the scan.
-    pub arcs_kept: Vec<Arc<Vec<WideQSig>>>,
+    /// The stored signature windows referenced by `windows`, not decoded.
+    pub arcs_kept: Vec<SigWindow>,
     /// Stream id of each kept arc's turn — the arena residency key.
     pub arc_sids: Vec<StreamId>,
     /// `(arc index into arcs_kept, window start, window end, exchange slot)`.
@@ -66,7 +66,7 @@ pub(crate) fn assemble_file_scans(
         // resolve back to it — so a query matching one structural region of a
         // prefilled listing surfaces the whole turn without diluting against
         // the rest.
-        let mut arcs: Vec<Option<Arc<Vec<WideQSig>>>> = Vec::new();
+        let mut arcs: Vec<Option<SigWindow>> = Vec::new();
         let mut arc_turn: Vec<TurnIndex> = Vec::new();
         let mut arc_bounds: Vec<Vec<(usize, usize)>> = Vec::new();
         for i in 0..count {
@@ -88,7 +88,7 @@ pub(crate) fn assemble_file_scans(
             // coupled call with the wrong later turn. A sig-less turn contributes
             // no gallery window (empty bounds) but still joins its exchange.
             arc_turn.push(idx);
-            match sub.decoded_wide_sig(turn_stream_id(timeline.raw(), i)) {
+            match sub.wide_sig_window(turn_stream_id(timeline.raw(), i)) {
                 Some(window) => {
                     // Self-referencing projection events mark sub-window seams.
                     // Read the memoized (sorted, deduped) seams — decoded from the
@@ -138,7 +138,7 @@ pub(crate) fn assemble_file_scans(
         // separate cases and split the scope's vote. Then the L46-weighted vote
         // (§83) decides the exchange. Only the arcs actually referenced by a
         // window are kept alive.
-        let mut arcs_kept: Vec<Arc<Vec<WideQSig>>> = Vec::new();
+        let mut arcs_kept: Vec<SigWindow> = Vec::new();
         let mut arc_sids: Vec<StreamId> = Vec::new();
         let mut windows: Vec<(usize, usize, usize, usize)> = Vec::new();
         for (ai, arc) in arcs.iter().enumerate() {
@@ -206,10 +206,21 @@ pub(crate) fn competitions(files: &[FileScan]) -> Vec<Vec<usize>> {
     out
 }
 
+/// Every file's kept windows decoded, `[file][arc]` — what the host scan
+/// reads, held only for the scan that needs it.
+fn decode_files(files: &[FileScan]) -> Vec<Vec<Vec<WideQSig>>> {
+    files
+        .iter()
+        .map(|f| f.arcs_kept.iter().map(SigWindow::decode).collect())
+        .collect()
+}
+
 /// One competition's gallery windows, the case each votes for, and its case
 /// count: each file's exchanges at its offset among the competition's cases.
+/// `decoded` is [`decode_files`] of `files`.
 fn competition_windows<'a>(
-    files: &'a [FileScan],
+    files: &[FileScan],
+    decoded: &'a [Vec<Vec<WideQSig>>],
     comp: &[usize],
 ) -> (Vec<&'a [WideQSig]>, Vec<usize>, usize) {
     let mut wref = Vec::new();
@@ -218,7 +229,7 @@ fn competition_windows<'a>(
     for &fi in comp {
         let f = &files[fi];
         for &(k, s, e, slot) in &f.windows {
-            wref.push(&f.arcs_kept[k][s..e]);
+            wref.push(&decoded[fi][k][s..e]);
             wslot.push(n_cases + slot);
         }
         n_cases += f.n_slots;
@@ -269,12 +280,15 @@ pub(crate) fn scan_file_scans(
     let comps = competitions(files);
     // The CPU scan of one probe — the path a host without the arena takes —
     // one competition at a time, its votes laid end to end in competition
-    // order, as the arena lays them.
+    // order, as the arena lays them. The windows are decoded on the host path's
+    // first use and shared by every probe of this call.
+    let decoded: OnceCell<Vec<Vec<Vec<WideQSig>>>> = OnceCell::new();
     let scan_files_cpu = |p: &[WideQSig]| -> Vec<(Vec<f32>, Vec<f32>)> {
+        let decoded = decoded.get_or_init(|| decode_files(files));
         let mut fused_all: Vec<f32> = Vec::new();
         let mut base_all: Vec<f32> = Vec::new();
         for comp in &comps {
-            let (wref, wslot, n_cases) = competition_windows(files, comp);
+            let (wref, wslot, n_cases) = competition_windows(files, decoded, comp);
             let (fused, base) = match group.policy.scan.fusion {
                 FusionMode::Additive => {
                     let v = score_slots_weighted(p, &wref, &wslot, n_cases, weights);
@@ -298,14 +312,10 @@ pub(crate) fn scan_file_scans(
             .collect()
     };
     let gpu_scores: Option<Vec<Vec<(Vec<f32>, Vec<f32>)>>> = arena.and_then(|arena| {
-        // Per-turn residency fingerprint: the decoded-sig `Arc` identity + a
-        // content sample (first/last words). The memo serves a STABLE `Arc`
-        // that changes identity only when a turn's blob is rewritten (and keeps
-        // unchanged Arcs alive), so the pointer is a cheap content key — a seal
-        // bumps it, a reprojection against unchanged turns does not. The word
-        // sample is the ABA guard against an in-place re-seal / substrate reset
-        // reusing an address. Keyed per turn, so a seal re-uploads only that
-        // turn's pages; unchanged turns stay resident (no upload).
+        // Per-turn residency fingerprint: the stored window's
+        // (`SigWindow::fingerprint`), which changes only when the turn's blob is
+        // rewritten — so a seal re-uploads only that turn's pages, unchanged
+        // turns stay resident, and a resident turn is never decoded.
         // One segment per competition, each file's exchanges at its offset in
         // the competition's cases.
         let segments: Vec<PagedSegment> = comps
@@ -317,8 +327,8 @@ pub(crate) fn scan_file_scans(
                     let f = &files[fi];
                     windows.extend(f.windows.iter().map(|&(k, s, e, slot)| PagedWindow {
                         sid: f.arc_sids[k],
-                        fingerprint: sig_fingerprint(&f.arcs_kept[k]),
-                        turn: f.arcs_kept[k].as_slice(),
+                        fingerprint: f.arcs_kept[k].fingerprint(),
+                        turn: (&f.arcs_kept[k]).into(),
                         start: s,
                         end: e,
                         case: n_cases + slot,
@@ -412,7 +422,10 @@ pub(crate) fn scan_file_scans(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::provenance::encode_wide_sigs;
 
     /// A deterministic pseudo-random folded signature: 3 groups × 4 heads ×
     /// 2 words.
@@ -432,13 +445,12 @@ mod tests {
     /// A file of `exchanges` one-turn exchanges of `tokens` signature tokens
     /// each, seeded from `seed`.
     fn file(timeline: u64, seed: u64, exchanges: usize, tokens: usize) -> FileScan {
-        let arcs: Vec<Arc<Vec<WideQSig>>> = (0..exchanges)
+        let arcs: Vec<SigWindow> = (0..exchanges)
             .map(|e| {
-                Arc::new(
-                    (0..tokens)
-                        .map(|t| sig(seed * 10_000 + (e * tokens + t) as u64))
-                        .collect(),
-                )
+                let sigs: Vec<WideQSig> = (0..tokens)
+                    .map(|t| sig(seed * 10_000 + (e * tokens + t) as u64))
+                    .collect();
+                SigWindow::new(Arc::from(encode_wide_sigs(&sigs))).expect("a stored window")
             })
             .collect();
         let tl = TimelineId::for_test(timeline);
@@ -479,11 +491,12 @@ mod tests {
     fn a_pooled_document_is_scored_against_the_others() {
         let files: Vec<FileScan> = (1..=5).map(|i| file(i, i, 1, 24)).collect();
         // The probe is a stretch of document 3's own signature.
-        let probe: Vec<WideQSig> = files[2].arcs_kept[0][4..16].to_vec();
+        let probe: Vec<WideQSig> = files[2].arcs_kept[0].decode()[4..16].to_vec();
 
         let comps = competitions(&files);
         assert_eq!(comps, vec![vec![0, 1, 2, 3, 4]]);
-        let (wref, wslot, n_cases) = competition_windows(&files, &comps[0]);
+        let decoded = decode_files(&files);
+        let (wref, wslot, n_cases) = competition_windows(&files, &decoded, &comps[0]);
         let pooled = scatter(
             &files,
             &comps,
@@ -498,7 +511,9 @@ mod tests {
         // Alone, a document the probe is not from still scores most of what
         // the right one does.
         let alone = |f: &FileScan| {
-            let (wref, wslot, n) = competition_windows(std::slice::from_ref(f), &[0]);
+            let one = std::slice::from_ref(f);
+            let decoded = decode_files(one);
+            let (wref, wslot, n) = competition_windows(one, &decoded, &[0]);
             score_slots_weighted(&probe, &wref, &wslot, n, &[])[0]
         };
         assert!(alone(&files[0]) > 0.2 * alone(&files[2]));

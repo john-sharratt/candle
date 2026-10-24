@@ -1357,7 +1357,7 @@ fn scan_bench(
     iters: usize,
     gpu_batch: usize,
 ) -> Result<()> {
-    use candle_conversation::provenance::{score_slots, WideQSig};
+    use candle_conversation::provenance::{score_slots, SigWindow, WideQSig};
     use std::time::Instant;
 
     // Live reproject cadence/probe cap (candle-conversation defaults) — used to
@@ -1370,22 +1370,20 @@ fn scan_bench(
     // token payloads, keeps the wide-Q sig blobs the gallery reads.
     println!("── Phase 1: load (fast metadata walk) ──────────────────────────");
     let t_build = Instant::now();
-    let mut substrate = build_substrate(log)?;
+    let substrate = build_substrate(log)?;
     let load_s = t_build.elapsed().as_secs_f64();
     let n_streams = substrate.all_streams().count();
     println!("  substrate load: {load_s:.2} s   ({n_streams} streams)");
 
     // ── Phase 2: assemble the tag-scoped gallery (belief_gallery equivalent) ─
-    // This rebuild runs on EVERY live reprojection. With the decoded-sig cache it
-    // decodes the static gallery once per session and serves the memo thereafter,
-    // so we time it COLD (first, decodes) and WARM (cached) to show the win.
-    use std::sync::Arc;
+    // Assembly runs on every live reprojection and reads the stored windows
+    // without decoding them; a host scan decodes what it scores. Both are timed.
     println!("\n── Phase 2: gallery assembly (per-reprojection in production) ──");
     let assemble = |sub: &Substrate| {
         let mut slot_names: Vec<String> = Vec::new();
-        let mut windows: Vec<Arc<Vec<WideQSig>>> = Vec::new();
+        let mut windows: Vec<SigWindow> = Vec::new();
         let mut slots: Vec<usize> = Vec::new();
-        let mut probe_pick: Option<Arc<Vec<WideQSig>>> = None;
+        let mut probe_pick: Option<SigWindow> = None;
         for (sid, e) in sub.all_streams() {
             let Some(StreamDecl::Turn(t)) = &e.decl else {
                 continue;
@@ -1396,7 +1394,7 @@ fn scan_bench(
             let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
                 continue;
             };
-            let Some(window) = sub.decoded_wide_sig(sid) else {
+            let Some(window) = sub.wide_sig_window(sid) else {
                 continue;
             };
             if probe_id.is_none() && probe_pick.is_none() {
@@ -1414,27 +1412,12 @@ fn scan_bench(
         }
         (slot_names, windows, slots, probe_pick)
     };
-    let t_cold = Instant::now();
-    let (slot_names, windows, slots, probe_pick) = assemble(&substrate);
-    let cold_ms = t_cold.elapsed().as_secs_f64() * 1e3;
-    let t_warm = Instant::now();
-    let _ = assemble(&substrate);
-    let warm_ms = t_warm.elapsed().as_secs_f64() * 1e3;
-
-    // Churn check: simulate a turn seal (one sig write). Incremental per-stream
-    // eviction must leave the rest of the gallery cached, so re-assembly stays
-    // warm — a global-clear invalidation would re-decode all of it here.
-    use candle_conversation::persistence::content_hash::turn_stream_id;
-    use candle_conversation::persistence::identity::RecordIdentity;
-    use candle_conversation::provenance::encode_wide_sigs;
-    substrate.apply_wide_q_sigs(
-        turn_stream_id(u64::MAX, 0),
-        encode_wide_sigs(&[]),
-        RecordIdentity::NONE,
-    );
-    let t_churn = Instant::now();
-    let _ = assemble(&substrate);
-    let churn_ms = t_churn.elapsed().as_secs_f64() * 1e3;
+    let t_assemble = Instant::now();
+    let (slot_names, stored, slots, probe_pick) = assemble(&substrate);
+    let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1e3;
+    let t_decode = Instant::now();
+    let windows: Vec<Vec<WideQSig>> = stored.iter().map(SigWindow::decode).collect();
+    let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
 
     if windows.is_empty() {
         println!("  gallery is EMPTY for tag {tag:?} — nothing to scan.");
@@ -1457,21 +1440,22 @@ fn scan_bench(
         "  sig shape: {n_heads} heads × {wph} words/head → {n_groups} groups × {} words/group",
         4 * wph
     );
-    println!("  cold assembly (first, decodes all): {cold_ms:.1} ms");
     println!(
-        "  warm assembly (cached decode):      {warm_ms:.1} ms   ← per-reprojection steady state"
+        "  assembly (stored windows):          {assemble_ms:.1} ms   ← per-reprojection steady state"
     );
     println!(
-        "  after a turn seal (1 sig write):    {churn_ms:.1} ms   ← incremental evict, no churn"
+        "  decode (host scan only):            {decode_ms:.1} ms   ← a GPU scan of resident turns skips it"
     );
 
     // Resolve the probe window (named stream or the auto-pick).
     let full_probe: Vec<WideQSig> = match probe_id {
         Some(id) => substrate
-            .decoded_wide_sig(id)
-            .map(|a| (*a).clone())
+            .wide_sig_window(id)
+            .map(|w| w.decode())
             .with_context(|| format!("probe stream {} has no wide-Q signature", id.0))?,
-        None => (*probe_pick.expect("non-empty gallery guarantees a probe pick")).clone(),
+        None => probe_pick
+            .expect("non-empty gallery guarantees a probe pick")
+            .decode(),
     };
 
     // ── Phase 3: reference vs packed — parity + latency ─────────────────────
@@ -1546,15 +1530,14 @@ fn scan_bench(
         / (LIVE_PROBE_CAP.min(full_probe.len()) as f64
             * total_gallery_tokens as f64
             * n_groups as f64);
-    let per_reproj = warm_ms + live_scan_ms;
+    let per_reproj = assemble_ms + decode_ms + live_scan_ms;
     println!("\n── Phase 4: problem domain ─────────────────────────────────────");
     println!("  ONE-TIME prep (engine load):        {load_s:.2} s   ({n_streams} streams)");
     println!(
         "  STEADY-STATE per reprojection:      {per_reproj:.1} ms  (every {LIVE_REPROJECT_EVERY} decoded tokens)"
     );
-    println!(
-        "    ├─ gallery assembly (cached):     {warm_ms:.1} ms   (was {cold_ms:.1} ms uncached)"
-    );
+    println!("    ├─ gallery assembly:              {assemble_ms:.1} ms");
+    println!("    ├─ host decode:                   {decode_ms:.1} ms");
     println!(
         "    └─ flat scan @ {}-tok probe cap:  {live_scan_ms:.1} ms   ← O(probe × gallery × groups)",
         LIVE_PROBE_CAP.min(full_probe.len())

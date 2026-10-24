@@ -149,7 +149,7 @@ fn main() {
                 .map(|(slot, (turn_idx, sigs))| PagedWindow {
                     sid: turn_stream_id(*tl, *turn_idx),
                     fingerprint: fp_of(sigs),
-                    turn: sigs.as_slice(),
+                    turn: sigs.as_slice().into(),
                     start: 0,
                     end: sigs.len(),
                     case: slot,
@@ -236,7 +236,7 @@ fn main() {
                 windows.push(PagedWindow {
                     sid: turn_stream_id(*tl, *turn_idx),
                     fingerprint: fp_of(sigs),
-                    turn: sigs.as_slice(),
+                    turn: sigs.as_slice().into(),
                     start: 0,
                     end: sigs.len(),
                     case,
