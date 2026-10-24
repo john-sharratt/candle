@@ -71,6 +71,11 @@ const IN_CONTEXT: &str = "in_context";
 /// evidence the content exists, and the cue that finds the same text in
 /// context; the page anchor is a string that occurs exactly once there.
 ///
+/// **And the lines the page holds.** With the first line alone, the model
+/// took it for all it had been given — "what it actually surfaced is a single
+/// title line" — and grepped the paper for three rounds; `lines` says the
+/// whole page is in context, `201-400 of 1399`.
+///
 /// **No `error`, and no `detail`.** Both mark a failed call — the GUI renders
 /// either as a red card (`is_error`, `zend/web/index.html`) and the model reads
 /// a failure as grounds to try again, which here means doing the very read the
@@ -80,10 +85,14 @@ const IN_CONTEXT: &str = "in_context";
 /// read, not this conversation. Told it had already read it, the model
 /// searched its own reads, found none, and called the reply false. `in_context`
 /// says what is true: the content is here, at this anchor.
-fn served_response(anchor: String, page: u32, pages: u32, begins: Option<String>) -> Value {
+fn served_response(anchor: String, page: u32, lines: usize, begins: Option<String>) -> Value {
+    let pages = page_count(lines);
+    let first = (page - 1) * PAGE_LINES + 1;
+    let last = (page * PAGE_LINES).min(lines as u32).max(first);
     let mut reply = json!({
         "status": IN_CONTEXT,
         "anchor": format!("{anchor} page={page} pages={pages}"),
+        "lines": format!("{first}-{last} of {lines}"),
     });
     if let Some(begins) = begins {
         reply["begins"] = Value::String(begins);
@@ -275,7 +284,7 @@ impl Screen<'_> {
             .and_then(|r| r.read(rel).ok().flatten())
             .and_then(|text| page_begins(&text, page, lines));
         Some(Hit {
-            response: served_response(file_anchor(repo, rel), page, page_count(lines), begins),
+            response: served_response(file_anchor(repo, rel), page, lines, begins),
             served: Served {
                 tool: FILE_READ,
                 path: key,
@@ -483,17 +492,17 @@ mod tests {
         let reply = served_response(
             file_anchor("candle", "Cargo.toml"),
             1,
-            1,
+            42,
             Some("1  [workspace]".to_string()),
         );
         assert_eq!(
             serde_json::to_string(&reply).unwrap(),
-            r#"{"status":"in_context","anchor":"file=candle/Cargo.toml page=1 pages=1","begins":"1  [workspace]"}"#
+            r#"{"status":"in_context","anchor":"file=candle/Cargo.toml page=1 pages=1","lines":"1-42 of 42","begins":"1  [workspace]"}"#
         );
-        let bare = served_response(file_anchor("candle", "a.rs"), 2, 3, None);
+        let bare = served_response(file_anchor("candle", "a.rs"), 2, 450, None);
         assert_eq!(
             serde_json::to_string(&bare).unwrap(),
-            r#"{"status":"in_context","anchor":"file=candle/a.rs page=2 pages=3"}"#
+            r#"{"status":"in_context","anchor":"file=candle/a.rs page=2 pages=3","lines":"201-400 of 450"}"#
         );
     }
 
@@ -504,7 +513,7 @@ mod tests {
         let fence = zend_tools::tools::file::render::numbered_excerpt(
             "candle", "a.rs", 2, 3, 201, 400, 450, "rust", "x",
         );
-        let reply = served_response(file_anchor("candle", "a.rs"), 2, 3, None);
+        let reply = served_response(file_anchor("candle", "a.rs"), 2, 450, None);
         assert!(fence.contains(reply["anchor"].as_str().unwrap()));
     }
 
