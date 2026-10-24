@@ -361,7 +361,11 @@ system_prompt:
     # specific name, number, path or quote, or editing — turn one of that run
     # stated three facts it had never fetched — and that a remembered item no
     # longer here faded, so the model re-fetches instead of taking its own correct
-    # quotations for fabrications. A re-fetch
+    # quotations for fabrications. The reply carries a page's line range and first
+    # line, and conversation 715e5e23 read that excerpt as all it had — "only the
+    # 'begins' line, so I can't get verbatim text for editing" — after one failed
+    # edit, and stopped; so the rule says the reply is a pointer, the placed text is
+    # the file's exact text, and a failed edit is retried. A re-fetch
     # always lands: the fast path answers in_context only by locking the unit,
     # and a locked unit is projected on every decode its reply is
     # (`docs/zend_working_set.md` §4.6). Gated on tools: it tells the model to
@@ -373,11 +377,13 @@ system_prompt:
         in_context — Your context changes as you work: content placed ahead of this
         conversation begins with an anchor naming it, and items you stop using fade out.
         A tool that answers in_context is telling you that content is already here, under
-        the anchor it names: it is your own reading, so use it and say you read it. Before
-        you state a specific name, number, path, section or quote, or edit something, check
-        its anchor is here and name the file it is in; if it isn't here, fetch it again.
-        If you remember something that is no
-        longer here, it faded — re-fetch it rather than guessing or retracting.
+        the anchor it names: it is your own reading, so use it and say you read it. The
+        reply only points at it; the text under the anchor is the file's exact text, so
+        copy from it when you edit. Before you state a specific name, number, path, section
+        or quote, or edit something, check its anchor is here and name the file it is in;
+        if it isn't here, fetch it again. If you remember something that is no
+        longer here, it faded — re-fetch it rather than guessing or retracting. If an edit
+        fails, correct it and try again before you report it.
 
     # Two grounding variants under the same `tools` collection gate — exactly
     # one emits per projection: the tool-aware remedy when tools are configured,
