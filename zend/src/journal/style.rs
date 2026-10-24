@@ -91,6 +91,7 @@ fn stretch(from_ms: u64, to_ms: u64) -> String {
 /// The wording a coding session's journal is kept in.
 pub const CODING: Style = Style {
     entry: "Entry",
+    latest: "Your latest entry:",
     span,
     day,
     hour,

@@ -77,6 +77,7 @@ fn stretch(from_ms: u64, to_ms: u64) -> String {
 /// The wording a character's journal is kept in.
 pub const NPC: Style = Style {
     entry: "Entry",
+    latest: "Your latest entry:",
     span,
     day,
     hour,
@@ -255,8 +256,15 @@ mod tests {
             text.contains("\n   14:23 (background) You: reflect — I feel uneasy"),
             "{text}"
         );
-        assert!(ask::writing(&span, &NPC, false, None).ends_with(WRITE_QUESTION));
-        assert!(ask::writing(&span, &NPC, true, None)
-            .ends_with(&format!("{WRITE_QUESTION} {SKIP_QUESTION}")));
+        assert!(ask::writing(&span, &NPC, None, None).ends_with(WRITE_QUESTION));
+        let latest = Entry {
+            summary: "Went to see Pax.".into(),
+            ..entry(3)
+        };
+        assert!(
+            ask::writing(&span, &NPC, Some(&latest), None).ends_with(&format!(
+            "Your latest entry: Entry 3 — Went to see Pax.\n\n{SKIP_QUESTION}\n\n{WRITE_QUESTION}"
+        ))
+        );
     }
 }

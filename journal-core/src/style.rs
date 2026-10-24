@@ -13,6 +13,9 @@
 pub struct Style {
     /// The word an entry's number follows at its head: "Entry 3 [span]".
     pub entry: &'static str,
+    /// What names the latest entry in a draft's question, before the step test:
+    /// "Your latest entry:".
+    pub latest: &'static str,
     /// How the span `from_ms ..= to_ms` is written where an entry is shown on
     /// its own — to an inspector.
     pub span: fn(from_ms: u64, to_ms: u64) -> String,
@@ -91,6 +94,7 @@ pub(crate) mod testing {
     /// which one a line was rendered under.
     pub const PLAIN: Style = Style {
         entry: "Entry",
+        latest: "Latest:",
         span,
         day,
         hour,

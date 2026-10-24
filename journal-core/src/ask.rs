@@ -4,9 +4,11 @@
 //! number and the live history is not numbered. Each turn the writer may rely on
 //! carries its number; a turn it may not rely on is shown without one, marked as
 //! background, so it is context and cannot be cited. When the journal already
-//! holds an entry, the same question offers `journal_skip` for a stretch that
-//! adds nothing to it.
+//! holds an entry, the same question first asks whether the stretch is a step
+//! of its own, naming the latest entry, and offers `journal_skip` for one that
+//! is not.
 
+use crate::entry::Entry;
 use crate::span::Span;
 use crate::style::Style;
 
@@ -24,8 +26,13 @@ pub fn stretch(span: &Span, style: &Style) -> String {
     out
 }
 
-/// The writing question: the stretch with its turn numbers, then what is asked
-/// — with the skip offered when `may_skip`.
+/// The writing question: the stretch with its turn numbers, then what is asked.
+///
+/// With a `latest` entry to weigh the stretch against, the skip is asked
+/// first, and against that entry by name: whether the stretch is a step of its
+/// own or more of what the latest entry is about is the decision, and a writer
+/// shown the step it would be filed under compares against it rather than
+/// against the whole journal. The write follows for a stretch that is a step.
 ///
 /// After a refused attempt `refused` holds that attempt as it was written and why
 /// it was refused, because each question is put afresh and the writer would
@@ -33,14 +40,22 @@ pub fn stretch(span: &Span, style: &Style) -> String {
 pub fn writing(
     span: &Span,
     style: &Style,
-    may_skip: bool,
+    latest: Option<&Entry>,
     refused: Option<(&str, &str)>,
 ) -> String {
-    let mut out = format!("{}\n\n{}", stretch(span, style), style.write_question);
-    if may_skip {
-        out.push(' ');
-        out.push_str(style.skip_question);
+    let mut out = stretch(span, style);
+    if let Some(latest) = latest {
+        out.push_str(&format!(
+            "\n\n{} {} {} — {}\n\n{}",
+            style.latest,
+            style.entry,
+            latest.id,
+            latest.summary.trim(),
+            style.skip_question
+        ));
     }
+    out.push_str("\n\n");
+    out.push_str(style.write_question);
     if let Some((attempt, why)) = refused {
         out.push_str(&format!(
             "\n\nYou tried this:\n{}\n\nIt was refused: {why}\nWrite it again with that put right.",
@@ -53,6 +68,7 @@ pub fn writing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry::testing::entry;
     use crate::entry::Kind;
     use crate::span::testing::turn;
     use crate::style::testing::PLAIN;
@@ -79,7 +95,7 @@ mod tests {
 
     #[test]
     fn the_writing_question_is_the_stretch_then_the_call() {
-        let asked = writing(&span(), &PLAIN, false, None);
+        let asked = writing(&span(), &PLAIN, None, None);
         assert_eq!(
             asked,
             format!(
@@ -89,13 +105,20 @@ mod tests {
         );
     }
 
+    /// With an entry to weigh the stretch against, the step test comes first
+    /// and names the entry a skip would file the stretch under.
     #[test]
-    fn the_skip_is_offered_after_the_write_when_it_may_be_taken() {
-        let asked = writing(&span(), &PLAIN, true, None);
+    fn the_step_test_comes_first_and_names_the_latest_entry() {
+        let latest = Entry {
+            summary: "Looked up IN_PROMPT. ".into(),
+            ..entry(4)
+        };
+        let asked = writing(&span(), &PLAIN, Some(&latest), None);
         assert_eq!(
             asked,
             format!(
-                "{}\n\nWrite it up with journal_write. Or skip it with journal_skip.",
+                "{}\n\nLatest: Entry 4 — Looked up IN_PROMPT.\n\nOr skip it with journal_skip.\
+                 \n\nWrite it up with journal_write.",
                 stretch(&span(), &PLAIN)
             )
         );
@@ -106,7 +129,7 @@ mod tests {
         let asked = writing(
             &span(),
             &PLAIN,
-            false,
+            None,
             Some((" {\"name\": \"journal_write\"} ", "Claim 1 cites turn 3.")),
         );
         assert!(

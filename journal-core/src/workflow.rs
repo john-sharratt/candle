@@ -132,14 +132,14 @@ async fn draft<D: Desk, S: Holds>(
     style: &Style,
     timing: &mut Timing,
 ) -> Outcome {
-    let (open, may_skip) = {
+    let (open, latest) = {
         let held = hold(state);
         let journal = held.journal();
         let open = journal.open().to_vec();
-        let may_skip = journal.entries().next().is_some();
-        (open, may_skip)
+        let latest = journal.entries().last().cloned();
+        (open, latest)
     };
-    let Some(specs) = tools::draft_specs(&span.citable_ids(), &open, may_skip) else {
+    let Some(specs) = tools::draft_specs(&span.citable_ids(), &open, latest.is_some()) else {
         let why = "nothing in the stretch was something a claim could rest on".to_string();
         return settle(desk, state, span, style, why).await;
     };
@@ -148,7 +148,7 @@ async fn draft<D: Desk, S: Holds>(
     let asked = Asked {
         specs: &specs,
         open: &open,
-        may_skip,
+        latest: latest.as_ref(),
     };
     let outcome = write(desk, state, span, world, style, &asked).await;
     timing.write_ms = millis(started);
@@ -159,7 +159,9 @@ async fn draft<D: Desk, S: Holds>(
 struct Asked<'a> {
     specs: &'a [Value],
     open: &'a [Item],
-    may_skip: bool,
+    /// The entry a skip files the stretch under — `None` before the first,
+    /// when there is nothing to weigh the stretch against and no skip.
+    latest: Option<&'a Entry>,
 }
 
 /// Ask for the entry until one passes the check, the writer skips, or the
@@ -178,7 +180,7 @@ async fn write<D: Desk, S: Holds>(
         let question = ask::writing(
             span,
             style,
-            asked.may_skip,
+            asked.latest,
             refused
                 .as_ref()
                 .map(|(answer, reason)| (answer.as_str(), reason.as_str())),
@@ -187,7 +189,7 @@ async fn write<D: Desk, S: Holds>(
             Ok(answer) => answer,
             Err(e) => return Outcome::Abandoned(Abandon::Asking(e.to_string())),
         };
-        let reason = match tools::parse(&answer, asked.may_skip) {
+        let reason = match tools::parse(&answer, asked.latest.is_some()) {
             Err(reason) => reason,
             Ok(Answer::Skip(why)) => {
                 let why = if why.is_empty() {
@@ -383,7 +385,7 @@ mod tests {
         let mut desk = Script::new(&[WRITE]);
         run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
         let first = &desk.write_asked[0];
-        assert_eq!(first, &ask::writing(&span, &PLAIN, false, None));
+        assert_eq!(first, &ask::writing(&span, &PLAIN, None, None));
         assert!(first.contains("#1 ") && first.contains("#2 "), "{first}");
         assert!(first.contains("(background)"), "{first}");
         assert_eq!(
@@ -428,7 +430,15 @@ mod tests {
                 tools::skip_spec()
             ]
         );
-        assert_eq!(desk.write_asked[0], ask::writing(&span, &PLAIN, true, None));
+        let latest = hold(&state).entries().last().cloned().unwrap();
+        assert_eq!(
+            desk.write_asked[0],
+            ask::writing(&span, &PLAIN, Some(&latest), None)
+        );
+        assert!(
+            desk.write_asked[0].contains("Latest: Entry 1 — Greeted Pax."),
+            "the question names the entry a skip files the stretch under"
+        );
     }
 
     #[tokio::test]

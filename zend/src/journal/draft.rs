@@ -178,7 +178,10 @@ mod tests {
         assert_eq!(desk.asked.len(), 1, "one answer, no separate gate");
         assert_eq!(desk.offered[0], vec![WRITE.to_string(), SKIP.to_string()]);
         assert!(
-            desk.asked[0].ends_with(&format!("{WRITE_QUESTION} {SKIP_QUESTION}")),
+            desk.asked[0].ends_with(&format!(
+                "Your latest entry: Entry 1 — Started on the scan.\n\n{SKIP_QUESTION}\n\n\
+                 {WRITE_QUESTION}"
+            )),
             "{}",
             desk.asked[0]
         );

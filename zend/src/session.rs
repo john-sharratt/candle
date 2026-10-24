@@ -4931,7 +4931,8 @@ fn journal_record(state: &InferenceState, timeline: TimelineId) -> Option<Kept> 
 ///
 /// Nothing waits for a section to seal: a round reads the journal as it last
 /// sealed, and a new entry joins the prompt the first round after its section
-/// seals (`journal::carry`).
+/// seals (`journal::carry`). Called at each round's head, and by a draft as it
+/// ends, so a new entry is already sealing before the next round begins.
 async fn carry_journal(
     state: &InferenceState,
     conv_id: &str,
@@ -5122,6 +5123,18 @@ fn spawn_journal_draft(
             checks = ?record.checks,
             "journal draft ended",
         );
+        // The sections follow the record now rather than at the next round's
+        // head, so they are sealing — a chain one link after another — while
+        // the user is still reading the reply, and the next round reads the
+        // entry. A conversation busy in a round is left to that round's own
+        // reconcile, which does the same.
+        let held = state.conversations.lock().unwrap().get(&conv_id).cloned();
+        if let Some(conversation) = held {
+            if let Ok(mut cs) = conversation.try_lock() {
+                let mut unused = SelectionState::default();
+                carry_journal(&state, &conv_id, timeline, &mut cs, &mut unused).await;
+            }
+        }
     });
 }
 
