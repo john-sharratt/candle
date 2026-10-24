@@ -37,13 +37,14 @@ pub const QUIET: Duration = Duration::from_secs(30);
 pub const ADMISSION_QUIET_LIMIT: u32 = 2;
 
 /// Whether a catch-up last heard of at `word` has gone quiet at `now`: no word
-/// of it for [`QUIET`], and no message arriving on its socket either
-/// (`arriving`, the last byte of a message not yet whole). Over a slow link a
-/// reply is still arriving while its frame is not yet whole. An idle socket's
-/// `PING`s are whole messages, so they never hold a catch-up: a request that
-/// will get no answer still goes quiet. The gateway says `LOST` when it knows
-/// one will not come — and once told `LOST`, the catch-up's own silence is all
-/// that counts.
+/// of it for [`QUIET`], and no answer arriving on its socket either
+/// (`arriving`: the last catch-up frame, or byte of a message not yet whole).
+/// Over a slow link a reply is still arriving while its frame is not yet whole,
+/// and a fetched record of many fragments lands as a whole only at its last.
+/// An idle socket's `PING`s are whole messages and no catch-up's, so they never
+/// hold one: a request that will get no answer still goes quiet. The gateway
+/// says `LOST` when it knows one will not come — and once told `LOST`, the
+/// catch-up's own silence is all that counts.
 pub fn is_quiet(now: Instant, word: Instant, arriving: Option<Instant>, lost: bool) -> bool {
     let silent = |at: Instant| now.duration_since(at) >= QUIET;
     silent(word) && (lost || arriving.is_none_or(silent))
@@ -147,7 +148,7 @@ impl Replicator {
                 s.sockets
                     .get(c)
                     .and_then(Option::as_ref)
-                    .and_then(|h| h.mid_message())
+                    .and_then(|h| h.answer_heard())
                     .map(|at| at.into_std())
             };
             let quiet: Vec<(u64, usize, Purpose)> = s

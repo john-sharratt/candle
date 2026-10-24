@@ -111,11 +111,13 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
-    /// When a byte last arrived of a message still part-way across, when the
-    /// transport can tell; `None` when none is. An idle socket's `PING`s are
-    /// whole messages, so they never read as one arriving.
-    pub fn mid_message(&self) -> Option<Instant> {
-        self.hearing.mid_message()
+    /// When a catch-up's answer was last heard arriving on this socket: a
+    /// catch-up frame — a `HEADERS`, a `DONE`, a fetched record's fragment —
+    /// or a message still part-way across, which may be one. An idle socket's
+    /// `PING`s are whole messages and no catch-up's, so they never read as an
+    /// answer arriving.
+    pub fn answer_heard(&self) -> Option<Instant> {
+        self.hearing.answer()
     }
 
     /// Whether the session has ended: nothing sent on it is delivered, and

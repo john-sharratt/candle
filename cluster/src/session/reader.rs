@@ -119,20 +119,30 @@ pub async fn run<R: PipeRx>(
                     stream.reset();
                 }
             }
-            Frame::Event { catchup, event } => match reassembly.accept(event) {
-                Ok(Some(whole)) => {
-                    let _ = incoming
-                        .send(Incoming::Event {
-                            catchup,
-                            whole,
-                            frame: number,
-                        })
-                        .await;
+            Frame::Event { catchup, event } => {
+                // A fetched record's fragment is a catch-up's answer arriving,
+                // though the record is whole only at its last.
+                if catchup || event.reply_to.is_some() {
+                    hearing.catchup();
                 }
-                Ok(None) => {}
-                Err(e) => break violation(e.to_string()),
-            },
+                match reassembly.accept(event) {
+                    Ok(Some(whole)) => {
+                        let _ = incoming
+                            .send(Incoming::Event {
+                                catchup,
+                                whole,
+                                frame: number,
+                            })
+                            .await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => break violation(e.to_string()),
+                }
+            }
             other => {
+                if matches!(other, Frame::Headers(_) | Frame::Done(_)) {
+                    hearing.catchup();
+                }
                 let _ = incoming.send(Incoming::Frame(other)).await;
             }
         }
