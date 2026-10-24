@@ -767,6 +767,7 @@ struct YamlSelection {
 struct YamlWorkingSet {
     budget_tokens: usize,
     folder_tokens: usize,
+    lock_tokens: usize,
     beta: f32,
     min_momentum: f32,
     max_file_tokens: usize,
@@ -817,6 +818,7 @@ fn parse_working_set(
     Ok(Some(WorkingSetConfig {
         budget_tokens: yw.budget_tokens,
         folder_tokens: yw.folder_tokens,
+        lock_tokens: yw.lock_tokens,
         beta: yw.beta,
         min_momentum: yw.min_momentum,
         max_file_tokens: yw.max_file_tokens,

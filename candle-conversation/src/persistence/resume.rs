@@ -1043,6 +1043,7 @@ mod tests {
                 selection: Default::default(),
                 materialized: Default::default(),
                 self_reference: false,
+                groups: Default::default(),
             },
             ProjectionEvent {
                 start_token: 120,
@@ -1057,6 +1058,7 @@ mod tests {
                 selection: Default::default(),
                 materialized: Default::default(),
                 self_reference: false,
+                groups: Default::default(),
             },
         ];
         let payload = encode_events(&events);

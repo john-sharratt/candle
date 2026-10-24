@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ids::{CollectionId, GroupId, SectionId, TurnIndex, TurnKey};
 use super::project::{ProjectionSegment, SealedKind};
+use super::scan_stats::GroupScan;
 use super::schema::{Schema, SystemPromptItem};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{SelectionOrigin, TurnKind};
@@ -322,6 +323,19 @@ pub struct ProjectionEvent {
     /// and the turn is scored as one window.
     #[serde(default)]
     pub self_reference: bool,
+    /// The raw-score statistics of every turn group the belief scan scored for
+    /// this projection, selected or not — what each layer's need is read from.
+    /// Empty on records written before this field and on synthesized events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupScanRecord>,
+}
+
+/// One turn group's scan, named for the record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupScanRecord {
+    pub group: String,
+    #[serde(flatten)]
+    pub scan: GroupScan,
 }
 
 /// One classified segment before aggregation — `(kind, label, tokens)`.
@@ -372,6 +386,7 @@ pub fn aggregate(
         selection: ProjectionSelection::default(),
         materialized: Vec::new(),
         self_reference: false,
+        groups: Vec::new(),
     }
 }
 
@@ -433,6 +448,7 @@ pub fn staged_ingest_event(
         selection: ProjectionSelection { system, turns },
         materialized: Vec::new(),
         self_reference: false,
+        groups: Vec::new(),
     }
 }
 
@@ -497,6 +513,7 @@ pub fn summary_node_event(
         },
         materialized: Vec::new(),
         self_reference: false,
+        groups: Vec::new(),
     }
 }
 
@@ -584,6 +601,17 @@ pub fn from_projection_with_origins(
 
     let mut event = aggregate(&classified, substrate_tokens, start_token, seconds);
     event.selection = build_selection(segments, origins, schema, resolver, scores);
+    event.groups = schema
+        .layers
+        .iter()
+        .flat_map(|l| l.groups.iter())
+        .filter_map(|g| {
+            resolver.group_scan(g.id).map(|scan| GroupScanRecord {
+                group: g.name.clone(),
+                scan,
+            })
+        })
+        .collect();
     event
 }
 
@@ -941,10 +969,12 @@ mod tests {
     use super::super::project::{
         GeneratedIdentity, ProjectionSegment, ResolvedSection, ResolvedTurn, SealedKind,
     };
+    use super::super::scan_stats::{GroupScan, ScanStats};
     use super::{
         aggregate, decode_events, decode_points, encode_events, from_projection,
-        staged_ingest_event, summary_node_event, BucketKind, MaterializedPiece, ProjectionBucket,
-        ProjectionPoint, SegmentTokens, SelectedTurn, SelectionScores, SystemItem,
+        staged_ingest_event, summary_node_event, BucketKind, GroupScanRecord, MaterializedPiece,
+        ProjectionBucket, ProjectionPoint, SegmentTokens, SelectedTurn, SelectionScores,
+        SystemItem,
     };
     use crate::substrate::ContentResolver;
     use crate::summary_tree::TurnKind;
@@ -1132,11 +1162,15 @@ layers:
     struct TokResolver {
         section_tokens: HashMap<u32, usize>,
         turn_tokens: HashMap<(u32, u32), usize>,
+        group_scans: HashMap<u32, GroupScan>,
     }
 
     impl ContentResolver for TokResolver {
         fn group_turns(&self, _group: GroupId) -> Vec<TurnKey> {
             Vec::new()
+        }
+        fn group_scan(&self, group: GroupId) -> Option<GroupScan> {
+            self.group_scans.get(&group.raw()).copied()
         }
         /// Fixtures are keyed by `(group, index)`; the emitted turns carry a
         /// timeline whose raw id is the group id (see the mock in
@@ -1239,6 +1273,51 @@ layers:
         assert_eq!(ev.materialized_tokens, 64 + 800 + 200 + 4);
         assert_eq!(ev.substrate_tokens, 99_999);
         assert_eq!(ev.seconds, 12.0);
+        assert!(ev.groups.is_empty(), "no group was scanned");
+    }
+
+    /// A scanned group's statistics ride the event under the group's name,
+    /// whether or not anything of it was selected; an unscanned group is absent.
+    #[test]
+    fn from_projection_records_each_scanned_group_by_name() {
+        let b = Builder::from_yaml(YAML).unwrap();
+        let conv = b.id_for_group("conversation").unwrap();
+        let stats = |top: f32| ScanStats {
+            members: 12,
+            top,
+            p90: 40.0,
+            median: 10.0,
+        };
+        let scan = GroupScan {
+            tail: stats(90.0),
+            question: Some(stats(300.0)),
+        };
+        let mut res = TokResolver::default();
+        res.group_scans.insert(conv.raw(), scan);
+        let ev = from_projection(
+            &[],
+            b.schema(),
+            &res,
+            &SelectionScores::default(),
+            0,
+            0,
+            0.0,
+        );
+        assert_eq!(
+            ev.groups,
+            vec![GroupScanRecord {
+                group: "conversation".to_string(),
+                scan,
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(&ev.groups).unwrap(),
+            serde_json::json!([{
+                "group": "conversation",
+                "tail": {"members": 12, "top": 90.0, "p90": 40.0, "median": 10.0},
+                "question": {"members": 12, "top": 300.0, "p90": 40.0, "median": 10.0},
+            }])
+        );
     }
 
     const TREE_GLUE_YAML: &str = r#"

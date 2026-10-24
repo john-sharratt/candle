@@ -16,12 +16,15 @@ const FULL_HIT: f32 = 1000.0;
 /// conversation is such a target.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkingSetConfig {
-    /// Tokens the whole working set may hold: seeds, locks and provenance,
-    /// folders and files together.
+    /// Tokens the working set holds voluntarily: seeds and provenance, folders
+    /// and files together. The locks sit on top.
     pub budget_tokens: usize,
     /// The most of `budget_tokens` the folder members may hold between them.
     /// The files take what the folders leave.
     pub folder_tokens: usize,
+    /// Tokens the locks may hold together, on top of `budget_tokens` — what the
+    /// model's own reads may add before one runs for real.
+    pub lock_tokens: usize,
     /// Per-file momentum leak: `m ← (1 − β)·m + fresh`.
     pub beta: f32,
     /// Momentum below which a file leaves the map and is no provenance candidate.
@@ -62,6 +65,7 @@ impl WorkingSetConfig {
         Limits {
             budget_tokens: self.budget_tokens,
             folder_tokens: self.folder_tokens,
+            lock_tokens: self.lock_tokens,
             max_file_tokens: self.max_file_tokens,
         }
     }
@@ -80,6 +84,7 @@ mod tests {
         WorkingSetConfig {
             budget_tokens: 350_000,
             folder_tokens: 30_000,
+            lock_tokens: 200_000,
             beta: 0.2,
             min_momentum: 100.0,
             max_file_tokens: 100_000,
@@ -108,11 +113,16 @@ mod tests {
     }
 
     #[test]
-    fn the_limits_carry_both_shares() {
+    fn the_limits_carry_every_share() {
         let l = cfg().limits();
         assert_eq!(
-            (l.budget_tokens, l.folder_tokens, l.max_file_tokens),
-            (350_000, 30_000, 100_000)
+            (
+                l.budget_tokens,
+                l.folder_tokens,
+                l.lock_tokens,
+                l.max_file_tokens
+            ),
+            (350_000, 30_000, 200_000, 100_000)
         );
     }
 }

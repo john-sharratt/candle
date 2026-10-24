@@ -48,6 +48,7 @@ layers:
     working_set:
       budget_tokens: 1000
       folder_tokens: 300
+      lock_tokens: 1000
       beta: 0.2
       min_momentum: 100
       max_file_tokens: 800

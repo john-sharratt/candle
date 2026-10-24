@@ -216,6 +216,7 @@ mod project;
 mod reconcile;
 pub mod replication;
 mod resolver;
+pub mod scan_stats;
 mod schema;
 mod score;
 mod selection;

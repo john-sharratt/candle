@@ -1371,17 +1371,21 @@ layers:
     # What every dialogue already knows about the code (docs/zend_working_set.md):
     # whole `repo_map` folders and `code_reading` files, projected ahead of its
     # own turns and outside its `window`, in the order they entered. A
-    # `file_read` or `file_list` the corpus already holds is answered "already
-    # read" and locked for the rest of the task; the files it keeps attending
-    # to — starting with the seeds — stay by momentum and fade when it stops.
-    # A real user turn, or a round making any `release_on` call, releases the
-    # locks into provenance in place.
+    # `file_read` or `file_list` the corpus already holds is answered
+    # `in_context` and locked for as long as that reply is in the dialogue's
+    # projection; the files it keeps attending to — starting with the seeds —
+    # stay by momentum and fade when it stops.
     working_set:
-      # 250K + this layer's 116K window is ~366K positions — ~158K clear of the
-      # ×2 rung's ceiling of 524,288 (the floor `rope: min_yarn_factor: 2`
-      # puts every sequence on), so a conversation grows a long way before
-      # progressive YaRN climbs to ×4 (§5).
-      budget_tokens: 250000
+      # What the set holds voluntarily — seeds and provenance. With the system
+      # prompt, the priming chain and a young dialogue it puts a decode near
+      # 150K materialized. Measured 2026-10-24 at 250K: 321K–350K per decode,
+      # ~215K–248K of it provenance the scan pulled in on momentum.
+      budget_tokens: 80000
+      # The locks sit on top: a read the model makes adds to what it carries
+      # and never displaces the provenance around it, up to this ceiling.
+      # 80K + 150K + this layer's 116K window stays clear of the ×2 rung's
+      # ceiling of 524,288 (`rope: min_yarn_factor: 2`, §5).
+      lock_tokens: 150000
       folder_tokens: 10000       # repo_map's share: pinned + provenance folders
       beta: 0.2                  # per-file momentum leak: m ← (1 − β)·m + fresh
       min_momentum: 100          # below this a file is no provenance candidate

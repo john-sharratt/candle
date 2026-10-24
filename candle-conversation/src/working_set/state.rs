@@ -14,11 +14,14 @@ const DISLODGE_MARGIN: f32 = 1.5;
 /// The size limits an admission is checked against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// Tokens every member together may hold.
+    /// Tokens the voluntary members — seeds and provenance — may hold
+    /// together. Locks are not counted: they sit on top.
     pub budget_tokens: usize,
-    /// Tokens the folder members may hold between them; the files take what is
-    /// left of `budget_tokens`.
+    /// Tokens the voluntary folder members may hold between them; the files
+    /// take what is left of `budget_tokens`.
     pub folder_tokens: usize,
+    /// Tokens the locks may hold together, on top of `budget_tokens`.
+    pub lock_tokens: usize,
     /// Tokens one member may hold.
     pub max_file_tokens: usize,
 }
@@ -35,7 +38,7 @@ pub enum Refusal {
     NoCost,
     /// The conversation alone is past `max_file_tokens`.
     TooLarge,
-    /// The locks already held leave no room for it.
+    /// The locks already held leave no room for it under `lock_tokens`.
     Full,
 }
 
@@ -76,14 +79,17 @@ struct Member {
 /// churn — newcomers arriving, the weakest leaving — lands in the middle,
 /// where attention is weakest anyway.
 ///
-/// **Locks** are pinned: they never decay and are never dislodged. A lock is
-/// released into provenance in place when the turn ends ([`Self::release`]),
-/// and the insertion point moves past it, so the next task's members enter
-/// beside the dialogue. **Provenance** decays by momentum and leaves below the
-/// floor. When a newcomer needs room, the weakest provenance is dislodged —
-/// by a lock always, by new provenance only when the newcomer is
-/// [`DISLODGE_MARGIN`] stronger. The **seeds** are the first provenance a
-/// conversation admits.
+/// **Locks** are pinned: they never decay and are never dislodged, and they
+/// sit on top of the voluntary budget under a ceiling of their own — a read
+/// the model makes adds to what it carries, it never takes the place of the
+/// provenance around it. A lock is released into provenance in place when its
+/// promise ends ([`Self::release`], [`Self::release_one`]); from then it
+/// competes for the voluntary budget like any provenance, and the next
+/// [`Self::observe`] trims the weakest provenance if it no longer fits.
+/// **Provenance** decays by momentum and leaves below the floor. When a
+/// newcomer needs room, the weakest provenance is dislodged only when the
+/// newcomer is [`DISLODGE_MARGIN`] stronger. The **seeds** are the first
+/// provenance a conversation admits.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkingSet {
     members: Vec<Member>,
@@ -144,6 +150,16 @@ impl WorkingSet {
         self.members.iter().map(|m| m.tokens).sum()
     }
 
+    /// Tokens the members of one standing hold — the locks (`true`), or the
+    /// voluntary members (`false`).
+    fn tokens_where(&self, locked: bool) -> usize {
+        self.members
+            .iter()
+            .filter(|m| m.locked == locked)
+            .map(|m| m.tokens)
+            .sum()
+    }
+
     /// Where the next member enters.
     pub fn insertion_point(&self) -> usize {
         self.insert_at
@@ -153,14 +169,13 @@ impl WorkingSet {
         self.members.iter().position(|m| m.timeline == timeline)
     }
 
-    /// Lock `timeline` for the rest of the task.
+    /// Lock `timeline` for as long as the reply promising it stands.
     ///
     /// A member is locked where it stands — moving it would undo the stability
     /// this order exists for, and its content is in context wherever it sits.
-    /// A newcomer dislodges the weakest provenance until it fits, then enters
-    /// just before the insertion point. Locks are never dislodged, so a lock
-    /// that cannot fit beside the ones already held is refused and the call
-    /// runs for real.
+    /// A newcomer enters just before the insertion point, on top of the
+    /// voluntary members: it dislodges nothing. A lock that would take the
+    /// locks past `lock_tokens` is refused and the call runs for real.
     pub fn lock(
         &mut self,
         timeline: TimelineId,
@@ -176,10 +191,9 @@ impl WorkingSet {
         if tokens > limits.max_file_tokens {
             return Err(Refusal::TooLarge);
         }
-        let victims = self
-            .room_for(tokens, share, limits, &|_| true)
-            .ok_or(Refusal::Full)?;
-        self.evict(&victims);
+        if self.tokens_where(true) + tokens > limits.lock_tokens {
+            return Err(Refusal::Full);
+        }
         self.members.insert(
             self.insert_at,
             Member {
@@ -286,7 +300,9 @@ impl WorkingSet {
     ///    locked, where one the scan did not score counts as a fresh zero.
     /// 2. Below `min_momentum` a conversation leaves the map, and a member
     ///    leaves the sequence — the gap closes. So does an unlocked member
-    ///    `admissible` no longer allows (out of scope, gone).
+    ///    `admissible` no longer allows (out of scope, gone). Then, while the
+    ///    voluntary members are over budget — a released lock joined them —
+    ///    the weakest of them leaves.
     /// 3. The strongest candidates that are not members try to enter, each
     ///    dislodging only provenance it beats by [`DISLODGE_MARGIN`] — at most
     ///    `max_admits` of them. One reprojection that admits a dozen files
@@ -329,6 +345,12 @@ impl WorkingSet {
             .map(|(i, _)| i)
             .collect();
         self.evict(&leaving);
+        if let Some(over) = self.room_for(0, WorkingSetShare::Remainder, limits, &|_| true) {
+            self.evict(&over);
+        }
+        if let Some(over) = self.room_for(0, WorkingSetShare::Folders, limits, &|_| true) {
+            self.evict(&over);
+        }
 
         let mut newcomers: Vec<(TimelineId, f32)> = self
             .momentum
@@ -384,11 +406,12 @@ impl WorkingSet {
         self.insert_at += 1;
     }
 
-    /// The members that must leave for `tokens` of `share` to fit, weakest
-    /// first among the unlocked ones `may_dislodge` allows (judged on their
-    /// momentum) — or `None` when no such set makes it fit. On a momentum tie
-    /// the one nearest the insertion point goes first: it moves the fewest
-    /// members on its left.
+    /// The voluntary members that must leave for `tokens` more voluntary
+    /// tokens of `share` to fit, weakest first among those `may_dislodge`
+    /// allows (judged on their momentum) — or `None` when no such set makes it
+    /// fit. On a momentum tie the one nearest the insertion point goes first:
+    /// it moves the fewest members on its left. Locks count against nothing
+    /// here; they sit on top.
     fn room_for(
         &self,
         tokens: usize,
@@ -396,11 +419,11 @@ impl WorkingSet {
         limits: Limits,
         may_dislodge: &dyn Fn(f32) -> bool,
     ) -> Option<Vec<usize>> {
-        let mut total = self.tokens();
+        let mut total = self.tokens_where(false);
         let mut folders: usize = self
             .members
             .iter()
-            .filter(|m| m.share == WorkingSetShare::Folders)
+            .filter(|m| !m.locked && m.share == WorkingSetShare::Folders)
             .map(|m| m.tokens)
             .sum();
         let folder_bound = |folders: usize| {
@@ -464,6 +487,7 @@ mod tests {
         Limits {
             budget_tokens,
             folder_tokens: budget_tokens,
+            lock_tokens: budget_tokens,
             max_file_tokens: 1_000,
         }
     }
@@ -572,20 +596,35 @@ mod tests {
         assert!(!ws.release_one(tl(1), 5_000.0), "provenance is no lock");
     }
 
-    /// **A lock dislodges the weakest provenance**, and the gap closes.
+    /// **A lock sits on top of the voluntary budget**: with the provenance
+    /// filling it, a new lock enters and dislodges nothing.
     #[test]
-    fn a_lock_dislodges_the_weakest_provenance() {
+    fn a_lock_sits_on_top_of_a_full_voluntary_budget() {
         let mut ws = WorkingSet::default();
         observe(&mut ws, &[(1, 900.0), (2, 300.0), (3, 600.0)], 300);
         assert_eq!(order(&ws), vec![1, 3, 2]);
         ws.lock(tl(4), cand(4), limits(300)).unwrap();
+        assert_eq!(order(&ws), vec![1, 3, 2, 4], "nothing left for it");
+        assert_eq!(ws.tokens(), 400);
+    }
+
+    /// **A released lock rejoins the voluntary members**, and the next
+    /// reprojection trims the weakest of them back under the budget.
+    #[test]
+    fn a_released_lock_is_trimmed_back_into_the_budget() {
+        let mut ws = WorkingSet::default();
+        observe(&mut ws, &[(1, 900.0), (2, 300.0), (3, 600.0)], 300);
+        ws.lock(tl(4), cand(4), limits(300)).unwrap();
+        assert!(ws.release_one(tl(4), 5_000.0));
+        observe(&mut ws, &[], 300);
         assert_eq!(order(&ws), vec![1, 3, 4], "2, the weakest, left");
     }
 
-    /// **Locks are never dislodged**: a lock that cannot fit beside the
-    /// others is refused, and nothing is evicted for it.
+    /// **Locks are never dislodged, and keep to their own ceiling**: a lock
+    /// that would take the locks past `lock_tokens` is refused, and nothing is
+    /// evicted for it.
     #[test]
-    fn a_lock_that_only_locks_could_make_room_for_is_refused() {
+    fn a_lock_past_the_lock_ceiling_is_refused() {
         let mut ws = WorkingSet::default();
         ws.lock(tl(1), cand(1), limits(200)).unwrap();
         ws.lock(tl(2), cand(2), limits(200)).unwrap();
@@ -691,12 +730,15 @@ mod tests {
         let lim = Limits {
             budget_tokens: 300,
             folder_tokens: 100,
+            lock_tokens: 300,
             max_file_tokens: 1_000,
         };
         let fresh: HashMap<TimelineId, f32> = HashMap::from([(tl(50), 900.0), (tl(1), 200.0)]);
         ws.observe(&fresh, 0.2, 100.0, lim, NonZeroUsize::MAX, &info);
         assert_eq!(order(&ws), vec![50, 1]);
-        ws.lock(tl(51), cand(51), lim).unwrap();
+        // 50 decays to 720, and 720 × 1.5 < 5,000.
+        let fresh: HashMap<TimelineId, f32> = HashMap::from([(tl(51), 5_000.0)]);
+        ws.observe(&fresh, 0.2, 100.0, lim, NonZeroUsize::MAX, &info);
         assert_eq!(
             order(&ws),
             vec![1, 51],

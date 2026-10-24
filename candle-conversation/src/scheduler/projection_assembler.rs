@@ -3429,6 +3429,7 @@ mod tests {
         let limits = Limits {
             budget_tokens: 1_000,
             folder_tokens: 1_000,
+            lock_tokens: 1_000,
             max_file_tokens: 1_000,
         };
         sub.working_set_observe(

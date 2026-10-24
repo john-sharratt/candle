@@ -80,6 +80,7 @@ use crate::persistence::record::{
 };
 use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
 use crate::persistence::walker::WalkEntry;
+use crate::projection::scan_stats::GroupScan;
 use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, LayerId, OwnedSection, OwnedSections,
     ProjectionEvent, ProjectionTarget, SectionId, SystemItem, TimelineAllocator, TimelineId,
@@ -894,6 +895,9 @@ pub struct ProjectionScores {
     /// scan; consumed by the flexbox / member-budget modulation in `project`.
     group_mass: AHashMap<u32, f32>,
     collection_mass: AHashMap<u32, f32>,
+    /// The order statistics of each turn group's raw scores this projection,
+    /// keyed by group id — what the group's need is read from.
+    group_scan: AHashMap<u32, GroupScan>,
     /// Concept C: turns whose score was RAISED by locality drag (selected only
     /// through a neighbor) — stamped `SelectionOrigin::Locality` at selection.
     locality_boosted: AHashSet<TurnKey>,
@@ -956,6 +960,16 @@ impl ProjectionScores {
     /// A turn group's attention mass (0 when unscored this projection).
     pub fn group_mass(&self, group: GroupId) -> f32 {
         self.group_mass.get(&group.raw()).copied().unwrap_or(0.0)
+    }
+
+    /// Record the order statistics of a turn group's raw scores.
+    pub fn set_group_scan(&mut self, group: GroupId, scan: GroupScan) {
+        self.group_scan.insert(group.raw(), scan);
+    }
+
+    /// A turn group's raw-score statistics; `None` when it was not scanned.
+    pub fn group_scan(&self, group: GroupId) -> Option<GroupScan> {
+        self.group_scan.get(&group.raw()).copied()
     }
 
     /// A collection's attention mass (0 when unscored this projection).
@@ -1207,6 +1221,12 @@ pub trait ContentResolver {
     /// unscored — adaptivity then rests at the static budget).
     fn group_attention_mass(&self, _group: GroupId) -> f32 {
         0.0
+    }
+
+    /// The order statistics of a turn group's raw scores this projection;
+    /// `None` when the group was not scanned (default: no scan behind it).
+    fn group_scan(&self, _group: GroupId) -> Option<GroupScan> {
+        None
     }
 
     /// Concept B: a collection's attention mass this projection.
@@ -3524,10 +3544,16 @@ impl Substrate {
 
     /// What admitting `timeline` into `target`'s working set needs: its
     /// recorded size and its share — or `None` when it cannot be a member at
-    /// all: it cannot deliver ([`Self::deliverable`]), or the scope of its
-    /// group no longer offers it to `target`.
+    /// all: it cannot deliver ([`Self::deliverable`]), it is a link of
+    /// `target`'s inherited chain (projected as the conversation's own opening
+    /// already — admitted again it emitted twice: `CLAUDE.md`'s 46K characters
+    /// stood in both the working set and the chain), or the scope of its group
+    /// no longer offers it to `target`.
     fn working_set_candidate(&self, target: TimelineId, timeline: TimelineId) -> Option<Candidate> {
         if !self.deliverable(target, timeline) {
+            return None;
+        }
+        if self.inherited_chain(target).contains(&timeline) {
             return None;
         }
         let group = self.timeline_target(timeline).map(|(_, g)| g);
@@ -7885,6 +7911,10 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         self.scores.group_mass(group)
     }
 
+    fn group_scan(&self, group: GroupId) -> Option<GroupScan> {
+        self.scores.group_scan(group)
+    }
+
     fn collection_attention_mass(&self, collection: u32) -> f32 {
         self.scores.collection_mass(collection)
     }
@@ -8007,6 +8037,10 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
 
     fn group_attention_mass(&self, group: GroupId) -> f32 {
         self.scores_or_empty().group_mass(group)
+    }
+
+    fn group_scan(&self, group: GroupId) -> Option<GroupScan> {
+        self.scores_or_empty().group_scan(group)
     }
 
     fn collection_attention_mass(&self, collection: u32) -> f32 {
@@ -8289,6 +8323,7 @@ mod tests {
         Limits {
             budget_tokens,
             folder_tokens: budget_tokens,
+            lock_tokens: budget_tokens,
             max_file_tokens: 100_000,
         }
     }
@@ -8315,6 +8350,40 @@ mod tests {
             sub.working_set(target).unwrap().pinned(),
             vec![reads[1], reads[0]]
         );
+    }
+
+    /// A link of the dialogue's own inherited chain is projected as its opening
+    /// already, so it is never a member: not seeded, not locked, not admitted
+    /// on momentum. Admitted, it emitted twice.
+    #[test]
+    fn a_link_of_the_dialogues_own_chain_is_never_a_member() {
+        let (mut sub, target, reads) = working_set_fixture(2, 10);
+        set_parent(&mut sub, target, reads[0]);
+        assert_eq!(
+            sub.working_set_lock(target, reads[0], ws_limits(1000)),
+            Err(Refusal::Gone)
+        );
+        assert_eq!(
+            sub.working_set_seed(target, &[reads[0], reads[1]], ws_limits(1000), 1000.0),
+            vec![reads[0]],
+        );
+        let fresh = HashMap::from([(reads[0], 5000.0), (reads[1], 5000.0)]);
+        sub.working_set_observe(
+            target,
+            &fresh,
+            0.2,
+            100.0,
+            ws_limits(1000),
+            NonZeroUsize::new(4).unwrap(),
+        );
+        let members: Vec<TimelineId> = sub
+            .working_set(target)
+            .unwrap()
+            .members()
+            .into_iter()
+            .map(|(tl, _)| tl)
+            .collect();
+        assert_eq!(members, vec![reads[1]]);
     }
 
     /// A conversation in no working-set group can never be a member.

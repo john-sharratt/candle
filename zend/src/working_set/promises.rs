@@ -160,6 +160,7 @@ mod tests {
         WorkingSetConfig {
             budget_tokens: 1_000,
             folder_tokens: 100,
+            lock_tokens: 1_000,
             beta: 0.2,
             min_momentum: 100.0,
             max_file_tokens: 500,

@@ -6,7 +6,8 @@
 
 ## 1. The idea
 
-Every dialogue carries a **working set**: a token budget (250K) of
+Every dialogue carries a **working set**: a voluntary token budget (80K, with
+locks on top under a 150K ceiling of their own) of
 already-ingested `code_reading` files and `repo_map` folders, projected ahead of
 its own turns as **one sequence in the order its members entered**. The unit is
 always a **whole ingest conversation** — one file or one folder — so an item
@@ -37,8 +38,11 @@ Everything enters at one **insertion point**: a lock just before it, so the
 oldest lock stays nearest the dialogue; provenance just after the provenance
 already there, so the newest provenance sits beside the locks. A member keeps
 its place until it leaves, and the gap closes at once. A newcomer that needs
-room dislodges the weakest provenance — a lock always, new provenance only when
-it is clearly stronger; nothing dislodges a lock. When a lock cannot fit beside
+room dislodges the weakest provenance only when it is clearly stronger; a lock
+dislodges nothing — it sits on top of the voluntary budget, so a read the model
+makes adds to what it carries instead of taking the place of the provenance
+around it — and nothing dislodges a lock. When a lock cannot fit under the lock
+ceiling beside
 the locks already held, the tool call runs for real — the fast path is an
 optimisation, and running out of it costs a read, never correctness. A lock is
 released into provenance when the reply that promised it leaves the dialogue's
@@ -107,8 +111,8 @@ ahead of the dialogue, so:
 
 ```
 system prompt
-repo_map/structure      pinned folders + provenance folders   ┐ working set,
-code_reading/scopes     pinned files   + provenance files     ┘ ≤ budget_tokens
+repo_map/structure      pinned folders + provenance folders   ┐ working set: provenance ≤ budget_tokens,
+code_reading/scopes     pinned files   + provenance files     ┘ locks ≤ lock_tokens on top
 lineage + dialogue      untouched: recent 16 + historical 8, its own 116K window
 ```
 
@@ -159,9 +163,23 @@ ahead of it moves further back. That remains open.
 `window` over the rest as today. Their `budget:` shares in `projection.yaml` are
 deleted.
 
-- `repo_map` — pinned folders, then provenance folders, up to `folder_tokens`.
-- `code_reading` — pinned files, then provenance files, up to what remains of
+- `repo_map` — pinned folders, then provenance folders up to `folder_tokens`.
+- `code_reading` — pinned files, then provenance files up to what remains of
   `budget_tokens`.
+- The pinned members of both count against `lock_tokens`, never against
+  `budget_tokens`.
+
+**The voluntary budget is small on purpose.** Measured 2026-10-24 at a 250K
+budget (conversation `1f283ffd`): every decode materialized 321K–350K tokens,
+~215K–248K of it provenance the scan had pulled in on momentum — with the one
+file the model had actually asked for, the paper, ~125K tokens from the
+question. At 80K a decode with a young dialogue sits near 150K materialized,
+and every `file_read` lock adds to that rather than displacing it.
+
+**No link of the dialogue's own chain is ever a member.** The chain is projected
+as the conversation's opening already; admitted on momentum it emitted twice —
+measured: `CLAUDE.md`'s 46K characters in both the working set and the chain
+(`Substrate::working_set_candidate`).
 
 Two budgets because the two groups' scores are normalised separately and cannot
 be ranked against each other; folders are small, so a fixed slice is enough.
@@ -173,8 +191,9 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
 ```yaml
   - name: dialogue
     working_set:
-      budget_tokens: 250000      # everything below, together
-      folder_tokens: 10000       # repo_map's share: pinned + provenance folders
+      budget_tokens: 80000       # seeds + provenance, folders and files together
+      lock_tokens: 150000        # the locks, on top of budget_tokens
+      folder_tokens: 10000       # repo_map's share of budget_tokens
       beta: 0.2                  # per-file momentum leak (§4.3)
       min_momentum: 100          # below this a file is not a provenance candidate
       max_file_tokens: 100000    # one file above this is never seeded or locked
@@ -237,7 +256,7 @@ set at setup from each `working_set` rule's `share`). Every operation:
 
 | Operation | What happens |
 |---|---|
-| `lock` | A member is locked **where it stands**. A newcomer dislodges the weakest provenance (lowest momentum; on a tie the one nearest the insertion point) until it fits, then enters just before the insertion point. A lock never dislodges a lock: one that cannot fit is refused (`Refusal::Full`). |
+| `lock` | A member is locked **where it stands**. A newcomer enters just before the insertion point and dislodges nothing: locks sit on top of `budget_tokens`. One that would take the locks past `lock_tokens` is refused (`Refusal::Full`). |
 | `observe` | Momentum decays for everything not locked; a conversation under `min_momentum` leaves the map and, if a member, the sequence — the gap closes. An unlocked member its scope no longer offers leaves too. Then the strongest non-members try to enter at the insertion point (which moves past them), each dislodging only provenance it beats by `DISLODGE_MARGIN` (×1.5) — without the margin two files near the floor trade places every reprojection and each trade rebuilds everything to its right. |
 | `release` | Every lock becomes provenance **in place**, at momentum `max(m, 1000/β)`, and the insertion point moves to the end — the next members enter beside the dialogue. Nothing moves. |
 | `release_one` | One lock becomes provenance **in place**, at momentum `max(m, 1000/β)`; every other lock stands. Nothing moves. |
@@ -311,8 +330,10 @@ over the other groups as if the working set were not there. Its selection is
 sized by its own budget and never trimmed.
 
 **Budget between the two groups.** Enforced when a member enters (§4.3): the
-folder members hold at most `folder_tokens` between them, and the files take
-what `budget_tokens` leaves.
+voluntary folder members hold at most `folder_tokens` between them, the
+voluntary files take what `budget_tokens` leaves, and the locks of both hold at
+most `lock_tokens` on top. A released lock joins the voluntary members, and the
+next `observe` trims the weakest of them back under the budget.
 
 `in_tool_rounds` becomes `true` on both layers — the working set must be present
 in the rounds that lean on it. `locality`, `anchor`, `budget_adaptive` and the
@@ -329,10 +350,9 @@ lineage and its own turns only, and its 116K window is its own again.
 The screen stays in `fast_path.rs`; its admission changes and four checks are
 added.
 
-- **A lock dislodges provenance, never a lock.** `WorkingSet::lock` makes room by
-  dislodging the weakest provenance; when only locks would have to go, it
-  refuses and the call runs for real (§3.5). A file already in the set is
-  locked in place.
+- **A lock dislodges nothing.** `WorkingSet::lock` enters on top of the
+  voluntary budget; when the locks would pass `lock_tokens`, it refuses and the
+  call runs for real (§3.5). A file already in the set is locked in place.
 - **Real cost.** The per-file cap and the budget both use
   `timeline_token_totals`; a timeline with no total is a miss (§3.6).
 - **A round is screened only up to its first `release_on` call.** Calls after it
@@ -531,9 +551,9 @@ audit of "what did the fast path promise this conversation" a direct answer.
 ## 5. Constraints and cost
 
 - **Context length.** Flash-Next is trained to 262,144 positions; progressive
-  YaRN (`qwen4exp/rope.rs`) carries it ×2 to 524,288. 250K + the dialogue's 116K
-  (which includes the 100K lineage cap) is ~366K, leaving ~158K before the slot
-  climbs to ×4. A slot's rung follows its deepest position, so **a dialogue past
+  YaRN (`qwen4exp/rope.rs`) carries it ×2 to 524,288. 80K voluntary + 150K of
+  locks + the dialogue's 116K (which includes the 100K lineage cap) is ~346K at
+  the most, leaving ~178K before the slot climbs to ×4. A slot's rung follows its deepest position, so **a dialogue past
   262K runs factor 2 at every position, its own turns included** — the working
   set changes the whole conversation's rotation, not just its reach. The
   shipped schema's `rope: min_yarn_factor: 2` puts every dialogue on ×2 from
@@ -558,7 +578,8 @@ audit of "what did the fast path promise this conversation" a direct answer.
   enabled, the draft head must be checked to rotate by the slot's rung past
   262K, or its drafts will be rejected at depth.
 
-Budget ships at 250K (D10); the §7 measurement watches these numbers.
+Budget ships at 80K voluntary + 150K of locks (D10); the §7 measurement watches
+these numbers.
 
 ## 6. Code map
 
@@ -584,7 +605,10 @@ Budget ships at 250K (D10); the §7 measurement watches these numbers.
 
 ## 7. Tests (CPU unless marked)
 
-- `WorkingSet`: lock admits until full, then refuses without evicting; release
+- `WorkingSet`: a lock sits on top of a full voluntary budget and dislodges
+  nothing; locks admit until `lock_tokens`, then refuse without evicting; a
+  released lock is trimmed back into the budget on the next `observe`; a link
+  of the dialogue's own chain is never seeded, locked or admitted; release
   clears locks and sets momentum `1000/β`; release_one ends one lock and leaves
   the others standing and nothing moving; `observe` settles a steady file at
   `fresh/β` and decays an idle one; a file below `min_momentum` leaves the map
@@ -639,7 +663,7 @@ Budget ships at 250K (D10); the §7 measurement watches these numbers.
 | D7 | Provenance unit | Whole files and folders. |
 | D8 | Seed list | §4.2 draft, to be edited. |
 | D9 | Fade rate | Per-file momentum at β 0.2, leaking by its own value. |
-| D10 | Default budget | 250K — with the 116K window, ~158K clear of the ×2 ceiling before YaRN climbs to ×4; measured alongside. |
+| D10 | Default budget | 80K voluntary, locks on top up to 150K. The 250K it replaced held 215K–248K of momentum provenance per decode (measured 2026-10-24) and put a decode at 321K–350K materialized; at 80K a young dialogue's decode sits near 150K, and the model's own reads add to it. |
 | D11 | Momentum store | In `WorkingSet`, not the belief carry; in-memory. |
 | D12 | Restart | Served calls are marked on their turn (`working_set:lock:<tl>`, `working_set:release:<tl>`, `working_set:release`) through the existing persisted turn tags, which every gather-scope reader ignores; locks rebuild from the marks. Momentum rebuilds from the scan. |
 | D13 | Folder vs file budget | `folder_tokens` slice for `repo_map`, the rest for `code_reading`. |

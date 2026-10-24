@@ -23,6 +23,7 @@ use super::ids::{
 };
 use super::owned_sections::OwnedSection;
 use super::project::ProjectionTarget;
+use super::scan_stats::{scan_stats, GroupScan};
 use super::schema::{
     CorruptTurnPolicy, GroupSchema, LayerSchema, Schema, SectionCollection, SystemPromptItem,
     SystemPromptSchema,
@@ -2388,8 +2389,14 @@ impl Conversation {
                 Some(q) => scan_files(&[probe, q]),
                 None => scan_files(&[probe]),
             };
-            let fresh_q_per_file: Option<Vec<Vec<f32>>> = question
-                .and_then(|_| scanned.pop())
+            let question_scan = question.and_then(|_| scanned.pop());
+            let q_base: Option<Vec<f32>> = question_scan.as_ref().map(|per_file| {
+                per_file
+                    .iter()
+                    .flat_map(|(_, base)| base.iter().copied())
+                    .collect()
+            });
+            let fresh_q_per_file: Option<Vec<Vec<f32>>> = question_scan
                 .map(|per_file| per_file.into_iter().map(|(fused, _)| fused).collect());
             let tail_scan = scanned.pop().unwrap_or_default();
             let fresh_per_file: Vec<Vec<f32>> =
@@ -2540,6 +2547,10 @@ impl Conversation {
                     group.policy.scan.mass_rho,
                 ),
             );
+            if let Some(tail) = scan_stats(&group_raw) {
+                let question = q_base.as_deref().and_then(scan_stats);
+                scores.set_group_scan(group.id, GroupScan { tail, question });
+            }
             // Where this group's scan time went, and what it walked to spend it.
             // `assemble_us` is host work proportional to the group's turns;
             // `score_us` is the batched launch (plus the CPU fallback when the
