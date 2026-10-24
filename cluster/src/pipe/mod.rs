@@ -12,6 +12,7 @@ pub mod drain;
 pub mod heard;
 pub mod memory;
 pub mod socket;
+pub mod stamped;
 pub mod tungstenite;
 
 use std::future::Future;
@@ -20,6 +21,7 @@ use tokio::time::Instant;
 
 pub use drain::Drain;
 pub use heard::Heard;
+pub use stamped::Stamped;
 
 use crate::close::Close;
 

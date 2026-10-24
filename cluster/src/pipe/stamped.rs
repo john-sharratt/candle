@@ -1,13 +1,15 @@
 //! A transport stream that stamps every read: below TLS and the WebSocket, so
 //! the bytes of a message still arriving count as hearing from the peer
-//! (`cluster::pipe::Heard`).
+//! ([`Heard`]). A member's dialled socket and a gateway's accepted one both run
+//! over it.
 
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use cluster::pipe::Heard;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use super::Heard;
 
 pub struct Stamped<T> {
     inner: T,

@@ -17,6 +17,7 @@
 //! | [`bearer_key`] | the keys that stand in for a session: status, ops |
 //! | [`ops_key`] | the admin an operator on the box acts as, for emergencies |
 //! | [`peers`] | the peer gateways: node id, identity, dial loops (§13.4) |
+//! | [`upgrade`] | the socket's WebSocket upgrade, over a transport that stamps its reads |
 //! | [`upgrades`] | the gateway's upgrade commands, the forced rollout's plan |
 //!
 //! The state itself — admission, members, claims, the log — is the `cluster`
@@ -24,7 +25,6 @@
 
 pub mod aggregate;
 pub mod bearer_key;
-pub mod codec;
 pub mod endpoint;
 pub mod jobs;
 pub mod load;
@@ -37,6 +37,7 @@ pub mod route;
 pub mod streams;
 pub mod transport;
 pub mod tunnel;
+pub mod upgrade;
 pub mod upgrades;
 
 use std::sync::{Arc, OnceLock};

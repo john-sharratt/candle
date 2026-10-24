@@ -26,6 +26,7 @@ use cluster::handshake::GroupKey;
 use cluster::member::{AppMember, Check, Identity, Link};
 use cluster::pipe::socket::{split, SocketRx, SocketTx};
 use cluster::pipe::tungstenite::Tungstenite;
+use cluster::pipe::Heard;
 use cluster::session::VirtualConn;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
@@ -227,7 +228,7 @@ impl Connect for Dial {
         let (ws, _) = connect_async(self.0.as_str())
             .await
             .map_err(|e| e.to_string())?;
-        Ok(split::<Tungstenite, _, _>(ws))
+        Ok(split::<Tungstenite, _, _>(ws, Heard::new()))
     }
 }
 

@@ -15,7 +15,7 @@ use cluster::handshake::HandshakeError;
 use cluster::offline;
 use cluster::pipe::socket::{split, SocketRx, SocketTx};
 use cluster::pipe::tungstenite::Tungstenite;
-use cluster::pipe::{Heard, Message, PipeRx};
+use cluster::pipe::{Heard, Message, PipeRx, Stamped};
 use cluster::session::Ended;
 use rustls_pki_types::ServerName;
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
@@ -29,7 +29,6 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::paths::{Fault, PathId, Paths, Timing};
 use crate::sources::sources_for;
-use crate::stamped::Stamped;
 use crate::target::{Endpoint, Target};
 use crate::{Io, Socket, MAX_MESSAGE};
 
@@ -304,7 +303,6 @@ async fn transport(
 pub struct PathRx {
     inner: SocketRx<Socket, Tungstenite>,
     leaving: Arc<Notify>,
-    heard: Heard,
 }
 
 impl PipeRx for PathRx {
@@ -318,7 +316,7 @@ impl PipeRx for PathRx {
     }
 
     fn heard(&self) -> Option<Instant> {
-        self.heard.at()
+        self.inner.heard()
     }
 }
 
@@ -344,15 +342,8 @@ impl Connect for Dial {
                         since: Instant::now(),
                         probe,
                     });
-                    let (tx, rx) = split::<Tungstenite, _, _>(ws);
-                    return Ok((
-                        tx,
-                        PathRx {
-                            inner: rx,
-                            leaving,
-                            heard,
-                        },
-                    ));
+                    let (tx, rx) = split::<Tungstenite, _, _>(ws, heard);
+                    return Ok((tx, PathRx { inner: rx, leaving }));
                 }
                 Err(failure) => failure,
             };

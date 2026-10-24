@@ -5,14 +5,20 @@
 //! Sends go through a pump task that writes and flushes one message at a
 //! time; a message counts as unsent until its flush returns, which is when the
 //! transport has taken it. That count gates the catch-up lane (§4.2).
+//!
+//! The receiving half reports the [`Heard`] it is split with: a socket over a
+//! [`super::Stamped`] transport is heard by its bytes, a message still
+//! arriving included; one over a transport that cannot tell is never stamped,
+//! and is heard by whole messages.
 
 use std::marker::PhantomData;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
-use super::{Drain, Message, PipeClosed, PipeRx, PipeTx};
+use super::{Drain, Heard, Message, PipeClosed, PipeRx, PipeTx};
 use crate::close::Close;
 
 /// What a socket's message is, as a pipe reads it.
@@ -41,11 +47,13 @@ pub struct SocketTx {
 
 pub struct SocketRx<S, C> {
     stream: SplitStream<S>,
+    heard: Heard,
     codec: PhantomData<C>,
 }
 
-/// Split `socket` into a pipe's two halves, spawning the send pump.
-pub fn split<C, S, E>(socket: S) -> (SocketTx, SocketRx<S, C>)
+/// Split `socket` into a pipe's two halves, spawning the send pump; the
+/// receiving half reports `heard`, the stamp its transport's reads leave.
+pub fn split<C, S, E>(socket: S, heard: Heard) -> (SocketTx, SocketRx<S, C>)
 where
     C: Codec,
     S: Sink<C::Message, Error = E> + Stream<Item = Result<C::Message, E>> + Send + Unpin + 'static,
@@ -59,6 +67,7 @@ where
         SocketTx { tx, unsent },
         SocketRx {
             stream,
+            heard,
             codec: PhantomData,
         },
     )
@@ -121,6 +130,10 @@ where
             }
         }
     }
+
+    fn heard(&self) -> Option<Instant> {
+        self.heard.at()
+    }
 }
 
 #[cfg(test)]
@@ -138,9 +151,34 @@ mod tests {
         let gateway = WebSocketStream::from_raw_socket(a, Role::Server, None).await;
         let member = WebSocketStream::from_raw_socket(b, Role::Client, None).await;
         (
-            split::<Tungstenite, _, _>(gateway),
-            split::<Tungstenite, _, _>(member),
+            split::<Tungstenite, _, _>(gateway, Heard::new()),
+            split::<Tungstenite, _, _>(member, Heard::new()),
         )
+    }
+
+    /// Over a stamped transport the receiving half is heard by its bytes: the
+    /// first bytes of a frame, with the rest yet to come, already count — and
+    /// no whole message has arrived.
+    #[tokio::test]
+    async fn a_stamped_socket_is_heard_before_its_message_is_whole() {
+        use tokio::io::AsyncWriteExt;
+
+        let (a, mut peer) = duplex(1 << 10);
+        let heard = Heard::new();
+        let gateway = WebSocketStream::from_raw_socket(
+            crate::pipe::Stamped::new(a, heard.clone()),
+            Role::Server,
+            None,
+        )
+        .await;
+        let (_gtx, mut grx) = split::<Tungstenite, _, _>(gateway, heard);
+        assert_eq!(grx.heard(), None);
+        // A masked binary frame's header announcing a 16-bit length, and
+        // nothing more of it.
+        peer.write_all(&[0x82, 0xfe, 0x10]).await.unwrap();
+        let whole = tokio::time::timeout(std::time::Duration::from_millis(200), grx.recv()).await;
+        assert!(whole.is_err(), "no message is whole yet");
+        assert!(grx.heard().is_some(), "but its bytes have been heard");
     }
 
     /// Frames cross a real WebSocket in order both ways, byte for byte; a

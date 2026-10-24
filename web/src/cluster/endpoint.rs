@@ -6,17 +6,15 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use cluster::gateway::APPS;
 use cluster::peer::GATEWAY_APP;
-use cluster::pipe::socket::split;
 
-use super::codec::AxumWs;
+use super::upgrade::upgrade;
 use super::{streams, Gateway};
 use crate::tls::SecureEntrance;
 
@@ -55,18 +53,9 @@ async fn dial_in(
                 .into_response();
         };
         let secure = req.extensions().get::<SecureEntrance>().is_some();
-        let (mut parts, _) = req.into_parts();
-        let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-            Ok(ws) => ws,
-            Err(rejection) => return rejection.into_response(),
-        };
-        return ws
-            .max_message_size(MAX_MESSAGE)
-            .max_frame_size(MAX_MESSAGE)
-            .on_upgrade(move |socket| async move {
-                let (tx, rx) = split::<AxumWs, _, _>(socket);
-                peering.accept(tx, rx, secure).await;
-            });
+        return upgrade(req, MAX_MESSAGE, move |tx, rx| async move {
+            peering.accept(tx, rx, secure).await;
+        });
     }
     let Some(app) = APPS.iter().find(|a| **a == app).copied() else {
         return (
@@ -76,18 +65,10 @@ async fn dial_in(
             .into_response();
     };
     let ip = peer.map_or(IpAddr::from([0, 0, 0, 0]), |ConnectInfo(a)| a.ip());
-    let (mut parts, _) = req.into_parts();
-    let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-        Ok(ws) => ws,
-        Err(rejection) => return rejection.into_response(),
-    };
-    ws.max_message_size(MAX_MESSAGE)
-        .max_frame_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| async move {
-            gateway.tick_upgrades();
-            let (tx, rx) = split::<AxumWs, _, _>(socket);
-            let hub = gateway.hub.clone();
-            hub.serve(app, ip, tx, rx, |s| streams::serve(&gateway, ip, s))
-                .await;
-        })
+    upgrade(req, MAX_MESSAGE, move |tx, rx| async move {
+        gateway.tick_upgrades();
+        let hub = gateway.hub.clone();
+        hub.serve(app, ip, tx, rx, |s| streams::serve(&gateway, ip, s))
+            .await;
+    })
 }
