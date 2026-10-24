@@ -1401,12 +1401,14 @@ layers:
       # the scan pulled in on momentum; at 80K the provenance on a question
       # about a paper was ~70K of test files the question never touched — the
       # scan's per-file standardisation cannot rank files against each other,
-      # so what fills this budget is largely arbitrary. The model's own reads
-      # sit on top under `lock_tokens`.
-      budget_tokens: 40000
+      # so what fills this budget is largely arbitrary — at 40K one 32K test
+      # file, ranked first on every question, took nearly all of it. 10K holds
+      # the seeds' folders and small files and never a large file the scan
+      # merely guessed at. The model's own reads sit on top under `lock_tokens`.
+      budget_tokens: 10000
       # The locks sit on top: a read the model makes adds to what it carries
       # and never displaces the provenance around it, up to this ceiling.
-      # 40K + 150K + this layer's 116K window stays clear of the ×2 rung's
+      # 10K + 150K + this layer's 116K window stays clear of the ×2 rung's
       # ceiling of 524,288 (`rope: min_yarn_factor: 2`, §5).
       lock_tokens: 150000
       folder_tokens: 10000       # repo_map's share: pinned + provenance folders
