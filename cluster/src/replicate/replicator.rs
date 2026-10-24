@@ -83,6 +83,12 @@ fn room_for(len: usize) -> u32 {
     len.div_ceil(ROOM_UNIT).clamp(1, ROOM_PERMITS) as u32
 }
 
+/// The bytes of [`ARRIVALS_CAP`] that queued records hold, given the permits
+/// still `available`.
+fn waiting(available: usize) -> usize {
+    ROOM_PERMITS.saturating_sub(available) * ROOM_UNIT
+}
+
 #[cfg(test)]
 mod room_tests {
     use super::*;
@@ -99,6 +105,15 @@ mod room_tests {
         assert_eq!(room_for(59 * 1024), 59);
         assert_eq!(room_for(ARRIVALS_CAP * 4), ROOM_PERMITS as u32);
         assert_eq!(ROOM_PERMITS, 131_072, "twice a 64 MiB fetch window, in KiB");
+    }
+
+    /// What waits to be applied is the budget's spent share, in bytes: none
+    /// with every permit free, the whole cap with none.
+    #[test]
+    fn waiting_to_apply_is_the_spent_share_of_the_budget() {
+        assert_eq!(waiting(ROOM_PERMITS), 0);
+        assert_eq!(waiting(ROOM_PERMITS - 59), 59 * 1024);
+        assert_eq!(waiting(0), ARRIVALS_CAP);
     }
 
     /// The budget holds: once it is spent, the next record waits until a
@@ -278,6 +293,11 @@ pub struct ReplicationView {
     pub catchups: Vec<CatchupView>,
     /// Catch-up answers running for other members, one per requester.
     pub answering: usize,
+    /// Received records waiting to be applied: their share of
+    /// [`ARRIVALS_CAP`], in bytes. At the cap, the member's sockets are not
+    /// read until applying frees room — a gateway then sees its queue for this
+    /// member stand still.
+    pub waiting_to_apply: usize,
     /// The counters, under their own key: flattened, `stats.catchups` (a
     /// count) overwrote the `catchups` list above.
     pub stats: Stats,
@@ -694,6 +714,7 @@ impl Replicator {
                 })
                 .collect(),
             answering: s.answering.len(),
+            waiting_to_apply: waiting(self.room.available_permits()),
             stats: s.stats.clone(),
             quorum: QuorumView {
                 max_members: s.max_members,
