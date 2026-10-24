@@ -344,10 +344,16 @@ system_prompt:
     # kind of content or a new fast path needs no change here. The literal anchor
     # arrives in the served reply (`{"status":"in_context","anchor":…}`,
     # `zend/src/fast_path.rs`), whose status is this section's id so the reply
-    # calls this rule to attention by the same token. It promises no persistence:
-    # it says content fades, to check the anchor before quoting, citing or editing,
-    # and that a remembered item no longer here faded — so the model re-fetches
-    # instead of taking its own correct quotations for fabrications. A re-fetch
+    # calls this rule to attention by the same token. It says what that reply
+    # means — the item is here, and is the model's own reading. Measured
+    # 2026-10-24 (conversation 1f283ffd): told only to check anchors, the model
+    # got in_context for the paper twice, answered from the paper's body, and told
+    # the user it had only "in_context stubs" and had not read it. It promises no
+    # persistence: it says content fades, to check the anchor before stating any
+    # specific name, number, path or quote, or editing — turn one of that run
+    # stated three facts it had never fetched — and that a remembered item no
+    # longer here faded, so the model re-fetches instead of taking its own correct
+    # quotations for fabrications. A re-fetch
     # always lands: the fast path answers in_context only by locking the unit,
     # and a locked unit is projected on every decode its reply is
     # (`docs/zend_working_set.md` §4.6). Gated on tools: it tells the model to
@@ -358,9 +364,11 @@ system_prompt:
       content: |+
         in_context — Your context changes as you work: content placed ahead of this
         conversation begins with an anchor naming it, and items you stop using fade out.
-        Before you quote, cite or edit something, check its anchor is here; if it isn't,
-        fetch it again. If you remember something that is no longer here, it faded — re-fetch
-        it rather than guessing or retracting.
+        A tool that answers in_context is telling you that content is already here, under
+        the anchor it names: it is your own reading, so use it and say you read it. Before
+        you state a specific name, number, path or quote, or edit something, check its
+        anchor is here; if it isn't, fetch it again. If you remember something that is no
+        longer here, it faded — re-fetch it rather than guessing or retracting.
 
     # Two grounding variants under the same `tools` collection gate — exactly
     # one emits per projection: the tool-aware remedy when tools are configured,

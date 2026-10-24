@@ -429,9 +429,14 @@ paid on every served call; what the status means is said once, in the system
 prompt's `in_context` section, whose id is the status word — the reply recalls
 the rule by the same token rather than restating it. The rule is general: the
 context changes as the model works; placed content begins with an anchor naming
-it, and items it stops using fade out; before quoting, citing or editing
-something, check its anchor is here and fetch it again if not; a remembered item
-no longer here faded — re-fetch it rather than guessing or retracting. It
+it, and items it stops using fade out; a tool answering `in_context` is saying
+the content is already here under that anchor, as the model's own reading, to be
+used and said to be read; before stating a specific name, number, path or quote,
+or editing, check its anchor is here and fetch it again if not; a remembered item
+no longer here faded — re-fetch it rather than guessing or retracting. Measured
+2026-10-24 (conversation `1f283ffd`): a rule that said only to check anchors left
+the model answering from the paper's body while telling the user it had only
+"in_context stubs", and stating three facts it had never fetched. It
 promises no persistence, and it does not say the model never invents things, so
 genuine self-correction still works. A re-fetch always lands: the screen answers
 `in_context` only by locking the unit, and a lock is projected on every decode. It
