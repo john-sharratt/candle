@@ -167,6 +167,27 @@ The first launch's vote is credited to the second's best chunk in the winning
 file; a window's tally is the votes credited to the chunks it covers. That is
 the CPU tally at chunk resolution, for about twice the scan.
 
+**What ships** is the summed vote, with every file one case of one
+competition (`ScanCases::File`), every fold group voting alike: the window
+tallies helped request and summary probes but not analysis units' answers,
+which decide. A file-scored group's warm-up teaches its pool scope nothing —
+a file's self-match would teach it only that file's ceiling — so its levels
+are live traffic's.
+
+Two corrections that won on the analysis-unit probes lost on the paper
+conversation (gate 4), and neither ships:
+
+- **Hub correction** — each file over its *background peak*, the most it
+  scored on probes of other files, floored at 100. MRR over the analysis-unit
+  probes rose 0.40–0.44 → 0.45–0.50, but the paper conversation's first
+  message found 38% of the files it should (91% without), and 9 of its 14
+  tool calls' files in the top ten (14 without): the files a real
+  conversation asks about are often the hubs.
+- **Top fold group alone** (`[0, 0, 1]`): 75% and 11 of 14 on the same turn.
+
+Both are kept as rules in the harness (`provenance_gates/rules.rs`) to be
+measured against again.
+
 ### 2.4 Analysis units
 
 An analysis unit — `dependency_analysis`, `code_review`, `security_review`,
@@ -194,8 +215,9 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   tombstoned once its answer is read; one question per line is kept.
 - **Calibrated as tools' questions are.** All of a unit's questions go in as
   one turn group in a conversation of the hidden calibration layer, under the
-  system prompt every conversation opens with: each masked to itself, sealed
-  one turn apiece with an empty answer, tagged `calibration`. The
+  system prompt every conversation opens with, prefilled lossless
+  (`kv_lossless`): each masked to itself, sealed one turn apiece with an empty
+  answer, tagged `calibration`. The
   conversation names the unit (`Substrate::CALIBRATES_KEY`), is archived —
   the commit — and is distilled `ProvenanceOnly`: K/V dropped, signatures
   kept.
@@ -205,12 +227,15 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   under file-scored cases is the unit. A calibration is never itself a
   candidate, a working-set member, or a dialogue probe.
 - **Resumed like the tools' corpus.** Ahead of each ingest pass, a layer's
-  units that stand — committed, finished, every turn holding content —
-  without an archived calibration carrying their current marker (layer,
-  digest of what is asked, the unit's content key) are calibrated; every other
-  calibration of the layer is retired. Units read before the block existed are
-  calibrated without being read again, and a unit read again is calibrated
-  again.
+  ready units — finished without a chain break, every turn holding content
+  here — without an archived calibration carrying their current marker
+  (layer, digest of what is asked, the unit's content key) are calibrated. A
+  unit present but not ready keeps the calibration its marker names and waits:
+  a member that holds another member's reading hollow must not retire a
+  calibration every member shares. Every other calibration of the layer — of
+  no present unit, never finished, or a second of the same marker — is
+  retired. Units read before the block existed are calibrated
+  without being read again, and a unit read again is calibrated again.
 
 ## 3. Gates
 
@@ -284,7 +309,7 @@ replay of the conversation remains the end-to-end check after the gate passes.
 | Probe construction | `scheduler/mod.rs` (the reproject probe) — the shape the windows mirror |
 | Gates 3.1–3.3 | tests beside the rule and the scan |
 | The harness | `candle-conversation/examples/provenance_gates` — the sweep, gate 4 and the questions gate on the GPU gallery (`GalleryArena::scan_votes`) |
-| Calibration questions (§2.5) | `zend/src/calibrate/` (spec, plan, questions, run); `Substrate::{CALIBRATES_KEY, calibrations}`; the merge in `belief_files::assemble_file_scans` |
+| Calibration questions (§2.5) | `zend/src/calibrate/` (spec, plan, questions, run); `Substrate::{CALIBRATES_KEY, calibrations, calibrations_of}`; the merge in `belief_files::assemble_file_scans` |
 
 ## 7. Open
 

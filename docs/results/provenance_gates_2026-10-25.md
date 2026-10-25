@@ -184,21 +184,60 @@ the file it analyses (5.2 M gallery tokens, 192 probes).
   over each file's **background** (what it wins on probes of other files, its
   own left out) they lose that lead: the share less the background mean helps,
   and the raw score over the file's background *peak*, both at a 256-token
-  probe and floored at 100, helps most. That denominator is production's
-  traffic-peak normalization (`normalization::ScopeState` with a level-prior
-  floor), so it ships as configuration plus a warm-up: the file-scored groups
-  set `level_prior: { floor_base: 100, floor_cap: 1 }`, and
-  `Conversation::warm_pool_background` folds 64 background probes into each
-  group's pool scope, triggered as the group grows.
+  probe and floored at 100, helps most on these probes. It does not survive
+  the paper conversation (below), and does not ship.
+
+The sweeps run on the GPU gallery (`GalleryArena::scan_votes`, the raw
+per-token votes): 62 s a sweep, against 16–33 minutes scanned on the host.
+
+## Calibration questions
+
+Each `code_reading` file wrote 16 questions its content answers
+(`zend::calibrate`, design §2.5); all 1,005 files calibrated, 16,038
+questions. **The questions gate** holds each file's questions out in turn and
+asks them of the gallery: each question should find its own file.
+
+| rule | MRR |
+|---|---|
+| today: [1, 1, 1], summed | 0.125 |
+| today + questions | 0.180 |
+| top group [0, 0, 1] + questions | 0.187 |
+| over-peak (floor 100) + questions | 0.173 |
+| top group, over-peak, + questions | 0.182 |
+
+With its file's other questions in the gallery, a question finds its file
+nearly half again as often (0.125 → 0.180). The other rules move it less than
+a hundredth either way.
+
+## Gate 4 — the paper conversation
+
+`paper e7bca43ccfa75cbd`, checked against
+`docs/provenance_expectations/paper_conversation.yaml`. Its first message asks
+about the paper. The table gives the share of the files it should find that
+are found, and how many of its 14 tool calls' files are in the top ten:
+
+| rule | should-hit | tool calls in top 10 |
+|---|---|---|
+| today | 88% | 14 / 14 |
+| today + questions | **91%** | **14 / 14** |
+| top group + questions | 75% | 11 / 14 |
+| over-peak + questions | 38% | 9 / 14 |
+| top group, over-peak, + questions | 50% | 9 / 14 |
+
+The hub correction, which won on the analysis units' answers, loses a real
+conversation more than half the files it should find: the files it asks
+about are often the hubs, and the correction marks them down. The top group
+alone loses less, but still loses: 75% and 11 of 14. **What ships** is
+today's scorer — every fold group alike, no background peak — with the
+calibration questions in the gallery. `code_reading`'s `scopes` keeps its
+cold-scope floor (`level_prior: { floor_base: 2, floor_cap: 16 }`); the
+analysis groups have none. No file-scored group is warmed by self-match;
+their levels are live traffic's.
 
 ## Open
 
-- The production warm folds every growth's probes into one max-ever peak, so a
-  group warmed many times has seen more than the sweep's 64 background probes;
-  the sweep now takes the count (`sweep <per source> <background probes>`) to
-  measure what that does.
-- The over-peak sweep ranks [0, 0, 1] at keep 0.5 above the shipped [0.5, 1, 2]
-  at keep 0.25; the keep fraction is a constant of the GPU tally today.
+- The analysis-unit probes and the paper conversation disagree on what helps.
+  A rule is measured against both before it ships.
 - Next rule to measure: identity and best-window combined (the better of a
   file's identity score and its count-normalised best window, each
   standardised), and a milder count correction.

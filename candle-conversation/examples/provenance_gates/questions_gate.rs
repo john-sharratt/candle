@@ -3,6 +3,7 @@
 //! is left out of the gallery. Ranked by every rule ([`crate::rules`]), so the
 //! same probes say what the questions buy over the files' content alone.
 
+use anyhow::Context;
 use candle_conversation::provenance::boundaries::BoundaryRule;
 
 use crate::corpus::File;
@@ -13,7 +14,7 @@ use crate::stats::mrr;
 
 pub fn run(files: &[File], rule: &BoundaryRule, per_file: usize) -> anyhow::Result<()> {
     let gpu = GpuGallery::new(files)?;
-    let scorer = Scorer::new(&gpu, files, rule)?;
+    let scorer = Scorer::new(&gpu, files, rule).context("learning the background peaks")?;
     let calibrated = files.iter().filter(|f| !f.questions.is_empty()).count();
     println!(
         "questions gate: {calibrated} of {} files calibrated, up to {per_file} probes each",
@@ -22,7 +23,16 @@ pub fn run(files: &[File], rule: &BoundaryRule, per_file: usize) -> anyhow::Resu
     let mut ranks: Vec<Vec<usize>> = vec![Vec::new(); RULES.len()];
     for (fi, f) in files.iter().enumerate() {
         for (qi, q) in f.questions.iter().enumerate().take(per_file) {
-            let scores = scorer.score(&q.sigs, &|_, _| false, &|f2, q2| f2 == fi && q2 == qi)?;
+            let scores = scorer
+                .score(&q.sigs, &|_, _| false, &|f2, q2| f2 == fi && q2 == qi)
+                .with_context(|| {
+                    format!(
+                        "file {fi} question {qi} ({} signatures, calibration {:016x} turn {})",
+                        q.sigs.len(),
+                        q.timeline,
+                        q.turn
+                    )
+                })?;
             for (ri, s) in scores.iter().enumerate() {
                 let rank = order(s)
                     .iter()
@@ -34,13 +44,13 @@ pub fn run(files: &[File], rule: &BoundaryRule, per_file: usize) -> anyhow::Resu
         }
     }
     println!(
-        "\n{:<20} {:>7} {:>6} {:>6} {:>6} {:>6}",
+        "\n{:<26} {:>7} {:>6} {:>6} {:>6} {:>6}",
         "rule", "probes", "R@1", "R@5", "R@10", "MRR"
     );
     for (r, rs) in RULES.iter().zip(&ranks) {
         let at = |k: usize| rs.iter().filter(|&&x| x <= k).count() as f32 / rs.len().max(1) as f32;
         println!(
-            "{:<20} {:>7} {:>6.3} {:>6.3} {:>6.3} {:>6.3}",
+            "{:<26} {:>7} {:>6.3} {:>6.3} {:>6.3} {:>6.3}",
             r.name,
             rs.len(),
             at(1),

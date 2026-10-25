@@ -183,12 +183,6 @@ impl NormalizationCache {
         self.scopes.get(scope).and_then(|s| s.level_of(child))
     }
 
-    /// The peak `child` has reached in `scope`'s observed traffic.
-    #[cfg(test)]
-    pub(crate) fn peak_of(&self, scope: &ScopeKey, child: &ChildKey) -> Option<f32> {
-        self.scopes.get(scope).and_then(|s| s.peak_of(child))
-    }
-
     #[cfg(test)]
     pub(super) fn count_of(&self, scope: &ScopeKey, child: &ChildKey) -> Option<u32> {
         self.scopes.get(scope).and_then(|s| s.count_of(child))

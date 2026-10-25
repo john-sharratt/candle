@@ -141,8 +141,10 @@ reached 643,768). Neither ranks files against each other.
 
 ### After hub correction and whole-only delivery (2026-10-25, `74306441`)
 
-The working set's files are scored over each file's background peak
-(`docs/results/provenance_gates_2026-10-25.md`), and only a conversation
+The working set's files were scored over each file's background peak
+(`docs/results/provenance_gates_2026-10-25.md`) — a correction withdrawn the
+same night, when gate 4 showed it losing this conversation more than half the
+files it should find — and only a conversation
 whose every turn holds content is locked or seeded (`Substrate::holds_whole`).
 One run on `.5`, conversation `9f5a6d4c`:
 

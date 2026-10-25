@@ -1,6 +1,7 @@
 //! The rules gate 4 and the questions gate rank files by, each scored on the
-//! GPU gallery: today's scorer, and the live one — over-peak hub correction —
-//! each with and without the calibration questions in the gallery.
+//! GPU gallery: the shipped scorer, with and without the calibration questions
+//! in the gallery, beside the top-group weights and the over-peak hub
+//! correction it is measured against.
 
 use candle_conversation::provenance::boundaries::BoundaryRule;
 use candle_conversation::provenance::hubness::{corrected, peak, HubCorrection};
@@ -25,7 +26,7 @@ pub struct Rule {
     pub questions: Questions,
 }
 
-pub const RULES: [Rule; 4] = [
+pub const RULES: [Rule; 6] = [
     Rule {
         name: "today",
         weights: [1.0, 1.0, 1.0],
@@ -41,14 +42,28 @@ pub const RULES: [Rule; 4] = [
         questions: Questions::With,
     },
     Rule {
-        name: "live",
+        name: "top group + questions",
+        weights: [0.0, 0.0, 1.0],
+        keep: 0.25,
+        fold: HubCorrection::None,
+        questions: Questions::With,
+    },
+    Rule {
+        name: "over-peak + questions",
+        weights: [1.0, 1.0, 1.0],
+        keep: 0.25,
+        fold: HubCorrection::OverPeak { floor: 100.0 },
+        questions: Questions::With,
+    },
+    Rule {
+        name: "top group, over-peak",
         weights: [0.0, 0.0, 1.0],
         keep: 0.25,
         fold: HubCorrection::OverPeak { floor: 100.0 },
         questions: Questions::Without,
     },
     Rule {
-        name: "live + questions",
+        name: "top group, over-peak + q",
         weights: [0.0, 0.0, 1.0],
         keep: 0.25,
         fold: HubCorrection::OverPeak { floor: 100.0 },

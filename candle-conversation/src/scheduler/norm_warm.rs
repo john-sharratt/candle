@@ -51,26 +51,10 @@ pub(super) struct IngestSliceJob {
     pub(super) response_tx: Sender<Option<usize>>,
 }
 
-/// One file-scored group whose background is due a warm
-/// ([`Conversation::take_background_warms`]).
-struct BackgroundJob {
-    conversation: Conversation,
-    projection: Arc<Builder>,
-    group: GroupId,
-    /// The batch this step scans; the job is queued again for the next.
-    batch: usize,
-    started: Instant,
-    /// The longest step so far — what a live turn stood behind.
-    longest_step: Duration,
-}
-
 /// The replay's backlog, and what the current one has done so far.
 #[derive(Default)]
 pub(super) struct NormWarm {
     backlog: VecDeque<WarmJob>,
-    /// Background warms of file-scored groups, served after the replay's turns
-    /// and before ingest slices.
-    background: VecDeque<BackgroundJob>,
     /// Ingest warm-up slices, served after the replay's turns.
     ingest: VecDeque<IngestSliceJob>,
     /// When the replay now draining was queued.
@@ -84,24 +68,21 @@ impl Scheduler {
     /// the warm-up its next turn: `None` with nothing queued (block as usual),
     /// zero while anything is.
     pub(super) fn norm_warm_wait(&self) -> Option<Duration> {
-        let warm = &self.norm_warm;
-        if warm.backlog.is_empty() && warm.background.is_empty() && warm.ingest.is_empty() {
+        if self.norm_warm.backlog.is_empty() && self.norm_warm.ingest.is_empty() {
             return None;
         }
         Some(Duration::ZERO)
     }
 
     /// Queue the dialogue warm-up replay when it is armed — see
-    /// [`Conversation::take_warm_replay`] — and any background warm that is
-    /// due ([`Self::queue_background_warms`]). A no-op otherwise, so it is
-    /// cheap to call on every reprojection.
+    /// [`Conversation::take_warm_replay`]. A no-op otherwise, so it is cheap to
+    /// call on every reprojection.
     pub(super) fn queue_norm_warm(
         &mut self,
         substrate: &Conversation,
         projection: &Arc<Builder>,
         target: ProjectionTarget,
     ) {
-        self.queue_background_warms(substrate, projection);
         let Some(probes) = substrate.take_warm_replay(target) else {
             return;
         };
@@ -113,32 +94,6 @@ impl Scheduler {
             target,
             probe,
         }));
-    }
-
-    /// Queue the background warm of every file-scored group that has grown
-    /// since its last ([`Conversation::take_background_warms`]) — at a turn's
-    /// opening projection as well as its reprojections, since a short turn
-    /// never reprojects. A no-op otherwise.
-    pub(super) fn queue_background_warms(
-        &mut self,
-        substrate: &Conversation,
-        projection: &Arc<Builder>,
-    ) {
-        // Scored on the arena only: a scan of a whole file-scored group on the
-        // host is seconds this loop would stand behind.
-        if self.gallery_arena.is_none() {
-            return;
-        }
-        for group in substrate.take_background_warms(projection.schema()) {
-            self.norm_warm.background.push_back(BackgroundJob {
-                conversation: substrate.clone(),
-                projection: Arc::clone(projection),
-                group,
-                batch: 0,
-                started: Instant::now(),
-                longest_step: Duration::ZERO,
-            });
-        }
     }
 
     /// Queue one ingest warm-up slice; [`Self::step_norm_warm`] scores it on a
@@ -155,8 +110,6 @@ impl Scheduler {
         let warm = &mut self.norm_warm;
         warm.backlog
             .retain(|job| !job.substrate.same_substrate(conversation));
-        warm.background
-            .retain(|job| !job.conversation.same_substrate(conversation));
         warm.ingest
             .retain(|slice| !slice.conversation.same_substrate(conversation));
         if warm.backlog.is_empty() {
@@ -164,38 +117,9 @@ impl Scheduler {
         }
     }
 
-    /// Score one queued replay turn — or, with none left, one group's
-    /// background warm, then one ingest slice. Returns whether one was scored.
+    /// Score one queued replay turn — or, with none left, one ingest slice.
+    /// Returns whether one was scored.
     pub(super) fn step_norm_warm(&mut self) -> bool {
-        if self.norm_warm.backlog.is_empty() {
-            if let Some(mut job) = self.norm_warm.background.pop_front() {
-                // One batch a step: a whole group's background is several
-                // scans of the whole gallery, ~2 s over 843 files.
-                let step = Instant::now();
-                let (files, batches) = job.conversation.warm_group_background(
-                    job.projection.schema(),
-                    job.group,
-                    job.batch,
-                    self.gallery_arena.as_deref(),
-                );
-                job.longest_step = job.longest_step.max(step.elapsed());
-                job.batch += 1;
-                if job.batch < batches {
-                    self.norm_warm.background.push_back(job);
-                } else {
-                    tracing::info!(
-                        target: "candle_conversation::provenance",
-                        group = job.group.raw(),
-                        files,
-                        batches,
-                        longest_step_ms = job.longest_step.as_millis() as u64,
-                        elapsed_ms = job.started.elapsed().as_millis() as u64,
-                        "normalization warm-up: learned a file-scored group's background peaks"
-                    );
-                }
-                return true;
-            }
-        }
         let Some(job) = self.norm_warm.backlog.pop_front() else {
             let Some(slice) = self.norm_warm.ingest.pop_front() else {
                 return false;
