@@ -29,9 +29,13 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent::checkouts::Checkouts;
+use agent::config::{AgentConfig, CheckoutConfig};
+use agent::jobs::Jobs;
 use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::persistence::content_hash::ContentHash;
@@ -71,6 +75,8 @@ pub fn quiet_turn(engine: &ConversationEngine, budget: usize) -> TurnOptions {
         ..Default::default()
     }
 }
+use zend_vfs::sandbox::programs::policy;
+use zend_vfs::Priority;
 use zend_vfs::Workspace as ServedWorkspace;
 
 const PROJECTION_YAML: &str = include_str!("../../src/prompts/projection.yaml");
@@ -364,15 +370,72 @@ pub fn kept_workspace(name: &str) -> PathBuf {
     ws
 }
 
-/// The daemon's view of the test workspace at `ws`: one repository, `project`
-/// (its folder created, empty unless a test writes into it), plus uploads.
+/// The daemon's view of the test workspace at `ws`: one repository, `project`,
+/// read from the substrate as every daemon's repositories are — pulled through
+/// the [`agent`] the daemon is given — plus uploads.
 pub fn served(ws: &Path) -> ServedWorkspace {
-    zend::workspace::single_repo(ws, PROJECT_REPO).expect("the test workspace")
+    zend::workspace::single_repo(ws, PROJECT_REPO)
+        .and_then(|w| Ok(w.in_substrate(PROJECT_REPO)?))
+        .expect("the test workspace")
 }
 
 /// The one repository a test workspace holds — where a test writes the files
 /// its tools should see.
 pub const PROJECT_REPO: &str = "project";
+
+/// The agent a test daemon over `ws` reaches [`PROJECT_REPO`] through
+/// (`docs/substrate_git.md` §9): a daemon with no agent and no cluster has no
+/// way to a repository, and refuses to load. Kept in the workspace beside its
+/// substrate — a bare origin holding one commit, and the agent's checkout of
+/// it — made on the first run and reused by every later one.
+pub fn agent(ws: &Path) -> Arc<Jobs> {
+    let root = ws.join("agent");
+    let checkout = root.join(PROJECT_REPO);
+    if !checkout.join(".git").exists() {
+        let origin = root.join("origin.git");
+        let seed = root.join("seed");
+        if root.exists() {
+            std::fs::remove_dir_all(&root).expect("clear a half-made agent");
+        }
+        std::fs::create_dir_all(&seed).expect("create the agent's folder");
+        let origin_url = origin.to_str().expect("a path git can name");
+        git(&root, &["init", "-q", "--bare", "-b", "main", origin_url]);
+        git(&seed, &["init", "-q", "-b", "main"]);
+        std::fs::write(seed.join("README.md"), "# project\n").expect("seed the project");
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-q", "-m", "first"]);
+        git(&seed, &["push", "-q", origin_url, "main"]);
+        git(&root, &["clone", "-q", origin_url, PROJECT_REPO]);
+        std::fs::remove_dir_all(&seed).expect("drop the seed");
+    }
+    let cfg = AgentConfig {
+        jobs_dir: root.join("jobs"),
+        slots: Some(1),
+        stage_dir: None,
+        checkouts: vec![CheckoutConfig {
+            name: PROJECT_REPO.into(),
+            dir: checkout,
+            push: false,
+        }],
+    };
+    let checkouts = Checkouts::open(&cfg, &policy()).expect("open the agent's checkout");
+    Jobs::new(checkouts, 1, Priority::Normal)
+}
+
+/// Run `git` in `dir` with a fixed identity, panicking on failure.
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
 
 /// A reused workspace is not compacted below this size.
 ///

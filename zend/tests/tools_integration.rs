@@ -66,7 +66,7 @@ mod tool_scenarios {
     use tokio::runtime::Runtime;
 
     use crate::common::{
-        kept_workspace, needs_compaction, production_workspace, run_conv_id, served,
+        agent, kept_workspace, needs_compaction, production_workspace, run_conv_id, served,
     };
     use candle::quantized::pinned_staging::recycled_stats;
     use candle::vram::{host_pinned_breakdown, host_pinned_bytes};
@@ -312,6 +312,7 @@ mod tool_scenarios {
         let config = DaemonConfig {
             model,
             compact_substrate,
+            agent: Some(agent(&workspace)),
             ..DaemonConfig::new(served(&workspace))
         };
         let session = Arc::new(ZendSession::new(config));

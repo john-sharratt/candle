@@ -26,7 +26,7 @@ mod conversation {
 
     use futures::StreamExt;
 
-    use crate::common::{needs_compaction, production_workspace, run_conv_id, served};
+    use crate::common::{agent, needs_compaction, production_workspace, run_conv_id, served};
     use zend::config::DaemonConfig;
     use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role};
@@ -92,6 +92,7 @@ mod conversation {
         let workspace = production_workspace();
         let config = DaemonConfig {
             compact_substrate: needs_compaction(&workspace),
+            agent: Some(agent(&workspace)),
             ..DaemonConfig::new(served(&workspace))
         };
         let conv_id = run_conv_id("test-conv");

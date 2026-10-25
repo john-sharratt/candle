@@ -35,7 +35,7 @@ mod replay {
     use candle_conversation::{OptionalState, SamplingConfig, SelectionState, NO_THINK_SELECTOR};
     use futures::StreamExt;
 
-    use crate::common::{needs_compaction, production_workspace, served};
+    use crate::common::{agent, needs_compaction, production_workspace, served};
     use zend::config::DaemonConfig;
     use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::ToolMode;
@@ -77,6 +77,7 @@ mod replay {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            agent: Some(agent(&workspace)),
             ..DaemonConfig::new(served(&workspace))
         };
         // NOTE: caller must invoke `session.start_loading()` from WITHIN the Tokio
