@@ -518,24 +518,28 @@ pub async fn table_step(
     if gates::tidy_on(&shelf, &op.document) {
         hosted.with_sim(|s| s.bench.rebase(&op.document, &shelf));
     }
-    let held = shelf.read(&op.document);
-    let corpus = Corpus::read(&mind, hosted.id());
-    let material = held.and_then(|text| {
-        let corpus = corpus.clone().holding(&op.document, text);
-        let drafted = material::draft(
-            &corpus,
-            &op.document,
-            op.target.strip_prefix("era:"),
-            &context,
-        )?;
-        Some((corpus, drafted))
-    });
-    let Some((corpus, material)) = material else {
+    let Some(text) = shelf.read(&op.document) else {
         hosted.with_sim(|s| {
             s.missions
                 .cancel_operation(id, "its document is no longer in its store")
         });
         tracing::warn!(operation = %op.name, document = %op.document, "operation: document gone, called off");
+        return Ok(());
+    };
+    // **A draft the store holds but the reading cannot be built around is not a
+    // document gone.** Both used to end here as "document gone", which sent the
+    // hunt for a lost store after a missing life or era.
+    let corpus = Corpus::read(&mind, hosted.id()).holding(&op.document, text);
+    let Some(material) = material::draft(
+        &corpus,
+        &op.document,
+        op.target.strip_prefix("era:"),
+        &context,
+    ) else {
+        let why = "its draft is in its store, but what it is read against — its life or era — \
+                   is not in the record";
+        hosted.with_sim(|s| s.missions.cancel_operation(id, why));
+        tracing::warn!(operation = %op.name, document = %op.document, "operation: called off — {why}");
         return Ok(());
     };
     let told = match context.iter().any(|c| c == "told") {
