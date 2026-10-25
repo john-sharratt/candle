@@ -15,8 +15,10 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::caller::Caller;
+use super::reported::{self, Mark};
 use super::state::{Session, DEFAULT_WAIT_S};
 use crate::session::ZendSession;
 
@@ -56,14 +58,19 @@ pub struct Ctx {
     /// The MCP session the call came on, and its id.
     pub mcp: Session,
     pub mcp_id: String,
+    /// Where the call says each step of the work it waits on: the call's event
+    /// stream, when it is answered on one.
+    pub progress: Option<UnboundedSender<String>>,
 }
 
-/// A tool's answer: its text, and whether it is an error the model should
-/// read as one.
+/// A tool's answer: its text, whether it is an error the model should read as
+/// one, and the journal entries it hands over, to be marked reported once it
+/// is delivered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
     pub text: String,
     pub is_error: bool,
+    pub marks: Vec<Mark>,
 }
 
 impl Answer {
@@ -71,6 +78,7 @@ impl Answer {
         Self {
             text: text.into(),
             is_error: false,
+            marks: Vec::new(),
         }
     }
 
@@ -78,6 +86,21 @@ impl Answer {
         Self {
             text: text.into(),
             is_error: true,
+            marks: Vec::new(),
+        }
+    }
+
+    pub fn marking(self, marks: Vec<Mark>) -> Self {
+        Self { marks, ..self }
+    }
+
+    /// Keep this answer's marks for the caller of `ctx`: it was delivered.
+    pub fn delivered(&self, ctx: &Ctx) {
+        if self.marks.is_empty() {
+            return;
+        }
+        if let Some(records) = ctx.session.shared_substrate() {
+            reported::keep(&records, &ctx.caller.key(), &self.marks);
         }
     }
 

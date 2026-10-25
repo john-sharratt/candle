@@ -46,7 +46,8 @@ no engine dependency, so it builds and tests in seconds:
 | `tools.rs` | the `journal_write` and `journal_skip` calls as flat `{name, params}` JSON a stencil `ToolSpec` reads, and reading an answer back |
 | `repeats.rs` | what the journal already says, dropped before a keep (70% word overlap) |
 | `ask.rs` | the question a stretch is put as, the skip offered beside an entry, and a refused answer sent back with its reason |
-| `workflow.rs` | `run`: write or skip in one answer (at most `MAX_ROUNDS`, 4, answers), the check, the keep, against a `Desk` |
+| `workflow.rs` | `run`: write or skip in one answer (at most `Desk::rounds` answers — `MAX_ROUNDS`, 4, unless the desk asks fewer), the check, the keep, against a `Desk` |
+| `cut.rs` | `close_cut`: an answer its token budget cut off, closed so what it said is read |
 | `journal.rs` | `Journal`: entries, open items, coverage, ids; the `Holds` trait a caller's state implements |
 | `section.rs` | the journal as system-prompt sections, and the metadata record a restart rebuilds from |
 | `record.rs` | what each draft did, and the API's view |
@@ -316,10 +317,17 @@ written closed, decoded greedily (`zend/src/journal/draft.rs`, which runs
    on over it (`Journal::nothing_to_write`), so its turns are found under the
    step they belong to, and its line does not change, so nothing is resealed.
    The check runs as often as before — the cadence gives the record its
-   resolution — and the gate decides what is a step. At most four answers; a
-   refused write is asked again with the refusal appended, and may still be
-   answered with a skip. What the journal already says is dropped, and an
-   entry of nothing else is filed as a skip is.
+   resolution — and the gate decides what is a step. **zend asks once**
+   (`Desk::rounds`, 1; npcd keeps the default four): a refused write is not
+   asked again, because an answer asked again runs as long as the first and a
+   delegated task's caller waits on the draft. An answer its 2,048-token
+   budget (`WRITE_TOKENS`) cuts off is read as far as it got
+   (`journal_core::cut`): the string it was writing ends in `...`, the call is
+   closed, and a last claim or open item the cut left incomplete is dropped.
+   Where more than one answer is allowed, a refused write is asked again with
+   the refusal appended, and may still be answered with a skip. What the
+   journal already says is dropped, and an entry of nothing else is filed as a
+   skip is.
 3. **The keep:** ids are staged, the stretch's turns are filed under their
    entry (§4.1), the record is written to the conversation's metadata, and only
    then is the entry in memory — a record that fails to write leaves the

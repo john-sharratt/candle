@@ -24,8 +24,8 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::corpus::{gather, ByLayer, File, DIALOGUE};
-use crate::gpu_gallery::GpuGallery;
 use crate::ranking::order;
+use crate::remote_gallery::{Daemon, RemoteGallery};
 use crate::rules::{Scorer, RULES};
 
 /// The expectations file.
@@ -87,9 +87,10 @@ pub fn run(
     tokenizer: &Tokenizer,
     timeline: u64,
     expectations: &Path,
+    daemon: &Daemon,
 ) -> anyhow::Result<()> {
     let exp: Expectations = serde_yaml::from_str(&std::fs::read_to_string(expectations)?)?;
-    let gpu = GpuGallery::new(files)?;
+    let gpu = RemoteGallery::new(files, daemon);
     let scorer = Scorer::new(&gpu, files, rule)?;
     let turns = by_layer
         .remove(&DIALOGUE)

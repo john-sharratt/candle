@@ -43,3 +43,32 @@ pub fn recall(ranks: &[usize], k: usize) -> f32 {
 pub fn mrr(ranks: &[usize]) -> f32 {
     ranks.iter().map(|&x| 1.0 / x as f32).sum::<f32>() / ranks.len().max(1) as f32
 }
+
+/// The Gini coefficient of `counts`: 0 when every one is equal, `1 - 1/n`
+/// when one holds everything.
+pub fn gini(counts: &[usize]) -> f32 {
+    let mut v: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
+    v.sort_by(f64::total_cmp);
+    let n = v.len() as f64;
+    let total: f64 = v.iter().sum();
+    if total == 0.0 {
+        return 0.0;
+    }
+    let weighted: f64 = v
+        .iter()
+        .enumerate()
+        .map(|(i, x)| (i as f64 + 1.0) * x)
+        .sum();
+    ((2.0 * weighted) / (n * total) - (n + 1.0) / n) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gini_is_zero_when_equal_and_three_quarters_when_one_of_four_takes_all() {
+        assert_eq!(gini(&[3, 3, 3, 3]), 0.0);
+        assert!((gini(&[0, 0, 0, 12]) - 0.75).abs() < 1e-6);
+    }
+}

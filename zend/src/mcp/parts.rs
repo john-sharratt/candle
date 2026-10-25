@@ -96,15 +96,11 @@ pub fn existing<'a>(parent: &Worker, wanted: &str, under: &'a [Worker]) -> Optio
         .max_by_key(|w| w.started_ms)
 }
 
-/// The response for a part that ended: its journal entries, and the end of its
-/// final response — the shape its worker asked it to answer in, which an entry
-/// only summarises.
+/// The response for a part that ended: its final response — the shape its
+/// worker asked it to answer in, which an entry only summarises — and every
+/// journal entry it wrote.
 pub fn response(part: &Worker) -> SubagentResponse {
-    let mut result = result_of(part);
-    if part.state == State::Done && !part.entries.is_empty() && !part.final_text.is_empty() {
-        result.push_str("\n\nIts final response ended:\n");
-        result.push_str(&part.final_text);
-    }
+    let result = result_of(part, None);
     SubagentResponse {
         path: part.path(),
         state: match part.state {
@@ -159,7 +155,8 @@ impl SubagentRunner for Parts {
         let mut restarts = 0;
         loop {
             let wanted = [(part.thread.clone(), part.name.clone())];
-            let read = runtime.block_on(workers::wait(&session, owner, &wanted, WAIT_SLICE))?;
+            let read =
+                runtime.block_on(workers::wait(&session, owner, &wanted, WAIT_SLICE, None))?;
             match read.into_iter().next().and_then(|(_, w)| w) {
                 Some(w) if w.state.working() => continue,
                 // Found running across a restart, its beat ran out while
@@ -200,6 +197,8 @@ mod tests {
             final_text: "ok".into(),
             error: None,
             question: None,
+            activity: None,
+            no_entry: None,
         }
     }
 
@@ -240,9 +239,9 @@ mod tests {
         assert_eq!(r.state, "done");
         assert_eq!(
             r.result,
-            "T:review/verify/read — done. Its journal:\n\n\
-             T:review/verify/read#2\nEntry 2 — read the parser\n\n\
-             Its final response ended:\nok"
+            "T:review/verify/read — done. Its answer:\nok\n\n\
+             Journal entries:\n\n\
+             T:review/verify/read#2\nEntry 2 — read the parser"
         );
         let mut failed = worker("verify/read", 0, State::Error);
         failed.error = Some("boom".into());

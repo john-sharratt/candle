@@ -91,6 +91,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap.workspace = true
 clap-verbosity-flag.workspace = true
 term_size = { workspace = true }
+# The provenance-gates harness asks a running daemon to scan its resident
+# gallery (`POST /v1/substrate/zend/scan`) instead of uploading its own.
+ureq = { version = "2.12", default-features = false, features = ["json"] }
 
 # Crate-wide clippy lint policy.  These four lints are deliberately
 # silenced because the patterns they flag are systemic to the design

@@ -135,7 +135,7 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 |---|---|---|
 | `zend_attach {thread}` | Binds the MCP session to `thread`, creating it on first use (§4) | The thread's path and its journal's head lines |
 | `zend_task {thread, name, prompt, priority?, wait_s?}` | Starts a worker named `name` under `thread` (§4, §5.2), runs the task on it, waits for its journal entry (§5), records the outcome on the thread, and archives the worker once it is `done` | One of the states of §3.3 |
-| `zend_wait {workers, wait_s?}` | Waits on one or more running workers, answering as soon as any of them leaves `running` (§3.3) | That worker's state, and one line for each still running |
+| `zend_wait {workers, wait_s?}` | Waits on one or more running workers, answering as soon as any of them leaves `running` (§3.3) | That worker's state, and for each still running what it has done so far, with any journal entries not yet given |
 | `zend_answer {worker, answer}` | Answers a worker's question or unsticks it (§6.2): the answer is the worker's next turn | As `zend_task` |
 | `zend_nudge {worker, message}` | Sends guidance to a running worker, taken at its next round head (§6.2) | `queued` |
 | `journal_read {journal, entry?, offset?, limit?}` | Without `entry`: the journal's entries, one line each, with open items. With an `entry` (or an entry address, `…#12`): pages the turns behind it | The journal as the prompt reads it, or `limit` lines from `offset` (200 by default, 400 at most) |
@@ -193,27 +193,47 @@ held longer than `wait_s`:
   within `wait_s` and the worker carries on, so Claude starts as many tasks as
   it wants in one turn. `zend_wait {workers: [...]}` then waits on the whole
   set and answers as soon as **any** of them leaves `running` — `done`,
-  `question`, `stuck` or `error` — with that worker's result and one line per
-  worker still running. Claude handles that one (reads the entry, answers the
-  question) and waits again on the rest. A question from any worker surfaces
-  on the next return, so no worker sits blocked behind another's long build.
-- **The response starts at once.** The stream opens on the call and carries
-  MCP progress notifications while it waits, so Claude Code's first-byte and
-  idle timers never fire.
+  `question`, `stuck` or `error` — with that worker's result and, for each
+  worker still running, what it has done. Claude handles that one (reads the
+  answer, answers the question) and waits again on the rest. A question from
+  any worker surfaces on the next return, so no worker sits blocked behind
+  another's long build.
+- **A short wait is the progress report.** `wait_s` defaults to 45 s, so a
+  wait that finds every worker still running answers every 45 s with, for
+  each, one sentence counted from its turn's stream — never summarised by a
+  model (`zend/src/mcp/activity.rs`): `running 4m10s, 6 rounds: 1,934
+  thinking tokens, 12 tool calls (web_fetch 5, web_search 4, file_grep 3); now
+  thinking` — and the journal entries it has drafted since Claude last heard.
+  Claude reads them and calls again, or stops waiting when the entries already
+  answer it. The counts are on the worker's record, which the worker's beat
+  writes every 30 s and at once when a round ends or a batch of tool calls
+  begins, so a wait on any member reads the same sentence.
+- **Each entry is given once.** A record per worker
+  (`mcp/reported/<owner>/<thread>/<name>`, `zend/src/mcp/reported.rs`) holds
+  the newest entry a tool result has handed Claude; every later answer gives
+  only the entries after it. A worker that is `done` answers with its final
+  response **whole** — the answer to the task — and only the entries not
+  already given, so the last answer is short and quick.
+- **The response starts at once, and the GUI follows every step.** The stream
+  opens on the call and carries an MCP progress notification for each step
+  the waited workers take — a round, a batch of tool calls, a journal entry —
+  and at least every 15 s, so Claude Code's first-byte and idle timers never
+  fire. Notifications are shown to the person, not read into Claude's context,
+  so they cost the conversation nothing.
 - **`wait_s` is bounded per client** (§13.2), the client named by the MCP
   session's `clientInfo`:
 
 | Client | `wait_s` default | `wait_s` at most | How long waits are carried |
 |---|---|---|---|
-| claude.ai, Claude Desktop | 50 s | 200 s, inside the 240 s cap | Polling: each `zend_wait` holds up to 200 s and answers; the model has no notification channel, so an hour of fan-out is about 18 small calls of status lines |
-| Claude Code | 50 s | 3,600 s, inside the server entry's `timeout` | The background: a main-conversation call running past 2 min moves to a background task and Claude works on, notified when it answers, so one `zend_wait` on a whole batch can hold until something finishes |
+| claude.ai, Claude Desktop | 45 s | 200 s, inside the 240 s cap | Polling: each `zend_wait` holds up to `wait_s` and answers with what each worker has done; the model has no notification channel, so the answers are its progress report |
+| Claude Code | 45 s | 3,600 s, inside the server entry's `timeout` | Polling as above by default; a longer `wait_s` holds the call, and a main-conversation call running past 2 min moves to a background task and Claude works on, notified when it answers |
 
 `zend_task`, `zend_wait` and `zend_answer` answer one of:
 
 | State | Meaning |
 |---|---|
-| `done` | The task ended and its journal entry is kept: the entry, the worker's path. The worker is archived. |
-| `running` | Still working: the worker's path, its last round, the time it has run. |
+| `done` | The task ended: its final response whole, and its journal entries not already given — or, when it kept none, why, from its draft's record (refused, judged to add nothing, not finished in time). The worker is archived. |
+| `running` | Still working: the worker's path, the sentence of what its turn has done, and the journal entries not already given. |
 | `question` | The worker asked Claude (§6.2): the question, its options, what it tried, its pointers. The worker is live, its turn ended. |
 | `stuck` | The repeat guard or the round cap closed its turn (§6.2): the closing response. The worker is live. |
 | `error` | The turn failed: the error. The worker is archived with its evidence. |

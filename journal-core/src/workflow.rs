@@ -11,7 +11,7 @@
 //! # The shape of a draft
 //!
 //! 1. A stretch with nothing a claim could rest on is not written about at all.
-//! 2. The write, at most [`MAX_ROUNDS`] answers. The grammar holds each answer to
+//! 2. The write, at most [`Desk::rounds`] answers. The grammar holds each answer to
 //!    one call: `journal_write`, or — once the journal holds an entry to weigh
 //!    the stretch against — `journal_skip`. A skip covers the stretch with its
 //!    reason and ends the draft, so whether the stretch is worth an entry is
@@ -68,6 +68,14 @@ pub trait Desk: Send {
         filed: Option<&Filed>,
         ceased: &[u64],
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// The most answers one write takes before the draft is given up:
+    /// [`MAX_ROUNDS`] unless the desk asks for fewer. A desk whose caller is
+    /// waiting on the entry asks once, and takes what came back as far as it
+    /// reads.
+    fn rounds(&self) -> usize {
+        MAX_ROUNDS
+    }
 }
 
 /// Why a draft ended without an entry or a verdict.
@@ -187,7 +195,7 @@ async fn write<D: Desk, S: Holds>(
 ) -> Outcome {
     let open = asked.open;
     let mut refused: Option<(String, String)> = None;
-    for round in 1..=MAX_ROUNDS {
+    for round in 1..=desk.rounds() {
         let question = ask::writing(
             span,
             style,
@@ -629,6 +637,36 @@ mod tests {
         assert_eq!(hold(&state).covered_to(), 0);
         assert!(!hold(&state).pending());
         assert!(desk.kept.is_empty());
+    }
+
+    /// A desk that asks once gives up after its one refused answer.
+    #[tokio::test]
+    async fn a_desk_that_asks_once_is_asked_once() {
+        struct Once(Script);
+        impl Desk for Once {
+            async fn write(&mut self, specs: &[Value], question: &str) -> anyhow::Result<String> {
+                self.0.write(specs, question).await
+            }
+            async fn keep(
+                &mut self,
+                prompt: &JournalPrompt,
+                filed: Option<&Filed>,
+                ceased: &[u64],
+            ) -> anyhow::Result<()> {
+                self.0.keep(prompt, filed, ceased).await
+            }
+            fn rounds(&self) -> usize {
+                1
+            }
+        }
+        let mut desk = Once(Script::new(&[WRITE_SCENERY, WRITE]));
+        let (state, span) = started(turns());
+        let (outcome, _) = run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
+        assert!(
+            matches!(outcome, Outcome::Abandoned(Abandon::Refused(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(desk.0.write_asked.len(), 1);
     }
 
     #[tokio::test]

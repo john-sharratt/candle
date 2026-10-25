@@ -98,6 +98,7 @@ impl SchedulerRequest {
             | Self::WarmCollectionNormalization { .. }
             | Self::PreloadGalleries { .. }
             | Self::WarmIngestSlice { .. }
+            | Self::ScanGroupVotes { .. }
             | Self::DemoteTimelinesHot { .. }
             | Self::Wake
             | Self::Settle { .. }
@@ -122,6 +123,7 @@ impl SchedulerRequest {
             | Self::WarmCollectionNormalization { conversation, .. }
             | Self::PreloadGalleries { conversation, .. }
             | Self::WarmIngestSlice { conversation, .. }
+            | Self::ScanGroupVotes { conversation, .. }
             | Self::DemoteTimelinesHot { conversation, .. } => Some(conversation),
             Self::ScoreSealedTurn { substrate, .. } => Some(substrate),
             Self::ForkEphemeralSequence { .. }

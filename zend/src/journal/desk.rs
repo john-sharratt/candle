@@ -13,7 +13,8 @@
 //! The answer is held to one call of those the draft offers — `journal_write`,
 //! and `journal_skip` once the journal holds an entry — compiled from their
 //! `{name, params}` form the first time it is asked and reused for the rest of
-//! the draft, whose every round offers the same calls.
+//! the draft, whose every round offers the same calls. A draft is one answer
+//! ([`Desk::rounds`]).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -26,8 +27,10 @@ use journal_core::transcript::Filed;
 use journal_core::workflow::Desk;
 use serde_json::Value;
 
-/// Room for a brief entry: a few claims, what is intended, what is open.
-pub const WRITE_TOKENS: usize = 1024;
+/// Room for an entry: its claims, what is intended, what is open. An answer
+/// that runs past it is read as far as it got
+/// ([`journal_core::tools::parse`]).
+pub const WRITE_TOKENS: usize = 2048;
 
 /// Room for a fold: a one-line summary and a digest of a few paragraphs. A
 /// month's digest runs well past an entry, and an answer cut off by its budget
@@ -124,5 +127,12 @@ impl Desk for ZendDesk {
     ) -> impl Future<Output = anyhow::Result<()>> + Send {
         let kept = (self.record)(prompt, filed, ceased);
         async move { kept }
+    }
+
+    /// One answer: a draft blocks whoever waits on the entry — a delegated
+    /// task's caller above all — an answer asked again runs as long as the
+    /// first, and one cut off is read as far as it got.
+    fn rounds(&self) -> usize {
+        1
     }
 }

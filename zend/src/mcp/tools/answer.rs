@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::wait::render;
+use super::wait::answer_for;
 use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::names::Path;
 use crate::mcp::workers;
@@ -25,7 +25,7 @@ pub fn definition() -> Value {
             "properties": {
                 "worker": {"type": "string", "description": "The worker's path, `T:<thread>/<name>`."},
                 "answer": {"type": "string", "description": "The decision, or what to do instead."},
-                "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait before answering `running` (50 by default)."}
+                "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait before answering `running` (45 by default)."}
             },
             "required": ["worker", "answer"],
             "additionalProperties": false
@@ -51,9 +51,5 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         return Answer::error(e);
     }
     let wanted = [(thread, name)];
-    let wait = Duration::from_secs(wait_secs(ctx, args));
-    match workers::wait(&ctx.session, &ctx.caller.key(), &wanted, wait).await {
-        Ok(read) => Answer::ok(render(&read)),
-        Err(e) => Answer::error(e),
-    }
+    answer_for(ctx, &wanted, Duration::from_secs(wait_secs(ctx, args))).await
 }
