@@ -905,10 +905,11 @@ layers:
           # quiet file's rare genuine hit stands out
           # (docs/results/provenance_gates_2026-10-25.md, hubness).
           level_prior: { floor_base: 100.0, floor_cap: 1.0 }
-          # The upper fold groups carry a file's identity; the lowest is
+          # The top fold group carries a file's identity; the lower two are
           # mostly shared phrasing. Measured over the analysis units' answers
-          # finding their own file (docs/results/provenance_gates_2026-10-25.md).
-          layer_weights: [0.5, 1.0, 2.0]
+          # finding their own file, best on two galleries
+          # (docs/results/provenance_gates_2026-10-25.md).
+          layer_weights: [0.0, 0.0, 1.0]
 
   # ── Dependency Analysis ────────────────────────────────────────────────────
   - name: dependency_analysis
@@ -996,7 +997,7 @@ layers:
         policy:
           cases: file
           level_prior: { floor_base: 100.0, floor_cap: 1.0 }
-          layer_weights: [0.5, 1.0, 2.0]
+          layer_weights: [0.0, 0.0, 1.0]
 
   # ── Code Review ────────────────────────────────────────────────────────────
   # Beside dependency_analysis, not above it: each unit continues the file's
@@ -1079,7 +1080,7 @@ layers:
         policy:
           cases: file
           level_prior: { floor_base: 100.0, floor_cap: 1.0 }
-          layer_weights: [0.5, 1.0, 2.0]
+          layer_weights: [0.0, 0.0, 1.0]
 
   # ── Security Review ────────────────────────────────────────────────────────
   # Beside dependency_analysis and code_review (`after: code_reading`), so an
@@ -1176,7 +1177,7 @@ layers:
         policy:
           cases: file
           level_prior: { floor_base: 100.0, floor_cap: 1.0 }
-          layer_weights: [0.5, 1.0, 2.0]
+          layer_weights: [0.0, 0.0, 1.0]
 
   # ── Dialogue ───────────────────────────────────────────────────────────────
   # The live developer ↔ assistant conversation.  Highest layer — sees

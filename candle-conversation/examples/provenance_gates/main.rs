@@ -21,7 +21,7 @@
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> retrieval [probes per source]
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
-//!     <workspace dir> sweep [probes per source] [only this source]
+//!     <workspace dir> sweep [probes per source] [background probes] [only this source]
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> paper <dialogue timeline, hex> <expectations.yaml>
 

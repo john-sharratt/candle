@@ -61,6 +61,13 @@ impl Substrate {
             .is_some_and(|tl| tl.gaps.contains(&index))
     }
 
+    /// Whether any position of `timeline` is a gap — a turn still to arrive.
+    pub fn holds_gap(&self, timeline: TimelineId) -> bool {
+        self.timelines
+            .get(&timeline)
+            .is_some_and(|tl| !tl.gaps.is_empty())
+    }
+
     /// Whether a turn — anything but a gap — holds `index` of `timeline`.
     pub fn holds_turn(&self, timeline: TimelineId, index: TurnIndex) -> bool {
         self.timelines

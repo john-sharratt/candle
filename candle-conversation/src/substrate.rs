@@ -3526,10 +3526,18 @@ impl Substrate {
     /// send the call to a real read: being told it has a file it does not have
     /// is worse than reading the file twice. A conversation never carries
     /// itself.
+    ///
+    /// **Nor does one holding a gap.** A turn another member wrote whose
+    /// records have not arrived is held as an empty gap at its index
+    /// (`restore_gap_turn`), and the projection skips an empty turn — so a
+    /// reading made elsewhere locked whole on this member, told the model the
+    /// paper was in context, and placed nothing (445 such turns on `.5`,
+    /// 2026-10-25).
     fn deliverable(&self, target: TimelineId, timeline: TimelineId) -> bool {
         timeline != target
             && !self.tombstoned_timelines.contains(&timeline)
             && self.timelines.get(&timeline).is_some_and(|e| !e.archived)
+            && !self.holds_gap(timeline)
             && Substrate::turn_count(self, timeline) > 0
     }
 
@@ -8391,6 +8399,28 @@ mod tests {
             vec![reads[0], empty],
         );
         assert!(sub.working_set(target).unwrap().provenance().is_empty());
+    }
+
+    /// **A conversation holding a gap is gone.** A turn another member wrote
+    /// and this one has not fetched is an empty gap, which the projection
+    /// skips: locked, the conversation was promised whole and placed nothing.
+    #[test]
+    fn a_conversation_holding_a_gap_is_gone() {
+        let (mut sub, target, _) = working_set_fixture(0, 10);
+        let partial = unshared_timeline(3);
+        sub.register_timeline(partial, LayerId::for_test(1), GroupId::for_test(1));
+        sub.restore_gap_turn(partial);
+        sub.append_with_blocks(partial, 10, 0, 1);
+        assert_eq!(sub.turn_count(partial), 2);
+        assert_eq!(
+            sub.working_set_lock(target, partial, ws_limits(1000)),
+            Err(Refusal::Gone)
+        );
+        assert!(!sub.working_set_restore_lock(target, partial));
+        assert_eq!(
+            sub.working_set_seed(target, &[partial], ws_limits(1000), 1000.0),
+            vec![partial],
+        );
     }
 
     /// A tombstoned conversation leaves every dialogue's working set — a pinned

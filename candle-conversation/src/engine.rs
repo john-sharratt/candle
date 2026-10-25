@@ -1205,6 +1205,12 @@ impl ConversationEngine {
         self.conversation.find_timelines_by_metadata(key, value)
     }
 
+    /// Whether any turn of `timeline` is a gap: written by another member and
+    /// not here yet, so the conversation cannot be placed whole.
+    pub fn holds_gap(&self, timeline: TimelineId) -> bool {
+        self.conversation.read().holds_gap(timeline)
+    }
+
     /// Lock `read` into `target`'s working set — the conversation that already
     /// read this content, standing in for reading it again
     /// (`docs/zend_working_set.md` §4.5). A refusal means the caller must do
