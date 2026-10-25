@@ -100,7 +100,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::substrate::{Substrate, TurnMark};
+use crate::projection::TimelineId;
+use crate::substrate::{file_store_key, Substrate, TurnMark};
 
 use accounting::RecordAccounting;
 use adoption::Adoption;
@@ -455,6 +456,41 @@ impl SharedSubstrate {
     /// a key in stamp order.
     pub fn vfs_events(&self, timeline: u64) -> Result<Vec<VfsEventPayload>> {
         self.persistence.lock().unwrap().vfs_events(timeline)
+    }
+
+    /// Every timeline holding file events or tombstones, in id order.
+    pub fn vfs_timelines(&self) -> Vec<u64> {
+        self.persistence
+            .lock()
+            .unwrap()
+            .vfs_index()
+            .timelines()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Declare `timeline` a file store, so every rewrite of the log carries its
+    /// events though no conversation is registered on it
+    /// ([`Substrate::is_file_store`]) — once: a store already declared writes
+    /// nothing.
+    pub fn declare_file_store(&self, timeline: TimelineId) -> Result<()> {
+        if self.substrate.read().unwrap().is_file_store(timeline) {
+            return Ok(());
+        }
+        self.put_custom_object(CustomObjectPayload::new(
+            file_store_key(timeline),
+            serde_json::Value::Null,
+        ))
+    }
+
+    /// Release `timeline`'s declaration as a file store: from the next rewrite
+    /// its events are an orphan's.
+    pub fn release_file_store(&self, timeline: TimelineId) -> Result<()> {
+        if !self.substrate.read().unwrap().is_file_store(timeline) {
+            return Ok(());
+        }
+        self.put_custom_object(CustomObjectPayload::ceased(file_store_key(timeline)))
     }
 
     /// Keep `bytes` as a blob, durably, unless one of their hash is already
@@ -3476,7 +3512,6 @@ impl SubstratePersistence {
 mod tests {
     use super::*;
     use crate::models::identity::{ModelKey, RecordedModel};
-    use crate::projection::TimelineId;
     use log_file::{LogFile, SUPERBLOCK_SIZE};
     use segment::FIRST_SEGMENT;
     use streams::{SectionDecl, TurnDecl};

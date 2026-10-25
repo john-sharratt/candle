@@ -543,6 +543,12 @@ pub fn idle_for(last_used: u64, epoch: u64) -> u64 {
     epoch.saturating_sub(last_used)
 }
 
+/// The custom object that declares `timeline` a file store
+/// ([`Substrate::is_file_store`]).
+pub fn file_store_key(timeline: TimelineId) -> String {
+    format!("file-store/{}", timeline.raw())
+}
+
 /// Index into [`Substrate::residence`]. Strongly typed so it can't be
 /// confused with [`TurnIndex`] or any other `usize`.
 ///
@@ -5677,6 +5683,17 @@ impl Substrate {
     /// Call it right after minting a code_read scope fork, before its first turn
     /// seals — like [`Self::mark_timeline_transient`], it flags the residences
     /// already allocated and every later one.
+    /// Whether `timeline` is declared a **file store** — its whole content file
+    /// events, with no conversation registered on it — by a live custom object
+    /// under [`file_store_key`]. A rewrite of the log carries a store's events
+    /// (`persistence::vfs::carried`); undeclared, it reads as an orphan and
+    /// every compaction drops it. The declaration is a record like any other:
+    /// it replicates, it is in place when the log is read back before
+    /// maintenance can start, and its tombstone is the store's release.
+    pub fn is_file_store(&self, timeline: TimelineId) -> bool {
+        self.custom_object(&file_store_key(timeline)).is_some()
+    }
+
     pub fn mark_timeline_splice_source(&mut self, timeline: TimelineId) {
         self.splice_source_timelines.insert(timeline);
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {

@@ -30,11 +30,17 @@ use crate::projection::TimelineId;
 use crate::substrate::Substrate;
 
 /// The timelines whose file events and tombstones a rewrite of the log
-/// carries: registered, not tombstoned, not distilled. Anything else is an
-/// orphan — its conversation retired, distilled to its signatures, or never
-/// there — and every rewrite leaves it behind. The one rule compaction,
-/// maintenance and segment liveness all read, so what is carried and what is
-/// counted live never disagree.
+/// carries: registered — or declared a file store ([`Substrate::is_file_store`])
+/// — and not tombstoned, not distilled.
+/// Anything else is an orphan — its conversation retired, distilled to its
+/// signatures, or never there — and every rewrite leaves it behind. The one
+/// rule compaction, maintenance and segment liveness all read, so what is
+/// carried and what is counted live never disagree.
+///
+/// **A file store is not an orphan for having no conversation.** An npcd
+/// operation's or author's store lives as file events on a timeline nothing
+/// registers; read as an orphan, every compaction that rewrote its segment
+/// dropped it, and committed drafts vanished before the table could read them.
 pub(super) fn carried<'a>(
     substrate: &Substrate,
     index: &'a VfsIndex,
@@ -46,7 +52,7 @@ pub(super) fn carried<'a>(
             let Some(timeline) = NonZeroU64::new(*raw).map(TimelineId::new) else {
                 return false;
             };
-            substrate.timeline_entry(timeline).is_some()
+            (substrate.timeline_entry(timeline).is_some() || substrate.is_file_store(timeline))
                 && !substrate.is_tombstoned(timeline)
                 && !substrate.distilled_timelines().contains_key(&timeline)
         })

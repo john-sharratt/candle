@@ -1249,9 +1249,11 @@ mod tests {
     use crate::persistence::log_file::{read_record_at, LogSource, MemLog, SUPERBLOCK_SIZE};
     use crate::persistence::manifest::ConvState;
     use crate::persistence::rebase::RebaseEntry;
+    use crate::persistence::record::CustomObjectPayload;
     use crate::persistence::record::{encode_record, SectionGeneration};
     use crate::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
     use crate::persistence::vfs::VfsEventId;
+    use crate::substrate::file_store_key;
 
     /// A clock at the epoch: no tombstone is ever old enough to shrink.
     const NO_EXPIRY: TombstoneExpiry = TombstoneExpiry {
@@ -2905,6 +2907,69 @@ mod tests {
             .collect();
         assert_eq!(events, vec![(live_tl, 1, (4_096 * live_tl + 1_024, 128))]);
         assert!(!has_type(&live, RecordType::VfsTombstone));
+    }
+
+    /// **A file store's events are carried though no conversation is
+    /// registered on it** — declared by a record read back with the log, as
+    /// every member reads it before its maintenance starts — and a declared
+    /// timeline that is tombstoned, or an undeclared one, is left behind.
+    #[test]
+    fn collect_carries_a_declared_file_stores_events() {
+        let (store_tl, dead_tl, undeclared_tl) = (21u64, 22u64, 23u64);
+        let mut blob = Vec::new();
+        for tl in [store_tl, dead_tl] {
+            let declared = CustomObjectPayload::new(
+                file_store_key(TimelineId::from_raw(tl).unwrap()),
+                serde_json::Value::Null,
+            );
+            blob.extend_from_slice(&record(
+                RecordType::CustomObject,
+                declared.stream_id(),
+                0,
+                &declared.encode(),
+            ));
+        }
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: dead_tl,
+                turn_index: None,
+                turn_writer: 0,
+                reason: None,
+            }
+            .encode(),
+        ));
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+
+        let mut vfs = VfsIndex::new();
+        for tl in [store_tl, dead_tl, undeclared_tl] {
+            vfs.record_event(
+                tl,
+                VfsEventId { origin: 0, seq: 0 },
+                loc_at(4_096 * tl, 128),
+            );
+        }
+        let live = collect_live_records(
+            &manifest,
+            &substrate,
+            &StampedLocs::new(),
+            &vfs,
+            &BlobIndex::new(),
+            &MarkerIds::new(),
+            0,
+            NO_EXPIRY,
+            &Housekeeping::default(),
+        );
+        let carried: Vec<u64> = live
+            .iter()
+            .filter(|it| it.header().record_type == RecordType::VfsEvent)
+            .map(|it| it.header().stream_id)
+            .collect();
+        assert_eq!(carried, vec![store_tl]);
     }
 
     /// A tool round-trip's coupling survives compaction.

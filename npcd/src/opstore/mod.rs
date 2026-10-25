@@ -39,6 +39,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use candle_conversation::persistence::SharedSubstrate;
+use candle_conversation::projection::TimelineId;
 use store_events::Mirror;
 use tokio::sync::watch;
 use zend_vfs::workspace::Repo as WorkspaceRepo;
@@ -167,7 +168,21 @@ impl MindStores {
     }
 
     /// The substrate the stores' events are kept in.
+    ///
+    /// **Every file timeline there is a store's**, and each is declared one
+    /// ([`SharedSubstrate::declare_file_store`]): no conversation registers a
+    /// store's timeline, so undeclared it reads as an orphan and a compaction
+    /// drops it — on WW a draft committed at a step was gone by its reading.
+    /// A store is declared before its first save (`keep`); this declares the
+    /// ones written before declarations were.
     pub fn set_substrate(&self, shared: SharedSubstrate) {
+        for raw in shared.vfs_timelines() {
+            if let Some(timeline) = TimelineId::from_raw(raw) {
+                if let Err(e) = shared.declare_file_store(timeline) {
+                    tracing::warn!(timeline = raw, "a store could not be declared: {e}");
+                }
+            }
+        }
         let _ = self.shared.set(shared);
     }
 
@@ -250,6 +265,11 @@ impl MindStores {
             return;
         }
         if let Some(shared) = self.shared.get() {
+            // Declared before its first event lands, so no rewrite between the
+            // two can take it for an orphan — see `set_substrate`.
+            if let Err(e) = shared.declare_file_store(owner.timeline()) {
+                tracing::warn!(?owner, "the store could not be declared: {e}");
+            }
             store_events::save(
                 &Substrate(shared),
                 owner.timeline(),
@@ -316,10 +336,17 @@ impl MindStores {
     }
 
     /// Drop `owner`'s store: every change it holds goes, as its events'
-    /// tombstones.
+    /// tombstones, and its declaration as a store is released, so the next
+    /// rewrite of the log reclaims the lot. A store used again is declared
+    /// again at its next save.
     pub fn discard(&self, owner: &Owner) {
         self.change(owner, |store| store.discard());
         self.held().remove(owner);
+        if let Some(shared) = self.shared.get() {
+            if let Err(e) = shared.release_file_store(owner.timeline()) {
+                tracing::warn!(?owner, "the store's declaration could not be released: {e}");
+            }
+        }
     }
 
     /// Scrap what a disconnected `world` held: on rejoining, its operations'
