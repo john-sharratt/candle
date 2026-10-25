@@ -529,7 +529,8 @@ pub async fn table_step(
     };
     // **A draft the store holds but the reading cannot be built around is not a
     // document gone.** Both used to end here as "document gone", which sent the
-    // hunt for a lost store after a missing life or era.
+    // hunt for a lost store after a missing life — the one thing, with the
+    // draft held, the reading's material cannot do without.
     let corpus = Corpus::read(&mind, hosted.id()).holding(&op.document, text);
     let Some(material) = material::draft(
         &corpus,
@@ -537,8 +538,8 @@ pub async fn table_step(
         op.target.strip_prefix("era:"),
         &context,
     ) else {
-        let why = "its draft is in its store, but what it is read against — its life or era — \
-                   is not in the record";
+        let why = "its draft is in its store, but the life it is read against is not in the \
+                   record";
         hosted.with_sim(|s| s.missions.cancel_operation(id, why));
         tracing::warn!(operation = %op.name, document = %op.document, "operation: called off — {why}");
         return Ok(());

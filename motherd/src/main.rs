@@ -25,7 +25,10 @@
 //!
 //! `apps: [npcd]` (or `[zend]`) runs one daemon alone — it alone serves, and
 //! joins the cluster — for taking one app out of a member while the other
-//! goes on elsewhere. The process's log, offline marker and upgrade record
+//! goes on elsewhere. The daemon left out still asks what it asks of the
+//! engine, read from its own section (zend's from its workspace's projection
+//! schema), so the engine is the one the two build together — its conversation
+//! capacity included. The process's log, offline marker and upgrade record
 //! stay beside zend's substrate either way.
 //!
 //! Paths resolve against the working directory — the repository root, which
@@ -75,7 +78,8 @@ enum App {
 #[serde(default, deny_unknown_fields)]
 struct Config {
     /// The daemons to run — `[npcd]` serves and joins the cluster as npcd
-    /// alone, its section the only one read. Both when absent.
+    /// alone. Both when absent. A daemon left out still has its section read
+    /// for its asks of the engine, and zend's for where the process's state is.
     apps: Option<Vec<App>>,
     host: HostArgs,
     zend: ZendArgs,
@@ -122,7 +126,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         Seat::Stands {
             name: "zend",
-            asks: config.zend.engine_requests(),
+            asks: config.zend.engine_requests()?,
         }
     };
     let npcd: Seat = if runs_npcd {

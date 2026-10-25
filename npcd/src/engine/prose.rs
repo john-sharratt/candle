@@ -353,7 +353,9 @@ async fn run_turn(
     use tokio_stream::StreamExt;
 
     let handle = sequence.submit_turn_with_options(prompt, options)?;
+    let seq = sequence.id();
     tracing::info!(
+        %seq,
         prompt_words = prompt.split_whitespace().count(),
         "prose turn submitted"
     );
@@ -390,6 +392,7 @@ async fn run_turn(
         anyhow::bail!("the scheduler went away before the prose finished");
     };
     tracing::info!(
+        %seq,
         first_token_ms = first_token.map(|d| d.as_millis() as u64),
         total_ms = submitted.elapsed().as_millis() as u64,
         tokens = ids.len(),

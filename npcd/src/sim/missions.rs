@@ -192,7 +192,8 @@ impl Missions {
         self.closed.get(body).copied().unwrap_or(0)
     }
 
-    /// The mission the body closed last — reported, rejected or called off.
+    /// The work the body closed last — reported, rejected or called off — which
+    /// is what its chapter closes with; the table's routines are not counted.
     pub fn last_closed(&self, body: &str) -> Option<&Mission> {
         self.last_closed.get(body)
     }
@@ -208,10 +209,15 @@ impl Missions {
     /// turned 52 chapters in an hour, each a whole journal resealed, and the
     /// reseals took the engine the table needed to write the work that would
     /// have ended the routines.
+    ///
+    /// A routine is not what the chapter closes with either: one handed in
+    /// between a mission and the next turn would otherwise write the chapter's
+    /// journal entry in the mission's place.
     fn close(&mut self, body: &str, mission: &Mission) {
-        if !matches!(mission.origin, Origin::Random { .. }) {
-            *self.closed.entry(body.to_string()).or_insert(0) += 1;
+        if matches!(mission.origin, Origin::Random { .. }) {
+            return;
         }
+        *self.closed.entry(body.to_string()).or_insert(0) += 1;
         self.last_closed.insert(body.to_string(), mission.clone());
     }
 
@@ -1064,26 +1070,33 @@ mod tests {
         assert_eq!(m.chapter("cindy"), 0);
     }
 
-    /// **A routine handed in turns no chapter**, though it is still the
-    /// mission closed last.
+    /// **A routine handed in turns no chapter**, and a chapter closes with the
+    /// work that turned it, not with a routine handed in after it.
     #[test]
     fn a_routine_closed_turns_no_chapter() {
-        let mut m = Missions::default();
-        m.assign(
-            "bram",
+        let routine = || {
             Mission::new(
                 "read the breaker panel",
                 vec![Todo::new("go to the plant room")],
                 Origin::Random {
                     routine: "read-a-station".to_string(),
                 },
-            ),
-        );
+            )
+        };
+        let mut m = Missions::default();
+        m.assign("bram", routine());
         m.report("bram", Outcome::Pass, "it reads tight", None);
         assert_eq!(m.chapter("bram"), 0);
+        assert!(m.last_closed("bram").is_none());
+
+        m.assign("bram", a_mission("the work"));
+        m.report("bram", Outcome::Pass, "done", None);
+        m.assign("bram", routine());
+        m.report("bram", Outcome::Pass, "it reads tight", None);
+        assert_eq!(m.chapter("bram"), 1);
         assert_eq!(
             m.last_closed("bram").map(|x| x.prompt.as_str()),
-            Some("read the breaker panel")
+            Some("the work")
         );
     }
 

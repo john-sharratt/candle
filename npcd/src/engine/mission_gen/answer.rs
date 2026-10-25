@@ -179,7 +179,9 @@ pub fn specs(kind: Kind) -> Vec<ToolSpec> {
 }
 
 /// Every field of `kind`'s call that is held to a length, and its cap in words
-/// — the caps [`specs`] bounds the grammar by and the answer is checked against.
+/// — what the answer is checked against, the same constants the checks use.
+/// For a text field it is also what [`specs`] bounds the grammar by; a list's
+/// grammar bounds each entry instead, and the cap here is the list's whole.
 fn caps(kind: Kind) -> &'static [(&'static str, usize)] {
     match kind {
         Kind::LifeEvent => &[
@@ -1251,6 +1253,9 @@ pub struct Desk {
 
 #[cfg(test)]
 mod tests {
+    use candle_conversation::models::DialectType;
+    use candle_conversation::stencil::{compile_tool_call_tree, ToolCallEnvelope};
+
     use super::*;
     use crate::engine::mission_gen::corpus::tests::mind;
     use crate::engine::mission_gen::target::next;
@@ -1260,8 +1265,6 @@ mod tests {
     /// must not be a different order of thing.
     #[test]
     fn the_answer_grammars_are_of_one_order_of_size() {
-        use candle_conversation::models::DialectType;
-        use candle_conversation::stencil::{compile_tool_call_tree, ToolCallEnvelope};
         let env = ToolCallEnvelope::for_dialect(&DialectType::ChatML.dialect())
             .with_max_string_tokens(1800);
         let size = |kind| {
@@ -1276,7 +1279,7 @@ mod tests {
             size(Kind::Contradiction),
         );
         assert!(
-            story <= life * 3,
+            story <= life * 3 && pair <= life * 3,
             "life {life} nodes, story {story}, contradiction {pair}"
         );
     }
@@ -1303,6 +1306,18 @@ mod tests {
             b.sort_unstable();
             n.sort_unstable();
             assert_eq!(b, n, "{kind:?}: bounded fields and stated lengths differ");
+            // A text field's grammar bound is its stated cap's, so the length
+            // told and the length the grammar closes at cannot drift apart.
+            for p in call.params.iter().filter(|p| p.items.is_none()) {
+                if let Some((_, words)) = caps(kind).iter().find(|(n, _)| *n == p.name) {
+                    assert_eq!(
+                        p.max_tokens,
+                        Some(tokens_for(*words)),
+                        "{kind:?}: `{}` is bounded at another length than it is told",
+                        p.name
+                    );
+                }
+            }
             let line = lengths(kind);
             for (name, words) in caps(kind) {
                 assert!(
