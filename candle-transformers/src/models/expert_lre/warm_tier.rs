@@ -50,10 +50,17 @@ const DRIVER_LOCK_MARGIN: usize = 1024 * 1024 * 1024;
 /// driver still grants — says nothing about whether the device can still
 /// *address* one: the warm tier pinned 16.02 GiB of a 17.22 GiB budget on the
 /// 31.5 GiB box, kept its lock margin, and the startup fill's first upload
-/// failed with `CUDA_ERROR_OUT_OF_MEMORY` on most runs. Runs that loaded had
-/// left 1.6 GiB or more. Two GiB keeps the pinned part below every failing
-/// figure with room for the paging WDDM does when VRAM is full.
-pub(crate) const ADDRESSABLE_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
+/// failed with `CUDA_ERROR_OUT_OF_MEMORY` on most runs.
+///
+/// **Two GiB is not enough either.** On driver 610.60, Flash-Next on the same
+/// box, a tier the cap bound left exactly 2.00 GiB of a 17.22 GiB budget
+/// (15.22 GiB used) and the driver refused everything from then on — the first
+/// upload, `cuMemGetInfo`, even `cuMemFreeHost` — with 2.4 GiB of host RAM
+/// free; a tier that RAM bound first left 2.15 GiB and loaded. The cap only
+/// binds when RAM is plentiful, so the margin decided whether a *cleaner*
+/// machine booted. Three GiB keeps the pinned part a GiB clear of the failing
+/// figure, with room for the paging WDDM does when VRAM is full.
+pub(crate) const ADDRESSABLE_MARGIN: u64 = 3 * 1024 * 1024 * 1024;
 
 /// The most pinned slots of `slot_size` that leave [`ADDRESSABLE_MARGIN`] of
 /// `room` — GPU-addressable host memory not yet in use — unspent, capped at
@@ -289,13 +296,14 @@ mod tests {
 
     /// The 31.5 GiB box: 17.22 GiB of non-local budget with 0.66 GiB already in
     /// use leaves 16.17 GiB of room, so at 1.84 MiB slots the pinned part stops
-    /// at 14.17 GiB — under the 16.02 GiB that failed.
+    /// at 13.17 GiB — three GiB of room unspent, a GiB clear of the 2.00 GiB
+    /// that failed.
     #[test]
     fn the_pinned_part_leaves_the_addressable_margin() {
         let slot = 1_929_216usize; // 1.84 MiB
         let room = 16_560 * 1024 * 1024u64;
         let pinned = addressable_pinned_slots(Some(room), slot, 10_496);
-        assert_eq!(pinned, 7_887);
+        assert_eq!(pinned, 7_331);
         assert!(pinned as u64 * slot as u64 <= room - ADDRESSABLE_MARGIN);
         assert!((pinned as u64 + 1) * slot as u64 > room - ADDRESSABLE_MARGIN);
     }
