@@ -212,6 +212,12 @@ their text is ceased (§4.1); the folded entry's digest is filed as the text
 behind it, so `journal_read` on a day entry reads its digest. Open items are the
 journal's, not any entry's, and are untouched.
 
+A conversation owned through `/mcp` is the exception: the conversations below it
+cite its entries, so its fold files the folded entries' turns under the fold,
+beside the digest, and notes where each went (`JournalText::refile`). Reading a
+folded entry reads the fold's turns and says where the entry went, through a
+later fold too (`docs/claude_zend_gateway.md` §5.2).
+
 A fold shares the draft's single flight. It is tried after every round's seal
 when no draft starts, after every draft, and every five minutes over the open
 conversations (`FOLD_SWEEP_EVERY`), so a day that turns over while a

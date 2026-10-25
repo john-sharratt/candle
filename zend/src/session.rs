@@ -106,7 +106,7 @@ use crate::journal::shelf::{Above, Drafted, Lazy, Notes, Shelf};
 use crate::journal::state::{SessionJournal, FOLD_SWEEP_EVERY};
 use crate::journal::style::style_for;
 use crate::journal::text::JournalText;
-use crate::journal::world::ConversationFiles;
+use crate::journal::world::{Citable, ConversationFiles};
 use crate::journal::{carry, draft, origin, pressure};
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
@@ -5222,6 +5222,9 @@ struct JournalAbove {
     ancestor: lineage::Ancestor,
     name: String,
     conv_id: Option<String>,
+    /// The entries a citation may name: a worker's journal's ids and those its
+    /// folds took, a thread's or project's notes numbered from 1.
+    entries: Vec<u64>,
 }
 
 /// The journals above `conv_id`, nearest first — none for a conversation not
@@ -5236,22 +5239,30 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
     let mut above = names::parent_of(name);
     while !above.is_empty() {
         let id = threads::conv_id(owner, thread, above);
+        let (lines, mut entries) = journal_of(state, &id);
+        // A fold's entries are still cited by their addresses, which read.
+        entries.extend(journal_text(state, conversation_timeline(&id)).folded());
         nearest_first.push(JournalAbove {
             ancestor: lineage::Ancestor {
                 path: format!("T:{thread}/{above}"),
                 whose: lineage::Whose::Worker,
-                lines: journal_lines(state, &id),
+                lines,
             },
             name: names::leaf(above).to_string(),
             conv_id: Some(id),
+            entries,
         });
         above = names::parent_of(above);
     }
+    let notes = |journal: &str| threads::note_lines(&threads::notes(&records, owner, journal));
+    let numbered = |lines: &[String]| (1..=lines.len() as u64).collect();
+    let lines = notes(thread);
     nearest_first.push(JournalAbove {
+        entries: numbered(&lines),
         ancestor: lineage::Ancestor {
             path: format!("T:{thread}"),
             whose: lineage::Whose::Thread,
-            lines: threads::note_lines(&threads::notes(&records, owner, thread)),
+            lines,
         },
         name: thread.to_string(),
         conv_id: None,
@@ -5263,9 +5274,11 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
         .filter(|r| r.name != UPLOADS_REPO)
     {
         let project = project_journal(&repo.name);
+        let lines = notes(&project);
         nearest_first.push(JournalAbove {
+            entries: numbered(&lines),
             ancestor: lineage::Ancestor {
-                lines: threads::note_lines(&threads::notes(&records, owner, &project)),
+                lines,
                 path: project,
                 whose: lineage::Whose::Project,
             },
@@ -5276,8 +5289,21 @@ fn journals_above(state: &InferenceState, conv_id: &str) -> Vec<JournalAbove> {
     nearest_first
 }
 
-/// `conv_id`'s journal, one line per entry and one per open item.
-fn journal_lines(state: &InferenceState, conv_id: &str) -> Vec<String> {
+/// The journals above `conv_id` as its claims may cite them.
+fn citable_above(state: &InferenceState, conv_id: &str) -> Vec<Citable> {
+    journals_above(state, conv_id)
+        .into_iter()
+        .map(|a| Citable {
+            path: a.ancestor.path,
+            name: a.name,
+            entries: a.entries,
+        })
+        .collect()
+}
+
+/// `conv_id`'s journal — one line per entry and one per open item — and its
+/// entries' ids.
+fn journal_of(state: &InferenceState, conv_id: &str) -> (Vec<String>, Vec<u64>) {
     let journal = state.journals.of(conv_id, || {
         journal_record(state, conversation_timeline(conv_id))
     });
@@ -5287,13 +5313,14 @@ fn journal_lines(state: &InferenceState, conv_id: &str) -> Vec<String> {
         .entries()
         .map(|e| format!("#{} {}", e.id, e.summary))
         .collect();
+    let ids = held.journal().entries().map(|e| e.id).collect();
     lines.extend(
         held.journal()
             .open()
             .iter()
             .map(|item| format!("Still open #{}: {}", item.id, item.text)),
     );
-    lines
+    (lines, ids)
 }
 
 /// When a journal draft starts.
@@ -5392,10 +5419,14 @@ fn begin_journal_draft(
 /// greedily.
 fn journal_desk(
     state: &Arc<InferenceState>,
+    conv_id: &str,
     timeline: TimelineId,
     asker: UnsealedAsker,
     max_tokens: usize,
 ) -> ZendDesk {
+    // A conversation with a lineage — the one `style_for` and the journals
+    // above it read — is the one whose entries are cited from below.
+    let folds_keep_turns = conv_names(conv_id).is_some();
     let dialect = state.refresh_config.dialect.clone();
     let env = ToolCallEnvelope::for_assistant_calls(&dialect);
     let close = ToolCallEnvelope::turn_close(&dialect);
@@ -5435,9 +5466,19 @@ fn journal_desk(
                 .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"))?;
             // Only once the record no longer holds them: a fold whose record
             // fails is abandoned with its entries still in the journal, and
-            // their text must still be there to read.
-            for entry in ceased {
-                text.cease_entry(*entry)?;
+            // their text must still be there to read. A conversation owned
+            // through `/mcp` files a fold's entries' turns under the fold, so
+            // what its readers cite keeps its evidence
+            // (`docs/claude_zend_gateway.md` §5.2).
+            match filed {
+                Some(fold) if folds_keep_turns && !ceased.is_empty() => {
+                    text.refile(ceased, fold.entry)?;
+                }
+                _ => {
+                    for entry in ceased {
+                        text.cease_entry(*entry)?;
+                    }
+                }
             }
             Ok(())
         },
@@ -5487,7 +5528,7 @@ fn journal_shelf(
 
 /// `conv_id`'s journals as they stand now.
 fn shelf_of(state: &InferenceState, conv_id: &str, timeline: TimelineId) -> Shelf {
-    let own = Drafted::new(journal_lines(state, conv_id), journal_text(state, timeline));
+    let own = Drafted::new(journal_of(state, conv_id).0, journal_text(state, timeline));
     let above = journals_above(state, conv_id)
         .into_iter()
         .map(|a| {
@@ -5519,8 +5560,8 @@ fn spawn_journal_draft(
     span: Span,
 ) {
     tokio::spawn(async move {
-        let mut desk = journal_desk(&state, timeline, open.asker, WRITE_TOKENS);
-        let world = ConversationFiles::of(open.files);
+        let mut desk = journal_desk(&state, &conv_id, timeline, open.asker, WRITE_TOKENS);
+        let world = ConversationFiles::of(open.files).citing(citable_above(&state, &conv_id));
         let record = draft::draft(&mut desk, &journal, &span, &world).await;
         tracing::info!(
             target: "zend::journal",
@@ -5604,7 +5645,7 @@ fn spawn_journal_folds(
     journal: Arc<Mutex<SessionJournal>>,
 ) {
     tokio::spawn(async move {
-        let mut desk = journal_desk(&state, timeline, open.asker, FOLD_TOKENS);
+        let mut desk = journal_desk(&state, &conv_id, timeline, open.asker, FOLD_TOKENS);
         let mut folded = 0usize;
         let style = journal.lock().unwrap().style();
         loop {
@@ -7457,7 +7498,7 @@ impl ZendSession {
                 .set_conversation_metadata_many(timeline, &metadata_of(&prompt))
                 .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"))
                 .and_then(|()| {
-                    JournalText::of(engine.conversation().shared(), timeline).cease_entry(entry)
+                    JournalText::of(engine.conversation().shared(), timeline).forget(entry)
                 })
         };
         Some(recorded.map(|_| {

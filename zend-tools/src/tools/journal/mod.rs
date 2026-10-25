@@ -19,6 +19,7 @@
 //! |------|-------|
 //! | `no_journal` | The conversation keeps no journal: not a dialogue, or archived |
 //! | `no_such_journal` | `journal` names nothing the conversation can read |
+//! | `two_entries` | the address in `journal` and `entry` name different entries |
 //! | `no_journal_text` | No entry holds kept text yet |
 //! | `no_entry_text` | The entry named holds no kept text |
 
@@ -63,6 +64,8 @@ pub enum JournalError {
     NoJournal,
     #[error("{0}")]
     Unknown(String),
+    #[error("the address names entry {0} and `entry` names {1}: name one")]
+    TwoEntries(u64, u64),
     #[error("{}", .0.detail())]
     Missed(Miss),
 }
@@ -72,8 +75,23 @@ impl ToolError for JournalError {
         match self {
             JournalError::NoJournal => "no_journal",
             JournalError::Unknown(_) => "no_such_journal",
+            JournalError::TwoEntries(..) => "two_entries",
             JournalError::Missed(miss) => miss.code(),
         }
+    }
+}
+
+/// `journal` split into the journal it names and the entry its address names,
+/// if any: `T:review#12` is entry 12 of `T:review`, and `check-plan#3.2` —
+/// one claim of an entry — is entry 3 of `check-plan`
+/// (`docs/claude_zend_gateway.md` §5.2).
+pub fn address(journal: &str) -> (&str, Option<u64>) {
+    match journal.rsplit_once('#') {
+        Some((name, number)) => match number.split('.').next().map(str::parse::<u64>) {
+            Some(Ok(entry)) if !name.is_empty() => (name, Some(entry)),
+            _ => (journal, None),
+        },
+        None => (journal, None),
     }
 }
 

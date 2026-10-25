@@ -10,6 +10,12 @@
 //! | `file:<repo>/<path>` | `blob` | the git blob id of the file the conversation reads, while it is the branch's |
 //! | `branch:<repo>` | `head` | the commit the conversation's branch is at |
 //! | `branch:<repo>` | `name` | the branch the conversation reads the repository through |
+//! | `entry:<journal>#<n>` | `exists` | `true` when `<journal>` — a path, or a bare name resolved upward — is a journal above the conversation holding entry `n`; `false` otherwise |
+//!
+//! The last is the cross-journal citation check of a conversation owned
+//! through `/mcp` (`docs/claude_zend_gateway.md` §5.2): a worker's claim that
+//! rests on its thread's decision cites it, and an entry that is not there, or
+//! not an ancestor's, is corrected to say so.
 //!
 //! Anything else reads as no answer, which the check treats as "the workspace
 //! cannot say" rather than as a disagreement: the claim stays, as prose. So
@@ -18,21 +24,63 @@
 use std::sync::Arc;
 
 use journal_core::verify::World;
+use zend_tools::tools::journal::address as journal_address;
 use zend_vfs::{RepoFiles, Rev, VfsStore};
 
 /// The subject prefix of a file.
 pub const FILE: &str = "file:";
 /// The subject prefix of a repository's branch.
 pub const BRANCH: &str = "branch:";
+/// The subject prefix of an entry of a journal above the conversation.
+pub const ENTRY: &str = "entry:";
 
-/// One conversation's view of the workspace.
+/// A journal above the conversation, as a citation names it: its path, the
+/// bare name it answers to, and the entries a citation may name — those it
+/// holds, and those a fold took, whose addresses still read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Citable {
+    pub path: String,
+    pub name: String,
+    pub entries: Vec<u64>,
+}
+
+/// One conversation's view of the workspace, and of the journals above it.
 pub struct ConversationFiles {
     files: Arc<RepoFiles>,
+    /// Nearest first.
+    above: Vec<Citable>,
 }
 
 impl ConversationFiles {
     pub fn of(files: Arc<RepoFiles>) -> Self {
-        Self { files }
+        Self {
+            files,
+            above: Vec::new(),
+        }
+    }
+
+    /// This view, citing `above` — the journals above the conversation,
+    /// nearest first.
+    pub fn citing(self, above: Vec<Citable>) -> Self {
+        Self { above, ..self }
+    }
+
+    /// Whether `address` — `<journal>#<n>`, or `#<n>.<m>` for one of its
+    /// claims — names an entry of a journal above; `None` when it is no
+    /// address.
+    fn entry(&self, address: &str, attribute: &str) -> Option<String> {
+        if attribute != "exists" {
+            return None;
+        }
+        let (journal, Some(entry)) = journal_address(address.trim()) else {
+            return None;
+        };
+        let held = self
+            .above
+            .iter()
+            .filter(|a| a.path == journal || a.name == journal)
+            .any(|a| a.entries.contains(&entry));
+        Some(held.to_string())
     }
 
     fn file(&self, repo: &str, path: &str, attribute: &str) -> Option<String> {
@@ -75,6 +123,9 @@ impl World for ConversationFiles {
         }
         if let Some(repo) = subject.strip_prefix(BRANCH) {
             return self.branch(repo.trim(), &attribute);
+        }
+        if let Some(address) = subject.strip_prefix(ENTRY) {
+            return self.entry(address, &attribute);
         }
         None
     }
@@ -190,6 +241,37 @@ mod tests {
         assert_eq!(world.read("file:r/a.txt", "size"), None);
         assert_eq!(world.read("branch:r", "upstream"), None);
         assert_eq!(world.read("test:scan", "passed"), None);
+    }
+
+    /// **A citation of an entry above is checked**: there and an ancestor's
+    /// reads true, by path or bare name, a claim's address by its entry;
+    /// anything else reads false, so the claim is corrected.
+    #[test]
+    fn an_entry_above_is_cited_by_path_or_name_and_nothing_else_is() {
+        let world = ConversationFiles::of(Arc::new(RepoFiles::detached())).citing(vec![
+            Citable {
+                path: "T:review/verify".into(),
+                name: "verify".into(),
+                entries: vec![2, 3],
+            },
+            Citable {
+                path: "T:review".into(),
+                name: "review".into(),
+                entries: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            },
+        ]);
+        let reads = |s: &str| world.read(s, "exists");
+        assert_eq!(reads("entry:T:review#12").as_deref(), Some("true"));
+        assert_eq!(reads("entry:review#12").as_deref(), Some("true"));
+        assert_eq!(reads("entry:verify#3.2").as_deref(), Some("true"));
+        assert_eq!(reads("entry:T:review/verify#9").as_deref(), Some("false"));
+        assert_eq!(
+            reads("entry:T:other#1").as_deref(),
+            Some("false"),
+            "not an ancestor's"
+        );
+        assert_eq!(reads("entry:T:review"), None, "no entry named");
+        assert_eq!(world.read("entry:T:review#1", "size"), None);
     }
 
     #[test]

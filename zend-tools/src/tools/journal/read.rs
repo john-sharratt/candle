@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{open, JournalError};
+use super::{address, open, JournalError};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Lines a read returns when it names no count.
@@ -14,11 +14,12 @@ const DEFAULT_LINES: usize = 200;
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReadRequest {
     /// Whose journal: "self" for your own, or an ancestor's name or path as
-    /// your journals show it. Required.
+    /// your journals show it — or an entry's address, `name#3`. Required.
     #[validate(length(min = 1))]
     pub journal: String,
     /// The entry whose turns to read, as the journal numbers it: 3 for
-    /// "Entry 3 — …". Leave it out to list the journal's entries.
+    /// "Entry 3 — …". Leave it out, with no address, to list the journal's
+    /// entries.
     pub entry: Option<u64>,
     /// First line to show, counted from 1. Default 1.
     pub offset: Option<usize>,
@@ -57,8 +58,14 @@ impl Tool for JournalRead {
     }
 
     fn run(ctx: &ToolContext, req: ReadRequest) -> Result<ReadResponse, JournalError> {
-        let book = open(ctx, &req.journal)?;
-        let Some(entry) = req.entry else {
+        let (journal, addressed) = address(&req.journal);
+        if let (Some(a), Some(e)) = (addressed, req.entry) {
+            if a != e {
+                return Err(JournalError::TwoEntries(a, e));
+            }
+        }
+        let book = open(ctx, journal)?;
+        let Some(entry) = req.entry.or(addressed) else {
             return Ok(ReadResponse::Entries {
                 journal: req.journal,
                 entries: book.entries(),
