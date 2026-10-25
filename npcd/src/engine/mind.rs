@@ -130,20 +130,6 @@ const META_FRAME: &str = "frame_sha256";
 /// it reads the stand-in member instead.
 const SEAL_WAIT: Duration = Duration::from_secs(20);
 
-/// How a character's journal sections are sealed: each on its own.
-///
-/// **Not as a chain, though a chain reads truer.** A character's conversation
-/// is rolled at every piece of work it hands in (`Minds::think`), and a new
-/// conversation seals its journal afresh — its sections are addressed by its
-/// timeline. A chain seals one link after another, so on WW with four Makers a
-/// journal of twenty entries took longer to seal than a chapter lasted: each
-/// roll retired the chain half-sealed, 546 sections failed in twenty minutes,
-/// nothing sealed for the turns to read, and the command table's turns waited
-/// behind it — none finished. Sealed apart, the same twenty minutes sealed 955
-/// and failed none, and the table's turns ran. A chain comes back once a roll
-/// can carry the sealed journal into the next conversation.
-const JOURNAL_LINKING: Linking = Linking::Apart;
-
 /// The sections a journal should be carried as.
 fn journal_wants(prompt: Option<&JournalPrompt>) -> Vec<Want<'_>> {
     prompt
@@ -1292,7 +1278,7 @@ impl Minds {
                 sequence,
                 identity::JOURNAL,
                 &journal_wants(Some(prompt)),
-                JOURNAL_LINKING,
+                Linking::Chain,
                 &sweep,
                 None,
                 tokio::time::sleep,
@@ -1954,7 +1940,7 @@ impl Minds {
                 &mut live.sequence,
                 identity::JOURNAL,
                 &journal_wants(persona.journal),
-                JOURNAL_LINKING,
+                Linking::Chain,
                 &journal_sweep(persona.journal),
                 None,
                 tokio::time::sleep,
