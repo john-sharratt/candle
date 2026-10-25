@@ -147,7 +147,9 @@ impl SubstratePersistence {
         if self.is_applied(id.origin, id.oseq) {
             return Ok(RemoteOutcome::Duplicate);
         }
-        if id.origin == self.node() {
+        // This node's own record, not held: a gap a purge left, which another
+        // member's copy fills (§7.8) — or an `oseq` it never minted.
+        if id.origin == self.node() && id.oseq >= self.minter.origination().next_oseq() {
             return Ok(RemoteOutcome::Refused(Refusal::OwnOrigin));
         }
         self.minter.observe(&id);
@@ -161,6 +163,13 @@ impl SubstratePersistence {
         }
         if let Err(refusal) = checked {
             return Ok(RemoteOutcome::Refused(refusal.clone()));
+        }
+        // One of this node's own is taken into its written set before the
+        // append, so the append's tap does not send it out again: the member
+        // it came from holds it. A failed append leaves the gap open on disk —
+        // the replica record that would close it is written by a commit.
+        if id.origin == self.node() {
+            self.mark_applied(&id);
         }
         let at = self.append_carried(
             h.record_type,
@@ -211,10 +220,9 @@ impl SubstratePersistence {
         }
     }
 
-    /// Record `id` as applied without writing it.
+    /// Record `id` as applied — into the replica, or for one of this node's
+    /// own a purge dropped, into its written set.
     fn mark_applied(&mut self, id: &RecordIdentity) {
-        if self.replica.applied.insert(id.origin, id.oseq) {
-            self.replica_dirty = true;
-        }
+        self.mark_gone(id.origin, id.oseq, id.oseq);
     }
 }

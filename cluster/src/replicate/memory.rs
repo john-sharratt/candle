@@ -17,7 +17,7 @@ use applied_set::AppliedSet;
 
 use super::store::{Applied, Disk, Listing, Store, Tap, Tombstones, GEN_DETACHED};
 use crate::consensus::{Change, MaxMembers};
-use crate::frame::{Gone, RecordHeader};
+use crate::frame::RecordHeader;
 
 const MAX_MEMBERS_SET: &[u8] = b"cluster/max_members/set";
 const MAX_MEMBERS_RAISE: &[u8] = b"cluster/max_members/raise/";
@@ -178,9 +178,17 @@ pub struct MemoryStore {
     refused_origins: Mutex<Vec<u64>>,
     /// Record types it never takes from another member, set by the tests.
     local_only: Mutex<Vec<u8>>,
+    /// How many times the replicator has marked it joined.
+    joined_marks: AtomicU64,
 }
 
 impl MemoryStore {
+    /// How many times the replicator has marked it joined
+    /// ([`Store::mark_joined`]).
+    pub fn joined_marks(&self) -> u64 {
+        self.joined_marks.load(Ordering::Relaxed)
+    }
+
     pub fn new(node: u64) -> MemoryStore {
         MemoryStore {
             node,
@@ -199,6 +207,7 @@ impl MemoryStore {
             census: Mutex::new(Vec::new()),
             refused_origins: Mutex::new(Vec::new()),
             local_only: Mutex::new(Vec::new()),
+            joined_marks: AtomicU64::new(0),
         }
     }
 
@@ -434,22 +443,19 @@ impl Store for MemoryStore {
                         digest: digest(&bytes),
                     });
                 }
-                None => listing.gone.push(Gone {
-                    oseq,
-                    deleted_entry: None,
-                }),
+                None => listing.gone.push(oseq),
             }
         }
         listing
     }
 
-    fn gone(&self, origin: u64, gone: &[Gone]) {
+    fn gone(&self, origin: u64, gone: &[u64]) {
         if origin == self.node {
             return;
         }
         let mut s = self.inner();
-        for g in gone {
-            s.applied.insert(origin, g.oseq);
+        for &oseq in gone {
+            s.applied.insert(origin, oseq);
         }
     }
 
@@ -605,6 +611,10 @@ impl Store for MemoryStore {
     fn tombstones(&self) -> Tombstones {
         Tombstones::default()
     }
+
+    fn mark_joined(&self) {
+        self.joined_marks.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// `k` for a key `cluster/gen/<k>`.
@@ -702,13 +712,7 @@ mod tests {
             l.records.iter().map(|r| r.oseq).collect::<Vec<_>>(),
             vec![1, 3]
         );
-        assert_eq!(
-            l.gone,
-            vec![Gone {
-                oseq: 2,
-                deleted_entry: None
-            }]
-        );
+        assert_eq!(l.gone, vec![2]);
     }
 
     /// `max_members` is raised by sightings and lowered by a set, and a raise

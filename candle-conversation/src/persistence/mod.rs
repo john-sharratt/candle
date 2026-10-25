@@ -49,6 +49,9 @@ mod held_types;
 pub mod identity;
 pub mod inherit;
 pub mod integrity;
+pub mod joined;
+#[cfg(test)]
+mod joined_tests;
 mod le_reader;
 pub mod listing;
 pub mod liveness_audit;
@@ -113,6 +116,7 @@ use identity::{
     OwnSections, RecordIdentity, Stamped, VersionStamp, GEN_DETACHED,
 };
 use inherit::InheritedSubstrate;
+use joined::Purge;
 use liveness_audit::{keyed_by_payload, resident_key, ResidentKey};
 use manifest::{ChunkLoc, Manifest, RecordLoc};
 pub use model_binding::{Admit, BoundSubstrate, ModelBinding};
@@ -730,10 +734,6 @@ fn record_metadata_loc(map: &mut StampedLocs<MetadataKey>, entry: &walker::WalkE
     }
 }
 
-/// Take one walked record into the replica and the location index: every
-/// record with an identity is located, another origin's is applied, and a
-/// `Replica` record's sets join what is held. Both only grow, so the order the
-/// walk meets them in does not matter.
 /// `entry` with its identity fixed: a record this node wrote cut off carries
 /// the generation a rejoin fixed for it ([`RebaseMap`]); any other record is
 /// itself.
@@ -748,9 +748,20 @@ fn fix_walked<'a>(entry: &'a WalkEntry, rebases: &RebaseMap) -> Cow<'a, WalkEntr
     Cow::Owned(owned)
 }
 
+/// Take one walked record into the replica and the location index: every
+/// record with an identity is located, another origin's is applied, and a
+/// `Replica` record's sets join what is held. Both only grow, so the order the
+/// walk meets them in does not matter.
+///
+/// A `Replica` record's entry for `node` itself is not the replica's: it is
+/// this node's own written set as the record saw it, its gaps what a purge
+/// dropped (§7.8). The last record walked is the latest written, so it alone
+/// says which gaps still stand — `own_kept` takes its entry, or `None` when it
+/// has none.
 fn observe_replica(
     replica: &mut ReplicaPayload,
     locations: &mut LocationIndex,
+    own_kept: &mut Option<OriginApplied>,
     node: u64,
     entry: &walker::WalkEntry,
 ) {
@@ -769,7 +780,8 @@ fn observe_replica(
         }
     }
     if h.record_type == RecordType::Replica {
-        if let Ok(held) = ReplicaPayload::decode(&entry.record.payload) {
+        if let Ok(mut held) = ReplicaPayload::decode(&entry.record.payload) {
+            *own_kept = held.applied.remove(node);
             replica.applied.merge(&held.applied);
             replica.deferred.extend(held.deferred);
         }
@@ -911,7 +923,7 @@ impl SubstratePersistence {
 
     /// Open the persistence layer at `<dir>/substrate/` (the segment set).
     pub fn open_in(dir: &Path) -> Result<SubstratePersistence> {
-        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], false, |_| {})
+        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], false, Purge::Nothing, |_| {})
     }
 
     /// Open the persistence layer and drive every record through
@@ -954,6 +966,9 @@ impl SubstratePersistence {
     /// `progress` is told the stage it is in and how far through it the open
     /// is: MiB of log walked against the store's size for a walk, records
     /// rewritten of the live set for the adoption ([`OpenStage::unit`]).
+    ///
+    /// A member away too long ([`joined`]) walks without what it can no longer
+    /// trust — `sink` never sees it — and compacts it away before it returns.
     fn open_adopting<F>(
         dir: &Path,
         substrate: &mut Substrate,
@@ -964,10 +979,12 @@ impl SubstratePersistence {
     where
         F: FnMut(&WalkEntry),
     {
+        let last_joined = joined::read(dir)?;
+        let purge = Purge::after(last_joined, now_ms());
         let total = store_mib(dir);
         progress(OpenStage::Reading, 0, total);
         let mut meter = MibMeter::default();
-        let mut sp = Self::from_dir_with_sink(dir, &[], false, |entry| {
+        let mut sp = Self::from_dir_with_sink(dir, &[], false, purge, |entry| {
             substrate.apply_walker_entry(entry);
             sink(entry);
             if let Some(mib) = meter.add(entry.size) {
@@ -976,24 +993,34 @@ impl SubstratePersistence {
         })?;
         progress(OpenStage::Reading, total, total);
         sp.admit(admit)?;
-        if !sp.predates_identities() {
-            return Ok(sp);
+        if sp.predates_identities() {
+            sp.adopt(substrate, &|done, total| {
+                progress(OpenStage::Stamping, done, total)
+            })?;
+            drop(sp);
+            *substrate = Substrate::new();
+            let total = store_mib(dir);
+            progress(OpenStage::Rereading, 0, total);
+            let mut meter = MibMeter::default();
+            sp = Self::from_dir_with_sink(dir, &[], false, Purge::Nothing, |entry| {
+                substrate.apply_walker_entry(entry);
+                if let Some(mib) = meter.add(entry.size) {
+                    progress(OpenStage::Rereading, mib.min(total), total);
+                }
+            })?;
+            progress(OpenStage::Rereading, total, total);
+        } else if purge.drops_any() {
+            sp.compact(
+                substrate,
+                Some(&|done, total| progress(OpenStage::Purging, done, total)),
+            )?;
         }
-        sp.adopt(substrate, &|done, total| {
-            progress(OpenStage::Stamping, done, total)
-        })?;
-        drop(sp);
-        *substrate = Substrate::new();
-        let total = store_mib(dir);
-        progress(OpenStage::Rereading, 0, total);
-        let mut meter = MibMeter::default();
-        let sp = Self::from_dir_with_sink(dir, &[], false, |entry| {
-            substrate.apply_walker_entry(entry);
-            if let Some(mib) = meter.add(entry.size) {
-                progress(OpenStage::Rereading, mib.min(total), total);
-            }
-        })?;
-        progress(OpenStage::Rereading, total, total);
+        // Judged now: a store never judged starts its clock here, and one just
+        // purged starts it again rather than purging at every open until the
+        // replicator next marks it joined.
+        if last_joined.is_none() || purge.drops_any() {
+            joined::write(dir, now_ms())?;
+        }
         Ok(sp)
     }
 
@@ -1018,9 +1045,13 @@ impl SubstratePersistence {
         dir: &Path,
         substrate: &mut Substrate,
     ) -> Result<SubstratePersistence> {
-        Self::from_dir_with_sink(&dir.join(SUBSTRATE_DIR), &[], true, |entry| {
-            substrate.apply_walker_entry(entry)
-        })
+        Self::from_dir_with_sink(
+            &dir.join(SUBSTRATE_DIR),
+            &[],
+            true,
+            Purge::Nothing,
+            |entry| substrate.apply_walker_entry(entry),
+        )
     }
 
     /// As [`Self::open_in_with_substrate`], but the caller also sees every
@@ -1057,7 +1088,7 @@ impl SubstratePersistence {
         let (active_dir, inherited) = logs.split_last().ok_or_else(|| {
             PersistenceError::Corrupt("open_concat needs at least one log".into())
         })?;
-        Self::from_dir_with_sink(active_dir, inherited, false, |_| {})
+        Self::from_dir_with_sink(active_dir, inherited, false, Purge::Nothing, |_| {})
     }
 
     /// Open the segment set in `dir` (the `substrate/` directory) with the
@@ -1066,10 +1097,17 @@ impl SubstratePersistence {
     /// dead-weight accounting. `read_only` opens the segment set with
     /// [`SegmentedLog::open_read_only_with_sink`] instead of
     /// [`SegmentedLog::open_with_sink`].
+    ///
+    /// A record `purge` drops is walked past as if it were not there — but for
+    /// the clock and the `oseq` counter, which it still advances, so this node
+    /// never mints an identity it issued before. The replica then forgets every
+    /// other origin, and this node's own dropped `oseq`s are gaps in what it
+    /// has written, for a catch-up to fill ([`joined`]).
     fn from_dir_with_sink<F>(
         dir: &Path,
         inherited: &[PathBuf],
         read_only: bool,
+        purge: Purge,
         mut sink: F,
     ) -> Result<SubstratePersistence>
     where
@@ -1133,6 +1171,9 @@ impl SubstratePersistence {
         let held: RefCell<Vec<WalkEntry>> = RefCell::new(Vec::new());
         let draining = Cell::new(false);
         let mut unstamped = RecordCensus::new();
+        let mut own_kept = None;
+        let mut dropped_own = OriginApplied::default();
+        let mut dropped_foreign = 0u64;
         let mut walk = |entry: &WalkEntry| {
             let h = &entry.record.header;
             if adoption::predates_identities(h) {
@@ -1150,9 +1191,18 @@ impl SubstratePersistence {
             let fixed = fix_walked(entry, &rebases.borrow());
             let entry = fixed.as_ref();
             let h = &entry.record.header;
-            origination.observe(&h.identity());
+            let id = h.identity();
+            origination.observe(&id);
+            if purge.drops(node, &id) {
+                if id.origin == node {
+                    dropped_own.insert(id.oseq);
+                } else {
+                    dropped_foreign += 1;
+                }
+                return;
+            }
             own_sections.observe(node, h, &entry.record.payload);
-            observe_replica(&mut replica, &mut locations, node, entry);
+            observe_replica(&mut replica, &mut locations, &mut own_kept, node, entry);
             marker_ids.record(
                 h.record_type,
                 h.stream_id,
@@ -1193,9 +1243,37 @@ impl SubstratePersistence {
             origination.detach(still_detached);
         }
         // Every own record the store holds may be sent, but what it wrote cut
-        // off and no rejoin fixed (§6.3, §6.7).
-        let own_written =
-            OriginApplied::from_parts(still_detached.unwrap_or(origination.next_oseq()) - 1, []);
+        // off and no rejoin fixed (§6.3, §6.7), and what a purge dropped and no
+        // catch-up has returned yet — the gaps the replica's own entry kept,
+        // and the ones this open just made (§7.8).
+        let mut own_missing = dropped_own;
+        if let Some(kept) = own_kept {
+            for (start, end) in kept.gaps() {
+                own_missing.insert_range(start, end);
+            }
+        }
+        if purge.drops_any() {
+            replica = ReplicaPayload::default();
+            tracing::warn!(
+                target: "candle_conversation::persistence::joined",
+                node = format!("{node:016x}"),
+                dir = %dir.display(),
+                ?purge,
+                dropped_foreign,
+                own_missing = own_missing.ranges().iter().map(|(s, e)| e - s + 1).sum::<u64>(),
+                "this member was away longer than a tombstone may be missed — dropping what \
+                 it can no longer trust; a catch-up refetches what the cluster still holds"
+            );
+        }
+        let own_top = still_detached.unwrap_or(origination.next_oseq()) - 1;
+        let own_written = OriginApplied::from_top_and_gaps(
+            own_top,
+            own_missing
+                .ranges()
+                .into_iter()
+                .filter(|(start, _)| *start <= own_top)
+                .map(|(start, end)| (start, end.min(own_top))),
+        );
         let segmented_log::OpenedSegments {
             mut segments,
             manifest,
@@ -1263,7 +1341,8 @@ impl SubstratePersistence {
             node_source,
             marker_ids,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
-            replica_dirty: release_known_deferred(&mut replica) && !read_only,
+            replica_dirty: (release_known_deferred(&mut replica) || purge.drops_any())
+                && !read_only,
             replica,
             locations,
             rebases,
@@ -1834,19 +1913,30 @@ impl SubstratePersistence {
         }
     }
 
-    /// Whether `(origin, oseq)` is applied here or known gone.
+    /// Whether `(origin, oseq)` is applied here or known gone. Of this node's
+    /// own, every `oseq` minted so far but a gap a purge left (§7.8): what it
+    /// wrote past its written set's top is held, cut off or not.
     pub fn is_applied(&self, origin: u64, oseq: u64) -> bool {
         if origin == self.node() {
-            oseq != 0 && oseq < self.minter.origination().next_oseq()
+            oseq != 0
+                && oseq < self.minter.origination().next_oseq()
+                && (oseq > self.own_written.top() || self.own_written.contains(oseq))
         } else {
             self.replica.applied.contains(origin, oseq)
         }
     }
 
     /// Record `start..=end` of `origin` as gone — `oseq`s a catch-up learned
-    /// no member holds any more (§7.2). The next commit persists it.
+    /// no member holds any more (§7.2), this node's own among them when a
+    /// purge dropped them (§7.8). The next commit persists it.
     pub fn mark_gone(&mut self, origin: u64, start: u64, end: u64) {
-        if origin != self.node() && self.replica.applied.insert_range(origin, start, end) {
+        let added = if origin == self.node() {
+            self.own_written
+                .insert_range(start, end.min(self.own_written.top()))
+        } else {
+            self.replica.applied.insert_range(origin, start, end)
+        };
+        if added {
             self.replica_dirty = true;
         }
     }
@@ -2002,6 +2092,26 @@ impl SubstratePersistence {
         Ok(Some(entry))
     }
 
+    /// The replica as its record holds it: every other origin's applied set,
+    /// and this node's own written set, whose gaps are what a purge dropped
+    /// and no catch-up has returned (§7.8). The walk takes the own entry from
+    /// the latest record alone ([`observe_replica`]), so once the store holds
+    /// any replica record every record carries it: one without would leave an
+    /// older record's gaps standing whenever maintenance reclaimed the newer
+    /// first. A node that has never applied another origin, holds no replica
+    /// record and has no gaps writes none.
+    fn replica_record(&self) -> ReplicaPayload {
+        let mut record = self.replica.clone();
+        let holds_one = self.held_types & (1u32 << RecordType::Replica.tag()) != 0;
+        let needed = holds_one || !self.replica.is_empty() || !self.own_written.gaps().is_empty();
+        if self.own_written.top() > 0 && needed {
+            record
+                .applied
+                .set_origin(self.node(), self.own_written.clone());
+        }
+        record
+    }
+
     /// Write the replica when it changed since it was last written — at a
     /// commit, before the sync that makes it durable. Local housekeeping: it
     /// carries no identity and is never replicated.
@@ -2009,7 +2119,7 @@ impl SubstratePersistence {
         if !self.replica_dirty {
             return Ok(());
         }
-        let payload = self.replica.encode();
+        let payload = self.replica_record().encode();
         self.append_carried(
             RecordType::Replica,
             0,
@@ -3167,6 +3277,13 @@ impl SubstratePersistence {
         let dir = self.segments.dir().to_path_buf();
         // Planning only — no disk reads; each read-back record carries its
         // source location, read back coalesced + staged verbatim in step 3.
+        let expiry = TombstoneExpiry {
+            now_ms: now_ms(),
+            retention: self.tombstone_retention,
+        };
+        // What this compaction drops: the substrate forgets it once the
+        // rewritten log is walked back in, or maintenance would carry it again.
+        let expired = expiry.expired(substrate, &self.marker_ids);
         let live = compaction::collect_live_records(
             &self.manifest,
             substrate,
@@ -3175,12 +3292,9 @@ impl SubstratePersistence {
             &self.blob_index,
             &self.marker_ids,
             self.node(),
-            TombstoneExpiry {
-                now_ms: now_ms(),
-                retention: self.tombstone_retention,
-            },
+            expiry,
             &Housekeeping {
-                replica: self.replica.clone(),
+                replica: self.replica_record(),
                 rebases: self.rebases.clone(),
             },
         );
@@ -3321,10 +3435,13 @@ impl SubstratePersistence {
         let replica = &mut self.replica;
         let locations = &mut self.locations;
         let rebases = &self.rebases;
+        // The carried record's own entry is `own_written` as it stands, which
+        // this handle already holds.
+        let mut own_kept = None;
         let (last_index, tail_digests) = self.segments.recover_active_with_sink(|entry| {
             let fixed = fix_walked(entry, rebases);
             let entry = fixed.as_ref();
-            observe_replica(replica, locations, node, entry);
+            observe_replica(replica, locations, &mut own_kept, node, entry);
             let h = &entry.record.header;
             marker_ids.record(
                 h.record_type,
@@ -3341,6 +3458,7 @@ impl SubstratePersistence {
             blob::record_blob_loc(blob_index, entry);
             substrate.apply_walker_entry(entry);
         })?;
+        substrate.forget_expired_tombstones(&expired);
         // The compacted segment carries a fresh index chain; chain the next
         // flush onto it.
         self.last_index = last_index;

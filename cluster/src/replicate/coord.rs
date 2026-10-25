@@ -146,7 +146,6 @@ impl Replicator {
             tombstones: TombstoneView {
                 held: tombstones.held,
                 waiting_age: tombstones.swept,
-                deleted: tombstones.deleted,
             },
             disk: DiskView {
                 free: disk.free,

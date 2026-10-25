@@ -2448,8 +2448,8 @@ wrote them.
   name.
 - **Tombstones** still dominate. A conversation the group deleted while a member was
   cut off stays deleted, and that member's writes to it die (§6.5). That holds however
-  long the member was away, because an expired tombstone stays in the deleted set
-  (§6.8).
+  long the member was away: within 30 days the tombstone is still held, and past them
+  the member drops what the cluster no longer holds before it offers anything (§7.8).
 - **npcd** keeps its characters living while cut off, in a local world (§9.4).
   - **World state is not a detached event at all.** In disconnected mode it is never
     persisted, and on rejoin it is scrapped for the authoritative state.
@@ -2489,54 +2489,31 @@ replicated record is an ordinary record.
   holding the fields it won, plus the least record that named the conversation's
   `conv_id`, which is its place in creation order.
 
-**When a tombstone record expires.** A tombstone record, 4 KiB with its padding, is
-shrunk by a compaction only when **both** of these hold:
+**When a tombstone expires.** A tombstone record, 4 KiB with its padding, is compacted
+away only when **both** of these hold:
 
-1. **A complete compaction has run since it.** The member records, beside each
-   tombstone, whether a full `compact()` has finished end to end after the tombstone
-   was applied (`persistence/mod.rs:2169-2344`). That compaction is the one that
-   removed every record of the timeline the member held.
-2. **The tombstone is older than *N* days**, by its `hlc` (§6.2) against this member's
-   clock. *N* is the member's `--tombstone-retention`, default 30.
+1. **A complete compaction has run since it.** That compaction is the one that removed
+   every record of the timeline the member held. The member records which tombstones a
+   full `compact()` has finished end to end after (*swept*), in its `Deleted` record
+   (`persistence/deleted.rs`, tag 31): one resident record of local housekeeping,
+   rewritten whole by every compaction, never replicated, with no identity. It is the
+   first of the two conditions, which a compaction can only know from the compaction
+   before it.
+2. **The tombstone is older than 30 days**, by its `hlc` (§6.2) against this member's
+   clock (`--tombstone-retention`, `persistence/tombstone_expiry.rs`).
 
-**Expiring shrinks a tombstone; it never forgets it.** The record leaves the log, and an
-entry takes its place in the member's **deleted set**, a new resident record, `Deleted`
-(tag 31), rewritten at each compaction:
+**An expired tombstone is forgotten.** Its record leaves the log and nothing takes its
+place, so a deletion is carried for 30 days and no longer. What makes that safe is the
+rule for a member away longer than that window allows (§7.8): no member applies a record
+it did not write itself after more than 20 days away without first dropping everything
+it did not author and syncing afresh, and past 30 days it also drops what it authored
+before it left and the cluster no longer holds. Every member that could still carry a
+record a deletion named has, by then, either received the tombstone or dropped the
+record.
 
-| Tombstone | Entry kept for good |
-|---|---|
-| a timeline's | `(timeline, origin, oseq)`: 24 bytes. A timeline id is never reused, so the timeline stays dead. |
-| a keyed value's, such as a world entity that ceased (§9.1) | `(key hash, stamp, origin, oseq)`. A later write with a greater stamp, such as a body re-entering the world, still wins, as it would against the tombstone. |
-
-A million deleted conversations cost 24 MB, against 4 GB as tombstone records.
-
-The `Deleted` record (`persistence/deleted.rs`) is local housekeeping: one record,
-rewritten whole by every compaction and carried by maintenance, never replicated, so it
-carries no identity. Beside the entries it lists the timeline tombstones a complete
-compaction has already run past (*swept*) — the first of the two expiry conditions,
-which a compaction can only know from the compaction before it. The keyed-value entry
-arrives with the keyed tombstones it shrinks, in chunk 7 (§15): chunk 1 has none.
-
-**The deleted set dominates exactly as the tombstone did** (§6.5):
-
-- a record for a timeline it names is dead at read, and a remote one is not written, at
-  any time, however late;
-- a keyed write it outranks is skipped too;
-- `register_timeline` registers a timeline it names dead.
-
-**A catch-up carries the set.** When a catch-up's headers list an `oseq` as gone (§7.2),
-and that `oseq` was a tombstone that expired, the header says so and carries its entry.
-The requester adds the entry to its own deleted set before anything else. So a member
-that was away for any length of time learns of every deletion it missed:
-
-- it drops the timelines the entries name from its own substrate, by the same apply
-  that a tombstone would run;
-- its unsent writes to them die wherever they arrive, because every member holds the
-  entry.
-
-**So time changes no result.** *N* only decides when a tombstone's bytes are reclaimed,
-so members need not agree on it, and nothing limits how long a member may be away. The
-only clock-dependent part is when each member's own log shrinks.
+Members need not agree on the retention for any result: a record a tombstone named is
+dead on every member that has it, and a member that rejoins after the tombstone expired
+follows §7.8.
 
 ### 6.9 Why arrival order does not matter
 
@@ -2556,9 +2533,10 @@ whatever order they arrived in, tombstones removing what they name. That holds b
    when §6.5 makes it dead in any order. A catch-up records an `oseq` as gone only when
    the answerer's coverage says so (§7.2).
 
-   Tombstone expiry removes a tombstone's record but keeps its entry in the deleted set
-   for good (§6.8). So an event arriving after expiry, however late, dies exactly as it
-   would have against the tombstone.
+   Tombstone expiry removes a tombstone after 30 days (§6.8). An event arriving later
+   could only come from a member away longer than that, and such a member drops what
+   it did not author and what the cluster no longer holds before it applies or offers
+   anything (§7.8).
 3. **Ids cannot collide.**
    - Records are keyed by `(origin, oseq)`.
    - Turn streams and VFS events are indexed by origin.
@@ -2709,9 +2687,7 @@ what it lacks. Every reply carries `reply_to`, so it reaches the requester alone
      (§6.5).
    - It records as gone, in its applied set, exactly the `oseq`s the header lists as
      gone: records superseded or tombstoned and compacted away on the answerer by rules
-     every member applies alike (§6.8). A gone `oseq` that was an expired tombstone
-     comes with its deleted-set entry, which the requester applies first, so a
-     deletion it missed still reaches it (§6.8). An `oseq` outside the answerer's
+     every member applies alike (§6.8). An `oseq` outside the answerer's
      complete ranges stays wanted. A later catch-up, often addressed to its origin
      (§7.1), finds it.
 5. **Fetch.** The requester sends `FETCH { request, reply_to: self, from_node, origin,
@@ -2937,6 +2913,57 @@ The conversation's claim then moves, so the client's retry is served by another 
 Entering and leaving are entries in the coordination log (§12.3). `/v1/status` on the
 member itself carries the same fault in its `cluster` block, so its own health check
 shows it too.
+
+### 7.8 A member away too long
+
+An expired tombstone is forgotten everywhere (§6.8). So a member away longer than the
+retention cannot learn of a deletion it missed, and its copy of the deleted records would
+stand for ever. No other member takes them back: each has their `oseq`s in its applied
+set, gone or held. But the member itself would go on serving them. So a member that
+comes back after too long drops what it can no longer trust, before it applies or offers
+anything, and syncs afresh.
+
+**When it was last joined.** `substrate/JOINED` holds one wall-clock reading in
+milliseconds (`persistence/joined.rs`). The replicator rewrites it once a minute while
+the member is joined and caught up on at least one socket (`replicate/tick.rs`,
+`Store::mark_joined`). A store with no file has never been judged: its first open writes
+one and drops nothing.
+
+**At open.** A writable open reads the file before it walks the log
+(`SubstratePersistence::open_adopting`):
+
+| Away | Dropped |
+|---|---|
+| up to 20 days | nothing |
+| over 20 days | every record another origin wrote |
+| over 30 days | those, and its own records whose `hlc` is before the reading |
+
+A dropped record is walked past as if absent. It never reaches the substrate, an index
+or the open's sink, but it still advances the clock and the `oseq` counter, so the node
+never mints an identity twice. The replica then forgets every other origin, gone
+`oseq`s included. The open compacts the store, so the dropped records leave the disk, and
+restarts the clock. What the member wrote after it was last joined is kept: no other
+member has it.
+
+**Taking back what the cluster still holds.**
+
+- **Other origins.** Nothing of theirs is applied any more, so the admission catch-up
+  (§7.5) lists and fetches everything the answerer holds. What a deletion took is not
+  listed, because it is gone everywhere.
+- **Its own records.** Each one dropped is a gap in its own written set, below that
+  set's top. The applied set it offers and asks from carries the gaps, so an answerer
+  that holds the records lists them, and they are fetched like any other. Applying one of
+  its own records is allowed only into such a gap (`remote/apply.rs`). An `oseq` it never
+  minted is still refused as `OwnOrigin`, and the refetched record is not tapped out
+  again. An own `oseq` listed as gone closes its gap.
+- **Across restarts.** The `Replica` record (§6.2) carries the node's own written set
+  beside the other origins' applied sets, once the store holds any `Replica` record. The
+  walk takes the own entry from the **latest** record alone, not as a union, so a closed
+  gap stays closed. Below the entry's top its gaps stand; above it, every own record
+  written since is held.
+
+`own_through` is the top of the own written set: everything up to it is written, and below
+it a gap is a record other members hold for it.
 
 ---
 

@@ -18,8 +18,6 @@ pub struct TombstoneCounts {
     /// Of those, the ones a complete compaction has run past: waiting only for
     /// their age.
     pub swept: usize,
-    /// Expired tombstones kept as deleted-set entries.
-    pub deleted: usize,
 }
 
 impl Conversation {
@@ -59,22 +57,14 @@ impl Conversation {
         counts
     }
 
-    /// The timeline tombstones held and the deleted set's entries.
+    /// The timeline tombstones held, and how many of them a complete
+    /// compaction has run past.
     pub fn tombstone_counts(&self) -> TombstoneCounts {
         let view = self.read();
         let held = view.tombstoned_timelines();
-        let deleted: Vec<u64> = view.deleted_entries().map(|e| e.timeline).collect();
-        let live: Vec<_> = held
-            .iter()
-            .filter(|t| !deleted.contains(&t.raw()))
-            .collect();
         TombstoneCounts {
-            held: live.len(),
-            swept: live
-                .iter()
-                .filter(|t| view.is_tombstone_swept(***t))
-                .count(),
-            deleted: deleted.len(),
+            held: held.len(),
+            swept: held.iter().filter(|t| view.is_tombstone_swept(**t)).count(),
         }
     }
 

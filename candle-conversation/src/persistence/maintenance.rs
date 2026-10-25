@@ -736,12 +736,9 @@ pub(super) fn gather_resident_set(
             .encode(),
         ));
     }
-    // A tombstone that expired is carried as its entry in the deleted set, not
-    // as itself (§6.8).
+    // A tombstone a compaction expired is no longer held dead, so it is not
+    // carried (§6.8).
     for t in substrate.tombstoned_timelines() {
-        if substrate.deleted_entry(*t).is_some() {
-            continue;
-        }
         out.push(marker(
             RecordType::Tombstone,
             0,
@@ -1766,17 +1763,17 @@ impl SubstratePersistence {
 
     /// The whole resident set an op re-emits: the substrate's
     /// ([`gather_resident_set`]) and this handle's own — the `Replica` record,
-    /// when the member has applied anything of another origin or deferred
-    /// anything, and the `Rebase` record, when it has rejoined after writing
-    /// cut off.
+    /// when the member has written or applied anything or deferred anything,
+    /// and the `Rebase` record, when it has rejoined after writing cut off.
     fn resident_set(&self, substrate: &Substrate) -> Vec<Resident> {
         let mut out = gather_resident_set(substrate, &self.marker_ids, self.node());
-        if !self.replica.is_empty() {
+        let replica = self.replica_record();
+        if !replica.is_empty() {
             out.push(Resident {
                 rt: RecordType::Replica,
                 stream_id: 0,
                 chunk_index: 0,
-                payload: self.replica.encode().into(),
+                payload: replica.encode().into(),
                 id: RecordIdentity::NONE,
             });
         }

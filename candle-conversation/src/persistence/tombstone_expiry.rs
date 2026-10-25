@@ -1,16 +1,19 @@
-//! When a timeline tombstone may shrink to its deleted-set entry
-//! (`docs/replicated_substrate.md` §6.8).
+//! When a tombstone expires (`docs/replicated_substrate.md` §6.8).
 //!
 //! Two conditions, both required: a complete compaction has run since the
-//! tombstone (the deleted set records which, as *swept*), and the tombstone is
-//! older than the member's retention by its `hlc`, whose high bits read as
-//! milliseconds. Expiry only decides when a tombstone's bytes are reclaimed —
-//! the timeline stays dead either way — so members need not agree on the
-//! retention, and nothing limits how long one may be away.
+//! tombstone (the `Deleted` record names which, as *swept*), and the tombstone
+//! is older than the member's retention by its `hlc`, whose high bits read as
+//! milliseconds. An expired tombstone is dropped and leaves nothing behind; a
+//! member away longer than that drops what it did not author before it syncs
+//! again (§7.8).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
-use super::identity::COUNTER_BITS;
+use super::identity::{MarkerIds, COUNTER_BITS};
+use super::record::{RecordType, TombstonePayload};
+use crate::projection::TimelineId;
+use crate::substrate::Substrate;
 
 /// How long a timeline tombstone is kept by default before it may shrink:
 /// `--tombstone-retention`'s default.
@@ -32,6 +35,47 @@ impl TombstoneExpiry {
         let written_ms = hlc >> COUNTER_BITS;
         self.now_ms.saturating_sub(written_ms) > self.retention.as_millis() as u64
     }
+
+    /// The tombstones `substrate` holds that expire under this rule: every
+    /// swept, old timeline tombstone, and every swept, old keyed tombstone by
+    /// key hash. What a compaction drops, and what the substrate then forgets.
+    pub fn expired(&self, substrate: &Substrate, marker_ids: &MarkerIds) -> Expired {
+        let timelines = substrate
+            .tombstoned_timelines()
+            .iter()
+            .copied()
+            .filter(|&tl| {
+                let payload = TombstonePayload {
+                    timeline_id: tl.raw(),
+                    turn_index: None,
+                    turn_writer: 0,
+                    reason: None,
+                }
+                .encode();
+                let id = marker_ids.identity_for(RecordType::Tombstone, 0, &payload);
+                substrate.is_tombstone_swept(tl) && self.is_old(id.hlc)
+            })
+            .collect();
+        let keys = substrate
+            .held_custom_objects()
+            .into_iter()
+            .filter(|(obj, id)| {
+                obj.ceased
+                    && substrate.is_key_tombstone_swept(obj.stream_id())
+                    && self.is_old(id.hlc)
+            })
+            .map(|(obj, _)| obj.stream_id())
+            .collect();
+        Expired { timelines, keys }
+    }
+}
+
+/// The tombstones one compaction expires — see [`TombstoneExpiry::expired`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Expired {
+    pub timelines: HashSet<TimelineId>,
+    /// Keyed tombstones, by key hash.
+    pub keys: HashSet<u64>,
 }
 
 #[cfg(test)]

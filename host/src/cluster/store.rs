@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use applied_set::AppliedSet;
-use candle_conversation::persistence::deleted::{DeletedEntry, DeletedKey, DeletedTimeline};
 use candle_conversation::persistence::identity::VersionStamp;
 use candle_conversation::persistence::record::{decode_header, RecordType};
 use candle_conversation::persistence::remote::RemoteOutcome;
@@ -19,7 +18,7 @@ use candle_conversation::projection::replication::CLUSTER_PREFIX;
 use candle_conversation::projection::Conversation;
 use cluster::consensus::votes::{FileJournal, VoteStore, DEFAULT_SIZE};
 use cluster::consensus::{Change, MaxMembers};
-use cluster::frame::{Gone, RecordHeader};
+use cluster::frame::RecordHeader;
 use cluster::replicate::{Applied, Disk, Listing, Replication, Store, Tap, Tombstones};
 use serde_json::{json, Value};
 
@@ -105,48 +104,19 @@ impl ConversationStore {
     }
 }
 
-/// A deleted-set entry as a `HEADERS` gone entry carries it: a kind byte —
-/// `0` a timeline's, `1` a keyed value's — then its words, little-endian:
-/// `timeline`, `origin`, `oseq`; or `key`, `gen`, `epoch`, `hlc`, `origin`,
-/// `oseq`.
-pub fn encode_entry(e: &DeletedEntry) -> Vec<u8> {
-    let (kind, words): (u8, Vec<u64>) = match e {
-        DeletedEntry::Timeline(t) => (0, vec![t.timeline, t.origin, t.oseq]),
-        DeletedEntry::Key(k) => (1, vec![k.key, k.gen, k.epoch, k.hlc, k.origin, k.oseq]),
-    };
-    let mut out = vec![kind];
-    out.extend(words.iter().flat_map(|w| w.to_le_bytes()));
-    out
-}
-
-pub fn decode_entry(b: &[u8]) -> Option<DeletedEntry> {
-    let (&kind, rest) = b.split_first()?;
-    let word = |i: usize| u64::from_le_bytes(rest[i * 8..i * 8 + 8].try_into().unwrap());
-    match (kind, rest.len()) {
-        (0, 24) => Some(DeletedEntry::Timeline(DeletedTimeline {
-            timeline: word(0),
-            origin: word(1),
-            oseq: word(2),
-        })),
-        (1, 48) => Some(DeletedEntry::Key(DeletedKey {
-            key: word(0),
-            gen: word(1),
-            epoch: word(2),
-            hlc: word(3),
-            origin: word(4),
-            oseq: word(5),
-        })),
-        _ => None,
-    }
-}
-
 impl Store for ConversationStore {
     fn node(&self) -> u64 {
         self.conversation.node()
     }
 
     fn own_through(&self) -> u64 {
-        self.conversation.applied_set().through(self.node())
+        self.conversation.own_through()
+    }
+
+    fn mark_joined(&self) {
+        if let Err(e) = self.conversation.mark_joined() {
+            tracing::error!("the moment this member was joined was not recorded: {e}");
+        }
     }
 
     fn set_tap(&self, tap: Tap) {
@@ -247,28 +217,12 @@ impl Store for ConversationStore {
                     digest: r.digest,
                 })
                 .collect(),
-            gone: held
-                .gone
-                .into_iter()
-                .map(|(oseq, e)| Gone {
-                    oseq,
-                    deleted_entry: e.as_ref().map(encode_entry),
-                })
-                .collect(),
+            gone: held.gone,
         }
     }
 
-    fn gone(&self, origin: u64, gone: &[Gone]) {
-        let gone: Vec<(u64, Option<DeletedEntry>)> = gone
-            .iter()
-            .map(|g| (g.oseq, g.deleted_entry.as_deref().and_then(decode_entry)))
-            .collect();
-        if let Err(e) = self.conversation.record_gone(origin, &gone) {
-            tracing::error!(
-                origin,
-                "what a catch-up learned is gone was not recorded: {e}"
-            );
-        }
+    fn gone(&self, origin: u64, gone: &[u64]) {
+        self.conversation.record_gone(origin, gone);
     }
 
     fn travels(&self, record_type: u8) -> bool {
@@ -406,47 +360,6 @@ impl Store for ConversationStore {
         Tombstones {
             held: t.held,
             swept: t.swept,
-            deleted: t.deleted,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_timelines_entry_is_a_kind_byte_and_24_bytes() {
-        let e = DeletedEntry::Timeline(DeletedTimeline {
-            timeline: 0x0102,
-            origin: 0xA,
-            oseq: 7,
-        });
-        let mut want = vec![0, 0x02, 0x01, 0, 0, 0, 0, 0, 0];
-        want.extend([0x0A, 0, 0, 0, 0, 0, 0, 0]);
-        want.extend([7, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(encode_entry(&e), want);
-        assert_eq!(decode_entry(&want), Some(e));
-        assert_eq!(decode_entry(&want[..24]), None);
-    }
-
-    #[test]
-    fn a_keyed_entry_is_a_kind_byte_and_48_bytes() {
-        let e = DeletedEntry::Key(DeletedKey {
-            key: 0x55,
-            gen: 1,
-            epoch: 2,
-            hlc: 3,
-            origin: 0xB,
-            oseq: 9,
-        });
-        let mut want = vec![1];
-        for w in [0x55u8, 1, 2, 3, 0x0B, 9] {
-            want.extend([w, 0, 0, 0, 0, 0, 0, 0]);
-        }
-        assert_eq!(encode_entry(&e), want);
-        assert_eq!(decode_entry(&want), Some(e));
-        assert_eq!(decode_entry(&[2, 0]), None, "an unknown kind");
-        assert_eq!(decode_entry(&[]), None);
     }
 }

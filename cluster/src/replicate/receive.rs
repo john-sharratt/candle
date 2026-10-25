@@ -14,7 +14,7 @@ use super::catchup::Purpose;
 use super::replicator::{Arrival, Phase, Replicator};
 use super::store::Applied;
 use crate::fragment::Whole;
-use crate::frame::{Done, Fetch, Frame, Gone, Have, Headers};
+use crate::frame::{Done, Fetch, Frame, Have, Headers};
 
 /// The most records, and bytes, applied in one batch.
 const BATCH_RECORDS: usize = 512;
@@ -154,10 +154,7 @@ impl Replicator {
             .into_iter()
             .partition(|r| self.store.travels(r.record_type));
         headers.records = travel;
-        headers.gone.extend(stay.into_iter().map(|r| Gone {
-            oseq: r.oseq,
-            deleted_entry: None,
-        }));
+        headers.gone.extend(stay.into_iter().map(|r| r.oseq));
         let store = self.store.clone();
         let Ok(applied) = tokio::task::spawn_blocking(move || store.applied()).await else {
             return;

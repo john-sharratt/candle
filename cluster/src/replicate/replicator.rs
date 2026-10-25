@@ -232,6 +232,8 @@ pub(super) struct State {
     pub governor: Governor,
     /// When a reply flagged as the gateway's tie-break vote last arrived.
     pub voter_seen: Option<Instant>,
+    /// When the store was last marked joined (§7.8).
+    pub joined_marked: Option<Instant>,
     pub stats: Stats,
 }
 
@@ -492,6 +494,7 @@ impl Replicator {
                 coord_sent: None,
                 governor: Governor::default(),
                 voter_seen: None,
+                joined_marked: None,
                 stats: Stats::default(),
             }),
             send_wake: Notify::new(),

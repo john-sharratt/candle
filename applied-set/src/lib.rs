@@ -38,6 +38,17 @@ impl OriginApplied {
         self.above.iter().map(|(s, e)| (*s, *e))
     }
 
+    /// Every covered range, in order, as inclusive `(start, end)`: `1..=through`
+    /// when `through` is past zero, then the ranges above it.
+    pub fn ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::with_capacity(self.above.len() + 1);
+        if self.through > 0 {
+            ranges.push((1, self.through));
+        }
+        ranges.extend(self.ranges_above());
+        ranges
+    }
+
     /// The uncovered ranges below [`Self::top`], in order, as inclusive
     /// `(start, end)`.
     pub fn gaps(&self) -> Vec<(u64, u64)> {
@@ -219,6 +230,11 @@ impl AppliedSet {
         self.origins.insert(origin, applied);
     }
 
+    /// Take `origin`'s coverage out of the set.
+    pub fn remove(&mut self, origin: u64) -> Option<OriginApplied> {
+        self.origins.remove(&origin)
+    }
+
     /// The origins of which this set holds an `oseq` `other` does not, in
     /// origin order: what a member holding `other` catches up on from the
     /// member holding this one (§7.5).
@@ -276,6 +292,28 @@ mod tests {
         assert!(o.insert_range(1, 9));
         assert_eq!(parts(&o), (25, vec![]));
         assert!(!o.insert_range(3, 7));
+    }
+
+    /// Every covered range, `1..=through` first; none when nothing is.
+    #[test]
+    fn ranges_list_through_then_the_ranges_above() {
+        assert_eq!(OriginApplied::default().ranges(), vec![]);
+        let o = OriginApplied::from_parts(3, [(6, 7), (9, 9)]);
+        assert_eq!(o.ranges(), vec![(1, 3), (6, 7), (9, 9)]);
+        let above_only = OriginApplied::from_parts(0, [(4, 5)]);
+        assert_eq!(above_only.ranges(), vec![(4, 5)]);
+    }
+
+    /// A removed origin's coverage comes back out, and the set no longer
+    /// holds it.
+    #[test]
+    fn a_removed_origin_is_returned_and_gone() {
+        let mut a = AppliedSet::default();
+        a.insert_range(7, 1, 4);
+        a.insert(8, 1);
+        assert_eq!(a.remove(7), Some(OriginApplied::from_parts(4, [])));
+        assert_eq!(a.remove(7), None);
+        assert!(!a.contains(7, 1) && a.contains(8, 1));
     }
 
     /// Unstamped records are never covered; origins are independent.

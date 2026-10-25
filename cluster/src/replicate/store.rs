@@ -5,7 +5,7 @@
 
 use applied_set::AppliedSet;
 
-use crate::frame::{Gone, RecordHeader};
+use crate::frame::RecordHeader;
 
 /// The provisional generation of a record written cut off (§6.7).
 pub const GEN_DETACHED: u64 = u64::MAX;
@@ -42,17 +42,14 @@ pub struct Tombstones {
     pub held: usize,
     /// Of those, the ones a complete compaction has run past.
     pub swept: usize,
-    /// Expired tombstones kept as deleted-set entries.
-    pub deleted: usize,
 }
 
 /// What a store holds of one origin's range, for a `HEADERS`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Listing {
     pub records: Vec<RecordHeader>,
-    /// The `oseq`s in the range it knows no longer exist, each one that was an
-    /// expired tombstone with its deleted-set entry.
-    pub gone: Vec<Gone>,
+    /// The `oseq`s in the range it knows no longer exist.
+    pub gone: Vec<u64>,
 }
 
 pub trait Store: Send + Sync + 'static {
@@ -60,7 +57,8 @@ pub trait Store: Send + Sync + 'static {
     fn node(&self) -> u64;
 
     /// Every own `oseq` up to this one is written and may be sent: everything
-    /// but what it wrote cut off and no rejoin has fixed yet.
+    /// but what it wrote cut off and no rejoin has fixed yet. Below it, an
+    /// `oseq` a purge dropped is held by other members, not this one (§7.8).
     fn own_through(&self) -> u64;
 
     /// Call `tap` with the `oseq` of every record this member writes from now
@@ -90,9 +88,8 @@ pub trait Store: Send + Sync + 'static {
     /// completely, and the `oseq`s in it that are gone.
     fn list(&self, origin: u64, from: u64, to: u64) -> Listing;
 
-    /// `oseq`s of `origin` a catch-up learned are gone; an expired
-    /// tombstone's deleted-set entry is applied before anything else.
-    fn gone(&self, origin: u64, gone: &[Gone]);
+    /// `oseq`s of `origin` a catch-up learned are gone.
+    fn gone(&self, origin: u64, gone: &[u64]);
 
     /// Whether a record of type `record_type` (a listed header's tag) is one
     /// this store takes from another member. One it would refuse on arrival
@@ -166,4 +163,9 @@ pub trait Store: Send + Sync + 'static {
 
     /// Its timeline tombstones.
     fn tombstones(&self) -> Tombstones;
+
+    /// The member is joined and caught up now. A member away too long drops
+    /// what it can no longer trust when it next opens, judged from the last
+    /// time this was recorded (§7.8).
+    fn mark_joined(&self);
 }

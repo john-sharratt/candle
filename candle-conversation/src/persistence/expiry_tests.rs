@@ -1,16 +1,14 @@
 //! **Tombstone expiry** (`docs/replicated_substrate.md` §6.8, §14.1).
 //!
-//! A timeline tombstone is kept by every compaction until a complete
-//! compaction has finished after it **and** it is older than the retention;
-//! then it shrinks to its entry in the `Deleted` record, and the timeline stays
-//! dead for good. A keyed value's tombstone does the same, its entry keeping
-//! the stamp a later write must exceed.
+//! A tombstone is kept by every compaction until a complete compaction has
+//! finished after it **and** it is older than the retention; then it is
+//! dropped and leaves nothing behind (§7.8 covers a member away longer).
 
 use std::time::Duration;
 
 use super::blob::BlobIndex;
 use super::compaction::{collect_live_records, CompactItem, Housekeeping};
-use super::deleted::{DeletedKey, DeletedPayload, DeletedTimeline};
+use super::deleted::DeletedPayload;
 use super::identity::{MarkerIds, RecordIdentity, COUNTER_BITS};
 use super::log_file::{MemLog, SUPERBLOCK_SIZE};
 use super::maintenance::gather_resident_set;
@@ -23,7 +21,7 @@ use super::streams::{StreamDecl, TurnDecl};
 use super::tombstone_expiry::TombstoneExpiry;
 use super::vfs::VfsIndex;
 use super::SubstratePersistence;
-use crate::projection::{GroupId, LayerId, TimelineId};
+use crate::projection::TimelineId;
 use crate::substrate::Substrate;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -178,13 +176,12 @@ fn initial() -> Vec<(RecordType, u64, Vec<u8>, RecordIdentity)> {
     ]
 }
 
-/// **Neither condition alone shrinks a tombstone, and both do.** The first
+/// **Neither condition alone expires a tombstone, and both do.** The first
 /// compaction finds it old but not yet swept, and keeps it, recording that it
 /// has now run past it; a later one finds it swept but young, and keeps it;
-/// one that finds it both shrinks it to its entry — the identity of the
-/// tombstone it replaced — and keeps the timeline dead.
+/// one that finds it both drops it, and leaves nothing behind.
 #[test]
-fn a_tombstone_shrinks_only_once_swept_and_old() {
+fn a_tombstone_expires_only_once_swept_and_old() {
     let store = open(&initial());
     let first = compact(&store, 100 * DAY_MS);
     assert_eq!(
@@ -226,85 +223,17 @@ fn a_tombstone_shrinks_only_once_swept_and_old() {
 
     let expired = compact(&swept, 100 * DAY_MS);
     assert!(of_type(&expired, RecordType::Tombstone).is_empty());
-    let entry = DeletedPayload {
-        timelines: vec![DeletedTimeline {
-            timeline: DEAD,
-            origin: A,
-            oseq: 7,
-        }],
-        ..DeletedPayload::default()
-    }
-    .encode();
-    assert_eq!(of_type(&expired, RecordType::Deleted), vec![entry.clone()]);
-
-    // The entry survives every later compaction byte for byte.
+    assert!(
+        of_type(&expired, RecordType::Deleted).is_empty(),
+        "nothing is left in its place"
+    );
     let after = open(&expired);
-    let again = compact(&after, 400 * DAY_MS);
-    assert_eq!(of_type(&again, RecordType::Deleted), vec![entry]);
-    assert!(of_type(&again, RecordType::Tombstone).is_empty());
-}
-
-/// **A deleted timeline stays dead, however late its records arrive.** A year
-/// after expiry, a record for it — in every order with the `Deleted` record —
-/// leaves the observable state as it was, registering it leaves it dead, and
-/// maintenance carries the entry rather than a tombstone.
-#[test]
-fn a_deleted_timeline_stays_dead_whatever_arrives() {
-    let swept = open(&compact(&open(&initial()), 100 * DAY_MS));
-    let expired = compact(&swept, 100 * DAY_MS);
-    let late_decl = turn(DEAD);
-    let late: Vec<(RecordType, u64, Vec<u8>, RecordIdentity)> = vec![
-        (
-            RecordType::StreamDecl,
-            late_decl.stream_id().0,
-            late_decl.encode(),
-            at(40, 465 * DAY_MS),
-        ),
-        (
-            RecordType::Label,
-            0,
-            encode_label_payload(DEAD, "c-dead", "Back", &Default::default()),
-            at(41, 465 * DAY_MS),
-        ),
-    ];
-    let reference = open(&expired).substrate.replicated_state();
-    let after: Vec<_> = expired
+    assert!(!after
+        .substrate
+        .is_tombstoned(TimelineId::from_raw(DEAD).unwrap()));
+    assert!(compact(&after, 400 * DAY_MS)
         .iter()
-        .cloned()
-        .chain(late.iter().cloned())
-        .collect();
-    let before: Vec<_> = late
-        .iter()
-        .cloned()
-        .chain(expired.iter().cloned())
-        .collect();
-    for (order, records) in [("after", after), ("before", before)] {
-        let mut store = open(&records);
-        let dead = TimelineId::from_raw(DEAD).unwrap();
-        assert!(store.substrate.is_tombstoned(dead), "{order}");
-        assert_eq!(
-            store.substrate.replicated_state(),
-            reference,
-            "a late record {order} the entry changed the state"
-        );
-        let group = GroupId::from_raw(1).unwrap();
-        store
-            .substrate
-            .register_timeline(dead, LayerId::from_raw(1).unwrap(), group);
-        assert!(store.substrate.is_tombstoned(dead));
-        assert!(store
-            .substrate
-            .active_timelines_for_group(group)
-            .all(|t| t != dead));
-        let resident = gather_resident_set(&store.substrate, &store.markers, 0);
-        assert!(resident.iter().any(|r| r.rt == RecordType::Deleted));
-        assert!(
-            !resident
-                .iter()
-                .any(|r| r.rt == RecordType::Tombstone && *r.payload == *tombstone(DEAD)),
-            "an expired tombstone is not carried as itself"
-        );
-    }
+        .all(|(t, ..)| *t != RecordType::Tombstone && *t != RecordType::Deleted));
 }
 
 const ENDED: &str = "world/w1/mission/m1";
@@ -335,10 +264,9 @@ fn keyed() -> Vec<(RecordType, u64, Vec<u8>, RecordIdentity)> {
 
 /// **A keyed tombstone hides its key and expires like a timeline's.** It is
 /// carried until a complete compaction has run past it and it is old, then
-/// shrinks to an entry keeping its stamp; the live entity beside it is
-/// carried throughout.
+/// dropped; the live entity beside it is carried throughout.
 #[test]
-fn a_keyed_tombstone_shrinks_once_swept_and_old() {
+fn a_keyed_tombstone_expires_once_swept_and_old() {
     let hash = CustomObjectPayload::stream_id_for(ENDED);
     let store = open(&keyed());
     assert!(
@@ -366,57 +294,16 @@ fn a_keyed_tombstone_shrinks_once_swept_and_old() {
     let objects = of_type(&expired, RecordType::CustomObject);
     assert_eq!(objects.len(), 1, "only the live entity");
     assert_eq!(CustomObjectPayload::decode(&objects[0]).unwrap().key, KEPT);
-    let entry = DeletedKey::of(hash, at(3, 10 * DAY_MS));
-    assert_eq!(
-        of_type(&expired, RecordType::Deleted),
-        vec![DeletedPayload {
-            keys: vec![entry],
-            ..DeletedPayload::default()
-        }
-        .encode()]
-    );
+    assert!(of_type(&expired, RecordType::Deleted).is_empty());
     let after = open(&expired);
-    assert_eq!(after.substrate.deleted_key(hash), Some(entry));
     assert!(after.substrate.custom_object(ENDED).is_none());
-}
-
-/// **The entry outranks writes below its tombstone, and not above.** A write
-/// replicated late from before the tombstone stays dead in either order with
-/// the entry; one stamped after it — the entity coming back — stands.
-#[test]
-fn a_keyed_entry_holds_against_earlier_writes_only() {
-    let expired = compact(&open(&compact(&open(&keyed()), 100 * DAY_MS)), 100 * DAY_MS);
-    let late = object(
-        CustomObjectPayload::new(ENDED, serde_json::json!({"step": 1})),
-        at(4, 8 * DAY_MS),
-    );
-    let back = object(
-        CustomObjectPayload::new(ENDED, serde_json::json!({"step": 9})),
-        at(5, 200 * DAY_MS),
-    );
-    for records in [
-        expired
-            .iter()
-            .cloned()
-            .chain([late.clone()])
-            .collect::<Vec<_>>(),
-        [late.clone()]
-            .into_iter()
-            .chain(expired.iter().cloned())
-            .collect(),
-    ] {
-        assert!(open(&records).substrate.custom_object(ENDED).is_none());
-    }
-    let returned = open(&expired.iter().cloned().chain([back]).collect::<Vec<_>>());
-    assert_eq!(
-        returned.substrate.custom_object(ENDED).unwrap().blob,
-        serde_json::json!({"step": 9})
-    );
+    assert!(!after.substrate.is_key_tombstone_swept(hash));
 }
 
 /// **The retention reaches compaction.** Through the real store: a tombstone
 /// survives the first compaction after it whatever the retention, and with
-/// no retention the second one shrinks it.
+/// no retention the second one drops it — from the log and from the
+/// substrate, so maintenance does not carry it again.
 #[test]
 fn compaction_applies_the_members_retention() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -433,19 +320,18 @@ fn compaction_applies_the_members_retention() {
     sp.set_tombstone_retention(Duration::ZERO);
     sp.compact(&mut substrate, None).unwrap();
     assert!(substrate.is_tombstone_swept(dead));
-    assert!(
-        substrate.deleted_entry(dead).is_none(),
-        "not swept before it"
-    );
+    assert!(substrate.is_tombstoned(dead), "not swept before it");
     // The clock reads in milliseconds: step past the tombstone's.
     std::thread::sleep(Duration::from_millis(2));
     sp.compact(&mut substrate, None).unwrap();
-    let entry = substrate.deleted_entry(dead).expect("shrunk to its entry");
-    assert_eq!(entry.origin, sp.node());
-    assert!(substrate.is_tombstoned(dead));
+    assert!(!substrate.is_tombstoned(dead), "forgotten in RAM");
+    let resident = gather_resident_set(&substrate, &MarkerIds::new(), 0);
+    assert!(
+        !resident.iter().any(|r| r.rt == RecordType::Tombstone),
+        "maintenance does not carry it again"
+    );
     drop(sp);
     let mut reopened = Substrate::new();
     let _sp = SubstratePersistence::open_in_with_substrate(dir.path(), &mut reopened).unwrap();
-    assert!(reopened.is_tombstoned(dead));
-    assert_eq!(reopened.deleted_entry(dead), Some(entry));
+    assert!(!reopened.is_tombstoned(dead));
 }

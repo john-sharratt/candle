@@ -45,21 +45,13 @@ fn a_tombstone_is_swept_by_a_complete_compaction() {
     conv.commit_persistence_if_pending().unwrap();
     assert_eq!(
         conv.tombstone_counts(),
-        TombstoneCounts {
-            held: 1,
-            swept: 0,
-            deleted: 0
-        }
+        TombstoneCounts { held: 1, swept: 0 }
     );
     assert!(conv.live_bytes() > 0, "the tombstone itself is live");
     conv.compact_substrate(None).unwrap();
     assert_eq!(
         conv.tombstone_counts(),
-        TombstoneCounts {
-            held: 1,
-            swept: 1,
-            deleted: 0
-        }
+        TombstoneCounts { held: 1, swept: 1 }
     );
 }
 

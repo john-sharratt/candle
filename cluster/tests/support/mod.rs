@@ -16,7 +16,6 @@ use tokio::time::sleep;
 use cluster::consensus::votes::MemoryVotes;
 use cluster::dial::Connect;
 use cluster::dispatch::{Dispatch, Route, RouteTable};
-use cluster::frame::Gone;
 use cluster::frame::{BuildId, Capacity, MemberState, ModelId};
 use cluster::gateway::Hub;
 use cluster::handshake::GroupKey;
@@ -347,7 +346,7 @@ impl Store for Recording {
     fn list(&self, origin: u64, from: u64, to: u64) -> Listing {
         self.inner.list(origin, from, to)
     }
-    fn gone(&self, origin: u64, gone: &[Gone]) {
+    fn gone(&self, origin: u64, gone: &[u64]) {
         self.inner.gone(origin, gone)
     }
     fn travels(&self, record_type: u8) -> bool {
@@ -409,6 +408,9 @@ impl Store for Recording {
     }
     fn tombstones(&self) -> Tombstones {
         self.inner.tombstones()
+    }
+    fn mark_joined(&self) {
+        self.inner.mark_joined()
     }
 }
 

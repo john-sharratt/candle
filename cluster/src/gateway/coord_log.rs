@@ -152,10 +152,8 @@ pub fn changes(before: Option<&CoordState>, after: &CoordState) -> Vec<String> {
     if resent > 0 {
         lines.push(format!("{resent} events retransmitted"));
     }
-    let expired = after
-        .tombstones
-        .deleted
-        .saturating_sub(before.tombstones.deleted);
+    // A held tombstone only ever leaves by expiring (§6.8).
+    let expired = before.tombstones.held.saturating_sub(after.tombstones.held);
     if expired > 0 {
         lines.push(format!("{expired} tombstones expired"));
     }
@@ -272,10 +270,13 @@ mod tests {
         after.paxos.max_members = 2;
         after.paxos.quorum = 2;
         after.stats.resent = 12;
+        before.tombstones = TombstoneView {
+            held: 6,
+            waiting_age: 6,
+        };
         after.tombstones = TombstoneView {
             held: 1,
             waiting_age: 0,
-            deleted: 5,
         };
         assert_eq!(
             changes(Some(&before), &after),

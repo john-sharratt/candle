@@ -324,7 +324,7 @@ impl Commands {
                     out.insert(
                         t.app.into(),
                         json!({
-                            "expired": after.deleted.saturating_sub(before.deleted),
+                            "expired": before.held.saturating_sub(after.held),
                             "held": after.held,
                         }),
                     );

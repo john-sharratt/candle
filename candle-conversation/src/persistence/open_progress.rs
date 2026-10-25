@@ -1,7 +1,9 @@
 //! What a substrate open says while it runs, for a loading screen.
 //!
 //! An open walks the store into RAM, and a store written before identities is
-//! then rewritten whole, once, and walked again (`adoption`). Each counts in
+//! then rewritten whole, once, and walked again (`adoption`); a store whose
+//! member was away too long is rewritten without what it dropped (`joined`).
+//! Each counts in
 //! its own unit ([`OpenStage::unit`]): a walk counts MiB of log read against
 //! the store's size on disk, the rewrite counts records written.
 
@@ -18,6 +20,9 @@ pub enum OpenStage {
     Stamping,
     /// Walking the rewritten store into RAM.
     Rereading,
+    /// Rewriting a store whose member was away too long, without what it can
+    /// no longer trust (`joined`). Counts records written of the live set.
+    Purging,
 }
 
 impl OpenStage {
@@ -27,6 +32,7 @@ impl OpenStage {
             OpenStage::Reading => "Reading the substrate",
             OpenStage::Stamping => "Stamping records with this node's identity (once)",
             OpenStage::Rereading => "Reading the rewritten substrate",
+            OpenStage::Purging => "Dropping records a long absence left stale",
         }
     }
 
@@ -34,7 +40,7 @@ impl OpenStage {
     pub fn unit(self) -> &'static str {
         match self {
             OpenStage::Reading | OpenStage::Rereading => "MiB",
-            OpenStage::Stamping => "records",
+            OpenStage::Stamping | OpenStage::Purging => "records",
         }
     }
 }
@@ -89,6 +95,7 @@ mod tests {
             OpenStage::Reading,
             OpenStage::Stamping,
             OpenStage::Rereading,
+            OpenStage::Purging,
         ] {
             assert!(!s.label().is_empty(), "{s:?}");
             assert!(!s.unit().is_empty(), "{s:?}");

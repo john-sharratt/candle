@@ -170,33 +170,10 @@ impl RecordHeader {
     }
 }
 
-/// An `oseq` the answerer knows no longer exists, with its deleted-set entry
-/// when it was an expired tombstone (§6.8).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Gone {
-    pub oseq: u64,
-    pub deleted_entry: Option<Vec<u8>>,
-}
-
-impl Gone {
-    pub fn write(&self, w: &mut Writer) {
-        w.u64(self.oseq)
-            .option(self.deleted_entry.as_ref(), |w, e| {
-                w.blob(e);
-            });
-    }
-
-    pub fn read(r: &mut Reader) -> Result<Self, WireError> {
-        Ok(Self {
-            oseq: r.u64()?,
-            deleted_entry: r.option(|r| r.blob_vec())?,
-        })
-    }
-}
-
 /// What the answerer holds of `origin`'s range `from..=to`, a range it covers
-/// completely (§7.2). `answerer` names it, the member a `FETCH` for these
-/// records goes to.
+/// completely (§7.2): the records it holds, and the `oseq`s it knows no longer
+/// exist (`gone`). `answerer` names it, the member a `FETCH` for these records
+/// goes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Headers {
     pub request: u64,
@@ -205,7 +182,7 @@ pub struct Headers {
     pub origin: u64,
     pub from: u64,
     pub to: u64,
-    pub gone: Vec<Gone>,
+    pub gone: Vec<u64>,
     pub records: Vec<RecordHeader>,
 }
 
@@ -217,7 +194,9 @@ impl Headers {
             .u64(self.origin)
             .u64(self.from)
             .u64(self.to)
-            .list(&self.gone, |w, g| g.write(w))
+            .list(&self.gone, |w, oseq| {
+                w.u64(*oseq);
+            })
             .list(&self.records, |w, h| h.write(w));
     }
 
@@ -229,13 +208,13 @@ impl Headers {
             origin: r.u64()?,
             from: r.u64()?,
             to: r.u64()?,
-            gone: r.list(Gone::read)?,
+            gone: r.list(|r| r.u64())?,
             records: r.list(RecordHeader::read)?,
         };
         let outside = |oseq: u64| oseq < h.from || oseq > h.to;
         if h.from == 0
             || h.from > h.to
-            || h.gone.iter().any(|g| outside(g.oseq))
+            || h.gone.iter().any(|&oseq| outside(oseq))
             || h.records.iter().any(|rec| outside(rec.oseq))
         {
             return Err(WireError::Invalid {

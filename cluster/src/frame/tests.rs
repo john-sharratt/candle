@@ -558,10 +558,7 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 origin: 5,
                 from: 4,
                 to: 6,
-                gone: vec![Gone {
-                    oseq: 5,
-                    deleted_entry: Some(vec![1]),
-                }],
+                gone: vec![5],
                 records: vec![header],
             }),
             B::header(64, 0, 0)
@@ -573,9 +570,6 @@ fn samples() -> Vec<(Frame, Vec<u8>)> {
                 .u64(6)
                 .u32(1)
                 .u64(5)
-                .u8(1)
-                .u32(1)
-                .u8(1)
                 .u32(1)
                 .u64(4)
                 .u8(12)

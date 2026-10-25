@@ -32,8 +32,7 @@ pub use peering::{AcmeCert, AcmeChallenge, CertLine, PeerHello};
 pub use pulse::Pulse;
 pub use streams::{Data, Open, Window, MAX_DATA};
 pub use substrate::{
-    Ack, Catchup, Done, Event, Fetch, Gone, Have, Headers, Lost, Receipt, RecordHeader,
-    MAX_FRAGMENT,
+    Ack, Catchup, Done, Event, Fetch, Have, Headers, Lost, Receipt, RecordHeader, MAX_FRAGMENT,
 };
 pub use types::{
     Artifact, Ballot, BuildId, ClaimInfo, Epoch, MemberInfo, MemberState, ModelId, RepoAd,

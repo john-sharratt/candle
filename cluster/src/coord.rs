@@ -282,8 +282,6 @@ pub struct TombstoneView {
     pub held: usize,
     /// Of those, the ones waiting only for their age.
     pub waiting_age: usize,
-    /// Expired tombstones kept as deleted-set entries.
-    pub deleted: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,7 +350,7 @@ mod tests {
             r#""paxos":{"max_members":3,"quorum":2,"keys":[]},"worlds":[],"npc_leases":[],"#,
             r#""claims":[],"applied":[],"#,
             r#""outbox":{"unsent":1,"in_flight":4},"catchups":[],"#,
-            r#""tombstones":{"held":0,"waiting_age":0,"deleted":0},"#,
+            r#""tombstones":{"held":0,"waiting_age":0},"#,
             r#""disk":{"free":0,"total":0,"floor":0},"#,
             r#""stats":{"applied":0,"refused":0,"reloads":0,"catchups":0,"answered":0,"#,
             r#""fetched_for_others":0,"resent":0},"commands":[]}"#

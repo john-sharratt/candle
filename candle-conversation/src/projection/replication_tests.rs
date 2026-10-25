@@ -9,7 +9,6 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use super::{Conversation, GroupId, LayerId};
-use crate::persistence::deleted::{DeletedEntry, DeletedTimeline};
 use crate::persistence::identity::GEN_DETACHED;
 use crate::persistence::record::{decode_header, RecordType};
 use crate::persistence::SubstratePersistence;
@@ -158,32 +157,13 @@ fn a_range_listed_and_read_applies_elsewhere() {
         .any(|(k, v, _)| k == "cluster/k2" && *v == json!(2)));
 }
 
-/// `oseq`s learned gone count as applied; one that was an expired tombstone
-/// brings its deleted-set entry, which kills its timeline here and outlives a
-/// restart.
+/// `oseq`s learned gone count as applied.
 #[test]
-fn what_a_catch_up_learns_is_gone_is_kept() {
+fn what_a_catch_up_learns_is_gone_is_applied() {
     let dir = TempDir::new().unwrap();
     let conv = open(&dir);
-    let timeline = conv.mint_timeline(LayerId::new(1), GroupId::new(1));
-    let entry = DeletedTimeline {
-        timeline: timeline.raw(),
-        origin: 0xA,
-        oseq: 7,
-    };
-    conv.record_gone(
-        0xA,
-        &[
-            (5, None),
-            (6, None),
-            (7, Some(DeletedEntry::Timeline(entry))),
-        ],
-    )
-    .unwrap();
-    assert!(conv.applied_set().contains(0xA, 6));
-    assert_eq!(conv.read().deleted_entry(timeline), Some(entry));
-    drop(conv);
-    let again = open(&dir);
-    assert!(again.applied_set().contains(0xA, 7));
-    assert_eq!(again.read().deleted_entry(timeline), Some(entry));
+    conv.record_gone(0xA, &[5, 6, 7]);
+    assert!(conv.applied_set().contains(0xA, 5));
+    assert!(conv.applied_set().contains(0xA, 7));
+    assert!(!conv.applied_set().contains(0xA, 8));
 }

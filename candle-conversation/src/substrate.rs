@@ -68,7 +68,7 @@ use crate::conversation::window_sealed_tokens;
 use crate::index_pages::{self, StoredPages};
 use crate::normalization::Phase;
 use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
-use crate::persistence::deleted::{DeletedKey, DeletedPayload, DeletedTimeline};
+use crate::persistence::deleted::DeletedPayload;
 use crate::persistence::identity::{RecordIdentity, VersionStamp};
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
@@ -79,6 +79,7 @@ use crate::persistence::record::{
     TurnCouplingPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
+use crate::persistence::tombstone_expiry::Expired;
 use crate::persistence::walker::WalkEntry;
 use crate::projection::scan_stats::GroupScan;
 use crate::projection::{
@@ -5058,17 +5059,9 @@ impl Substrate {
 
     /// Apply custom-object record `id` — on replay and on the runtime write
     /// path. Keyed by the stable hash of its `key`, and the greatest stamp per
-    /// key holds it. A key whose tombstone expired holds against every write
-    /// stamped below that tombstone (§6.8).
+    /// key holds it.
     pub fn apply_custom_object(&mut self, obj: CustomObjectPayload, id: RecordIdentity) {
         let key = obj.stream_id();
-        if self
-            .deleted
-            .key_entry(key)
-            .is_some_and(|e| id.stamp() <= e.stamp())
-        {
-            return;
-        }
         if take(self.custom_object_ids.entry(key).or_default(), id) {
             self.custom_objects.insert(key, obj);
             self.custom_objects_version += 1;
@@ -5120,19 +5113,9 @@ impl Substrate {
             .collect()
     }
 
-    /// The entry a keyed value's expired tombstone left, if it expired.
-    pub fn deleted_key(&self, key_hash: u64) -> Option<DeletedKey> {
-        self.deleted.key_entry(key_hash).copied()
-    }
-
     /// Whether a complete compaction has run past the tombstone on `key_hash`.
     pub fn is_key_tombstone_swept(&self, key_hash: u64) -> bool {
         self.deleted.is_key_swept(key_hash)
-    }
-
-    /// Every expired keyed tombstone's entry, in key order.
-    pub fn deleted_keys(&self) -> impl Iterator<Item = DeletedKey> + '_ {
-        self.deleted.key_entries()
     }
 
     /// Apply a decoded [`TombstonePayload`].  Works whether or not
@@ -5174,8 +5157,7 @@ impl Substrate {
         }
     }
 
-    /// Replay a timeline's death, from its tombstone or from its entry in a
-    /// `Deleted` record.
+    /// Replay a timeline's death from its tombstone.
     fn mark_timeline_dead(&mut self, timeline: TimelineId) {
         self.tombstoned_timelines.insert(timeline);
         self.gallery_epoch += 1;
@@ -5193,34 +5175,26 @@ impl Substrate {
         self.retire_snapshot_stream(timeline);
     }
 
-    /// Apply a `Deleted` record: each timeline it names is dead for good, as
-    /// its tombstone made it, and the tombstones it names as swept have had a
-    /// complete compaction run past them (§6.8).
-    pub fn apply_deleted(&mut self, payload: &DeletedPayload) {
-        self.deleted.apply(payload);
-        for entry in &payload.timelines {
-            if let Some(timeline) = TimelineId::from_raw(entry.timeline) {
-                self.mark_timeline_dead(timeline);
-            }
+    /// Forget the tombstones a compaction expired (§6.8): their timelines are
+    /// no longer held dead, and their ceased keyed values no longer held, so
+    /// nothing carries them again. Every record they named is already gone.
+    pub fn forget_expired_tombstones(&mut self, expired: &Expired) {
+        for tl in &expired.timelines {
+            self.tombstoned_timelines.remove(tl);
         }
-        // A key's entry outranks whatever this substrate held of it from at or
-        // below its tombstone, as the tombstone did.
-        for entry in &payload.keys {
-            let held_below = self
-                .custom_object_ids
-                .get(&entry.key)
-                .is_some_and(|id| id.stamp() <= entry.stamp());
-            if held_below {
-                self.custom_objects.remove(&entry.key);
-                self.custom_object_ids.remove(&entry.key);
+        for key in &expired.keys {
+            if self.custom_objects.get(key).is_some_and(|obj| obj.ceased) {
+                self.custom_objects.remove(key);
+                self.custom_object_ids.remove(key);
                 self.custom_objects_version += 1;
             }
         }
     }
 
-    /// The entry a timeline's expired tombstone left, if it expired.
-    pub fn deleted_entry(&self, timeline: TimelineId) -> Option<DeletedTimeline> {
-        self.deleted.entry(timeline.raw()).copied()
+    /// Apply a `Deleted` record: the tombstones it names as swept have had a
+    /// complete compaction run past them (§6.8).
+    pub fn apply_deleted(&mut self, payload: &DeletedPayload) {
+        self.deleted.apply(payload);
     }
 
     /// Whether a complete compaction has run past `timeline`'s tombstone.
@@ -5228,13 +5202,8 @@ impl Substrate {
         self.deleted.is_swept(timeline.raw())
     }
 
-    /// Every expired timeline tombstone's entry, in timeline order.
-    pub fn deleted_entries(&self) -> impl Iterator<Item = DeletedTimeline> + '_ {
-        self.deleted.entries()
-    }
-
-    /// The deleted set as its record holds it — what maintenance carries —
-    /// or `None` when it is empty.
+    /// The swept set as its record holds it — what maintenance carries — or
+    /// `None` when it is empty.
     pub fn deleted_payload(&self) -> Option<DeletedPayload> {
         self.deleted.payload()
     }

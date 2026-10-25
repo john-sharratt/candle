@@ -589,8 +589,8 @@ function renderDiagnostics(s, earlier) {
     lent.map(([w, l]) => [td(w.world, "m"), td(l.npc, "m"), td(l.holder || "freed by an admin", "m"), td(l.expires_ms ? when(l.expires_ms) : "—", "m"), td(l.next || "—", "m")]), "")
     + table(["Member", "World", "Cut off since", "Characters"],
     s.disconnected.map((d) => [td(d.host), td(d.world, "m"), td(ago(d.since_ms, s.now_ms), "m"), td(d.characters.join(", ") || "none", "w")]), ""), s.worlds.length || null);
-  section("tombstones", () => table(["App", "Member", "Held", "Waiting for age", "Expired"],
-    reported.map((m) => [td(appName(m.app)), td(m.host), td(m.coord.tombstones.held, "m"), td(m.coord.tombstones.waiting_age, "m"), td(m.coord.tombstones.deleted, "m")]),
+  section("tombstones", () => table(["App", "Member", "Held", "Waiting for age"],
+    reported.map((m) => [td(appName(m.app)), td(m.host), td(m.coord.tombstones.held, "m"), td(m.coord.tombstones.waiting_age, "m")]),
     "No member has reported."), null);
   section("claims", () => table(["App", "Key", "Holder", "Since"],
     s.claims.map((c) => [td(appName(c.app)), td(c.key, "m"), td(c.node, "m"), td(when(c.epoch_ms), "m")]), "No conversation is claimed."), s.claims.length || null);

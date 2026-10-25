@@ -67,6 +67,25 @@ pub enum QuietAdmission {
     Serve,
 }
 
+/// How often a joined member records that it is (§7.8). The absence that
+/// decides what an open drops is counted in days, so a minute is exact enough
+/// and costs one small file write a minute.
+pub const JOINED_MARK: Duration = Duration::from_secs(60);
+
+/// Whether the store is to be marked joined at `now`: joined, with a socket
+/// whose admission catch-up has finished, and not marked within
+/// [`JOINED_MARK`].
+pub fn joined_mark_due(
+    phase: Phase,
+    caught_up: bool,
+    marked: Option<Instant>,
+    now: Instant,
+) -> bool {
+    phase == Phase::Joined
+        && caught_up
+        && marked.is_none_or(|at| now.duration_since(at) >= JOINED_MARK)
+}
+
 impl Replicator {
     pub(super) async fn ticker(self: Arc<Self>) {
         let mut tick = interval(TICK);
@@ -88,6 +107,7 @@ impl Replicator {
         self.send_coord().await;
         self.cut_off_if_alone().await;
         self.refresh_group().await;
+        self.mark_joined().await;
         // In fault mode a member applies nothing, so it acknowledges nothing
         // and asks for nothing; leaving starts its catch-ups (§7.7).
         if self.faulted() {
@@ -215,6 +235,26 @@ impl Replicator {
         }
     }
 
+    /// Record that the member is joined and caught up, when due
+    /// ([`joined_mark_due`]).
+    async fn mark_joined(self: &Arc<Self>) {
+        let now = Instant::now();
+        {
+            let mut s = self.state();
+            let caught_up = s
+                .ready
+                .iter()
+                .zip(&s.sockets)
+                .any(|(ready, socket)| *ready && socket.is_some());
+            if !joined_mark_due(s.phase, caught_up, s.joined_marked, now) {
+                return;
+            }
+            s.joined_marked = Some(now);
+        }
+        let store = self.store.clone();
+        let _ = tokio::task::spawn_blocking(move || store.mark_joined()).await;
+    }
+
     /// With no socket admitted and the member's link cut off, what it writes
     /// from here on is detached (§6.7).
     async fn cut_off_if_alone(self: &Arc<Self>) {
@@ -242,7 +282,11 @@ impl Replicator {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{after_quiet_admission, is_quiet, QuietAdmission, ADMISSION_QUIET_LIMIT, QUIET};
+    use super::Phase;
+    use super::{
+        after_quiet_admission, is_quiet, joined_mark_due, QuietAdmission, ADMISSION_QUIET_LIMIT,
+        JOINED_MARK, QUIET,
+    };
 
     /// **A reply still arriving is not silence.** AlienWorld's gap catch-ups
     /// were dropped every 32 s while BlackWorld's ~3 KB/s kept arriving on the
@@ -277,5 +321,28 @@ mod tests {
         assert_eq!(after_quiet_admission(0), QuietAdmission::AskAgain);
         assert_eq!(after_quiet_admission(1), QuietAdmission::Serve);
         assert_eq!(after_quiet_admission(7), QuietAdmission::Serve);
+    }
+
+    /// Marked joined only while joined and caught up on some socket, and at
+    /// most once a [`JOINED_MARK`].
+    #[test]
+    fn a_joined_caught_up_member_is_marked_once_a_minute() {
+        let t0 = Instant::now();
+        let just = Duration::from_secs(1);
+        assert!(joined_mark_due(Phase::Joined, true, None, t0));
+        assert!(!joined_mark_due(Phase::Joined, false, None, t0));
+        assert!(!joined_mark_due(Phase::CutOff, true, None, t0));
+        assert!(!joined_mark_due(
+            Phase::Joined,
+            true,
+            Some(t0),
+            t0 + JOINED_MARK - just
+        ));
+        assert!(joined_mark_due(
+            Phase::Joined,
+            true,
+            Some(t0),
+            t0 + JOINED_MARK
+        ));
     }
 }

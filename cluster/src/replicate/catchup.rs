@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use applied_set::AppliedSet;
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{Fetch, Gone, Headers};
+use crate::frame::{Fetch, Headers};
 
 /// The most bytes of fetched records outstanding at once.
 ///
@@ -132,7 +132,7 @@ impl Requester {
         &mut self,
         h: Headers,
         held: impl Fn(u64, u64) -> bool,
-    ) -> (Vec<Gone>, Vec<(u64, u64)>) {
+    ) -> (Vec<u64>, Vec<(u64, u64)>) {
         self.progress.answerer = Some(h.answerer);
         let mut wanted = Vec::new();
         for r in &h.records {
@@ -447,10 +447,7 @@ mod tests {
 
         let mut gone = Requester::new(1, 0, Purpose::Admission, 7, AppliedSet::default());
         let mut h = listing(3, 9, 1, 4, &[]);
-        h.gone = vec![Gone {
-            oseq: 4,
-            deleted_entry: None,
-        }];
+        h.gone = vec![4];
         gone.headers(h, |_, _| false);
         gone.headers_done(counter());
         assert!(gone.asks_again(&moved()));
@@ -465,16 +462,7 @@ mod tests {
         let since = moved();
         let mut r = Requester::new(1, 0, Purpose::Admission, 7, since.clone());
         let mut h = listing(3, 9, 2, 4, &[]);
-        h.gone = vec![
-            Gone {
-                oseq: 3,
-                deleted_entry: None,
-            },
-            Gone {
-                oseq: 4,
-                deleted_entry: None,
-            },
-        ];
+        h.gone = vec![3, 4];
         r.headers(h, |_, _| false);
         r.headers_done(counter());
         assert!(r.finished());

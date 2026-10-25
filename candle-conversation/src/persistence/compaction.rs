@@ -22,14 +22,14 @@
 //! [`SubstratePersistence::compact`]: super::SubstratePersistence::compact
 //! [`SubstratePersistence::should_compact`]: super::SubstratePersistence::should_compact
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use super::adoption::Adoption;
 use super::blob::BlobIndex;
 use super::content_hash::snapshot_stream_id;
-use super::deleted::{DeletedKey, DeletedPayload, DeletedTimeline};
+use super::deleted::DeletedPayload;
 use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use super::identity::MarkerIds;
 use super::log_file::LogFile;
@@ -214,10 +214,9 @@ fn local_record(record_type: RecordType, payload: Vec<u8>) -> CompactItem {
 /// a header-keyed type needs a `Raw` carry-forward from its location map, and a
 /// payload-keyed one needs a `Synth` re-emit from substrate RAM.
 ///
-/// A timeline tombstone is carried until `expiry` lets it shrink to its
-/// deleted-set entry (§6.8): this compaction runs past every tombstone it
-/// carries, and says so in the `Deleted` record it writes. The member's own
-/// [`Housekeeping`] is written whole.
+/// A tombstone is carried until `expiry` drops it (§6.8): this compaction runs
+/// past every tombstone it carries, and says so in the `Deleted` record it
+/// writes. The member's own [`Housekeeping`] is written whole.
 #[allow(clippy::too_many_arguments)]
 pub fn collect_live_records(
     manifest: &Manifest,
@@ -231,8 +230,6 @@ pub fn collect_live_records(
     housekeeping: &Housekeeping,
 ) -> Vec<CompactItem> {
     let mut out: Vec<CompactItem> = Vec::new();
-    // Keyed tombstones this compaction expires, by key hash: not carried.
-    let mut expired_keys: HashSet<u64> = HashSet::new();
 
     if !housekeeping.replica.is_empty() {
         out.push(local_record(
@@ -691,17 +688,19 @@ pub fn collect_live_records(
     // Timeline tombstones are kept although their records vanish wholesale
     // above: a record replicated late — by a member that was cut off — must
     // still find the tombstone and die. Each stays until it is old and this is
-    // not the first complete compaction to run past it, when it shrinks to its
-    // entry in the deleted set; this compaction has run past every one it
-    // carries, and the `Deleted` record it writes says so.
+    // not the first complete compaction to run past it, when it is dropped and
+    // leaves nothing behind (a member away longer drops what it did not author
+    // before it syncs, `docs/replicated_substrate.md` §7.8); this compaction
+    // has run past every one it carries, and the `Deleted` record it writes
+    // says so.
+    let expired = expiry.expired(substrate, marker_ids);
     let mut dead: Vec<TimelineId> = substrate
         .tombstoned_timelines()
         .iter()
         .copied()
-        .filter(|tl| substrate.deleted_entry(*tl).is_none())
+        .filter(|tl| !expired.timelines.contains(tl))
         .collect();
     dead.sort_unstable();
-    let mut deleted: Vec<DeletedTimeline> = substrate.deleted_entries().collect();
     let mut swept: Vec<u64> = Vec::new();
     for tl in dead {
         let payload = TombstonePayload {
@@ -712,14 +711,6 @@ pub fn collect_live_records(
         }
         .encode();
         let id = marker_ids.identity_for(RecordType::Tombstone, 0, &payload);
-        if substrate.is_tombstone_swept(tl) && expiry.is_old(id.hlc) {
-            deleted.push(DeletedTimeline {
-                timeline: tl.raw(),
-                origin: id.origin,
-                oseq: id.oseq,
-            });
-            continue;
-        }
         swept.push(tl.raw());
         out.push(CompactItem::synth(
             RecordHeader {
@@ -731,34 +722,18 @@ pub fn collect_live_records(
             payload,
         ));
     }
-    deleted.sort_unstable();
     // A keyed value's tombstone expires the same way: once a complete
-    // compaction has run past it and it is old, it shrinks to an entry that
-    // keeps its stamp. The custom objects below skip what expires here.
-    let mut keys: Vec<DeletedKey> = substrate.deleted_keys().collect();
-    let mut swept_keys: Vec<u64> = Vec::new();
-    for (obj, id) in substrate.held_custom_objects() {
-        if !obj.ceased {
-            continue;
-        }
-        let hash = obj.stream_id();
-        if substrate.is_key_tombstone_swept(hash) && expiry.is_old(id.hlc) {
-            keys.push(DeletedKey::of(hash, id));
-            expired_keys.insert(hash);
-        } else {
-            swept_keys.push(hash);
-        }
-    }
-    keys.sort_unstable();
+    // compaction has run past it and it is old, it is dropped. The custom
+    // objects below skip what expires here.
+    let mut swept_keys: Vec<u64> = substrate
+        .held_custom_objects()
+        .into_iter()
+        .filter(|(obj, _)| obj.ceased && !expired.keys.contains(&obj.stream_id()))
+        .map(|(obj, _)| obj.stream_id())
+        .collect();
     swept_keys.sort_unstable();
-    if !deleted.is_empty() || !swept.is_empty() || !keys.is_empty() || !swept_keys.is_empty() {
-        let payload = DeletedPayload {
-            timelines: deleted,
-            swept,
-            keys,
-            swept_keys,
-        }
-        .encode();
+    if !swept.is_empty() || !swept_keys.is_empty() {
+        let payload = DeletedPayload { swept, swept_keys }.encode();
         out.push(CompactItem::synth(
             RecordHeader {
                 record_type: RecordType::Deleted,
@@ -1009,7 +984,7 @@ pub fn collect_live_records(
     // stable key-hash `stream_id` it was written under; a tombstone among
     // them is carried until it expired above.
     for (obj, id) in substrate.held_custom_objects() {
-        if expired_keys.contains(&obj.stream_id()) {
+        if expired.keys.contains(&obj.stream_id()) {
             continue;
         }
         let bytes = obj.encode();
@@ -3273,17 +3248,26 @@ mod tests {
             }
             .encode(),
         ));
-        // The deleted set — a timeline whose tombstone expired.
+        // A dead timeline's tombstone, and the swept set naming it — a
+        // compaction carries both while it is young.
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: 1003,
+                turn_index: None,
+                turn_writer: 0,
+                reason: None,
+            }
+            .encode(),
+        ));
         blob.extend_from_slice(&record(
             RecordType::Deleted,
             0,
             0,
             &DeletedPayload {
-                timelines: vec![DeletedTimeline {
-                    timeline: 1003,
-                    origin: 0xA,
-                    oseq: 4,
-                }],
+                swept: vec![1003],
                 ..DeletedPayload::default()
             }
             .encode(),

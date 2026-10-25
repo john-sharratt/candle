@@ -6,14 +6,15 @@
 //! Locks are taken in the order a reload takes them — persistence, then the
 //! substrate — and never nested the other way.
 
+use std::io;
 use std::path::PathBuf;
 
 use serde_json::Value;
 
 use super::ids::TimelineId;
 use super::resolver::Conversation;
-use crate::persistence::deleted::{DeletedEntry, DeletedPayload};
-use crate::persistence::identity::{MintGeneration, VersionStamp, GEN_DETACHED};
+use crate::persistence::identity::{now_ms, MintGeneration, VersionStamp, GEN_DETACHED};
+use crate::persistence::joined;
 use crate::persistence::listing::ListedRecord;
 use crate::persistence::record::{decode_header, CustomObjectPayload};
 use crate::persistence::replica::AppliedSet;
@@ -27,9 +28,8 @@ pub const CLUSTER_PREFIX: &str = "cluster/";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeldRange {
     pub records: Vec<ListedRecord>,
-    /// The `oseq`s in the range no record holds any more, each one that was an
-    /// expired tombstone with the deleted-set entry it left (§6.8).
-    pub gone: Vec<(u64, Option<DeletedEntry>)>,
+    /// The `oseq`s in the range no record holds any more.
+    pub gone: Vec<u64>,
 }
 
 /// A generation the group has decided, handed to the rejoin that fixes what
@@ -53,6 +53,19 @@ impl Conversation {
     /// included (§7.2, §7.5).
     pub fn applied_set(&self) -> AppliedSet {
         self.persistence.lock().unwrap().applied_set()
+    }
+
+    /// Every own `oseq` up to this one is written and may be sent: the top of
+    /// this member's own written set, whatever gaps a purge left below it
+    /// (§7.8).
+    pub fn own_through(&self) -> u64 {
+        self.persistence.lock().unwrap().own_written().top()
+    }
+
+    /// This member is joined and caught up now: an open after a long absence
+    /// is judged from this moment (§7.8).
+    pub fn mark_joined(&self) -> io::Result<()> {
+        joined::write(&self.substrate_dir(), now_ms())
     }
 
     /// The `oseq` of `timeline`'s newest commit that `origin` wrote — what a
@@ -197,7 +210,7 @@ impl Conversation {
     }
 
     /// What this member holds of `origin`'s `from..=to`, a range it covers
-    /// completely; an `oseq` gone with an expired tombstone carries its entry.
+    /// completely.
     ///
     /// Listed from memory (`persistence::listing`) under one short hold of the
     /// persistence lock, taken behind the waiters (`lock_behind_waiters`):
@@ -209,55 +222,18 @@ impl Conversation {
             .lock_behind_waiters()
             .unwrap()
             .list(origin, from, to);
-        let view = self.read();
-        let in_range = |e: &DeletedEntry| e.origin() == origin && (from..=to).contains(&e.oseq());
-        let entries: Vec<DeletedEntry> = view
-            .deleted_entries()
-            .map(DeletedEntry::Timeline)
-            .chain(view.deleted_keys().map(DeletedEntry::Key))
-            .filter(in_range)
-            .collect();
         HeldRange {
             records: listing.records,
-            gone: listing
-                .gone
-                .into_iter()
-                .map(|oseq| (oseq, entries.iter().copied().find(|e| e.oseq() == oseq)))
-                .collect(),
+            gone: listing.gone,
         }
     }
 
-    /// `oseq`s of `origin` a catch-up learned are gone. A deleted-set entry
-    /// among them is applied, and made durable, before anything else: the
-    /// timeline it names is dead here from now on, and the key it names holds
-    /// against every write below its tombstone (§6.8, §7.2).
-    pub fn record_gone(
-        &self,
-        origin: u64,
-        gone: &[(u64, Option<DeletedEntry>)],
-    ) -> PersistenceResult<()> {
-        let mut learned = DeletedPayload::default();
-        for entry in gone.iter().filter_map(|(_, e)| *e) {
-            match entry {
-                DeletedEntry::Timeline(t) => learned.timelines.push(t),
-                DeletedEntry::Key(k) => learned.keys.push(k),
-            }
-        }
+    /// `oseq`s of `origin` a catch-up learned are gone (§7.2).
+    pub fn record_gone(&self, origin: u64, gone: &[u64]) {
         let mut p = self.persistence.lock().unwrap();
-        if learned != DeletedPayload::default() {
-            let deleted = {
-                let mut view = self.write();
-                view.apply_deleted(&learned);
-                view.deleted_payload()
-            };
-            if let Some(deleted) = deleted {
-                p.write_deleted(&deleted)?;
-            }
-        }
-        for (oseq, _) in gone {
+        for oseq in gone {
             p.mark_gone(origin, *oseq, *oseq);
         }
-        Ok(())
     }
 
     /// A position in the substrate writer's queue.
