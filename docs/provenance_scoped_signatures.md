@@ -1,8 +1,11 @@
 # Provenance signatures scoped like projection
 
 **Status:** §2.1 built — `provenance::boundaries` is the one rule, and the
-decode loop steps it; the gallery windows (§2.2) and the aggregations (§2.3)
-are next. Supersedes the per-turn gallery windows the belief scan uses today
+decode loop steps it. §2.2's windows (`provenance::probe_windows`) and §2.3's
+aggregations (`provenance::window_score`) are built and measured offline by
+gates 2–3 (`candle-conversation/examples/provenance_gates`); gate 4's harness
+and expectations are written and wait for the replay. The live scan has not
+switched yet. Supersedes the per-turn gallery windows the belief scan uses today
 for ingested conversations. The acceptance test is
 `docs/paper_conversation_replay.md`; this document adds the gates that come
 before it.
@@ -138,6 +141,31 @@ rule.
 
 Turn layouts record each segment's span, and signatures are 1:1 with tokens,
 so the identity windows are selected from what is stored.
+
+**What the gates found** (`docs/results/provenance_gates_2026-10-25.md`):
+
+- Scoring a window by its own per-token z-scores fails outright: it has no
+  competition between files, so boilerplate every file matches swamps it.
+- What works keeps late fusion's competition and adds coherence: each probe
+  token's `z × margin` vote — won by one file, its margin over the runner-up
+  file — is credited to the windows around the gallery token it was won at
+  (`provenance::window_score::late_fusion_votes`, `window_tally`), and a file
+  scores by its windows. Of the three candidates, the better of a file's
+  identity windows and its count-normalised best window, each standardised
+  (`FileAggregate::IdentityOrCount`), is the best all-round rule so far.
+- Re-scoring a shortlist of today's best files by window loses the gain: the
+  runner-up a margin is taken against has to be the whole gallery's.
+
+**On the GPU**, with the arena's kernels unchanged. The paged scan emits, per
+probe token, fold group and segment, the winning case and its vote. Two
+launches over the same resident gallery give the vote and where it was won:
+
+1. today's — one case per file — the winning file and its `z × margin` vote;
+2. one segment per file, one case per 32-token chunk — each file's best chunk.
+
+The first launch's vote is credited to the second's best chunk in the winning
+file; a window's tally is the votes credited to the chunks it covers. That is
+the CPU tally at chunk resolution, for about twice the scan.
 
 ### 2.4 Analysis units
 
