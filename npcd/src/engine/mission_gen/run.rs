@@ -31,6 +31,7 @@ use crate::engine::prose::{self, decode_call, CallAsk};
 use crate::engine::runtime::Runtime;
 use crate::engine::work::what_happens;
 use crate::engine::workflow::{OnFailed, Where};
+use crate::mind::files::MindFiles;
 use crate::opstore::owner::Owner;
 use crate::prose::Request;
 use crate::sim::operations::Operation;
@@ -616,6 +617,24 @@ fn offer_step(hosted: &Hosted, corpus: &Corpus, id: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Put every Maker's step the operations of `hosted` owe on the table. A step
+/// that cannot be written up never will be: its operation is called off, so it
+/// does not hold its target.
+fn offer_owed(hosted: &Hosted, mind: &Arc<MindFiles>) {
+    let owed = hosted.sim(|s| s.missions.operations().awaiting_offer(now_ms()));
+    if owed.is_empty() {
+        return;
+    }
+    let corpus = Corpus::read(mind, hosted.id());
+    for op in owed {
+        if let Err(e) = offer_step(hosted, &corpus, op) {
+            let why = format!("its step could not be put on the table: {e}");
+            hosted.with_sim(|s| s.missions.cancel_operation(op, &why));
+            tracing::warn!(operation = op, "operation: called off — {why}");
+        }
+    }
+}
+
 /// Settle every failed operation of `hosted` not yet settled, as its
 /// workflow's `on-failed` says: its store discarded, or kept unpublished for
 /// an operator to reopen (`docs/replicated_substrate.md` §10.3).
@@ -716,19 +735,7 @@ pub fn spawn(rt: Arc<Runtime>) {
                             break;
                         }
                     }
-                    let owed = hosted.sim(|s| s.missions.operations().awaiting_offer(now_ms()));
-                    if !owed.is_empty() {
-                        let corpus = Corpus::read(&mind, hosted.id());
-                        for op in owed {
-                            // A step that cannot be written up never will be:
-                            // called off, so it does not hold its target.
-                            if let Err(e) = offer_step(&hosted, &corpus, op) {
-                                let why = format!("its step could not be put on the table: {e}");
-                                hosted.with_sim(|s| s.missions.cancel_operation(op, &why));
-                                tracing::warn!(operation = op, "operation: called off — {why}");
-                            }
-                        }
-                    }
+                    offer_owed(&hosted, &mind);
                 }
                 // Work waiting for a Maker this world does not have is called
                 // off, so it neither blocks its target nor counts as stock.
@@ -750,7 +757,11 @@ pub fn spawn(rt: Arc<Runtime>) {
                 {
                     match generate(&rt, &hosted, &config, None).await {
                         Ok(Generation::NoWork) => break,
-                        Ok(_) => {}
+                        // An operation just opened has its first step put on
+                        // the table now, not after the rest of the stocking:
+                        // each generation can take minutes, and meanwhile a
+                        // Maker at the table is handed a routine instead.
+                        Ok(_) => offer_owed(&hosted, &mind),
                         Err(e) => {
                             tracing::warn!("mission generator: {e:#}");
                             break;
