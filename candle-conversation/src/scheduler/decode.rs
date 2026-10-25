@@ -2114,63 +2114,23 @@ impl Scheduler {
                 }
 
                 // ── Continuous re-projection triggers ─────────────────────────
-                // Two trigger conditions, OR'd:
-                //   (a) Cadence: decoded count crossed an `every_n_tokens`
-                //       boundary.  Guarantees a re-project at predictable
-                //       intervals even on long uninterrupted spans.
-                //   (b) Punctuation: the just-sampled token is in the
-                //       policy's `trigger_token_ids` set (linefeed, period,
-                //       etc.) AND more than 16 non-trigger tokens have been
-                //       decoded since the last projection.  Re-orients attention
-                //       at semantic transitions, but the content gate stops short
-                //       lines and runs of trigger tokens from each re-projecting.
-                // De-duped so a token that satisfies BOTH only queues once.
-                // Skipped when the sequence just finished — finalize fires
-                // via `cleanup_finished` instead.
+                // The boundary rule (`provenance::boundaries`) — the one the
+                // gallery cuts ingested turns by: a line feed past the content
+                // gate, the cadence, and one lock-in at `<tool_call>` with the
+                // call body frozen until `</tool_call>`. Skipped when the
+                // sequence just finished — finalize fires via
+                // `cleanup_finished` instead.
                 if !state.finished {
-                    // Compute the flags via a match so the immutable borrow of
-                    // `state.reprojection` ends before we mutate the counter below.
-                    let flags = match state.reprojection.as_ref() {
-                        Some(p) => Some((
-                            !p.trigger_token_ids.is_empty()
-                                && p.trigger_token_ids.contains(&next_token),
-                            p.every_n_tokens > 0
-                                && state.generated_tokens.len() % p.every_n_tokens == 0,
-                            p.tool_call_open_id == Some(next_token),
-                            p.tool_call_close_id == Some(next_token),
-                        )),
-                        None => None,
+                    let count = state.generated_tokens.len();
+                    let step = match state.reprojection.as_ref() {
+                        Some(p) => state.boundary.step(&p.boundary, next_token, count),
+                        None => Step::Quiet,
                     };
-                    if let Some((is_trigger, cadence_fire, is_tool_open, is_tool_close)) = flags {
-                        if is_tool_open {
-                            // Entering the tool call: fire one lock-in reprojection so
-                            // the tool committed from the reasoning so far is what the
-                            // model sees, then freeze — the generic call body must not
-                            // re-orient the selection.
-                            Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
-                            state.non_punct_since_reproject = 0;
-                            state.in_tool_call = true;
-                            state.wrote_tool_call = true;
-                        } else if is_tool_close {
-                            // Leaving the call: reprojection re-enables for whatever
-                            // follows (further calls, or the seal).
-                            state.in_tool_call = false;
-                            state.non_punct_since_reproject = 0;
-                        } else if state.in_tool_call {
-                            // Inside the call body — every cadence/punctuation trigger
-                            // is suppressed so the committed tool stays fixed.
-                        } else {
-                            let punctuation_fire =
-                                is_trigger && state.non_punct_since_reproject > 16;
-                            if cadence_fire || punctuation_fire {
-                                Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
-                                state.non_punct_since_reproject = 0;
-                            } else if !is_trigger {
-                                // A non-trigger token adds to the content accumulated
-                                // toward the next punctuation-driven reprojection.
-                                state.non_punct_since_reproject += 1;
-                            }
-                        }
+                    if step == Step::OpenedToolCall {
+                        state.wrote_tool_call = true;
+                    }
+                    if step.fires() {
+                        Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
                     }
                 }
             }

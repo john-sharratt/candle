@@ -22,6 +22,7 @@
 //! ([`belief_step`]) that drives selection — the live sequence is its own probe.
 
 pub mod belief;
+pub mod boundaries;
 pub mod fusion;
 pub mod gallery_arena;
 pub mod gather;

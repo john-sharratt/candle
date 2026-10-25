@@ -1,7 +1,9 @@
 # Provenance signatures scoped like projection
 
-**Status:** design, not built. Supersedes the per-turn gallery windows the
-belief scan uses today for ingested conversations. The acceptance test is
+**Status:** §2.1 built — `provenance::boundaries` is the one rule, and the
+decode loop steps it; the gallery windows (§2.2) and the aggregations (§2.3)
+are next. Supersedes the per-turn gallery windows the belief scan uses today
+for ingested conversations. The acceptance test is
 `docs/paper_conversation_replay.md`; this document adds the gates that come
 before it.
 
@@ -107,7 +109,10 @@ would have been at `b`:
 - the tokens before `b`, back to at most 256, chunk-aligned as the probe is.
 
 Windows overlap, as successive probes do. They are offsets into the turn's
-stored signatures, so they cost no signature storage. They are computed at
+stored signatures, so they cost no signature storage. A massive prefill — a
+file's pages — captures its per-token `sign(Q)` exactly as any prefill does,
+and is carved by the same rule afterwards: capture never changes, only the
+cut. They are computed at
 gallery assembly from the turn's stored tokens and memoized per stream, as
 seams are today; **no re-ingest** is needed to adopt them.
 

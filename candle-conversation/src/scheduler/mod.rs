@@ -105,6 +105,7 @@ use crate::persistence::cold_load::{
     preallocate_pinned_scratch, ColdLoadStager, PINNED_PREALLOC_BYTES,
 };
 use crate::persistence::content_hash::{section_stream_id, turn_stream_id, ContentChain};
+use crate::provenance::boundaries::{BoundaryRule, BoundaryState, Step};
 // Only the K/V-digest request carries these, and it is a test-helper probe.
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::persistence::content_hash::{ContentHash, ContentHasher};
@@ -1324,11 +1325,11 @@ const CARRIED_BELIEF_TURN_DECAY: f32 = 0.5;
 /// caller.  Built once at [`SchedulerRequest::SubmitTurn`] time and stored
 /// on the active `DecodeState`.
 ///
-/// When `every_n_tokens > 0`, the scheduler:
+/// At each boundary its `boundary` rule fires, the scheduler:
 ///
 /// 1. Tracks decoded-token count per-view.
-/// 2. After every `every_n_tokens` tokens, extracts live Q sigs from the
-///    view's R16 backing at the three provenance layers.
+/// 2. Extracts live Q sigs from the view's R16 backing at the three
+///    provenance layers.
 /// 3. Runs provenance against the substrate corpus and writes fresh per-turn
 ///    scores under [`Conversation::write`].
 /// 4. Re-runs `Builder::project` for `target` to obtain a new
@@ -1346,29 +1347,15 @@ pub(crate) struct ReprojectionPolicy {
     /// the same selector options as the initial prefill.
     pub(crate) selection: SelectionState,
     pub(crate) substrate: Conversation,
-    /// Cadence trigger: re-project after every `every_n_tokens` decoded
-    /// tokens.  `0` disables the cadence trigger (punctuation triggers
-    /// can still fire).
-    pub(crate) every_n_tokens: usize,
+    /// Where reprojections fire: the cadence, the trigger tokens and the
+    /// tool-call gate (`provenance::boundaries`) — the same rule the gallery
+    /// cuts ingested turns by.
+    pub(crate) boundary: BoundaryRule,
     /// Maximum tokens looking back from the current decode position to
     /// include in the wide-Q probe.  Caps the "thought window" — beyond
     /// this many tokens the prior reprojection already captured the
     /// older intent.  Must be `>= 1`.  Default: 64.
     pub(crate) max_probe_tokens: usize,
-    /// Token IDs that, when sampled, fire an immediate reprojection in
-    /// addition to the every-`every_n_tokens` cadence.  Use for
-    /// paragraph/sentence boundaries (`\n`, `. `, etc) so attention
-    /// re-orients at semantic transition points rather than waiting
-    /// for the next fixed-cadence trigger.
-    pub(crate) trigger_token_ids: Arc<Vec<u32>>,
-    /// Token id of the `<tool_call>` open tag (when the tokenizer has it as a
-    /// single token). When sampled, one lock-in reprojection fires — committing
-    /// the tool from the reasoning so far — and reprojection is then suppressed
-    /// until `tool_call_close_id`, so the generic call body doesn't re-orient the
-    /// selection. `None` disables the gate (tag not a single token).
-    pub(crate) tool_call_open_id: Option<u32>,
-    /// Token id of the `</tool_call>` close tag — re-enables reprojection.
-    pub(crate) tool_call_close_id: Option<u32>,
 }
 
 impl ReprojectionPolicy {
@@ -1616,16 +1603,16 @@ struct DecodeState {
     turn_start: Instant,
     /// Per-sequence decode health tracking state.
     health: DecodeHealthState,
-    /// Continuous re-projection policy.  When `Some` and
-    /// `policy.every_n_tokens > 0`, the scheduler fires a view swap each
-    /// time `generated_tokens.len()` becomes a multiple of
-    /// `every_n_tokens`.  Carried across mid-decode swaps unchanged.
+    /// Continuous re-projection policy.  When `Some`, the scheduler fires a
+    /// view swap at each boundary its rule fires.  Carried across mid-decode
+    /// swaps unchanged.
     reprojection: Option<ReprojectionPolicy>,
-    /// Count of non-trigger tokens decoded since the last reprojection.
-    /// A punctuation trigger only fires a reprojection once this exceeds 16,
-    /// so short lines / runs of trigger tokens don't each re-project. Reset to
-    /// 0 whenever a reprojection (cadence or punctuation) is queued.
-    non_punct_since_reproject: usize,
+    /// Where the reprojection boundary rule stands: the content counted since
+    /// the last boundary, and whether decode is inside a `<tool_call>` body,
+    /// where every trigger is suppressed so the generic call body can't
+    /// re-orient the committed tool (`provenance::boundaries`). Migrates with
+    /// the decode state across view swaps.
+    boundary: BoundaryState,
     /// Generated-token index of the previous projection point, so a reprojection
     /// event's span is `[last_projection_end, current_gen)`. Lives on the decode
     /// state (which migrates correctly across reprojection view swaps), unlike the
@@ -1681,12 +1668,6 @@ struct DecodeState {
     /// verbatim as `TurnPart::assistant_text` at seal time. Empty for decode
     /// turns, where the seal uses the model's decoded text instead.
     prefill_assistant_text: String,
-    /// `true` while decoding inside a `<tool_call>…</tool_call>` block. Set when
-    /// the open tag is sampled (which also fires one lock-in reprojection) and
-    /// cleared at the close tag. While set, cadence/punctuation reprojection is
-    /// suppressed so the generic call body can't re-orient the committed tool.
-    /// Migrates with the decode state across view swaps.
-    in_tool_call: bool,
     /// Whether this turn has written a tool call — its open tag sampled, or a
     /// tool-call stencil walked to the turn's end. Its caller acts on the
     /// `Done` (it runs the tool and submits the result), so the finished turn's
@@ -6118,7 +6099,7 @@ impl Scheduler {
             turn_start,
             health,
             reprojection: None,
-            non_punct_since_reproject: 0,
+            boundary: BoundaryState::default(),
             last_projection_end: 0,
             post_decode_tokens: TokenBuffer::default(),
             belief: PriorBelief::default(),
@@ -6129,7 +6110,6 @@ impl Scheduler {
             user_content_end: 0,
             assistant_content_start: 0,
             no_think: false,
-            in_tool_call: false,
             wrote_tool_call: false,
             triggers: Arc::new(TriggerRegistry::new()),
             stencil: None,
@@ -15830,7 +15810,7 @@ mod tests {
             turn_start: Instant::now(),
             health: crate::decode_health::DecodeHealthState::new(8, 8),
             reprojection: None,
-            non_punct_since_reproject: 0,
+            boundary: BoundaryState::default(),
             last_projection_end: 0,
             post_decode_tokens: TokenBuffer::default(),
             belief: PriorBelief::default(),
@@ -15841,7 +15821,6 @@ mod tests {
             user_content_end: 0,
             assistant_content_start: 0,
             no_think: false,
-            in_tool_call: false,
             wrote_tool_call: false,
             triggers: Arc::new(TriggerRegistry::new()),
             stencil: None,

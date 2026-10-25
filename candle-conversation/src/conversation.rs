@@ -8,6 +8,7 @@ use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnHandle, TurnResponse};
 use crate::index_pages::StoredPages;
+use crate::provenance::boundaries::BoundaryRule;
 use crate::recorded_reply::recorded_reply;
 use crate::recovered_message::{tool_response_lengths, RecoveredMessage, TOOL_RESPONSE_OPEN};
 use candle_transformers::models::delta_net::ExportedLayerState;
@@ -5250,9 +5251,8 @@ impl Sequence {
     /// scheduler then runs the turn as a single-shot prefill+decode
     /// without mid-decode view swaps.
     fn build_reprojection_policy(&self) -> Option<ReprojectionPolicy> {
-        let n = self.config.reproject_every_n_tokens;
-        let trigger_ids = Arc::new(self.build_reproject_trigger_token_ids());
-        if n == 0 && trigger_ids.is_empty() {
+        let boundary = self.boundary_rule();
+        if !boundary.is_active() {
             return None;
         }
         Some(ReprojectionPolicy {
@@ -5260,12 +5260,20 @@ impl Sequence {
             projection: Arc::clone(&self.projection),
             selection: self.selection.clone(),
             substrate: self.substrate.clone(),
-            every_n_tokens: n,
+            boundary,
             max_probe_tokens: self.config.reproject_max_probe_tokens.max(1),
-            trigger_token_ids: trigger_ids,
-            tool_call_open_id: self.single_token_id("<tool_call>"),
-            tool_call_close_id: self.single_token_id("</tool_call>"),
         })
+    }
+
+    /// The rule reprojection boundaries fire by — and that the gallery cuts
+    /// ingested turns by (`provenance::boundaries`).
+    pub fn boundary_rule(&self) -> BoundaryRule {
+        BoundaryRule {
+            triggers: Arc::new(self.build_reproject_trigger_token_ids()),
+            cadence: self.config.reproject_every_n_tokens,
+            tool_call_open: self.single_token_id("<tool_call>"),
+            tool_call_close: self.single_token_id("</tool_call>"),
+        }
     }
 
     /// The token id of `text` iff the tokenizer encodes it to exactly one token.

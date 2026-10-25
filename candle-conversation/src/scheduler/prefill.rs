@@ -5732,9 +5732,8 @@ impl Scheduler {
                         hs
                     },
                     reprojection: work.reprojection,
-                    non_punct_since_reproject: 0,
+                    boundary: BoundaryState::default(),
                     last_projection_end: 0,
-                    in_tool_call: false,
                     wrote_tool_call: false,
                     free_tool_calls_from_penalties: work.free_tool_calls_from_penalties,
                     triggers: work.triggers,
@@ -5871,9 +5870,8 @@ impl Scheduler {
                 hs
             },
             reprojection: work.reprojection,
-            non_punct_since_reproject: 0,
+            boundary: BoundaryState::starting(first_token_opens_call),
             last_projection_end: 0,
-            in_tool_call: first_token_opens_call,
             wrote_tool_call: first_token_opens_call,
             free_tool_calls_from_penalties: work.free_tool_calls_from_penalties,
             triggers: work.triggers,
