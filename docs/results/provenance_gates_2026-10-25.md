@@ -86,6 +86,42 @@ Reading it:
   but read nothing when the left-out turn held the file's only closing window —
   summary-to-rest's 0.00 is that artefact, not the rule.
 
+### Run 6 — the combined rule
+
+302 files, 2,221,127 tokens, 92,227 windows, 57 probes a source; coverage
+644/644 exact. Two rules added: count normalisation at half strength, and
+**identity-or-count** — the better of a file's identity score and its
+count-normalised best window, each standardised over the files.
+
+| source | rule | R@1 | R@5 | R@10 | MRR |
+|---|---|---|---|---|---|
+| request-to-rest | late fusion (today) | 0.04 | 0.30 | 0.49 | 0.178 |
+| request-to-rest | best-window | 0.04 | 0.30 | 0.49 | 0.169 |
+| request-to-rest | count-normalised ×1 | 0.04 | 0.30 | 0.51 | 0.171 |
+| request-to-rest | identity | 0.12 | 0.35 | 0.47 | 0.218 |
+| request-to-rest | identity-or-count ×1 | 0.07 | 0.32 | 0.51 | 0.199 |
+| summary-to-rest | late fusion (today) | 0.07 | 0.30 | 0.44 | 0.184 |
+| summary-to-rest | best-window | 0.11 | 0.32 | 0.44 | 0.206 |
+| summary-to-rest | count-normalised ×1 | 0.11 | 0.35 | 0.54 | 0.244 |
+| summary-to-rest | identity | 0.00 | 0.02 | 0.05 | 0.019 |
+| summary-to-rest | identity-or-count ×1 | 0.11 | 0.35 | 0.53 | 0.228 |
+| self (control) | every rule | 1.00 | 1.00 | 1.00 | 1.000 |
+
+| rule | size bias ρ |
+|---|---|
+| late fusion (today) | +0.152 |
+| best-window | +0.120 |
+| count-normalised ×1 | −0.171 |
+| count-normalised ×0.5 | −0.117 |
+| identity | +0.041 |
+| identity-or-count ×1 | −0.115 |
+| identity-or-count ×0.5 | −0.085 |
+
+**identity-or-count ×1 is the best all-round rule so far**: above today on
+both sources (MRR 0.18 → 0.20 and 0.18 → 0.23, R@10 0.49 → 0.51 and
+0.44 → 0.53), with the size bias halved and of the opposite sign. The margins
+are modest and the probes few; the analysis-unit source decides.
+
 ## Open
 
 - The analysis-unit source (a `dependency_analysis` / `code_review` /

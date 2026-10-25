@@ -1,0 +1,74 @@
+# What each message of the paper conversation's projections should hold
+# (docs/paper_conversation_replay.md §5, §8; docs/provenance_scoped_signatures.md §3.4).
+#
+# Read by `candle-conversation/examples/provenance_gates` (`paper`). Every probe
+# of a message's turns — its user turn, visible answers, tool calls and tool
+# responses — is graded on its top `top_k` files: how many of `should` it holds,
+# and how many files matching `should_not` it holds. Paths are workspace keys,
+# `<repo>/<path>`; `*` matches any run of characters, `/` included. A probe
+# holding a tool call is also graded on whether the file the call reads is in
+# its top K, with no line here.
+
+top_k: 10
+
+messages:
+  # a — a tour: broad structure, nothing deep.
+  - starts: "Give me a tour of the codebase"
+    should:
+      - candle/README.md
+      - candle/ARCHITECTURE.md
+      - candle/CLAUDE.md
+      - candle/Cargo.toml
+      - candle/candle-core/src/lib.rs
+      - candle/candle-nn/src/lib.rs
+      - candle/candle-transformers/src/lib.rs
+      - candle/candle-conversation/src/lib.rs
+      - candle/zend/src/lib.rs
+    should_not:
+      - "*/tests/*"
+      - "*_tests.rs"
+      - "*/benches/*"
+      - "*/examples/*"
+      - "battle-cities/*"
+
+  # b — the paper, owned as its own reading; nothing unrelated.
+  - starts: "what do you think of the unbounded context paper"
+    should:
+      - candle/docs/unbounded_agents.md
+    should_not:
+      - "*/tests/*"
+      - "*_tests.rs"
+      - "*/benches/*"
+      - "*/examples/*"
+      - "battle-cities/*"
+
+  # c — the paper and the evidence behind its claims: the measurements and the
+  # code they rest on (answer key items 4–9).
+  - starts: "if you were to improve the paper"
+    should:
+      - candle/docs/unbounded_agents.md
+      - candle/docs/performance.md
+      - candle/candle-nn/src/kv_cache/chunked/compression_policy.rs
+      - candle/candle-nn/src/kv_cache/chunked/sampled_selection/params.rs
+      - candle/candle-conversation/src/provenance/wide_sig.rs
+      - candle/candle-conversation/src/projection/project.rs
+      - candle/candle-conversation/src/config.rs
+      - candle/CLAUDE.md
+    should_not:
+      - "*/tests/*"
+      - "*_tests.rs"
+      - "*/benches/*"
+      - "battle-cities/*"
+
+  # d — editing the paper, and the places that restate what changes
+  # (answer key items 1–4, 10, 12).
+  - starts: "ok. make those changes first"
+    should:
+      - candle/docs/unbounded_agents.md
+      - candle/README.md
+      - candle/ARCHITECTURE.md
+      - candle/CLAUDE.md
+    should_not:
+      - "*/tests/*"
+      - "*_tests.rs"
+      - "*/benches/*"

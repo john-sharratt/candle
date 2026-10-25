@@ -159,33 +159,66 @@ pub fn window_tally(votes: &[Vote], windows: &[Vec<Range<usize>>], n_tokens: usi
 }
 
 /// How a file's windows make its one score.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FileAggregate {
     /// Its best window.
     BestWindow,
-    /// Its best window, less what the best of that many windows reaches by
-    /// chance: `σ · √(2 ln W)` for `W` windows, `σ` the spread of every
-    /// window's score for this probe.
-    CountNormalised,
+    /// Its best window, less `strength` times what the best of that many
+    /// windows reaches by chance: `σ · √(2 ln W)` for `W` windows, `σ` the
+    /// spread of every window's score for this probe.
+    CountNormalised { strength: f32 },
     /// Its best identity window — its first turn's request and its last turn's
     /// closing summary.
     Identity,
+    /// The better of its identity score and its count-normalised best window
+    /// at `strength`, each standardised over the files that have one.
+    IdentityOrCount { strength: f32 },
 }
 
 impl FileAggregate {
-    pub const ALL: [FileAggregate; 3] = [
+    pub const ALL: [FileAggregate; 6] = [
         FileAggregate::BestWindow,
-        FileAggregate::CountNormalised,
+        FileAggregate::CountNormalised { strength: 1.0 },
+        FileAggregate::CountNormalised { strength: 0.5 },
         FileAggregate::Identity,
+        FileAggregate::IdentityOrCount { strength: 1.0 },
+        FileAggregate::IdentityOrCount { strength: 0.5 },
     ];
 
-    pub fn name(self) -> &'static str {
+    pub fn name(self) -> String {
         match self {
-            FileAggregate::BestWindow => "best-window",
-            FileAggregate::CountNormalised => "count-normalised",
-            FileAggregate::Identity => "identity",
+            FileAggregate::BestWindow => "best-window".into(),
+            FileAggregate::CountNormalised { strength } => format!("count-normalised x{strength}"),
+            FileAggregate::Identity => "identity".into(),
+            FileAggregate::IdentityOrCount { strength } => {
+                format!("identity-or-count x{strength}")
+            }
         }
     }
+}
+
+/// `scores` standardised over its finite entries; a non-finite entry stays.
+fn standardised(scores: &[f32]) -> Vec<f32> {
+    let finite: Vec<f64> = scores
+        .iter()
+        .filter(|s| s.is_finite())
+        .map(|&s| s as f64)
+        .collect();
+    if finite.is_empty() {
+        return scores.to_vec();
+    }
+    let n = finite.len() as f64;
+    let mean = finite.iter().sum::<f64>() / n;
+    let sd = (finite.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n)
+        .sqrt()
+        .max(1e-9);
+    scores
+        .iter()
+        .map(|&s| match s.is_finite() {
+            true => ((s as f64 - mean) / sd) as f32,
+            false => s,
+        })
+        .collect()
 }
 
 /// Each file's score under `mode`: `scores[w]` is window `w`'s, `file[w]` its
@@ -200,6 +233,12 @@ pub fn file_scores(
     n_files: usize,
     mode: FileAggregate,
 ) -> Vec<f32> {
+    if let FileAggregate::IdentityOrCount { strength } = mode {
+        let by = |m| standardised(&file_scores(scores, file, identity, live, n_files, m));
+        let ident = by(FileAggregate::Identity);
+        let count = by(FileAggregate::CountNormalised { strength });
+        return ident.iter().zip(&count).map(|(a, b)| a.max(*b)).collect();
+    }
     let mut best = vec![f32::NEG_INFINITY; n_files];
     let mut count = vec![0usize; n_files];
     let (mut sum, mut sumsq, mut n) = (0f64, 0f64, 0f64);
@@ -217,7 +256,10 @@ pub fn file_scores(
         count[f] += 1;
         best[f] = best[f].max(scores[w]);
     }
-    if mode != FileAggregate::CountNormalised || n == 0.0 {
+    let FileAggregate::CountNormalised { strength } = mode else {
+        return best;
+    };
+    if n == 0.0 {
         return best;
     }
     let sd = (sumsq / n - (sum / n).powi(2)).max(0.0).sqrt() as f32;
@@ -225,7 +267,7 @@ pub fn file_scores(
         .zip(&count)
         .map(|(&b, &c)| match c {
             0 => f32::NEG_INFINITY,
-            c => b - sd * (2.0 * (c as f32).ln()).max(0.0).sqrt(),
+            c => b - strength * sd * (2.0 * (c as f32).ln()).max(0.0).sqrt(),
         })
         .collect()
 }
@@ -327,9 +369,16 @@ mod tests {
         let agg = |mode, live: &[bool]| file_scores(&scores, &file, &identity, live, 2, mode);
         assert_eq!(agg(FileAggregate::BestWindow, &live), vec![5.0, 5.5]);
         assert_eq!(agg(FileAggregate::Identity, &live), vec![5.0, 1.0]);
-        let norm = agg(FileAggregate::CountNormalised, &live);
+        let norm = agg(FileAggregate::CountNormalised { strength: 1.0 }, &live);
         assert_eq!(norm[0], 5.0, "one window draws no extra chance");
         assert!(norm[1] < 5.0, "four windows pay for their draws: {norm:?}");
+        let half = agg(FileAggregate::CountNormalised { strength: 0.5 }, &live);
+        assert!(half[1] > norm[1] && half[1] < 5.5, "{half:?}");
+        // Identity standardised: [1, -1]; count standardised: file 0 above
+        // file 1. The better of the two, per file.
+        let both = agg(FileAggregate::IdentityOrCount { strength: 1.0 }, &live);
+        assert_eq!(both[0], 1.0);
+        assert!(both[1] < 1.0, "{both:?}");
         let masked = [true, true, true, false, true];
         assert_eq!(agg(FileAggregate::BestWindow, &masked), vec![5.0, 3.0]);
         let none = agg(FileAggregate::BestWindow, &[false; 5]);
