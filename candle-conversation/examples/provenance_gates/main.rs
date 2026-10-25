@@ -14,6 +14,12 @@
 //!   own tokens, and the size bias of each rule.
 //! - **Gate 4** (`paper`): the paper conversation's projections against
 //!   written and mechanical expectations.
+//! - **Questions** (`questions`): each file's calibration questions probing
+//!   for it, their own turn left out, with and without the questions in the
+//!   gallery.
+//!
+//! The sweep, gate 4 and the questions gate scan on the GPU gallery arena
+//! (`gpu_gallery`); the rest scans on the CPU.
 //!
 //! Run, from the repository root:
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
@@ -24,12 +30,16 @@
 //!     <workspace dir> sweep [probes per source] [background probes] [only this source]
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> paper <dialogue timeline, hex> <expectations.yaml>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> questions [probes per file]
 
 mod corpus;
 mod gpu_gallery;
 mod paper;
+mod questions_gate;
 mod ranking;
 mod retrieval;
+mod rules;
 mod stats;
 mod sweep;
 
@@ -69,7 +79,12 @@ fn main() -> anyhow::Result<()> {
         .chain(ANALYSIS)
         .collect();
     let mut by_layer = corpus::load(&sub, &mut sp, &layers)?;
-    let files = corpus::files(&mut by_layer, &tokenizer);
+    let files = corpus::files(&mut by_layer, &tokenizer, corpus::questions(&sub));
+    println!(
+        "calibration: {} files, {} questions",
+        files.iter().filter(|f| !f.questions.is_empty()).count(),
+        files.iter().map(|f| f.questions.len()).sum::<usize>()
+    );
     corpus::coverage(&files);
     if files.len() < 2 {
         println!("fewer than two code_reading files — nothing to rank yet");
@@ -129,7 +144,6 @@ fn main() -> anyhow::Result<()> {
             );
             paper::run(
                 &files,
-                &gallery,
                 &mut by_layer,
                 &rule,
                 &tokenizer,
@@ -137,7 +151,13 @@ fn main() -> anyhow::Result<()> {
                 &expectations,
             )?;
         }
-        other => anyhow::bail!("unknown command `{other}`: files, retrieval, sweep or paper"),
+        "questions" => {
+            let per_file = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(4);
+            questions_gate::run(&files, &rule, per_file)?;
+        }
+        other => {
+            anyhow::bail!("unknown command `{other}`: files, retrieval, sweep, paper or questions")
+        }
     }
     Ok(())
 }

@@ -176,6 +176,42 @@ question asked of it, its tool rounds, and its answer — cut by §2.1 and §2.2
 never the inherited reading. A `security_review` unit's web searches are tool
 rounds like any other and are cut the same way.
 
+### 2.5 Calibration questions
+
+A unit's own windows are its **content**: the request that read it, the tool
+calls, the file, its summary. A live probe is a **question**. The tool catalog
+measured the gap: its exemplars were ~95% think block and call, and when plain
+questions joined them as exemplars Top-1 rose 74.5% → 87.9%
+(`docs/tool_selection_provenance_results.md` §26.3). A unit is given the same.
+
+- **Declared per layer.** A layer opts in with a `calibrate:` block — how many
+  questions, and the prompt that asks for them (`<<n>>`, `<<subject>>`,
+  `<<file>>`, `<<repo>>`, `<<path>>`). Nothing names a layer; `code_reading`
+  declares 16.
+- **Written by the unit.** Each unit is asked in a draft forked from its
+  layer's base with the unit as its lineage — so it writes its questions with
+  its whole content in front of it — without reasoning or tools. The draft is
+  tombstoned once its answer is read; one question per line is kept.
+- **Calibrated as tools' questions are.** All of a unit's questions go in as
+  one turn group in a conversation of the hidden calibration layer, under the
+  system prompt every conversation opens with: each masked to itself, sealed
+  one turn apiece with an empty answer, tagged `calibration`. The
+  conversation names the unit (`Substrate::CALIBRATES_KEY`), is archived —
+  the commit — and is distilled `ProvenanceOnly`: K/V dropped, signatures
+  kept.
+- **Scored with the unit.** Wherever the unit is scored, each of its
+  calibration's questions is one more window voting for it
+  (`belief_files::assemble_file_scans`) — for the unit's head exchange, which
+  under file-scored cases is the unit. A calibration is never itself a
+  candidate, a working-set member, or a dialogue probe.
+- **Resumed like the tools' corpus.** Ahead of each ingest pass, a layer's
+  units that stand — committed, finished, every turn holding content —
+  without an archived calibration carrying their current marker (layer,
+  digest of what is asked, the unit's content key) are calibrated; every other
+  calibration of the layer is retired. Units read before the block existed are
+  calibrated without being read again, and a unit read again is calibrated
+  again.
+
 ## 3. Gates
 
 Each gate must hold before the next is run. All are `#[test]`s.
@@ -247,7 +283,8 @@ replay of the conversation remains the end-to-end check after the gate passes.
 | Per-file aggregation | `candle-conversation/src/projection/belief_files.rs` / the scan wrappers |
 | Probe construction | `scheduler/mod.rs` (the reproject probe) — the shape the windows mirror |
 | Gates 3.1–3.3 | tests beside the rule and the scan |
-| The harness | a recorded fixture of the paper conversation and a GPU `#[test]` over `gallery_arena` |
+| The harness | `candle-conversation/examples/provenance_gates` — the sweep, gate 4 and the questions gate on the GPU gallery (`GalleryArena::scan_votes`) |
+| Calibration questions (§2.5) | `zend/src/calibrate/` (spec, plan, questions, run); `Substrate::{CALIBRATES_KEY, calibrations}`; the merge in `belief_files::assemble_file_scans` |
 
 ## 7. Open
 

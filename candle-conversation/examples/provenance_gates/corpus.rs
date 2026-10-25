@@ -68,11 +68,57 @@ impl Turn {
 }
 
 /// One `code_reading` file: its timeline, the workspace path its request
-/// names, and its turns in order.
+/// names, its turns in order, and its calibrations' questions.
 pub struct File {
     pub timeline: u64,
     pub path: Option<String>,
     pub turns: Vec<Turn>,
+    pub questions: Vec<Question>,
+}
+
+/// One calibration question: its calibration's timeline, its turn there, and
+/// its signatures. A calibration is distilled provenance-only, so its tokens
+/// are gone and only the signatures are read.
+pub struct Question {
+    pub timeline: u64,
+    pub turn: u32,
+    pub sigs: Vec<WideQSig>,
+}
+
+/// Every calibration's questions, keyed by the timeline it calibrates.
+pub fn questions(sub: &Substrate) -> HashMap<u64, Vec<Question>> {
+    let mut of: HashMap<u64, u64> = HashMap::new();
+    for (unit, cals) in sub.calibrations() {
+        for cal in cals {
+            of.insert(cal.raw(), unit.raw());
+        }
+    }
+    let mut out: HashMap<u64, Vec<Question>> = HashMap::new();
+    for (_, e) in sub.all_streams() {
+        let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
+            continue;
+        };
+        let Some(&unit) = of.get(&d.timeline_id) else {
+            continue;
+        };
+        let sigs = e
+            .wide_q_sigs
+            .as_ref()
+            .and_then(|b| decode_wide_sigs(b))
+            .unwrap_or_default();
+        if sigs.is_empty() {
+            continue;
+        }
+        out.entry(unit).or_default().push(Question {
+            timeline: d.timeline_id,
+            turn: d.turn_index,
+            sigs,
+        });
+    }
+    for qs in out.values_mut() {
+        qs.sort_by_key(|q| (q.timeline, q.turn));
+    }
+    out
 }
 
 /// Every turn of `layers`, by layer, then timeline, then turn index — each
@@ -123,8 +169,12 @@ pub fn load(
 }
 
 /// The `code_reading` files of `by_layer`, each named by the path its opening
-/// request reads.
-pub fn files(by_layer: &mut ByLayer, tokenizer: &Tokenizer) -> Vec<File> {
+/// request reads, with its calibrations' questions from `questions`.
+pub fn files(
+    by_layer: &mut ByLayer,
+    tokenizer: &Tokenizer,
+    mut questions: HashMap<u64, Vec<Question>>,
+) -> Vec<File> {
     by_layer
         .remove(&CODE_READING)
         .unwrap_or_default()
@@ -139,6 +189,7 @@ pub fn files(by_layer: &mut ByLayer, tokenizer: &Tokenizer) -> Vec<File> {
                 timeline,
                 path,
                 turns,
+                questions: questions.remove(&timeline).unwrap_or_default(),
             }
         })
         .collect()

@@ -135,8 +135,11 @@ pub fn calibrate_layer(
     let failed = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..LAYER_PARALLELISM.min(todo.run.len()).max(1) {
+            // Only a shutdown stops it. A pass asked for meanwhile waits: this
+            // runs ahead of every pass, so yielding to one handed the worker
+            // to a pass that reads for hours and left the layer uncalibrated.
             s.spawn(|| loop {
-                if crate::ingest_cancel::cancelled() || crate::ingest_worker::preempted() {
+                if crate::ingest_cancel::cancelled() {
                     return;
                 }
                 let Some(unit) = todo.run.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
