@@ -104,6 +104,7 @@ impl CalibrateSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_conversation::projection::Builder;
 
     fn spec() -> CalibrateSpec {
         CalibrateSpec {
@@ -169,11 +170,7 @@ layers:
         selection: {{ kind: top_k, k: 2 }}
 "#
         );
-        candle_conversation::projection::Builder::from_yaml(&yaml)
-            .unwrap()
-            .schema()
-            .layers[0]
-            .clone()
+        Builder::from_yaml(&yaml).unwrap().schema().layers[0].clone()
     }
 
     #[test]

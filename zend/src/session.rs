@@ -85,6 +85,7 @@ use crate::api::substrate::{
 use crate::branch_ingest::filter::IngestScope;
 use crate::branch_ingest::keys::{BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY};
 use crate::branch_ingest::{moves_branches, BranchIngest, LayerPass};
+use crate::calibrate::{calibrate_layer, Frame as CalibrateFrame, Layer as CalibrateLayer};
 use crate::code_read::PATH_KEY;
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
@@ -3147,14 +3148,10 @@ impl InferenceState {
         Ok(())
     }
 
-    /// The prefilled template a `Folders`/`Files` ingest layer's units fork
-    /// their own conversation from — see [`InferenceState::ingest_bases`].
-    /// `Err` only for a layer name that isn't one of those two modes (a
-    /// caller bug: `ingest_bases` is built for every such layer at boot).
     /// Calibrate every branch layer that declares a `calibrate:` block
-    /// (`crate::calibrate`): each unit that stands without a calibration of
-    /// its current version writes its questions, and they are prefilled as
-    /// its exemplars. Run ahead of each pass, so units already read are
+    /// (`crate::calibrate`): each ready unit without a calibration of its
+    /// current version writes its questions, and they are prefilled as its
+    /// exemplars. Run ahead of each pass, so units already read are
     /// calibrated without being read again; a unit the pass reads is
     /// calibrated by the next.
     fn calibrate_layers(&self) {
@@ -3166,15 +3163,29 @@ impl InferenceState {
                 continue;
             };
             let Some(group) = self.refresh_builder.id_for_group(&il.group) else {
+                tracing::error!(
+                    target: "zend::calibrate",
+                    layer = %il.name,
+                    group = %il.group,
+                    "the layer declares a calibration but its group is not in the schema",
+                );
                 continue;
             };
-            let Ok(base) = self.ingest_base(&il.name) else {
-                continue;
+            let base = match self.ingest_base(&il.name) {
+                Ok(base) => base,
+                Err(e) => {
+                    tracing::error!(
+                        target: "zend::calibrate",
+                        layer = %il.name,
+                        "the layer declares a calibration but cannot be calibrated: {e:#}",
+                    );
+                    continue;
+                }
             };
-            crate::calibrate::calibrate_layer(
+            calibrate_layer(
                 &self.engine,
-                &crate::calibrate::Layer { spec, group, base },
-                &crate::calibrate::Frame {
+                &CalibrateLayer { spec, group, base },
+                &CalibrateFrame {
                     system_prompt: &self.formatted_prompt,
                     config: &self.refresh_config,
                 },
@@ -3182,6 +3193,10 @@ impl InferenceState {
         }
     }
 
+    /// The prefilled template a `Folders`/`Files` ingest layer's units fork
+    /// their own conversation from — see [`InferenceState::ingest_bases`].
+    /// `Err` only for a layer name that isn't one of those two modes (a
+    /// caller bug: `ingest_bases` is built for every such layer at boot).
     fn ingest_base(&self, layer_name: &str) -> anyhow::Result<&Mutex<Sequence>> {
         self.ingest_bases
             .get(layer_name)
@@ -8955,6 +8970,7 @@ mod projection_schema_tests {
     /// per-axis split).
     #[test]
     fn embedded_schema_carries_the_working_set_config() {
+        use crate::calibrate::CalibrateSpec;
         use candle_conversation::projection::{ScanCases, SystemPromptItem};
         use candle_conversation::provenance::FusionMode;
         let builder = build_projection_builder(Path::new("demo-project"));
@@ -8985,8 +9001,7 @@ mod projection_schema_tests {
         }
 
         // Whole files and analysis units are each one case of one competition,
-        // voted by the top fold group alone, each normalized over
-        // its background peak floored flat at 100.
+        // every fold group voting alike.
         for name in [
             "code_reading",
             "dependency_analysis",
@@ -8995,16 +9010,26 @@ mod projection_schema_tests {
         ] {
             let g = &layer(name).groups[0];
             assert_eq!(g.policy.scan.cases, ScanCases::File, "{name}");
-            assert_eq!(g.policy.layer_weights, vec![0.0, 0.0, 1.0], "{name}");
-            assert_eq!(g.policy.scan.level_prior_base, 100.0, "{name}");
-            assert_eq!(g.policy.scan.level_prior_cap, 1.0, "{name}");
+            assert!(g.policy.layer_weights.is_empty(), "{name}");
+            // The cold-scope floor is code_reading's alone.
+            let floor = if name == "code_reading" {
+                (2.0, 16.0)
+            } else {
+                (0.0, 8.0)
+            };
+            let scan = &g.policy.scan;
+            assert_eq!(
+                (scan.level_prior_base, scan.level_prior_cap),
+                floor,
+                "{name}"
+            );
         }
         assert_eq!(
             layer("repo_map").groups[0].policy.scan.cases,
             ScanCases::Exchange
         );
         // Each file's reading is calibrated with the questions it answers.
-        let calibrate = crate::calibrate::CalibrateSpec::of(layer("code_reading"))
+        let calibrate = CalibrateSpec::of(layer("code_reading"))
             .unwrap()
             .expect("code_reading declares a calibration");
         assert_eq!(calibrate.questions, 16);

@@ -229,6 +229,12 @@ pub struct Substrate {
     /// belief scan.
     working_sets: HashMap<TimelineId, WorkingSet>,
 
+    /// Each calibrated conversation's calibrations, by the timeline each
+    /// names under [`Self::CALIBRATES_KEY`] — kept as that metadata is applied,
+    /// so a scan reads a unit's calibrations without walking every timeline.
+    /// Tombstoned calibrations stay listed and are filtered at the read.
+    calibrations_of: HashMap<TimelineId, Vec<TimelineId>>,
+
     /// Groups whose conversations are offered to a projection only as its
     /// target's scope names them ([`Self::set_retrieval_scope`]). Ingested
     /// content keyed by what it shows — a file as one branch holds it — is
@@ -3528,9 +3534,9 @@ impl Substrate {
     /// itself.
     ///
     /// **Nor does one that is not whole** ([`Self::holds_whole`]). The
-    /// projection skips an empty turn, so a reading whose turns were emptied on
-    /// this member — the paper on `.5`, 2026-10-25, three turns of nothing —
-    /// was locked, told the model it was in context, and placed nothing.
+    /// projection skips an empty turn — a gap still to arrive from another
+    /// member, or a retired turn — so such a conversation, locked, would tell
+    /// the model a file is in context and place none of what is missing.
     ///
     /// A calibration ([`Self::CALIBRATES_KEY`]) never is: its questions stand
     /// in the gallery for the conversation they calibrate, which is the one
@@ -4959,7 +4965,37 @@ impl Substrate {
         }
         for (k, v) in &meta.custom {
             if take_keyed(&mut entry.ids.custom, k.clone(), id) {
-                entry.custom.insert(k.clone(), v.clone());
+                let before = entry.custom.insert(k.clone(), v.clone());
+                if k == Self::CALIBRATES_KEY {
+                    Self::index_calibration(
+                        &mut self.calibrations_of,
+                        timeline,
+                        before.as_deref(),
+                        v,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Move `calibration` in `index` from the unit `before` named to the one
+    /// `now` names.
+    fn index_calibration(
+        index: &mut HashMap<TimelineId, Vec<TimelineId>>,
+        calibration: TimelineId,
+        before: Option<&str>,
+        now: &str,
+    ) {
+        let unit = |v: &str| v.parse().ok().and_then(TimelineId::from_raw);
+        if let Some(old) = before.and_then(unit) {
+            if let Some(list) = index.get_mut(&old) {
+                list.retain(|&t| t != calibration);
+            }
+        }
+        if let Some(new) = unit(now) {
+            let list = index.entry(new).or_default();
+            if let Err(at) = list.binary_search(&calibration) {
+                list.insert(at, calibration);
             }
         }
     }
@@ -7045,29 +7081,27 @@ impl Substrate {
             .and_then(TimelineId::from_raw)
     }
 
-    /// Every live calibration conversation, keyed by the conversation it
-    /// calibrates, each list in timeline order. Archived and distilled ones
-    /// count: a calibration ends archived and provenance-only by design.
+    /// `unit`'s live calibrations, in timeline order. Archived and distilled
+    /// ones count: a calibration ends archived and provenance-only by design.
+    pub fn calibrations_of(&self, unit: TimelineId) -> impl Iterator<Item = TimelineId> + '_ {
+        self.calibrations_of
+            .get(&unit)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|tl| !self.tombstoned_timelines.contains(tl))
+    }
+
+    /// Every live calibration, keyed by the conversation it calibrates —
+    /// [`Self::calibrations_of`] for every unit that has one.
     pub fn calibrations(&self) -> HashMap<TimelineId, Vec<TimelineId>> {
-        let mut out: HashMap<TimelineId, Vec<TimelineId>> = HashMap::new();
-        for (&tl, entry) in &self.timelines {
-            if self.tombstoned_timelines.contains(&tl) {
-                continue;
-            }
-            let Some(of) = entry
-                .custom
-                .get(Self::CALIBRATES_KEY)
-                .and_then(|v| v.parse().ok())
-                .and_then(TimelineId::from_raw)
-            else {
-                continue;
-            };
-            out.entry(of).or_default().push(tl);
-        }
-        for list in out.values_mut() {
-            list.sort();
-        }
-        out
+        self.calibrations_of
+            .keys()
+            .filter_map(|&unit| {
+                let live: Vec<TimelineId> = self.calibrations_of(unit).collect();
+                (!live.is_empty()).then_some((unit, live))
+            })
+            .collect()
     }
 
     /// All **live** (non-tombstoned) timelines whose `custom` metadata
@@ -7368,6 +7402,7 @@ impl Substrate {
         self.transient_sections.clear();
         self.owned_sections.clear_ownership();
         self.timeline_token_totals.clear();
+        self.calibrations_of.clear();
         self.section_token_total = 0;
         self.gallery_epoch += 1;
     }
@@ -8520,6 +8555,25 @@ mod tests {
             Err(Refusal::Gone)
         );
         assert_eq!(sub.working_set_lock(target, file, ws_limits(1000)), Ok(()));
+
+        // Re-pointed at another unit, a calibration moves with it.
+        let other = unshared_timeline(14);
+        let kv = BTreeMap::from([(
+            Substrate::CALIBRATES_KEY.to_string(),
+            other.raw().to_string(),
+        )]);
+        sub.merge_custom(a, &kv, RecordIdentity::NONE);
+        assert_eq!(sub.calibrations_of(file).collect::<Vec<_>>(), vec![b]);
+        assert_eq!(sub.calibrations_of(other).collect::<Vec<_>>(), vec![a]);
+
+        // Named before it registered, a calibration is found once it does.
+        let early = unshared_timeline(15);
+        sub.merge_custom(early, &kv, RecordIdentity::NONE);
+        assert_eq!(sub.calibrations_of(other).collect::<Vec<_>>(), vec![a]);
+        sub.register_timeline(early, LayerId::for_test(1), GroupId::for_test(1));
+        let mut expect = vec![a, early];
+        expect.sort();
+        assert_eq!(sub.calibrations_of(other).collect::<Vec<_>>(), expect);
     }
 
     /// A tombstoned conversation leaves every dialogue's working set — a pinned

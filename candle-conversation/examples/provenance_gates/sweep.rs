@@ -14,7 +14,7 @@ use candle_conversation::provenance::{WideQSig, FOLD_GROUPS};
 use candle_conversation::substrate::Substrate;
 
 use crate::corpus::{gather, ByLayer, File};
-use crate::gpu_gallery::GpuGallery;
+use crate::gpu_gallery::{GpuGallery, Questions};
 use crate::ranking::order;
 use crate::retrieval::{probes, Probe};
 use crate::stats::mrr;
@@ -31,8 +31,18 @@ const WEIGHTS: [[f32; 3]; 8] = [
 ];
 const KEEP: [f32; 4] = [0.1, 0.25, 0.5, 1.0];
 
-/// Which turns of each file the gallery holds.
-const GALLERIES: [&str; 2] = ["all", "no-request"];
+/// Which turns of each file the gallery holds, and whether its calibration
+/// questions stand beside them.
+const GALLERIES: [&str; 3] = ["all", "no-request", "all+questions"];
+
+/// Whether gallery `gi` holds the calibration questions.
+fn questions_of(gi: usize) -> Questions {
+    if gi == 2 {
+        Questions::With
+    } else {
+        Questions::Without
+    }
+}
 
 /// How a setting's gated votes become file scores: summed per file, or summed
 /// and set against each file's background.
@@ -52,7 +62,7 @@ const T_REF: usize = 256;
 type Backgrounds = HashMap<(usize, usize, usize), (Vec<f32>, Vec<f32>)>;
 
 /// One probe's per-token, per-fold-group votes.
-type TokenVotes = Vec<[Option<Vote>; FOLD_GROUPS]>;
+pub type TokenVotes = Vec<[Option<Vote>; FOLD_GROUPS]>;
 
 /// Gated votes summed per file.
 fn sum_scores(kept: &[Vote], n_files: usize) -> Vec<f32> {
@@ -102,9 +112,12 @@ pub fn run(
     for probe in probes.iter().filter(|p| p.0 != "self (control)") {
         for gi in 0..GALLERIES.len() {
             let (_, _, sigs, left_out) = probe;
-            let votes = gpu.votes(&[sigs.as_slice()], &|f, t| {
-                Some((f, t)) == *left_out || (gi == 1 && first_turn[f] == Some(t))
-            })?;
+            let votes = gpu.votes(
+                &[sigs.as_slice()],
+                &|f, t| Some((f, t)) == *left_out || (gi == 1 && first_turn[f] == Some(t)),
+                questions_of(gi),
+                &|_, _| false,
+            )?;
             score_settings(probe, &votes[0], files.len(), gi, &backgrounds, &mut ranks);
         }
     }
@@ -118,17 +131,15 @@ pub fn run(
     Ok(())
 }
 
-/// Every file's background share and peak under every gallery, weights and
-/// keep.
-fn backgrounds(
-    gpu: &GpuGallery,
+/// Up to `n` background probes, spread evenly over `files`: the middle window
+/// of each one's last covered turn, with the file it came from.
+pub fn background_sources(
     files: &[File],
     rule: &BoundaryRule,
-    first_turn: &[Option<usize>],
-    n_probes: usize,
-) -> anyhow::Result<Backgrounds> {
-    let stride = files.len().div_ceil(n_probes.max(1)).max(1);
-    let sources: Vec<(usize, Vec<WideQSig>)> = files
+    n: usize,
+) -> Vec<(usize, Vec<WideQSig>)> {
+    let stride = files.len().div_ceil(n.max(1)).max(1);
+    files
         .iter()
         .enumerate()
         .step_by(stride)
@@ -138,14 +149,34 @@ fn backgrounds(
             let w = windows.get(windows.len() / 2)?;
             Some((fi, gather(&turn.sigs, w)))
         })
-        .collect();
+        .collect()
+}
+
+/// Gated votes summed per file.
+pub fn summed(votes: &TokenVotes, weights: &[f32], keep: f32, n_files: usize) -> Vec<f32> {
+    sum_scores(&gate(votes, weights, keep), n_files)
+}
+
+/// Every file's background share and peak under every gallery, weights and
+/// keep.
+fn backgrounds(
+    gpu: &GpuGallery,
+    files: &[File],
+    rule: &BoundaryRule,
+    first_turn: &[Option<usize>],
+    n_probes: usize,
+) -> anyhow::Result<Backgrounds> {
+    let sources = background_sources(files, rule, n_probes);
     let mut out = Backgrounds::new();
     for gi in 0..GALLERIES.len() {
         let mut votes: Vec<TokenVotes> = Vec::with_capacity(sources.len());
         for (fi, sigs) in &sources {
-            let v = gpu.votes(&[sigs.as_slice()], &|f, t| {
-                f == *fi || (gi == 1 && first_turn[f] == Some(t))
-            })?;
+            let v = gpu.votes(
+                &[sigs.as_slice()],
+                &|f, t| f == *fi || (gi == 1 && first_turn[f] == Some(t)),
+                questions_of(gi),
+                &|f, _| f == *fi,
+            )?;
             votes.extend(v);
         }
         for (wi, w) in WEIGHTS.iter().enumerate() {

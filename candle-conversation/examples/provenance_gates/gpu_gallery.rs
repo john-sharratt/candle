@@ -16,12 +16,25 @@ use crate::corpus::File;
 /// The locked fold: words per token and fold groups.
 const WPT: usize = 24;
 
-/// Every covered turn of every file, resident on the device.
+/// Every covered turn of every file, and every calibration question, resident
+/// on the device.
 pub struct GpuGallery<'a> {
     arena: GalleryArena,
     /// `(file, turn, its signatures, the file's timeline)`.
     turns: Vec<(usize, usize, &'a Vec<WideQSig>, u64)>,
+    /// `(file, question index, its signatures, calibration timeline, turn)`.
+    questions: Vec<(usize, usize, &'a Vec<WideQSig>, u64, u32)>,
     n_files: usize,
+}
+
+/// What a scan's gallery holds beside the files' own turns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Questions {
+    /// The files' own turns alone.
+    Without,
+    /// Each file's calibration questions too, each voting for its file — but
+    /// the one a mask names.
+    With,
 }
 
 impl<'a> GpuGallery<'a> {
@@ -39,27 +52,51 @@ impl<'a> GpuGallery<'a> {
                     .map(move |(ti, t)| (fi, ti, &t.sigs, f.timeline))
             })
             .collect();
+        let questions = files
+            .iter()
+            .enumerate()
+            .flat_map(|(fi, f)| {
+                f.questions
+                    .iter()
+                    .enumerate()
+                    .map(move |(qi, q)| (fi, qi, &q.sigs, q.timeline, q.turn))
+            })
+            .collect();
         Ok(GpuGallery {
             arena,
             turns,
+            questions,
             n_files: files.len(),
         })
     }
 
     /// Each probe's per-token, per-fold-group vote — the file it went to and
     /// its `z × margin` weight — against every turn `masked` does not name, as
-    /// `(file, turn)`. A vote does not carry the gallery token it was won at.
+    /// `(file, turn)`, and with [`Questions::With`] every calibration question
+    /// `masked_question` does not name, as `(file, question)`. A vote does not
+    /// carry the gallery token it was won at.
     pub fn votes(
         &self,
         probes: &[&[WideQSig]],
         masked: &dyn Fn(usize, usize) -> bool,
+        questions: Questions,
+        masked_question: &dyn Fn(usize, usize) -> bool,
     ) -> anyhow::Result<Vec<Vec<[Option<Vote>; FOLD_GROUPS]>>> {
-        let windows: Vec<PagedWindow> = self
+        let own = self
             .turns
             .iter()
             .filter(|(f, t, _, _)| !masked(*f, *t))
-            .map(|&(f, t, sigs, timeline)| PagedWindow {
-                sid: turn_stream_id(timeline, t as u32),
+            .map(|&(f, t, sigs, timeline)| (f, sigs, turn_stream_id(timeline, t as u32)));
+        let asked = self
+            .questions
+            .iter()
+            .filter(|_| questions == Questions::With)
+            .filter(|(f, qi, _, _, _)| !masked_question(*f, *qi))
+            .map(|&(f, _, sigs, timeline, turn)| (f, sigs, turn_stream_id(timeline, turn)));
+        let windows: Vec<PagedWindow> = own
+            .chain(asked)
+            .map(|(f, sigs, sid)| PagedWindow {
+                sid,
                 fingerprint: 1,
                 turn: sigs.into(),
                 start: 0,

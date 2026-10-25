@@ -1,7 +1,7 @@
 //! Calibrating a layer's conversations for provenance: each unit — a file's
 //! reading, an analysis of it, a day — writes the questions its content
 //! answers, and those questions, prefilled alone, stand in the gallery for it
-//! (`docs/provenance_scoped_signatures.md` §5).
+//! (`docs/provenance_scoped_signatures.md` §2.5).
 //!
 //! A unit's own gallery windows are its content: the request that read it,
 //! the tool calls, the file, its summary. A live probe is a question. Scored
@@ -11,9 +11,9 @@
 //! questions (`docs/tool_selection_provenance_results.md` §26.3).
 //!
 //! Any layer opts in with a `calibrate:` block ([`spec`]). Calibration is the
-//! tools' resume filter applied to units ([`plan`]): a pass finds every unit
-//! that stands without a calibration carrying its current marker and
-//! calibrates it ([`run`]), so units read before the layer declared the block
+//! tools' resume filter applied to units ([`plan`]): a pass finds every ready
+//! unit without a calibration carrying its current marker and calibrates it
+//! ([`run`]), so units read before the layer declared the block
 //! are calibrated without being read again, and a unit read again — a new
 //! version, a changed prompt — is calibrated again.
 

@@ -902,22 +902,17 @@ layers:
           fusion: { mode: additive }
           # Concept F: pinned question window as a second scan.
           question_pin: true
+          # Concept A.4: cold-scope size floor (see repo_map's note).
+          level_prior: { floor_base: 2.0, floor_cap: 16.0 }
           # A file is taken whole, so it is one case, every file in one
           # competition: a file of several exchanges scored alone was scored
           # only against itself, and the large files read over several rounds
           # topped every question (docs/provenance_scoped_signatures.md §2.3).
-          cases: file
-          # Each file over the peak it scores on background probes — the
-          # warm-up's probes of other files — floored flat at 100: a hub that
-          # wins part of every question reads low at its usual peak, and a
-          # quiet file's rare genuine hit stands out
-          # (docs/results/provenance_gates_2026-10-25.md, hubness).
-          level_prior: { floor_base: 100.0, floor_cap: 1.0 }
-          # The top fold group carries a file's identity; the lower two are
-          # mostly shared phrasing. Measured over the analysis units' answers
-          # finding their own file, best on two galleries
+          # Every fold group votes alike: reading each file over its
+          # background peak lost the paper conversation more than half its
+          # files, and weighting the top group a quarter of its tool calls'
           # (docs/results/provenance_gates_2026-10-25.md).
-          layer_weights: [0.0, 0.0, 1.0]
+          cases: file
 
   # ── Dependency Analysis ────────────────────────────────────────────────────
   - name: dependency_analysis
@@ -1001,11 +996,9 @@ layers:
         budget:
           priority: 100
         # A unit is taken whole: one case each, all in one competition (see
-        # code_reading's `scopes`), over its background peak.
+        # code_reading's `scopes`).
         policy:
           cases: file
-          level_prior: { floor_base: 100.0, floor_cap: 1.0 }
-          layer_weights: [0.0, 0.0, 1.0]
 
   # ── Code Review ────────────────────────────────────────────────────────────
   # Beside dependency_analysis, not above it: each unit continues the file's
@@ -1087,8 +1080,6 @@ layers:
           priority: 100
         policy:
           cases: file
-          level_prior: { floor_base: 100.0, floor_cap: 1.0 }
-          layer_weights: [0.0, 0.0, 1.0]
 
   # ── Security Review ────────────────────────────────────────────────────────
   # Beside dependency_analysis and code_review (`after: code_reading`), so an
@@ -1184,8 +1175,6 @@ layers:
           priority: 100
         policy:
           cases: file
-          level_prior: { floor_base: 100.0, floor_cap: 1.0 }
-          layer_weights: [0.0, 0.0, 1.0]
 
   # ── Dialogue ───────────────────────────────────────────────────────────────
   # The live developer ↔ assistant conversation.  Highest layer — sees

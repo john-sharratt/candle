@@ -23,8 +23,10 @@ use candle_conversation::provenance::boundaries::BoundaryRule;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-use crate::corpus::{gather, ByLayer, File, Gallery, DIALOGUE};
-use crate::ranking::{order, rule_names, score};
+use crate::corpus::{gather, ByLayer, File, DIALOGUE};
+use crate::gpu_gallery::GpuGallery;
+use crate::ranking::order;
+use crate::rules::{Scorer, RULES};
 
 /// The expectations file.
 #[derive(Deserialize)]
@@ -80,7 +82,6 @@ pub fn called_paths(text: &str) -> Vec<String> {
 
 pub fn run(
     files: &[File],
-    gallery: &Gallery,
     by_layer: &mut ByLayer,
     rule: &BoundaryRule,
     tokenizer: &Tokenizer,
@@ -88,6 +89,8 @@ pub fn run(
     expectations: &Path,
 ) -> anyhow::Result<()> {
     let exp: Expectations = serde_yaml::from_str(&std::fs::read_to_string(expectations)?)?;
+    let gpu = GpuGallery::new(files)?;
+    let scorer = Scorer::new(&gpu, files, rule)?;
     let turns = by_layer
         .remove(&DIALOGUE)
         .and_then(|mut d| d.remove(&timeline))
@@ -112,7 +115,7 @@ pub fn run(
             }
         }
     }
-    let rules = rule_names();
+    let rules: Vec<&str> = RULES.iter().map(|r| r.name).collect();
     let k = exp.top_k;
     // [message][rule] → (projections, should hits, should total, should_not hits).
     let mut graded: BTreeMap<(usize, usize), (usize, usize, usize, usize)> = BTreeMap::new();
@@ -152,7 +155,7 @@ pub fn run(
                 .into_iter()
                 .filter(|p| index_of.contains_key(p.as_str()))
                 .collect();
-            let per_rule = score(&probe, gallery, files.len(), None);
+            let per_rule = scorer.score(&probe, &|_, _| false, &|_, _| false)?;
             let mut tops: Vec<String> = Vec::new();
             for (ri, s) in per_rule.iter().enumerate() {
                 let top: Vec<&str> = order(s)
@@ -180,8 +183,8 @@ pub fn run(
                     c.0 += 1;
                     c.1 += usize::from(top.contains(&p.as_str()));
                 }
-                // Today's, and the best rule gate 3 has measured so far.
-                if ri == 0 || ri == 5 {
+                // Today's, and the live rule with its questions.
+                if ri == 0 || ri + 1 == RULES.len() {
                     tops.push(format!(
                         "    {}: {}",
                         rules[ri],

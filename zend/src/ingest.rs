@@ -23,10 +23,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use candle_conversation::projection::{LayerSchema, Schema, SelectionRule, SystemPromptItem};
 use candle_conversation::Sequence;
 use journal_core::section::JOURNAL;
+
+use crate::calibrate::CalibrateSpec;
+use crate::layers::LayerSpec;
 
 use crate::raw_read::RawState;
 
@@ -74,10 +78,10 @@ pub struct IngestLayer {
     pub unit: String,
     /// How a [`IngestMode::Derived`] layer's units are read; `None` for every
     /// other mode.
-    pub spec: Option<std::sync::Arc<crate::layers::LayerSpec>>,
+    pub spec: Option<Arc<LayerSpec>>,
     /// How the layer's units are calibrated (`crate::calibrate`); `None` for a
     /// layer that declares no `calibrate:` block.
-    pub calibrate: Option<std::sync::Arc<crate::calibrate::CalibrateSpec>>,
+    pub calibrate: Option<Arc<CalibrateSpec>>,
 }
 
 /// A raw-ChatML layer's live state, held between refreshes and keyed by layer
@@ -148,15 +152,15 @@ pub fn ingest_layers(
         // A layer that declares how its units are read is read that way, in any
         // workspace: its units are built from the layers below it, never from a
         // folder of the user's project.
-        let spec = match crate::layers::LayerSpec::of(layer) {
-            Ok(spec) => spec.map(std::sync::Arc::new),
+        let spec = match LayerSpec::of(layer) {
+            Ok(spec) => spec.map(Arc::new),
             Err(e) => {
                 tracing::error!("{e:#} — the layer is not ingested");
                 continue;
             }
         };
-        let calibrate = match crate::calibrate::CalibrateSpec::of(layer) {
-            Ok(spec) => spec.map(std::sync::Arc::new),
+        let calibrate = match CalibrateSpec::of(layer) {
+            Ok(spec) => spec.map(Arc::new),
             Err(e) => {
                 tracing::error!("{e:#} — the layer is not calibrated");
                 None

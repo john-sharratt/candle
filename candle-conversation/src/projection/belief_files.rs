@@ -41,13 +41,10 @@ pub(crate) struct FileScan {
     /// Stream id of each kept arc's turn — the arena residency key.
     pub arc_sids: Vec<StreamId>,
     /// `(arc index into arcs_kept, window start, window end, exchange slot)`:
-    /// the file's own windows first, then its calibrations'.
+    /// the file's own windows first, then the questions its calibrations hold
+    /// ([`Substrate::CALIBRATES_KEY`]), each voting for the file's head
+    /// exchange — under file-scored cases, for the file.
     pub windows: Vec<(usize, usize, usize, usize)>,
-    /// How many of `windows` are the file's own content; the rest are the
-    /// questions its calibrations hold ([`Substrate::CALIBRATES_KEY`]), each
-    /// voting for the file's head exchange — under file-scored cases, for the
-    /// file.
-    pub own_windows: usize,
     /// Real signature tokens per exchange slot — the Concept A.4 size input.
     pub ex_tokens: Vec<usize>,
 }
@@ -60,7 +57,6 @@ pub(crate) fn assemble_file_scans(
 ) -> (Vec<FileScan>, usize) {
     let mut turns_walked = 0usize;
     let mut files: Vec<FileScan> = Vec::new();
-    let calibrations = sub.calibrations();
     for timeline in timelines {
         // Enumerate the group's turns exactly as selection does — the whole
         // resolved timeline, `0..turn_count`, fetched by stream id — instead
@@ -175,8 +171,7 @@ pub(crate) fn assemble_file_scans(
         }
         // Each calibration's questions, a window apiece, voting for the head
         // exchange. Counted in no exchange's size: they are not its content.
-        let own_windows = windows.len();
-        for &cal in calibrations.get(&timeline).map_or(&[][..], Vec::as_slice) {
+        for cal in sub.calibrations_of(timeline) {
             for i in 0..sub.turn_count(cal) {
                 let sid = turn_stream_id(cal.raw(), i);
                 let Some(window) = sub.wide_sig_window(sid) else {
@@ -199,7 +194,6 @@ pub(crate) fn assemble_file_scans(
             arcs_kept,
             arc_sids,
             windows,
-            own_windows,
             ex_tokens,
         });
     }
@@ -531,7 +525,6 @@ mod tests {
                 .map(|i| turn_stream_id(tl.raw(), i))
                 .collect(),
             windows: (0..exchanges).map(|e| (e, 0, tokens, e)).collect(),
-            own_windows: exchanges,
             ex_tokens: vec![tokens; exchanges],
             arcs_kept: arcs,
         }

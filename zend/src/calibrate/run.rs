@@ -1,5 +1,5 @@
-//! Calibrating a layer's units: find what stands and is not calibrated, ask
-//! each unit for its questions, and prefill them as its calibration.
+//! Calibrating a layer's units: find each ready unit without a calibration,
+//! ask it for its questions, and prefill them as its calibration.
 //!
 //! A unit is asked in a **draft** — a conversation forked from its layer's
 //! base with the unit as its lineage, so the unit's whole conversation is the
@@ -31,7 +31,7 @@ use candle_conversation::projection::{
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
 
-use super::plan::{plan, Prior, Standing};
+use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
 use super::spec::CalibrateSpec;
 use crate::branch_ingest::keys::CONTENT_KEY;
@@ -63,6 +63,9 @@ pub struct Report {
     pub sealed: usize,
     /// Units that failed, calibrated again by a later pass.
     pub failed: usize,
+    /// Units neither calibrated nor ready, calibrated by a later pass once
+    /// they are.
+    pub waiting: usize,
     /// Calibrations retired, and drafts a crash left.
     pub retired: usize,
 }
@@ -82,8 +85,8 @@ pub struct Frame<'a> {
     pub config: &'a SequenceConfig,
 }
 
-/// Calibrate every unit of `layer` that stands and is not calibrated, and
-/// retire every calibration of a unit no longer standing.
+/// Calibrate every unit of `layer` that is ready and not calibrated, and
+/// retire every calibration of a unit no longer there.
 pub fn calibrate_layer(
     engine: &Mutex<ConversationEngine>,
     layer: &Layer<'_>,
@@ -98,7 +101,7 @@ pub fn calibrate_layer(
                 report.retired += 1;
             }
         }
-        let units = standing(&e, layer);
+        let units = units(&e, layer);
         let priors: Vec<(TimelineId, String, bool)> = e
             .conversations_with_metadata_key(MARKER_KEY)
             .into_iter()
@@ -122,11 +125,13 @@ pub fn calibrate_layer(
         todo
     };
     report.done = todo.done;
+    report.waiting = todo.waiting;
     tracing::info!(
         target: "zend::calibrate",
         layer = %spec.layer,
         calibrated = todo.done,
         to_calibrate = todo.run.len(),
+        waiting = report.waiting,
         retired = report.retired,
         "calibrating the layer's units",
     );
@@ -135,8 +140,10 @@ pub fn calibrate_layer(
     let failed = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..LAYER_PARALLELISM.min(todo.run.len()).max(1) {
+            // Only a shutdown stops it: a pass asked for meanwhile waits for
+            // the layer to finish, since this runs ahead of every pass.
             s.spawn(|| loop {
-                if crate::ingest_cancel::cancelled() || crate::ingest_worker::preempted() {
+                if crate::ingest_cancel::cancelled() {
                     return;
                 }
                 let Some(unit) = todo.run.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
@@ -169,36 +176,52 @@ pub fn calibrate_layer(
         calibrated = report.done,
         sealed = report.sealed,
         failed = report.failed,
+        waiting = report.waiting,
         retired = report.retired,
         "the layer's calibration pass ended",
     );
     report
 }
 
-/// Every unit of `layer` that stands: committed under a content key, naming
-/// its subject, its chain finished, and every turn holding its content.
-fn standing(engine: &ConversationEngine, layer: &Layer<'_>) -> Vec<Standing> {
+/// Every unit of `layer`: each conversation of its group committed under a
+/// content key and naming its subject — ready when its chain finished and
+/// every turn holds its content.
+fn units(engine: &ConversationEngine, layer: &Layer<'_>) -> Vec<Unit> {
     let conv = engine.conversation();
     let substrate = conv.read();
-    let mut units: Vec<Standing> = substrate
-        .active_timelines_for_group(layer.group)
+    units_of(&substrate, layer.group, layer.spec)
+}
+
+/// [`units`] over `substrate`.
+fn units_of(substrate: &Substrate, group: GroupId, spec: &CalibrateSpec) -> Vec<Unit> {
+    let mut units: Vec<Unit> = substrate
+        .active_timelines_for_group(group)
         .filter(|&tl| substrate.calibrates(tl).is_none())
         .filter_map(|tl| {
             let meta = substrate.custom_of(tl)?;
             let key = meta.get(CONTENT_KEY)?;
             let subject = meta.get(SUBJECT_KEY).or_else(|| meta.get(PATH_KEY))?;
-            if chain_break(&substrate, tl).is_some() || !substrate.holds_whole(tl) {
-                return None;
-            }
-            Some(Standing {
+            Some(Unit {
                 timeline: tl,
                 subject: subject.clone(),
-                marker: layer.spec.marker(key),
+                marker: spec.marker(key),
+                ready: chain_break(substrate, tl).is_none() && substrate.holds_whole(tl),
             })
         })
         .collect();
     units.sort_by_key(|u| u.timeline);
     units
+}
+
+/// The config a calibration is prefilled under: the frame's, lossless until
+/// the seal, as the tools' calibrations are — the signature is captured from
+/// every token's Q at the seal, and a quantized K/V would capture it from a
+/// degraded one.
+fn calibration_config(frame: &SequenceConfig) -> SequenceConfig {
+    SequenceConfig {
+        kv_lossless: true,
+        ..frame.clone()
+    }
 }
 
 /// The selection a draft is asked under: no reasoning, and no tool block.
@@ -215,7 +238,7 @@ fn calibrate_one(
     engine: &Mutex<ConversationEngine>,
     layer: &Layer<'_>,
     frame: &Frame<'_>,
-    unit: &Standing,
+    unit: &Unit,
 ) -> anyhow::Result<()> {
     let spec = layer.spec;
     let asked = draft(engine, layer, unit)?;
@@ -230,7 +253,7 @@ fn calibrate_one(
             frame.system_prompt,
             Reserved::Calibration,
             DecodePriority::Normal,
-            frame.config.clone(),
+            calibration_config(frame.config),
         )
         .map_err(|e| anyhow::anyhow!("calibration conversation: {e}"))?;
     let timeline = conv.timeline_id();
@@ -293,7 +316,7 @@ fn calibrate_one(
 fn draft(
     engine: &Mutex<ConversationEngine>,
     layer: &Layer<'_>,
-    unit: &Standing,
+    unit: &Unit,
 ) -> anyhow::Result<String> {
     let spec = layer.spec;
     let mut conv = layer
@@ -343,7 +366,90 @@ fn draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_conversation::projection::{Conversation, LayerId};
+    use candle_conversation::substrate::TurnPartWrite;
+    use candle_conversation::turn_layout::{KvSpan, TurnLayout, TurnSegment};
+    use candle_conversation::Role;
 
+    /// **Every keyed unit is found; only a whole, finished one is ready.** A
+    /// unit with a turn still to arrive, and one cut off mid-thought, are
+    /// found but not ready; a calibration and an unkeyed conversation of the
+    /// group are not units.
+    #[test]
+    fn a_unit_is_ready_only_whole_and_finished() {
+        let conv = Conversation::ephemeral();
+        let layer = LayerId::from_raw(1).unwrap();
+        let group = GroupId::from_raw(1).unwrap();
+        let spec = CalibrateSpec {
+            layer: "code_reading".into(),
+            questions: 4,
+            prompt: "ask".into(),
+        };
+        let said = |tl: TimelineId, text: &str| {
+            conv.record_turn(
+                tl,
+                Role::User,
+                TurnPartWrite {
+                    layout: TurnLayout::new(vec![TurnSegment::Assistant {
+                        text: Some(text.into()),
+                        kv: KvSpan::new(0, 4),
+                    }]),
+                    token_count: 4,
+                    ..Default::default()
+                },
+                |seqs| Ok(seqs.to_vec()),
+            )
+            .unwrap();
+        };
+        let answered = |tl: TimelineId| said(tl, "It reads the file.");
+        let keyed = |tl: TimelineId, path: &str| {
+            conv.set_conversation_metadata(tl, CONTENT_KEY, &format!("key:{path}"))
+                .unwrap();
+            conv.set_conversation_metadata(tl, PATH_KEY, path).unwrap();
+        };
+        let [whole, gappy, cal, unkeyed, cut] =
+            [11u64, 12, 13, 14, 15].map(|raw| TimelineId::from_raw(raw).unwrap());
+        for tl in [whole, gappy, cal, unkeyed, cut] {
+            conv.register_timeline(tl, layer, group);
+        }
+        answered(whole);
+        keyed(whole, "candle/a.rs");
+        conv.write().restore_gap_turn(gappy);
+        answered(gappy);
+        keyed(gappy, "candle/b.rs");
+        answered(cal);
+        keyed(cal, "candle/c.rs");
+        conv.set_conversation_metadata(cal, Substrate::CALIBRATES_KEY, &whole.raw().to_string())
+            .unwrap();
+        answered(unkeyed);
+        said(cut, "<think>It reads the fi");
+        keyed(cut, "candle/d.rs");
+
+        let units = units_of(&conv.read(), group, &spec);
+        assert_eq!(
+            units,
+            vec![
+                Unit {
+                    timeline: whole,
+                    subject: "candle/a.rs".into(),
+                    marker: spec.marker("key:candle/a.rs"),
+                    ready: true,
+                },
+                Unit {
+                    timeline: gappy,
+                    subject: "candle/b.rs".into(),
+                    marker: spec.marker("key:candle/b.rs"),
+                    ready: false,
+                },
+                Unit {
+                    timeline: cut,
+                    subject: "candle/d.rs".into(),
+                    marker: spec.marker("key:candle/d.rs"),
+                    ready: false,
+                },
+            ]
+        );
+    }
     /// A draft is asked without reasoning and without a tool block.
     #[test]
     fn a_draft_neither_reasons_nor_sees_tools() {
