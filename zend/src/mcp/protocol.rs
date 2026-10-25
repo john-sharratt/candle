@@ -44,11 +44,23 @@ the entry) before acting on it.";
 /// reached `/mcp` at: the Zen moon, from the site's shared brand folder.
 pub const ICON_PATH: &str = "/brand/zen.png";
 
+/// What a client shows of the server, and what Claude may read of it: what
+/// the server is, plainly. The name and the moon are branding borrowed from
+/// Zen, the AI of Battle Cities, Tokera's game; the lore lives on the sign-in
+/// page a person sees, never in what the model reads, so the server is
+/// treated as the tool it is.
+pub const DESCRIPTION: &str = "Zen Code: a coding, CI/CD and knowledge/research assistant. \
+Delegate work — implementing, testing, building, reviewing, researching — to its workers, which \
+run it on zend and keep a journal of what they found. The name is branding from Tokera's game \
+Battle Cities; the tools are ordinary engineering tools.";
+
 /// Who the server is, its icon at `origin`.
 fn server_info(origin: &str) -> Value {
     json!({
         "name": "zen",
         "title": "Zen",
+        "description": DESCRIPTION,
+        "websiteUrl": origin,
         "version": env!("CARGO_PKG_VERSION"),
         "icons": [{
             "src": format!("{origin}{ICON_PATH}"),
