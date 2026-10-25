@@ -751,21 +751,21 @@ pub fn spawn(rt: Arc<Runtime>) {
                         "operation: no Maker left who may take it, called off"
                     );
                 }
-                while hosted.sim(|s| s.table_open && s.bench.has_root())
+                // **One generation a tick.** Each can take minutes, and the open
+                // operations' steps above come first: stocking the table in a
+                // loop here held a draft's reading behind every generation it
+                // took to stock, while the Makers drew routines.
+                if hosted.sim(|s| s.table_open && s.bench.has_root())
                     && !hosted.sim(|s| s.missions.stocked_for(&makers, config.keep))
                     && !rt.stopping()
                 {
                     match generate(&rt, &hosted, &config, None).await {
-                        Ok(Generation::NoWork) => break,
+                        Ok(Generation::NoWork) => {}
                         // An operation just opened has its first step put on
-                        // the table now, not after the rest of the stocking:
-                        // each generation can take minutes, and meanwhile a
-                        // Maker at the table is handed a routine instead.
+                        // the table now rather than a tick later, while a
+                        // Maker at the table would be handed a routine.
                         Ok(_) => offer_owed(&hosted, &mind),
-                        Err(e) => {
-                            tracing::warn!("mission generator: {e:#}");
-                            break;
-                        }
+                        Err(e) => tracing::warn!("mission generator: {e:#}"),
                     }
                 }
             }
