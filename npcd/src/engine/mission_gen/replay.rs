@@ -29,7 +29,7 @@ use super::material;
 use super::reading;
 use super::run::{reading_prompt, READING_TOKENS, THINK};
 use crate::engine::mind::Minds;
-use crate::engine::prose::{decode_call_thought, CallAsk};
+use crate::engine::prose::{decode_call_thought, CallAsk, WORK_BAND};
 use journal_core::tools::arguments;
 
 const MIND: &str = "D:/prog/mind";
@@ -145,6 +145,7 @@ fn the_reading_replayed_on_the_real_model() {
                     temperature: None,
                     seed: *seed,
                     think: THINK,
+                    band: WORK_BAND,
                 };
                 decode_call_thought(&engine, sampler, &ask)
                     .await

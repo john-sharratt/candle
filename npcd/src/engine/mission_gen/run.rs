@@ -27,7 +27,7 @@ use super::target::{self, Kind, Target};
 use crate::api::now_ms;
 use crate::engine::mind::Minds;
 use crate::engine::mission::{time_step_text, Mission, Todo};
-use crate::engine::prose::{self, decode_call, CallAsk};
+use crate::engine::prose::{self, decode_call, CallAsk, WORK_BAND};
 use crate::engine::runtime::Runtime;
 use crate::engine::work::what_happens;
 use crate::engine::workflow::{OnFailed, Where};
@@ -188,6 +188,7 @@ async fn write_up(
             temperature: None,
             seed: resolve_seed(None),
             think: THINK,
+            band: WORK_BAND,
         };
         let raw = decode_call(&engine, &base, &ask).await?;
         let checked = match answer::check(&raw, generator.kind, target, corpus) {
@@ -447,6 +448,7 @@ async fn table_reading(
             temperature: None,
             seed: resolve_seed(None),
             think: THINK,
+            band: WORK_BAND,
         };
         let raw = decode_call(engine, base, &ask).await?;
         match reading::check(&raw, &op.document, corpus, attempt < ATTEMPTS) {
