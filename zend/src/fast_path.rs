@@ -190,10 +190,10 @@ pub fn file_conversation(
         // in context, it would put an assistant that deliberates and
         // answers nothing into this conversation.
         .filter(|&tl| chain_finished(engine, tl))
-        // A reading another member made whose turns have not all arrived here
-        // places nothing for the turns it is missing; another reading of the
-        // same version, made here, may be whole.
-        .filter(|&tl| !engine.holds_gap(tl))
+        // A reading with turns empty here — not yet fetched from the member
+        // that wrote them, or retired — places nothing for them; another
+        // reading of the same version may be whole.
+        .filter(|&tl| engine.holds_whole(tl))
         .find_map(|tl| {
             let lines = lines_of(engine, tl)?;
             coverage

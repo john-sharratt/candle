@@ -1205,10 +1205,10 @@ impl ConversationEngine {
         self.conversation.find_timelines_by_metadata(key, value)
     }
 
-    /// Whether any turn of `timeline` is a gap: written by another member and
-    /// not here yet, so the conversation cannot be placed whole.
-    pub fn holds_gap(&self, timeline: TimelineId) -> bool {
-        self.conversation.read().holds_gap(timeline)
+    /// Whether every turn of `timeline` holds its content, so the conversation
+    /// can be placed whole ([`Substrate::holds_whole`](crate::substrate::Substrate::holds_whole)).
+    pub fn holds_whole(&self, timeline: TimelineId) -> bool {
+        self.conversation.read().holds_whole(timeline)
     }
 
     /// Lock `read` into `target`'s working set — the conversation that already

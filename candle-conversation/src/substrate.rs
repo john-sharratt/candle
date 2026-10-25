@@ -3527,17 +3527,15 @@ impl Substrate {
     /// is worse than reading the file twice. A conversation never carries
     /// itself.
     ///
-    /// **Nor does one holding a gap.** A turn another member wrote whose
-    /// records have not arrived is held as an empty gap at its index
-    /// (`restore_gap_turn`), and the projection skips an empty turn — so a
-    /// reading made elsewhere locked whole on this member, told the model the
-    /// paper was in context, and placed nothing (445 such turns on `.5`,
-    /// 2026-10-25).
+    /// **Nor does one that is not whole** ([`Self::holds_whole`]). The
+    /// projection skips an empty turn, so a reading whose turns were emptied on
+    /// this member — the paper on `.5`, 2026-10-25, three turns of nothing —
+    /// was locked, told the model it was in context, and placed nothing.
     fn deliverable(&self, target: TimelineId, timeline: TimelineId) -> bool {
         timeline != target
             && !self.tombstoned_timelines.contains(&timeline)
             && self.timelines.get(&timeline).is_some_and(|e| !e.archived)
-            && !self.holds_gap(timeline)
+            && self.holds_whole(timeline)
             && Substrate::turn_count(self, timeline) > 0
     }
 
@@ -8401,11 +8399,12 @@ mod tests {
         assert!(sub.working_set(target).unwrap().provenance().is_empty());
     }
 
-    /// **A conversation holding a gap is gone.** A turn another member wrote
-    /// and this one has not fetched is an empty gap, which the projection
-    /// skips: locked, the conversation was promised whole and placed nothing.
+    /// **A conversation that is not whole is gone.** A gap — a turn another
+    /// member wrote and this one has not fetched — and a retired turn are both
+    /// empty, and the projection skips an empty turn: locked, the conversation
+    /// was promised whole and placed nothing.
     #[test]
-    fn a_conversation_holding_a_gap_is_gone() {
+    fn a_conversation_that_is_not_whole_is_gone() {
         let (mut sub, target, _) = working_set_fixture(0, 10);
         let partial = unshared_timeline(3);
         sub.register_timeline(partial, LayerId::for_test(1), GroupId::for_test(1));
@@ -8420,6 +8419,18 @@ mod tests {
         assert_eq!(
             sub.working_set_seed(target, &[partial], ws_limits(1000), 1000.0),
             vec![partial],
+        );
+
+        let retired = unshared_timeline(4);
+        sub.register_timeline(retired, LayerId::for_test(1), GroupId::for_test(1));
+        sub.append_with_blocks(retired, 10, 0, 1);
+        sub.append_with_blocks(retired, 10, 1, 2);
+        assert!(sub.holds_whole(retired));
+        sub.tombstone_turn(retired, 1);
+        assert!(!sub.holds_whole(retired));
+        assert_eq!(
+            sub.working_set_lock(target, retired, ws_limits(1000)),
+            Err(Refusal::Gone)
         );
     }
 
@@ -9819,6 +9830,7 @@ mod tests {
                 timeline,
                 TurnPartWrite {
                     sealed_gpu: Some(Arc::new(vec![minimal_sealed_layer()])),
+                    token_count: 1,
                     ..Default::default()
                 },
                 identity_migrate,

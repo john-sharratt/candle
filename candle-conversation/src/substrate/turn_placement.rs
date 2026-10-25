@@ -61,11 +61,21 @@ impl Substrate {
             .is_some_and(|tl| tl.gaps.contains(&index))
     }
 
-    /// Whether any position of `timeline` is a gap — a turn still to arrive.
-    pub fn holds_gap(&self, timeline: TimelineId) -> bool {
-        self.timelines
-            .get(&timeline)
-            .is_some_and(|tl| !tl.gaps.is_empty())
+    /// Whether every turn of `timeline` holds its content: no gap — a turn
+    /// still to arrive — and no other empty turn but a summary anchor, which
+    /// holds none by design. A retired turn is emptied in place, as a reload
+    /// leaves a turn whose records it could not use, and the projection skips
+    /// every empty turn — so a conversation that is not whole cannot be placed
+    /// as the whole it was read as. `false` for a timeline the substrate does
+    /// not hold.
+    pub fn holds_whole(&self, timeline: TimelineId) -> bool {
+        self.timelines.get(&timeline).is_some_and(|tl| {
+            tl.gaps.is_empty()
+                && tl.turns.iter().all(|(idx, turn)| {
+                    turn.content.token_count > 0
+                        || tl.tree_meta.get(idx).is_some_and(|m| m.kind.is_summary())
+                })
+        })
     }
 
     /// Whether a turn — anything but a gap — holds `index` of `timeline`.
