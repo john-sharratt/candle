@@ -159,12 +159,46 @@ the production shape that would leave the GPU scan unchanged.
 - The CPU scan took 1,842 s for 180 probes at 2.8 M gallery tokens — ~10 s a
   probe: offline only.
 
+### Sweeps — the scorer's settings and hubness
+
+`provenance_gates sweep` scores each probe once (`group_votes`) and weighs,
+gates and aggregates every setting on the host: per-fold-group vote weights,
+the needle gate's keep fraction, whether the gallery holds each file's request
+turn, and the fold from votes to file scores. The source that decides is the
+**analysis units**: a `dependency_analysis` unit's answer windows, each finding
+the file it analyses (5.2 M gallery tokens, 192 probes).
+
+| setting | MRR |
+|---|---|
+| today: weights [1, 1, 1], keep 0.25, summed | 0.436 |
+| best weights and keep, summed | 0.456 |
+| [0.5, 1, 2], keep 0.25, over-peak (floor 100) | 0.469 |
+| [0, 0, 1], keep 0.5, over-peak (floor 100) | **0.502** |
+
+- **Window tallies do not carry over to analysis units.** Count-normalised
+  and identity-or-count, the best rules on request and summary probes, sit at
+  or below the summed votes here.
+- **Hubness is what costs the most.** The same few files —
+  `regen_summaries.rs`, `battle-cities/CLAUDE.md`, `coding_assistant.md`,
+  `batch_norm.rs` — win part of every probe's votes whatever it asks. Scored
+  over each file's **background** (what it wins on probes of other files, its
+  own left out) they lose that lead: the share less the background mean helps,
+  and the raw score over the file's background *peak*, both at a 256-token
+  probe and floored at 100, helps most. That denominator is production's
+  traffic-peak normalization (`normalization::ScopeState` with a level-prior
+  floor), so it ships as configuration plus a warm-up: the file-scored groups
+  set `level_prior: { floor_base: 100, floor_cap: 1 }`, and
+  `Conversation::warm_pool_background` folds 64 background probes into each
+  group's pool scope, triggered as the group grows.
+
 ## Open
 
-- The analysis-unit source (a `dependency_analysis` / `code_review` /
-  `security_review` unit's own answer finding its file) has no probes yet: no
-  analysis layer has run on the fresh substrate. It is the gate's real test.
-- 37 probes a source is small; rerun as the gallery grows.
+- The production warm folds every growth's probes into one max-ever peak, so a
+  group warmed many times has seen more than the sweep's 64 background probes;
+  the sweep now takes the count (`sweep <per source> <background probes>`) to
+  measure what that does.
+- The over-peak sweep ranks [0, 0, 1] at keep 0.5 above the shipped [0.5, 1, 2]
+  at keep 0.25; the keep fraction is a constant of the GPU tally today.
 - Next rule to measure: identity and best-window combined (the better of a
   file's identity score and its count-normalised best window, each
   standardised), and a milder count correction.

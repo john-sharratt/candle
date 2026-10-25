@@ -263,41 +263,48 @@ fn score_settings<'a>(
     }
 }
 
-/// The best settings by mean MRR over the sources, and today's.
+/// The best settings for each source by its MRR, and today's. Each source is
+/// ranked alone: a gallery without the request turns lifts request probes and
+/// takes summary probes' answers away, so a mean over sources ranks galleries
+/// by an artefact.
 fn report(ranks: &Ranks<'_>) {
     let sources: Vec<&str> = ranks
         .values()
         .next()
         .map(|m| m.keys().copied().collect())
         .unwrap_or_default();
-    let mut rows: Vec<(f32, bool, String)> = ranks
+    let rows: Vec<(Vec<f32>, bool, String)> = ranks
         .iter()
         .map(|(&(gi, wi, ki, fi), by_source)| {
             let per: Vec<f32> = sources.iter().map(|s| mrr(&by_source[s])).collect();
-            let mean = per.iter().sum::<f32>() / per.len().max(1) as f32;
             let cells: Vec<String> = per.iter().map(|m| format!("{m:.3}")).collect();
             let today = gi == 0 && wi == 0 && KEEP[ki] == 0.25 && fi == 0;
             let row = format!(
-                "{mean:.3}  {:<10} {:<17} keep {:<4} {:<26} {}",
+                "{:<10} {:<17} keep {:<4} {:<26} {}",
                 GALLERIES[gi],
                 format!("{:?}", WEIGHTS[wi]),
                 KEEP[ki],
                 FOLDS[fi].name(),
                 cells.join("  ")
             );
-            (mean, today, row)
+            (per, today, row)
         })
         .collect();
-    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
-    println!(
-        "mean   gallery    weights           keep      fold                       \
+    let header = format!(
+        "gallery    weights           keep      fold                       \
          MRR per source: {}",
         sources.join(" / ")
     );
-    for (_, _, row) in rows.iter().take(25) {
-        println!("{row}");
+    for (si, source) in sources.iter().enumerate() {
+        let mut order: Vec<&(Vec<f32>, bool, String)> = rows.iter().collect();
+        order.sort_by(|a, b| b.0[si].total_cmp(&a.0[si]));
+        println!("best for {source}:\n{header}");
+        for (_, _, row) in order.iter().take(15) {
+            println!("{row}");
+        }
+        println!();
     }
     if let Some((_, _, row)) = rows.iter().find(|r| r.1) {
-        println!("\ntoday: {row}");
+        println!("today: {row}");
     }
 }

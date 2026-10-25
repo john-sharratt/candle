@@ -87,9 +87,8 @@ impl Scheduler {
     }
 
     /// Queue the dialogue warm-up replay when it is armed — see
-    /// [`Conversation::take_warm_replay`] — and the background warm of every
-    /// file-scored group that has grown since its last
-    /// ([`Conversation::take_background_warms`]). A no-op otherwise, so it is
+    /// [`Conversation::take_warm_replay`] — and any background warm that is
+    /// due ([`Self::queue_background_warms`]). A no-op otherwise, so it is
     /// cheap to call on every reprojection.
     pub(super) fn queue_norm_warm(
         &mut self,
@@ -97,17 +96,7 @@ impl Scheduler {
         projection: &Arc<Builder>,
         target: ProjectionTarget,
     ) {
-        // Scored on the arena only: a scan of a whole file-scored group on the
-        // host is seconds this loop would stand behind.
-        if self.gallery_arena.is_some() {
-            for group in substrate.take_background_warms(projection.schema()) {
-                self.norm_warm.background.push_back(BackgroundJob {
-                    conversation: substrate.clone(),
-                    projection: Arc::clone(projection),
-                    group,
-                });
-            }
-        }
+        self.queue_background_warms(substrate, projection);
         let Some(probes) = substrate.take_warm_replay(target) else {
             return;
         };
@@ -119,6 +108,29 @@ impl Scheduler {
             target,
             probe,
         }));
+    }
+
+    /// Queue the background warm of every file-scored group that has grown
+    /// since its last ([`Conversation::take_background_warms`]) — at a turn's
+    /// opening projection as well as its reprojections, since a short turn
+    /// never reprojects. A no-op otherwise.
+    pub(super) fn queue_background_warms(
+        &mut self,
+        substrate: &Conversation,
+        projection: &Arc<Builder>,
+    ) {
+        // Scored on the arena only: a scan of a whole file-scored group on the
+        // host is seconds this loop would stand behind.
+        if self.gallery_arena.is_none() {
+            return;
+        }
+        for group in substrate.take_background_warms(projection.schema()) {
+            self.norm_warm.background.push_back(BackgroundJob {
+                conversation: substrate.clone(),
+                projection: Arc::clone(projection),
+                group,
+            });
+        }
     }
 
     /// Queue one ingest warm-up slice; [`Self::step_norm_warm`] scores it on a

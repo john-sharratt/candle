@@ -4564,6 +4564,7 @@ impl Scheduler {
                             return true;
                         }
                     };
+                    self.queue_background_warms(&conversation, &inputs.projection);
                     // Target-aware read: the projection sees only
                     // `target.timeline` within `target.group`,
                     // masking sibling timelines.
