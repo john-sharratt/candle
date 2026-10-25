@@ -3301,6 +3301,9 @@ pub(crate) struct Scheduler {
     /// Submitted turns whose projection is chosen but not yet on the device,
     /// offered to the admission fill with their lift priced (`submit_admit`).
     pub(super) pending_submits: VecDeque<submit_admit::PendingSubmit>,
+    /// When a turn waiting long for admission was last reported
+    /// (`submit_admit::Scheduler::report_waiting_submits`).
+    pub(super) waiting_told: Option<Instant>,
     /// Whether a slot has released its ground since the last admission pass.
     ///
     /// **Admission opportunities are created only by completions.** Nothing new
@@ -4076,6 +4079,7 @@ impl Scheduler {
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
             pending_submits: VecDeque::new(),
+            waiting_told: None,
             // See the field: the first pass has nothing to wait for.
             settled_since_admit: true,
             settle_owed: false,
