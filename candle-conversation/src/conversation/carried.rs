@@ -68,13 +68,14 @@ struct Plan {
 }
 
 /// One section already held: its name, its text, the sections it was sealed
-/// after, and whether it can still be read (it has neither failed to seal nor
-/// been removed).
+/// after, whether it can still be read (it has neither failed to seal nor
+/// been removed), and whether it is still waiting to seal.
 struct Standing<'a> {
     name: &'a str,
     text: &'a str,
     after: &'a [String],
     alive: bool,
+    pending: bool,
 }
 
 /// The names a chained section at `i` of `wanted` continues.
@@ -90,6 +91,15 @@ fn before(wanted: &[Want<'_>], i: usize) -> Vec<String> {
 ///
 /// `sweep` names are removed when `sweeping`, whether or not anything held
 /// carries them, because a stream an earlier run left is not held.
+///
+/// **A chain still sealing is left to finish.** Replacing it while a link is
+/// pending removes that link under the links sealed after it, and every one of
+/// them fails with it. Under load a chain takes minutes to seal, the wants it
+/// is reconciled to move faster than that, and a journal was resealed over and
+/// over without converging: 519 seals and 454 failures in half an hour, ahead
+/// of everything else the engine had to do. Once nothing is pending, the next
+/// reconcile carries whatever is wanted then; meanwhile a turn reads the
+/// chain's sealed beginning, as it does while any chain seals.
 fn plan(
     held: &[Standing<'_>],
     wanted: &[Want<'_>],
@@ -98,6 +108,9 @@ fn plan(
     sweeping: bool,
 ) -> Plan {
     let mut plan = Plan::default();
+    if kept == Linking::Chain && held.iter().any(|h| h.pending) {
+        return plan;
+    }
     let mut broken = false;
     for (i, want) in wanted.iter().enumerate() {
         let after = match kept {
@@ -173,14 +186,15 @@ impl Carried {
         let standing: Vec<Standing<'_>> = self
             .held
             .iter()
-            .map(|(name, h)| Standing {
-                name,
-                text: &h.text,
-                after: &h.after,
-                alive: !matches!(
-                    h.section.state(),
-                    SectionState::Failed(_) | SectionState::Removed
-                ),
+            .map(|(name, h)| {
+                let state = h.section.state();
+                Standing {
+                    name,
+                    text: &h.text,
+                    after: &h.after,
+                    alive: !matches!(state, SectionState::Failed(_) | SectionState::Removed),
+                    pending: matches!(state, SectionState::Pending),
+                }
             })
             .collect();
         let todo = plan(&standing, wanted, kept, sweep, !self.swept);
@@ -273,6 +287,7 @@ mod tests {
             text,
             after: NONE,
             alive,
+            pending: false,
         }
     }
 
@@ -282,7 +297,57 @@ mod tests {
             text,
             after,
             alive: true,
+            pending: false,
         }
+    }
+
+    /// **A chain with a link still sealing is not replaced under it.** Losing
+    /// its first link would reseal every later one; while one of them is
+    /// pending, nothing is submitted or removed, and the reconcile after it
+    /// settles does the whole change.
+    #[test]
+    fn a_chain_still_sealing_is_left_to_finish() {
+        let one = names(&["journal/1"]);
+        let two = names(&["journal/1", "journal/2"]);
+        let held = [
+            chained("journal/1", "a", NONE),
+            Standing {
+                pending: true,
+                ..chained("journal/2", "b", &one)
+            },
+            chained("journal/open", "x", &two),
+        ];
+        let wanted = [want("journal/2", "b"), want("journal/open", "y")];
+        assert_eq!(
+            plan(&held, &wanted, Linking::Chain, &[], false),
+            Plan::default()
+        );
+        let settled = [
+            chained("journal/1", "a", NONE),
+            chained("journal/2", "b", &one),
+            chained("journal/open", "x", &two),
+        ];
+        let p = plan(&settled, &wanted, Linking::Chain, &[], false);
+        assert_eq!(p.submit, vec![0, 1]);
+        assert_eq!(p.remove, vec!["journal/1".to_string()]);
+    }
+
+    /// Sections kept apart have nothing sealed after them, so a pending one is
+    /// replaced as soon as its text changes.
+    #[test]
+    fn a_pending_section_kept_apart_is_replaced_at_once() {
+        let held = [Standing {
+            pending: true,
+            ..standing("mission/standing", "go", true)
+        }];
+        let p = plan(
+            &held,
+            &[want("mission/standing", "stay")],
+            Linking::Apart,
+            &[],
+            false,
+        );
+        assert_eq!(p.submit, vec![0]);
     }
 
     fn names(n: &[&str]) -> Vec<String> {
