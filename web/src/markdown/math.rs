@@ -14,6 +14,8 @@
 
 use latex2mathml::{latex_to_mathml, DisplayStyle};
 
+use crate::html::escape;
+
 /// `$…$` — flows with the sentence around it.
 pub fn inline(latex: &str) -> String {
     convert(latex, DisplayStyle::Inline, "math-inline")
@@ -269,20 +271,6 @@ fn convert(latex: &str, style: DisplayStyle, class: &str) -> String {
     // published document is not rendering, and nothing else surfaces it.
     tracing::debug!(error = %failure, latex, "math: falling back to literal LaTeX");
     format!("<code class=\"{class} math-raw\">{}</code>", escape(latex))
-}
-
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

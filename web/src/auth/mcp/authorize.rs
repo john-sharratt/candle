@@ -18,13 +18,17 @@
 use std::collections::HashMap;
 
 use axum::http::{header, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use reqwest::Url;
 
 use super::client::{self, ClientDoc};
-use super::grants::{self, Code, Consent, Grant, Kind, CODE_TTL_SECS, CONSENT_TTL_SECS};
+use super::grants::{
+    self, Code, Consent, Grant, Kind, CODE_TTL_SECS, CONSENT_TTL_SECS, REFRESH_TTL_SECS,
+};
+use super::page::respond;
 use crate::auth::oidc::urlencode;
 use crate::auth::session::{Identity, Key};
+use crate::html::escape;
 
 /// A client's authorization request, checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,16 +98,10 @@ pub fn answer_redirect(
     with_query(redirect_uri, &pairs)
 }
 
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-/// The consent page: who asks, where they will be sent, as whom.
-pub fn consent_page(consent: &Consent, sealed: &str) -> String {
+/// The consent card: who asks, what it may do, as whom, and where it will be
+/// sent. Nothing is focused, so no keystroke meant for another window can
+/// press Allow.
+pub fn consent_card(consent: &Consent, sealed: &str) -> String {
     let to = Url::parse(&consent.grant.redirect_uri)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
@@ -114,35 +112,43 @@ pub fn consent_page(consent: &Consent, sealed: &str) -> String {
         consent.grant.email.clone()
     };
     format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Allow access to zend</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.5}}button{{font:inherit;padding:.5rem 1.25rem;margin-right:.5rem}}code{{word-break:break-all}}</style>
-</head><body>
-<h1>Allow access to zend?</h1>
-<p><strong>{name}</strong> asks to use zend as <strong>{who}</strong>: to start and read your threads, run tasks on them, and read their journals.</p>
-<p>It will be sent back to <code>{to}</code>.</p>
-<form method="post" action="/oauth/authorize">
+        r#"<div class="body">
+<h1><span class="client">{name}</span> wants to use zend</h1>
+<p class="lede">It will act as you, through the tools zend gives it.</p>
+<div class="who"><span class="dot" aria-hidden="true"></span><span>Signed in as <b>{who}</b></span></div>
+<ul class="can">
+<li>Start and read your threads</li>
+<li>Run tasks on zend's workers, and answer their questions</li>
+<li>Read the journals and the evidence behind them</li>
+</ul>
+<p class="to">You will be sent back to <code>{to}</code>.</p>
+<form method="post" action="/oauth/authorize" class="actions">
 <input type="hidden" name="consent" value="{sealed}">
-<button type="submit" name="decision" value="allow">Allow</button>
-<button type="submit" name="decision" value="deny">Deny</button>
+<button type="submit" name="decision" value="deny" class="deny">Deny</button>
+<button type="submit" name="decision" value="allow" class="allow">Allow</button>
 </form>
-</body></html>
-"#,
+</div>
+<div class="foot">Only allow a client you started yourself. Access lasts {days} days, and each use renews it.</div>"#,
         name = escape(&consent.client_name),
         who = escape(&who),
         to = escape(&to),
         sealed = escape(sealed),
+        days = REFRESH_TTL_SECS / 86_400,
     )
 }
 
+/// A refusal, in the same look: what went wrong, and that the sign-in starts
+/// again from the client.
 fn page(status: StatusCode, message: &str) -> Response {
-    let body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Sign-in refused</title></head>\
-         <body><h1>Sign-in refused</h1><p>{}</p></body></html>",
+    let card = format!(
+        r#"<div class="body refused">
+<h1>Sign-in refused</h1>
+<p class="lede">{}</p>
+</div>
+<div class="foot">Start the sign-in again from the client that sent you here.</div>"#,
         escape(message)
     );
-    (status, Html(body)).into_response()
+    respond(status, "Sign-in refused", &card)
 }
 
 fn see_other(location: &str) -> Response {
@@ -200,11 +206,11 @@ pub async fn ask(
         client_name: doc.display_name(),
     };
     let sealed = grants::seal(key, Kind::McpConsent, now + CONSENT_TTL_SECS, &consent);
-    (
-        [(header::CACHE_CONTROL, "no-store")],
-        Html(consent_page(&consent, &sealed)),
+    respond(
+        StatusCode::OK,
+        "Allow access to zend",
+        &consent_card(&consent, &sealed),
     )
-        .into_response()
 }
 
 /// Step 4: the answer `identity` gave.
@@ -259,6 +265,7 @@ pub fn decide(
 mod tests {
     use super::*;
     use crate::auth::mcp::grants::testing::{grant, key};
+    use crate::auth::mcp::page::PAGE_POLICY;
 
     const RESOURCE: &str = "https://code.tokera.com/mcp";
 
@@ -332,17 +339,27 @@ mod tests {
     }
 
     #[test]
-    fn the_consent_page_escapes_what_the_client_wrote() {
+    fn the_consent_card_escapes_what_the_client_wrote_and_focuses_nothing() {
         let c = Consent {
             client_name: "<script>x</script>".into(),
             ..consent()
         };
-        let html = consent_page(&c, "id\"1");
+        let html = consent_card(&c, "id\"1");
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains(r#"value="id&quot;1""#));
         assert!(html.contains("<code>claude.ai</code>"));
         assert!(html.contains("boss@example.com"));
+        assert!(!html.contains("autofocus"));
+        assert!(html.contains("Access lasts 30 days"));
+    }
+
+    #[test]
+    fn a_refusal_goes_out_unframeable_and_uncached() {
+        let res = page(StatusCode::BAD_REQUEST, "<no>");
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(res.headers()[header::CONTENT_SECURITY_POLICY], PAGE_POLICY);
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     fn location(res: &Response) -> String {

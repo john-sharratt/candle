@@ -32,6 +32,7 @@ pub mod authorize;
 pub mod client;
 pub mod grants;
 pub mod metadata;
+pub mod page;
 pub mod token;
 
 use grants::{Grant, Kind};
