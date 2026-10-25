@@ -107,6 +107,11 @@ pub struct FetchJob {
     pub branch: Option<String>,
     /// Commits the member holds: what the bundle leaves out.
     pub have: Vec<String>,
+    /// Fetch origin before answering. A long history's first slice does; every
+    /// later slice of the same run answers from what that fetch brought, so a
+    /// first pull asks origin once, not once a slice — a round trip to GitHub
+    /// was half of every slice's time.
+    pub refresh: bool,
     /// At most this many commits the member lacks in one answer, oldest first;
     /// a longer history comes back [`partial`](Fetched::partial), in slices an
     /// answer can carry (`docs/substrate_git.md` §5.1). Unbounded when absent.
@@ -495,12 +500,13 @@ mod tests {
             repo: "mind".into(),
             branch: Some("main".into()),
             have: vec![A.into()],
+            refresh: true,
             max_commits: None,
             max_bytes: None,
         });
         assert_eq!(
             serde_json::to_value(&fetch).unwrap(),
-            json!({ "job": "fetch", "repo": "mind", "branch": "main", "have": [A] })
+            json!({ "job": "fetch", "repo": "mind", "branch": "main", "have": [A], "refresh": true })
         );
         let answer = Fetched {
             tips: BTreeMap::from([("main".to_string(), B.to_string())]),

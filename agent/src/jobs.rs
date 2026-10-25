@@ -24,7 +24,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 use tokio::task::{spawn_blocking, AbortHandle};
@@ -114,7 +114,14 @@ pub struct Jobs {
     switch: Switch,
     running: AtomicU32,
     table: Mutex<Table>,
+    /// When each repository's origin was last fetched into its checkout.
+    fetched: Mutex<HashMap<String, Instant>>,
 }
+
+/// How recent a fetch of origin a slice past a run's first answers from: a
+/// run of slices takes minutes, and a slice that lands on an agent whose
+/// checkout has not fetched in that time fetches origin itself.
+const SLICE_FRESH: Duration = Duration::from_secs(10 * 60);
 
 type Table = (HashMap<String, Entry>, VecDeque<String>);
 
@@ -190,6 +197,7 @@ impl Jobs {
             switch,
             running: AtomicU32::new(0),
             table: Mutex::new((HashMap::new(), VecDeque::new())),
+            fetched: Mutex::new(HashMap::new()),
         })
     }
 
@@ -306,7 +314,9 @@ impl Jobs {
             .iter()
             .map(|o| Oid::parse(o).map_err(|e| JobError::Bad(format!("`{o}`: {e}"))))
             .collect::<Result<Vec<_>, _>>()?;
-        self.fetch(&fetch.repo).await?;
+        if fetch.refresh || !self.fetched_within(&fetch.repo, SLICE_FRESH) {
+            self.fetch(&fetch.repo).await?;
+        }
         let jobs = Arc::clone(self);
         let repo = fetch.repo.clone();
         let held = have.clone();
@@ -378,16 +388,30 @@ impl Jobs {
             return Ok(());
         }
         let jobs = Arc::clone(self);
-        let repo = repo.to_string();
+        let name = repo.to_string();
         spawn_blocking(move || {
-            let c = jobs.checkout(&repo)?;
+            let c = jobs.checkout(&name)?;
             c.repo()
                 .fetch(&origin(), &FetchSpec::AllBranches)
                 .map(|_| ())
-                .map_err(|e| JobError::Bad(format!("fetching `{repo}`'s origin: {e}")))
+                .map_err(|e| JobError::Bad(format!("fetching `{name}`'s origin: {e}")))
         })
         .await
-        .map_err(|e| JobError::Bad(e.to_string()))?
+        .map_err(|e| JobError::Bad(e.to_string()))??;
+        self.fetched
+            .lock()
+            .unwrap()
+            .insert(repo.to_string(), Instant::now());
+        Ok(())
+    }
+
+    /// Whether `repo`'s origin was fetched into its checkout within `fresh`.
+    fn fetched_within(&self, repo: &str, fresh: Duration) -> bool {
+        self.fetched
+            .lock()
+            .unwrap()
+            .get(repo)
+            .is_some_and(|at| at.elapsed() < fresh)
     }
 
     async fn run(self: &Arc<Self>, run: RunJob) -> Result<JobView, JobError> {
@@ -736,6 +760,7 @@ mod tests {
             repo: "mind".into(),
             branch: Some("main".into()),
             have: Vec::new(),
+            refresh: true,
             max_commits: None,
             max_bytes: None,
         };

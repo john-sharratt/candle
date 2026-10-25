@@ -8,6 +8,7 @@
 //! A fetch is made from a thread that may block; the job itself runs on the
 //! member's runtime, where its socket lives.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -26,16 +27,26 @@ pub struct AgentFetch {
     runtime: Handle,
     /// The repository's name, which the agent holds it under.
     repo: String,
+    /// Answers whose objects this repository has taken in, ever: each one a
+    /// pack. A long first pull is many answers inside one fetch, and this is
+    /// how its progress reads while the fetch runs.
+    taken: Arc<AtomicUsize>,
 }
 
 impl AgentFetch {
     /// The fetches of the repository the agents hold as `repo`, made through
-    /// `agents` on `runtime`.
-    pub fn shared(agents: Agents, runtime: Handle, repo: impl Into<String>) -> Arc<dyn Fetch> {
+    /// `agents` on `runtime`, counting each answer taken in on `taken`.
+    pub fn shared(
+        agents: Agents,
+        runtime: Handle,
+        repo: impl Into<String>,
+        taken: Arc<AtomicUsize>,
+    ) -> Arc<dyn Fetch> {
         Arc::new(AgentFetch {
             agents,
             runtime,
             repo: repo.into(),
+            taken,
         })
     }
 }
@@ -62,6 +73,9 @@ impl Fetch for AgentFetch {
         // `refs/remotes/origin/*`, which the log's packs filled — and the
         // slices a run cut short already took.
         let mut slices: Vec<(RefName, Oid)> = repo.refs_in(SLICES)?;
+        // Origin is fetched by the run's first answer; the slices after it are
+        // cut from what that fetch brought.
+        let mut refresh = true;
         let mut have: Vec<String> = Vec::new();
         let held = repo
             .tracking_tips(remote)?
@@ -87,9 +101,11 @@ impl Fetch for AgentFetch {
                     FetchSpec::AllBranches => None,
                 },
                 have: have.clone(),
+                refresh,
                 max_commits: Some(SLICE),
                 max_bytes: Some(SLICE_BYTES),
             };
+            refresh = false;
             let agents = self.agents.clone();
             let (tx, rx) = mpsc::channel();
             self.runtime.spawn(async move {
@@ -101,6 +117,9 @@ impl Fetch for AgentFetch {
                 .map_err(|e| failed(remote, e.to_string()))?;
             if !fetched.partial {
                 let taken = repo.take_fetch(remote, spec, &fetched)?;
+                if fetched.bundle.is_some() {
+                    self.taken.fetch_add(1, Ordering::Relaxed);
+                }
                 drop_slices(repo, &slices);
                 return Ok(taken);
             }
@@ -111,6 +130,7 @@ impl Fetch for AgentFetch {
                 return Err(failed(remote, "a partial answer named no heads".into()));
             }
             repo.take_bundle(bundle)?;
+            self.taken.fetch_add(1, Ordering::Relaxed);
             let mut txn = RefTransaction::new();
             for tip in &fetched.heads {
                 let named = tip.to_string();

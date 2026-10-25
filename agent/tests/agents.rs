@@ -20,6 +20,7 @@
 use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -392,7 +393,8 @@ async fn a_members_jobs_reach_an_agent_through_the_gateway() {
     std::fs::create_dir(&mirror).unwrap();
     git(&mirror, &["init", "-q", "-b", "main"]);
     git(&mirror, &["remote", "add", "origin", "agent:r"]);
-    let fetcher = AgentFetch::shared(agents.clone(), Handle::current(), "r");
+    let taken = Arc::new(AtomicUsize::new(0));
+    let fetcher = AgentFetch::shared(agents.clone(), Handle::current(), "r", taken.clone());
     let pulled = spawn_blocking(move || {
         Repo::open(&mirror)
             .unwrap()
@@ -404,6 +406,7 @@ async fn a_members_jobs_reach_an_agent_through_the_gateway() {
     .unwrap();
     assert_eq!(pulled.on_origin, Some(tip.clone()));
     assert_eq!(pulled.tip, Some(tip));
+    assert_eq!(taken.load(Ordering::Relaxed), 1, "one answer, one pack");
 }
 
 /// **An admin's member lists the agents, reads what one ran and its log, and
@@ -569,6 +572,7 @@ async fn a_cut_off_member_reaches_only_its_own_agent() {
         repo: "r".into(),
         branch: Some("main".into()),
         have: Vec::new(),
+        refresh: true,
         max_commits: None,
         max_bytes: None,
     };

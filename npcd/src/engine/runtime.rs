@@ -4318,6 +4318,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             agents.clone(),
             handle.clone(),
             &source.name,
+            Arc::new(AtomicUsize::new(0)),
         ));
         let access = Access {
             agents,

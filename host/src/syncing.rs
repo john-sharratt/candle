@@ -8,26 +8,31 @@
 //! prints a [`SYNCING`] line, and `keep` restarts the limit there: a catch-up
 //! that keeps receiving is waited out, and one that stalls prints nothing and
 //! runs the limit down.
+//!
+//! A repository's first pull from origin is sync data of the same kind: a
+//! member with a new substrate takes every pack of a large repository before
+//! it serves, and on 2026-10-25 a fresh `.5` was rolled back ten minutes into
+//! pulling candle's history, answer by answer, with nothing wrong but its size.
 
 use cluster::upgrade::switch::SYNCING;
 
 use crate::loading::LoadingView;
 
-/// The step id both tenants give their catch-up.
-const CATCH_UP: &str = "catchup";
+/// The step ids whose progress is data received: the catch-up both tenants
+/// give, and a repository pull's packs.
+const SYNC_STEPS: [&str; 3] = ["catchup", "pulling_repositories", "repositories"];
 
 /// The syncing line to print for one tenant's newest load, or `None`.
 ///
-/// `last` is what the tenant had caught up on at the previous look, kept here
-/// for the next one. A line is due only when the count has risen since: a
-/// catch-up standing still says nothing, which is what lets a stalled one time
-/// out.
+/// `last` is what the tenant had received at the previous look, kept here for
+/// the next one. A line is due only when the count has risen since: a sync
+/// standing still says nothing, which is what lets a stalled one time out.
 pub fn next_syncing_line(
     tenant: usize,
     view: Option<&LoadingView>,
     last: &mut u64,
 ) -> Option<String> {
-    let view = view.filter(|v| v.current == CATCH_UP)?;
+    let view = view.filter(|v| SYNC_STEPS.contains(&v.current))?;
     let risen = view.progressed > *last;
     *last = view.progressed;
     risen.then(|| {
@@ -43,6 +48,8 @@ mod tests {
     use super::*;
 
     use cluster::upgrade::switch::is_syncing;
+
+    const CATCH_UP: &str = "catchup";
 
     fn view(current: &'static str, progressed: u64) -> LoadingView {
         LoadingView {
@@ -89,6 +96,19 @@ mod tests {
         assert_eq!(next_syncing_line(0, None, &mut last), None);
         assert_eq!(
             next_syncing_line(0, Some(&view(CATCH_UP, 0)), &mut last),
+            None
+        );
+    }
+
+    /// A repository pull's packs are received data too, in either step.
+    #[test]
+    fn a_repository_pull_that_takes_packs_prints_a_line() {
+        let mut last = 0;
+        let line = next_syncing_line(0, Some(&view("pulling_repositories", 3)), &mut last).unwrap();
+        assert_eq!(line, "INFO syncing tenant 0 3/5000 records");
+        assert!(next_syncing_line(0, Some(&view("repositories", 4)), &mut last).is_some());
+        assert_eq!(
+            next_syncing_line(0, Some(&view("repositories", 4)), &mut last),
             None
         );
     }

@@ -9,7 +9,7 @@ use super::{ModelArch, ModelSpec, RopePreset};
 use crate::cancel::CancelToken;
 use crate::config::{
     pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SchedulerConfig,
-    SequenceConfig,
+    SequenceConfig, REPROJECT_EVERY_N_TOKENS, REPROJECT_MAX_PROBE_TOKENS, REPROJECT_TRIGGER_TEXTS,
 };
 use crate::engine::{ConversationEngine, EngineAttacher};
 use crate::engine_slot::CoreRequests;
@@ -803,15 +803,15 @@ impl ModelBuilder {
             // recall fall back to whatever ranges the scheduler's
             // initial `Builder::project()` happened to compute at
             // submit time.
-            reproject_every_n_tokens: 64,
+            reproject_every_n_tokens: REPROJECT_EVERY_N_TOKENS,
             // The belief probe covers the last N decode-window tokens. 256 spans
             // a full tool-call turn's discriminative span; the §80.2 sweep shows
             // the true tool is always within Top-3 at this width (100% recall at
             // budget 3), where a 64-token tail needed budget 5. See docs §80.2.
-            reproject_max_probe_tokens: 256,
+            reproject_max_probe_tokens: REPROJECT_MAX_PROBE_TOKENS,
             // Linefeed is the most reliable paragraph/section break
             // signal across chat templates and content styles.
-            reproject_trigger_texts: vec!["\n".to_string()],
+            reproject_trigger_texts: REPROJECT_TRIGGER_TEXTS.map(String::from).to_vec(),
             disable_reprojection: false,
             // Default: turns use the engine-wide compression level. Utility
             // layers override these per-conversation (e.g. code_reading → C8,

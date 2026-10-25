@@ -1789,6 +1789,15 @@ pub fn pick_max_hot_turns(arena_chunks: usize, chunk_size: usize, tokens_per_tur
 // Sequence Configuration
 // ────────────────────────────────────────────────────────────────────────────
 
+/// [`SequenceConfig::reproject_every_n_tokens`]'s default.
+pub const REPROJECT_EVERY_N_TOKENS: usize = 64;
+
+/// [`SequenceConfig::reproject_max_probe_tokens`]'s default.
+pub const REPROJECT_MAX_PROBE_TOKENS: usize = 256;
+
+/// [`SequenceConfig::reproject_trigger_texts`]'s default.
+pub const REPROJECT_TRIGGER_TEXTS: [&str; 1] = ["\n"];
+
 /// Per-conversation configuration.
 #[derive(Debug, Clone)]
 pub struct SequenceConfig {
@@ -1863,9 +1872,8 @@ pub struct SequenceConfig {
     /// **more than 16 non-trigger tokens** have been decoded since the last
     /// projection.  That content gate stops short lines and runs of trigger
     /// tokens (e.g. consecutive newlines) from each re-orienting attention.
-    /// Encoded via the conversation's tokenizer at policy build time;
-    /// any text that doesn't tokenize to exactly one ID is silently
-    /// skipped.
+    /// Encoded via the conversation's tokenizer at policy build time; every
+    /// token a text encodes to is a trigger (`provenance::boundaries`).
     ///
     /// **Default: `["\n"]`** — re-orient attention at line breaks,
     /// which usually mark paragraph or section boundaries where the

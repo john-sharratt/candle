@@ -19,6 +19,8 @@
 
 use std::sync::Arc;
 
+use tokenizers::Tokenizer;
+
 /// Non-trigger tokens that must pass before a trigger fires a boundary, so
 /// short lines and runs of line feeds do not each fire one.
 pub const CONTENT_GATE: usize = 16;
@@ -37,6 +39,32 @@ pub struct BoundaryRule {
 }
 
 impl BoundaryRule {
+    /// The rule `tokenizer` gives `trigger_texts` (each text's tokens are all
+    /// triggers) and `cadence`, with the tool-call gate on the tags the
+    /// tokenizer holds as single tokens.
+    pub fn from_tokenizer(tokenizer: &Tokenizer, trigger_texts: &[String], cadence: usize) -> Self {
+        let mut triggers: Vec<u32> = Vec::new();
+        for text in trigger_texts.iter().filter(|t| !t.is_empty()) {
+            if let Ok(enc) = tokenizer.encode(text.as_str(), false) {
+                for &id in enc.get_ids() {
+                    if !triggers.contains(&id) {
+                        triggers.push(id);
+                    }
+                }
+            }
+        }
+        let single = |text: &str| match tokenizer.encode(text, false).ok()?.get_ids() {
+            [id] => Some(*id),
+            _ => None,
+        };
+        BoundaryRule {
+            triggers: Arc::new(triggers),
+            cadence,
+            tool_call_open: single("<tool_call>"),
+            tool_call_close: single("</tool_call>"),
+        }
+    }
+
     /// Whether the rule can fire at all.
     pub fn is_active(&self) -> bool {
         self.cadence > 0 || !self.triggers.is_empty()

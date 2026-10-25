@@ -29,6 +29,7 @@ pub mod gather;
 pub mod gpu;
 pub mod packed;
 mod popcount;
+pub mod probe_windows;
 pub mod raw_store;
 pub mod scan;
 pub mod selection;

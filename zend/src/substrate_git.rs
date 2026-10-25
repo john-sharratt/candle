@@ -156,23 +156,23 @@ pub fn load(
         workspace.attach(name, store.objects().clone(), store.fetcher())?;
     }
     // Pulling while any repository is still being pulled from origin, or waits
-    // for its first pull — the log names none of its packs yet — counted in
-    // repositories; then the packs taken in, counted in packs. Once past the
-    // pull the step does not go back to it: a late pull reads in the detail.
+    // for its first pull — the log names none of its packs yet — then loading.
+    // Once past the pull the step does not go back to it: a late pull reads in
+    // the detail. Both count packs, the answers a running pull has taken in
+    // among them, so a long first pull rises answer by answer — what keeps a
+    // supervisor's trial waiting while it receives (`host::syncing`).
     let pulled = Cell::new(false);
     repos.load(&cancelled, &|state: &[Loading]| {
         let awaiting_pull = |l: &Loading| !l.whole && (l.pulling || l.listed == 0);
         if !pulled.get() && state.iter().any(awaiting_pull) {
             progress.set_step(LoadStep::PullingRepositories);
-            let done = state.iter().filter(|l| !awaiting_pull(l)).count();
-            progress.set_step_progress(done as u64, state.len() as u64);
         } else {
             pulled.set(true);
             progress.set_step(LoadStep::Repositories);
-            let held: usize = state.iter().map(|l| l.held).sum();
-            let listed: usize = state.iter().map(|l| l.listed).sum();
-            progress.set_step_progress(held as u64, listed as u64);
         }
+        let held: usize = state.iter().map(|l| l.held + l.received).sum();
+        let listed: usize = state.iter().map(|l| l.listed + l.received).sum();
+        progress.set_step_progress(held as u64, listed as u64);
         status.send(detail(state)).ok();
     })?;
     progress.set_step(LoadStep::Repositories);

@@ -5268,46 +5268,11 @@ impl Sequence {
     /// The rule reprojection boundaries fire by — and that the gallery cuts
     /// ingested turns by (`provenance::boundaries`).
     pub fn boundary_rule(&self) -> BoundaryRule {
-        BoundaryRule {
-            triggers: Arc::new(self.build_reproject_trigger_token_ids()),
-            cadence: self.config.reproject_every_n_tokens,
-            tool_call_open: self.single_token_id("<tool_call>"),
-            tool_call_close: self.single_token_id("</tool_call>"),
-        }
-    }
-
-    /// The token id of `text` iff the tokenizer encodes it to exactly one token.
-    /// `<tool_call>` / `</tool_call>` are registered as single added tokens in the
-    /// Qwen3 tokenizer, so this pins the reprojection-suppression boundary; a
-    /// tokenizer without them yields `None` and the gate is simply inactive.
-    fn single_token_id(&self, text: &str) -> Option<u32> {
-        let enc = self.tokenizer.encode(text, false).ok()?;
-        match enc.get_ids() {
-            [id] => Some(*id),
-            _ => None,
-        }
-    }
-
-    /// Encode each `reproject_trigger_texts` entry via the tokenizer
-    /// and collect their IDs.  Multi-token texts contribute all their
-    /// IDs (any one matching fires the trigger) — typically the
-    /// caller passes single-character strings like `"\n"` so this is
-    /// one ID per entry.
-    fn build_reproject_trigger_token_ids(&self) -> Vec<u32> {
-        let mut ids: Vec<u32> = Vec::new();
-        for text in &self.config.reproject_trigger_texts {
-            if text.is_empty() {
-                continue;
-            }
-            if let Ok(enc) = self.tokenizer.encode(text.as_str(), false) {
-                for &id in enc.get_ids() {
-                    if !ids.contains(&id) {
-                        ids.push(id);
-                    }
-                }
-            }
-        }
-        ids
+        BoundaryRule::from_tokenizer(
+            &self.tokenizer,
+            &self.config.reproject_trigger_texts,
+            self.config.reproject_every_n_tokens,
+        )
     }
 }
 

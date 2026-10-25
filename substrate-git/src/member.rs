@@ -20,6 +20,7 @@
 //! member's pushes and syncs; the lease holder fetches every [`FETCH_EVERY`].
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -175,6 +176,11 @@ pub struct Loading {
     /// now — read while the round runs, so a pull reads as itself and not as
     /// the wait for the lease that came before it.
     pub pulling: bool,
+    /// Answers the running round has taken in from origin, each a pack not yet
+    /// in [`Self::held`] — read while the round runs, so a long first pull,
+    /// many answers inside one round, shows its progress before the round
+    /// ends. Zero between rounds, when `held` counts them.
+    pub received: usize,
 }
 
 /// How often a load reports while its rounds run, so a pull in progress shows.
@@ -185,6 +191,8 @@ type OnChange = Arc<dyn Fn(&str) + Send + Sync>;
 struct Inner {
     /// Each store and its importer.
     repos: Vec<(Store, Importer)>,
+    /// Each store's answers taken in from origin, ever (`AgentFetch`).
+    taken: Vec<Arc<AtomicUsize>>,
     shared: SharedSubstrate,
     on_change: Mutex<Option<OnChange>>,
 }
@@ -222,20 +230,29 @@ impl Repos {
             None => Arc::new(Alone),
         };
         let mut repos = Vec::new();
+        let mut taken = Vec::new();
         for db in dbs {
             let name = db.name().to_string();
+            let answers = Arc::new(AtomicUsize::new(0));
             // Every fetch through an agent holding the repository by name: the
             // daemon has no checkout and no way to origin of its own.
             let store = Store::over(db)?.with_origin(
                 &RemoteUrl::parse(&format!("agent:{name}"))?,
-                AgentFetch::shared(access.agents.clone(), access.runtime.clone(), name.clone()),
+                AgentFetch::shared(
+                    access.agents.clone(),
+                    access.runtime.clone(),
+                    name.clone(),
+                    Arc::clone(&answers),
+                ),
             )?;
             let importer = Importer::new(Arc::clone(&lease)).fetching_every(FETCH_EVERY);
             repos.push((store, importer));
+            taken.push(answers);
         }
         Ok(Self {
             inner: Arc::new(Inner {
                 repos,
+                taken,
                 shared,
                 on_change: Mutex::new(None),
             }),
@@ -269,12 +286,24 @@ impl Repos {
             });
         }
         let mut took = vec![(0usize, Took::default()); state.len()];
+        let taken_now = || -> Vec<usize> {
+            self.inner
+                .taken
+                .iter()
+                .map(|t| t.load(Ordering::Relaxed))
+                .collect()
+        };
         let started = Instant::now();
         report(&state);
         loop {
             for l in state.iter_mut().filter(|l| !l.whole) {
                 l.busy = true;
             }
+            // Answers a round takes are its packs: counted here while it runs,
+            // in `held` once it ends.
+            let at_round_start = taken_now();
+            let received =
+                |i: usize| self.inner.taken[i].load(Ordering::Relaxed) - at_round_start[i];
             report(&state);
             thread::scope(|s| -> anyhow::Result<()> {
                 let (tx, rx) = mpsc::channel();
@@ -294,10 +323,13 @@ impl Repos {
                 loop {
                     let (i, ended) = match rx.recv_timeout(REPORT_EVERY) {
                         Ok(got) => got,
-                        // Rounds still running: whether each is fetching now.
+                        // Rounds still running: whether each is fetching now,
+                        // and how many answers its fetch has taken in.
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let mut changed = false;
-                            for (l, (_, importer)) in state.iter_mut().zip(&self.inner.repos) {
+                            for (i, (l, (_, importer))) in
+                                state.iter_mut().zip(&self.inner.repos).enumerate()
+                            {
                                 let pulling = l.busy && importer.fetching();
                                 if pulling != l.pulling {
                                     l.pulling = pulling;
@@ -306,6 +338,11 @@ impl Repos {
                                         // round said about waiting for it is over.
                                         l.error = None;
                                     }
+                                    changed = true;
+                                }
+                                let got = received(i);
+                                if got != l.received {
+                                    l.received = got;
                                     changed = true;
                                 }
                             }
@@ -318,6 +355,7 @@ impl Repos {
                     };
                     let (mut loading, t) = ended?;
                     loading.pulling = false;
+                    loading.received = 0;
                     took[i].0 += 1;
                     took[i].1.add(&t);
                     if loading.whole {
