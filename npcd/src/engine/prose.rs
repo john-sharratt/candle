@@ -52,14 +52,17 @@ use crate::engine::reflect::{plain_prose, think_off};
 use crate::engine::throwaway::Throwaway;
 use crate::prose::{Answer, Request, DEFAULT_SYSTEM};
 
-/// Decode `request` with `seed`, handing each new fragment of text to
-/// `on_fragment` as it lands.
+/// Decode `request` with `seed` on `band`, handing each new fragment of text
+/// to `on_fragment` as it lands.
 ///
-/// Awaits the decode; the routes in [`crate::prose`] call it directly.
+/// Awaits the decode; the routes in [`crate::prose`] call it directly, on the
+/// characters' [`DecodePriority::Normal`]; a judgement an operation waits on
+/// takes [`WORK_BAND`].
 pub async fn decode(
     engine: &Arc<Mutex<ConversationEngine>>,
     base: &SequenceConfig,
     request: &Request,
+    band: DecodePriority,
     seed: u64,
     on_fragment: &mut (dyn FnMut(&str) + Send),
 ) -> anyhow::Result<Answer> {
@@ -86,7 +89,7 @@ pub async fn decode(
         max_tokens: request.max_tokens as usize,
         temperature: request.temperature,
         think: None,
-        band: DecodePriority::Normal,
+        band,
     };
     let (text, tokens) = framed(
         engine,

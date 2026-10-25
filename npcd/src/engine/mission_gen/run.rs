@@ -321,7 +321,7 @@ async fn contradict(
         seed: Some(1),
         choices: Some(vec!["yes".into(), "no".into()]),
     };
-    let answer = prose::decode(engine, base, &request, 1, &mut |_: &str| {}).await?;
+    let answer = prose::decode(engine, base, &request, WORK_BAND, 1, &mut |_: &str| {}).await?;
     Ok(answer.text.trim().eq_ignore_ascii_case("yes"))
 }
 

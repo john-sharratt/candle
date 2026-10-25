@@ -29,6 +29,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use candle_conversation::guest::resolve_seed;
+use candle_conversation::projection::DecodePriority;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -201,9 +202,18 @@ pub async fn run_streamed(
     // Awaited directly: the decode yields on the turn's event channel, so a
     // long generation parks a future rather than a thread — and a caller that
     // gives up drops the future, which stops the decode.
-    crate::engine::prose::decode(&engine, &cfg, &request, seed, &mut on_fragment)
-        .await
-        .map_err(|e| ProseError::Failed(format!("{e:#}")))
+    // On the characters' band: a job asked for here is nothing an operation
+    // waits on.
+    crate::engine::prose::decode(
+        &engine,
+        &cfg,
+        &request,
+        DecodePriority::Normal,
+        seed,
+        &mut on_fragment,
+    )
+    .await
+    .map_err(|e| ProseError::Failed(format!("{e:#}")))
 }
 
 /// What a caller posts to `/v1/generate/prose`.

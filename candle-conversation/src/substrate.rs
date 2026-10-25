@@ -5689,7 +5689,9 @@ impl Substrate {
     /// (`persistence::vfs::carried`); undeclared, it reads as an orphan and
     /// every compaction drops it. The declaration is a record like any other:
     /// it replicates, it is in place when the log is read back before
-    /// maintenance can start, and its tombstone is the store's release.
+    /// maintenance can start, and it is never released: a store's discard
+    /// tombstones its events, and a release racing another member's next
+    /// save would leave that save undeclared.
     pub fn is_file_store(&self, timeline: TimelineId) -> bool {
         self.custom_object(&file_store_key(timeline)).is_some()
     }

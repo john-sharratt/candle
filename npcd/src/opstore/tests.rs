@@ -2,8 +2,9 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
+use candle_conversation::persistence::record::CustomObjectPayload;
 use candle_conversation::persistence::SubstratePersistence;
-use candle_conversation::substrate::Substrate;
+use candle_conversation::substrate::{file_store_key, Substrate};
 use tempfile::TempDir;
 
 use super::owner::Owner;
@@ -231,6 +232,55 @@ fn a_discarded_store_is_gone() {
             .read("layers/eras/a.md")
             .as_deref(),
         Some("the era\n")
+    );
+}
+
+/// **A store is declared at its first save and stays declared**, so no rewrite
+/// takes its events for an orphan's; its discard does not release it, since a
+/// release landing on another member after its next save there would leave that
+/// save undeclared. A start declares a store written before declarations were,
+/// but not one discarded since: an empty store has nothing to carry.
+#[test]
+fn a_store_is_declared_and_its_discard_releases_nothing() {
+    let (dir, shared) = setup();
+    let s = stores(&dir, &shared);
+    let (one, two) = (Owner::operation("vault", 1), Owner::operation("vault", 2));
+    let key = |o: &Owner| file_store_key(o.timeline());
+    shelf(&s, 1)
+        .commit(&[("layers/eras/a.md".into(), Some("kept\n".into()))])
+        .unwrap();
+    assert!(
+        shared.custom_object(&key(&one)).is_some(),
+        "declared at save"
+    );
+    s.discard(&one);
+    assert!(
+        shared.custom_object(&key(&one)).is_some(),
+        "a discard releases nothing"
+    );
+
+    // A store saved before declarations were: events, and no declaration.
+    shelf(&s, 2)
+        .commit(&[("layers/eras/a.md".into(), Some("old\n".into()))])
+        .unwrap();
+    shared
+        .put_custom_object(CustomObjectPayload::ceased(key(&two)))
+        .unwrap();
+    stores(&dir, &shared);
+    assert!(
+        shared.custom_object(&key(&two)).is_some(),
+        "a start declares a store with live events"
+    );
+
+    // A discarded store with no declaration is not brought back as one.
+    s.discard(&two);
+    shared
+        .put_custom_object(CustomObjectPayload::ceased(key(&two)))
+        .unwrap();
+    stores(&dir, &shared);
+    assert!(
+        shared.custom_object(&key(&two)).is_none(),
+        "an empty store is not declared"
     );
 }
 

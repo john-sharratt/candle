@@ -174,9 +174,13 @@ impl MindStores {
     /// store's timeline, so undeclared it reads as an orphan and a compaction
     /// drops it — on WW a draft committed at a step was gone by its reading.
     /// A store is declared before its first save (`keep`); this declares the
-    /// ones written before declarations were.
+    /// ones written before declarations were — those still holding live
+    /// events, so a discarded store is not brought back as one.
     pub fn set_substrate(&self, shared: SharedSubstrate) {
         for raw in shared.vfs_timelines() {
+            if shared.vfs_events(raw).is_ok_and(|e| e.is_empty()) {
+                continue;
+            }
             if let Some(timeline) = TimelineId::from_raw(raw) {
                 if let Err(e) = shared.declare_file_store(timeline) {
                     tracing::warn!(timeline = raw, "a store could not be declared: {e}");
@@ -266,9 +270,12 @@ impl MindStores {
         }
         if let Some(shared) = self.shared.get() {
             // Declared before its first event lands, so no rewrite between the
-            // two can take it for an orphan — see `set_substrate`.
+            // two can take it for an orphan — see `set_substrate`. A store that
+            // cannot be declared is saved all the same: unsaved, the change is
+            // lost now; saved, it stands until a rewrite, and its next save or
+            // the next start declares it.
             if let Err(e) = shared.declare_file_store(owner.timeline()) {
-                tracing::warn!(?owner, "the store could not be declared: {e}");
+                tracing::error!(?owner, "the store could not be declared: {e}");
             }
             store_events::save(
                 &Substrate(shared),
@@ -336,17 +343,13 @@ impl MindStores {
     }
 
     /// Drop `owner`'s store: every change it holds goes, as its events'
-    /// tombstones, and its declaration as a store is released, so the next
-    /// rewrite of the log reclaims the lot. A store used again is declared
-    /// again at its next save.
+    /// tombstones, which the next rewrite of the log reclaims. Its declaration
+    /// as a store stands ([`SharedSubstrate::declare_file_store`]): a release could land
+    /// on another member after its next save there, leaving that save to be
+    /// dropped as an orphan's.
     pub fn discard(&self, owner: &Owner) {
         self.change(owner, |store| store.discard());
         self.held().remove(owner);
-        if let Some(shared) = self.shared.get() {
-            if let Err(e) = shared.release_file_store(owner.timeline()) {
-                tracing::warn!(?owner, "the store's declaration could not be released: {e}");
-            }
-        }
     }
 
     /// Scrap what a disconnected `world` held: on rejoining, its operations'
