@@ -113,6 +113,7 @@ pub fn consent_card(consent: &Consent, sealed: &str) -> String {
     };
     format!(
         r#"<div class="body">
+<p class="whisper">The Citadel stirs. Another mind asks to be joined.</p>
 <h1><span class="client">{name}</span> wants to use Zen</h1>
 <p class="lede">It will act as you, through the tools Zen gives it.</p>
 <div class="who"><span class="dot" aria-hidden="true"></span><span>Signed in as <b>{who}</b></span></div>
@@ -142,6 +143,7 @@ pub fn consent_card(consent: &Consent, sealed: &str) -> String {
 fn page(status: StatusCode, message: &str) -> Response {
     let card = format!(
         r#"<div class="body refused">
+<p class="whisper">The Citadel's gate stays sealed.</p>
 <h1>Sign-in refused</h1>
 <p class="lede">{}</p>
 </div>
