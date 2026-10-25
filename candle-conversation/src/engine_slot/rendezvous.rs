@@ -39,13 +39,13 @@ struct State<H> {
 impl<H: Clone> Rendezvous<H> {
     pub(super) fn new(
         expected: &[&'static str],
-        standing: Vec<(TenantRank, &'static str, CoreRequests)>,
+        standing: Vec<(TenantRank, CoreRequests)>,
     ) -> Self {
         Self {
             expected: expected.to_vec(),
             state: Mutex::new(State {
                 arrivals: Vec::new(),
-                standing: standing.into_iter().map(|(r, _, a)| (r, a)).collect(),
+                standing,
                 arrived: Vec::new(),
                 withdrawn: Vec::new(),
                 building: false,
@@ -285,7 +285,7 @@ mod tests {
     fn a_standing_seat_is_merged_but_never_waited_for() {
         let mut zend = ask(4);
         zend.min_rope_factor = Some(2.0);
-        let r: Rendezvous<u32> = Rendezvous::new(&["npcd"], vec![(rank(0), "zend", zend)]);
+        let r: Rendezvous<u32> = Rendezvous::new(&["npcd"], vec![(rank(0), zend)]);
         let got = r.arrive(
             rank(1),
             "npcd",

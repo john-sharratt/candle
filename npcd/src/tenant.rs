@@ -979,6 +979,16 @@ mod tests {
 
     use clap::Parser;
 
+    /// **What npcd asks without loading is what its load asks** — its prefill
+    /// pass — and no guests: a host running zend alone seats this in npcd's
+    /// place, and nothing there would call a guest.
+    #[test]
+    fn the_engine_requests_carry_npcds_prefill_pass_and_no_guests() {
+        let asks = NpcdArgs::default().engine_requests();
+        assert_eq!(asks.prefill_pass_tokens, Some(8192));
+        assert!(asks.guests.is_empty());
+    }
+
     #[derive(Parser)]
     struct Cli {
         #[command(flatten)]

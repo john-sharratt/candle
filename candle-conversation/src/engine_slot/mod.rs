@@ -55,7 +55,7 @@ impl EngineSlot {
     /// tenant arrives, so no build can start without them.
     pub fn with_standing(
         expected: &[&'static str],
-        standing: Vec<(TenantRank, &'static str, CoreRequests)>,
+        standing: Vec<(TenantRank, CoreRequests)>,
     ) -> Arc<Self> {
         Arc::new(Self {
             rendezvous: Rendezvous::new(expected, standing),

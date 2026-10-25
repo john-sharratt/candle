@@ -2254,6 +2254,9 @@ pub(super) struct QueuedSection {
     /// See [`SchedulerRequest::IngestSection::band`].
     pub(super) band: DecodePriority,
     pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
+    /// When it was queued — what a long wait for admission is reported from
+    /// (`submit_admit::Scheduler::report_waiting_submits`).
+    pub(super) queued_at: Instant,
 }
 
 /// An in-flight section ingest — CPU setup is done, awaiting the batched
@@ -4994,6 +4997,7 @@ impl Scheduler {
                     start,
                     band,
                     response_tx,
+                    queued_at: Instant::now(),
                 };
                 if section.tokens.is_empty() {
                     // No forward pass, so nothing to admit or claim: seal now.
@@ -14631,6 +14635,7 @@ mod tests {
             start: Some(SharedState::from(&start)),
             band: DecodePriority::Low,
             response_tx,
+            queued_at: Instant::now(),
         };
         assert!(
             sched.begin_section(queued).is_ok(),
