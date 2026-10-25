@@ -34,6 +34,7 @@
 //! of the arms.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use candle_conversation::projection::{
     Builder, DecodePriority, GroupId, LayerId, Reserved, SectionId,
@@ -355,11 +356,17 @@ async fn run_turn(
     let mut ids: Vec<u32> = Vec::new();
     let mut preview = Preview::default();
     let mut response = None;
+    // **How long a prose turn waited, and how long it ran.** The table's
+    // generations and readings are prose turns, and the loop waits on each:
+    // one that took eighty minutes said nothing at all while it did.
+    let submitted = Instant::now();
+    let mut first_token: Option<Duration> = None;
     {
         let mut events = std::pin::pin!(handle.stream_async());
         while let Some(event) = events.next().await {
             match event {
                 TurnEvent::Token(id) => {
+                    first_token.get_or_insert_with(|| submitted.elapsed());
                     ids.push(id);
                     if let Some(delta) = preview.advance(visible(&decoder.decode(&ids))) {
                         on_fragment(&delta);
@@ -377,6 +384,12 @@ async fn run_turn(
     let Some(r) = response else {
         anyhow::bail!("the scheduler went away before the prose finished");
     };
+    tracing::info!(
+        first_token_ms = first_token.map(|d| d.as_millis() as u64),
+        total_ms = submitted.elapsed().as_millis() as u64,
+        tokens = ids.len(),
+        "prose turn done"
+    );
     sequence.finish_turn(handle, &r)?;
     Ok(r)
 }
