@@ -133,7 +133,7 @@ const SEAL_WAIT: Duration = Duration::from_secs(20);
 /// How a character's journal sections are sealed: each on its own.
 ///
 /// **Not as a chain, though a chain reads truer.** A character's conversation
-/// is rolled at every mission it hands in (`Minds::think`), and a new
+/// is rolled at every piece of work it hands in (`Minds::think`), and a new
 /// conversation seals its journal afresh — its sections are addressed by its
 /// timeline. A chain seals one link after another, so on WW with four Makers a
 /// journal of twenty entries took longer to seal than a chapter lasted: each
@@ -1657,7 +1657,8 @@ impl Minds {
                 // moment the narrative clock is paused, jumped or re-paced —
                 // all of which the console can do at any moment.
                 // **And the mission boundary.** A mission handed in closes a
-                // chapter: the next starts in a conversation of its own, the
+                // chapter — the table's routines excepted, see
+                // `Missions::close`: the next starts in a conversation of its own, the
                 // journal carrying the work across, so a stretch that went badly
                 // — Makers once spent hours telling each other there was nothing
                 // left to do — ends with the work it went badly on.

@@ -1255,6 +1255,32 @@ mod tests {
     use crate::engine::mission_gen::corpus::tests::mind;
     use crate::engine::mission_gen::target::next;
 
+    /// **Each kind's answer grammar is of one order of size.** A story's call
+    /// is the life event's with two more fields and a second list; its grammar
+    /// must not be a different order of thing.
+    #[test]
+    fn the_answer_grammars_are_of_one_order_of_size() {
+        use candle_conversation::models::DialectType;
+        use candle_conversation::stencil::{compile_tool_call_tree, ToolCallEnvelope};
+        let env = ToolCallEnvelope::for_dialect(&DialectType::ChatML.dialect())
+            .with_max_string_tokens(1800);
+        let size = |kind| {
+            compile_tool_call_tree(&specs(kind), &env)
+                .unwrap()
+                .nodes
+                .len()
+        };
+        let (life, story, pair) = (
+            size(Kind::LifeEvent),
+            size(Kind::Gap),
+            size(Kind::Contradiction),
+        );
+        assert!(
+            story <= life * 3,
+            "life {life} nodes, story {story}, contradiction {pair}"
+        );
+    }
+
     /// **What the writer is told is what it is held to.** Every field the
     /// grammar bounds is named in [`lengths`], every name there is a field of
     /// the call, and the line says each cap.

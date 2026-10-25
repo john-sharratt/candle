@@ -187,7 +187,7 @@ impl Missions {
     }
 
     /// The chapter of its working life the body is in: how many missions it has
-    /// closed.
+    /// closed, not counting the table's routines.
     pub fn chapter(&self, body: &str) -> u64 {
         self.closed.get(body).copied().unwrap_or(0)
     }
@@ -197,9 +197,21 @@ impl Missions {
         self.last_closed.get(body)
     }
 
-    /// `mission` of the body's is closed: the next chapter begins.
+    /// `mission` of the body's is closed: the next chapter begins — unless it
+    /// was one of the table's routines.
+    ///
+    /// **A routine is an interlude, not a stretch of work.** A chapter closes so
+    /// the work it held is carried across in the journal and the next starts in
+    /// a conversation of its own, which reseals the journal from nothing. The
+    /// routines a Maker draws while the table has no work for it — read a
+    /// station, walk the halls — take a couple of minutes each: on WW they
+    /// turned 52 chapters in an hour, each a whole journal resealed, and the
+    /// reseals took the engine the table needed to write the work that would
+    /// have ended the routines.
     fn close(&mut self, body: &str, mission: &Mission) {
-        *self.closed.entry(body.to_string()).or_insert(0) += 1;
+        if !matches!(mission.origin, Origin::Random { .. }) {
+            *self.closed.entry(body.to_string()).or_insert(0) += 1;
+        }
         self.last_closed.insert(body.to_string(), mission.clone());
     }
 
@@ -1050,6 +1062,29 @@ mod tests {
         assert!(!m.cancel("bram"), "nothing open, nothing closed");
         assert_eq!(m.chapter("bram"), 2);
         assert_eq!(m.chapter("cindy"), 0);
+    }
+
+    /// **A routine handed in turns no chapter**, though it is still the
+    /// mission closed last.
+    #[test]
+    fn a_routine_closed_turns_no_chapter() {
+        let mut m = Missions::default();
+        m.assign(
+            "bram",
+            Mission::new(
+                "read the breaker panel",
+                vec![Todo::new("go to the plant room")],
+                Origin::Random {
+                    routine: "read-a-station".to_string(),
+                },
+            ),
+        );
+        m.report("bram", Outcome::Pass, "it reads tight", None);
+        assert_eq!(m.chapter("bram"), 0);
+        assert_eq!(
+            m.last_closed("bram").map(|x| x.prompt.as_str()),
+            Some("read the breaker panel")
+        );
     }
 
     #[test]
