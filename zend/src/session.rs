@@ -3128,6 +3128,37 @@ impl InferenceState {
     /// their own conversation from — see [`InferenceState::ingest_bases`].
     /// `Err` only for a layer name that isn't one of those two modes (a
     /// caller bug: `ingest_bases` is built for every such layer at boot).
+    /// Calibrate every branch layer that declares a `calibrate:` block
+    /// (`crate::calibrate`): each unit that stands without a calibration of
+    /// its current version writes its questions, and they are prefilled as
+    /// its exemplars. Run ahead of each pass, so units already read are
+    /// calibrated without being read again; a unit the pass reads is
+    /// calibrated by the next.
+    fn calibrate_layers(&self) {
+        for (il, _) in &self.branch_layers {
+            if crate::ingest_cancel::cancelled() {
+                return;
+            }
+            let Some(spec) = il.calibrate.as_deref() else {
+                continue;
+            };
+            let Some(group) = self.refresh_builder.id_for_group(&il.group) else {
+                continue;
+            };
+            let Ok(base) = self.ingest_base(&il.name) else {
+                continue;
+            };
+            crate::calibrate::calibrate_layer(
+                &self.engine,
+                &crate::calibrate::Layer { spec, group, base },
+                &crate::calibrate::Frame {
+                    system_prompt: &self.formatted_prompt,
+                    config: &self.refresh_config,
+                },
+            );
+        }
+    }
+
     fn ingest_base(&self, layer_name: &str) -> anyhow::Result<&Mutex<Sequence>> {
         self.ingest_bases
             .get(layer_name)
@@ -3155,6 +3186,7 @@ impl InferenceState {
         // silent so a pass doesn't log "load step started Loading model".
         let progress = Arc::new(LoadProgress::silent());
         let mut any = false;
+        self.calibrate_layers();
         if !self.branch_layers.is_empty() {
             let passes = self.layer_passes()?;
             let ctx = self.refresh_ctx();
@@ -8668,6 +8700,12 @@ mod projection_schema_tests {
             layer("repo_map").groups[0].policy.scan.cases,
             ScanCases::Exchange
         );
+        // Each file's reading is calibrated with the questions it answers.
+        let calibrate = crate::calibrate::CalibrateSpec::of(layer("code_reading"))
+            .unwrap()
+            .expect("code_reading declares a calibration");
+        assert_eq!(calibrate.questions, 16);
+        assert!(calibrate.prompt.contains("<<path>>"));
 
         let ws = layer("dialogue")
             .working_set

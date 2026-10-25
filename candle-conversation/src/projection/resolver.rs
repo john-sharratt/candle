@@ -2293,7 +2293,7 @@ impl Conversation {
             let probes: Vec<(TimelineId, Vec<WideQSig>)> = held
                 .iter()
                 .filter_map(|f| {
-                    let &(k, s, e, _) = f.windows.get(f.windows.len() / 2)?;
+                    let &(k, s, e, _) = f.windows[..f.own_windows].get(f.own_windows / 2)?;
                     let sigs = f.arcs_kept[k].decode();
                     let e = e.min(sigs.len());
                     let s = s.max(e.saturating_sub(LEVEL_PRIOR_T_REF));
@@ -6610,6 +6610,127 @@ layers:
         assert_eq!(conv.warm_group_background(schema, group, 0, None), (4, 2));
         assert_eq!(conv.warm_group_background(schema, group, 1, None), (4, 2));
         assert_eq!(peaks(), first);
+    }
+
+    /// **A calibration's questions vote for the file they calibrate.** Two
+    /// files whose content shares nothing with a question; a calibration of
+    /// the second holds that question. Assembled, the second file carries the
+    /// question as a window beyond its own, the first is untouched, and the
+    /// question probe ranks the second first.
+    #[test]
+    fn a_calibrations_questions_vote_for_their_file() {
+        use super::super::belief_files::{assemble_file_scans, scan_file_scans};
+        use crate::provenance::{encode_wide_sigs, WideQSig};
+        use crate::substrate::Substrate;
+
+        const YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
+layers:
+  - name: files
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: scopes
+        selection: { kind: top_k, k: 2 }
+        policy: { cases: file }
+  - name: hidden
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 10
+    groups:
+      - id: calibration
+        selection: { kind: top_k, k: 1 }
+"#;
+        let sig = |fill: u64| WideQSig {
+            n_heads: 12,
+            words: vec![fill; 24],
+        };
+        let builder = Builder::from_yaml(YAML).unwrap();
+        let files_layer = builder.id_for_layer("files").unwrap();
+        let scopes = builder.id_for_group("scopes").unwrap();
+        let hidden = builder.id_for_layer("hidden").unwrap();
+        let calibration = builder.id_for_group("calibration").unwrap();
+        let conv = Conversation::ephemeral();
+        let write = |tl: TimelineId, sigs: Vec<WideQSig>| {
+            let idx = conv
+                .record_turn(
+                    tl,
+                    Role::User,
+                    TurnPartWrite {
+                        token_count: sigs.len(),
+                        ..Default::default()
+                    },
+                    |seqs| Ok(seqs.to_vec()),
+                )
+                .expect("record_turn");
+            conv.persist_wide_q_sigs(turn_stream_id(tl.raw(), idx.0), &encode_wide_sigs(&sigs))
+                .expect("persist sigs");
+        };
+        let (x, y, cal) = (
+            TimelineId::from_raw(51).unwrap(),
+            TimelineId::from_raw(52).unwrap(),
+            TimelineId::from_raw(53).unwrap(),
+        );
+        conv.register_timeline(x, files_layer, scopes);
+        conv.register_timeline(y, files_layer, scopes);
+        conv.register_timeline(cal, hidden, calibration);
+        write(
+            x,
+            vec![sig(0x0F0F_0F0F_0F0F_0F0F), sig(0x00FF_00FF_00FF_00FF)],
+        );
+        write(
+            y,
+            vec![sig(0x3333_3333_3333_3333), sig(0x0000_FFFF_0000_FFFF)],
+        );
+        let question = 0x5555_5555_5555_5555u64;
+        write(cal, vec![sig(question)]);
+        conv.set_conversation_metadata(cal, Substrate::CALIBRATES_KEY, &y.raw().to_string())
+            .unwrap();
+
+        let files = {
+            let sub = conv.inner.read().unwrap();
+            assemble_file_scans(&sub, vec![x, y]).0
+        };
+        assert_eq!(files.len(), 2);
+        assert_eq!((files[0].own_windows, files[0].windows.len()), (1, 1));
+        assert_eq!((files[1].own_windows, files[1].windows.len()), (1, 2));
+        assert_eq!(files[1].arc_sids[1], turn_stream_id(cal.raw(), 0));
+
+        let group = builder
+            .schema()
+            .layers
+            .iter()
+            .flat_map(|l| &l.groups)
+            .find(|g| g.id == scopes)
+            .unwrap();
+        let probe = vec![sig(question)];
+        let scanned = scan_file_scans(&files, group, &[probe.as_slice()], None);
+        let (x_score, y_score) = (scanned[0][0].0[0], scanned[0][1].0[0]);
+        assert!(y_score > x_score, "x {x_score} y {y_score}");
     }
 
     /// **A file-scored group is due a background warm as it grows**: from two

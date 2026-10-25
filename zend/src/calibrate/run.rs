@@ -1,0 +1,358 @@
+//! Calibrating a layer's units: find what stands and is not calibrated, ask
+//! each unit for its questions, and prefill them as its calibration.
+//!
+//! A unit is asked in a **draft** — a conversation forked from its layer's
+//! base with the unit as its lineage, so the unit's whole conversation is the
+//! draft's opening and the model writes its questions with what it read in
+//! front of it. The draft is tombstoned once its answer is read: only the
+//! questions are kept.
+//!
+//! The questions are calibrated the way a tool's are (`ToolDef::questions`):
+//! every one in ONE prefill, a turn group in a conversation of the hidden
+//! calibration layer, each masked to itself and sealed one turn apiece with an
+//! empty answer. A question prefilled alone, under the system prompt every
+//! conversation opens with, is what a live question looks like before
+//! anything is projected for it — the region a live probe resembles, where
+//! the unit's own windows are its content. The calibration carries
+//! [`Substrate::CALIBRATES_KEY`], so its questions vote for the unit wherever
+//! the unit is scored, and is then archived — the commit — and distilled
+//! provenance-only: its K/V is dropped and its signatures stay.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use candle_conversation::chain_health::chain_break;
+use candle_conversation::persistence::record::DistillMode;
+use candle_conversation::projection::{
+    DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId,
+    NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
+};
+use candle_conversation::substrate::Substrate;
+use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
+
+use super::plan::{plan, Prior, Standing};
+use super::questions::questions;
+use super::spec::CalibrateSpec;
+use crate::branch_ingest::keys::CONTENT_KEY;
+use crate::code_read::PATH_KEY;
+use crate::layers::keys::SUBJECT_KEY;
+use crate::layers::run::{answer_of, LAYER_PARALLELISM};
+
+/// The calibration marker a calibration carries ([`CalibrateSpec::marker`]).
+pub const MARKER_KEY: &str = "calibration";
+
+/// The layer a draft asks for — set on every draft, so a draft a crash left
+/// is found and retired.
+pub const DRAFT_KEY: &str = "calibration_draft";
+
+/// The tag every calibration turn carries: it keeps the questions out of
+/// every gather that reads untagged turns as dialogue.
+pub const TAG: &str = "calibration";
+
+/// Decode budget for a draft's answer: room for the questions, which are
+/// asked for without reasoning.
+const DRAFT_MAX_TOKENS: usize = 1024;
+
+/// What one layer's pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Report {
+    /// Units already calibrated.
+    pub done: usize,
+    /// Units calibrated by this pass.
+    pub sealed: usize,
+    /// Units that failed, calibrated again by a later pass.
+    pub failed: usize,
+    /// Calibrations retired, and drafts a crash left.
+    pub retired: usize,
+}
+
+/// One layer to calibrate: its spec, the group its units are in, and the base
+/// their drafts fork from.
+pub struct Layer<'a> {
+    pub spec: &'a CalibrateSpec,
+    pub group: GroupId,
+    pub base: &'a Mutex<Sequence>,
+}
+
+/// Where calibrations are prefilled: the system prompt every conversation
+/// opens with, dialect-formatted, and the sequence config they run under.
+pub struct Frame<'a> {
+    pub system_prompt: &'a str,
+    pub config: &'a SequenceConfig,
+}
+
+/// Calibrate every unit of `layer` that stands and is not calibrated, and
+/// retire every calibration of a unit no longer standing.
+pub fn calibrate_layer(
+    engine: &Mutex<ConversationEngine>,
+    layer: &Layer<'_>,
+    frame: &Frame<'_>,
+) -> Report {
+    let spec = layer.spec;
+    let mut report = Report::default();
+    let todo = {
+        let e = engine.lock().unwrap();
+        for (tl, of) in e.conversations_with_metadata_key(DRAFT_KEY) {
+            if of == spec.layer && e.tombstone_timeline(tl).is_ok() {
+                report.retired += 1;
+            }
+        }
+        let units = standing(&e, layer);
+        let priors: Vec<(TimelineId, String, bool)> = e
+            .conversations_with_metadata_key(MARKER_KEY)
+            .into_iter()
+            .filter(|(_, m)| spec.owns(m))
+            .map(|(tl, m)| (tl, m, e.is_conversation_archived(tl)))
+            .collect();
+        let priors: Vec<Prior<'_>> = priors
+            .iter()
+            .map(|(tl, m, archived)| Prior {
+                timeline: *tl,
+                marker: m,
+                archived: *archived,
+            })
+            .collect();
+        let todo = plan(units, &priors);
+        for &tl in &todo.retire {
+            if e.tombstone_timeline(tl).is_ok() {
+                report.retired += 1;
+            }
+        }
+        todo
+    };
+    report.done = todo.done;
+    tracing::info!(
+        target: "zend::calibrate",
+        layer = %spec.layer,
+        calibrated = todo.done,
+        to_calibrate = todo.run.len(),
+        retired = report.retired,
+        "calibrating the layer's units",
+    );
+    let cursor = AtomicUsize::new(0);
+    let sealed = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..LAYER_PARALLELISM.min(todo.run.len()).max(1) {
+            s.spawn(|| loop {
+                if crate::ingest_cancel::cancelled() || crate::ingest_worker::preempted() {
+                    return;
+                }
+                let Some(unit) = todo.run.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
+                    return;
+                };
+                match calibrate_one(engine, layer, frame, unit) {
+                    Ok(()) => {
+                        sealed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        if !crate::ingest_cancel::cancelled() {
+                            tracing::warn!(
+                                target: "zend::calibrate",
+                                layer = %spec.layer,
+                                subject = %unit.subject,
+                                "calibration failed (calibrated again next pass): {e:#}",
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    });
+    report.sealed = sealed.into_inner();
+    report.failed = failed.into_inner();
+    tracing::info!(
+        target: "zend::calibrate",
+        layer = %spec.layer,
+        calibrated = report.done,
+        sealed = report.sealed,
+        failed = report.failed,
+        retired = report.retired,
+        "the layer's calibration pass ended",
+    );
+    report
+}
+
+/// Every unit of `layer` that stands: committed under a content key, naming
+/// its subject, its chain finished, and every turn holding its content.
+fn standing(engine: &ConversationEngine, layer: &Layer<'_>) -> Vec<Standing> {
+    let conv = engine.conversation();
+    let substrate = conv.read();
+    let mut units: Vec<Standing> = substrate
+        .active_timelines_for_group(layer.group)
+        .filter(|&tl| substrate.calibrates(tl).is_none())
+        .filter_map(|tl| {
+            let meta = substrate.custom_of(tl)?;
+            let key = meta.get(CONTENT_KEY)?;
+            let subject = meta.get(SUBJECT_KEY).or_else(|| meta.get(PATH_KEY))?;
+            if chain_break(&substrate, tl).is_some() || !substrate.holds_whole(tl) {
+                return None;
+            }
+            Some(Standing {
+                timeline: tl,
+                subject: subject.clone(),
+                marker: layer.spec.marker(key),
+            })
+        })
+        .collect();
+    units.sort_by_key(|u| u.timeline);
+    units
+}
+
+/// The selection a draft is asked under: no reasoning, and no tool block.
+fn draft_selection() -> SelectionState {
+    let mut selection = SelectionState::new();
+    selection.select("thinking_effort", "off");
+    selection.set_optional(NO_THINK_SELECTOR, OptionalState::Present);
+    selection.set_optional(TOOLS_ENABLED_SELECTOR, OptionalState::Absent);
+    selection
+}
+
+/// Ask `unit` for its questions and calibrate them.
+fn calibrate_one(
+    engine: &Mutex<ConversationEngine>,
+    layer: &Layer<'_>,
+    frame: &Frame<'_>,
+    unit: &Standing,
+) -> anyhow::Result<()> {
+    let spec = layer.spec;
+    let asked = draft(engine, layer, unit)?;
+    let found = questions(&asked, spec.questions);
+    if found.is_empty() {
+        anyhow::bail!("the draft wrote no question ({} chars)", asked.len());
+    }
+    let mut conv = engine
+        .lock()
+        .unwrap()
+        .new_reserved_conversation(
+            frame.system_prompt,
+            Reserved::Calibration,
+            DecodePriority::Normal,
+            frame.config.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("calibration conversation: {e}"))?;
+    let timeline = conv.timeline_id();
+    // Its K/V is dropped at the distill; written cold, it would be bytes
+    // the next compaction deletes.
+    engine
+        .lock()
+        .unwrap()
+        .conversation()
+        .mark_timeline_transient(timeline);
+    let mut meta = BTreeMap::new();
+    meta.insert("kind".to_string(), TAG.to_string());
+    meta.insert(MARKER_KEY.to_string(), unit.marker.clone());
+    meta.insert(
+        Substrate::CALIBRATES_KEY.to_string(),
+        unit.timeline.raw().to_string(),
+    );
+    meta.insert(SUBJECT_KEY.to_string(), unit.subject.clone());
+    let sealed = conv
+        .set_metadata_many(&meta)
+        .map_err(|e| anyhow::anyhow!("naming the calibration: {e}"))
+        .and_then(|()| {
+            let cases: Vec<(String, String, Vec<String>)> = found
+                .iter()
+                .map(|q| (q.clone(), String::new(), vec![TAG.to_string()]))
+                .collect();
+            let (handle, _) = conv
+                .submit_prefilled_turn_group(&cases, SelectionState::new())
+                .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
+            let resp = handle
+                .wait_cancellable(crate::ingest_cancel::token())
+                .map_err(|e| anyhow::anyhow!("prefill: {e}"))?;
+            conv.finish_turn(handle, &resp)
+                .map_err(|e| anyhow::anyhow!("seal: {e}"))?;
+            Ok(())
+        });
+    let e = engine.lock().unwrap();
+    if let Err(err) = sealed {
+        let _ = e.tombstone_timeline(timeline);
+        return Err(err);
+    }
+    e.set_conversation_archived(timeline, true)
+        .map_err(|err| anyhow::anyhow!("archiving the calibration: {err}"))?;
+    if e.timeline_has_kv(timeline) && !e.is_timeline_distilled(timeline) {
+        e.distill_timeline(timeline, DistillMode::ProvenanceOnly)
+            .map_err(|err| anyhow::anyhow!("distilling the calibration: {err}"))?;
+    }
+    tracing::debug!(
+        target: "zend::calibrate",
+        layer = %spec.layer,
+        subject = %unit.subject,
+        questions = found.len(),
+        "unit calibrated",
+    );
+    Ok(())
+}
+
+/// The unit's answer to its layer's calibration prompt, asked in a draft
+/// whose lineage is the unit; the draft is tombstoned either way.
+fn draft(
+    engine: &Mutex<ConversationEngine>,
+    layer: &Layer<'_>,
+    unit: &Standing,
+) -> anyhow::Result<String> {
+    let spec = layer.spec;
+    let mut conv = layer
+        .base
+        .lock()
+        .unwrap()
+        .fork()
+        .map_err(|e| anyhow::anyhow!("draft conversation: {e}"))?;
+    let timeline = conv.timeline_id();
+    let named = {
+        let e = engine.lock().unwrap();
+        e.conversation().mark_timeline_transient(timeline);
+        e.set_timeline_summarize(timeline, false);
+        e.set_conversation_metadata(timeline, DRAFT_KEY, &spec.layer)
+            .and_then(|()| e.set_forked_from(timeline, unit.timeline))
+            .map_err(|err| anyhow::anyhow!("draft lineage: {err}"))
+    };
+    let answer = named.and_then(|()| {
+        if let Err(err) = conv.seed_recurrent_from_lineage() {
+            tracing::warn!(
+                target: "zend::calibrate",
+                subject = %unit.subject,
+                "seeding the draft's recurrent memory from its unit failed: {err:#}",
+            );
+        }
+        let options = TurnOptions {
+            max_tokens: Some(DRAFT_MAX_TOKENS),
+            selection: draft_selection(),
+            tags: vec![TAG.to_string()],
+            ..Default::default()
+        };
+        let handle = conv
+            .submit_turn_with_options(spec.prompt_for(&unit.subject), options)
+            .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
+        let resp = handle
+            .wait_cancellable(crate::ingest_cancel::token())
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+        let answer = answer_of(&resp.answer, 0, &resp.stats.finish);
+        conv.finish_turn(handle, &resp)
+            .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+        answer
+    });
+    let _ = engine.lock().unwrap().tombstone_timeline(timeline);
+    answer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A draft is asked without reasoning and without a tool block.
+    #[test]
+    fn a_draft_neither_reasons_nor_sees_tools() {
+        let s = draft_selection();
+        assert_eq!(s.get("thinking_effort"), Some("off"));
+        assert_eq!(s.optional(NO_THINK_SELECTOR), Some(OptionalState::Present));
+        assert_eq!(
+            s.optional(TOOLS_ENABLED_SELECTOR),
+            Some(OptionalState::Absent)
+        );
+    }
+}
