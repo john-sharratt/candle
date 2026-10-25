@@ -10,6 +10,7 @@
 pub mod filter;
 pub mod keys;
 pub mod manifest;
+pub mod order;
 pub mod plan;
 pub mod prime;
 pub mod tie;
@@ -207,18 +208,20 @@ impl BranchIngest {
             .map(|f| (f.key.as_str(), f.at.to_string()))
             .collect();
         backfill_commits(ctx.engine, layer.name, &held, &found);
-        let jobs: Vec<FileJob> = p
-            .queued
-            .iter()
-            .map(|&i| files[i])
-            .map(|f| FileJob {
-                path: f.file.path.clone(),
-                blob: f.file.blob.clone(),
-                language: f.file.language,
-                at: Some(f.at.clone()),
-                branches: f.branches.clone(),
-            })
-            .collect();
+        let jobs: Vec<FileJob> = order::in_read_order(
+            p.queued
+                .iter()
+                .map(|&i| files[i])
+                .map(|f| FileJob {
+                    path: f.file.path.clone(),
+                    blob: f.file.blob.clone(),
+                    language: f.file.language,
+                    at: Some(f.at.clone()),
+                    branches: f.branches.clone(),
+                })
+                .collect(),
+            |j| j.path.as_str(),
+        );
         tracing::info!(
             target: "zend::branch_ingest",
             layer = layer.name,

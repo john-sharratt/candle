@@ -16,7 +16,15 @@ use std::arch::x86_64::{
 use std::sync::LazyLock;
 
 /// Words in the locked layer-group width the vector path covers.
-const GROUP_WORDS: usize = 8;
+pub(super) const GROUP_WORDS: usize = 8;
+
+/// Whether this CPU runs the 512-bit vector popcount ([`agreement8_vpopcnt`]).
+pub(super) fn has_vpopcnt() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return *VPOPCNT;
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
 
 /// Whether this CPU runs the 512-bit vector popcount — asked once.
 #[cfg(target_arch = "x86_64")]
@@ -52,7 +60,8 @@ fn agreement_scalar(a: &[u64], b: &[u64]) -> u32 {
 /// each hold [`GROUP_WORDS`] words.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512vpopcntdq")]
-unsafe fn agreement8_vpopcnt(a: &[u64], b: &[u64]) -> u32 {
+#[inline]
+pub(super) unsafe fn agreement8_vpopcnt(a: &[u64], b: &[u64]) -> u32 {
     debug_assert!(a.len() == GROUP_WORDS && b.len() == GROUP_WORDS);
     let va = _mm512_loadu_si512(a.as_ptr().cast());
     let vb = _mm512_loadu_si512(b.as_ptr().cast());

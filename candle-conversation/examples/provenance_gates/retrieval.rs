@@ -21,7 +21,8 @@ use crate::corpus::{gather, ByLayer, File, Gallery, ANALYSIS};
 use crate::ranking::{order, rule_names, score};
 use crate::stats::{mrr, recall, spearman};
 
-type Probe = (&'static str, usize, Vec<WideQSig>, Option<(usize, usize)>);
+/// `(source, target file, the probe's signatures, the turn left out)`.
+pub type Probe = (&'static str, usize, Vec<WideQSig>, Option<(usize, usize)>);
 
 pub fn run(
     sub: &Substrate,
@@ -81,7 +82,7 @@ pub fn run(
     }
 }
 
-fn probes(
+pub fn probes(
     sub: &Substrate,
     files: &[File],
     by_layer: &mut ByLayer,
@@ -118,22 +119,32 @@ fn probes(
         .collect();
     let mut units = 0usize;
     for layer in ANALYSIS {
-        for (timeline, turns) in by_layer.remove(&layer).unwrap_or_default() {
+        let timelines = by_layer.remove(&layer).unwrap_or_default();
+        let (mut parented, mut filed, mut held) = (0usize, 0usize, 0usize);
+        let n_units = timelines.len();
+        for (timeline, turns) in timelines {
             if units >= per_source {
                 break;
             }
             let parent = TimelineId::from_raw(timeline).and_then(|tl| sub.parent_timeline(tl));
+            parented += usize::from(parent.is_some());
             let Some(&fi) = parent.and_then(|p| file_of.get(&p.raw())) else {
                 continue;
             };
+            filed += 1;
             let Some(turn) = turns.values().rev().find(|t| t.covered()) else {
                 continue;
             };
+            held += 1;
             if let Some(w) = turn.windows(rule).last() {
                 probes.push(("analysis-unit", fi, gather(&turn.sigs, w), None));
                 units += 1;
             }
         }
+        println!(
+            "layer {layer}: {n_units} units, {parented} with a parent, {filed} whose parent \
+             is a file, {held} with a covered turn"
+        );
     }
     probes
 }

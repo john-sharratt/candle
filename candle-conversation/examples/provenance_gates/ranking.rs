@@ -22,15 +22,10 @@ pub fn rule_names() -> Vec<String> {
         .collect()
 }
 
-/// Every rule's score per file for `probe`, with the turn `left_out` — as
-/// `(file, turn)` — taking no part.
-pub fn score(
-    probe: &[WideQSig],
-    gallery: &Gallery,
-    n_files: usize,
-    left_out: Option<(usize, usize)>,
-) -> Vec<Vec<f32>> {
-    let token_file: Vec<usize> = gallery
+/// Each gallery token's file, the tokens of the turn `left_out` — as
+/// `(file, turn)` — belonging to none.
+pub fn token_files(gallery: &Gallery, left_out: Option<(usize, usize)>) -> Vec<usize> {
+    gallery
         .turns
         .iter()
         .flat_map(|(f, t, r)| {
@@ -41,13 +36,24 @@ pub fn score(
             };
             repeat_n(file, r.len())
         })
-        .collect();
-    let votes = late_fusion_votes(probe, &gallery.tokens, &token_file, n_files, &[]);
+        .collect()
+}
+
+/// Every rule's score per file for `probe`, with the turn `left_out` — as
+/// `(file, turn)` — taking no part.
+pub fn score(
+    probe: &[WideQSig],
+    gallery: &Gallery,
+    n_files: usize,
+    left_out: Option<(usize, usize)>,
+) -> Vec<Vec<f32>> {
+    let token_file = token_files(gallery, left_out);
+    let votes = late_fusion_votes(probe, &gallery.flat, &token_file, n_files, &[]);
     let mut today = vec![0.0f32; n_files];
     for v in &votes {
         today[v.file] += v.weight;
     }
-    let tally = window_tally(&votes, &gallery.windows, gallery.tokens.len());
+    let tally = window_tally(&votes, &gallery.windows, gallery.flat.len());
     let live: Vec<bool> = gallery
         .window_turn
         .iter()

@@ -15,9 +15,198 @@ use std::ops::Range;
 
 use rayon::prelude::*;
 
-use super::popcount::group_agreement;
+#[cfg(target_arch = "x86_64")]
+use super::popcount::{agreement8_vpopcnt, has_vpopcnt, GROUP_WORDS};
 use super::scan::NEEDLE_KEEP_FRAC;
 use super::{heads_per_group, WideQSig, FOLD_GROUPS};
+
+/// A gallery's signatures laid end to end in one array, `wpt` words a token —
+/// what a scan streams. A `WideQSig` holds its words in a heap allocation of
+/// its own, so a scan over a gallery of them chases a pointer per token per
+/// probe token; flat, the gallery is one contiguous run the cache prefetches.
+pub struct FlatSigs {
+    words: Vec<u64>,
+    wpt: usize,
+    n_heads: u16,
+}
+
+impl FlatSigs {
+    /// `tokens` laid flat, or `None` when they are empty or not all one width.
+    pub fn new(tokens: &[WideQSig]) -> Option<FlatSigs> {
+        let first = tokens.first()?;
+        let wpt = first.words.len();
+        if wpt == 0 || tokens.iter().any(|t| t.words.len() != wpt) {
+            return None;
+        }
+        let mut words = Vec::with_capacity(tokens.len() * wpt);
+        for t in tokens {
+            words.extend_from_slice(&t.words);
+        }
+        Some(FlatSigs {
+            words,
+            wpt,
+            n_heads: first.n_heads,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.words.len() / self.wpt
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+}
+
+/// Probe tokens scored together in one pass over a gallery slice: a gallery
+/// past the last-level cache makes the scan memory-bound, so each pass over
+/// the slice's words serves this many probe tokens.
+const PROBE_TILE: usize = 32;
+
+/// Gallery tokens a slice aims for. Slices cut at file boundaries and run in
+/// parallel, so every core is busy whatever the probe's length.
+const SLICE_TOKENS: usize = 32 * 1024;
+
+/// One slice's answer for one probe token and fold group: its best file's
+/// agreement, file and token, its runner-up file's agreement, and the
+/// agreement sums the z is taken over.
+#[derive(Clone, Copy)]
+struct SliceBest {
+    top1: u32,
+    file: usize,
+    token: u32,
+    top2: u32,
+    sum: u64,
+    sumsq: u64,
+}
+
+impl SliceBest {
+    const NONE: SliceBest = SliceBest {
+        top1: 0,
+        file: usize::MAX,
+        token: u32::MAX,
+        top2: 0,
+        sum: 0,
+        sumsq: 0,
+    };
+
+    /// Two slices' answers as one: the best two files of both, the sums
+    /// added. Files never span slices, so the two best are distinct files.
+    fn merge(self, o: SliceBest) -> SliceBest {
+        let (hi, lo) = match (self.file, o.file) {
+            (usize::MAX, _) => (o, self),
+            (_, usize::MAX) => (self, o),
+            _ if o.top1 > self.top1 => (o, self),
+            _ => (self, o),
+        };
+        let runner = if lo.file == usize::MAX { 0 } else { lo.top1 };
+        SliceBest {
+            top2: hi.top2.max(runner),
+            sum: self.sum + o.sum,
+            sumsq: self.sumsq + o.sumsq,
+            ..hi
+        }
+    }
+}
+
+/// One probe tile's pass over one gallery slice: every gallery token against
+/// every probe token of the tile, per fold group — the agreement sums into
+/// `sums` (`[probe token in tile][group]`) and each file's best agreement and
+/// token into `best` (`[probe token in tile][file in slice][group]`).
+struct TilePass<'a> {
+    rows: &'a [u64],
+    wpt: usize,
+    gw: usize,
+    /// The slice's first gallery token.
+    start: usize,
+    token_file: &'a [usize],
+    n_files: usize,
+    /// The slice's lowest file id, and how many file ids it spans.
+    lo: usize,
+    width: usize,
+    tile: &'a [&'a WideQSig],
+    sums: &'a mut [SliceBest],
+    best: &'a mut [(u32, u32)],
+}
+
+impl TilePass<'_> {
+    /// The pass with the widest popcount this CPU runs: one 512-bit XOR and
+    /// vector popcount a group where the CPU has `VPOPCNTDQ` and the group is
+    /// the locked eight words, else straight-line `POPCNT`s. Both count the
+    /// same bits.
+    fn run(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        if self.gw == GROUP_WORDS && has_vpopcnt() {
+            // SAFETY: the CPU reported `avx512f` and `avx512vpopcntdq`.
+            unsafe { self.run_vpopcnt() };
+            return;
+        }
+        self.scan(agree);
+    }
+
+    /// # Safety
+    ///
+    /// The CPU must support `avx512f` and `avx512vpopcntdq`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512vpopcntdq")]
+    unsafe fn run_vpopcnt(&mut self) {
+        // SAFETY: this function's own features, and `gw` is the eight words the
+        // vector loads read.
+        self.scan(|a, b| unsafe { agreement8_vpopcnt(a, b) });
+    }
+
+    #[inline(always)]
+    fn scan(&mut self, agree: impl Fn(&[u64], &[u64]) -> u32) {
+        let (gw, width) = (self.gw, self.width);
+        for (i, row) in self.rows.chunks_exact(self.wpt).enumerate() {
+            let t = self.start + i;
+            let f = self.token_file[t];
+            let local = (f < self.n_files).then(|| f - self.lo);
+            for (qi, q) in self.tile.iter().enumerate() {
+                for g in 0..FOLD_GROUPS {
+                    let base = g * gw;
+                    let ag = agree(&q.words[base..base + gw], &row[base..base + gw]);
+                    let o = &mut self.sums[qi * FOLD_GROUPS + g];
+                    o.sum += ag as u64;
+                    o.sumsq += (ag as u64) * (ag as u64);
+                    if let Some(lf) = local {
+                        let b = &mut self.best[(qi * width + lf) * FOLD_GROUPS + g];
+                        if b.1 == u32::MAX || ag > b.0 {
+                            *b = (ag, t as u32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Cut `0..token_file.len()` into ranges of about [`SLICE_TOKENS`], each
+/// ending where the file changes, so no file spans two slices.
+fn slices(token_file: &[usize]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < token_file.len() {
+        let mut end = (start + SLICE_TOKENS).min(token_file.len());
+        while end < token_file.len() && token_file[end] == token_file[end - 1] {
+            end += 1;
+        }
+        out.push(start..end);
+        start = end;
+    }
+    out
+}
+
+/// `popcount(!(a ^ b))` over equal-length word runs — the inner loop, kept
+/// inline so the pass over the gallery compiles to straight-line `POPCNT`s.
+#[inline(always)]
+fn agree(a: &[u64], b: &[u64]) -> u32 {
+    let mut n = 0u32;
+    for (x, y) in a.iter().zip(b) {
+        n += (!(x ^ y)).count_ones();
+    }
+    n
+}
 
 /// One probe token's late-fusion vote: the gallery token that won it, the file
 /// that holds it, and its weight.
@@ -35,89 +224,167 @@ pub struct Vote {
 /// magnitude. Summed per file these are today's scores. `token_file[t]` is
 /// gallery token `t`'s file; a token whose file is `n_files` or past it takes
 /// no part. `group_weights` weighs the fold groups (empty: uniform).
+///
 pub fn late_fusion_votes(
     probe: &[WideQSig],
-    tokens: &[WideQSig],
+    gallery: &FlatSigs,
     token_file: &[usize],
     n_files: usize,
     group_weights: &[f32],
 ) -> Vec<Vote> {
-    let Some(shape) = probe.first() else {
-        return Vec::new();
-    };
-    let wph = shape.words_per_head();
-    let hpg = heads_per_group(shape.n_heads as usize);
-    if wph == 0 || hpg == 0 || tokens.is_empty() || tokens.len() != token_file.len() {
+    gate(
+        &group_votes(probe, gallery, token_file, n_files),
+        group_weights,
+        NEEDLE_KEEP_FRAC,
+    )
+}
+
+/// Each usable probe token's vote per fold group, unweighted and ungated:
+/// `z × margin`, won by the file holding the best-agreeing gallery token, the
+/// margin over the best token of any other file. [`gate`] weighs and gates
+/// them, so one scan serves any weights and keep fraction.
+///
+/// The gallery is cut into slices at file boundaries ([`SLICE_TOKENS`]) that
+/// run in parallel, each scoring the probe [`PROBE_TILE`] tokens to a pass
+/// over its words and keeping, per probe token and group, only its best two
+/// files and its agreement sums; the slices then merge exactly.
+pub fn group_votes(
+    probe: &[WideQSig],
+    gallery: &FlatSigs,
+    token_file: &[usize],
+    n_files: usize,
+) -> Vec<[Option<Vote>; FOLD_GROUPS]> {
+    let n_tokens = gallery.len();
+    let wph = gallery.wpt / gallery.n_heads.max(1) as usize;
+    let hpg = heads_per_group(gallery.n_heads as usize);
+    if wph == 0 || hpg == 0 || n_tokens == 0 || n_tokens != token_file.len() {
         return Vec::new();
     }
     let gw = hpg * wph;
     let need = FOLD_GROUPS * gw;
-    let n = tokens.len() as f32;
-    let per_query: Vec<Vec<Vote>> = probe
-        .par_iter()
-        .filter(|q| q.words.len() >= need)
-        .map(|q| {
-            let mut best = vec![(0u32, usize::MAX); n_files];
-            let mut out = Vec::with_capacity(FOLD_GROUPS);
-            for g in 0..FOLD_GROUPS {
-                let base = g * gw;
-                let qg = &q.words[base..base + gw];
-                best.iter_mut().for_each(|b| *b = (0, usize::MAX));
-                let (mut sum, mut sumsq) = (0u64, 0u64);
-                for (t, cand) in tokens.iter().enumerate() {
-                    let Some(cg) = cand.words.get(base..base + gw) else {
-                        continue;
-                    };
-                    let ag = group_agreement(qg, cg);
-                    let f = token_file[t];
-                    if f < n_files && (best[f].1 == usize::MAX || ag > best[f].0) {
-                        best[f] = (ag, t);
+    let wpt = gallery.wpt;
+    let n = n_tokens as f32;
+    let usable: Vec<&WideQSig> = probe.iter().filter(|q| q.words.len() >= need).collect();
+    let nq = usable.len();
+    // [probe token][group], merged over every slice.
+    let merged: Vec<SliceBest> = slices(token_file)
+        .into_par_iter()
+        .map(|range| {
+            let mut out = vec![SliceBest::NONE; nq * FOLD_GROUPS];
+            // The slice's files are a contiguous run of ids; a token of no
+            // file takes part in the sums only.
+            let files = token_file[range.clone()]
+                .iter()
+                .copied()
+                .filter(|&f| f < n_files);
+            let (lo, hi) = files.fold((usize::MAX, 0), |(lo, hi), f| (lo.min(f), hi.max(f)));
+            let width = if lo == usize::MAX { 0 } else { hi - lo + 1 };
+            for (t0, tile) in usable.chunks(PROBE_TILE).enumerate() {
+                let q0 = t0 * PROBE_TILE;
+                // [probe token in tile][file in slice][group] → (agreement, token).
+                let mut best = vec![(0u32, u32::MAX); tile.len() * width * FOLD_GROUPS];
+                let mut pass = TilePass {
+                    rows: &gallery.words[range.start * wpt..range.end * wpt],
+                    wpt,
+                    gw,
+                    start: range.start,
+                    token_file,
+                    n_files,
+                    lo,
+                    width,
+                    tile,
+                    sums: &mut out[q0 * FOLD_GROUPS..(q0 + tile.len()) * FOLD_GROUPS],
+                    best: &mut best,
+                };
+                pass.run();
+                for qi in 0..tile.len() {
+                    for g in 0..FOLD_GROUPS {
+                        let o = &mut out[(q0 + qi) * FOLD_GROUPS + g];
+                        for lf in 0..width {
+                            let (m, t) = best[(qi * width + lf) * FOLD_GROUPS + g];
+                            if t == u32::MAX {
+                                continue;
+                            }
+                            if o.file == usize::MAX || m > o.top1 {
+                                if o.file != usize::MAX {
+                                    o.top2 = o.top2.max(o.top1);
+                                }
+                                o.top1 = m;
+                                o.file = lo + lf;
+                                o.token = t;
+                            } else if m > o.top2 {
+                                o.top2 = m;
+                            }
+                        }
                     }
-                    sum += ag as u64;
-                    sumsq += (ag as u64).pow(2);
-                }
-                let (mut top1, mut top1f, mut top2) = (0u32, usize::MAX, 0u32);
-                for (f, &(m, t)) in best.iter().enumerate() {
-                    if t == usize::MAX {
-                        continue;
-                    }
-                    if top1f == usize::MAX || m > top1 {
-                        top2 = top1;
-                        top1 = m;
-                        top1f = f;
-                    } else if m > top2 {
-                        top2 = m;
-                    }
-                }
-                if top1f != usize::MAX {
-                    let mean = sum as f32 / n;
-                    let var = (sumsq as f32 / n - mean * mean).max(1e-6);
-                    let z = ((top1 as f32 - mean) / var.sqrt()).max(0.0);
-                    let margin = top1.saturating_sub(top2) as f32;
-                    let w = group_weights.get(g).copied().unwrap_or(1.0);
-                    out.push(Vote {
-                        token: best[top1f].1,
-                        file: top1f,
-                        weight: z * margin * w,
-                    });
                 }
             }
             out
         })
+        .reduce(
+            || vec![SliceBest::NONE; nq * FOLD_GROUPS],
+            |a, b| a.into_iter().zip(b).map(|(x, y)| x.merge(y)).collect(),
+        );
+    (0..nq)
+        .map(|qi| {
+            let mut votes = [None; FOLD_GROUPS];
+            for (g, vote) in votes.iter_mut().enumerate() {
+                let b = merged[qi * FOLD_GROUPS + g];
+                if b.file == usize::MAX {
+                    continue;
+                }
+                let mean = b.sum as f32 / n;
+                let var = (b.sumsq as f32 / n - mean * mean).max(1e-6);
+                let z = ((b.top1 as f32 - mean) / var.sqrt()).max(0.0);
+                let margin = b.top1.saturating_sub(b.top2) as f32;
+                *vote = Some(Vote {
+                    token: b.token as usize,
+                    file: b.file,
+                    weight: z * margin,
+                });
+            }
+            votes
+        })
+        .collect()
+}
+
+/// [`group_votes`] weighed by `group_weights` (empty: uniform) and gated: the
+/// probe tokens whose summed vote is in the top `keep` fraction keep their
+/// votes, the rest are dropped — late fusion's needle gate at
+/// [`NEEDLE_KEEP_FRAC`].
+pub fn gate(
+    per_token: &[[Option<Vote>; FOLD_GROUPS]],
+    group_weights: &[f32],
+    keep: f32,
+) -> Vec<Vote> {
+    let weighed: Vec<Vec<Vote>> = per_token
+        .iter()
+        .map(|votes| {
+            votes
+                .iter()
+                .enumerate()
+                .filter_map(|(g, v)| {
+                    let w = group_weights.get(g).copied().unwrap_or(1.0);
+                    v.map(|v| Vote {
+                        weight: v.weight * w,
+                        ..v
+                    })
+                })
+                .collect()
+        })
         .collect();
-    // The needle gate, as late fusion keeps it.
-    let mags: Vec<f32> = per_query
+    let mags: Vec<f32> = weighed
         .iter()
         .map(|v| v.iter().map(|x| x.weight).sum())
         .collect();
     if mags.is_empty() {
         return Vec::new();
     }
-    let keep = ((NEEDLE_KEEP_FRAC * mags.len() as f32).ceil() as usize).clamp(1, mags.len());
+    let n_keep = ((keep * mags.len() as f32).ceil() as usize).clamp(1, mags.len());
     let mut sorted = mags.clone();
     sorted.sort_unstable_by(|a, b| b.total_cmp(a));
-    let thresh = sorted[keep - 1];
-    per_query
+    let thresh = sorted[n_keep - 1];
+    weighed
         .into_iter()
         .zip(mags)
         .filter(|(_, m)| *m >= thresh)
@@ -303,7 +570,8 @@ mod tests {
             .cloned()
             .chain((900..920).map(sig))
             .collect();
-        let votes = late_fusion_votes(&probe, &tokens, &token_file, 5, &[]);
+        let flat = FlatSigs::new(&tokens).unwrap();
+        let votes = late_fusion_votes(&probe, &flat, &token_file, 5, &[]);
         let mut per_file = vec![0.0f32; 5];
         for v in &votes {
             assert_eq!(token_file[v.token], v.file);
@@ -327,9 +595,55 @@ mod tests {
         let tokens: Vec<WideQSig> = (0..120).map(sig).collect();
         let token_file: Vec<usize> = (0..120).map(|t| if t < 60 { 2 } else { 1 }).collect();
         let probe: Vec<WideQSig> = tokens[10..30].to_vec();
-        let votes = late_fusion_votes(&probe, &tokens, &token_file, 2, &[]);
+        let flat = FlatSigs::new(&tokens).unwrap();
+        let votes = late_fusion_votes(&probe, &flat, &token_file, 2, &[]);
         assert!(!votes.is_empty());
         assert!(votes.iter().all(|v| v.file == 1 && v.token >= 60));
+    }
+
+    /// **The slices change nothing.** A gallery many slices long votes exactly
+    /// as late fusion over it whole, ties included.
+    #[test]
+    fn a_sliced_gallery_votes_as_one_scan() {
+        let n = SLICE_TOKENS * 3 + 517;
+        let tokens: Vec<WideQSig> = (0..n as u64).map(|s| sig(s % 4093)).collect();
+        // Files of uneven length, one spanning a slice cut, and a token of no
+        // file in the middle.
+        let mut token_file: Vec<usize> = (0..n).map(|t| (t * 3 / SLICE_TOKENS).min(20)).collect();
+        token_file[SLICE_TOKENS + 5] = usize::MAX;
+        let probe: Vec<WideQSig> = (0..40u64).map(|s| sig(s * 97 % 4093)).collect();
+        let flat = FlatSigs::new(&tokens).unwrap();
+        let votes = late_fusion_votes(&probe, &flat, &token_file, 21, &[]);
+        let mut per_file = vec![0.0f32; 21];
+        for v in &votes {
+            per_file[v.file] += v.weight;
+        }
+        let refs: Vec<&WideQSig> = tokens.iter().collect();
+        let case: Vec<u32> = token_file
+            .iter()
+            .map(|&f| if f < 21 { f as u32 } else { u32::MAX })
+            .collect();
+        let want = crate::provenance::score_provenance_late_fusion(&probe, &refs, &case, 21);
+        for (a, b) in per_file.iter().zip(&want) {
+            assert!(
+                (a - b).abs() <= 1e-3 * (1.0 + b.abs()),
+                "{per_file:?} vs {want:?}"
+            );
+        }
+        assert!(slices(&token_file).len() >= 3);
+    }
+
+    /// Laid flat only when every token is one width.
+    #[test]
+    fn a_gallery_lies_flat_only_at_one_width() {
+        let tokens: Vec<WideQSig> = (0..3).map(sig).collect();
+        let flat = FlatSigs::new(&tokens).unwrap();
+        assert_eq!(flat.len(), 3);
+        assert_eq!(&flat.words[24..48], &tokens[1].words[..]);
+        let mut ragged = tokens.clone();
+        ragged[2].words.pop();
+        assert!(FlatSigs::new(&ragged).is_none());
+        assert!(FlatSigs::new(&[]).is_none());
     }
 
     /// A vote counts for every window holding its token, and for no other.

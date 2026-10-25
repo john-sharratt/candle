@@ -28,6 +28,7 @@ mod paper;
 mod ranking;
 mod retrieval;
 mod stats;
+mod sweep;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -71,11 +72,13 @@ fn main() -> anyhow::Result<()> {
         println!("fewer than two code_reading files — nothing to rank yet");
         return Ok(());
     }
-    let gallery = Gallery::build(&files, &rule);
+    let Some(gallery) = Gallery::build(&files, &rule) else {
+        anyhow::bail!("the gallery holds no signature, or signatures of more than one width");
+    };
     println!(
         "gallery: {} files, {} tokens, {} windows",
         files.len(),
-        gallery.tokens.len(),
+        gallery.flat.len(),
         gallery.windows.len()
     );
     match command {
@@ -97,6 +100,10 @@ fn main() -> anyhow::Result<()> {
             let per_source = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(40);
             retrieval::run(&sub, &files, &gallery, &mut by_layer, &rule, per_source);
         }
+        "sweep" => {
+            let per_source = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(40);
+            sweep::run(&sub, &files, &gallery, &mut by_layer, &rule, per_source);
+        }
         "paper" => {
             let timeline = u64::from_str_radix(
                 args.get(2)
@@ -117,7 +124,7 @@ fn main() -> anyhow::Result<()> {
                 &expectations,
             )?;
         }
-        other => anyhow::bail!("unknown command `{other}`: files, retrieval or paper"),
+        other => anyhow::bail!("unknown command `{other}`: files, retrieval, sweep or paper"),
     }
     Ok(())
 }

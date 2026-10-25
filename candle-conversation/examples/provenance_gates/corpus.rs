@@ -11,8 +11,10 @@ use candle_conversation::persistence::streams::StreamDecl;
 use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::provenance::boundaries::BoundaryRule;
 use candle_conversation::provenance::probe_windows::{probe_windows, ProbeWindow};
+use candle_conversation::provenance::window_score::FlatSigs;
 use candle_conversation::provenance::{decode_wide_sigs, WideQSig};
 use candle_conversation::substrate::Substrate;
+use candle_conversation::turn_layout::TurnSegment;
 use candle_conversation::REPROJECT_MAX_PROBE_TOKENS;
 use tokenizers::Tokenizer;
 
@@ -26,12 +28,35 @@ pub const CHUNK: usize = 32;
 
 /// One turn as the gates read it.
 pub struct Turn {
+    /// Its tokens outside its reasoning: what its signature is captured over.
+    /// The seal signs a turn's tokens but its `Thinking` spans, so a turn that
+    /// reasoned signs fewer tokens than it holds.
     pub tokens: Vec<u32>,
     pub sigs: Vec<WideQSig>,
 }
 
 impl Turn {
-    /// Whether its signature covers its tokens one to one.
+    /// The turn whose `Tokens` record holds `all`, laid out by `segments`.
+    pub fn new(all: Vec<u32>, sigs: Vec<WideQSig>, segments: &[TurnSegment]) -> Turn {
+        let thinking: Vec<Range<usize>> = segments
+            .iter()
+            .filter(|s| matches!(s, TurnSegment::Thinking { .. }))
+            .filter_map(|s| s.kv())
+            .map(|kv| kv.range())
+            .collect();
+        let tokens = if thinking.is_empty() {
+            all
+        } else {
+            all.into_iter()
+                .enumerate()
+                .filter(|(i, _)| !thinking.iter().any(|r| r.contains(i)))
+                .map(|(_, t)| t)
+                .collect()
+        };
+        Turn { tokens, sigs }
+    }
+
+    /// Whether its signature covers its signed tokens one to one.
     pub fn covered(&self) -> bool {
         !self.tokens.is_empty() && self.sigs.len() == self.tokens.len()
     }
@@ -72,10 +97,17 @@ pub fn load(
             .as_ref()
             .and_then(|b| decode_wide_sigs(b))
             .unwrap_or_default();
-        found.push((d.layer_id, d.timeline_id, d.turn_index, sid, sigs));
+        found.push((
+            d.layer_id,
+            d.timeline_id,
+            d.turn_index,
+            sid,
+            sigs,
+            d.segments.clone(),
+        ));
     }
     let mut by_layer = ByLayer::new();
-    for (layer, timeline, turn_index, sid, sigs) in found {
+    for (layer, timeline, turn_index, sid, sigs, segments) in found {
         let tokens = match sp.read_tokens(sub, sid)? {
             Some(bytes) => decode_token_ids(&bytes)?,
             None => Vec::new(),
@@ -85,7 +117,7 @@ pub fn load(
             .or_default()
             .entry(timeline)
             .or_default()
-            .insert(turn_index, Turn { tokens, sigs });
+            .insert(turn_index, Turn::new(tokens, sigs, &segments));
     }
     Ok(by_layer)
 }
@@ -161,7 +193,7 @@ pub fn gather(sigs: &[WideQSig], w: &ProbeWindow) -> Vec<WideQSig> {
 
 /// The gallery: every file's covered turns laid end to end, windowed.
 pub struct Gallery {
-    pub tokens: Vec<WideQSig>,
+    pub flat: FlatSigs,
     /// Each covered turn, as `(file, turn, range)`.
     pub turns: Vec<(usize, usize, Range<usize>)>,
     pub windows: Vec<Vec<Range<usize>>>,
@@ -172,16 +204,16 @@ pub struct Gallery {
 }
 
 impl Gallery {
-    pub fn build(files: &[File], rule: &BoundaryRule) -> Gallery {
-        let mut g = Gallery {
-            tokens: Vec::new(),
-            turns: Vec::new(),
-            windows: Vec::new(),
-            window_file: Vec::new(),
-            window_turn: Vec::new(),
-            identity: Vec::new(),
-            file_tokens: vec![0; files.len()],
-        };
+    /// `None` when no covered turn holds a signature, or they are not all one
+    /// width.
+    pub fn build(files: &[File], rule: &BoundaryRule) -> Option<Gallery> {
+        let mut tokens: Vec<WideQSig> = Vec::new();
+        let mut turns = Vec::new();
+        let mut windows = Vec::new();
+        let mut window_file = Vec::new();
+        let mut window_turn = Vec::new();
+        let mut identity = Vec::new();
+        let mut file_tokens = vec![0; files.len()];
         for (fi, f) in files.iter().enumerate() {
             let covered: Vec<usize> = (0..f.turns.len())
                 .filter(|&i| f.turns[i].covered())
@@ -190,24 +222,31 @@ impl Gallery {
             let last = covered.last().copied();
             for &ti in &covered {
                 let t = &f.turns[ti];
-                let base = g.tokens.len();
-                g.tokens.extend(t.sigs.iter().cloned());
-                g.turns.push((fi, ti, base..base + t.sigs.len()));
-                g.file_tokens[fi] += t.sigs.len();
-                let windows = t.windows(rule);
-                let n = windows.len();
-                for (wi, w) in windows.iter().enumerate() {
-                    g.windows
-                        .push(w.ranges().map(|r| base + r.start..base + r.end).collect());
-                    g.window_file.push(fi);
-                    g.window_turn.push((fi, ti));
+                let base = tokens.len();
+                tokens.extend(t.sigs.iter().cloned());
+                turns.push((fi, ti, base..base + t.sigs.len()));
+                file_tokens[fi] += t.sigs.len();
+                let cut = t.windows(rule);
+                let n = cut.len();
+                for (wi, w) in cut.iter().enumerate() {
+                    windows.push(w.ranges().map(|r| base + r.start..base + r.end).collect());
+                    window_file.push(fi);
+                    window_turn.push((fi, ti));
                     // The first turn's opening window holds the request; the
                     // last turn's closing window the summary.
-                    g.identity
+                    identity
                         .push((Some(ti) == first && wi == 0) || (Some(ti) == last && wi + 1 == n));
                 }
             }
         }
-        g
+        Some(Gallery {
+            flat: FlatSigs::new(&tokens)?,
+            turns,
+            windows,
+            window_file,
+            window_turn,
+            identity,
+            file_tokens,
+        })
     }
 }
