@@ -114,7 +114,7 @@ impl ThinkMode {
     /// **`graceful` is the number that matters** — it is where a block actually
     /// lands, because the close fires at the next clause boundary once passed
     /// (measured: `graceful + ~10` tokens).  The ladder is therefore the
-    /// thinking length each rung buys: **1024 → 3072 → 4096 → 8192**.
+    /// thinking length each rung buys: **1024 → 3072 → 6144 → 8192**.
     ///
     /// `Quick` 1024 is an order of magnitude above a trivial turn's 33–58, so
     /// nothing ordinary is ever touched.  `Balanced` 3072 is the default path,
@@ -124,9 +124,11 @@ impl ThinkMode {
     /// deep reasoning in a tool round reached the budget routinely, with the
     /// close ramp then raising `</think>` and EOS over a thought still under
     /// way.  3072 lets that thought finish before the ramp starts, while an
-    /// unbounded enumeration still gets closed.  `Deep` 4096 and
-    /// `Exhaustive` 8192 extend the 1024–4096 range where extra thinking is
-    /// documented to pay; `Exhaustive` is twice the checkpoint's own
+    /// unbounded enumeration still gets closed.  `Deep` 6144 — the dial a
+    /// delegated task's own turns run at — is twice `Balanced`, so one notch up
+    /// is twice the thinking; at 4096 it sat one notch's worth above a tool
+    /// round and left a deep turn little more room than the round it planned.
+    /// `Exhaustive` 8192 is twice the checkpoint's own
     /// `thinking_budget` default (4000), to the nearest power of two.
     ///
     /// The two derived figures follow from `graceful` so the three can never
@@ -142,7 +144,7 @@ impl ThinkMode {
         let graceful = match self {
             ThinkMode::Off | ThinkMode::Quick => 1024,
             ThinkMode::Balanced => 3072,
-            ThinkMode::Deep => 4096,
+            ThinkMode::Deep => 6144,
             ThinkMode::Exhaustive => 8192,
         };
         (graceful, graceful + (graceful / 2).min(MAX_CLOSE_WINDOW))
@@ -327,7 +329,7 @@ fn close_tag_then_end(spec: &mut TreeSpec, env: &ThinkSteerEnvelope) -> SpecId {
 /// ramp above them was inert and nothing else stopped the block.
 const QUICK_SPAN_CAP: u32 = 3072;
 const BALANCED_SPAN_CAP: u32 = 7168;
-const DEEP_SPAN_CAP: u32 = 9216;
+const DEEP_SPAN_CAP: u32 = 13312;
 const EXHAUSTIVE_SPAN_CAP: u32 = 17408;
 
 /// The most tokens the close ramp runs past a dial's `graceful` budget before
@@ -936,12 +938,12 @@ mod tests {
     /// [`eot_budget_scales_and_stays_under_span_caps`]; this test fixes the
     /// anchors they derive from.
     #[test]
-    fn the_thinking_ladder_is_1024_3072_4096_8192() {
+    fn the_thinking_ladder_is_1024_3072_6144_8192() {
         use ThinkMode::*;
         let graceful = |m: ThinkMode| m.eot_budget().0;
         assert_eq!(graceful(Quick), 1024);
         assert_eq!(graceful(Balanced), 3072);
-        assert_eq!(graceful(Deep), 4096);
+        assert_eq!(graceful(Deep), 6144);
         assert_eq!(graceful(Exhaustive), 8192);
 
         // Each rung buys more thinking than the one below: one notch up never
@@ -998,7 +1000,7 @@ mod tests {
         assert_eq!(window(Exhaustive), MAX_CLOSE_WINDOW);
         assert_eq!(
             [Quick, Balanced, Deep, Exhaustive].map(|m| m.eot_budget().1),
-            [1536, 3584, 4608, 8704]
+            [1536, 3584, 6656, 8704]
         );
         // `Off` never decodes inside the block, so it reserves nothing.
         assert_eq!(Off.span_cap(), 0);
