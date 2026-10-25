@@ -124,7 +124,8 @@ use crate::projection::{
     TimelineId, TurnId, TurnIndex, TurnKey,
 };
 use crate::projection::{
-    CollectionWarm, DecodePriority, GalleryPreload, GroupId, LayerId, Schema, SubstrateRef,
+    CollectionWarm, DecodePriority, GalleryPreload, GroupId, GroupVotes, LayerId, Schema,
+    SubstrateRef,
 };
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
@@ -172,6 +173,7 @@ use self::turn_group::{GroupCaseId, TurnGroup};
 use flume::{Receiver, Sender, TryRecvError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::take;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -831,6 +833,20 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Option<usize>>,
     },
 
+    /// Score a batch of probes raw against every file of a belief group on
+    /// this thread's GPU gallery arena ([`Conversation::scan_group_votes`]),
+    /// at the same priority as an ingest slice. Replies with the votes, or
+    /// `None` when this scheduler has no arena.
+    ScanGroupVotes {
+        conversation: Conversation,
+        group: GroupId,
+        calibrations: bool,
+        masked: HashSet<StreamId>,
+        excluded: HashMap<StreamId, Vec<Range<usize>>>,
+        probes: Vec<Vec<WideQSig>>,
+        response_tx: Sender<Option<candle::Result<GroupVotes>>>,
+    },
+
     /// Reclaim VRAM by demoting the hot K/V of specific (already-sealed,
     /// retired) timelines to the warm tier, keeping their warm copy. Used by
     /// the calibration phase to hold VRAM flat: each throwaway case's K/V is
@@ -915,6 +931,7 @@ impl SchedulerRequest {
             Self::WarmCollectionNormalization { .. } => "req:warm_collection_normalization",
             Self::PreloadGalleries { .. } => "req:preload_galleries",
             Self::WarmIngestSlice { .. } => "req:warm_ingest_slice",
+            Self::ScanGroupVotes { .. } => "req:scan_group_votes",
             Self::DemoteTimelinesHot { .. } => "req:demote_timelines_hot",
             Self::Wake => "req:wake",
             Self::Settle { .. } => "req:settle",
@@ -5432,6 +5449,29 @@ impl Scheduler {
                     layer,
                     group,
                     timelines,
+                    response_tx,
+                });
+                true
+            }
+
+            SchedulerRequest::ScanGroupVotes {
+                conversation,
+                group,
+                calibrations,
+                masked,
+                excluded,
+                probes,
+                response_tx,
+            } => {
+                // Background work, like an ingest slice: run from the loop top
+                // (`step_norm_warm`), never inside the drain that received it.
+                self.queue_group_scan(norm_warm::ScanVotesJob {
+                    conversation,
+                    group,
+                    calibrations,
+                    masked,
+                    excluded,
+                    probes,
                     response_tx,
                 });
                 true

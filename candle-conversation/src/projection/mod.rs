@@ -204,6 +204,7 @@ mod belief_scan_split;
 mod builder;
 mod error;
 pub(crate) mod event;
+mod group_votes;
 mod held_index_pages;
 mod ids;
 pub mod layer_toggle;
@@ -257,6 +258,7 @@ pub use event::{
     MaterializedPiece, ProjectionBucket, ProjectionEvent, ProjectionPoint, ProjectionSelection,
     SelectedSection, SelectedTurn, SelectionScores, SystemItem,
 };
+pub use group_votes::GroupVotes;
 pub use ids::{
     process_timeline_allocator, CollectionId, GroupId, LayerId, Reserved, SectionId,
     TimelineAllocator, TimelineId, TurnId, TurnIndex, TurnKey,

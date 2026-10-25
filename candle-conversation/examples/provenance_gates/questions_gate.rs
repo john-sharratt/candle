@@ -7,13 +7,18 @@ use anyhow::Context;
 use candle_conversation::provenance::boundaries::BoundaryRule;
 
 use crate::corpus::File;
-use crate::gpu_gallery::GpuGallery;
 use crate::ranking::order;
+use crate::remote_gallery::{Daemon, RemoteGallery};
 use crate::rules::{Scorer, RULES};
 use crate::stats::mrr;
 
-pub fn run(files: &[File], rule: &BoundaryRule, per_file: usize) -> anyhow::Result<()> {
-    let gpu = GpuGallery::new(files)?;
+pub fn run(
+    files: &[File],
+    rule: &BoundaryRule,
+    per_file: usize,
+    daemon: &Daemon,
+) -> anyhow::Result<()> {
+    let gpu = RemoteGallery::new(files, daemon);
     let scorer = Scorer::new(&gpu, files, rule).context("learning the background peaks")?;
     let calibrated = files.iter().filter(|f| !f.questions.is_empty()).count();
     println!(

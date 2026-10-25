@@ -2,11 +2,11 @@
 //! (`docs/provenance_scoped_signatures.md` §3.2–§3.4, §4).
 //!
 //! Opens a workspace's substrate **read-only** — beside a running daemon, which
-//! keeps writing it — and runs on the CPU, so a GPU serving decode is left
-//! alone. Probes are cut by the projection's own boundary rule and window shape
-//! (`provenance::boundaries`, `provenance::probe_windows`) and scored by late
-//! fusion's votes (`provenance::window_score`): summed per file, which is
-//! today's scorer, and tallied per window under each file aggregate.
+//! keeps writing it — and never touches the GPU. Probes are cut by the
+//! projection's own boundary rule and window shape (`provenance::boundaries`,
+//! `provenance::probe_windows`) and scored by late fusion's votes
+//! (`provenance::window_score`): summed per file, which is today's scorer, and
+//! tallied per window under each file aggregate.
 //!
 //! - **Gate 2** (`corpus::coverage`): every `code_reading` turn's signature
 //!   tokens against its tokens.
@@ -17,9 +17,15 @@
 //! - **Questions** (`questions`): each file's calibration questions probing
 //!   for it, their own turn left out, with and without the questions in the
 //!   gallery.
+//! - **Normalization** (`normalization`): every question scored raw and as
+//!   production normalizes it, and against each file's background.
+//! - **Chunk factor** (`chunk-factor`): a calibration factor per stored
+//!   signature chunk, from the votes it wins on other files' questions.
 //!
-//! The sweep, gate 4 and the questions gate scan on the GPU gallery arena
-//! (`gpu_gallery`); the rest scans on the CPU.
+//! The sweep, gate 4, the questions gate, the normalization probe and the
+//! chunk factor scan on a running daemon's gallery
+//! (`POST /v1/substrate/zend/scan`, `remote_gallery`), named by
+//! `--daemon <url> --node <member hex>`; the rest scans on the CPU.
 //!
 //! Run, from the repository root:
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
@@ -27,19 +33,31 @@
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> retrieval [probes per source]
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
-//!     <workspace dir> sweep [probes per source] [background probes] [only this source]
+//!     <workspace dir> sweep [probes per source] [background probes] [only this source] \
+//!     --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
-//!     <workspace dir> paper <dialogue timeline, hex> <expectations.yaml>
+//!     <workspace dir> paper <dialogue timeline, hex> <expectations.yaml> \
+//!     --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
-//!     <workspace dir> questions [probes per file]
+//!     <workspace dir> questions [probes per file] --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> normalization [path filter …] --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> chunk-factor --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> scan-loop [passes] --daemon <url> --node <hex>
 
+mod background;
+mod chunk_factor;
 mod corpus;
-mod gpu_gallery;
+mod norm_probe;
 mod paper;
 mod questions_gate;
 mod ranking;
+mod remote_gallery;
 mod retrieval;
 mod rules;
+mod scan_loop;
 mod stats;
 mod sweep;
 
@@ -53,11 +71,52 @@ use candle_conversation::{REPROJECT_EVERY_N_TOKENS, REPROJECT_TRIGGER_TEXTS};
 use tokenizers::Tokenizer;
 
 use corpus::{Gallery, ANALYSIS, CODE_READING, DIALOGUE};
+use remote_gallery::Daemon;
+
+/// `args` less `--daemon <url>` and `--node <hex>`, and the daemon they name
+/// when both are given.
+fn split_daemon(args: Vec<String>) -> anyhow::Result<(Vec<String>, Option<Daemon>)> {
+    let (mut url, mut node, mut rest) = (None, None, Vec::new());
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--daemon" => {
+                url = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--daemon needs a url"))?,
+                )
+            }
+            "--node" => {
+                node = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--node needs a member"))?,
+                )
+            }
+            _ => rest.push(a),
+        }
+    }
+    let daemon = match (url, node) {
+        (Some(url), Some(node)) => Some(Daemon {
+            url: url.trim_end_matches('/').to_string(),
+            node,
+        }),
+        (None, None) => None,
+        _ => anyhow::bail!("--daemon and --node go together"),
+    };
+    Ok((rest, daemon))
+}
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (args, daemon) = split_daemon(std::env::args().skip(1).collect())?;
     let dir = PathBuf::from(args.first().map(String::as_str).unwrap_or(".."));
     let command = args.get(1).map(String::as_str).unwrap_or("retrieval");
+    let daemon = || {
+        daemon.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "`{command}` scans on a running daemon: give --daemon <url> --node <hex>"
+            )
+        })
+    };
 
     let t = Instant::now();
     let mut sub = Substrate::new();
@@ -130,6 +189,7 @@ fn main() -> anyhow::Result<()> {
                 per_source,
                 background_probes,
                 only,
+                daemon()?,
             )?;
         }
         "paper" => {
@@ -149,15 +209,49 @@ fn main() -> anyhow::Result<()> {
                 &tokenizer,
                 timeline,
                 &expectations,
+                daemon()?,
             )?;
         }
         "questions" => {
             let per_file = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(4);
-            questions_gate::run(&files, &rule, per_file)?;
+            questions_gate::run(&files, &rule, per_file, daemon()?)?;
+        }
+        "normalization" => {
+            norm_probe::run(&files, &args[2..], daemon()?)?;
+        }
+        "chunk-factor" => {
+            chunk_factor::run(&files, daemon()?)?;
+        }
+        "scan-loop" => {
+            let passes = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(5);
+            scan_loop::run(&files, passes, daemon()?)?;
         }
         other => {
-            anyhow::bail!("unknown command `{other}`: files, retrieval, sweep, paper or questions")
+            anyhow::bail!(
+                "unknown command `{other}`: files, retrieval, sweep, paper, questions, \
+                 normalization, chunk-factor or scan-loop"
+            )
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_daemon_flags_come_out_of_the_arguments_anywhere() {
+        let args = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let (rest, daemon) =
+            split_daemon(args(".. --daemon http://h:8081/ questions 1 --node 00ab")).unwrap();
+        assert_eq!(rest, args(".. questions 1"));
+        let daemon = daemon.unwrap();
+        assert_eq!(
+            (daemon.url.as_str(), daemon.node.as_str()),
+            ("http://h:8081", "00ab")
+        );
+        assert!(split_daemon(args(".. questions")).unwrap().1.is_none());
+        assert!(split_daemon(args(".. --node 00ab")).is_err());
+    }
 }

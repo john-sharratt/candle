@@ -5,6 +5,7 @@ use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
 use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::engine_attachments::Attachments;
 use crate::error::ConversationError;
+use crate::group_scanner::GroupScanner;
 use crate::handle::{TokenDecoder, TurnEvent};
 use crate::ingest_warmer::IngestWarmer;
 use crate::models::identity::ModelKey;
@@ -1053,6 +1054,16 @@ impl ConversationEngine {
     /// (never concurrently — it would starve the ingest writer).
     pub fn ingest_warmer(&self) -> IngestWarmer {
         IngestWarmer {
+            conversation: self.conversation.clone(),
+            scheduler_tx: self.core.scheduler_tx.clone(),
+        }
+    }
+
+    /// A handle that scores probes raw against a belief group on the
+    /// scheduler's GPU gallery arena without holding the engine — see
+    /// [`GroupScanner::scan`].
+    pub fn group_scanner(&self) -> GroupScanner {
+        GroupScanner {
             conversation: self.conversation.clone(),
             scheduler_tx: self.core.scheduler_tx.clone(),
         }

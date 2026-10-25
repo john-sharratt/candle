@@ -1,8 +1,8 @@
 //! The scorer's free settings swept over gate 3's probes: which turns the
 //! gallery holds, per-fold-group vote weights, the needle gate's keep fraction,
-//! and the fold from votes to file scores. One GPU scan a probe and gallery
-//! ([`GpuGallery::votes`]); every other setting is weighed, gated and folded on
-//! the host.
+//! and the fold from votes to file scores. One scan a probe and gallery, on
+//! the daemon ([`RemoteGallery::votes`]); every other setting is weighed, gated
+//! and folded on the host.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -14,8 +14,8 @@ use candle_conversation::provenance::{WideQSig, FOLD_GROUPS};
 use candle_conversation::substrate::Substrate;
 
 use crate::corpus::{gather, ByLayer, File};
-use crate::gpu_gallery::{GpuGallery, Questions};
 use crate::ranking::order;
+use crate::remote_gallery::{Daemon, Questions, RemoteGallery};
 use crate::retrieval::{probes, Probe};
 use crate::stats::mrr;
 
@@ -89,9 +89,10 @@ pub fn run(
     per_source: usize,
     background_probes: usize,
     only: Option<&str>,
+    daemon: &Daemon,
 ) -> anyhow::Result<()> {
     let t = Instant::now();
-    let gpu = GpuGallery::new(files)?;
+    let gpu = RemoteGallery::new(files, daemon);
     let probes: Vec<Probe> = probes(sub, files, by_layer, rule, per_source)
         .into_iter()
         .filter(|p| only.is_none_or(|s| p.0 == s))
@@ -160,7 +161,7 @@ pub fn summed(votes: &TokenVotes, weights: &[f32], keep: f32, n_files: usize) ->
 /// Every file's background share and peak under every gallery, weights and
 /// keep.
 fn backgrounds(
-    gpu: &GpuGallery,
+    gpu: &RemoteGallery,
     files: &[File],
     rule: &BoundaryRule,
     first_turn: &[Option<usize>],
