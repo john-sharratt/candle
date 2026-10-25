@@ -206,6 +206,11 @@ pub struct Mission {
     /// plainly within reach — see `engine::work`.
     #[serde(default)]
     pub stuck_refused: u32,
+    /// Whether the world has refused the carrier something since the desk last
+    /// turned a `report_stuck` away — what makes that turn-away count toward
+    /// believing the next one ([`Self::refuse_stuck_on_the_way`]).
+    #[serde(default)]
+    pub refused_since: bool,
     /// The documents the mission is about, when it is work on the record.
     #[serde(default)]
     pub work: Option<Work>,
@@ -227,6 +232,7 @@ impl Mission {
             origin,
             observed: Vec::new(),
             stuck_refused: 0,
+            refused_since: false,
             work: None,
             year: None,
         }
@@ -400,6 +406,25 @@ impl Mission {
     pub fn refuse_stuck(&mut self) -> u32 {
         self.stuck_refused += 1;
         self.stuck_refused
+    }
+
+    /// Turn away a `report_stuck` whose way the world can see is open, and say
+    /// how many such turn-aways count. **Only a real one counts**: one after
+    /// which the world refused the carrier something it tried. A Maker gave two
+    /// operations up as stuck at an open lift — "no mechanism exists to access
+    /// other levels" — having walked between the lift and the table and never
+    /// once called `lift_use`; two turn-aways and the third report was
+    /// believed. Told the way and not trying it is not being blocked by it.
+    pub fn refuse_stuck_on_the_way(&mut self) -> u32 {
+        if std::mem::take(&mut self.refused_since) {
+            self.stuck_refused += 1;
+        }
+        self.stuck_refused
+    }
+
+    /// The world refused the carrier an act while this mission was open.
+    pub fn refused_an_act(&mut self) {
+        self.refused_since = true;
     }
 
     /// Note something the engine saw happen toward the mission. A line already

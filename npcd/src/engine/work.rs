@@ -275,8 +275,10 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             // the person "nowhere to be found" one room away, the machine "not
             // responding" in a room they never reached. When the next step's
             // room, machine or person is within reach, the desk says where and
-            // how instead. Twice, then it takes the report: a character that has
-            // been told the way twice and still cannot is reporting a real block.
+            // how instead. Twice, then it takes the report — counting only the
+            // turn-aways after which the world refused something the character
+            // tried: one told the way that tried it twice and was refused is
+            // reporting a real block; one that never tried it is not.
             // A document sent back to be written is stuck only once its
             // faults have been put in front of the Maker: what to change, not
             // the way to a desk.
@@ -291,7 +293,7 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 }
             }
             if let Some(way) = still_doable(hosted, body) {
-                let refused = hosted.with_sim(|s| s.missions.refuse_stuck(body));
+                let refused = hosted.with_sim(|s| s.missions.refuse_stuck_on_the_way(body));
                 if refused <= STUCK_REFUSALS {
                     return Outcome::Refused(format!(
                         "It is not stuck yet — {way} Do that, then come back to the table and \
@@ -4245,29 +4247,63 @@ mod tests {
     }
 
     /// **Stuck is turned away while the next step is within reach**, with where
-    /// and how — twice. The third time the report is taken: a character told
-    /// the way twice that still cannot is reporting a real block.
+    /// and how — and a character that never tries the way is never believed,
+    /// however often it reports.
     #[test]
     fn stuck_is_refused_while_the_next_step_is_within_reach() {
         let h = vault();
         assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        for _ in 0..4 {
+            match crate::engine::body::perform(
+                &h,
+                "m1",
+                &act("report_stuck", json!({"why":"it will not answer"})),
+            ) {
+                Outcome::Refused(why) => {
+                    assert!(why.starts_with("It is not stuck yet — "), "{why}");
+                    assert!(why.contains("`move_to`"), "{why}");
+                }
+                other => panic!("a step never tried is not stuck, got {other:?}"),
+            }
+        }
+        assert!(h.sim(|s| s.missions.is_on_mission("m1")));
+    }
+
+    /// **A turn-away counts once the world has refused what the character
+    /// tried.** Twice told the way and twice refused on it, the third report is
+    /// taken: that is a real block.
+    #[test]
+    fn stuck_is_believed_after_the_way_was_tried_and_refused_twice() {
+        let h = vault();
+        assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        let body = crate::engine::body::perform;
+        let tried = || {
+            let out = body(
+                &h,
+                "m1",
+                &act("move_to", json!({"destination":"the far side of the moon"})),
+            );
+            assert!(
+                matches!(out, Outcome::Refused(_)),
+                "a place off the map is refused"
+            );
+        };
         let stuck = || {
-            perform(
+            body(
                 &h,
                 "m1",
                 &act("report_stuck", json!({"why":"it will not answer"})),
             )
         };
         for _ in 0..2 {
-            match stuck() {
-                Outcome::Refused(why) => {
-                    assert!(why.starts_with("It is not stuck yet — "), "{why}");
-                    assert!(why.contains("`move_to`"), "{why}");
-                }
-                other => panic!("a reachable step is not stuck, got {other:?}"),
-            }
+            tried();
+            assert!(matches!(stuck(), Outcome::Refused(_)));
         }
-        assert!(stuck().happened(), "the third time, the report is taken");
+        tried();
+        assert!(
+            stuck().happened(),
+            "the third time, after trying, the report is taken"
+        );
         assert!(!h.sim(|s| s.missions.is_on_mission("m1")));
     }
 
