@@ -23,6 +23,10 @@
 //! POST /auth/logout         → clears it
 //! GET  /auth/me             → who the browser is, or that nobody is
 //! ```
+//!
+//! Beside them, the authorization server for `/mcp` ([`mcp`]): its discovery
+//! documents, `/oauth/authorize` and `/oauth/token`, signing in through the
+//! same session.
 
 use std::sync::Arc;
 
@@ -37,6 +41,7 @@ use serde_json::json;
 pub mod cookie;
 pub mod forwarded;
 pub mod gateways;
+pub mod mcp;
 pub mod oidc;
 pub mod role;
 pub mod session;
@@ -149,7 +154,9 @@ impl Auth {
             .route("/auth/callback", get(callback))
             .route("/auth/logout", post(logout).get(logout))
             .route("/auth/me", get(me))
-            .with_state(self)
+            .with_state(self.clone())
+            // The MCP authorization server signs in through the same session.
+            .merge(self.mcp_router())
     }
 }
 

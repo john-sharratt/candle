@@ -19,6 +19,7 @@ use host::access::role;
 
 use super::chat_frames::{call_id, finish_reason, Framer, Framing};
 use crate::access;
+use crate::mcp::ownership;
 use crate::openai_tools::{self, wire_function};
 use crate::passthrough::PASSTHROUGH_MODEL;
 use crate::reasoning_split;
@@ -176,6 +177,11 @@ pub async fn completions(
         let Some(conv_id) = conv_id.filter(|id| !id.trim().is_empty()) else {
             return missing_conv_id();
         };
+        // A worker `/mcp` started takes turns from its owner alone; to anyone
+        // else it is not there (`crate::mcp::ownership`).
+        if !ownership::may_open(&conv_id, &headers, session.roles()) {
+            return ownership::not_found();
+        }
         session
             .submit(
                 messages,
@@ -399,6 +405,9 @@ fn stream_sse(
             }
 
             Ok(StreamItem::Error(message)) => vec![Ok(turn_error_event(&message))],
+
+            // The closing turn's own text says what it could not do.
+            Ok(StreamItem::Closing(_)) => Vec::new(),
         })
         .flat_map(futures::stream::iter);
 
@@ -455,6 +464,7 @@ async fn collect_completion(
             Ok(StreamItem::Tool(_)) => {}   // tool lifecycle; display-only, not in the body
             Ok(StreamItem::Prefill { .. }) => {} // prefill progress; display-only
             Ok(StreamItem::Think { .. }) => {} // reasoning progress; display-only
+            Ok(StreamItem::Closing(_)) => {} // the closing turn's text says it
             Ok(StreamItem::Error(message)) => {
                 failed.get_or_insert(message);
             }

@@ -52,11 +52,11 @@ same Claude budget, without lowering the standard of what is accepted.
 ## 2. Shape
 
 ```
-                                        ┌─ zend member: native conversations (provenance,
- Claude Code ─┐                         │    working set, journals) and its tools
-              ├─ remote MCP ─► gateway ─┼─ every member: maintenance commands, status, logs
- claude.ai  ──┘   /mcp, OAuth   (AS)    ├─ agents (inside each motherd): build, test, run
-      │                                 └─ keep, on each machine: trials, start, stop
+                                          ┌─ zend member: /mcp; native conversations
+ Claude Code ─┐                           │    (provenance, journals) and tools
+              ├─ remote MCP ─► gateway ───┼─ every member: maintenance commands, status, logs
+ claude.ai  ──┘   /mcp       sign-in, OAuth├─ agents (inside each motherd): build, test, run
+      │                                   └─ keep, on each machine: trials, start, stop
       └─ global skills: the workflows, the prompts, the result formats, the fallback
 ```
 
@@ -67,8 +67,9 @@ Five parts:
    the thread and its workers keep (§5).
 2. **Operations tools** (§8): the cluster's management, build, test and deploy
    flows.
-3. **The gateway's authorization server** (§12): OAuth for the MCP clients,
-   signing the user in through the Google account the gateway already uses.
+3. **The authorization server** (§12): OAuth for the MCP clients, in the
+   gateway beside the sign-in it already owns, through the Google account it
+   already uses.
 4. **Global skills** (§7, §9): each workflow is a skill: what it calls, the
    prompt it sends, what it requires the worker to verify, the result format,
    what needs the user's approval, and what Claude does if zend is down. A
@@ -76,7 +77,7 @@ Five parts:
    no deploy.
 5. **Routing rules** in each project's `CLAUDE.md` (§10).
 
-**Remote, not local.** The endpoint is served over HTTPS by the gateway, so the
+**Remote, not local.** The endpoint is served over HTTPS through the gateway, so the
 same tools reach the cluster from Claude Code on any machine and from an
 ordinary claude.ai conversation. claude.ai calls connectors from Anthropic's
 cloud (`160.79.104.0/21`), so `/mcp` and the authorization server's endpoints
@@ -87,12 +88,20 @@ orchestrates and reviews.
 
 ## 3. Work tools
 
-`/mcp` on the gateway, MCP's Streamable HTTP transport. The gateway
-authenticates the bearer token (§12), states the identity on the
-`X-Tokera-*` headers as it does on every route, and proxies the MCP session to
-a zend member. The endpoint answers both handshakes in use: `initialize`
-(protocol 2025-11-25, which claude.ai speaks) and `server/discover`
-(2026-07-28, which Claude Code negotiates).
+`/mcp`, MCP's Streamable HTTP transport, served by a zend member
+(`zend/src/mcp/http.rs`) and forwarded by the gateway. The member checks the
+bearer token itself (§12). It answers both protocol eras in use:
+
+- **2025-11-25**, claude.ai's: `initialize` negotiates the version and opens
+  a session named by `Mcp-Session-Id`; an unknown session is `404`, which
+  tells the client to initialize again.
+- **2026-07-28**, Claude Code's: no handshake and no session; every request
+  names its version on `MCP-Protocol-Version` and its client in
+  `params._meta`, and `server/discover` describes the server. What the server
+  holds for such a client — its attached thread — is keyed by its token. A
+  version served by neither era is `400` with `-32022` and the supported list.
+
+A browser `Origin` naming anywhere but this origin is `403`.
 
 ### 3.1 Native zend conversations, never a passthrough
 
@@ -135,33 +144,41 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 | `zend_threads {prefix?}` | The caller's threads, newest first | Path, last activity, open items, any worker waiting on Claude |
 | `zend_archive {thread}` | Archives a finished feature's thread | The thread's last state |
 
-What each wraps:
+**How they are served.** The member serving `/mcp` runs the tools in
+process, on the session (`zend/src/mcp/tools/`, one file per tool), not
+through zend's REST routes:
 
-| Tool | Route |
-|---|---|
-| `zend_attach` | **new:** `PUT /v1/threads/{name}` — creates the thread conversation, owned by the caller, under the project's journal; or answers the existing one |
-| `zend_task` | **new:** `POST /v1/threads/{thread}/workers` with `name` → the worker, its journal parent recorded (§5.1); then `POST /v1/chat/completions` (`conv_id: worker`, zend's model); `POST /v1/conversations/{worker}/journal/draft` and `GET …/journal` until it covers the task (§5); the thread's outcome entry; `POST /v1/conversations/{worker}/archive` |
-| `zend_wait` | **new:** `POST /v1/threads/wait` with the workers' paths — held until one leaves `running` or `wait_s` passes, then each worker's state (§3.3). Built over `GET /v1/conversations/{worker}/live` (404 when nothing is in flight, `zend/src/api/conversations.rs:89-95`) and the state in each worker's metadata, and dispatched to any member, since the state replicates |
-| `zend_answer` | `POST /v1/chat/completions` (`conv_id: worker`) with the answer as the turn's message, then as `zend_task` from the draft on |
-| `zend_nudge` | **new:** `POST /v1/conversations/{worker}/nudge` |
-| `journal_read` | `GET /v1/conversations/{id}/journal`, and `GET …/journal/{eid}/turns?offset=&limit=` with an entry (`zend/src/api/mod.rs:224-247`) |
-| `journal_grep` | **new:** `GET /v1/conversations/{id}/journal/grep?pattern=&entry=&max_results=`, over `JournalBook::grep` (`zend/src/journal/text.rs:110-120`); **new:** `GET /v1/threads/{thread}/grep` for a subtree, dispatched to any member, since journal text is replicated custom objects (`text.rs:4-6`) |
-| `journal_note` | **new:** `POST /v1/conversations/{thread}/notes` |
-| `zend_threads` | **new:** `GET /v1/threads` — the caller's threads only. The existing `GET /v1/conversations` lists every conversation on the member, unfiltered, with only `{id, label, turn_count, archived, updated_ms}` (`zend/src/session.rs:6910-6982`) |
-| `zend_archive` | `POST /v1/conversations/{thread}/archive` (`mod.rs:194-199`) |
+- **Threads, workers and the thread's journal are records** — custom objects
+  in the substrate under `mcp/…`, keyed by the owner (`zend/src/mcp/threads.rs`)
+  — so they replicate, and any member reads them. A path resolves to its
+  record by the owner's key and the names in it, with no lookup table.
+- **A task's turn** is submitted on the worker's conversation through
+  `ZendSession::submit`, the call `POST /v1/chat/completions` makes, so it is
+  projected exactly as a chat turn is. Its draft is `journal_draft`, its
+  entries `journal`, its evidence `journal_turns`, and its archive
+  `archive_worker`, which keeps the journal text (§4).
+- **`zend_nudge`** queues as records under the worker's conversation
+  (`zend/src/mcp/nudges.rs`), so it reaches the worker whichever member took
+  the call; the loop takes the queue where a tool round's results become the
+  next turn's input — after the check that ends a round with no results, so a
+  nudge never makes a turn of nothing (`session.rs`, `nudges::follow`).
+- **MCP sessions are records too** (`zend/src/mcp/state.rs`): a handshake
+  session under its `Mcp-Session-Id`, a 2026-07-28 client's under its person
+  and client — unchanged by a token refresh — each with the thread it is
+  attached to, swept after 30 days unused. So `/mcp` is `Dispatch::Any`: any
+  member answers any call.
 
-Paths resolve to conversation ids on the member (**new:**
-`GET /v1/journals/resolve?path=`) against the names and journal parents the
-conversations carry in their metadata (§5.2).
-
-**Owned, and checked.** Every conversation `/mcp` creates records its owner —
-the caller's provider and subject from `X-Tokera-Provider` / `X-Tokera-User`
-(`web/src/auth/forwarded.rs:20-67`) — in its metadata, which is durable and
-replicates (`candle-conversation/src/engine.rs:1132-1158`). **new:** every
-`/v1/conversations/*` and `/v1/threads/*` route serves an owned conversation
-only to its owner or an Admin. Today those routes are `Role::Unauthenticated`
-(`zend/src/api/mod.rs:162-247`); conversations with no owner — the dialogues
-zend's own UI makes — keep today's access.
+**Owned, and checked.** A worker's conversation id names its owner —
+`mcp:<owner key>:<thread>/<name>` — and the owner key is the first 16 hex
+digits of `sha256(provider \0 sub)` from the gateway's `X-Tokera-Provider` /
+`X-Tokera-User` (`zend/src/mcp/caller.rs`). Every record `/mcp` keeps is
+under that key. On zend's other routes, a layer over the whole route table
+(`zend/src/mcp/ownership.rs`) answers `404` to any request whose path or
+`x-tokera-conversation` header names such a conversation for anyone but its
+owner or an Admin; the chat route checks its body's `conv_id` the same way,
+and `GET /v1/conversations` lists them to their owner and Admins alone.
+Conversations that name no owner — the dialogues zend's own UI makes — keep
+the access they have.
 
 ### 3.3 Long work
 
@@ -336,10 +353,11 @@ result is every entry whose span overlaps the task's turns, the last of them
 first. Two things about the draft route shape this:
 
 - It only starts the draft: `202 {from_turn, to_turn, parts}`, the entry kept
-  later (`zend/src/session.rs:5171, 5270-5299, 7051-7063`). **new:** `GET
-  …/journal` reports `covered_to`, which the journal record already carries
-  (`docs/zend_journal.md` §7), so the poll ends on coverage rather than on a
-  new entry appearing.
+  later (`zend/src/session.rs:5171, 5270-5299, 7051-7063`). `GET …/journal`
+  already reports `drafting` and `covered_to` (`journal-core/src/record.rs:140-158`),
+  so the task waits for `drafting` to clear, then takes the entries whose ids
+  are past the newest the worker's journal held before the task began
+  (`zend/src/mcp/workers.rs`).
 - It answers `409 nothing_to_draft` both while a draft runs and when nothing is
   new, and `409 not_open` when the conversation is not open on the member
   (`zend/src/api/journal.rs:59-74`). **new:** a running draft answers
@@ -617,23 +635,30 @@ stuck — the spec is ambiguous, two designs trade off and the choice is a desig
 decision, the same failure keeps coming back, it is about to give up — does not
 guess and does not stop. It asks, and Claude's answer moves it on.
 
-**`ask_claude {question, options?, tried?, pointers?}`** is a **new** zend
-tool, offered only to conversations owned through `/mcp`:
+**A worker asks by ending its final response with a question block**, which
+every task's prompt describes (`ASKING`, `zend/src/mcp/workers.rs`):
 
-- `question` — what it needs decided or explained, in one or two sentences;
-- `options` — the choices it sees, each with its consequence, so the answer
-  can be a pick;
-- `tried` — what it already did and what happened;
-- `pointers` — the files, lines, jobs and turns the question rests on, so
-  Claude can check rather than take its word.
+```
+QUESTION: what it needs decided or explained, in a sentence or two
+OPTIONS: each choice it sees, and what it leads to
+TRIED: what it already did, and what happened
+POINTERS: the files and lines, commands or turns the question rests on
+```
 
-**Asking ends the turn.** `ask_claude` records the question in the worker's
-metadata and closes the turn loop, as the repeat guard's close does
-(`zend/src/session.rs:4245-4251`): the turn ends with the question as its final
-response. Nothing waits mid-turn — no conversation lock is held, and a restart
-finds a finished turn, not a call to re-dispatch. The worker stays live, its
-working set and its locks standing; its K/V is in the substrate, so a question
-waiting an hour costs nothing.
+so the answer can be a pick, nothing tried is tried again, and Claude can
+check the pointers rather than take its word. The block is read from its own
+line at the reply's end; the word appearing mid-text is not a question.
+
+It is a protocol in the final response, not a tool, deliberately. A tool would
+need calibration exemplars like every zend tool, and a way to end the turn loop
+from inside a tool round; the final response needs neither, and ends the turn
+by construction.
+
+**Asking ends the turn.** The question is the turn's last words. Nothing waits
+mid-turn — no conversation lock is held, and a restart finds a finished turn,
+not a call to re-dispatch. The worker settles `question`, is not archived, and
+its working set and locks stand; its K/V is in the substrate, so a question
+waiting an hour costs nothing. The thread's journal gains a `Task asks:` entry.
 
 **The question reaches Claude as a tool result.** The `zend_task` call on the
 worker, or the `zend_wait` call whose set includes it, answers `question` with
@@ -643,24 +668,27 @@ waiting, `zend_threads` lists the thread as having a worker waiting, so the
 next look finds it. Claude checks what it needs through the pointers and
 answers with `zend_answer`.
 
-**The answer is the worker's next turn.** `zend_answer` submits it as the
-worker's next message on `POST /v1/chat/completions` — the existing route — and
-the worker carries on with the answer in its history, so a later round, its
-journal and its verifier all see what was decided: the answer's part renders
-`Claude said:` (§5). The answer is also entered on the thread (§4), so every
-live worker under the thread reads the decision at its next round head and the
-worker beside it does not ask again.
+**The answer is the worker's next turn.** `zend_answer {worker, answer}`
+submits it as the worker's next message through the same session path a chat
+turn takes, and the worker carries on with the answer in its history, so a
+later round, its journal and its verifier all see what was decided. The answer
+is also entered on the thread as `Claude answered:` (§4), so it stands in the
+thread's record for every later task. A worker may ask again; it settles after
+every turn.
 
 **Stuck turns ask the same way.** The repeat guard closes a loop after two
 rounds of a repeated call, and the round cap at `MAX_TOOL_ROUNDS = 32`
-(`zend/src/repeat_guard.rs:62-65`, `zend/src/session.rs:356-368, 4920-4939`);
-both end in a closing turn that may not call tools. In an `/mcp` worker the
-closing turn's prompt asks for what it needs to go on, and the task answers
-`stuck` with it. Claude answers with `zend_answer`, exactly as for a question.
+(`zend/src/repeat_guard.rs:62-65`, `zend/src/session.rs:356-368`); both end in
+a closing turn that may not call tools. The loop sends `StreamItem::Closing`
+when it closes (`CLOSED_BY_REPEATS`, `CLOSED_BY_CAP`), which the chat stream
+shows nothing for and the worker reads as **stuck**: it settles `stuck` with
+its closing response, unarchived, and Claude answers with `zend_answer`
+exactly as for a question.
 
-**Claude can also push unasked.** `zend_nudge` queues guidance; **new:** a
-per-conversation guidance queue, kept in the worker's metadata so it survives
-a restart, read at each round head and added to that round as Claude's message.
+**Claude can also push unasked.** `zend_nudge` queues guidance as records
+under the worker's conversation; the worker's next tool round takes it and
+adds it to that round's results as Claude's words, literal text under a line
+naming whose they are.
 A nudge never interrupts a decoding round. Today a second message on a busy
 conversation waits on its lock until the whole turn ends
 (`zend/src/session.rs:3848-3862`), which is too late to steer it.
@@ -963,40 +991,66 @@ and identity stated to the members on `X-Tokera-User` / `-Provider` / `-Email`
 believed only from the trusted peers and stripped from anyone else
 (`web/src/auth/gateways.rs:15-37`, `web/src/server.rs:594-604`). `Role` is the
 gateway's (`web/src/auth/role.rs:63-70`); zend maps it to tool modes
-(`zend/src/access.rs:30, 44`). `/mcp` keeps all of that, and adds one thing.
+(`zend/src/access.rs:30, 44`). `/mcp` keeps all of that.
 
-**new: the gateway is the OAuth 2.1 authorization server for `/mcp`.** Today it
-has no authorization-server capability — no discovery documents, no
-`/authorize`, no `/token`, no client registration — and accepts identity only
-from its cookie (`server.rs:611-615`); its design records that it has no bearer
-sessions (`docs/web_gateway_design.md:211-217`). For `/mcp` only, it adds what
-claude.ai and Claude Code require (§13.1):
+**The gateway is the OAuth 2.1 authorization server for `/mcp`**
+(`web/src/auth/mcp/`), beside the sign-in it already owns. Its routes are
+mounted ahead of site routing on every host, as `/auth/*` are. On `/mcp`
+alone, an access token it issued is an identity exactly as the session cookie
+is (`Auth::mcp_identity`, read where the cookie is in `web/src/server.rs`), so
+the member serving `/mcp` receives the caller on `X-Tokera-*` like any other
+request and never sees what a token means. The site table forwards only
+`/mcp` to the members (`web/web.yaml`, the `zend` site; motherd answers it,
+`host/src/server.rs` `API_PREFIXES`).
 
-- **Discovery.** An unauthenticated request to `/mcp` answers `401` with
-  `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/mcp"`.
-  That document (RFC 9728) names the resource as the connector URL exactly,
-  path included, and the gateway as its one authorization server, whose own
-  metadata (RFC 8414) is served at `/.well-known/oauth-authorization-server`.
+- **Discovery.** A request reaching the member with no identity answers `401`
+  with `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/mcp"`
+  (`error="invalid_token"` when it sent a token the gateway did not take),
+  the origin being the client's, from the gateway's `X-Forwarded-Host` /
+  `-Proto` (`zend/src/mcp/http.rs`). The gateway serves that document
+  (RFC 9728), naming the resource as `<origin>/mcp` exactly and the origin as
+  its one authorization server, and its own metadata (RFC 8414) at
+  `/.well-known/oauth-authorization-server`. Exact bytes in
+  `web/src/auth/mcp/metadata.rs`.
 - **Clients without registration.** The metadata advertises Client ID Metadata
-  Documents (`client_id_metadata_document_supported: true`, and `"none"` in
-  `token_endpoint_auth_methods_supported`), which both claude.ai and Claude
-  Code use, so no registration endpoint is needed. Allowed redirects:
-  `https://claude.ai/api/mcp/auth_callback`, and `http://localhost` and
-  `http://127.0.0.1` on any port for Claude Code.
-- **`/authorize`** requires PKCE `S256`, signs the user in through the existing
-  Google flow — or the session cookie if one stands — and issues the code to
-  the redirect.
-- **`/token`** takes form-urlencoded bodies, exchanges the code, issues a
-  short-lived access token bound to the resource and a rotating refresh token,
-  answers `invalid_grant` for a bad or spent one, and answers within 10 s, the
-  deadline claude.ai holds discovery, registration and token endpoints to (30 s
-  for a refresh).
-- **Bearer on `/mcp` only.** The gateway validates the token, states its
-  identity on the `X-Tokera-*` headers exactly as a cookie session does, and
-  proxies. No other route accepts a bearer token.
-- **Peered gateways** already share the session key and the OAuth client
-  (`web/src/cluster/peers.rs:83`); the token signing key is shared the same
-  way, so a token minted by one is honoured by the other.
+  Documents (`client_id_metadata_document_supported: true`, `"none"` in
+  `token_endpoint_auth_methods_supported`), so no registration endpoint is
+  offered. The gateway fetches the `client_id` URL (5 s, 64 KiB, no redirects),
+  refuses a document naming another client, and allows a redirect the document
+  lists — or, for a loopback redirect, one differing only in its port
+  (RFC 8252 §7.3). The two documents in use, fetched 2026-10-25:
+  `https://claude.ai/oauth/mcp-oauth-client-metadata` (Claude, redirect
+  `https://claude.ai/api/mcp/auth_callback`) and
+  `https://claude.ai/oauth/claude-code-client-metadata` (Claude Code,
+  redirects `http://localhost/callback` and `http://127.0.0.1/callback`).
+- **`/oauth/authorize`** checks the request (PKCE `S256` required, the resource
+  this one), fetches the client's document and matches the redirect — none of
+  which redirects anywhere, since an unchecked redirect is not one to send a
+  browser to. **The user is then asked.** Who they are is the gateway's own
+  session cookie; nobody signed in is sent to `/auth/login?next=…`, which
+  brings them back. A client document is anyone's to write, so a code is never
+  issued unasked: a link naming an attacker's client would otherwise hand a
+  signed-in user's code to the attacker. The consent page names the client and
+  where it will be sent, and posts back the consent it showed, signed and bound
+  to the person who saw it; the answer is a code to the redirect with `state`
+  and `iss` (RFC 9207), or `access_denied`.
+- **`/oauth/token`** takes form-urlencoded bodies; a code works with the PKCE
+  verifier, for the client and redirect it was issued to; a refresh token buys
+  a fresh pair. Errors are RFC 6749's (`invalid_grant`,
+  `unsupported_grant_type`, `invalid_target`). A code lasts five minutes, an
+  access token an hour, a refresh token 30 days.
+- **Stateless, like the session.** A consent, a code and each token are values
+  signed with the session key (`web/src/auth/mcp/grants.rs`), each with a
+  `kind` its reader requires, so a code is never a token and a session cookie
+  — which has no `kind` — is never either. Peered gateways share that key
+  (`web/src/cluster/peers.rs:83`), so each honours what any of them issued,
+  and nothing is stored. The cost: a code works for its five minutes and a
+  refresh token until it expires, not once — neither is any use without what
+  the client alone holds, the PKCE verifier or the token itself — and signing
+  every grant out at once is rotating the session key, as it is for sessions.
+  The role is read from `roles.yaml` by the member on every call, not frozen
+  into the token.
+- **Bearer on `/mcp` only.** No other route reads a bearer token.
 
 **Who may use it: any signed-in user.** Every `/mcp` conversation is owned by
 its caller and served only to them or an Admin (§3.2). An Admin's tasks run
@@ -1004,7 +1058,9 @@ Comprehensive and reach the operations tools; anyone else's run Restricted,
 and the operations tools, Look included, answer that they need Admin.
 
 **No new shared secret on the members.** Like the rest of the estate, the
-daemons hold no key that could mint a session; only the gateways sign tokens.
+daemons hold no key that could mint a session or a token: only the gateways
+sign, and the members believe the identity they state from the gateway peers
+alone.
 
 ## 13. The Claude clients
 
@@ -1092,8 +1148,9 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
 - The authorization server: the `401` and its `resource_metadata`; both
   metadata documents' exact bytes; a CIMD client accepted, a redirect outside
   the allowed set refused; PKCE `S256` required; the code exchange, refresh
-  rotation and `invalid_grant`; a bearer token refused on every route but
-  `/mcp`; a token from one peered gateway honoured by the other.
+  rotation and `invalid_grant`; the consent page escaping what a client wrote,
+  an answer from another person refused, a consent spent once; a secret never
+  a record's key; a bearer token read on `/mcp` only.
 - Ownership: an owned conversation refused to another user on every
   `/v1/conversations/*` and `/v1/threads/*` route, served to its owner and an
   Admin; an unowned dialogue unchanged.
@@ -1122,11 +1179,11 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
 - A task's end: the forced draft polled to `covered_to`; `draft_running`
   waited out; a skipped final stretch reported; the task's result being every
   entry overlapping its turns.
-- `ask_claude` ending the turn and recording the question; `zend_wait`
-  answering `question`; `zend_answer` landing as the next turn, rendered
-  `Claude said:`, and entered on the thread; a restart finding a finished
-  turn; `ask_claude` absent outside `/mcp` conversations. The repeat guard and
-  the round cap answering `stuck`.
+- The question block read only from its own line at a reply's end; a reply
+  ending in one settling `question`, unarchived, with a `Task asks:` entry;
+  `zend_wait` answering it; `zend_answer` refused for a worker not waiting,
+  landing as the next turn otherwise, entered as `Claude answered:`; a restart
+  finding a finished turn. `StreamItem::Closing` settling the worker `stuck`.
 - `zend_nudge` queued, surviving a restart, and taken at the next round head,
   never mid-decode.
 - `sub_run`: a part started under the worker's path, pinning its ancestors'
@@ -1154,14 +1211,17 @@ and reached the way a real client reaches it:
 - **motherd on the RTX 4090 Laptop, unclustered.** A copy of
   `motherd/motherd.laptop.yaml` with `clusters`, `cluster_name` and
   `group_key` dropped, its own `port`/`tls_port`, its own zend working folder
-  and npcd data folder, and no `agent`, run by hand
+  (a `workspace.yaml` naming one scratch repository) and an agent file whose
+  one checkout is that repository, with `push: false`; run by hand
   (`target\release\motherd.exe --config <that file>`), not by keep. Nothing it
-  writes replicates.
-- **Through the public gateway.** The gateway, built with §12's authorization
-  server, routes `/mcp` to that motherd's port, while every other route stays
-  as it is. claude.ai adds the connector by its public URL and Claude Code by
-  `claude mcp add`, so the OAuth flow, the timeouts and the result limits are
-  the real ones.
+  writes replicates. With `local_signin` naming the user, a loopback caller
+  is that user with no gateway in front, for driving `/mcp` directly.
+- **Through the public gateway.** The gateway, built with the authorization
+  server (§12), forwards `/mcp` to that motherd's port, which trusts the
+  gateways' identity headers (`gateways:` in its config), while every other
+  route stays as it is. claude.ai adds the connector by its public URL and
+  Claude Code by `claude mcp add`, so the OAuth flow, the timeouts and the
+  result limits are the real ones.
 - Only once a skill passes there does the endpoint route to the cluster.
 
 ## 15. Failure
@@ -1172,7 +1232,7 @@ and reached the way a real client reaches it:
 | A name clashes with an ancestor's or a live sibling's | Refused before anything runs, naming the clash; the caller picks another |
 | A `journal` names nothing, or `"self"` before `zend_attach` | Refused, naming what was not found; nothing is written |
 | A worker calls `journal_note` | Refused, saying a finding belongs in its final response |
-| A worker is stuck | It asks (`ask_claude`, §6.2) rather than guessing or stopping; Claude answers and it carries on |
+| A worker is blocked on a decision | It ends its final response with a question block (§6.2) rather than guessing or stopping; Claude answers and it carries on |
 | A turn hits the repeat guard or the round cap | The task answers `stuck` with the closing response; Claude answers with `zend_answer` |
 | A turn errors | `zend_task` answers `error`; the skill retries once with a fresh worker on the same thread, then falls back. The failed worker is archived like any finished one, so its evidence stays readable |
 | The forced draft is refused or skips | `zend_task` answers the task's earlier entries and says the final stretch added nothing; with none at all, the final response's text and that no entry was kept |
@@ -1201,12 +1261,11 @@ Made in the change that builds each piece:
     entries kept from a note with no model reply.
   - §7: a journal is read by its own conversation and its descendants, and
     through the tools by its owner.
-  - The draft route's `409 draft_running`, and `covered_to` on `GET …/journal`.
-- **`docs/web_gateway_design.md`**: the authorization server, and bearer
-  tokens accepted on `/mcp` only.
+  - The draft route's `409 draft_running`.
+- **`docs/web_gateway_design.md`**: the authorization server for `/mcp`
+  (§12), and an access token read as an identity on `/mcp` alone.
 - **`docs/replicated_substrate.md`**: keep's routes on its cluster socket and
   the trial as a job (§3.9); the member route that submits an agent run job
   (§11).
 - **`docs/zend_layers.md`** and the tool YAMLs: `journal_read`'s and
-  `journal_grep`'s `journal` parameter, `journal_note`, `ask_claude`,
-  `sub_run`'s runner.
+  `journal_grep`'s `journal` parameter, `journal_note`, `sub_run`'s runner.

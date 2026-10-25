@@ -147,7 +147,9 @@ pub fn claims_of(id_token: &str) -> anyhow::Result<Claims> {
     Ok(serde_json::from_slice(&json)?)
 }
 
-fn pkce_challenge(verifier: &str) -> String {
+/// The PKCE `S256` challenge of `verifier`: `base64url(sha256(verifier))`, no
+/// padding (RFC 7636 §4.2).
+pub fn pkce_challenge(verifier: &str) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use base64::Engine;
     use sha2::{Digest, Sha256};
@@ -157,7 +159,7 @@ fn pkce_challenge(verifier: &str) -> String {
 
 /// 256 bits from the OS. `state`, `nonce` and the PKCE verifier are all
 /// unguessability, so none of them may come from a seeded generator.
-fn random_token() -> String {
+pub fn random_token() -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use base64::Engine;
     use rand::TryRngCore;
