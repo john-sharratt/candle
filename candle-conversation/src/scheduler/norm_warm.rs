@@ -51,10 +51,21 @@ pub(super) struct IngestSliceJob {
     pub(super) response_tx: Sender<Option<usize>>,
 }
 
+/// One file-scored group whose background is due a warm
+/// ([`Conversation::take_background_warms`]).
+struct BackgroundJob {
+    conversation: Conversation,
+    projection: Arc<Builder>,
+    group: GroupId,
+}
+
 /// The replay's backlog, and what the current one has done so far.
 #[derive(Default)]
 pub(super) struct NormWarm {
     backlog: VecDeque<WarmJob>,
+    /// Background warms of file-scored groups, served after the replay's turns
+    /// and before ingest slices.
+    background: VecDeque<BackgroundJob>,
     /// Ingest warm-up slices, served after the replay's turns.
     ingest: VecDeque<IngestSliceJob>,
     /// When the replay now draining was queued.
@@ -68,21 +79,35 @@ impl Scheduler {
     /// the warm-up its next turn: `None` with nothing queued (block as usual),
     /// zero while anything is.
     pub(super) fn norm_warm_wait(&self) -> Option<Duration> {
-        if self.norm_warm.backlog.is_empty() && self.norm_warm.ingest.is_empty() {
+        let warm = &self.norm_warm;
+        if warm.backlog.is_empty() && warm.background.is_empty() && warm.ingest.is_empty() {
             return None;
         }
         Some(Duration::ZERO)
     }
 
     /// Queue the dialogue warm-up replay when it is armed — see
-    /// [`Conversation::take_warm_replay`]. A no-op otherwise, so it is cheap to
-    /// call on every reprojection.
+    /// [`Conversation::take_warm_replay`] — and the background warm of every
+    /// file-scored group that has grown since its last
+    /// ([`Conversation::take_background_warms`]). A no-op otherwise, so it is
+    /// cheap to call on every reprojection.
     pub(super) fn queue_norm_warm(
         &mut self,
         substrate: &Conversation,
         projection: &Arc<Builder>,
         target: ProjectionTarget,
     ) {
+        // Scored on the arena only: a scan of a whole file-scored group on the
+        // host is seconds this loop would stand behind.
+        if self.gallery_arena.is_some() {
+            for group in substrate.take_background_warms(projection.schema()) {
+                self.norm_warm.background.push_back(BackgroundJob {
+                    conversation: substrate.clone(),
+                    projection: Arc::clone(projection),
+                    group,
+                });
+            }
+        }
         let Some(probes) = substrate.take_warm_replay(target) else {
             return;
         };
@@ -110,6 +135,8 @@ impl Scheduler {
         let warm = &mut self.norm_warm;
         warm.backlog
             .retain(|job| !job.substrate.same_substrate(conversation));
+        warm.background
+            .retain(|job| !job.conversation.same_substrate(conversation));
         warm.ingest
             .retain(|slice| !slice.conversation.same_substrate(conversation));
         if warm.backlog.is_empty() {
@@ -117,9 +144,27 @@ impl Scheduler {
         }
     }
 
-    /// Score one queued replay turn — or, with none left, one ingest slice.
-    /// Returns whether one was scored.
+    /// Score one queued replay turn — or, with none left, one group's
+    /// background warm, then one ingest slice. Returns whether one was scored.
     pub(super) fn step_norm_warm(&mut self) -> bool {
+        if self.norm_warm.backlog.is_empty() {
+            if let Some(job) = self.norm_warm.background.pop_front() {
+                let started = Instant::now();
+                let files = job.conversation.warm_group_background(
+                    job.projection.schema(),
+                    job.group,
+                    self.gallery_arena.as_deref(),
+                );
+                tracing::info!(
+                    target: "candle_conversation::provenance",
+                    group = job.group.raw(),
+                    files,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "normalization warm-up: learned a file-scored group's background peaks"
+                );
+                return true;
+            }
+        }
         let Some(job) = self.norm_warm.backlog.pop_front() else {
             let Some(slice) = self.norm_warm.ingest.pop_front() else {
                 return false;

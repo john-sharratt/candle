@@ -384,6 +384,9 @@ pub struct Conversation {
     /// armed — once per process, and again after each
     /// [`Self::reset_normalization_warm`]. See [`Self::take_warm_replay`].
     normalization_warm: Arc<AtomicBool>,
+    /// Each file-scored group's file count when its background was last handed
+    /// out to be warmed. See [`Self::take_background_warms`].
+    background_warmed: Arc<Mutex<HashMap<GroupId, usize>>>,
     /// Cached `(segment_count, last_op)` for the `/v1/status` maintenance
     /// indicator — refreshed by the persistence thread after each maintenance
     /// pass. Read through this **separate** lock so the status endpoint never
@@ -581,6 +584,7 @@ impl Conversation {
             minter,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
+            background_warmed: Arc::default(),
             writer,
             sealed,
             branch_checkpoint: Arc::new(Mutex::new(None)),
@@ -640,6 +644,7 @@ impl Conversation {
             minter,
             normalization: Arc::new(Mutex::new(NormalizationCache::default())),
             normalization_warm: Arc::new(AtomicBool::new(false)),
+            background_warmed: Arc::default(),
             writer,
             sealed,
             branch_checkpoint: Arc::new(Mutex::new(None)),
@@ -1649,6 +1654,62 @@ impl Conversation {
         self.normalization_warm.store(false, AtomicOrdering::SeqCst);
     }
 
+    /// The file-scored groups of `schema` whose background is due a warm:
+    /// never warmed, or grown by a tenth since. Each growth is handed out once,
+    /// so this is cheap to call on every reprojection; the caller warms each
+    /// group with [`Self::warm_group_background`] where the arena is.
+    ///
+    /// A file-scored group normalizes each file over its background peak
+    /// ([`Self::warm_pool_background`]), and until that is learned it ranks by
+    /// raw votes, hubs first. The ingest warm-up runs when its pass is done —
+    /// hours into a first ingest — so a growing group is warmed from here.
+    pub fn take_background_warms(&self, schema: &Schema) -> Vec<GroupId> {
+        let sub = self.inner.read().unwrap();
+        let mut warmed = self.background_warmed.lock().unwrap();
+        let mut due = Vec::new();
+        let file_scored = schema
+            .layers
+            .iter()
+            .flat_map(|l| &l.groups)
+            .filter(|g| g.policy.scan.cases == ScanCases::File && is_warmable(g));
+        for group in file_scored {
+            let n = sub.active_timelines_for_group(group.id).count();
+            let last = warmed.get(&group.id).copied().unwrap_or(0);
+            if n >= 2 && n >= last + (last / 10).max(1) {
+                warmed.insert(group.id, n);
+                due.push(group.id);
+            }
+        }
+        due
+    }
+
+    /// Warm `group`'s background from its files as they stand, on `arena` when
+    /// given ([`Self::warm_pool_background`]). Returns how many files the group
+    /// holds; `0` when it is not a warmable group of `schema`.
+    pub fn warm_group_background(
+        &self,
+        schema: &Schema,
+        group: GroupId,
+        arena: Option<&GalleryArena>,
+    ) -> usize {
+        let Some(group) = schema
+            .layers
+            .iter()
+            .flat_map(|l| &l.groups)
+            .find(|g| g.id == group && is_warmable(g))
+        else {
+            return 0;
+        };
+        let timelines: Vec<TimelineId> = self
+            .inner
+            .read()
+            .unwrap()
+            .active_timelines_for_group(group.id)
+            .collect();
+        self.warm_pool_background(group, &timelines, arena);
+        timelines.len()
+    }
+
     /// Fold one replayed dialogue turn into the hit levels — a seal-style
     /// observe against every belief node, whose normalized scores are
     /// discarded.
@@ -2050,7 +2111,13 @@ impl Conversation {
             // its own turns went cold forever: no later pass ever warmed
             // them, so a conversation several turns into its own history
             // could no longer retrieve its own earlier turns.
-            for group in layer.groups.iter().filter(|g| is_warmable(g)) {
+            // A file-scored group's background is warmed as the group grows
+            // (`take_background_warms`), not a slice of its files at a time.
+            let groups = layer
+                .groups
+                .iter()
+                .filter(|g| is_warmable(g) && g.policy.scan.cases == ScanCases::Exchange);
+            for group in groups {
                 let timelines: Vec<TimelineId> = self
                     .inner
                     .read()
@@ -6521,6 +6588,79 @@ layers:
 
         conv.warm_group_normalization(builder.schema(), group);
         assert_eq!(peaks(), first, "the same gallery folds nothing new");
+
+        // The reprojection's trigger hands the group out once at this size,
+        // and warming it then teaches nothing the warm above did not.
+        assert_eq!(conv.take_background_warms(builder.schema()), vec![group]);
+        assert!(conv.take_background_warms(builder.schema()).is_empty());
+        assert_eq!(conv.warm_group_background(builder.schema(), group, None), 4);
+        assert_eq!(peaks(), first);
+    }
+
+    /// **A file-scored group is due a background warm as it grows**: from two
+    /// files, then again each time it has grown by a tenth (at least one
+    /// file) — never twice at one size. A group scored by exchange never is.
+    #[test]
+    fn a_file_scored_group_is_due_a_background_warm_as_it_grows() {
+        const YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
+layers:
+  - name: files
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: scopes
+        selection: { kind: top_k, k: 2 }
+        policy: { cases: file }
+      - id: turns
+        selection: { kind: top_k, k: 2 }
+"#;
+        let builder = Builder::from_yaml(YAML).unwrap();
+        let layer = builder.id_for_layer("files").unwrap();
+        let scopes = builder.id_for_group("scopes").unwrap();
+        let turns = builder.id_for_group("turns").unwrap();
+        let conv = Conversation::ephemeral();
+        let add = |raw: u64, group: GroupId| {
+            conv.register_timeline(
+                TimelineId::from_raw(raw).expect("timeline id"),
+                layer,
+                group,
+            );
+        };
+        let due = || conv.take_background_warms(builder.schema());
+
+        add(100, turns);
+        add(101, turns);
+        add(1, scopes);
+        assert!(due().is_empty(), "one file is no competition");
+        add(2, scopes);
+        assert_eq!(due(), vec![scopes]);
+        assert!(due().is_empty(), "not twice at one size");
+        add(3, scopes);
+        assert_eq!(due(), vec![scopes], "one file is a tenth of two");
+        for raw in 4..=30 {
+            add(raw, scopes);
+        }
+        assert_eq!(due(), vec![scopes]);
+        add(31, scopes);
+        add(32, scopes);
+        assert!(due().is_empty(), "32 is short of 30 and a tenth");
+        add(33, scopes);
+        assert_eq!(due(), vec![scopes]);
     }
 
     /// `(tags, timeline, index)` rows in the shape `collection_warm_plan` reads.
