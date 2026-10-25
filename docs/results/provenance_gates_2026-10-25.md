@@ -238,6 +238,16 @@ their levels are live traffic's.
 
 - The analysis-unit probes and the paper conversation disagree on what helps.
   A rule is measured against both before it ships.
+- The GPU harness intermittently ends in `CUDA_ERROR_ILLEGAL_ADDRESS` inside
+  `GalleryArena::scan_votes` — once in three runs of the questions gate, once
+  in the paper gate; the other runs complete with identical numbers. Neither
+  sanitizer reproduces it: `memcheck` over a whole questions gate reports 0
+  errors, and `racecheck` over the IMMA parity tests
+  (`tensor_backends_match_scalar_on_adversarial_corpus`,
+  `a_wide_gallery_is_scanned_in_probe_chunks_bit_identically`) 0 hazards.
+  The index upload, the page uploads and the scan share the device's one
+  stream, so the scan cannot run ahead of its tables. Every run, failing or
+  not, shared the card with a live `motherd`; none has yet run on an idle one.
 - Next rule to measure: identity and best-window combined (the better of a
   file's identity score and its count-normalised best window, each
   standardised), and a milder count correction.
