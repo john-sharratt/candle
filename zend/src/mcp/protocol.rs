@@ -41,7 +41,7 @@ entry: an entry is evidence, not truth, so check a claim against the turns it ci
 the entry) before acting on it.";
 
 fn server_info() -> Value {
-    json!({"name": "zend", "title": "zend", "version": env!("CARGO_PKG_VERSION")})
+    json!({"name": "zen", "title": "Zen", "version": env!("CARGO_PKG_VERSION")})
 }
 
 fn capabilities() -> Value {
@@ -123,7 +123,8 @@ mod tests {
     fn the_handshake_and_discovery_results_are_shaped_as_their_specs_say() {
         let init = initialize_result("2025-11-25");
         assert_eq!(init["protocolVersion"], "2025-11-25");
-        assert_eq!(init["serverInfo"]["name"], "zend");
+        assert_eq!(init["serverInfo"]["name"], "zen");
+        assert_eq!(init["serverInfo"]["title"], "Zen");
         assert_eq!(
             init["capabilities"],
             json!({"tools": {"listChanged": false}})
@@ -133,7 +134,7 @@ mod tests {
         assert_eq!(d["supportedVersions"][0], MODERN);
         assert_eq!(
             d["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
-            "zend"
+            "zen"
         );
         assert!(d.get("protocolVersion").is_none());
     }

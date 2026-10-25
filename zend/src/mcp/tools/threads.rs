@@ -113,6 +113,8 @@ mod tests {
             final_text: String::new(),
             error: None,
             question: Some("QUESTION: Inclusive?".into()),
+            activity: None,
+            no_entry: None,
         }
     }
 

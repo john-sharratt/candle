@@ -25,14 +25,18 @@
 //! asks nobody: it ends `done` or `error`, is archived either way, and its
 //! settling is its worker's business, not an entry on Claude's thread.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use candle_conversation::persistence::SharedSubstrate;
 use futures::StreamExt;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Notify;
 use web::auth::Role as AccessRole;
 
+use super::activity::{Activity, Doing};
 use super::caller::Caller;
 use super::names;
 use super::nudges;
@@ -49,8 +53,13 @@ const TASK_EFFORT: u8 = 3;
 const DRAFT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// How often a draft's progress is read.
 const DRAFT_POLL: Duration = Duration::from_secs(2);
-/// How much of a task's final response is kept, from its end.
-const FINAL_TAIL: usize = 2_000;
+/// The least time between two writes of a running worker's record.
+const STEP_GAP: Duration = Duration::from_secs(5);
+/// How often a wait says again what a worker still running has done, with
+/// its time brought up to date, when it has taken no new step — inside the
+/// stream's own repeat (`http::PROGRESS_EVERY`), so the line the person sees
+/// is a worker's, with its time current.
+const PROGRESS_AGAIN: Duration = Duration::from_secs(10);
 /// How much of a prompt the thread's journal quotes.
 const PROMPT_QUOTE: usize = 160;
 
@@ -137,16 +146,12 @@ pub fn drafting(view: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
-/// The reply of a final response: what follows its last `</think>`, the end
-/// of it, at most [`FINAL_TAIL`] characters.
+/// The reply of a final response, whole: what follows its last `</think>`.
 pub fn final_reply(text: &str) -> String {
-    let reply = text
-        .rsplit_once("</think>")
+    text.rsplit_once("</think>")
         .map_or(text, |(_, after)| after)
-        .trim();
-    let chars: Vec<char> = reply.chars().collect();
-    let start = chars.len().saturating_sub(FINAL_TAIL);
-    chars[start..].iter().collect()
+        .trim()
+        .to_string()
 }
 
 /// The question block a reply ends with, from its [`QUESTION_MARK`] line on;
@@ -279,6 +284,8 @@ fn fresh(
         final_text: String::new(),
         error: None,
         question: None,
+        activity: None,
+        no_entry: None,
     }
 }
 
@@ -459,14 +466,19 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
         return;
     };
     // The record says the task still runs for as long as it does — through
-    // the turn and the draft after it — so no reader takes it for cut off.
+    // the turn and the draft after it — so no reader takes it for cut off,
+    // and carries what the turn has done so far.
+    let live = Live::default();
     let beating = tokio::spawn(beat(
+        Arc::clone(&session),
         records.clone(),
         owner.clone(),
         worker.thread.clone(),
         worker.name.clone(),
+        live.clone(),
     ));
-    let ended = turn(&session, &worker, message).await;
+    let ended = turn(&session, &worker, message, &live).await;
+    live.set_doing(Doing::Journaling);
     // A nudge that came after the turn's last tool round was never read.
     for undelivered in nudges::take(&records, &worker.conv_id) {
         let line = format!(
@@ -477,10 +489,16 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
             tracing::warn!(conv_id = %worker.conv_id, "mcp: an undelivered nudge could not be entered: {e}");
         }
     }
-    if !matches!(ended, Ended::Failed(_)) {
-        finish_journal(&session, &worker.conv_id).await;
-        let view = session.journal(&worker.conv_id);
-        worker.entries = entries_after(view.as_ref(), worker.entries_after);
+    worker.no_entry = None;
+    let drafted = match ended {
+        Ended::Failed(_) => None,
+        _ => Some(finish_journal(&session, &worker.conv_id).await),
+    };
+    // A failed turn still carries what its cadence drafted while it ran.
+    let view = session.journal(&worker.conv_id);
+    worker.entries = entries_after(view.as_ref(), worker.entries_after);
+    if let Some(drafted) = drafted.filter(|_| worker.entries.is_empty()) {
+        worker.no_entry = Some(why_no_entry(view.as_ref(), drafted));
     }
     let (label, outcome) = if worker.is_part() {
         settle_part(&mut worker, ended)
@@ -490,6 +508,7 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
     // The beat stops, and is done writing, before the settled record is.
     beating.abort();
     let _ = beating.await;
+    worker.activity = Some(live.snapshot());
     if !worker.state.live() {
         worker.ended_ms = Some(now_ms());
         match session.archive_worker(&worker.conv_id) {
@@ -513,20 +532,77 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
     session.mcp().bump();
 }
 
-/// Say on the worker's record, every [`BEAT_EVERY_MS`], that its task still
-/// runs; until aborted.
-async fn beat(records: SharedSubstrate, owner: String, thread: String, name: String) {
+/// What a running turn has done, shared between the turn that counts it and
+/// the beat that writes it.
+#[derive(Clone, Default)]
+struct Live {
+    activity: Arc<Mutex<Activity>>,
+    /// Woken when a step is worth telling at once.
+    moved: Arc<Notify>,
+}
+
+impl Live {
+    fn observe(&self, item: &StreamItem) {
+        let step = self
+            .activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(item);
+        if step {
+            self.moved.notify_one();
+        }
+    }
+
+    fn set_doing(&self, doing: Doing) {
+        self.activity.lock().unwrap_or_else(|e| e.into_inner()).now = doing;
+        self.moved.notify_one();
+    }
+
+    fn snapshot(&self) -> Activity {
+        self.activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+/// Say on the worker's record that its task still runs, what its turn has
+/// done, and the journal entries drafted so far — every [`BEAT_EVERY_MS`], and
+/// at once when a round ends or a batch of tool calls begins — then wake every
+/// waiter; until aborted. The only writer of the record while the turn runs.
+async fn beat(
+    session: Arc<ZendSession>,
+    records: SharedSubstrate,
+    owner: String,
+    thread: String,
+    name: String,
+    live: Live,
+) {
     let mut every = tokio::time::interval(Duration::from_millis(BEAT_EVERY_MS));
     every.tick().await;
+    let mut kept = Instant::now();
     loop {
-        every.tick().await;
+        tokio::select! {
+            _ = every.tick() => {}
+            _ = live.moved.notified() => {}
+        }
+        // Steps that come quicker than the gap are told together: the record
+        // replicates, and every write of it is kept.
+        let since = kept.elapsed();
+        if since < STEP_GAP {
+            tokio::time::sleep(STEP_GAP - since).await;
+        }
+        kept = Instant::now();
         let Some(mut w) = threads::worker(&records, &owner, &thread, &name) else {
             return;
         };
         w.beat_ms = now_ms();
+        w.activity = Some(live.snapshot());
+        w.entries = entries_after(session.journal(&w.conv_id).as_ref(), w.entries_after);
         if let Err(e) = threads::put_worker(&records, &owner, &w) {
             tracing::warn!(conv_id = %w.conv_id, "mcp: the task's beat could not be kept: {e}");
         }
+        session.mcp().bump();
     }
 }
 
@@ -607,8 +683,9 @@ fn settle_part(part: &mut Worker, ended: Ended) -> (&'static str, String) {
     }
 }
 
-/// Run one turn of the worker on `message` to its end, as its role.
-async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String) -> Ended {
+/// Run one turn of the worker on `message` to its end, as its role, counting
+/// what it does into `live`.
+async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String, live: &Live) -> Ended {
     let mode = access::effective_mode(worker.role, None);
     let mut selection = dial_selection(Some(TASK_EFFORT), None, Some(true));
     apply_tools_dial(&mut selection, mode);
@@ -629,6 +706,9 @@ async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String) -> E
     let mut failed: Option<String> = None;
     let mut closed = false;
     while let Some(item) = stream.next().await {
+        if let Ok(item) = &item {
+            live.observe(item);
+        }
         match item {
             Ok(StreamItem::Token(t)) => text.push_str(&t),
             Ok(StreamItem::Error(e)) => {
@@ -648,13 +728,30 @@ async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String) -> E
     }
 }
 
+/// How a turn's closing draft went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drafted {
+    /// A draft over the turn's stretch ran and ended: its record is the
+    /// journal's last.
+    Ended,
+    /// None ran, for this reason.
+    NotRun(NoDraft),
+    /// The conversation keeps no journal.
+    NoJournal,
+    /// The turn or its draft did not end before [`DRAFT_DEADLINE`].
+    TimedOut,
+}
+
 /// Draft the journal over the turn's stretch now, and wait for the draft to
 /// end.
-async fn finish_journal(session: &ZendSession, conv_id: &str) {
+async fn finish_journal(session: &ZendSession, conv_id: &str) -> Drafted {
     let deadline = Instant::now() + DRAFT_DEADLINE;
     // The reply's stream ends before its turn is committed; the draft reads
     // the committed history, so it waits for the turn to leave the live set.
-    while session.live_turn(conv_id).is_some() && Instant::now() < deadline {
+    while session.live_turn(conv_id).is_some() {
+        if Instant::now() >= deadline {
+            return Drafted::TimedOut;
+        }
         tokio::time::sleep(DRAFT_POLL).await;
     }
     loop {
@@ -664,30 +761,112 @@ async fn finish_journal(session: &ZendSession, conv_id: &str) {
             // turn's last stretch: wait it out and ask again.
             Some(Err(NoDraft::Running)) => {
                 if Instant::now() >= deadline {
-                    return;
+                    return Drafted::TimedOut;
                 }
                 tokio::time::sleep(DRAFT_POLL).await;
             }
-            // Nothing new: the journal already covers the turn.
-            Some(Err(_)) | None => return,
+            Some(Err(why)) => return Drafted::NotRun(why),
+            None => return Drafted::NoJournal,
         }
     }
-    while drafting(session.journal(conv_id).as_ref()) && Instant::now() < deadline {
+    while drafting(session.journal(conv_id).as_ref()) {
+        if Instant::now() >= deadline {
+            return Drafted::TimedOut;
+        }
         tokio::time::sleep(DRAFT_POLL).await;
     }
+    Drafted::Ended
+}
+
+/// Why a turn whose journal `view` shows no new entry kept none — worded for
+/// the caller, who reads it beside the answer: how its closing draft went,
+/// and when one ran, its record's reason.
+pub fn why_no_entry(view: Option<&Value>, drafted: Drafted) -> String {
+    match drafted {
+        Drafted::Ended => {}
+        Drafted::TimedOut => {
+            return format!(
+                "its journal draft did not finish within {} minutes",
+                DRAFT_DEADLINE.as_secs() / 60
+            )
+        }
+        Drafted::NotRun(NoDraft::NothingNew) => {
+            return "nothing in its turn was new to its journal".into()
+        }
+        Drafted::NotRun(NoDraft::NotOpen) => {
+            return "its conversation was not open where it ran, so no draft could run".into()
+        }
+        Drafted::NotRun(NoDraft::NotDue | NoDraft::Running) => {
+            return "no journal draft ran".into()
+        }
+        Drafted::NoJournal => return "its conversation keeps no journal".into(),
+    }
+    let Some(last) = view
+        .and_then(|v| v.get("drafts"))
+        .and_then(Value::as_array)
+        .and_then(|d| d.last())
+    else {
+        return "no journal draft ran".into();
+    };
+    let detail = last
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("no reason was recorded");
+    match last.get("result").and_then(Value::as_str) {
+        Some("nothing") => format!("the journal judged it added nothing: {detail}"),
+        Some("abandoned") => format!("its journal draft failed: {detail}"),
+        Some("not_started") => format!("no journal draft ran: {detail}"),
+        Some("wrote") => "an earlier entry already covers its turn".into(),
+        _ => "no journal draft ran".into(),
+    }
+}
+
+/// What a read of the waited workers says: per worker still running, what its
+/// turn has done, keyed by its path; per journal entry it has written, the
+/// entry's summary line, keyed by its address. Each with the line, and the
+/// step it tells — the line less its elapsed time, which alone is no step.
+pub fn progress_lines(
+    read: &[(String, Option<Worker>)],
+    now: u64,
+) -> Vec<(String, String, String)> {
+    let mut lines = Vec::new();
+    for w in read.iter().filter_map(|(_, w)| w.as_ref()) {
+        if !w.state.working() {
+            continue;
+        }
+        let path = w.path();
+        let activity = w.activity.clone().unwrap_or_default();
+        lines.push((
+            path.clone(),
+            activity.sentence(0),
+            format!(
+                "{path} — {}",
+                activity.sentence(now.saturating_sub(w.turn_ms))
+            ),
+        ));
+        for e in &w.entries {
+            let at = format!("{path}#{}", e.id);
+            let line = format!("{at} — {}", summary_line(&e.text, 200));
+            lines.push((at, String::new(), line));
+        }
+    }
+    lines
 }
 
 /// Wait up to `wait` for any of `wanted` — `(thread, worker)` pairs of
 /// `owner`'s — to stop working; every one of them as it then stands, `None`
-/// for a name that is not a worker.
+/// for a name that is not a worker. Each step the waited workers take while it
+/// waits is said on `progress`, once.
 pub async fn wait(
     session: &ZendSession,
     owner: &str,
     wanted: &[(String, String)],
     wait: Duration,
+    progress: Option<&UnboundedSender<String>>,
 ) -> Result<Vec<(String, Option<Worker>)>, String> {
     let records = session.shared_substrate().ok_or_else(loading)?;
     let deadline = Instant::now() + wait;
+    let mut told: HashMap<String, (String, Instant)> = HashMap::new();
     loop {
         // Subscribe before reading, so a change between the read and the wait
         // still wakes it.
@@ -710,9 +889,23 @@ pub async fn wait(
         if any_settled || left.is_zero() {
             return Ok(read);
         }
-        // Wake on a change, and at least every ten seconds: a task another
-        // member runs changes the record without bumping this process.
-        let nap = left.min(Duration::from_secs(10));
+        if let Some(progress) = progress {
+            for (key, step, line) in progress_lines(&read, now) {
+                // A worker's line is said again once it is stale; an entry's
+                // never changes, so it is said once.
+                let fresh = told.get(&key).is_some_and(|(said, at)| {
+                    *said == step && (step.is_empty() || at.elapsed() < PROGRESS_AGAIN)
+                });
+                if !fresh {
+                    told.insert(key, (step, Instant::now()));
+                    let _ = progress.send(line);
+                }
+            }
+        }
+        // Wake on a change, and at least every [`PROGRESS_AGAIN`]: a task
+        // another member runs changes the record without bumping this
+        // process, and a stale line is said again.
+        let nap = left.min(PROGRESS_AGAIN);
         let _ = tokio::time::timeout(nap, changed.changed()).await;
     }
 }
@@ -754,6 +947,8 @@ mod tests {
             final_text: String::new(),
             error: None,
             question: None,
+            activity: None,
+            no_entry: None,
         }
     }
 
@@ -794,14 +989,94 @@ mod tests {
     }
 
     #[test]
-    fn the_final_reply_is_what_follows_the_thinking_and_its_tail() {
+    fn the_final_reply_is_all_that_follows_the_thinking() {
         assert_eq!(
             final_reply("<think>hmm</think>\n\nVerdict: ok"),
             "Verdict: ok"
         );
         assert_eq!(final_reply("plain"), "plain");
-        let long = "x".repeat(FINAL_TAIL + 10);
-        assert_eq!(final_reply(&long).chars().count(), FINAL_TAIL);
+        let long = "x".repeat(5_000);
+        assert_eq!(final_reply(&long), long);
+    }
+
+    /// **A turn with no entry says why**, from its last draft's record.
+    #[test]
+    fn a_turn_with_no_entry_says_why_from_its_draft() {
+        let with = |draft: Value| json!({"entries": [], "drafts": [draft]});
+        assert_eq!(
+            why_no_entry(
+                Some(&with(
+                    json!({"result": "abandoned", "detail": "the entry was refused: x"})
+                )),
+                Drafted::Ended
+            ),
+            "its journal draft failed: the entry was refused: x"
+        );
+        assert_eq!(
+            why_no_entry(
+                Some(&with(
+                    json!({"result": "nothing", "detail": "more of the same"})
+                )),
+                Drafted::Ended
+            ),
+            "the journal judged it added nothing: more of the same"
+        );
+        assert_eq!(
+            why_no_entry(Some(&json!({"drafts": []})), Drafted::Ended),
+            "no journal draft ran"
+        );
+        assert_eq!(
+            why_no_entry(None, Drafted::TimedOut),
+            "its journal draft did not finish within 15 minutes"
+        );
+        // A draft that did not run this turn is not blamed on an earlier
+        // turn's record.
+        let earlier = with(json!({"result": "abandoned", "detail": "the entry was refused: x"}));
+        assert_eq!(
+            why_no_entry(Some(&earlier), Drafted::NotRun(NoDraft::NothingNew)),
+            "nothing in its turn was new to its journal"
+        );
+    }
+
+    /// **Progress is a line per running worker and per entry it wrote**, each
+    /// keyed so a repeat is not said twice; the step a worker's line tells
+    /// leaves out the elapsed time, which alone is no step.
+    #[test]
+    fn progress_is_a_line_per_running_worker_and_per_entry() {
+        let mut running = worker();
+        running.turn_ms = 1_000;
+        running.activity = Some(Activity {
+            rounds: 1,
+            ..Activity::default()
+        });
+        let mut done = worker();
+        done.name = "done".into();
+        done.state = State::Done;
+        let read = vec![
+            ("T:review/verify".to_string(), Some(running)),
+            ("T:review/done".to_string(), Some(done)),
+            ("T:review/gone".to_string(), None),
+        ];
+        let lines = progress_lines(&read, 46_000);
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    "T:review/verify".to_string(),
+                    "running 0s, 1 round: 0 thinking tokens, no tool calls yet; now starting"
+                        .to_string(),
+                    "T:review/verify — running 45s, 1 round: 0 thinking tokens, no tool calls \
+                     yet; now starting"
+                        .to_string(),
+                ),
+                (
+                    "T:review/verify#2".to_string(),
+                    String::new(),
+                    "T:review/verify#2 — Entry 2 — Checked the expiry.".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(progress_lines(&read, 90_000)[0].1, lines[0].1);
     }
 
     #[test]
