@@ -44,7 +44,7 @@
 
 use std::fmt;
 
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::handler::Handler;
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -123,6 +123,18 @@ macro_rules! method {
             }
         }
     };
+}
+
+impl<S> Methods<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    /// Accept request bodies of up to `bytes` — past axum's 2 MB default, for
+    /// a route whose request is itself the payload (a batch of signatures).
+    pub fn body_limit(mut self, bytes: usize) -> Self {
+        self.router = self.router.layer(DefaultBodyLimit::max(bytes));
+        self
+    }
 }
 
 // axum answers `HEAD` from a `GET` handler, so a `GET` route answers both.
@@ -390,7 +402,7 @@ impl Routes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::Request as HttpRequest;
     use cluster::dispatch::Merge;
     use tower::ServiceExt;
@@ -440,6 +452,33 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert_eq!(call(Role::Admin, Some("boss")).await, StatusCode::OK);
+    }
+
+    /// **A route's body limit is its own.** A 3 MB body is refused under
+    /// axum's 2 MB default and read whole by the same route given 4 MiB.
+    #[tokio::test]
+    async fn a_route_reads_a_body_up_to_its_own_limit() {
+        let read = |limit: Option<usize>| {
+            let methods = post(|body: Bytes| async move { body.len().to_string() });
+            let methods = match limit {
+                Some(bytes) => methods.body_limit(bytes),
+                None => methods,
+            };
+            Api::<()>::new(roles())
+                .route("/x", Role::Unauthenticated, Dispatch::Any, methods)
+                .into_routes(())
+                .router
+        };
+        let body = || {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/x")
+                .body(Body::from(vec![0u8; 3_000_000]))
+                .unwrap()
+        };
+        let status = |router: Router| async move { router.oneshot(body()).await.unwrap().status() };
+        assert_eq!(status(read(None)).await, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(status(read(Some(4 << 20))).await, StatusCode::OK);
     }
 
     /// What the startup log prints and the route-table tests assert against.
