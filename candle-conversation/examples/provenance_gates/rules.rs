@@ -1,28 +1,39 @@
 //! The rules gate 4 and the questions gate rank files by, each scored on the
-//! GPU gallery: the shipped scorer, with and without the calibration questions
-//! in the gallery, beside the top-group weights and the over-peak hub
-//! correction it is measured against.
+//! daemon's gallery: today's scorer with and without the calibration questions in
+//! the gallery; the over-peak hub correction, which gate 4 withdrew; and
+//! surprise against each file's background ([`crate::background`]), alone and
+//! blended with the score's size.
 
 use candle_conversation::provenance::boundaries::BoundaryRule;
 use candle_conversation::provenance::hubness::{corrected, peak, HubCorrection};
 use candle_conversation::provenance::WideQSig;
 
+use crate::background::{learn, question_probes, scaled_scores, to_ref, Background};
 use crate::corpus::File;
-use crate::gpu_gallery::{GpuGallery, Questions};
+use crate::remote_gallery::{Questions, RemoteGallery};
 use crate::sweep::{background_sources, summed};
 
 /// The probe length a peak is scaled to: the live probe cap.
 const T_REF: usize = 256;
 
-/// Background probes a rule's peaks are learned from: production's warm.
+/// Background probes a peak is learned from: production's warm.
 const BACKGROUND_PROBES: usize = 64;
+
+/// How a rule turns a probe's summed votes into file scores.
+#[derive(Clone, Copy)]
+pub enum Fold {
+    /// The votes as they are, or over a hub correction's peak.
+    Hub(HubCorrection),
+    /// Surprise against each file's background, plus `blend × ln(1 + x)`.
+    Surprise { blend: f32 },
+}
 
 /// One way of ranking files.
 pub struct Rule {
     pub name: &'static str,
     pub weights: [f32; 3],
     pub keep: f32,
-    pub fold: HubCorrection,
+    pub fold: Fold,
     pub questions: Questions,
 }
 
@@ -31,64 +42,68 @@ pub const RULES: [Rule; 6] = [
         name: "today",
         weights: [1.0, 1.0, 1.0],
         keep: 0.25,
-        fold: HubCorrection::None,
+        fold: Fold::Hub(HubCorrection::None),
         questions: Questions::Without,
     },
     Rule {
         name: "today + questions",
         weights: [1.0, 1.0, 1.0],
         keep: 0.25,
-        fold: HubCorrection::None,
-        questions: Questions::With,
-    },
-    Rule {
-        name: "top group + questions",
-        weights: [0.0, 0.0, 1.0],
-        keep: 0.25,
-        fold: HubCorrection::None,
+        fold: Fold::Hub(HubCorrection::None),
         questions: Questions::With,
     },
     Rule {
         name: "over-peak + questions",
         weights: [1.0, 1.0, 1.0],
         keep: 0.25,
-        fold: HubCorrection::OverPeak { floor: 100.0 },
+        fold: Fold::Hub(HubCorrection::OverPeak { floor: 100.0 }),
         questions: Questions::With,
     },
     Rule {
-        name: "top group, over-peak",
-        weights: [0.0, 0.0, 1.0],
+        name: "surprise + questions",
+        weights: [1.0, 1.0, 1.0],
         keep: 0.25,
-        fold: HubCorrection::OverPeak { floor: 100.0 },
-        questions: Questions::Without,
+        fold: Fold::Surprise { blend: 0.0 },
+        questions: Questions::With,
     },
     Rule {
-        name: "top group, over-peak + q",
-        weights: [0.0, 0.0, 1.0],
+        name: "surprise+0.5 + questions",
+        weights: [1.0, 1.0, 1.0],
         keep: 0.25,
-        fold: HubCorrection::OverPeak { floor: 100.0 },
+        fold: Fold::Surprise { blend: 0.5 },
+        questions: Questions::With,
+    },
+    Rule {
+        name: "surprise+1.0 + questions",
+        weights: [1.0, 1.0, 1.0],
+        keep: 0.25,
+        fold: Fold::Surprise { blend: 1.0 },
         questions: Questions::With,
     },
 ];
 
-/// Every rule's file scores for a probe, its background peaks learned once.
+/// Every rule's file scores for a probe, its peaks and backgrounds learned
+/// once.
 pub struct Scorer<'g, 'a> {
-    gpu: &'g GpuGallery<'a>,
+    gpu: &'g RemoteGallery<'a>,
     n_files: usize,
     /// Each rule's per-file background peak; empty for a rule that needs none.
     peaks: Vec<Vec<f32>>,
+    /// Each file's background against the gallery with the questions in it,
+    /// when a surprise rule needs one.
+    backgrounds: Vec<Background>,
 }
 
 impl<'g, 'a> Scorer<'g, 'a> {
     pub fn new(
-        gpu: &'g GpuGallery<'a>,
+        gpu: &'g RemoteGallery<'a>,
         files: &[File],
         rule: &BoundaryRule,
     ) -> anyhow::Result<Self> {
         let sources = background_sources(files, rule, BACKGROUND_PROBES);
         let mut peaks = Vec::with_capacity(RULES.len());
         for r in &RULES {
-            if !matches!(r.fold, HubCorrection::OverPeak { .. }) {
+            if !matches!(r.fold, Fold::Hub(HubCorrection::OverPeak { .. })) {
                 peaks.push(Vec::new());
                 continue;
             }
@@ -105,10 +120,21 @@ impl<'g, 'a> Scorer<'g, 'a> {
             }
             peaks.push(peak(&with_len, files.len(), T_REF));
         }
+        let backgrounds = if RULES
+            .iter()
+            .any(|r| matches!(r.fold, Fold::Surprise { .. }))
+        {
+            let probes = question_probes(files);
+            let scaled = scaled_scores(gpu, &probes, Questions::With, files.len())?;
+            learn(&probes, &scaled, files.len())
+        } else {
+            Vec::new()
+        };
         Ok(Scorer {
             gpu,
             n_files: files.len(),
             peaks,
+            backgrounds,
         })
     }
 
@@ -137,8 +163,13 @@ impl<'g, 'a> Scorer<'g, 'a> {
                 };
                 let s = summed(votes, &r.weights, r.keep, self.n_files);
                 match r.fold {
-                    HubCorrection::None => s,
-                    h => corrected(&s, peaks, h, probe.len(), T_REF),
+                    Fold::Hub(HubCorrection::None) => s,
+                    Fold::Hub(h) => corrected(&s, peaks, h, probe.len(), T_REF),
+                    Fold::Surprise { blend } => s
+                        .iter()
+                        .zip(&self.backgrounds)
+                        .map(|(&x, b)| b.blended(to_ref(x, probe.len()), blend))
+                        .collect(),
                 }
             })
             .collect())

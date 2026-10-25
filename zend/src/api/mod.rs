@@ -34,6 +34,7 @@ pub mod models;
 pub mod projections;
 pub mod prompt_tokens;
 mod repo_map;
+pub mod scan;
 pub mod substrate;
 
 /// zend's routes, graded by `roles`, on `session` — every one behind the
@@ -146,6 +147,14 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Role::Admin,
             Dispatch::Best,
             post(substrate::project),
+        )
+        // One member's arena scores it: the votes depend only on the replicated
+        // gallery, so any one answers.
+        .route(
+            "/v1/substrate/zend/scan",
+            Role::Admin,
+            Dispatch::Best,
+            post(scan::scan),
         )
         // Every member reaches every agent through its gateway, so any one
         // answers for them.
@@ -295,6 +304,7 @@ mod tests {
                 ("/v1/substrate/zend/timeline/:tl", "admin"),
                 ("/v1/substrate/zend/timeline/:tl/selection", "admin"),
                 ("/v1/substrate/zend/project", "admin"),
+                ("/v1/substrate/zend/scan", "admin"),
                 ("/v1/agents", "admin"),
                 ("/v1/agents/:node", "admin"),
                 ("/v1/agents/:node/jobs/:id", "admin"),
@@ -385,6 +395,7 @@ mod tests {
             ("GET", "/v1/substrate/zend/timeline/7", Dispatch::Any),
             ("POST", "/mcp", Dispatch::Any),
             ("DELETE", "/v1/substrate/zend/timeline/7", Dispatch::Best),
+            ("POST", "/v1/substrate/zend/scan", Dispatch::Best),
             ("GET", "/v1/substrate/zend/system-prompt", Dispatch::Any),
             ("DELETE", "/v1/substrate/zend/system-prompt", Dispatch::Best),
             (

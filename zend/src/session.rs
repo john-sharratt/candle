@@ -52,8 +52,8 @@ use candle_conversation::Result as EngineResult;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
-    Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers, Linking,
-    OptionalState, ProjectionEvent, PromptDump, SamplingConfig, SelectionState, Sequence,
+    Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers, GroupScanner,
+    Linking, OptionalState, ProjectionEvent, PromptDump, SamplingConfig, SelectionState, Sequence,
     ThinkSteering, TokenDecoder, TurnEvent, TurnHandle, TurnResponse, UnsealedAsker, Want,
 };
 use host::download::ensure_model_pack;
@@ -6422,6 +6422,14 @@ impl ZendSession {
     /// The projection schema this session runs — its layers, as parsed.
     pub fn projection_builder(&self) -> &Builder {
         &self.projection_builder
+    }
+
+    /// A handle that scores probes raw on the scheduler's GPU gallery arena
+    /// without holding the engine, or `None` until the model is loaded.
+    pub fn group_scanner(&self) -> Option<GroupScanner> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let scanner = state.engine.lock().unwrap().group_scanner();
+        Some(scanner)
     }
 
     /// The workspace folder — where `substrate/` lives.

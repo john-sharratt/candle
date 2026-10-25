@@ -79,3 +79,28 @@ pub fn order(scores: &[f32]) -> Vec<usize> {
     order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
     order
 }
+
+/// The 1-based rank of `file` in `scores`.
+pub fn rank_of(scores: &[f32], file: usize) -> usize {
+    order(scores)
+        .iter()
+        .position(|&x| x == file)
+        .unwrap_or(scores.len())
+        + 1
+}
+
+/// Per file, how many of `scored` it ranks first on that `owners` does not
+/// name as its own; a probe that scored nothing is won by no one.
+pub fn wins(owners: &[usize], scored: &[Vec<f32>], n_files: usize) -> Vec<usize> {
+    let mut w = vec![0usize; n_files];
+    for (owner, s) in owners.iter().zip(scored) {
+        if s.iter().all(|&x| x == 0.0) {
+            continue;
+        }
+        let top = order(s)[0];
+        if top != *owner {
+            w[top] += 1;
+        }
+    }
+    w
+}

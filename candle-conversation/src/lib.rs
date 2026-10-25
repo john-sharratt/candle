@@ -66,6 +66,7 @@ mod error;
 /// that keeps it honest. Reachable from both the integration tests and the
 /// `kv_fragmentation` example, which is why it is here rather than under `tests/`.
 pub mod fragmentation_probe;
+mod group_scanner;
 pub mod guest;
 mod handle;
 pub mod index_pages;
@@ -134,6 +135,7 @@ pub use engine::{
 };
 pub use engine_slot::{Capabilities, EngineSlot, EngineSource, EngineTicket};
 pub use error::ConversationError;
+pub use group_scanner::{GroupScanner, ScanRefused};
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use ingest_warmer::IngestWarmer;
 pub use projection::{

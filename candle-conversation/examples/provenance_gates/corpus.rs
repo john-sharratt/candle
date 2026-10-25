@@ -9,6 +9,7 @@ use std::ops::Range;
 use candle_conversation::persistence::resume::decode_token_ids;
 use candle_conversation::persistence::streams::StreamDecl;
 use candle_conversation::persistence::SubstratePersistence;
+use candle_conversation::projection::TimelineId;
 use candle_conversation::provenance::boundaries::BoundaryRule;
 use candle_conversation::provenance::probe_windows::{probe_windows, ProbeWindow};
 use candle_conversation::provenance::window_score::FlatSigs;
@@ -136,6 +137,13 @@ pub fn load(
             continue;
         };
         if !layers.contains(&d.layer_id) {
+            continue;
+        }
+        // A tombstoned conversation or turn votes in no live scan: a file's
+        // superseded reading, a calibration's draft.
+        let live = TimelineId::from_raw(d.timeline_id)
+            .is_some_and(|tl| !sub.is_tombstoned(tl) && !sub.is_turn_tombstoned(tl, d.turn_index));
+        if !live {
             continue;
         }
         let sigs = e

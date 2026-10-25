@@ -19,17 +19,25 @@
 //! moment it arrived, each slice was ~300 ms of self-match scans the decode
 //! loop stood behind, once per decode step: a dialogue opened right after a
 //! load decoded at a fraction of its rate until the ~30 s warm-up was done.
+//!
+//! A raw group scan ([`Conversation::scan_group_votes`]) — an offline caller
+//! scoring its own probes against the resident gallery — waits in the same
+//! loop under the same rule, after the replay and before ingest slices.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flume::Sender;
 
 use super::Scheduler;
+use crate::persistence::streams::StreamId;
 use crate::projection::{
-    Builder, Conversation, GroupId, LayerId, ProjectionTarget, Schema, TimelineId, WarmProbe,
+    Builder, Conversation, GroupId, GroupVotes, LayerId, ProjectionTarget, Schema, TimelineId,
+    WarmProbe,
 };
+use crate::provenance::WideQSig;
 
 /// One replayed turn waiting to be scored, with what scoring it needs.
 struct WarmJob {
@@ -51,10 +59,26 @@ pub(super) struct IngestSliceJob {
     pub(super) response_tx: Sender<Option<usize>>,
 }
 
+/// A batch of probes scored raw against a belief group's files — the
+/// [`super::SchedulerRequest::ScanGroupVotes`] it arrived as.
+pub(super) struct ScanVotesJob {
+    pub(super) conversation: Conversation,
+    pub(super) group: GroupId,
+    pub(super) calibrations: bool,
+    pub(super) masked: HashSet<StreamId>,
+    pub(super) excluded: HashMap<StreamId, Vec<Range<usize>>>,
+    pub(super) probes: Vec<Vec<WideQSig>>,
+    /// The votes, or `None` when this scheduler has no arena.
+    pub(super) response_tx: Sender<Option<candle::Result<GroupVotes>>>,
+}
+
 /// The replay's backlog, and what the current one has done so far.
 #[derive(Default)]
 pub(super) struct NormWarm {
     backlog: VecDeque<WarmJob>,
+    /// Raw group scans, served after the replay's turns and before ingest
+    /// slices.
+    scans: VecDeque<ScanVotesJob>,
     /// Ingest warm-up slices, served after the replay's turns.
     ingest: VecDeque<IngestSliceJob>,
     /// When the replay now draining was queued.
@@ -68,7 +92,8 @@ impl Scheduler {
     /// the warm-up its next turn: `None` with nothing queued (block as usual),
     /// zero while anything is.
     pub(super) fn norm_warm_wait(&self) -> Option<Duration> {
-        if self.norm_warm.backlog.is_empty() && self.norm_warm.ingest.is_empty() {
+        let warm = &self.norm_warm;
+        if warm.backlog.is_empty() && warm.scans.is_empty() && warm.ingest.is_empty() {
             return None;
         }
         Some(Duration::ZERO)
@@ -102,6 +127,12 @@ impl Scheduler {
         self.norm_warm.ingest.push_back(job);
     }
 
+    /// Queue one raw group scan; [`Self::step_norm_warm`] runs it on a later
+    /// loop iteration.
+    pub(super) fn queue_group_scan(&mut self, job: ScanVotesJob) {
+        self.norm_warm.scans.push_back(job);
+    }
+
     /// Drop every queued job for `conversation`'s substrate — it has detached,
     /// and nothing on this thread may refer to it afterwards. A dropped
     /// slice's reply channel closes, which its warmer reads as the engine
@@ -110,6 +141,8 @@ impl Scheduler {
         let warm = &mut self.norm_warm;
         warm.backlog
             .retain(|job| !job.substrate.same_substrate(conversation));
+        warm.scans
+            .retain(|scan| !scan.conversation.same_substrate(conversation));
         warm.ingest
             .retain(|slice| !slice.conversation.same_substrate(conversation));
         if warm.backlog.is_empty() {
@@ -117,10 +150,25 @@ impl Scheduler {
         }
     }
 
-    /// Score one queued replay turn — or, with none left, one ingest slice.
-    /// Returns whether one was scored.
+    /// Score one queued replay turn — or, with none left, one raw group scan,
+    /// then one ingest slice. Returns whether one was scored.
     pub(super) fn step_norm_warm(&mut self) -> bool {
         let Some(job) = self.norm_warm.backlog.pop_front() else {
+            if let Some(scan) = self.norm_warm.scans.pop_front() {
+                let votes = self.gallery_arena.as_deref().map(|arena| {
+                    scan.conversation.scan_group_votes(
+                        scan.group,
+                        scan.calibrations,
+                        &scan.masked,
+                        &scan.excluded,
+                        &scan.probes,
+                        arena,
+                    )
+                });
+                // A caller that has gone away has nothing left to wait for.
+                let _ = scan.response_tx.send(votes);
+                return true;
+            }
             let Some(slice) = self.norm_warm.ingest.pop_front() else {
                 return false;
             };
@@ -220,6 +268,40 @@ mod tests {
         conv.reset_normalization_warm();
         sched.queue_norm_warm(&conv, &builder, target);
         assert_eq!(sched.norm_warm.backlog.len(), 2, "a re-arm queues it again");
+    }
+
+    /// **A raw group scan is answered on a later step, not when it arrives** —
+    /// here `None`, a scheduler with no arena — and the drained queue stops
+    /// shortening the idle wait.
+    #[test]
+    fn a_group_scan_is_answered_on_the_next_step() {
+        use super::ScanVotesJob;
+        use crate::projection::GroupId;
+        use std::collections::{HashMap, HashSet};
+
+        let dir = tempfile::tempdir().unwrap();
+        let conv = open(dir.path());
+        let (mut sched, _tx) = make_test_scheduler();
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        sched.queue_group_scan(ScanVotesJob {
+            conversation: conv,
+            group: GroupId::from_raw(1).unwrap(),
+            calibrations: true,
+            masked: HashSet::new(),
+            excluded: HashMap::new(),
+            probes: Vec::new(),
+            response_tx: reply_tx,
+        });
+        assert_eq!(sched.norm_warm_wait(), Some(Duration::ZERO));
+        assert!(reply_rx.try_recv().is_err(), "the caller is still waiting");
+
+        assert!(sched.step_norm_warm());
+        assert!(
+            reply_rx.try_recv().unwrap().is_none(),
+            "no arena on this scheduler"
+        );
+        assert!(!sched.step_norm_warm(), "the scan was the whole backlog");
+        assert_eq!(sched.norm_warm_wait(), None);
     }
 
     /// **An ingest warm-up slice is answered on a later step, not when it
