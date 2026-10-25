@@ -12,15 +12,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use candle_conversation::engine_slot::CoreRequests;
 use candle_conversation::models::{Recent, StrataTokens};
 use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use clap::Args;
-use host::OneShot;
+use host::{OneShot, MODEL};
 use serde::{Deserialize, Deserializer};
 
 use crate::config::{DaemonConfig, SelfCheck};
+use crate::engine_asks;
 use crate::secrets;
+use crate::session::build_projection_builder;
 use crate::substrate_git::open_workspace;
 use crate::tenant::ZendTenant;
 
@@ -253,8 +256,26 @@ impl ZendArgs {
     /// Where the substrate of these settings is, or will be: the workspace's
     /// `substrate`, without opening it.
     pub fn substrate_dir(&self) -> PathBuf {
+        self.resolved_root().join(SUBSTRATE_DIR)
+    }
+
+    /// What zend asks of the engine it shares, without loading zend: what a
+    /// host running its other daemons alone seats in zend's place, so their
+    /// engine is the one built beside zend.
+    pub fn engine_requests(&self) -> CoreRequests {
+        let schema = build_projection_builder(&self.resolved_root());
+        engine_asks::ask(
+            MODEL.builder(),
+            &schema,
+            self.qsa_selection_budget,
+            self.qsa_strata(),
+        )
+        .take_core_requests()
+    }
+
+    fn resolved_root(&self) -> PathBuf {
         let root = self.root();
-        root.canonicalize().unwrap_or(root).join(SUBSTRATE_DIR)
+        root.canonicalize().unwrap_or(root)
     }
 
     /// The stratified selection the `--qsa-*` flags describe.
@@ -363,6 +384,8 @@ mod tests {
 
     use clap::Parser;
 
+    use crate::session::MAX_TURN_TOKENS;
+
     #[derive(Parser)]
     struct Cli {
         #[command(flatten)]
@@ -373,6 +396,23 @@ mod tests {
         let mut all = vec!["zend"];
         all.extend_from_slice(args);
         Cli::try_parse_from(all).unwrap().zend
+    }
+
+    /// **What zend asks without loading is what its load asks.** A host
+    /// running npcd alone seats these in zend's place; the RoPE floor among
+    /// them is part of the model key of every substrate written beside zend, so
+    /// an engine built without it refuses them.
+    #[test]
+    fn the_engine_requests_carry_zends_floor_and_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let asks = parse(&["--working-dir", dir.path().to_str().unwrap()]).engine_requests();
+        assert_eq!(
+            asks.min_rope_factor,
+            Some(2.0),
+            "the bundled schema's floor"
+        );
+        assert_eq!(asks.max_response_tokens, MAX_TURN_TOKENS);
+        assert_eq!(asks.thinking, Some(true));
     }
 
     #[test]

@@ -22,6 +22,9 @@ pub(super) struct Rendezvous<H> {
 struct State<H> {
     /// Each arrived tenant's rank and requests, until the build takes them.
     arrivals: Vec<(TenantRank, CoreRequests)>,
+    /// The requests of daemons left out of the process, at the ranks they
+    /// would run at: merged into the build, never building or attaching.
+    standing: Vec<(TenantRank, CoreRequests)>,
     /// Every tenant that has arrived, by name — kept after the build takes
     /// the requests.
     arrived: Vec<&'static str>,
@@ -34,11 +37,15 @@ struct State<H> {
 }
 
 impl<H: Clone> Rendezvous<H> {
-    pub(super) fn new(expected: &[&'static str]) -> Self {
+    pub(super) fn new(
+        expected: &[&'static str],
+        standing: Vec<(TenantRank, &'static str, CoreRequests)>,
+    ) -> Self {
         Self {
             expected: expected.to_vec(),
             state: Mutex::new(State {
                 arrivals: Vec::new(),
+                standing: standing.into_iter().map(|(r, _, a)| (r, a)).collect(),
                 arrived: Vec::new(),
                 withdrawn: Vec::new(),
                 building: false,
@@ -109,6 +116,7 @@ impl<H: Clone> Rendezvous<H> {
             if told.is_empty() && first && !st.building {
                 st.building = true;
                 let mut asks: Vec<(TenantRank, CoreRequests)> = take(&mut st.arrivals);
+                asks.append(&mut st.standing);
                 drop(st);
                 asks.sort_by_key(|(r, _)| *r);
                 let merged = CoreRequests::merge(asks.into_iter().map(|(_, a)| a).collect())
@@ -168,7 +176,7 @@ mod tests {
     /// for nobody.
     #[test]
     fn a_lone_tenant_builds_at_once() {
-        let r: Rendezvous<u32> = Rendezvous::new(&["zend"]);
+        let r: Rendezvous<u32> = Rendezvous::new(&["zend"], Vec::new());
         let got = r.arrive(
             rank(0),
             "zend",
@@ -184,7 +192,7 @@ mod tests {
     /// tenants' requests merged and the second attaches to what it built.
     #[test]
     fn the_first_tenant_builds_with_every_request_and_the_second_attaches() {
-        let r: Arc<Rendezvous<u32>> = Arc::new(Rendezvous::new(BOTH));
+        let r: Arc<Rendezvous<u32>> = Arc::new(Rendezvous::new(BOTH, Vec::new()));
         let second = {
             let r = Arc::clone(&r);
             std::thread::spawn(move || {
@@ -223,7 +231,7 @@ mod tests {
     /// npcd" while npcd is still opening its substrate.
     #[test]
     fn a_tenant_waiting_is_told_whom_it_waits_for() {
-        let r: Arc<Rendezvous<u32>> = Arc::new(Rendezvous::new(BOTH));
+        let r: Arc<Rendezvous<u32>> = Arc::new(Rendezvous::new(BOTH, Vec::new()));
         let told: Arc<Mutex<Vec<Vec<&'static str>>>> = Arc::new(Mutex::new(Vec::new()));
         let first = {
             let (r, told) = (Arc::clone(&r), Arc::clone(&told));
@@ -257,7 +265,7 @@ mod tests {
     /// A tenant that withdraws is not waited for.
     #[test]
     fn a_withdrawn_tenant_is_not_waited_for() {
-        let r: Rendezvous<u32> = Rendezvous::new(BOTH);
+        let r: Rendezvous<u32> = Rendezvous::new(BOTH, Vec::new());
         r.withdraw("npcd");
         let got = r.arrive(
             rank(0),
@@ -270,10 +278,32 @@ mod tests {
         assert_eq!(got.unwrap(), 4);
     }
 
+    /// **A daemon left out still asks.** npcd run alone, at the rank it holds
+    /// beside zend, builds at once — waiting for nobody — on the merge it
+    /// would have had: zend's standing asks first, its own after.
+    #[test]
+    fn a_standing_seat_is_merged_but_never_waited_for() {
+        let mut zend = ask(4);
+        zend.min_rope_factor = Some(2.0);
+        let r: Rendezvous<u32> = Rendezvous::new(&["npcd"], vec![(rank(0), "zend", zend)]);
+        let got = r.arrive(
+            rank(1),
+            "npcd",
+            ask(3),
+            &|w| panic!("a standing seat is not waited for, told {w:?}"),
+            |m| {
+                assert_eq!(m.min_rope_factor, Some(2.0), "zend's floor");
+                Ok((m.max_concurrent, 1))
+            },
+            |_| panic!("npcd is the only tenant that runs, so it builds"),
+        );
+        assert_eq!(got.unwrap(), 7, "both seats' conversations");
+    }
+
     /// A failed build reaches every tenant waiting on it, named.
     #[test]
     fn a_failed_build_reaches_the_tenants_waiting_on_it() {
-        let r: Arc<Rendezvous<u32>> = Arc::new(Rendezvous::new(BOTH));
+        let r: Arc<Rendezvous<u32>> = Arc::new(Rendezvous::new(BOTH, Vec::new()));
         let second = {
             let r = Arc::clone(&r);
             std::thread::spawn(move || {

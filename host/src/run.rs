@@ -13,6 +13,7 @@ use std::process::exit;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use candle_conversation::engine_slot::CoreRequests;
 use candle_conversation::profile::set_gpu_span_period;
 use candle_conversation::{EngineSlot, TenantRank};
 use cluster::launch::{LaunchSpec, OneShot};
@@ -120,10 +121,31 @@ fn resolved(dir: &Path) -> PathBuf {
     }
 }
 
+/// One place among a binary's daemons, in rank order.
+pub enum Seat {
+    /// A daemon this process runs.
+    Runs(Box<dyn Tenant>),
+    /// A daemon this process leaves out, whose asks of the shared engine still
+    /// count — merged at its rank — so the engine the others get is the one
+    /// built beside it. The RoPE floor is part of each substrate's model key:
+    /// without the asks, an engine built for fewer daemons would refuse the
+    /// substrates they wrote together.
+    Stands {
+        name: &'static str,
+        asks: CoreRequests,
+    },
+}
+
 /// Run `tenants` — ranked in the order given — until the process is told to
 /// stop, then drain them in reverse and exit. Never returns: the host exits
 /// once, after every tenant has stopped, or with status 1 on a failed start.
 pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
+    run_seated(cfg, tenants.into_iter().map(Seat::Runs).collect())
+}
+
+/// [`run`] the daemons `seats` runs, each at its seat's rank, on the engine
+/// every seat's asks make.
+pub fn run_seated(cfg: HostConfig, seats: Vec<Seat>) -> ! {
     install_panic_hook();
     // As early as possible, before anything could change argv or the working
     // directory: a launch spec captured late might not be this one.
@@ -134,7 +156,21 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     if let Some(pid) = cfg.args.after_pid {
         cluster::upgrade::os::wait_until_gone(pid);
     }
-    let Some(first) = tenants.first() else {
+    let mut tenants: Vec<(TenantRank, Box<dyn Tenant>)> = Vec::new();
+    let mut standing: Vec<(TenantRank, &'static str, CoreRequests)> = Vec::new();
+    for (i, seat) in seats.into_iter().enumerate() {
+        let Some(rank) = TenantRank::nth(i) else {
+            fail_early(&format!(
+                "at most {} tenants share one engine",
+                TenantRank::MAX
+            ));
+        };
+        match seat {
+            Seat::Runs(tenant) => tenants.push((rank, tenant)),
+            Seat::Stands { name, asks } => standing.push((rank, name, asks)),
+        }
+    }
+    let Some((_, first)) = tenants.first() else {
         fail_early("no tenants to run");
     };
     // The log, the self-heal restart marker and its attempt count live beside
@@ -147,7 +183,7 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     if let Err(e) = std::fs::create_dir_all(&state_dir) {
         fail_early(&format!("could not make {}: {e}", state_dir.display()));
     }
-    let names: Vec<&'static str> = tenants.iter().map(|t| t.name()).collect();
+    let names: Vec<&'static str> = tenants.iter().map(|(_, t)| t.name()).collect();
     let bus = LogBus::new(&names);
     let log_name = format!("{}.log", cfg.binary);
     let resumed = match init_logging(&bus, &names, cfg.args.verbose, &state_dir, &log_name) {
@@ -195,6 +231,7 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     let served = runtime.block_on(serve_tenants(
         cfg,
         tenants,
+        standing,
         bus,
         stopping,
         Arc::clone(&installer),
@@ -276,7 +313,8 @@ fn announce_when_ready(reports: Vec<Arc<dyn Reports>>) {
 
 async fn serve_tenants(
     cfg: HostConfig,
-    tenants: Vec<Box<dyn Tenant>>,
+    tenants: Vec<(TenantRank, Box<dyn Tenant>)>,
+    standing: Vec<(TenantRank, &'static str, CoreRequests)>,
     bus: Arc<LogBus>,
     stopping: Arc<Stopping>,
     installer: Arc<HostInstaller>,
@@ -284,14 +322,15 @@ async fn serve_tenants(
 ) -> anyhow::Result<Ending> {
     let substrates: Vec<(&str, PathBuf)> = tenants
         .iter()
-        .map(|t| (t.name(), t.substrate_dir()))
+        .map(|(_, t)| (t.name(), t.substrate_dir()))
         .collect();
     check_substrates(&substrates)?;
     // Before any tenant starts the engine: the expert cache reads it at load
     // to decide whether to start the CPU pool.
     cfg.args.expert_split.apply();
     let listen = cfg.args.listen()?;
-    let uis: Vec<(&'static str, TenantUi)> = tenants.iter().map(|t| (t.name(), t.ui())).collect();
+    let uis: Vec<(&'static str, TenantUi)> =
+        tenants.iter().map(|(_, t)| (t.name(), t.ui())).collect();
     let common = Roots::embedded(&[&COMMON]);
     let local_signin = LocalSignin::new(cfg.args.local_signin.as_deref())?;
     if let Some(email) = &cfg.args.local_signin {
@@ -379,20 +418,20 @@ async fn serve_tenants(
     };
 
     // Every tenant takes its engine from one slot: the highest-ranked builds it
-    // with every tenant's requests merged, the rest attach their substrates.
-    let slot = EngineSlot::new(&names);
+    // with every seat's requests merged — a daemon left out still asks — and
+    // the rest attach their substrates.
+    for (_, name, _) in &standing {
+        tracing::info!(
+            daemon = *name,
+            "not run here; its asks of the engine still count"
+        );
+    }
+    let slot = EngineSlot::with_standing(&names, standing);
     let mut reports = Vec::new();
     let mut tenant_routes = Vec::new();
     let mut stops: Vec<(&'static str, Stop)> = Vec::new();
-    for ((i, tenant), starting) in tenants.into_iter().enumerate().zip(start_lines) {
+    for ((rank, tenant), starting) in tenants.into_iter().zip(start_lines) {
         let name = tenant.name();
-        let Some(rank) = TenantRank::nth(i) else {
-            stop_all(stops).await;
-            anyhow::bail!(
-                "{name}: at most {} tenants share one engine",
-                TenantRank::MAX
-            );
-        };
         let ctx = TenantContext {
             engine: slot.source(rank, name, tenant.requires()),
             log: Arc::clone(&bus),

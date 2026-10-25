@@ -89,6 +89,7 @@ use crate::conv_order;
 use crate::conv_overlay::{self, Mirror};
 use crate::conv_sweep::{self, Sweep, CONV_IDLE_TTL, CONV_SWEEP_EVERY};
 use crate::deletions::Deletions;
+use crate::engine_asks;
 use crate::fast_path::coverage::Coverage;
 use crate::fast_path::{self, Screen};
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
@@ -436,7 +437,7 @@ fn think_mode_from_selection(selection: &candle_conversation::SelectionState) ->
 /// so a whole file can be written. So it has to hold the longest think block and
 /// one full value with room to spare, which the engine's default of 16k does
 /// not.
-const MAX_TURN_TOKENS: usize = 65_536;
+pub(crate) const MAX_TURN_TOKENS: usize = 65_536;
 
 /// Maps the composer's `response_length` dial (terse/concise/standard/detailed/
 /// comprehensive = 0..4, the verbosity toggle) to the answer's token budget — the
@@ -1413,60 +1414,57 @@ impl InferenceState {
         crate::branch_ingest::keys::set_model_bits(
             candle_conversation::guest::checkpoint::weight_bits(&pack),
         );
-        let mut builder = model
-            .builder()
-            .system_prompt(&before_text)
-            .model_path(pack)
-            .workspace_path(root.clone())
-            .read_only_substrate(read_only_substrate)
-            .tombstone_retention(tombstone_retention)
-            .cancel_token(crate::ingest_cancel::token().clone())
-            .qsa_selection_budget(qsa_selection_budget)
-            .qsa_strata(qsa_strata)
-            // The schema's `rope: min_yarn_factor:` — engine-wide, so it is
-            // read once here rather than per layer.
-            .min_rope_factor(proj_builder.schema().min_yarn_factor)
-            .max_response_tokens(MAX_TURN_TOKENS)
-            // Dialogue turns compress at C5 (moderate adaptive quantization).
-            // Paired with the removed uniform-K pin (see `ModelBuilder::engine`),
-            // so K is adaptive too.
-            .compression_level(5)
-            // Thinking is ENABLED at the model level; per-turn suppression is
-            // driven by the section-tree `no_think` selector (the composer
-            // effort dial), not this static flag.
-            .thinking(true)
-            // Per-layer corrupt-turn policy (from the projection schema): the
-            // startup reload drops the whole conversation for ingest layers and
-            // only the corrupt turn for dialogue.
-            .corrupt_turn_policies(
-                proj_builder
-                    .schema()
-                    .layers
-                    .iter()
-                    .map(|l| (l.id, l.on_corrupt_turn))
-                    .collect(),
-            )
-            // The substrate open is its own step: a store written before
-            // identities is stamped here, record by record, and that ran for a
-            // minute and a half under "Loading model" at 0%. The stage names
-            // the line under the bar; the records fill it.
-            .on_substrate_open({
-                let progress = Arc::clone(&progress);
-                let status = status_tx.clone();
-                let shown: Arc<Mutex<Option<OpenStage>>> = Arc::new(Mutex::new(None));
-                OpenProgressHook(Arc::new(
-                    move |stage: OpenStage, done: usize, total: usize| {
-                        progress.set_step(LoadStep::Opening);
-                        progress.set_step_unit(stage.unit());
-                        progress.set_step_progress(done as u64, total as u64);
-                        let mut last = shown.lock().unwrap_or_else(|e| e.into_inner());
-                        if *last != Some(stage) {
-                            *last = Some(stage);
-                            status.send(stage.label().to_string()).ok();
-                        }
-                    },
-                ))
-            });
+        // zend's engine-wide asks come from `engine_asks`, the one place a
+        // host that runs without zend also takes them from.
+        let mut builder = engine_asks::ask(
+            model
+                .builder()
+                .system_prompt(&before_text)
+                .model_path(pack)
+                .workspace_path(root.clone())
+                .read_only_substrate(read_only_substrate)
+                .tombstone_retention(tombstone_retention)
+                .cancel_token(crate::ingest_cancel::token().clone()),
+            &proj_builder,
+            qsa_selection_budget,
+            qsa_strata,
+        )
+        // Dialogue turns compress at C5 (moderate adaptive quantization).
+        // Paired with the removed uniform-K pin (see `ModelBuilder::engine`),
+        // so K is adaptive too.
+        .compression_level(5)
+        // Per-layer corrupt-turn policy (from the projection schema): the
+        // startup reload drops the whole conversation for ingest layers and
+        // only the corrupt turn for dialogue.
+        .corrupt_turn_policies(
+            proj_builder
+                .schema()
+                .layers
+                .iter()
+                .map(|l| (l.id, l.on_corrupt_turn))
+                .collect(),
+        )
+        // The substrate open is its own step: a store written before
+        // identities is stamped here, record by record, and that ran for a
+        // minute and a half under "Loading model" at 0%. The stage names
+        // the line under the bar; the records fill it.
+        .on_substrate_open({
+            let progress = Arc::clone(&progress);
+            let status = status_tx.clone();
+            let shown: Arc<Mutex<Option<OpenStage>>> = Arc::new(Mutex::new(None));
+            OpenProgressHook(Arc::new(
+                move |stage: OpenStage, done: usize, total: usize| {
+                    progress.set_step(LoadStep::Opening);
+                    progress.set_step_unit(stage.unit());
+                    progress.set_step_progress(done as u64, total as u64);
+                    let mut last = shown.lock().unwrap_or_else(|e| e.into_inner());
+                    if *last != Some(stage) {
+                        *last = Some(stage);
+                        status.send(stage.label().to_string()).ok();
+                    }
+                },
+            ))
+        });
         // The model load, phase by phase: the builder says when it begins —
         // as soon as the substrate is open — and each phase names the line
         // under the bar and what its counts are.
@@ -8467,7 +8465,7 @@ fn system_prompt_labels(sp: &SystemPromptSchema) -> Vec<String> {
         .collect()
 }
 
-fn build_projection_builder(workspace: &Path) -> Builder {
+pub(crate) fn build_projection_builder(workspace: &Path) -> Builder {
     let name = workspace
         .file_name()
         .and_then(|n| n.to_str())

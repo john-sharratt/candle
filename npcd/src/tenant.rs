@@ -18,6 +18,7 @@ use anyhow::Context;
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::{self, Next};
 use axum::Router;
+use candle_conversation::engine_slot::CoreRequests;
 use candle_conversation::models::DialectType;
 use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::persistence::{OpenStage, SUBSTRATE_DIR};
@@ -26,7 +27,7 @@ use clap::Args;
 use cluster::dispatch::Dispatch;
 use futures::future::BoxFuture;
 use host::guard::{Api, Guarded, Routes};
-use host::{OneShot, Running, Tenant, TenantContext, TenantUi};
+use host::{OneShot, Running, Tenant, TenantContext, TenantUi, MODEL};
 use include_dir::{include_dir, Dir};
 use serde::Deserialize;
 use serde_json::Value;
@@ -45,7 +46,7 @@ use crate::effector::token::Tokens;
 use crate::engine;
 use crate::engine::guardian::{GuardianBuilder, GuardianConfig, RuntimeProbe};
 use crate::engine::identity::Authored as Identities;
-use crate::engine::runtime::{start as start_engine, Arrived, LoadPlan, Runtime};
+use crate::engine::runtime::{engine_asks, start as start_engine, Arrived, LoadPlan, Runtime};
 use crate::identity::log_identity;
 use crate::images::Images;
 use crate::mind::files::MindFiles;
@@ -169,6 +170,14 @@ impl NpcdArgs {
             takes_value: false,
         },
     ];
+
+    /// What npcd asks of the engine it shares, without loading npcd: what a
+    /// host running zend alone seats in npcd's place, so zend's engine is the
+    /// one built beside npcd. Its guests stay out — co-resident models only a
+    /// running npcd calls.
+    pub fn engine_requests(&self) -> CoreRequests {
+        engine_asks(MODEL.builder()).take_core_requests()
+    }
 }
 
 impl Default for NpcdArgs {

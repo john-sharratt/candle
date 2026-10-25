@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use cluster::version::info::MOTHERD;
 use host::build_info::first;
-use host::{run, HostArgs, HostConfig, Tenant};
+use host::{run_seated, HostArgs, HostConfig, Seat};
 use npcd::tenant::NpcdArgs;
 use serde::Deserialize;
 use zend::cli::ZendArgs;
@@ -98,7 +98,7 @@ impl Config {
     }
 
     fn runs(&self, app: App) -> bool {
-        self.apps.as_ref().map_or(true, |apps| apps.contains(&app))
+        self.apps.as_ref().is_none_or(|apps| apps.contains(&app))
     }
 }
 
@@ -112,18 +112,30 @@ fn main() -> anyhow::Result<()> {
     // run, so its log, offline marker and upgrade record do not move when
     // `apps` changes.
     let state_dir = config.zend.substrate_dir();
-    // zend first: it builds the shared engine, and stops last.
-    let (zend, npcd) = (config.runs(App::Zend), config.runs(App::Npcd));
-    let mut tenants: Vec<Box<dyn Tenant>> = Vec::new();
-    if zend {
-        tenants.push(Box::new(config.zend.resolve()?));
-    }
-    if npcd {
-        tenants.push(Box::new(config.npcd.resolve()?));
-    }
+    // zend first: it builds the shared engine, and stops last. A daemon `apps`
+    // leaves out keeps its seat: its asks of the engine still count, so the
+    // engine is the one the two build together and every substrate they wrote
+    // opens on it.
+    let (runs_zend, runs_npcd) = (config.runs(App::Zend), config.runs(App::Npcd));
+    let zend: Seat = if runs_zend {
+        Seat::Runs(Box::new(config.zend.resolve()?))
+    } else {
+        Seat::Stands {
+            name: "zend",
+            asks: config.zend.engine_requests(),
+        }
+    };
+    let npcd: Seat = if runs_npcd {
+        Seat::Runs(Box::new(config.npcd.resolve()?))
+    } else {
+        Seat::Stands {
+            name: "npcd",
+            asks: config.npcd.engine_requests(),
+        }
+    };
     // Nothing to drop on a relaunch: the one-shot flags cannot be set in
     // `motherd.yaml` (`ZendArgs::ONE_SHOT`, `NpcdArgs::ONE_SHOT`).
-    run(
+    run_seated(
         HostConfig {
             binary: "motherd",
             version: env!("CARGO_PKG_VERSION"),
@@ -131,7 +143,7 @@ fn main() -> anyhow::Result<()> {
             one_shot: &[],
             state_dir: Some(state_dir),
         },
-        tenants,
+        vec![zend, npcd],
     )
 }
 

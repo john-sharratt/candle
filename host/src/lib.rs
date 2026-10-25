@@ -52,7 +52,7 @@ pub mod ui;
 pub use ::cluster::launch::OneShot;
 pub use cli::HostArgs;
 pub use model::MODEL;
-pub use run::{run, HostConfig};
+pub use run::{run, run_seated, HostConfig, Seat};
 pub use server::Listen;
 pub use tenant::{
     CheckProgress, Maintenance, MeShare, Reports, Running, Stop, Tenant, TenantContext,

@@ -46,8 +46,19 @@ pub struct EngineSlot {
 impl EngineSlot {
     /// A slot for the tenants named `expected`.
     pub fn new(expected: &[&'static str]) -> Arc<Self> {
+        Self::with_standing(expected, Vec::new())
+    }
+
+    /// A slot for the tenants named `expected`, its build also merging the
+    /// requests of `standing`: daemons the process leaves out, each at the
+    /// rank it would run at, which never build or attach. Seated before any
+    /// tenant arrives, so no build can start without them.
+    pub fn with_standing(
+        expected: &[&'static str],
+        standing: Vec<(TenantRank, &'static str, CoreRequests)>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            rendezvous: Rendezvous::new(expected),
+            rendezvous: Rendezvous::new(expected, standing),
         })
     }
 

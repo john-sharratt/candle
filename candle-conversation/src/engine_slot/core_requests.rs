@@ -30,8 +30,9 @@ pub struct CoreRequests {
 }
 
 impl CoreRequests {
-    /// Merge every tenant's requests, highest-ranked first (`asks[0]` is the
-    /// tenant that builds the engine):
+    /// Merge every tenant's requests, highest-ranked first — a daemon the
+    /// process leaves out still asks at its rank, so `asks[0]` is the
+    /// highest-ranked seat, running or not:
     ///
     /// | setting | rule |
     /// |---|---|

@@ -33,6 +33,7 @@ use tokio::runtime::{Builder as RuntimeBuilder, Handle};
 use tokio::sync::oneshot;
 
 use candle_conversation::guest::resolve_seed;
+use candle_conversation::models::ModelBuilder;
 use candle_conversation::persistence::SharedSubstrate;
 use candle_conversation::projection::{
     Builder, GroupId, LayerId, ProjectionEvent, SelectionState, TimelineId,
@@ -159,6 +160,14 @@ use tokio::sync::watch;
 /// Qwen3.6-35B-A3B for a 3.3 GB transient tier a 24 GB card's partition did not
 /// have, and every document in the wave failed.
 const PREFILL_PASS_TOKENS: usize = 8192;
+
+/// `builder` asking for npcd's engine-wide settings: what its load gives the
+/// model builder, and what a host running zend without npcd seats in npcd's
+/// place ([`crate::tenant::NpcdArgs::engine_requests`]), so the engine is the
+/// same one either way.
+pub(crate) fn engine_asks(builder: ModelBuilder) -> ModelBuilder {
+    builder.prefill_pass_tokens(PREFILL_PASS_TOKENS)
+}
 
 /// Resolves a character's world-clock instant, in milliseconds.
 ///
@@ -4114,11 +4123,9 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
         drop(download);
         resolved?
     };
-    let mut builder = MODEL
-        .builder()
+    let mut builder = engine_asks(MODEL.builder())
         .model_path(pack)
         .guests(guests)
-        .prefill_pass_tokens(PREFILL_PASS_TOKENS)
         .corrupt_turn_policies(corrupt_turn)
         .substrate(shared.clone());
     // The checkpoint's own dialect and sampling. Captured before the builder is
