@@ -139,6 +139,23 @@ cannot be compared across files, and larger files draw more maxima. The
 normalised score's band runs ~1000× over on short probes (momentum once
 reached 643,768). Neither ranks files against each other.
 
+### After hub correction and whole-only delivery (2026-10-25, `74306441`)
+
+The working set's files are scored over each file's background peak
+(`docs/results/provenance_gates_2026-10-25.md`), and only a conversation
+whose every turn holds content is locked or seeded (`Substrate::holds_whole`).
+One run on `.5`, conversation `9f5a6d4c`:
+
+- No `in_context` reply was made for content the projection did not hold.
+  Every earlier run that day had answered `in_context` for a reading made on
+  another member whose turns were empty on `.5`, and the model then disputed
+  the reply; b now read the paper's seven pages for real and owned them.
+- The test files are gone from the voluntary files; what fills them now is
+  docs and design notes, related to the question more often than not, but the
+  paper itself never entered by momentum.
+- d made 58 `file_edit` calls, the paper grew to 8 pages, and two calls ended
+  `not_found`.
+
 ## 7. What the overnight runs taught (2026-10-24/25, 30 runs)
 
 What was learned, separate from the workarounds that were later removed:
