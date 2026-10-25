@@ -8622,7 +8622,7 @@ mod projection_schema_tests {
     /// per-axis split).
     #[test]
     fn embedded_schema_carries_the_working_set_config() {
-        use candle_conversation::projection::SystemPromptItem;
+        use candle_conversation::projection::{ScanCases, SystemPromptItem};
         use candle_conversation::provenance::FusionMode;
         let builder = build_projection_builder(Path::new("demo-project"));
         let schema = builder.schema();
@@ -8650,6 +8650,23 @@ mod projection_schema_tests {
             assert!(g.budget_adaptive.is_none(), "{name}");
             assert!(l.budget.adaptive.is_none(), "{name}");
         }
+
+        // Whole files and analysis units are each one case of one competition,
+        // voted with the upper fold groups weighted up.
+        for name in [
+            "code_reading",
+            "dependency_analysis",
+            "code_review",
+            "security_review",
+        ] {
+            let g = &layer(name).groups[0];
+            assert_eq!(g.policy.scan.cases, ScanCases::File, "{name}");
+            assert_eq!(g.policy.layer_weights, vec![0.5, 1.0, 2.0], "{name}");
+        }
+        assert_eq!(
+            layer("repo_map").groups[0].policy.scan.cases,
+            ScanCases::Exchange
+        );
 
         let ws = layer("dialogue")
             .working_set

@@ -70,7 +70,8 @@ use serde::Deserialize;
 use crate::provenance::FusionMode;
 
 use super::adaptive::{
-    AnchorConfig, AnchorMember, BudgetAdaptive, LocalityConfig, MemberBudgetAdaptive, ScanPolicy,
+    AnchorConfig, AnchorMember, BudgetAdaptive, LocalityConfig, MemberBudgetAdaptive, ScanCases,
+    ScanPolicy,
 };
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
@@ -218,6 +219,10 @@ struct YamlPolicy {
     /// Concept A.4: size-aware level-prior constants.
     #[serde(default)]
     level_prior: Option<YamlLevelPrior>,
+    /// What a turn group's scan scores as one case: `exchange` | `file`.
+    /// Omitted ⇒ inherit.
+    #[serde(default)]
+    cases: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -930,6 +935,18 @@ fn parse_policy(
         if let Some(c) = lp.floor_cap {
             scan.level_prior_cap = c;
         }
+    }
+    if let Some(c) = &yp.cases {
+        scan.cases = match c.as_str() {
+            "exchange" => ScanCases::Exchange,
+            "file" => ScanCases::File,
+            other => {
+                return Err(ConstructionError::InvalidPolicy {
+                    name: name.to_string(),
+                    reason: format!("unknown cases {other:?} (exchange | file)"),
+                })
+            }
+        };
     }
     validate_scan(name, &scan)?;
     Ok(SelectionPolicy {

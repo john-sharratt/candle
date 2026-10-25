@@ -21,6 +21,8 @@
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> retrieval [probes per source]
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> sweep [probes per source] [only this source]
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> paper <dialogue timeline, hex> <expectations.yaml>
 
 mod corpus;
@@ -102,7 +104,16 @@ fn main() -> anyhow::Result<()> {
         }
         "sweep" => {
             let per_source = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(40);
-            sweep::run(&sub, &files, &gallery, &mut by_layer, &rule, per_source);
+            let only = args.get(3).map(String::as_str);
+            sweep::run(
+                &sub,
+                &files,
+                &gallery,
+                &mut by_layer,
+                &rule,
+                per_source,
+                only,
+            );
         }
         "paper" => {
             let timeline = u64::from_str_radix(

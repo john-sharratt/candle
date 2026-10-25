@@ -896,6 +896,15 @@ layers:
           question_pin: true
           # Concept A.4: cold-scope size floor (see repo_map's note).
           level_prior: { floor_base: 2.0, floor_cap: 16.0 }
+          # A file is taken whole, so it is one case, every file in one
+          # competition: a file of several exchanges scored alone was scored
+          # only against itself, and the large files read over several rounds
+          # topped every question (docs/provenance_scoped_signatures.md §2.3).
+          cases: file
+          # The upper fold groups carry a file's identity; the lowest is
+          # mostly shared phrasing. Measured over the analysis units' answers
+          # finding their own file (docs/results/provenance_gates_2026-10-25.md).
+          layer_weights: [0.5, 1.0, 2.0]
 
   # ── Dependency Analysis ────────────────────────────────────────────────────
   - name: dependency_analysis
@@ -978,6 +987,11 @@ layers:
         score_threshold: 0.0  # inverted within-layer signal — no useful threshold; TopK handles ranking
         budget:
           priority: 100
+        # A unit is taken whole: one case each, all in one competition (see
+        # code_reading's `scopes`).
+        policy:
+          cases: file
+          layer_weights: [0.5, 1.0, 2.0]
 
   # ── Code Review ────────────────────────────────────────────────────────────
   # Beside dependency_analysis, not above it: each unit continues the file's
@@ -1057,6 +1071,9 @@ layers:
         score_threshold: 0.0
         budget:
           priority: 100
+        policy:
+          cases: file
+          layer_weights: [0.5, 1.0, 2.0]
 
   # ── Security Review ────────────────────────────────────────────────────────
   # Beside dependency_analysis and code_review (`after: code_reading`), so an
@@ -1150,6 +1167,9 @@ layers:
         score_threshold: 0.0
         budget:
           priority: 100
+        policy:
+          cases: file
+          layer_weights: [0.5, 1.0, 2.0]
 
   # ── Dialogue ───────────────────────────────────────────────────────────────
   # The live developer ↔ assistant conversation.  Highest layer — sees

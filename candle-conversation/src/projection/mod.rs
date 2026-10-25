@@ -247,7 +247,7 @@ mod working_set_tests;
 pub use crate::substrate::{ContentResolver, Substrate, SubstrateRead, SubstrateWrite};
 pub use adaptive::{
     attention_mass, AnchorConfig, AnchorMember, BudgetAdaptive, LocalityConfig,
-    MemberBudgetAdaptive, ScanPolicy,
+    MemberBudgetAdaptive, ScanCases, ScanPolicy,
 };
 pub use builder::Builder;
 pub use error::ConstructionError;

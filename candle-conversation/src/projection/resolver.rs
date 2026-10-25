@@ -14,6 +14,7 @@ mod maintenance_op;
 pub use maintenance_op::MaintenanceOp;
 use maintenance_op::Pass;
 
+use super::adaptive::ScanCases;
 use super::belief_files::{assemble_file_scans, scan_file_scans};
 use super::belief_scan_split::GROUP_SCAN_SPLIT;
 use super::held_index_pages::HeldIndexPages;
@@ -2179,7 +2180,10 @@ impl Conversation {
             let (files, _) = assemble_file_scans(&sub, vec![tl]);
             (sigs, files)
         };
-        let Some(file) = files.first().filter(|f| f.n_slots > 1) else {
+        // A file of several exchanges is its own scope only when its exchanges
+        // are the cases; scored by file, it is one case of the group's pool.
+        let own_scope = group.policy.scan.cases == ScanCases::Exchange;
+        let Some(file) = files.first().filter(|f| f.n_slots > 1 && own_scope) else {
             return;
         };
         let probes: Vec<(u64, &[WideQSig])> = sigs
@@ -2432,8 +2436,8 @@ impl Conversation {
             for (fi, (f, fresh)) in files.iter().zip(&fresh_per_file).enumerate() {
                 let timeline = f.timeline;
                 // `belief_files::competitions` pools exactly the files of one
-                // exchange.
-                let in_pool = f.n_slots == 1;
+                // exchange — or, scored by file, every file.
+                let in_pool = f.n_slots == 1 || group.policy.scan.cases == ScanCases::File;
                 let scope = match in_pool {
                     true => pool_scope.clone(),
                     false => ScopeKey::turn_group(group.id.raw() as u64, timeline.raw()),

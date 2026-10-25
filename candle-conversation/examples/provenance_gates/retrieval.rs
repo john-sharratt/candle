@@ -21,6 +21,9 @@ use crate::corpus::{gather, ByLayer, File, Gallery, ANALYSIS};
 use crate::ranking::{order, rule_names, score};
 use crate::stats::{mrr, recall, spearman};
 
+/// Probes taken from each analysis unit's answer, its last windows first.
+const UNIT_WINDOWS: usize = 8;
+
 /// `(source, target file, the probe's signatures, the turn left out)`.
 pub type Probe = (&'static str, usize, Vec<WideQSig>, Option<(usize, usize)>);
 
@@ -136,10 +139,13 @@ pub fn probes(
                 continue;
             };
             held += 1;
-            if let Some(w) = turn.windows(rule).last() {
+            // Every window of the unit's answer is about its subject; its tool
+            // rounds read other files, which a probe from them should find.
+            let windows = turn.windows(rule);
+            for w in windows.iter().rev().take(UNIT_WINDOWS) {
                 probes.push(("analysis-unit", fi, gather(&turn.sigs, w), None));
-                units += 1;
             }
+            units += 1;
         }
         println!(
             "layer {layer}: {n_units} units, {parented} with a parent, {filed} whose parent \

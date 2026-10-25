@@ -44,6 +44,26 @@ pub struct ScanPolicy {
     pub level_prior_base: f32,
     /// Concept A.4: maximum size-scaling multiple for tiny children.
     pub level_prior_cap: f32,
+    /// What a turn group's scan scores as one case.
+    pub cases: ScanCases,
+}
+
+/// What a turn group's scan scores as one case
+/// (`docs/provenance_scoped_signatures.md` §2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanCases {
+    /// Each exchange: a file of one exchange competes in a pool with every
+    /// other such file, a file of several competes alone, its exchanges against
+    /// each other. For a group selected within a conversation — a dialogue's
+    /// own history.
+    #[default]
+    Exchange,
+    /// Each file, all of the group's files in one competition, the file's
+    /// score standing for every exchange of it. For a group whose files are
+    /// selected whole — the working set's files and analysis units — where a
+    /// file competing alone is scored only against itself and no score
+    /// compares across files.
+    File,
 }
 
 impl Default for ScanPolicy {
@@ -55,6 +75,7 @@ impl Default for ScanPolicy {
             mass_rho: 2.0,
             level_prior_base: 0.0,
             level_prior_cap: 8.0,
+            cases: ScanCases::Exchange,
         }
     }
 }
