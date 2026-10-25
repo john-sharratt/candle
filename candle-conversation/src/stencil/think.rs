@@ -114,33 +114,40 @@ impl ThinkMode {
     /// **`graceful` is the number that matters** — it is where a block actually
     /// lands, because the close fires at the next clause boundary once passed
     /// (measured: `graceful + ~10` tokens).  The ladder is therefore the
-    /// thinking length each rung buys: **1024 → 2048 → 4096 → 8192**.
+    /// thinking length each rung buys: **1024 → 3072 → 6144 → 8192**.
     ///
     /// `Quick` 1024 is an order of magnitude above a trivial turn's 33–58, so
-    /// nothing ordinary is ever touched.  `Balanced` 2048 is the default path.
-    /// A review turn — "read this paper and tell me what you think" — measured
-    /// closing at 1031 thinking tokens under a 1024 budget, still mid-thought,
-    /// so the default sits at twice that: a long considered thought completes,
-    /// while an unbounded enumeration still gets closed.  `Deep` 4096 and
-    /// `Exhaustive` 8192 extend the 1024–4096 range where extra thinking is
-    /// documented to pay; `Exhaustive` is twice the checkpoint's own
+    /// nothing ordinary is ever touched.  `Balanced` 3072 is the default path,
+    /// and the dial a delegated task's tool rounds run at.  A review turn —
+    /// "read this paper and tell me what you think" — measured closing at 1031
+    /// thinking tokens under a 1024 budget, still mid-thought; and at 2048,
+    /// deep reasoning in a tool round reached the budget routinely, with the
+    /// close ramp then raising `</think>` and EOS over a thought still under
+    /// way.  3072 lets that thought finish before the ramp starts, while an
+    /// unbounded enumeration still gets closed.  `Deep` 6144 — the dial a
+    /// delegated task's own turns run at — is twice `Balanced`, so one notch up
+    /// is twice the thinking; at 4096 it sat one notch's worth above a tool
+    /// round and left a deep turn little more room than the round it planned.
+    /// `Exhaustive` 8192 is twice the checkpoint's own
     /// `thinking_budget` default (4000), to the nearest power of two.
     ///
-    /// The two derived figures are held at fixed ratios so the three can never
-    /// drift apart: `force = 1.5 × graceful` gives the clause-boundary close a
-    /// real window to find a boundary in, and the span cap is `2 × force`
-    /// (= `3 × graceful`), far enough above that the stencil's runaway guard
-    /// stays a last resort rather than the routine terminator it once was.
-    /// `Off` never reaches a decode point inside the block, so its numbers are
-    /// inert.
+    /// The two derived figures follow from `graceful` so the three can never
+    /// drift apart. `force` sits half of `graceful` above it, but never more
+    /// than [`MAX_CLOSE_WINDOW`] above: the window gives the clause-boundary
+    /// close room to find a boundary, and a few hundred tokens is room enough —
+    /// half of a long rung's budget is not window, it is thinking the turn
+    /// pays for and the answer's reservation carries. The span cap is
+    /// `2 × force`, far enough above that the stencil's runaway guard stays a
+    /// last resort rather than the routine terminator it once was. `Off` never
+    /// reaches a decode point inside the block, so its numbers are inert.
     pub fn eot_budget(self) -> (i32, i32) {
-        match self {
-            ThinkMode::Off => (1024, 1536),
-            ThinkMode::Quick => (1024, 1536),
-            ThinkMode::Balanced => (2048, 3072),
-            ThinkMode::Deep => (4096, 6144),
-            ThinkMode::Exhaustive => (8192, 12288),
-        }
+        let graceful = match self {
+            ThinkMode::Off | ThinkMode::Quick => 1024,
+            ThinkMode::Balanced => 3072,
+            ThinkMode::Deep => 6144,
+            ThinkMode::Exhaustive => 8192,
+        };
+        (graceful, graceful + (graceful / 2).min(MAX_CLOSE_WINDOW))
     }
 
     /// This dial's hard runaway backstop — the `forced_after` its steered span
@@ -321,9 +328,13 @@ fn close_tag_then_end(spec: &mut TreeSpec, env: &ThinkSteerEnvelope) -> SpecId {
 /// measured turns ended at exactly 513 tokens, cut mid-word, because the EOT
 /// ramp above them was inert and nothing else stopped the block.
 const QUICK_SPAN_CAP: u32 = 3072;
-const BALANCED_SPAN_CAP: u32 = 6144;
-const DEEP_SPAN_CAP: u32 = 12288;
-const EXHAUSTIVE_SPAN_CAP: u32 = 24576;
+const BALANCED_SPAN_CAP: u32 = 7168;
+const DEEP_SPAN_CAP: u32 = 13312;
+const EXHAUSTIVE_SPAN_CAP: u32 = 17408;
+
+/// The most tokens the close ramp runs past a dial's `graceful` budget before
+/// the hard close ([`ThinkMode::eot_budget`]).
+const MAX_CLOSE_WINDOW: i32 = 512;
 
 /// The tree's opening static: the newline after `<think>`, and nothing else.
 ///
@@ -927,21 +938,20 @@ mod tests {
     /// [`eot_budget_scales_and_stays_under_span_caps`]; this test fixes the
     /// anchors they derive from.
     #[test]
-    fn the_thinking_ladder_is_1024_2048_4096_8192() {
+    fn the_thinking_ladder_is_1024_3072_6144_8192() {
         use ThinkMode::*;
         let graceful = |m: ThinkMode| m.eot_budget().0;
         assert_eq!(graceful(Quick), 1024);
-        assert_eq!(graceful(Balanced), 2048);
-        assert_eq!(graceful(Deep), 4096);
+        assert_eq!(graceful(Balanced), 3072);
+        assert_eq!(graceful(Deep), 6144);
         assert_eq!(graceful(Exhaustive), 8192);
 
-        // Each rung doubles the one below: the dial is a power-of-two ladder,
-        // so "one notch up" always means "twice the thinking".
+        // Each rung buys more thinking than the one below: one notch up never
+        // means less room to reason.
         for (lo, hi) in [(Quick, Balanced), (Balanced, Deep), (Deep, Exhaustive)] {
-            assert_eq!(
-                graceful(lo) * 2,
-                graceful(hi),
-                "{hi:?} must be exactly twice {lo:?}"
+            assert!(
+                graceful(lo) < graceful(hi),
+                "{hi:?} must think longer than {lo:?}"
             );
         }
     }
@@ -977,16 +987,21 @@ mod tests {
                 "{m:?}: the runaway cap must be twice the EOT force cutoff"
             );
         }
-        // force = 1.5x graceful, so the clause-boundary close gets a real
-        // window to find a boundary in before the hard cutoff.
-        for m in [Quick, Balanced, Deep, Exhaustive] {
+        // The close window — force past graceful — is half of graceful, capped
+        // at MAX_CLOSE_WINDOW: room to find a clause boundary, never half of a
+        // long rung's budget.
+        let window = |m: ThinkMode| {
             let (g, f) = m.eot_budget();
-            assert_eq!(
-                g * 3,
-                f * 2,
-                "{m:?}: expected force({f}) == 1.5 x graceful({g})"
-            );
-        }
+            f - g
+        };
+        assert_eq!(window(Quick), 512, "half of 1024");
+        assert_eq!(window(Balanced), MAX_CLOSE_WINDOW);
+        assert_eq!(window(Deep), MAX_CLOSE_WINDOW);
+        assert_eq!(window(Exhaustive), MAX_CLOSE_WINDOW);
+        assert_eq!(
+            [Quick, Balanced, Deep, Exhaustive].map(|m| m.eot_budget().1),
+            [1536, 3584, 6656, 8704]
+        );
         // `Off` never decodes inside the block, so it reserves nothing.
         assert_eq!(Off.span_cap(), 0);
     }
@@ -1021,17 +1036,14 @@ mod tests {
             // Reserving the cutoff over-reserves by exactly the gap between it
             // and where blocks actually land (`graceful`), and that slack falls
             // into the answer's budget — so `response_length` bounds a runaway
-            // answer loosely, the more so the higher the dial. Held to half the
-            // landing point, which is what `force = 1.5 x graceful` makes it;
+            // answer loosely. The close window caps it: never more than half
+            // the landing point, nor more than MAX_CLOSE_WINDOW tokens;
             // reserving the SPAN CAP instead would make it 2x the landing point
-            // and the dial close to meaningless. The tight fix is to rebuild the
-            // budget from where the block actually closed rather than from a
-            // prediction, which this derivation cannot do.
+            // and the dial close to meaningless.
             let slack = thinking - m.eot_budget().0; // reserved minus where blocks land
-            assert_eq!(
-                slack * 2,
-                m.eot_budget().0,
-                "{m:?}: reservation slack must stay half the landing point"
+            assert!(
+                slack * 2 <= m.eot_budget().0 && slack <= MAX_CLOSE_WINDOW,
+                "{m:?}: reservation slack {slack} must stay within the close window"
             );
             assert!(
                 forced > thinking,
