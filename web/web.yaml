@@ -309,12 +309,13 @@ sites:
         upstream: "https://192.168.0.5:8444"
         self_signed: true
         cluster: zend
-      # The MCP endpoint for Claude connectors, served by AlienWorld's
-      # unclustered motherd (docs/claude_zend_gateway.md §12) — a fixed
-      # upstream, no `cluster:`. Sign-in and OAuth stay the gateway's.
+      # The MCP endpoint for Claude connectors (docs/claude_zend_gateway.md
+      # §12), served by the cluster's zend members like the rest of the API.
+      # Sign-in and OAuth stay the gateway's.
       - prefix: /mcp
-        upstream: "https://192.168.0.237:18444"
+        upstream: "https://192.168.0.5:8444"
         self_signed: true
+        cluster: zend
 
   # ── the other Tokera names ──────────────────────────────────────────────
   # Every alternate domain for the brand, sent to the one that is the brand.
