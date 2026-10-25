@@ -82,6 +82,7 @@ mod wave_retry;
 mod wave_timing;
 mod whole_conversations;
 
+use band::recorded_band;
 use detached::Detached;
 use graph_window::graph_window;
 use phase_split::cobatched_shares;
@@ -3499,9 +3500,11 @@ pub(crate) struct Scheduler {
     /// [`Self::ephemeral_sigs`] for the caller to retrieve via `ProbeWideSigs`.
     ephemeral_slots: std::collections::HashSet<SequenceId>,
 
-    /// The band an ephemeral fork decodes at
-    /// ([`SchedulerRequest::ForkEphemeralSequence`]), in place of its target
-    /// layer's `decode_priority`. Dropped when the slot is freed.
+    /// The band a slot decodes at in place of its target layer's
+    /// `decode_priority`: an ephemeral fork's, named by its asker
+    /// ([`SchedulerRequest::ForkEphemeralSequence`]), or the one its
+    /// conversation records for itself under [`DecodePriority::METADATA_KEY`].
+    /// Dropped when the slot is freed.
     slot_bands: HashMap<SequenceId, DecodePriority>,
 
     /// Wide-Q window gathered for each ephemeral slot's turn at completion, keyed
@@ -7328,6 +7331,10 @@ impl Scheduler {
             self.restore_carried_belief(slot_id, &conversation, target.timeline);
         }
 
+        // A conversation that records a band of its own decodes at it.
+        if let Some(band) = target.and_then(|t| recorded_band(&conversation, t.timeline)) {
+            self.slot_bands.insert(slot_id, band);
+        }
         self.slot_conversations.insert(slot_id, conversation);
         if let Some(target) = target {
             self.slot_targets.insert(slot_id, target);
@@ -17590,6 +17597,43 @@ mod tests {
             scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: child });
             assert!(!scheduler.slot_bands.contains_key(&child));
         }
+    }
+
+    /// **A conversation that records its own band decodes at it**, in place of
+    /// its layer's, from the slot its turns run on; the band goes with the
+    /// slot. One that records none decodes at its layer's.
+    #[test]
+    fn a_slot_decodes_at_the_band_its_conversation_records() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = Conversation::new();
+        let timeline = TimelineId::from_raw(41).unwrap();
+        conversation
+            .set_conversation_metadata(timeline, DecodePriority::METADATA_KEY, "normal")
+            .unwrap();
+        let target = ProjectionTarget {
+            timeline,
+            layer: LayerId::from_raw(1).unwrap(),
+            group: GroupId::from_raw(1).unwrap(),
+        };
+        conversation.register_timeline(timeline, target.layer, target.group);
+        let slot = scheduler
+            .create_sequence(conversation.clone(), Some(target))
+            .expect("slot");
+        assert_eq!(
+            scheduler.decode_layer_priority(slot),
+            Some(DecodePriority::Normal)
+        );
+        scheduler.handle_request(SchedulerRequest::FreeSequence { sequence_id: slot });
+        assert!(!scheduler.slot_bands.contains_key(&slot));
+
+        let other = ProjectionTarget {
+            timeline: TimelineId::from_raw(42).unwrap(),
+            ..target
+        };
+        let plain = scheduler
+            .create_sequence(conversation, Some(other))
+            .expect("slot");
+        assert!(!scheduler.slot_bands.contains_key(&plain));
     }
 
     /// **A turn run on the fork decodes at the fork's band**: the view's band is

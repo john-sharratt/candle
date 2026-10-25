@@ -945,6 +945,30 @@ pub enum DecodePriority {
 }
 
 impl DecodePriority {
+    /// The conversation metadata key a conversation's own band is kept under,
+    /// in place of its target layer's: a task delegated to a dialogue-layer
+    /// conversation decodes below a live user unless someone waits on it.
+    pub const METADATA_KEY: &'static str = "decode_band";
+
+    /// The band's name, as YAML and the metadata spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            DecodePriority::Low => "low",
+            DecodePriority::Normal => "normal",
+            DecodePriority::High => "high",
+        }
+    }
+
+    /// The band `name` spells; `None` for anything else.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "low" => Some(DecodePriority::Low),
+            "normal" => Some(DecodePriority::Normal),
+            "high" => Some(DecodePriority::High),
+            _ => None,
+        }
+    }
+
     /// The decode-to-prefill airtime ratio `R`: how many decode tokens are
     /// produced for each prefill forward that completes. Always `>= 1`.
     pub fn ratio(self) -> u32 {

@@ -3778,6 +3778,13 @@ impl Conversation {
         self.read().custom_of(timeline).cloned()
     }
 
+    /// One value of `timeline`'s `custom` metadata — `None` when it is
+    /// unregistered or holds no `key` — without copying the rest of the bag,
+    /// which can hold a whole journal.
+    pub fn conversation_metadata_value(&self, timeline: TimelineId, key: &str) -> Option<String> {
+        self.read().custom_of(timeline)?.get(key).cloned()
+    }
+
     /// Every live timeline whose `custom` metadata contains `key == value`.
     /// The reload-time cache lookup utility ingests use to skip units
     /// already present in the substrate. Tombstoned timelines are excluded.
