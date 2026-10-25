@@ -10,6 +10,7 @@
 //! journals with it. The design is `docs/zend_journal.md`.
 
 pub mod ask;
+pub mod cut;
 pub mod entry;
 pub mod fold;
 pub mod folding;

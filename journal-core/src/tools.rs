@@ -39,6 +39,7 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::cut::close_cut;
 use crate::entry::{Item, Typed};
 use crate::json_repair::escape_control_in_strings;
 use crate::verify::{Draft, DraftClaim, DraftOpen, Relates};
@@ -285,32 +286,63 @@ fn claim_of(n: usize, v: &Value) -> Result<DraftClaim, String> {
     Ok(DraftClaim { text, cite, typed })
 }
 
-fn items_of(v: &Value) -> Result<Vec<DraftOpen>, String> {
-    let Some(list) = v.as_array() else {
-        return Err("`open` is a list.".into());
-    };
-    list.iter()
-        .enumerate()
-        .map(|(n, o)| {
-            let text = o
-                .get("text")
-                .and_then(text_of)
-                .ok_or_else(|| format!("Open item {} has no `text`.", n + 1))?;
-            let relates = relates_of(o.get("relates").unwrap_or(&Value::Null))?;
-            Ok(DraftOpen { text, relates })
-        })
-        .collect()
+fn item_of(n: usize, o: &Value) -> Result<DraftOpen, String> {
+    let text = o
+        .get("text")
+        .and_then(text_of)
+        .ok_or_else(|| format!("Open item {} has no `text`.", n + 1))?;
+    let relates = relates_of(o.get("relates").unwrap_or(&Value::Null))?;
+    Ok(DraftOpen { text, relates })
 }
 
-fn draft_of(args: &Map<String, Value>) -> Result<Draft, String> {
+/// A list written as JSON text inside an element, read, and whether the answer
+/// was cut in the middle of it — closed first, then ([`close_cut`]).
+fn listed(v: &Value) -> Option<(Vec<Value>, bool)> {
+    let Value::String(s) = v else {
+        return None;
+    };
+    let s = s.trim();
+    if !s.starts_with('[') {
+        return None;
+    }
+    match serde_json::from_str(s) {
+        Ok(Value::Array(list)) => Some((list, false)),
+        Ok(_) => None,
+        Err(_) => match serde_json::from_str(&close_cut(s)?.text) {
+            Ok(Value::Array(list)) => Some((list, true)),
+            _ => None,
+        },
+    }
+}
+
+/// Each of `list` read by `read`. In an answer that was `cut`, a last element
+/// the cut left unreadable is dropped rather than refusing the rest.
+fn each<T>(
+    list: &[Value],
+    cut: bool,
+    read: impl Fn(usize, &Value) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    let mut out = Vec::with_capacity(list.len());
+    for (n, v) in list.iter().enumerate() {
+        match read(n, v) {
+            Ok(t) => out.push(t),
+            Err(_) if cut && n + 1 == list.len() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// The draft `args` say. `cut_in` names the argument the answer was cut off
+/// in, whose last element may be dropped.
+fn draft_of(args: &Map<String, Value>, cut_in: Option<&str>) -> Result<Draft, String> {
     let claims = match args.get("claims") {
         None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(list)) => list
-            .iter()
-            .enumerate()
-            .map(|(n, c)| claim_of(n, c))
-            .collect::<Result<_, _>>()?,
-        Some(_) => return Err("`claims` is a list.".into()),
+        Some(Value::Array(list)) => each(list, cut_in == Some("claims"), claim_of)?,
+        Some(v) => match listed(v) {
+            Some((list, cut)) => each(&list, cut, claim_of)?,
+            None => return Err("`claims` is a list.".into()),
+        },
     };
     let intend = match args.get("intend") {
         None | Some(Value::Null) => Vec::new(),
@@ -319,7 +351,11 @@ fn draft_of(args: &Map<String, Value>) -> Result<Draft, String> {
     };
     let open = match args.get("open") {
         None | Some(Value::Null) => Vec::new(),
-        Some(v) => items_of(v)?,
+        Some(Value::Array(list)) => each(list, cut_in == Some("open"), item_of)?,
+        Some(v) => match listed(v) {
+            Some((list, cut)) => each(&list, cut, item_of)?,
+            None => return Err("`open` is a list.".into()),
+        },
     };
     let summary = args.get("summary").and_then(text_of).unwrap_or_default();
     Ok(Draft {
@@ -333,11 +369,30 @@ fn draft_of(args: &Map<String, Value>) -> Result<Draft, String> {
 /// Read one answer, which may be a `journal_skip` only when `may_skip`. The
 /// error is worded for the model, which is shown it with its refused attempt
 /// and answers again.
+///
+/// An answer its token budget cut off is read as far as it got: closed
+/// ([`close_cut`]), its last string ending in `...`, and a last claim or open
+/// item the cut left incomplete dropped.
 pub fn parse(answer: &str, may_skip: bool) -> Result<Answer, String> {
-    let (name, args) =
-        arguments(answer).ok_or_else(|| "That was not a journal_write call.".to_string())?;
+    let (name, args, cut_in) = match arguments(answer) {
+        Some((name, args)) => (name, args, None),
+        None => {
+            let closed = answer
+                .find('{')
+                .and_then(|start| close_cut(&answer[start..]))
+                .ok_or_else(|| "That was not a journal_write call.".to_string())?;
+            let (name, args) = json_call(&closed.text).ok_or_else(|| {
+                "That was a journal_write call cut off where it could not be closed.".to_string()
+            })?;
+            let cut_in = match closed.open.as_slice() {
+                [outer, field, ..] if outer == "arguments" => Some(field.clone()),
+                _ => None,
+            };
+            (name, args, cut_in)
+        }
+    };
     match name.as_str() {
-        WRITE => draft_of(&args).map(Answer::Write),
+        WRITE => draft_of(&args, cut_in.as_deref()).map(Answer::Write),
         SKIP if may_skip => Ok(Answer::Skip(
             args.get("reason").and_then(text_of).unwrap_or_default(),
         )),
@@ -647,6 +702,59 @@ mod tests {
             parse("I think nothing much happened."),
             Err("That was not a journal_write call.".to_string())
         );
+    }
+
+    /// **A cut-off write keeps what it got to**: the string it was writing
+    /// ends in `...`, and a last claim the cut left without a citation is
+    /// dropped rather than refusing the claims before it.
+    #[test]
+    fn a_write_cut_off_by_its_budget_is_read_as_far_as_it_got() {
+        let cut = r#"<tool_call>
+{"name": "journal_write", "arguments": {"claims": [
+  {"text": "The scan's parity test fails on the 3090.", "cite": "4"},
+  {"text": "The fix moves the sign table into shar"#;
+        let draft = parse(cut).expect("read as far as it got");
+        assert_eq!(draft.claims.len(), 1);
+        assert_eq!(
+            draft.claims[0].text,
+            "The scan's parity test fails on the 3090."
+        );
+
+        let mid_summary = r#"{"name": "journal_write", "arguments": {"claims": [
+  {"text": "a", "cite": "4"}], "summary": "Found why the scan fa"#;
+        assert_eq!(
+            parse(mid_summary).unwrap().summary,
+            "Found why the scan fa..."
+        );
+
+        let mid_text_of_a_cited_claim = r#"{"name": "journal_write", "arguments": {"claims": [
+  {"cite": "4", "text": "The scan fa"#;
+        assert_eq!(
+            parse(mid_text_of_a_cited_claim).unwrap().claims[0].text,
+            "The scan fa..."
+        );
+    }
+
+    #[test]
+    fn a_whole_write_with_a_bad_last_claim_is_still_refused() {
+        let said = r#"{"name": "journal_write", "arguments": {"claims": [{"text": "a", "cite": "1"}, {"text": "b"}]}}"#;
+        assert_eq!(parse(said), Err("Claim 2 cites no turn.".to_string()));
+    }
+
+    /// A cut elsewhere excuses nothing in a list the answer had closed.
+    #[test]
+    fn a_cut_in_the_summary_does_not_excuse_a_bad_claim() {
+        let said = r#"{"name": "journal_write", "arguments": {"claims": [{"text": "a", "cite": "1"}, {"text": "b"}], "summary": "Fou"#;
+        assert_eq!(parse(said), Err("Claim 2 cites no turn.".to_string()));
+    }
+
+    #[test]
+    fn a_function_shape_list_cut_off_is_closed_too() {
+        let said = "<tool_call>\n<function=journal_write>\n\
+            <parameter=claims>\n[{\"text\": \"The lift stopped.\", \"cite\": \"4\"}, {\"text\": \"The sta";
+        let draft = parse(said).unwrap();
+        assert_eq!(draft.claims.len(), 1);
+        assert_eq!(draft.claims[0].text, "The lift stopped.");
     }
 
     #[test]

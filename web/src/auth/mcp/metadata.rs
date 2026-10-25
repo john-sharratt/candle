@@ -31,7 +31,7 @@ pub fn protected_resource(resource: &str, issuer: &str) -> Value {
         "authorization_servers": [issuer],
         "bearer_methods_supported": ["header"],
         "scopes_supported": [SCOPE],
-        "resource_name": "zend",
+        "resource_name": "Zen",
     })
 }
 
@@ -60,7 +60,7 @@ mod tests {
         assert_eq!(
             protected_resource("https://code.tokera.com/mcp", "https://code.tokera.com")
                 .to_string(),
-            r#"{"resource":"https://code.tokera.com/mcp","authorization_servers":["https://code.tokera.com"],"bearer_methods_supported":["header"],"scopes_supported":["zend"],"resource_name":"zend"}"#
+            r#"{"resource":"https://code.tokera.com/mcp","authorization_servers":["https://code.tokera.com"],"bearer_methods_supported":["header"],"scopes_supported":["zend"],"resource_name":"Zen"}"#
         );
         assert_eq!(
             authorization_server("https://code.tokera.com").to_string(),

@@ -205,6 +205,26 @@ pub fn is_device(tool: &str) -> bool {
 
 /// Perform one act against the world a body stands in.
 pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
+    let done = dispatch(hosted, body, act);
+    // **A refusal is the world saying a way is shut**, and the stuck desk
+    // believes a report only after one (`Mission::refuse_stuck_on_the_way`).
+    // The desk's own answers are not the world refusing the way.
+    if matches!(done, Outcome::Refused(_)) && !DESK_REPORTS.contains(&act.tool) {
+        hosted.with_sim(|s| s.missions.refused_an_act(body));
+    }
+    done
+}
+
+/// The acts that report on a mission at its desk: a refusal of one is about the
+/// report, never the way.
+const DESK_REPORTS: &[&str] = &[
+    "collect_mission",
+    "report_done",
+    "report_stuck",
+    "report_rejected",
+];
+
+fn dispatch(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
     match act.tool {
         // `speak` is not offered any more, but a model that has seen it will
         // reach for it — and reading it as what it plainly means costs one arm

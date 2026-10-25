@@ -206,6 +206,16 @@ pub struct Mission {
     /// plainly within reach — see `engine::work`.
     #[serde(default)]
     pub stuck_refused: u32,
+    /// Whether the world has refused the carrier something since the desk last
+    /// turned a `report_stuck` away — what makes that turn-away count toward
+    /// believing the next one ([`Self::refuse_stuck_on_the_way`]).
+    #[serde(default)]
+    pub refused_since: bool,
+    /// A digest of the mission's document as it stood when the desk last
+    /// turned a `report_stuck` away over its faults — what tells a rewrite from
+    /// none ([`Self::refuse_stuck_over_faults`]).
+    #[serde(default)]
+    pub faulted_draft: Option<u64>,
     /// The documents the mission is about, when it is work on the record.
     #[serde(default)]
     pub work: Option<Work>,
@@ -227,6 +237,8 @@ impl Mission {
             origin,
             observed: Vec::new(),
             stuck_refused: 0,
+            refused_since: false,
+            faulted_draft: None,
             work: None,
             year: None,
         }
@@ -400,6 +412,40 @@ impl Mission {
     pub fn refuse_stuck(&mut self) -> u32 {
         self.stuck_refused += 1;
         self.stuck_refused
+    }
+
+    /// Turn away a `report_stuck` whose way the world can see is open, and say
+    /// how many such turn-aways count. **Only a real one counts**: one after
+    /// which the world refused the carrier something it tried. A Maker gave two
+    /// operations up as stuck at an open lift — "no mechanism exists to access
+    /// other levels" — having walked between the lift and the table and never
+    /// once called `lift_use`; two turn-aways and the third report was
+    /// believed. Told the way and not trying it is not being blocked by it.
+    pub fn refuse_stuck_on_the_way(&mut self) -> u32 {
+        if std::mem::take(&mut self.refused_since) {
+            self.stuck_refused += 1;
+        }
+        self.stuck_refused
+    }
+
+    /// Turn away a `report_stuck` over a document whose faults were put in front
+    /// of the carrier, `draft` the digest of the document as it stands, and say
+    /// how many such turn-aways count. **One counts only after a rewrite**: the
+    /// document must differ from what it was at the last turn-away. A Maker shown
+    /// "the brief's own words are still in the text" quoted the fault back as its
+    /// reason for being stuck, rewrote nothing, and the third report failed the
+    /// operation. Rewritten and still refused is a real block; unrewritten is not.
+    pub fn refuse_stuck_over_faults(&mut self, draft: u64) -> u32 {
+        if self.faulted_draft != Some(draft) {
+            self.stuck_refused += 1;
+        }
+        self.faulted_draft = Some(draft);
+        self.stuck_refused
+    }
+
+    /// The world refused the carrier an act while this mission was open.
+    pub fn refused_an_act(&mut self) {
+        self.refused_since = true;
     }
 
     /// Note something the engine saw happen toward the mission. A line already
@@ -1470,6 +1516,32 @@ mod tests {
                 by: "u_abc".to_string(),
             },
         )
+    }
+
+    /// **A stuck report counts only once something was tried.** Over a
+    /// document's faults, a turn-away counts once per rewrite: the same draft
+    /// reported stuck again is not a try. On the way, one counts only after the
+    /// world refused an act.
+    #[test]
+    fn only_a_real_turn_away_counts_toward_believing_stuck() {
+        let mut m = a_mission();
+        assert_eq!(
+            m.refuse_stuck_over_faults(7),
+            1,
+            "the first draft was a try"
+        );
+        assert_eq!(
+            m.refuse_stuck_over_faults(7),
+            1,
+            "the same draft again is not"
+        );
+        assert_eq!(m.refuse_stuck_over_faults(8), 2, "a rewrite is");
+
+        let mut m = a_mission();
+        assert_eq!(m.refuse_stuck_on_the_way(), 0, "nothing tried");
+        m.refused_an_act();
+        assert_eq!(m.refuse_stuck_on_the_way(), 1);
+        assert_eq!(m.refuse_stuck_on_the_way(), 1, "one refusal counts once");
     }
 
     /// **Arriving signs the journey off; arriving somewhere else does not.** The

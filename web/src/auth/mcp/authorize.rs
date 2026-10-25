@@ -113,12 +113,12 @@ pub fn consent_card(consent: &Consent, sealed: &str) -> String {
     };
     format!(
         r#"<div class="body">
-<h1><span class="client">{name}</span> wants to use zend</h1>
-<p class="lede">It will act as you, through the tools zend gives it.</p>
+<h1><span class="client">{name}</span> wants to use Zen</h1>
+<p class="lede">It will act as you, through the tools Zen gives it.</p>
 <div class="who"><span class="dot" aria-hidden="true"></span><span>Signed in as <b>{who}</b></span></div>
 <ul class="can">
 <li>Start and read your threads</li>
-<li>Run tasks on zend's workers, and answer their questions</li>
+<li>Run tasks on Zen's workers, and answer their questions</li>
 <li>Read the journals and the evidence behind them</li>
 </ul>
 <p class="to">You will be sent back to <code>{to}</code>.</p>

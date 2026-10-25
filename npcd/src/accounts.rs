@@ -423,6 +423,30 @@ impl Accounts {
         Ok(with_public_id(&key, &body))
     }
 
+    /// Every account by the names it is known by — its public id, its chosen
+    /// name, its display name and email — for an admin choosing whom to hand a
+    /// character to. Never the provider's subject.
+    pub fn known(&self) -> Vec<Value> {
+        let mut rows: Vec<Value> = self
+            .all()
+            .into_iter()
+            .map(|(key, body)| {
+                let field = |f: &str| body.get(f).cloned().unwrap_or(json!(""));
+                json!({
+                    "user_id": public_id(&key),
+                    "unique_name": field("unique_name"),
+                    "display": field("display"),
+                    "email": field("email"),
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let name = |v: &Value| v["unique_name"].as_str().unwrap_or_default().to_lowercase();
+            name(a).cmp(&name(b))
+        });
+        rows
+    }
+
     /// What the console sees for a verified identity, without creating anything.
     pub fn get(&self, id: &Identity) -> Option<Value> {
         let key = file_id(&id.provider, &id.sub);

@@ -11,8 +11,10 @@
 //! carries no challenge.
 //!
 //! A `tools/call` from a client that accepts an event stream is answered on
-//! one: progress every [`PROGRESS_EVERY`] while the tool runs — which keeps
-//! Claude Code's idle timer from firing — then the result.
+//! one: a progress notification for each step of the work the call waits on —
+//! a worker's round, a batch of tool calls, a journal entry — and at least
+//! every [`PROGRESS_EVERY`], which keeps Claude Code's idle timer from firing;
+//! then the result. Notifications are shown, not read into Claude's context.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -179,7 +181,10 @@ pub async fn post(
         };
         let mut res = json_rpc(
             StatusCode::OK,
-            jsonrpc::result(id, protocol::initialize_result(version)),
+            jsonrpc::result(
+                id,
+                protocol::initialize_result(version, &origin::of(&headers)),
+            ),
         );
         if let Ok(v) = HeaderValue::from_str(&id_opened) {
             res.headers_mut().insert(SESSION_HEADER, v);
@@ -214,7 +219,7 @@ pub async fn post(
     match method.as_str() {
         "server/discover" => json_rpc(
             StatusCode::OK,
-            jsonrpc::result(id, protocol::discover_result()),
+            jsonrpc::result(id, protocol::discover_result(&origin::of(&headers))),
         ),
         "ping" if !modern => json_rpc(StatusCode::OK, jsonrpc::result(id, json!({}))),
         "tools/list" => json_rpc(
@@ -236,17 +241,23 @@ pub async fn post(
                 );
             };
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let ctx = Ctx {
+            let mut ctx = Ctx {
                 session: Arc::clone(&session),
                 caller,
                 mcp: mcp_session,
                 mcp_id,
+                progress: None,
             };
             let progress = protocol::progress_token(&params);
             if wants_stream(&headers) {
-                stream_call(ctx, name, args, id, progress, modern)
+                let (steps_tx, steps) = mpsc::unbounded_channel();
+                ctx.progress = Some(steps_tx);
+                stream_call(ctx, name, args, id, progress, steps, modern)
             } else {
                 let answer = tools::call(&ctx, &name, &args).await;
+                // Answered in the response itself, which nothing here can
+                // see fail.
+                answer.delivered(&ctx);
                 json_rpc(
                     StatusCode::OK,
                     jsonrpc::result(id, protocol::call_result(answer.result(), modern)),
@@ -269,14 +280,17 @@ pub async fn post(
 }
 
 /// Run a `tools/call` on an event stream: progress while it runs, then the
-/// result, which ends the stream. The tool runs to its end whether or not the
-/// client stays — the work is zend's either way.
+/// result, which ends the stream. Each step the tool says on `steps` is a
+/// progress notification of its own, and a quiet [`PROGRESS_EVERY`] repeats
+/// the last one. The tool runs to its end whether or not the client stays —
+/// the work is zend's either way.
 fn stream_call(
     ctx: Ctx,
     name: String,
     args: Value,
     id: Value,
     progress: Option<Value>,
+    mut steps: mpsc::UnboundedReceiver<String>,
     modern: bool,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
@@ -285,30 +299,46 @@ fn stream_call(
         tokio::pin!(call);
         let mut tick = tokio::time::interval(PROGRESS_EVERY);
         tick.tick().await;
-        let mut beats: u64 = 0;
+        let mut sent: u64 = 0;
+        let mut last = format!("{name} working");
         let answer = loop {
-            tokio::select! {
+            let message = tokio::select! {
                 answer = &mut call => break answer,
-                _ = tick.tick() => {
-                    beats += 1;
-                    let event = match &progress {
-                        Some(token) => Event::default().data(
-                            jsonrpc::notification("notifications/progress", json!({
-                                "progressToken": token,
-                                "progress": beats,
-                                "message": format!("{name} working, {} s", beats * PROGRESS_EVERY.as_secs()),
-                            }))
-                            .to_string(),
-                        ),
-                        None => Event::default().comment("working"),
-                    };
-                    // A client gone is no reason to stop: the result is kept by the tool.
-                    let _ = tx.send(Ok(event)).await;
+                Some(step) = steps.recv() => {
+                    tick.reset();
+                    step
                 }
-            }
+                _ = tick.tick() => last.clone(),
+            };
+            sent += 1;
+            let event = match &progress {
+                Some(token) => Event::default().data(
+                    jsonrpc::notification(
+                        "notifications/progress",
+                        json!({
+                            "progressToken": token,
+                            "progress": sent,
+                            "message": message,
+                        }),
+                    )
+                    .to_string(),
+                ),
+                None => Event::default().comment("working"),
+            };
+            last = message;
+            // A client gone is no reason to stop: the result is kept by the tool.
+            let _ = tx.send(Ok(event)).await;
         };
         let done = jsonrpc::result(id, protocol::call_result(answer.result(), modern));
-        let _ = tx.send(Ok(Event::default().data(done.to_string()))).await;
+        // A client gone before the result leaves its entries unmarked, for
+        // the next call to give.
+        if tx
+            .send(Ok(Event::default().data(done.to_string())))
+            .await
+            .is_ok()
+        {
+            answer.delivered(&ctx);
+        }
     });
     let mut res = Sse::new(ReceiverStream::new(rx)).into_response();
     res.headers_mut()

@@ -280,11 +280,25 @@ fn a_time_machine_sets_the_year_the_mission_is_worked_in() {
             ),
         )
     };
+    // Somewhere the world refuses, as a way tried and found shut.
+    let tried = || {
+        refused(&perform(
+            &h,
+            "m1",
+            &act(
+                "move_to",
+                json!({"destination": "the far side of the moon"}),
+            ),
+        ));
+    };
     // The writing step's desks can be reached, so the report is turned away
-    // with the way there — twice — and taken the third time.
+    // with the way there — twice, each after a way tried and refused — and
+    // taken the third time.
     for _ in 0..2 {
+        tried();
         assert!(refused(&stuck()).contains("The desks are on"));
     }
+    tried();
     let handed_in = stuck();
     assert!(
         did(&handed_in).contains("back in the world's present"),

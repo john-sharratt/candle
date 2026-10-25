@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use web::auth::Role;
 
+use super::activity::Activity;
 use super::names::{parent_of, Path};
 use super::records::Records;
 
@@ -122,10 +123,11 @@ pub struct Worker {
     /// task's own entries are the ones after it.
     #[serde(default)]
     pub entries_after: Option<u64>,
-    /// The task's entries, once it ended.
+    /// The task's entries: those drafted so far while it runs, all of them
+    /// once it ended.
     #[serde(default)]
     pub entries: Vec<Entry>,
-    /// The end of the task's final response, once it ended.
+    /// The task's final response, whole, once it ended.
     #[serde(default)]
     pub final_text: String,
     #[serde(default)]
@@ -134,6 +136,12 @@ pub struct Worker {
     /// final response ended with.
     #[serde(default)]
     pub question: Option<String>,
+    /// What its current turn has done so far, counted from the turn's stream —
+    /// none until its first turn begins.
+    pub activity: Option<Activity>,
+    /// Why its turn ended with no journal entry, as the draft recorded it;
+    /// none when it kept one.
+    pub no_entry: Option<String>,
 }
 
 /// How often the member running a task says so on its record.
@@ -428,6 +436,8 @@ mod tests {
             final_text: String::new(),
             error: None,
             question: None,
+            activity: None,
+            no_entry: None,
         };
         assert_eq!(
             w.clone().observed(1_000 + BEAT_LOST_MS).state,

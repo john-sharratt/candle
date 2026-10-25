@@ -544,6 +544,18 @@ export const MockAPI = {
   async deleteNpc(id) { const i = NPCS.findIndex((x) => x.npc_id === id); if (i >= 0) NPCS.splice(i, 1); return null; },
   async setTags(id, tags) { (await this.getNpc(id)).tags = tags; return { ok: true }; },
   async setHidden(id, hidden) { (await this.getNpc(id)).hidden = hidden; return { ok: true }; },
+  async getOwners() {
+    await sleep(40);
+    return {
+      me: 'u_8812',
+      accounts: [
+        { user_id: 'u_8812', unique_name: 'wren', display: 'Johnathan', email: 'you@example.com' },
+        { user_id: 'u_31c0', unique_name: 'boss', display: '', email: 'tests@example.com' },
+      ],
+      npcs: NPCS.map((n) => ({ npc_id: n.npc_id, name: n.name, world_id: n.world_id, owner_id: n.owner_id })),
+    };
+  },
+  async setOwner(id, ownerId) { const n = await this.getNpc(id); n.owner_id = ownerId; return n; },
   async perceive(_id, events) { return { accepted: events.length, tick_scheduled: true, preempted: false }; },
 
   async getBeliefs() {

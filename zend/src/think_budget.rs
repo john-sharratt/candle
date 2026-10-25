@@ -68,17 +68,17 @@ mod tests {
         steer(&mut s, ThinkMode::Balanced, 7168, &[7, 8]);
         assert_eq!(
             (s.graceful_segment_close_after, s.force_segment_close_after),
-            (2048, 3072)
+            (3072, 3584)
         );
         assert_eq!(
             (s.segment_close_ramp_start, s.segment_close_ramp_len),
-            (2048, 3072)
+            (3072, 3584)
         );
         // Thinking reserves the force cutoff; the answer's room sits above it.
-        assert_eq!(s.eos_ramp_start, 3072);
-        assert_eq!(s.graceful_eos_after, 3072 + 7168 * 4 / 5);
+        assert_eq!(s.eos_ramp_start, 3584);
+        assert_eq!(s.graceful_eos_after, 3584 + 7168 * 4 / 5);
         assert_eq!(s.eos_ramp_len, s.graceful_eos_after);
-        assert_eq!(s.forced_eos_after, 3072 + 7168);
+        assert_eq!(s.forced_eos_after, 3584 + 7168);
         assert_eq!(
             s.segment_suppress_penalty,
             ThinkMode::Balanced.suppress_penalty()

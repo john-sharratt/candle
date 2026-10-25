@@ -35,6 +35,7 @@ import { estateSwitcher } from '/common/lib/estate.js';
  *   /personality/:aid/life → GET /v1/life/:who      admin
  *   /performance → GET  /v1/telemetry, /v1/memory   user
  *   /operations  → GET  /v1/pulse/operations        admin
+ *   /owners      → GET  /v1/npcs/owners             admin
  *   /substrate   → GET  /v1/substrate               admin
  *   /logs        → WS   /ws/logs                    user
  */
@@ -94,6 +95,11 @@ definePage({ path: '/pulse', role: 'user', nav: { section: 'main', order: 45, la
 // operation's missions are carried by the whole cast.
 definePage({ path: '/operations', role: 'admin', nav: { section: 'main', order: 47, label: 'Operations' },
   load: () => import('./pages/operations.js') });
+// Who owns each character, and handing one over — admin, like
+// `/v1/npcs/owners` and `/v1/npc/:nid/owner`: the one write that crosses
+// ownership.
+definePage({ path: '/owners', role: 'admin', nav: { section: 'main', order: 48, label: 'Owners' },
+  load: () => import('./pages/owners.js') });
 // Names the redo log's absolute path, so it matches `/v1/substrate`.
 definePage({ path: '/substrate', role: 'admin', nav: { section: 'main', order: 50, label: 'Substrate' },
   load: () => import('./pages/substrate.js') });

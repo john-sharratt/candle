@@ -117,12 +117,47 @@ pub fn lore(root: &MindFiles) -> Arc<String> {
             }
         }
     }
+    for name in lived(root) {
+        text.push_str(&name);
+        text.push('\n');
+    }
     let text = Arc::new(text.to_lowercase());
     cache
         .lock()
         .expect("lore lock")
         .insert(key, Arc::clone(&text));
     text
+}
+
+/// The names of the people the record keeps a life of: each personality with a
+/// folder under `layers/life`, by the `name:` its personality gives it.
+///
+/// **A person of the world is the world's, whatever a Maker is called.** A
+/// Maker named Bram Hollis made "bram" a writers' term, and a life of Rook —
+/// whose household gardener is Bram — was refused for naming him at every
+/// report until the operation failed. The Makers' own personality keeps no
+/// life, so its name stays the vault's.
+fn lived(root: &MindFiles) -> Vec<String> {
+    let mut ids: Vec<String> = root
+        .walk("layers/life")
+        .iter()
+        .filter_map(|p| {
+            p.strip_prefix("layers/life/")?
+                .split('/')
+                .next()
+                .map(str::to_string)
+        })
+        .collect();
+    ids.dedup();
+    ids.iter()
+        .filter_map(|id| root.read(&format!("personalities/{id}.yaml")))
+        .filter_map(|yaml| {
+            yaml.lines()
+                .find_map(|l| l.strip_prefix("name:"))
+                .map(|n| n.trim().trim_matches(['"', '\'']).to_string())
+        })
+        .filter(|n| !n.is_empty())
+        .collect()
 }
 
 /// The writers' terms `text` holds that the lore never uses, in the order of
@@ -229,6 +264,43 @@ mod tests {
         assert_eq!(
             leaks("A light ring hummed.", &vocabulary, ""),
             ["light ring"]
+        );
+    }
+
+    /// **A person the record keeps a life of is the world's**, though a Maker
+    /// shares the name; a personality with no life — the Makers' own — is not.
+    #[test]
+    fn a_lived_persons_name_is_the_worlds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let put = |rel: &str, text: &str| {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        put("layers/eras/a.md", "the towers stood\n");
+        put(
+            "personalities/bram-the-gardener.yaml",
+            "id: bram-the-gardener\nname: Bram\n",
+        );
+        put(
+            "layers/life/bram-the-gardener/2811 The Nine Hours.md",
+            "you grow bodies\n",
+        );
+        put("personalities/maker.yaml", "id: maker\nname: Maker\n");
+        let lore = lore(&MindFiles::folder(dir.path()));
+        let vocabulary = words(&["bram hollis", "bram", "maker"]);
+        assert!(
+            leaks("Bram set the feed rate and waited.", &vocabulary, &lore).is_empty(),
+            "the gardener is the world's"
+        );
+        assert_eq!(
+            leaks("The Maker wrote it down.", &vocabulary, &lore),
+            ["maker"]
+        );
+        assert_eq!(
+            leaks("Bram Hollis bent over the desk.", &vocabulary, &lore),
+            ["bram hollis"],
+            "the Maker's full name is still the vault's"
         );
     }
 

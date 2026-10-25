@@ -60,8 +60,10 @@ impl Client {
     }
 }
 
-/// The longest any call waits when it names no `wait_s`.
-pub const DEFAULT_WAIT_S: u64 = 50;
+/// The longest any call waits when it names no `wait_s`: short enough that a
+/// running worker reports what it has done every 45 seconds, and Claude can
+/// stop waiting on what it reads.
+pub const DEFAULT_WAIT_S: u64 = 45;
 
 /// How long a session may go unused before it is swept.
 pub const SESSION_IDLE_MS: u64 = 30 * 24 * 3600 * 1000;

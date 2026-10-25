@@ -560,6 +560,21 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Dispatch::Best,
             post(import_npcs),
         )
+        // Who owns what, and handing a character to another account. Admin:
+        // the listing reads every owner's cast, and the reassignment is the one
+        // write that crosses ownership.
+        .route(
+            "/v1/npcs/owners",
+            Role::Admin,
+            Dispatch::Any,
+            get(get_owners),
+        )
+        .route(
+            "/v1/npc/:nid/owner",
+            Role::Admin,
+            Dispatch::Best,
+            put(put_owner),
+        )
         .route(
             "/v1/npc/:nid",
             Role::User,
@@ -823,6 +838,65 @@ async fn import_npcs(State(s): State<Arc<Authored>>, Json(body): Json<Value>) ->
             tracing::error!(error = ?e, "npc import failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "import failed").into_response()
         }
+    }
+}
+
+/// `GET /v1/npcs/owners` — every living character with its owner, the accounts
+/// a character can be handed to, and the caller's own id among them.
+async fn get_owners(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Response {
+    let (_, me) = match owner_of(&s, &headers).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let npcs = s.npcs.read().await.owners();
+    let accounts = s.accounts.read().await.known();
+    Json(json!({ "me": me, "accounts": accounts, "npcs": npcs })).into_response()
+}
+
+/// `PUT /v1/npc/:nid/owner` — hand a character to another account.
+///
+/// Body `{"owner_id": "u_…"}`. Only an account that exists may be named: a
+/// character handed to an id nobody signs in as is one nobody can see again.
+async fn put_owner(
+    State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
+    Path(nid): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = owner_of(&s, &headers).await {
+        return *r;
+    }
+    let Some(npc_id) = npcs::npc_id_of_wire(&nid) else {
+        return err(StatusCode::NOT_FOUND, "npc_not_found", "no such character");
+    };
+    let Some(to) = body.get("owner_id").and_then(Value::as_str) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "owner_missing",
+            "say whose it is to be: {\"owner_id\": \"u_…\"}",
+        );
+    };
+    let known = s
+        .accounts
+        .read()
+        .await
+        .known()
+        .iter()
+        .any(|a| a["user_id"] == to);
+    if !known {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "owner_unknown",
+            "no account has that id — an owner is somebody who has signed in",
+        );
+    }
+    match s.npcs.write().await.reassign(npc_id, to, now_ms()) {
+        Ok(mut v) => {
+            tracing::info!(npc = %nid, owner = to, "character reassigned");
+            name_personality(&mut v, &*s.personalities.read().await);
+            Json(v).into_response()
+        }
+        Err(e) => npc_err(e),
     }
 }
 
@@ -3600,6 +3674,10 @@ mod tests {
                 // `admin`, a full-estate read and a bulk write.
                 ("/v1/npcs/export", "admin"),
                 ("/v1/npcs/import", "admin"),
+                // Who owns what, and handing a character over: `admin`, the one
+                // write that crosses ownership.
+                ("/v1/npcs/owners", "admin"),
+                ("/v1/npc/:nid/owner", "admin"),
                 ("/v1/npc/:nid", "user"),
                 ("/v1/npc/:nid/tags", "user"),
                 ("/v1/npc/:nid/hidden", "user"),

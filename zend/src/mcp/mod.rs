@@ -14,6 +14,8 @@
 //! | [`jsonrpc`] | One JSON-RPC message per POST |
 //! | [`tools`] | The tools, one file each |
 //! | [`workers`] | Running a task, answering a worker, and waiting on workers |
+//! | [`activity`] | What a running worker is doing, counted from its stream and said in one sentence |
+//! | [`reported`] | The journal entries already handed to Claude, so a later result gives only new ones |
 //! | [`parts`] | `sub_run`: a worker's parts, started under it and waited on |
 //! | [`lineage`] | The journals a worker or part inherits from above it |
 //! | [`ops`] | What the operations tools share: Admins only, the decision gate, the way up |
@@ -26,6 +28,7 @@
 //! | [`state`] | What is held in memory: sessions, running tasks |
 //! | [`origin`] | The public origin a request reached `/mcp` at |
 
+pub mod activity;
 pub mod caller;
 pub mod http;
 pub mod jsonrpc;
@@ -38,6 +41,7 @@ pub mod ownership;
 pub mod parts;
 pub mod protocol;
 pub mod records;
+pub mod reported;
 pub mod state;
 pub mod threads;
 pub mod tools;

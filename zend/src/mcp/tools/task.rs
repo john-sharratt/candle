@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::wait::render;
+use super::wait::answer_for;
 use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::threads::Priority;
 use crate::mcp::workers;
@@ -21,9 +21,10 @@ pub fn definition() -> Value {
             analysis layers and its own tools; its result is its journal entry. State the task in full in \
             `prompt` — what to do, what to verify before answering, and the shape of the final response \
             (verdict, findings, pointers such as file:line). Name the worker for what it does, as a \
-            kebab-case slug (`verify-expiry`), never a number. Answers `done` with the worker's entry, or \
-            `running` with its path — then call `zend_wait` on it, or start more tasks first and wait on \
-            them all at once. Pass the thread you attached to.",
+            kebab-case slug (`verify-expiry`), never a number. Answers `done` with the worker's final \
+            response and its journal entries, or running with its path and what it has done so far — then \
+            call `zend_wait` on it, or start more tasks first and wait on them all at once. Pass the thread \
+            you attached to.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -31,7 +32,7 @@ pub fn definition() -> Value {
                 "name": {"type": "string", "description": "The worker's name: a kebab-case slug of at most 40 characters saying what it does."},
                 "prompt": {"type": "string", "description": "The task, stated in full."},
                 "priority": {"type": "string", "enum": ["normal", "high"], "description": "How urgently it decodes: `normal` (the default) runs below a live user; `high` only when someone is waiting on it interactively."},
-                "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait before answering `running` (50 by default)."}
+                "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait before answering `running` (45 by default)."}
             },
             "required": ["thread", "name", "prompt"],
             "additionalProperties": false
@@ -57,9 +58,5 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Err(e) => return Answer::error(e),
     };
     let wanted = [(worker.thread.clone(), worker.name.clone())];
-    let wait = Duration::from_secs(wait_secs(ctx, args));
-    match workers::wait(&ctx.session, &ctx.caller.key(), &wanted, wait).await {
-        Ok(read) => Answer::ok(render(&read)),
-        Err(e) => Answer::error(e),
-    }
+    answer_for(ctx, &wanted, Duration::from_secs(wait_secs(ctx, args))).await
 }
