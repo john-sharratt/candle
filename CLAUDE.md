@@ -303,6 +303,28 @@ walks the narrowing itself — add another `on_bad` callback and let them compou
 
 ---
 
+## Delegating to zend
+
+When the zend MCP connector is attached (`docs/claude_zend_gateway.md`), the
+default is to delegate, through the skills in `skills/` (`zend-thread` first):
+
+- **Delegate** anything reading-heavy or mechanical — implementing a spec,
+  answering a codebase question, writing tests, building, testing, a trial
+  deploy, watching, reviewing, researching — as a `zend_task` on this work's
+  thread.
+- **Call directly** the short operations — `cluster_status`, `cluster_logs`, a
+  job's result.
+- **Keep** deciding what to do, design and its documents, checking zend's
+  results against the turns they cite before acting on them, and every step
+  that needs the user's approval. A Decide command's `confirm` is passed only
+  with the user's approval, and every rule above — commits, wipes, no flags,
+  file tools only — binds work done through zend exactly as work done here.
+
+If `cluster_status` says zend cannot take work, or a task errors or stalls
+past its timeout, do the job the ordinary way.
+
+---
+
 ## Build Commands
 
 ```bash
