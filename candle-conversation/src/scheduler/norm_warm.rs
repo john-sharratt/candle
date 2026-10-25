@@ -57,6 +57,11 @@ struct BackgroundJob {
     conversation: Conversation,
     projection: Arc<Builder>,
     group: GroupId,
+    /// The batch this step scans; the job is queued again for the next.
+    batch: usize,
+    started: Instant,
+    /// The longest step so far — what a live turn stood behind.
+    longest_step: Duration,
 }
 
 /// The replay's backlog, and what the current one has done so far.
@@ -129,6 +134,9 @@ impl Scheduler {
                 conversation: substrate.clone(),
                 projection: Arc::clone(projection),
                 group,
+                batch: 0,
+                started: Instant::now(),
+                longest_step: Duration::ZERO,
             });
         }
     }
@@ -160,20 +168,31 @@ impl Scheduler {
     /// background warm, then one ingest slice. Returns whether one was scored.
     pub(super) fn step_norm_warm(&mut self) -> bool {
         if self.norm_warm.backlog.is_empty() {
-            if let Some(job) = self.norm_warm.background.pop_front() {
-                let started = Instant::now();
-                let files = job.conversation.warm_group_background(
+            if let Some(mut job) = self.norm_warm.background.pop_front() {
+                // One batch a step: a whole group's background is several
+                // scans of the whole gallery, ~2 s over 843 files.
+                let step = Instant::now();
+                let (files, batches) = job.conversation.warm_group_background(
                     job.projection.schema(),
                     job.group,
+                    job.batch,
                     self.gallery_arena.as_deref(),
                 );
-                tracing::info!(
-                    target: "candle_conversation::provenance",
-                    group = job.group.raw(),
-                    files,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "normalization warm-up: learned a file-scored group's background peaks"
-                );
+                job.longest_step = job.longest_step.max(step.elapsed());
+                job.batch += 1;
+                if job.batch < batches {
+                    self.norm_warm.background.push_back(job);
+                } else {
+                    tracing::info!(
+                        target: "candle_conversation::provenance",
+                        group = job.group.raw(),
+                        files,
+                        batches,
+                        longest_step_ms = job.longest_step.as_millis() as u64,
+                        elapsed_ms = job.started.elapsed().as_millis() as u64,
+                        "normalization warm-up: learned a file-scored group's background peaks"
+                    );
+                }
                 return true;
             }
         }

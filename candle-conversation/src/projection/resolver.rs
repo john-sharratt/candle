@@ -1683,22 +1683,25 @@ impl Conversation {
         due
     }
 
-    /// Warm `group`'s background from its files as they stand, on `arena` when
-    /// given ([`Self::warm_pool_background`]). Returns how many files the group
-    /// holds; `0` when it is not a warmable group of `schema`.
+    /// Warm batch `batch` of `group`'s background from its files as they
+    /// stand, on `arena` when given ([`Self::warm_pool_background`]) — one
+    /// scan, so a caller between waves takes one batch a step. Returns the
+    /// group's file count and its batch count; `(0, 0)` when it is not a
+    /// warmable group of `schema`.
     pub fn warm_group_background(
         &self,
         schema: &Schema,
         group: GroupId,
+        batch: usize,
         arena: Option<&GalleryArena>,
-    ) -> usize {
+    ) -> (usize, usize) {
         let Some(group) = schema
             .layers
             .iter()
             .flat_map(|l| &l.groups)
             .find(|g| g.id == group && is_warmable(g))
         else {
-            return 0;
+            return (0, 0);
         };
         let timelines: Vec<TimelineId> = self
             .inner
@@ -1706,8 +1709,8 @@ impl Conversation {
             .unwrap()
             .active_timelines_for_group(group.id)
             .collect();
-        self.warm_pool_background(group, &timelines, arena);
-        timelines.len()
+        let batches = self.warm_pool_background(group, &timelines, arena, Some(batch));
+        (timelines.len(), batches)
     }
 
     /// Fold one replayed dialogue turn into the hit levels — a seal-style
@@ -2219,7 +2222,7 @@ impl Conversation {
     ) -> usize {
         if group.policy.scan.cases == ScanCases::File {
             if !self.ingest_cancelled() {
-                self.warm_pool_background(group, timelines, arena);
+                self.warm_pool_background(group, timelines, arena, None);
             }
             return timelines.len();
         }
@@ -2254,12 +2257,16 @@ impl Conversation {
     /// are made of. Every scored file's raw score is folded into the pool scope
     /// under a source naming the probe and the gallery's size, so a later pass
     /// over a larger gallery folds again.
+    ///
+    /// `only` scans that one batch and no other, so a caller between waves can
+    /// spread the warm over several steps. Returns how many batches there are.
     fn warm_pool_background(
         &self,
         group: &GroupSchema,
         sources: &[TimelineId],
         arena: Option<&GalleryArena>,
-    ) {
+        only: Option<usize>,
+    ) -> usize {
         let stride = sources.len().div_ceil(WARM_BACKGROUND_PROBES).max(1);
         let sources: Vec<TimelineId> = sources.iter().step_by(stride).copied().collect();
         let mut files = {
@@ -2273,9 +2280,13 @@ impl Conversation {
         // At most half the group leaves the gallery, so a small group still
         // has files to score.
         let batch_len = WARM_BACKGROUND_BATCH.min(n_files / 2).max(1);
-        for batch in sources.chunks(batch_len) {
+        let n_batches = sources.len().div_ceil(batch_len);
+        for (bi, batch) in sources.chunks(batch_len).enumerate() {
             if self.ingest_cancelled() {
-                return;
+                return n_batches;
+            }
+            if only.is_some_and(|k| k != bi) {
+                continue;
             }
             let (held, gallery): (Vec<FileScan>, Vec<FileScan>) =
                 files.into_iter().partition(|f| batch.contains(&f.timeline));
@@ -2315,6 +2326,7 @@ impl Conversation {
             }
             files = gallery.into_iter().chain(held).collect();
         }
+        n_batches
     }
 
     /// Self-match one timeline of `group`: a handful of its own turns probe it,
@@ -6593,7 +6605,10 @@ layers:
         // and warming it then teaches nothing the warm above did not.
         assert_eq!(conv.take_background_warms(builder.schema()), vec![group]);
         assert!(conv.take_background_warms(builder.schema()).is_empty());
-        assert_eq!(conv.warm_group_background(builder.schema(), group, None), 4);
+        // Four files, two at a time out of the gallery: two batches.
+        let schema = builder.schema();
+        assert_eq!(conv.warm_group_background(schema, group, 0, None), (4, 2));
+        assert_eq!(conv.warm_group_background(schema, group, 1, None), (4, 2));
         assert_eq!(peaks(), first);
     }
 
