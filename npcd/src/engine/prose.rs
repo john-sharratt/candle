@@ -353,12 +353,17 @@ async fn run_turn(
     use tokio_stream::StreamExt;
 
     let handle = sequence.submit_turn_with_options(prompt, options)?;
+    tracing::info!(
+        prompt_words = prompt.split_whitespace().count(),
+        "prose turn submitted"
+    );
     let mut ids: Vec<u32> = Vec::new();
     let mut preview = Preview::default();
     let mut response = None;
-    // **How long a prose turn waited, and how long it ran.** The table's
-    // generations and readings are prose turns, and the loop waits on each:
-    // one that took eighty minutes said nothing at all while it did.
+    // **How long a prose turn waited, and how long it ran** — and, above, that
+    // it was submitted at all. The table's generations and readings are prose
+    // turns, and the loop waits on each: one that took eighty minutes said
+    // nothing at all while it did.
     let submitted = Instant::now();
     let mut first_token: Option<Duration> = None;
     {
