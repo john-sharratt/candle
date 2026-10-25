@@ -24,17 +24,19 @@ use crate::cuda_backend::CudaDevice;
 /// Bytes of the NON_LOCAL segment budget not yet in use by this process, or
 /// `None` where the platform reports no such budget.
 pub fn gpu_addressable_room(device: &CudaDevice) -> Option<u64> {
-    room(device)
+    gpu_addressable_budget(device).map(|(budget, usage)| budget.saturating_sub(usage))
 }
 
+/// The NON_LOCAL segment as `(Budget, CurrentUsage)`, or `None` where the
+/// platform reports no such budget. The OS revises the budget as the machine's
+/// memory changes, so a reading holds for the instant it was taken.
 #[cfg(windows)]
-fn room(device: &CudaDevice) -> Option<u64> {
+pub fn gpu_addressable_budget(device: &CudaDevice) -> Option<(u64, u64)> {
     let probe = super::DxgiProbe::for_cuda_device(device).ok()?;
-    let (budget, usage) = probe.non_local().ok()?;
-    Some(budget.saturating_sub(usage))
+    probe.non_local().ok()
 }
 
 #[cfg(not(windows))]
-fn room(_device: &CudaDevice) -> Option<u64> {
+pub fn gpu_addressable_budget(_device: &CudaDevice) -> Option<(u64, u64)> {
     None
 }

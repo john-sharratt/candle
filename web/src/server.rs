@@ -608,10 +608,16 @@ async fn handle(
     // from the headers the proxy sets. Both get the same answer from the same
     // check — the session cookie, which the strip above does not touch — or,
     // for a request a member forwarded up, the identity it carries.
+    // On `/mcp` alone, an access token the authorization server issued is an
+    // identity too (`auth::mcp`): a remote MCP client holds a token, not a
+    // cookie.
     let identity = app
         .auth
         .as_ref()
-        .and_then(|a| a.identity(req.headers()))
+        .and_then(|a| {
+            a.identity(req.headers())
+                .or_else(|| a.mcp_identity(req.headers(), &path))
+        })
         .or_else(|| origin.as_ref().and_then(|_| identify(req.headers()).ok()));
     let assertion = app
         .auth

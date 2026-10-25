@@ -15,10 +15,12 @@
 
 use std::sync::Arc;
 
+use axum::middleware;
 use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
 use host::guard::{delete, get, post, put, Api, Guarded, Routes};
 use web::auth::{Role, Roles};
 
+use crate::mcp;
 use crate::session::ZendSession;
 
 pub mod agents;
@@ -34,9 +36,16 @@ pub mod prompt_tokens;
 mod repo_map;
 pub mod substrate;
 
-/// zend's routes, graded by `roles`, on `session`.
+/// zend's routes, graded by `roles`, on `session` — every one behind the
+/// ownership layer, which keeps a conversation `/mcp` started to its owner
+/// ([`mcp::ownership`]).
 pub fn routes(session: Arc<ZendSession>, roles: Roles) -> Routes {
-    table(roles).into_routes(session)
+    let mut routes = table(roles).into_routes(Arc::clone(&session));
+    routes.router = routes.router.layer(middleware::from_fn_with_state(
+        session,
+        mcp::ownership::guard,
+    ));
+    routes
 }
 
 /// Every route zend serves, and the role each needs — the table the host
@@ -245,6 +254,18 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             conversation(),
             get(journal::turns),
         )
+        // The remote MCP endpoint (`crate::mcp`). Open, because `/mcp` names
+        // its own caller from the gateway's identity and refuses nobody with
+        // the challenge that starts a sign-in at the gateway. What it keeps is
+        // replicated records, so any member answers.
+        .route(
+            "/mcp",
+            Role::Unauthenticated,
+            Dispatch::Any,
+            post(mcp::http::post)
+                .get(mcp::http::get)
+                .delete(mcp::http::delete),
+        )
 }
 
 #[cfg(test)]
@@ -300,6 +321,7 @@ mod tests {
                     "/v1/conversations/:id/journal/:eid/turns",
                     "unauthenticated"
                 ),
+                ("/mcp", "unauthenticated"),
             ]
         );
     }
@@ -361,6 +383,7 @@ mod tests {
                 Dispatch::Any,
             ),
             ("GET", "/v1/substrate/zend/timeline/7", Dispatch::Any),
+            ("POST", "/mcp", Dispatch::Any),
             ("DELETE", "/v1/substrate/zend/timeline/7", Dispatch::Best),
             ("GET", "/v1/substrate/zend/system-prompt", Dispatch::Any),
             ("DELETE", "/v1/substrate/zend/system-prompt", Dispatch::Best),

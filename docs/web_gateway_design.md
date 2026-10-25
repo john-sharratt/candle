@@ -219,6 +219,16 @@ smaller claim, and it distributes no secret at all.
 This supersedes `npc_api_gui_design.md` §8.1's per-daemon OAuth: `npcd` does not
 run its own dance, and its `/v1/me` reports the identity it was handed.
 
+**One bearer path: `/mcp`.** A remote MCP client (Claude Code, claude.ai) holds
+a token, not a cookie, so the gateway is also an OAuth 2.1 authorization server
+for `/mcp` (`web/src/auth/mcp/`, `docs/claude_zend_gateway.md` §12): its
+discovery documents, a consent page behind the same sign-in, and codes and
+tokens signed with the session key — stateless, like the session, each with a
+`kind` its reader requires. On `/mcp` alone an access token resolves to an
+identity where the cookie does (`Auth::mcp_identity`), and that identity
+reaches the member on `X-Tokera-*` like any other. No other path reads a bearer
+token, and the members still hold no key.
+
 ### Decisions worth recording
 
 **Stateless sessions.** A server-side session table would have to be shared by

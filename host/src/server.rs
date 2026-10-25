@@ -34,8 +34,9 @@ use crate::cluster::Cluster;
 use crate::tenant::TenantUi;
 
 /// The path prefixes the one router answers on every site: the API, the
-/// sockets, and the shared front-end.
-const API_PREFIXES: [&str; 4] = ["/v1", "/ws", "/common", "/brand"];
+/// sockets, the shared front-end, and the remote MCP endpoint
+/// (`docs/claude_zend_gateway.md` §3).
+const API_PREFIXES: [&str; 5] = ["/v1", "/ws", "/common", "/brand", "/mcp"];
 
 /// Where the host listens, and whom it believes.
 #[derive(Debug, Clone)]

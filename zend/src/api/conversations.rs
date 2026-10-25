@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use super::chat;
 use super::compressed;
 use crate::chatml::split_turn;
+use crate::mcp::ownership;
 use crate::projection_event::ProjectionSpanOut;
 use crate::session::{ConvEntry, ConversationDials, UploadInfo, UploadStats, ZendSession};
 use crate::types::Role;
@@ -43,11 +44,17 @@ pub struct ListQuery {
 
 pub async fn list(
     State(session): State<Arc<ZendSession>>,
+    headers: HeaderMap,
     Query(q): Query<ListQuery>,
 ) -> Json<ListBody> {
-    Json(ListBody {
-        conversations: session.list_conversations(q.include_archived),
-    })
+    // A worker `/mcp` started is listed to its owner and an Admin alone
+    // (`crate::mcp::ownership`).
+    let conversations = session
+        .list_conversations(q.include_archived)
+        .into_iter()
+        .filter(|c| ownership::may_open(&c.id, &headers, session.roles()))
+        .collect();
+    Json(ListBody { conversations })
 }
 
 pub async fn archive(

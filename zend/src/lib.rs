@@ -44,6 +44,7 @@ pub mod legacy_uploads;
 pub mod lenient_json;
 pub mod live_turn;
 pub mod loading;
+pub mod mcp;
 pub mod openai_tools;
 pub mod passthrough;
 pub mod projection_event;

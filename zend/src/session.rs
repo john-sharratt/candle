@@ -30,7 +30,9 @@ use tokio::task::JoinHandle as TaskHandle;
 use candle::{vram, Device};
 use candle_conversation::models::{Dialect, Model, StrataTokens};
 use candle_conversation::persistence::record::DistillMode;
-use candle_conversation::persistence::{content_hash, OpenProgressHook, OpenStage, SUBSTRATE_DIR};
+use candle_conversation::persistence::{
+    content_hash, OpenProgressHook, OpenStage, SharedSubstrate, SUBSTRATE_DIR,
+};
 use candle_conversation::projection::{
     self, Builder, Conversation, DecodePriority, GroupId, GroupSchema, LayerId, Reserved,
     SectionId, SectionLoads, SelectionRule, SystemItem, SystemPromptItem, SystemPromptSchema,
@@ -46,6 +48,7 @@ use candle_conversation::working_set::WorkingSetConfig;
 use candle_conversation::FinishReason;
 use candle_conversation::LoadPhase;
 use candle_conversation::RecoveredMessage;
+use candle_conversation::Result as EngineResult;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
@@ -62,7 +65,7 @@ use journal_core::journal::Holds;
 use journal_core::record::view as journal_view;
 use journal_core::section::{JournalPrompt, Kept, JOURNAL};
 use journal_core::span::Span;
-use journal_core::transcript::{Filed, Miss, Page};
+use journal_core::transcript::{Filed, Hits, Miss, Page};
 use serde_json::{json, Value};
 use web::auth::Roles;
 use zend_tools::state::Secrets;
@@ -104,6 +107,8 @@ use crate::journal::world::ConversationFiles;
 use crate::journal::{carry, draft, origin, pressure};
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
+use crate::mcp::state::McpState;
+use crate::mcp::{nudges, ownership};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -239,7 +244,18 @@ pub enum StreamItem {
     /// collected one answers `500` with it, since a body-reading client has the
     /// status to go on.
     Error(String),
+    /// The repeat guard or the round cap closed the turn's tool loop, so the
+    /// turn that follows answers without tools — sent once, before it, naming
+    /// which ([`CLOSED_BY_REPEATS`], [`CLOSED_BY_CAP`]). A task `/mcp` started
+    /// reads it as stuck (`crate::mcp::workers`); the chat stream shows nothing
+    /// for it.
+    Closing(&'static str),
 }
+
+/// [`StreamItem::Closing`]'s reason when the repeat guard closed the loop.
+pub const CLOSED_BY_REPEATS: &str = "repeats";
+/// [`StreamItem::Closing`]'s reason when the round cap closed it.
+pub const CLOSED_BY_CAP: &str = "round_cap";
 
 /// A dialogue conversation's recovered history, as `GET /v1/conversations/{id}`
 /// shows it — the summariser's ghost summary turns hidden.
@@ -4925,6 +4941,7 @@ fn run_inference_stream(
                     repeat_guard::NOTICE_FROM - 1,
                 );
                 closing = true;
+                let _ = tx.send(Ok(StreamItem::Closing(CLOSED_BY_REPEATS))).await;
             }
             if !closing && closes_at_cap(iteration) {
                 tracing::warn!(
@@ -4934,6 +4951,7 @@ fn run_inference_stream(
                 );
                 repeat_guard::cap_notice(&mut results);
                 closing = true;
+                let _ = tx.send(Ok(StreamItem::Closing(CLOSED_BY_CAP))).await;
             }
             // Each result measured as its own block of the turn it is about to
             // become — the length its card shows.
@@ -4970,6 +4988,15 @@ fn run_inference_stream(
                      of submitting an empty follow-up turn",
                 );
                 break;
+            }
+            // Guidance Claude queued for a worker `/mcp` started joins real
+            // results only — after the check above, so a nudge never turns an
+            // empty round into a turn, and one left queued when the loop ends
+            // is reported by the worker as undelivered. The round boundary is
+            // where it is read, never mid-decode.
+            if ownership::owner_of(&conv_id).is_some() {
+                let shared = state.engine.lock().unwrap().conversation().shared();
+                current_message = nudges::follow(current_message, &shared, &conv_id);
             }
 
             // The round-trip is now certain — the tools returned real output and
@@ -6012,6 +6039,9 @@ pub struct ZendSession {
     /// the engine, so a stopped session never keeps its model resident — or
     /// its scan on the device — behind the next one.
     ingest_worker: Mutex<Option<crate::ingest_worker::IngestWorker>>,
+    /// What `/mcp` holds in memory: its sessions, the tasks this process runs,
+    /// and the signal a waiting `zend_wait` wakes on (`crate::mcp`).
+    mcp: Arc<McpState>,
 }
 
 /// Snapshot returned by `GET /v1/status`. `loading` is `None` once the
@@ -6165,11 +6195,27 @@ impl ZendSession {
             started_at_ms,
             load_thread: Mutex::new(None),
             ingest_worker: Mutex::new(None),
+            mcp: Arc::new(McpState::default()),
         }
     }
 
     fn loaded(&self) -> Option<Arc<InferenceState>> {
         self.inference.read().unwrap().as_ref().map(Arc::clone)
+    }
+
+    /// What `/mcp` holds in memory.
+    pub fn mcp(&self) -> &Arc<McpState> {
+        &self.mcp
+    }
+
+    /// The substrate the model's conversations live in, for records kept
+    /// beside them (`crate::mcp::records`). The load publishes the engine's
+    /// conversation handle as soon as the redo log has replayed and keeps it
+    /// for the process's life, so this never takes the engine lock, and a
+    /// caller can read while zend is still loading. `None` before that.
+    pub fn shared_substrate(&self) -> Option<SharedSubstrate> {
+        let conv = self.loading_substrate.read().unwrap().clone()?;
+        Some(conv.shared())
     }
 
     /// Whether the model and its substrate are loaded: what a conversation's
@@ -6987,15 +7033,38 @@ impl ZendSession {
     /// its entries, and the text behind them is ceased: no tool runs on an
     /// archived conversation again. Returns `None` when the model isn't loaded
     /// yet.
-    pub fn archive_conversation(&self, conv_id: &str) -> Option<candle_conversation::Result<()>> {
+    pub fn archive_conversation(&self, conv_id: &str) -> Option<EngineResult<()>> {
+        let (state, timeline, distilled) = self.distill_archived(conv_id)?;
+        let engine = state.engine.lock().unwrap();
+        Some(distilled.and_then(|()| cease_journal_text(&engine, timeline)))
+    }
+
+    /// Archive a worker `/mcp` started (`crate::mcp::workers`): distilled like
+    /// any archived conversation, but its journal's text is **kept**. The
+    /// turns behind a worker's entries are the evidence for its task's outcome
+    /// — exactly what Claude reads later, through `journal_read` with an entry
+    /// — so they stay until the worker's thread is done with
+    /// (`docs/claude_zend_gateway.md` §4). `None` when the model isn't loaded.
+    pub fn archive_worker(&self, conv_id: &str) -> Option<EngineResult<()>> {
+        self.distill_archived(conv_id)
+            .map(|(_, _, distilled)| distilled)
+    }
+
+    /// What every archive does: set the archived flag and mark the timeline
+    /// for `TextOnly` distillation. `None` when the model isn't loaded.
+    fn distill_archived(
+        &self,
+        conv_id: &str,
+    ) -> Option<(Arc<InferenceState>, TimelineId, EngineResult<()>)> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = conversation_timeline(conv_id);
-        let engine = state.engine.lock().unwrap();
-        let result = engine
-            .set_conversation_archived(timeline, true)
-            .and_then(|()| engine.distill_timeline(timeline, DistillMode::TextOnly))
-            .and_then(|()| cease_journal_text(&engine, timeline));
-        Some(result)
+        let distilled = {
+            let engine = state.engine.lock().unwrap();
+            engine
+                .set_conversation_archived(timeline, true)
+                .and_then(|()| engine.distill_timeline(timeline, DistillMode::TextOnly))
+        };
+        Some((state, timeline, distilled))
     }
 
     /// Permanently tombstone a conversation — the delete path behind
@@ -7074,6 +7143,21 @@ impl ZendSession {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = conversation_timeline(conv_id);
         Some(journal_text(&state, timeline).read(entry, from, lines))
+    }
+
+    /// The lines of `conv_id`'s journal text that hold `pattern`, ignoring
+    /// case — in `entry`'s turns, or every entry's — the first `max`, exactly
+    /// as `journal_grep` finds them. `None` while the model is not loaded.
+    pub fn journal_grep(
+        &self,
+        conv_id: &str,
+        pattern: &str,
+        entry: Option<u64>,
+        max: usize,
+    ) -> Option<Result<Hits, Miss>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = conversation_timeline(conv_id);
+        Some(journal_text(&state, timeline).grep(pattern, entry, max))
     }
 
     /// `GET /v1/conversations/{id}/prompt-tokens`: the tokens the conversation
