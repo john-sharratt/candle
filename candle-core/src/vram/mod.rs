@@ -42,7 +42,7 @@ mod probe_dxgi;
 pub use budget::GovernorConfig;
 pub use diag::{BudgetRow, BudgetTable};
 #[cfg(feature = "cuda")]
-pub use gpu_addressable::gpu_addressable_room;
+pub use gpu_addressable::{gpu_addressable_budget, gpu_addressable_room};
 pub use host_probe::{
     available_low_water, available_physical_ram, host_perf, host_ram_budget, host_ram_budget_from,
     launch_available_ram, pages_in_per_sec, sample_available_low_water, snapshot_launch,

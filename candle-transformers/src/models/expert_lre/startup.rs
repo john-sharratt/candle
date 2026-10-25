@@ -13,7 +13,7 @@ use super::slot_image::build_slot_from_record_on_stream;
 use super::types::ExpertSlot;
 use super::warm_tier::WarmTier;
 use crate::models::load_phase::{LoadPhase, LoadProgress};
-use candle::vram::{available_physical_ram, host_pinned_bytes};
+use candle::vram::{available_physical_ram, gpu_addressable_budget, host_pinned_bytes};
 use candle::Result;
 use cudarc::driver::CudaEvent;
 
@@ -82,9 +82,23 @@ impl<'a> StartupRing<'a> {
     }
 }
 
-/// VRAM free, host RAM available, and host bytes pinned by this process, read
-/// at the moment an upload failed — the three things a
-/// `CUDA_ERROR_OUT_OF_MEMORY` on an upload can be about.
+/// The NON_LOCAL budget and this process's use of it — the GPU-addressable
+/// host memory every page-locked byte is charged against — as log text.
+fn addressable_state(cuda_dev: &candle::CudaDevice) -> String {
+    const GIB: f64 = (1u64 << 30) as f64;
+    match gpu_addressable_budget(cuda_dev) {
+        Some((budget, usage)) => format!(
+            "GPU-addressable budget {:.2} GiB, used {:.2} GiB",
+            budget as f64 / GIB,
+            usage as f64 / GIB
+        ),
+        None => "GPU-addressable budget unreported".to_string(),
+    }
+}
+
+/// VRAM free, host RAM available, host bytes pinned by this process, and the
+/// GPU-addressable budget, read at the moment an upload failed — the four
+/// things a `CUDA_ERROR_OUT_OF_MEMORY` on an upload can be about.
 fn memory_state(cuda_dev: &candle::CudaDevice) -> String {
     const GIB: f64 = (1u64 << 30) as f64;
     let vram = match cuda_dev.mem_get_info() {
@@ -99,8 +113,9 @@ fn memory_state(cuda_dev: &candle::CudaDevice) -> String {
         format!("{:.2} GiB", b as f64 / GIB)
     });
     format!(
-        "{vram}, host RAM available {available}, host pinned {:.2} GiB",
-        host_pinned_bytes() as f64 / GIB
+        "{vram}, host RAM available {available}, host pinned {:.2} GiB, {}",
+        host_pinned_bytes() as f64 / GIB,
+        addressable_state(cuda_dev)
     )
 }
 
@@ -151,6 +166,11 @@ pub(crate) fn startup_from_pack(
     }
     let total_experts = num_moe_layers * num_experts;
     let t0 = std::time::Instant::now();
+    tracing::info!(
+        target: "candle_transformers::expert_lre",
+        memory = %memory_state(cuda_dev),
+        "startup: before the warm tier fill"
+    );
 
     // ── Warm tier: the membership records, a batch at a time ──
     //
@@ -191,6 +211,7 @@ pub(crate) fn startup_from_pack(
         target: "candle_transformers::expert_lre",
         warm_slots = t.membership.len(),
         secs = t0.elapsed().as_secs_f64(),
+        memory = %memory_state(cuda_dev),
         "startup: warm tier filled from the pack"
     );
 
