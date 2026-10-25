@@ -324,16 +324,7 @@ window. While nothing has sealed, `journal_none` shows.
   recurrence running on from the state they leave — so read in order it is
   computed as it is read (`docs/deltanet_state_persistence.md` §11a.3b-i). A new
   entry reseals itself and the closing section; a fold reseals what follows the
-  place it took; a turn pins only the chain's sealed beginning. A chain with a
-  link still sealing is left to finish: replacing it then would remove that link
-  under the ones sealed after it and fail them all, so the reconcile after it
-  settles carries whatever is wanted by then.
-  **npcd seals its journal apart, not as a chain** (`mind::JOURNAL_LINKING`): a
-  character's conversation rolls at every mission handed in and reseals its
-  journal in the new one, and a chain sealed link by link could not finish
-  inside a chapter — it failed half-sealed at every roll, starving the engine.
-  zend keeps the chain. npcd returns to it once a roll carries the sealed
-  journal into the next conversation.
+  place it took; a turn pins only the chain's sealed beginning.
   `Minds::prepare` reconciles them before each turn through the same `Carried`
   reconcile the mission uses (`mind/carried.rs`): what the prompt wants and is not
   yet held is submitted and sealed; a section the prompt no longer wants is

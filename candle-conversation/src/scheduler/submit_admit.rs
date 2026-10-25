@@ -10,6 +10,8 @@
 //! 5.06 GB and the KV it indexes beside it, spent at submit with no admission
 //! decision, and every forward then paid a 38%-hit expert sweep.
 
+use std::time::{Duration, Instant};
+
 use super::*;
 use crate::index_pages::StoredPages;
 
@@ -108,6 +110,61 @@ impl PendingSubmit {
     /// The parent slot the turn is submitted on.
     pub(super) fn parent(&self) -> SequenceId {
         self.work.sequence_id
+    }
+}
+
+/// How long a submitted turn waits before its wait is reported.
+const LONG_WAIT: Duration = Duration::from_secs(120);
+
+impl Scheduler {
+    /// Say which submitted turns have waited longer than [`LONG_WAIT`] to be
+    /// admitted or to begin, and at what price — at most once a minute.
+    ///
+    /// **A turn the admission never takes says nothing.** A table generation
+    /// on WW sat submitted for over an hour, the waves running beside it, and
+    /// not one line said it was there or what held it.
+    pub(super) fn report_waiting_submits(&mut self) {
+        if self
+            .waiting_told
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        let pending = self
+            .pending_submits
+            .iter()
+            .filter(|p| p.work.submitted_at.elapsed() >= LONG_WAIT);
+        let mut told = false;
+        for p in pending {
+            tracing::info!(
+                target: "candle_conversation::scheduler::throttle",
+                seq = %p.parent(),
+                waited_s = p.work.submitted_at.elapsed().as_secs(),
+                tokens = p.work.tokens.len(),
+                depth = p.depth,
+                lift_mib = p.lift >> 20,
+                band = ?self.decode_priority_or_high(p.parent()),
+                "a submitted turn is still waiting for admission"
+            );
+            told = true;
+        }
+        for w in self
+            .prefill_queue
+            .iter()
+            .filter(|w| w.submitted_at.elapsed() >= LONG_WAIT)
+        {
+            tracing::info!(
+                target: "candle_conversation::scheduler::throttle",
+                seq = %w.sequence_id,
+                waited_s = w.submitted_at.elapsed().as_secs(),
+                tokens = w.tokens.len(),
+                "an admitted turn is still waiting to begin"
+            );
+            told = true;
+        }
+        if told {
+            self.waiting_told = Some(Instant::now());
+        }
     }
 }
 

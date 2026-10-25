@@ -1386,6 +1386,7 @@ impl Scheduler {
                     self.wave_rate.as_mut().map(|r| r.take_trades()),
                     self.model.recurrent_census(),
                 );
+                self.report_waiting_submits();
                 // Same cadence: publish the full memory report (global slot for
                 // `GET /v1/memory` + one JSON debug line). See `memory_report`.
                 self.publish_memory_report();
