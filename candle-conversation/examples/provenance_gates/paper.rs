@@ -146,7 +146,12 @@ pub fn run(
                 .flat_map(|r| turn.tokens[r].iter().copied())
                 .collect();
             let window_text = tokenizer.decode(&window_tokens, false).unwrap_or_default();
-            let read = called_paths(&window_text);
+            // Only a read of a file the gallery holds can be found: a listing
+            // of a folder, or a file not yet read, is no expectation.
+            let read: Vec<String> = called_paths(&window_text)
+                .into_iter()
+                .filter(|p| index_of.contains_key(p.as_str()))
+                .collect();
             let per_rule = score(&probe, gallery, files.len(), None);
             let mut tops: Vec<String> = Vec::new();
             for (ri, s) in per_rule.iter().enumerate() {

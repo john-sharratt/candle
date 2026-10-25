@@ -27,6 +27,7 @@ pub mod fusion;
 pub mod gallery_arena;
 pub mod gather;
 pub mod gpu;
+pub mod hubness;
 pub mod packed;
 mod popcount;
 pub mod probe_windows;

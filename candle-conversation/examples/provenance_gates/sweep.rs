@@ -4,16 +4,18 @@
 //! every other setting is weighed, gated and aggregated on the host, so a
 //! sweep costs about two gate-3 runs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use candle_conversation::provenance::boundaries::BoundaryRule;
+use candle_conversation::provenance::hubness::{background, corrected, HubCorrection};
 use candle_conversation::provenance::window_score::{
-    file_scores, gate, group_votes, window_tally, FileAggregate,
+    file_scores, gate, group_votes, window_tally, FileAggregate, Vote,
 };
+use candle_conversation::provenance::WideQSig;
 use candle_conversation::substrate::Substrate;
 
-use crate::corpus::{ByLayer, File, Gallery};
+use crate::corpus::{gather, ByLayer, File, Gallery};
 use crate::ranking::{order, token_files};
 use crate::retrieval::{probes, Probe};
 use crate::stats::mrr;
@@ -33,11 +35,13 @@ const KEEP: [f32; 4] = [0.1, 0.25, 0.5, 1.0];
 /// Which turns of each file the gallery holds.
 const GALLERIES: [&str; 2] = ["all", "no-request"];
 
-/// How a setting's gated votes become file scores: summed per file (today), or
-/// tallied per window under an aggregate.
+/// How a setting's gated votes become file scores: summed per file (today),
+/// summed and corrected for each file's background share, or tallied per
+/// window under an aggregate.
 #[derive(Clone, Copy)]
 enum Fold {
     Sum,
+    Hub(HubCorrection),
     Windows(FileAggregate),
 }
 
@@ -45,16 +49,37 @@ impl Fold {
     fn name(self) -> String {
         match self {
             Fold::Sum => "sum".into(),
+            Fold::Hub(h) => format!("sum, {}", h.name()),
             Fold::Windows(a) => a.name(),
         }
     }
 }
 
-const FOLDS: [Fold; 3] = [
+const FOLDS: [Fold; 6] = [
     Fold::Sum,
+    Fold::Hub(HubCorrection::Less),
+    Fold::Hub(HubCorrection::Over { floor: 0.001 }),
+    Fold::Hub(HubCorrection::Over { floor: 0.01 }),
     Fold::Windows(FileAggregate::CountNormalised { strength: 1.0 }),
     Fold::Windows(FileAggregate::IdentityOrCount { strength: 1.0 }),
 ];
+
+/// Background probes: windows of files' own pages, each scored with its own
+/// file left out, so a file's background is what it wins of probes it is not
+/// the answer to.
+const BACKGROUND_PROBES: usize = 64;
+
+/// `(gallery, weights, keep)` → each file's background share.
+type Backgrounds = HashMap<(usize, usize, usize), Vec<f32>>;
+
+/// Gated votes summed per file.
+fn sum_scores(kept: &[Vote], n_files: usize) -> Vec<f32> {
+    let mut s = vec![0.0f32; n_files];
+    for v in kept {
+        s[v.file] += v.weight;
+    }
+    s
+}
 
 /// `(gallery, weights, keep, fold)` → source → ranks.
 type Ranks<'a> = BTreeMap<(usize, usize, usize, usize), BTreeMap<&'a str, Vec<usize>>>;
@@ -80,11 +105,21 @@ pub fn run(
         .map(|f| (0..f.turns.len()).find(|&i| f.turns[i].covered()))
         .collect();
     let t = Instant::now();
+    let backgrounds = backgrounds(files, gallery, rule, &first_turn);
+    println!("backgrounds in {:.1}s", t.elapsed().as_secs_f64());
     let mut ranks = Ranks::new();
     for probe in probes.iter().filter(|p| p.0 != "self (control)") {
         for gi in 0..GALLERIES.len() {
             let masked = |f: usize, t: usize| gi == 1 && first_turn[f] == Some(t);
-            score_settings(probe, gallery, files.len(), gi, &masked, &mut ranks);
+            score_settings(
+                probe,
+                gallery,
+                files.len(),
+                gi,
+                &masked,
+                &backgrounds,
+                &mut ranks,
+            );
         }
     }
     println!(
@@ -96,6 +131,52 @@ pub fn run(
     report(&ranks);
 }
 
+/// Every file's background share under every gallery, weights and keep.
+fn backgrounds(
+    files: &[File],
+    gallery: &Gallery,
+    rule: &BoundaryRule,
+    first_turn: &[Option<usize>],
+) -> Backgrounds {
+    let stride = (files.len() / BACKGROUND_PROBES).max(1);
+    let sources: Vec<(usize, Vec<WideQSig>)> = files
+        .iter()
+        .enumerate()
+        .step_by(stride)
+        .filter_map(|(fi, f)| {
+            let turn = f.turns.iter().rev().find(|t| t.covered())?;
+            let windows = turn.windows(rule);
+            let w = windows.get(windows.len() / 2)?;
+            Some((fi, gather(&turn.sigs, w)))
+        })
+        .collect();
+    let mut out = Backgrounds::new();
+    for gi in 0..GALLERIES.len() {
+        let votes: Vec<_> = sources
+            .iter()
+            .map(|(fi, sigs)| {
+                let mut token_file = token_files(gallery, None);
+                for (f, t, r) in &gallery.turns {
+                    if *f == *fi || (gi == 1 && first_turn[*f] == Some(*t)) {
+                        token_file[r.clone()].fill(usize::MAX);
+                    }
+                }
+                group_votes(sigs, &gallery.flat, &token_file, files.len())
+            })
+            .collect();
+        for (wi, w) in WEIGHTS.iter().enumerate() {
+            for (ki, &keep) in KEEP.iter().enumerate() {
+                let per_probe: Vec<Vec<f32>> = votes
+                    .iter()
+                    .map(|v| sum_scores(&gate(v, w, keep), files.len()))
+                    .collect();
+                out.insert((gi, wi, ki), background(&per_probe, files.len()));
+            }
+        }
+    }
+    out
+}
+
 /// Every setting's rank of `probe`'s target over the gallery without the turns
 /// `masked` names.
 fn score_settings<'a>(
@@ -104,6 +185,7 @@ fn score_settings<'a>(
     n_files: usize,
     gi: usize,
     masked: &dyn Fn(usize, usize) -> bool,
+    backgrounds: &Backgrounds,
     ranks: &mut Ranks<'a>,
 ) {
     let (source, target, sigs, left_out) = probe;
@@ -123,15 +205,11 @@ fn score_settings<'a>(
         for (ki, &keep) in KEEP.iter().enumerate() {
             let kept = gate(&votes, w, keep);
             let tally = window_tally(&kept, &gallery.windows, gallery.flat.len());
+            let summed = sum_scores(&kept, n_files);
             for (fi, fold) in FOLDS.iter().enumerate() {
                 let scores = match fold {
-                    Fold::Sum => {
-                        let mut s = vec![0.0f32; n_files];
-                        for v in &kept {
-                            s[v.file] += v.weight;
-                        }
-                        s
-                    }
+                    Fold::Sum => summed.clone(),
+                    Fold::Hub(h) => corrected(&summed, &backgrounds[&(gi, wi, ki)], *h),
                     Fold::Windows(a) => file_scores(
                         &tally,
                         &gallery.window_file,
