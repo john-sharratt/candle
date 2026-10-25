@@ -62,7 +62,7 @@
 use std::sync::Arc;
 
 use candle::cuda_backend::cudarc::driver::result::device::get_attribute;
-use candle::cuda_backend::cudarc::driver::result::memset_d8_async;
+use candle::cuda_backend::cudarc::driver::result::{mem_get_info, memset_d8_async};
 use candle::cuda_backend::cudarc::driver::sys::{
     CUdevice, CUdevice_attribute_enum, CUdeviceptr, CUmemAccessDesc, CUmemAccess_flags_enum,
     CUmemAllocationGranularity_flags_enum, CUmemAllocationHandleType_enum, CUmemAllocationProp_st,
@@ -102,6 +102,17 @@ pub(crate) struct Reservation {
     /// "every granule is now paying a full context sync", which is the
     /// optimisation silently undone.
     not_ready_retries: u32,
+}
+
+/// Free memory a range leaves to the driver: its own allocations — module
+/// loads, a context's local memory, a library's workspace — are taken after
+/// the span is mapped and would otherwise find the card full.
+const FREE_MARGIN: usize = 256 << 20;
+
+/// How many `granularity`-byte granules fit in `free` bytes of free device
+/// memory, [`FREE_MARGIN`] left over.
+fn granules_that_fit(free: usize, granularity: usize) -> usize {
+    free.saturating_sub(FREE_MARGIN) / granularity.max(1)
 }
 
 fn check(res: CUresult, what: &str) -> Result<()> {
@@ -434,12 +445,29 @@ impl Reservation {
     /// equal to the rounded-up request when the whole range was claimed, and
     /// less when the driver refused part-way. Callers size themselves from the
     /// return value rather than assuming they got what they asked for.
+    ///
+    /// **Never past what the card has free.** The touch cannot refuse in time:
+    /// it is queued, and a granule the card cannot back is not refused there but
+    /// faults the first kernel to reach it — an illegal address (Xid 13, MMU
+    /// NACK) long after this returned. On a card another process already fills,
+    /// that is every granule past its free memory: a gallery harness beside a
+    /// `motherd` holding 70.7 of 73.4 GiB faulted at a random scan in every run,
+    /// and pushed the daemon itself into a device assert. So the range stops at
+    /// the free memory the driver reports, less [`FREE_MARGIN`] for the
+    /// driver's own allocations, exactly as at a refusal. On a card this
+    /// process has to itself, that is the card.
     pub(crate) fn map_range(&mut self, offset: usize, bytes: usize) -> Result<usize> {
         let first = offset / self.granularity;
         let last = (offset + bytes).div_ceil(self.granularity);
+        self.context
+            .bind_to_thread()
+            .map_err(|e| candle::Error::Msg(format!("bind_to_thread: {e}")))?;
+        let (free, _) =
+            mem_get_info().map_err(|e| candle::Error::Msg(format!("cuMemGetInfo: {e}")))?;
+        let fit = granules_that_fit(free, self.granularity);
         let mut claimed = 0;
         let retries_before = self.not_ready_retries;
-        for idx in first..last.min(self.granules.len()) {
+        for idx in (first..last.min(self.granules.len())).take(fit) {
             if !self.map_granule(idx)? {
                 break;
             }
@@ -489,8 +517,19 @@ impl Drop for Reservation {
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
-    use super::Reservation;
+    use super::{granules_that_fit, Reservation};
     use candle::{Device, Result};
+
+    /// **A range maps only what the card has free, the margin left over.**
+    /// 1 GiB free in 2 MiB granules leaves 768 MiB past the 256 MiB margin:
+    /// 384 granules. Less free than the margin maps nothing.
+    #[test]
+    fn a_range_fits_in_the_free_memory_less_the_margin() {
+        assert_eq!(granules_that_fit(1 << 30, 2 << 20), 384);
+        assert_eq!(granules_that_fit(256 << 20, 2 << 20), 0);
+        assert_eq!(granules_that_fit(100 << 20, 2 << 20), 0);
+        assert_eq!(granules_that_fit((256 << 20) + (5 << 20), 2 << 20), 2);
+    }
 
     /// A CUDA stream **and** the crate-wide GPU serialisation guard.
     ///
