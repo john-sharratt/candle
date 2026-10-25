@@ -18,16 +18,16 @@ const MS_PER_MINUTE: u64 = 60_000;
 /// The write question, with `$more` said after it.
 macro_rules! write_question {
     ($more:literal) => {
-        concat!("Write it up with journal_write. For `claims`, go through \
-the numbered turns in order and write a claim for each one that established something: what \
-the user asked for, each tool result and what it showed — a file's line numbers, a definition, \
-a test's outcome — each decision, each change made, and what you concluded and told the user. \
-One thing per claim, so a stretch of several steps is several claims, up to twelve; a stretch \
-that read a file and answered from it is at least a claim for the request, one for what the \
-file showed, and one for the answer. Each claim's `text` is one short, specific sentence — \
-names, paths and numbers as they were — and `cite` the number of the turn it rests on \
-(`also_cite` for a second). A tool result you read is cited by its number; so is what the user \
-said, and so is a call you made. Something you worked out and did \
+        concat!("Write it up with journal_write. An entry records what was \
+significant in this stretch, not a retelling of it: whoever reads your journal later sees the \
+entry, and goes to the turns themselves when they need the detail. For `claims`, write what \
+matters from here on — what was asked for, what was found (a cause, a result that settled a \
+question, the definition or line that decided something), each decision, each change made, and \
+what was concluded and told — and leave out the steps that only led there: the searches, the \
+reads that showed nothing, the calls made again. One fact per claim, in one short, specific \
+sentence — names, paths and numbers as they were — and `cite` the number of the turn it rests \
+on (`also_cite` for a second). A tool result you read is cited by its number; so is what you \
+were told, and so is a call you made. Something you worked out and did \
 not see in a result still cites the turn that led you to it. Only a claim that is itself one \
 fact about the workspace — that a file exists or not, which blob a file is at, which commit a \
 branch is on — takes `typed`, with `subject` `file:<repo>/<path>` and `attribute` `exists` or \

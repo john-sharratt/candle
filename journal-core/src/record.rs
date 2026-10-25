@@ -64,7 +64,7 @@ fn checks(notes: &[Note]) -> Vec<Check> {
 fn detail(why: &Abandon) -> String {
     match why {
         Abandon::Asking(e) => format!("could not ask the model: {e}"),
-        Abandon::Refused(e) => format!("refused until out of rounds: {e}"),
+        Abandon::Refused(e) => format!("the entry was refused: {e}"),
         Abandon::Keeping(e) => format!("keeping the entry failed: {e}"),
     }
 }
@@ -291,7 +291,7 @@ mod tests {
         );
         assert_eq!(
             said(Abandon::Refused("empty".into())),
-            "refused until out of rounds: empty"
+            "the entry was refused: empty"
         );
         assert_eq!(
             said(Abandon::Keeping("disk".into())),
