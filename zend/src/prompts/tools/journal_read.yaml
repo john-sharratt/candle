@@ -28,11 +28,11 @@ parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
     journal:
-      description: Whose journal — "self" for your own, or an ancestor's name or path as your journals show it. Required.
+      description: Whose journal — "self" for your own, or an ancestor's name or path as your journals show it — or an entry's address, `name#3`. Required.
       minLength: 1
       type: string
     entry:
-      description: 'The entry whose turns to read, as the journal numbers it: 3 for "Entry 3 — …". Leave it out to list the journal''s entries.'
+      description: 'The entry whose turns to read, as the journal numbers it: 3 for "Entry 3 — …". Leave it out, with no address, to list the journal''s entries.'
       format: uint64
       minimum: 0
       type:

@@ -514,15 +514,22 @@ would leave the prompt and the address disagreeing; there is no rename.
   appears once, so a worker cites `check-plan#3`, short in sealed text, and it
   resolves against its own ancestors only. Claude always uses full paths, and
   every tool prints them.
-- **Folds keep addresses alive.** When the calendar folds `#3`–`#9` into `#10`,
-  `#5` resolves to `#10` and says it was folded. A fold ceases the folded
-  entries' text today (`zend/src/session.rs:5229-5234`); **new:** in a
-  conversation owned through `/mcp` the fold files the folded entries' turns
-  under the fold, so a citation's evidence survives it too.
+- **Folds keep addresses alive.** A fold ceases the folded entries' text in a
+  dialogue; in a conversation owned through `/mcp` it files the folded
+  entries' turns under the fold instead, and notes where each went
+  (`JournalText::refile`, `zend/src/journal/text.rs`). When the calendar folds
+  `#3`–`#9` into `#10`, reading `#5` reads `#10`'s turns and says `#5` was
+  folded into it — through a later fold too — so a citation's evidence
+  survives.
 - **Entries cite across journals.** A worker's claim may cite an ancestor's
-  entry — *Decided (per `T:review-layers#12`): …* — and the server checks the
-  cited entry exists and is an ancestor's. That is a provenance chain from a
-  worker's action back to Claude's decision, and from it to what the user said.
+  entry — *Decided (per `T:review-layers#12`): …* — as a typed claim with
+  subject `entry:T:review-layers#12`, attribute `exists`, which the draft of a
+  conversation owned through `/mcp` is asked for (`LINEAGE_WRITE_QUESTION`,
+  `zend/src/journal/style.rs`). The check reads it against the journals above
+  the writer (`zend/src/journal/world.rs`): an entry that is not there, or not
+  an ancestor's, reads `false` and the claim is corrected to say so. That is a
+  provenance chain from a worker's action back to Claude's decision, and from
+  it to what the user said.
 
 ### 5.3 The journal tools
 

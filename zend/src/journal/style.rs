@@ -15,10 +15,10 @@ use crate::mcp::threads::conv_names;
 const MS_PER_DAY: u64 = 86_400_000;
 const MS_PER_MINUTE: u64 = 60_000;
 
-/// What the model is asked once the stretch is on the table.
-///
-/// The call is shown nowhere else, so the question says what each part of it is.
-pub const WRITE_QUESTION: &str = "Write it up with journal_write. For `claims`, go through \
+/// The write question, with `$more` said after it.
+macro_rules! write_question {
+    ($more:literal) => {
+        concat!("Write it up with journal_write. For `claims`, go through \
 the numbered turns in order and write a claim for each one that established something: what \
 the user asked for, each tool result and what it showed — a file's line numbers, a definition, \
 a test's outcome — each decision, each change made, and what you concluded and told the user. \
@@ -39,7 +39,24 @@ next, as short lines, at most three. `open` is what is still unsettled — a fai
 the user has not answered, a step not done: its `text`, and `relates` — `new` for something \
 you were not carrying, `restates N` to say an open item again, `resolves N` when it has been \
 settled. Put nothing in that did not happen: a conclusion you only worked out is written as \
-one, and a result that may have changed since is written as it was when you read it.";
+one, and a result that may have changed since is written as it was when you read it.", $more)
+    };
+}
+
+/// What the model is asked once the stretch is on the table.
+///
+/// The call is shown nowhere else, so the question says what each part of it is.
+pub const WRITE_QUESTION: &str = write_question!("");
+
+/// [`WRITE_QUESTION`] for a conversation with journals above it: a claim that
+/// rests on one of their entries names it, and the check confirms the entry is
+/// there and is an ancestor's (`docs/claude_zend_gateway.md` §5.2).
+pub const LINEAGE_WRITE_QUESTION: &str = write_question!(
+    " A claim that rests on an entry of a journal above you — a decision in your thread's \
+notes, a standing rule of the project, a finding of the worker that started you — says so in \
+its text, `per T:<thread>#<n>`, and takes `typed` with `subject` `entry:<journal>#<n>` (the \
+journal's path or name as your journals show it), `attribute` `exists` and `value` `true`."
+);
 
 /// Offered after [`WRITE_QUESTION`] once the journal holds an entry.
 ///
@@ -183,6 +200,7 @@ from its turns or from what was retrieved for it, not from your journal.",
 /// task, an answer, a nudge — so what it heard is what Claude said.
 pub const DELEGATED: Style = Style {
     heard: "Claude said:",
+    write_question: LINEAGE_WRITE_QUESTION,
     ..CODING
 };
 
@@ -190,6 +208,7 @@ pub const DELEGATED: Style = Style {
 /// itself with `sub_run`: its user turns are that worker's.
 pub const PART: Style = Style {
     heard: "Its worker said:",
+    write_question: LINEAGE_WRITE_QUESTION,
     ..CODING
 };
 

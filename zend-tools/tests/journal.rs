@@ -258,6 +258,37 @@ fn a_read_with_no_entry_lists_the_entries() {
     assert!(book.reads.lock().unwrap().is_empty());
 }
 
+/// **An address names the entry**: `T:t#3` reads entry 3 of `T:t`, and a
+/// claim's address `self#3.2` reads the entry the claim is in.
+#[test]
+fn an_address_reads_the_entry_it_names() {
+    let own = Arc::new(Fake::default());
+    let ancestor = Arc::new(Fake::default());
+    let (ctx, shelf) = shelved(&own, &ancestor);
+    expect_success(invoke_with_ctx(
+        "journal_read",
+        json!({"journal": "T:t#3"}),
+        &ctx,
+    ));
+    expect_success(invoke_with_ctx(
+        "journal_read",
+        json!({"journal": "self#3.2"}),
+        &ctx,
+    ));
+    assert_eq!(*shelf.opened.lock().unwrap(), ["T:t", "self"]);
+    assert_eq!(*ancestor.reads.lock().unwrap(), [(3, 1, 200)]);
+    assert_eq!(*own.reads.lock().unwrap(), [(3, 1, 200)]);
+
+    expect_error(
+        &invoke_with_ctx(
+            "journal_read",
+            json!({"journal": "T:t#3", "entry": 4}),
+            &ctx,
+        ),
+        "two_entries",
+    );
+}
+
 #[test]
 fn a_conversation_with_no_journal_says_so() {
     expect_error(
