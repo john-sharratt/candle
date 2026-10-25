@@ -23,6 +23,11 @@
 //!   data: ../npcd-data
 //! ```
 //!
+//! `apps: [npcd]` (or `[zend]`) runs one daemon alone — it alone serves, and
+//! joins the cluster — for taking one app out of a member while the other
+//! goes on elsewhere. The process's log, offline marker and upgrade record
+//! stay beside zend's substrate either way.
+//!
 //! Paths resolve against the working directory — the repository root, which
 //! every daemon runs from — so from `D:\prog\candle` that is zend's workspace
 //! `D:\prog` and npcd's data folder `D:\prog\npcd-data`. `--config` defaults to
@@ -57,10 +62,21 @@ struct Cli {
     after_pid: Option<u32>,
 }
 
+/// A daemon this process can run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum App {
+    Zend,
+    Npcd,
+}
+
 /// `motherd.yaml`.
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
+    /// The daemons to run — `[npcd]` serves and joins the cluster as npcd
+    /// alone, its section the only one read. Both when absent.
+    apps: Option<Vec<App>>,
     host: HostArgs,
     zend: ZendArgs,
     npcd: NpcdArgs,
@@ -70,7 +86,19 @@ impl Config {
     fn load(path: &Path) -> anyhow::Result<Self> {
         let text = fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        serde_yaml::from_str(&text).map_err(|e| anyhow::anyhow!("in {}: {e}", path.display()))
+        let config: Self = serde_yaml::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("in {}: {e}", path.display()))?;
+        if config.apps.as_ref().is_some_and(Vec::is_empty) {
+            anyhow::bail!(
+                "in {}: `apps` names no daemon — leave it out to run both",
+                path.display()
+            );
+        }
+        Ok(config)
+    }
+
+    fn runs(&self, app: App) -> bool {
+        self.apps.as_ref().map_or(true, |apps| apps.contains(&app))
     }
 }
 
@@ -80,11 +108,19 @@ fn main() -> anyhow::Result<()> {
     let mut config = Config::load(&cli.config)?;
     config.host.upgrade_failed = cli.upgrade_failed;
     config.host.after_pid = cli.after_pid;
+    // The process's state stays beside zend's substrate whichever daemons
+    // run, so its log, offline marker and upgrade record do not move when
+    // `apps` changes.
+    let state_dir = config.zend.substrate_dir();
     // zend first: it builds the shared engine, and stops last.
-    let tenants: Vec<Box<dyn Tenant>> = vec![
-        Box::new(config.zend.resolve()?),
-        Box::new(config.npcd.resolve()?),
-    ];
+    let (zend, npcd) = (config.runs(App::Zend), config.runs(App::Npcd));
+    let mut tenants: Vec<Box<dyn Tenant>> = Vec::new();
+    if zend {
+        tenants.push(Box::new(config.zend.resolve()?));
+    }
+    if npcd {
+        tenants.push(Box::new(config.npcd.resolve()?));
+    }
     // Nothing to drop on a relaunch: the one-shot flags cannot be set in
     // `motherd.yaml` (`ZendArgs::ONE_SHOT`, `NpcdArgs::ONE_SHOT`).
     run(
@@ -93,6 +129,7 @@ fn main() -> anyhow::Result<()> {
             version: env!("CARGO_PKG_VERSION"),
             args: config.host,
             one_shot: &[],
+            state_dir: Some(state_dir),
         },
         tenants,
     )
@@ -136,7 +173,10 @@ mod tests {
         let c = Config::load(&example).unwrap();
         assert_eq!(c.host.port, 8081);
         assert_eq!(c.host.tls_port, Some(8444));
-        assert_eq!(c.host.clusters, ["https://gateway.tokera.com:9443"]);
+        assert_eq!(
+            c.host.clusters,
+            ["https://gateway.tokera.local:9443 https://gateway.tokera.com:9443"]
+        );
         assert_eq!(c.host.cluster_name.as_deref(), Some("tokera.com"));
         assert!(c.host.group_key.is_some() && c.host.agent.is_some());
         assert_eq!(c.npcd.mind_repo.as_deref(), Some("battle-mind"));
@@ -180,5 +220,38 @@ mod tests {
         assert!(Config::load(&path).is_err());
         fs::write(&path, "{}").unwrap();
         assert_eq!(Config::load(&path).unwrap(), Config::default());
+    }
+
+    /// `apps` picks the daemons: both when absent, one when named, and an
+    /// empty or unknown list is refused rather than running nothing.
+    #[test]
+    fn apps_names_the_daemons_to_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("motherd.yaml");
+        fs::write(&path, "{}").unwrap();
+        let both = Config::load(&path).unwrap();
+        assert!(both.runs(App::Zend) && both.runs(App::Npcd));
+        fs::write(&path, "apps: [npcd]\n").unwrap();
+        let npcd = Config::load(&path).unwrap();
+        assert!(npcd.runs(App::Npcd) && !npcd.runs(App::Zend));
+        fs::write(&path, "apps: []\n").unwrap();
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("`apps`"), "{err}");
+        fs::write(&path, "apps: [zen]\n").unwrap();
+        assert!(Config::load(&path).is_err());
+    }
+
+    /// The state directory is zend's substrate whether or not zend runs.
+    #[test]
+    fn the_state_stays_beside_zends_substrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let zend = ZendArgs {
+            working_dir: Some(dir.path().to_path_buf()),
+            ..ZendArgs::default()
+        };
+        assert_eq!(
+            zend.substrate_dir(),
+            dir.path().canonicalize().unwrap().join("substrate")
+        );
     }
 }

@@ -37,6 +37,7 @@ fn main() -> anyhow::Result<()> {
             version: env!("CARGO_PKG_VERSION"),
             args: cli.host,
             one_shot: NpcdArgs::ONE_SHOT,
+            state_dir: None,
         },
         vec![tenant],
     )

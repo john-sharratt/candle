@@ -58,8 +58,8 @@ const GPU_SPAN_PERIOD: u32 = 8;
 /// How the process runs, whatever its tenants.
 #[derive(Debug, Clone)]
 pub struct HostConfig {
-    /// The binary's name — its log file is `<binary>.log`, beside the
-    /// highest-ranked tenant's substrate.
+    /// The binary's name — its log file is `<binary>.log`, in the process's
+    /// state directory ([`HostConfig::state_dir`]).
     pub binary: &'static str,
     /// The binary's version, part of the UI build id.
     pub version: &'static str,
@@ -68,6 +68,10 @@ pub struct HostConfig {
     /// The tenants' flags that act once and that a self-heal relaunch drops
     /// ([`LaunchSpec::capture`]).
     pub one_shot: &'static [OneShot],
+    /// Where the process keeps its own state — its log, the offline marker,
+    /// its upgrade record — when that must not move with the tenants chosen;
+    /// by default beside the highest-ranked tenant's substrate.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Refuse two tenants naming the same substrate directory, before either
@@ -134,9 +138,15 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
         fail_early("no tenants to run");
     };
     // The log, the self-heal restart marker and its attempt count live beside
-    // the highest-ranked tenant's substrate — the process's state, in the one
-    // directory every run of this binary shares.
-    let state_dir = first.substrate_dir();
+    // the highest-ranked tenant's substrate, unless the binary names their
+    // place — the process's state, in the one directory every run shares.
+    let state_dir = cfg
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| first.substrate_dir());
+    if let Err(e) = std::fs::create_dir_all(&state_dir) {
+        fail_early(&format!("could not make {}: {e}", state_dir.display()));
+    }
     let names: Vec<&'static str> = tenants.iter().map(|t| t.name()).collect();
     let bus = LogBus::new(&names);
     let log_name = format!("{}.log", cfg.binary);

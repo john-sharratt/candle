@@ -250,6 +250,13 @@ impl ZendArgs {
             .unwrap_or_else(|| self.workspace.clone())
     }
 
+    /// Where the substrate of these settings is, or will be: the workspace's
+    /// `substrate`, without opening it.
+    pub fn substrate_dir(&self) -> PathBuf {
+        let root = self.root();
+        root.canonicalize().unwrap_or(root).join(SUBSTRATE_DIR)
+    }
+
     /// The stratified selection the `--qsa-*` flags describe.
     pub fn qsa_strata(&self) -> StrataTokens {
         StrataTokens {
