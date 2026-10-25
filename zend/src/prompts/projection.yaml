@@ -815,6 +815,14 @@ layers:
       its own decoded summary once the whole file has been read.
     # Loading-screen unit for this layer's startup ingest.
     ingest_unit: files
+    # Each file's reading writes the questions it answers; prefilled alone,
+    # they stand in the gallery for the file, where its own windows are its
+    # content (`zend::calibrate`). A live probe is a question, and the tool
+    # catalog gained 10.6 points Top-1 when its exemplars became questions.
+    calibrate:
+      questions: 16
+      prompt: |
+        Write <<n>> different questions someone working in this workspace might ask whose answer needs what you just read in `<<path>>`. Vary what they ask: what it is for, how it works, where something is done, why it is built the way it is, how to change or extend it, what it relates to. Ask them as a person would, not as a summary. At most half may name the file. Write one question per line and nothing else.
     # In tool rounds, like repo_map: a dialogue sees this layer as its working
     # set's files — whole, pinned or by momentum — and the rounds that lean on
     # them must still have them.

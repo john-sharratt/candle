@@ -75,6 +75,9 @@ pub struct IngestLayer {
     /// How a [`IngestMode::Derived`] layer's units are read; `None` for every
     /// other mode.
     pub spec: Option<std::sync::Arc<crate::layers::LayerSpec>>,
+    /// How the layer's units are calibrated (`crate::calibrate`); `None` for a
+    /// layer that declares no `calibrate:` block.
+    pub calibrate: Option<std::sync::Arc<crate::calibrate::CalibrateSpec>>,
 }
 
 /// A raw-ChatML layer's live state, held between refreshes and keyed by layer
@@ -152,6 +155,13 @@ pub fn ingest_layers(
                 continue;
             }
         };
+        let calibrate = match crate::calibrate::CalibrateSpec::of(layer) {
+            Ok(spec) => spec.map(std::sync::Arc::new),
+            Err(e) => {
+                tracing::error!("{e:#} — the layer is not calibrated");
+                None
+            }
+        };
         let (mode, default_folder, base_display) = match layer.name.as_str() {
             "repo_map" => (IngestMode::Folders, "", "Scanning repositories"),
             "code_reading" => (IngestMode::Files, "", "Reading code"),
@@ -200,6 +210,7 @@ pub fn ingest_layers(
             display,
             unit,
             spec,
+            calibrate,
         });
     }
     out

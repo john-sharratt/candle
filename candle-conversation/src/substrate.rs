@@ -3531,10 +3531,15 @@ impl Substrate {
     /// projection skips an empty turn, so a reading whose turns were emptied on
     /// this member — the paper on `.5`, 2026-10-25, three turns of nothing —
     /// was locked, told the model it was in context, and placed nothing.
+    ///
+    /// A calibration ([`Self::CALIBRATES_KEY`]) never is: its questions stand
+    /// in the gallery for the conversation they calibrate, which is the one
+    /// delivered.
     fn deliverable(&self, target: TimelineId, timeline: TimelineId) -> bool {
         timeline != target
             && !self.tombstoned_timelines.contains(&timeline)
             && self.timelines.get(&timeline).is_some_and(|e| !e.archived)
+            && self.calibrates(timeline).is_none()
             && self.holds_whole(timeline)
             && Substrate::turn_count(self, timeline) > 0
     }
@@ -7021,6 +7026,50 @@ impl Substrate {
         self.timelines.get(&timeline).map(|e| &e.custom)
     }
 
+    /// Metadata key a **calibration** conversation carries: the raw timeline
+    /// id of the conversation it calibrates. Its turns are questions that
+    /// conversation's content answers, each prefilled alone, and their
+    /// signatures vote for that conversation wherever it is scored
+    /// (`belief_files::assemble_file_scans`) — the gallery entries a live
+    /// question resembles, where the conversation's own are its content.
+    pub const CALIBRATES_KEY: &'static str = "calibrates";
+
+    /// The conversation `timeline` calibrates, when it is a calibration.
+    pub fn calibrates(&self, timeline: TimelineId) -> Option<TimelineId> {
+        self.timelines
+            .get(&timeline)?
+            .custom
+            .get(Self::CALIBRATES_KEY)?
+            .parse()
+            .ok()
+            .and_then(TimelineId::from_raw)
+    }
+
+    /// Every live calibration conversation, keyed by the conversation it
+    /// calibrates, each list in timeline order. Archived and distilled ones
+    /// count: a calibration ends archived and provenance-only by design.
+    pub fn calibrations(&self) -> HashMap<TimelineId, Vec<TimelineId>> {
+        let mut out: HashMap<TimelineId, Vec<TimelineId>> = HashMap::new();
+        for (&tl, entry) in &self.timelines {
+            if self.tombstoned_timelines.contains(&tl) {
+                continue;
+            }
+            let Some(of) = entry
+                .custom
+                .get(Self::CALIBRATES_KEY)
+                .and_then(|v| v.parse().ok())
+                .and_then(TimelineId::from_raw)
+            else {
+                continue;
+            };
+            out.entry(of).or_default().push(tl);
+        }
+        for list in out.values_mut() {
+            list.sort();
+        }
+        out
+    }
+
     /// All **live** (non-tombstoned) timelines whose `custom` metadata
     /// contains `key == value` (exact match). The content-addressed cache
     /// lookup used by utility ingests to skip re-building units already
@@ -8432,6 +8481,45 @@ mod tests {
             sub.working_set_lock(target, retired, ws_limits(1000)),
             Err(Refusal::Gone)
         );
+    }
+
+    /// **A calibration names what it calibrates, and is never a member.**
+    /// The lookup keys each live calibration by its conversation — archived
+    /// ones included, tombstoned ones not — and a calibration is refused as a
+    /// lock however whole it is.
+    #[test]
+    fn a_calibration_is_found_by_its_conversation_and_never_delivered() {
+        let (mut sub, target, reads) = working_set_fixture(1, 10);
+        let file = reads[0];
+        let calibrate = |sub: &mut Substrate, raw: u64| {
+            let tl = unshared_timeline(raw);
+            sub.register_timeline(tl, LayerId::for_test(1), GroupId::for_test(1));
+            sub.append_with_blocks(tl, 4, 0, 1);
+            let kv = BTreeMap::from([(
+                Substrate::CALIBRATES_KEY.to_string(),
+                file.raw().to_string(),
+            )]);
+            sub.merge_custom(tl, &kv, RecordIdentity::NONE);
+            tl
+        };
+        let (a, b, gone) = (
+            calibrate(&mut sub, 11),
+            calibrate(&mut sub, 12),
+            calibrate(&mut sub, 13),
+        );
+        sub.set_archived(b, true);
+        sub.tombstone_timeline(gone);
+
+        assert_eq!(sub.calibrates(a), Some(file));
+        assert_eq!(sub.calibrates(file), None);
+        let mut expect = vec![a, b];
+        expect.sort();
+        assert_eq!(sub.calibrations(), HashMap::from([(file, expect)]));
+        assert_eq!(
+            sub.working_set_lock(target, a, ws_limits(1000)),
+            Err(Refusal::Gone)
+        );
+        assert_eq!(sub.working_set_lock(target, file, ws_limits(1000)), Ok(()));
     }
 
     /// A tombstoned conversation leaves every dialogue's working set — a pinned

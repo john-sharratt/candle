@@ -17,6 +17,7 @@ pub mod access;
 pub mod agent_exec;
 pub mod api;
 pub mod branch_ingest;
+pub mod calibrate;
 pub mod chatml;
 pub mod cli;
 pub mod code_read;

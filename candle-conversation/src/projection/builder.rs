@@ -1419,6 +1419,7 @@ impl Builder {
                 ingest_unit: None,
                 in_tool_rounds: true,
                 ingest: None,
+                calibrate: None,
             }],
         };
         validate(&schema).expect("synthetic schema must always be valid");

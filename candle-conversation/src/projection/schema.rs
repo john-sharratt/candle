@@ -917,6 +917,11 @@ pub struct LayerSchema {
     /// builds on are the host's to interpret, never the projection's. `None`
     /// for a layer the host fills some other way, or not at all.
     pub ingest: Option<serde_yaml::Value>,
+    /// How the host calibrates the layer's conversations for provenance
+    /// (`calibrate:` in YAML), carried through unread like [`Self::ingest`]:
+    /// what each conversation is asked about itself and how many exemplars it
+    /// lends are the host's. `None` for a layer that is not calibrated.
+    pub calibrate: Option<serde_yaml::Value>,
 }
 
 /// How strongly a layer's decode is favoured over a co-running background

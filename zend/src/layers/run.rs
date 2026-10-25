@@ -588,7 +588,11 @@ fn ask(
 /// The unit's answer: what it said, its thinking set aside. A turn that spent
 /// its budget, or stopped inside its thinking, has not answered — what it
 /// wrote is reasoning, or an answer cut short, and it is read again.
-fn answer_of(written: &TurnText, round: usize, finish: &FinishReason) -> anyhow::Result<String> {
+pub(crate) fn answer_of(
+    written: &TurnText,
+    round: usize,
+    finish: &FinishReason,
+) -> anyhow::Result<String> {
     let chars: usize = written.pieces().iter().map(|p| p.text.len()).sum();
     let (unclosed, answer) = split_thinking(written);
     if *finish == FinishReason::Length || unclosed {

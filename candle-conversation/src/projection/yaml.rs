@@ -604,6 +604,10 @@ struct YamlLayer {
     /// [`LayerSchema::ingest`]. Passed through unread.
     #[serde(default)]
     ingest: Option<serde_yaml::Value>,
+    /// The host's calibration of the layer's conversations — see
+    /// [`LayerSchema::calibrate`]. Passed through unread.
+    #[serde(default)]
+    calibrate: Option<serde_yaml::Value>,
     /// Whether the layer's turns project into tool rounds — see
     /// [`LayerSchema::in_tool_rounds`]. Omitted → `true`.
     #[serde(default)]
@@ -1226,6 +1230,7 @@ fn build(
             // schema had before a layer could declare its place in it.
             rank: yl.rank.unwrap_or(layers.len() as i32),
             ingest: yl.ingest.clone(),
+            calibrate: yl.calibrate.clone(),
         });
     }
 
