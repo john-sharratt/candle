@@ -140,6 +140,11 @@ impl ScopeState {
         self.children.get(k).map(|h| h.level())
     }
 
+    #[cfg(test)]
+    pub(super) fn peak_of(&self, k: &ChildKey) -> Option<f32> {
+        self.children.get(k).map(|h| h.peak())
+    }
+
     /// How many distinct observations have shaped this child's level here — the
     /// measure of whether this scope knows enough about it to be its
     /// denominator. `None` when the scope has never seen it at all.

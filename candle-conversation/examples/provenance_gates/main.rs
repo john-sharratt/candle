@@ -104,7 +104,8 @@ fn main() -> anyhow::Result<()> {
         }
         "sweep" => {
             let per_source = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(40);
-            let only = args.get(3).map(String::as_str);
+            let background_probes = args.get(3).map(|a| a.parse()).transpose()?.unwrap_or(64);
+            let only = args.get(4).map(String::as_str);
             sweep::run(
                 &sub,
                 &files,
@@ -112,6 +113,7 @@ fn main() -> anyhow::Result<()> {
                 &mut by_layer,
                 &rule,
                 per_source,
+                background_probes,
                 only,
             );
         }

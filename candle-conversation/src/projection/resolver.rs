@@ -3,6 +3,7 @@
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -15,7 +16,7 @@ pub use maintenance_op::MaintenanceOp;
 use maintenance_op::Pass;
 
 use super::adaptive::ScanCases;
-use super::belief_files::{assemble_file_scans, scan_file_scans};
+use super::belief_files::{assemble_file_scans, scan_file_scans, FileScan};
 use super::belief_scan_split::GROUP_SCAN_SPLIT;
 use super::held_index_pages::HeldIndexPages;
 use super::ids::{
@@ -106,6 +107,18 @@ const WARM_COLLECTION_PROBES_PER_MEMBER: usize = 8;
 /// probe upload is `probe tokens × words per token` and grows with the corpus, so
 /// the batch bounds it; each launch reuses the segment's cached index.
 const WARM_GPU_PROBE_BATCH: usize = 128;
+
+/// Background probes one warm of a file-scored group takes at most, spread
+/// evenly over the files it was asked for
+/// ([`Conversation::warm_pool_background`]). The offline measure used 64; an
+/// ingest slice asks for fewer, and every slice of a pass lends its own.
+const WARM_BACKGROUND_PROBES: usize = 64;
+
+/// Background probes per scan. Each batch's own files leave the gallery for
+/// its scan, so a probe's own file does not take the votes the other files'
+/// backgrounds are made of; the batch bounds how many files one scan leaves
+/// out. The ingest warmer's slice is the same size, so a slice is one scan.
+const WARM_BACKGROUND_BATCH: usize = 16;
 
 /// One sealed dialogue turn the normalization warm-up replays — see
 /// [`Conversation::take_warm_replay`].
@@ -2127,12 +2140,22 @@ impl Conversation {
 
     /// Warm each of `timelines` of `group`, on `arena` when given. Returns how
     /// many were asked for.
+    ///
+    /// A group scored by file is warmed from background traffic instead
+    /// ([`Self::warm_pool_background`]): its files share the pool scope, and a
+    /// file's self-match teaches that scope nothing but its own ceiling.
     fn warm_timelines(
         &self,
         group: &GroupSchema,
         timelines: &[TimelineId],
         arena: Option<&GalleryArena>,
     ) -> usize {
+        if group.policy.scan.cases == ScanCases::File {
+            if !self.ingest_cancelled() {
+                self.warm_pool_background(group, timelines, arena);
+            }
+            return timelines.len();
+        }
         for &tl in timelines {
             // A shutdown ends the warm-up here too, not one timeline at a time.
             if self.ingest_cancelled() {
@@ -2141,6 +2164,90 @@ impl Conversation {
             self.warm_timeline(group, tl, arena);
         }
         timelines.len()
+    }
+
+    /// Teach a file-scored group's pool scope each file's **background**: what
+    /// it scores on probes it is not the answer to.
+    ///
+    /// Some files win part of every probe's votes whatever the probe asks — a
+    /// hub of generic phrasing — and ranked by raw votes the same hubs top
+    /// every question. The pool scope normalizes a file against the peak of
+    /// the traffic it has observed (`normalization::ScopeState`'s traffic-peak
+    /// path, with the group's size floor), so once that traffic is background
+    /// a hub scoring its usual peak reads low and a quiet file's rare genuine
+    /// hit stands out. Measured offline over the analysis units' answers
+    /// finding their own file: MRR 0.436 → 0.47 at the shipped needle gate
+    /// (`docs/results/provenance_gates_2026-10-25.md`).
+    ///
+    /// Up to [`WARM_BACKGROUND_PROBES`] of `sources`, spread evenly, each lend
+    /// one probe — the middle window of its own pages, at the live probe's
+    /// length. They are scanned [`WARM_BACKGROUND_BATCH`] at a time, each batch
+    /// against the group without the batch's own files: a probe's own file is
+    /// the answer to it and would take the votes the other files' backgrounds
+    /// are made of. Every scored file's raw score is folded into the pool scope
+    /// under a source naming the probe and the gallery's size, so a later pass
+    /// over a larger gallery folds again.
+    fn warm_pool_background(
+        &self,
+        group: &GroupSchema,
+        sources: &[TimelineId],
+        arena: Option<&GalleryArena>,
+    ) {
+        let stride = sources.len().div_ceil(WARM_BACKGROUND_PROBES).max(1);
+        let sources: Vec<TimelineId> = sources.iter().step_by(stride).copied().collect();
+        let mut files = {
+            let _g = profile::span("warm:background_assemble");
+            let sub = self.inner.read().unwrap();
+            let timelines: Vec<TimelineId> = sub.active_timelines_for_group(group.id).collect();
+            assemble_file_scans(&sub, timelines).0
+        };
+        let n_files = files.len();
+        let scope = ScopeKey::pool(group.id.raw() as u64);
+        // At most half the group leaves the gallery, so a small group still
+        // has files to score.
+        let batch_len = WARM_BACKGROUND_BATCH.min(n_files / 2).max(1);
+        for batch in sources.chunks(batch_len) {
+            if self.ingest_cancelled() {
+                return;
+            }
+            let (held, gallery): (Vec<FileScan>, Vec<FileScan>) =
+                files.into_iter().partition(|f| batch.contains(&f.timeline));
+            let probes: Vec<(TimelineId, Vec<WideQSig>)> = held
+                .iter()
+                .filter_map(|f| {
+                    let &(k, s, e, _) = f.windows.get(f.windows.len() / 2)?;
+                    let sigs = f.arcs_kept[k].decode();
+                    let e = e.min(sigs.len());
+                    let s = s.max(e.saturating_sub(LEVEL_PRIOR_T_REF));
+                    (e > s).then(|| (f.timeline, sigs[s..e].to_vec()))
+                })
+                .collect();
+            if gallery.len() >= 2 && !probes.is_empty() {
+                let probe_refs: Vec<&[WideQSig]> =
+                    probes.iter().map(|(_, p)| p.as_slice()).collect();
+                let scanned = {
+                    let _g = profile::span("warm:background_scan");
+                    scan_file_scans(&gallery, group, &probe_refs, arena)
+                };
+                let mut cache = self.normalization.lock().unwrap();
+                for ((src, probe), per_file) in probes.iter().zip(&scanned) {
+                    let pairs: Vec<(ChildKey, f32)> = gallery
+                        .iter()
+                        .zip(per_file)
+                        .map(|(f, (fused, _))| {
+                            (
+                                ChildKey::timeline(f.timeline.raw()),
+                                fused.first().copied().unwrap_or(0.0),
+                            )
+                        })
+                        .collect();
+                    let mut h = DefaultHasher::new();
+                    (src.raw(), n_files).hash(&mut h);
+                    cache.observe(&scope, h.finish(), &pairs, probe.len());
+                }
+            }
+            files = gallery.into_iter().chain(held).collect();
+        }
     }
 
     /// Self-match one timeline of `group`: a handful of its own turns probe it,
@@ -6314,6 +6421,106 @@ layers:
             ingest_group(b.schema(), ground, facts).map(|g| g.id),
             Some(facts)
         );
+    }
+
+    /// **A file-scored group learns each file's background peak.** Three
+    /// files hold one signature token each, pairwise half-agreeing — no one
+    /// of them wins another's probe — and a hub holds a near copy of all
+    /// three. Warmed, every file has a peak in the group's pool scope, and the
+    /// hub's is the highest: it wins every probe it is in the gallery for,
+    /// where each other file wins only the hub's. A second warm over the same
+    /// gallery folds nothing.
+    #[test]
+    fn a_file_scored_group_learns_each_files_background_peak() {
+        use crate::normalization::{ChildKey, ScopeKey};
+        use crate::provenance::{encode_wide_sigs, WideQSig};
+
+        const YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
+layers:
+  - name: files
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: scopes
+        selection: { kind: top_k, k: 2 }
+        policy:
+          cases: file
+          level_prior: { floor_base: 100.0, floor_cap: 1.0 }
+"#;
+        let sig = |fill: u64| WideQSig {
+            n_heads: 12,
+            words: vec![fill; 24],
+        };
+        let (a, b, c) = (
+            0x0F0F_0F0F_0F0F_0F0Fu64,
+            0x3333_3333_3333_3333u64,
+            0x5555_5555_5555_5555u64,
+        );
+        let builder = Builder::from_yaml(YAML).unwrap();
+        let layer = builder.id_for_layer("files").unwrap();
+        let group = builder.id_for_group("scopes").unwrap();
+        let conv = Conversation::ephemeral();
+        let files: Vec<(TimelineId, Vec<WideQSig>)> = vec![
+            (41, vec![sig(a)]),
+            (42, vec![sig(b)]),
+            (43, vec![sig(c)]),
+            (44, vec![sig(a ^ 1), sig(b ^ 1), sig(c ^ 1)]),
+        ]
+        .into_iter()
+        .map(|(raw, sigs)| (TimelineId::from_raw(raw).expect("timeline id"), sigs))
+        .collect();
+        for (tl, sigs) in &files {
+            conv.register_timeline(*tl, layer, group);
+            let idx = conv
+                .record_turn(
+                    *tl,
+                    Role::User,
+                    TurnPartWrite {
+                        token_count: sigs.len(),
+                        ..Default::default()
+                    },
+                    |seqs| Ok(seqs.to_vec()),
+                )
+                .expect("record_turn");
+            conv.persist_wide_q_sigs(turn_stream_id(tl.raw(), idx.0), &encode_wide_sigs(sigs))
+                .expect("persist sigs");
+        }
+
+        assert_eq!(conv.warm_group_normalization(builder.schema(), group), 4);
+        let scope = ScopeKey::pool(group.raw() as u64);
+        let peaks = || -> Vec<f32> {
+            let cache = conv.normalization.lock().unwrap();
+            files
+                .iter()
+                .map(|(tl, _)| {
+                    cache
+                        .peak_of(&scope, &ChildKey::timeline(tl.raw()))
+                        .expect("every file is observed")
+                })
+                .collect()
+        };
+        let first = peaks();
+        let hub = first[3];
+        assert!(hub > 0.0, "{first:?}");
+        assert!(first[..3].iter().all(|&p| p < hub), "{first:?}");
+
+        conv.warm_group_normalization(builder.schema(), group);
+        assert_eq!(peaks(), first, "the same gallery folds nothing new");
     }
 
     /// `(tags, timeline, index)` rows in the shape `collection_warm_plan` reads.

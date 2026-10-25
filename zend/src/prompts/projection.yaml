@@ -894,13 +894,17 @@ layers:
           fusion: { mode: additive }
           # Concept F: pinned question window as a second scan.
           question_pin: true
-          # Concept A.4: cold-scope size floor (see repo_map's note).
-          level_prior: { floor_base: 2.0, floor_cap: 16.0 }
           # A file is taken whole, so it is one case, every file in one
           # competition: a file of several exchanges scored alone was scored
           # only against itself, and the large files read over several rounds
           # topped every question (docs/provenance_scoped_signatures.md §2.3).
           cases: file
+          # Each file over the peak it scores on background probes — the
+          # warm-up's probes of other files — floored flat at 100: a hub that
+          # wins part of every question reads low at its usual peak, and a
+          # quiet file's rare genuine hit stands out
+          # (docs/results/provenance_gates_2026-10-25.md, hubness).
+          level_prior: { floor_base: 100.0, floor_cap: 1.0 }
           # The upper fold groups carry a file's identity; the lowest is
           # mostly shared phrasing. Measured over the analysis units' answers
           # finding their own file (docs/results/provenance_gates_2026-10-25.md).
@@ -988,9 +992,10 @@ layers:
         budget:
           priority: 100
         # A unit is taken whole: one case each, all in one competition (see
-        # code_reading's `scopes`).
+        # code_reading's `scopes`), over its background peak.
         policy:
           cases: file
+          level_prior: { floor_base: 100.0, floor_cap: 1.0 }
           layer_weights: [0.5, 1.0, 2.0]
 
   # ── Code Review ────────────────────────────────────────────────────────────
@@ -1073,6 +1078,7 @@ layers:
           priority: 100
         policy:
           cases: file
+          level_prior: { floor_base: 100.0, floor_cap: 1.0 }
           layer_weights: [0.5, 1.0, 2.0]
 
   # ── Security Review ────────────────────────────────────────────────────────
@@ -1169,6 +1175,7 @@ layers:
           priority: 100
         policy:
           cases: file
+          level_prior: { floor_base: 100.0, floor_cap: 1.0 }
           layer_weights: [0.5, 1.0, 2.0]
 
   # ── Dialogue ───────────────────────────────────────────────────────────────

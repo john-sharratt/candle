@@ -8650,7 +8650,8 @@ mod projection_schema_tests {
         }
 
         // Whole files and analysis units are each one case of one competition,
-        // voted with the upper fold groups weighted up.
+        // voted with the upper fold groups weighted up, each normalized over
+        // its background peak floored flat at 100.
         for name in [
             "code_reading",
             "dependency_analysis",
@@ -8660,6 +8661,8 @@ mod projection_schema_tests {
             let g = &layer(name).groups[0];
             assert_eq!(g.policy.scan.cases, ScanCases::File, "{name}");
             assert_eq!(g.policy.layer_weights, vec![0.5, 1.0, 2.0], "{name}");
+            assert_eq!(g.policy.scan.level_prior_base, 100.0, "{name}");
+            assert_eq!(g.policy.scan.level_prior_cap, 1.0, "{name}");
         }
         assert_eq!(
             layer("repo_map").groups[0].policy.scan.cases,

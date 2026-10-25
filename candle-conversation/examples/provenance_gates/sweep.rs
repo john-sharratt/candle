@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use candle_conversation::provenance::boundaries::BoundaryRule;
-use candle_conversation::provenance::hubness::{background, corrected, HubCorrection};
+use candle_conversation::provenance::hubness::{background, corrected, peak, HubCorrection};
 use candle_conversation::provenance::window_score::{
     file_scores, gate, group_votes, window_tally, FileAggregate, Vote,
 };
@@ -55,22 +55,22 @@ impl Fold {
     }
 }
 
-const FOLDS: [Fold; 6] = [
+const FOLDS: [Fold; 7] = [
     Fold::Sum,
     Fold::Hub(HubCorrection::Less),
     Fold::Hub(HubCorrection::Over { floor: 0.001 }),
-    Fold::Hub(HubCorrection::Over { floor: 0.01 }),
+    Fold::Hub(HubCorrection::OverPeak { floor: 1.0 }),
+    Fold::Hub(HubCorrection::OverPeak { floor: 100.0 }),
     Fold::Windows(FileAggregate::CountNormalised { strength: 1.0 }),
     Fold::Windows(FileAggregate::IdentityOrCount { strength: 1.0 }),
 ];
 
-/// Background probes: windows of files' own pages, each scored with its own
-/// file left out, so a file's background is what it wins of probes it is not
-/// the answer to.
-const BACKGROUND_PROBES: usize = 64;
+/// The probe length a peak and an over-peak score are scaled to: the live
+/// probe cap, as production's normalization scales them.
+const T_REF: usize = 256;
 
-/// `(gallery, weights, keep)` → each file's background share.
-type Backgrounds = HashMap<(usize, usize, usize), Vec<f32>>;
+/// `(gallery, weights, keep)` → each file's background mean share and peak.
+type Backgrounds = HashMap<(usize, usize, usize), (Vec<f32>, Vec<f32>)>;
 
 /// Gated votes summed per file.
 fn sum_scores(kept: &[Vote], n_files: usize) -> Vec<f32> {
@@ -84,6 +84,11 @@ fn sum_scores(kept: &[Vote], n_files: usize) -> Vec<f32> {
 /// `(gallery, weights, keep, fold)` → source → ranks.
 type Ranks<'a> = BTreeMap<(usize, usize, usize, usize), BTreeMap<&'a str, Vec<usize>>>;
 
+/// Sweep over `per_source` probes a source, each file's background learned
+/// from `background_probes` windows of files' own pages — each scored with its
+/// own file left out, so a file's background is what it wins of probes it is
+/// not the answer to.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     sub: &Substrate,
     files: &[File],
@@ -91,6 +96,7 @@ pub fn run(
     by_layer: &mut ByLayer,
     rule: &BoundaryRule,
     per_source: usize,
+    background_probes: usize,
     only: Option<&str>,
 ) {
     let probes: Vec<Probe> = probes(sub, files, by_layer, rule, per_source)
@@ -105,8 +111,11 @@ pub fn run(
         .map(|f| (0..f.turns.len()).find(|&i| f.turns[i].covered()))
         .collect();
     let t = Instant::now();
-    let backgrounds = backgrounds(files, gallery, rule, &first_turn);
-    println!("backgrounds in {:.1}s", t.elapsed().as_secs_f64());
+    let backgrounds = backgrounds(files, gallery, rule, &first_turn, background_probes);
+    println!(
+        "{background_probes} background probes in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     let mut ranks = Ranks::new();
     for probe in probes.iter().filter(|p| p.0 != "self (control)") {
         for gi in 0..GALLERIES.len() {
@@ -137,8 +146,9 @@ fn backgrounds(
     gallery: &Gallery,
     rule: &BoundaryRule,
     first_turn: &[Option<usize>],
+    n_probes: usize,
 ) -> Backgrounds {
-    let stride = (files.len() / BACKGROUND_PROBES).max(1);
+    let stride = files.len().div_ceil(n_probes.max(1)).max(1);
     let sources: Vec<(usize, Vec<WideQSig>)> = files
         .iter()
         .enumerate()
@@ -170,7 +180,18 @@ fn backgrounds(
                     .iter()
                     .map(|v| sum_scores(&gate(v, w, keep), files.len()))
                     .collect();
-                out.insert((gi, wi, ki), background(&per_probe, files.len()));
+                let with_len: Vec<(Vec<f32>, usize)> = per_probe
+                    .iter()
+                    .zip(&sources)
+                    .map(|(s, (_, sigs))| (s.clone(), sigs.len()))
+                    .collect();
+                out.insert(
+                    (gi, wi, ki),
+                    (
+                        background(&per_probe, files.len()),
+                        peak(&with_len, files.len(), T_REF),
+                    ),
+                );
             }
         }
     }
@@ -209,7 +230,14 @@ fn score_settings<'a>(
             for (fi, fold) in FOLDS.iter().enumerate() {
                 let scores = match fold {
                     Fold::Sum => summed.clone(),
-                    Fold::Hub(h) => corrected(&summed, &backgrounds[&(gi, wi, ki)], *h),
+                    Fold::Hub(h) => {
+                        let (mean, peaked) = &backgrounds[&(gi, wi, ki)];
+                        let bg = match h {
+                            HubCorrection::OverPeak { .. } => peaked,
+                            _ => mean,
+                        };
+                        corrected(&summed, bg, *h, sigs.len(), T_REF)
+                    }
                     Fold::Windows(a) => file_scores(
                         &tally,
                         &gallery.window_file,
