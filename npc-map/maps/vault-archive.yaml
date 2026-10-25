@@ -29,7 +29,7 @@ nodes:
     kind: work
     name: the merge room
     off: [stacks-north]
-    parts: [{ part: merge-table, count: 6 }, story-desk, light-ring]
+    parts: [{ part: merge-table, count: 15 }, story-desk, light-ring]
 
   - id: reading-room
     kind: social

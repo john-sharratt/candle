@@ -85,6 +85,8 @@ fn a_part_clause_stands_on_its_own_in_a_sentence() {
             " fires ",
             " turns ",
             " opens ",
+            // A merge table lands work in the record.
+            " lands ",
         ];
         assert!(
             verbs.iter().any(|v| flat.contains(v)),
@@ -99,7 +101,7 @@ fn the_vault_loads_and_every_join_holds() {
     let set = vault();
     let building = set.get("creators-vault").expect("the building");
     assert_eq!(building.kind, AreaKind::Building);
-    assert_eq!(set.children("creators-vault").len(), 7);
+    assert_eq!(set.children("creators-vault").len(), 8);
 }
 
 #[test]
@@ -131,14 +133,14 @@ fn the_vault_has_enough_standing_recordings_to_go_days_without_repeating() {
 }
 
 #[test]
-fn the_levels_are_numbered_one_to_seven_in_the_order_the_building_names_them() {
+fn the_levels_are_numbered_one_to_eight_in_the_order_the_building_names_them() {
     let set = vault();
     let ordinals: Vec<u32> = set
         .children("creators-vault")
         .iter()
         .map(|l| l.ordinal.expect("every level is numbered"))
         .collect();
-    assert_eq!(ordinals, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(ordinals, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 }
 
 #[test]
@@ -288,7 +290,7 @@ fn the_building_memory_names_every_level_a_maker_knows() {
             level.name
         );
     }
-    assert!(text.contains("seven levels"), "{text}");
+    assert!(text.contains("eight levels"), "{text}");
 }
 
 #[test]
