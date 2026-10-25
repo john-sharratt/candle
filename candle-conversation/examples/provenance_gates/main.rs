@@ -26,6 +26,7 @@
 //!     <workspace dir> paper <dialogue timeline, hex> <expectations.yaml>
 
 mod corpus;
+mod gpu_gallery;
 mod paper;
 mod ranking;
 mod retrieval;
@@ -109,13 +110,12 @@ fn main() -> anyhow::Result<()> {
             sweep::run(
                 &sub,
                 &files,
-                &gallery,
                 &mut by_layer,
                 &rule,
                 per_source,
                 background_probes,
                 only,
-            );
+            )?;
         }
         "paper" => {
             let timeline = u64::from_str_radix(

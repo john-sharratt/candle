@@ -1,22 +1,21 @@
 //! The scorer's free settings swept over gate 3's probes: which turns the
 //! gallery holds, per-fold-group vote weights, the needle gate's keep fraction,
-//! and the file aggregate. One scan a probe and gallery ([`group_votes`]);
-//! every other setting is weighed, gated and aggregated on the host, so a
-//! sweep costs about two gate-3 runs.
+//! and the fold from votes to file scores. One GPU scan a probe and gallery
+//! ([`GpuGallery::votes`]); every other setting is weighed, gated and folded on
+//! the host.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use candle_conversation::provenance::boundaries::BoundaryRule;
 use candle_conversation::provenance::hubness::{background, corrected, peak, HubCorrection};
-use candle_conversation::provenance::window_score::{
-    file_scores, gate, group_votes, window_tally, FileAggregate, Vote,
-};
-use candle_conversation::provenance::WideQSig;
+use candle_conversation::provenance::window_score::{gate, Vote};
+use candle_conversation::provenance::{WideQSig, FOLD_GROUPS};
 use candle_conversation::substrate::Substrate;
 
-use crate::corpus::{gather, ByLayer, File, Gallery};
-use crate::ranking::{order, token_files};
+use crate::corpus::{gather, ByLayer, File};
+use crate::gpu_gallery::GpuGallery;
+use crate::ranking::order;
 use crate::retrieval::{probes, Probe};
 use crate::stats::mrr;
 
@@ -35,34 +34,14 @@ const KEEP: [f32; 4] = [0.1, 0.25, 0.5, 1.0];
 /// Which turns of each file the gallery holds.
 const GALLERIES: [&str; 2] = ["all", "no-request"];
 
-/// How a setting's gated votes become file scores: summed per file (today),
-/// summed and corrected for each file's background share, or tallied per
-/// window under an aggregate.
-#[derive(Clone, Copy)]
-enum Fold {
-    Sum,
-    Hub(HubCorrection),
-    Windows(FileAggregate),
-}
-
-impl Fold {
-    fn name(self) -> String {
-        match self {
-            Fold::Sum => "sum".into(),
-            Fold::Hub(h) => format!("sum, {}", h.name()),
-            Fold::Windows(a) => a.name(),
-        }
-    }
-}
-
-const FOLDS: [Fold; 7] = [
-    Fold::Sum,
-    Fold::Hub(HubCorrection::Less),
-    Fold::Hub(HubCorrection::Over { floor: 0.001 }),
-    Fold::Hub(HubCorrection::OverPeak { floor: 1.0 }),
-    Fold::Hub(HubCorrection::OverPeak { floor: 100.0 }),
-    Fold::Windows(FileAggregate::CountNormalised { strength: 1.0 }),
-    Fold::Windows(FileAggregate::IdentityOrCount { strength: 1.0 }),
+/// How a setting's gated votes become file scores: summed per file, or summed
+/// and set against each file's background.
+const FOLDS: [HubCorrection; 5] = [
+    HubCorrection::None,
+    HubCorrection::Less,
+    HubCorrection::Over { floor: 0.001 },
+    HubCorrection::OverPeak { floor: 1.0 },
+    HubCorrection::OverPeak { floor: 100.0 },
 ];
 
 /// The probe length a peak and an over-peak score are scaled to: the live
@@ -71,6 +50,9 @@ const T_REF: usize = 256;
 
 /// `(gallery, weights, keep)` → each file's background mean share and peak.
 type Backgrounds = HashMap<(usize, usize, usize), (Vec<f32>, Vec<f32>)>;
+
+/// One probe's per-token, per-fold-group votes.
+type TokenVotes = Vec<[Option<Vote>; FOLD_GROUPS]>;
 
 /// Gated votes summed per file.
 fn sum_scores(kept: &[Vote], n_files: usize) -> Vec<f32> {
@@ -92,13 +74,14 @@ type Ranks<'a> = BTreeMap<(usize, usize, usize, usize), BTreeMap<&'a str, Vec<us
 pub fn run(
     sub: &Substrate,
     files: &[File],
-    gallery: &Gallery,
     by_layer: &mut ByLayer,
     rule: &BoundaryRule,
     per_source: usize,
     background_probes: usize,
     only: Option<&str>,
-) {
+) -> anyhow::Result<()> {
+    let t = Instant::now();
+    let gpu = GpuGallery::new(files)?;
     let probes: Vec<Probe> = probes(sub, files, by_layer, rule, per_source)
         .into_iter()
         .filter(|p| only.is_none_or(|s| p.0 == s))
@@ -110,8 +93,7 @@ pub fn run(
         .iter()
         .map(|f| (0..f.turns.len()).find(|&i| f.turns[i].covered()))
         .collect();
-    let t = Instant::now();
-    let backgrounds = backgrounds(files, gallery, rule, &first_turn, background_probes);
+    let backgrounds = backgrounds(&gpu, files, rule, &first_turn, background_probes)?;
     println!(
         "{background_probes} background probes in {:.1}s",
         t.elapsed().as_secs_f64()
@@ -119,16 +101,11 @@ pub fn run(
     let mut ranks = Ranks::new();
     for probe in probes.iter().filter(|p| p.0 != "self (control)") {
         for gi in 0..GALLERIES.len() {
-            let masked = |f: usize, t: usize| gi == 1 && first_turn[f] == Some(t);
-            score_settings(
-                probe,
-                gallery,
-                files.len(),
-                gi,
-                &masked,
-                &backgrounds,
-                &mut ranks,
-            );
+            let (_, _, sigs, left_out) = probe;
+            let votes = gpu.votes(&[sigs.as_slice()], &|f, t| {
+                Some((f, t)) == *left_out || (gi == 1 && first_turn[f] == Some(t))
+            })?;
+            score_settings(probe, &votes[0], files.len(), gi, &backgrounds, &mut ranks);
         }
     }
     println!(
@@ -138,16 +115,18 @@ pub fn run(
         t.elapsed().as_secs_f64()
     );
     report(&ranks);
+    Ok(())
 }
 
-/// Every file's background share under every gallery, weights and keep.
+/// Every file's background share and peak under every gallery, weights and
+/// keep.
 fn backgrounds(
+    gpu: &GpuGallery,
     files: &[File],
-    gallery: &Gallery,
     rule: &BoundaryRule,
     first_turn: &[Option<usize>],
     n_probes: usize,
-) -> Backgrounds {
+) -> anyhow::Result<Backgrounds> {
     let stride = files.len().div_ceil(n_probes.max(1)).max(1);
     let sources: Vec<(usize, Vec<WideQSig>)> = files
         .iter()
@@ -162,18 +141,13 @@ fn backgrounds(
         .collect();
     let mut out = Backgrounds::new();
     for gi in 0..GALLERIES.len() {
-        let votes: Vec<_> = sources
-            .iter()
-            .map(|(fi, sigs)| {
-                let mut token_file = token_files(gallery, None);
-                for (f, t, r) in &gallery.turns {
-                    if *f == *fi || (gi == 1 && first_turn[*f] == Some(*t)) {
-                        token_file[r.clone()].fill(usize::MAX);
-                    }
-                }
-                group_votes(sigs, &gallery.flat, &token_file, files.len())
-            })
-            .collect();
+        let mut votes: Vec<TokenVotes> = Vec::with_capacity(sources.len());
+        for (fi, sigs) in &sources {
+            let v = gpu.votes(&[sigs.as_slice()], &|f, t| {
+                f == *fi || (gi == 1 && first_turn[f] == Some(t))
+            })?;
+            votes.extend(v);
+        }
         for (wi, w) in WEIGHTS.iter().enumerate() {
             for (ki, &keep) in KEEP.iter().enumerate() {
                 let per_probe: Vec<Vec<f32>> = votes
@@ -195,57 +169,32 @@ fn backgrounds(
             }
         }
     }
-    out
+    Ok(out)
 }
 
-/// Every setting's rank of `probe`'s target over the gallery without the turns
-/// `masked` names.
+/// Every setting's rank of `probe`'s target from its `votes` against gallery
+/// `gi`.
 fn score_settings<'a>(
     probe: &'a Probe,
-    gallery: &Gallery,
+    votes: &TokenVotes,
     n_files: usize,
     gi: usize,
-    masked: &dyn Fn(usize, usize) -> bool,
     backgrounds: &Backgrounds,
     ranks: &mut Ranks<'a>,
 ) {
-    let (source, target, sigs, left_out) = probe;
-    let mut token_file = token_files(gallery, *left_out);
-    for (f, t, r) in &gallery.turns {
-        if masked(*f, *t) {
-            token_file[r.clone()].fill(usize::MAX);
-        }
-    }
-    let live: Vec<bool> = gallery
-        .window_turn
-        .iter()
-        .map(|&(f, t)| Some((f, t)) != *left_out && !masked(f, t))
-        .collect();
-    let votes = group_votes(sigs, &gallery.flat, &token_file, n_files);
+    let (source, target, sigs, _) = probe;
     for (wi, w) in WEIGHTS.iter().enumerate() {
         for (ki, &keep) in KEEP.iter().enumerate() {
-            let kept = gate(&votes, w, keep);
-            let tally = window_tally(&kept, &gallery.windows, gallery.flat.len());
-            let summed = sum_scores(&kept, n_files);
+            let summed = sum_scores(&gate(votes, w, keep), n_files);
+            let (mean, peaked) = &backgrounds[&(gi, wi, ki)];
             for (fi, fold) in FOLDS.iter().enumerate() {
+                let bg = match fold {
+                    HubCorrection::OverPeak { .. } => peaked,
+                    _ => mean,
+                };
                 let scores = match fold {
-                    Fold::Sum => summed.clone(),
-                    Fold::Hub(h) => {
-                        let (mean, peaked) = &backgrounds[&(gi, wi, ki)];
-                        let bg = match h {
-                            HubCorrection::OverPeak { .. } => peaked,
-                            _ => mean,
-                        };
-                        corrected(&summed, bg, *h, sigs.len(), T_REF)
-                    }
-                    Fold::Windows(a) => file_scores(
-                        &tally,
-                        &gallery.window_file,
-                        &gallery.identity,
-                        &live,
-                        n_files,
-                        *a,
-                    ),
+                    HubCorrection::None => summed.clone(),
+                    h => corrected(&summed, bg, *h, sigs.len(), T_REF),
                 };
                 let rank = order(&scores)
                     .iter()

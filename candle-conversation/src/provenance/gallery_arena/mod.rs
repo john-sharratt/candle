@@ -23,10 +23,12 @@ mod pages;
 mod probe_rows;
 mod scan;
 pub mod scan_split;
+mod token_votes;
 mod turn_sigs;
 
 pub use pages::{page_u64, pages_for, transpose_to_pages, PAGE_TOKENS};
 pub use scan::{PagedSegment, PagedWindow};
+pub use token_votes::TokenVotes;
 pub use turn_sigs::TurnSigs;
 
 use std::collections::HashMap;

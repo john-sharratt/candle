@@ -35,7 +35,17 @@ use super::super::WideQSig;
 use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
 use super::scan_split::{self, LaunchTiming};
-use super::{GalleryArena, TurnSigs};
+use super::{GalleryArena, TokenVotes, TurnSigs};
+
+/// What producing a scan's rows cost: the launch's timing, the probe tokens it
+/// scored (the rest were read from [`ProbeRows`]), and the row cache's own
+/// time.
+#[derive(Default)]
+struct Launched {
+    timing: LaunchTiming,
+    fresh: usize,
+    rows_us: u64,
+}
 
 /// A sub-window of a resident turn that contributes to a scan: `[start, end)`
 /// tokens of the turn identified by `sid`/`fingerprint`, voting for `case`.
@@ -369,6 +379,20 @@ impl GalleryArena {
             .get_or_init(|| unsafe { (bdp_bmma_supported() != 0, bdp_imma_supported() != 0) })
     }
 
+    /// Every probe token's raw vote in every fold group and segment, before the
+    /// needle gate and the tally — one launch, on the backend the auto ladder
+    /// picks. For an offline harness that weighs, gates and folds the same
+    /// votes under many settings; the live scan is [`Self::scan_weighted`].
+    pub fn scan_votes(
+        &self,
+        segments: &[PagedSegment],
+        probes: &[&[WideQSig]],
+    ) -> Result<TokenVotes> {
+        self.with_index(segments, |idx| {
+            self.token_votes(idx, probes, None).map(|(votes, _)| votes)
+        })
+    }
+
     fn scan_weighted_impl(
         &self,
         segments: &[PagedSegment],
@@ -376,6 +400,19 @@ impl GalleryArena {
         group_weights: &[f32],
         force: Option<PagedBackend>,
     ) -> Result<Vec<Vec<f32>>> {
+        self.with_index(segments, |idx| {
+            self.launch_paged(idx, probes, group_weights, force)
+        })
+    }
+
+    /// Run `launch` over the index for `segments` — reused from the cache when
+    /// the same segment set is rescanned, built (and cached) otherwise — with
+    /// the index's turns pinned resident for the launch's duration.
+    fn with_index<T>(
+        &self,
+        segments: &[PagedSegment],
+        launch: impl FnOnce(&PagedIndex) -> Result<T>,
+    ) -> Result<T> {
         // **Every scan path binds this arena's context first.**
         //
         // Below here are raw driver calls and FFI that read the *calling
@@ -435,7 +472,7 @@ impl GalleryArena {
             s.index_us += index_us;
         });
         let t_launch = Instant::now();
-        let result = self.launch_paged(&idx, probes, group_weights, force);
+        let result = launch(&idx);
         let launch_us = t_launch.elapsed().as_micros() as u64;
         profile::record("arena:launch", t_launch.elapsed());
         // Release the scan's pins whether or not the launch succeeded — the pages
@@ -448,7 +485,6 @@ impl GalleryArena {
         // costs, so a slow scan is attributed to one or the other.
         tracing::trace!(
             target: "candle_conversation::provenance::gallery_arena",
-            probes = probes.len(),
             segments = segments.len(),
             turns = idx.pinned_sids.len(),
             tokens = idx.n_tokens,
@@ -469,6 +505,66 @@ impl GalleryArena {
         group_weights: &[f32],
         force: Option<PagedBackend>,
     ) -> Result<Vec<Vec<f32>>> {
+        let (raw, launched) = self.token_votes(idx, probes, force)?;
+        let t_tally = Instant::now();
+        let votes = needle_tally_segments(
+            &raw.case,
+            &raw.vote,
+            &raw.per_probe,
+            &idx.seg_case,
+            raw.n_groups,
+            idx.n_segments,
+            idx.n_cases,
+            group_weights,
+        );
+        let LaunchTiming {
+            upload_us,
+            kernel_us,
+            readback_us,
+        } = launched.timing;
+        profile::record("arena:launch_upload", Duration::from_micros(upload_us));
+        profile::record("arena:launch_kernel", Duration::from_micros(kernel_us));
+        profile::record("arena:launch_readback", Duration::from_micros(readback_us));
+        profile::record("arena:launch_tally", t_tally.elapsed());
+        let tally_us = t_tally.elapsed().as_micros() as u64;
+        scan_split::add(|s| {
+            s.launches += u64::from(launched.fresh > 0);
+            s.fresh_tokens += launched.fresh as u64;
+            s.upload_us += upload_us;
+            s.kernel_us += kernel_us;
+            s.readback_us += readback_us;
+            s.rows_us += launched.rows_us;
+            s.tally_us += tally_us;
+        });
+        // Where a launch's time goes: the probe upload, the kernel (to its
+        // synchronize), the vote readback, and the host tally — over the
+        // `scored` tokens no earlier launch over this index had scored.
+        tracing::trace!(
+            target: "candle_conversation::provenance::gallery_arena",
+            tokens = idx.n_tokens,
+            probe_tokens = raw.per_probe.iter().sum::<usize>(),
+            scored = launched.fresh,
+            segments = idx.n_segments,
+            cases = idx.n_cases,
+            upload_us,
+            kernel_us,
+            readback_us,
+            tally_us,
+            "arena launch"
+        );
+        Ok(votes)
+    }
+
+    /// Every probe token's raw `(case, vote)` row against `idx`: the tokens no
+    /// earlier launch over this index scored go to the kernel, the rest are
+    /// read back from the rows it kept ([`ProbeRows`]). Returns the rows and
+    /// what the launch cost.
+    fn token_votes(
+        &self,
+        idx: &PagedIndex,
+        probes: &[&[WideQSig]],
+        force: Option<PagedBackend>,
+    ) -> Result<(TokenVotes, Launched)> {
         let dev = match self.device() {
             Device::Cuda(d) => d,
             _ => return Err(candle::Error::Msg("paged scan requires CUDA".into())),
@@ -477,15 +573,18 @@ impl GalleryArena {
         let n_groups = self.n_groups();
         let n_cases = idx.n_cases;
         let n_segments = idx.n_segments;
-
-        if probes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let Some(d_idx) = idx.device.as_ref() else {
-            return Ok(vec![vec![0.0; n_cases]; probes.len()]);
+        let none = || {
+            (
+                TokenVotes::none(probes.len(), n_groups, n_segments),
+                Launched::default(),
+            )
         };
-        if n_segments == 0 || n_cases == 0 {
-            return Ok(vec![vec![0.0; n_cases]; probes.len()]);
+
+        let Some(d_idx) = idx.device.as_ref() else {
+            return Ok(none());
+        };
+        if probes.is_empty() || n_segments == 0 || n_cases == 0 {
+            return Ok(none());
         }
 
         // Batch probes (token-major, full-width only — the reference's filter).
@@ -501,9 +600,8 @@ impl GalleryArena {
             }
             per_req_tokens.push(cnt);
         }
-        let n_probe_tokens = probe_words.len() / wpt;
-        if n_probe_tokens == 0 {
-            return Ok(vec![vec![0.0; n_cases]; probes.len()]);
+        if probe_words.is_empty() {
+            return Ok(none());
         }
 
         // Only the tokens no earlier launch over this index scored go to the
@@ -515,11 +613,7 @@ impl GalleryArena {
         let fresh = rows.plan(&probe_words, wpt);
         profile::record("arena:rows_plan", t_plan.elapsed());
         let mut rows_us = t_plan.elapsed().as_micros() as u64;
-        let LaunchTiming {
-            upload_us,
-            kernel_us,
-            readback_us,
-        } = if fresh.is_empty() {
+        let timing = if fresh.is_empty() {
             LaunchTiming::default()
         } else {
             let tokens: Vec<&[u64]> = fresh
@@ -543,48 +637,20 @@ impl GalleryArena {
         profile::record("arena:rows_assemble", t_assemble.elapsed());
         rows_us += t_assemble.elapsed().as_micros() as u64;
 
-        let t_tally = Instant::now();
-        let votes = needle_tally_segments(
-            &out_case,
-            &out_vote,
-            &per_req_tokens,
-            &idx.seg_case,
-            n_groups,
-            n_segments,
-            n_cases,
-            group_weights,
-        );
-        profile::record("arena:launch_upload", Duration::from_micros(upload_us));
-        profile::record("arena:launch_kernel", Duration::from_micros(kernel_us));
-        profile::record("arena:launch_readback", Duration::from_micros(readback_us));
-        profile::record("arena:launch_tally", t_tally.elapsed());
-        let tally_us = t_tally.elapsed().as_micros() as u64;
-        scan_split::add(|s| {
-            s.launches += u64::from(!fresh.is_empty());
-            s.fresh_tokens += fresh.len() as u64;
-            s.upload_us += upload_us;
-            s.kernel_us += kernel_us;
-            s.readback_us += readback_us;
-            s.rows_us += rows_us;
-            s.tally_us += tally_us;
-        });
-        // Where a launch's time goes: the probe upload, the kernel (to its
-        // synchronize), the vote readback, and the host tally — over the
-        // `scored` tokens no earlier launch over this index had scored.
-        tracing::trace!(
-            target: "candle_conversation::provenance::gallery_arena",
-            tokens = idx.n_tokens,
-            probe_tokens = n_probe_tokens,
-            scored = fresh.len(),
-            segments = n_segments,
-            cases = n_cases,
-            upload_us,
-            kernel_us,
-            readback_us,
-            tally_us = t_tally.elapsed().as_micros() as u64,
-            "arena launch"
-        );
-        Ok(votes)
+        Ok((
+            TokenVotes {
+                case: out_case,
+                vote: out_vote,
+                per_probe: per_req_tokens,
+                n_groups,
+                n_segments,
+            },
+            Launched {
+                timing,
+                fresh: fresh.len(),
+                rows_us,
+            },
+        ))
     }
 
     /// One kernel launch over `n_probe_tokens` probe tokens (`probe_words`,
@@ -1033,6 +1099,71 @@ mod tests {
         assert!(
             reused[0].iter().any(|&v| v != 0.0),
             "the probe scored nothing — the comparison proves nothing"
+        );
+    }
+
+    /// **The raw votes are the scan's own.** Gated and tallied on the host,
+    /// [`GalleryArena::scan_votes`]' rows give exactly what
+    /// [`GalleryArena::scan_weighted`] returns, bit for bit, over several
+    /// segments and probes. Skips when no CUDA device is present.
+    #[test]
+    fn the_raw_votes_tally_to_the_weighted_scan() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let a: Vec<WideQSig> = (0..5).map(|t| sig(0x1000 + t)).collect();
+        let b: Vec<WideQSig> = (0..40).map(|t| sig(0x3000 + t)).collect();
+        let c: Vec<WideQSig> = (0..7).map(|t| sig(0x5000 + t)).collect();
+        fn window(sid: u64, turn: &Vec<WideQSig>, case: usize) -> PagedWindow<'_> {
+            PagedWindow {
+                sid: turn_stream_id(sid, 0),
+                fingerprint: sid,
+                turn: turn.into(),
+                start: 0,
+                end: turn.len(),
+                case,
+            }
+        }
+        let segs = vec![
+            PagedSegment {
+                windows: vec![window(1, &a, 0), window(2, &b, 1)],
+                n_cases: 2,
+            },
+            PagedSegment {
+                windows: vec![window(3, &c, 0)],
+                n_cases: 1,
+            },
+        ];
+        let p0 = vec![sig(0x1001), sig(0x3000 + 30), sig(0xBEEF)];
+        let p1 = vec![sig(0x5003), sig(0x1004)];
+        let probes = [p0.as_slice(), p1.as_slice()];
+        let weights = [0.5f32, 1.0, 2.0];
+
+        let raw = arena.scan_votes(&segs, &probes).unwrap();
+        assert_eq!(raw.per_probe, vec![3, 2]);
+        let tallied = needle_tally_segments(
+            &raw.case,
+            &raw.vote,
+            &raw.per_probe,
+            &[0, 2, 3],
+            raw.n_groups,
+            raw.n_segments,
+            3,
+            &weights,
+        );
+        let weighted = arena.scan_weighted(&segs, &probes, &weights).unwrap();
+        let bits = |v: &[Vec<f32>]| {
+            v.iter()
+                .map(|p| p.iter().map(|x| x.to_bits()).collect::<Vec<u32>>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&tallied), bits(&weighted));
+        assert!(
+            weighted.iter().flatten().any(|&v| v != 0.0),
+            "nothing scored"
         );
     }
 
