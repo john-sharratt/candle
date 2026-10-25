@@ -100,6 +100,34 @@ fn a_draft_is_kept_as_the_operations_events_and_never_reaches_the_mind() {
     );
 }
 
+/// **A draft outlives a restart.** Committed, then the substrate closed and
+/// opened again from its folder, as a daemon's restart does: the operation's
+/// store still holds it. On WW a committed draft read back as no events at all
+/// after a restart, and the table called its operation off as "document gone".
+#[test]
+fn a_draft_is_read_back_after_the_substrate_reopens() {
+    let (dir, shared) = setup();
+    shelf(&stores(&dir, &shared), 1)
+        .commit(&[(
+            "layers/stories/s.md".into(),
+            Some("a night at the gate\n".into()),
+        )])
+        .unwrap();
+    drop(shared);
+
+    let mut substrate = Substrate::new();
+    let p =
+        SubstratePersistence::open_in_with_substrate(&dir.path().join("substrate"), &mut substrate)
+            .unwrap();
+    let reopened = SharedSubstrate::new(substrate, p);
+    assert_eq!(
+        shelf(&stores(&dir, &reopened), 1)
+            .read("layers/stories/s.md")
+            .as_deref(),
+        Some("a night at the gate\n")
+    );
+}
+
 /// **Two operations over one base see different files.**
 #[test]
 fn two_operations_see_their_own_files() {
