@@ -168,8 +168,9 @@ async fn write_up(
         });
     };
     let asked = format!(
-        "# The record\n\n{material}\n\n# What you are asked\n\n{}",
-        generator.prompt.trim()
+        "# The record\n\n{material}\n\n# What you are asked\n\n{}\n\n{}",
+        generator.prompt.trim(),
+        answer::lengths(generator.kind)
     );
     tracing::info!(generator = %generator.id, target = %target.key, "mission generator: asking");
 

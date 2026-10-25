@@ -178,6 +178,45 @@ pub fn specs(kind: Kind) -> Vec<ToolSpec> {
     ]
 }
 
+/// Every field of `kind`'s call that is held to a length, and its cap in words
+/// — the caps [`specs`] bounds the grammar by and the answer is checked against.
+fn caps(kind: Kind) -> &'static [(&'static str, usize)] {
+    match kind {
+        Kind::LifeEvent => &[
+            ("leaves", LEAVES_WORDS),
+            ("agrees_with", AGREES_WORDS),
+            ("turns", TURNS_WORDS),
+            ("happens", HAPPENS_WORDS),
+        ],
+        Kind::Contradiction => &[("why", WHY_WORDS), ("change", CHANGE_WORDS)],
+        Kind::Gap => &[
+            ("when", WHEN_WORDS),
+            ("where", WHERE_WORDS),
+            ("who", WHO_WORDS),
+            ("agrees_with", AGREES_WORDS),
+            ("turns", TURNS_WORDS),
+            ("happens", HAPPENS_WORDS),
+        ],
+    }
+}
+
+/// How long each field of `kind`'s call may be, said before it is written.
+///
+/// **A cap the writer is not told is a refusal waiting to happen.** The checks
+/// held `happens` under 240 words while no prompt said so: answers came back at
+/// 250, 264 and 318 words, and each was refused and asked again whole — three
+/// minutes a try — to learn what one line up front says.
+pub fn lengths(kind: Kind) -> String {
+    let each: Vec<String> = caps(kind)
+        .iter()
+        .map(|(name, words)| format!("`{name}` under {words} words"))
+        .collect();
+    format!(
+        "Keep to these lengths, counted in words: {}.",
+        each.join("; ")
+    )
+}
+
 pub(super) fn text(name: &str) -> CallParam {
     CallParam {
         name: name.to_string(),
@@ -1215,6 +1254,38 @@ mod tests {
     use super::*;
     use crate::engine::mission_gen::corpus::tests::mind;
     use crate::engine::mission_gen::target::next;
+
+    /// **What the writer is told is what it is held to.** Every field the
+    /// grammar bounds is named in [`lengths`], every name there is a field of
+    /// the call, and the line says each cap.
+    #[test]
+    fn the_lengths_named_are_the_fields_bounded() {
+        for kind in [Kind::LifeEvent, Kind::Contradiction, Kind::Gap] {
+            let call = &specs(kind)[0];
+            let bounded: Vec<&str> = call
+                .params
+                .iter()
+                .filter(|p| {
+                    p.max_tokens.is_some()
+                        || p.items.as_ref().is_some_and(|i| i.max_tokens.is_some())
+                })
+                .map(|p| p.name.as_str())
+                .collect();
+            let named: Vec<&str> = caps(kind).iter().map(|(n, _)| *n).collect();
+            let mut b = bounded.clone();
+            let mut n = named.clone();
+            b.sort_unstable();
+            n.sort_unstable();
+            assert_eq!(b, n, "{kind:?}: bounded fields and stated lengths differ");
+            let line = lengths(kind);
+            for (name, words) in caps(kind) {
+                assert!(
+                    line.contains(&format!("`{name}` under {words} words")),
+                    "{kind:?}: {line}"
+                );
+            }
+        }
+    }
 
     fn call(name: &str, args: serde_json::Value) -> String {
         format!(
