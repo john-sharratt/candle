@@ -24,6 +24,8 @@
 //! thing let go without a reason cannot be argued with later. Each of those is
 //! written for a character to read and act on.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -287,7 +289,8 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 false => None,
             };
             if let Some(faults) = faults {
-                let refused = hosted.with_sim(|s| s.missions.refuse_stuck(body));
+                let draft = draft_digest(hosted, body);
+                let refused = hosted.with_sim(|s| s.missions.refuse_stuck_over_faults(body, draft));
                 if refused <= STUCK_REFUSALS {
                     return Outcome::Refused(format!("It is not stuck yet — {faults}"));
                 }
@@ -459,6 +462,16 @@ fn rewriting_next(hosted: &Hosted, body: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// A digest of the body's mission document as its shelf holds it now — `0` for
+/// one not there — so a rewrite can be told from none.
+fn draft_digest(hosted: &Hosted, body: &str) -> u64 {
+    let path = hosted.sim(|s| Some(s.missions.active(body)?.work.as_ref()?.writes.clone()));
+    let text = path.and_then(|p| hosted.shelf_of(body).read(&p));
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 
 /// What stands between the body and reporting its operation's document done:
