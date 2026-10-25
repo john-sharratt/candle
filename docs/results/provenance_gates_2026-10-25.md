@@ -122,6 +122,43 @@ both sources (MRR 0.18 → 0.20 and 0.18 → 0.23, R@10 0.49 → 0.51 and
 0.44 → 0.53), with the size bias halved and of the opposite sign. The margins
 are modest and the probes few; the analysis-unit source decides.
 
+### Run 7 — two stages do not carry the gain
+
+401 files, 2,782,797 tokens, 114,271 windows, 60 probes a source; coverage
+853/853 exact. Added: **today's top 32, re-scored** — today's per-file scan
+picks 32 files and only they compete again by window (identity-or-count ×1),
+the production shape that would leave the GPU scan unchanged.
+
+| source | rule | R@1 | R@5 | R@10 | MRR |
+|---|---|---|---|---|---|
+| request-to-rest | late fusion (today) | 0.08 | 0.47 | 0.62 | 0.241 |
+| request-to-rest | today's top 32, re-scored | 0.08 | 0.43 | 0.60 | 0.231 |
+| request-to-rest | identity | 0.17 | 0.53 | 0.58 | 0.320 |
+| request-to-rest | identity-or-count ×1 | 0.15 | 0.48 | 0.65 | 0.292 |
+| summary-to-rest | late fusion (today) | 0.05 | 0.43 | 0.60 | 0.209 |
+| summary-to-rest | today's top 32, re-scored | 0.05 | 0.35 | 0.67 | 0.200 |
+| summary-to-rest | count-normalised ×1 | 0.05 | 0.50 | 0.67 | 0.237 |
+| summary-to-rest | identity-or-count ×1 | 0.05 | 0.47 | 0.63 | 0.211 |
+
+| rule | size bias ρ |
+|---|---|
+| late fusion (today) | +0.337 |
+| best-window | +0.304 |
+| count-normalised ×1 | +0.079 |
+| identity-or-count ×1 | +0.107 |
+| today's top 32, re-scored | +0.129 |
+
+- **Re-scoring a shortlist loses the gain** (MRR at or below today): the
+  votes are margins over the runner-up file, and with the field cut to 32 the
+  runner-up is a different file than over the whole gallery. Window tallies
+  have to come from the full scan — the GPU arena must return each vote's
+  winning token, not only its file.
+- Over the whole gallery identity-or-count holds its lead on request probes
+  (MRR 0.24 → 0.29) and ties on summary probes; count normalisation leads on
+  summary probes. Both cut today's size bias by two thirds or more.
+- The CPU scan took 1,842 s for 180 probes at 2.8 M gallery tokens — ~10 s a
+  probe: offline only.
+
 ## Open
 
 - The analysis-unit source (a `dependency_analysis` / `code_review` /
