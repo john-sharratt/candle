@@ -35,6 +35,7 @@ pub mod scan;
 pub mod selection;
 pub mod sig_window;
 pub mod wide_sig;
+pub mod window_score;
 
 pub use belief::{ToolBelief, DEFAULT_LEAK_BETA};
 pub use fusion::FusionMode;

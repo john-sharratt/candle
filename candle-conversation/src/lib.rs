@@ -122,7 +122,8 @@ pub mod working_set;
 pub use cancel::{CancelToken, CancelWait};
 pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, ModeSampling, SamplingConfig,
-    SchedulerConfig, SequenceConfig,
+    SchedulerConfig, SequenceConfig, REPROJECT_EVERY_N_TOKENS, REPROJECT_MAX_PROBE_TOKENS,
+    REPROJECT_TRIGGER_TEXTS,
 };
 pub use conversation::{
     AskScope, Carried, ChainRound, GlueMarkers, Linking, PieceKind, PromptDump, PromptPiece,
