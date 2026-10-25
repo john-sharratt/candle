@@ -17,6 +17,8 @@
 //!
 //! Run, from the repository root:
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> files [path filter]
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> retrieval [probes per source]
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> paper <dialogue timeline, hex> <expectations.yaml>
@@ -77,6 +79,20 @@ fn main() -> anyhow::Result<()> {
         gallery.windows.len()
     );
     match command {
+        "files" => {
+            let filter = args.get(2).map(String::as_str).unwrap_or("");
+            let shown = files
+                .iter()
+                .filter(|f| f.path.as_deref().unwrap_or("").contains(filter));
+            for f in shown {
+                println!(
+                    "{:016x} {} turns {}",
+                    f.timeline,
+                    f.turns.len(),
+                    f.path.as_deref().unwrap_or("<no path>")
+                );
+            }
+        }
         "retrieval" => {
             let per_source = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(40);
             retrieval::run(&sub, &files, &gallery, &mut by_layer, &rule, per_source);
@@ -101,7 +117,7 @@ fn main() -> anyhow::Result<()> {
                 &expectations,
             )?;
         }
-        other => anyhow::bail!("unknown command `{other}`: retrieval or paper"),
+        other => anyhow::bail!("unknown command `{other}`: files, retrieval or paper"),
     }
     Ok(())
 }
