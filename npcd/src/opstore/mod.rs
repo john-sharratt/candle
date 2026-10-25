@@ -221,12 +221,21 @@ impl MindStores {
     fn open(&self, owner: &Owner) -> Option<(Arc<RepoFiles>, Mirror)> {
         let (mind, _) = self.mind.as_ref()?;
         if let Some(held) = self.held().get(owner) {
+            tracing::debug!(?owner, "store opened from what this member holds");
             return Some((Arc::clone(held), Mirror::unread()));
         }
         let files = Arc::new(mind.fresh());
         let mirror = Mutex::new(Mirror::unread());
         if let Some(shared) = self.shared.get() {
             store_events::restore(&Substrate(shared), owner.timeline(), &files, &mirror);
+        }
+        if owner.world().is_some() {
+            tracing::info!(
+                ?owner,
+                events = self.event_count(owner),
+                changed = files.snapshots().len(),
+                "operation store opened"
+            );
         }
         let mirror = mirror.into_inner().unwrap_or_else(|e| e.into_inner());
         Some((files, mirror))
@@ -237,6 +246,12 @@ impl MindStores {
     fn keep(&self, owner: &Owner, files: &Arc<RepoFiles>, mirror: Mirror) {
         if self.is_quiet(owner) {
             self.held().insert(owner.clone(), Arc::clone(files));
+            if owner.world().is_some() {
+                tracing::info!(
+                    ?owner,
+                    "operation store held in memory: its world is disconnected"
+                );
+            }
             return;
         }
         if let Some(shared) = self.shared.get() {
@@ -247,6 +262,23 @@ impl MindStores {
                 &Mutex::new(mirror),
             );
         }
+        if owner.world().is_some() {
+            tracing::info!(
+                ?owner,
+                events = self.event_count(owner),
+                "operation store saved"
+            );
+        }
+    }
+
+    /// How many file events `owner`'s timeline holds: what an operation's
+    /// store was saved as, read straight from the substrate.
+    fn event_count(&self, owner: &Owner) -> Option<usize> {
+        let shared = self.shared.get()?;
+        shared
+            .vfs_events(owner.timeline().raw())
+            .ok()
+            .map(|e| e.len())
     }
 
     /// `owner`'s store, ready to use: an author's with nothing in it lets go
