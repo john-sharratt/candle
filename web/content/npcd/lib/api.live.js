@@ -152,6 +152,11 @@ export const LiveAPI = {
   deleteNpc: (id) => j(`/v1/npc/${id}`, { method: 'DELETE' }),
   setTags:   (id, tags) => j(`/v1/npc/${id}/tags`, { method: 'PUT', body: { tags } }),
   setHidden: (id, hidden) => j(`/v1/npc/${id}/hidden`, { method: 'PUT', body: { hidden } }),
+  /* Admin: every living character with its owner, the accounts one can be
+   * handed to, and the caller's own id — `{me, accounts, npcs}`. */
+  getOwners: () => j('/v1/npcs/owners'),
+  /* Admin: hand a character to another account by its public id (`u_…`). */
+  setOwner:  (id, ownerId) => j(`/v1/npc/${id}/owner`, { method: 'PUT', body: { owner_id: ownerId } }),
 
   perceive:  (id, events) => j(`/v1/npc/${id}/perceive`, { method: 'POST', body: { events } }),
 

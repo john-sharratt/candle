@@ -871,6 +871,15 @@ impl Missions {
             .map_or(0, Mission::refuse_stuck_on_the_way)
     }
 
+    /// Count a `report_stuck` turned away over its document's faults, when the
+    /// document was rewritten since the last — see
+    /// [`Mission::refuse_stuck_over_faults`]. `0` with no open mission.
+    pub fn refuse_stuck_over_faults(&mut self, body: &str, draft: u64) -> u32 {
+        self.active
+            .get_mut(body)
+            .map_or(0, |m| m.refuse_stuck_over_faults(draft))
+    }
+
     /// The world refused `body` an act; noted on its open mission, if any.
     pub fn refused_an_act(&mut self, body: &str) {
         if let Some(m) = self.active.get_mut(body) {
