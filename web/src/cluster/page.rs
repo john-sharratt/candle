@@ -15,12 +15,12 @@ use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::route::{forward, Context};
-use super::{upgrades, Gateway};
+use super::{upgrades, Gateway, MemberOrigin};
 use crate::auth::{Auth, Identity, Role, Roles};
 use crate::config::Cache;
 use crate::site::tokera::page::{nav_bar, Nav};
@@ -60,8 +60,12 @@ pub fn router(gateway: Arc<Gateway>, auth: Option<Arc<Auth>>, roles: Roles) -> R
 /// The caller, if an admin — by session or by the ops key
 /// ([`Gateway::caller`]) — else the refusal for one who is not. Boxed because
 /// a `Response` is large and this is the cold path.
-fn admin(s: &PageState, headers: &HeaderMap) -> Result<Option<Identity>, Box<Response>> {
-    let identity = s.gateway.caller(s.auth.as_deref(), headers);
+fn admin(
+    s: &PageState,
+    headers: &HeaderMap,
+    origin: Option<&MemberOrigin>,
+) -> Result<Option<Identity>, Box<Response>> {
+    let identity = s.gateway.caller(s.auth.as_deref(), headers, origin);
     let role = s.roles.of(identity.as_ref());
     if role.at_least(Role::Admin) {
         return Ok(identity);
@@ -83,8 +87,15 @@ fn admin(s: &PageState, headers: &HeaderMap) -> Result<Option<Identity>, Box<Res
     ))
 }
 
-async fn page(State(s): State<PageState>, headers: HeaderMap) -> Response {
-    if let Err(refused) = admin(&s, &headers) {
+/// The member a request came up from, when one did ([`MemberOrigin`]).
+type Origin = Option<Extension<MemberOrigin>>;
+
+fn origin_of(origin: &Origin) -> Option<&MemberOrigin> {
+    origin.as_ref().map(|Extension(o)| o)
+}
+
+async fn page(State(s): State<PageState>, origin: Origin, headers: HeaderMap) -> Response {
+    if let Err(refused) = admin(&s, &headers, origin_of(&origin)) {
         return *refused;
     }
     ([(header::CACHE_CONTROL, "no-store")], Html(PAGE.as_str())).into_response()
@@ -116,6 +127,7 @@ struct LogQuery {
 /// without a browser session reads how the cluster stands.
 async fn status(
     State(s): State<PageState>,
+    origin: Origin,
     headers: HeaderMap,
     Query(q): Query<LogQuery>,
 ) -> Response {
@@ -125,7 +137,7 @@ async fn status(
         .as_ref()
         .is_some_and(|k| k.presented(&headers));
     if !keyed {
-        if let Err(refused) = admin(&s, &headers) {
+        if let Err(refused) = admin(&s, &headers, origin_of(&origin)) {
             return *refused;
         }
     }
@@ -145,16 +157,16 @@ async fn status(
 
 /// Stop admitting member sockets, close the ones there with `1001`, and
 /// answer once the requests in flight have finished, or a minute has passed.
-async fn drain(State(s): State<PageState>, headers: HeaderMap) -> Response {
-    if let Err(refused) = admin(&s, &headers) {
+async fn drain(State(s): State<PageState>, origin: Origin, headers: HeaderMap) -> Response {
+    if let Err(refused) = admin(&s, &headers, origin_of(&origin)) {
         return *refused;
     }
     let still_open = s.gateway.hub.drain_gateway().await;
     Json(json!({ "draining": true, "still_open": still_open })).into_response()
 }
 
-async fn undrain(State(s): State<PageState>, headers: HeaderMap) -> Response {
-    if let Err(refused) = admin(&s, &headers) {
+async fn undrain(State(s): State<PageState>, origin: Origin, headers: HeaderMap) -> Response {
+    if let Err(refused) = admin(&s, &headers, origin_of(&origin)) {
         return *refused;
     }
     s.gateway.hub.undrain_gateway();
@@ -175,7 +187,7 @@ async fn member(
     peer: Option<ConnectInfo<SocketAddr>>,
     mut req: Request,
 ) -> Response {
-    let identity = match admin(&s, req.headers()) {
+    let identity = match admin(&s, req.headers(), req.extensions().get::<MemberOrigin>()) {
         Ok(identity) => identity,
         Err(refused) => return *refused,
     };

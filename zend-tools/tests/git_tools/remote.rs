@@ -5,7 +5,11 @@
 //! for another developer — the only way to test what these exist to get
 //! right: what happens when the remote moved while you were not looking.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
 use serde_json::{json, Value};
+use zend_tools::registry::find;
 
 use crate::harness::{branch_rev, git_in, remote_oid, GitWorkspace};
 
@@ -408,6 +412,43 @@ fn a_branch_can_be_published_from_another_revision() {
     );
     assert_eq!(out["accepted"], true, "{out}");
     assert_eq!(remote_oid(&origin, "release"), ws.oid("main"));
+}
+
+/// **A branches-only conversation never changes the default branch**: an
+/// update and a delete of it are refused before anything is sent, while a
+/// branch of its own publishes as usual.
+#[test]
+fn a_branches_only_context_cannot_push_the_default_branch() {
+    let ws = GitWorkspace::new();
+    let origin = ws.with_origin();
+    let defaults = Arc::new(BTreeMap::from([(
+        "app".to_string(),
+        BTreeSet::from(["main".to_string()]),
+    )]));
+    let ctx = ws.comprehensive_ctx().branches_only(defaults);
+    let push_with = |pushes: Value| {
+        find("git_push").unwrap().call(
+            &ctx,
+            &json!({"repo": "app", "remote": "origin", "pushes": pushes}),
+        )
+    };
+    for action in ["update_branch", "delete_branch"] {
+        let out = push_with(json!([{"action": action, "name": "main", "new": true}]));
+        assert_eq!(out["error"], "invalid_arguments", "{out}");
+        assert!(
+            out["detail"]
+                .as_str()
+                .unwrap()
+                .contains("main is a default branch of app"),
+            "{out}"
+        );
+    }
+    assert!(git_in(&origin, &["branch"]).trim().is_empty());
+
+    ws.git(&["branch", "feature"]);
+    let out = push_with(json!([{"action": "update_branch", "name": "feature", "new": true}]));
+    assert_eq!(out["accepted"], true, "{out}");
+    assert_eq!(remote_oid(&origin, "feature"), ws.oid("main"));
 }
 
 /// The one tool whose effect leaves the machine is Comprehensive's alone.

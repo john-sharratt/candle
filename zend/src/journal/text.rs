@@ -1,5 +1,6 @@
 //! A dialogue's journal text: the turns behind each entry, whole, kept in the
-//! substrate beside the conversation for `journal_read` and `journal_grep`.
+//! substrate beside the conversation for `journal_read` and `journal_grep`
+//! (through [`crate::journal::shelf`]).
 //!
 //! Each stretch a draft covers is one custom object under the conversation's
 //! timeline ([`journal_core::transcript::key`]), written once and never
@@ -18,7 +19,6 @@ use journal_core::transcript::{
     entry_of, entry_prefix, owner_prefix, Book, Filed, Hits, Miss, Page, Part,
 };
 use serde_json::{json, Value};
-use zend_tools::tools::journal::JournalBook;
 
 use crate::journal::style::CODING;
 
@@ -96,10 +96,11 @@ fn parts_of(blob: &Value) -> Vec<Part> {
         .unwrap_or_default()
 }
 
-impl JournalBook for JournalText {
+impl JournalText {
+    /// `lines` lines of `entry`'s turns from line `from`, counted from 1.
     /// Reads the entry's own stretches alone: an entry with none is a miss of
     /// that entry, whatever the others hold.
-    fn read(&self, entry: u64, from: usize, lines: usize) -> Result<Page, Miss> {
+    pub fn read(&self, entry: u64, from: usize, lines: usize) -> Result<Page, Miss> {
         let stretches = self.stretches(&entry_prefix(&self.owner, entry));
         if stretches.is_empty() {
             return Err(Miss::Entry(entry));
@@ -107,7 +108,9 @@ impl JournalBook for JournalText {
         Book::new(stretches, &CODING).read(entry, from, lines)
     }
 
-    fn grep(&self, pattern: &str, entry: Option<u64>, max: usize) -> Result<Hits, Miss> {
+    /// The lines that hold `pattern`, ignoring case, in `entry`'s turns or in
+    /// every entry's; the first `max`.
+    pub fn grep(&self, pattern: &str, entry: Option<u64>, max: usize) -> Result<Hits, Miss> {
         let prefix = match entry {
             Some(e) => entry_prefix(&self.owner, e),
             None => owner_prefix(&self.owner),

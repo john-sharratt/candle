@@ -24,7 +24,7 @@
 //! output presented to the client — the user sees only the assistant's
 //! final natural-language answer.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::iter;
 use std::sync::{Arc, OnceLock};
@@ -46,15 +46,17 @@ use tokio::runtime::Handle;
 use zend_tools::executor::Executor;
 use zend_tools::sandboxes::Sandboxes;
 use zend_tools::state::Secrets;
-use zend_tools::tools::journal::JournalBook;
-use zend_tools::{alias_pins, registry, replay, Replay, ToolContext};
+use zend_tools::tools::journal::JournalShelf;
+use zend_tools::{alias_pins, registry, replay, Replay, SubagentRunner, ToolContext};
 use zend_vfs::sandbox::programs;
 use zend_vfs::{GitError, RepoFiles, Workspace, JOBS_DIR};
 
 use crate::access;
 use crate::agent_exec::AgentExecutor;
+use crate::mcp::ownership::owner_of;
 use crate::substrate_git::agents as agents_for;
 use crate::tool_guidance;
+use crate::tool_round::{self, Step};
 use crate::types::ToolMode;
 use crate::workspace::UPLOADS_REPO;
 
@@ -634,14 +636,8 @@ fn not_replayed(name: &str) -> Value {
     })
 }
 
-/// Dispatch every parsed tool call sequentially and pair each call with
-/// its result.  Sequential rather than concurrent because the same
-/// session/notes/credential stores are mutated by some tools — running
-/// concurrently would require per-tool locking discipline that is
-/// currently the responsibility of the `zend-tools` state stores
-/// (which are `Arc<RwLock<...>>` internally, but ordering across
-/// distinct tools matters for stateful flows like
-/// `ssh_session_open` → `ssh_session_exec`).
+/// Dispatch every parsed tool call as a round ([`tool_round::run`]): in order,
+/// pairing each call with its result, with a run of `sub_run` calls at once.
 ///
 /// On [`Dispatch::Resumed`] each call is put to its tool first: the ones that
 /// leave what they left the first time are run, and the rest are answered with
@@ -652,23 +648,20 @@ pub fn run_tool_calls(
     calls: Vec<ToolCall>,
     dispatch: Dispatch,
 ) -> Vec<ToolResult> {
-    calls
+    let steps = calls
         .into_iter()
         .map(|c| {
-            let refused =
-                dispatch == Dispatch::Resumed && replay(&c.name, &c.arguments) == Replay::Unsafe;
-            let resp = if refused {
-                tracing::info!(tool = %c.name, "resumed turn: call not re-issued");
-                not_replayed(&c.name)
+            if dispatch == Dispatch::Resumed && replay(&c.name, &c.arguments) == Replay::Unsafe {
+                Step::Withheld(ToolResult {
+                    response: not_replayed(&c.name),
+                    call: c,
+                })
             } else {
-                run_tool(ctx, &c)
-            };
-            ToolResult {
-                call: c,
-                response: resp,
+                Step::Run(c)
             }
         })
-        .collect()
+        .collect();
+    tool_round::run(ctx, steps)
 }
 
 /// Format executed tool results into a single chained-turn string,
@@ -765,10 +758,9 @@ pub fn tool_round_text(text: &str) -> TurnText {
 
 // ── Public helper bundle ─────────────────────────────────────────────────────
 
-/// Tool execution context for the daemon.  Holds the [`ToolContext`] and
-/// the optional [`zend_tools::SubagentRunner`] (currently always `None`
-/// — subagent loops aren't wired yet).  Cloned cheaply (Arc-shared
-/// stores).
+/// Tool execution context for the daemon: one [`ToolContext`] per tools mode,
+/// each carrying the session's [`SubagentRunner`] once
+/// [`Self::running_parts`] gives it one. Cloned cheaply (Arc-shared stores).
 ///
 /// One host serves the whole daemon, but the `file_*` overlay does not: each
 /// conversation has its own file stores ([`Self::conversation_files`]), and a
@@ -786,7 +778,15 @@ pub struct ToolHost {
     /// Indexed by [`ToolMode::level`]. Each mode's own file stores are never
     /// handed to a round — a round gets its conversation's.
     contexts: [Arc<ToolContext>; ToolMode::ALL.len()],
+    /// The branches of each repository a conversation owned through `/mcp`
+    /// may never push to (`docs/claude_zend_gateway.md` §11).
+    default_branches: Arc<BTreeMap<String, BTreeSet<String>>>,
 }
+
+/// The names a default branch goes by. Closed beside each repository's own
+/// base branch, since the remote's default is not read here and a task's
+/// branch never needs either name.
+const CONVENTIONAL_DEFAULTS: [&str; 2] = ["main", "master"];
 
 impl ToolHost {
     /// Build a host whose file tools overlay `workspace`'s repositories, which
@@ -847,7 +847,54 @@ impl ToolHost {
             .with_executor(executor);
         let contexts =
             ToolMode::ALL.map(|mode| Arc::new(base.clone().granting(access::grants(mode))));
-        Ok(Self { contexts })
+        Ok(Self {
+            contexts,
+            default_branches: Arc::default(),
+        })
+    }
+
+    /// This host with `runner` starting the parts every context's `sub_run`
+    /// asks for.
+    pub fn running_parts(self, runner: Arc<dyn SubagentRunner>) -> Self {
+        Self {
+            contexts: self.contexts.map(|ctx| {
+                Arc::new(Arc::unwrap_or_clone(ctx).with_subagent_runner(Arc::clone(&runner)))
+            }),
+            ..self
+        }
+    }
+
+    /// This host closing each repository's base branch in `bases`, and the
+    /// [`CONVENTIONAL_DEFAULTS`], to the pushes of every conversation owned
+    /// through `/mcp`. A repository `bases` does not name takes no push from
+    /// such a conversation.
+    pub fn guarding_defaults(self, bases: &BTreeMap<String, String>) -> Self {
+        let closed = bases
+            .iter()
+            .map(|(repo, base)| {
+                let mut names: BTreeSet<String> = CONVENTIONAL_DEFAULTS
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect();
+                names.insert(base.clone());
+                (repo.clone(), names)
+            })
+            .collect();
+        Self {
+            default_branches: Arc::new(closed),
+            ..self
+        }
+    }
+
+    /// The context of `mode` for the conversation `lineage`, with its file
+    /// stores `files`: branches-only when an `/mcp` caller owns it.
+    fn bound(&self, mode: ToolMode, files: &Arc<RepoFiles>, lineage: &str) -> ToolContext {
+        let ctx = self.contexts[mode.level() as usize].with_files(Arc::clone(files), lineage);
+        if owner_of(lineage).is_some() {
+            ctx.branches_only(Arc::clone(&self.default_branches))
+        } else {
+            ctx
+        }
     }
 
     /// A new conversation's own file stores: an overlay over each repository
@@ -868,23 +915,19 @@ impl ToolHost {
         files: &Arc<RepoFiles>,
         lineage: &str,
     ) -> Arc<ToolContext> {
-        Arc::new(self.contexts[mode.level() as usize].with_files(Arc::clone(files), lineage))
+        Arc::new(self.bound(mode, files, lineage))
     }
 
     /// [`Self::context_for`] a dialogue's round, whose journal tools read
-    /// `journal`.
+    /// `journals`.
     pub fn dialogue_context(
         &self,
         mode: ToolMode,
         files: &Arc<RepoFiles>,
         lineage: &str,
-        journal: Arc<dyn JournalBook>,
+        journals: Arc<dyn JournalShelf>,
     ) -> Arc<ToolContext> {
-        Arc::new(
-            self.contexts[mode.level() as usize]
-                .with_files(Arc::clone(files), lineage)
-                .with_journal(journal),
-        )
+        Arc::new(self.bound(mode, files, lineage).with_journals(journals))
     }
 }
 
@@ -951,6 +994,26 @@ mod tests {
         }
         assert_eq!(names(ToolMode::Comprehensive).len(), tool_catalog().len());
         assert!(names(ToolMode::None).is_empty());
+    }
+
+    /// **A conversation owned through `/mcp` pushes to branches only**: its
+    /// context closes each repository's default branch, and an ordinary
+    /// dialogue's closes nothing.
+    #[test]
+    fn an_mcp_conversations_context_closes_the_default_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(&workspace_in(&dir), no_secrets())
+            .unwrap()
+            .guarding_defaults(&BTreeMap::from([("r".to_string(), "trunk".to_string())]));
+        let files = host.conversation_files();
+        let owned = host.context_for(ToolMode::Comprehensive, &files, "mcp:abc:review/verify");
+        for closed in ["trunk", "main", "master"] {
+            assert!(owned.check_push("r", closed).is_err(), "{closed}");
+        }
+        assert!(owned.check_push("r", "verify-expiry").is_ok());
+        assert!(owned.check_push("unknown", "verify-expiry").is_err());
+        let dialogue = host.context_for(ToolMode::Comprehensive, &files, "c1");
+        assert!(dialogue.check_push("r", "main").is_ok());
     }
 
     /// **Dispatch holds an alias to its name** for a call that did not come

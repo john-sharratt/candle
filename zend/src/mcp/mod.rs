@@ -14,6 +14,9 @@
 //! | [`jsonrpc`] | One JSON-RPC message per POST |
 //! | [`tools`] | The tools, one file each |
 //! | [`workers`] | Running a task, answering a worker, and waiting on workers |
+//! | [`parts`] | `sub_run`: a worker's parts, started under it and waited on |
+//! | [`lineage`] | The journals a worker or part inherits from above it |
+//! | [`ops`] | What the operations tools share: Admins only, the decision gate, the way up |
 //! | [`nudges`] | Guidance for a running worker, taken at its next tool round |
 //! | [`threads`] | Threads, workers and the thread's journal, as records |
 //! | [`names`] | Names and paths |
@@ -26,10 +29,13 @@
 pub mod caller;
 pub mod http;
 pub mod jsonrpc;
+pub mod lineage;
 pub mod names;
 pub mod nudges;
+pub mod ops;
 pub mod origin;
 pub mod ownership;
+pub mod parts;
 pub mod protocol;
 pub mod records;
 pub mod state;

@@ -6,11 +6,17 @@
 //! ```yaml
 //! jobs_dir: D:/agent/jobs
 //! slots: 4
+//! stage_dir: D:/prog/candle/keep/stage
 //! checkouts:
 //!   - name: candle
 //!     dir: D:/agent/candle
 //!     push: true
 //! ```
+//!
+//! `stage_dir` is where a run that asks for it stages the file it built —
+//! this machine's `keep/stage/`, which `keep` tries a build from
+//! (`docs/claude_zend_gateway.md` §8.4). Without it, a run asking to stage is
+//! refused.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +42,9 @@ pub struct AgentConfig {
     /// absent.
     #[serde(default)]
     pub slots: Option<u32>,
+    /// Where a run stages the file it built, for this machine's keep.
+    #[serde(default)]
+    pub stage_dir: Option<PathBuf>,
     pub checkouts: Vec<CheckoutConfig>,
 }
 
@@ -69,7 +78,7 @@ mod tests {
     #[test]
     fn the_file_names_its_checkouts_and_slots() {
         let cfg = AgentConfig::parse(
-            "jobs_dir: /a/jobs\nslots: 3\ncheckouts:\n  - name: candle\n    dir: /a/candle\n    push: true\n  - name: site\n    dir: /a/site\n",
+            "jobs_dir: /a/jobs\nslots: 3\nstage_dir: /a/stage\ncheckouts:\n  - name: candle\n    dir: /a/candle\n    push: true\n  - name: site\n    dir: /a/site\n",
         )
         .unwrap();
         assert_eq!(
@@ -77,6 +86,7 @@ mod tests {
             AgentConfig {
                 jobs_dir: "/a/jobs".into(),
                 slots: Some(3),
+                stage_dir: Some("/a/stage".into()),
                 checkouts: vec![
                     CheckoutConfig {
                         name: "candle".into(),

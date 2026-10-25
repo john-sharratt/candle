@@ -187,6 +187,11 @@ pub struct RunJob {
     pub program: String,
     pub args: Vec<String>,
     pub timeout_secs: u64,
+    /// A file the run builds, relative to the checkout —
+    /// `target/release/motherd.exe` — copied to the agent's `stage_dir` once
+    /// the run exits 0, for this machine's keep to try.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +240,20 @@ pub struct JobView {
     /// A listing's answer, on the answer to its submit only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listed: Option<Listed>,
+    /// A run that asked to stage what it built, once it has ended: the staged
+    /// file's path on the agent's machine, or why nothing was staged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<Staged>,
+}
+
+/// What a run's staging came to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Staged {
+    /// The file is at this path, for keep to try.
+    At(String),
+    /// Nothing was staged, and why.
+    Not(String),
 }
 
 /// What a job does.
@@ -413,6 +432,7 @@ mod tests {
             program: "cargo".into(),
             args: vec!["test".into()],
             timeout_secs: 600,
+            stage: None,
         });
         assert_eq!(
             serde_json::to_value(&run).unwrap(),
@@ -422,6 +442,18 @@ mod tests {
                 "program": "cargo", "args": ["test"], "timeout_secs": 600
             })
         );
+        let staging = Submit::Run(RunJob {
+            repo: "candle".into(),
+            branch: "main".into(),
+            overlay: Snapshot::new(None, BTreeMap::new()),
+            program: "cargo".into(),
+            args: vec!["build".into()],
+            timeout_secs: 600,
+            stage: Some("target/release/motherd.exe".into()),
+        });
+        let wire = serde_json::to_value(&staging).unwrap();
+        assert_eq!(wire["stage"], "target/release/motherd.exe");
+        assert_eq!(serde_json::from_value::<Submit>(wire).unwrap(), staging);
         let push = Submit::Push(PushJob {
             repo: "candle".into(),
             bundle: Some(encode_bundle(b"PACK")),
@@ -479,6 +511,7 @@ mod tests {
             pushed: Vec::new(),
             fetched: None,
             listed: None,
+            staged: None,
         };
         let wire = serde_json::to_value(&view).unwrap();
         assert_eq!(
@@ -489,6 +522,13 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<JobView>(wire).unwrap(), view);
+        let staged = JobView {
+            staged: Some(Staged::At("D:/keep/stage/motherd.exe".into())),
+            ..view
+        };
+        let wire = serde_json::to_value(&staged).unwrap();
+        assert_eq!(wire["staged"], json!({"at": "D:/keep/stage/motherd.exe"}));
+        assert_eq!(serde_json::from_value::<JobView>(wire).unwrap(), staged);
     }
 
     /// A fetch asks for a branch past what the member holds; its answer

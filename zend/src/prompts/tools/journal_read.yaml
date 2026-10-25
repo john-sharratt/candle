@@ -18,17 +18,26 @@ questions:
 - what were the line numbers I found in that file earlier
 - give me the original wording of the user's first request
 - continue reading entry 6 from line 200
+- list the entries in my journal
+- read the notes of the thread above me
+- what are the project's standing rules
 category: Journal
 mandatory: true
-description: "Read the turns behind one of your journal entries, whole: what the user said, each tool result and what you replied, each turn headed by its number and time. Use it when an entry's one line is not enough — the exact file contents, error or answer from earlier. Pages like file_read: `offset` and `limit` in lines. To find which entry holds something, use journal_grep."
+description: "Read a journal: \"self\" for your own, or an ancestor's by its name or path. Without `entry`, its entries; with one, the turns behind that entry, whole — what was said, each tool result and each reply, each turn headed by its number and time. Use it when an entry's one line is not enough — the exact file contents, error or answer from earlier. Pages like file_read: `offset` and `limit` in lines. To find which entry holds something, use journal_grep."
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
+    journal:
+      description: Whose journal — "self" for your own, or an ancestor's name or path as your journals show it. Required.
+      minLength: 1
+      type: string
     entry:
-      description: 'The number of the journal entry whose turns to read, as the journal shows it: 3 for "Entry 3 — …". Required.'
+      description: 'The entry whose turns to read, as the journal numbers it: 3 for "Entry 3 — …". Leave it out to list the journal''s entries.'
       format: uint64
       minimum: 0
-      type: integer
+      type:
+      - integer
+      - 'null'
     offset:
       description: First line to show, counted from 1. Default 1.
       format: uint
@@ -45,7 +54,7 @@ parameters:
       - integer
       - 'null'
   required:
-  - entry
+  - journal
   title: ReadRequest
   type: object
 examples:

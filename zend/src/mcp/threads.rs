@@ -15,10 +15,12 @@
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use candle_conversation::projection::DecodePriority;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use web::auth::Role;
 
-use super::names::Path;
+use super::names::{parent_of, Path};
 use super::records::Records;
 
 /// Orders the notes one process writes within one millisecond.
@@ -52,6 +54,35 @@ impl State {
     }
 }
 
+/// How urgently a task decodes (`docs/claude_zend_gateway.md` §3.4): `normal`,
+/// below a live user, unless someone waits on it interactively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    #[default]
+    Normal,
+    High,
+}
+
+impl Priority {
+    /// The priority a call names, `normal` when it names none.
+    pub fn of(name: Option<&str>) -> Result<Self, String> {
+        match name {
+            None | Some("normal") => Ok(Self::Normal),
+            Some("high") => Ok(Self::High),
+            Some(other) => Err(format!("`priority` is `normal` or `high`, not `{other}`")),
+        }
+    }
+
+    /// The band its conversation decodes at.
+    pub fn band(self) -> DecodePriority {
+        match self {
+            Self::Normal => DecodePriority::Normal,
+            Self::High => DecodePriority::High,
+        }
+    }
+}
+
 /// One of a task's journal entries, as the worker's journal kept it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -59,16 +90,28 @@ pub struct Entry {
     pub text: String,
 }
 
-/// A worker's record.
+/// A worker's record — a task Claude started, or a part a worker started
+/// under itself with `sub_run`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worker {
     pub thread: String,
+    /// Its lineage name below the thread: `verify` for a task, `verify/read`
+    /// for a part of it ([`super::names`]).
     pub name: String,
     /// The zend conversation the task runs in.
     pub conv_id: String,
     pub prompt: String,
     pub state: State,
+    /// The role its current turn runs as: its owner's role when the turn
+    /// began, read afresh for every task and answer, so a part runs with
+    /// exactly the tools its worker has.
+    pub role: Role,
+    /// How urgently its turns decode; a part decodes as its worker does.
+    pub priority: Priority,
     pub started_ms: u64,
+    /// When its current turn began: a part this worker started in an earlier
+    /// turn is never mistaken for the answer to a call in this one.
+    pub turn_ms: u64,
     /// When the member running the task last said it still was
     /// ([`BEAT_EVERY_MS`]).
     #[serde(default)]
@@ -124,6 +167,12 @@ impl Worker {
         }
         .text()
     }
+
+    /// Whether it is a part of another worker's task, not a task Claude
+    /// started.
+    pub fn is_part(&self) -> bool {
+        !parent_of(&self.name).is_empty()
+    }
 }
 
 /// A thread's record.
@@ -165,10 +214,25 @@ fn note_prefix(owner: &str, thread: &str) -> String {
     format!("mcp/note/{owner}/{thread}/")
 }
 
+/// The journal of the project `repo`, `P:<repo>`: the standing rules every
+/// task in every thread inherits, kept like a thread's notes under the name
+/// — which no thread can take, since a thread's name holds no `:`.
+pub fn project_journal(repo: &str) -> String {
+    format!("P:{repo}")
+}
+
 /// The zend conversation a worker's task runs in. Owner, thread and name are
 /// all in it, so two people's same-named workers are two conversations.
 pub fn conv_id(owner: &str, thread: &str, name: &str) -> String {
     format!("mcp:{owner}:{thread}/{name}")
+}
+
+/// The owner, thread and lineage name a worker's conversation id names —
+/// [`conv_id`] read back; `None` for any other conversation.
+pub fn conv_names(conv_id: &str) -> Option<(&str, &str, &str)> {
+    let (owner, rest) = conv_id.strip_prefix("mcp:")?.split_once(':')?;
+    let (thread, name) = rest.split_once('/')?;
+    (!owner.is_empty() && !thread.is_empty() && !name.is_empty()).then_some((owner, thread, name))
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(value: Value) -> Option<T> {
@@ -262,16 +326,26 @@ pub fn notes(records: &dyn Records, owner: &str, thread: &str) -> Vec<Note> {
         .collect()
 }
 
-/// The thread's journal as `journal_read` prints it: one numbered line per
-/// entry, under the thread's path.
-pub fn render_journal(thread: &str, notes: &[Note]) -> String {
-    let mut out = format!("Journal of T:{thread}, written by Claude");
+/// A thread's or project's journal, one numbered line per entry, oldest first.
+pub fn note_lines(notes: &[Note]) -> Vec<String> {
+    notes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("#{} {} {}", i + 1, n.label, n.text))
+        .collect()
+}
+
+/// A thread's or project's journal as `journal_read` prints it: one numbered
+/// line per entry, under its path.
+pub fn render_journal(path: &str, notes: &[Note]) -> String {
+    let mut out = format!("Journal of {path}, written by Claude");
     if notes.is_empty() {
         out.push_str(" — no entries yet.");
         return out;
     }
-    for (i, n) in notes.iter().enumerate() {
-        out.push_str(&format!("\n#{} {} {}", i + 1, n.label, n.text));
+    for line in note_lines(notes) {
+        out.push('\n');
+        out.push_str(&line);
     }
     out
 }
@@ -325,13 +399,13 @@ mod tests {
         let got = notes(&r, "o", "review");
         assert_eq!(got.len(), 3);
         assert_eq!(
-            render_journal("review", &got),
+            render_journal("T:review", &got),
             "Journal of T:review, written by Claude\n\
              #1 Claude asked: verify\n#2 Task ended: verify — ok\n#3 Claude asked: check"
         );
         assert_eq!(
-            render_journal("empty", &[]),
-            "Journal of T:empty, written by Claude — no entries yet."
+            render_journal("P:candle", &[]),
+            "Journal of P:candle, written by Claude — no entries yet."
         );
     }
 
@@ -343,7 +417,10 @@ mod tests {
             conv_id: "c".into(),
             prompt: "p".into(),
             state: State::Running,
+            role: Role::User,
+            priority: Priority::Normal,
             started_ms: 0,
+            turn_ms: 0,
             beat_ms: 1_000,
             ended_ms: None,
             entries_after: None,
@@ -378,10 +455,64 @@ mod tests {
     }
 
     #[test]
+    fn a_task_decodes_normal_unless_asked_high() {
+        assert_eq!(Priority::of(None).unwrap().band(), DecodePriority::Normal);
+        assert_eq!(Priority::of(Some("normal")).unwrap(), Priority::Normal);
+        assert_eq!(
+            Priority::of(Some("high")).unwrap().band(),
+            DecodePriority::High
+        );
+        assert_eq!(
+            Priority::of(Some("low")).unwrap_err(),
+            "`priority` is `normal` or `high`, not `low`"
+        );
+    }
+
+    #[test]
     fn a_workers_conversation_names_its_owner_thread_and_name() {
         assert_eq!(
             conv_id("abc", "review", "verify.2"),
             "mcp:abc:review/verify.2"
         );
+        assert_eq!(
+            conv_id("abc", "review", "verify/read"),
+            "mcp:abc:review/verify/read"
+        );
+        assert_eq!(
+            conv_names("mcp:abc:review/verify/read"),
+            Some(("abc", "review", "verify/read"))
+        );
+        for other in [
+            "c-123",
+            "mcp:abc:review",
+            "mcp::t/n",
+            "mcp:abc:/n",
+            "mcp:abc:t/",
+        ] {
+            assert_eq!(conv_names(other), None, "{other}");
+        }
+    }
+
+    /// A record reads back as written, and a part is told from a task by its
+    /// lineage name.
+    #[test]
+    fn a_part_is_known_by_its_name() {
+        let kept = serde_json::json!({
+            "thread": "t", "name": "verify/read", "conv_id": "c", "prompt": "p",
+            "state": "running", "role": "admin", "priority": "high",
+            "started_ms": 0, "turn_ms": 5, "beat_ms": 5
+        });
+        let w: Worker = serde_json::from_value(kept).unwrap();
+        assert_eq!(
+            (w.role, w.priority, w.turn_ms),
+            (Role::Admin, Priority::High, 5)
+        );
+        assert!(w.is_part());
+        assert_eq!(w.path(), "T:t/verify/read");
+        let task = Worker {
+            name: "verify".into(),
+            ..w
+        };
+        assert!(!task.is_part());
     }
 }

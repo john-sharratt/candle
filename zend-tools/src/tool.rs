@@ -82,26 +82,32 @@ pub enum Replay {
     Unsafe,
 }
 
-/// Input to a subagent invocation.
+/// A part to start under the calling conversation.
 pub struct SubagentRequest {
-    pub instruction: String,
-    pub tools: Option<Vec<String>>,
-    pub model: Option<String>,
-    pub endpoint: Option<String>,
-    pub max_turns: u32,
+    /// What the part is for, as a kebab-case slug; with the caller's path it is
+    /// the part's address.
+    pub name: String,
+    /// The part's task, in full.
+    pub prompt: String,
 }
 
-/// Output from a subagent invocation.
+/// How a part ended.
 pub struct SubagentResponse {
+    /// The part's address, which the caller cites.
+    pub path: String,
+    /// `done` or `error`: a part asks nobody, so it never waits.
+    pub state: String,
+    /// The part's journal entry — its line, claims and address — or, with no
+    /// entry kept, the end of its final response or its error.
     pub result: String,
-    pub turns: u32,
-    pub tool_calls_made: u32,
 }
 
-/// Injected by the caller (e.g. `zend` daemon) to run nested agent loops.
-/// `zend-tools` defines the interface; the daemon implements it.
+/// Injected by the daemon to run parts: each a conversation of its own under
+/// the calling one, run to its end before the call returns.
 pub trait SubagentRunner: Send + Sync + 'static {
-    fn run(&self, req: SubagentRequest) -> Result<SubagentResponse, String>;
+    /// Start, or find again, the part `req` names under the conversation
+    /// `parent`, and wait for it to end.
+    fn run(&self, parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String>;
 }
 
 /// A tool implementation.

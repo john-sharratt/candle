@@ -22,14 +22,14 @@ use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use cluster::gateway::rolls_out;
 use cluster::gateway::upgrades::plan::Ask;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::route::{forward, Context};
-use super::Gateway;
+use super::{Gateway, MemberOrigin};
 use crate::auth::{Auth, Role, Roles};
 use crate::config::Cache;
 
@@ -78,12 +78,17 @@ async fn command(
     State(s): State<CmdState>,
     Path(name): Path<String>,
     peer: Option<ConnectInfo<SocketAddr>>,
+    origin: Option<Extension<MemberOrigin>>,
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Response {
-    // A session, or the ops key: an emergency rollback must not wait on a
-    // browser sign-in.
-    let identity = s.gateway.caller(s.auth.as_deref(), &headers);
+    // A session, the ops key — an emergency rollback must not wait on a
+    // browser sign-in — or the identity a member states for its caller.
+    let identity = s.gateway.caller(
+        s.auth.as_deref(),
+        &headers,
+        origin.as_ref().map(|Extension(o)| o),
+    );
     let role = s.roles.of(identity.as_ref());
     if !role.at_least(Role::Admin) {
         let status = if identity.is_none() {

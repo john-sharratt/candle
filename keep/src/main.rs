@@ -32,26 +32,32 @@
 //! stack sample needs no elevation.
 //!
 //! It does not certify, roll out, or choose a canary. It joins the gateway as
-//! the app `keep` so the cluster page lists it.
+//! the app `keep`, so the cluster page lists it, and serves an Admin's
+//! operations tools on that socket: its state, a trial run as a job, and a
+//! service's restart, stop or start (`remote`).
 
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use board::BOARD;
 use cluster::upgrade::switch::SWITCH_ADDR;
 use place::{accept, previous_of, restore, same_file};
 use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use trial::{spawn_detached, switch_to, Ended, Running};
 
+mod board;
 #[cfg(windows)]
 mod owner_access;
 mod place;
 mod presence;
+mod remote;
 mod trial;
 
 /// How long a trial may run before it is stopped and the stable file is
@@ -140,9 +146,6 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     owner_access::grant_owner()
         .map_err(|e| anyhow::anyhow!("granting the owner its children: {e}"))?;
-    if let Some(cluster) = cfg.cluster.clone() {
-        presence::start(cluster, &cfg.state);
-    }
     let mut slots = Vec::new();
     for svc in cfg.services {
         let svc = prepare(&cfg.state, svc)?;
@@ -158,6 +161,9 @@ fn main() -> anyhow::Result<()> {
             .name(format!("keep-{name}"))
             .spawn(move || supervise(svc, rx))
             .map_err(|e| anyhow::anyhow!("starting {name}: {e}"))?;
+    }
+    if let Some(cluster) = cfg.cluster.clone() {
+        presence::start(cluster, &cfg.state, Arc::new(slots.clone()));
     }
     let listener = bind_switch()?;
     let addr = listener.local_addr()?;
@@ -659,59 +665,95 @@ enum Hand {
 }
 
 fn dispatch(body: &str, slots: &[Slot], hand: Hand) -> Answer {
+    let (path, slot) = match target(body, slots) {
+        Ok(t) => t,
+        Err(refused) => return refused,
+    };
+    if hand == Hand::Trial {
+        if let Err(refused) = begin(slot, body) {
+            return refused;
+        }
+    }
+    switch(path, slot, hand)
+}
+
+/// The executable `body` names and the service it is for, or why it is
+/// refused before anything is asked of the service.
+fn target<'a>(body: &str, slots: &'a [Slot]) -> Result<(PathBuf, &'a Slot), Answer> {
     if body.is_empty() {
-        return Answer {
+        return Err(Answer {
             status: 400,
             reason: "Bad Request",
             body: "the body is the path of the new executable\n".into(),
-        };
+        });
     }
     let path = PathBuf::from(body);
     if !path.is_file() {
-        return Answer {
+        return Err(Answer {
             status: 400,
             reason: "Bad Request",
             body: format!("not a file: {}\n", path.display()),
-        };
+        });
     }
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return Answer {
+        return Err(Answer {
             status: 400,
             reason: "Bad Request",
             body: "the path has no file name\n".into(),
-        };
+        });
     };
     let Some(slot) = slots.iter().find(|s| s.file.eq_ignore_ascii_case(name)) else {
-        return Answer {
+        return Err(Answer {
             status: 404,
             reason: "Not Found",
             body: "no such service\n".into(),
-        };
+        });
     };
     if same_file(&path, &slot.stable) {
-        return Answer {
+        return Err(Answer {
             status: 400,
             reason: "Bad Request",
             body: "the stable file is not a trial\n".into(),
-        };
+        });
     }
+    Ok((path, slot))
+}
+
+/// Put a trial of `artifact` on `slot`'s board: on it while it runs, however
+/// it was asked for, so the cluster reads it and a second one is refused.
+fn begin(slot: &Slot, artifact: &str) -> Result<(), Answer> {
+    BOARD.begin(&slot.name, artifact).map_err(|why| Answer {
+        status: 409,
+        reason: "Conflict",
+        body: format!("{why}\n"),
+    })
+}
+
+/// Hand `path` to `slot`'s supervisor and wait for its answer; a trial's end
+/// goes on the board.
+fn switch(path: PathBuf, slot: &Slot, hand: Hand) -> Answer {
     let (tx, rx) = mpsc::channel();
     let req = match hand {
         Hand::Trial => Req::Switch { path, reply: tx },
         Hand::Accept => Req::Accept { path, reply: tx },
     };
-    if slot.tx.send(req).is_err() {
-        return Answer {
+    let answer = if slot.tx.send(req).is_err() {
+        Answer {
             status: 409,
             reason: "Conflict",
             body: "rolled back\nthe service is not running\n".into(),
-        };
+        }
+    } else {
+        rx.recv().unwrap_or(Answer {
+            status: 409,
+            reason: "Conflict",
+            body: "rolled back\nno answer\n".into(),
+        })
+    };
+    if hand == Hand::Trial {
+        BOARD.end(&slot.name, answer.status == 200, &answer.body);
     }
-    rx.recv().unwrap_or(Answer {
-        status: 409,
-        reason: "Conflict",
-        body: "rolled back\nno answer\n".into(),
-    })
+    answer
 }
 
 /// A request's target and body. A POST with no `Content-Length` has an empty

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx, LOADING};
 use crate::mcp::names::Path;
-use crate::mcp::threads;
+use crate::mcp::threads::{self, project_journal};
 
 pub const NAME: &str = "journal_read";
 
@@ -21,14 +21,16 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Read a journal. `journal` is `\"self\"` for the thread this session is attached to, \
-            a thread's path (`T:<thread>`) for every task started on it and how each ended, or a worker's \
-            path (`T:<thread>/<name>`) for the entries its conversation kept. With `entry`, pages the turns \
-            behind one of a worker's entries — the evidence behind a claim — `limit` lines from `offset`. \
-            Read the entry first, and the turns only where a claim needs checking.",
+            a thread's path (`T:<thread>`) for every task started on it and how each ended, a worker's \
+            path (`T:<thread>/<name>`) for the entries its conversation kept, or a project's \
+            (`P:<repository>`) for its standing rules. With `entry`, pages the turns behind one of a \
+            worker's entries — the evidence behind a claim — `limit` lines from `offset`. Read the entry \
+            first, and the turns only where a claim needs checking. Re-read the thread's journal after \
+            your context is compacted.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`\"self\"`, `T:<thread>`, or `T:<thread>/<name>`."},
+                "journal": {"type": "string", "description": "`\"self\"`, `T:<thread>`, `T:<thread>/<name>` or `P:<repository>`."},
                 "entry": {"type": "integer", "minimum": 0, "description": "A worker's entry id, to page the turns behind it."},
                 "offset": {"type": "integer", "minimum": 1, "description": "The first line of the page (1 by default)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LINES, "description": "Lines in the page (200 by default)."}
@@ -60,6 +62,18 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     let owner = ctx.caller.key();
     match path {
+        Path::Project(repo) => {
+            if args.get("entry").is_some() {
+                return Answer::error(
+                    "a project's entries are its whole record; `entry` pages a worker's turns",
+                );
+            }
+            let journal = project_journal(&repo);
+            Answer::ok(threads::render_journal(
+                &journal,
+                &threads::notes(&records, &owner, &journal),
+            ))
+        }
         Path::Thread(thread) => {
             if threads::thread(&records, &owner, &thread).is_none() {
                 return Answer::error(format!("there is no thread `T:{thread}`"));
@@ -70,7 +84,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
                 );
             }
             Answer::ok(threads::render_journal(
-                &thread,
+                &format!("T:{thread}"),
                 &threads::notes(&records, &owner, &thread),
             ))
         }

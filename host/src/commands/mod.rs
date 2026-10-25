@@ -6,6 +6,7 @@
 //! | Module | |
 //! |---|---|
 //! | [`parse`] | a command's name and body, and a destructive one's `confirm` |
+//! | [`class`] | what a command may be run by: look, care, decide |
 //! | [`jobs`] | one command at a time, its progress as NDJSON |
 //! | [`exec`] | what each command does |
 //!
@@ -14,6 +15,7 @@
 //! `COORD`, so every gateway's coordination log shows who ran it, with what,
 //! and how it ended.
 
+pub mod class;
 pub mod exec;
 pub mod jobs;
 pub mod parse;

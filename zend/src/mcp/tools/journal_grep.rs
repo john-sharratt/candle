@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx, LOADING};
 use crate::mcp::names::Path;
-use crate::mcp::threads::{self, Worker};
+use crate::mcp::threads::{self, project_journal, Worker};
 
 pub const NAME: &str = "journal_grep";
 
@@ -21,13 +21,13 @@ pub fn definition() -> Value {
         "description": "Search journals for a word or phrase (case-insensitive substring), to find the \
             evidence behind a claim without paging through it. `journal` is a worker's path \
             (`T:<thread>/<name>`) to search the turns behind its entries — or one `entry` of them — or a \
-            thread's subtree (`T:<thread>/*`) to search every worker on it, or `\"self\"` / `T:<thread>` \
-            for the thread's own journal. Each hit names its journal, entry, turn and line; read around \
-            one with `journal_read` and the entry.",
+            thread's subtree (`T:<thread>/*`) to search every worker on it, `\"self\"` / `T:<thread>` \
+            for the thread's own journal, or `P:<repository>` for a project's standing rules. Each hit \
+            names its journal, entry, turn and line; read around one with `journal_read` and the entry.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "journal": {"type": "string", "description": "`T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>` or `\"self\"`."},
+                "journal": {"type": "string", "description": "`T:<thread>/<name>`, `T:<thread>/*`, `T:<thread>`, `P:<repository>` or `\"self\"`."},
                 "pattern": {"type": "string", "description": "The text to find, ignoring case."},
                 "entry": {"type": "integer", "minimum": 0, "description": "One of a worker's entries, to search it alone."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_HITS, "description": "Hits to answer (20 by default)."}
@@ -40,8 +40,9 @@ pub fn definition() -> Value {
 
 /// What `journal` names to search.
 enum Scope {
-    /// The thread's own journal.
-    Thread(String),
+    /// A thread's or project's own journal, under the name its notes are
+    /// kept by, and its path.
+    Notes(String, String),
     /// One worker's turns.
     Worker(String, String),
     /// Every worker on the thread.
@@ -49,20 +50,22 @@ enum Scope {
 }
 
 fn scope(ctx: &Ctx, journal: &str) -> Result<Scope, String> {
+    let thread = |t: String| Scope::Notes(format!("T:{t}"), t);
     if journal == "self" {
-        return ctx.mcp.attached.clone().map(Scope::Thread).ok_or_else(|| {
+        return ctx.mcp.attached.clone().map(thread).ok_or_else(|| {
             "`self` names the attached thread, and none is attached: call `zend_attach` first"
                 .into()
         });
     }
-    if let Some(thread) = journal.strip_suffix("/*") {
-        return match Path::parse(thread)? {
+    if let Some(prefix) = journal.strip_suffix("/*") {
+        return match Path::parse(prefix)? {
             Path::Thread(t) => Ok(Scope::Subtree(t)),
-            Path::Worker { .. } => Err(format!("`{journal}`: a subtree is `T:<thread>/*`")),
+            _ => Err(format!("`{journal}`: a subtree is `T:<thread>/*`")),
         };
     }
     Ok(match Path::parse(journal)? {
-        Path::Thread(t) => Scope::Thread(t),
+        Path::Project(repo) => Scope::Notes(project_journal(&repo), project_journal(&repo)),
+        Path::Thread(t) => thread(t),
         Path::Worker { thread, worker } => Scope::Worker(thread, worker),
     })
 }
@@ -132,12 +135,12 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     let owner = ctx.caller.key();
     match scope {
-        Scope::Thread(thread) => {
-            if threads::thread(&records, &owner, &thread).is_none() {
-                return Answer::error(format!("there is no thread `T:{thread}`"));
+        Scope::Notes(path, key) => {
+            if path.starts_with("T:") && threads::thread(&records, &owner, &key).is_none() {
+                return Answer::error(format!("there is no thread `{path}`"));
             }
             let needle = pattern.to_lowercase();
-            let lines: Vec<String> = threads::notes(&records, &owner, &thread)
+            let lines: Vec<String> = threads::notes(&records, &owner, &key)
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| {
@@ -145,7 +148,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
                         .to_lowercase()
                         .contains(&needle)
                 })
-                .map(|(i, n)| format!("T:{thread}#{} {} {}", i + 1, n.label, n.text))
+                .map(|(i, n)| format!("{path}#{} {} {}", i + 1, n.label, n.text))
                 .collect();
             let total = lines.len();
             answer(lines.into_iter().take(max).collect(), total, pattern)

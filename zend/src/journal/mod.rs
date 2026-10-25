@@ -18,10 +18,12 @@
 //! | [`carry`] | the journal as the system prompt carries it |
 //! | [`record`] | the record a restart rebuilds the journal from |
 //! | [`text`] | the turns behind each entry, whole, for `journal_read` and `journal_grep` |
+//! | [`shelf`] | the journals a dialogue's journal tools reach by name: its own, and those above it |
 //! | [`registry`] | every dialogue's journal, by conversation |
 //!
-//! Only a dialogue journals. A journal is private to its conversation: no other
-//! conversation retrieves its sections and no layer reads them, and it is
+//! Only a dialogue journals. A journal is read by its own conversation and,
+//! for a conversation owned through `/mcp`, by the conversations below it
+//! (`docs/claude_zend_gateway.md` §5.1); no layer reads it, and it is
 //! tombstoned with the conversation.
 
 pub mod carry;
@@ -31,6 +33,7 @@ pub mod origin;
 pub mod pressure;
 pub mod record;
 pub mod registry;
+pub mod shelf;
 pub mod state;
 pub mod style;
 pub mod text;

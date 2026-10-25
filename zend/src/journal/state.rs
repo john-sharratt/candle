@@ -15,8 +15,10 @@ use std::time::{Duration, Instant};
 use journal_core::journal::{Holds, Journal};
 use journal_core::section::Kept;
 use journal_core::span::{Span, SpanTurn};
+use journal_core::style::Style;
 
 use crate::journal::origin::{reply_part, turn_of};
+use crate::journal::style::CODING;
 
 /// Sealed dialogue turns that must land since the last look before the next
 /// draft.
@@ -32,11 +34,19 @@ pub const FOLD_SWEEP_EVERY: Duration = Duration::from_secs(5 * 60);
 /// and every sweep — four decodes each time, against the dialogue's slot.
 pub const FOLD_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SessionJournal {
     journal: Journal,
     /// When a fold was last given up on, if one was this run.
     fold_failed_at: Option<Instant>,
+    /// The wording its entries are kept in ([`super::style::style_for`]).
+    style: &'static Style,
+}
+
+impl Default for SessionJournal {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Holds for SessionJournal {
@@ -50,8 +60,13 @@ impl Holds for SessionJournal {
 }
 
 impl SessionJournal {
+    /// An empty journal of a coding session.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            journal: Journal::default(),
+            fold_failed_at: None,
+            style: &CODING,
+        }
     }
 
     /// Rebuild from the record the conversation's metadata held. Part numbers
@@ -61,8 +76,18 @@ impl SessionJournal {
         let covered_to = kept.covered_to;
         Self {
             journal: Journal::restore(kept, covered_to),
-            fold_failed_at: None,
+            ..Self::new()
         }
+    }
+
+    /// This journal, kept in `style`.
+    pub fn in_style(self, style: &'static Style) -> Self {
+        Self { style, ..self }
+    }
+
+    /// The wording its entries are kept in.
+    pub fn style(&self) -> &'static Style {
+        self.style
     }
 
     /// A fold was given up on at `now`.

@@ -800,6 +800,18 @@ build is certified (§3.8):
 
    `--after-pid` and `--upgrade-failed` are one-shot flags: `LaunchSpec::capture`
    drops them, so no later relaunch repeats them.
+
+   **keep on its cluster socket.** Beside its loopback switch, keep declares
+   routes on the socket it holds as the app `keep` (`keep/src/remote.rs`):
+   `GET /v1/keep/state`, `POST /v1/keep/trial` — a trial run as a job, answered
+   at once, its end read from the state — and `POST
+   /v1/keep/service/:name/:action`. It serves only a request the gateway stamped
+   with the member it came from. A member reaches a machine's keep over
+   `group:keep`, naming the machine in `x-tokera-host`
+   (`web/src/cluster/keeps.rs`); this is how an Admin's operations tools try a
+   build on one machine (`docs/claude_zend_gateway.md` §8.4). A trial asked for
+   this way is refused for an artifact whose `--build-info` names a `local`
+   build.
 5. **Members that cannot upgrade** are closed 4410 once the rollout settles, 120 s after
    the floor rose: stranded ones, failed ones, and ones that hold no verified artifact
    of the build and fetch none. A member still waiting for the lease, fetching or
@@ -3671,7 +3683,10 @@ one opened `pushing_through` one makes every push (`zend_vfs::Fetch`, `zend_vfs:
 ### 11.5 How zend calls it
 
 With `--cluster`, `run_command`, `run_output` and the git writers dispatch to agents
-through a stream the member opens to `group:agent` (§5.1). The in-process `Sandboxes`
+through a stream the member opens to `group:agent` (§5.1). An Admin's operations tool
+starts a run job the same way, without waiting for it (`Agents::submit`), and a run job
+naming a `stage` has the agent copy what it built to the agent's `stage_dir` once it
+exits 0, for that machine's keep (`docs/claude_zend_gateway.md` §8.3–§8.4). The in-process `Sandboxes`
 (`zend/src/tools.rs:771`) remain the executor of a daemon without `--cluster`. That is a
 deployment configuration, not a fallback: with `--cluster`, an unreachable agent is the
 tool error `no_agent`, never a quiet local run.

@@ -199,6 +199,14 @@ impl Tool for GitPush {
         let repo = open(ctx, &req.repo)?;
         let remote = RemoteName::parse(&req.remote)?;
 
+        // A conversation that pushes to branches only never changes a
+        // repository's default branch, whichever way the push would.
+        for item in &req.pushes {
+            if matches!(item.action, PushAct::UpdateBranch | PushAct::DeleteBranch) {
+                ctx.check_push(&req.repo, &item.name)
+                    .map_err(GitError::invalid)?;
+            }
+        }
         let mut specs = Vec::with_capacity(req.pushes.len());
         for item in &req.pushes {
             let lease = |repo: &GitRepo, branch: &BranchName| -> Result<Lease, GitToolError> {

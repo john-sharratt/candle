@@ -6,7 +6,9 @@
 #   target\release\keep.exe keep/keep.yaml
 
 state: keep/state
-# Listed on the gateway's cluster page as the app keep. No routes, no rollout.
+# Listed on the gateway's cluster page as the app keep, and reached there by an
+# Admin's operations tools: its state, a trial, a service's restart, stop or
+# start (docs/claude_zend_gateway.md §8.4). No rollout.
 cluster:
   url: https://gateway.tokera.com:9443
   name: tokera.com

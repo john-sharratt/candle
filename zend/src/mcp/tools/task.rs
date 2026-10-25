@@ -1,5 +1,6 @@
-//! `zend_task {thread, name, prompt, wait_s?}`: start a task on a new worker,
-//! and wait for it up to `wait_s` (`docs/claude_zend_gateway.md` §3.2, §3.3).
+//! `zend_task {thread, name, prompt, priority?, wait_s?}`: start a task on a
+//! new worker, and wait for it up to `wait_s` (`docs/claude_zend_gateway.md`
+//! §3.2, §3.3, §3.4).
 
 use std::time::Duration;
 
@@ -7,6 +8,7 @@ use serde_json::{json, Value};
 
 use super::wait::render;
 use super::{string, wait_secs, Answer, Ctx};
+use crate::mcp::threads::Priority;
 use crate::mcp::workers;
 
 pub const NAME: &str = "zend_task";
@@ -28,6 +30,7 @@ pub fn definition() -> Value {
                 "thread": {"type": "string", "description": "The thread the task belongs to; created on first use."},
                 "name": {"type": "string", "description": "The worker's name: a kebab-case slug of at most 40 characters saying what it does."},
                 "prompt": {"type": "string", "description": "The task, stated in full."},
+                "priority": {"type": "string", "enum": ["normal", "high"], "description": "How urgently it decodes: `normal` (the default) runs below a live user; `high` only when someone is waiting on it interactively."},
                 "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait before answering `running` (50 by default)."}
             },
             "required": ["thread", "name", "prompt"],
@@ -45,7 +48,11 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         (Ok(t), Ok(n), Ok(p)) => (t, n, p),
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return Answer::error(e),
     };
-    let worker = match workers::start(&ctx.session, &ctx.caller, thread, name, prompt) {
+    let priority = match Priority::of(args.get("priority").and_then(Value::as_str)) {
+        Ok(p) => p,
+        Err(e) => return Answer::error(e),
+    };
+    let worker = match workers::start(&ctx.session, &ctx.caller, thread, name, prompt, priority) {
         Ok(w) => w,
         Err(e) => return Answer::error(e),
     };

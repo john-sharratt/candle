@@ -36,9 +36,9 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     let (thread, name) = match Path::parse(path) {
         Ok(Path::Worker { thread, worker }) => (thread, worker),
-        Ok(Path::Thread(_)) => {
+        Ok(_) => {
             return Answer::error(format!(
-                "`{path}` is a thread; a worker is `T:<thread>/<name>`"
+                "`{path}` is not a worker; a worker is `T:<thread>/<name>`"
             ))
         }
         Err(e) => return Answer::error(e),

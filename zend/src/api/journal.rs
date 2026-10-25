@@ -64,11 +64,16 @@ fn no_draft(why: NoDraft) -> Response {
             "the conversation is not open on this member — a draft forks its live slot, so \
              send it a message first",
         ),
+        NoDraft::Running => refused(
+            StatusCode::CONFLICT,
+            "draft_running",
+            "a draft is running; it may not cover the latest turns, so ask again once \
+             `drafting` clears",
+        ),
         NoDraft::NotDue | NoDraft::NothingNew => refused(
             StatusCode::CONFLICT,
             "nothing_to_draft",
-            "a draft is already running, or nothing has happened since the journal last \
-             looked",
+            "nothing has happened since the journal last looked",
         ),
     }
 }
@@ -145,6 +150,15 @@ mod tests {
         let (status, body) = body(no_draft(NoDraft::NotOpen)).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "not_open");
+    }
+
+    /// A running draft is its own refusal, so a caller waits it out rather
+    /// than reading it as nothing new.
+    #[tokio::test]
+    async fn a_draft_already_running_says_so() {
+        let (status, body) = body(no_draft(NoDraft::Running)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "draft_running");
     }
 
     #[tokio::test]

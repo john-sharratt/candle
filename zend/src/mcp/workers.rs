@@ -19,6 +19,11 @@
 //!
 //! Each settling is entered on the thread. An answer is the worker's next turn,
 //! and the worker settles again after it.
+//!
+//! A **part** — what a worker starts under itself with `sub_run`
+//! (`super::parts`) — runs the same way, as the role its worker runs as, but
+//! asks nobody: it ends `done` or `error`, is archived either way, and its
+//! settling is its worker's business, not an entry on Claude's thread.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,12 +31,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use candle_conversation::persistence::SharedSubstrate;
 use futures::StreamExt;
 use serde_json::Value;
+use web::auth::Role as AccessRole;
 
 use super::caller::Caller;
 use super::names;
 use super::nudges;
 use super::records::Records;
-use super::threads::{self, Entry, Note, State, Worker, BEAT_EVERY_MS};
+use super::threads::{self, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
 use crate::session::{NoDraft, StreamItem, ZendSession};
@@ -71,6 +77,18 @@ OPTIONS: each choice you see, and what it leads to\n\
 TRIED: what you already did, and what happened\n\
 POINTERS: the files and lines, commands or turns the question rests on\n\
 Never ask what you can settle yourself by reading, running or searching.";
+
+/// What every part's prompt ends with: whose part it is, and that nobody
+/// answers it.
+pub fn part_close(parent: &str) -> String {
+    format!(
+        "\n\n---\nYou are a part of the task of {parent}, which started you with `sub_run` and \
+         waits for you: your final response, and the journal entry drafted from it, are what it \
+         gets back. Nobody can answer a question from you. If something blocks you, say exactly \
+         what in your final response — what you tried, what happened, and the files, lines or \
+         commands it rests on — and end there."
+    )
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -166,14 +184,15 @@ pub fn summary_line(entry: &str, max: usize) -> String {
     }
 }
 
-/// Start `prompt` on a new worker named after `wanted` under `thread`; the
-/// worker's record, `running`.
+/// Start `prompt` on a new worker named after `wanted` under `thread`,
+/// decoding at `priority`; the worker's record, `running`.
 pub fn start(
     session: &Arc<ZendSession>,
     caller: &Caller,
     thread: &str,
     wanted: &str,
     prompt: &str,
+    priority: Priority,
 ) -> Result<Worker, String> {
     let records = session.shared_substrate().ok_or_else(loading)?;
     let owner = caller.key();
@@ -184,30 +203,17 @@ pub fn start(
     let now = now_ms();
     threads::attach(&records, &owner, thread, now).map_err(|e| e.to_string())?;
     let _held = BEGIN.lock().unwrap();
-    let taken: Vec<(String, bool)> = threads::workers(&records, &owner, thread)
-        .into_iter()
-        .map(|w| {
-            let live = w.clone().observed(now).state.live();
-            (w.name, live)
-        })
-        .collect();
-    let name = names::worker_name(thread, wanted, &taken)?;
-    let conv_id = threads::conv_id(&owner, thread, &name);
-    let worker = Worker {
-        thread: thread.to_string(),
-        name: name.clone(),
-        conv_id: conv_id.clone(),
-        prompt: prompt.to_string(),
-        state: State::Running,
-        started_ms: now,
-        beat_ms: now,
-        ended_ms: None,
-        entries_after: newest_entry(session.journal(&conv_id).as_ref()),
-        entries: Vec::new(),
-        final_text: String::new(),
-        error: None,
-        question: None,
-    };
+    let taken = taken(&records, &owner, thread, now);
+    let name = names::child_name(thread, "", wanted, &taken)?;
+    let worker = fresh(
+        session,
+        &owner,
+        thread,
+        name,
+        prompt,
+        (caller.role, priority),
+        now,
+    );
     note(
         &records,
         &owner,
@@ -217,12 +223,93 @@ pub fn start(
     )?;
     begin(
         session,
-        caller,
         &records,
         &owner,
         worker,
         format!("{prompt}{ASKING}"),
     )
+}
+
+/// Every conversation under `thread`, by lineage name, and whether it is live.
+///
+/// A name is taken by its record's key, read or not: a record that no longer
+/// decodes still names a conversation that exists, so its name is never given
+/// out again — it counts as ended, and a new task asking for it gets the next
+/// numbered sibling.
+fn taken(records: &dyn Records, owner: &str, thread: &str, now: u64) -> Vec<(String, bool)> {
+    let prefix = threads::worker_prefix(owner, thread);
+    records
+        .under(&prefix)
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let name = key.strip_prefix(&prefix)?.to_string();
+            let live =
+                serde_json::from_value::<Worker>(value).is_ok_and(|w| w.observed(now).state.live());
+            Some((name, live))
+        })
+        .collect()
+}
+
+/// A new worker's record, `running`, its turn beginning `now`, running as
+/// `role` at `priority`.
+fn fresh(
+    session: &ZendSession,
+    owner: &str,
+    thread: &str,
+    name: String,
+    prompt: &str,
+    (role, priority): (AccessRole, Priority),
+    now: u64,
+) -> Worker {
+    let conv_id = threads::conv_id(owner, thread, &name);
+    Worker {
+        thread: thread.to_string(),
+        entries_after: newest_entry(session.journal(&conv_id).as_ref()),
+        name,
+        conv_id,
+        prompt: prompt.to_string(),
+        state: State::Running,
+        role,
+        priority,
+        started_ms: now,
+        turn_ms: now,
+        beat_ms: now,
+        ended_ms: None,
+        entries: Vec::new(),
+        final_text: String::new(),
+        error: None,
+        question: None,
+    }
+}
+
+/// Start a part named after `wanted` under `parent`, running `prompt` as the
+/// role `parent` runs as; the part's record, `running`.
+pub fn start_part(
+    session: &Arc<ZendSession>,
+    owner: &str,
+    parent: &Worker,
+    wanted: &str,
+    prompt: &str,
+) -> Result<Worker, String> {
+    let records = session.shared_substrate().ok_or_else(loading)?;
+    if prompt.trim().is_empty() {
+        return Err("the part's `prompt` is empty: state its task in full".into());
+    }
+    let now = now_ms();
+    let _held = BEGIN.lock().unwrap();
+    let taken = taken(&records, owner, &parent.thread, now);
+    let name = names::child_name(&parent.thread, &parent.name, wanted, &taken)?;
+    let part = fresh(
+        session,
+        owner,
+        &parent.thread,
+        name,
+        prompt,
+        (parent.role, parent.priority),
+        now,
+    );
+    let message = format!("{prompt}{}", part_close(&parent.path()));
+    begin(session, &records, owner, part, message)
 }
 
 /// Answer the worker `name` of `thread`, which asked or is stuck: the answer
@@ -256,7 +343,9 @@ pub fn answer(
     }
     let now = now_ms();
     worker.state = State::Running;
+    worker.role = caller.role;
     worker.beat_ms = now;
+    worker.turn_ms = now;
     worker.question = None;
     worker.entries_after = newest_entry(session.journal(&worker.conv_id).as_ref());
     worker.entries = Vec::new();
@@ -267,14 +356,7 @@ pub fn answer(
         "Claude answered:",
         first_line(text, PROMPT_QUOTE),
     )?;
-    begin(
-        session,
-        caller,
-        &records,
-        &owner,
-        worker,
-        format!("{text}{ASKING}"),
-    )
+    begin(session, &records, &owner, worker, format!("{text}{ASKING}"))
 }
 
 /// Queue `text` for the running worker `name` of `thread`, taken at its next
@@ -342,17 +424,19 @@ fn note(
 /// Keep `worker` as running and start its turn on `message`.
 fn begin(
     session: &Arc<ZendSession>,
-    caller: &Caller,
     records: &dyn Records,
     owner: &str,
     worker: Worker,
     message: String,
 ) -> Result<Worker, String> {
     threads::put_worker(records, owner, &worker).map_err(|e| e.to_string())?;
+    // Recorded before the turn makes the conversation's slot, which reads it.
+    if let Some(Err(e)) = session.set_decode_band(&worker.conv_id, worker.priority.band()) {
+        tracing::warn!(conv_id = %worker.conv_id, "mcp: the task's priority could not be kept: {e}");
+    }
     session.mcp().bump();
     tokio::spawn(run(
         Arc::clone(session),
-        caller.clone(),
         owner.to_string(),
         worker.clone(),
         message,
@@ -370,13 +454,7 @@ enum Ended {
 }
 
 /// The turn's life after [`begin`], and the worker's settling.
-async fn run(
-    session: Arc<ZendSession>,
-    caller: Caller,
-    owner: String,
-    mut worker: Worker,
-    message: String,
-) {
+async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, message: String) {
     let Some(records) = session.shared_substrate() else {
         return;
     };
@@ -388,7 +466,7 @@ async fn run(
         worker.thread.clone(),
         worker.name.clone(),
     ));
-    let ended = turn(&session, &caller, &worker, message).await;
+    let ended = turn(&session, &worker, message).await;
     // A nudge that came after the turn's last tool round was never read.
     for undelivered in nudges::take(&records, &worker.conv_id) {
         let line = format!(
@@ -404,7 +482,11 @@ async fn run(
         let view = session.journal(&worker.conv_id);
         worker.entries = entries_after(view.as_ref(), worker.entries_after);
     }
-    let (label, outcome) = settle(&mut worker, ended);
+    let (label, outcome) = if worker.is_part() {
+        settle_part(&mut worker, ended)
+    } else {
+        settle(&mut worker, ended)
+    };
     // The beat stops, and is done writing, before the settled record is.
     beating.abort();
     let _ = beating.await;
@@ -421,8 +503,12 @@ async fn run(
     if let Err(e) = threads::put_worker(&records, &owner, &worker) {
         tracing::warn!(conv_id = %worker.conv_id, "mcp: the worker's outcome could not be kept: {e}");
     }
-    if let Err(e) = note(&records, &owner, &worker, label, outcome) {
-        tracing::warn!(conv_id = %worker.conv_id, "mcp: the outcome could not be entered on the thread: {e}");
+    // The thread is Claude's record of what Claude did; a part's outcome goes
+    // to the worker that started it, as its `sub_run` result.
+    if !worker.is_part() {
+        if let Err(e) = note(&records, &owner, &worker, label, outcome) {
+            tracing::warn!(conv_id = %worker.conv_id, "mcp: the outcome could not be entered on the thread: {e}");
+        }
     }
     session.mcp().bump();
 }
@@ -493,14 +579,37 @@ fn settle(worker: &mut Worker, ended: Ended) -> (&'static str, String) {
     }
 }
 
-/// Run one turn of the worker on `message` to its end.
-async fn turn(
-    session: &Arc<ZendSession>,
-    caller: &Caller,
-    worker: &Worker,
-    message: String,
-) -> Ended {
-    let mode = access::effective_mode(caller.role, None);
+/// Settle the part `part` on how its turn `ended`: `done` with its final
+/// response — a part asks nobody, so a question block or a closed loop is
+/// still its answer, said as such — or `error`.
+fn settle_part(part: &mut Worker, ended: Ended) -> (&'static str, String) {
+    match ended {
+        Ended::Failed(error) => {
+            let line = format!("error: {}", first_line(&error, 200));
+            part.error = Some(error);
+            part.state = State::Error;
+            ("Part ended:", line)
+        }
+        Ended::Closed(text) => {
+            part.final_text = format!(
+                "Its tools were closed before it finished — the same call repeated, or the \
+                 round cap reached — and it ended:\n{}",
+                final_reply(&text)
+            );
+            part.state = State::Done;
+            ("Part ended:", "its tools were closed".into())
+        }
+        Ended::Replied(text) => {
+            part.final_text = final_reply(&text);
+            part.state = State::Done;
+            ("Part ended:", "done".into())
+        }
+    }
+}
+
+/// Run one turn of the worker on `message` to its end, as its role.
+async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String) -> Ended {
+    let mode = access::effective_mode(worker.role, None);
     let mut selection = dial_selection(Some(TASK_EFFORT), None, Some(true));
     apply_tools_dial(&mut selection, mode);
     let mut stream = session
@@ -553,7 +662,7 @@ async fn finish_journal(session: &ZendSession, conv_id: &str) {
             Some(Ok(_)) => break,
             // A draft already running — the cadence's — may not cover the
             // turn's last stretch: wait it out and ask again.
-            Some(Err(NoDraft::NothingNew)) if drafting(session.journal(conv_id).as_ref()) => {
+            Some(Err(NoDraft::Running)) => {
                 if Instant::now() >= deadline {
                     return;
                 }
@@ -611,6 +720,7 @@ pub async fn wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::records::MemRecords;
     use serde_json::json;
 
     fn view() -> Value {
@@ -630,7 +740,10 @@ mod tests {
             conv_id: "c".into(),
             prompt: "p".into(),
             state: State::Running,
+            role: AccessRole::Admin,
+            priority: Priority::Normal,
             started_ms: 0,
+            turn_ms: 0,
             beat_ms: 0,
             ended_ms: None,
             entries_after: None,
@@ -642,6 +755,29 @@ mod tests {
             error: None,
             question: None,
         }
+    }
+
+    /// **A record that does not read still takes its name**: it counts as
+    /// ended, so its name is not handed out again for a new conversation.
+    #[test]
+    fn a_name_is_taken_by_its_key_whether_or_not_its_record_reads() {
+        let records = MemRecords::default();
+        let mut live = worker();
+        live.beat_ms = 1_000;
+        threads::put_worker(&records, "o", &live).unwrap();
+        records
+            .put(
+                &threads::worker_key("o", "review", "old"),
+                json!({"name": "old", "written": "by an earlier build"}),
+            )
+            .unwrap();
+        let mut t = taken(&records, "o", "review", 1_000);
+        t.sort();
+        assert_eq!(
+            t,
+            [("old".to_string(), false), ("verify".to_string(), true)]
+        );
+        assert_eq!(names::child_name("review", "", "old", &t).unwrap(), "old.2");
     }
 
     #[test]
@@ -714,6 +850,50 @@ mod tests {
     fn every_task_is_told_how_to_ask() {
         assert!(ASKING.contains(QUESTION_MARK));
         assert!(ASKING.contains("OPTIONS:") && ASKING.contains("POINTERS:"));
+    }
+
+    /// **A part never waits on anyone**: a question block or a closed loop is
+    /// its answer, settled `done` — said as such — and only a failure is
+    /// `error`. Either way it is no longer live.
+    #[test]
+    fn a_part_settles_done_or_failed_and_never_waits() {
+        let part = || Worker {
+            name: "verify/read".into(),
+            ..worker()
+        };
+        let mut p = part();
+        settle_part(&mut p, Ended::Replied("Read it.\nQUESTION: which?".into()));
+        assert_eq!(p.state, State::Done);
+        assert_eq!(p.final_text, "Read it.\nQUESTION: which?");
+        assert_eq!(p.question, None);
+
+        let mut p = part();
+        settle_part(
+            &mut p,
+            Ended::Closed("<think>x</think>I could not finish.".into()),
+        );
+        assert_eq!(p.state, State::Done);
+        assert_eq!(
+            p.final_text,
+            "Its tools were closed before it finished — the same call repeated, or the \
+             round cap reached — and it ended:\nI could not finish."
+        );
+
+        let mut p = part();
+        settle_part(&mut p, Ended::Failed("boom".into()));
+        assert_eq!((p.state, p.error.as_deref()), (State::Error, Some("boom")));
+        assert!(!p.state.live());
+    }
+
+    #[test]
+    fn a_part_is_told_whose_it_is_and_that_nobody_answers_it() {
+        let close = part_close("T:review/verify");
+        assert!(close.contains("the task of T:review/verify"), "{close}");
+        assert!(
+            close.contains("Nobody can answer a question from you"),
+            "{close}"
+        );
+        assert!(!close.contains(QUESTION_MARK));
     }
 
     #[test]

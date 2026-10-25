@@ -2,7 +2,7 @@
 name = "keep"
 version = "0.1.0"
 edition = "2021"
-description = "Failsafe for web and motherd. Starts the stable executable and switches it on a loopback request."
+description = "Failsafe for web and motherd. Starts the stable executable and switches it on a loopback request, or on an Admin's request through the cluster."
 
 [[bin]]
 name = "keep"
@@ -12,6 +12,10 @@ path = "src/main.rs"
 anyhow       = { workspace = true }
 cluster      = { path = "../cluster" }
 cluster-dial = { path = "../cluster-dial" }
+# keep's routes on its cluster socket, served to the streams a gateway opens.
+http-body-util = "0.1"
+hyper        = { version = "1", features = ["server", "http1"] }
+hyper-util   = { version = "0.1", features = ["tokio"] }
 rand         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }

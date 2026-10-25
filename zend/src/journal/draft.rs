@@ -16,7 +16,6 @@ use journal_core::verify::World;
 use journal_core::workflow::{self, Desk};
 
 use crate::journal::state::SessionJournal;
-use crate::journal::style::CODING;
 
 fn hold(state: &Mutex<SessionJournal>) -> MutexGuard<'_, SessionJournal> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -32,7 +31,8 @@ pub async fn draft<D: Desk>(
     world: &(dyn World + Sync),
 ) -> DraftRecord {
     let started = Instant::now();
-    let (outcome, timing) = workflow::run(desk, state, span, world, &CODING).await;
+    let style = hold(state).style();
+    let (outcome, timing) = workflow::run(desk, state, span, world, style).await;
     let record = DraftRecord::of(span, started.elapsed(), &outcome).timed(timing);
     hold(state).journal_mut().record(record.clone());
     record

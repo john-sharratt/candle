@@ -18,7 +18,8 @@
 //! | `subagent_runner` | `Option<Arc<dyn SubagentRunner>>` | Injected by daemon to run nested agent loops |
 //! | `executor` | [`Executor`] | Where `run_command` runs and the repositories' pushes are made: this daemon's sandboxes, or agents — commands reached only through [`ToolContext::executor`] |
 //! | `lineage` | `String` | The conversation the context's jobs belong to, which keeps them on one agent |
-//! | `journal` | `Option<Arc<dyn JournalBook>>` | The conversation's journal text, for `journal_read` and `journal_grep` — reached only through [`ToolContext::journal`] |
+//! | `journals` | `Option<Arc<dyn JournalShelf>>` | The journals the conversation reads — its own and its ancestors' — for `journal_read` and `journal_grep`, reached only through [`ToolContext::journals`] |
+//! | `default_branches` | `Option<Arc<BTreeMap<String, BTreeSet<String>>>>` | The branches of each repository `git_push` may not change — set for a conversation that may push to branches only ([`ToolContext::check_push`]) |
 //!
 //! # Grants
 //!
@@ -37,12 +38,13 @@
 //! tests want; a test needing the lower layer builds a `Workspace` over a temp
 //! dir.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::executor::Executor;
 use crate::grants::{Capability, Grants, NotPermitted};
 use crate::state::{CredentialStore, HashStateStore, NotesStore, Secrets, SessionRegistry};
-use crate::tools::journal::JournalBook;
+use crate::tools::journal::JournalShelf;
 use zend_vfs::{here, GitError, Push, RepoFiles, Workspace};
 
 /// Read-only handle bundle passed by the runner into each tool invocation.
@@ -64,7 +66,10 @@ pub struct ToolContext {
     /// The conversation this context's jobs belong to; empty for none.
     lineage: String,
     /// `None` for a conversation that keeps no journal.
-    journal: Option<Arc<dyn JournalBook>>,
+    journals: Option<Arc<dyn JournalShelf>>,
+    /// The branches of each repository closed to `git_push`; `None` when the
+    /// context may push to any branch its grants allow.
+    default_branches: Option<Arc<BTreeMap<String, BTreeSet<String>>>>,
     grants: Grants,
 }
 
@@ -102,8 +107,37 @@ impl ToolContext {
             subagent_runner: None,
             executor: None,
             lineage: String::new(),
-            journal: None,
+            journals: None,
+            default_branches: None,
             grants: Grants::NONE,
+        }
+    }
+
+    /// This context pushing to branches only: `defaults` names, per
+    /// repository, the branches [`Self::check_push`] refuses.
+    pub fn branches_only(mut self, defaults: Arc<BTreeMap<String, BTreeSet<String>>>) -> Self {
+        self.default_branches = Some(defaults);
+        self
+    }
+
+    /// Refuse a push that would change `branch` of `repo` when this context
+    /// pushes to branches only and `branch` is one of the repository's
+    /// defaults — or when the repository's defaults are not known, so a push
+    /// cannot be shown to spare them.
+    pub fn check_push(&self, repo: &str, branch: &str) -> Result<(), String> {
+        let Some(defaults) = self.default_branches.as_deref() else {
+            return Ok(());
+        };
+        match defaults.get(repo) {
+            Some(closed) if closed.contains(branch) => Err(format!(
+                "{branch} is a default branch of {repo}, and this conversation pushes to \
+                 branches only: push to a branch of its own, and its owner merges it"
+            )),
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "{repo}'s default branch is not known, and this conversation pushes to \
+                 branches only, so it cannot push there"
+            )),
         }
     }
 
@@ -166,14 +200,15 @@ impl ToolContext {
         }
     }
 
-    /// The conversation's journal text — `None` when it keeps no journal.
-    pub fn journal(&self) -> Option<&dyn JournalBook> {
-        self.journal.as_deref()
+    /// The journals the conversation's journal tools read — `None` when it
+    /// keeps no journal.
+    pub fn journals(&self) -> Option<&dyn JournalShelf> {
+        self.journals.as_deref()
     }
 
-    /// This context reading `journal` as its conversation's journal text.
-    pub fn with_journal(mut self, journal: Arc<dyn JournalBook>) -> Self {
-        self.journal = Some(journal);
+    /// This context reading its journals from `journals`.
+    pub fn with_journals(mut self, journals: Arc<dyn JournalShelf>) -> Self {
+        self.journals = Some(journals);
         self
     }
 
@@ -219,6 +254,32 @@ mod tests {
             .granting(Grants::NONE.with(Capability::Network))
             .http()
             .is_ok());
+    }
+
+    /// **A branches-only context refuses its repositories' default branches,
+    /// and fails closed**: a repository whose defaults are not known takes no
+    /// push from it at all. An ordinary context refuses nothing.
+    #[test]
+    fn a_branches_only_context_refuses_the_default_branch() {
+        let defaults = Arc::new(BTreeMap::from([(
+            "candle".to_string(),
+            BTreeSet::from(["main".to_string(), "master".to_string()]),
+        )]));
+        let ctx = ToolContext::new().branches_only(defaults);
+        let err = ctx.check_push("candle", "main").unwrap_err();
+        assert_eq!(
+            err,
+            "main is a default branch of candle, and this conversation pushes to branches \
+             only: push to a branch of its own, and its owner merges it"
+        );
+        assert!(ctx.check_push("candle", "master").is_err());
+        assert!(ctx.check_push("candle", "feature").is_ok());
+        assert_eq!(
+            ctx.check_push("other", "feature").unwrap_err(),
+            "other's default branch is not known, and this conversation pushes to branches \
+             only, so it cannot push there"
+        );
+        assert!(ToolContext::new().check_push("candle", "main").is_ok());
     }
 
     /// **The executor is out of reach without `Exec`**, and a context given

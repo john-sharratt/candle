@@ -7,10 +7,10 @@
 //! estate's table on every call, so a role changed in `roles.yaml` takes effect
 //! on the next call rather than the next sign-in.
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use web::auth::forwarded::identify;
+use web::auth::forwarded::{identify, EMAIL, NAME, PROVIDER, USER};
 use web::auth::{Identity, Role, Roles};
 
 /// The person a token speaks for.
@@ -82,6 +82,24 @@ impl Caller {
     pub fn is_admin(&self) -> bool {
         self.role.at_least(Role::Admin)
     }
+
+    /// The identity a request this member sends on the caller's behalf
+    /// states — the headers the gateway believes from a member's socket — so
+    /// every hop checks the caller's role, and the coordination log records
+    /// who ran what.
+    pub fn headers(&self) -> Vec<(HeaderName, HeaderValue)> {
+        let p = &self.person;
+        [
+            (USER, p.sub.as_str()),
+            (PROVIDER, p.provider.as_str()),
+            (EMAIL, p.email.as_str()),
+            (NAME, p.name.as_str()),
+        ]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .filter_map(|(k, v)| Some((HeaderName::from_static(k), HeaderValue::from_str(v).ok()?)))
+        .collect()
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +137,31 @@ mod tests {
         let c = Caller::of(&h, &roles).unwrap();
         assert_eq!(c.key(), person("google", "boss").key());
         assert!(c.is_admin());
+    }
+
+    /// What a caller states up a member's socket reads back as the same
+    /// caller, and an empty field is not sent.
+    #[test]
+    fn the_headers_a_caller_states_identify_it_again() {
+        let roles: Roles = serde_yaml::from_str("admins:\n  - sub: boss\n").unwrap();
+        let caller = Caller {
+            person: Person {
+                provider: "google".into(),
+                sub: "boss".into(),
+                email: "b@x.com".into(),
+                name: String::new(),
+            },
+            role: Role::Admin,
+        };
+        let sent = caller.headers();
+        assert_eq!(sent.len(), 3, "no empty name");
+        let mut h = HeaderMap::new();
+        for (k, v) in sent {
+            h.insert(k, v);
+        }
+        let again = Caller::of(&h, &roles).unwrap();
+        assert_eq!(again.person, caller.person);
+        assert!(again.is_admin());
     }
 
     #[test]

@@ -15,6 +15,8 @@ use crate::config::AgentConfig;
 /// One repository's checkout.
 pub struct Checkout {
     pub name: String,
+    /// Its folder: where a run's build outputs are, for staging.
+    pub dir: PathBuf,
     /// The agent holds the credentials to push to its origin.
     pub push: bool,
     /// Origin's fetch URL; empty when the checkout has no origin.
@@ -38,6 +40,8 @@ pub struct Checkouts {
     /// The folder the job logs are written to, which also keeps the agent's
     /// node and its switch.
     jobs_dir: PathBuf,
+    /// Where a run stages what it built, for this machine's keep.
+    stage_dir: Option<PathBuf>,
 }
 
 impl Checkouts {
@@ -68,6 +72,7 @@ impl Checkouts {
                 c.name.clone(),
                 Checkout {
                     name: c.name.clone(),
+                    dir: c.dir.clone(),
                     push: c.push,
                     origin,
                     source,
@@ -79,12 +84,18 @@ impl Checkouts {
             by_name,
             toolchains,
             jobs_dir: cfg.jobs_dir.clone(),
+            stage_dir: cfg.stage_dir.clone(),
         })
     }
 
     /// The folder the job logs are written to.
     pub fn jobs_dir(&self) -> &Path {
         &self.jobs_dir
+    }
+
+    /// Where a run stages what it built; `None` when this agent stages nothing.
+    pub fn stage_dir(&self) -> Option<&Path> {
+        self.stage_dir.as_deref()
     }
 
     /// What `CAPACITY` advertises as its toolchains (§11.2).

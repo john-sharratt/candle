@@ -191,10 +191,26 @@ impl Agents {
         self.in_process.as_ref().filter(|_| !self.admitted())
     }
 
-    /// Run `job` for `lineage` and wait for it to end.
-    pub async fn run(&self, lineage: &str, job: RunJob) -> Result<Ran, AgentError> {
+    /// Start `job` for `lineage` — on agent `to`, or on the one the gateway
+    /// chooses — and answer where it runs and how it stands, without waiting
+    /// for it to end.
+    pub async fn submit(
+        &self,
+        lineage: &str,
+        job: RunJob,
+        to: Option<u64>,
+    ) -> Result<(At, JobView), AgentError> {
         if let Some(jobs) = self.local() {
-            return run_in_process(jobs, job).await;
+            // Cut off, this process's agent is the only one in reach: a job
+            // pinned to another runs nowhere rather than somewhere unasked.
+            if let Some(node) = to.filter(|n| self.at(*n) != At::InProcess) {
+                return Err(AgentError::NoAgent(format!(
+                    "agent {node:016x} is out of reach: this member is cut off from every \
+                     cluster, and only its own agent runs jobs"
+                )));
+            }
+            let view = jobs.submit(Submit::Run(job)).await.map_err(refused)?;
+            return Ok((At::InProcess, view));
         }
         let body = serde_json::to_vec(&Submit::Run(job.clone())).expect("a job serialises");
         let (agent, started) = self
@@ -202,17 +218,29 @@ impl Agents {
                 method: Method::POST,
                 path: "/v1/jobs".into(),
                 body,
-                to: None,
+                to,
                 lineage: Some(lineage),
                 repo: Some(&job.repo),
                 toolchain: Some(&job.program),
                 push: false,
             })
             .await?;
-        let mut view = Self::view_of(&started)?;
+        let view = Self::view_of(&started)?;
         let agent = agent.ok_or_else(|| {
             AgentError::Transport("the gateway named no agent for the job".into())
         })?;
+        Ok((At::Agent(agent), view))
+    }
+
+    /// Run `job` for `lineage` and wait for it to end.
+    pub async fn run(&self, lineage: &str, job: RunJob) -> Result<Ran, AgentError> {
+        if let Some(jobs) = self.local() {
+            return run_in_process(jobs, job).await;
+        }
+        let (at, mut view) = self.submit(lineage, job, None).await?;
+        let At::Agent(agent) = at else {
+            return run_in_process_after(self.own()?, view).await;
+        };
         while !view.status.is_finished() {
             let (_, body) = self
                 .call(Call {
@@ -297,6 +325,16 @@ impl Agents {
     /// agents are in reach.
     pub fn admitted(&self) -> bool {
         self.member.as_ref().is_some_and(|m| m.admitted())
+    }
+
+    /// The node of the agent a job `at` runs on — this process's own agent's
+    /// for one run in process — as [`Self::at`] takes it back.
+    pub fn node_of(&self, at: At) -> Result<u64, AgentError> {
+        match at {
+            At::Agent(node) => Ok(node),
+            At::InProcess => node_in(self.own()?.checkouts().jobs_dir())
+                .map_err(|e| AgentError::NoAgent(e.to_string())),
+        }
     }
 
     /// Where requests for agent `node` go: this process's own agent while it
@@ -570,7 +608,13 @@ fn refused(e: JobError) -> AgentError {
 }
 
 async fn run_in_process(jobs: &Arc<Jobs>, job: RunJob) -> Result<Ran, AgentError> {
-    let mut view = jobs.submit(Submit::Run(job)).await.map_err(refused)?;
+    let view = jobs.submit(Submit::Run(job)).await.map_err(refused)?;
+    run_in_process_after(jobs, view).await
+}
+
+/// Wait for job `view`, started on this process's agent, to end; it and its
+/// log.
+async fn run_in_process_after(jobs: &Arc<Jobs>, mut view: JobView) -> Result<Ran, AgentError> {
     while !view.status.is_finished() {
         view = jobs.wait(&view.id, WAIT).await.map_err(refused)?;
     }

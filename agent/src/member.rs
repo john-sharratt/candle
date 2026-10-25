@@ -243,6 +243,7 @@ mod tests {
         let cfg = AgentConfig {
             jobs_dir: dir.path().join("jobs"),
             slots: Some(2),
+            stage_dir: None,
             checkouts: Vec::new(),
         };
         let open = || Checkouts::open(&cfg, &CommandPolicy::allowing(["cargo"])).unwrap();
@@ -261,6 +262,7 @@ mod tests {
         let cfg = AgentConfig {
             jobs_dir: dir.path().join("jobs"),
             slots: Some(1),
+            stage_dir: None,
             checkouts: Vec::new(),
         };
         let jobs = Jobs::new(

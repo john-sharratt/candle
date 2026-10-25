@@ -70,8 +70,11 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         .into_iter()
         .filter(|t| include_archived || !t.archived)
         .map(|t| {
+            // A thread's tasks are Claude's; the parts its workers started
+            // are theirs, and wait on nobody.
             let workers: Vec<Worker> = threads::workers(&records, &owner, &t.name)
                 .into_iter()
+                .filter(|w| !w.is_part())
                 .map(|w| w.observed(now))
                 .collect();
             let notes = threads::notes(&records, &owner, &t.name);
@@ -90,6 +93,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use web::auth::Role;
 
     fn worker(name: &str, state: State) -> Worker {
         Worker {
@@ -98,7 +102,10 @@ mod tests {
             conv_id: "c".into(),
             prompt: "p".into(),
             state,
+            role: Role::User,
+            priority: Default::default(),
             started_ms: 0,
+            turn_ms: 0,
             beat_ms: 0,
             ended_ms: None,
             entries_after: None,

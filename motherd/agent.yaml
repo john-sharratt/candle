@@ -8,6 +8,9 @@
 # `workspace.yaml` names them, and the mind as motherd.yaml's `mind_repo:`.
 jobs_dir: D:/agent/jobs
 slots: 4
+# Where a build job stages what it built for this machine's keep to try
+# (docs/claude_zend_gateway.md §8.4).
+stage_dir: D:/prog/candle/keep/stage
 checkouts:
   - name: candle
     dir: D:/agent/candle

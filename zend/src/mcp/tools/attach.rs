@@ -49,6 +49,6 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     let notes = threads::notes(&records, &owner, thread);
     Answer::ok(format!(
         "Attached to T:{thread}.\n\n{}",
-        threads::render_journal(thread, &notes)
+        threads::render_journal(&format!("T:{thread}"), &notes)
     ))
 }

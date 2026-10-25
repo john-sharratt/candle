@@ -19,6 +19,7 @@ use journal_core::section::Kept;
 use zend_vfs::RepoFiles;
 
 use crate::journal::state::SessionJournal;
+use crate::journal::style::style_for;
 
 /// What a draft needs of an open conversation.
 #[derive(Clone)]
@@ -48,7 +49,9 @@ impl Journals {
         if let Some(held) = self.get(conv_id) {
             return held;
         }
-        let restored = restore().map_or_else(SessionJournal::new, SessionJournal::restore);
+        let restored = restore()
+            .map_or_else(SessionJournal::new, SessionJournal::restore)
+            .in_style(style_for(conv_id));
         let mut held = self.held.lock().unwrap();
         let entry = held.entry(conv_id.to_string()).or_insert_with(|| Held {
             journal: Arc::new(Mutex::new(restored)),
@@ -156,6 +159,15 @@ mod tests {
         let again = journals.of("c-1", || panic!("read again"));
         assert!(Arc::ptr_eq(&first, &again));
         assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn a_journal_is_kept_in_its_conversations_wording() {
+        let journals = Journals::default();
+        let task = journals.of("mcp:abc:review/verify", || None);
+        assert_eq!(task.lock().unwrap().style().heard, "Claude said:");
+        let dialogue = journals.of("c-1", || Some(kept()));
+        assert_eq!(dialogue.lock().unwrap().style().heard, "User said:");
     }
 
     #[test]

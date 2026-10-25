@@ -93,7 +93,7 @@ fork already holds every turn in full. A reply's reasoning block is left out.
 | Kind | Cited part | Rendered under |
 |---|---|---|
 | `Observed` | a user side carrying `<tool_response>` blocks: a file read, a grep, a command's output | `Saw:` |
-| `Heard` | a user side carrying a person's message | `User said:` |
+| `Heard` | a user side carrying a person's message | `User said:` — `Claude said:` in a task delegated through `/mcp`, `Its worker said:` in a part (`style::style_for`) |
 | `Did` | a reply: the call it made, or what it told the user | `Did:` |
 | `Inferred` | nothing the session saw supports it | `Concluded, not seen:` |
 
@@ -161,6 +161,12 @@ the conversation's — one per entry the journal holds (`journal/<id>`), plus
   prompt the first round after its section seals, and until then the turns it
   was written from are still in the conversation.
 - **Last before the close**, so a new entry changes nothing above it.
+- **A task inherits its lineage's journals.** A conversation owned through
+  `/mcp` carries, in the same collection and the same chain, its ancestors'
+  journals ahead of its own — the project's standing rules, its thread's notes,
+  and for a part each worker's above it — as sections `lineage/<n>`, and a
+  reader's line, `lineage/reader`, after its own (`mcp::lineage`,
+  `docs/claude_zend_gateway.md` §5.1).
 - The collection is not a section sink: `ingest::section_sinks` never fills it
   from a `journals/` folder.
 
@@ -221,20 +227,27 @@ One line per entry summarises; the turns it was written from are kept, whole,
 for the dialogue to read back when the line is not enough — the exact request,
 a file's contents, an error from back then. Two dialogue tools read them:
 
-- **`journal_read {entry, offset?, limit?}`** pages one entry's turns the way
-  `file_read` pages a file: each turn opens with its number and time
-  (`#7 14:20 User: …`), then runs as it was, 200 lines a page by default and
-  400 at most.
-- **`journal_grep {pattern, entry?, max_results?}`** finds the lines that hold
-  some text, ignoring case, in every entry's turns or one's: each hit names its
-  entry, turn and line, to read around with `journal_read`.
+- **`journal_read {journal, entry?, offset?, limit?}`** lists a journal's
+  entries, or with `entry` pages one entry's turns the way `file_read` pages a
+  file: each turn opens with its number and time (`#7 14:20 User: …`), then
+  runs as it was, 200 lines a page by default and 400 at most.
+- **`journal_grep {journal, pattern, entry?, max_results?}`** finds the lines
+  that hold some text, ignoring case, in every entry's turns or one's: each hit
+  names its entry, turn and line, to read around with `journal_read`.
+
+`journal` is mandatory: `"self"` for the dialogue's own, or — in a
+conversation owned through `/mcp` — a journal above it, by its bare name or
+full path (`docs/claude_zend_gateway.md` §5.3). A thread's or project's
+journal is Claude's notes, with no turns behind them, so its entry reads as
+the note itself.
 
 Both are **mandatory** (`ToolDef::mandatory`), projected on every round the way
 the file tools are, and the journal intro names them, so the model knows the
 line is not all there is and always holds the call that reads behind it.
 Reading and searching are `journal_core::transcript::Book`'s, shared with npcd;
-the tools (`zend-tools/src/tools/journal/`) reach the conversation's text
-through `ToolContext::journal`, which zend sets on every dialogue round.
+the tools (`zend-tools/src/tools/journal/`) reach the journals through
+`ToolContext::journals`, a shelf (`zend/src/journal/shelf.rs`) zend builds on
+every dialogue round.
 
 **Each stretch is filed under the entry it went into** (`transcript::Filed`):
 the entry a draft wrote, or — when the draft skipped the stretch as more of the
@@ -252,7 +265,9 @@ entry does:
 - **Tombstoning the conversation** ceases all of them.
 - **Archiving the conversation** ceases all of them and keeps the entries: the
   journal can still be read, and nothing runs a tool on an archived
-  conversation again.
+  conversation again. A worker `/mcp` started is the exception
+  (`archive_worker`): its turns are the evidence behind its task's outcome,
+  which Claude reads later, so they are kept.
 
 npcd's characters keep no text behind their entries: none of their tools would
 read it.
@@ -363,9 +378,10 @@ them.
 - **A forgotten entry** leaves the record at once and its section at the
   conversation's next round. One a restart left sealed is never selected — the
   collection is read by name — and goes with the conversation.
-- **Private.** A journal is read by its own conversation and nothing else: no
-  other conversation retrieves its sections, and no layer (`daily_history`
-  included) reads them.
+- **Private, lineage-scoped.** A journal is read by its own conversation, by
+  the conversations below it in an `/mcp` lineage (§4), and through the
+  `/mcp` tools by its owner — nothing else: no other conversation retrieves its
+  sections, and no layer (`daily_history` included) reads them.
 - **Only a dialogue journals.** zend has no dialogue fork; the titler,
   passthrough conversations, calibration and the ingest layers never journal.
 
@@ -377,9 +393,10 @@ them.
   `took_ms`, `write_ms`, the result (a skip's reason as its `detail`), and each
   claim's verdict and kind.
 - `POST /v1/conversations/:id/journal/draft` drafts now over whatever is not
-  covered: 202 with the turns it covers, or 409 — `nothing_to_draft` while a
-  draft runs or when nothing is new, `not_open` when the conversation is not
-  open on this member (a draft forks its live slot).
+  covered: 202 with the turns it covers, or 409 — `draft_running` while a
+  draft runs (it may not cover the latest turns: ask again once `drafting`
+  clears), `nothing_to_draft` when nothing is new, `not_open` when the
+  conversation is not open on this member (a draft forks its live slot).
 - `DELETE /v1/conversations/:id/journal/:eid` forgets one entry: the journal as
   it now reads, or 404 `no_such_entry`.
 - Log target `zend::journal`: each draft's start, and its end with stretch,
@@ -422,9 +439,10 @@ them.
 | `zend/src/journal/draft.rs` | one draft and its record |
 | `zend/src/journal/carry.rs` | the schema install, the wanted sections, the round's selection |
 | `zend/src/journal/record.rs` | the metadata record |
-| `zend/src/journal/text.rs` | `JournalText`: the turns behind each entry as custom objects, and the tools' `JournalBook` |
+| `zend/src/journal/text.rs` | `JournalText`: the turns behind each entry as custom objects |
+| `zend/src/journal/shelf.rs` | the tools' `JournalShelf`: a dialogue's own journal and those above it, each a `JournalBook` |
 | `journal-core/src/transcript.rs` | `Filed`, the keys, and `Book`: paging and searching the kept turns |
-| `zend-tools/src/tools/journal/` | `journal_read`, `journal_grep`, and the `JournalBook` they read through |
+| `zend-tools/src/tools/journal/` | `journal_read`, `journal_grep`, and the `JournalShelf` and `JournalBook` they read through |
 | `zend/src/journal/registry.rs` | `Journals`: every dialogue's journal, and what a draft forks from |
 | `zend/src/api/journal.rs` | the four routes |
 | `zend/web/index.html` | the journal dock and its entry modal |

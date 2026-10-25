@@ -2,10 +2,10 @@
 
 use journal_core::transcript::{Page, MAX_LINES};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::JournalError;
+use super::{open, JournalError};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
 /// Lines a read returns when it names no count.
@@ -13,9 +13,13 @@ const DEFAULT_LINES: usize = 200;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReadRequest {
-    /// The number of the journal entry whose turns to read, as the journal
-    /// shows it: 3 for "Entry 3 — …". Required.
-    pub entry: u64,
+    /// Whose journal: "self" for your own, or an ancestor's name or path as
+    /// your journals show it. Required.
+    #[validate(length(min = 1))]
+    pub journal: String,
+    /// The entry whose turns to read, as the journal numbers it: 3 for
+    /// "Entry 3 — …". Leave it out to list the journal's entries.
+    pub entry: Option<u64>,
     /// First line to show, counted from 1. Default 1.
     pub offset: Option<usize>,
     /// How many lines to show. Default 200, at most 400.
@@ -23,19 +27,28 @@ pub struct ReadRequest {
     pub limit: Option<usize>,
 }
 
+/// A journal's entries, or one page of an entry's turns.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum ReadResponse {
+    Entries { journal: String, entries: String },
+    Turns(Page),
+}
+
 pub struct JournalRead;
 
 impl Tool for JournalRead {
     const NAME: &'static str = "journal_read";
     const DESCRIPTION: &'static str =
-        "Read the turns behind one of your journal entries, whole: what the user said, each \
-         tool result and what you replied, each turn headed by its number and time. Use it \
+        "Read a journal: \"self\" for your own, or an ancestor's by its name or path. Without \
+         `entry`, its entries; with one, the turns behind that entry, whole — what was said, \
+         each tool result and each reply, each turn headed by its number and time. Use it \
          when an entry's one line is not enough — the exact file contents, error or answer \
          from earlier. Pages like file_read: `offset` and `limit` in lines. To find which \
          entry holds something, use journal_grep.";
 
     type Request = ReadRequest;
-    type Response = Page;
+    type Response = ReadResponse;
     type Error = JournalError;
 
     /// Reads the journal; writes nothing.
@@ -43,13 +56,20 @@ impl Tool for JournalRead {
         Replay::Safe
     }
 
-    fn run(ctx: &ToolContext, req: ReadRequest) -> Result<Page, JournalError> {
-        let book = ctx.journal().ok_or(JournalError::NoJournal)?;
+    fn run(ctx: &ToolContext, req: ReadRequest) -> Result<ReadResponse, JournalError> {
+        let book = open(ctx, &req.journal)?;
+        let Some(entry) = req.entry else {
+            return Ok(ReadResponse::Entries {
+                journal: req.journal,
+                entries: book.entries(),
+            });
+        };
         book.read(
-            req.entry,
+            entry,
             req.offset.unwrap_or(1),
             req.limit.unwrap_or(DEFAULT_LINES).min(MAX_LINES),
         )
+        .map(ReadResponse::Turns)
         .map_err(JournalError::Missed)
     }
 }

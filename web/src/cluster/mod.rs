@@ -27,6 +27,7 @@ pub mod aggregate;
 pub mod bearer_key;
 pub mod endpoint;
 pub mod jobs;
+pub mod keeps;
 pub mod load;
 pub mod merge_ws;
 pub mod mirror;
@@ -57,6 +58,7 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use crate::acme::names::groups;
 use crate::acme::peers::AcmePeers;
+use crate::auth::forwarded::identify;
 use crate::auth::{Auth, Identity};
 use crate::config::{Cluster as ClusterConfig, Config};
 use axum::http::HeaderMap;
@@ -251,11 +253,20 @@ impl Gateway {
         })
     }
 
-    /// Who a request to one of this gateway's own routes is: its session, or
-    /// the ops key's admin when it presents that key ([`OpsKey`]).
-    pub fn caller(&self, auth: Option<&Auth>, headers: &HeaderMap) -> Option<Identity> {
+    /// Who a request to one of this gateway's own routes is: its session, the
+    /// ops key's admin when it presents that key ([`OpsKey`]), or — on a
+    /// request a member sent up its socket, `origin` — the identity the member
+    /// states, believed as the site routes believe it, since the member proved
+    /// the group key and vouches for its caller by the same rules.
+    pub fn caller(
+        &self,
+        auth: Option<&Auth>,
+        headers: &HeaderMap,
+        origin: Option<&MemberOrigin>,
+    ) -> Option<Identity> {
         auth.and_then(|a| a.identity(headers))
             .or_else(|| self.ops_key.as_ref().and_then(|k| k.caller(headers)))
+            .or_else(|| origin.and_then(|_| identify(headers).ok()))
     }
 
     pub fn set_router(&self, router: Router) {
@@ -284,6 +295,25 @@ mod tests {
             "whiteworld 31f662ee0edbae23"
         );
         assert_eq!(served_by("whiteworld", None).unwrap(), "whiteworld");
+    }
+
+    /// **A member's stated identity is believed on its own socket only**: the
+    /// same headers from anyone else name nobody.
+    #[test]
+    fn a_member_states_its_callers_identity_over_its_socket_only() {
+        let gateway = Gateway::with_hub(Hub::new(GroupKey::from_bytes([7; 32]), "g"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tokera-user", HeaderValue::from_static("u1"));
+        headers.insert("x-tokera-provider", HeaderValue::from_static("google"));
+        let origin = MemberOrigin {
+            app: "zend".into(),
+            node: 1,
+        };
+        assert_eq!(
+            gateway.caller(None, &headers, Some(&origin)).map(|i| i.sub),
+            Some("u1".to_string())
+        );
+        assert_eq!(gateway.caller(None, &headers, None), None);
     }
 
     #[test]

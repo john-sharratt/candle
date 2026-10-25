@@ -2,305 +2,151 @@ mod harness;
 
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use zend_tools::{SubagentRequest, SubagentResponse, SubagentRunner};
+use zend_tools::{SubagentRequest, SubagentResponse, SubagentRunner, ToolContext};
+use zend_vfs::RepoFiles;
 
 // ── Reusable mock runners ─────────────────────────────────────────────────────
 
+/// Answers a part under `parent/name` that ended `done` with its prompt.
 struct EchoRunner;
 impl SubagentRunner for EchoRunner {
-    fn run(&self, req: SubagentRequest) -> Result<SubagentResponse, String> {
+    fn run(&self, parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String> {
         Ok(SubagentResponse {
-            result: format!("echo: {}", req.instruction),
-            turns: 1,
-            tool_calls_made: 0,
+            path: format!("{parent}/{}", req.name),
+            state: "done".into(),
+            result: format!("echo: {}", req.prompt),
         })
     }
 }
 
 struct FailRunner;
 impl SubagentRunner for FailRunner {
-    fn run(&self, _req: SubagentRequest) -> Result<SubagentResponse, String> {
+    fn run(&self, _parent: &str, _req: SubagentRequest) -> Result<SubagentResponse, String> {
         Err("model crashed".into())
     }
 }
 
+/// Keeps the parent and request it was called with.
 #[derive(Default)]
 struct CapturingRunner {
-    captured: Mutex<Option<SubagentRequest>>,
+    captured: Mutex<Option<(String, String, String)>>,
 }
 
 impl SubagentRunner for CapturingRunner {
-    fn run(&self, req: SubagentRequest) -> Result<SubagentResponse, String> {
-        *self.captured.lock().unwrap() = Some(req);
+    fn run(&self, parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String> {
+        *self.captured.lock().unwrap() = Some((parent.to_string(), req.name, req.prompt));
         Ok(SubagentResponse {
+            path: "T:t/w/p".into(),
+            state: "stuck".into(),
             result: "captured".into(),
-            turns: 2,
-            tool_calls_made: 5,
         })
     }
 }
 
-// ── Basic lifecycle ───────────────────────────────────────────────────────────
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn subagent_not_configured() {
-    let resp = harness::invoke("sub_run", json!({"instruction": "do something"}));
+fn a_context_with_no_runner_cannot_start_parts() {
+    let resp = harness::invoke("sub_run", json!({"name": "a", "prompt": "do something"}));
     harness::expect_error(&resp, "not_configured");
 }
 
 #[test]
-fn subagent_with_mock_runner() {
+fn the_parts_path_state_and_result_are_the_response() {
     let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "sub_run",
-        json!({"instruction": "test task"}),
+        json!({"name": "read-parser", "prompt": "test task"}),
         &ctx,
     ));
-    assert!(resp["result"].as_str().unwrap().contains("test task"));
-    assert_eq!(resp["turns"], 1);
-    assert_eq!(resp["tool_calls_made"], 0);
+    assert_eq!(
+        resp,
+        json!({"path": "/read-parser", "state": "done", "result": "echo: test task"})
+    );
 }
 
 #[test]
-fn subagent_runner_failed() {
+fn a_runner_failure_is_the_tools_error_with_its_message() {
     let ctx = harness::granted().with_subagent_runner(Arc::new(FailRunner));
-    let resp = harness::invoke_with_ctx("sub_run", json!({"instruction": "fail please"}), &ctx);
-    harness::expect_error(&resp, "subagent_failed");
-}
-
-#[test]
-fn subagent_runner_error_detail_contains_message() {
-    let ctx = harness::granted().with_subagent_runner(Arc::new(FailRunner));
-    let resp = harness::invoke_with_ctx("sub_run", json!({"instruction": "trigger failure"}), &ctx);
+    let resp = harness::invoke_with_ctx("sub_run", json!({"name": "a", "prompt": "fail"}), &ctx);
     let detail = harness::expect_error(&resp, "subagent_failed");
     assert!(detail.contains("model crashed"), "detail was: {detail}");
 }
 
-// ── Default and custom max_turns ──────────────────────────────────────────────
-
+/// **The part hangs under the calling conversation**: the runner is told the
+/// conversation the context's calls belong to, with the call's name and prompt
+/// as given.
 #[test]
-fn subagent_max_turns_default() {
-    static CAPTURED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-    struct TurnsCapture;
-    impl SubagentRunner for TurnsCapture {
-        fn run(&self, req: SubagentRequest) -> Result<SubagentResponse, String> {
-            CAPTURED.store(req.max_turns, std::sync::atomic::Ordering::Relaxed);
-            Ok(SubagentResponse {
-                result: "ok".into(),
-                turns: 1,
-                tool_calls_made: 0,
-            })
-        }
-    }
-
-    let ctx = harness::granted().with_subagent_runner(Arc::new(TurnsCapture));
-    harness::invoke_with_ctx("sub_run", json!({"instruction": "x"}), &ctx);
-    assert_eq!(CAPTURED.load(std::sync::atomic::Ordering::Relaxed), 10);
-}
-
-#[test]
-fn subagent_custom_max_turns() {
+fn the_runner_is_given_the_calling_conversation_and_the_request() {
     let runner = Arc::new(CapturingRunner::default());
-    let ctx = harness::granted().with_subagent_runner(runner.clone());
-    harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "short task", "max_turns": 3}),
-        &ctx,
-    );
-    let captured = runner.captured.lock().unwrap();
-    assert_eq!(captured.as_ref().unwrap().max_turns, 3);
-}
-
-// ── Instruction validation ────────────────────────────────────────────────────
-
-#[test]
-fn subagent_empty_instruction_rejected() {
-    let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
-    let resp = harness::invoke_with_ctx("sub_run", json!({"instruction": ""}), &ctx);
-    harness::expect_error(&resp, "invalid_arguments");
-}
-
-#[test]
-fn subagent_instruction_too_long_accepted_by_validator() {
-    // validator only checks min=1; long instructions should succeed
-    let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
-    let long = "x".repeat(4096);
+    let ctx = harness::granted()
+        .with_files(Arc::new(RepoFiles::detached()), "mcp:o:review/verify")
+        .with_subagent_runner(runner.clone());
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "sub_run",
-        json!({"instruction": long}),
+        json!({"name": "check-plan", "prompt": "check the plan"}),
         &ctx,
     ));
-    assert!(resp["result"].as_str().is_some());
-}
-
-// ── Optional parameter passthrough ───────────────────────────────────────────
-
-#[test]
-fn subagent_tool_filter_passed_to_runner() {
-    let runner = Arc::new(CapturingRunner::default());
-    let ctx = harness::granted().with_subagent_runner(runner.clone());
-    harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "use files", "tools": ["write", "file_read"]}),
-        &ctx,
-    );
-    let captured = runner.captured.lock().unwrap();
-    let tools = captured.as_ref().unwrap().tools.as_ref().unwrap();
-    assert_eq!(tools, &["write", "file_read"]);
-}
-
-#[test]
-fn subagent_default_tools_is_none() {
-    let runner = Arc::new(CapturingRunner::default());
-    let ctx = harness::granted().with_subagent_runner(runner.clone());
-    harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "no tools specified"}),
-        &ctx,
-    );
-    let captured = runner.captured.lock().unwrap();
-    assert!(captured.as_ref().unwrap().tools.is_none());
-}
-
-#[test]
-fn subagent_model_override_passed_to_runner() {
-    let runner = Arc::new(CapturingRunner::default());
-    let ctx = harness::granted().with_subagent_runner(runner.clone());
-    harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "use big model", "model": "claude-opus-4-7"}),
-        &ctx,
-    );
-    let captured = runner.captured.lock().unwrap();
+    assert_eq!(resp["state"], "stuck");
     assert_eq!(
-        captured.as_ref().unwrap().model.as_deref(),
-        Some("claude-opus-4-7")
+        runner.captured.lock().unwrap().clone().unwrap(),
+        (
+            "mcp:o:review/verify".to_string(),
+            "check-plan".to_string(),
+            "check the plan".to_string()
+        )
     );
 }
 
+// ── Validation ────────────────────────────────────────────────────────────────
+
 #[test]
-fn subagent_default_model_is_none() {
+fn an_empty_name_or_prompt_is_refused_before_the_runner() {
     let runner = Arc::new(CapturingRunner::default());
     let ctx = harness::granted().with_subagent_runner(runner.clone());
-    harness::invoke_with_ctx("sub_run", json!({"instruction": "default model"}), &ctx);
-    let captured = runner.captured.lock().unwrap();
-    assert!(captured.as_ref().unwrap().model.is_none());
-}
-
-#[test]
-fn subagent_endpoint_override_passed_to_runner() {
-    let runner = Arc::new(CapturingRunner::default());
-    let ctx = harness::granted().with_subagent_runner(runner.clone());
-    harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "custom endpoint", "endpoint": "https://custom.api/v1"}),
-        &ctx,
-    );
-    let captured = runner.captured.lock().unwrap();
-    assert_eq!(
-        captured.as_ref().unwrap().endpoint.as_deref(),
-        Some("https://custom.api/v1"),
-    );
-}
-
-// ── Response field verification ───────────────────────────────────────────────
-
-#[test]
-fn subagent_result_is_string() {
-    let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
-    let resp = harness::expect_success(harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "return string"}),
-        &ctx,
-    ));
-    assert!(resp["result"].is_string());
-}
-
-#[test]
-fn subagent_turns_and_tool_calls_present() {
-    let ctx = harness::granted().with_subagent_runner(Arc::new(EchoRunner));
-    let resp = harness::expect_success(harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "check fields"}),
-        &ctx,
-    ));
-    assert!(resp["turns"].is_number());
-    assert!(resp["tool_calls_made"].is_number());
-}
-
-#[test]
-fn subagent_many_tool_calls_propagated() {
-    struct HighUsageRunner;
-    impl SubagentRunner for HighUsageRunner {
-        fn run(&self, _req: SubagentRequest) -> Result<SubagentResponse, String> {
-            Ok(SubagentResponse {
-                result: "done".into(),
-                turns: 7,
-                tool_calls_made: 50,
-            })
-        }
+    for args in [
+        json!({"name": "", "prompt": "x"}),
+        json!({"name": "a", "prompt": ""}),
+        json!({"prompt": "x"}),
+        json!({"name": "a"}),
+        json!({"name": "a".repeat(41), "prompt": "x"}),
+    ] {
+        let resp = harness::invoke_with_ctx("sub_run", args.clone(), &ctx);
+        harness::expect_error(&resp, "invalid_arguments");
     }
-    let ctx = harness::granted().with_subagent_runner(Arc::new(HighUsageRunner));
-    let resp = harness::expect_success(harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "complex task"}),
-        &ctx,
-    ));
-    assert_eq!(resp["turns"], 7);
-    assert_eq!(resp["tool_calls_made"], 50);
+    assert!(runner.captured.lock().unwrap().is_none());
 }
 
-// ── Context isolation ─────────────────────────────────────────────────────────
+/// A resumed turn issues `sub_run` again: the runner finds the part it
+/// started by name, so running the call twice starts it once.
+#[test]
+fn a_part_call_is_safe_to_issue_again_after_a_restart() {
+    assert_eq!(
+        zend_tools::replay("sub_run", &json!({"name": "a", "prompt": "x"})),
+        zend_tools::Replay::Safe
+    );
+}
 
 #[test]
-fn subagent_contexts_are_independent() {
+fn contexts_keep_their_own_runners() {
     struct IdRunner {
         id: &'static str,
     }
     impl SubagentRunner for IdRunner {
-        fn run(&self, _req: SubagentRequest) -> Result<SubagentResponse, String> {
+        fn run(&self, _parent: &str, _req: SubagentRequest) -> Result<SubagentResponse, String> {
             Ok(SubagentResponse {
+                path: String::new(),
+                state: "done".into(),
                 result: self.id.into(),
-                turns: 1,
-                tool_calls_made: 0,
             })
         }
     }
-
-    let ctx_a = harness::granted().with_subagent_runner(Arc::new(IdRunner { id: "runner_A" }));
+    let ctx_a: ToolContext =
+        harness::granted().with_subagent_runner(Arc::new(IdRunner { id: "runner_A" }));
     let ctx_b = harness::granted().with_subagent_runner(Arc::new(IdRunner { id: "runner_B" }));
-
-    let a = harness::expect_success(harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "x"}),
-        &ctx_a,
-    ));
-    let b = harness::expect_success(harness::invoke_with_ctx(
-        "sub_run",
-        json!({"instruction": "x"}),
-        &ctx_b,
-    ));
+    let args = json!({"name": "a", "prompt": "x"});
+    let a = harness::expect_success(harness::invoke_with_ctx("sub_run", args.clone(), &ctx_a));
+    let b = harness::expect_success(harness::invoke_with_ctx("sub_run", args, &ctx_b));
     assert_eq!(a["result"], "runner_A");
     assert_eq!(b["result"], "runner_B");
-}
-
-#[test]
-fn subagent_no_runner_in_default_context() {
-    // A fresh ToolContext without with_subagent_runner must return not_configured
-    let ctx = harness::granted();
-    let resp = harness::invoke_with_ctx("sub_run", json!({"instruction": "anything"}), &ctx);
-    harness::expect_error(&resp, "not_configured");
-}
-
-// ── Instruction echo roundtrip ────────────────────────────────────────────────
-
-#[test]
-fn subagent_instruction_roundtrip() {
-    let runner = Arc::new(CapturingRunner::default());
-    let ctx = harness::granted().with_subagent_runner(runner.clone());
-    let instruction = "process the dataset and produce a summary";
-    harness::invoke_with_ctx("sub_run", json!({"instruction": instruction}), &ctx);
-    let captured = runner.captured.lock().unwrap();
-    assert_eq!(captured.as_ref().unwrap().instruction, instruction);
 }

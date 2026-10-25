@@ -229,6 +229,14 @@ identity where the cookie does (`Auth::mcp_identity`), and that identity
 reaches the member on `X-Tokera-*` like any other. No other path reads a bearer
 token, and the members still hold no key.
 
+**A member's caller on the gateway's own routes.** A request a member sends up
+its socket is believed for the identity it states, as the site routes believe it
+(`MemberOrigin`), and the gateway's own `/gateway/*` routes do the same
+(`Gateway::caller`'s `origin`): that is how an Admin's operations tools, served
+by a member on `/mcp`, read `status.json` and run the gateway's commands as that
+Admin (`docs/claude_zend_gateway.md` §8). A member's stream towards `group:keep`
+reaches the keep of the machine it names (`web/src/cluster/keeps.rs`).
+
 ### Decisions worth recording
 
 **Stateless sessions.** A server-side session table would have to be shared by

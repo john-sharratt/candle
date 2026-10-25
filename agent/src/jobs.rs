@@ -21,7 +21,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,7 +38,7 @@ use crate::checkouts::{Checkout, Checkouts};
 use crate::switch::Switch;
 use crate::wire::{
     decode_bundle, AgentJobs, FetchJob, Fetched, JobKind, JobLine, JobView, ListJob, Listed,
-    LogChunk, PushJob, Pushed, RunJob, Submit,
+    LogChunk, PushJob, Pushed, RunJob, Staged, Submit,
 };
 
 /// Jobs kept after they end.
@@ -79,6 +79,10 @@ enum Kind {
         /// the job.
         task: AbortHandle,
         outcome: Option<RunOutcome>,
+        /// What it asked to stage, relative to its checkout.
+        stage: Option<String>,
+        /// What staging came to, once it ended.
+        staged: Option<Staged>,
     },
     Push {
         status: JobStatus,
@@ -161,6 +165,26 @@ fn fetch_command(fetch: &FetchJob) -> Vec<String> {
 /// no objects to take, and every branch's commit one it already holds.
 fn brought_nothing(found: &FetchBundle, have: &[Oid]) -> bool {
     found.bundle.is_none() && found.tips.values().all(|o| have.contains(o))
+}
+
+/// `rel` as a file a run may stage, refused before the run starts: this agent
+/// must have a stage folder, and `rel` must stay inside the checkout.
+fn stage_path(rel: &str, stage_dir: Option<&Path>) -> Result<String, JobError> {
+    if stage_dir.is_none() {
+        return Err(JobError::Bad(
+            "this agent stages nothing: its file names no stage_dir".into(),
+        ));
+    }
+    let inside = !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+    if !inside {
+        return Err(JobError::Bad(format!(
+            "`{rel}` is not a file inside the checkout"
+        )));
+    }
+    Ok(rel.to_string())
 }
 
 /// Up to `max` bytes of the file at `path` from byte `from`, and the file's
@@ -285,6 +309,7 @@ impl Jobs {
             pushed: Vec::new(),
             fetched: None,
             listed: Some(Listed::of(&listed)),
+            staged: None,
         })
     }
 
@@ -345,6 +370,7 @@ impl Jobs {
                     pushed: Vec::new(),
                     fetched: Some(Fetched::of(&f)),
                     listed: None,
+                    staged: None,
                 })
             }
             Ok(f) => (JobStatus::Exited { code: Some(0) }, Some(Fetched::of(&f))),
@@ -417,6 +443,10 @@ impl Jobs {
     async fn run(self: &Arc<Self>, run: RunJob) -> Result<JobView, JobError> {
         let c = self.checkout(&run.repo)?;
         let branch = BranchName::parse(&run.branch).map_err(|e| JobError::Bad(e.to_string()))?;
+        let stage = match run.stage {
+            Some(rel) => Some(stage_path(&rel, self.checkouts.stage_dir())?),
+            None => None,
+        };
         let started_ms = now_ms();
         let line = Line {
             branch: Some(run.branch.clone()),
@@ -459,7 +489,8 @@ impl Jobs {
             let mut t = self.table();
             let task = tokio::spawn(async move {
                 let outcome = handle.finish().await.ok();
-                jobs.finished(&job, outcome);
+                let staged = Arc::clone(&jobs).staging(&job, outcome.as_ref()).await;
+                jobs.finished(&job, outcome, staged);
             });
             keep_in(
                 &mut t,
@@ -469,6 +500,8 @@ impl Jobs {
                     kind: Kind::Run {
                         task: task.abort_handle(),
                         outcome: None,
+                        stage,
+                        staged: None,
                     },
                     line,
                     ended,
@@ -478,9 +511,31 @@ impl Jobs {
         self.view(&id)
     }
 
-    /// Run `id` ended — by itself, or cancelled. Its slot is given back once,
-    /// whichever comes first.
-    fn finished(&self, id: &str, outcome: Option<RunOutcome>) {
+    /// What run `id`, which ended with `outcome`, staged — `None` when it
+    /// asked to stage nothing. A run that exited 0 stages what it built on the
+    /// blocking pool, before it is marked ended: the checkout's build outputs
+    /// are its own until then.
+    async fn staging(self: Arc<Self>, id: &str, outcome: Option<&RunOutcome>) -> Option<Staged> {
+        let (repo, rel) = {
+            let t = self.table();
+            t.0.get(id).and_then(|e| match &e.kind {
+                Kind::Run { stage, .. } => stage.clone().map(|s| (e.repo.clone(), s)),
+                _ => None,
+            })
+        }?;
+        if !outcome.is_some_and(|o| o.exit_code == Some(0) && !o.timed_out) {
+            return Some(Staged::Not(
+                "the run did not exit 0, so nothing was staged".into(),
+            ));
+        }
+        let id = id.to_string();
+        let copied = spawn_blocking(move || self.stage(&id, &repo, &rel)).await;
+        Some(copied.unwrap_or_else(|e| Staged::Not(format!("staging stopped: {e}"))))
+    }
+
+    /// Run `id` ended — by itself, or cancelled — having staged `staged`. Its
+    /// slot is given back once, whichever comes first.
+    fn finished(&self, id: &str, outcome: Option<RunOutcome>, staged: Option<Staged>) {
         let mut t = self.table();
         let Some(e) = t.0.get_mut(id) else {
             self.running.fetch_sub(1, Ordering::Relaxed);
@@ -489,8 +544,14 @@ impl Jobs {
         if *e.ended.borrow() {
             return;
         }
-        if let Kind::Run { outcome: o, .. } = &mut e.kind {
+        if let Kind::Run {
+            outcome: o,
+            staged: s,
+            ..
+        } = &mut e.kind
+        {
             *o = outcome;
+            *s = staged;
         }
         e.line.ended_ms = Some(now_ms());
         let _ = e.ended.send(true);
@@ -575,6 +636,7 @@ impl Jobs {
                 pushed: pushed.clone(),
                 fetched: None,
                 listed: None,
+                staged: None,
             },
             Kind::Fetch { status } => JobView {
                 id: id.to_string(),
@@ -586,8 +648,11 @@ impl Jobs {
                 pushed: Vec::new(),
                 fetched: None,
                 listed: None,
+                staged: None,
             },
-            Kind::Run { outcome, .. } => {
+            Kind::Run {
+                outcome, staged, ..
+            } => {
                 let info = JobId::parse(id)
                     .and_then(|j| self.checkout(&e.repo).ok()?.server.query_job(&j).ok())
                     .ok_or_else(|| JobError::NotFound(id.to_string()))?;
@@ -601,9 +666,41 @@ impl Jobs {
                     pushed: Vec::new(),
                     fetched: None,
                     listed: None,
+                    staged: staged.clone(),
                 }
             }
         })
+    }
+
+    /// Copy `rel` — what run `id` of `repo` built — to the stage folder, for
+    /// this machine's keep: written beside its final name under the run's own
+    /// name and renamed into place, so keep never reads half a file and two
+    /// runs staging at once never write one file between them.
+    fn stage(&self, id: &str, repo: &str, rel: &str) -> Staged {
+        let Some(dir) = self.checkouts.stage_dir() else {
+            return Staged::Not("this agent's file names no stage_dir".into());
+        };
+        let Ok(c) = self.checkout(repo) else {
+            return Staged::Not(format!("this agent holds no repository `{repo}`"));
+        };
+        let from = c.dir.join(rel);
+        let Some(name) = from.file_name() else {
+            return Staged::Not(format!("`{rel}` names no file"));
+        };
+        let to = dir.join(name);
+        let part = dir.join(format!("{}.{id}.part", name.to_string_lossy()));
+        let copied = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::copy(&from, &part))
+            .and_then(|_| std::fs::rename(&part, &to));
+        match copied {
+            Ok(()) => Staged::At(to.display().to_string()),
+            Err(e) => {
+                // A copy that stopped short, or could not be renamed into
+                // place, is nothing keep may run.
+                let _ = std::fs::remove_file(&part);
+                Staged::Not(format!("{} could not be staged: {e}", from.display()))
+            }
+        }
     }
 
     /// Job `id` once it has ended, or as it stands after `wait`.
@@ -642,15 +739,29 @@ impl Jobs {
                 t.0.get(id)
                     .ok_or_else(|| JobError::NotFound(id.to_string()))?;
             match &e.kind {
-                Kind::Run { task, .. } => {
-                    task.abort();
-                    true
+                Kind::Run { task, stage, .. } => {
+                    // A run whose command has ended is staging what it built,
+                    // or done: its own task records how it ended, and what it
+                    // staged.
+                    let ended = JobId::parse(id)
+                        .and_then(|j| self.checkout(&e.repo).ok()?.server.query_job(&j).ok())
+                        .is_some_and(|info| {
+                            !matches!(info.status, JobStatus::Queued | JobStatus::Running)
+                        });
+                    if ended {
+                        None
+                    } else {
+                        task.abort();
+                        Some(stage.is_some())
+                    }
                 }
-                Kind::Push { .. } | Kind::Fetch { .. } => false,
+                Kind::Push { .. } | Kind::Fetch { .. } => None,
             }
         };
-        if aborted {
-            self.finished(id, None);
+        if let Some(asked) = aborted {
+            let staged =
+                asked.then(|| Staged::Not("the run was cancelled, so nothing was staged".into()));
+            self.finished(id, None, staged);
         }
         self.view(id)
     }

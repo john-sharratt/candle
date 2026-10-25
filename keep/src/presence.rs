@@ -1,14 +1,15 @@
 //! `keep` joined to the gateway as the app `keep`, so the cluster page lists
-//! it beside zend and npcd. The socket declares no routes and registers no
-//! upgrader: the gateway stores none of its bytes, and nothing here is
-//! certified or rolled out. The failsafe loop does not run on this thread.
+//! it beside zend and npcd, and an Admin's operations tools reach it: the
+//! socket declares keep's routes and serves the streams the gateway opens with
+//! them (`crate::remote`). It registers no upgrader: the gateway stores none of
+//! its bytes, and nothing here is certified or rolled out. The failsafe loop
+//! does not run on this thread.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use cluster::dispatch::RouteTable;
 use cluster::frame::{Capacity, MemberState};
 use cluster::gateway::KEEP;
 use cluster::handshake::GroupKey;
@@ -17,6 +18,8 @@ use cluster::member::{AppMember, Identity};
 use cluster::version::this_build;
 use cluster_dial::{tls_connector, Dial, Target};
 use serde::Deserialize;
+
+use crate::{remote, Slot};
 
 /// How `keep.yaml` names the gateway this process lists itself on.
 #[derive(Debug, Clone, Deserialize)]
@@ -32,9 +35,9 @@ pub struct ClusterJoin {
     pub offline_marker: Option<PathBuf>,
 }
 
-/// Dial `cluster` on its own thread. A failure is printed; the failsafe keeps
-/// running either way.
-pub fn start(cluster: ClusterJoin, state: &Path) {
+/// Dial `cluster` on its own thread, serving `slots` to the streams its
+/// gateway opens. A failure is printed; the failsafe keeps running either way.
+pub fn start(cluster: ClusterJoin, state: &Path, slots: Arc<Vec<Slot>>) {
     let state = state.to_path_buf();
     let _ = std::thread::Builder::new()
         .name("keep-presence".into())
@@ -49,13 +52,13 @@ pub fn start(cluster: ClusterJoin, state: &Path) {
                     return;
                 }
             };
-            if let Err(e) = rt.block_on(join(cluster, &state)) {
+            if let Err(e) = rt.block_on(join(cluster, &state, slots)) {
                 eprintln!("keep: not listed on the cluster: {e}");
             }
         });
 }
 
-async fn join(cluster: ClusterJoin, state: &Path) -> anyhow::Result<()> {
+async fn join(cluster: ClusterJoin, state: &Path, slots: Arc<Vec<Slot>>) -> anyhow::Result<()> {
     let node = node_in(state)?;
     let key = GroupKey::load(&cluster.group_key).map_err(|e| anyhow::anyhow!("group key: {e}"))?;
     let target = Target::parse(&cluster.url, Some(&cluster.name))?;
@@ -70,7 +73,7 @@ async fn join(cluster: ClusterJoin, state: &Path) -> anyhow::Result<()> {
         },
         key,
         vec![target.url.clone()],
-        RouteTable::new(Vec::new()).expect("no routes"),
+        remote::table(),
         Box::new(capacity),
         None,
         Instant::now(),
@@ -80,8 +83,8 @@ async fn join(cluster: ClusterJoin, state: &Path) -> anyhow::Result<()> {
     }
     let tls = tls_connector()?;
     let stopped = member
-        .run(0, Dial::new(Arc::new(target), KEEP, tls), |conn| {
-            conn.reset()
+        .run(0, Dial::new(Arc::new(target), KEEP, tls), move |conn| {
+            remote::serve(conn, Arc::clone(&slots))
         })
         .await;
     eprintln!("keep: left the cluster: {stopped:?}");

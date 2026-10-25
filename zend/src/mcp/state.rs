@@ -14,10 +14,13 @@
 //!   since a worker another member runs changes its record without bumping
 //!   this one.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use web::auth::oidc::random_token;
 
+use super::parts::Parts;
 use super::records::Records;
 
 /// Which client opened a session, as its `clientInfo.name` says.
@@ -177,20 +180,28 @@ pub fn close(records: &dyn Records, id: &str) -> anyhow::Result<()> {
     records.cease(&key(id))
 }
 
-/// What `/mcp` holds in memory: the change signal.
+/// What `/mcp` holds in memory: the change signal, and the runner that starts
+/// workers' parts.
 pub struct McpState {
     changed: watch::Sender<u64>,
+    parts: Arc<Parts>,
 }
 
 impl Default for McpState {
     fn default() -> Self {
         Self {
             changed: watch::channel(0).0,
+            parts: Arc::default(),
         }
     }
 }
 
 impl McpState {
+    /// The `sub_run` runner every tool context carries.
+    pub fn parts(&self) -> &Arc<Parts> {
+        &self.parts
+    }
+
     /// Tell every waiter a worker's state moved.
     pub fn bump(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));

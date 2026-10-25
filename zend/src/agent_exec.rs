@@ -113,6 +113,7 @@ impl Executor for AgentExecutor {
             program: request.command.program.clone(),
             args: request.command.args.clone(),
             timeout_secs: request.command.timeout.as_secs(),
+            stage: None,
         };
         let ran = self.wait_for(lineage, job).map_err(failed)?;
         let id = JobId::parse(&ran.view.id).ok_or_else(|| {
@@ -273,6 +274,7 @@ mod tests {
         let cfg = AgentConfig {
             jobs_dir: root.path().join("agent-jobs"),
             slots: Some(1),
+            stage_dir: None,
             checkouts: vec![CheckoutConfig {
                 name: "app".into(),
                 dir: agent_dir.clone(),

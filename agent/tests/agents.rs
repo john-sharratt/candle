@@ -31,7 +31,9 @@ use agent::fetcher::AgentFetch;
 use agent::jobs::{JobError, Jobs};
 use agent::member::{Agent, APP};
 use agent::pusher::AgentPush;
-use agent::wire::{encode_bundle, FetchJob, JobKind, JobView, PushJob, PushLine, RunJob, Submit};
+use agent::wire::{
+    encode_bundle, FetchJob, JobKind, JobView, PushJob, PushLine, RunJob, Staged, Submit,
+};
 use cluster::dial::Connect;
 use cluster::dispatch::RouteTable;
 use cluster::frame::{BuildId, Capacity, MemberState, ModelId};
@@ -132,6 +134,7 @@ fn jobs_over(r: &Repos, push: bool) -> Arc<Jobs> {
     let cfg = AgentConfig {
         jobs_dir: r.jobs.clone(),
         slots: Some(2),
+        stage_dir: Some(r.jobs.join("stage")),
         checkouts: vec![CheckoutConfig {
             name: "r".into(),
             dir: r.agent.clone(),
@@ -163,6 +166,7 @@ fn run_job(store: &VfsStore) -> RunJob {
         program,
         args,
         timeout_secs: 60,
+        stage: None,
     }
 }
 
@@ -205,6 +209,52 @@ async fn a_run_on_an_agent_comes_back_as_deltas() {
     assert!(!r.agent.join("out.txt").exists());
     assert!(jobs.log(&view.id).unwrap().is_file());
     assert_eq!(jobs.slots(), (2, 0));
+}
+
+/// **A run that asks to stage what it built leaves it in the stage folder**:
+/// the build output — ignored by git, as a real build's is — copied there once
+/// the run exits 0, and the job's view says where.
+#[tokio::test]
+async fn a_run_stages_what_it_built_for_keep() {
+    let r = repos();
+    std::fs::create_dir(r.agent.join("build")).unwrap();
+    std::fs::write(r.agent.join(".git/info/exclude"), b"build/\n").unwrap();
+    let jobs = jobs_over(&r, false);
+    let store = changed_store(&r);
+    let built = if cfg!(windows) {
+        "build\\app.bin"
+    } else {
+        "build/app.bin"
+    };
+    let (program, args) = copy("in.txt", built);
+    let job = RunJob {
+        program,
+        args,
+        stage: Some("build/app.bin".into()),
+        ..run_job(&store)
+    };
+    let view = ended(&jobs, jobs.submit(Submit::Run(job)).await.unwrap()).await;
+    let staged = r.jobs.join("stage").join("app.bin");
+    assert_eq!(
+        view.staged,
+        Some(Staged::At(staged.display().to_string())),
+        "{view:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&staged)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "changed\n"
+    );
+    let outside = RunJob {
+        stage: Some("../escape.bin".into()),
+        ..run_job(&store)
+    };
+    let refused = jobs.submit(Submit::Run(outside)).await.unwrap_err();
+    assert_eq!(
+        refused,
+        JobError::Bad("`../escape.bin` is not a file inside the checkout".into())
+    );
 }
 
 /// A commit the member built is pushed by the agent through a bundle, under
@@ -547,6 +597,36 @@ async fn a_cut_off_member_watches_and_switches_its_own_agent() {
     );
     assert!(agents.switch(At::InProcess, true).await.unwrap());
     assert!(jobs.enabled());
+}
+
+/// **Cut off, a job pinned to another agent is refused**, not run on the
+/// member's own; pinned to its own agent, it runs there, and the node it
+/// answers is that agent's.
+#[tokio::test]
+async fn a_cut_off_member_runs_a_pinned_job_only_on_its_own_agent() {
+    let r = repos();
+    let jobs = jobs_over(&r, false);
+    let agents = Agents::new(zend_member(0x5), Some(Arc::clone(&jobs)));
+    let own = u64::from_str_radix(&agents.listing().await.unwrap()[0].node, 16).unwrap();
+    let store = changed_store(&r);
+
+    let elsewhere = agents
+        .submit("conv-5", run_job(&store), Some(own ^ 1))
+        .await;
+    assert!(
+        matches!(&elsewhere, Err(AgentError::NoAgent(why)) if why.contains("out of reach")),
+        "{elsewhere:?}"
+    );
+    assert!(jobs.list(10).jobs.is_empty(), "nothing ran");
+
+    let (at, view) = agents
+        .submit("conv-5", run_job(&store), Some(own))
+        .await
+        .unwrap();
+    assert_eq!(at, At::InProcess);
+    assert_eq!(agents.node_of(at).unwrap(), own);
+    assert_eq!(agents.at(own), At::InProcess);
+    ended(&jobs, view).await;
 }
 
 /// Cut off, a member's job goes to the agent in its own process, and with

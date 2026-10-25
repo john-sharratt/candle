@@ -33,8 +33,9 @@ pub fn definition() -> Value {
     })
 }
 
-/// One worker's result, as a block of text.
-fn result_of(w: &Worker) -> String {
+/// One worker's result, as a block of text: what a wait answers for it, and
+/// what `sub_run` answers for a part.
+pub fn result_of(w: &Worker) -> String {
     match w.state {
         State::Running => format!("{} — running", w.path()),
         State::Question => format!(
@@ -106,9 +107,9 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         };
         match Path::parse(text) {
             Ok(Path::Worker { thread, worker }) => wanted.push((thread, worker)),
-            Ok(Path::Thread(_)) => {
+            Ok(_) => {
                 return Answer::error(format!(
-                    "`{text}` is a thread; a worker is `T:<thread>/<name>`"
+                    "`{text}` is not a worker; a worker is `T:<thread>/<name>`"
                 ))
             }
             Err(e) => return Answer::error(e),
@@ -128,6 +129,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
 mod tests {
     use super::*;
     use crate::mcp::threads::Entry;
+    use web::auth::Role;
 
     fn worker(name: &str, state: State) -> Worker {
         Worker {
@@ -136,7 +138,10 @@ mod tests {
             conv_id: "c".into(),
             prompt: "p".into(),
             state,
+            role: Role::User,
+            priority: Default::default(),
             started_ms: workers::now_ms(),
+            turn_ms: 0,
             beat_ms: 0,
             ended_ms: None,
             entries_after: None,

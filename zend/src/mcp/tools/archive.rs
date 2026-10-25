@@ -103,5 +103,5 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = threads::add_note(&records, &owner, thread, &note) {
         return Answer::error(e.to_string());
     }
-    Answer::ok(format!("Archived T:{thread}. {}", note.text))
+    Answer::ok(format!("Archived T:{thread}: {}.", note.text))
 }

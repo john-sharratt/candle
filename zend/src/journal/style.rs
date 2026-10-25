@@ -10,6 +10,7 @@ use journal_core::period::{civil_from_days, utc_bucket, Period};
 use journal_core::style::Style;
 
 use crate::layers::days::day_of;
+use crate::mcp::threads::conv_names;
 
 const MS_PER_DAY: u64 = 86_400_000;
 const MS_PER_MINUTE: u64 = 60_000;
@@ -177,6 +178,30 @@ from its turns or from what was retrieved for it, not from your journal.",
     fold_question: FOLD_QUESTION,
 };
 
+/// The wording of a task's journal — a conversation owned through `/mcp`
+/// (`docs/claude_zend_gateway.md` §5): every user turn there is Claude's — the
+/// task, an answer, a nudge — so what it heard is what Claude said.
+pub const DELEGATED: Style = Style {
+    heard: "Claude said:",
+    ..CODING
+};
+
+/// The wording of a part's journal — what a task's worker started under
+/// itself with `sub_run`: its user turns are that worker's.
+pub const PART: Style = Style {
+    heard: "Its worker said:",
+    ..CODING
+};
+
+/// The wording `conv_id`'s journal is kept in.
+pub fn style_for(conv_id: &str) -> &'static Style {
+    match conv_names(conv_id) {
+        Some((_, _, lineage)) if lineage.contains('/') => &PART,
+        Some(_) => &DELEGATED,
+        None => &CODING,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use journal_core::entry::{Claim, Entry, Item, Kind};
@@ -256,6 +281,26 @@ mod tests {
              - Did: Edited scan.rs to bound the loop.\n\
              - Concluded, not seen: The race is in the reclaim path. (re-check)\n\
              Left open:\n- #2 Does the 3090 build pass?"
+        );
+    }
+
+    /// **In a task's journal, what was heard is what Claude said**: every
+    /// user turn of a conversation owned through `/mcp` is Claude's. Every
+    /// other conversation keeps the user's words.
+    #[test]
+    fn a_tasks_journal_hears_claude() {
+        let mut e = entry();
+        e.claims = vec![claim("Asked for the expiry check.", Kind::Heard, false)];
+        assert_eq!(
+            e.detail(style_for("mcp:abc:review/verify")),
+            "Entry 1 [2026-10-23 14:20–14:41 UTC]\n\
+             Fixed the scan's race.\n\
+             - Claude said: Asked for the expiry check."
+        );
+        assert_eq!(style_for("c-123").heard, "User said:");
+        assert_eq!(
+            style_for("mcp:abc:review/verify/read").heard,
+            "Its worker said:"
         );
     }
 

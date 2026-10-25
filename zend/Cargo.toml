@@ -45,6 +45,8 @@ store-events = { path = "../store-events" }
 # gateway and the host.
 web          = { path = "../web" }
 reqwest      = { version = "0.12", features = ["stream"] }
+# The query strings the operations tools send up to a gateway.
+url          = "2"
 
 candle              = { workspace = true, features = ["cuda"] }
 candle-conversation = { path = "../candle-conversation", features = ["hub"] }
