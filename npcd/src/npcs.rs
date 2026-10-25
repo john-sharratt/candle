@@ -912,6 +912,38 @@ impl Npcs {
         self.by_id.values().cloned().collect()
     }
 
+    /// Every living character and the account it belongs to, by name — what an
+    /// admin reassigning characters chooses from.
+    pub fn owners(&self) -> Vec<Value> {
+        let mut rows: Vec<&NpcPayload> =
+            self.by_id.values().filter(|n| !n.is_tombstoned()).collect();
+        rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.npc_id.cmp(&b.npc_id)));
+        rows.into_iter()
+            .map(|n| {
+                json!({
+                    "npc_id": npc_id_wire(n.npc_id),
+                    "name": n.name,
+                    "world_id": n.world_id,
+                    "owner_id": n.owner_id,
+                })
+            })
+            .collect()
+    }
+
+    /// Hand character `npc_id` to the account `to` (its public id) — an admin's
+    /// act, and the one write that crosses ownership: every other write starts
+    /// from [`Self::owned`]. Ownership is what every read and write of the
+    /// character is checked against, so this is how a character made under one
+    /// account comes to be another's to watch and author.
+    pub fn reassign(&mut self, npc_id: u64, to: &str, now_ms: u64) -> Result<Value, NpcError> {
+        let mut npc = self.payload(npc_id).ok_or(NpcError::NotFound)?.clone();
+        if npc.owner_id == to {
+            return Ok(wire(&npc, to));
+        }
+        npc.owner_id = to.to_string();
+        self.bump(npc, to, now_ms)
+    }
+
     /// Restore backed-up character records into a fresh substrate.
     ///
     /// Each payload is written verbatim — its id, owner, revision and last place
@@ -1353,6 +1385,38 @@ mod tests {
         assert_eq!(back["owner_id"], ME);
         assert_eq!(back["revision"], 1);
         assert_eq!(reopened.list(ME, &Filter::default()).len(), 1);
+    }
+
+    /// **A character handed to another account is theirs, and stays theirs.**
+    /// The new owner reads and lists it, the old one no longer does, the owners
+    /// listing says so, and a restart keeps it.
+    #[test]
+    fn a_reassigned_character_belongs_to_its_new_owner() {
+        let dir = tmp();
+        let npc_id = {
+            let mut n = Npcs::load(&dir).unwrap();
+            let npc_id = nid(&n.create(&ident("u1"), OTHER, &body("Ilsa"), 1_000).unwrap());
+            let handed = n.reassign(npc_id, ME, 2_000).unwrap();
+            assert_eq!(handed["owner_id"], ME);
+            assert_eq!(handed["access"], "owner");
+            assert_eq!(handed["revision"], 2);
+            assert_eq!(n.owners()[0]["owner_id"], ME);
+            assert_eq!(n.owners()[0]["name"], "Ilsa");
+            assert_eq!(
+                n.reassign(npc_id, ME, 3_000).unwrap()["revision"],
+                2,
+                "handing it to its owner writes nothing"
+            );
+            assert!(matches!(
+                n.reassign(npc_id + 1, ME, 3_000),
+                Err(NpcError::NotFound)
+            ));
+            npc_id
+        };
+        let reopened = Npcs::load(&dir).unwrap();
+        assert_eq!(reopened.get(npc_id, ME).unwrap()["name"], "Ilsa");
+        assert!(reopened.get(npc_id, OTHER).is_err());
+        assert_eq!(reopened.list(OTHER, &Filter::default()).len(), 0);
     }
 
     /// **A character created while the daemon runs survives the engine's
