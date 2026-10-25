@@ -334,7 +334,7 @@ mod tests {
 
     /// **The closing answer bans the call and is bounded above the think
     /// block** — on a turn the balanced dial programmed, the answer keeps its
-    /// room past the 3072-token thinking cap — and a tighter bound the turn
+    /// room past the 3584-token thinking cap — and a tighter bound the turn
     /// already had stands.
     #[test]
     fn the_closing_answer_is_banned_from_calling_and_bounded() {
@@ -344,7 +344,7 @@ mod tests {
         assert!(balanced.banned_tokens.contains(&42));
         assert_eq!(
             (balanced.graceful_eos_after, balanced.forced_eos_after),
-            (3072 + CLOSING_ANSWER_GRACEFUL, 3072 + CLOSING_ANSWER_FORCED)
+            (3584 + CLOSING_ANSWER_GRACEFUL, 3584 + CLOSING_ANSWER_FORCED)
         );
         assert_eq!(balanced.eos_ramp_len, balanced.graceful_eos_after);
 
