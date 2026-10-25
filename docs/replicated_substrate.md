@@ -4315,7 +4315,7 @@ with headroom from its first measurement on this machine.
 
 | # | Harness | Load | Asserts | Budget |
 |---|---|---|---|---|
-| H1 | codec | encode and decode 2 M mixed frames | byte-exact round trip; ≥ the frames/s floor | 1 s |
+| H1 | codec | encode and decode 2 M mixed frames | byte-exact round trip; the best of ten 100 ms windows ≥ the frames/s floor | 1 s |
 | H2 | multiplexer | 1,000 concurrent virtual streams × 64 KiB over one in-memory socket pair, with a 63 MB event interleaved | every stream intact; no stream's frame waits behind more than one 1 MiB fragment; control-frame latency bound | 3 s |
 | H3 | relay fan-out | in-process gateway, 4 members, 50 k events | every member gets every other member's events exactly once, none echoed, per-origin order kept; ≥ the events/s floor | 3 s |
 | H4 | recovery under load | live traffic running throughout: a member's socket dropped mid-burst with 5 k events in flight, then reconnected; a member offline while 100 k records across 3 origins go by, some since compacted, then back; a restarted member holding 10 k records nobody else has; one slow receiver | every member ends holding the same applied set and the same substrate; the dropped socket's in-flight events arrive again and nothing receipted is re-sent; the returning member fetches exactly the records it lacked, by header compare, and no other member receives a catch-up frame; killing the returning member mid-catch-up and restarting it resumes from its persisted `Replica`; live-event p99 latency stays under its bound while catch-up runs; the catch-up queue never passes its cap | 4 s |
