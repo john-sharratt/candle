@@ -40,31 +40,47 @@ for what it does — and wait on them together with zend_wait. A task's result i
 entry: an entry is evidence, not truth, so check a claim against the turns it cites (journal_read with \
 the entry) before acting on it.";
 
-fn server_info() -> Value {
-    json!({"name": "zen", "title": "Zen", "version": env!("CARGO_PKG_VERSION")})
+/// Where the connector's icon is served, under the public origin a request
+/// reached `/mcp` at: the Zen moon, from the site's shared brand folder.
+pub const ICON_PATH: &str = "/brand/zen.png";
+
+/// Who the server is, its icon at `origin`.
+fn server_info(origin: &str) -> Value {
+    json!({
+        "name": "zen",
+        "title": "Zen",
+        "version": env!("CARGO_PKG_VERSION"),
+        "icons": [{
+            "src": format!("{origin}{ICON_PATH}"),
+            "mimeType": "image/png",
+            "sizes": ["256x256"],
+        }],
+    })
 }
 
 fn capabilities() -> Value {
     json!({"tools": {"listChanged": false}})
 }
 
-/// The `initialize` result in `version`.
-pub fn initialize_result(version: &str) -> Value {
+/// The `initialize` result in `version`, for a request that reached `/mcp`
+/// at `origin`.
+pub fn initialize_result(version: &str, origin: &str) -> Value {
     json!({
         "protocolVersion": version,
         "capabilities": capabilities(),
-        "serverInfo": server_info(),
+        "serverInfo": server_info(origin),
         "instructions": INSTRUCTIONS,
     })
 }
 
-/// The `server/discover` result.
-pub fn discover_result() -> Value {
+/// The `server/discover` result, for a request that reached `/mcp` at
+/// `origin`.
+pub fn discover_result(origin: &str) -> Value {
     json!({
         "resultType": "complete",
         "supportedVersions": supported(),
         "capabilities": capabilities(),
-        "_meta": {"io.modelcontextprotocol/serverInfo": server_info()},
+        "_meta": {"io.modelcontextprotocol/serverInfo": server_info(origin)},
         "instructions": INSTRUCTIONS,
     })
 }
@@ -121,15 +137,23 @@ mod tests {
 
     #[test]
     fn the_handshake_and_discovery_results_are_shaped_as_their_specs_say() {
-        let init = initialize_result("2025-11-25");
+        let init = initialize_result("2025-11-25", "https://code.tokera.com");
         assert_eq!(init["protocolVersion"], "2025-11-25");
         assert_eq!(init["serverInfo"]["name"], "zen");
         assert_eq!(init["serverInfo"]["title"], "Zen");
         assert_eq!(
+            init["serverInfo"]["icons"],
+            json!([{
+                "src": "https://code.tokera.com/brand/zen.png",
+                "mimeType": "image/png",
+                "sizes": ["256x256"],
+            }])
+        );
+        assert_eq!(
             init["capabilities"],
             json!({"tools": {"listChanged": false}})
         );
-        let d = discover_result();
+        let d = discover_result("https://code.tokera.com");
         assert_eq!(d["resultType"], "complete");
         assert_eq!(d["supportedVersions"][0], MODERN);
         assert_eq!(

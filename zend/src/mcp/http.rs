@@ -181,7 +181,10 @@ pub async fn post(
         };
         let mut res = json_rpc(
             StatusCode::OK,
-            jsonrpc::result(id, protocol::initialize_result(version)),
+            jsonrpc::result(
+                id,
+                protocol::initialize_result(version, &origin::of(&headers)),
+            ),
         );
         if let Ok(v) = HeaderValue::from_str(&id_opened) {
             res.headers_mut().insert(SESSION_HEADER, v);
@@ -216,7 +219,7 @@ pub async fn post(
     match method.as_str() {
         "server/discover" => json_rpc(
             StatusCode::OK,
-            jsonrpc::result(id, protocol::discover_result()),
+            jsonrpc::result(id, protocol::discover_result(&origin::of(&headers))),
         ),
         "ping" if !modern => json_rpc(StatusCode::OK, jsonrpc::result(id, json!({}))),
         "tools/list" => json_rpc(
