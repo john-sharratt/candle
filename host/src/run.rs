@@ -143,6 +143,20 @@ pub fn run(cfg: HostConfig, tenants: Vec<Box<dyn Tenant>>) -> ! {
     run_seated(cfg, tenants.into_iter().map(Seat::Runs).collect())
 }
 
+/// Each of `seats` at the rank its place gives it — a seat left standing keeps
+/// its rank, so the ones after it rank as they would beside it — or why not.
+fn ranked<T>(seats: Vec<T>) -> Result<Vec<(TenantRank, T)>, String> {
+    seats
+        .into_iter()
+        .enumerate()
+        .map(|(i, seat)| {
+            TenantRank::nth(i)
+                .map(|rank| (rank, seat))
+                .ok_or_else(|| format!("at most {} tenants share one engine", TenantRank::MAX))
+        })
+        .collect()
+}
+
 /// [`run`] the daemons `seats` runs, each at its seat's rank, on the engine
 /// every seat's asks make.
 pub fn run_seated(cfg: HostConfig, seats: Vec<Seat>) -> ! {
@@ -158,13 +172,7 @@ pub fn run_seated(cfg: HostConfig, seats: Vec<Seat>) -> ! {
     }
     let mut tenants: Vec<(TenantRank, Box<dyn Tenant>)> = Vec::new();
     let mut standing: Vec<(TenantRank, &'static str, CoreRequests)> = Vec::new();
-    for (i, seat) in seats.into_iter().enumerate() {
-        let Some(rank) = TenantRank::nth(i) else {
-            fail_early(&format!(
-                "at most {} tenants share one engine",
-                TenantRank::MAX
-            ));
-        };
+    for (rank, seat) in ranked(seats).unwrap_or_else(|e| fail_early(&e)) {
         match seat {
             Seat::Runs(tenant) => tenants.push((rank, tenant)),
             Seat::Stands { name, asks } => standing.push((rank, name, asks)),
@@ -426,7 +434,13 @@ async fn serve_tenants(
             "not run here; its asks of the engine still count"
         );
     }
-    let slot = EngineSlot::with_standing(&names, standing);
+    let slot = EngineSlot::with_standing(
+        &names,
+        standing
+            .into_iter()
+            .map(|(rank, _, asks)| (rank, asks))
+            .collect(),
+    );
     let mut reports = Vec::new();
     let mut tenant_routes = Vec::new();
     let mut stops: Vec<(&'static str, Stop)> = Vec::new();
@@ -609,6 +623,21 @@ mod tests {
     use super::*;
 
     use tempfile::TempDir;
+
+    /// **A seat ranks by its place, standing or running**, so npcd beside a
+    /// standing zend ranks where it does beside a running one; past
+    /// [`TenantRank::MAX`] the start is refused.
+    #[test]
+    fn seats_rank_by_their_place() {
+        let ranks: Vec<usize> = ranked(vec!["zend", "npcd"])
+            .unwrap()
+            .into_iter()
+            .map(|(rank, _)| rank.index())
+            .collect();
+        assert_eq!(ranks, [0, 1]);
+        let err = ranked(vec![(); TenantRank::MAX + 1]).unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+    }
 
     /// Two tenants naming one substrate refuse the start, naming both; two
     /// directories are fine — however the same one is spelled.

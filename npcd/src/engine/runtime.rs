@@ -105,7 +105,7 @@ use crate::engine::mission_gen::config::Config;
 use crate::engine::mission_gen::gates::{life_voice, Form};
 use crate::engine::mission_gen::material::strip_calls;
 use crate::engine::prompt::{self, Persona};
-use crate::engine::prose::{decode_call, CallAsk};
+use crate::engine::prose::{decode_call, CallAsk, WORK_BAND};
 use crate::engine::reflect;
 use crate::engine::schema;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
@@ -2841,6 +2841,7 @@ impl Runtime {
                 temperature: None,
                 seed: resolve_seed(None),
                 think: compose::THINK,
+                band: WORK_BAND,
             };
             let raw = match decode_call(&engine, &base, &ask).await {
                 Ok(raw) => raw,

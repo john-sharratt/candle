@@ -113,12 +113,16 @@ impl PendingSubmit {
     }
 }
 
-/// How long a submitted turn waits before its wait is reported.
+/// How long a submitted turn or a section waits before its wait is reported.
 const LONG_WAIT: Duration = Duration::from_secs(120);
 
+/// How often long waits are reported while they last.
+const TELL_EVERY: Duration = Duration::from_secs(60);
+
 impl Scheduler {
-    /// Say which submitted turns have waited longer than [`LONG_WAIT`] to be
-    /// admitted or to begin, and at what price — at most once a minute.
+    /// Say what has waited longer than [`LONG_WAIT`] to be admitted or to
+    /// begin — the oldest of each kind, how many more, and at what price — at
+    /// most once every [`TELL_EVERY`].
     ///
     /// **A turn the admission never takes says nothing.** A table generation
     /// on WW sat submitted for over an hour, the waves running beside it, and
@@ -126,16 +130,17 @@ impl Scheduler {
     pub(super) fn report_waiting_submits(&mut self) {
         if self
             .waiting_told
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+            .is_some_and(|at| at.elapsed() < TELL_EVERY)
         {
             return;
         }
-        let pending = self
+        let mut told = false;
+        let pending: Vec<&PendingSubmit> = self
             .pending_submits
             .iter()
-            .filter(|p| p.work.submitted_at.elapsed() >= LONG_WAIT);
-        let mut told = false;
-        for p in pending {
+            .filter(|p| p.work.submitted_at.elapsed() >= LONG_WAIT)
+            .collect();
+        if let Some(p) = pending.iter().max_by_key(|p| p.work.submitted_at.elapsed()) {
             tracing::info!(
                 target: "candle_conversation::scheduler::throttle",
                 seq = %p.parent(),
@@ -144,21 +149,46 @@ impl Scheduler {
                 depth = p.depth,
                 lift_mib = p.lift >> 20,
                 band = ?self.decode_priority_or_high(p.parent()),
-                "a submitted turn is still waiting for admission"
+                waiting = pending.len(),
+                lift_total_mib = pending.iter().map(|p| p.lift).sum::<u64>() >> 20,
+                "submitted turns are still waiting for admission"
             );
             told = true;
         }
-        for w in self
+        // A section waiting is reported too: a turn whose conversation's own
+        // frame has not sealed waits behind it, held before it is ever a
+        // submission. The oldest, and how many have waited as long.
+        let waiting: Vec<&QueuedSection> = self
+            .section_queue
+            .iter()
+            .filter(|s| s.queued_at.elapsed() >= LONG_WAIT)
+            .collect();
+        if let Some(s) = waiting.iter().max_by_key(|s| s.queued_at.elapsed()) {
+            tracing::info!(
+                target: "candle_conversation::scheduler::throttle",
+                section = %s.debug_name,
+                waited_s = s.queued_at.elapsed().as_secs(),
+                tokens = s.tokens.len(),
+                band = ?s.band,
+                waiting = waiting.len(),
+                queued = self.section_queue.len(),
+                "sections are still waiting for admission"
+            );
+            told = true;
+        }
+        let carved: Vec<&PrefillWork> = self
             .prefill_queue
             .iter()
             .filter(|w| w.submitted_at.elapsed() >= LONG_WAIT)
-        {
+            .collect();
+        if let Some(w) = carved.iter().max_by_key(|w| w.submitted_at.elapsed()) {
             tracing::info!(
                 target: "candle_conversation::scheduler::throttle",
                 seq = %w.sequence_id,
                 waited_s = w.submitted_at.elapsed().as_secs(),
                 tokens = w.tokens.len(),
-                "an admitted turn is still waiting to begin"
+                waiting = carved.len(),
+                "admitted turns are still waiting to begin"
             );
             told = true;
         }

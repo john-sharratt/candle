@@ -27,7 +27,7 @@ use super::target::{self, Kind, Target};
 use crate::api::now_ms;
 use crate::engine::mind::Minds;
 use crate::engine::mission::{time_step_text, Mission, Todo};
-use crate::engine::prose::{self, decode_call, CallAsk};
+use crate::engine::prose::{self, decode_call, CallAsk, WORK_BAND};
 use crate::engine::runtime::Runtime;
 use crate::engine::work::what_happens;
 use crate::engine::workflow::{OnFailed, Where};
@@ -188,6 +188,7 @@ async fn write_up(
             temperature: None,
             seed: resolve_seed(None),
             think: THINK,
+            band: WORK_BAND,
         };
         let raw = decode_call(&engine, &base, &ask).await?;
         let checked = match answer::check(&raw, generator.kind, target, corpus) {
@@ -447,6 +448,7 @@ async fn table_reading(
             temperature: None,
             seed: resolve_seed(None),
             think: THINK,
+            band: WORK_BAND,
         };
         let raw = decode_call(engine, base, &ask).await?;
         match reading::check(&raw, &op.document, corpus, attempt < ATTEMPTS) {
@@ -529,7 +531,8 @@ pub async fn table_step(
     };
     // **A draft the store holds but the reading cannot be built around is not a
     // document gone.** Both used to end here as "document gone", which sent the
-    // hunt for a lost store after a missing life or era.
+    // hunt for a lost store after a missing life — the one thing, with the
+    // draft held, the reading's material cannot do without.
     let corpus = Corpus::read(&mind, hosted.id()).holding(&op.document, text);
     let Some(material) = material::draft(
         &corpus,
@@ -537,8 +540,8 @@ pub async fn table_step(
         op.target.strip_prefix("era:"),
         &context,
     ) else {
-        let why = "its draft is in its store, but what it is read against — its life or era — \
-                   is not in the record";
+        let why = "its draft is in its store, but the life it is read against is not in the \
+                   record";
         hosted.with_sim(|s| s.missions.cancel_operation(id, why));
         tracing::warn!(operation = %op.name, document = %op.document, "operation: called off — {why}");
         return Ok(());

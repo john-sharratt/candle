@@ -230,12 +230,7 @@ impl MindStores {
             store_events::restore(&Substrate(shared), owner.timeline(), &files, &mirror);
         }
         if owner.world().is_some() {
-            tracing::info!(
-                ?owner,
-                events = self.event_count(owner),
-                changed = files.snapshots().len(),
-                "operation store opened"
-            );
+            tracing::debug!(?owner, "operation store opened");
         }
         let mirror = mirror.into_inner().unwrap_or_else(|e| e.into_inner());
         Some((files, mirror))

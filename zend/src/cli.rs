@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer};
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::engine_asks;
 use crate::secrets;
-use crate::session::build_projection_builder;
+use crate::session::try_projection_builder;
 use crate::substrate_git::open_workspace;
 use crate::tenant::ZendTenant;
 
@@ -261,16 +261,17 @@ impl ZendArgs {
 
     /// What zend asks of the engine it shares, without loading zend: what a
     /// host running its other daemons alone seats in zend's place, so their
-    /// engine is the one built beside zend.
-    pub fn engine_requests(&self) -> CoreRequests {
-        let schema = build_projection_builder(&self.resolved_root());
-        engine_asks::ask(
+    /// engine is the one built beside zend. Refused when the workspace's
+    /// projection schema does not parse, as zend's own load would refuse it.
+    pub fn engine_requests(&self) -> anyhow::Result<CoreRequests> {
+        let schema = try_projection_builder(&self.resolved_root()).map_err(anyhow::Error::msg)?;
+        Ok(engine_asks::ask(
             MODEL.builder(),
             &schema,
             self.qsa_selection_budget,
             self.qsa_strata(),
         )
-        .take_core_requests()
+        .take_core_requests())
     }
 
     fn resolved_root(&self) -> PathBuf {
@@ -405,7 +406,9 @@ mod tests {
     #[test]
     fn the_engine_requests_carry_zends_floor_and_turn() {
         let dir = tempfile::tempdir().unwrap();
-        let asks = parse(&["--working-dir", dir.path().to_str().unwrap()]).engine_requests();
+        let asks = parse(&["--working-dir", dir.path().to_str().unwrap()])
+            .engine_requests()
+            .unwrap();
         assert_eq!(
             asks.min_rope_factor,
             Some(2.0),

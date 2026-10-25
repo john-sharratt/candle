@@ -158,6 +158,27 @@ One run on `.5`, conversation `9f5a6d4c`:
 - d made 58 `file_edit` calls, the paper grew to 8 pages, and two calls ended
   `not_found`.
 
+### Calibration questions, hub correction withdrawn (2026-10-25, `9c09dd9e`)
+
+The file-scored groups vote with every fold group alike, no file is read over
+its background peak, and every `code_reading` file carries the 16 questions it
+answers in the gallery (`docs/provenance_scoped_signatures.md` §2.3, §2.5).
+Two runs on `.5`, conversations `c6c2018d` and `cd6b4c16`:
+
+- b found the paper placed and read its pages; c read the rest.
+- The second run's d still doubted one: served `config.rs` page 10, whose
+  whole reading was locked in every later projection, it wrote that the page
+  was not in its visible context and checked the value elsewhere — the
+  disputed-placement behaviour of §7, not a false reply.
+- The first decode of the tour still held unrelated voluntary files
+  (`candle-wasm-examples/phi/…`).
+- d differed as §2 warns. In the first run it read `wide_sig.rs`, wrote that
+  `file_edit`'s signature was not shown, announced its edits, and ended
+  without a call. In the second it made 32 `file_edit` calls over 13 rounds:
+  29 to the paper, one each to README and ARCHITECTURE, and one out of scope
+  to `candle-conversation/examples/substrate_inspect.rs`; one call ended
+  `not_found`.
+
 ## 7. What the overnight runs taught (2026-10-24/25, 30 runs)
 
 What was learned, separate from the workarounds that were later removed:

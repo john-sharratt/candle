@@ -86,6 +86,7 @@ pub async fn decode(
         max_tokens: request.max_tokens as usize,
         temperature: request.temperature,
         think: None,
+        band: DecodePriority::Normal,
     };
     let (text, tokens) = framed(
         engine,
@@ -119,7 +120,21 @@ pub struct CallAsk<'a> {
     /// How much the answer is thought through before the call is written.
     /// [`ThinkMode::Off`] opens straight into the call.
     pub think: ThinkMode,
+    /// The band the job decodes at — see [`WORK_BAND`].
+    pub band: DecodePriority,
 }
+
+/// The band of the work an operation waits on: the table's proposals and
+/// readings, and a Maker's composing of the document.
+///
+/// **Above the characters' own turns, which wait on it.** At the characters'
+/// band, a table call on WW waited 31 to 52 minutes for its first token behind
+/// four Makers' turns, dreams and journals — its prefill throttled under their
+/// decodes — and then decoded in under a minute. While it waited every Maker
+/// drew routines, because the work the call would have handed them did not
+/// exist yet. The engine's other prose — a description, a name, a life — stays
+/// at the characters' band.
+pub const WORK_BAND: DecodePriority = DecodePriority::High;
 
 /// Decode an answer held to one of `ask.calls`, and return the call as written.
 ///
@@ -185,6 +200,7 @@ pub async fn decode_call_thought(
         max_tokens,
         temperature: ask.temperature,
         think: (ask.think != ThinkMode::Off).then_some((ask.think, ask.max_tokens)),
+        band: ask.band,
     };
     let (text, _) = framed(
         engine,
@@ -241,6 +257,8 @@ struct Held {
     /// the turn opens one: its close budget is programmed into the sampling the
     /// way an acting turn's is.
     think: Option<(ThinkMode, usize)>,
+    /// The band the turn decodes at.
+    band: DecodePriority,
 }
 
 /// One turn under `system`, in a conversation opened for it and then thrown
@@ -263,6 +281,7 @@ async fn framed(
         max_tokens,
         temperature,
         think,
+        band,
     } = held;
 
     let formatted = base.dialect.format_system_prompt(system);
@@ -274,7 +293,7 @@ async fn framed(
     };
     let (mut sequence, timeline, decoder) = {
         let e = engine.lock().unwrap();
-        let (builder, layer, group) = prose_projection(system, frame.id)?;
+        let (builder, layer, group) = prose_projection(system, frame.id, band)?;
         let seq = e.new_conversation_with_projection(&formatted, builder, layer, group, cfg)?;
         let tl = seq.timeline_id();
         e.mark_timeline_transient(tl);
@@ -353,7 +372,9 @@ async fn run_turn(
     use tokio_stream::StreamExt;
 
     let handle = sequence.submit_turn_with_options(prompt, options)?;
+    let seq = sequence.id();
     tracing::info!(
+        %seq,
         prompt_words = prompt.split_whitespace().count(),
         "prose turn submitted"
     );
@@ -390,6 +411,7 @@ async fn run_turn(
         anyhow::bail!("the scheduler went away before the prose finished");
     };
     tracing::info!(
+        %seq,
         first_token_ms = first_token.map(|d| d.as_millis() as u64),
         total_ms = submitted.elapsed().as_millis() as u64,
         tokens = ids.len(),
@@ -427,10 +449,15 @@ const CLOSED: &str = "prose:closed";
 /// the same reserved group, and a group with no tags admits every turn in it.
 /// Tagged with something no turn carries, it admits none of them, and a job
 /// reads its own system prompt and question and nothing else.
-fn prose_projection(system: &str, frame: SectionId) -> anyhow::Result<(Builder, LayerId, GroupId)> {
-    // npcd's band, as its characters' turns: below zend's dialogue.
-    let mut builder =
-        Builder::for_plain_prompt_reserved(system, Reserved::Prose, frame, DecodePriority::Normal);
+///
+/// `band` is the job's: the characters' own, [`DecodePriority::Normal`] —
+/// below zend's dialogue — or [`WORK_BAND`] for the work an operation waits on.
+fn prose_projection(
+    system: &str,
+    frame: SectionId,
+    band: DecodePriority,
+) -> anyhow::Result<(Builder, LayerId, GroupId)> {
+    let mut builder = Builder::for_plain_prompt_reserved(system, Reserved::Prose, frame, band);
     builder
         .set_group_tags(PROSE_GROUP, vec![CLOSED.to_string()])
         .map_err(|e| anyhow::anyhow!("closing the prose group: {e}"))?;
@@ -553,7 +580,8 @@ mod tests {
     fn a_prose_projection_is_reserved_and_framed_by_its_own_section() {
         let frame = SectionId::new(7_001);
         let (builder, layer, group) =
-            prose_projection("You name characters.", frame).expect("the group exists to be closed");
+            prose_projection("You name characters.", frame, DecodePriority::Normal)
+                .expect("the group exists to be closed");
         assert!(
             layer.is_reserved(),
             "a prose job must not share the mind's id space"

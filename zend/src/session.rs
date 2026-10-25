@@ -8856,7 +8856,16 @@ fn system_prompt_labels(sp: &SystemPromptSchema) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn build_projection_builder(workspace: &Path) -> Builder {
+/// The workspace's projection schema — its `projection.yaml` or the embedded
+/// default. A schema that does not parse stops zend at its load: there is no
+/// daemon to run without one.
+fn build_projection_builder(workspace: &Path) -> Builder {
+    try_projection_builder(workspace).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`build_projection_builder`], with a schema that does not parse as an
+/// error — for a host reading zend's settings without running zend.
+pub(crate) fn try_projection_builder(workspace: &Path) -> Result<Builder, String> {
     let name = workspace
         .file_name()
         .and_then(|n| n.to_str())
@@ -8879,9 +8888,7 @@ pub(crate) fn build_projection_builder(workspace: &Path) -> Builder {
         None => (PROJECTION_SCHEMA_TEMPLATE, "embedded default".to_string()),
     };
     Builder::from_yaml_with_vars_and_dialect(yaml, &[("workspace", name)], Some(&dialect))
-        .unwrap_or_else(|e| {
-            panic!("projection.yaml ({source}) failed to parse — check YAML syntax and {{workspace}} placeholder: {e:#}")
-        })
+        .map_err(|e| format!("projection.yaml ({source}) failed to parse — check YAML syntax and {{workspace}} placeholder: {e:#}"))
 }
 
 /// Concatenate the content of every top-level Section that appears
