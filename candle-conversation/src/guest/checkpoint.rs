@@ -44,7 +44,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use candle::quantized::gguf_file;
 use candle::safetensors::MmapedSafetensors;
-use memmap2::Mmap;
 
 /// What a cache entry is keyed by: the path, and enough of the file's identity
 /// to notice it was replaced.
@@ -82,11 +81,6 @@ impl Stamp {
 /// size of a vocabulary, so "the old one is dropped" is a claim worth checking
 /// rather than asserting in a comment.
 static HEADERS: OnceLock<Mutex<HashMap<Stamp, Arc<gguf_file::Content>>>> = OnceLock::new();
-
-/// Mapped checkpoint payloads. Holds address space, not resident memory: the
-/// pages are the OS page cache's, and it evicts them under pressure like any
-/// other file-backed pages.
-static PAYLOADS: OnceLock<Mutex<HashMap<Stamp, Arc<Mmap>>>> = OnceLock::new();
 
 /// Mapped and indexed safetensors sets, keyed by the whole file list — a model
 /// is its files together, and one of them changing invalidates the index built
@@ -178,56 +172,6 @@ pub fn file_type_bits(ftype: u32) -> Option<u32> {
         7 => 8,
         _ => return None,
     })
-}
-
-/// The checkpoint's bytes, mapped rather than read.
-///
-/// **Why a mapping and not a buffer.** The loader used to `read_exact` each
-/// tensor into a fresh `Vec` — 2.46 GiB of copying per drain, measured at
-/// 884 ms, to stage bytes the page cache was already holding. A mapping hands
-/// the same bytes to `memcpy_htod` in place: no copy, no allocation, and the
-/// second drain onward touches only pages that are already resident.
-///
-/// It also removes the reason the per-tensor `stream.synchronize()` existed. A
-/// local `Vec` dies at the end of the function that made it, so an async copy
-/// out of it had to be waited on or it would read freed memory. A mapping is
-/// held here for the life of the process, which is exactly the condition
-/// `load_repacked_into` was written for — the expert cache uploads out of a
-/// long-lived mmap for the same reason.
-///
-/// # Safety
-///
-/// Mapping a file is unsound if another process writes it underneath us: the
-/// bytes would change beneath a read the compiler believes is stable. This is a
-/// model checkpoint on local disk that a deployment installs once, and the
-/// [`Stamp`] means a *replacement* is noticed rather than silently mixed with
-/// the old mapping. That is the same bargain every mmap-backed loader in this
-/// crate makes, stated rather than assumed.
-pub fn payload(path: &Path) -> candle::Result<Arc<Mmap>> {
-    let cache = PAYLOADS.get_or_init(|| Mutex::new(HashMap::new()));
-
-    let stamp = Stamp::of(path)
-        .map_err(|e| candle::Error::Msg(format!("guest checkpoint {path:?}: {e}")))?;
-    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&stamp).cloned()) {
-        return Ok(hit);
-    }
-
-    let file = File::open(path)
-        .map_err(|e| candle::Error::Msg(format!("guest checkpoint {path:?}: {e}")))?;
-    // SAFETY: as documented above — a checkpoint a deployment installed, whose
-    // replacement is caught by the stamp rather than by aliasing a live map.
-    let map = unsafe { Mmap::map(&file) }
-        .map_err(|e| candle::Error::Msg(format!("guest checkpoint {path:?}: mapping: {e}")))?;
-    let map = Arc::new(map);
-
-    if let Ok(mut c) = cache.lock() {
-        // A superseded mapping is dropped, which unmaps it once the last live
-        // model using it has gone — the `Arc` is what keeps a load that is
-        // still running from having its bytes pulled out from under it.
-        c.retain(|k, _| k.path != stamp.path);
-        c.insert(stamp, Arc::clone(&map));
-    }
-    Ok(map)
 }
 
 /// A set of safetensors files, mapped and indexed once per process.

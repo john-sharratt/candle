@@ -58,6 +58,7 @@ pub mod queue;
 pub mod seed;
 pub mod tiled;
 pub mod varground;
+pub mod windowed;
 pub mod work;
 
 pub use drain::{drain_one, DrainReport, EngineRoom};
