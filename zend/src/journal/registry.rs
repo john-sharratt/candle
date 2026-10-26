@@ -4,9 +4,9 @@
 //! anything asks for it, and held for the life of the process: a draft runs off
 //! the conversation's lock and outlives the reply that started it, and the API
 //! reads a journal while a reply holds that lock. What a draft needs of the
-//! conversation itself — the asker its questions go through and the files its
-//! claims are checked against — is registered when the conversation is opened,
-//! so a draft can be started without the conversation's lock.
+//! conversation itself — the asker its questions go through — is registered
+//! when the conversation is opened, so a draft can be started without the
+//! conversation's lock.
 //!
 //! The map's lock is never held while a record is read: the record is read
 //! first, and kept only if no one registered the journal in the meantime.
@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex};
 
 use candle_conversation::UnsealedAsker;
 use journal_core::section::Kept;
-use zend_vfs::RepoFiles;
 
 use crate::journal::state::SessionJournal;
 use crate::journal::style::style_for;
@@ -25,7 +24,6 @@ use crate::journal::style::style_for;
 #[derive(Clone)]
 pub struct Open {
     pub asker: UnsealedAsker,
-    pub files: Arc<RepoFiles>,
 }
 
 struct Held {

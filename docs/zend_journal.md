@@ -27,7 +27,7 @@ The journal fills the same gap and avoids each cause of that failure:
 |---|---|
 | Written in the reply's voice, so they read as history | Framed as the model's own **dated notes**, in a section of the system prompt, never as turns |
 | Nothing tied a sentence to where it came from | Every claim **cites turn parts**; the kind of claim (saw, did, heard, concluded) is derived by the server from what it cites, never from the wording |
-| Nothing checked a sentence against the world | Typed claims about the **workspace** are checked against it when the entry is kept, and corrected or demoted when they are wrong |
+| Nothing checked a sentence against the world | Where the world can read what a claim is about — npcd's game state — a claim's **typed fact** is checked against it when the entry is kept, and corrected or demoted when wrong. A coding journal offers no facts (§3.3) |
 | Compressed every exchange, needed or not | Once the journal holds an entry, the draft may answer **`journal_skip`** instead of writing; a skip is final for that stretch |
 
 The real turns stay in the substrate, and provenance still retrieves them. The
@@ -56,7 +56,8 @@ no engine dependency, so it builds and tests in seconds:
 The section reconcile — submit what is wanted and not held, remove what is held
 and not wanted — is `candle_conversation::Carried`, beside the `Sequence` it
 works on. Each product supplies only what is its own: how a turn's origin maps
-to a claim kind, the `World` typed claims are checked against, its `Style`, its
+to a claim kind, the `World` typed claims are checked against and the entries
+above a claim may rest on, its `Style` (whether claims carry facts), its
 `Desk`, and when a draft is due.
 
 ## 3. An entry, for coding
@@ -106,27 +107,35 @@ calling it one.
 renders with `(re-check)`, because the file, the test result or the branch may
 have changed since.
 
-### 3.3 Typed claims, checked against the workspace
+### 3.3 No typed facts; entries above, by `per`
 
-A claim may carry `{subject, attribute, value}`. It is checked when the entry is
-checked, against the conversation's own files — its branch in each repository
-and the changes its tool rounds made there (`zend/src/journal/world.rs`):
+A coding journal's claims carry **no typed facts** (`Style::facts` is off for
+`CODING`, `DELEGATED` and `PART`): the call offers no `typed` slot, and the
+write question never mentions one. What a coding claim is about — what a file
+says, why a test failed, what was decided — is nothing a check can read, and
+the workspace questions that could be read (does a file exist, which blob,
+which commit) never earned their place: live drafts filled the slot with
+facts about something else — every claim typed `file:… exists` with a line
+number for its value, and a web-research claim typed with an unrelated
+`README.md` — which the check, reading only the fact, confirmed. A claim rests
+on the turns it cites; a test result or an exit code is `Observed` from the
+tool response that reported it, and renders with `(re-check)`.
 
-| Subject | Attribute | Read as |
-|---|---|---|
-| `file:<repo>/<path>` | `exists` | `true` or `false` |
-| `file:<repo>/<path>` | `blob` | the git blob id, while the file is the branch's |
-| `branch:<repo>` | `head` | the commit the conversation's branch is at |
-| `branch:<repo>` | `name` | the branch the conversation reads the repository through |
+A claim of a conversation with journals above it — owned through `/mcp` — may
+name the entry it rests on in **`per`** (`T:review#4`). The call offers exactly
+the entries those journals hold (`World::entries`, `JournalsAbove` in
+`zend/src/journal/world.rs`), as `cite` offers exactly the stretch's turns, so
+an entry that is not there cannot be written; one that arrives by any other
+path is dropped and the claim stands on its turns (`Demoted`), never costing
+the entry. The `per` sentence of the write question is said only when the
+call offers `per` (`Style::per_question`), so a writer with no journals above
+is never told of a slot it does not have. The list costs the grammar nothing
+as it grows: `per` is one choice whose values are a table (1,169 nodes at 10
+entries above or 1,600). The claim's line reads `… (per T:review#4)`.
 
-- A match is kept.
-- A mismatch is replaced by what the workspace says, and marked `corrected`.
-- A claim the workspace cannot answer becomes prose. So does a file's `blob`
-  once the session has changed the file: its bytes are no blob yet.
-
-Test results and exit codes are deliberately **not** typed claims. They are
-facts about a past run, cited as `Observed` from the tool response that
-reported them, and they render with `(re-check)`.
+npcd keeps typed facts (`Style::facts` on): a character's claims are about the
+world's state — energy, stockpiles, what a tower is doing — which its world
+reads, and a fact the world reads differently is corrected.
 
 ## 4. The journal in the prompt
 
@@ -448,7 +457,7 @@ them.
 | `zend/src/journal/state.rs` | `SessionJournal`: a journal and its cadence |
 | `zend/src/journal/pressure.rs` | selection pressure from the projection event |
 | `zend/src/journal/style.rs` | `CODING`: UTC dates and a coding session's words |
-| `zend/src/journal/world.rs` | `ConversationFiles`: the workspace typed claims are checked against |
+| `zend/src/journal/world.rs` | `JournalsAbove`: the entries above a conversation its claims may rest on (`per`) |
 | `zend/src/journal/desk.rs` | `ZendDesk`: the draft's question on a focused fork at `Normal`, the record write |
 | `zend/src/journal/draft.rs` | one draft and its record |
 | `zend/src/journal/carry.rs` | the schema install, the wanted sections, the round's selection |

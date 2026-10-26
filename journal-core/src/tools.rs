@@ -97,13 +97,27 @@ pub fn claim_floor(citable: usize) -> usize {
 /// The most claims the grammar insists on, however long the stretch.
 pub const CLAIM_FLOOR_MAX: usize = 6;
 
-/// The `journal_write` call, for the stretch whose turns are `citable` and with
-/// `open` items standing. It holds at least [`claim_floor`] claims.
+/// What a claim may carry beside its sentence and the turns it cites.
+#[derive(Clone, Copy, Debug)]
+pub struct Claims<'a> {
+    /// A typed fact the world is asked about ([`crate::style::Style::facts`]):
+    /// offered only where the world can read what claims are about. Left out,
+    /// the call has no slot for one, so none can be written.
+    pub facts: bool,
+    /// The entries of other journals a claim may rest on, by address
+    /// ([`crate::verify::World::entries`]): `per` offers exactly these, and
+    /// is left out when there are none.
+    pub entries: &'a [String],
+}
+
+/// The `journal_write` call, for the stretch whose turns are `citable`, with
+/// `open` items standing, its claims shaped by `claims`. It holds at least
+/// [`claim_floor`] claims.
 ///
 /// `None` when nothing in the stretch can be cited: there is no entry to write,
 /// and a `cite` with no value to choose would be a grammar that cannot be
 /// satisfied.
-pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<Value> {
+pub fn write_spec(citable: &[u64], open: &[Item], claims: Claims<'_>) -> Option<Value> {
     if citable.is_empty() {
         return None;
     }
@@ -114,24 +128,26 @@ pub fn write_spec(citable: &[u64], open: &[Item]) -> Option<Value> {
         relations.push(format!("resolves {}", item.id));
     }
 
-    let claim = object(
-        "",
-        true,
-        vec![
-            text("text", true),
-            choice("cite", true, &ids),
-            choice("also_cite", false, &ids),
-            object(
-                "typed",
-                false,
-                vec![
-                    text("subject", true),
-                    text("attribute", true),
-                    text("value", true),
-                ],
-            ),
-        ],
-    );
+    let mut properties = vec![
+        text("text", true),
+        choice("cite", true, &ids),
+        choice("also_cite", false, &ids),
+    ];
+    if !claims.entries.is_empty() {
+        properties.push(choice("per", false, claims.entries));
+    }
+    if claims.facts {
+        properties.push(object(
+            "typed",
+            false,
+            vec![
+                text("subject", true),
+                text("attribute", true),
+                text("value", true),
+            ],
+        ));
+    }
+    let claim = object("", true, properties);
     let item = object(
         "",
         true,
@@ -154,10 +170,15 @@ pub fn skip_spec() -> Value {
 }
 
 /// The calls a draft's answer may be, in the flat `{name, params}` form: the
-/// write, and the skip when `may_skip`. `None` when nothing can be cited, as
-/// for [`write_spec`].
-pub fn draft_specs(citable: &[u64], open: &[Item], may_skip: bool) -> Option<Vec<Value>> {
-    let mut specs = vec![write_spec(citable, open)?];
+/// write, its claims shaped by `claims`, and the skip when `may_skip`. `None`
+/// when nothing can be cited, as for [`write_spec`].
+pub fn draft_specs(
+    citable: &[u64],
+    open: &[Item],
+    may_skip: bool,
+    claims: Claims<'_>,
+) -> Option<Vec<Value>> {
+    let mut specs = vec![write_spec(citable, open, claims)?];
     if may_skip {
         specs.push(skip_spec());
     }
@@ -283,7 +304,13 @@ fn claim_of(n: usize, v: &Value) -> Result<DraftClaim, String> {
             }
         }
     };
-    Ok(DraftClaim { text, cite, typed })
+    let per = v.get("per").and_then(text_of);
+    Ok(DraftClaim {
+        text,
+        cite,
+        typed,
+        per,
+    })
 }
 
 fn item_of(n: usize, o: &Value) -> Result<DraftOpen, String> {
@@ -407,6 +434,52 @@ mod tests {
     use super::*;
     use crate::entry::testing::item;
 
+    /// Claims that may carry a typed fact, with no journal above to rest on.
+    const FACTS: Claims<'static> = Claims {
+        facts: true,
+        entries: &[],
+    };
+
+    /// **A world that cannot read what claims are about offers no fact
+    /// slot**, and the journals above offer exactly their entries to rest on.
+    #[test]
+    fn a_claim_carries_a_fact_only_when_offered_and_rests_only_on_entries_above() {
+        let names = |claims: Claims<'_>| -> Vec<String> {
+            let spec = write_spec(&[1], &[], claims).unwrap();
+            param(&spec, "claims")["items"]["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names(FACTS), ["text", "cite", "also_cite", "typed"]);
+        let above = ["T:review#4".to_string(), "P:candle#2".to_string()];
+        let workspace = Claims {
+            facts: false,
+            entries: &above,
+        };
+        assert_eq!(names(workspace), ["text", "cite", "also_cite", "per"]);
+        let spec = write_spec(&[1], &[], workspace).unwrap();
+        let per = property(&param(&spec, "claims")["items"], "per");
+        assert_eq!(per["enum"], json!(["T:review#4", "P:candle#2"]));
+        assert_eq!(per["required"], false);
+        let bare = Claims {
+            facts: false,
+            entries: &[],
+        };
+        assert_eq!(names(bare), ["text", "cite", "also_cite"]);
+    }
+
+    #[test]
+    fn a_claim_resting_on_an_entry_above_is_read_with_it() {
+        let said = r#"{"name": "journal_write", "arguments": {"claims": [{"text": "a", "cite": "1", "per": "T:review#4"}]}}"#;
+        assert_eq!(
+            parse(said).unwrap().claims[0].per.as_deref(),
+            Some("T:review#4")
+        );
+    }
+
     /// An answer read as an entry, where a skip is not on offer.
     fn parse(said: &str) -> Result<Draft, String> {
         match super::parse(said, false)? {
@@ -461,10 +534,16 @@ mod tests {
 
     #[test]
     fn a_draft_offers_the_write_and_the_skip_only_when_asked_to() {
-        let write = write_spec(&[1], &[]).unwrap();
-        assert_eq!(draft_specs(&[1], &[], false), Some(vec![write.clone()]));
-        assert_eq!(draft_specs(&[1], &[], true), Some(vec![write, skip_spec()]));
-        assert_eq!(draft_specs(&[], &[], true), None);
+        let write = write_spec(&[1], &[], FACTS).unwrap();
+        assert_eq!(
+            draft_specs(&[1], &[], false, FACTS),
+            Some(vec![write.clone()])
+        );
+        assert_eq!(
+            draft_specs(&[1], &[], true, FACTS),
+            Some(vec![write, skip_spec()])
+        );
+        assert_eq!(draft_specs(&[], &[], true, FACTS), None);
     }
 
     fn param<'a>(spec: &'a Value, name: &str) -> &'a Value {
@@ -487,7 +566,7 @@ mod tests {
 
     #[test]
     fn the_write_call_takes_claims_then_a_summary_then_intend_then_open() {
-        let spec = write_spec(&[1, 2], &[]).unwrap();
+        let spec = write_spec(&[1, 2], &[], FACTS).unwrap();
         assert_eq!(spec["name"], WRITE);
         let names: Vec<(&str, bool)> = spec["params"]
             .as_array()
@@ -513,7 +592,7 @@ mod tests {
 
     #[test]
     fn an_entry_cannot_be_written_without_a_claim() {
-        let spec = write_spec(&[1, 2], &[]).unwrap();
+        let spec = write_spec(&[1, 2], &[], FACTS).unwrap();
         let min: Vec<u64> = spec["params"]
             .as_array()
             .unwrap()
@@ -530,18 +609,18 @@ mod tests {
             .map(claim_floor)
             .collect();
         assert_eq!(floors, [1, 1, 1, 2, 2, 3, 4, 6, 6, 6]);
-        let spec = write_spec(&[49, 50, 51, 52], &[]).unwrap();
+        let spec = write_spec(&[49, 50, 51, 52], &[], FACTS).unwrap();
         assert_eq!(param(&spec, "claims")["min_items"], 2);
     }
 
     #[test]
     fn a_stretch_with_nothing_to_cite_has_no_writing_grammar() {
-        assert!(write_spec(&[], &[item(1, "the door")]).is_none());
+        assert!(write_spec(&[], &[item(1, "the door")], FACTS).is_none());
     }
 
     #[test]
     fn cite_offers_exactly_the_turns_of_the_stretch() {
-        let spec = write_spec(&[7, 9, 12], &[]).unwrap();
+        let spec = write_spec(&[7, 9, 12], &[], FACTS).unwrap();
         let element = &param(&spec, "claims")["items"];
         for key in ["cite", "also_cite"] {
             assert_eq!(
@@ -557,7 +636,7 @@ mod tests {
 
     #[test]
     fn relates_offers_new_and_restating_or_settling_each_open_item_only() {
-        let spec = write_spec(&[1], &[item(3, "the valve"), item(5, "the roster")]).unwrap();
+        let spec = write_spec(&[1], &[item(3, "the valve"), item(5, "the roster")], FACTS).unwrap();
         let relates = property(&param(&spec, "open")["items"], "relates");
         assert_eq!(
             relates["enum"],
@@ -573,7 +652,7 @@ mod tests {
 
     #[test]
     fn with_nothing_open_the_only_relation_is_new() {
-        let spec = write_spec(&[1], &[]).unwrap();
+        let spec = write_spec(&[1], &[], FACTS).unwrap();
         let relates = property(&param(&spec, "open")["items"], "relates");
         assert_eq!(relates["enum"], json!(["new"]));
     }

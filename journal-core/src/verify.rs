@@ -21,19 +21,28 @@ pub const MAX_CLAIMS: usize = 12;
 /// Intentions one entry may carry.
 pub const MAX_INTEND: usize = 3;
 
-/// What the world can say about a thing, when asked.
+/// What the world can say about a thing, when asked, and the entries of other
+/// journals a claim may rest on.
 ///
 /// `None` is "the world has no answer", which is not a disagreement.
 pub trait World {
     fn read(&self, subject: &str, attribute: &str) -> Option<String>;
+
+    /// The entries of other journals a claim may say it rests on, by
+    /// address — `T:review#4`. None, unless the writer has journals above it.
+    fn entries(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A claim as the model wrote it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DraftClaim {
     pub text: String,
     pub cite: Vec<u64>,
     pub typed: Option<Typed>,
+    /// The entry of another journal it rests on.
+    pub per: Option<String>,
 }
 
 /// How an open item relates to the items already open.
@@ -102,7 +111,8 @@ pub enum Verdict {
     /// The world answered differently; the claim keeps its sentence and
     /// carries what the world read.
     Corrected,
-    /// The world had no answer; the claim stands as prose.
+    /// The world had no answer, or the entry above it named is not there; the
+    /// claim stands as prose, on its turns.
     Demoted,
     /// A later claim about the same subject and attribute took its typed fact
     /// over: it stands as prose.
@@ -179,6 +189,7 @@ pub fn verify(
         });
     }
     let citable: BTreeSet<u64> = span.citable_ids().into_iter().collect();
+    let entries: BTreeSet<String> = world.entries().into_iter().collect();
 
     let mut claims: Vec<(usize, Claim)> = Vec::new();
     let mut notes: Vec<Note> = Vec::new();
@@ -192,6 +203,11 @@ pub fn verify(
                 turn: *turn,
             });
         }
+        // An entry above that is not there is dropped, and the claim stands on
+        // its turns: the call offers only the entries there are, so one
+        // arrives only by another path, and costs its claim nothing more.
+        let rests_on_nothing = c.per.as_ref().is_some_and(|a| !entries.contains(a));
+        let per = c.per.filter(|_| !rests_on_nothing);
         let kind = derive_kind(span, &c.cite);
         let mut claim = Claim {
             text: c.text.trim().to_string(),
@@ -200,8 +216,13 @@ pub fn verify(
             perishable: kind != Kind::Did,
             typed: c.typed,
             corrected: false,
+            per,
         };
-        let mut verdict = Verdict::Kept;
+        let mut verdict = if rests_on_nothing {
+            Verdict::Demoted
+        } else {
+            Verdict::Kept
+        };
         if let Some(t) = claim.typed.clone() {
             match world.read(&t.subject, &t.attribute) {
                 Some(actual) if same(&actual, &t.value) => {}
@@ -319,23 +340,36 @@ pub(crate) mod testing {
 
     use super::World;
 
-    /// A world that answers from a table, case-blind.
+    /// A world that answers from a table, case-blind, with the entries above
+    /// it a claim may rest on.
     #[derive(Default)]
-    pub struct Fake(BTreeMap<(String, String), String>);
+    pub struct Fake {
+        facts: BTreeMap<(String, String), String>,
+        above: Vec<String>,
+    }
 
     impl Fake {
         pub fn with(mut self, s: &str, a: &str, v: &str) -> Self {
-            self.0
+            self.facts
                 .insert((s.to_lowercase(), a.to_lowercase()), v.into());
+            self
+        }
+
+        pub fn above(mut self, entries: &[&str]) -> Self {
+            self.above = entries.iter().map(|e| e.to_string()).collect();
             self
         }
     }
 
     impl World for Fake {
         fn read(&self, subject: &str, attribute: &str) -> Option<String> {
-            self.0
+            self.facts
                 .get(&(subject.to_lowercase(), attribute.to_lowercase()))
                 .cloned()
+        }
+
+        fn entries(&self) -> Vec<String> {
+            self.above.clone()
         }
     }
 }
@@ -364,7 +398,7 @@ mod tests {
         DraftClaim {
             text: text.into(),
             cite: cite.to_vec(),
-            typed: None,
+            ..DraftClaim::default()
         }
     }
 
@@ -377,6 +411,7 @@ mod tests {
                 attribute: attribute.into(),
                 value: value.into(),
             }),
+            per: None,
         }
     }
 
@@ -602,6 +637,7 @@ mod tests {
                 attribute: "exists".into(),
                 value: value.into(),
             }),
+            per: None,
         };
         let v = verify(
             Draft {
@@ -627,6 +663,30 @@ mod tests {
             ]
         );
         assert!(v.entry.claims.iter().all(|c| c.corrected));
+    }
+
+    /// **A claim rests on an entry above only if that entry is there**: one
+    /// the world offers is kept with it; any other is dropped, and the claim
+    /// stands on its turns — the entry is not refused for it.
+    #[test]
+    fn a_claim_rests_only_on_an_entry_the_journals_above_hold() {
+        let world = Fake::default().above(&["T:review#4", "P:candle#2"]);
+        let resting = |per: &str| Draft {
+            claims: vec![DraftClaim {
+                per: Some(per.into()),
+                ..claim("Expiry is inclusive.", &[1])
+            }],
+            ..Default::default()
+        };
+        let v = verify(resting("T:review#4"), &span(), &[], &world).unwrap();
+        assert_eq!(v.entry.claims[0].per.as_deref(), Some("T:review#4"));
+        assert_eq!(v.notes[0].verdict, Verdict::Kept);
+        for (missing, world) in [("T:review#9", &world), ("T:review#4", &Fake::default())] {
+            let v = verify(resting(missing), &span(), &[], world).unwrap();
+            assert_eq!(v.entry.claims[0].per, None, "{missing}");
+            assert_eq!(v.entry.claims[0].text, "Expiry is inclusive.");
+            assert_eq!(v.notes[0].verdict, Verdict::Demoted);
+        }
     }
 
     #[test]
@@ -693,6 +753,7 @@ mod tests {
                 attribute: "exists".into(),
                 value: "true".into(),
             }),
+            per: None,
         };
         let v = verify(
             Draft {
