@@ -245,6 +245,16 @@ impl Registry {
         if let Some(m) = a.members.get_mut(&node) {
             m.applied = applied;
         }
+        // A release every placeable member now holds places like no release
+        // at all — `Best` among them — so it is forgotten here rather than
+        // waiting for its key's next request, which may never come: a
+        // conversation not resumed, a picture never edited. What stands is
+        // only what is still replicating.
+        let placeable: Vec<&MemberView> = a.members.values().filter(|m| m.placeable()).collect();
+        if !placeable.is_empty() {
+            a.handovers
+                .retain(|_, h| !placeable.iter().all(|m| h.held_by(m)));
+        }
     }
 
     /// `key`'s claim was let go by `by`, its own records then reaching

@@ -349,6 +349,28 @@ fn a_released_key_goes_to_a_member_holding_its_last_turn() {
     );
 }
 
+/// **A release is forgotten once every member holds it, asked for or not**: a
+/// conversation never resumed, a picture never edited, leaves nothing behind
+/// once its records have reached everyone. One still replicating stands.
+#[test]
+fn a_release_every_member_holds_is_forgotten_without_being_asked_for() {
+    let mut r = three();
+    r.released("zend", b"never-asked", 1, 500);
+    r.released("zend", b"still-going", 1, 900);
+    r.applied("zend", 2, vec![(1, 500)]);
+    assert_eq!(r.apps["zend"].handovers.len(), 2, "node 3 holds neither");
+    r.applied("zend", 3, vec![(1, 600)]);
+    assert!(
+        !r.apps["zend"]
+            .handovers
+            .contains_key(b"never-asked".as_slice()),
+        "every member holds it: forgotten"
+    );
+    assert!(r.apps["zend"]
+        .handovers
+        .contains_key(b"still-going".as_slice()));
+}
+
 /// **A member reporting a key complete may take it, whatever else of its last
 /// holder's it lacks** (`COMPLETE`, `docs/cooperative_admission.md` §2.2).
 /// Node 2 has applied node 1's records only to 100, far short of the release

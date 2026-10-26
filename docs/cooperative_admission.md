@@ -192,6 +192,12 @@ How it is built:
 - A request the gateway sends after a release reaches a member that applies the
   records relayed ahead of it before serving (`APPLY_WAIT`); placement only ever
   chooses one that already has.
+- **A stored picture is placed the same way, with no turn to hold it.** npcd's
+  member takes a picture's key and lets it go the moment the picture is stored
+  (`Authored::hand_over_image`), so an `image_edit` naming it — its `image`
+  argument, an MCP subject — is placed among the members holding that release's
+  records, exactly as a conversation's next turn is. A draw names nothing and
+  goes `Best`.
 
 ### 2.3 Fairness
 

@@ -5,23 +5,28 @@
 //! The picture is the draw's **reference**: the walk starts from it rather than
 //! from noise, and `hold` is how much of it survives. So the prompt describes
 //! the whole picture as it should end up, not only the change, and the answer
-//! is a new picture with its own link — which is itself something to edit, so
-//! a picture is refined a step at a time.
+//! is a new picture with its own id and link — which is itself something to
+//! edit, so a picture is refined a step at a time. The chain keeps two: an
+//! edit kept an hour, and the picture two edits back retired as the new one
+//! is made (`crate::images::Kept`), so the step before is always there to
+//! undo to and repeated edits do not pile up.
 //!
 //! **A picture is named, never sent.** `image` takes the link or id a draw, an
 //! edit or an upload (`image_upload`) answered with, and the bytes are read
 //! from the image store — so a refinement costs the conversation one line, and
 //! a picture uploaded once is edited as often as wanted.
 //!
-//! **Every member holds every image, so whichever serves the edit has it.** An
-//! image is a blob in the substrate, which replicates, and the gateway orders
-//! a write's records ahead of its response: a call it routes afterwards, to
-//! any member, is served only once that member has applied them
-//! (`docs/replicated_substrate.md` §6.4). An image is immutable and named by
-//! its hash, so it is never stale — only present or not. Not present means it
-//! expired, or the member that stored it failed before its records left; it
-//! will not arrive by waiting, so the edit says so at once and the caller
-//! stores it again.
+//! **An edit is placed among the members that hold its picture.** The picture
+//! is its key (`image`, a subject the gateway routes by), and the member that
+//! stored it let the key go at once, at its own records then
+//! (`Authored::hand_over_image`): the gateway places the edit, as it places a
+//! conversation's next turn, on the best member that has applied them — never
+//! one that would wait — with the storing member the fallback
+//! (`docs/cooperative_admission.md` §2.2). A draw names no picture and goes to
+//! the best member anywhere. An image is immutable and named by its hash, so it
+//! is never stale — only present or not; not present means it expired, or the
+//! member that stored it failed before its records left, which no wait mends,
+//! so the edit says so at once and the caller stores it again.
 
 use std::sync::Arc;
 
@@ -29,10 +34,11 @@ use axum::http::HeaderMap;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use candle_conversation::guest::MAX_REFERENCE_HOLD;
+use cluster::dispatch::image_id;
 use serde_json::{json, Value};
 
 use super::args::string;
-use super::image::{body, draw, format, MAX_SIDE, STEPS};
+use super::image::{body, draw, format, Made, MAX_SIDE, STEPS};
 use super::{Answer, Tool};
 use crate::api::Authored;
 use crate::guest_routes::ImageBody;
@@ -61,9 +67,9 @@ impl Tool for Edit {
                 is the link or id image_generate, an earlier image_edit, or image_upload (for a \
                 picture of the user's own) answered with. The prompt describes the whole picture \
                 as it should end up, not only the change; `hold` is how much of the original \
-                survives. Answers like image_generate: the new picture for you to look at, and a \
-                link to its file for 24 hours, which can be edited again. Read the guide `image` \
-                first.",
+                survives. Every edit makes a new image with its own link, kept for 1 hour or \
+                until two more edits follow it; the image before stays until the new one is \
+                edited, so editing from it undoes a step. Read the guide `image` first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -88,8 +94,9 @@ impl Tool for Edit {
             Ok(b) => b,
             Err(e) => return Answer::error(e),
         };
+        let from = image_id(args["image"].as_str().unwrap_or_default());
         match edit_body(args, &source).and_then(|b| Ok((b, format(args)?))) {
-            Ok((body, format)) => draw(s, headers, body, format).await,
+            Ok((body, format)) => draw(s, headers, body, format, Made::Edited { from }).await,
             Err(e) => Answer::error(e),
         }
     }
@@ -118,13 +125,6 @@ fn unavailable(id: &str) -> String {
          one hour) or the server holding it failed before it was shared. Store it again — \
          image_upload for the user's picture, or draw it again — then edit the new one"
     )
-}
-
-/// The image id in a link this server gave — `…/v1/image/link/<id>?exp=…&sig=…`
-/// or `…/v1/image/<id>` — or the id itself.
-fn image_id(link: &str) -> &str {
-    let path = link.split(['?', '#']).next().unwrap_or(link);
-    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// The draw's body: the tool's dials as `image_generate` reads them, the

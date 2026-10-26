@@ -162,11 +162,15 @@ push the finish, and when the user asks to change a photo of their own
   colour, a finish. Look at the result: the change did not happen — lower
   it; the picture drifted from the original — raise it. Past about 0.45 the
   subject itself (a face, an animal) no longer changes much.
-- **One change at a time**, each edit from the last one's link, so a step
-  that goes wrong is undone by editing from the one before.
-
-Each edit answers like a draw — the picture to look at and a link for 24
-hours — and its link is what the next edit takes.
+- **One change at a time**, each edit from the last one's link. Every edit
+  is a new image with its own link, and Zen keeps the last two: the newest,
+  and the one it was edited from. A step that went wrong is undone by
+  editing from the one before — its link still works until the newest is
+  edited again. Anything older is deleted as you go; to go further back,
+  upload or draw it again.
+- **An edit lives 1 hour, or until two more edits follow it** — the answer
+  says so. Give the user the file of the one they want to keep (below)
+  rather than its link.
 
 ## Give it to the user
 

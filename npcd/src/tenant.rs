@@ -747,15 +747,7 @@ fn retire_kept_pictures(authored: &Arc<Authored>) {
             if authored.runtime.as_ref().is_some_and(|rt| rt.stopping()) {
                 return;
             }
-            let mut named = authored.npcs.read().await.portrait_ids();
-            named.extend(
-                authored
-                    .personality_portraits
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .values()
-                    .cloned(),
-            );
+            let named = authored.portrait_image_ids().await;
             let images = authored.images.clone();
             let now = api::now_ms();
             match spawn_blocking(move || images.retire_kept(now, &named)).await {

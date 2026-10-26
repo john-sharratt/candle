@@ -56,8 +56,8 @@ fn instructions(url: &str) -> String {
     format!(
         "Send the picture, as a file from your sandbox, within 10 minutes:\n\n\
          curl -sS -X PUT --data-binary @<file> '{url}'\n\n\
-         It answers {{\"image\": \"<id>\", \"width\": …, \"height\": …}}: pass the id to \
-         image_edit as `image`. Zen keeps the picture for an hour. Keep the URL whole — its \
+         It answers {{\"image\": \"<id>\", \"width\": …, \"height\": …, \"link\": …}}: pass the \
+         id (or the link) to image_edit as `image`. Zen keeps the picture for an hour. Keep the URL whole — its \
          `exp` and `sig` are the permission. If your sandbox cannot reach the URL, tell the user \
          the picture cannot be sent from here."
     )

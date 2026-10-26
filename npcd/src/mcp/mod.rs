@@ -34,8 +34,10 @@
 //! [`args`] reads a tool's arguments, [`route`] reads a handler's answer, and
 //! [`view`] words a mission.
 //!
-//! The `image_*` tools act on no bot or world, so like `bot_list` they name no
-//! subject and reach any member.
+//! `image_generate` and `image_upload` act on nothing stored, so like
+//! `bot_list` they name no subject and go to the best member. `image_edit`
+//! names its picture as `image`, which the gateway places among the members
+//! that hold it (`Authored::hand_over_image`).
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -293,8 +295,9 @@ mod tests {
         );
     }
 
-    /// **Every tool acting on a bot or a world names it as the cluster routes
-    /// by** ([`MCP_SUBJECTS`]), so the call reaches the member holding it.
+    /// **Every tool acting on a bot, a world or a stored picture names it as
+    /// the cluster routes by** ([`MCP_SUBJECTS`]), so the call reaches a
+    /// member holding it; a draw and an upload name nothing and go anywhere.
     #[test]
     fn every_tool_names_its_subject_as_the_cluster_routes_by() {
         for d in definitions().as_array().unwrap() {
@@ -307,8 +310,10 @@ mod tests {
                 assert!(required.is_empty());
                 continue;
             }
-            // Acts on no bot or world: any member draws it.
-            if d["name"].as_str().is_some_and(|n| n.starts_with("image_")) {
+            // Acts on nothing stored: any member draws it, or takes the upload.
+            // An edit names its picture (`image`), and is placed among the
+            // members that hold it.
+            if d["name"] == "image_generate" || d["name"] == "image_upload" {
                 assert!(MCP_SUBJECTS.into_iter().all(|k| !props.contains_key(k)));
                 continue;
             }

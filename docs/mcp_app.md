@@ -181,22 +181,33 @@ good for 24 hours (`npcd::image_links`). The model downloads it and sends the
 user the file. `GET /v1/image/:iid`, by id alone, still needs a signed-in
 caller.
 
-A drawn picture is kept as long as its link works, an uploaded one an hour.
-Each is noted as the custom object `image/drawn/<id>` or `image/uploaded/<id>`
-with the moment it arrived; every member looks the notes over every ten
+A drawn picture is kept as long as its link works, an uploaded one an hour,
+and an edit an hour or until two more edits follow it: an edit is always a
+new image, its note (`image/edited/<id>`) names the picture it came from, and
+making C from B, made from A, retires A at once — B stays, so editing from it
+undoes a step, and repeated edits do not pile up. Each is noted as the custom
+object `image/drawn/<id>`, `image/uploaded/<id>` or `image/edited/<id>` with
+the moment it arrived; every member looks the notes over every ten
 minutes, and a picture whose every note has run its time has its blob
 retired — unless a character's or personality's portrait names the same
 image — and its notes ended (`npcd::images::kept`). Retiring a blob is a
 tombstone (`docs/replicated_substrate.md` §10.3), so the bytes leave every
 member's log at its next compaction.
 
-**An edit finds its picture on whichever member serves it.** The picture is
-a substrate blob, replicated to every member, and the gateway sends a write's
-records ahead of its response, so a call it routes afterwards — to any member
-— is served only once they are applied (§6.4 there). Being immutable and named
-by its hash, a picture is present or absent, never stale; absent means it
-expired or the member that stored it failed before its records left, which no
-wait mends, so `image_edit` answers at once and the caller stores it again.
+**An edit is placed among the members that hold its picture, a draw on the
+best member anywhere.** A draw (`image_generate`) and an upload name nothing
+stored, so they go `Best`: the idle or least-used member. An edit names its
+picture as `image`, one of the subjects the gateway routes by
+(`cluster::dispatch::MCP_SUBJECTS`, a link reduced to its id). The member that
+stores a picture — a draw, an edit's result, an upload — takes the picture's
+key and lets it go at once, at its own records as they stand
+(`Authored::hand_over_image`), so the gateway places an edit naming it as it
+places a conversation's next turn (`docs/cooperative_admission.md` §2.2): on
+the best member that has applied those records, never one that would wait,
+with the storing member the fallback. Being immutable and named by its hash, a
+picture is present or absent, never stale; absent means it expired or the
+member that stored it failed before its records left, which no wait mends, so
+`image_edit` answers at once and the caller stores it again.
 
 **A call reaches the member holding what it acts on.** Character and world
 routes are dispatched to the member holding that character's or world's lease

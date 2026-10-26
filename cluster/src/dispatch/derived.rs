@@ -9,9 +9,12 @@
 //! said since.
 //!
 //! **`mcp_subject`**: an MCP `tools/call` names what it acts on among its
-//! arguments — an npcd character as `bot`, a world as `world` — and is
-//! answered by the member holding that, as the route for the same act would
-//! be (`docs/mcp_app.md` §4). Any other message names nothing.
+//! arguments — an npcd character as `bot`, a world as `world`, a stored
+//! picture as `image` — and is answered by the member holding that, as the
+//! route for the same act would be (`docs/mcp_app.md` §4). An image is held
+//! by no one: the member that stored it lets its key go at once, so an edit is
+//! placed among the members that hold it (`docs/cooperative_admission.md`
+//! §2.2). Any other message names nothing.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -50,22 +53,34 @@ impl Derived {
 
 /// The arguments an MCP `tools/call` may name its subject by, in the order
 /// they are looked for.
-pub const MCP_SUBJECTS: [&str; 2] = ["bot", "world"];
+pub const MCP_SUBJECTS: [&str; 3] = ["bot", "world", "image"];
 
 /// What an MCP `tools/call` body acts on: the first of [`MCP_SUBJECTS`] its
-/// arguments name, trimmed; `None` for any other message.
+/// arguments name, trimmed — an `image` given as a link reduced to its id
+/// ([`image_id`]), so a link and its id are one key; `None` for any other
+/// message.
 pub fn mcp_subject_key(body: &Value) -> Option<String> {
     if body.get("method").and_then(Value::as_str) != Some("tools/call") {
         return None;
     }
     let args = body.get("params")?.get("arguments")?;
     MCP_SUBJECTS.iter().find_map(|k| {
-        args.get(*k)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+        let named = args.get(*k).and_then(Value::as_str).map(str::trim)?;
+        let named = if *k == "image" {
+            image_id(named)
+        } else {
+            named
+        };
+        (!named.is_empty()).then(|| named.to_string())
     })
+}
+
+/// The image id a link names — `…/v1/image/link/<id>?exp=…&sig=…`,
+/// `…/v1/image/<id>` — or the id itself: its last path segment, before any
+/// query. An image's key wherever it is routed or read.
+pub fn image_id(link: &str) -> &str {
+    let path = link.split(['?', '#']).next().unwrap_or(link);
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// The `model` a passthrough request names.
@@ -228,6 +243,17 @@ mod tests {
             Some("w1".into())
         );
         assert_eq!(Derived::McpSubject.key(&call(json!({"bot": ""}))), None);
+        // An image by its link or its id is one key.
+        let id = "ab".repeat(32) + ".jpg";
+        for given in [
+            format!("https://bot.tokera.com/v1/image/link/{id}?exp=1&sig=cd"),
+            format!(" {id} "),
+        ] {
+            assert_eq!(
+                Derived::McpSubject.key(&call(json!({"image": given, "prompt": "p"}))),
+                Some(id.clone())
+            );
+        }
         assert_eq!(Derived::McpSubject.key(&call(json!({"q": "Pax"}))), None);
         assert_eq!(
             Derived::McpSubject.key(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})),
