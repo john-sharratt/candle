@@ -203,7 +203,8 @@ One stream removes the class: there is no other stream for a launch to land on.
 
 The constants are short on purpose: a decode wave is a token or so, so reaching the lock costs
 seconds of decode, not minutes — a trial whose shapes all recur every wave ends at its 64-wave
-minimum, and the cap is about twenty seconds.
+minimum, and the cap is about twenty seconds of a benchmark's decode (~45 s of a serving
+daemon's mix).
 
 **A shape is only as stable as its launches' grids.** A kernel whose grid follows a per-token
 count makes every segment holding it a new shape. Launches inside a recorded wave size their

@@ -212,11 +212,17 @@ impl GalleryArena {
         let mut case_off = 0usize;
         let mut max_seg_cases = 1usize;
 
+        // Keep the arena under its own ceiling before the build admits anything
+        // — once, not per turn: the pass walks every resident turn, so run
+        // ahead of each of a large index's ensures it made the build quadratic
+        // in its turns. What the build uploads is held only by its own pins
+        // until the launch, so nothing it admits is given up under it.
+        self.evict_past_keep();
         // Turns pinned so far — released on error so a failed build never leaks pins.
         let mut pinned_sids: Vec<StreamId> = Vec::new();
         let mut run_ids: Vec<u64> = Vec::new();
-        // What the build cost, and why: the turns it had to upload (a residency
-        // mutation across their ensure) against the turns already resident.
+        // What the build cost, and why: the turns it had to upload against the
+        // turns already resident.
         let t_build = Instant::now();
         let mut ensure_time = Duration::ZERO;
         let mut uploaded = 0usize;
@@ -240,12 +246,10 @@ impl GalleryArena {
                         // Pin the turn atomically with residency so the governor
                         // can't free its pages before the launch reads them.
                         let t_ensure = Instant::now();
-                        let gen = self.residency_gen();
                         let ensured = self.scan_ensure(w.sid, w.turn, w.fingerprint);
                         ensure_time += t_ensure.elapsed();
-                        uploaded += usize::from(self.residency_gen() != gen);
-                        let (addrs, run_id) = match ensured {
-                            Ok(a) => a,
+                        let ensured = match ensured {
+                            Ok(e) => e,
                             Err(e) => {
                                 for &s in &pinned_sids {
                                     self.unpin(s);
@@ -253,10 +257,11 @@ impl GalleryArena {
                                 return Err(e);
                             }
                         };
+                        uploaded += usize::from(ensured.uploaded);
                         pinned_sids.push(w.sid);
-                        run_ids.push(run_id);
+                        run_ids.push(ensured.run_id);
                         let b = page_ptr.len();
-                        page_ptr.extend_from_slice(&addrs);
+                        page_ptr.extend_from_slice(&ensured.addrs);
                         turn_base.insert(w.sid, b);
                         b
                     }
@@ -300,7 +305,7 @@ impl GalleryArena {
             turns = pinned_sids.len(),
             uploaded,
             tokens = n_tokens,
-            ensure_ms = ensure_time.as_millis() as u64,
+            ensure_with_lock_wait_ms = ensure_time.as_millis() as u64,
             walk_ms = walked.saturating_sub(ensure_time).as_millis() as u64,
             index_upload_ms = t_upload.elapsed().as_millis() as u64,
             "built a scan index"
@@ -497,24 +502,14 @@ impl GalleryArena {
         let t_index = Instant::now();
         let gen_before = self.residency_gen();
         let fp = fingerprint_segments(segments);
-        let cached = self
-            .index_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&fp);
         let (idx, reused) = match self.reuse_index(fp) {
-            Some(idx) => (idx, true),
-            None => {
+            Ok(idx) => (idx, true),
+            Err(miss) => {
                 tracing::debug!(
                     target: "candle_conversation::provenance::gallery_arena",
                     fingerprint = fp,
-                    stale = cached,
                     "scan index rebuilt: {}",
-                    if cached {
-                        "a turn it holds moved or was replaced"
-                    } else {
-                        "no index for this segment set"
-                    }
+                    miss.reason()
                 );
                 let built = Arc::new(self.build_index(segments)?);
                 // What a scan waits for when its working set is not all
@@ -985,6 +980,7 @@ impl GalleryArena {
 #[cfg(test)]
 mod tests {
     use super::super::tests::gallery_pool;
+    use super::super::IndexMiss;
     use super::*;
     use crate::persistence::content_hash::turn_stream_id;
     use crate::provenance::gpu::{BatchedGpuGallery, SegmentInput};
@@ -1587,9 +1583,15 @@ mod tests {
         // This index's own turn is re-sealed under a new fingerprint: its pages
         // are replaced, so the cached addresses are gone with them.
         arena.ensure_resident(turn_stream_id(7, 0), &a, 2).unwrap();
-        assert!(
-            arena.reuse_index(fp).is_none(),
+        assert_eq!(
+            arena.reuse_index(fp).err(),
+            Some(IndexMiss::Stale),
             "a re-sealed turn invalidates every index over it"
+        );
+        assert_eq!(
+            arena.reuse_index(fp).err(),
+            Some(IndexMiss::Absent),
+            "the stale index was dropped from the cache"
         );
     }
 

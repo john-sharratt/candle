@@ -550,11 +550,10 @@ fn turn_sampling(
 }
 
 /// Calibration questions per file a layer's chunk exclusion is learned from:
-/// a background of ~3,300 questions over the workspace's ~1,650 files. The
-/// outliers it cuts sit orders of magnitude above the rest, so a sample finds
-/// them. The scans run between waves, after the pass: six a file (~9,800
-/// questions, ~1,230 scans of ~140 ms) held conversations to a stutter for
-/// three minutes after each restart.
+/// a background of ~3,300 questions over the workspace's ~1,650 files, ~410
+/// scans of 16 questions run between waves. The outliers it cuts sit orders
+/// of magnitude above the rest, so a sample finds them; the cut it learns at
+/// this sample has not been measured against the six-a-file one.
 const EXCLUSION_QUESTIONS_PER_FILE: usize = 2;
 
 /// The triggers a chat turn decodes under: any `<tool_call>` the model emits is
@@ -3212,11 +3211,14 @@ impl InferenceState {
     ///
     /// **After the pass, never ahead of it.** The learn is a few hundred scans,
     /// each one background job the scheduler runs between waves; under live
-    /// conversations that is many minutes, and run ahead of the pass it held
-    /// the ingest back that long after every restart — on BlackWorld
-    /// (2026-10-26) restarts a quarter of an hour apart kept the ingest from
-    /// reading a file for hours. The cut measured neutral on retrieval, so a
-    /// pass read without one loses nothing.
+    /// conversations that is many minutes, and a pass waiting on it reads
+    /// nothing meanwhile — on BlackWorld (2026-10-26) restarts a quarter of an
+    /// hour apart left the ingest reading no file for hours. The price is the
+    /// first pass after a restart, which has no exclusion: the units its
+    /// derived layers write are projected without the cut. On the
+    /// calibration competition the cut measured neutral (MRR 0.251 → 0.250);
+    /// on content alone it bought MRR 0.172 → 0.186
+    /// (`docs/provenance_scoped_signatures.md` §2.6).
     fn learn_chunk_exclusions(&self) {
         for (il, _) in &self.branch_layers {
             if crate::ingest_cancel::cancelled() {
@@ -3287,10 +3289,14 @@ impl InferenceState {
         if !self.branch_layers.is_empty() {
             let passes = self.layer_passes()?;
             let ctx = self.refresh_ctx();
-            any |= self
+            // Learned whether or not the pass succeeded: a failed pass is read
+            // again only on the next branch move or layer clock, and the scans
+            // until then would run without an exclusion.
+            let passed = self
                 .branch_ingest
-                .pass(&ctx, &self.workspace, &passes, &progress)?;
+                .pass(&ctx, &self.workspace, &passes, &progress);
             self.learn_chunk_exclusions();
+            any |= passed?;
         }
         for il in &self.ingest_layers {
             // Cooperative shutdown: stop the background reconcile between layers so

@@ -311,9 +311,13 @@ loses (`docs/results/provenance_gates_2026-10-26.md`).
   one job held the engine ~40 s at a time and froze every live conversation
   for minutes. A standing exclusion is kept, nothing scanned, until the
   questions it was learned from move by a tenth; a restart, which holds none,
-  learns it once its first pass ends. Ahead of the pass, its few hundred jobs
-  under live conversations held the ingest back for many minutes after every
-  restart, and the cut measured neutral on retrieval.
+  learns it once its first pass ends, whether or not that pass succeeded. It
+  is not learned ahead of the pass because its few hundred jobs, run between
+  live conversations' waves, take many minutes, and a pass waiting on them
+  reads nothing. The price is that first pass: the units its derived layers
+  write are projected without the cut. Learned from 2 questions a file
+  (`EXCLUSION_QUESTIONS_PER_FILE`); the cut at that sample has not been
+  measured against the 6-a-file one below.
 - **Measured.** Held-out questions, content alone: MRR 0.172 → 0.186; stacked
   on the calibration competition at 15 questions a file: 0.220 → 0.228, R@10
   0.364 → 0.379.
