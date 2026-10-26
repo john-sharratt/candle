@@ -11,6 +11,9 @@ use crate::mcp::workers;
 
 pub const NAME: &str = "repo_task_wait";
 
+/// The line a wait's answer opens its workers still running under.
+pub const STILL_RUNNING: &str = "Still running:";
+
 pub fn definition() -> Value {
     json!({
         "name": NAME,
@@ -128,7 +131,8 @@ pub fn render(read: &[(String, Option<Worker>)], seen: &dyn Fn(&Worker) -> Optio
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        out.push_str("Still running:\n");
+        out.push_str(STILL_RUNNING);
+        out.push('\n');
         out.push_str(&running.join("\n\n"));
     }
     out

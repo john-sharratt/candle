@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 
 use super::{Answer, Ctx, LOADING};
 use crate::api::substrate::TimelineDetail;
+use crate::mcp::names::Path;
 use crate::mcp::ops;
+use crate::mcp::threads;
 use crate::mcp::workers::first_line;
 
 pub const NAME: &str = "timeline_read";
@@ -27,7 +29,8 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Read one stored conversation — a timeline in the substrate, the store everything \
-            is kept in — by the id `layer_read` lists, or a worker's own: its label, layer, tokens, \
+            is kept in — by the id `layer_read` lists, or a worker's own by its path \
+            (`T:<thread>/<name>`): its label, layer, tokens, \
             metadata (the dials a worker ran with among it) and lineage, then its turns a page at a time — \
             each with its index, kind (normal, or a summary of turns or of summaries), tokens, and the first \
             line of each half. With `turn`, that one turn in full instead: the user half (a tool call's \
@@ -36,7 +39,7 @@ pub fn definition() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "The timeline id, a decimal number."},
+                "id": {"type": "string", "description": "The timeline id, a decimal number as `layer_read` lists it — or a worker's path, `T:<thread>/<name>`, for its own conversation."},
                 "offset": {"type": "integer", "minimum": 0, "description": "The first turn (0 by default)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "How many turns (40 by default)."},
                 "turn": {"type": "integer", "minimum": 0, "description": "One turn's index, to read it in full."},
@@ -130,20 +133,48 @@ pub fn render_turn(t: &TimelineDetail, index: u32, from: usize) -> Result<String
     Ok(out)
 }
 
+const ID_IS: &str =
+    "`id` is a timeline id, a decimal number as `layer_read` lists it, or a worker's path, \
+     `T:<thread>/<name>`";
+
+/// The conversation an `id` names: a timeline by number, or a worker of the
+/// caller's by its path.
+#[derive(Debug, PartialEq, Eq)]
+enum Which {
+    Timeline(u64),
+    Worker { thread: String, name: String },
+}
+
+impl Which {
+    fn of(id: &str) -> Result<Self, String> {
+        let id = id.trim();
+        if let Ok(raw) = id.parse::<u64>() {
+            return Ok(Self::Timeline(raw));
+        }
+        match Path::parse(id) {
+            Ok(Path::Worker { thread, worker }) => Ok(Self::Worker {
+                thread,
+                name: worker,
+            }),
+            _ => Err(ID_IS.into()),
+        }
+    }
+}
+
 pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = ops::admin_only(&ctx.caller, NAME) {
         return Answer::error(e);
     }
-    let Some(raw) = args
-        .get("id")
-        .and_then(|v| {
-            v.as_str()
-                .map(str::to_string)
-                .or_else(|| v.as_u64().map(|n| n.to_string()))
-        })
-        .and_then(|s| s.parse::<u64>().ok())
-    else {
-        return Answer::error("`id` is a timeline id, a decimal number as `layer_read` lists it");
+    let Some(id) = args.get("id").and_then(|v| {
+        v.as_str()
+            .map(str::to_string)
+            .or_else(|| v.as_u64().map(|n| n.to_string()))
+    }) else {
+        return Answer::error(ID_IS);
+    };
+    let which = match Which::of(&id) {
+        Ok(w) => w,
+        Err(e) => return Answer::error(e),
     };
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let limit = (args
@@ -154,8 +185,20 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     if !ctx.session.is_loaded() {
         return Answer::error(LOADING);
     }
-    let Some(t) = ctx.session.substrate_timeline(raw) else {
-        return Answer::error(format!("there is no timeline {raw}"));
+    let found = match &which {
+        Which::Timeline(raw) => ctx.session.substrate_timeline(*raw),
+        Which::Worker { thread, name } => {
+            ctx.session
+                .conversation_detail(&threads::conv_id(&ctx.caller.key(), thread, name))
+        }
+    };
+    let Some(t) = found else {
+        return Answer::error(match which {
+            Which::Timeline(raw) => format!("there is no timeline {raw}"),
+            Which::Worker { thread, name } => {
+                format!("`T:{thread}/{name}` has no conversation of yours")
+            }
+        });
     };
     match args.get("turn").and_then(Value::as_u64) {
         Some(index) => {
@@ -178,6 +221,25 @@ mod tests {
 
     use super::*;
     use crate::api::substrate::TurnView;
+
+    /// **An id is a timeline's number or a worker's path**; anything else is
+    /// refused saying what it may be.
+    #[test]
+    fn an_id_is_a_timeline_number_or_a_workers_path() {
+        assert_eq!(
+            Which::of("7303474180578274787"),
+            Ok(Which::Timeline(7303474180578274787))
+        );
+        assert_eq!(
+            Which::of(" T:night-test/verify-branch.2 "),
+            Ok(Which::Worker {
+                thread: "night-test".into(),
+                name: "verify-branch.2".into()
+            })
+        );
+        assert_eq!(Which::of("T:night-test"), Err(ID_IS.to_string()));
+        assert_eq!(Which::of("seven"), Err(ID_IS.to_string()));
+    }
 
     #[test]
     fn a_timeline_reads_as_its_head_then_its_turns() {

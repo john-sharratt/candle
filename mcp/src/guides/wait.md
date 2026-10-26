@@ -15,7 +15,12 @@ rest. Never wait on one worker while others run unwatched.
 ## Read what each answer brings
 
 - **Progress lines**: what each worker is doing — rounds, tool calls,
-  thinking.
+  thinking — and its phase: *reading its input* (taking in its prompt and
+  context, which runs long on a large task), *thinking*, *writing*, *calling
+  tools*, *writing its journal entry*. A phase that holds for minutes is
+  usually a long input or a long thought, not a stall; a worker whose member
+  stopped running it reports as lost. After a reply, its time counts from the
+  reply.
 - **New journal entries**: what a worker has found so far. If they already
   answer your question, stop waiting and use them; the work goes on whether or
   not anyone waits.

@@ -24,6 +24,12 @@ fetch, or is on a path you no longer want. It stops at its next tool round
 and answers with what it has found and what remains. It is then stopped but
 live.
 
+- The next tool round can be minutes away while the worker thinks or writes;
+  until then the stop answers that it is queued. Wait on it as on any worker.
+- The worker reads the reason and shapes its closing answer to it — write the
+  reason as the direction you want ("scope is now only the Admin tools"), and
+  the reply after it can be shorter.
+
 ## Reply — give it the decision
 
 After a stop, a question or a stuck loop, `repo_task_reply {worker, answer}` is its

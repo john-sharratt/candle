@@ -66,10 +66,15 @@ entries (`T:<thread>/<name>#<n>`) and says what to check.
   its claims. With an entry's address (`…#<n>`) it pages the raw turns behind
   that entry, which run to hundreds of lines: find the turn with
   `journal_grep` first, then page to it with `offset`.
-- `timeline_read {id, turn}` (Admins only) reads one turn whole: the tool
-  results in its user half — the fetched page as the worker got it — and its
-  thinking and tool calls in the assistant half. The timeline's metadata shows
-  the effort the worker ran at.
+- `timeline_read {id: "T:<thread>/<name>", turn}` (Admins only) reads one of
+  the worker's turns whole: the tool results in its user half — the fetched
+  page as the worker got it — and its thinking and tool calls in the assistant
+  half, a page of characters at a time. Without `turn` it lists the turns, and
+  its head shows the effort the worker ran at. Its turn numbers count whole
+  turns; `journal_read`'s count each half, so the two differ.
+- A journal page is counted in lines, and one line of a tool result can run
+  to thousands of characters: page an entry's turns with a small `limit`
+  (20–50), or read the one turn with `timeline_read`.
 
 ## A code answer
 
