@@ -255,7 +255,7 @@ fn main() -> anyhow::Result<()> {
         }
         "questions" => {
             let per_file = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(4);
-            questions_gate::run(&files, &rule, per_file, daemon()?)?;
+            questions_gate::run(&files, per_file, daemon()?)?;
         }
         "normalization" => {
             norm_probe::run(&files, &args[2..], daemon()?)?;

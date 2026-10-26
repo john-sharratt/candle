@@ -370,7 +370,7 @@ impl BatchedGpuGallery {
             n_groups,
             n_segments,
             n_cases,
-            group_weights,
+            &vec![group_weights; n_segments],
         ))
     }
 }
@@ -389,6 +389,11 @@ impl BatchedGpuGallery {
 /// plain scatter, no cross-segment summation, order-independent and bit-identical
 /// to a serial fold. Each segment tallies in its OWN local case space (width
 /// `seg_nc`). `seg_case` is the `n_segments+1` case-prefix array.
+///
+/// `segment_weights[s]` weighs segment `s`'s fold groups — in its gate and its
+/// tally alike — so competitions that carry their identity in different groups
+/// are each weighed by their own.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn needle_tally_segments(
     out_case: &[i32],
     out_vote: &[f32],
@@ -397,8 +402,13 @@ pub(crate) fn needle_tally_segments(
     n_groups: usize,
     n_segments: usize,
     n_cases: usize,
-    group_weights: &[f32],
+    segment_weights: &[&[f32]],
 ) -> Vec<Vec<f32>> {
+    assert_eq!(
+        segment_weights.len(),
+        n_segments,
+        "one fold-group weighting per segment"
+    );
     let mut results = Vec::with_capacity(per_req_tokens.len());
     let mut tok_base = 0usize;
     for &cnt in per_req_tokens {
@@ -416,6 +426,7 @@ pub(crate) fn needle_tally_segments(
                 if cnt == 0 {
                     return (case0, local);
                 }
+                let group_weights = segment_weights[s];
                 let wof = |g: usize| group_weights.get(g).copied().unwrap_or(1.0);
                 // Pass 1: per-query magnitude (sum of weighted votes over groups).
                 let mut mags = vec![0f32; cnt];
@@ -487,6 +498,25 @@ mod tests {
             n_heads: 12,
             words: vec![fill; 24],
         }
+    }
+
+    /// Each segment is gated and tallied under its own fold-group weights: two
+    /// segments seeing the same votes keep different tokens and tally
+    /// different sums when weighed apart.
+    #[test]
+    fn each_segment_is_gated_and_tallied_by_its_own_weights() {
+        // One probe of two tokens, two fold groups, two segments of one case
+        // each; `(token × groups + group) × segments + segment`.
+        let out_vote = [1.0f32, 1.0, 4.0, 4.0, 3.0, 3.0, 1.0, 1.0];
+        let out_case = [0i32, 1, 0, 1, 0, 1, 0, 1];
+        let tally = |w: &[&[f32]]| {
+            needle_tally_segments(&out_case, &out_vote, &[2], &[0, 1, 2], 2, 2, 2, w)
+        };
+        // Alike: both segments keep token 0 (magnitude 5 against 4).
+        assert_eq!(tally(&[&[1.0, 1.0], &[1.0, 1.0]]), vec![vec![5.0, 5.0]]);
+        // Apart: segment 0 weighs group 0 alone and keeps token 1 (3 > 1);
+        // segment 1 weighs group 1 alone and keeps token 0 (4 > 1).
+        assert_eq!(tally(&[&[1.0, 0.0], &[0.0, 1.0]]), vec![vec![3.0, 4.0]]);
     }
 
     /// The batched GPU scan must be **bit-identical** to running the CPU

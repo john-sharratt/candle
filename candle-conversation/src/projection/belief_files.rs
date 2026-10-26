@@ -419,8 +419,9 @@ fn with_calibration(
 /// z / margin / needle gate, numerically equivalent to the CPU per-file scan up
 /// to fast-math ULP — same ranking); CPU = the identical `score_slots_weighted`
 /// per file, on a host without the arena or when the arena declines. Per-layer-
-/// group vote weights come from the group's `policy.layer_weights` (empty ⇒
-/// uniform).
+/// group vote weights come from the group's `policy.layer_weights` for the
+/// content competitions and `policy.calibration_layer_weights` for the
+/// calibration competition (empty ⇒ uniform).
 ///
 /// **Calibrations compete among themselves.** A calibration's exemplars and a
 /// live probe share a distribution, so in one pool with the files' content
@@ -437,6 +438,7 @@ pub(crate) fn scan_file_scans(
     arena: Option<&GalleryArena>,
 ) -> Vec<Vec<(Vec<f32>, Vec<f32>)>> {
     let weights = &group.policy.layer_weights;
+    let cal_weights = &group.policy.calibration_layer_weights;
     let cases = group.policy.scan.cases;
     let cal_weight = group.policy.scan.calibration_weight;
     let comps = competitions(files, cases);
@@ -450,14 +452,14 @@ pub(crate) fn scan_file_scans(
         let decoded = decoded.get_or_init(|| decode_files(files));
         let mut fused_all: Vec<f32> = Vec::new();
         let mut base_all: Vec<f32> = Vec::new();
-        let mut score = |wref: &[&[WideQSig]], wslot: &[usize], n_cases: usize| {
+        let mut score = |wref: &[&[WideQSig]], wslot: &[usize], n_cases: usize, w: &[f32]| {
             let (fused, base) = match group.policy.scan.fusion {
                 FusionMode::Additive => {
-                    let v = score_slots_weighted(p, wref, wslot, n_cases, weights);
+                    let v = score_slots_weighted(p, wref, wslot, n_cases, w);
                     (v.clone(), v)
                 }
                 mode => {
-                    let grouped = score_slots_grouped(p, wref, wslot, n_cases, weights);
+                    let grouped = score_slots_grouped(p, wref, wslot, n_cases, w);
                     if grouped.is_empty() {
                         (vec![0.0; n_cases], vec![0.0; n_cases])
                     } else {
@@ -470,11 +472,11 @@ pub(crate) fn scan_file_scans(
         };
         for comp in &comps {
             let (wref, wslot, n_cases) = competition_windows(files, decoded, comp, cases);
-            score(&wref, &wslot, n_cases);
+            score(&wref, &wslot, n_cases, weights);
         }
         if !cal.is_empty() {
             let (wref, wslot) = calibration_windows(files, decoded, &cal);
-            score(&wref, &wslot, cal.len());
+            score(&wref, &wslot, cal.len(), cal_weights);
         }
         let split = |votes: &[f32]| with_calibration(files, &comps, &cal, votes, cases, cal_weight);
         split(&fused_all)
@@ -528,9 +530,14 @@ pub(crate) fn scan_file_scans(
                 n_cases: cal.len(),
             });
         }
-        // `[probe][file][slot]`.
-        let arena_scan = |w: &[f32]| -> Option<Vec<Vec<Vec<f32>>>> {
-            match arena.scan_weighted(&segments, probes, w) {
+        // `[probe][file][slot]`, the content competitions weighed by `w`, the
+        // calibration competition by `cw`.
+        let arena_scan = |w: &[f32], cw: &[f32]| -> Option<Vec<Vec<Vec<f32>>>> {
+            let mut per_segment: Vec<&[f32]> = vec![w; comps.len()];
+            if !cal.is_empty() {
+                per_segment.push(cw);
+            }
+            match arena.scan_segment_weighted(&segments, probes, &per_segment) {
                 Ok(out) => {
                     // One per-GLOBAL-case vote vector per probe, in segment
                     // (competition) order — split back per file, the
@@ -572,7 +579,7 @@ pub(crate) fn scan_file_scans(
         // the mode — the same law as the CPU `score_slots_fused`. The ungated
         // group sum rides along as the mass base.
         match group.policy.scan.fusion {
-            FusionMode::Additive => arena_scan(weights).map(|per_probe| {
+            FusionMode::Additive => arena_scan(weights, cal_weights).map(|per_probe| {
                 per_probe
                     .into_iter()
                     .map(|per_file| per_file.into_iter().map(|v| (v.clone(), v)).collect())
@@ -590,9 +597,12 @@ pub(crate) fn scan_file_scans(
                 // grouped[g][probe][file][slot]
                 let mut grouped: Vec<Vec<Vec<Vec<f32>>>> = Vec::with_capacity(n_groups);
                 for g in 0..n_groups {
-                    let mut one_hot = vec![0.0f32; n_groups];
-                    one_hot[g] = weights.get(g).copied().unwrap_or(1.0);
-                    grouped.push(arena_scan(&one_hot)?);
+                    let one_hot = |w: &[f32]| {
+                        let mut v = vec![0.0f32; n_groups];
+                        v[g] = w.get(g).copied().unwrap_or(1.0);
+                        v
+                    };
+                    grouped.push(arena_scan(&one_hot(weights), &one_hot(cal_weights))?);
                 }
                 Some(
                     (0..probes.len())
@@ -809,6 +819,35 @@ layers:
         group.policy.scan.calibration_weight = 0.0;
         let unweighed = scores(&group);
         assert!(unweighed[1] < weighed[1], "{unweighed:?} vs {weighed:?}");
+    }
+
+    /// The calibration competition is weighed by its own fold groups: with
+    /// every content group weighed out the calibration still finds the file,
+    /// and weighing its own groups out leaves nothing.
+    #[test]
+    fn the_calibration_competition_is_weighed_by_its_own_fold_groups() {
+        let questions: Vec<Vec<WideQSig>> = (0..3)
+            .map(|i| (0..12).map(|t| sig(50_000 + i * 100 + t)).collect())
+            .collect();
+        let files: Vec<FileScan> = (0..3)
+            .map(|i| calibrated_file(i + 1, i + 1, 1, 24, &questions[i as usize..i as usize + 1]))
+            .collect();
+        let probe: Vec<WideQSig> = questions[1][2..10].to_vec();
+        let mut group = schema_group(ScanCases::File);
+        let scores = |g: &GroupSchema| {
+            scan_file_scans(&files, g, &[probe.as_slice()], None)[0]
+                .iter()
+                .map(|(fused, _)| fused[0])
+                .collect::<Vec<f32>>()
+        };
+        group.policy.layer_weights = vec![0.0; 3];
+        let calibration_only = scores(&group);
+        assert!(
+            calibration_only[1] > calibration_only[0] && calibration_only[1] > calibration_only[2],
+            "{calibration_only:?}"
+        );
+        group.policy.calibration_layer_weights = vec![0.0; 3];
+        assert_eq!(scores(&group), vec![0.0, 0.0, 0.0]);
     }
 
     /// Files of one exchange compete together, a file of several on its own.

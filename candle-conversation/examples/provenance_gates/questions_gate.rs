@@ -1,10 +1,10 @@
 //! The questions gate: each calibrated file's questions, one at a time, probe
 //! for the file — the probe is a question, as a live one is, and its own turn
-//! is left out of the gallery. Ranked by every rule ([`crate::rules`]), so the
-//! same probes say what the questions buy over the files' content alone.
+//! is left out of the gallery — its calibration competition included. Ranked
+//! by every rule ([`crate::rules`]), so the same probes say what the
+//! calibration and each fold-group weighting buy over the content alone.
 
 use anyhow::Context;
-use candle_conversation::provenance::boundaries::BoundaryRule;
 
 use crate::corpus::File;
 use crate::ranking::order;
@@ -12,14 +12,9 @@ use crate::remote_gallery::{Daemon, RemoteGallery};
 use crate::rules::{Scorer, RULES};
 use crate::stats::mrr;
 
-pub fn run(
-    files: &[File],
-    rule: &BoundaryRule,
-    per_file: usize,
-    daemon: &Daemon,
-) -> anyhow::Result<()> {
+pub fn run(files: &[File], per_file: usize, daemon: &Daemon) -> anyhow::Result<()> {
     let gpu = RemoteGallery::new(files, daemon);
-    let scorer = Scorer::new(&gpu, files, rule).context("learning the background peaks")?;
+    let scorer = Scorer::new(&gpu, files.len());
     let calibrated = files.iter().filter(|f| !f.questions.is_empty()).count();
     println!(
         "questions gate: {calibrated} of {} files calibrated, up to {per_file} probes each",

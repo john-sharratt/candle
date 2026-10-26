@@ -775,6 +775,7 @@ impl Builder {
                     config,
                     tags: Vec::new(),
                     layer_weights: Vec::new(),
+                    calibration_layer_weights: Vec::new(),
                     scan: ScanPolicy::default(),
                 }
             }

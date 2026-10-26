@@ -65,6 +65,11 @@ pub struct PagedSegment<'a> {
     pub n_cases: usize,
 }
 
+/// `weights` for every one of `segments`.
+fn every<'w>(segments: &[PagedSegment], weights: &'w [f32]) -> Vec<&'w [f32]> {
+    vec![weights; segments.len()]
+}
+
 /// The index's arrays on the device — uploaded once, when the index is built,
 /// and read in place by every launch that reuses it.
 ///
@@ -326,7 +331,25 @@ impl GalleryArena {
         probes: &[&[WideQSig]],
         group_weights: &[f32],
     ) -> Result<Vec<Vec<f32>>> {
-        self.scan_weighted_impl(segments, probes, group_weights, None)
+        self.scan_weighted_impl(segments, probes, &every(segments, group_weights), None)
+    }
+
+    /// [`Self::scan_weighted`] with each segment's fold groups weighed by its
+    /// own `segment_weights[s]` — one launch, the weights applied in the tally.
+    pub fn scan_segment_weighted(
+        &self,
+        segments: &[PagedSegment],
+        probes: &[&[WideQSig]],
+        segment_weights: &[&[f32]],
+    ) -> Result<Vec<Vec<f32>>> {
+        if segment_weights.len() != segments.len() {
+            return Err(candle::Error::Msg(format!(
+                "paged scan: {} segment weightings for {} segments",
+                segment_weights.len(),
+                segments.len()
+            )));
+        }
+        self.scan_weighted_impl(segments, probes, segment_weights, None)
     }
 
     /// [`Self::scan_weighted`] forced onto the scalar kernel — the universal
@@ -338,7 +361,12 @@ impl GalleryArena {
         probes: &[&[WideQSig]],
         group_weights: &[f32],
     ) -> Result<Vec<Vec<f32>>> {
-        self.scan_weighted_impl(segments, probes, group_weights, Some(PagedBackend::Scalar))
+        self.scan_weighted_impl(
+            segments,
+            probes,
+            &every(segments, group_weights),
+            Some(PagedBackend::Scalar),
+        )
     }
 
     /// [`Self::scan_weighted`] forced onto the b1 tensor-core (BMMA) kernel —
@@ -352,7 +380,12 @@ impl GalleryArena {
         probes: &[&[WideQSig]],
         group_weights: &[f32],
     ) -> Result<Vec<Vec<f32>>> {
-        self.scan_weighted_impl(segments, probes, group_weights, Some(PagedBackend::Bmma))
+        self.scan_weighted_impl(
+            segments,
+            probes,
+            &every(segments, group_weights),
+            Some(PagedBackend::Bmma),
+        )
     }
 
     /// [`Self::scan_weighted`] forced onto the INT8 tensor-core (IMMA) kernel —
@@ -366,7 +399,12 @@ impl GalleryArena {
         probes: &[&[WideQSig]],
         group_weights: &[f32],
     ) -> Result<Vec<Vec<f32>>> {
-        self.scan_weighted_impl(segments, probes, group_weights, Some(PagedBackend::Imma))
+        self.scan_weighted_impl(
+            segments,
+            probes,
+            &every(segments, group_weights),
+            Some(PagedBackend::Imma),
+        )
     }
 
     /// This arena device's tensor capabilities `(b1 BMMA, INT8 IMMA)`, queried
@@ -397,11 +435,11 @@ impl GalleryArena {
         &self,
         segments: &[PagedSegment],
         probes: &[&[WideQSig]],
-        group_weights: &[f32],
+        segment_weights: &[&[f32]],
         force: Option<PagedBackend>,
     ) -> Result<Vec<Vec<f32>>> {
         self.with_index(segments, |idx| {
-            self.launch_paged(idx, probes, group_weights, force)
+            self.launch_paged(idx, probes, segment_weights, force)
         })
     }
 
@@ -502,7 +540,7 @@ impl GalleryArena {
         &self,
         idx: &PagedIndex,
         probes: &[&[WideQSig]],
-        group_weights: &[f32],
+        segment_weights: &[&[f32]],
         force: Option<PagedBackend>,
     ) -> Result<Vec<Vec<f32>>> {
         let (raw, launched) = self.token_votes(idx, probes, force)?;
@@ -515,7 +553,7 @@ impl GalleryArena {
             raw.n_groups,
             idx.n_segments,
             idx.n_cases,
-            group_weights,
+            segment_weights,
         );
         let LaunchTiming {
             upload_us,
@@ -1152,7 +1190,7 @@ mod tests {
             raw.n_groups,
             raw.n_segments,
             3,
-            &weights,
+            &[&weights, &weights],
         );
         let weighted = arena.scan_weighted(&segs, &probes, &weights).unwrap();
         let bits = |v: &[Vec<f32>]| {

@@ -206,6 +206,10 @@ struct YamlPolicy {
     /// Per-fold-group vote weights (`[g0, g1, g2]`); omitted ⇒ inherit / uniform.
     #[serde(default)]
     layer_weights: Option<Vec<f32>>,
+    /// `layer_weights` for the calibration competition's votes; omitted ⇒
+    /// inherit / uniform.
+    #[serde(default)]
+    calibration_layer_weights: Option<Vec<f32>>,
     /// Concept G fusion mode: `additive` | `content_gated` | `consensus_min` |
     /// `consensus_geo`, with `gate_group` for `content_gated`. Omitted ⇒ inherit.
     #[serde(default)]
@@ -905,6 +909,10 @@ fn parse_policy(
         Some(w) => w.clone(),
         None => inherited.layer_weights.clone(),
     };
+    let calibration_layer_weights = match &yp.calibration_layer_weights {
+        Some(w) => w.clone(),
+        None => inherited.calibration_layer_weights.clone(),
+    };
     let mut scan = inherited.scan;
     if let Some(f) = &yp.fusion {
         scan.fusion = match f.mode.as_str() {
@@ -960,10 +968,20 @@ fn parse_policy(
         scan.calibration_weight = w;
     }
     validate_scan(name, &scan)?;
+    if calibration_layer_weights
+        .iter()
+        .any(|w| w.is_nan() || *w < 0.0)
+    {
+        return Err(ConstructionError::InvalidPolicy {
+            name: name.to_string(),
+            reason: "calibration_layer_weights must each be >= 0".to_string(),
+        });
+    }
     Ok(SelectionPolicy {
         config,
         tags,
         layer_weights,
+        calibration_layer_weights,
         scan,
     })
 }
@@ -1491,6 +1509,9 @@ fn build_system_prompt(
                             config,
                             tags: base_policy.tags.clone(),
                             layer_weights: base_policy.layer_weights.clone(),
+                            calibration_layer_weights: base_policy
+                                .calibration_layer_weights
+                                .clone(),
                             scan: base_policy.scan,
                         }
                     }

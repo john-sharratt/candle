@@ -139,6 +139,18 @@ impl Bump {
         whole + here
     }
 
+    /// Hand the whole ground out again from its start.
+    ///
+    /// For a guest whose stages do not overlap: what the first stage placed is
+    /// dead once it has run, and the next stage stands on the same bytes. The
+    /// caller must have dropped every tensor viewing a placement made before
+    /// this — one that survived would read whatever the next stage writes over
+    /// it, and nothing faults to say so.
+    pub fn rewind(&mut self) {
+        self.run = 0;
+        self.offset = 0;
+    }
+
     /// Place `len` bytes, aligned to `align`.
     ///
     /// **An allocation never crosses a run boundary.** Two runs are separated by
@@ -249,6 +261,11 @@ impl GuestGround {
 
     pub fn place(&mut self, len: usize, align: usize) -> Result<Placement, GroundError> {
         self.bump.place(len, align)
+    }
+
+    /// See [`Bump::rewind`]; the regions stay claimed.
+    pub fn rewind(&mut self) {
+        self.bump.rewind()
     }
 
     /// The coalesced stretches this ground occupies.
@@ -411,6 +428,19 @@ mod tests {
         assert_eq!(b.runs()[0].bytes, 0x3000);
         assert_eq!(b.runs()[0].base, 0x8000);
         assert_eq!(b.largest_run(), 0x3000);
+    }
+
+    /// A rewound ground serves its first placement again, from the widest run,
+    /// with all of it free — the next stage stands where the last one stood.
+    #[test]
+    fn a_rewound_ground_hands_out_its_start_again() {
+        let mut b = scattered();
+        let first = b.place(0x1800, 1).unwrap();
+        b.place(0x800, 1).unwrap();
+        assert_eq!(b.free(), 0x1000);
+        b.rewind();
+        assert_eq!(b.free(), b.capacity());
+        assert_eq!(b.place(0x1800, 1).unwrap(), first);
     }
 
     #[test]

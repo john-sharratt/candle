@@ -217,6 +217,13 @@ pub struct SelectionPolicy {
     /// concentrates — see `docs/tool_selection_provenance_results.md` §83. Set via
     /// the node's `policy.layer_weights` in the YAML.
     pub layer_weights: Vec<f32>,
+    /// [`Self::layer_weights`] for the calibration competition's votes (missing
+    /// / empty ⇒ uniform 1.0). A file's calibration questions and thinking
+    /// carry its identity in other fold groups than its content does — over
+    /// `code_reading`'s live-turn probes the top group alone, against groups
+    /// 1–2 for content (`docs/results/provenance_gates_2026-10-26.md`) — so the
+    /// two competitions are weighed apart. Set via `policy.calibration_layer_weights`.
+    pub calibration_layer_weights: Vec<f32>,
     /// Scan-side knobs (`docs/provenance_adaptive_projection.md`): fusion mode
     /// (Concept G), question pinning (Concept F), mass constants (Concept B),
     /// level-prior constants (Concept A.4). Defaults = today's behavior.
@@ -231,6 +238,7 @@ impl SelectionPolicy {
             config: PolicyPreset::CommittedToolScope.config(),
             tags: Vec::new(),
             layer_weights: Vec::new(),
+            calibration_layer_weights: Vec::new(),
             scan: ScanPolicy::default(),
         }
     }
@@ -241,6 +249,7 @@ impl SelectionPolicy {
             config: preset.config(),
             tags: Vec::new(),
             layer_weights: Vec::new(),
+            calibration_layer_weights: Vec::new(),
             scan: ScanPolicy::default(),
         }
     }
