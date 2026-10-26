@@ -5,6 +5,9 @@
 User-agent: *
 Allow: /$
 Allow: /favicon.svg
+Allow: /favicon.png
+Allow: /favicon.ico
+Allow: /brand/
 
 # The tool pages. They also carry `noindex` in their own head, which is the
 # stronger signal — a page merely disallowed here can still be indexed from a
