@@ -10,6 +10,11 @@
 //! tool catalog measured at +10.6 points Top-1 when its exemplars became
 //! questions (`docs/tool_selection_provenance_results.md` §26.3).
 //!
+//! Each question is asked again alone, with thinking on, and what the model
+//! reasons opens its calibration answer ([`thinking`]): a live probe is
+//! mostly the model's thinking, and the question's thinking is the gallery's
+//! counterpart to it.
+//!
 //! Any layer opts in with a `calibrate:` block ([`spec`]). Calibration is the
 //! tools' resume filter applied to units ([`plan`]): a pass finds every ready
 //! unit without a calibration carrying its current marker and calibrates it
@@ -21,6 +26,7 @@ pub mod plan;
 pub mod questions;
 pub mod run;
 pub mod spec;
+pub mod thinking;
 
 pub use run::{calibrate_layer, Frame, Layer, Report};
 pub use spec::CalibrateSpec;

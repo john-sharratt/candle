@@ -336,6 +336,16 @@ impl Scheduler {
                 // whenever decode has been paid what the last co-batched step
                 // owed it (`creep_owed_after`), so work admitted mid-quantum
                 // joins the next step rather than the next quantum.
+                // **A debt holds only work of its own band or below.** It is
+                // decode's protection from the work that ran it up; a prompt of
+                // a higher band shares the device by its own ratio. Run up by a
+                // `Low` ingest chunk at 64, one debt held four Makers' `High`
+                // prompts at a fixed backlog for most of a minute (WhiteWorld,
+                // 2026-10-26).
+                if !self.creep_owed.is_zero() && self.waiting_above(self.creep_owed_band, |_| false)
+                {
+                    self.creep_owed = Duration::ZERO;
+                }
                 let owed = !self.creep_owed.is_zero();
                 self.wave_cohort_advanced = owed;
                 self.wave_section_advanced = owed;
@@ -343,6 +353,7 @@ impl Scheduler {
                 // decode-only, then filed by the shape the wave turned out to be.
                 self.wave_cobatched = false;
                 self.wave_step_creep_layer_rows = 0;
+                self.wave_step_creep_layers = 0;
                 self.wave_step_creep_layer_pairs = 0.0;
                 // What the creep had to ride with, before the step moves it.
                 let admitted = self.prefill_width() > 0 || self.section_ingest_width() > 0;
@@ -402,6 +413,9 @@ impl Scheduler {
                     self.decode_only_step,
                     self.wave_step_ratio,
                 );
+                if carried {
+                    self.creep_owed_band = self.wave_step_band;
+                }
                 self.width_steps.record(width, step, Instant::now());
                 if !self.wave_cobatched {
                     self.decode_only_step = Some(next_decode_only(self.decode_only_step, step));
@@ -413,6 +427,12 @@ impl Scheduler {
                         step,
                         decode_only,
                         self.wave_step_creep_layer_rows,
+                    );
+                    self.creep_layer_cost = next_layer_row_cost(
+                        self.creep_layer_cost,
+                        step,
+                        decode_only,
+                        self.wave_step_creep_layers,
                     );
                 }
             }
@@ -561,6 +581,7 @@ impl Scheduler {
             return;
         }
         self.wave_step_creep_layer_rows = 0;
+        self.wave_step_creep_layers = 0;
         self.wave_step_creep_layer_pairs = 0.0;
         let t_step = Instant::now();
         let out = self.decode_forward_cobatched(&[], &[], &[], &[]);
@@ -585,6 +606,12 @@ impl Scheduler {
                     t_step.elapsed(),
                     Duration::ZERO,
                     self.wave_step_creep_layer_rows,
+                );
+                self.creep_layer_cost = next_layer_row_cost(
+                    self.creep_layer_cost,
+                    t_step.elapsed(),
+                    Duration::ZERO,
+                    self.wave_step_creep_layers,
                 );
             }
             // A refused tier is answered where it was refused — the next wave is
@@ -1377,6 +1404,7 @@ impl Scheduler {
                             s.expert_misses,
                             s.worker_promotions,
                             s.worker_cold,
+                            s.worker_cpu,
                         )
                     }),
                     match &self.device {

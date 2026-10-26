@@ -36,6 +36,10 @@ pub struct PipelineStats {
     pub worker_pinned: usize,
     /// Misses bucketize found cold — waited on until the stager published them.
     pub worker_cold: usize,
+    /// Pinned misses bucketize gave the CPU expert pool (`docs/cpu_expert_compute.md`):
+    /// computed on the host from RAM, so they crossed no link. Among
+    /// `worker_pinned`; the rest of those were copied over the link.
+    pub worker_cpu: usize,
     /// The device's waits for cold experts' publish (`cold_wait`): nanoseconds
     /// summed over cold experts, one sample per expert per layer, and how many
     /// samples. Filled when the stats are read, not by the pipeline thread.
@@ -283,6 +287,7 @@ impl PipelineStats {
             s.expert_misses = 0;
             s.worker_pinned = 0;
             s.worker_cold = 0;
+            s.worker_cpu = 0;
             s.cold_wait_ns = 0;
             s.cold_waits = 0;
             s.evictions = 0;

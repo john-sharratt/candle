@@ -7,13 +7,21 @@
 //! front of it. The draft is tombstoned once its answer is read: only the
 //! questions are kept.
 //!
+//! Each question is then asked again on its own — a conversation of the
+//! hidden calibration layer, the system prompt every conversation opens with,
+//! nothing projected — with thinking on, and what the model reasons, up to the
+//! layer's `think` budget, is kept ([`super::thinking`]). Every question of a
+//! unit is asked at once, so they decode in one wave.
+//!
 //! The questions are calibrated the way a tool's are (`ToolDef::questions`):
 //! every one in ONE prefill, a turn group in a conversation of the hidden
-//! calibration layer, each masked to itself and sealed one turn apiece with an
-//! empty answer. A question prefilled alone, under the system prompt every
-//! conversation opens with, is what a live question looks like before
-//! anything is projected for it — the region a live probe resembles, where
-//! the unit's own windows are its content. The calibration carries
+//! calibration layer, each masked to itself and sealed one turn apiece, its
+//! answer its thinking. A question prefilled alone, under the system prompt
+//! every conversation opens with, and the thinking it starts, are what a live
+//! turn looks like before anything is projected for it — the region a live
+//! probe resembles, where the unit's own windows are its content. The
+//! answer is assistant content, not a reasoning segment, so the seal keeps its
+//! signatures. The calibration carries
 //! [`Substrate::CALIBRATES_KEY`], so its questions vote for the unit wherever
 //! the unit is scored, and is then archived — the commit — and distilled
 //! provenance-only: its K/V is dropped and its signatures stay.
@@ -34,6 +42,7 @@ use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOpti
 use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
 use super::spec::CalibrateSpec;
+use super::thinking::{exemplar, thinking_of};
 use crate::branch_ingest::keys::CONTENT_KEY;
 use crate::code_read::PATH_KEY;
 use crate::layers::keys::SUBJECT_KEY;
@@ -52,7 +61,7 @@ pub const TAG: &str = "calibration";
 
 /// Decode budget for a draft's answer: room for the questions, which are
 /// asked for without reasoning.
-const DRAFT_MAX_TOKENS: usize = 1024;
+const DRAFT_MAX_TOKENS: usize = 2048;
 
 /// What one layer's pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -113,6 +122,7 @@ pub fn calibrate_layer(
             .map(|(tl, m, archived)| Prior {
                 timeline: *tl,
                 marker: m,
+                unit: CalibrateSpec::unit_of(m).unwrap_or(m),
                 archived: *archived,
             })
             .collect();
@@ -204,6 +214,7 @@ fn units_of(substrate: &Substrate, group: GroupId, spec: &CalibrateSpec) -> Vec<
             Some(Unit {
                 timeline: tl,
                 subject: subject.clone(),
+                key: key.clone(),
                 marker: spec.marker(key),
                 ready: chain_break(substrate, tl).is_none() && substrate.holds_whole(tl),
             })
@@ -246,6 +257,7 @@ fn calibrate_one(
     if found.is_empty() {
         anyhow::bail!("the draft wrote no question ({} chars)", asked.len());
     }
+    let thought = thoughts(engine, frame, spec, &found)?;
     let mut conv = engine
         .lock()
         .unwrap()
@@ -278,7 +290,8 @@ fn calibrate_one(
         .and_then(|()| {
             let cases: Vec<(String, String, Vec<String>)> = found
                 .iter()
-                .map(|q| (q.clone(), String::new(), vec![TAG.to_string()]))
+                .zip(&thought)
+                .map(|(q, t)| (q.clone(), exemplar(t), vec![TAG.to_string()]))
                 .collect();
             let (handle, _) = conv
                 .submit_prefilled_turn_group(&cases, SelectionState::new())
@@ -309,6 +322,76 @@ fn calibrate_one(
         "unit calibrated",
     );
     Ok(())
+}
+
+/// The selection a question's thinking is decoded under: a live dialogue
+/// turn's, every dial at its default.
+fn thinking_selection() -> SelectionState {
+    SelectionState::new()
+}
+
+/// Each of `questions`' thinking, in order: every question asked at once, each
+/// alone in a transient conversation under the frame's system prompt, decoded
+/// to the spec's `think` budget. Each conversation is tombstoned either way.
+/// A question the model did not think about fails the unit, which is
+/// calibrated again by a later pass.
+fn thoughts(
+    engine: &Mutex<ConversationEngine>,
+    frame: &Frame<'_>,
+    spec: &CalibrateSpec,
+    questions: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut asked: Vec<(Sequence, TimelineId)> = Vec::with_capacity(questions.len());
+    let opened: anyhow::Result<()> = questions.iter().try_for_each(|_| {
+        let e = engine.lock().unwrap();
+        let conv = e
+            .new_reserved_conversation(
+                frame.system_prompt,
+                Reserved::Calibration,
+                DecodePriority::Normal,
+                frame.config.clone(),
+            )
+            .map_err(|err| anyhow::anyhow!("thinking conversation: {err}"))?;
+        let timeline = conv.timeline_id();
+        asked.push((conv, timeline));
+        e.conversation().mark_timeline_transient(timeline);
+        e.set_timeline_summarize(timeline, false);
+        e.set_conversation_metadata(timeline, DRAFT_KEY, &spec.layer)
+            .map_err(|err| anyhow::anyhow!("naming the thinking conversation: {err}"))
+    });
+    let thought = opened.and_then(|()| {
+        let mut handles = Vec::with_capacity(questions.len());
+        for ((conv, _), q) in asked.iter_mut().zip(questions) {
+            let options = TurnOptions {
+                max_tokens: Some(spec.think),
+                selection: thinking_selection(),
+                tags: vec![TAG.to_string()],
+                ..Default::default()
+            };
+            let handle = conv
+                .submit_turn_with_options(q.clone(), options)
+                .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
+            handles.push(handle);
+        }
+        let mut out = Vec::with_capacity(questions.len());
+        for (((conv, _), q), handle) in asked.iter_mut().zip(questions).zip(handles) {
+            let resp = handle
+                .wait_cancellable(crate::ingest_cancel::token())
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+            conv.finish_turn(handle, &resp)
+                .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+            out.push(
+                thinking_of(&resp.answer)
+                    .ok_or_else(|| anyhow::anyhow!("the model did not think about {q:?}"))?,
+            );
+        }
+        Ok(out)
+    });
+    let e = engine.lock().unwrap();
+    for (_, timeline) in &asked {
+        let _ = e.tombstone_timeline(*timeline);
+    }
+    thought
 }
 
 /// The unit's answer to its layer's calibration prompt, asked in a draft
@@ -383,6 +466,7 @@ mod tests {
         let spec = CalibrateSpec {
             layer: "code_reading".into(),
             questions: 4,
+            think: 64,
             prompt: "ask".into(),
         };
         let said = |tl: TimelineId, text: &str| {
@@ -432,24 +516,36 @@ mod tests {
                 Unit {
                     timeline: whole,
                     subject: "candle/a.rs".into(),
+                    key: "key:candle/a.rs".into(),
                     marker: spec.marker("key:candle/a.rs"),
                     ready: true,
                 },
                 Unit {
                     timeline: gappy,
                     subject: "candle/b.rs".into(),
+                    key: "key:candle/b.rs".into(),
                     marker: spec.marker("key:candle/b.rs"),
                     ready: false,
                 },
                 Unit {
                     timeline: cut,
                     subject: "candle/d.rs".into(),
+                    key: "key:candle/d.rs".into(),
                     marker: spec.marker("key:candle/d.rs"),
                     ready: false,
                 },
             ]
         );
     }
+    /// A question's thinking is decoded as a live dialogue turn is: no dial
+    /// is set, so thinking stays on at the dialogue's default effort.
+    #[test]
+    fn a_question_is_thought_about_as_a_live_turn_is() {
+        let s = thinking_selection();
+        assert_eq!(s.get("thinking_effort"), None);
+        assert_eq!(s.optional(NO_THINK_SELECTOR), None);
+    }
+
     /// A draft is asked without reasoning and without a tool block.
     #[test]
     fn a_draft_neither_reasons_nor_sees_tools() {

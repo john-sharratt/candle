@@ -36,12 +36,81 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use axum::Json;
-use candle_conversation::profile::pipeline_snapshot_and_reset;
+use candle_conversation::profile::{grow_tally, pipeline_snapshot_and_reset, spare_tally};
 use serde::Serialize;
 
 /// When the window now being closed was opened. `None` until the first call,
 /// whose window therefore starts at process start and is reported as such.
 static WINDOW_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The boundary tallies as the last call read them, so a window reports what
+/// moved within it — `None` until the first call, which reports since boot.
+static BOUNDARY_AT: Mutex<Option<([u64; 7], [u64; 8])>> = Mutex::new(None);
+
+/// What the elastic VRAM boundary answered over the window: the pool's answers
+/// to the expert zone's growth question, and what the zone did with them.
+///
+/// **The spans say a decode step is expert reads; this says why the experts are
+/// not resident.** A zone that never grows reads the same whether no ground was
+/// free, the KV side was rising, or the ground was offered and the zone refused
+/// it — and those are three different fixes. The forward gate prints these per
+/// run; a daemon had no way to read them.
+#[derive(Serialize)]
+struct Boundary {
+    /// Pool refusals: no workload measured yet.
+    observing: u64,
+    /// Pool refusals: KV demand rising, or the KV side bought ground since the
+    /// last negotiation.
+    pressure: u64,
+    /// Pool refusals: the KV side holds the ground.
+    occupied: u64,
+    /// Pool refusals: free ground in holes below a live region.
+    fragmented: u64,
+    /// Regions the pool offered the weight side.
+    granted_regions: u64,
+    /// KV purchases from the weight side that it conceded, and that it refused.
+    kv_purchases_conceded: u64,
+    kv_purchases_refused: u64,
+    /// The expert zone's side: growth questions asked, answered with nothing,
+    /// regions offered, moves refused by the floor, asks skipped at the zone's
+    /// limit, and the slots it gained.
+    zone_asked: u64,
+    zone_no_spare: u64,
+    zone_offered_regions: u64,
+    zone_target_unchanged: u64,
+    zone_target_backwards: u64,
+    zone_floor_refused: u64,
+    zone_at_limit: u64,
+    zone_gained_slots: u64,
+}
+
+fn boundary_window() -> Boundary {
+    let now = (spare_tally(), grow_tally());
+    let then = BOUNDARY_AT
+        .lock()
+        .ok()
+        .and_then(|mut b| b.replace(now))
+        .unwrap_or(([0; 7], [0; 8]));
+    let s: [u64; 7] = std::array::from_fn(|i| now.0[i].saturating_sub(then.0[i]));
+    let g: [u64; 8] = std::array::from_fn(|i| now.1[i].saturating_sub(then.1[i]));
+    Boundary {
+        observing: s[0],
+        pressure: s[1],
+        occupied: s[2],
+        fragmented: s[6],
+        granted_regions: s[3],
+        kv_purchases_conceded: s[4],
+        kv_purchases_refused: s[5],
+        zone_asked: g[0],
+        zone_no_spare: g[1],
+        zone_offered_regions: g[2],
+        zone_target_unchanged: g[3],
+        zone_target_backwards: g[4],
+        zone_floor_refused: g[5],
+        zone_at_limit: g[6],
+        zone_gained_slots: g[7],
+    }
+}
 
 #[derive(Serialize)]
 pub struct Profile {
@@ -54,6 +123,8 @@ pub struct Profile {
     window_secs: Option<f64>,
     /// Spans, largest total first.
     entries: Vec<Entry>,
+    /// What the VRAM boundary answered over the same window.
+    boundary: Boundary,
 }
 
 #[derive(Serialize)]
@@ -98,5 +169,6 @@ pub async fn profile() -> Json<Profile> {
         enabled: cfg!(feature = "profile"),
         window_secs,
         entries,
+        boundary: boundary_window(),
     })
 }

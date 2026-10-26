@@ -2471,7 +2471,7 @@ struct WaveStats {
     in_decode_quantum: bool,
     /// The expert pipeline's `(hits, misses, DMA loads)` at the previous flush,
     /// so each wave line reports this window's own — `None` on a dense model.
-    experts_prev: Option<(usize, usize, usize, usize)>,
+    experts_prev: Option<(usize, usize, usize, usize, usize)>,
     /// The device's wave-capture counters at the previous flush, so the wave
     /// line reports this window's own — `None` off CUDA.
     graphs_prev: Option<CaptureStats>,
@@ -2666,7 +2666,7 @@ impl WaveStats {
         backlog: u64,
         bands: VramBands,
         slots: (u32, u32, u32, u32),
-        experts: Option<(usize, usize, usize, usize)>,
+        experts: Option<(usize, usize, usize, usize, usize)>,
         graphs: Option<CaptureStats>,
         trades: Option<admit::rate::TradeWindow>,
         stores: (usize, usize),
@@ -2737,14 +2737,17 @@ impl WaveStats {
         // that says whether decode is bound by the card or by the link; and how
         // many experts the window promoted into VRAM. `cold` is the share of the
         // misses that were in no pinned slot and waited on the stager's pack
-        // read — the slow kind, which a miss count alone cannot tell apart.
+        // read — the slow kind, which a miss count alone cannot tell apart —
+        // and `cpu` the share the host's expert pool computed, which crossed no
+        // link: the rest of the misses are what the link carried.
         let experts_str = match (experts, self.experts_prev) {
-            (Some((h, m, d, c)), Some((h0, m0, d0, c0))) if (h + m) > (h0 + m0) => {
+            (Some((h, m, d, c, p)), Some((h0, m0, d0, c0, p0))) if (h + m) > (h0 + m0) => {
                 let (hits, misses) = (h.saturating_sub(h0), m.saturating_sub(m0));
                 format!(
-                    " | experts hit={:.2}% miss={misses} cold={} promoted={}",
+                    " | experts hit={:.2}% miss={misses} cold={} cpu={} promoted={}",
                     100.0 * hits as f64 / (hits + misses) as f64,
                     c.saturating_sub(c0),
+                    p.saturating_sub(p0),
                     d.saturating_sub(d0),
                 )
             }
@@ -3828,6 +3831,11 @@ pub(crate) struct Scheduler {
     /// paid down by each decode-only step. Kept across quanta, so the creep
     /// rides as often as its ratio allows, not once per quantum.
     creep_owed: Duration,
+    /// The band of the work that ran [`Self::creep_owed`] up — what decode is
+    /// protected from by it. Work of a higher band is not held by it.
+    creep_owed_band: DecodePriority,
+    /// The band the last wave step's co-batched work ran at.
+    wave_step_band: DecodePriority,
     /// What a decode-only step takes now — an average over the recent ones, so
     /// it follows the decode width and depth. `None` until one has run.
     decode_only_step: Option<Duration>,
@@ -3838,9 +3846,15 @@ pub(crate) struct Scheduler {
     /// average over the steps it rode (`creep_slice::next_layer_row_cost`), so
     /// a slice can be bounded in time. `None` until a creep has ridden one.
     creep_layer_row_cost: Option<Duration>,
+    /// What one layer of creep costs whatever its rows — the same average over
+    /// the steps it rode, per layer swept — the floor a slice's per-row price
+    /// cannot go under (`creep_slice::time_bounded_layers`).
+    creep_layer_cost: Option<Duration>,
     /// Rows times layers of creep the last wave step carried beside decode
     /// rows; zero when it carried none, or carried no decode.
     wave_step_creep_layer_rows: usize,
+    /// The layers of creep the last wave step swept; zero as above.
+    wave_step_creep_layers: usize,
     /// The query×key pairs the creep attended through those layers this step.
     wave_step_creep_layer_pairs: f64,
     /// Consecutive failures of the decode-less wave step and the wait owed
@@ -4194,10 +4208,14 @@ impl Scheduler {
             wave_step_open: None,
             wave_cohort_advanced: false,
             creep_owed: Duration::ZERO,
+            creep_owed_band: DecodePriority::Low,
+            wave_step_band: DecodePriority::Low,
             decode_only_step: None,
             width_steps: step_census::WidthSteps::default(),
             creep_layer_row_cost: None,
+            creep_layer_cost: None,
             wave_step_creep_layer_rows: 0,
+            wave_step_creep_layers: 0,
             wave_step_creep_layer_pairs: 0.0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),
