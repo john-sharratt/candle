@@ -78,6 +78,8 @@ clothing. A prompt that leaves an age unclear may be declined.
   change. **Shift:** leave it alone.
 - **Time:** a draw takes from about half a minute to two, most of it the
   prompt check before drawing; progress arrives while it works.
+- **One at a time.** The engine holds one image model at once: send the next
+  draw after the last has answered, never several together.
 
 ## Look, then refine
 
@@ -95,10 +97,18 @@ you can see. Look at it against the request before showing it:
 When the draw fails for any other reason, the prompt was not the problem —
 do not rewrite it:
 
-- "is unavailable" (`upstream_unavailable`, `upstream_backoff`), `no_room` or
-  a call cut off — the image service is restarting or busy. Send the same
-  call again in a minute or two; after three tries over about ten minutes,
-  tell the user it is down and give them the prompt to draw later.
+- `no_room` — the engine had no room for the image model just then. Try again
+  in a minute; a smaller size (768 on the long side) needs less room.
+- "is unavailable" (`upstream_unavailable`, `upstream_backoff`) or a call cut
+  off — the image service is restarting. Send the same call again in a minute
+  or two.
+- `failed: …` — a fault in the image engine itself. Try once more; if it
+  fails the same way, stop — repeating it can take the service down — and
+  tell the user, quoting the error and the size.
+
+After three tries over about ten minutes, tell the user it is down and give
+them the prompt to draw later; `cluster_status` says whether the bots'
+service is up at all.
 
 Two or three rounds is normal. Show the user the result and the prompt that
 made it, so the next request can start from it.

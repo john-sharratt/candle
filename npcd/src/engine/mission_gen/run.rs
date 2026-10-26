@@ -7,7 +7,8 @@
 //! do. The loop runs one at a time per world while the table is open and its
 //! pool is below the configured level.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use candle_conversation::guest::resolve_seed;
@@ -366,6 +367,16 @@ fn through_time(hosted: &Hosted, mut mission: Mission, year: Option<u32>) -> Mis
     mission
 }
 
+/// Whether this is the first time operation `id` was held off the table for a
+/// desk the world lacks — said once, not every pass it stays owed.
+fn unplaced_once(id: u64) -> bool {
+    static SAID: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    SAID.get_or_init(Default::default)
+        .lock()
+        .map(|mut said| said.insert(id))
+        .unwrap_or(false)
+}
+
 /// The first room in the world holding `part`, and the level it is on.
 fn room_with(hosted: &Hosted, part: &str) -> Option<Desk> {
     hosted.read(|w| {
@@ -607,7 +618,29 @@ fn offer_step(hosted: &Hosted, corpus: &Corpus, id: u64) -> Result<(), String> {
             Some((desk, wf.year.is_some() && !step.publishes()))
         })
         .ok_or("no such operation, or its workflow is not loaded")?;
-    let desk = desk.and_then(|d| room_with(hosted, &d));
+    // **A desk no room holds is a world that cannot serve the step.** Offered
+    // anyway, the mission named a table nobody could find and tools nobody
+    // could reach: every Maker on a publish step asked the others where the
+    // merge table was, and reflected on a record that would not land. Not
+    // offered, and not called off — the operation's verified work is not at
+    // fault — it waits, owed, until the world places the desk.
+    let desk = match desk {
+        Some(part) => match room_with(hosted, &part) {
+            Some(room) => Some(room),
+            None => {
+                if unplaced_once(id) {
+                    tracing::error!(
+                        operation = id,
+                        desk = %part,
+                        "operation: its step's desk is in no room of this world — the step \
+                         waits off the table until the map places one"
+                    );
+                }
+                return Ok(());
+            }
+        },
+        None => None,
+    };
     let (op, mission) = hosted.sim(|s| {
         let ops = s.missions.operations();
         let op = ops.get(id).ok_or("no such operation")?.clone();

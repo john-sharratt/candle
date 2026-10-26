@@ -239,7 +239,7 @@ held longer than `wait_s`:
 | Client | `wait_s` default | `wait_s` at most | How long waits are carried |
 |---|---|---|---|
 | claude.ai, Claude Desktop | 45 s | 200 s, inside the 240 s cap | Polling: each `repo_task_wait` holds up to `wait_s` and answers with what each worker has done; the model has no notification channel, so the answers are its progress report |
-| Claude Code | 45 s | 3,600 s, inside the server entry's `timeout` | Polling as above by default; a longer `wait_s` holds the call, and a main-conversation call running past 2 min moves to a background task and Claude works on, notified when it answers |
+| Claude Code | 45 s | 240 s, inside the claude.ai connector's ~300 s | Polling as above: a longer wait is another call |
 
 `repo_task_start`, `repo_task_wait` and `repo_task_reply` answer one of:
 
@@ -1193,10 +1193,10 @@ specification, checked 2026-10-25.
 
 So the work tools open their stream at once, send progress while they wait, and
 never hold a call past `wait_s`, whose ceiling is set per client (§3.3):
-200 s on claude.ai, inside its 240 s cap; 3,600 s on Claude Code, whose server
-entry sets `timeout: 3700000` so the call outlives the longest wait, and whose
-automatic move to the background after 2 min (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`)
-lets Claude work on while it waits. Every result is a text block — any
+200 s on claude.ai, inside its 240 s cap; 240 s on Claude Code, which reaches
+Zen through the claude.ai connector — no server entry of its own sets a longer
+timeout there, and a call with nothing delivered is given up after about 300 s
+(measured 2026-10-27). A longer wait is a second call. Every result is a text block — any
 structured content is repeated as text — and the paging limits (§3.2) keep a
 page far inside both clients' bounds.
 
@@ -1241,7 +1241,7 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
 - `repo_task_wait` over a set: answering on the first worker to leave `running`
   with the others' lines; a question from one worker returned while another
   still builds; the stream opened at once with progress notifications;
-  `wait_s` clamped to 200 s for a claude.ai `clientInfo` and 3,600 s for
+  `wait_s` clamped to 200 s for a claude.ai `clientInfo` and 240 s for
   Claude Code's.
 - `passthrough` refused by the endpoint; a task turn submitted with zend's
   model and a `conv_id`.

@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Client {
-    /// Claude Code: a call past two minutes moves to the background, and the
-    /// server entry sets a long timeout, so a wait may hold an hour.
+    /// Claude Code: reached through the claude.ai connector, whose calls are
+    /// given up after about 300 s with nothing delivered, so a wait holds four
+    /// minutes and is called again.
     ClaudeCode,
     /// claude.ai, Claude Desktop, or anyone else: a call is cut off at 240 s.
     Other,
@@ -26,7 +27,7 @@ impl Client {
     /// The longest a call from this client may wait, in seconds.
     pub fn wait_ceiling(self) -> u64 {
         match self {
-            Self::ClaudeCode => 3_600,
+            Self::ClaudeCode => 240,
             Self::Other => 200,
         }
     }
@@ -54,8 +55,8 @@ mod tests {
 
     #[test]
     fn the_client_bounds_the_wait() {
-        assert_eq!(Client::of("claude-code").wait_ceiling(), 3_600);
-        assert_eq!(Client::of("Claude Code").wait_ceiling(), 3_600);
+        assert_eq!(Client::of("claude-code").wait_ceiling(), 240);
+        assert_eq!(Client::of("Claude Code").wait_ceiling(), 240);
         assert_eq!(Client::of("claude-ai").wait_ceiling(), 200);
         assert_eq!(Client::of("anything").wait_ceiling(), 200);
     }
