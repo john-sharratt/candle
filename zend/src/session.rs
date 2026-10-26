@@ -550,10 +550,12 @@ fn turn_sampling(
 }
 
 /// Calibration questions per file a layer's chunk exclusion is learned from:
-/// a background of ~10,000 questions over the workspace's ~1,600 files, a
-/// scan of about two minutes at ingest priority. The outliers it cuts sit
-/// orders of magnitude above the rest, so a sample finds them.
-const EXCLUSION_QUESTIONS_PER_FILE: usize = 6;
+/// a background of ~3,300 questions over the workspace's ~1,650 files. The
+/// outliers it cuts sit orders of magnitude above the rest, so a sample finds
+/// them. The scans run between waves on the engine every restart pays for:
+/// six a file (~9,800 questions, ~1,230 scans of ~140 ms) held conversations
+/// to a stutter for three minutes after each.
+const EXCLUSION_QUESTIONS_PER_FILE: usize = 2;
 
 /// The triggers a chat turn decodes under: any `<tool_call>` the model emits is
 /// forced to the exact JSON shape of a tool `tools_mode` offers (name ∈ that

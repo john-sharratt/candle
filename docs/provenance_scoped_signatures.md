@@ -275,7 +275,7 @@ token's next-best agreement; down-weighting them only shrinks the vote and
 loses (`docs/results/provenance_gates_2026-10-26.md`).
 
 - **Learned from the questions, never from the gallery alone.** A layer's
-  calibration questions — `EXCLUSION_QUESTIONS_PER_FILE` (6) of each file —
+  calibration questions — `EXCLUSION_QUESTIONS_PER_FILE` (2) of each file —
   are scanned raw against the group's content alone: no calibration in the
   gallery, nothing cut, so the exclusion never learns from a gallery it already
   shaped. Each kept vote for a file not the question's own is credited to the

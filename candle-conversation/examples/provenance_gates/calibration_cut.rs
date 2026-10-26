@@ -20,7 +20,7 @@ use crate::sweep::summed;
 
 /// Questions per file the cut is learned from, after question 0: production's
 /// `EXCLUSION_QUESTIONS_PER_FILE`.
-const LEARN: usize = 6;
+const LEARN: usize = 2;
 
 /// The calibration competition's weight, production's.
 const WEIGHT: f32 = 0.5;
