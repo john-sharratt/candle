@@ -66,7 +66,7 @@ pub fn heads_per_group(n_heads: usize) -> usize {
 /// §82 (holds 100% Tool-3/Tool-5, sharpens Tool-1, on ~75% fewer effective
 /// tokens) — and, being magnitude- not position-keyed, generalizes to content
 /// windows where the relevant reference is a sparse needle among boilerplate.
-pub(super) const NEEDLE_KEEP_FRAC: f32 = 0.25;
+pub(crate) const NEEDLE_KEEP_FRAC: f32 = 0.25;
 
 /// Score `n_cases` corpus cases against a `query` window of folded provenance
 /// signatures via `z × margin` late-fusion voting over the signature's layer-groups.

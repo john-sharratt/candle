@@ -9,7 +9,7 @@ use std::ops::Range;
 use flume::Sender;
 
 use crate::persistence::streams::StreamId;
-use crate::projection::{Conversation, GroupId, GroupVotes};
+use crate::projection::{Conversation, ExclusionReport, GroupId, GroupVotes};
 use crate::provenance::WideQSig;
 use crate::scheduler::SchedulerRequest;
 
@@ -34,6 +34,27 @@ impl GroupScanner {
     /// `probes`' raw votes against every active file of `group` — see
     /// [`Conversation::scan_group_votes`]. Blocks until the scheduler, at
     /// ingest priority, has run it.
+    /// Learn `group`'s anomalous-chunk exclusion from up to `per_file` of each
+    /// file's calibration questions, scanned here against its content alone,
+    /// and set it for every live scan — see
+    /// [`Conversation::learn_chunk_exclusion`]. Blocks for the scan; the
+    /// attribution runs on the calling thread, holding no lock.
+    pub fn learn_chunk_exclusion(
+        &self,
+        group: GroupId,
+        per_file: usize,
+    ) -> candle::Result<ExclusionReport> {
+        self.conversation
+            .learn_chunk_exclusion(group, per_file, |probes| {
+                match self.scan(group, false, HashSet::new(), HashMap::new(), probes) {
+                    Ok(votes) => votes,
+                    Err(refused) => Err(candle::Error::Msg(format!(
+                        "the chunk-exclusion scan was refused: {refused:?}"
+                    ))),
+                }
+            })
+    }
+
     pub fn scan(
         &self,
         group: GroupId,

@@ -11,6 +11,7 @@
 //! self-probes instead of once per probe.
 
 use std::cell::OnceCell;
+use std::mem::take;
 use std::ops::Range;
 
 use super::adaptive::ScanCases;
@@ -19,6 +20,7 @@ use super::resolver::subwindow_bounds;
 use super::schema::GroupSchema;
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::streams::StreamId;
+use crate::provenance::chunk_exclusion::{uncut, ChunkExclusion};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
@@ -203,6 +205,24 @@ pub(crate) fn assemble_file_scans(
         });
     }
     (files, turns_walked)
+}
+
+/// `files` with every range `exclusion` names cut from their own windows — a
+/// window split around a cut, one wholly cut dropped — so a live scan never
+/// sees the chunks that win everything (`crate::provenance::chunk_exclusion`).
+/// Calibration windows are not cut: they compete apart.
+pub(crate) fn cut_excluded(files: &mut [FileScan], exclusion: &ChunkExclusion) {
+    if exclusion.is_empty() {
+        return;
+    }
+    for f in files {
+        let windows = take(&mut f.windows);
+        for (k, s, e, slot) in windows {
+            for (a, b) in uncut(s, e, exclusion.of(f.arc_sids[k])) {
+                f.windows.push((k, a, b, slot));
+            }
+        }
+    }
 }
 
 /// The score competitions `files` form under `cases`, each as the indices of
@@ -689,6 +709,24 @@ layers:
             f.cal_windows.push((f.arcs_kept.len() - 1, 0, q.len()));
         }
         f
+    }
+
+    /// **A cut chunk leaves the scan; the rest of its window stays.** A
+    /// 3-exchange file of 64-token turns loses chunk 1 of its first turn (the
+    /// window splits around it) and both chunks of its second (the window
+    /// goes); its calibration window is untouched.
+    #[test]
+    fn excluded_chunks_are_cut_from_a_files_own_windows() {
+        let q = vec![(0..8).map(|t| sig(70_000 + t)).collect::<Vec<_>>()];
+        let mut files = vec![calibrated_file(1, 1, 3, 64, &q)];
+        let (t0, t1) = (files[0].arc_sids[0], files[0].arc_sids[1]);
+        let x = ChunkExclusion::of_chunks([(t0, 1, 64), (t1, 0, 64), (t1, 1, 64)]);
+        cut_excluded(&mut files, &x);
+        assert_eq!(files[0].windows, vec![(0, 0, 32, 0), (2, 0, 64, 2)]);
+        assert_eq!(files[0].cal_windows, vec![(3, 0, 8)]);
+        let before = files[0].windows.clone();
+        cut_excluded(&mut files, &ChunkExclusion::default());
+        assert_eq!(files[0].windows, before);
     }
 
     /// **The calibration competition's votes land on their files.** Votes
