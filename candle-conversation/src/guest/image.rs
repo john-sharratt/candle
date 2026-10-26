@@ -573,6 +573,29 @@ fn vae_bytes(dir: &std::path::Path) -> usize {
         .sum()
 }
 
+/// Where the activation arena stands after `what`: its cursor, its high-water
+/// and its capacity.
+///
+/// At info, because an overrun is an error and this is the number the claim
+/// has to be sized from — the high-water of the largest stage. A cursor above
+/// zero between stages is carves no stage owned.
+fn arena_reading(device: &Device, what: &str) {
+    let Ok(cuda) = device.as_cuda_device() else {
+        return;
+    };
+    if let Some((cursor, peak, capacity)) =
+        candle_nn::kv_cache::guest_domain_stats(cuda.cuda_stream().context().ordinal())
+    {
+        tracing::info!(
+            target: "candle_conversation::guest",
+            cursor_mib = cursor >> 20,
+            peak_mib = peak >> 20,
+            capacity_mib = capacity >> 20,
+            "image guest: activation arena after {what}"
+        );
+    }
+}
+
 /// Every distinct prompt among the backlog's `lora` jobs, conditioned, on the
 /// host.
 ///
@@ -768,19 +791,7 @@ impl Loaded {
         // the number the activation claim has to cover for the arena to hold a
         // whole stage, and the only alternative to measuring it is the guessing
         // this replaced.
-        if let Ok(cuda) = self.device.as_cuda_device() {
-            if let Some((cursor, peak, capacity)) =
-                candle_nn::kv_cache::guest_domain_stats(cuda.cuda_stream().context().ordinal())
-            {
-                tracing::debug!(
-                    target: "candle_conversation::guest",
-                    cursor_mib = cursor >> 20,
-                    peak_mib = peak >> 20,
-                    capacity_mib = capacity >> 20,
-                    "image guest: activation arena high-water"
-                );
-            }
-        }
+        arena_reading(&self.device, "the draw");
         let report = candle::forbidden_alloc::take_report();
         if !report.is_clean() {
             tracing::warn!(
@@ -850,6 +861,9 @@ impl Loaded {
             // of a batch.
             let out = self.transformer.forward(x, &cap, t)?;
             step_no += 1;
+            if step_no == 1 {
+                arena_reading(&self.device, "the first denoise step");
+            }
             tracing::debug!(
                 target: "candle_conversation::guest",
                 step = step_no,
@@ -868,6 +882,10 @@ impl Loaded {
             });
             Ok(out)
         })?;
+        // Between the two passes, so a draw that overruns says which one did:
+        // a cursor standing high here is the denoise leaving carves behind its
+        // stages, not the decode needing more than the arena.
+        arena_reading(&self.device, "the denoise");
 
         // **Give the denoise's pool blocks back to the driver before the decode
         // asks for its own.**
