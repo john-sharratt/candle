@@ -200,7 +200,7 @@ struct Live {
 
 /// Every character's conversation, and the engine they run on.
 pub struct Minds {
-    engine: Arc<Mutex<ConversationEngine>>,
+    engine: Arc<ConversationEngine>,
     /// The substrate, taken when the minds were built. Status and the host's
     /// substrate reads use this and do not take `engine`: that mutex is held
     /// across scheduler waits, and a `/v1/status` poll blocked on it is the
@@ -347,12 +347,12 @@ pub struct Probe {
 /// `env.close` ending in EOS would end the turn on the first call and the loop
 /// would be unreachable.
 fn compile_act_loop(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     cfg: &SequenceConfig,
     thinking: identity::Deliberation,
     within: &tools::Within,
 ) -> anyhow::Result<Arc<StencilTree>> {
-    let e = engine.lock().unwrap();
+    let e = engine;
     let tok = e.tokenizer();
     let (Some(_call_open), Some(think_open), Some(think_close)) = (
         tok.token_to_id("<tool_call>"),
@@ -395,7 +395,7 @@ fn compile_act_loop(
         }
     };
     let specs = tools::specs_within(Mode::Physical, within);
-    compile_calls(&e, cfg, &specs, tools::ACTS_PER_TURN, prelude.as_ref())
+    compile_calls(e, cfg, &specs, tools::ACTS_PER_TURN, prelude.as_ref())
 }
 
 /// A grammar for a turn made of calls to `specs`, at most `max_calls` of them.
@@ -487,7 +487,7 @@ pub struct Thought {
 }
 
 impl Minds {
-    pub fn new(engine: Arc<Mutex<ConversationEngine>>, base_config: SequenceConfig) -> Self {
+    pub fn new(engine: Arc<ConversationEngine>, base_config: SequenceConfig) -> Self {
         let mut base_config = base_config;
         // **Program the reasoning-block close budget, or a block that opens
         // never shuts.**
@@ -507,7 +507,7 @@ impl Minds {
         // (`identity::Deliberation`); this is the backstop underneath, and a
         // backstop that is off is not a backstop.
         let substrate = {
-            let e = engine.lock().unwrap();
+            let e = &engine;
             let max = base_config.max_response_tokens;
             base_config
                 .sampling
@@ -684,12 +684,7 @@ impl Minds {
     /// character can read. `None` before the projection is loaded.
     pub fn layer_counts(&self, npc_id: u64) -> Option<Vec<layers::LayerCount>> {
         let (builder, live) = self.as_character(npc_id)?;
-        Some(layers::counts(
-            &self.engine.lock().unwrap(),
-            &builder,
-            live,
-            npc_id,
-        ))
+        Some(layers::counts(&self.engine, &builder, live, npc_id))
     }
 
     /// The newest `limit` conversations of one layer this character can read.
@@ -697,14 +692,7 @@ impl Minds {
     /// loaded.
     pub fn layer_page(&self, npc_id: u64, layer: &str, limit: usize) -> Option<layers::Page> {
         let (builder, live) = self.as_character(npc_id)?;
-        layers::page(
-            &self.engine.lock().unwrap(),
-            &builder,
-            live,
-            npc_id,
-            layer,
-            limit,
-        )
+        layers::page(&self.engine, &builder, live, npc_id, layer, limit)
     }
 
     /// The schema this character's conversations open with, and the live group
@@ -749,8 +737,6 @@ impl Minds {
         };
         let warmed = self
             .engine
-            .lock()
-            .unwrap()
             .warm_group_normalization(projected.builder.schema(), group);
         tracing::info!("dreams: {warmed} dream(s) put on the normalized score band");
     }
@@ -801,17 +787,13 @@ impl Minds {
                     persona.building,
                     thinking,
                 );
-                let seq = self
-                    .engine
-                    .lock()
-                    .unwrap()
-                    .new_conversation_with_projection(
-                        &p.prompt,
-                        p.builder.clone(),
-                        p.layer,
-                        p.group,
-                        cfg,
-                    )?;
+                let seq = self.engine.new_conversation_with_projection(
+                    &p.prompt,
+                    p.builder.clone(),
+                    p.layer,
+                    p.group,
+                    cfg,
+                )?;
                 (seq, p.prompt.clone(), sel)
             }
             None => {
@@ -823,7 +805,7 @@ impl Minds {
                     &for_mode(mode),
                     &ToolCallEnvelope::for_dialect(&self.base_config.dialect),
                 );
-                let seq = self.engine.lock().unwrap().new_conversation(&system, cfg)?;
+                let seq = self.engine.new_conversation(&system, cfg)?;
                 // The dial applies with no schema to pin members in — it is the
                 // turn's own, not the projection's.
                 (seq, system, identity::deliberation(thinking))
@@ -1024,7 +1006,7 @@ impl Minds {
         if let Some(tree) = self.acts.lock().unwrap().get(&key) {
             return Some(Arc::clone(tree));
         }
-        // Compiled outside the cache lock: it takes the engine lock, and a
+        // Compiled outside the cache lock: a compile takes a while, and a
         // second character arriving mid-compile must not wait behind it.
         let built = match compile_act_loop(&self.engine, &self.base_config, thinking, within) {
             Ok(tree) => tree,
@@ -1049,7 +1031,7 @@ impl Minds {
     /// handle is shared rather than a second engine because there is one card
     /// and one scheduler, and the generator's forks batch into the same waves as
     /// everything else.
-    pub fn engine(&self) -> Arc<Mutex<ConversationEngine>> {
+    pub fn engine(&self) -> Arc<ConversationEngine> {
         Arc::clone(&self.engine)
     }
 
@@ -1298,8 +1280,6 @@ impl Minds {
             (META_KEPT.to_string(), record.to_string()),
         ]);
         self.engine
-            .lock()
-            .unwrap()
             .set_conversation_metadata_many(live.sequence.timeline_id(), &kept)
             .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e:?}"))?;
         live.journal_record = record.to_string();
@@ -1312,14 +1292,13 @@ impl Minds {
     /// A character with no such conversation, or none whose record parses, wakes
     /// with an empty journal. Of several, the one that kept the newest entry wins.
     pub fn restore_journal(&self, npc_id: u64) -> JournalState {
-        let engine = self.engine.lock().unwrap();
+        let engine = &self.engine;
         let kept = engine
             .find_conversations_by_metadata(META_OF, &npc_id.to_string())
             .into_iter()
             .filter_map(|tl| engine.conversation_metadata(tl)?.remove(META_KEPT))
             .filter_map(|record| section::restore(&record))
             .max_by_key(|k| k.newest());
-        drop(engine);
         match kept {
             Some(k) => JournalState::restore(npc_id, k),
             None => JournalState::new(npc_id),
@@ -1344,7 +1323,7 @@ impl Minds {
             },
             &NPC,
         );
-        let engine = self.engine.lock().unwrap();
+        let engine = &self.engine;
         let mut emptied = 0;
         for timeline in engine.find_conversations_by_metadata(META_OF, &npc_id.to_string()) {
             match engine.set_conversation_metadata(timeline, META_KEPT, empty.record()) {
@@ -1467,7 +1446,7 @@ impl Minds {
         };
 
         let rejoined = resumable(&self.engine, &id, &frame).and_then(|timeline| {
-            let engine = self.engine.lock().ok()?;
+            let engine = &self.engine;
             // Resumed against the same schema it was opened under. A conversation
             // minted on the projection and rejoined on the synthetic one would
             // carry a different prompt under the same fingerprint, which is the
@@ -1483,11 +1462,8 @@ impl Minds {
             };
             match resumed {
                 Ok(sequence) => {
-                    // Both read the substrate, so both are answered while the
-                    // lock the resume needed is still in hand.
                     let depth = engine.timeline_turn_count(timeline);
-                    let watermark = retention::resume_watermark(&engine, timeline, depth);
-                    drop(engine);
+                    let watermark = retention::resume_watermark(engine, timeline, depth);
                     tracing::info!(
                         depth,
                         watermark,
@@ -1497,7 +1473,6 @@ impl Minds {
                     Some((sequence, watermark))
                 }
                 Err(e) => {
-                    drop(engine);
                     tracing::warn!(
                         "conversation {id} could not be rejoined: {e:?} — it is superseded below \
                          and a fresh one is opened in its place"
@@ -1542,7 +1517,7 @@ impl Minds {
         }
 
         let sequence = {
-            let engine = self.engine.lock().unwrap();
+            let engine = &self.engine;
             match projected {
                 // Its own dreams and nobody else's, a few lines deep — a turn
                 // in the room is reminded of one when something resonates.
@@ -1558,7 +1533,7 @@ impl Minds {
         };
         let timeline = sequence.timeline_id();
         {
-            let engine = self.engine.lock().unwrap();
+            let engine = &self.engine;
             // **The derived id, given to the substrate.** Minting it and keeping
             // it in this struct made it a log label and nothing else: the
             // timeline went into the redo log anonymous, so nothing downstream
@@ -1771,7 +1746,7 @@ impl Minds {
             let scopes = self.scopes.read().unwrap().as_ref().map(Arc::clone);
             let bearing = scopes.as_ref().map(|s| {
                 s.apply(
-                    &self.engine.lock().unwrap(),
+                    &self.engine,
                     live.sequence.timeline_id(),
                     &within.parts,
                     within.year,
@@ -1862,14 +1837,12 @@ impl Minds {
         // failed write or a restarted daemon catch up instead of stranding
         // those turns below the horizon for good.
         //
-        // The conversation's own lock is released first: retiring takes the
-        // engine lock to write, and holding both would put every other
-        // character's decode behind this one's bookkeeping.
+        // The conversation's own lock is released first: retiring writes the
+        // substrate, and holding the conversation across it would put this
+        // character's next turn behind its own bookkeeping.
         if let Some(keep) = self.keep_turns {
-            // The engine guard lives inside this block and is gone before the
-            // await below — a `!Send` guard held across an await would pin the
-            // whole character task to one thread.
-            let settled = self.engine.lock().ok().map(|engine| {
+            let settled = {
+                let engine = &self.engine;
                 // **The substrate's count, not the sequence's.**
                 //
                 // `Sequence::turn_count` counts a user and an assistant message
@@ -1881,8 +1854,10 @@ impl Minds {
                 // last real turn, retiring the whole conversation. `keep_turns:
                 // 64` came to mean keep nothing.
                 let depth = engine.timeline_turn_count(timeline);
-                retention::retire_expired(&engine, timeline, depth, keep, watermark)
-            });
+                Some(retention::retire_expired(
+                    engine, timeline, depth, keep, watermark,
+                ))
+            };
             if let Some((through, retired)) = settled {
                 conversation.lock().await.retired_through = through;
                 thought.retired = retired;
@@ -2086,8 +2061,7 @@ pub fn frame_fingerprint(frame: &str) -> String {
 /// rather than the first, which makes the choice deterministic instead of
 /// dependent on lookup order. The others are retired by
 /// [`retire_superseded`] on the way past.
-fn resumable(engine: &Arc<Mutex<ConversationEngine>>, id: &str, frame: &str) -> Option<TimelineId> {
-    let engine = engine.lock().ok()?;
+fn resumable(engine: &Arc<ConversationEngine>, id: &str, frame: &str) -> Option<TimelineId> {
     let mut best: Option<(u64, TimelineId)> = None;
     for timeline in engine.find_conversations_by_metadata(META_CONVERSATION, id) {
         match engine
@@ -2158,13 +2132,10 @@ fn resumable(engine: &Arc<Mutex<ConversationEngine>>, id: &str, frame: &str) -> 
 ///
 /// Returns how many it retired.
 fn retire_superseded(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     npc_id: u64,
     keep: Option<TimelineId>,
 ) -> usize {
-    let Ok(engine) = engine.lock() else {
-        return 0;
-    };
     // Both the action conversations and their narrator threads, by their two
     // conv-id namespaces. The narrator thread is never rejoined — its prose is
     // derived and cheaply rebuilt — so every stale narrator generation goes,
@@ -2205,8 +2176,7 @@ fn retire_superseded(
 /// Failure is logged, never propagated. A tombstone that did not land leaves
 /// yesterday's turns selectable — untidy, and strictly better than refusing to
 /// open today's conversation over it.
-fn retire(engine: &Arc<Mutex<ConversationEngine>>, l: &Live) {
-    let engine = engine.lock().unwrap();
+fn retire(engine: &Arc<ConversationEngine>, l: &Live) {
     match engine.tombstone_timeline(l.sequence.timeline_id()) {
         Ok(()) => tracing::info!("conversation {} retired (tombstoned)", l.id),
         Err(e) => tracing::warn!(

@@ -26,7 +26,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use candle_conversation::projection::{Builder, SelectionRule, SelectionState, TimelineId};
@@ -230,7 +230,7 @@ fn sentences(para: &str) -> Vec<String> {
 ///
 /// [`dreaming_selection_for`]: crate::engine::identity::Installed::dreaming_selection_for
 pub async fn dream(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     base_config: &SequenceConfig,
     projected: &Projected,
     npc_id: u64,
@@ -240,7 +240,6 @@ pub async fn dream(
     let mut cfg = base_config.clone();
     cfg.context_window_turns = 2;
     let (mut sequence, timeline) = {
-        let engine = engine.lock().unwrap();
         let seq = engine.new_conversation_with_projection(
             &projected.prompt,
             projected.builder.clone(),
@@ -425,7 +424,7 @@ pub struct Kept {
 /// `npc-<id>-day-` prefix every conversation open sweeps, because a
 /// character's dreams outlive its days (§11, *Naming*).
 pub async fn keep(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     base_config: &SequenceConfig,
     projected: &Projected,
     npc_id: u64,
@@ -448,12 +447,12 @@ pub async fn keep(
     // that *targets* this layer self-local — its own lines, not everybody's —
     // which is what writing a dream is. Idempotent, and it changes nothing for
     // a conversation that only reads the layer.
-    engine.lock().unwrap().mark_layer_append_only(layer);
+    engine.mark_layer_append_only(layer);
 
     // Opened to this character's own dreams, so its own lines are in scope of
     // its own projection — and so is nobody else's.
     let builder = scoped(&projected.builder, npc_id, IN_REFLECTION);
-    let mut sequence = engine.lock().unwrap().new_conversation_with_projection(
+    let mut sequence = engine.new_conversation_with_projection(
         &projected.prompt,
         builder,
         layer,
@@ -463,7 +462,6 @@ pub async fn keep(
     let timeline = sequence.timeline_id();
     let name = format!("npc-{npc_id}-dream-{}", timeline.raw());
     {
-        let engine = engine.lock().unwrap();
         // A kept dream is recalled, never continued: it keeps its turns and no
         // recurrent snapshot — one whole recurrent state per dream otherwise.
         engine.mark_timeline_unresumed(timeline);
@@ -503,7 +501,7 @@ pub async fn keep(
     // finished having.
     if let Err(e) = write.await {
         drop(sequence);
-        if let Err(t) = engine.lock().unwrap().tombstone_timeline(timeline) {
+        if let Err(t) = engine.tombstone_timeline(timeline) {
             tracing::warn!("{name}: the half-written dream could not be retired — {t:?}");
         }
         return Err(e);
@@ -514,19 +512,11 @@ pub async fn keep(
     // here on; this is the start they teach from — see `Minds::warm_dreams`.
     // Left cold, a new dream would divide by the bare prior and be the one
     // scored on a different scale from all the others.
-    if !engine
-        .lock()
-        .unwrap()
-        .warm_timeline_normalization(projected.builder.schema(), timeline)
-    {
+    if !engine.warm_timeline_normalization(projected.builder.schema(), timeline) {
         tracing::warn!("{name}: not put on the normalized score band — its recall is unscaled");
     }
     // Give the arena back — the same reason every ingest does.
-    if let Err(e) = engine
-        .lock()
-        .unwrap()
-        .demote_timelines_hot(&[timeline], true)
-    {
+    if let Err(e) = engine.demote_timelines_hot(&[timeline], true) {
         tracing::debug!("{name}: demote failed — {e}");
     }
     tracing::info!(
@@ -534,7 +524,7 @@ pub async fn keep(
         written.len(),
         started.elapsed()
     );
-    let forgotten = forget_oldest(&engine.lock().unwrap(), npc_id);
+    let forgotten = forget_oldest(engine, npc_id);
     if forgotten > 0 {
         tracing::info!("npc {npc_id}: {forgotten} oldest dream(s) forgotten — {KEEP_DREAMS} kept");
     }
@@ -582,8 +572,7 @@ pub fn forget_oldest(engine: &ConversationEngine, npc_id: u64) -> usize {
 /// the generator recombined them; shown a random eight it found a new one. The
 /// order is shuffled per call, so two reflections in a row are steered away
 /// from different incumbents.
-pub fn sample_axes(engine: &Arc<Mutex<ConversationEngine>>, npc_id: u64, n: usize) -> Vec<String> {
-    let engine = engine.lock().unwrap();
+pub fn sample_axes(engine: &Arc<ConversationEngine>, npc_id: u64, n: usize) -> Vec<String> {
     let mut axes: Vec<String> = engine
         .find_conversations_by_metadata(META_OF, &npc_id.to_string())
         .into_iter()
@@ -595,7 +584,6 @@ pub fn sample_axes(engine: &Arc<Mutex<ConversationEngine>>, npc_id: u64, n: usiz
         })
         .filter(|a| !a.trim().is_empty())
         .collect();
-    drop(engine);
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -610,10 +598,8 @@ pub fn sample_axes(engine: &Arc<Mutex<ConversationEngine>>, npc_id: u64, n: usiz
 }
 
 /// How many dreams this character has kept.
-pub fn count(engine: &Arc<Mutex<ConversationEngine>>, npc_id: u64) -> usize {
+pub fn count(engine: &Arc<ConversationEngine>, npc_id: u64) -> usize {
     engine
-        .lock()
-        .unwrap()
         .find_conversations_by_metadata(META_OF, &npc_id.to_string())
         .len()
 }
@@ -629,8 +615,7 @@ pub fn count(engine: &Arc<Mutex<ConversationEngine>>, npc_id: u64) -> usize {
 /// stays recallable, which is untidy and no reason to stop the cast waking.
 ///
 /// Returns how many it retired.
-pub fn forget(engine: &Arc<Mutex<ConversationEngine>>, npc_id: u64) -> usize {
-    let engine = engine.lock().unwrap();
+pub fn forget(engine: &Arc<ConversationEngine>, npc_id: u64) -> usize {
     let kept = engine.find_conversations_by_metadata(META_OF, &npc_id.to_string());
     let mut retired = 0;
     for timeline in kept {
