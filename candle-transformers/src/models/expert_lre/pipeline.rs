@@ -495,6 +495,7 @@ impl PipelineState {
                 self.transition_matrix.reset_pass();
                 self.set_read_ahead_window();
                 self.set_eviction_order();
+                self.decide_read_ahead();
             }
             self.pass = Some(msg.pass);
             self.last_summary = None;
@@ -757,21 +758,8 @@ impl PipelineState {
                 .pack_read_secs
                 .unwrap_or(self.image_bytes as f64 / self.link_rate.max(1.0));
             let us = link_us(copies, cold, self.image_bytes, self.link_rate, cold_secs);
-            let was = self.link_time.on();
-            let on = self.link_time.observe(us);
-            self.read_ahead.set(on);
-            // It flips with the link's measured time, several times a minute
-            // under load: debug, not a daemon's info log.
-            if on != was {
-                tracing::debug!(
-                    link_us_per_invocation = self.link_time.us(),
-                    "expert cache: read-ahead {}",
-                    if on { "on" } else { "off" }
-                );
-            }
-            if let Ok(mut s) = self.stats.lock() {
-                s.ahead_link_us = self.link_time.us();
-            }
+            // Decided at the pass's end (`decide_read_ahead`), not here.
+            self.link_time.observe(us);
         }
         self.profile.record("pipe_classify", t);
 
@@ -1628,6 +1616,69 @@ impl PipelineState {
             self.predict_ahead(target, &selected)?;
         }
         Ok(())
+    }
+
+    /// Decide whether the next pass reads ahead (`read_ahead_gate`), from the
+    /// pass just finished — after `set_read_ahead_window`, so the fillable
+    /// ground is measured against the window that pass will read with.
+    fn decide_read_ahead(&mut self) {
+        let fillable = self.fillable_ground();
+        let was = self.link_time.on();
+        let on = self.link_time.end_pass(fillable);
+        self.read_ahead.set(on);
+        if on != was {
+            tracing::debug!(
+                link_us_per_invocation = self.link_time.us(),
+                fillable,
+                "expert cache: read-ahead {}",
+                if on { "on" } else { "off" }
+            );
+        }
+        if let Ok(mut s) = self.stats.lock() {
+            s.ahead_link_us = self.link_time.us();
+            s.ahead_passes += 1;
+            s.ahead_passes_on += usize::from(on);
+            s.ahead_switches += usize::from(on != was);
+        }
+    }
+
+    /// Whether the zone holds ground read-ahead can fill without evicting: at
+    /// least a layer's window of empty slots — free, or empty offers standing
+    /// in the ring — and at least as many experts decode routed recently that
+    /// the zone does not hold (`scored_absent`'s rule), which is what a
+    /// concession handed back and the zone grew into leaves. Counted only to
+    /// the window: the answer is a threshold, not a census.
+    fn fillable_ground(&self) -> bool {
+        if self.all_resident {
+            return false;
+        }
+        let window = self.window as usize;
+        if window == 0 {
+            return false;
+        }
+        let empty = self.inner.free_len()
+            + self
+                .promo_ring
+                .as_ref()
+                .map_or(0, |ring| self.empty_offers(ring));
+        if empty < window {
+            return false;
+        }
+        let width = self.inner.experts_per_layer;
+        let mut absent = 0usize;
+        for row in self.inner.pinned_layers..self.num_moe_layers {
+            for e in 0..width {
+                if self.inner.score(row, e) >= RECENT_MIN_SCORE
+                    && !self.inner.key_to_slot.contains_key(&(row, e))
+                {
+                    absent += 1;
+                    if absent >= window {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Size read-ahead's window from the pass just finished: the median

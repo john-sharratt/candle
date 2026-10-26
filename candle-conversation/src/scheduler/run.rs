@@ -1434,15 +1434,7 @@ impl Scheduler {
                     backlog,
                     vram,
                     slots,
-                    self.model.expert_stats().map(|s| {
-                        (
-                            s.expert_hits,
-                            s.expert_misses,
-                            s.worker_promotions,
-                            s.worker_cold,
-                            s.worker_cpu,
-                        )
-                    }),
+                    self.model.expert_stats().map(|s| ExpertCounters::of(&s)),
                     match &self.device {
                         Device::Cuda(d) => Some(d.capture_stats()),
                         _ => None,
