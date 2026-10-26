@@ -81,7 +81,8 @@ clothing. A prompt that leaves an age unclear may be declined.
   while it works and give a call up after about five minutes; a call given up
   that way may still be drawing, so wait two minutes before sending it again.
 - **One at a time.** The engine holds one image model at once: send the next
-  draw after the last has answered, never several together.
+  draw after the last has answered, never several together — of several sent
+  at once, one is drawn and the rest are refused `no_room`.
 
 ## Look, then refine
 
@@ -99,8 +100,10 @@ you can see. Look at it against the request before showing it:
 When the draw fails for any other reason, the prompt was not the problem —
 do not rewrite it:
 
-- `no_room` — the engine had no room for the image model just then. Try again
-  in a minute; a smaller size (768 on the long side) needs less room.
+- `no_room` — the engine had no room for the image model just then. On a
+  draw sent alongside another, that is the other draw: send it again once
+  the other has answered. On a draw sent alone, the engine was busy: try
+  again in a minute; a smaller size (768 on the long side) needs less room.
 - "is unavailable" (`upstream_unavailable`, `upstream_backoff`), a call cut
   off, or — while the service comes back up — a `404` or a `401 … sign in`:
   the image service is restarting. Send the same call again in a minute or
