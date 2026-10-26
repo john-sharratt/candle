@@ -2155,6 +2155,7 @@ fn bench(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::survey;
     use crate::sim::shelf::NO_OPERATION;
     use npc_map::world::Where;
     use serde_json::json;
@@ -4269,6 +4270,38 @@ mod tests {
         assert!(format!("{out:?}").contains(&format!(
             "Raised, and you may be wrong in public: {name} — it hums"
         )));
+    }
+
+    /// **A scan that signs a reading off keeps what it read**, as an arrival
+    /// does. Signed off with nothing kept, the report prompt had nothing to
+    /// quote, and a Maker reported the previous mission's reading for the
+    /// machine this one sent it to.
+    #[test]
+    fn a_scan_keeps_the_reading_it_signs_off() {
+        let h = vault();
+        assert!(perform(&h, "m1", &act("collect_mission", json!({}))).happened());
+        let (device, mode, at) = h.sim(|s| {
+            let m = s.missions.active("m1").unwrap();
+            let d = s
+                .devices
+                .iter()
+                .find(|d| m.todo.iter().any(|t| t.text.contains(&d.name)))
+                .expect("the first routine reads a machine");
+            (d.name.clone(), d.mode.clone(), d.at.clone())
+        });
+        let (area, node) = at.split_once('/').unwrap();
+        h.with(|w| w.place("m1", Where::new(area, node))).unwrap();
+        assert!(h.sim(|s| s.missions.active("m1").unwrap().observed.is_empty()));
+
+        assert!(survey::here(&h, "m1").happened());
+
+        let observed = h.sim(|s| s.missions.active("m1").unwrap().observed.clone());
+        assert!(
+            observed
+                .iter()
+                .any(|o| o.ends_with(&format!(", {device}: {mode}"))),
+            "{observed:?}"
+        );
     }
 
     /// A mission taken up at the desk, worked with its progress recorded, and

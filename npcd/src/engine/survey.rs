@@ -34,15 +34,42 @@ pub fn here(hosted: &Hosted, body: &str) -> Outcome {
     let room = hosted.read(|w| {
         let at = &w.actor(body)?.at;
         let level = w.map().get(&at.area).map(|a| a.name.clone())?;
-        Some((w.node(at)?.name.clone(), level))
+        Some((
+            w.node(at)?.name.clone(),
+            level,
+            format!("{}/{}", at.area, at.node),
+        ))
     });
     let next = hosted.with_sim(|s| {
+        // The machines the mission still asks to be read, with what they read
+        // now — kept as what the engine saw, as an arrival keeps them.
+        let asked: Vec<String> = match (&room, s.missions.active(body)) {
+            (Some((name, _, place)), Some(m)) => s
+                .devices
+                .iter()
+                .filter(|d| &d.at == place)
+                .filter(|d| {
+                    m.todo
+                        .iter()
+                        .any(|t| !t.done && t.text.to_lowercase().contains(&d.name.to_lowercase()))
+                })
+                .map(|d| format!("in {name}, {}: {}", d.name, d.mode))
+                .collect(),
+            _ => Vec::new(),
+        };
         // A scan is made standing in the room, so it is there too.
-        if let Some((room, level)) = &room {
+        if let Some((room, level, _)) = &room {
             s.missions.arrived_in(body, room, level);
         }
         if !s.missions.read_off(body, &seen) {
             return None;
+        }
+        // **What the scan read is what the report says.** Signed off with
+        // nothing kept, a reading left the report prompt with nothing to
+        // quote, and a Maker reported the last mission's reading — another
+        // room's desk — for the door this one sent it to.
+        for line in asked {
+            s.missions.observe(body, line);
         }
         let next = s.missions.active(body).and_then(Mission::next_step);
         tracing::info!(npc = %body, "mission reading signed off by a scan");
