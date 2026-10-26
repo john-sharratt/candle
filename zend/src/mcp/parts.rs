@@ -116,7 +116,7 @@ impl SubagentRunner for Parts {
     fn run(&self, parent: &str, req: SubagentRequest) -> Result<SubagentResponse, String> {
         let Some((owner, thread, name)) = threads::conv_names(parent) else {
             return Err(
-                "`sub_run` starts parts of a task Claude delegated through zend's MCP endpoint, \
+                "`sub_run` starts parts of a task Claude delegated through this MCP server, \
                  and this conversation is not one"
                     .into(),
             );
@@ -125,13 +125,13 @@ impl SubagentRunner for Parts {
             .bound
             .get()
             .and_then(|(s, rt)| Some((s.upgrade()?, rt.clone())))
-            .ok_or("zend is not running")?;
+            .ok_or("the model is not running")?;
         // The part's task is spawned, and its wait driven, on the session's
         // runtime, whatever thread this call came on.
         let _entered = runtime.enter();
         let records = session
             .shared_substrate()
-            .ok_or("zend is still loading its model")?;
+            .ok_or("the model is still loading")?;
         let parent = threads::worker(&records, owner, thread, name)
             .ok_or_else(|| format!("the calling task `T:{thread}/{name}` has no record"))?;
         check_depth(&parent)?;
@@ -201,6 +201,8 @@ mod tests {
             activity: None,
             no_entry: None,
             stopped: false,
+            resumable: false,
+            audit: None,
         }
     }
 

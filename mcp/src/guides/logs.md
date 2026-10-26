@@ -10,7 +10,7 @@ tools: [cluster_logs, cluster_status]
 1. Turn the symptom into a search:
    - `grep`: a regular expression found anywhere in a line;
    - `level`: WARN for problems, ERROR for failures;
-   - `tenant`: `zend` or `npcd` when known;
+   - `tenant`: `zend` (the coding service) or `npcd` (the bots) when known;
    - `since`: an RFC 3339 prefix (UTC) a little before it started.
 2. `cluster_logs {grep, level, tenant, since, limit}` — every member's
    matching lines, under that member, oldest first.

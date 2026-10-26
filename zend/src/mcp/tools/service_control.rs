@@ -16,7 +16,7 @@ pub const NAME: &str = "service_control";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Restart, stop or start a service — motherd (the daemon running zend and npcd) or web \
+        "description": "Restart, stop or start a service — motherd (the daemon that runs the models) or web \
             (the gateway) — on one machine, through keep, the supervisor that runs them. A restart runs the \
             installed binary again, with no trial; a start lifts a stop. A stop holds the service down until \
             it is started again — a decision: ask the user, and pass `confirm: \"approved by the user\"` only \

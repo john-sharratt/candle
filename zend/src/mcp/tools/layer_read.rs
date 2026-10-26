@@ -16,7 +16,7 @@ const MAX_LIMIT: usize = 500;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Read what one of zend's projection layers holds. A layer is one kind of analysis kept \
+        "description": "Read what one of the projection layers holds. A layer is one kind of analysis kept \
             about the repositories — `repo_map`, `code_reading`, `dependency_analysis`, `code_review`, \
             `security_review`, `dialogue` — and workers read from it; each piece of it is a stored \
             conversation, a timeline. Lists the layer's timelines, each with its id, label, repository, \

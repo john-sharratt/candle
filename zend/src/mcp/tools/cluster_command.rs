@@ -42,7 +42,7 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": format!(
-            "Run one maintenance command on one member of the cluster — a machine running zend and npcd — \
+            "Run one maintenance command on one member of the cluster — a machine running the motherd daemon — \
             named by its node id as `cluster_status` lists it. Answers the job it started; read that with \
             `cluster_job_status`. Commands come in three kinds. Look commands only read ({}) and Care \
             commands are routine upkeep ({}): both run as asked. Decide commands change what the cluster \

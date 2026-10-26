@@ -15,7 +15,8 @@ pub fn definition() -> Value {
         "description": "List your threads, newest first: each one's path, how many tasks it has had, each \
             worker still running with what it has done so far, and any waiting on you — a question to answer, \
             or a stuck worker — with its path. Use it to find the thread of a feature you worked on before, \
-            and to see what is waiting on you when no call was open to return it.",
+            and to see what is waiting on you when no call was open to return it. A thread left a day with \
+            nothing new is archived on its own, as is any worker left a day.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -67,7 +68,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let Some(records) = ctx.session.shared_substrate() else {
-        return Answer::error("zend is still loading its model; try again shortly");
+        return Answer::error("the model is still loading; try again shortly");
     };
     let owner = ctx.caller.key();
     let now = now_ms();
@@ -122,6 +123,8 @@ mod tests {
             activity: None,
             no_entry: None,
             stopped: false,
+            resumable: false,
+            audit: None,
         }
     }
 

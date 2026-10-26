@@ -15,7 +15,11 @@
 //!   [`ASKING`] — it waits, live, for `task_reply`;
 //! - **stuck** — the repeat guard or the round cap closed its tools — it waits
 //!   the same way;
-//! - **done** or **failed** — it is archived, its evidence kept.
+//! - **done** — its answer's citations are audited (`super::audit`); an
+//!   answer citing what it never opened is sent back once to open it. Then it
+//!   is kept whole, to be continued with `task_reply`, until its thread is
+//!   archived or it sits a day idle (`super::archiving`);
+//! - **failed** — it is archived, its evidence kept.
 //!
 //! Each settling is entered on the thread. An answer is the worker's next turn,
 //! and the worker settles again after it.
@@ -37,6 +41,7 @@ use tokio::sync::Notify;
 use web::auth::Role as AccessRole;
 
 use super::activity::{Activity, Doing};
+use super::audit::{Audit, Turn};
 use super::caller::Caller;
 use super::names;
 use super::nudges;
@@ -45,6 +50,7 @@ use super::stops;
 use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
+use crate::api::substrate::TimelineDetail;
 use crate::session::{NoDraft, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
 use crate::types::{ChatMessage, Role};
 
@@ -106,7 +112,7 @@ pub fn now_ms() -> u64 {
 }
 
 fn loading() -> String {
-    "zend is still loading its model; try again when `cluster_status` says it is ready".into()
+    "the model is still loading; try again when `cluster_status` says it is ready".into()
 }
 
 /// The newest entry id `view` — a journal as `GET …/journal` answers it —
@@ -288,6 +294,8 @@ fn fresh(
         activity: None,
         no_entry: None,
         stopped: false,
+        resumable: false,
+        audit: None,
     }
 }
 
@@ -321,8 +329,9 @@ pub fn start_part(
     begin(session, &records, owner, part, message)
 }
 
-/// Answer the worker `name` of `thread`, which asked or is stuck: the answer
-/// is its next turn. The worker's record, `running` again.
+/// Answer the worker `name` of `thread`, which asked, is stuck, or finished
+/// and is kept to be continued: the answer is its next turn, in the same
+/// conversation. The worker's record, `running` again.
 pub fn answer(
     session: &Arc<ZendSession>,
     caller: &Caller,
@@ -340,21 +349,37 @@ pub fn answer(
         return Err(format!("there is no worker `T:{thread}/{name}`"));
     };
     let mut worker = found.observed(now_ms());
-    if !matches!(worker.state, State::Question | State::Stuck) {
-        return Err(format!(
-            "`{}` is {}, not waiting on an answer",
-            worker.path(),
-            match worker.state {
-                State::Running => "still working",
-                _ => "finished",
-            }
-        ));
-    }
+    let label = match worker.state {
+        State::Question | State::Stuck => "Claude answered:",
+        State::Done if worker.resumable => "Claude continued:",
+        State::Running => {
+            return Err(format!(
+                "`{}` is still working: nudge it with `task_nudge`, or wait",
+                worker.path()
+            ))
+        }
+        State::Done if !worker.is_part() => {
+            return Err(format!(
+                "`{}` finished and was archived, so it cannot be continued: start a new task, \
+                 citing its entries",
+                worker.path()
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "`{}` ended and cannot be continued: start a new task",
+                worker.path()
+            ))
+        }
+    };
     let now = now_ms();
     worker.state = State::Running;
     worker.role = caller.role;
     worker.beat_ms = now;
     worker.turn_ms = now;
+    worker.ended_ms = None;
+    worker.resumable = false;
+    worker.audit = None;
     worker.question = None;
     worker.entries_after = newest_entry(session.journal(&worker.conv_id).as_ref());
     worker.entries = Vec::new();
@@ -362,7 +387,7 @@ pub fn answer(
         &records,
         &owner,
         &worker,
-        "Claude answered:",
+        label,
         first_line(text, PROMPT_QUOTE),
     )?;
     begin(session, &records, &owner, worker, format!("{text}{ASKING}"))
@@ -535,41 +560,65 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
         worker.name.clone(),
         live.clone(),
     ));
-    let ended = turn(&session, &worker, message, &live).await;
-    live.set_doing(Doing::Journaling);
-    // A nudge that came after the turn's last tool round was never read.
-    for undelivered in nudges::take(&records, &worker.conv_id) {
-        let line = format!(
-            "not delivered — the turn ended without another tool round: {}",
-            first_line(&undelivered, PROMPT_QUOTE)
-        );
-        if let Err(e) = note(&records, &owner, &worker, "Nudge dropped:", line) {
-            tracing::warn!(conv_id = %worker.conv_id, "mcp: an undelivered nudge could not be entered: {e}");
+    let mut message = message;
+    let mut sent_back = false;
+    let (label, outcome) = loop {
+        let ended = turn(&session, &worker, message, &live).await;
+        live.set_doing(Doing::Journaling);
+        // A nudge that came after the turn's last tool round was never read.
+        for undelivered in nudges::take(&records, &worker.conv_id) {
+            let line = format!(
+                "not delivered — the turn ended without another tool round: {}",
+                first_line(&undelivered, PROMPT_QUOTE)
+            );
+            if let Err(e) = note(&records, &owner, &worker, "Nudge dropped:", line) {
+                tracing::warn!(conv_id = %worker.conv_id, "mcp: an undelivered nudge could not be entered: {e}");
+            }
         }
-    }
-    worker.no_entry = None;
-    let drafted = match ended {
-        Ended::Failed(_) => None,
-        _ => Some(finish_journal(&session, &worker.conv_id).await),
-    };
-    // A stop that came after the turn's last tool round — while it answered
-    // or drafted — found it finishing.
-    if stops::take(&records, &worker.conv_id).is_some() {
-        let line = "not reached — the turn ended without another tool round".to_string();
-        if let Err(e) = note(&records, &owner, &worker, "Stop dropped:", line) {
-            tracing::warn!(conv_id = %worker.conv_id, "mcp: an unreached stop could not be entered: {e}");
+        worker.no_entry = None;
+        let drafted = match ended {
+            Ended::Failed(_) => None,
+            _ => Some(finish_journal(&session, &worker.conv_id).await),
+        };
+        // A stop that came after the turn's last tool round — while it
+        // answered or drafted — found it finishing.
+        if stops::take(&records, &worker.conv_id).is_some() {
+            let line = "not reached — the turn ended without another tool round".to_string();
+            if let Err(e) = note(&records, &owner, &worker, "Stop dropped:", line) {
+                tracing::warn!(conv_id = %worker.conv_id, "mcp: an unreached stop could not be entered: {e}");
+            }
         }
-    }
-    // A failed turn still carries what its cadence drafted while it ran.
-    let view = session.journal(&worker.conv_id);
-    worker.entries = entries_after(view.as_ref(), worker.entries_after);
-    if let Some(drafted) = drafted.filter(|_| worker.entries.is_empty()) {
-        worker.no_entry = Some(why_no_entry(view.as_ref(), drafted));
-    }
-    let (label, outcome) = if worker.is_part() {
-        settle_part(&mut worker, ended)
-    } else {
-        settle(&mut worker, ended)
+        // A failed turn still carries what its cadence drafted while it ran.
+        let view = session.journal(&worker.conv_id);
+        worker.entries = entries_after(view.as_ref(), worker.entries_after);
+        if let Some(drafted) = drafted.filter(|_| worker.entries.is_empty()) {
+            worker.no_entry = Some(why_no_entry(view.as_ref(), drafted));
+        }
+        if worker.is_part() {
+            break settle_part(&mut worker, ended);
+        }
+        let settled = settle(&mut worker, ended);
+        if worker.state != State::Done {
+            break settled;
+        }
+        let audit = audit_of(&session, &records, &owner, &worker);
+        // An answer citing what it never opened goes back once to open it;
+        // the second answer is kept with its audit, whatever it says.
+        if audit.unopened() && !sent_back {
+            sent_back = true;
+            let line = format!(
+                "its answer cites {} it did not open; it is checking them",
+                audit.seen.len() + audit.never_seen.len()
+            );
+            if let Err(e) = note(&records, &owner, &worker, "Task sent back:", line) {
+                tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be entered: {e}");
+            }
+            worker.state = State::Running;
+            message = format!("{}{ASKING}", audit.correction());
+            continue;
+        }
+        worker.audit = audit.cites().then(|| audit.render());
+        break settled;
     };
     // The beat stops, and is done writing, before the settled record is.
     beating.abort();
@@ -577,12 +626,18 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
     worker.activity = Some(live.snapshot());
     if !worker.state.live() {
         worker.ended_ms = Some(now_ms());
-        match session.archive_worker(&worker.conv_id) {
-            Some(Ok(())) | None => {}
-            Some(Err(e)) => tracing::warn!(
-                conv_id = %worker.conv_id,
-                "mcp: the worker could not be archived: {e}"
-            ),
+        // A finished task is kept whole, to be continued with `task_reply`,
+        // until its thread is archived or it sits a day idle
+        // (`super::archiving`); a part and a failed task are archived now.
+        worker.resumable = worker.state == State::Done && !worker.is_part();
+        if !worker.resumable {
+            match session.archive_worker(&worker.conv_id) {
+                Some(Ok(())) | None => {}
+                Some(Err(e)) => tracing::warn!(
+                    conv_id = %worker.conv_id,
+                    "mcp: the worker could not be archived: {e}"
+                ),
+            }
         }
     }
     if let Err(e) = threads::put_worker(&records, &owner, &worker) {
@@ -670,6 +725,32 @@ async fn beat(
         }
         session.mcp().bump();
     }
+}
+
+/// The citation audit of `worker`'s final response, over every turn of its
+/// conversation and of each part it started (`super::audit`).
+fn audit_of(session: &ZendSession, records: &dyn Records, owner: &str, worker: &Worker) -> Audit {
+    let below = format!("{}/", worker.name);
+    let convs: Vec<String> = threads::workers(records, owner, &worker.thread)
+        .into_iter()
+        .filter(|w| w.name.starts_with(&below))
+        .map(|w| w.conv_id)
+        .chain([worker.conv_id.clone()])
+        .collect();
+    let details: Vec<TimelineDetail> = convs
+        .iter()
+        .filter_map(|c| session.conversation_detail(c))
+        .collect();
+    let turns: Vec<Turn<'_>> = details
+        .iter()
+        .flat_map(|d| &d.turns)
+        .filter(|t| t.kind == "normal")
+        .map(|t| Turn {
+            user: &t.user,
+            assistant: &t.assistant,
+        })
+        .collect();
+    Audit::of(&worker.final_text, &turns)
 }
 
 /// Settle `worker` on how its turn `ended`: its new state, and the thread's
@@ -1030,6 +1111,8 @@ mod tests {
             activity: None,
             no_entry: None,
             stopped: false,
+            resumable: false,
+            audit: None,
         }
     }
 

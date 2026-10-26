@@ -1,7 +1,10 @@
 # MCP guides: a skill library the connector serves
 
-**Status: designed, not built.** Written 2026-10-26 from the review of two Zen
-research runs and a design discussion that followed. It extends
+**Status: built** (2026-10-26): the guide library in the aggregator
+(`mcp/src/guides/`), continuing a finished worker and the 24-hour archive
+(`zend/src/mcp/archiving.rs`), and the citation audit with its correction round
+(`zend/src/mcp/audit.rs`). Written from the review of two Zen research runs and
+a design discussion that followed. It extends
 `docs/mcp_app.md` (the aggregator) and `docs/claude_zend_gateway.md` (zend's
 tools). Where this document and those disagree about guides, this one is
 authoritative; fix the others in the same change that builds it.
@@ -94,7 +97,9 @@ line to the description of every tool some guide lists:
 > checked; `verify` — checking a finished worker's output. Read one with
 > `guide_read` before you start.
 
-Only names and one-liners; the method arrives on demand. The backends know
+Only names and one-liners; the method arrives on demand. A tool more than four
+guides list (`NAMES_ONLY_PAST`) gets the names alone, so the line never
+outgrows the tool's own description. The backends know
 nothing of guides. A guide may span backends — a bot guide can list `bot_*`
 and `task_*` tools alike.
 
@@ -117,13 +122,26 @@ or held for the user's approval — the user's call.
 
 ## 3. Continuing a finished worker
 
-`task_reply` today answers a worker that asked, is stuck, or was stopped; a
-finished worker is archived and a reply to it is refused. The worker's
-conversation persists, so it can be continued:
+`task_reply` answers a worker that asked, is stuck, or was stopped — and one
+that finished. Archiving a worker distils its conversation to text
+(`ZendSession::archive_worker`), which is one way: an archived conversation
+cannot be continued with its context. So a finished task is not archived when
+it ends:
 
-- `task_reply` accepts a `done` worker too: the worker is un-archived, the
-  reply is its next turn with its whole context, and it answers as
-  `task_start` does. Its new journal entries are the reply's.
+- A task that ends `done` is kept whole and marked `resumable`. `task_reply`
+  accepts it: the reply is its next turn with its whole context, and it answers
+  as `task_start` does. Its new journal entries are the reply's. What a `done`
+  worker answers says it can be continued.
+- A part, and a task that failed, are archived as they end, as before.
+- A worker is archived — distilled, no longer resumable — when its thread is
+  archived (`thread_archive`), or when it has sat **24 hours** untouched. A
+  thread whose newest activity is 24 hours old, with nothing running on it, is
+  archived the same way. The sweep runs hourly on every member
+  (`zend/src/mcp/archiving.rs`); archiving is idempotent, so two members
+  sweeping one thread do no harm. Only these workers and threads are swept: a
+  person's own zend conversations are never archived automatically.
+- A worker waiting on Claude (a question, stuck) that sits 24 hours is archived
+  as an error saying so, its question kept, as `thread_archive` does.
 - This is the verification path: the same worker that did the research is asked
   to open what it skipped and correct itself, rather than a new worker starting
   cold.
@@ -139,19 +157,23 @@ cites, against what the worker actually did in its turns:
 | Mark | Meaning |
 |---|---|
 | opened | fetched with `web_fetch` (its `final_url`) |
-| seen | appeared only in a `web_search` result: the snippet, not the page |
+| seen | appeared only in a tool's result — a search hit, a snippet — never fetched |
 | never seen | cited, but nothing in the run touched it — inferred or invented |
 
 zend already reads the tool calls a turn made (`tools::extract_tool_calls`) and
 their results are the coupled turns' user halves, so the audit is deterministic
-and cheap. It goes at the end of what `task_wait` / `task_start` answer for a
-`done` worker.
+and cheap. It reads every normal turn of the worker's conversation and of each
+part it started (`ZendSession::conversation_detail`), and goes at the end of
+what `task_wait` / `task_start` answer for a `done` worker. An answer citing no
+URL carries no audit.
 
 **One automatic correction round.** When anything cited is `seen` or
-`never seen`, zend replies to the worker once by itself (§3): "you cited X, Y, Z
-without opening them — fetch them and correct your answer, or mark those claims
-unverified." The task answers after that round, with the audit of the
-corrected answer. Default for every task; a task may opt out.
+`never seen`, zend sends the worker back once by itself, as the next turn of the
+same run: "your answer cites X, Y, Z without having opened them — fetch each and
+correct your answer, remove what does not exist, mark UNVERIFIED what you still
+cannot confirm, with a CHANGES section." The thread's journal says it was sent
+back. The task answers after that round, with the audit of the corrected
+answer. Every task gets it; there is no opt-out.
 
 ## 5. The research guide
 
@@ -194,4 +216,16 @@ rolling to the cluster).
   argument, by the naming rule.
 - **Verification by the same worker** (§3), not a fresh one.
 - **The audit is zend's, deterministic**; the correction round is one round,
-  never a loop.
+  never a loop, and applies to every task — no opt-out, which would be a flag
+  with nothing to choose it.
+- **A finished worker is kept, not un-archived** (§3): archiving is a lossy
+  distil, so continuing one means not archiving it until it is done with —
+  its thread archived, or a day idle.
+- **Only `/mcp` workers and threads archive themselves.** A person's own
+  conversations are theirs to archive.
+- **What Claude reads never says "zend".** The server is Zen; tool
+  descriptions, errors, instructions and guides speak of workers, the model and
+  hardware the user owns. The app's name appears only where it is a value Claude
+  passes or reads back — `app` and `tenant` in the operations tools. The
+  aggregator's backends are named `coding` and `bot`, the names its failures
+  give.

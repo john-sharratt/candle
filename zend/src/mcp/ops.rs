@@ -73,7 +73,7 @@ pub fn node(text: &str) -> Result<String, String> {
 /// This member's way up to the cluster.
 pub fn member(session: &ZendSession) -> Result<Arc<AppMember>, String> {
     session.cluster_member().ok_or_else(|| {
-        "this zend member is not in a cluster, so it has no way to the others: run the \
+        "this member is not in a cluster, so it has no way to the others: run the \
          operation on a clustered member"
             .into()
     })

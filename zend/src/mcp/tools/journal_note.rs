@@ -89,7 +89,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         }
     };
     let Some(records) = ctx.session.shared_substrate() else {
-        return Answer::error("zend is still loading its model; try again shortly");
+        return Answer::error("the model is still loading; try again shortly");
     };
     let owner = ctx.caller.key();
     match &target {

@@ -88,6 +88,11 @@ only its own tools: claude.ai shows a refused list as no tools at all, and
 lists again for each conversation, so a short list lasts only until the
 backend is back. Only when no backend answers is the list refused.
 
+**Its own tools are the guides** (`docs/mcp_guides.md` §2): `guide_list` and
+`guide_read`, listed first and answered locally, never sent to a backend. Each
+backend tool some guide names gets a generated "Guides:" line on its
+description.
+
 **Every listing and call is logged**: one line each, naming the backend, the
 tool and how long it took, at `WARN` with the reason when it failed.
 
@@ -185,7 +190,7 @@ carrying.
 | `gateway` | The gateway's LAN entrance every backend is reached through (`http://192.168.0.5`) |
 | `state` | The folder its sessions are kept in |
 | `server` | Its card: `name`, `title`, `description`, `instructions`, `icon` |
-| `backends` | The servers whose tools it serves, in list order: `{name, host}` each |
+| `backends` | The servers whose tools it serves, in list order: `{name, host}` each. The name is what a failed listing tells the client — `coding` (zend) and `bot` (npcd), never the app's own name |
 
 | Module | What |
 |---|---|
@@ -194,6 +199,7 @@ carrying.
 | `sse` | Reading an event stream across chunks |
 | `caller` | Who is calling, believed from the gateway, and the token that names them |
 | `config` | `mcp/mcp.yaml` |
+| `guides` | The guide library: the embedded `.md` files, `guide_list` / `guide_read`, the "Guides:" lines |
 
 ## 6. Deployment
 

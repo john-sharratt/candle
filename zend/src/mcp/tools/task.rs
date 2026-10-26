@@ -15,7 +15,7 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Delegate a task: start it on a new worker under a thread, and wait for it up to \
-            `wait_s`. A worker is a model conversation running on zend, on hardware the user owns, with the \
+            `wait_s`. A worker is a model conversation running on hardware the user owns, with the \
             repository's analysis to read from and its own tools to read, run and edit with; its result is \
             the journal entry it writes. Pass the thread you attached to. State the task in full in `prompt` — \
             what to do, what to verify before answering, and the shape of the final response (verdict, \

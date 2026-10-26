@@ -245,14 +245,15 @@ held longer than `wait_s`:
 
 | State | Meaning |
 |---|---|
-| `done` | The task ended: its final response whole, and its journal entries not already given — or, when it kept none, why, from its draft's record (refused, judged to add nothing, not finished in time). The worker is archived. |
+| `done` | The task ended: its final response whole, its citation audit (`docs/mcp_guides.md` §4), and its journal entries not already given — or, when it kept none, why, from its draft's record (refused, judged to add nothing, not finished in time). The worker is kept whole, to be continued with `task_reply` (`docs/mcp_guides.md` §3). |
 | `running` | Still working: the worker's path, the sentence of what its turn has done, and the journal entries not already given. |
 | `question` | The worker asked Claude (§6.2): the question, its options, what it tried, its pointers. The worker is live, its turn ended. |
 | `stuck` | The repeat guard or the round cap closed its turn (§6.2): the closing response. The worker is live. |
 | `error` | The turn failed: the error. The worker is archived with its evidence. |
 
-A worker is archived only once it is `done` or `error`; one that asked or is
-stuck stays live, costing nothing while idle, until it is answered.
+A task worker is archived as it ends `error`; one that is `done`, asked, or is
+stuck stays whole, costing nothing while idle, until its thread is archived or
+it sits 24 hours untouched (`docs/mcp_guides.md` §3).
 
 ### 3.4 What a task turn runs as
 
@@ -348,13 +349,15 @@ The worker runs the task's rounds — its reads, its builds, its tool output —
 and ends in its journal entry (§5). Its fan-out parts and its verifier are
 workers too, started by the worker under its own path (§6.1).
 
-**When the task ends, the result goes up and the worker is archived:**
+**When the task ends, the result goes up:**
 
 1. the outcome is entered on the thread (above): the worker's entry line and
    address;
-2. the worker, and every part and verifier under it, is archived
-   (`POST /v1/conversations/{id}/archive`, answering 204): distilled to text,
-   its K/V dropped, never resumed.
+2. every part and verifier under it is archived as it ends: distilled to text,
+   its K/V dropped, never resumed;
+3. the worker itself, when `done`, is kept whole so `task_reply` can continue
+   it, and archived the same way when its thread is archived or after 24 hours
+   untouched (`docs/mcp_guides.md` §3); when it failed, it is archived at once.
 
 **An archived worker keeps the turns behind its entries.** Today archiving a
 conversation keeps its entries and ceases the text filed under them
@@ -367,8 +370,10 @@ is not open, so the calendar fold, which runs over the open conversations, never
 folds it (`docs/zend_journal.md` §4.2); its addresses stay exact.
 
 **When the feature is done, the thread is archived too** (`thread_archive`), on
-Claude's call or the skill's. Until then it stands, costing nothing while
-idle: every conversation's K/V is in the substrate.
+Claude's call or the skill's, or by the hourly sweep once its newest activity is
+24 hours old with nothing running (`zend/src/mcp/archiving.rs`). Until then it
+stands, costing nothing while idle: every conversation's K/V is in the
+substrate.
 
 So a feature's history is one thread journal of decisions and outcomes, each
 outcome pointing at the archived worker that holds its evidence, and the live
@@ -769,8 +774,9 @@ a Decide command's `confirm`, approve a merge, or lift a guardrail of §11.
 Those go through the operations tools and the user.
 
 **An unanswered question waits.** A worker that asked stays live until it is
-answered or its thread is archived; archiving a thread archives its waiting
-workers, and their questions stay in their entries as open items.
+answered, its thread is archived, or it sits 24 hours unanswered; archiving
+archives its waiting workers, and their questions stay in their entries as open
+items.
 
 ## 7. Work skills
 

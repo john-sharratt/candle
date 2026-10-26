@@ -13,6 +13,8 @@ anyhow       = { workspace = true }
 axum         = { version = "0.7" }
 clap         = { workspace = true }
 futures      = { workspace = true }
+# The guides, embedded at build time (`src/guides/`).
+include_dir  = { version = "0.7" }
 mcp-server   = { path = "../mcp-server" }
 reqwest      = { version = "0.12", default-features = false, features = ["stream", "json"] }
 serde        = { workspace = true }

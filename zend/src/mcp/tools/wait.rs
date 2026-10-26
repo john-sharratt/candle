@@ -78,17 +78,36 @@ pub fn result_of(w: &Worker, seen: Option<u64>) -> String {
             w.error.as_deref().unwrap_or("the task failed")
         ),
         State::Done if w.entries.is_empty() => format!(
-            "{} — done; no journal entry was kept ({}). Its answer:\n{}",
+            "{} — done; no journal entry was kept ({}). Its answer:\n{}{}",
             w.path(),
             w.no_entry.as_deref().unwrap_or("no journal draft ran"),
-            w.final_text
+            w.final_text,
+            done_close(w)
         ),
         State::Done => format!(
-            "{} — done. Its answer:\n{}{entries}",
+            "{} — done. Its answer:\n{}{}{entries}",
             w.path(),
-            w.final_text
+            w.final_text,
+            done_close(w)
         ),
     }
+}
+
+/// What follows a finished task's answer: its citation audit, and that it can
+/// be continued while it can.
+fn done_close(w: &Worker) -> String {
+    let mut out = String::new();
+    if let Some(audit) = &w.audit {
+        out.push_str("\n\n");
+        out.push_str(audit);
+    }
+    if w.resumable {
+        out.push_str(
+            "\n\nIt can be continued with `task_reply` — to check a claim, go deeper, or redo a \
+             part — until its thread is archived or it sits a day untouched.",
+        );
+    }
+    out
 }
 
 /// What a wait answers: every worker that stopped running, in full, then each
@@ -214,6 +233,8 @@ mod tests {
             activity: None,
             no_entry: None,
             stopped: false,
+            resumable: false,
+            audit: None,
         }
     }
 
@@ -300,5 +321,23 @@ mod tests {
         let mut failed = worker("v", State::Error);
         failed.error = Some("boom".into());
         assert_eq!(result_of(&failed, None), "T:review/v — error: boom");
+    }
+
+    /// **A finished task closes with its audit, and says it can be
+    /// continued** while it is kept whole.
+    #[test]
+    fn a_done_task_closes_with_its_audit_and_how_to_continue_it() {
+        let mut done = worker("v", State::Done);
+        done.entries = vec![entry(4, "Entry 4 — b")];
+        done.audit = Some("Citation audit: 1 cited — 1 opened, 0 seen only in search results, 0 never seen in the run.".into());
+        done.resumable = true;
+        assert_eq!(
+            result_of(&done, None),
+            "T:review/v — done. Its answer:\nVerdict: ok\n\n\
+             Citation audit: 1 cited — 1 opened, 0 seen only in search results, 0 never seen in the run.\n\n\
+             It can be continued with `task_reply` — to check a claim, go deeper, or redo a part — \
+             until its thread is archived or it sits a day untouched.\n\n\
+             Journal entries:\n\nT:review/v#4\nEntry 4 — b"
+        );
     }
 }

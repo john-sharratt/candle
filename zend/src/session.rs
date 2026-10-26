@@ -113,7 +113,7 @@ use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::mcp::ownership::owner_of;
 use crate::mcp::state::McpState;
 use crate::mcp::threads::{conv_names, project_journal};
-use crate::mcp::{lineage, names, nudges, stops, threads};
+use crate::mcp::{archiving, lineage, names, nudges, stops, threads};
 use crate::passthrough::{self, Exchange, LiveConv, PassthroughCache, Transcript};
 use crate::projection_event::{ProjectionEventOut, ProjectionSpanOut};
 use crate::refresh_ctx::RefreshContext;
@@ -6974,6 +6974,13 @@ impl ZendSession {
         })
     }
 
+    /// The conversation `conv_id` as [`Self::substrate_timeline`] reads it:
+    /// every turn decoded. `None` before the substrate has replayed, or when it
+    /// has no turns.
+    pub fn conversation_detail(&self, conv_id: &str) -> Option<TimelineDetail> {
+        self.substrate_timeline(conversation_timeline(conv_id).raw())
+    }
+
     /// `GET /v1/substrate/zend/timeline/{tl}` — one conversation's full summary forest,
     /// every turn decoded. `tl` is the raw timeline id. `None` before the
     /// substrate has replayed or when no such timeline exists.
@@ -8074,8 +8081,11 @@ impl ZendSession {
         // The runner a worker's `sub_run` starts its parts with, bound to this
         // session by a weak handle so no tool context keeps it alive. A session
         // loaded with no runtime around it serves no `/mcp`, so has no parts.
+        // The same runtime runs the sweep that archives the `/mcp` workers and
+        // threads left idle a day.
         if let Some(rt) = &rt_handle {
             self.mcp.parts().bind(Arc::downgrade(self), rt.clone());
+            archiving::start_sweeping(self, rt);
         }
         // Held by the spawned thread, which stores the ingest worker on the
         // session and hands it to the resumed turns.

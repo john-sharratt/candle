@@ -131,7 +131,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         .clamp(1, MAX_HITS) as usize;
     let entry = args.get("entry").and_then(Value::as_u64);
     let Some(records) = ctx.session.shared_substrate() else {
-        return Answer::error("zend is still loading its model; try again shortly");
+        return Answer::error("the model is still loading; try again shortly");
     };
     let owner = ctx.caller.key();
     match scope {

@@ -26,8 +26,8 @@ const TURN_PAGE: usize = 16_000;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Read one stored conversation — a timeline in zend's substrate, the store everything \
-            zend keeps lives in — by the id `layer_read` lists, or a worker's own: its label, layer, tokens, \
+        "description": "Read one stored conversation — a timeline in the substrate, the store everything \
+            is kept in — by the id `layer_read` lists, or a worker's own: its label, layer, tokens, \
             metadata (the dials a worker ran with among it) and lineage, then its turns a page at a time — \
             each with its index, kind (normal, or a summary of turns or of summaries), tokens, and the first \
             line of each half. With `turn`, that one turn in full instead: the user half (a tool call's \

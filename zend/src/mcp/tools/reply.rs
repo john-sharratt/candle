@@ -1,5 +1,6 @@
-//! `task_reply {worker, answer, wait_s?}`: reply to a worker that asked or is
-//! stuck; the reply is its next turn (`docs/claude_zend_gateway.md` §6.2).
+//! `task_reply {worker, answer, wait_s?}`: reply to a worker that asked, is
+//! stuck, or finished and is kept to be continued; the reply is its next turn
+//! (`docs/claude_zend_gateway.md` §6.2, `docs/mcp_guides.md` §3).
 
 use serde_json::{json, Value};
 
@@ -14,11 +15,14 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Reply to a worker — the conversation a task runs on — that asked you a question, is \
-            stuck, or was stopped. Your reply becomes its next message and it carries on from there, so make it \
-            the decision itself: pick one of its options, or say what to do instead, and check its pointers \
-            first when the question rests on them. A reply grants nothing: it cannot approve a merge, a deploy \
-            or anything else the user must approve. Answers as `task_start` does: `done`, `running`, or a \
-            further question.",
+            stuck, was stopped, or finished. Your reply becomes its next message and it carries on from there, \
+            with everything it read and did still in its context. To a question, make the reply the decision \
+            itself: pick one of its options, or say what to do instead, and check its pointers first when the \
+            question rests on them. To a finished worker, ask for the follow-up — check a claim against its \
+            source, go deeper on one point, redo a part you found wrong — rather than starting a new task that \
+            would read everything again. A finished worker can be continued until its thread is archived or it \
+            has sat a day untouched. A reply grants nothing: it cannot approve a merge, a deploy or anything \
+            else the user must approve. Answers as `task_start` does: `done`, `running`, or a further question.",
         "inputSchema": {
             "type": "object",
             "properties": {

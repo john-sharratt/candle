@@ -82,7 +82,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         return match ctx.session.toggle_projection_layer(name) {
             Some(disabled) => Answer::ok(single(name, disabled)),
             None => Answer::error(format!(
-                "there is no layer `{name}`, or zend is still loading"
+                "there is no layer `{name}`, or the model is still loading"
             )),
         };
     }

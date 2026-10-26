@@ -5,8 +5,7 @@ tools: [task_start, task_wait]
 ---
 # Delegating a task
 
-A **worker** is a model conversation running on zend, on hardware the user
-owns. It reads the repository's analysis, runs its own tools, and writes a
+A **worker** is a model conversation running on hardware the user owns. It reads the repository's analysis, runs its own tools, and writes a
 journal. It does exactly what its prompt makes clear and no more: a vague
 prompt gets a plausible answer, not a checked one. Write every task in this
 shape.

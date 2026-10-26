@@ -16,9 +16,9 @@ pub const NAME: &str = "cluster_status";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "How the cluster stands: each member — a machine running the motherd daemon, which \
-            hosts zend and npcd — with its machine name, node id, build, state, when it started, and how \
-            zend and npcd on it stand; and, for an Admin, the gateway's view: each app's floor (the oldest \
+        "description": "How the cluster stands: each member — a machine running the motherd daemon — with \
+            its machine name, node id, build, state, when it started, and how each app it hosts stands; and, \
+            for an Admin, the gateway's view: each app's floor (the oldest \
             build it still routes to) and ready members, upgrades in progress, members in fault. Check it \
             before delegating heavy work, before and after any operation, and whenever a task stalls.",
         "inputSchema": {
@@ -50,7 +50,7 @@ pub fn render_members(envelope: &Value, now: u64) -> String {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut out = format!("zend members answering /v1/status: {}", members.len());
+    let mut out = format!("Members answering /v1/status: {}", members.len());
     for m in &members {
         let (host, node) = (str_of(m, "host"), str_of(m, "node"));
         let code = m.get("status").and_then(Value::as_u64).unwrap_or(0);
@@ -230,7 +230,7 @@ mod tests {
         });
         assert_eq!(
             render_members(&envelope, NOW),
-            "zend members answering /v1/status: 2\n\
+            "Members answering /v1/status: 2\n\
              - blackworld 00000000000000ab build 5739-c544: ready, started 2.0 h ago; tenants: \
              npcd ready, zend loading\n\
              - whiteworld 00000000000000cd: no answer (504 deadline)\n\

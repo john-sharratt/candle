@@ -21,7 +21,7 @@ const MAX_LIMIT: u64 = 5000;
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Search the logs of the cluster's members — the machines running zend and npcd — for \
+        "description": "Search the logs of the cluster's members — the machines running the motherd daemon — for \
             what they say about a symptom: every member's matching lines, oldest first, each under its member. \
             `grep` is a regular expression found anywhere in a line; narrow with `level`, `tenant` and \
             `since`. A page, never a stream: call again with a later `since` to read on. Cite the lines you \
@@ -31,7 +31,7 @@ pub fn definition() -> Value {
             "properties": {
                 "grep": {"type": "string", "description": "A regular expression; a line is kept when it is found anywhere in it."},
                 "level": {"type": "string", "enum": ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"], "description": "The least level kept."},
-                "tenant": {"type": "string", "enum": ["zend", "npcd"], "description": "Only lines one tenant wrote."},
+                "tenant": {"type": "string", "enum": ["zend", "npcd"], "description": "Only lines one app wrote: `zend`, the coding service these tools run on, or `npcd`, the bots'."},
                 "since": {"type": "string", "description": "Only lines stamped at or after this: an RFC 3339 prefix such as `2026-10-16T00:20`."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "The most lines per member, the latest kept (200 by default)."},
                 "node": {"type": "string", "description": "One member's node id, as `cluster_status` lists it (Admins only)."}

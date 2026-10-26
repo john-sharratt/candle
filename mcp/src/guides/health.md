@@ -5,14 +5,15 @@ tools: [cluster_status, service_status, cluster_logs, cluster_audit]
 ---
 # Cluster health
 
-A **member** is one machine running the motherd daemon, which hosts zend and
-npcd. The **gateway** routes requests to members; each app's **floor** is the
+A **member** is one machine running the motherd daemon, which hosts the apps:
+`zend`, the coding service these tools run on, and `npcd`, the bots'. The
+**gateway** routes requests to members; each app's **floor** is the
 oldest build it still routes to.
 
 ## Do
 
 1. `cluster_status`: every member — machine, node id, build, state, when it
-   started, how zend and npcd on it stand — and, for an Admin, the gateway's
+   started, how each app on it stands — and, for an Admin, the gateway's
    view: each app's floor and ready members, upgrade candidates, members in or
    near fault.
 2. For a machine's services and its last trial: `service_status {host}`.

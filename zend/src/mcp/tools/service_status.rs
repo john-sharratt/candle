@@ -18,7 +18,7 @@ pub const NAME: &str = "service_status";
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Read how one machine's services stand — motherd (the daemon running zend and npcd) \
+        "description": "Read how one machine's services stand — motherd (the daemon that runs the models) \
             and web (the gateway) — as keep, the supervisor that runs them, reports it: the build each one's \
             installed binary is, whether it runs, any trial of a new build in progress, and how the last \
             trial ended, proven or rolled back. Read it after `service_trial` to learn the trial's outcome. \

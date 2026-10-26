@@ -5,8 +5,12 @@
 //!
 //! Every listing and every call is logged, one line each: which backend, how
 //! long it took, and — at `WARN` — why one failed.
+//!
+//! Beside the backends' tools it serves its own two, `guide_list` and
+//! `guide_read` (`crate::guides`), and adds to each backend tool a guide lists
+//! the line naming its guides.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -19,6 +23,8 @@ use serde_json::Value;
 
 use crate::backend::{Backend, Link, OnBehalf};
 use crate::caller::Caller;
+use crate::guides::tools as guide_tools;
+use crate::guides::Library;
 
 /// What every request is served with.
 pub struct App {
@@ -29,6 +35,8 @@ pub struct App {
     pub link: Link,
     /// Which backend runs each tool, by name, as they were last listed.
     pub routes: RwLock<HashMap<String, usize>>,
+    /// The guides served beside the backends' tools (`docs/mcp_guides.md`).
+    pub library: Library,
 }
 
 /// Every backend's tools in backend order, and which backend runs each: a
@@ -125,7 +133,7 @@ impl App {
                         "mcp: listing failed: {why}"
                     );
                     failed.push(i);
-                    why_failed.push(format!("{backend}'s tools could not be listed: {why}"));
+                    why_failed.push(format!("the {backend} tools could not be listed: {why}"));
                 }
             }
         }
@@ -172,18 +180,43 @@ impl Server for App {
     /// refused list as no tools at all, and lists again for each conversation,
     /// so a short list lasts only until the backend is back. Only when no
     /// backend answers is the list refused.
+    ///
+    /// The guide tools come first, and each backend tool a guide lists carries
+    /// the line naming its guides.
     async fn tools(this: &Arc<Self>, call: &Call<Self>) -> Result<Value, String> {
-        let listed = this.list(call).await;
+        let mut listed = this.list(call).await;
         if listed.tools.is_empty() && !listed.failed.is_empty() {
-            Err(listed.failed.join("; "))
-        } else {
-            Ok(Value::Array(listed.tools))
+            return Err(listed.failed.join("; "));
         }
+        if listed.failed.is_empty() {
+            let served: BTreeSet<&str> = listed
+                .tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str))
+                .collect();
+            for (tool, guides) in this.library.unserved(&served) {
+                tracing::warn!(
+                    tool,
+                    guides = guides.join(", "),
+                    "mcp: a guide lists a tool no backend serves"
+                );
+            }
+        }
+        this.library.decorate(&mut listed.tools);
+        let mut tools = guide_tools::definitions(&this.library);
+        tools.append(&mut listed.tools);
+        Ok(Value::Array(tools))
     }
 
     /// The call, run by the backend that lists `name` — the tools listed
     /// again first when none does yet, as after a restart.
     async fn call(this: &Arc<Self>, call: &Call<Self>, name: &str, args: &Value) -> Value {
+        if guide_tools::is_guide_tool(name) {
+            let answer = guide_tools::call(&this.library, name, args);
+            let guide = args.get("name").and_then(Value::as_str).unwrap_or("");
+            tracing::info!(tool = name, guide, "mcp: guide served");
+            return answer;
+        }
         let backend = match this.route(name) {
             Some(b) => b,
             None => {

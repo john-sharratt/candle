@@ -14,6 +14,8 @@
 //! | [`server`] | zend as an MCP server: its card, its caller, its sessions, its tools |
 //! | [`tools`] | The tools, one file each |
 //! | [`workers`] | Running a task, answering a worker, and waiting on workers |
+//! | [`audit`] | A finished task's citation audit: each cited URL opened, seen, or never seen |
+//! | [`archiving`] | Archiving threads and workers: by `thread_archive`, and after a day idle |
 //! | [`activity`] | What a running worker is doing, counted from its stream and said in one sentence |
 //! | [`reported`] | The journal entries already handed to Claude, so a later result gives only new ones |
 //! | [`parts`] | `sub_run`: a worker's parts, started under it and waited on |
@@ -29,6 +31,8 @@
 //! | [`state`] | Sessions as records, the attached thread, the change signal |
 
 pub mod activity;
+pub mod archiving;
+pub mod audit;
 pub mod caller;
 pub mod lineage;
 pub mod names;

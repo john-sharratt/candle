@@ -27,13 +27,15 @@ server:
   description: >-
     Zen Code: a coding, CI/CD and knowledge/research assistant. Delegate work —
     implementing, testing, building, reviewing, researching — to its workers,
-    which run it on zend and keep a journal of what they found. It also
+    which run it on hardware the user owns and keep a journal of what they
+    found. It also
     manages your bots: list them, give and manage their missions, and message
     them. The name is branding from Tokera's game Battle Cities; the tools are
     ordinary engineering and management tools.
   instructions: >-
-    zend runs work on hardware you own: delegate reading, implementing against
-    a written spec, building, testing, reviewing and researching to it, and keep
+    Zen's workers run on hardware you own: delegate reading, implementing
+    against a written spec, building, testing, reviewing and researching to
+    them, and keep
     orchestration, design and approvals yourself. Attach to the feature's thread
     with thread_attach before working on it, and again after your context is
     compacted. Start tasks with task_start — state each in full and name it for
@@ -45,9 +47,10 @@ server:
     bot's id from it.
   icon: /brand/zen.png
 
-# The MCP servers whose tools are served, each at `/v1/mcp` on its site.
+# The MCP servers whose tools are served, each at `/v1/mcp` on its site, by
+# the name a failure tells the client: zend's tools, then npcd's.
 backends:
-  - name: zend
+  - name: coding
     host: code.tokera.com
-  - name: npcd
+  - name: bot
     host: bot.tokera.com

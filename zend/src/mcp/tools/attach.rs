@@ -38,7 +38,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         Err(e) => return Answer::error(e),
     };
     let Some(records) = ctx.session.shared_substrate() else {
-        return Answer::error("zend is still loading its model; try again shortly");
+        return Answer::error("the model is still loading; try again shortly");
     };
     let owner = ctx.caller.key();
     if let Err(e) = threads::attach(&records, &owner, thread, now_ms()) {

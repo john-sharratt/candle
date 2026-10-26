@@ -6,7 +6,7 @@ tools: [agent_job, agent_job_log, service_trial, service_status, cluster_status,
 # Deploying to one machine
 
 **keep** is the supervisor on each machine that runs its services — motherd
-(zend and npcd) and web (the gateway). A **trial** starts a new build in place
+(the daemon that runs the models) and web (the gateway). A **trial** starts a new build in place
 of the installed one and keeps it only if it reports serving within ten
 minutes; otherwise it puts the previous binary back. Admins only.
 

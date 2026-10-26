@@ -186,6 +186,15 @@ pub struct Worker {
     /// for `task_reply` to redirect.
     #[serde(default)]
     pub stopped: bool,
+    /// Whether a finished task's conversation is still whole, so `task_reply`
+    /// can continue it: true from when it ends `done` until it is archived —
+    /// with its thread, or after a day idle (`super::archiving`).
+    #[serde(default)]
+    pub resumable: bool,
+    /// The citation audit of its final response (`super::audit`), once it
+    /// ended `done` citing anything.
+    #[serde(default)]
+    pub audit: Option<String>,
 }
 
 /// How often the member running a task says so on its record.
@@ -343,6 +352,18 @@ pub fn threads(records: &dyn Records, owner: &str) -> Vec<Thread> {
     all
 }
 
+/// Every thread of every owner, each with the owner key it is kept under.
+pub fn every_thread(records: &dyn Records) -> Vec<(String, Thread)> {
+    records
+        .under("mcp/thread/")
+        .into_iter()
+        .filter_map(|(key, v)| {
+            let (owner, _) = key.strip_prefix("mcp/thread/")?.split_once('/')?;
+            Some((owner.to_string(), decode(v)?))
+        })
+        .collect()
+}
+
 pub fn worker(records: &dyn Records, owner: &str, thread: &str, name: &str) -> Option<Worker> {
     records
         .get(&worker_key(owner, thread, name))
@@ -493,6 +514,8 @@ mod tests {
             activity: None,
             no_entry: None,
             stopped: false,
+            resumable: false,
+            audit: None,
         };
         assert_eq!(
             w.clone().observed(1_000 + BEAT_LOST_MS).state,

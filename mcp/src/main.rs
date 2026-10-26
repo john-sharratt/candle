@@ -8,6 +8,7 @@
 //! | [`backend`] | One backend, called through the gateway as the caller |
 //! | [`sse`] | Reading a backend's event stream |
 //! | [`caller`] | Who is calling, believed from the gateway |
+//! | [`guides`] | The guide library: the methods for using the tools, served as tools |
 //! | [`config`] | `mcp/mcp.yaml` |
 
 use std::collections::HashMap;
@@ -28,6 +29,7 @@ mod app;
 mod backend;
 mod caller;
 mod config;
+mod guides;
 mod sse;
 
 use app::App;
@@ -63,7 +65,9 @@ async fn main() -> anyhow::Result<()> {
             .collect(),
         link: Link::new(&config.gateway)?,
         routes: RwLock::new(HashMap::new()),
+        library: guides::embedded()?,
     });
+    tracing::info!(guides = app.library.count(), "guides loaded");
     let router = Router::new()
         .route(
             "/mcp",

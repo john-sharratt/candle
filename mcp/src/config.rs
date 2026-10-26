@@ -92,11 +92,11 @@ mod tests {
             c.backends,
             [
                 BackendConfig {
-                    name: "zend".into(),
+                    name: "coding".into(),
                     host: "code.tokera.com".into()
                 },
                 BackendConfig {
-                    name: "npcd".into(),
+                    name: "bot".into(),
                     host: "bot.tokera.com".into()
                 }
             ]

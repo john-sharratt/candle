@@ -79,7 +79,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     }
     let args = &args;
     let Some(records) = ctx.session.shared_substrate() else {
-        return Answer::error("zend is still loading its model; try again shortly");
+        return Answer::error("the model is still loading; try again shortly");
     };
     let owner = ctx.caller.key();
     match path {
@@ -127,7 +127,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
                         offset as usize,
                         limit as usize,
                     ) {
-                        None => Answer::error("zend is still loading its model; try again shortly"),
+                        None => Answer::error("the model is still loading; try again shortly"),
                         Some(Ok(page)) => Answer::ok(
                             serde_json::to_string_pretty(&page).unwrap_or_else(|e| e.to_string()),
                         ),

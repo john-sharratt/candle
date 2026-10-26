@@ -58,7 +58,7 @@ mod timeline_read;
 pub(crate) mod wait;
 
 /// What a tool answers when it needs the model and zend is still loading it.
-pub const LOADING: &str = "zend is still loading its model; try again shortly";
+pub const LOADING: &str = "the model is still loading; try again shortly";
 
 /// What a tool call runs with.
 pub struct Ctx {

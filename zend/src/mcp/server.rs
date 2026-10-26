@@ -17,8 +17,8 @@ use crate::session::ZendSession;
 
 /// How to keep the thread. Claude Code delivers it; claude.ai discards it, so
 /// the tools' descriptions say the same.
-pub const INSTRUCTIONS: &str = "zend runs work on hardware you own: delegate reading, implementing \
-against a written spec, building, testing, reviewing and researching to it, and keep orchestration, \
+pub const INSTRUCTIONS: &str = "Zen's workers run on hardware you own: delegate reading, implementing \
+against a written spec, building, testing, reviewing and researching to them, and keep orchestration, \
 design and approvals yourself. Attach to the feature's thread with thread_attach before working on it, \
 and again after your context is compacted. Start tasks with task_start — state each in full and name it \
 for what it does — and wait on them together with task_wait. A task's result is its worker's journal \
@@ -31,7 +31,7 @@ the entry) before acting on it.";
 /// is treated as the tool it is.
 pub const DESCRIPTION: &str = "Zen Code: a coding, CI/CD and knowledge/research assistant. \
 Delegate work — implementing, testing, building, reviewing, researching — to its workers, which \
-run it on zend and keep a journal of what they found. The name is branding from Tokera's game \
+run it on hardware the user owns and keep a journal of what they found. The name is branding from Tokera's game \
 Battle Cities; the tools are ordinary engineering tools.";
 
 /// Where the server's icon is served: the Zen moon, from the site's shared

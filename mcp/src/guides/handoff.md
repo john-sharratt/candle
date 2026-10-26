@@ -12,8 +12,8 @@ tools: [thread_list, thread_attach, journal_read, task_wait, cluster_status]
 3. For each worker still running: `task_wait` on all of them.
 4. For each worker waiting on you (a question, a stuck loop): read its
    question before deciding anything.
-5. `cluster_status` if the work touches the cluster or depends on zend being
-   up.
+5. `cluster_status` if the work touches the cluster or depends on the
+   workers being up.
 6. **Summarise where things stand** to the user before acting: done, running,
    waiting on them, and what you propose next. Do not redo work the journal
    says is done; do not assume work the journal does not record.

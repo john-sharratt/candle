@@ -20,7 +20,7 @@ here.
 
 1. `cluster_status`: the member's node id and how it stands.
 2. `cluster_command {member: <node>, name, args}` — `args` carries the
-   command's own arguments: `app` (`zend`, `npcd`), `from` for catch-up,
+   command's own arguments: `app` (`zend` for coding, `npcd` for bots), `from` for catch-up,
    `max_members` for set-quorum, and a destructive command's typed target (the
    machine's name) as `args.confirm`.
 3. `cluster_job_status {member, job}` until it is done or failed; quote its
