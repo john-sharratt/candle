@@ -40,6 +40,7 @@ use super::route::refused;
 use super::{Answer, Picture, Tool};
 use crate::api::{now_ms, Authored};
 use crate::guest_routes::{post_image, ImageBody};
+use crate::images::Kept;
 
 pub struct Generate;
 
@@ -135,7 +136,7 @@ pub(super) async fn draw(
         Err(e) => return Answer::error(e),
     };
     let now = now_ms();
-    let link = s.images.put_drawn(&drawn.file, now).map(|id| {
+    let link = s.images.put_kept(&drawn.file, Kept::Drawn, now).map(|id| {
         let path = s.image_links.path(&id, now / 1000);
         format!("{}{path}", origin::of(headers))
     });

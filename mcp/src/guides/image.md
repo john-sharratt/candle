@@ -1,7 +1,7 @@
 ---
 name: image
 description: For any request to draw, paint or generate a picture, image or photo — the user's own image model, used rather than an SVG or widget you draw yourself. How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, refine it with image_edit (add or remove details, change the light or the style), and send the user the file from the link the answer carries.
-tools: [image_generate, image_edit]
+tools: [image_generate, image_edit, image_upload]
 ---
 # Generating an image
 
@@ -109,7 +109,8 @@ do not rewrite it:
 - `no_room` — the engine had no room for the image model. A draw that finds
   the card busy does not fail at once: it waits up to three minutes, holding
   back new work so the turns running finish and free their room, and draws
-  as soon as it fits. That wait is normal and needs nothing from you — it
+  as soon as it fits — on a busy card a 1024 draw often waits a minute or
+  two and then draws. That wait is normal and needs nothing from you — it
   only makes the draw slower. So `no_room` means the card stayed full for
   those three minutes, or a draw sent alongside another lost to it. Send the
   draw again in a few minutes, alone; when the same size keeps being refused,
@@ -134,11 +135,22 @@ Two or three rounds is normal.
 `image_edit` changes a picture by a prompt: it draws again starting from the
 picture instead of from noise, keeping as much of it as `hold` says. Use it
 after a draw to add or remove a detail, change the light or the palette, or
-push the finish, and when the user asks to change a photo of their own.
+push the finish, and when the user asks to change a photo of their own
+(`image_upload` first).
 
 - **The picture:** `image` takes the link (or id) a draw or an earlier edit
-  answered with — nothing to download or send. A picture of the user's own
-  goes as `image_base64`. It keeps its shape unless you give a size.
+  answered with — nothing to download or send. It keeps its shape unless you
+  give a size.
+- **A picture of the user's own** goes to Zen first, once: `image_upload`
+  answers a link and a `curl` command that sends the file from your sandbox
+  (where the user's upload is a file). Its answer names the picture — pass
+  that as `image`, for as many edits as you like within the hour Zen keeps
+  it. Any common format and any reasonable size: Zen turns a phone photo
+  upright and fits it. When your sandbox cannot reach the link, say the
+  picture cannot be sent from here.
+- **"Not available"** means the picture expired or the server holding it
+  failed before sharing it: store it again (upload or draw) and edit the new
+  one. Waiting does not bring it back.
 - **The prompt is the whole picture as it should end up**, not the change
   alone: take the prompt that made it and edit that — add "a brass lantern
   hangs from the shelf", delete the sentence about the cat. The model has no

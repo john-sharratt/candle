@@ -31,9 +31,9 @@
 //! before it is stored, so what this serves back to browsers is images and
 //! nothing else — a stored `.html` served from this origin would run in it.
 
-mod drawn;
+mod kept;
 
-pub use drawn::KEPT as DRAWN_KEPT;
+pub use kept::Kept;
 
 use std::collections::HashMap;
 use std::io;
@@ -163,12 +163,12 @@ impl Images {
     ///
     /// The id is `<64 hex of the content hash>.<ext>` — content-addressed, so
     /// the same portrait uploaded twice is stored once, and idempotent, so a
-    /// retried upload is not a second blob. A picture drawn for a conversation
-    /// that is stored this way — a portrait made of it — is kept from then on
-    /// rather than retired after its day (`drawn`).
+    /// retried upload is not a second blob. A picture drawn or uploaded for a
+    /// while that is stored this way — a portrait made of it — is kept from then
+    /// on rather than retired (`kept`).
     pub fn put(&self, bytes: &[u8]) -> Result<String, ImageError> {
         let id = self.store(bytes)?;
-        self.keep_drawn(&id)?;
+        self.keep_for_good(&id)?;
         Ok(id)
     }
 
@@ -180,6 +180,12 @@ impl Images {
         let ext = sniff(bytes).ok_or(ImageError::NotAnImage)?;
         let sha256 = self.shared.put_blob(bytes.to_vec())?;
         Ok(format!("{}.{ext}", hex(&sha256)))
+    }
+
+    /// Whether `id` has the shape an image id has — a hash and a format this
+    /// serves — whether or not any image holds it.
+    pub fn is_id(id: &str) -> bool {
+        valid_id(id).is_some()
     }
 
     /// Read one back, with the type to serve it as.

@@ -162,7 +162,8 @@ itself.
 | `bot_channel_read {world}` | `GET /v1/world/:wid/channel` | The world's channel, as the caller has heard it |
 | `bot_channel_post {world, text}` | `POST /v1/world/:wid/channel` | Post on the world's channel (the Creator only) |
 | `image_generate {prompt, width?, height?, steps?, seed?, shift?, format?}` | `POST /v1/image/generate` | Draw a picture on the image guest, through the route's compliance gate. Sides are capped at 1024. The JPEG (or PNG with `format: png`) comes back as an MCP `image` content block after the text block, and the text carries a signed link to the stored file |
-| `image_edit {image \| image_base64, prompt, hold?, width?, height?, steps?, seed?, shift?, format?}` | `POST /v1/image/generate` with `reference` | Redraw a picture by a prompt, starting from it: `image` names one this server stored (a link or id from a draw), read from the image store so no picture crosses the conversation; `image_base64` is the user's own. `hold` (default 0.5, at most 0.95) is how much survives. The size defaults to the picture's shape within 1024. Answered like `image_generate`, with its own link |
+| `image_edit {image, prompt, hold?, width?, height?, steps?, seed?, shift?, format?}` | `POST /v1/image/generate` with `reference` | Redraw a picture by a prompt, starting from it: `image` names one this server stored (a link or id from a draw, an edit or an upload), read from the image store so no picture crosses the conversation. `hold` (default 0.5, at most 0.95) is how much survives. The size defaults to the picture's shape within 1024. Answered like `image_generate`, with its own link. A picture not in the store is answered "not available — store it again" at once |
+| `image_upload {}` | — | A link signed for 10 minutes, `<origin>/v1/image/upload?exp=…&sig=…`, and the `curl` that sends a file to it from the client's sandbox. `PUT` there (open; the signature is checked before the body is read) takes any JPEG, PNG, WebP, GIF, BMP or TIFF up to 32 MB, keeps it upright, within 2048 px and as a JPEG, for an hour, and answers `{image, width, height, kept_s}` |
 
 `image_generate` reads the route's NDJSON stream to its end and answers with
 the last line. A draw runs 10–60 s; the transport's progress notifications
@@ -180,13 +181,22 @@ good for 24 hours (`npcd::image_links`). The model downloads it and sends the
 user the file. `GET /v1/image/:iid`, by id alone, still needs a signed-in
 caller.
 
-A drawn picture is kept as long as its link works. The draw is noted as the
-custom object `image/drawn/<id>` with the moment it was drawn; every member
-looks the notes over hourly, and one past 24 hours has its blob retired —
-unless a character's or personality's portrait names the same image — and
-its note ended (`npcd::images::drawn`). Retiring a blob is a tombstone
-(`docs/replicated_substrate.md` §10.3), so the bytes leave every member's log
-at its next compaction.
+A drawn picture is kept as long as its link works, an uploaded one an hour.
+Each is noted as the custom object `image/drawn/<id>` or `image/uploaded/<id>`
+with the moment it arrived; every member looks the notes over every ten
+minutes, and a picture whose every note has run its time has its blob
+retired — unless a character's or personality's portrait names the same
+image — and its notes ended (`npcd::images::kept`). Retiring a blob is a
+tombstone (`docs/replicated_substrate.md` §10.3), so the bytes leave every
+member's log at its next compaction.
+
+**An edit finds its picture on whichever member serves it.** The picture is
+a substrate blob, replicated to every member, and the gateway sends a write's
+records ahead of its response, so a call it routes afterwards — to any member
+— is served only once they are applied (§6.4 there). Being immutable and named
+by its hash, a picture is present or absent, never stale; absent means it
+expired or the member that stored it failed before its records left, which no
+wait mends, so `image_edit` answers at once and the caller stores it again.
 
 **A call reaches the member holding what it acts on.** Character and world
 routes are dispatched to the member holding that character's or world's lease

@@ -29,12 +29,13 @@
 //! | [`channel_post`] | `bot_channel_post` — speak on a world's channel |
 //! | [`image`] | `image_generate` — draw a picture, answered as an image and a link to the file |
 //! | [`image_edit`] | `image_edit` — change a picture by a prompt, answered the same way |
+//! | [`image_upload`] | `image_upload` — a link the user's own picture is sent to, for `image_edit` |
 //!
 //! [`args`] reads a tool's arguments, [`route`] reads a handler's answer, and
 //! [`view`] words a mission.
 //!
-//! `image_generate` and `image_edit` act on no bot or world, so like
-//! `bot_list` they name no subject and reach any member.
+//! The `image_*` tools act on no bot or world, so like `bot_list` they name no
+//! subject and reach any member.
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -58,6 +59,7 @@ pub mod channel_read;
 pub mod give;
 pub mod image;
 pub mod image_edit;
+pub mod image_upload;
 pub mod list;
 pub mod message_read;
 pub mod message_send;
@@ -81,7 +83,7 @@ picture, image or photo goes to image_generate — the user's own image model, r
 widget you draw yourself; read the `image` guide first. It returns the picture for you to look \
 at, with a link to the file — the user may not see the image, so send them the file from the link. \
 image_edit changes a picture by a prompt — one image_generate drew, by its link, or the user's own \
-— to add or remove a detail or refine it.";
+sent with image_upload — to add or remove a detail or refine it.";
 
 static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     name: "bots".into(),
@@ -167,6 +169,7 @@ pub fn definitions() -> Value {
         channel_post::Post::definition(),
         image::Generate::definition(),
         image_edit::Edit::definition(),
+        image_upload::Upload::definition(),
     ])
 }
 
@@ -184,6 +187,7 @@ pub async fn call(s: &Arc<Authored>, headers: &HeaderMap, name: &str, args: &Val
         channel_post::Post::NAME => channel_post::Post::call(s, headers, args).await,
         image::Generate::NAME => image::Generate::call(s, headers, args).await,
         image_edit::Edit::NAME => image_edit::Edit::call(s, headers, args).await,
+        image_upload::Upload::NAME => image_upload::Upload::call(s, headers, args).await,
         other => Answer::error(format!("there is no tool `{other}`")),
     }
 }
@@ -283,7 +287,8 @@ mod tests {
                 "bot_channel_read",
                 "bot_channel_post",
                 "image_generate",
-                "image_edit"
+                "image_edit",
+                "image_upload"
             ]
         );
     }
@@ -303,7 +308,7 @@ mod tests {
                 continue;
             }
             // Acts on no bot or world: any member draws it.
-            if d["name"] == "image_generate" || d["name"] == "image_edit" {
+            if d["name"].as_str().is_some_and(|n| n.starts_with("image_")) {
                 assert!(MCP_SUBJECTS.into_iter().all(|k| !props.contains_key(k)));
                 continue;
             }
