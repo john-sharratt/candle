@@ -1,7 +1,7 @@
 ---
 name: rollback
 description: How to roll the cluster back to an earlier build — a rollout of that build, planned by the gateway, started only with the user's approval, watched until every member runs it.
-tools: [cluster_command, cluster_job_status, cluster_status, journal_note]
+tools: [cluster_command, cluster_job_status, cluster_status, cluster_audit, journal_note]
 ---
 # Rolling back
 
@@ -11,8 +11,10 @@ Admins only.
 
 ## Do
 
-1. `cluster_status`: the builds each member runs. The user names the build to
-   go back to, or confirm with them which.
+1. `cluster_status`: the builds each member runs; `cluster_audit`: the
+   floors the app has had (`floor <count> (<hash>) by …`), which are the
+   builds there are to go back to. The user names the build, or confirm with
+   them which.
 2. Plan, which changes nothing: `cluster_command {name: "rollout", args: {app,
    build: "<older build>"}}`.
 3. Show the plan and ask.

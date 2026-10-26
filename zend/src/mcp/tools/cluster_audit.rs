@@ -43,11 +43,22 @@ pub fn definition() -> Value {
 }
 
 /// Whether a log entry is an operation — about a member (its node id), or
-/// the group as a whole — rather than a step of replicating one key, whose
-/// subject is the key.
+/// the group as a whole — rather than replication's own bookkeeping: a step
+/// of replicating one key, whose subject is the key, or a member's lease on
+/// a key held or let go (`lease on <key> …`).
 fn is_operation(entry: &Value) -> bool {
     let subject = entry.get("subject").and_then(Value::as_str).unwrap_or("");
-    subject.is_empty() || (subject.len() == 16 && subject.bytes().all(|b| b.is_ascii_hexdigit()))
+    let text = entry.get("text").and_then(Value::as_str).unwrap_or("");
+    let about_member_or_group = subject.is_empty()
+        || (subject.len() == 16 && subject.bytes().all(|b| b.is_ascii_hexdigit()));
+    about_member_or_group && !text.starts_with("lease on ")
+}
+
+/// The UTC time of day `ms` falls at, `HH:MM:SSZ` — what lines an entry up
+/// with the members' logs, which are stamped in UTC.
+fn utc_clock(ms: u64) -> String {
+    let s = (ms / 1000) % 86_400;
+    format!("{:02}:{:02}:{:02}Z", s / 3600, (s / 60) % 60, s % 60)
 }
 
 /// The newest `n` operations in the log, newest first, one line each.
@@ -73,7 +84,13 @@ pub fn render(status: &Value, n: usize, now: u64) -> String {
                 .map(field)
                 .filter(|s| !s.is_empty())
                 .collect();
-            format!("{} — {}: {}", ago(at, now), about.join(" "), field("text"))
+            format!(
+                "{} ({}) — {}: {}",
+                utc_clock(at),
+                ago(at, now),
+                about.join(" "),
+                field("text")
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -124,6 +141,8 @@ mod tests {
              "text": "drain by j@x.com: ok"},
             {"at_ms": now - 90_000, "gateway": "bw", "app": "npcd", "subject": "lease/w1",
              "text": "claimed by a0ac88178cb2b57d at 9"},
+            {"at_ms": now - 95_000, "gateway": "bw", "app": "zend", "subject": "a0ac88178cb2b57d",
+             "text": "lease on ingest/v3:candle held"},
             {"at_ms": now - 7_200_000, "gateway": "bw", "app": "zend", "subject": "",
              "text": "floor 3825 (bc8c1817) by certification"},
             {"at_ms": now - 7_300_000, "gateway": "bw", "app": "zend", "subject": "0000000000000002",
@@ -131,8 +150,8 @@ mod tests {
         ]});
         assert_eq!(
             render(&status, 2, now),
-            "60 s ago — bw zend a0ac88178cb2b57d: drain by j@x.com: ok\n\
-             2.0 h ago — bw zend: floor 3825 (bc8c1817) by certification"
+            "07:59:00Z (60 s ago) — bw zend a0ac88178cb2b57d: drain by j@x.com: ok\n\
+             06:00:00Z (2.0 h ago) — bw zend: floor 3825 (bc8c1817) by certification"
         );
         assert_eq!(
             render(&json!({"log": []}), 50, now),

@@ -5,6 +5,13 @@ tools: [service_trial, service_status, cluster_status, cluster_logs, repo_job_st
 ---
 # A/B trial
 
+An A/B trial needs at least two members of the app, so one can keep serving
+the old build: `cluster_status` first. With one member there is no baseline
+to compare against while the trial runs — say so to the user, and measure
+before and after instead. The comparison window also closes once
+certification raises the floor, which can be minutes after the candidate is
+ready.
+
 ## Do
 
 1. **Decide what to compare** before starting: error rate, latency of a
@@ -21,7 +28,7 @@ tools: [service_trial, service_status, cluster_status, cluster_logs, repo_job_st
 
 ## Notes
 
-- Traffic splits by the gateway's routing, not evenly: say how much each
-  build actually served when comparing.
+- Traffic splits by the gateway's routing, not evenly, and no tool counts
+  requests per build: say so when comparing, rather than claiming a share.
 - A trial machine that rolled itself back has answered the question: the
   build did not serve.

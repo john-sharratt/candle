@@ -1,7 +1,7 @@
 ---
 name: overnight
 description: How to run work unattended while the user is away — decide against the design documents, note every decision, never commit or deploy without prior approval, and leave a report for the morning.
-tools: [thread_attach, journal_note, journal_read, repo_task_start, repo_task_wait, repo_task_reply, repo_job_start, repo_job_log, cluster_status]
+tools: [thread_attach, journal_note, journal_read, repo_task_start, repo_task_wait, repo_task_reply, repo_job_start, repo_job_log, cluster_status, cluster_audit]
 ---
 # Overnight work
 
@@ -22,12 +22,21 @@ The user is away: nobody will answer a question until they are back.
 
 ## Run
 
-1. Attach to the thread; read its journal and the user's instructions.
-2. List the tasks; delegate them (`delegate`), waiting on all together
+1. Attach to the thread; read its journal and the user's instructions. Name
+   the thread (`T:<thread>`) in every journal call, never `"self"`.
+2. `cluster_audit`: how often zend restarted lately. A restart loses every
+   running worker, so where restarts are frequent, have workers push as each
+   piece works, and expect to start some again (`wait`, the lost state).
+3. List the tasks; delegate them (`delegate`), waiting on all together
    (`wait`); verify each result (`verify`) — nobody else will before morning.
-3. Test on agents (`test`); review what was built (`review`).
+4. Test on agents (`test`); review what was built (`review`).
 
 ## The morning report
+
+Leave it where the user will find it: a note on the thread starting
+`MORNING REPORT:` (`journal_note`, up to 2,000 characters — cite worker
+entries, `T:<thread>/<name>#<n>`, rather than copying them), and say it in
+your last answer too.
 
 - Headline: what is green, what is not.
 - Done: each task, what changed, how it was verified.

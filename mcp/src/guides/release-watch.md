@@ -11,7 +11,10 @@ across runs, and the difference from last time.
 ## Thread
 
 One thread per subject, kept across surveys (`model-releases`), so each run
-starts from the last one's findings.
+starts from the last one's findings. Between surveys it archives itself after
+a day idle; `thread_attach` reopens it, journal and all — but the last
+survey's worker can no longer be continued, so the next survey is a new task
+that starts from the notes.
 
 ## Delegate
 
@@ -44,4 +47,8 @@ CONFLICTS / UNVERIFIED / SOURCES / COULD NOT DO: as in research
 ## After
 
 Verify (`verify`), then note on the thread what this survey settled, so the
-next one starts from it.
+next one starts from it: the items and their status in a line each, citing
+the worker's entry (`T:<thread>/<name>#<n>`) for the detail — a note holds
+2,000 characters, not a release table. Give the next survey's prompt this
+note in CONTEXT, with the research prompt in full: a worker reads its prompt
+and the thread's notes, not the guides.

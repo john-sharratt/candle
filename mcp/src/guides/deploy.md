@@ -15,7 +15,11 @@ minutes; otherwise it puts the previous binary back. Admins only.
 - The commit is on origin/main. keep refuses anything else: a local or branch
   build would serve real cluster traffic, and everything it writes replicates
   permanently. A branch is tested (`test`), never deployed.
-- `cluster_status`: note the machine's member, build and `started` time.
+- `cluster_status`: note the machine's member, build and `started` time, and
+  its agent's node id. No agent listed for the machine: say so and stop.
+- **If the machine runs an app's only member**, the trial takes that app out
+  of service while it runs, and every worker running on it is lost. Say so to
+  the user and wait for their go before starting.
 - **If the change alters something the gateway must understand** (the
   cluster's wire format, its route table), the gateway goes first: trial `web`
   on the gateway's machine before any `motherd`. An older gateway that cannot
@@ -28,15 +32,17 @@ minutes; otherwise it puts the previous binary back. Admins only.
    program: "cargo", args: ["build", "--release", "-p", "motherd"],
    stage: "target/release/motherd.exe", timeout_s: 3600}`
    (`web` the same way: `-p web`, `target/release/web.exe`).
-2. **Wait for it**: `repo_job_log {node, job}` until it has ended; its first
-   line says where it was staged. A failure: report the build error
+2. **Wait for it**: `repo_job_log {node, job}` until it has ended; its
+   answer says where it was staged — use that path, never a guessed one: it
+   differs from machine to machine. A failure: report the build error
    (`grep: "error"`) and stop.
 3. **Trial**: `service_trial {host, service: "motherd", artifact: <staged
    path>}`.
 4. **Watch**: `service_status {host}` every few minutes until the trial has
    ended: proven or rolled back.
 5. **Confirm**: `cluster_status` — the member started after the trial, ready,
-   on the new build.
+   on the new build. A gateway (`web`) has no member line: confirm it with
+   `service_status`, whose trial line says proven.
 
 ## Report
 
@@ -44,5 +50,6 @@ Proven or rolled back, `service_status`'s line, the member's build and
 `started` time. A rollback leaves the previous binary running — nothing is
 down; read why with `logs` from the trial's start.
 
-A trial of a commit on main is safe to run. Rolling the build out to other
-members is `release`, and the user's decision.
+Where other members serve the app meanwhile, a trial of a commit on main is
+safe to run. Rolling the build out to other members is `release`, and the
+user's decision.

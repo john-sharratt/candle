@@ -25,20 +25,27 @@ GOAL: upgrade <dependency> from <old> to <new> in <repository>, on branch
 
 CONTEXT: <the breaking changes found; the call sites found>
 
+CONSTRAINTS:
+- Push the branch; never push to the default branch, never force-push.
+- Build to check it compiles; do not run the test suites yourself — they run
+  on a build agent afterwards.
+
 METHOD:
 1. Bump the version; build; fix each break at its call site.
-2. Run the tests of every crate that uses it.
+2. Commit and push as each crate builds.
 3. Read the new version's behaviour where tests do not cover it.
 
 FINAL RESPONSE:
 VERDICT: upgraded | blocked
+BRANCH: <name> at <commit>
 CHANGES: each break and how it was fixed, file:line
-TESTS: result lines quoted
 RISKS: behaviour that changed and is not covered by a test
+UNVERIFIED: what you could not confirm
 COULD NOT DO: anything not done, and why
 ```
 
 ## 4. Test on an agent
 
-`test` guide. A toolchain upgrade is the whole repository's decision — ask
-the user before landing it.
+`test` guide, on the branch, for every crate that uses the dependency.
+Landing any upgrade is the user's decision — a toolchain upgrade most of all,
+since it touches the whole repository.
