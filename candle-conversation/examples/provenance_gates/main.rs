@@ -25,6 +25,8 @@
 //!   more and more of every file's other questions.
 //! - **Question cut** (`question-cut`): the anomalous-signal exclusion over a
 //!   gallery that holds calibration questions.
+//! - **Competitions** (`competitions`): calibration questions scored in a
+//!   competition of their own, combined with the content's.
 //!
 //! The sweep, gate 4, the questions gate, the normalization probe and the
 //! chunk factor scan on a running daemon's gallery
@@ -53,6 +55,8 @@
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> question-cut --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> competitions --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> scan-loop [passes] --daemon <url> --node <hex>
 
 mod anomaly;
@@ -60,6 +64,7 @@ mod attribution;
 mod background;
 mod boilerplate;
 mod chunk_factor;
+mod competitions;
 mod corpus;
 mod density;
 mod judge;
@@ -242,6 +247,9 @@ fn main() -> anyhow::Result<()> {
         "question-cut" => {
             question_cut::run(&files, daemon()?)?;
         }
+        "competitions" => {
+            competitions::run(&files, daemon()?)?;
+        }
         "scan-loop" => {
             let passes = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(5);
             scan_loop::run(&files, passes, daemon()?)?;
@@ -249,7 +257,7 @@ fn main() -> anyhow::Result<()> {
         other => {
             anyhow::bail!(
                 "unknown command `{other}`: files, retrieval, sweep, paper, questions, \
-                 normalization, chunk-factor, density, question-cut or scan-loop"
+                 normalization, chunk-factor, density, question-cut, competitions or scan-loop"
             )
         }
     }
