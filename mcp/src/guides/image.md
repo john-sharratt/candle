@@ -1,6 +1,6 @@
 ---
 name: image
-description: How to get a good picture from image_generate — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, and change the prompt rather than the seed.
+description: How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, and send the user the file from the link the answer carries.
 tools: [image_generate]
 ---
 # Generating an image
@@ -86,8 +86,10 @@ clothing. A prompt that leaves an age unclear may be declined.
 
 ## Look, then refine
 
-The answer is a line of text — size and seed — and the picture itself, which
-you can see. Look at it against the request before showing it:
+The answer is a line of text — size, seed, and a link to the file — and the
+picture itself. The picture is for you: many clients show the user nothing
+from a tool's result, so they have not seen it yet. Look at it against the
+request before showing it:
 
 - Something missing or wrong — name it more prominently and more concretely,
   earlier in the prompt.
@@ -120,8 +122,25 @@ After three tries over about ten minutes, tell the user it is down and give
 them the prompt to draw later; `cluster_status` says whether the bots'
 service is up at all.
 
-Two or three rounds is normal. Show the user the result and the prompt that
-made it, so the next request can start from it.
+Two or three rounds is normal.
+
+## Give it to the user
+
+The link opens the file for 7 days without signing in — the permission is
+in the link, so pass it on whole and do not trim its `?exp=…&sig=…`.
+
+1. When you can send the user a file (a tool that sends or attaches one),
+   download the link into your workspace and send that file. It is the JPEG
+   (or PNG) itself, so they see the picture you saw.
+2. When you can make a page or document, you can put the picture in it by
+   this link.
+3. Otherwise give them the link itself; it opens in their browser.
+
+With it, give the prompt and seed that made it, so the next request can
+start from them. Say the link stops working after 7 days. An answer that says
+"There is no link to the file" means the picture could not be stored: say so,
+and offer to draw it again. A fresh link that answers `image_not_found` was
+read before the file reached every server: fetch it again in a minute.
 
 ## Example
 
