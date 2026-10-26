@@ -43,10 +43,16 @@ const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 /// Distil one worker's conversation to text, by its `conv_id`.
 pub type Distil<'a> = &'a dyn Fn(&str) -> Result<(), String>;
 
-/// Whether `w` still holds its whole conversation: waiting on Claude, or
-/// finished and kept to be continued.
+/// Whether `w` — as [`Worker::observed`] reads it — was lost: its member
+/// stopped running it, so its record still says it runs and nothing ended it.
+pub fn lost(w: &Worker) -> bool {
+    w.state == State::Error && w.ended_ms.is_none()
+}
+
+/// Whether `w` still holds its whole conversation: waiting on Claude,
+/// finished and kept to be continued, or lost with nothing to end it.
 pub fn unarchived(w: &Worker) -> bool {
-    (w.state.live() && !w.state.working()) || w.resumable
+    (w.state.live() && !w.state.working()) || w.resumable || lost(w)
 }
 
 /// When `w` last did anything.
@@ -85,6 +91,8 @@ fn archived(mut w: Worker, why: &str) -> Worker {
         ));
         w.state = State::Error;
         w.ended_ms = Some(last_active(&w));
+    } else if lost(&w) {
+        w.ended_ms = Some(last_active(&w));
     }
     w.resumable = false;
     w
@@ -104,18 +112,19 @@ pub fn being_archived(conv_id: &str) -> bool {
     archiving().contains(conv_id)
 }
 
-/// Distil each claimed worker — as its record read when claimed — outside
-/// the lock, since distilling takes the engine's; then, under the lock, keep
-/// the archived record of each that distilled, when nothing has changed its
-/// record since, and release every claim. Nothing is written for one that
-/// failed, so no record says archived of a conversation that was not. The
-/// paths that failed, each with why.
+/// Distil each claimed worker — as its record read, observed at `now`, when
+/// claimed — outside the lock, since distilling takes the engine's; then,
+/// under the lock, keep the archived record of each that distilled, when
+/// nothing has changed its record since, and release every claim. Nothing is
+/// written for one that failed, so no record says archived of a conversation
+/// that was not. A task that was lost has its end entered on its thread —
+/// nothing else ever would. The paths that failed, each with why.
 fn distil_claimed(
     records: &dyn Records,
     distil: Distil,
     owner: &str,
     claimed: Vec<Worker>,
-    why: &str,
+    (why, now): (&str, u64),
 ) -> Vec<String> {
     let outcomes: Vec<(Worker, Result<(), String>)> = claimed
         .into_iter()
@@ -132,8 +141,9 @@ fn distil_claimed(
             failed.push(format!("{} ({e})", before.path()));
             continue;
         }
-        let now = threads::worker(records, owner, &before.thread, &before.name);
-        if now.as_ref() != Some(&before) {
+        let current =
+            threads::worker(records, owner, &before.thread, &before.name).map(|w| w.observed(now));
+        if current.as_ref() != Some(&before) {
             tracing::warn!(worker = %before.path(), "mcp: a worker changed while it was archived; its record is left as it is");
             continue;
         }
@@ -142,6 +152,21 @@ fn distil_claimed(
                 "{} (its record could not be kept: {e})",
                 before.path()
             ));
+            continue;
+        }
+        if lost(&before) && !before.is_part() {
+            let note = Note {
+                at_ms: now,
+                label: "Task ended:".into(),
+                text: format!(
+                    "{} — lost: the member running it restarted, and its turn with it",
+                    before.path()
+                ),
+                worker: Some(before.path()),
+            };
+            if let Err(e) = threads::add_note(records, owner, &before.thread, &note) {
+                tracing::warn!(worker = %before.path(), "mcp: a lost task's end could not be entered: {e}");
+            }
         }
     }
     failed
@@ -254,7 +279,7 @@ pub fn archive_thread(
         };
         (line, claimed)
     };
-    let failed = distil_claimed(records, distil, owner, claimed, "with its thread");
+    let failed = distil_claimed(records, distil, owner, claimed, ("with its thread", now));
     Ok(match line {
         Some(line) => Archived::Done { line, failed },
         None => Archived::Already { failed },
@@ -266,6 +291,9 @@ pub fn archive_thread(
 /// running on it. How many workers and threads it archived.
 pub fn sweep(records: &dyn Records, distil: Distil, now: u64) -> (usize, usize) {
     let idle = |at: u64| now.saturating_sub(at) > IDLE_MS;
+    // A lost worker is archived at once: nothing can continue it, and until
+    // then its record says it runs.
+    let due = |w: &Worker| unarchived(w) && (lost(w) || idle(last_active(w)));
     let (mut workers_archived, mut threads_archived) = (0, 0);
     for (owner, t) in threads::every_thread(records) {
         let workers: Vec<Worker> = threads::workers(records, &owner, &t.name)
@@ -273,10 +301,7 @@ pub fn sweep(records: &dyn Records, distil: Distil, now: u64) -> (usize, usize) 
             .map(|w| w.observed(now))
             .collect();
         let mut stuck = false;
-        for w in workers
-            .iter()
-            .filter(|w| unarchived(w) && idle(last_active(w)))
-        {
+        for w in workers.iter().filter(|w| due(w)) {
             // Read again and claimed under the lock a reply takes, so a
             // worker Claude continued a moment ago is never archived under
             // its turn, and one Claude tries to continue now is refused.
@@ -284,15 +309,21 @@ pub fn sweep(records: &dyn Records, distil: Distil, now: u64) -> (usize, usize) 
                 let _held = workers::holding();
                 let Some(w) = threads::worker(records, &owner, &t.name, &w.name)
                     .map(|w| w.observed(now))
-                    .filter(|w| unarchived(w) && idle(last_active(w)))
+                    .filter(|w| due(w))
                     .filter(claim)
                 else {
                     continue;
                 };
                 w
             };
-            match distil_claimed(records, distil, &owner, vec![claimed], "after a day idle")
-                .as_slice()
+            match distil_claimed(
+                records,
+                distil,
+                &owner,
+                vec![claimed],
+                ("after a day idle", now),
+            )
+            .as_slice()
             {
                 [] => workers_archived += 1,
                 failed => {
@@ -568,12 +599,37 @@ mod tests {
         continued.state = State::Running;
         threads::put_worker(&records, "o", &continued).unwrap();
         let ok = |_: &str| -> Result<(), String> { Ok(()) };
-        assert!(distil_claimed(&records, &ok, "o", vec![done.clone()], "x").is_empty());
+        assert!(distil_claimed(&records, &ok, "o", vec![done.clone()], ("x", 0)).is_empty());
         assert!(!being_archived(&done.conv_id));
         assert_eq!(
             threads::worker(&records, "o", "review", "done").unwrap(),
             continued
         );
+    }
+
+    /// **A lost worker is archived at the next sweep, and its end entered**:
+    /// its record said it ran, nothing could continue it, and nothing else
+    /// would ever say it ended.
+    #[test]
+    fn a_lost_worker_is_archived_at_once_with_its_end_on_the_thread() {
+        let records = MemRecords::default();
+        let mut gone = worker("gone", State::Running, 0);
+        gone.beat_ms = 10;
+        thread(&records, std::slice::from_ref(&gone));
+        let distil = |_: &str| -> Result<(), String> { Ok(()) };
+        let now = 10 + threads::BEAT_LOST_MS + 1;
+        assert_eq!(sweep(&records, &distil, now), (1, 0));
+        let after = threads::worker(&records, "o", "review", "gone").unwrap();
+        assert_eq!(
+            (after.state, after.ended_ms, after.resumable),
+            (State::Error, Some(10), false)
+        );
+        let notes = threads::notes(&records, "o", "review");
+        assert_eq!(
+            notes.last().unwrap().text,
+            "T:review/gone — lost: the member running it restarted, and its turn with it"
+        );
+        assert_eq!(sweep(&records, &distil, now + 1), (0, 0), "once only");
     }
 
     /// **The sweep's idle test is made again under the lock**: a thread

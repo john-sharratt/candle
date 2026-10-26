@@ -53,7 +53,9 @@ thread): a worker it shows under the name is yours — wait on that path.
 
 ## Waits are cut off
 
-claude.ai cuts a call off at about 200 s; Claude Code can wait an hour. A wait
-cut short says so: call `repo_task_wait` again. When no call is open — a new
+A call holds at most about four minutes — less on claude.ai — whatever
+`wait_s` asks; a wait cut short says so: call `repo_task_wait` again. Keep
+`wait_s` under 200 when starting or replying, so the answer arrives before
+any client gives up on the call. When no call is open — a new
 conversation, after compaction — `thread_list` shows what is running and what
 waits on you.
