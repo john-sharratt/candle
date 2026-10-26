@@ -1,5 +1,5 @@
-//! `image_edit {image | image_base64, prompt, hold?, width?, height?, steps?,
-//! seed?, shift?, format?}`: change a picture by a prompt — the same draw as
+//! `image_edit {image, prompt, hold?, width?, height?, steps?, seed?, shift?,
+//! format?}`: change a picture by a prompt — the same draw as
 //! `image_generate` (`POST /v1/image/generate`), started from the picture.
 //!
 //! The picture is the draw's **reference**: the walk starts from it rather than
@@ -8,10 +8,20 @@
 //! is a new picture with its own link — which is itself something to edit, so
 //! a picture is refined a step at a time.
 //!
-//! **A picture this server drew is named, not sent.** `image` takes the link
-//! or id a draw answered with and reads the bytes from the image store, so a
-//! refinement costs the conversation one line instead of the picture's base64.
-//! `image_base64` is for a picture of the user's own.
+//! **A picture is named, never sent.** `image` takes the link or id a draw, an
+//! edit or an upload (`image_upload`) answered with, and the bytes are read
+//! from the image store — so a refinement costs the conversation one line, and
+//! a picture uploaded once is edited as often as wanted.
+//!
+//! **Every member holds every image, so whichever serves the edit has it.** An
+//! image is a blob in the substrate, which replicates, and the gateway orders
+//! a write's records ahead of its response: a call it routes afterwards, to
+//! any member, is served only once that member has applied them
+//! (`docs/replicated_substrate.md` §6.4). An image is immutable and named by
+//! its hash, so it is never stale — only present or not. Not present means it
+//! expired, or the member that stored it failed before its records left; it
+//! will not arrive by waiting, so the edit says so at once and the caller
+//! stores it again.
 
 use std::sync::Arc;
 
@@ -21,10 +31,12 @@ use base64::Engine as _;
 use candle_conversation::guest::MAX_REFERENCE_HOLD;
 use serde_json::{json, Value};
 
+use super::args::string;
 use super::image::{body, draw, format, MAX_SIDE, STEPS};
 use super::{Answer, Tool};
 use crate::api::Authored;
 use crate::guest_routes::ImageBody;
+use crate::images::{ImageError, Images};
 use crate::refimage;
 
 pub struct Edit;
@@ -45,9 +57,9 @@ impl Tool for Edit {
         json!({
             "name": Self::NAME,
             "description": "Edit a picture by a prompt — add or remove a detail, change the light, \
-                the colours or the style, refine a draw — on the user's own image model. Pass the \
-                link or id image_generate (or an earlier image_edit) answered with as `image`, or a \
-                picture of the user's own as `image_base64`. The prompt describes the whole picture \
+                the colours or the style, refine a draw — on the user's own image model. `image` \
+                is the link or id image_generate, an earlier image_edit, or image_upload (for a \
+                picture of the user's own) answered with. The prompt describes the whole picture \
                 as it should end up, not only the change; `hold` is how much of the original \
                 survives. Answers like image_generate: the new picture for you to look at, and a \
                 link to its file for 24 hours, which can be edited again. Read the guide `image` \
@@ -55,8 +67,7 @@ impl Tool for Edit {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "image": {"type": "string", "description": "The picture to edit: the link or image id an image_generate or image_edit answer gave."},
-                    "image_base64": {"type": "string", "description": "Or a picture of the user's own, base64: JPEG, PNG, WebP, GIF, BMP or TIFF, any size up to 32 MB and 64 megapixels — Zen turns it the way its camera recorded and fits it."},
+                    "image": {"type": "string", "description": "The picture to edit: the link or image id an image_generate, image_edit or image_upload answer gave."},
                     "prompt": {"type": "string", "description": "The whole picture as it should end up, with the change in it."},
                     "hold": {"type": "number", "minimum": 0.0, "maximum": MAX_REFERENCE_HOLD, "default": HOLD, "description": "How much of the original survives: about 0.3 for a large change, 0.5 to add or remove a detail, 0.7 for a light touch."},
                     "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "description": "Width in pixels, a multiple of 16; the original's shape when absent."},
@@ -66,7 +77,7 @@ impl Tool for Edit {
                     "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "The schedule's shift; the deployment's own when absent."},
                     "format": {"type": "string", "enum": ["jpeg", "png"], "default": "jpeg", "description": "How the picture comes back."}
                 },
-                "required": ["prompt"],
+                "required": ["image", "prompt"],
                 "additionalProperties": false
             }
         })
@@ -84,32 +95,29 @@ impl Tool for Edit {
     }
 }
 
-/// The bytes of the picture to edit: the stored image `image` names, or the
-/// user's own in `image_base64` — exactly one.
+/// The bytes of the picture `image` names.
 fn source(s: &Authored, args: &Value) -> Result<Vec<u8>, String> {
-    let named = args.get("image").and_then(Value::as_str).map(str::trim);
-    let sent = args
-        .get("image_base64")
-        .and_then(Value::as_str)
-        .map(str::trim);
-    match (named, sent) {
-        (Some(link), None) if !link.is_empty() => {
-            let id = image_id(link);
-            s.images.get(id).map(|(bytes, _)| bytes).map_err(|e| {
-                format!(
-                    "`{id}`: {e} — a drawn picture is kept for 24 hours; draw it again, or send \
-                     the file as `image_base64`"
-                )
-            })
-        }
-        (None, Some(b64)) if !b64.is_empty() => BASE64
-            .decode(b64.as_bytes())
-            .map_err(|e| format!("`image_base64` is not base64: {e}")),
-        _ => Err(
-            "name the picture to edit: `image` (a link or id) or `image_base64`, one of them"
-                .into(),
-        ),
+    let id = image_id(string(args, "image")?);
+    if !Images::is_id(id) {
+        return Err(format!(
+            "`{id}` is not an image id — pass the link or id a draw, edit or upload answered with"
+        ));
     }
+    match s.images.get(id) {
+        Ok((bytes, _)) => Ok(bytes),
+        Err(ImageError::NotFound) => Err(unavailable(id)),
+        Err(e) => Err(format!("`{id}` could not be read: {e}")),
+    }
+}
+
+/// What an edit says when its picture is not here: it is not anywhere it can
+/// be reached, and waiting will not bring it, so the picture is stored again.
+fn unavailable(id: &str) -> String {
+    format!(
+        "image `{id}` is not available: it expired (a draw or edit is kept 24 hours, an upload \
+         one hour) or the server holding it failed before it was shared. Store it again — \
+         image_upload for the user's picture, or draw it again — then edit the new one"
+    )
 }
 
 /// The image id in a link this server gave — `…/v1/image/link/<id>?exp=…&sig=…`

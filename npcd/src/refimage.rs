@@ -31,6 +31,7 @@
 use std::io::Cursor;
 
 use candle_conversation::guest::ImageReference;
+use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, Rgb, RgbImage};
@@ -104,6 +105,47 @@ pub fn decode(bytes: &[u8]) -> Result<RgbImage, String> {
         .map_err(|e| format!("the picture could not be decoded: {e}"))?;
     img.apply_orientation(orientation);
     Ok(over_white(img))
+}
+
+/// The longest side an uploaded picture is kept at: twice the largest draw,
+/// so an edit at any size starts from more than it needs and nothing larger
+/// is carried around the cluster.
+pub const UPLOAD_SIDE: u32 = 2048;
+
+/// The JPEG quality an uploaded picture is kept at: past where re-encoding
+/// shows, since it is the start of every edit made from it.
+const UPLOAD_QUALITY: u8 = 92;
+
+/// An uploaded picture as Zen keeps it: whatever it came as, decoded
+/// ([`decode`] — turned, transparency over white), brought within
+/// [`UPLOAD_SIDE`], and encoded as a JPEG. One format and a bounded size for
+/// everything downstream, and a 50-megapixel camera original kept as a
+/// fraction of a megabyte. Answers the JPEG and its width and height.
+pub fn normalised(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    if bytes.is_empty() {
+        return Err("the picture is empty".into());
+    }
+    if bytes.len() > MAX_BYTES {
+        return Err(format!(
+            "the picture is {} bytes and the limit is {MAX_BYTES}",
+            bytes.len()
+        ));
+    }
+    let mut img = decode(bytes)?;
+    let (w, h) = img.dimensions();
+    if w.max(h) > UPLOAD_SIDE {
+        let scale = UPLOAD_SIDE as f64 / w.max(h) as f64;
+        let (nw, nh) = (
+            ((w as f64 * scale).round() as u32).max(1),
+            ((h as f64 * scale).round() as u32).max(1),
+        );
+        img = image::imageops::resize(&img, nw, nh, FILTER);
+    }
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpeg, UPLOAD_QUALITY)
+        .encode_image(&img)
+        .map_err(|e| format!("the picture could not be encoded: {e}"))?;
+    Ok((jpeg, img.width(), img.height()))
 }
 
 /// The picture's width and height as [`decode`] will turn it, read from its
@@ -361,6 +403,33 @@ mod tests {
         let upright = jpeg_with_orientation(8, 4, 1);
         assert_eq!(dimensions(&upright), Ok((8, 4)));
         assert_eq!(decode(&upright).unwrap().dimensions(), (8, 4));
+    }
+
+    /// **An upload is kept as an upright JPEG within the side limit**: a
+    /// sideways phone photo comes out turned, a large one scaled to fit, a
+    /// small one left its size, and a PNG with transparency becomes a JPEG.
+    #[test]
+    fn an_upload_is_kept_as_an_upright_jpeg_within_the_limit() {
+        let (jpeg, w, h) = normalised(&jpeg_with_orientation(8, 4, 6)).unwrap();
+        assert_eq!((w, h), (4, 8));
+        assert_eq!(&jpeg[..3], &[0xFF, 0xD8, 0xFF]);
+        assert_eq!(dimensions(&jpeg), Ok((4, 8)));
+
+        let big = encoded(
+            DynamicImage::ImageRgb8(RgbImage::new(UPLOAD_SIDE * 2, 100)),
+            ImageFormat::Png,
+        );
+        assert_eq!(normalised(&big).unwrap().1, UPLOAD_SIDE);
+        assert_eq!(normalised(&big).unwrap().2, 50);
+
+        let clear = encoded(
+            DynamicImage::ImageRgba8(image::RgbaImage::new(5, 3)),
+            ImageFormat::Png,
+        );
+        let (jpeg, w, h) = normalised(&clear).unwrap();
+        assert_eq!((w, h, &jpeg[..2]), (5, 3, &[0xFF, 0xD8][..]));
+        assert!(normalised(&[]).is_err());
+        assert!(normalised(b"not a picture").is_err());
     }
 
     /// **The three refusals a caller can act on, each named.** A byte limit, a

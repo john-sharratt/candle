@@ -9,6 +9,11 @@
 //! until it expires — when the drawn picture it opens is retired too
 //! (`crate::images`). Changing the id or the expiry breaks the signature.
 //!
+//! An **upload link** is the same permission the other way: it signs the word
+//! `upload` and an expiry, and `PUT /v1/image/upload?exp=…&sig=…` takes
+//! pictures with it for ten minutes — how a client's sandbox hands Zen a file
+//! the conversation cannot carry.
+//!
 //! The key is derived from the cluster's group key
 //! (`host::cluster::Join::derive_key`). A daemon with no cluster is its own
 //! only member and mints one at start, so its links stop working when it
@@ -23,14 +28,22 @@ use rand::rngs::OsRng;
 use rand::TryRngCore;
 use sha2::Sha256;
 
-use crate::images::DRAWN_KEPT;
+use crate::images::Kept;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// How long a link works: as long as a drawn picture is kept
-/// ([`DRAWN_KEPT`]), a day — long enough to be fetched, passed on and opened
+/// ([`Kept::Drawn`]), a day — long enough to be fetched, passed on and opened
 /// by the person it was passed to.
-pub const LIFETIME: Duration = DRAWN_KEPT;
+pub const LIFETIME: Duration = Kept::Drawn.lifetime();
+
+/// How long an upload link takes a picture: long enough for a client to
+/// fetch the file it was handed and send it, short enough that a link left in
+/// a transcript is no standing way in.
+pub const UPLOAD_OPEN: Duration = Duration::from_secs(10 * 60);
+
+/// The word an upload link signs beside its expiry ([`upload_message`]).
+const UPLOAD: &str = "upload";
 
 /// What a link's key is derived for, from the group key.
 pub const PURPOSE: &str = "npcd image links";
@@ -80,27 +93,60 @@ impl ImageLinks {
         format!("/v1/image/link/{id}?exp={exp}&sig={}", hex(&sig))
     }
 
-    /// Whether `sig` opens image `id` until `exp`, at `now_s`. The signature is
-    /// checked first and in constant time, so a forged link learns nothing
-    /// from which refusal it gets.
+    /// Whether `sig` opens image `id` until `exp`, at `now_s` ([`verify`]).
     pub fn check(&self, id: &str, exp: u64, sig: &str, now_s: u64) -> Result<(), Refused> {
-        let sig: [u8; 32] = parse_hex(sig).ok_or(Refused::Invalid)?;
-        self.mac(id, exp)
-            .verify_slice(&sig)
-            .map_err(|_| Refused::Invalid)?;
-        if now_s >= exp {
-            return Err(Refused::Expired);
-        }
-        Ok(())
+        verify(self.mac(id, exp), exp, sig, now_s)
+    }
+
+    /// The path, from the origin, that takes uploads (`PUT
+    /// /v1/image/upload`) for [`UPLOAD_OPEN`] from `now_s`.
+    pub fn upload_path(&self, now_s: u64) -> String {
+        let exp = now_s + UPLOAD_OPEN.as_secs();
+        let sig: [u8; 32] = self
+            .signed(&upload_message(exp))
+            .finalize()
+            .into_bytes()
+            .into();
+        format!("/v1/image/upload?exp={exp}&sig={}", hex(&sig))
+    }
+
+    /// Whether `sig` opens the upload until `exp`, at `now_s` — as
+    /// [`Self::check`] for an image.
+    pub fn check_upload(&self, exp: u64, sig: &str, now_s: u64) -> Result<(), Refused> {
+        verify(self.signed(&upload_message(exp)), exp, sig, now_s)
     }
 
     /// The MAC over `id` and `exp`, a newline between them: neither holds one,
     /// so no other pair signs the same bytes.
     fn mac(&self, id: &str, exp: u64) -> HmacSha256 {
+        self.signed(&format!("{id}\n{exp}"))
+    }
+
+    /// The MAC over `message`.
+    fn signed(&self, message: &str) -> HmacSha256 {
         let mut m = HmacSha256::new_from_slice(&self.key).expect("HMAC takes a key of any length");
-        m.update(format!("{id}\n{exp}").as_bytes());
+        m.update(message.as_bytes());
         m
     }
+}
+
+/// What an upload link signs: its expiry, a newline, and [`UPLOAD`]. An
+/// image's link signs `<id>\n<exp>`, whose second line is a number, so no
+/// image link and no upload link sign the same bytes, whatever the id.
+fn upload_message(exp: u64) -> String {
+    format!("{exp}\n{UPLOAD}")
+}
+
+/// Whether `sig` is `mac`'s, and `exp` not yet reached at `now_s`: the
+/// signature first and in constant time, so a forged link learns nothing from
+/// which refusal it gets.
+fn verify(mac: HmacSha256, exp: u64, sig: &str, now_s: u64) -> Result<(), Refused> {
+    let sig: [u8; 32] = parse_hex(sig).ok_or(Refused::Invalid)?;
+    mac.verify_slice(&sig).map_err(|_| Refused::Invalid)?;
+    if now_s >= exp {
+        return Err(Refused::Expired);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -157,6 +203,27 @@ mod tests {
             links.check(ID, exp, &flipped, exp + 1),
             Err(Refused::Invalid)
         );
+    }
+
+    /// **An upload link takes uploads for ten minutes and opens no image**;
+    /// an image's link takes no upload.
+    #[test]
+    fn an_upload_link_is_its_own_permission() {
+        let links = ImageLinks::new([7; 32]);
+        let path = links.upload_path(NOW);
+        assert!(
+            path.starts_with("/v1/image/upload?exp=1800000600&sig="),
+            "{path}"
+        );
+        let (exp, sig) = parts(&path);
+        assert_eq!(links.check_upload(exp, &sig, NOW), Ok(()));
+        assert_eq!(links.check_upload(exp, &sig, exp), Err(Refused::Expired));
+        assert_eq!(links.check(ID, exp, &sig, NOW), Err(Refused::Invalid));
+        let (exp, sig) = parts(&links.path(ID, NOW));
+        assert_eq!(links.check_upload(exp, &sig, NOW), Err(Refused::Invalid));
+        // Nor does an upload's signature open the "image" called `upload`.
+        let (exp, sig) = parts(&links.upload_path(NOW));
+        assert_eq!(links.check("upload", exp, &sig, NOW), Err(Refused::Invalid));
     }
 
     #[test]

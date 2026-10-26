@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, RwLock as SyncRwLock};
 
+use axum::body::{to_bytes, Body};
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -35,6 +36,7 @@ use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
+use tokio::task::spawn_blocking;
 use web::auth::session::Identity;
 
 use candle_conversation::persistence::record::NpcPayload;
@@ -49,7 +51,7 @@ use crate::engine::runtime::Runtime;
 use crate::guest_routes;
 use crate::identity::require;
 use crate::image_links::{ImageLinks, Refused};
-use crate::images::{ImageError, Images};
+use crate::images::{ImageError, Images, Kept};
 use crate::lifegen::job::Jobs;
 use crate::lifegen::narrate as lifegen_narrate;
 use crate::lifegen::routes as lifegen;
@@ -64,6 +66,7 @@ use crate::personality_portrait;
 use crate::portrait;
 use crate::projection::BUNDLED;
 use crate::prose;
+use crate::refimage;
 use crate::registry::authored::{PERSONALITIES, WORLDS};
 use crate::registry::{self, PutError, Record, Registry};
 use crate::sim::shelf::{Published, Shelf};
@@ -716,6 +719,16 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Role::Unauthenticated,
             Dispatch::Best,
             get(get_linked_image),
+        )
+        // A picture handed in to be edited, through an upload link
+        // (`image_upload`): open for the same reason, the link being the
+        // permission and the handler refusing anything else before it reads a
+        // byte of the body.
+        .route(
+            "/v1/image/upload",
+            Role::Unauthenticated,
+            Dispatch::Best,
+            put(put_upload).body_limit(UPLOAD_BODY),
         )
         // An account and its profile are the caller's own, so `User` and then
         // the record is keyed by their subject — there is no id in these paths
@@ -1744,6 +1757,92 @@ async fn get_linked_image(
             "link_invalid",
             "this is not a link to this image",
         ),
+    }
+}
+
+/// The most of an upload's body read: the largest picture a reference takes.
+const UPLOAD_BODY: usize = refimage::MAX_BYTES;
+
+/// `PUT /v1/image/upload?exp=…&sig=…` — a picture handed in to be edited,
+/// through a link `image_upload` signed ([`crate::image_links`]).
+///
+/// The link is checked **before a byte of the body is read**, so the open
+/// route takes nothing from anyone without one. The picture is kept as Zen
+/// keeps every upload ([`refimage::normalised`]: any reasonable format, turned
+/// upright, within 2048 px, a JPEG) for an hour ([`Kept::Uploaded`]), as a
+/// substrate blob that replicates to every member. Answers its id, which
+/// `image_edit` takes.
+async fn put_upload(
+    State(s): State<Arc<Authored>>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Body,
+) -> Response {
+    let exp = q.get("exp").and_then(|e| e.parse::<u64>().ok());
+    let sig = q.get("sig").map(String::as_str);
+    let checked = match (exp, sig) {
+        (Some(exp), Some(sig)) => s.image_links.check_upload(exp, sig, now_ms() / 1000),
+        _ => Err(Refused::Invalid),
+    };
+    match checked {
+        Ok(()) => {}
+        Err(Refused::Expired) => {
+            return err(
+                StatusCode::FORBIDDEN,
+                "link_expired",
+                "this upload link has expired; ask for another with image_upload",
+            )
+        }
+        Err(Refused::Invalid) => {
+            return err(
+                StatusCode::FORBIDDEN,
+                "link_invalid",
+                "this is not an upload link",
+            )
+        }
+    }
+    let bytes = match to_bytes(body, UPLOAD_BODY).await {
+        Ok(b) => b,
+        Err(_) => {
+            return err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                &format!("a picture is at most {UPLOAD_BODY} bytes"),
+            )
+        }
+    };
+    /// Why an upload was not kept: the picture, or the store.
+    enum NotKept {
+        Picture(String),
+        Store(ImageError),
+    }
+    // Decoding a camera original is a second of work: off the async workers.
+    let kept = spawn_blocking(move || {
+        let (jpeg, width, height) = refimage::normalised(&bytes).map_err(NotKept::Picture)?;
+        let id = s
+            .images
+            .put_kept(&jpeg, Kept::Uploaded, now_ms())
+            .map_err(NotKept::Store)?;
+        Ok((id, width, height))
+    })
+    .await;
+    match kept {
+        Ok(Ok((id, width, height))) => Json(json!({
+            "image": id,
+            "width": width,
+            "height": height,
+            "kept_s": Kept::Uploaded.lifetime().as_secs(),
+        }))
+        .into_response(),
+        Ok(Err(NotKept::Picture(why))) => err(StatusCode::BAD_REQUEST, "bad_upload", &why),
+        Ok(Err(NotKept::Store(e))) => image_err(e),
+        Err(e) => {
+            tracing::error!(error = %e, "an upload's decode panicked");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed",
+                "the picture could not be taken in",
+            )
+        }
     }
 }
 
@@ -3576,6 +3675,62 @@ mod tests {
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
     }
 
+    /// **A picture sent through an upload link is kept and named**, with
+    /// nobody signed in; without a link, with one altered or expired, it is
+    /// refused before it is read, and what is not a picture is named as such.
+    #[tokio::test]
+    async fn an_upload_through_its_link_is_kept_and_named() {
+        let st = state(tmp("upload-route"));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(40, 20))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let png = buf.into_inner();
+        let put = |path: &str, body: Vec<u8>| {
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // Through its link, with nobody signed in: kept as a JPEG and named.
+        let link = st.image_links.upload_path(now_ms() / 1000);
+        let (s, v) = call(router(st.clone()), put(&link, png.clone())).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let id = v["image"].as_str().unwrap().to_string();
+        assert!(id.ends_with(".jpg"), "{id}");
+        assert_eq!(
+            (v["width"].as_u64(), v["height"].as_u64()),
+            (Some(40), Some(20))
+        );
+        assert_eq!(v["kept_s"], 3600);
+        let (bytes, mime) = st.images.get(&id).unwrap();
+        assert_eq!((&bytes[..2], mime), (&[0xFF, 0xD8][..], "image/jpeg"));
+
+        // Without one, with one altered, and with one trimmed: refused.
+        let last = if link.ends_with('0') { '1' } else { '0' };
+        let forged = format!("{}{last}", &link[..link.len() - 1]);
+        for refused in [forged.as_str(), "/v1/image/upload"] {
+            let (s, v) = call(router(st.clone()), put(refused, png.clone())).await;
+            assert_eq!(
+                (s, v["error"].as_str()),
+                (StatusCode::FORBIDDEN, Some("link_invalid")),
+                "{refused}"
+            );
+        }
+        let expired = st.image_links.upload_path(0);
+        let (s, v) = call(router(st.clone()), put(&expired, png.clone())).await;
+        assert_eq!(v["error"], "link_expired", "{s}");
+
+        // Not a picture: named as the upload's fault.
+        let (s, v) = call(router(st), put(&link, b"not a picture".to_vec())).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("bad_upload"))
+        );
+    }
+
     /// **A cutout is a guest job, so it needs an engine.** It used to be a
     /// flood fill on the host and answered without one; it is a network now,
     /// and on a daemon with no engine the honest answer is the same 503 every
@@ -3779,6 +3934,9 @@ mod tests {
                 // over the id and an expiry is the permission, and the handler
                 // refuses anything else.
                 ("/v1/image/link/:iid", "unauthenticated"),
+                // A picture handed in through an upload link: the signature is
+                // the permission, checked before the body is read.
+                ("/v1/image/upload", "unauthenticated"),
                 // The caller's own account. `/v1/me` itself is the host's. The
                 // read and the write are registered apart for their dispatch.
                 ("/v1/me/profile", "user"),
