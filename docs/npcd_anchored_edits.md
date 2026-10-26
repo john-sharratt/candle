@@ -195,7 +195,28 @@ composed whole, as today.
 Prefill is the cheap side (hundreds of tok/s on the same machine), so the read
 cost is negligible beside the decode it saves.
 
-## 9. Tests
+## 9. Migration
+
+There is no backward compatibility, by the repository's standing rule: the
+anchored form **replaces** the line-numbered one, with no dual path and no flag
+to keep the old one alive.
+
+1. **`file_read` and `file_edit` change in place.** Line numbers and `old_str`
+   anchors are removed from the reads and the act; every caller, prompt and
+   example in the tool catalogue is moved to anchors in the same change.
+2. **zend's `code_reading` layer is wiped and re-ingested.** Its turns were read
+   with line numbers and cite them, so they describe a read format that no
+   longer exists. It is tombstoned whole on the first boot of the new build —
+   `--wipe-layer code_reading` (`DaemonConfig::wiped_layers`), on every member,
+   once — and the background ingest rebuilds it from the repositories with
+   anchored reads. Every other layer is untouched.
+3. **npcd needs no migration of its own.** Anchors are computed from the text
+   at read time and nothing about them is persisted (§5), so documents, drafts
+   in operation stores and the record carry over unchanged. A mission open
+   across the upgrade reads its document again before it edits, which the
+   staleness rule (§6) requires anyway.
+
+## 10. Tests
 
 Unit tests beside the code, asserting raw values:
 
