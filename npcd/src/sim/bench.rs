@@ -380,6 +380,21 @@ impl Benches {
         shelf: &dyn Shelf,
     ) -> Result<String, String> {
         let key = self.doc(raw)?;
+        // **An edit changes what is there; what is not is written.** Told only
+        // that the document was missing and what its folder held, a Maker on a
+        // step that writes a new one edited it again and again, anchoring each
+        // insert to a paragraph of a different document.
+        let held = self
+            .open
+            .get(body)
+            .is_some_and(|w| w.files.contains_key(&key));
+        if !held && shelf.read(&key).is_none() {
+            return Err(format!(
+                "{} An edit changes a document that is there. One not written yet is \
+                 written whole with `compose`, at a writing desk, and committed.",
+                self.missing(&key, shelf)
+            ));
+        }
         let current = self.read(body, raw, shelf)?;
         let done = apply(&Doc::new(&key, &current), edit).map_err(|e| format!("In {key}, {e}."))?;
         self.write(body, about, raw, &done.doc.text(), shelf)?;

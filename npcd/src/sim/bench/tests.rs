@@ -274,6 +274,27 @@ fn removing_something_that_is_not_there_is_refused() {
     );
 }
 
+/// An edit of a document not written yet says how one is written: an edit
+/// changes what is there.
+#[test]
+fn editing_a_document_not_written_yet_says_how_one_is_written() {
+    let (mut b, _, s) = rooted("edit-absent");
+    let err = b
+        .edit(
+            "m1",
+            "x",
+            "layers/eras/never.md",
+            &change("0tiT".into(), "x", "y"),
+            &s,
+        )
+        .unwrap_err();
+    assert!(
+        err.starts_with("There is no document at layers/eras/never.md."),
+        "{err}"
+    );
+    assert!(err.contains("written whole with `compose`"), "{err}");
+}
+
 // ── anchored edits ──────────────────────────────────────────────────────
 
 /// The anchor of paragraph `i` of a document as `body` has it.
