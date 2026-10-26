@@ -203,8 +203,9 @@ pub struct ModelBuilder {
     ///
     /// `None` sizes it to the card at engine start, by its VRAM and its measured
     /// host→device link (`crate::prefill_width`). A workload that reliably
-    /// has more than a turn or two waiting — a bulk ingest — may want it at the
-    /// model ceiling instead; see [`ModelBuilder::prefill_pass_tokens`].
+    /// has more than a turn or two waiting — a bulk ingest — may ask for more;
+    /// see [`ModelBuilder::prefill_pass_tokens`]. An ask is clamped to the card's
+    /// width either way.
     prefill_pass_tokens: Option<usize>,
     /// LoRA adapters to load alongside the base weights — `(name, directory)`.
     ///
@@ -325,8 +326,10 @@ impl ModelBuilder {
     /// The default is deliberately conservative because interactive serving
     /// rarely has more than a turn queued, and a forward that runs starved
     /// wastes the same fixed cost on fewer tokens. Raise it only where the
-    /// workload reliably keeps a wide forward fed. Bounded above by the model's
-    /// own per-forward ceiling, which the scheduler clamps to.
+    /// workload reliably keeps a wide forward fed. Bounded above by the card's
+    /// width (`crate::prefill_width`), past which each window's tier is bought
+    /// from the expert zone, and by the model's own per-forward ceiling, which
+    /// the scheduler clamps to.
     pub fn prefill_pass_tokens(mut self, tokens: usize) -> Self {
         self.prefill_pass_tokens = Some(tokens);
         self
@@ -944,26 +947,33 @@ impl ModelBuilder {
             },
             _ => 0.0,
         };
-        ret.scheduler.large_prefill_max_tokens = match self.prefill_pass_tokens {
-            Some(n) => n,
-            None => {
-                let total_vram = match device {
-                    Device::Cuda(d) => d
-                        .mem_get_info()
-                        .map(|(_free, total)| total as u64)
-                        .unwrap_or(0),
-                    _ => 0,
-                };
-                let n = prefill_pass_tokens(total_vram, link);
-                tracing::info!(
-                    total_vram_gib = total_vram / (1 << 30),
-                    link_gbps = link / 1e9,
-                    prefill_pass_tokens = n,
-                    "prefill forward sized to the card and its link"
-                );
-                n
-            }
+        // **The card's width is a ceiling, and an ask is clamped to it.** Tenants
+        // ask for what their workload wants — npcd the model's ceiling, so a slab
+        // carries several documents — and the merge takes the largest ask
+        // (`CoreRequests::merge`). What the card can carry is a different
+        // question: past it each window's tier is bought from the expert zone,
+        // and decode pays for it after the window. On BlackWorld npcd's 8,192
+        // overrode the card's 3,072 and every window conceded ~8 GB of experts.
+        let total_vram = match device {
+            Device::Cuda(d) => d
+                .mem_get_info()
+                .map(|(_free, total)| total as u64)
+                .unwrap_or(0),
+            _ => 0,
         };
+        let card = prefill_pass_tokens(total_vram, link);
+        let n = self
+            .prefill_pass_tokens
+            .map_or(card, |asked| asked.min(card));
+        tracing::info!(
+            total_vram_gib = total_vram / (1 << 30),
+            link_gbps = link / 1e9,
+            card_prefill_pass_tokens = card,
+            asked_prefill_pass_tokens = ?self.prefill_pass_tokens,
+            prefill_pass_tokens = n,
+            "prefill forward sized to the card and its link"
+        );
+        ret.scheduler.large_prefill_max_tokens = n;
         ret.batched_config.compression_level = Some(self.kv_compression_level);
         // Stress test: uniform-K pin REMOVED — both K and V now use fully
         // adaptive per-(head,palette) selection with non-identity pal_maps,
