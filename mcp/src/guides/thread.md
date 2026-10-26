@@ -29,13 +29,13 @@ is compacted, and what every worker on it starts with in its prompt.
 - **A standing rule of a repository** (a convention, something the user says
   always holds) goes on the project journal, `P:<repository>`, which every task
   in every thread starts with.
-- Pass the thread to every `task_start`.
+- Pass the thread to every `repo_task_start`.
 
 ## After your context is compacted
 
 Re-attach (`thread_attach` with the same name), then
 `journal_read {journal: "self"}`, and carry on from the notes — not from what
-you think you remember. Running workers are still running: `task_wait` on
+you think you remember. Running workers are still running: `repo_task_wait` on
 them.
 
 ## When the work is done

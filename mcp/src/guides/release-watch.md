@@ -1,7 +1,7 @@
 ---
 name: release-watch
 description: How to run a periodic survey — model releases, a dependency's changes, a vendor's announcements — over a date window, every date checked, vendor claims kept apart, what moved since last time.
-tools: [task_start, task_wait, task_reply, journal_read, journal_grep, timeline_read]
+tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_read, journal_grep, timeline_read]
 ---
 # Watching for releases
 

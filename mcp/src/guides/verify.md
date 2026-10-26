@@ -1,7 +1,7 @@
 ---
 name: verify
 description: How to check a finished worker's answer before relying on it — reading its citation audit, continuing the same worker to fix what it skipped, and spot-checking against its turns.
-tools: [task_wait, task_reply, journal_read, journal_grep, timeline_read]
+tools: [repo_task_wait, repo_task_reply, journal_read, journal_grep, timeline_read]
 ---
 # Verifying a worker's answer
 
@@ -36,8 +36,8 @@ a finding: ask for its sources.
 
 ## 2. Continue the same worker
 
-A finished worker can be continued with `task_reply {worker, answer}` until
-its thread is archived or it sits a day untouched — what `task_wait` answers
+A finished worker can be continued with `repo_task_reply {worker, answer}` until
+its thread is archived or it sits a day untouched — what `repo_task_wait` answers
 for it says so. It keeps its whole context, so it fixes its own work faster
 than a new worker can redo it:
 

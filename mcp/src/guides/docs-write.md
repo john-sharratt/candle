@@ -1,13 +1,13 @@
 ---
 name: docs-write
 description: How to have a worker write a design document or README from the code — every statement about the code cited, what is planned marked as planned.
-tools: [task_start, task_wait, journal_grep]
+tools: [repo_task_start, repo_task_wait, journal_grep]
 ---
 # Writing documentation from code
 
 ## Prompt
 
-`task_start {thread, name: "docs-<subject>", effort: "deep", prompt}`:
+`repo_task_start {thread, name: "docs-<subject>", effort: "deep", prompt}`:
 
 ```
 GOAL: write <the document> for <subject> in <repository>, at <path>, on

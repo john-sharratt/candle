@@ -1,7 +1,7 @@
 ---
 name: security-review
 description: How to have a worker review a change for security — threat-model first, every finding an exploit path from attacker-controlled input to a sink.
-tools: [task_start, task_wait, journal_grep, timeline_read]
+tools: [repo_task_start, repo_task_wait, journal_grep, timeline_read]
 ---
 # Security review
 
@@ -10,7 +10,7 @@ secrets, the network, file paths, sandboxing or anything that runs commands.
 
 ## Prompt
 
-`task_start {thread, name: "security-<area>", effort: "exhaustive", prompt}`:
+`repo_task_start {thread, name: "security-<area>", effort: "exhaustive", prompt}`:
 
 ```
 GOAL: review <change> of <repository> for security defects.

@@ -1,7 +1,7 @@
 ---
 name: test-write
 description: How to have a worker write tests — one behaviour each, exact expected values, run before they are called done.
-tools: [task_start, task_wait, agent_job, agent_job_log]
+tools: [repo_task_start, repo_task_wait, repo_job_start, repo_job_log]
 ---
 # Writing tests
 
@@ -9,7 +9,7 @@ tools: [task_start, task_wait, agent_job, agent_job_log]
 
 ## Prompt
 
-`task_start {thread, name: "tests-<what>", effort: "deep", prompt}`:
+`repo_task_start {thread, name: "tests-<what>", effort: "deep", prompt}`:
 
 ```
 GOAL: write tests for <module | behaviour> in <repository>, on branch

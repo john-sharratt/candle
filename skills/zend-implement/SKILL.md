@@ -22,7 +22,7 @@ every worker starts with them.
 
 ## Delegate
 
-`task_start {thread, name: "implement-<what>", prompt}` with this prompt,
+`repo_task_start {thread, name: "implement-<what>", prompt}` with this prompt,
 filled in:
 
 ```
@@ -52,7 +52,7 @@ Use `priority: high` only if the user is waiting on it now.
 
 ## Wait and answer
 
-`task_wait` until it settles. Answer questions with the spec in hand; if a
+`repo_task_wait` until it settles. Answer questions with the spec in hand; if a
 question exposes a gap in the spec, decide it, note the decision on the thread,
 and answer.
 

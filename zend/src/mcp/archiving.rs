@@ -2,7 +2,7 @@
 //! `thread_archive`, and by the sweep once they have sat idle a day.
 //!
 //! A worker that finished its task is kept whole — its conversation and its
-//! KV — so Claude can continue it with `task_reply`, as it can a worker that
+//! KV — so Claude can continue it with `repo_task_reply`, as it can a worker that
 //! asked or is stuck. Archiving distils the conversation to text
 //! (`ZendSession::archive_worker`), which is one way: an archived worker's
 //! evidence stays readable, and the worker is never continued.

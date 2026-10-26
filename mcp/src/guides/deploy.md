@@ -1,7 +1,7 @@
 ---
 name: deploy
 description: How to put a commit on origin/main onto one machine — build and stage it on that machine's agent, trial it through keep, watch it to proven or rolled back, confirm it serves.
-tools: [agent_job, agent_job_log, service_trial, service_status, cluster_status, cluster_logs]
+tools: [repo_job_start, repo_job_log, service_trial, service_status, cluster_status, cluster_logs]
 ---
 # Deploying to one machine
 
@@ -24,11 +24,11 @@ minutes; otherwise it puts the previous binary back. Admins only.
 ## Do
 
 1. **Build and stage** on that machine's agent:
-   `agent_job {node: <that machine's agent>, repo, branch: "main",
+   `repo_job_start {node: <that machine's agent>, repo, branch: "main",
    program: "cargo", args: ["build", "--release", "-p", "motherd"],
    stage: "target/release/motherd.exe", timeout_s: 3600}`
    (`web` the same way: `-p web`, `target/release/web.exe`).
-2. **Wait for it**: `agent_job_log {node, job}` until it has ended; its first
+2. **Wait for it**: `repo_job_log {node, job}` until it has ended; its first
    line says where it was staged. A failure: report the build error
    (`grep: "error"`) and stop.
 3. **Trial**: `service_trial {host, service: "motherd", artifact: <staged

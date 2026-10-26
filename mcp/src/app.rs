@@ -288,7 +288,10 @@ mod tests {
         let (tools, routes) = merge(vec![
             (
                 0,
-                vec![json!({"name": "task_start"}), json!({"name": "shared"})],
+                vec![
+                    json!({"name": "repo_task_start"}),
+                    json!({"name": "shared"}),
+                ],
             ),
             (
                 1,
@@ -300,7 +303,7 @@ mod tests {
             ),
         ]);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["task_start", "shared", "bot_list"]);
+        assert_eq!(names, ["repo_task_start", "shared", "bot_list"]);
         assert_eq!(routes["shared"], 0);
         assert_eq!(routes["bot_list"], 1);
         assert_eq!(routes.len(), 3);
@@ -311,16 +314,19 @@ mod tests {
     #[test]
     fn a_backend_that_did_not_answer_keeps_its_routes() {
         let old = HashMap::from([
-            ("task_start".to_string(), 0),
+            ("repo_task_start".to_string(), 0),
             ("bot_list".to_string(), 1),
             ("task_gone".to_string(), 0),
         ]);
-        let learned = HashMap::from([("task_start".to_string(), 0), ("task_new".to_string(), 0)]);
+        let learned = HashMap::from([
+            ("repo_task_start".to_string(), 0),
+            ("task_new".to_string(), 0),
+        ]);
         let routes = relearn(&old, learned, &[1]);
         assert_eq!(
             routes,
             HashMap::from([
-                ("task_start".to_string(), 0),
+                ("repo_task_start".to_string(), 0),
                 ("task_new".to_string(), 0),
                 ("bot_list".to_string(), 1),
             ])

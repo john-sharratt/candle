@@ -1,7 +1,7 @@
-//! `agent_job {node?, repo, branch, program, args, timeout_s?}`: run a program
+//! `repo_job_start {node?, repo, branch, program, args, timeout_s?}`: run a program
 //! on an agent (`docs/claude_zend_gateway.md` §8.3) — a build, a test run —
 //! against a branch as the agent fetches it. It answers once the job has
-//! started; `agent_job_log` reads it. Admins only.
+//! started; `repo_job_log` reads it. Admins only.
 //!
 //! The job goes over this member's own agent stream, placed as the gateway
 //! places any job — sticky on the caller, spilling to an idle agent, low
@@ -15,7 +15,7 @@ use zend_vfs::Snapshot;
 use super::{string, Answer, Ctx};
 use crate::mcp::ops;
 
-pub const NAME: &str = "agent_job";
+pub const NAME: &str = "repo_job_start";
 
 /// The longest a job may run when the call names no `timeout_s`, and the most.
 const DEFAULT_TIMEOUT_S: u64 = 1_800;
@@ -27,7 +27,7 @@ pub fn definition() -> Value {
         "description": "Run a build or a test run on a build agent — a cluster machine that checks out a \
             repository and runs programs on it, never one serving traffic — against a branch as it stands on \
             origin. Give a program and its arguments, never a shell line; the agent runs only programs on \
-            its allow-list. Answers the job id and the agent it runs on; follow it with `agent_job_log`. A \
+            its allow-list. Answers the job id and the agent it runs on; follow it with `repo_job_log`. A \
             job lives in its agent's process: one lost to a restart is reported lost, and is run again. Name \
             `node` to pin an agent; otherwise the gateway picks one. With `stage`, the file the job builds is \
             staged for `service_trial` once the job succeeds. Admins only.",
@@ -40,7 +40,7 @@ pub fn definition() -> Value {
                 "program": {"type": "string", "description": "The program, e.g. `cargo`."},
                 "args": {"type": "array", "items": {"type": "string"}, "description": "Its arguments."},
                 "timeout_s": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_S, "description": "The longest it may run (1800 by default)."},
-                "stage": {"type": "string", "description": "A file the job builds, relative to the checkout — `target/release/motherd.exe` — staged for `service_trial` on that machine once the job exits 0; `agent_job_log` answers where."}
+                "stage": {"type": "string", "description": "A file the job builds, relative to the checkout — `target/release/motherd.exe` — staged for `service_trial` on that machine once the job exits 0; `repo_job_log` answers where."}
             },
             "required": ["repo", "branch", "program", "args"],
             "additionalProperties": false
@@ -76,7 +76,7 @@ pub fn job_of(args: &Value) -> Result<RunJob, String> {
     })
 }
 
-/// An agent's node as `agent_job_log` takes it.
+/// An agent's node as `repo_job_log` takes it.
 pub fn place(node: u64) -> String {
     format!("{node:016x}")
 }
@@ -108,7 +108,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     match agents.node_of(at) {
         Ok(node) => Answer::ok(format!(
-            "Started `{command}` as job {} on agent {}: {:?}. Read it with `agent_job_log {{node: \
+            "Started `{command}` as job {} on agent {}: {:?}. Read it with `repo_job_log {{node: \
              \"{}\", job: \"{}\"}}`.",
             view.id,
             place(node),

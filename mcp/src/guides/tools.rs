@@ -77,7 +77,7 @@ mod tests {
         Library::new(vec![Guide {
             name: "research".into(),
             description: "A question answered from the web.".into(),
-            tools: vec!["task_start".into()],
+            tools: vec!["repo_task_start".into()],
             body: "# Research\n\nGather.".into(),
         }])
         .unwrap()

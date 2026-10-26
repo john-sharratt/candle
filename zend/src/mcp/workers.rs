@@ -5,19 +5,19 @@
 //! conversation, submitted as `POST /v1/chat/completions` submits one, so it is
 //! projected with provenance, the working set and the journal like any
 //! dialogue. It runs in a task of its own, never inside a tool call: the call
-//! that started it answers within `wait_s`, and `task_wait` reads how it stands.
+//! that started it answers within `wait_s`, and `repo_task_wait` reads how it stands.
 //!
 //! When a turn ends, the task asks for a journal draft at once instead of
 //! waiting for the cadence, waits for it, and takes the entries written since
 //! the turn began. Then the worker settles:
 //!
 //! - **asking** — its final response ended with the question block of
-//!   [`ASKING`] — it waits, live, for `task_reply`;
+//!   [`ASKING`] — it waits, live, for `repo_task_reply`;
 //! - **stuck** — the repeat guard or the round cap closed its tools — it waits
 //!   the same way;
 //! - **done** — its answer's citations are audited (`super::audit`); an
 //!   answer citing what it never opened is sent back once to open it. Then it
-//!   is kept whole, to be continued with `task_reply`, until its thread is
+//!   is kept whole, to be continued with `repo_task_reply`, until its thread is
 //!   archived or it sits a day idle (`super::archiving`);
 //! - **failed** — it is archived, its evidence kept.
 //!
@@ -374,7 +374,7 @@ pub fn answer(
         State::Done if worker.resumable => "Claude continued:",
         State::Running => {
             return Err(format!(
-                "`{}` is still working: nudge it with `task_nudge`, or wait",
+                "`{}` is still working: nudge it with `repo_task_nudge`, or wait",
                 worker.path()
             ))
         }
@@ -439,7 +439,7 @@ pub fn nudge(
             "`{}` is not working, so it would never read a nudge; {}",
             worker.path(),
             if worker.state.live() {
-                "it waits on an answer — use `task_reply`"
+                "it waits on an answer — use `repo_task_reply`"
             } else {
                 "it has finished — start a new task"
             }
@@ -479,7 +479,7 @@ pub fn stop(
             "`{}` is not running, so there is nothing to stop; {}",
             worker.path(),
             if worker.state.live() {
-                "it waits on an answer — redirect it with `task_reply`"
+                "it waits on an answer — redirect it with `repo_task_reply`"
             } else {
                 "it has finished"
             }
@@ -560,7 +560,7 @@ enum Ended {
 }
 
 impl Ended {
-    /// Whether Claude stopped the turn (`task_stop`).
+    /// Whether Claude stopped the turn (`repo_task_stop`).
     fn stopped(&self) -> bool {
         matches!(self, Ended::Closed { by, .. } if *by == CLOSED_BY_CLAUDE)
     }
@@ -667,7 +667,7 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
     worker.activity = Some(live.snapshot());
     if !worker.state.live() {
         worker.ended_ms = Some(now_ms());
-        // A finished task is kept whole, to be continued with `task_reply`,
+        // A finished task is kept whole, to be continued with `repo_task_reply`,
         // until its thread is archived or it sits a day idle
         // (`super::archiving`); a part and a failed task are archived now.
         worker.resumable = worker.state == State::Done && !worker.is_part();
@@ -827,7 +827,7 @@ fn keep_first_answer(worker: &mut Worker, answer: String, audit: &Audit) -> Stri
     };
     worker.audit = Some(format!(
         "{}\nIt was sent back to open these, and the check round {round}; the answer above is \
-         the one it gave before. Continue it with `task_reply` to finish the check.",
+         the one it gave before. Continue it with `repo_task_reply` to finish the check.",
         audit.render()
     ));
     worker.final_text = answer;
@@ -1225,7 +1225,7 @@ mod tests {
                  in the run.\nSeen only in tool results — a search hit, a link, an error — never \
                  opened: https://b.com\nIt was sent back to open these, and the check round failed: the \
                  engine went away; the answer above is the one it gave before. Continue it with \
-                 `task_reply` to finish the check."
+                 `repo_task_reply` to finish the check."
             )
         );
     }
@@ -1401,7 +1401,7 @@ mod tests {
         assert!(!w.stopped);
 
         // **A stopped worker is live, and says Claude stopped it**: stuck,
-        // so `task_reply` redirects it.
+        // so `repo_task_reply` redirects it.
         let mut w = worker();
         let (label, line) = settle(
             &mut w,

@@ -1,7 +1,7 @@
 ---
 name: postmortem
 description: How to write up an incident, a rollback or a bad run — the timeline from the audit and logs, the cause, what would have caught it, and the lasting fix noted.
-tools: [cluster_audit, cluster_logs, journal_read, journal_note, task_start, task_wait]
+tools: [cluster_audit, cluster_logs, journal_read, journal_note, repo_task_start, repo_task_wait]
 ---
 # Postmortem
 

@@ -1,7 +1,7 @@
 ---
 name: research
 description: How to have workers answer a question from the web with every claim checked against the page it came from — gather, verify, check themselves, then you verify them.
-tools: [task_start, task_wait, task_reply, journal_grep, timeline_read]
+tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline_read]
 ---
 # Research
 
@@ -76,7 +76,7 @@ COULD NOT DO: anything asked that you did not do, and why
 1. Read the citation audit at the end of the answer. The worker has already
    been sent back once to open anything it cited unopened, so what is still
    `seen` or `never seen` is unverified — say so, or fix it in step 2.
-2. Continue the same worker with `task_reply` — it keeps everything it read —
+2. Continue the same worker with `repo_task_reply` — it keeps everything it read —
    to open what remains, settle a conflict, or go deeper on one item. It can
    be continued until its thread is archived or it sits a day untouched.
 3. Spot-check the facts you will pass on: the audit proves a page was opened,

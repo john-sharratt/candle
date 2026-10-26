@@ -1,6 +1,6 @@
 ---
 name: zend-deploy
-description: Deploy a commit on origin/main to one machine — build it on that machine's agent, stage the binary, and run it as a keep trial there, which promotes it only if it serves and restores the previous binary otherwise — then confirm it is serving. Uses the zend MCP's agent_job, agent_job_log, service_trial and service_status tools. Use to put a merged build on one member. Admins only.
+description: Deploy a commit on origin/main to one machine — build it on that machine's agent, stage the binary, and run it as a keep trial there, which promotes it only if it serves and restores the previous binary otherwise — then confirm it is serving. Uses the zend MCP's repo_job_start, repo_job_log, service_trial and service_status tools. Use to put a merged build on one member. Admins only.
 ---
 
 # Deploying a build to one machine
@@ -15,11 +15,11 @@ description: Deploy a commit on origin/main to one machine — build it on that 
 ## Do
 
 1. **Build and stage** on that machine's agent:
-   `agent_job {node: <that machine's agent>, repo: "candle", branch: "main",
+   `repo_job_start {node: <that machine's agent>, repo: "candle", branch: "main",
    program: "cargo", args: ["build", "--release", "-p", "motherd"],
    stage: "target/release/motherd.exe", timeout_s: 3600}`. (`web` the same
    way, `-p web`, `target/release/web.exe`.)
-2. **Wait for it**: `agent_job_log {node, job}` until it has ended. Its first line
+2. **Wait for it**: `repo_job_log {node, job}` until it has ended. Its first line
    says `staged at <path>` — the artifact on that machine. If it failed or
    staged nothing, report the build error (`grep: "error"`) and stop.
 3. **Trial**: `service_trial {host, service: "motherd", artifact: <staged path>}`.

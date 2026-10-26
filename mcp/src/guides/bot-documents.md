@@ -1,7 +1,7 @@
 ---
 name: bot-documents
 description: How to have a bot write or edit a document — a brief that names the document, its purpose, sources and shape; the bot's report; and a review of what it wrote before anyone relies on it.
-tools: [bot_mission_give, bot_mission_read, bot_message_send, bot_message_read, task_start, task_wait]
+tools: [bot_mission_give, bot_mission_read, bot_message_send, bot_message_read, repo_task_start, repo_task_wait]
 ---
 # Bots writing documents
 
@@ -33,7 +33,7 @@ or add something it needs; `bot_message_read` for what it said back.
 ## Review before relying on it
 
 What a bot writes is a draft. Read the document, or delegate a review to a
-worker (`task_start` with `effort: "exhaustive"`): does each statement come
+worker (`repo_task_start` with `effort: "exhaustive"`): does each statement come
 from the sources named, is the shape what was asked, is anything invented?
 Fix it with a follow-up mission, or note what is wrong for the user.
 

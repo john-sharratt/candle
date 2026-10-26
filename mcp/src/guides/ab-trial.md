@@ -1,7 +1,7 @@
 ---
 name: ab-trial
 description: How to compare a new build against the running one — trial it on one machine while the others serve the old build, compare what matters, then decide whether to roll out.
-tools: [service_trial, service_status, cluster_status, cluster_logs, agent_job, agent_job_log]
+tools: [service_trial, service_status, cluster_status, cluster_logs, repo_job_start, repo_job_log]
 ---
 # A/B trial
 

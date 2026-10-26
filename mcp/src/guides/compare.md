@@ -1,7 +1,7 @@
 ---
 name: compare
 description: How to have workers compare libraries, services or approaches — fixed criteria for every option, evidence for each cell, a recommendation with its reason.
-tools: [task_start, task_wait, task_reply, journal_grep, timeline_read]
+tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline_read]
 ---
 # Comparing options
 

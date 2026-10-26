@@ -1,4 +1,4 @@
-//! `task_wait {workers, wait_s?}`: wait on one or more workers, answering as
+//! `repo_task_wait {workers, wait_s?}`: wait on one or more workers, answering as
 //! soon as any of them stops running (`docs/claude_zend_gateway.md` §3.3).
 
 use serde_json::{json, Value};
@@ -9,15 +9,15 @@ use crate::mcp::reported::{self, Mark};
 use crate::mcp::threads::{State, Worker};
 use crate::mcp::workers;
 
-pub const NAME: &str = "task_wait";
+pub const NAME: &str = "repo_task_wait";
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
-        "description": "Wait on running workers, by the paths `task_start` answered (`T:<thread>/<name>`). \
+        "description": "Wait on running workers, by the paths `repo_task_start` answered (`T:<thread>/<name>`). \
             Answers as soon as any one stops running — done, failed, asking you a question, or stuck — with a \
             line for each still running. So start every task first and wait on them all, handle the one that \
-            settled (reply to a question or a stuck worker with `task_reply`), then wait again on the rest. A \
+            settled (reply to a question or a stuck worker with `repo_task_reply`), then wait again on the rest. A \
             worker that is done answers with its final response in full. If `wait_s` passes first, each says \
             what it has done so far, with any journal entries it wrote since you last heard: call again, or \
             stop waiting if the entries already answer you. No entry is given twice. The work goes on whether \
@@ -56,19 +56,19 @@ pub fn result_of(w: &Worker, seen: Option<u64>) -> String {
     match w.state {
         State::Running => format!("{} — {}{entries}", w.path(), w.doing(workers::now_ms())),
         State::Question => format!(
-            "{} — asks Claude (reply with `task_reply`; it waits until then):\n{}{entries}",
+            "{} — asks Claude (reply with `repo_task_reply`; it waits until then):\n{}{entries}",
             w.path(),
             w.question.as_deref().unwrap_or("")
         ),
         State::Stuck if w.stopped => format!(
-            "{} — stopped, as you asked; it is live. Redirect it with `task_reply`, or end it \
+            "{} — stopped, as you asked; it is live. Redirect it with `repo_task_reply`, or end it \
              with `thread_archive`. Its closing response:\n{}{entries}",
             w.path(),
             w.final_text
         ),
         State::Stuck => format!(
             "{} — stuck: the repeat guard or the round cap closed its tools. Say how to go on \
-             with `task_reply`. Its closing response:\n{}{entries}",
+             with `repo_task_reply`. Its closing response:\n{}{entries}",
             w.path(),
             w.final_text
         ),
@@ -103,7 +103,7 @@ fn done_close(w: &Worker) -> String {
     }
     if w.resumable {
         out.push_str(
-            "\n\nIt can be continued with `task_reply` — to check a claim, go deeper, or redo a \
+            "\n\nIt can be continued with `repo_task_reply` — to check a claim, go deeper, or redo a \
              part — until its thread is archived or it sits a day untouched.",
         );
     }
@@ -138,7 +138,7 @@ pub fn render(read: &[(String, Option<Worker>)], seen: &dyn Fn(&Worker) -> Optio
 /// and answer with [`render`], carrying the entries it hands over as marks to
 /// keep once it is delivered, so the next answer gives only newer ones. A wait
 /// its client's ceiling cut short says so while anything still runs. What
-/// `task_wait`, `task_start` and `task_reply` answer.
+/// `repo_task_wait`, `repo_task_start` and `repo_task_reply` answer.
 pub async fn answer_for(ctx: &Ctx, wanted: &[(String, String)], wait: Wait) -> Answer {
     let owner = ctx.caller.key();
     let read = match workers::wait(
@@ -251,7 +251,7 @@ mod tests {
         asks.question = Some("QUESTION: Inclusive?".into());
         assert_eq!(
             result_of(&asks, None),
-            "T:review/v — asks Claude (reply with `task_reply`; it waits until then):\n\
+            "T:review/v — asks Claude (reply with `repo_task_reply`; it waits until then):\n\
              QUESTION: Inclusive?"
         );
         let stuck = worker("v", State::Stuck);
@@ -335,7 +335,7 @@ mod tests {
             result_of(&done, None),
             "T:review/v — done. Its answer:\nVerdict: ok\n\n\
              Citation audit: 1 cited — 1 opened, 0 seen only in search results, 0 never seen in the run.\n\n\
-             It can be continued with `task_reply` — to check a claim, go deeper, or redo a part — \
+             It can be continued with `repo_task_reply` — to check a claim, go deeper, or redo a part — \
              until its thread is archived or it sits a day untouched.\n\n\
              Journal entries:\n\nT:review/v#4\nEntry 4 — b"
         );

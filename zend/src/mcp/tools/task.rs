@@ -1,4 +1,4 @@
-//! `task_start {thread, name, prompt, priority?, effort?, wait_s?}`: start a
+//! `repo_task_start {thread, name, prompt, priority?, effort?, wait_s?}`: start a
 //! task on a new worker, and wait for it up to `wait_s`
 //! (`docs/claude_zend_gateway.md` §3.2, §3.3, §3.4).
 
@@ -9,7 +9,7 @@ use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::threads::{Effort, Priority};
 use crate::mcp::workers;
 
-pub const NAME: &str = "task_start";
+pub const NAME: &str = "repo_task_start";
 
 pub fn definition() -> Value {
     json!({
@@ -21,7 +21,7 @@ pub fn definition() -> Value {
             what to do, what to verify before answering, and the shape of the final response (verdict, \
             findings, pointers such as file:line). Name the worker for what it does, as a kebab-case slug \
             (`verify-expiry`), never a number. Answers `done` with the worker's final response and its \
-            journal entries, or `running` with its path and what it has done so far — then call `task_wait` \
+            journal entries, or `running` with its path and what it has done so far — then call `repo_task_wait` \
             on it, or start more tasks first and wait on them all at once.",
         "inputSchema": {
             "type": "object",

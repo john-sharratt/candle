@@ -11,7 +11,7 @@ poll loop.
 ## Do
 
 1. Attach to `watch-<what>` (zend-thread).
-2. `task_start {thread, name: "watch-<what>", prompt}`:
+2. `repo_task_start {thread, name: "watch-<what>", prompt}`:
 
 ```
 Watch <what> until <the end condition>, or for at most <duration>.
@@ -28,7 +28,7 @@ STATE: the last cluster_status, one line per member
 EXCEPTIONS: each, with its time and the evidence (status line or quoted log line)
 ```
 
-3. `task_wait` on it — it answers when the watch ends, either way.
+3. `repo_task_wait` on it — it answers when the watch ends, either way.
 4. Report the end state; for an exception, what it was and the evidence, and
    suggest the next step (cluster-logs, cluster-care, zend-rollback).
 

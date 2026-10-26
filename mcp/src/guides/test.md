@@ -1,7 +1,7 @@
 ---
 name: test
 description: How to build a branch and run its tests on a build agent — never on a member serving traffic — and report pass or fail with the evidence.
-tools: [agent_job, agent_job_log]
+tools: [repo_job_start, repo_job_log]
 ---
 # Testing a branch
 
@@ -13,13 +13,13 @@ traffic. Admins only.
 
 1. **Push first** — a job runs on the branch as origin holds it.
 2. **Start one job per crate the change touches**, together:
-   `agent_job {repo, branch, program: "cargo",
+   `repo_job_start {repo, branch, program: "cargo",
    args: ["test", "-p", "<crate>", "--no-fail-fast"], timeout_s}`.
    The whole workspace takes long; name the crates.
-3. **Read each**: `agent_job_log {node, job}` answers how it stands; while it
+3. **Read each**: `repo_job_log {node, job}` answers how it stands; while it
    runs, read again with `from` set to where the last page ended. Once ended,
    the first line has the exit code (and `timed out` past `timeout_s`).
-4. **On failure**: `agent_job_log {node, job, grep: "FAILED"}`, then read around
+4. **On failure**: `repo_job_log {node, job, grep: "FAILED"}`, then read around
    each — `panicked at`, the assertion values.
 
 ## Report

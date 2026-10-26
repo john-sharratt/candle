@@ -1,7 +1,7 @@
 ---
 name: overnight
 description: How to run work unattended while the user is away — decide against the design documents, note every decision, never commit or deploy without prior approval, and leave a report for the morning.
-tools: [thread_attach, journal_note, journal_read, task_start, task_wait, task_reply, agent_job, agent_job_log, cluster_status]
+tools: [thread_attach, journal_note, journal_read, repo_task_start, repo_task_wait, repo_task_reply, repo_job_start, repo_job_log, cluster_status]
 ---
 # Overnight work
 

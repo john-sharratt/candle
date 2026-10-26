@@ -1,7 +1,7 @@
 ---
 name: literature
 description: How to have workers survey papers on a technique — the papers read, not their abstracts; methods and numbers side by side; where results conflict and why.
-tools: [task_start, task_wait, task_reply, journal_grep, timeline_read]
+tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline_read]
 ---
 # Literature survey
 

@@ -1,7 +1,7 @@
 ---
 name: substrate
 description: How to find out whether a bad answer comes from the stored analysis — switch a layer off and ask again, read what the layer holds, and delete a corrupt conversation only with approval.
-tools: [layer_read, layer_toggle, timeline_read, timeline_delete, task_start, task_wait]
+tools: [layer_read, layer_toggle, timeline_read, timeline_delete, repo_task_start, repo_task_wait]
 ---
 # Stored analysis
 
@@ -14,7 +14,7 @@ Admins only.
 ## Find the source
 
 1. **Switch the suspect layer off** — `layer_toggle {name}` — and ask the same
-   question again (a fresh `task_start`). Held in memory; a restart switches
+   question again (a fresh `repo_task_start`). Held in memory; a restart switches
    it back on. If the answer is now right, the layer is the source.
 2. **Read what the layer holds**: `layer_read {name}` lists its timelines, each
    with its id, label, repository, turns and tokens.

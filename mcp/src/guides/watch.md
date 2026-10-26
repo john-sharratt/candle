@@ -1,7 +1,7 @@
 ---
 name: watch
 description: How to keep an eye on a rollout, a member or the logs for a while — delegated to a worker that reports only exceptions and the end state.
-tools: [task_start, task_wait, cluster_status, cluster_logs]
+tools: [repo_task_start, repo_task_wait, cluster_status, cluster_logs]
 ---
 # Watching
 
@@ -10,7 +10,7 @@ a poll loop.
 
 ## Delegate
 
-On a thread `watch-<what>`, `task_start {thread, name: "watch-<what>",
+On a thread `watch-<what>`, `repo_task_start {thread, name: "watch-<what>",
 effort: "balanced", prompt}`:
 
 ```
@@ -30,7 +30,7 @@ EXCEPTIONS: each, with its time and the evidence (status line or quoted log
 line)
 ```
 
-Then `task_wait` on it: it answers when the watch ends, either way. Report
+Then `repo_task_wait` on it: it answers when the watch ends, either way. Report
 the end state; for an exception, what it was, the evidence, and the next step
 (`logs`, `cluster-care`, `rollback`).
 

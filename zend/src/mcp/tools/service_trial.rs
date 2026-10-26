@@ -23,8 +23,8 @@ pub fn definition() -> Value {
             that runs the machine's services, starts the build in place of the installed one and keeps it \
             once it reports it is serving, within ten minutes; otherwise it puts the previous binary back. \
             Answers at once; read the outcome with `service_status`. Only a build of a commit on origin/main \
-            is tried — test a branch with `agent_job`. `artifact` is the build's path on that machine, as \
-            `agent_job_log` answered it for the job that staged it. Admins only.",
+            is tried — test a branch with `repo_job_start`. `artifact` is the build's path on that machine, as \
+            `repo_job_log` answered it for the job that staged it. Admins only.",
         "inputSchema": {
             "type": "object",
             "properties": {
