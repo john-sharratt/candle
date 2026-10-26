@@ -18,6 +18,20 @@ where
     f(x)
 }
 
+/// Run `f` over `items` in turn, each reading the last one's result. There is
+/// no guest arena without a GPU backend, so the chain is the plain fold.
+pub fn guest_chain<'a, T: 'a, I, F>(x: &Tensor, items: I, mut f: F) -> Result<Tensor>
+where
+    I: IntoIterator<Item = &'a T>,
+    F: FnMut(&Tensor, &'a T) -> Result<Tensor>,
+{
+    let mut h = x.clone();
+    for item in items {
+        h = f(&h, item)?;
+    }
+    Ok(h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::guest_stage;

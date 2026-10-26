@@ -1290,9 +1290,24 @@ fn carry_out(
     ticket: WaveTicket,
     high: usize,
 ) -> Result<candle::Tensor> {
+    let dst = carried(out.dims(), out.dtype(), cuda, inner, ticket, high)?;
+    dst.slice_set(out, 0, 0)?;
+    Ok(dst)
+}
+
+/// An uninitialised tensor carried at the top of `inner`'s span, above `high`,
+/// owned by the generation `ticket` names.
+fn carried(
+    dims: &[usize],
+    dtype: candle::DType,
+    cuda: &candle::CudaDevice,
+    inner: &Mutex<Inner>,
+    ticket: WaveTicket,
+    high: usize,
+) -> Result<candle::Tensor> {
     use candle::cuda_backend::wave_provenance::{exhausted, LeaseOrigin};
 
-    let bytes = out.elem_count() * out.dtype().size_in_bytes();
+    let bytes = dims.iter().product::<usize>() * dtype.size_in_bytes();
     let ptr = {
         let mut i = inner.lock().unwrap();
         match carry_locked(&mut i, bytes, 256, high) {
@@ -1308,19 +1323,99 @@ fn carry_out(
     };
     let dev = candle::Device::Cuda(cuda.clone());
     // SAFETY: the range was carried for the generation `ticket` names, which
-    // is still open — the stage's caller holds it — and is released only when
-    // that generation closes, after this tensor and everything read from it.
-    let dst = unsafe {
+    // is still open — its caller holds it — and is released only when that
+    // generation closes, after this tensor and everything read from it.
+    unsafe {
         candle::Tensor::from_leased_cuda_ptr(
             ptr,
-            out.dtype(),
-            out.dims().to_vec(),
+            dtype,
+            dims.to_vec(),
             &dev,
             LeaseOrigin::Wave(ticket),
         )
-    }?;
-    dst.slice_set(out, 0, 0)?;
-    Ok(dst)
+    }
+}
+
+/// Run `f` over `items` in turn, each a stage reading the last one's result —
+/// a model's block loop.
+///
+/// **Two carries for the whole chain, not one per stage.** [`guest_stage`]
+/// carries each result until the generation around it closes, which is right
+/// for a stage whose result something later reads, and wrong for a block loop:
+/// block `n`'s result is dead once block `n + 1` has read it, yet forty of
+/// them stood until the step closed — a gigabyte at 1024×768, past an arena
+/// the claim priced for one block. Here each stage writes into the carry the
+/// one before it read from, so the loop holds two hidden states whatever its
+/// length. Every stage must keep its input's shape, as a residual block does.
+///
+/// With no enclosing generation — nothing to own a carry — each item is an
+/// ordinary [`guest_stage`].
+pub fn guest_chain<'a, T: 'a, I, F>(
+    x: &candle::Tensor,
+    items: I,
+    mut f: F,
+) -> Result<candle::Tensor>
+where
+    I: IntoIterator<Item = &'a T>,
+    F: FnMut(&candle::Tensor, &'a T) -> Result<candle::Tensor>,
+{
+    let plain = |x: &candle::Tensor, items: I, f: &mut F| -> Result<candle::Tensor> {
+        let mut h = x.clone();
+        for item in items {
+            h = guest_stage(&h, |h| f(h, item))?;
+        }
+        Ok(h)
+    };
+    if !GUEST_ARENA_OPEN.load(Ordering::Relaxed) {
+        return plain(x, items, &mut f);
+    }
+    let Ok(cuda) = x.device().as_cuda_device() else {
+        return plain(x, items, &mut f);
+    };
+    let ordinal = cuda.cuda_stream().context().ordinal();
+    let Some(arena) = guest_domains().lock().unwrap().get(&ordinal).cloned() else {
+        return plain(x, items, &mut f);
+    };
+    let (live, epoch, cursor) = {
+        let i = arena.inner.lock().unwrap();
+        (i.live, i.epoch, i.cursor)
+    };
+    if live == 0 {
+        return plain(x, items, &mut f);
+    }
+    // Owned by the generation open now, as a stage's carried result is.
+    let ticket = WaveTicket {
+        domain: ordinal as u32,
+        arena: GUEST_ARENA,
+        epoch,
+    };
+    let mut cur = carried(x.dims(), x.dtype(), cuda, &arena.inner, ticket, cursor)?;
+    let mut next = carried(x.dims(), x.dtype(), cuda, &arena.inner, ticket, cursor)?;
+    cur.slice_set(x, 0, 0)?;
+    for item in items {
+        let stage = arena.generation(ordinal as u32, GUEST_ARENA)?;
+        // `cur` carries the open generation's epoch, so what the stage derives
+        // from it carves at the cursor — inside this stage — and goes when it
+        // closes.
+        let out = f(&cur, item)?;
+        if out.dims() != cur.dims() || out.dtype() != cur.dtype() {
+            candle::bail!(
+                "guest chain: a stage turned {:?} {:?} into {:?} {:?} — a chain's stages keep \
+                 their input's shape",
+                cur.dims(),
+                cur.dtype(),
+                out.dims(),
+                out.dtype()
+            );
+        }
+        // Into the carry the stage did not read: the one it read is still
+        // under its kernels until the stream reaches this copy.
+        next.slice_set(&out, 0, 0)?;
+        drop(out);
+        drop(stage);
+        std::mem::swap(&mut cur, &mut next);
+    }
+    Ok(cur)
 }
 
 /// Copy `x` into the open guest generation, so ops reading it carve there.
@@ -2834,6 +2929,58 @@ mod tests {
         );
         outer.alloc(capacity - 3 * 4096, 256).unwrap();
 
+        drop(outer);
+        assert_eq!(guest_domain_stats(ordinal).unwrap().0, 0);
+    }
+
+    /// **A chain carries two results however long it is**, and each stage reads
+    /// the one before it. Ten stages of 4 KiB leave 8 KiB carried, not 40 — the
+    /// bottom can still carve all but that — and the numbers are the fold's.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn a_chain_carries_two_results_however_long_it_is() {
+        use crate::kv_cache::{
+            begin_guest, close_guest_arena, guest_chain, guest_domain_stats, open_guest_arena,
+        };
+        use candle::cuda_backend::cudarc::driver::{CudaStream, DevicePtr};
+        use candle::{Device, Tensor};
+        use std::sync::Arc;
+
+        let _one = guest_arena_test();
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        let cuda = device.as_cuda_device().unwrap();
+        let stream = cuda.cuda_stream();
+        let ordinal = stream.context().ordinal();
+        let capacity = 1usize << 20;
+        let ground = unsafe { stream.alloc::<u8>(capacity).unwrap() };
+        let (base, _sync) = ground.device_ptr(&stream);
+        struct CloseOnDrop(Arc<CudaStream>);
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                close_guest_arena(&self.0);
+            }
+        }
+        open_guest_arena(&stream, base, capacity);
+        let _close = CloseOnDrop(stream.clone());
+
+        let outer = begin_guest(&stream).unwrap();
+        let x = Tensor::arange(0f32, 1024., &device).unwrap();
+        let steps: Vec<f64> = (1..=10).map(f64::from).collect();
+        let y = guest_chain(&x, &steps, |h, k| h.affine(1., *k)).unwrap();
+        assert_eq!(
+            guest_domain_stats(ordinal).unwrap().0,
+            0,
+            "a stage did not release"
+        );
+        let want: Vec<f32> = (0..1024).map(|i| i as f32 + 55.).collect();
+        assert_eq!(
+            y.to_vec1::<f32>().unwrap(),
+            want,
+            "the chain is not the fold"
+        );
+        outer.alloc(capacity - 3 * 4096, 256).unwrap();
         drop(outer);
         assert_eq!(guest_domain_stats(ordinal).unwrap().0, 0);
     }
