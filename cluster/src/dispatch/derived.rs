@@ -7,6 +7,11 @@
 //! messages, the client's tools, and every message before the first assistant
 //! reply. That is the same on every call of one conversation, whatever has been
 //! said since.
+//!
+//! **`mcp_subject`**: an MCP `tools/call` names what it acts on among its
+//! arguments — a character as `npc`, a world as `world` — and is answered by
+//! the member holding that, as the route for the same act would be
+//! (`docs/mcp_app.md` §4). Any other message names nothing.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,18 +20,21 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Derived {
     Passthrough,
+    McpSubject,
 }
 
 impl Derived {
     pub fn name(self) -> &'static str {
         match self {
             Derived::Passthrough => "passthrough",
+            Derived::McpSubject => "mcp_subject",
         }
     }
 
     pub fn from_name(name: &str) -> Option<Derived> {
         match name {
             "passthrough" => Some(Derived::Passthrough),
+            "mcp_subject" => Some(Derived::McpSubject),
             _ => None,
         }
     }
@@ -35,8 +43,29 @@ impl Derived {
     pub fn key(self, body: &Value) -> Option<String> {
         match self {
             Derived::Passthrough => passthrough_key(body),
+            Derived::McpSubject => mcp_subject_key(body),
         }
     }
+}
+
+/// The arguments an MCP `tools/call` may name its subject by, in the order
+/// they are looked for.
+pub const MCP_SUBJECTS: [&str; 2] = ["npc", "world"];
+
+/// What an MCP `tools/call` body acts on: the first of [`MCP_SUBJECTS`] its
+/// arguments name, trimmed; `None` for any other message.
+pub fn mcp_subject_key(body: &Value) -> Option<String> {
+    if body.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let args = body.get("params")?.get("arguments")?;
+    MCP_SUBJECTS.iter().find_map(|k| {
+        args.get(*k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// The `model` a passthrough request names.
@@ -178,6 +207,35 @@ mod tests {
         assert_ne!(
             conversation_key(&["ab"], &[], &[("user", "c")]),
             conversation_key(&["a"], &[], &[("user", "bc")])
+        );
+    }
+
+    /// **A tool call reaches the holder of what it acts on**: its character,
+    /// else its world; a call naming neither, and any other message, names
+    /// nothing and goes wherever the route's fallback sends it.
+    #[test]
+    fn an_mcp_tool_call_is_keyed_by_its_character_or_its_world() {
+        let call = |args: Value| {
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "npc_mission", "arguments": args}})
+        };
+        assert_eq!(
+            Derived::McpSubject.key(&call(json!({"npc": " 1z ", "world": "w1"}))),
+            Some("1z".into())
+        );
+        assert_eq!(
+            Derived::McpSubject.key(&call(json!({"world": "w1", "text": "hi"}))),
+            Some("w1".into())
+        );
+        assert_eq!(Derived::McpSubject.key(&call(json!({"npc": ""}))), None);
+        assert_eq!(Derived::McpSubject.key(&call(json!({"q": "Pax"}))), None);
+        assert_eq!(
+            Derived::McpSubject.key(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})),
+            None
+        );
+        assert_eq!(
+            Derived::from_name(Derived::McpSubject.name()),
+            Some(Derived::McpSubject)
         );
     }
 

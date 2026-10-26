@@ -2,14 +2,14 @@
 //! client to sign in, and the origin a browser's `Origin` must match
 //! (`docs/claude_zend_gateway.md` §12).
 //!
-//! Behind the gateway, the member sees the gateway's hop; the gateway states
-//! the client's host on `X-Forwarded-Host` and its scheme, from its own
+//! Behind the gateway, the app sees the gateway's hop; the gateway states the
+//! client's host on `X-Forwarded-Host` and its scheme, from its own
 //! configuration, on `X-Forwarded-Proto` (`web::proxy`). Called directly, the
 //! request's own `Host` is the origin, over plain HTTP.
 
 use axum::http::{header, HeaderMap};
 
-/// `https://code.tokera.com`, or `http://127.0.0.1:18081` when called directly.
+/// `https://code.tokera.com`, or `http://127.0.0.1:8095` when called directly.
 pub fn of(headers: &HeaderMap) -> String {
     let read = |name: &str| {
         headers
@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn behind_the_gateway_the_clients_origin_is_used() {
         let h = headers(&[
-            ("host", "192.168.0.237:18081"),
+            ("host", "192.168.0.237:8095"),
             ("x-forwarded-host", "code.tokera.com"),
             ("x-forwarded-proto", "https"),
         ]);
@@ -54,8 +54,8 @@ mod tests {
     #[test]
     fn called_directly_the_host_is_the_origin_over_http() {
         assert_eq!(
-            of(&headers(&[("host", "127.0.0.1:18081")])),
-            "http://127.0.0.1:18081"
+            of(&headers(&[("host", "127.0.0.1:8095")])),
+            "http://127.0.0.1:8095"
         );
         assert_eq!(of(&HeaderMap::new()), "http://localhost");
     }

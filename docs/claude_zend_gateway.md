@@ -15,6 +15,15 @@ design makes to them are listed in §16:
 | Sign-in and identity | `docs/web_gateway_design.md` §5 |
 | Membership, A/B upgrades, rollouts, maintenance commands, agents | `docs/replicated_substrate.md` §3, §11, §12 |
 | keep and the hand-off | `docs/replicated_substrate.md` §3.9 |
+| Where `/mcp` is served: an aggregator over the MCP servers zend and npcd each run at `/v1/mcp` | `docs/mcp_app.md` |
+
+**`/mcp` is the aggregator's** (`docs/mcp_app.md`). zend serves its tools as
+an MCP server of its own at `/v1/mcp`, and the aggregator serves them to Claude
+beside npcd's, calling zend through the gateway as the caller. The protocol,
+the sessions and the challenge below are written once in the `mcp-server`
+crate, which zend and the aggregator both serve on. Where this document places
+them in zend's `http.rs`, read `mcp_server::http`. zend's sessions are in
+`zend/src/mcp/state.rs`. What the tools do is unchanged, and stays zend's.
 
 Every statement below about existing code was checked against the tree on
 2026-10-25 and carries its source; everything that does not exist yet is
@@ -88,9 +97,10 @@ orchestrates and reviews.
 
 ## 3. Work tools
 
-`/mcp`, MCP's Streamable HTTP transport, served by a zend member
-(`zend/src/mcp/http.rs`) and forwarded by the gateway. The member checks the
-bearer token itself (§12). It answers both protocol eras in use:
+MCP's Streamable HTTP transport, served by a zend member at `/v1/mcp`
+(`zend/src/mcp/server.rs` on `mcp_server::http`) and reached through the
+aggregator at `/mcp` (`docs/mcp_app.md`). The gateway turns the bearer token
+into the caller (§12). It answers both protocol eras in use:
 
 - **2025-11-25**, claude.ai's: `initialize` negotiates the version and opens
   a session named by `Mcp-Session-Id`; an unknown session is `404`, which
@@ -163,11 +173,13 @@ through zend's REST routes:
   the call; the loop takes the queue where a tool round's results become the
   next turn's input — after the check that ends a round with no results, so a
   nudge never makes a turn of nothing (`session.rs`, `nudges::follow`).
-- **MCP sessions are records too** (`zend/src/mcp/state.rs`): a handshake
-  session under its `Mcp-Session-Id`, a 2026-07-28 client's under its person
-  and client — unchanged by a token refresh — each with the thread it is
-  attached to, swept after 30 days unused. So `/mcp` is `Dispatch::Any`: any
-  member answers any call.
+- **MCP sessions are records** under `mcp/session/` (`zend/src/mcp/state.rs`).
+  A handshake session is kept under its `Mcp-Session-Id`. A 2026-07-28
+  client's is kept under its person and client, and the aggregator's own
+  session the call is made on behalf of (`docs/mcp_app.md` §3), none of which
+  a token refresh changes. Each holds the thread it is attached to, and is
+  swept after 30 days unused. So `/v1/mcp` is `Dispatch::Any`: any member
+  answers any call.
 
 **Owned, and checked.** A worker's conversation id names its owner —
 `mcp:<owner key>:<thread>/<name>` — and the owner key is the first 16 hex
@@ -1064,19 +1076,20 @@ gateway's (`web/src/auth/role.rs:63-70`); zend maps it to tool modes
 
 **The gateway is the OAuth 2.1 authorization server for `/mcp`**
 (`web/src/auth/mcp/`), beside the sign-in it already owns. Its routes are
-mounted ahead of site routing on every host, as `/auth/*` are. On `/mcp`
-alone, an access token it issued is an identity exactly as the session cookie
-is (`Auth::mcp_identity`, read where the cookie is in `web/src/server.rs`), so
-the member serving `/mcp` receives the caller on `X-Tokera-*` like any other
-request and never sees what a token means. The site table forwards only
-`/mcp` to the members (`web/web.yaml`, the `zend` site; motherd answers it,
-`host/src/server.rs` `API_PREFIXES`).
+mounted ahead of site routing on every host, as `/auth/*` are. On `/mcp`, an
+access token it issued is an identity exactly as the session cookie is
+(`Auth::mcp_identity`, read where the cookie is in `web/src/server.rs`). From
+a listed backend, the aggregator, it is an identity on any path
+(`Auth::mcp_delegated`, `docs/mcp_app.md` §2). So the aggregator and the
+member serving `/v1/mcp` each receive the caller on `X-Tokera-*` like any
+other request, and never see what a token means. The site table forwards
+`/mcp` to the aggregator (`web/web.yaml`, the `zend` site).
 
 - **Discovery.** A request reaching the member with no identity answers `401`
   with `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/mcp"`
   (`error="invalid_token"` when it sent a token the gateway did not take),
   the origin being the client's, from the gateway's `X-Forwarded-Host` /
-  `-Proto` (`zend/src/mcp/http.rs`). The gateway serves that document
+  `-Proto` (`mcp_server::http`). The gateway serves that document
   (RFC 9728), naming the resource as `<origin>/mcp` exactly and the origin as
   its one authorization server, and its own metadata (RFC 8414) at
   `/.well-known/oauth-authorization-server`. Exact bytes in
@@ -1119,7 +1132,9 @@ request and never sees what a token means. The site table forwards only
   every grant out at once is rotating the session key, as it is for sessions.
   The role is read from `roles.yaml` by the member on every call, not frozen
   into the token.
-- **Bearer on `/mcp` only.** No other route reads a bearer token.
+- **Bearer on `/mcp` only**, and on any path from a listed backend, which
+  presents a person's token as that person (`docs/mcp_app.md` §2). Nowhere
+  else does a bearer token name anyone.
 
 **Who may use it: any signed-in user.** Every `/mcp` conversation is owned by
 its caller and served only to them or an Admin (§3.2). An Admin's tasks run

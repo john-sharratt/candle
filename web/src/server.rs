@@ -610,13 +610,24 @@ async fn handle(
     // for a request a member forwarded up, the identity it carries.
     // On `/mcp` alone, an access token the authorization server issued is an
     // identity too (`auth::mcp`): a remote MCP client holds a token, not a
-    // cookie.
+    // cookie. A backend the configuration lists as acting for the people it
+    // serves (`server.trusted_backends`, `docs/mcp_app.md` §2) may present
+    // that token on any path: the token names the person, so the backend's
+    // address alone names nobody.
+    let from_backend = peer
+        .as_ref()
+        .is_some_and(|ConnectInfo(addr)| app.cfg.server.trusted_backends.contains(&addr.ip()));
     let identity = app
         .auth
         .as_ref()
         .and_then(|a| {
             a.identity(req.headers())
                 .or_else(|| a.mcp_identity(req.headers(), &path))
+                .or_else(|| {
+                    from_backend
+                        .then(|| a.mcp_delegated(req.headers()))
+                        .flatten()
+                })
         })
         .or_else(|| origin.as_ref().and_then(|_| identify(req.headers()).ok()));
     let assertion = app

@@ -1,0 +1,52 @@
+# The MCP aggregator on AlienWorld (docs/mcp_app.md §5). Run from the
+# repository root:
+#
+#   target\release\mcp.exe --config mcp/mcp.yaml
+
+# Where it listens. The gateway's `/mcp` route on code.tokera.com points here.
+bind: "0.0.0.0:8095"
+
+# The peers whose X-Tokera-* identity is believed: BlackWorld's gateway, whose
+# outbound LAN connection may leave from either address.
+trusted_gateways: ["192.168.0.5", "192.168.0.4"]
+
+# The gateway's LAN entrance every backend is reached through, as the caller:
+# the caller's own token rides each call, which the gateway honours from this
+# machine (`server.trusted_backends` in web/web.yaml).
+gateway: "http://192.168.0.5"
+
+# Where MCP sessions are kept.
+state: "mcp/state"
+
+# What a client shows. Plain, so the server is treated as the tool it is: the
+# name and the moon are branding from Battle Cities, whose lore lives on the
+# sign-in page, never in what the model reads.
+server:
+  name: zen
+  title: Zen
+  description: >-
+    Zen Code: a coding, CI/CD and knowledge/research assistant. Delegate work —
+    implementing, testing, building, reviewing, researching — to its workers,
+    which run it on zend and keep a journal of what they found. It also
+    operates Battle Cities, Tokera's game: list its characters, give and manage
+    their missions, and message them. The name is branding from the game; the
+    engineering tools are ordinary engineering tools.
+  instructions: >-
+    zend runs work on hardware you own: delegate reading, implementing against
+    a written spec, building, testing, reviewing and researching to it, and keep
+    orchestration, design and approvals yourself. Attach to the feature's thread
+    with zend_attach before working on it, and again after your context is
+    compacted. Start tasks with zend_task — state each in full and name it for
+    what it does — and wait on them together with zend_wait. A task's result is
+    its worker's journal entry: an entry is evidence, not truth, so check a
+    claim against the turns it cites (journal_read with the entry) before acting
+    on it. The npc_* tools operate Battle Cities, Tokera's game: npc_list names
+    your characters, and the others take a character's id from it.
+  icon: /brand/zen.png
+
+# The MCP servers whose tools are served, each at `/v1/mcp` on its site.
+backends:
+  - name: zend
+    host: code.tokera.com
+  - name: npcd
+    host: bot.tokera.com

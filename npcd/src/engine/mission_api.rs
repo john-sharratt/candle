@@ -21,29 +21,21 @@ use serde_json::{json, Value};
 
 use crate::api::{err, owner_of, Authored};
 use crate::authority::ops::{OpReply, WorldOp};
+use crate::engine::bodies::{
+    CancelReply, LodgeReply, LodgeRequest, MissionStatus, MissionView, ReportView, StepReply,
+    StepRequest, StepView,
+};
 use crate::engine::event::{EventKind, Salience};
-use crate::engine::mission::{Mission, Origin, StepOutcome, Todo};
+use crate::engine::mission::{Mission, Origin, Todo};
 use crate::engine::mission_gen::config::Config;
 use crate::engine::mission_gen::run;
 use crate::engine::{no_engine, owned, owned_by, speaking_as, world_unreached};
 use npc_map::route;
 
-#[derive(Debug, Deserialize)]
-pub struct LodgeBody {
-    /// The brief — what is being asked of the character.
-    prompt: String,
-    /// The steps, in order. May be empty: a mission can be carried on its ask
-    /// alone, and the character may add steps as it discovers them.
-    #[serde(default)]
-    todo: Vec<String>,
-    /// Carry it at once, rousing the character to read it now, rather than
-    /// leaving it on the desk for the character to collect on its own. Absent
-    /// means queue it for collection.
-    #[serde(default)]
-    start: bool,
-}
-
-/// `POST /v1/npc/:nid/mission` — lodge a mission for a character.
+/// `POST /v1/npc/:nid/mission` — lodge a mission for a character
+/// ([`LodgeRequest`]): queued for it to collect at the command table, or, with
+/// `start`, carried at once. A mission may be carried on its brief alone, and
+/// the character may add steps as it discovers them.
 ///
 /// Ownership is checked: a mission is a thing asked of somebody's character, so
 /// it is a write to something they own.
@@ -51,7 +43,7 @@ pub async fn lodge(
     State(s): State<Arc<Authored>>,
     Path(nid): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<LodgeBody>,
+    Json(body): Json<LodgeRequest>,
 ) -> Response {
     let (id, owner, nid) = match owned_by(&s, &headers, &nid).await {
         Ok(v) => v,
@@ -144,12 +136,12 @@ pub async fn lodge(
         return world_unreached(&e);
     }
 
-    Json(json!({
-        "lodged": !start,
-        "carrying": start,
-        "prompt": prompt,
-        "steps": steps,
-    }))
+    Json(LodgeReply {
+        lodged: !start,
+        carrying: start,
+        prompt,
+        steps,
+    })
     .into_response()
 }
 
@@ -173,55 +165,34 @@ pub async fn status(
     let Some((hosted, character)) = rt.body_of(nid) else {
         // No body is no mission, not an error: a character out of the world
         // simply has none, which is what a caller wants to know.
-        return Json(json!({
-            "on_mission": false,
-            "mission": Value::Null,
-            "finished": Value::Null,
-            "lodged": 0,
-        }))
+        return Json(MissionStatus {
+            on_mission: false,
+            mission: None,
+            finished: None,
+            lodged: 0,
+        })
         .into_response();
     };
     // The last one it finished as well as the one in hand: a character that
     // reports and takes up the next at once would otherwise hide the outcome an
     // operator came to read behind the mission it has just started.
-    let (on_mission, mission, finished, lodged) = hosted.sim(|sim| {
-        (
-            sim.missions.is_on_mission(&character),
-            sim.missions.latest(&character).map(mission_view),
-            sim.missions.done(&character).map(mission_view),
-            sim.missions.lodged_count(&character),
-        )
+    let status = hosted.sim(|sim| MissionStatus {
+        on_mission: sim.missions.is_on_mission(&character),
+        mission: sim.missions.latest(&character).map(mission_view),
+        finished: sim.missions.done(&character).map(mission_view),
+        lodged: sim.missions.lodged_count(&character),
     });
-    Json(json!({
-        "on_mission": on_mission,
-        "mission": mission,
-        "finished": finished,
-        "lodged": lodged,
-    }))
-    .into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StepBody {
-    /// Sign off the first open step with this text.
-    #[serde(default)]
-    done: Option<String>,
-    /// How the step turned out: `achieved` (the default) or `thwarted`.
-    #[serde(default)]
-    outcome: Option<StepOutcome>,
-    /// Add a step with this text.
-    #[serde(default)]
-    add: Option<String>,
+    Json(status).into_response()
 }
 
 /// `POST /v1/npc/:nid/mission/step` — tick off or add a step on the character's
-/// open mission. Either changes the steps its prompt section lists, so the
-/// section is sealed again before its next turn.
+/// open mission ([`StepRequest`]). Either changes the steps its prompt section
+/// lists, so the section is sealed again before its next turn.
 pub async fn step(
     State(s): State<Arc<Authored>>,
     Path(nid): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<StepBody>,
+    Json(body): Json<StepRequest>,
 ) -> Response {
     let nid = match owned(&s, &headers, &nid).await {
         Ok(id) => id,
@@ -251,9 +222,7 @@ pub async fn step(
         add: body.add,
     };
     match rt.world_write(hosted.id(), op).await {
-        Ok(OpReply::Stepped { ticked, added }) => {
-            Json(json!({ "ticked": ticked, "added": added })).into_response()
-        }
+        Ok(OpReply::Stepped { ticked, added }) => Json(StepReply { ticked, added }).into_response(),
         Ok(other) => world_unreached(&anyhow::anyhow!("the world answered {other:?}")),
         Err(e) => world_unreached(&e),
     }
@@ -357,13 +326,13 @@ pub async fn cancel(
         return no_engine("cancelling a mission");
     };
     let Some((hosted, _)) = rt.body_of(nid) else {
-        return Json(json!({ "cancelled": false })).into_response();
+        return Json(CancelReply { cancelled: false }).into_response();
     };
     match rt
         .world_write(hosted.id(), WorldOp::Cancel { npc: nid })
         .await
     {
-        Ok(OpReply::Done { ok }) => Json(json!({ "cancelled": ok })).into_response(),
+        Ok(OpReply::Done { ok }) => Json(CancelReply { cancelled: ok }).into_response(),
         Ok(other) => world_unreached(&anyhow::anyhow!("the world answered {other:?}")),
         Err(e) => world_unreached(&e),
     }
@@ -450,7 +419,7 @@ pub async fn pool(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Respons
         };
         let view = hosted.sim(|sim| {
             json!({
-                "pool": sim.missions.pooled().iter().map(mission_view).collect::<Vec<_>>(),
+                "pool": sim.missions.pooled().iter().map(mission_view).collect::<Vec<MissionView>>(),
                 "targets": sim.missions.targets(),
             })
         });
@@ -550,20 +519,29 @@ fn steps_named_in(
 }
 
 /// One mission, as an operator reads it back.
-fn mission_view(m: &Mission) -> Value {
-    json!({
-        "prompt": m.mission_text(),
-        "open": m.is_open(),
-        "origin": m.origin,
-        "work": m.work,
-        "todo": m.todo,
-        "answer": m.answer,
-        "observed": m.observed,
-        "report": m.report.as_ref().map(|r| json!({
-            "outcome": r.outcome.as_str(),
-            "notes": r.notes,
-        })),
-    })
+fn mission_view(m: &Mission) -> MissionView {
+    MissionView {
+        prompt: m.mission_text(),
+        open: m.is_open(),
+        origin: serde_json::to_value(&m.origin).unwrap_or(Value::Null),
+        work: serde_json::to_value(&m.work).unwrap_or(Value::Null),
+        todo: m
+            .todo
+            .iter()
+            .map(|t| StepView {
+                text: t.text.clone(),
+                done: t.done,
+                outcome: t.outcome,
+                reports: t.reports,
+            })
+            .collect(),
+        answer: m.answer.clone(),
+        observed: serde_json::to_value(&m.observed).unwrap_or(Value::Null),
+        report: m.report.as_ref().map(|r| ReportView {
+            outcome: r.outcome.as_str().to_string(),
+            notes: r.notes.clone(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -613,7 +591,7 @@ mod tests {
             },
         );
         // Open: no report, no answer, steps not yet done.
-        let open = mission_view(&m);
+        let open = serde_json::to_value(mission_view(&m)).unwrap();
         assert_eq!(open["prompt"], "Check the record.");
         assert_eq!(open["open"], true);
         assert_eq!(open["report"], serde_json::Value::Null);
@@ -631,7 +609,7 @@ mod tests {
             "it holds",
             Some("the date is wrong".to_string()),
         );
-        let closed = mission_view(&m);
+        let closed = serde_json::to_value(mission_view(&m)).unwrap();
         assert_eq!(closed["open"], false);
         assert_eq!(closed["answer"], "the date is wrong");
         assert_eq!(closed["report"]["outcome"], "pass");

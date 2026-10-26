@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx};
 use crate::mcp::names;
-use crate::mcp::state;
+use crate::mcp::state::ATTACHED;
 use crate::mcp::threads;
 use crate::mcp::workers::now_ms;
 
@@ -43,7 +43,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     if let Err(e) = threads::attach(&records, &owner, thread, now_ms()) {
         return Answer::error(e.to_string());
     }
-    if let Err(e) = state::attach(&records, &ctx.mcp_id, thread, now_ms()) {
+    if let Err(e) = ctx.store.hold(&ctx.mcp_id, ATTACHED, thread, now_ms()) {
         return Answer::error(e.to_string());
     }
     let notes = threads::notes(&records, &owner, thread);

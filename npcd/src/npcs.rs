@@ -1327,6 +1327,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::engine::bodies::NpcList;
+
     use super::*;
 
     /// Two accounts, in the shape `accounts::with_public_id` mints: a `u_`
@@ -1960,5 +1962,22 @@ mod tests {
         assert!(v["npc_id"].is_string());
         assert!(v["world_id"].is_string());
         assert!(v["owner_id"].is_string());
+    }
+
+    /// **The roster reads as the MCP tools read it** (`engine::bodies::NpcList`):
+    /// what `GET /v1/npc` lists is the shape `npc_list` names a character by.
+    #[test]
+    fn the_roster_reads_as_the_mcp_tools_npc_list() {
+        let dir = tmp();
+        let mut n = Npcs::load(&dir).unwrap();
+        let v = n.create(&ident("u1"), ME, &body("Varek"), 1_000).unwrap();
+        let listed: NpcList =
+            serde_json::from_value(json!({ "items": n.list(ME, &Filter::default()) })).unwrap();
+        assert_eq!(listed.items.len(), 1);
+        let npc = &listed.items[0];
+        assert_eq!(npc.npc_id, v["npc_id"].as_str().unwrap());
+        assert_eq!(npc.name, "Varek");
+        assert_eq!(npc.state, v["state"].as_str().unwrap());
+        assert_eq!(npc.mood, None, "never asked is absent");
     }
 }

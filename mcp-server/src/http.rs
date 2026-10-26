@@ -1,27 +1,24 @@
-//! The routes of the remote MCP endpoint, `/mcp`
-//! (`docs/claude_zend_gateway.md` §3, §12).
+//! The routes of an MCP endpoint, for any [`Server`]: `POST` a message, `GET`
+//! (no server-initiated stream is offered), `DELETE` a handshake session.
 //!
-//! Sign-in is the gateway's: it runs the authorization server, and on `/mcp`
-//! it turns the client's bearer token into an identity stated on `X-Tokera-*`,
-//! as it does a session cookie (`web::auth::mcp`). The member believes those
-//! headers only from the gateways it trusts, so the caller here is whoever
-//! they name. A request naming nobody is refused with the `WWW-Authenticate`
-//! challenge that starts a client's sign-in at the gateway — which is why the
-//! route is registered `Role::Unauthenticated`: the route guard's own `401`
-//! carries no challenge.
+//! Sign-in is the gateway's: it runs the authorization server, and turns a
+//! client's bearer token into an identity stated on `X-Tokera-*`
+//! (`web::auth::mcp`). A request naming nobody is refused with the
+//! `WWW-Authenticate` challenge that starts a client's sign-in at the gateway.
 //!
 //! A `tools/call` from a client that accepts an event stream is answered on
-//! one: a progress notification for each step of the work the call waits on —
-//! a worker's round, a batch of tool calls, a journal entry — and at least
-//! every [`PROGRESS_EVERY`], which keeps Claude Code's idle timer from firing;
-//! then the result. Notifications are shown, not read into Claude's context.
+//! one: a progress notification for each step the tool says of the work it
+//! waits on, and at least every [`PROGRESS_EVERY`], which keeps Claude Code's
+//! idle timer from firing; then the result. Notifications are shown, not read
+//! into Claude's context.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
@@ -30,32 +27,38 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use web::auth::mcp::metadata::RESOURCE_DOC_PATH;
 
-use super::caller::Caller;
-use super::jsonrpc::{self, Message};
-use super::origin;
-use super::protocol::{self, MODERN, UNSUPPORTED_VERSION};
-use super::state::{self, Client};
-use super::tools::{self, Ctx};
-use super::workers::now_ms;
-use crate::session::ZendSession;
+use crate::client::Client;
+use crate::jsonrpc::{self, Message};
+use crate::origin;
+use crate::protocol::{self, MODERN, UNSUPPORTED_VERSION};
+use crate::server::{Call, Server};
+use crate::session::stateless_key;
 
 /// How often a running `tools/call` reports progress on its stream.
 pub const PROGRESS_EVERY: Duration = Duration::from_secs(15);
 
-const SESSION_HEADER: &str = "mcp-session-id";
-const VERSION_HEADER: &str = "mcp-protocol-version";
+/// The header a handshake session is named on.
+pub const SESSION_HEADER: &str = "mcp-session-id";
+/// The header a request names its protocol version on.
+pub const VERSION_HEADER: &str = "mcp-protocol-version";
 
-fn loading() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(header::RETRY_AFTER, "30")],
-        Json(json!({"error": "loading", "message": "zend is still loading its model"})),
-    )
-        .into_response()
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn json_rpc(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
+}
+
+fn unavailable(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "30")],
+        Json(json!({"error": "unavailable", "message": message})),
+    )
+        .into_response()
 }
 
 /// The `WWW-Authenticate` value a refused request carries, pointing the client
@@ -70,12 +73,12 @@ pub fn challenge(origin: &str, sent_a_token: bool) -> String {
     }
 }
 
-/// The refusal that starts a client's sign-in.
-fn unauthorized(headers: &HeaderMap) -> Response {
+/// The refusal that starts a client's sign-in to `title`.
+fn unauthorized(headers: &HeaderMap, title: &str) -> Response {
     let sent_a_token = headers.contains_key(header::AUTHORIZATION);
     let mut res = (
         StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "unauthorized", "message": "sign in to use zend"})),
+        Json(json!({"error": "unauthorized", "message": format!("sign in to use {title}")})),
     )
         .into_response();
     if let Ok(v) = HeaderValue::from_str(&challenge(&origin::of(headers), sent_a_token)) {
@@ -102,9 +105,10 @@ fn wants_stream(headers: &HeaderMap) -> bool {
     read_header(headers, header::ACCEPT.as_str()).is_some_and(|a| a.contains("text/event-stream"))
 }
 
-/// `POST /mcp`.
-pub async fn post(
-    State(session): State<Arc<ZendSession>>,
+/// `POST`: one JSON-RPC message.
+pub async fn post<S: Server>(
+    State(server): State<Arc<S>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -114,15 +118,17 @@ pub async fn post(
             jsonrpc::error(
                 Value::Null,
                 jsonrpc::INVALID_REQUEST,
-                "this origin may not call /mcp",
+                "this origin may not call this server",
             ),
         );
     }
-    let Some(caller) = Caller::of(&headers, session.roles()) else {
-        return unauthorized(&headers);
+    let identity = server.identity();
+    let Some(caller) = server.caller(&headers, peer.map(|ConnectInfo(a)| a.ip())) else {
+        return unauthorized(&headers, &identity.title);
     };
-    let Some(records) = session.shared_substrate() else {
-        return loading();
+    let store = match server.store() {
+        Ok(s) => s,
+        Err(why) => return unavailable(&why),
     };
     let message = match jsonrpc::parse(&body) {
         Ok(m) => m,
@@ -148,7 +154,7 @@ pub async fn post(
         }
     }
     let modern = version == Some(MODERN);
-    let owner = caller.key();
+    let owner = server.owner(&caller);
     let now = now_ms();
     let failed = |id: Value, e: anyhow::Error| {
         json_rpc(
@@ -159,11 +165,11 @@ pub async fn post(
 
     // Which session the call is on: a 2026-07-28 client's is keyed by its
     // person and client; a handshake client's is the one its `initialize`
-    // opened. Both are records, so any member answers.
-    let (mcp_id, mcp_session) = if modern {
+    // opened.
+    let (session_id, session) = if modern {
         let client = Client::of(protocol::modern_client(&params).unwrap_or(""));
-        let key = state::stateless_key(&owner, client);
-        match state::ensure(&records, &key, &owner, client, MODERN, now) {
+        let key = stateless_key(&owner, client, protocol::on_behalf(&params));
+        match store.ensure(&key, &owner, client, MODERN, now) {
             Ok(s) => (key, s),
             Err(e) => return failed(id, e),
         }
@@ -175,7 +181,7 @@ pub async fn post(
             .and_then(|c| c.get("name"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let id_opened = match state::open(&records, &owner, Client::of(client_name), version, now) {
+        let opened = match store.open(&owner, Client::of(client_name), version, now) {
             Ok(opened) => opened,
             Err(e) => return failed(id, e),
         };
@@ -183,10 +189,10 @@ pub async fn post(
             StatusCode::OK,
             jsonrpc::result(
                 id,
-                protocol::initialize_result(version, &origin::of(&headers)),
+                protocol::initialize_result(identity, version, &origin::of(&headers)),
             ),
         );
-        if let Ok(v) = HeaderValue::from_str(&id_opened) {
+        if let Ok(v) = HeaderValue::from_str(&opened) {
             res.headers_mut().insert(SESSION_HEADER, v);
         }
         return res;
@@ -201,7 +207,7 @@ pub async fn post(
                 ),
             );
         };
-        match state::get(&records, sid, now) {
+        match store.get(sid, now) {
             Some(s) if s.owner == owner => (sid.to_string(), s),
             _ => {
                 return json_rpc(
@@ -216,19 +222,39 @@ pub async fn post(
         }
     };
 
+    let mut call = Call::<S> {
+        caller,
+        headers,
+        session_id,
+        session,
+        store,
+        progress: None,
+    };
     match method.as_str() {
         "server/discover" => json_rpc(
             StatusCode::OK,
-            jsonrpc::result(id, protocol::discover_result(&origin::of(&headers))),
-        ),
-        "ping" if !modern => json_rpc(StatusCode::OK, jsonrpc::result(id, json!({}))),
-        "tools/list" => json_rpc(
-            StatusCode::OK,
             jsonrpc::result(
                 id,
-                protocol::tools_list_result(tools::definitions(), modern),
+                protocol::discover_result(identity, &origin::of(&call.headers)),
             ),
         ),
+        "ping" if !modern => json_rpc(StatusCode::OK, jsonrpc::result(id, json!({}))),
+        "tools/list" => match S::tools(&server, &call).await {
+            Ok(tools) => json_rpc(
+                StatusCode::OK,
+                jsonrpc::result(id, protocol::tools_list_result(tools, modern)),
+            ),
+            // Said as an error, so the client asks again rather than caching a
+            // list missing tools.
+            Err(why) => json_rpc(
+                StatusCode::SERVICE_UNAVAILABLE,
+                jsonrpc::error(
+                    id,
+                    jsonrpc::INTERNAL_ERROR,
+                    &format!("the tools could not be listed; try again shortly ({why})"),
+                ),
+            ),
+        },
         "tools/call" => {
             let Some(name) = params
                 .get("name")
@@ -241,26 +267,20 @@ pub async fn post(
                 );
             };
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let mut ctx = Ctx {
-                session: Arc::clone(&session),
-                caller,
-                mcp: mcp_session,
-                mcp_id,
-                progress: None,
-            };
             let progress = protocol::progress_token(&params);
-            if wants_stream(&headers) {
+            if wants_stream(&call.headers) {
                 let (steps_tx, steps) = mpsc::unbounded_channel();
-                ctx.progress = Some(steps_tx);
-                stream_call(ctx, name, args, id, progress, steps, modern)
+                call.progress = Some(steps_tx);
+                stream_call(server, call, name, args, id, progress, steps, modern)
             } else {
-                let answer = tools::call(&ctx, &name, &args).await;
-                // Answered in the response itself, which nothing here can
-                // see fail.
-                answer.delivered(&ctx);
+                let answer = S::call(&server, &call, &name, &args).await;
+                let result = server.result(&answer);
+                // Answered in the response itself, which nothing here can see
+                // fail; settled behind it, so the answer does not wait on it.
+                tokio::spawn(async move { S::delivered(&server, &call, &answer).await });
                 json_rpc(
                     StatusCode::OK,
-                    jsonrpc::result(id, protocol::call_result(answer.result(), modern)),
+                    jsonrpc::result(id, protocol::call_result(result, modern)),
                 )
             }
         }
@@ -273,7 +293,7 @@ pub async fn post(
             jsonrpc::error(
                 id,
                 jsonrpc::METHOD_NOT_FOUND,
-                &format!("`{other}` is not a method /mcp answers"),
+                &format!("`{other}` is not a method this server answers"),
             ),
         ),
     }
@@ -283,9 +303,14 @@ pub async fn post(
 /// result, which ends the stream. Each step the tool says on `steps` is a
 /// progress notification of its own, and a quiet [`PROGRESS_EVERY`] repeats
 /// the last one. The tool runs to its end whether or not the client stays —
-/// the work is zend's either way.
-fn stream_call(
-    ctx: Ctx,
+/// the work is the server's either way — but once the client has gone, the
+/// tool is told ([`Call::abandoned`]) and what it answers is not delivered: a
+/// server calling on to another drops that call, so the server behind it
+/// does not take an answer nobody read as delivered either.
+#[allow(clippy::too_many_arguments)]
+fn stream_call<S: Server>(
+    server: Arc<S>,
+    call: Call<S>,
     name: String,
     args: Value,
     id: Value,
@@ -295,49 +320,63 @@ fn stream_call(
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
     tokio::spawn(async move {
-        let call = tools::call(&ctx, &name, &args);
-        tokio::pin!(call);
+        let running = S::call(&server, &call, &name, &args);
+        tokio::pin!(running);
         let mut tick = tokio::time::interval(PROGRESS_EVERY);
         tick.tick().await;
         let mut sent: u64 = 0;
         let mut last = format!("{name} working");
+        let event = |sent: u64, message: &str| match &progress {
+            Some(token) => Event::default().data(
+                jsonrpc::notification(
+                    "notifications/progress",
+                    json!({
+                        "progressToken": token,
+                        "progress": sent,
+                        "message": message,
+                    }),
+                )
+                .to_string(),
+            ),
+            None => Event::default().comment("working"),
+        };
+        let mut gone = false;
         let answer = loop {
             let message = tokio::select! {
-                answer = &mut call => break answer,
-                Some(step) = steps.recv() => {
+                answer = &mut running => break answer,
+                // The client went: the tool is told by its steps closing.
+                _ = tx.closed(), if !gone => {
+                    gone = true;
+                    steps.close();
+                    continue;
+                }
+                Some(step) = steps.recv(), if !gone => {
                     tick.reset();
                     step
                 }
-                _ = tick.tick() => last.clone(),
+                _ = tick.tick(), if !gone => last.clone(),
             };
             sent += 1;
-            let event = match &progress {
-                Some(token) => Event::default().data(
-                    jsonrpc::notification(
-                        "notifications/progress",
-                        json!({
-                            "progressToken": token,
-                            "progress": sent,
-                            "message": message,
-                        }),
-                    )
-                    .to_string(),
-                ),
-                None => Event::default().comment("working"),
-            };
+            let _ = tx.send(Ok(event(sent, &message))).await;
             last = message;
-            // A client gone is no reason to stop: the result is kept by the tool.
-            let _ = tx.send(Ok(event)).await;
         };
-        let done = jsonrpc::result(id, protocol::call_result(answer.result(), modern));
-        // A client gone before the result leaves its entries unmarked, for
-        // the next call to give.
+        if gone {
+            // What delivering the answer would change stays unchanged, for
+            // the next call.
+            return;
+        }
+        // Steps said as the tool finished are still told, before its answer.
+        while let Ok(step) = steps.try_recv() {
+            sent += 1;
+            let _ = tx.send(Ok(event(sent, &step))).await;
+        }
+        let done = jsonrpc::result(id, protocol::call_result(server.result(&answer), modern));
         if tx
             .send(Ok(Event::default().data(done.to_string())))
             .await
             .is_ok()
         {
-            answer.delivered(&ctx);
+            S::delivered(&server, &call, &answer).await;
         }
     });
     let mut res = Sse::new(ReceiverStream::new(rx)).into_response();
@@ -350,24 +389,29 @@ fn stream_call(
     res
 }
 
-/// `GET /mcp`: no server-initiated stream is offered.
+/// `GET`: no server-initiated stream is offered.
 pub async fn get() -> Response {
     StatusCode::METHOD_NOT_ALLOWED.into_response()
 }
 
-/// `DELETE /mcp`: end a handshake session.
-pub async fn delete(State(session): State<Arc<ZendSession>>, headers: HeaderMap) -> Response {
-    let Some(caller) = Caller::of(&headers, session.roles()) else {
-        return unauthorized(&headers);
+/// `DELETE`: end a handshake session.
+pub async fn delete<S: Server>(
+    State(server): State<Arc<S>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(caller) = server.caller(&headers, peer.map(|ConnectInfo(a)| a.ip())) else {
+        return unauthorized(&headers, &server.identity().title);
     };
     let Some(sid) = read_header(&headers, SESSION_HEADER) else {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     };
-    let Some(records) = session.shared_substrate() else {
-        return loading();
+    let store = match server.store() {
+        Ok(s) => s,
+        Err(why) => return unavailable(&why),
     };
-    match state::get(&records, sid, now_ms()) {
-        Some(s) if s.owner == caller.key() => match state::close(&records, sid) {
+    match store.get(sid, now_ms()) {
+        Some(s) if s.owner == server.owner(&caller) => match store.close(sid) {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         },
@@ -401,20 +445,23 @@ mod tests {
 
     #[test]
     fn the_refusal_points_at_the_gateways_resource_document() {
-        let res = unauthorized(&headers(&[
-            ("host", "192.168.0.237:18444"),
-            ("x-forwarded-host", "code.tokera.com"),
-            ("x-forwarded-proto", "https"),
-        ]));
+        let res = unauthorized(
+            &headers(&[
+                ("host", "192.168.0.237:8095"),
+                ("x-forwarded-host", "code.tokera.com"),
+                ("x-forwarded-proto", "https"),
+            ]),
+            "Zen",
+        );
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             res.headers()[header::WWW_AUTHENTICATE],
             r#"Bearer resource_metadata="https://code.tokera.com/.well-known/oauth-protected-resource/mcp""#
         );
-        let sent = unauthorized(&headers(&[
-            ("host", "code.tokera.com"),
-            ("authorization", "Bearer x"),
-        ]));
+        let sent = unauthorized(
+            &headers(&[("host", "code.tokera.com"), ("authorization", "Bearer x")]),
+            "Zen",
+        );
         assert!(sent.headers()[header::WWW_AUTHENTICATE]
             .to_str()
             .unwrap()

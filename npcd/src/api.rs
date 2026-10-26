@@ -25,8 +25,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use cluster::dispatch::{Dispatch, Merge, Mirror};
+use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
 use host::guard::{delete, get, post, put};
+use mcp_server::http as mcp_http;
+use mcp_server::SealedStore;
 // Only the test-only `router` builds one directly; the tenant goes through `api`.
 #[cfg(test)]
 use axum::Router;
@@ -132,6 +134,9 @@ pub struct Authored {
     /// mind directory — the engine is something it borrows, not something it
     /// belongs to.
     pub lifegen: Jobs,
+    /// The MCP server's sessions ([`crate::mcp`]): carried in their ids, since
+    /// its tools hold nothing on a session and a call may reach any member.
+    pub mcp_sessions: Arc<SealedStore>,
 }
 
 impl Authored {
@@ -176,6 +181,7 @@ impl Authored {
             authored_dir,
             runtime: None,
             lifegen: Jobs::new(),
+            mcp_sessions: Arc::new(SealedStore),
         }
     }
 
@@ -545,6 +551,18 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // in the handler, because a role cannot express "yours" (§8.2).
         .route("/v1/npc", Role::User, Dispatch::Any, get(list_npcs))
         .route("/v1/npc", Role::User, Dispatch::Best, post(create_npc))
+        // Battle Cities' MCP server (`crate::mcp`). Open, because the server
+        // names its own caller and refuses nobody with the challenge that
+        // starts a sign-in. A tool call goes to the member holding the
+        // character or world it acts on, as the route for the same act would.
+        .route(
+            "/v1/mcp",
+            Role::Unauthenticated,
+            Dispatch::Owner(KeySource::Derived(Derived::McpSubject)),
+            post(mcp_http::post::<Authored>)
+                .get(mcp_http::get)
+                .delete(mcp_http::delete::<Authored>),
+        )
         // Backup and restore the whole cast, for a substrate wipe-and-rebuild.
         // Admin-only: export carries every character's record regardless of
         // owner, and import writes them verbatim into a fresh substrate.
@@ -900,7 +918,7 @@ async fn put_owner(
     }
 }
 
-async fn list_npcs(
+pub(crate) async fn list_npcs(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
@@ -3670,6 +3688,9 @@ mod tests {
                 // create goes to the best member.
                 ("/v1/npc", "user"),
                 ("/v1/npc", "user"),
+                // The MCP server: open, naming its own caller and sending
+                // nobody to sign in with the challenge.
+                ("/v1/mcp", "unauthenticated"),
                 // The whole cast in and out as records, for backup/restore —
                 // `admin`, a full-estate read and a bulk write.
                 ("/v1/npcs/export", "admin"),

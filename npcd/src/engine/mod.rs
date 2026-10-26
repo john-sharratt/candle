@@ -54,6 +54,7 @@ pub mod at_work;
 pub mod authoring;
 pub mod bearings;
 pub mod bench;
+pub mod bodies;
 pub mod body;
 pub mod check;
 pub mod chronology;
@@ -119,6 +120,7 @@ pub mod workflow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -132,10 +134,12 @@ use web::auth::{Identity, Role, Roles};
 
 use crate::api::{err, owner_of, Authored};
 use crate::authority::ops::{OpReply, WorldOp};
+use crate::engine::bodies::{Channel, ChannelSent, MessageSent, Messages, Said, Say};
 use crate::engine::interaction::Interlocutor;
 use crate::engine::mind::Minds;
 use crate::npcs;
 use crate::projection;
+use crate::sim::phone::CHANNEL;
 use host::guard::Api;
 
 /// The one refusal this module makes, worded once.
@@ -1128,16 +1132,22 @@ pub(crate) fn speaking_as(
     }
 }
 
+/// What a message or channel body says ([`Say`]): a body with no `text` says
+/// nothing, and is refused as empty in the route's own words.
+fn said(body: Result<Json<Say>, JsonRejection>) -> String {
+    body.map(|Json(b)| b.text).unwrap_or_default()
+}
+
 /// `POST /v1/npc/:nid/message` — say something to a character on its handset.
 ///
 /// Goes onto the same thread the characters use, so the character is told about
 /// it by the ordinary sweep and answers with the ordinary `message` act. A
 /// person is a party to the conversation rather than an operator poking at one.
-async fn post_message(
+pub(crate) async fn post_message(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path(nid): Path<String>,
-    Json(body): Json<Value>,
+    body: Result<Json<Say>, JsonRejection>,
 ) -> Response {
     let (id, handle) = match owner_of(&s, &headers).await {
         Ok(v) => v,
@@ -1147,11 +1157,8 @@ async fn post_message(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let text = body
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
+    let said = said(body);
+    let text = said.trim();
     if text.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -1183,18 +1190,18 @@ async fn post_message(
         Ok(_) => return not_in_a_world(),
         Err(e) => return world_unreached(&e),
     };
-    Json(json!({
-        "sent": text,
-        "from": me,
-        "to": sent.with,
-        "waiting_for_them": sent.waiting_for_them,
-        "can_reply": sent.can_reply,
-    }))
+    Json(MessageSent {
+        sent: text.to_string(),
+        from: me,
+        to: sent.with,
+        waiting_for_them: sent.waiting_for_them,
+        can_reply: sent.can_reply,
+    })
     .into_response()
 }
 
 /// `GET /v1/npc/:nid/message` — the conversation so far, oldest first.
-async fn get_messages(
+pub(crate) async fn get_messages(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path(nid): Path<String>,
@@ -1215,18 +1222,23 @@ async fn get_messages(
     let Some((them, messages)) = said else {
         // Not an error: a character with no body has nothing to say on a
         // handset yet, and the console renders an empty conversation.
-        return Json(json!({ "messages": [], "in_a_world": false })).into_response();
+        return Json(Messages {
+            messages: Vec::new(),
+            in_a_world: false,
+            with: None,
+            as_name: None,
+        })
+        .into_response();
     };
-    let messages: Vec<Value> = messages
-        .into_iter()
-        .map(|(from, text)| json!({ "from": from, "text": text }))
-        .collect();
-    Json(json!({
-        "messages": messages,
-        "in_a_world": true,
-        "with": them,
-        "as": me,
-    }))
+    Json(Messages {
+        messages: messages
+            .into_iter()
+            .map(|(from, text)| Said { from, text })
+            .collect(),
+        in_a_world: true,
+        with: Some(them),
+        as_name: Some(me),
+    })
     .into_response()
 }
 
@@ -1304,7 +1316,7 @@ async fn post_posting(
 /// Read as the caller, so it shows what the channel has carried since they
 /// joined it and not the hours before — the same rule every other member reads
 /// it under.
-async fn get_channel(
+pub(crate) async fn get_channel(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path(wid): Path<String>,
@@ -1324,16 +1336,15 @@ async fn get_channel(
             "that world is not hosted, so it has no channel",
         );
     };
-    let messages: Vec<Value> = said
-        .into_iter()
-        .map(|(from, text)| json!({ "from": from, "text": text }))
-        .collect();
-    Json(json!({
-        "channel": crate::sim::phone::CHANNEL,
-        "world": wid,
-        "as": me,
-        "messages": messages,
-    }))
+    Json(Channel {
+        channel: CHANNEL.to_string(),
+        world: wid,
+        as_name: me,
+        messages: said
+            .into_iter()
+            .map(|(from, text)| Said { from, text })
+            .collect(),
+    })
     .into_response()
 }
 
@@ -1344,21 +1355,18 @@ async fn get_channel(
 /// every character in a world at once, which is not a thing ownership can
 /// express — so it is bound to the one role that is *about* standing outside
 /// the whole world rather than owning part of it.
-async fn post_channel(
+pub(crate) async fn post_channel(
     State(s): State<Arc<Authored>>,
     headers: HeaderMap,
     Path(wid): Path<String>,
-    Json(body): Json<Value>,
+    body: Result<Json<Say>, JsonRejection>,
 ) -> Response {
     let (id, handle) = match owner_of(&s, &headers).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let text = body
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
+    let said = said(body);
+    let text = said.trim();
     if text.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -1386,13 +1394,13 @@ async fn post_channel(
             "that world is not hosted, so it has no channel",
         );
     };
-    Json(json!({
-        "sent": text,
-        "channel": crate::sim::phone::CHANNEL,
-        "world": wid,
-        "from": me,
-        "heard_by": heard,
-    }))
+    Json(ChannelSent {
+        sent: text.to_string(),
+        channel: CHANNEL.to_string(),
+        world: wid,
+        from: me,
+        heard_by: heard,
+    })
     .into_response()
 }
 

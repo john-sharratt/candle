@@ -40,6 +40,7 @@ pub mod guests;
 pub mod identity;
 pub mod images;
 pub mod lifegen;
+pub mod mcp;
 pub mod mind;
 pub mod mind_store;
 pub mod model;

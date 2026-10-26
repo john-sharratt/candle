@@ -18,6 +18,7 @@ use std::sync::Arc;
 use axum::middleware;
 use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
 use host::guard::{delete, get, post, put, Api, Guarded, Routes};
+use mcp_server::http as mcp_http;
 use web::auth::{Role, Roles};
 
 use crate::mcp;
@@ -38,7 +39,7 @@ pub mod scan;
 pub mod substrate;
 
 /// zend's routes, graded by `roles`, on `session` — every one behind the
-/// ownership layer, which keeps a conversation `/mcp` started to its owner
+/// ownership layer, which keeps a conversation MCP started to its owner
 /// ([`mcp::ownership`]).
 pub fn routes(session: Arc<ZendSession>, roles: Roles) -> Routes {
     let mut routes = table(roles).into_routes(Arc::clone(&session));
@@ -263,17 +264,17 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             conversation(),
             get(journal::turns),
         )
-        // The remote MCP endpoint (`crate::mcp`). Open, because `/mcp` names
-        // its own caller from the gateway's identity and refuses nobody with
-        // the challenge that starts a sign-in at the gateway. What it keeps is
-        // replicated records, so any member answers.
+        // zend's MCP server (`crate::mcp::server`). Open, because the server
+        // names its own caller from the gateway's identity and refuses nobody
+        // with the challenge that starts a sign-in at the gateway. What it
+        // keeps is replicated records, so any member answers.
         .route(
-            "/mcp",
+            "/v1/mcp",
             Role::Unauthenticated,
             Dispatch::Any,
-            post(mcp::http::post)
-                .get(mcp::http::get)
-                .delete(mcp::http::delete),
+            post(mcp_http::post::<ZendSession>)
+                .get(mcp_http::get)
+                .delete(mcp_http::delete::<ZendSession>),
         )
 }
 
@@ -331,7 +332,7 @@ mod tests {
                     "/v1/conversations/:id/journal/:eid/turns",
                     "unauthenticated"
                 ),
-                ("/mcp", "unauthenticated"),
+                ("/v1/mcp", "unauthenticated"),
             ]
         );
     }
@@ -393,7 +394,7 @@ mod tests {
                 Dispatch::Any,
             ),
             ("GET", "/v1/substrate/zend/timeline/7", Dispatch::Any),
-            ("POST", "/mcp", Dispatch::Any),
+            ("POST", "/v1/mcp", Dispatch::Any),
             ("DELETE", "/v1/substrate/zend/timeline/7", Dispatch::Best),
             ("POST", "/v1/substrate/zend/scan", Dispatch::Best),
             ("GET", "/v1/substrate/zend/system-prompt", Dispatch::Any),

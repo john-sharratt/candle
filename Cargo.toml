@@ -18,6 +18,8 @@ members = [
     "candle-wasm-tests",
     "host",
     "journal-core",
+    "mcp",
+    "mcp-server",
     "npc-map",
     "npcd",
     "store-events",

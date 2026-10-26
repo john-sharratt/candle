@@ -76,6 +76,20 @@ impl Auth {
             .then(|| grant.identity(session::now_secs() + grants::ACCESS_TTL_SECS))
     }
 
+    /// Who a backend acting for a person is (`server.trusted_backends`,
+    /// `docs/mcp_app.md` §2): the person whose `/mcp` access token it
+    /// presents, on whatever path and site it calls — a token this gateway
+    /// issued, for an MCP resource it serves. A backend that holds no token
+    /// is nobody: it cannot name a person it was not handed.
+    pub fn mcp_delegated(&self, headers: &HeaderMap) -> Option<Identity> {
+        let token = bearer(headers)?;
+        let grant: Grant = grants::open(&self.key, Kind::McpAccess, token, session::now_secs())?;
+        grant
+            .resource
+            .ends_with(metadata::MCP_PATH)
+            .then(|| grant.identity(session::now_secs() + grants::ACCESS_TTL_SECS))
+    }
+
     /// The authorization server's routes.
     pub fn mcp_router(self: Arc<Self>) -> Router {
         Router::new()

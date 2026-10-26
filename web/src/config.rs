@@ -11,7 +11,7 @@
 //! The same config shape covers both, so moving a site from one to the other is
 //! an edit to one line rather than a different deployment.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -221,6 +221,15 @@ pub struct Server {
     /// A file to read [`tls`](Self::tls) from, resolved against this config.
     #[serde(default)]
     pub tls_file: Option<PathBuf>,
+    /// Backends that call back through this gateway for the person they serve
+    /// (`docs/mcp_app.md` §2) — the mcp app, by address. A request from one
+    /// may present the person's `/mcp` access token on any path and site, and
+    /// is that person; the token names them, so the address alone names
+    /// nobody and a listed backend's `X-Tokera-*` headers are stripped like
+    /// anyone's. The list keeps a token from working that way from anywhere
+    /// else.
+    #[serde(default)]
+    pub trusted_backends: Vec<IpAddr>,
 }
 
 /// Where the TLS entrance listens, and where its certificates come from.
@@ -309,6 +318,7 @@ impl Default for Server {
             connect_timeout_ms: d_connect_timeout_ms(),
             tls: None,
             tls_file: None,
+            trusted_backends: Vec::new(),
         }
     }
 }

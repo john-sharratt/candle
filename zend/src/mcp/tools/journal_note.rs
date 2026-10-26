@@ -71,8 +71,8 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         ));
     }
     let target = if journal == "self" {
-        match &ctx.mcp.attached {
-            Some(t) => Target::Thread(t.clone()),
+        match ctx.attached() {
+            Some(t) => Target::Thread(t),
             None => return Answer::error(
                 "`self` names the attached thread, and none is attached: call `zend_attach` first",
             ),

@@ -45,6 +45,10 @@ store-events = { path = "../store-events" }
 # conditional answer, gzip, cache tier), one implementation shared with the
 # gateway and the host.
 web          = { path = "../web" }
+# The MCP server zend's tools are served on, at `/v1/mcp` (`docs/mcp_app.md`):
+# the protocol and its sessions, written once and shared with npcd and the
+# aggregator in front of both.
+mcp-server   = { path = "../mcp-server" }
 reqwest      = { version = "0.12", features = ["stream"] }
 # The query strings the operations tools send up to a gateway.
 url          = "2"

@@ -46,7 +46,7 @@ pub fn definition() -> Value {
 /// The path `journal` names for this call.
 fn resolve(ctx: &Ctx, journal: &str) -> Result<Path, String> {
     if journal == "self" {
-        return ctx.mcp.attached.clone().map(Path::Thread).ok_or_else(|| {
+        return ctx.attached().map(Path::Thread).ok_or_else(|| {
             "`self` names the attached thread, and none is attached: call `zend_attach` first"
                 .into()
         });

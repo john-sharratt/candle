@@ -52,7 +52,7 @@ enum Scope {
 fn scope(ctx: &Ctx, journal: &str) -> Result<Scope, String> {
     let thread = |t: String| Scope::Notes(format!("T:{t}"), t);
     if journal == "self" {
-        return ctx.mcp.attached.clone().map(thread).ok_or_else(|| {
+        return ctx.attached().map(thread).ok_or_else(|| {
             "`self` names the attached thread, and none is attached: call `zend_attach` first"
                 .into()
         });

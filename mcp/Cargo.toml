@@ -1,0 +1,25 @@
+[package]
+name = "mcp"
+version = "0.1.0"
+edition = "2021"
+description = "The MCP server Claude reaches at code.tokera.com/mcp: an aggregator over the MCP servers zend and npcd run, reached through the gateway as the caller"
+
+[[bin]]
+name = "mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow       = { workspace = true }
+axum         = { version = "0.7" }
+clap         = { workspace = true }
+futures      = { workspace = true }
+mcp-server   = { path = "../mcp-server" }
+reqwest      = { version = "0.12", default-features = false, features = ["stream", "json"] }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+serde_yaml   = { workspace = true }
+sha2         = "0.10"
+tokio        = { version = "1", features = ["full"] }
+tracing      = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+web          = { path = "../web" }

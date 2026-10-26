@@ -32,6 +32,13 @@ server:
   # must not take the real one.
   bind: "0.0.0.0:80"
 
+  # The backends that call back through this gateway for the person they serve
+  # (docs/mcp_app.md §2): the mcp app on AlienWorld, which runs Claude's tools
+  # on zend and npcd as the signed-in caller. From here a person's /mcp access
+  # token is honoured on any path; the token names the person, never the
+  # address.
+  trusted_backends: ["192.168.0.237"]
+
   # ── the TLS entrance ──────────────────────────────────────────────────────
   # HTTP/3 over QUIC on udp, with HTTP/2 and HTTP/1.1 over tcp for a client
   # that cannot reach udp — both on one port. A browser's first request always
@@ -309,13 +316,13 @@ sites:
         upstream: "https://192.168.0.5:8444"
         self_signed: true
         cluster: zend
-      # The MCP endpoint for Claude connectors (docs/claude_zend_gateway.md
-      # §12), served by the cluster's zend members like the rest of the API.
-      # Sign-in and OAuth stay the gateway's.
+      # The MCP endpoint for Claude connectors, served by the mcp app on
+      # AlienWorld (docs/mcp_app.md), which calls zend and npcd back through
+      # this gateway as the signed-in caller. Sign-in and OAuth stay the
+      # gateway's.
       - prefix: /mcp
-        upstream: "https://192.168.0.5:8444"
-        self_signed: true
-        cluster: zend
+        exact: true
+        upstream: "http://192.168.0.237:8095"
 
   # ── the other Tokera names ──────────────────────────────────────────────
   # Every alternate domain for the brand, sent to the one that is the brand.

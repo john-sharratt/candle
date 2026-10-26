@@ -21,6 +21,8 @@ use axum::Router;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 use serde_json::json;
+use web::auth::mcp::grants::{seal, Grant, Kind};
+use web::auth::session::{now_secs, Key};
 use web::{Builder, Config};
 
 // ── harness ────────────────────────────────────────────────────────────────
@@ -504,6 +506,12 @@ async fn spawn_echo_daemon() -> SocketAddr {
 }
 
 async fn gateway_with_subsite(provider: SocketAddr, daemon: SocketAddr) -> Fixture {
+    gateway_trusting(provider, daemon, &[]).await
+}
+
+/// [`gateway_with_subsite`], believing the identity `backends` state
+/// (`server.trusted_backends`).
+async fn gateway_trusting(provider: SocketAddr, daemon: SocketAddr, backends: &[&str]) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let session = write_secret(
         dir.path(),
@@ -513,6 +521,8 @@ async fn gateway_with_subsite(provider: SocketAddr, daemon: SocketAddr) -> Fixtu
     let secret = write_secret(dir.path(), "google.secret", "shh");
     let yaml = format!(
         r#"
+server:
+  trusted_backends: [{trusted}]
 auth:
   cookie_domain: ".tokera.com"
   session_secret_file: "{s}"
@@ -533,6 +543,11 @@ sites:
     hosts: ["bot.tokera.localhost"]
     api: [{{prefix: /v1, upstream: "http://{daemon}"}}]
 "#,
+        trusted = backends
+            .iter()
+            .map(|b| format!("\"{b}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
         s = session.display().to_string().replace('\\', "/"),
         g = secret.display().to_string().replace('\\', "/"),
     );
@@ -642,6 +657,64 @@ async fn a_client_cannot_forge_identity_headers_through_the_gateway() {
     )
     .await;
     assert!(mixed.body.contains("\"user\":\"u-101\""), "{}", mixed.body);
+}
+
+/// A `/mcp` access token for the person `sub`, as the gateway with the
+/// fixture's session key issues one.
+fn mcp_token(sub: &str, email: &str) -> String {
+    let key = Key::new(b"0123456789abcdef0123456789abcdef".to_vec()).unwrap();
+    let grant = Grant {
+        client_id: "https://claude.ai/oauth/mcp-oauth-client-metadata".into(),
+        redirect_uri: "https://claude.ai/api/mcp/auth_callback".into(),
+        resource: "http://code.tokera.localhost/mcp".into(),
+        provider: "google".into(),
+        sub: sub.into(),
+        email: email.into(),
+        name: String::new(),
+    };
+    seal(&key, Kind::McpAccess, now_secs() + 600, &grant)
+}
+
+/// **A listed backend acts for the person whose token it holds**
+/// (`docs/mcp_app.md` §2): it presents the person's `/mcp` access token, on
+/// another path and site, and the daemon is told who that is. Its own
+/// identity headers are no one's, listed or not, and the token works that way
+/// only from a listed backend.
+#[tokio::test]
+async fn a_listed_backend_acts_for_the_person_whose_token_it_holds() {
+    let provider = spawn_provider("u-102", "real@example.com").await;
+    let daemon = spawn_echo_daemon().await;
+    let fx = gateway_trusting(provider, daemon, &["127.0.0.1"]).await;
+    let bearer = format!("Bearer {}", mcp_token("u-7", "seven@example.com"));
+    let acting = request(
+        fx.gateway,
+        "/v1/whoami",
+        &[("host", "bot.tokera.localhost"), ("authorization", &bearer)],
+    )
+    .await;
+    assert!(acting.body.contains("\"user\":\"u-7\""), "{}", acting.body);
+    assert!(acting.body.contains("seven@example.com"), "{}", acting.body);
+
+    let forged = request(
+        fx.gateway,
+        "/v1/whoami",
+        &[
+            ("host", "bot.tokera.localhost"),
+            ("x-tokera-user", "u-7"),
+            ("x-tokera-provider", "google"),
+        ],
+    )
+    .await;
+    assert!(forged.body.contains("\"user\":\"\""), "{}", forged.body);
+
+    let elsewhere = gateway_trusting(provider, daemon, &["192.0.2.1"]).await;
+    let unlisted = request(
+        elsewhere.gateway,
+        "/v1/whoami",
+        &[("host", "bot.tokera.localhost"), ("authorization", &bearer)],
+    )
+    .await;
+    assert!(unlisted.body.contains("\"user\":\"\""), "{}", unlisted.body);
 }
 
 fn urlencode(s: &str) -> String {

@@ -15,12 +15,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use mcp_server::{protocol, Session, Store};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::caller::Caller;
 use super::reported::{self, Mark};
-use super::state::{Session, DEFAULT_WAIT_S};
+use super::state::{ATTACHED, DEFAULT_WAIT_S};
 use crate::session::ZendSession;
 
 mod agent_job;
@@ -57,12 +58,20 @@ pub const LOADING: &str = "zend is still loading its model; try again shortly";
 pub struct Ctx {
     pub session: Arc<ZendSession>,
     pub caller: Caller,
-    /// The MCP session the call came on, and its id.
+    /// The MCP session the call came on, its id, and where it is kept.
     pub mcp: Session,
     pub mcp_id: String,
+    pub store: Arc<dyn Store>,
     /// Where the call says each step of the work it waits on: the call's event
     /// stream, when it is answered on one.
     pub progress: Option<UnboundedSender<String>>,
+}
+
+impl Ctx {
+    /// The thread the session is attached to, which `"self"` names.
+    pub fn attached(&self) -> Option<String> {
+        self.mcp.held(ATTACHED).map(str::to_string)
+    }
 }
 
 /// A tool's answer: its text, whether it is an error the model should read as
@@ -96,22 +105,19 @@ impl Answer {
         Self { marks, ..self }
     }
 
-    /// Keep this answer's marks for the caller of `ctx`: it was delivered.
-    pub fn delivered(&self, ctx: &Ctx) {
+    /// Keep this answer's marks for `owner`: it was delivered.
+    pub fn delivered(&self, session: &ZendSession, owner: &str) {
         if self.marks.is_empty() {
             return;
         }
-        if let Some(records) = ctx.session.shared_substrate() {
-            reported::keep(&records, &ctx.caller.key(), &self.marks);
+        if let Some(records) = session.shared_substrate() {
+            reported::keep(&records, owner, &self.marks);
         }
     }
 
     /// The `tools/call` result: always a text block, which every client reads.
     pub fn result(&self) -> Value {
-        json!({
-            "content": [{"type": "text", "text": self.text}],
-            "isError": self.is_error,
-        })
+        protocol::text_result(&self.text, self.is_error)
     }
 }
 
