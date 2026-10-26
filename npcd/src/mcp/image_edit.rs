@@ -58,7 +58,7 @@ impl Tool for Edit {
                 "type": "object",
                 "properties": {
                     "image": {"type": "string", "description": "The picture to edit: the link or image id an image_generate or image_edit answer gave."},
-                    "image_base64": {"type": "string", "description": "Or a picture of the user's own, base64 (PNG, JPEG, WebP or GIF)."},
+                    "image_base64": {"type": "string", "description": "Or a picture of the user's own, base64 — a JPEG or a PNG."},
                     "prompt": {"type": "string", "description": "The whole picture as it should end up, with the change in it."},
                     "hold": {"type": "number", "minimum": 0.0, "maximum": MAX_REFERENCE_HOLD, "default": HOLD, "description": "How much of the original survives: about 0.3 for a large change, 0.5 to add or remove a detail, 0.7 for a light touch."},
                     "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "description": "Width in pixels, a multiple of 16; the original's shape when absent."},
