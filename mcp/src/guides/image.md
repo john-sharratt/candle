@@ -77,7 +77,8 @@ clothing. A prompt that leaves an age unclear may be declined.
   …"). Pass that seed back only to redraw the same picture with a small prompt
   change. **Shift:** leave it alone.
 - **Time:** a draw takes from about half a minute to three, most of it the
-  prompt check and loading the image model. Some clients show no progress
+  prompt check and loading the image model — up to three minutes more when
+  it has to wait for room on a busy card. Some clients show no progress
   while it works and give a call up after about five minutes; a call given up
   that way may still be drawing, so wait two minutes before sending it again.
 - **One at a time.** The engine holds one image model at once: send the next
@@ -102,13 +103,14 @@ request before showing it:
 When the draw fails for any other reason, the prompt was not the problem —
 do not rewrite it:
 
-- `no_room` — the engine had no room for the image model just then. On a
-  draw sent alongside another, that is the other draw: send it again once
-  the other has answered. On a draw sent alone, the engine was busy and came
-  up a few hundred MiB short; that room frees as its busy turns finish. Send
-  the same call again in a minute — it can take a few tries. A smaller size
-  (768 on the long side) needs about 500 MiB less, so it is the second
-  option when the same size keeps being refused.
+- `no_room` — the engine had no room for the image model. A draw that finds
+  the card busy does not fail at once: it waits up to three minutes, holding
+  back new work so the turns running finish and free their room, and draws
+  as soon as it fits. That wait is normal and needs nothing from you — it
+  only makes the draw slower. So `no_room` means the card stayed full for
+  those three minutes, or a draw sent alongside another lost to it. Send the
+  draw again in a few minutes, alone; when the same size keeps being refused,
+  a smaller one (768 on the long side) needs about 500 MiB less.
 - "is unavailable" (`upstream_unavailable`, `upstream_backoff`), a call cut
   off, or — while the service comes back up — a `404` or a `401 … sign in`:
   the image service is restarting. Send the same call again in a minute or
