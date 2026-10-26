@@ -177,12 +177,7 @@ pub const ESTATE: [(&str, &str, &str, &str); 4] = [
         "https://tokera.com/",
         "/brand/tokera.png",
     ),
-    (
-        "zend",
-        "Zen",
-        "https://code.tokera.com/",
-        "/brand/zen.png",
-    ),
+    ("zend", "Zen", "https://code.tokera.com/", "/brand/zen.png"),
     ("npcd", "NPCs", "https://bot.tokera.com/", "/brand/npcd.svg"),
     (
         "battlecities",

@@ -9118,8 +9118,9 @@ mod projection_schema_tests {
             assert!(l.budget.adaptive.is_none(), "{name}");
         }
 
-        // Whole files and analysis units are each one case of one competition,
-        // every fold group voting alike.
+        // Whole files and analysis units are each one case of one competition.
+        // A file's reading votes in every fold group alike; an analysis unit
+        // leaves group 0 out (asserted with its calibration below).
         for name in [
             "code_reading",
             "dependency_analysis",
@@ -9128,7 +9129,9 @@ mod projection_schema_tests {
         ] {
             let g = &layer(name).groups[0];
             assert_eq!(g.policy.scan.cases, ScanCases::File, "{name}");
-            assert!(g.policy.layer_weights.is_empty(), "{name}");
+            if name == "code_reading" {
+                assert!(g.policy.layer_weights.is_empty(), "{name}");
+            }
             // The cold-scope floor is code_reading's alone.
             let floor = if name == "code_reading" {
                 (2.0, 16.0)
@@ -9161,18 +9164,17 @@ mod projection_schema_tests {
             0.5
         );
         assert!(calibrate.prompt.contains("<<path>>"));
-        // So is every analysis of a file, and its calibration weighs alike.
+        // So is every analysis of a file; each leaves fold group 0 out and
+        // weighs its calibration at a quarter.
         for name in ["dependency_analysis", "code_review", "security_review"] {
             let spec = CalibrateSpec::of(layer(name))
                 .unwrap()
                 .unwrap_or_else(|| panic!("{name} declares a calibration"));
             assert_eq!((spec.questions, spec.think), (24, 64), "{name}");
             assert!(spec.prompt.contains("<<path>>"), "{name}");
-            assert_eq!(
-                layer(name).groups[0].policy.scan.calibration_weight,
-                0.5,
-                "{name}"
-            );
+            let policy = &layer(name).groups[0].policy;
+            assert_eq!(policy.scan.calibration_weight, 0.25, "{name}");
+            assert_eq!(policy.layer_weights, vec![0.0, 1.0, 1.0], "{name}");
         }
 
         let ws = layer("dialogue")

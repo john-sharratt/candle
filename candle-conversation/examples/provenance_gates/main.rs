@@ -32,6 +32,11 @@
 //! - **Calibration cut** (`calibration-cut`): the calibration competition's
 //!   cut as production learns it, over every calibrated file, judged on a
 //!   question held out of both the learning and the gallery.
+//! - **Momentum** (`momentum`): each file's held-out questions asked in
+//!   sequence, their scans fed through the working set's momentum, staying on
+//!   one file and switching to another.
+//! - **Layers** (`layers`): fold-group weightings for content and for the
+//!   calibration competition apart, from one scan each.
 //!
 //! The sweep, gate 4, the questions gate, the normalization probe and the
 //! chunk factor scan on a running daemon's gallery
@@ -66,6 +71,10 @@
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> calibration-cut --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> momentum --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> layers --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> scan-loop [passes] --daemon <url> --node <hex>
 
 mod anomaly;
@@ -78,6 +87,8 @@ mod competitions;
 mod corpus;
 mod density;
 mod judge;
+mod layers_gate;
+mod momentum_gate;
 mod norm_probe;
 mod paper;
 mod question_cut;
@@ -267,6 +278,12 @@ fn main() -> anyhow::Result<()> {
         "calibration-cut" => {
             calibration_cut::run(&files, daemon()?)?;
         }
+        "momentum" => {
+            momentum_gate::run(&files, daemon()?)?;
+        }
+        "layers" => {
+            layers_gate::run(&files, daemon()?)?;
+        }
         "scan-loop" => {
             let passes = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(5);
             scan_loop::run(&files, passes, daemon()?)?;
@@ -275,7 +292,7 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!(
                 "unknown command `{other}`: files, retrieval, sweep, paper, questions, \
                  normalization, chunk-factor, density, question-cut, competitions, thinking, \
-                 calibration-cut or scan-loop"
+                 calibration-cut, momentum, layers or scan-loop"
             )
         }
     }
