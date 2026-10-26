@@ -1064,12 +1064,15 @@ impl Conversation {
             return preload;
         };
         let mut seen: HashSet<StreamId> = HashSet::new();
-        for (sid, window) in windows {
-            if !seen.insert(sid) {
-                continue;
-            }
-            match arena.ensure_resident(sid, &window, window.fingerprint()) {
-                Ok(_) => {
+        windows.retain(|(sid, _)| seen.insert(*sid));
+        let ensured = arena.ensure_all_resident(
+            windows
+                .iter()
+                .map(|(sid, window)| (*sid, window.into(), window.fingerprint())),
+        );
+        for ((sid, window), done) in windows.iter().zip(ensured) {
+            match done {
+                Ok(()) => {
                     preload.resident += 1;
                     preload.tokens += window.len();
                 }

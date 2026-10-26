@@ -290,7 +290,8 @@ impl GalleryArena {
     /// One claim for the whole turn, so the arena window opens at most once however
     /// many new arenas it needs. A refusal means the span itself is full, and it
     /// **is** an error: routine growth is bounded well before this by the gallery's
-    /// own keep rule (`evict_past_keep_locked`, run before anything is admitted), so
+    /// own keep rule (`evict_past_keep_locked`, run once before a scan's index build,
+    /// a preload, and a single turn's miss), so
     /// reaching a refusal is the KV side having no region to spare for a gallery
     /// that is already inside its budget.
     fn alloc_and_upload(&self, sigs: TurnSigs<'_>) -> Result<PageRun> {
@@ -324,9 +325,10 @@ impl GalleryArena {
     /// **Makes no room.** The keep eviction walks every resident turn, so it is
     /// the caller's to run once before what it admits: a single turn's
     /// [`ensure_resident`](Self::ensure_resident) before its miss, a scan's
-    /// index build once before its every turn. Run ahead of each ensure, a
-    /// 27,217-turn `code_reading` index spent 20.6 s in it (BlackWorld,
-    /// 2026-10-26), stalling every reprojection.
+    /// index build and a preload once before their every turn. Its cost per
+    /// ensure is what this avoids: over a 27,217-turn `code_reading` index it
+    /// came to 20.6 s a build (BlackWorld, 2026-10-26), stalling every
+    /// reprojection.
     fn ensure_locked(
         &self,
         res: &mut HashMap<StreamId, ResidentTurn>,
@@ -422,7 +424,7 @@ impl GalleryArena {
     /// a stored window is decoded only on the miss.
     /// Does NOT pin — used off the scan hot path (and by tests).
     ///
-    /// A miss first keeps the arena under its own ceiling: this is where
+    /// A miss first gives up the turns past their keep time: this is where
     /// gallery growth is bounded outside a scan, since `alloc_and_upload` adds
     /// a slab whenever the page pool is empty and nothing else ever shrinks the
     /// arena. A hit admits nothing, so it makes no room.
@@ -438,6 +440,25 @@ impl GalleryArena {
         }
         self.ensure_locked(&mut res, sid, sigs.into(), fingerprint, false)
             .map(|ensured| ensured.addrs)
+    }
+
+    /// [`ensure_resident`](Self::ensure_resident) for many turns at once — a
+    /// gallery preload — giving up the turns past their keep time once, before
+    /// the first, rather than before each miss: the pass walks every resident
+    /// turn. One result per turn, in order.
+    pub fn ensure_all_resident<'a>(
+        &self,
+        turns: impl IntoIterator<Item = (StreamId, TurnSigs<'a>, u64)>,
+    ) -> Vec<Result<()>> {
+        self.evict_past_keep();
+        turns
+            .into_iter()
+            .map(|(sid, sigs, fingerprint)| {
+                let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+                self.ensure_locked(&mut res, sid, sigs, fingerprint, false)
+                    .map(|_| ())
+            })
+            .collect()
     }
 
     /// Like [`ensure_resident`](Self::ensure_resident) but **pins** the turn for
@@ -483,7 +504,8 @@ impl GalleryArena {
     /// Reuse the cached index if it matches `fingerprint` AND every turn it
     /// references is still resident on the run it was built against — in which
     /// case this **pins** them (bumping their LRU) for the scan and returns the
-    /// shared index. Returns `None` on any miss (caller rebuilds).
+    /// shared index. Otherwise says why it missed — no index cached, or a turn
+    /// it holds evicted, moved or re-uploaded — and the caller rebuilds.
     ///
     /// A turn whose run id still matches has not been re-uploaded, evicted or
     /// moved since the build, so every address the index holds for it is still
@@ -720,9 +742,6 @@ impl GalleryArena {
             .store(next.to_bits(), Ordering::Relaxed);
     }
 
-    /// Give up every turn not worth its ground ([`eviction::past_keep`]) — the
-    /// governor's relief rung and every admission alike. Returns the bytes
-    /// freed. Pinned turns never go, so an in-flight scan's pages stay.
     /// Resident turns, and of them how many a scan holds pinned now — what the
     /// keep trade may not take whatever their age.
     pub fn residency_counts(&self) -> (usize, usize) {
@@ -730,6 +749,10 @@ impl GalleryArena {
         (res.len(), res.values().filter(|rt| rt.pinned != 0).count())
     }
 
+    /// Give up every turn not worth its ground ([`eviction::past_keep`]) — the
+    /// governor's relief rung, a scan's index build, and a preload. Returns
+    /// the bytes freed. Pinned turns never go, so an in-flight scan's pages
+    /// stay.
     pub fn evict_past_keep(&self) -> u64 {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
         self.evict_past_keep_locked(&mut res)
@@ -932,6 +955,37 @@ mod tests {
         let res = arena.residency.lock().unwrap();
         assert_eq!(res.len(), 1, "the upload gave both idle turns up");
         assert!(res.contains_key(&sid(2)));
+    }
+
+    /// **A preload makes room once, before its first turn**, then admits every
+    /// turn it names, in order: the idle turns past the keep time go, and the
+    /// batch's own turns — one re-uploaded, one new — are all resident after.
+    #[test]
+    fn a_preload_gives_up_idle_turns_once_then_admits_its_own() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let sigs = |t: u64| -> Vec<WideQSig> { (0..32).map(|k| sig(t * 1000 + k)).collect() };
+        arena.ensure_resident(sid(0), &sigs(0), 1).unwrap();
+        arena.ensure_resident(sid(1), &sigs(1), 2).unwrap();
+        arena.set_keep_within(Some(Duration::from_nanos(1)));
+        std::thread::sleep(Duration::from_millis(2));
+        let (s0, s2) = (sigs(0), sigs(2));
+        let done = arena.ensure_all_resident([
+            (sid(0), TurnSigs::from(&s0), 1),
+            (sid(2), TurnSigs::from(&s2), 3),
+        ]);
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|r| r.is_ok()));
+        let res = arena.residency.lock().unwrap();
+        let mut held: Vec<StreamId> = res.keys().copied().collect();
+        held.sort_by_key(|s| s.0);
+        let mut want = vec![sid(0), sid(2)];
+        want.sort_by_key(|s| s.0);
+        assert_eq!(held, want, "the idle turn 1 went; the batch's turns stay");
     }
 
     /// Eviction frees LRU turns and skips the pinned working set.
