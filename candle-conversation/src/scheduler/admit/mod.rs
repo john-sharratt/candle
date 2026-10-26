@@ -483,7 +483,7 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                         )
                     } else if peers > 0 {
                         // Its rows refused, it joins only at no cost to them.
-                        rate.try_join_trading(before, after, peers as f64)
+                        rate.try_join_trading(before, after, peers as f64, cost.decodes_after)
                     } else {
                         rate.try_outranking(cost.rows, after)
                     };
@@ -537,67 +537,56 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                             Kind::Section => ground.decodes_active() > 0,
                             Kind::Decode => false,
                         };
-                    let decode_ok = if cost.decodes_after && !trading && !rate.carries_nothing() {
-                        // The decode that follows steps one row at a time; a
-                        // drafted turn is wider, and would only be refused more
-                        // readily than this asks for.
-                        match rate.decode_would_carry(0, before, after) {
-                            Ok(_) => true,
-                            Err(r) => {
-                                out.note(r);
-                                log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
-                                false
-                            }
-                        }
-                    } else {
-                        true
-                    };
                     // An offer of no rows joins a forward whose rows are already
                     // spent: it shares the forwards to come rather than widening
                     // this one, so there is no prefill gain to judge — only the
-                    // floor, and the decode question asked above.
+                    // floor and, beside running decodes, their rate: with the
+                    // join's own decode in the wave when it goes on to decode
+                    // (`WaveRate::try_join_trading`). The decode that follows
+                    // steps one row at a time; a drafted turn is wider, and would
+                    // only be refused more readily than this asks for.
                     //
                     // A prefill whose rows the rate model turns down for the rate
                     // alone has not been turned away: the forward's rows are spent,
                     // and the ground re-offers the same turn as a join on the next
                     // peek (`Ground::close_rows`, `WaveRate::try_widen`).
-                    decode_ok
-                        && match if cost.rows == 0 && ground.decodes_active() > 0 {
-                            // A join's K/V slows the decodes running beside it
-                            // as a widening's does (`WaveRate::try_join_trading`).
-                            rate.try_join_trading(before, after, ground.decodes_active() as f64)
-                        } else if cost.rows == 0 {
-                            rate.try_join(after)
-                        } else if trading {
-                            rate.try_widen_trading(
-                                cost.rows,
-                                before,
-                                after,
-                                ground.prefill_weight(prio),
-                                ground.decodes_active() as f64,
-                            )
-                        } else if kind == Kind::Prefill {
-                            rate.try_widen(cost.rows, before, after)
-                        } else {
-                            rate.try_admit(Admission::Prefill { tokens: cost.rows }, before, after)
-                        } {
-                            rate::Admit::Admitted { .. } => true,
-                            rate::Admit::Refused(
-                                r @ (rate::Refusal::Saturated { .. } | rate::Refusal::Worse { .. }),
-                            ) if kind == Kind::Prefill && ground.close_rows() => {
-                                log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
-                                continue;
-                            }
-                            rate::Admit::Refused(r) => {
-                                // `try_widen` leaves a rate refusal unlatched for
-                                // the join above; with no join to make, it ends
-                                // the wave as `try_admit`'s does.
-                                rate.latch_full();
-                                out.note(r);
-                                log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
-                                false
-                            }
+                    match if cost.rows == 0 {
+                        rate.try_join_trading(
+                            before,
+                            after,
+                            ground.decodes_active() as f64,
+                            cost.decodes_after,
+                        )
+                    } else if trading {
+                        rate.try_widen_trading(
+                            cost.rows,
+                            before,
+                            after,
+                            ground.prefill_weight(prio),
+                            ground.decodes_active() as f64,
+                        )
+                    } else if kind == Kind::Prefill {
+                        rate.try_widen(cost.rows, before, after)
+                    } else {
+                        rate.try_admit(Admission::Prefill { tokens: cost.rows }, before, after)
+                    } {
+                        rate::Admit::Admitted { .. } => true,
+                        rate::Admit::Refused(
+                            r @ (rate::Refusal::Saturated { .. } | rate::Refusal::Worse { .. }),
+                        ) if kind == Kind::Prefill && ground.close_rows() => {
+                            log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
+                            continue;
                         }
+                        rate::Admit::Refused(r) => {
+                            // `try_widen` leaves a rate refusal unlatched for
+                            // the join above; with no join to make, it ends
+                            // the wave as `try_admit`'s does.
+                            rate.latch_full();
+                            out.note(r);
+                            log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
+                            false
+                        }
+                    }
                 }
             };
             if !allowed {

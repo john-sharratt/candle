@@ -126,18 +126,22 @@ Two or three rounds is normal.
 
 ## Give it to the user
 
-The link opens the file for 7 days without signing in — the permission is
-in the link, so pass it on whole and do not trim its `?exp=…&sig=…`.
+The link opens the file for 24 hours without signing in — the permission is
+in the link, so pass it on whole and do not trim its `?exp=…&sig=…`. After
+that the link stops working and Zen deletes the picture, so what the user
+keeps is a file, not the link.
 
 1. When you can send the user a file (a tool that sends or attaches one),
    download the link into your workspace and send that file. It is the JPEG
    (or PNG) itself, so they see the picture you saw.
-2. When you can make a page or document, you can put the picture in it by
-   this link.
-3. Otherwise give them the link itself; it opens in their browser.
+2. When you can make a page or document, download the file and put it in
+   the page itself; a page that points at the link shows nothing after a day.
+3. Otherwise give them the link itself, and tell them to save the picture
+   within 24 hours.
 
 With it, give the prompt and seed that made it, so the next request can
-start from them. Say the link stops working after 7 days. An answer that says
+start from them — the same prompt and seed draw the same picture again
+after it is gone. An answer that says
 "There is no link to the file" means the picture could not be stored: say so,
 and offer to draw it again. A fresh link that answers `image_not_found` was
 read before the file reached every server: fetch it again in a minute.

@@ -280,8 +280,10 @@ pub fn collect_live_records(
         }
     }
 
-    // Blobs, staged verbatim by location: their bytes are never in RAM, and
-    // nothing supersedes one — the first record of each hash is carried.
+    // Blobs, staged verbatim by location: their bytes are never in RAM. The
+    // index holds each hash's greatest-stamp record and nothing a tombstone
+    // retired, so that is what is carried; the tombstone itself is a custom
+    // object, carried below until it expires.
     for (key, loc) in blob_index.blobs() {
         out.push(CompactItem::raw(
             RecordHeader {
@@ -3364,7 +3366,11 @@ mod tests {
 
         // And blobs, by location.
         let mut blobs = BlobIndex::new();
-        blobs.record(BlobKey { hi: 3, lo: 4 }, loc_at(16_384, 512));
+        blobs.record(
+            BlobKey { hi: 3, lo: 4 },
+            loc_at(16_384, 512),
+            RecordIdentity::NONE,
+        );
 
         // What the member has applied of another origin, and the generation
         // fixed for what it wrote cut off — held persistence-side.

@@ -8,9 +8,9 @@
 //!
 //! **And a link to the file.** The image block reaches the model, not the
 //! person: a client may show no picture from a tool at all. So the draw is
-//! stored ([`crate::images`]) and the answer carries a link signed for a week
-//! ([`crate::image_links`]) that opens it without signing in — what the model
-//! fetches to hand the person the file.
+//! stored for a day ([`crate::images`]) and the answer carries a link signed
+//! for as long ([`crate::image_links`]) that opens it without signing in —
+//! what the model fetches to hand the person the file.
 //!
 //! **JPEG unless PNG is asked for.** The answer is one message, and on a slow
 //! link to the client it is the whole of the wait: a 1024×768 PNG is 1.2 MB of
@@ -78,7 +78,7 @@ impl Tool for Generate {
             "name": Self::NAME,
             "description": "Generate an image from a text prompt (Z-Image-Turbo). The answer is the \
                 picture for you to look at — a JPEG, or a PNG when `format` asks for one — and a \
-                link to the file that works for 7 days without signing in. The user may not see \
+                link to the file that works for 24 hours without signing in. The user may not see \
                 the picture in the tool result: to show it to them, download the link and send \
                 them the file, or give them the link. Describe the subject, style, lighting and \
                 composition in plain sentences; variety comes from the prompt, not the seed. A \
@@ -120,8 +120,9 @@ impl Tool for Generate {
             Ok(d) => d,
             Err(e) => return Answer::error(e),
         };
-        let link = s.images.put(&drawn.file).map(|id| {
-            let path = s.image_links.path(&id, now_ms() / 1000);
+        let now = now_ms();
+        let link = s.images.put_drawn(&drawn.file, now).map(|id| {
+            let path = s.image_links.path(&id, now / 1000);
             format!("{}{path}", origin::of(headers))
         });
         Answer::picture(
@@ -148,7 +149,7 @@ struct Drawn {
 /// could not be stored, that there is none and why.
 fn said(drawn: &str, link: Result<String, String>) -> String {
     match link {
-        Ok(url) => format!("{drawn} The file, for 7 days and without signing in: {url}"),
+        Ok(url) => format!("{drawn} The file, for 24 hours and without signing in: {url}"),
         Err(e) => format!("{drawn} There is no link to the file: it could not be stored ({e})."),
     }
 }
@@ -314,7 +315,7 @@ mod tests {
                 "Drew a 512x512 image, seed 7.",
                 Ok("https://bot.tokera.com/v1/image/link/ab.jpg?exp=9&sig=cd".into())
             ),
-            "Drew a 512x512 image, seed 7. The file, for 7 days and without signing in: \
+            "Drew a 512x512 image, seed 7. The file, for 24 hours and without signing in: \
              https://bot.tokera.com/v1/image/link/ab.jpg?exp=9&sig=cd"
         );
         assert_eq!(

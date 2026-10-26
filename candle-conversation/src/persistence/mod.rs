@@ -107,7 +107,7 @@ use crate::substrate::{file_store_key, Substrate, TurnMark};
 use accounting::RecordAccounting;
 use adoption::Adoption;
 use appended::Appended;
-use blob::BlobIndex;
+use blob::{retired_blob, BlobIndex, BlobKey};
 use candle::direct_io::DirectFile;
 use chunk_plan::ChunkedReadPlan;
 use compaction::Housekeeping;
@@ -377,8 +377,10 @@ impl SharedSubstrate {
     /// in-RAM [`Substrate`] holds only the winner, under the identity its
     /// record carries, so compaction re-emits it. This is the write half of the
     /// durable host state (e.g. npcd's command-table open flag);
-    /// [`Self::custom_object`] reads it back.
+    /// [`Self::custom_object`] reads it back. A blob's tombstone
+    /// ([`BlobKey::tombstone_key`], ceased) retires the blob here at once.
     pub fn put_custom_object(&self, obj: CustomObjectPayload) -> Result<()> {
+        let retires = retired_blob(&obj);
         let id = {
             let mut p = self.persistence.lock().unwrap();
             let id = p.mint();
@@ -387,7 +389,34 @@ impl SharedSubstrate {
             id
         };
         self.substrate.write().unwrap().apply_custom_object(obj, id);
+        self.forget_retired_blobs(retires);
         Ok(())
+    }
+
+    /// Forget each of `keys` whose tombstone now outranks the blob held —
+    /// after the tombstones are durable and applied, so the commit's flush
+    /// holds no substrate lock.
+    fn forget_retired_blobs(&self, keys: impl IntoIterator<Item = BlobKey>) {
+        let mut keys = keys.into_iter().peekable();
+        if keys.peek().is_none() {
+            return;
+        }
+        let mut p = self.persistence.lock().unwrap();
+        let s = self.substrate.read().unwrap();
+        for key in keys {
+            p.forget_retired_blob(&s, key);
+        }
+    }
+
+    /// Retire the blob `sha256` names: write its tombstone
+    /// ([`BlobKey::tombstone_key`], ceased), which replicates like any keyed
+    /// one. It reads as absent at once, and its bytes go at the next
+    /// compaction or maintenance pass over them (`docs/replicated_substrate.md`
+    /// §10.3).
+    pub fn retire_blob(&self, sha256: &[u8; 32]) -> Result<()> {
+        self.put_custom_object(CustomObjectPayload::ceased(
+            BlobKey::of(sha256).tombstone_key(),
+        ))
     }
 
     /// Read the live [`CustomObjectPayload`] for `key`, or `None` if none was
@@ -420,10 +449,14 @@ impl SharedSubstrate {
             p.commit()?;
             ids
         };
-        let mut s = self.substrate.write().unwrap();
-        for (obj, id) in objs.into_iter().zip(ids) {
-            s.apply_custom_object(obj, id);
+        let retires: Vec<BlobKey> = objs.iter().filter_map(retired_blob).collect();
+        {
+            let mut s = self.substrate.write().unwrap();
+            for (obj, id) in objs.into_iter().zip(ids) {
+                s.apply_custom_object(obj, id);
+            }
         }
+        self.forget_retired_blobs(retires);
         Ok(())
     }
 
@@ -1021,6 +1054,9 @@ impl SubstratePersistence {
             }
         })?;
         progress(OpenStage::Reading, total, total);
+        // Before anything below rewrites the log, so a rewrite does not carry
+        // a blob its tombstone retired.
+        sp.forget_retired_blobs(substrate);
         sp.admit(admit)?;
         if sp.predates_identities() {
             sp.adopt(substrate, &|done, total| {
@@ -1038,6 +1074,7 @@ impl SubstratePersistence {
                 }
             })?;
             progress(OpenStage::Rereading, total, total);
+            sp.forget_retired_blobs(substrate);
         } else if purge.drops_any() {
             sp.compact(
                 substrate,
@@ -1078,14 +1115,16 @@ impl SubstratePersistence {
         // open starts over from an empty substrate (`vanished_segment`).
         let dir = dir.join(SUBSTRATE_DIR);
         let substrate = RefCell::new(substrate);
-        retry_vanished(
+        let mut sp = retry_vanished(
             || {
                 Self::from_dir_with_sink(&dir, &[], true, Purge::Nothing, |entry| {
                     substrate.borrow_mut().apply_walker_entry(entry)
                 })
             },
             || **substrate.borrow_mut() = Substrate::new(),
-        )
+        )?;
+        sp.forget_retired_blobs(&substrate.borrow());
+        Ok(sp)
     }
 
     /// As [`Self::open_in_with_substrate`], but the caller also sees every
