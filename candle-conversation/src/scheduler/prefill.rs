@@ -3166,6 +3166,7 @@ impl Scheduler {
         // Sections already creeping inside the wave group are excluded — their
         // offset isn't advanced until that group's head, so picking them here would
         // ingest the same chunk twice.
+        let band = self.section_batch_band()?;
         let in_flight = self.wave_group_section_seqs();
         let active: Vec<usize> = (0..self.active_section_ingests.len())
             .filter(|&i| {
@@ -3173,6 +3174,7 @@ impl Scheduler {
                 s.error.is_none()
                     && s.offset < s.tokens.len()
                     && !in_flight.contains(&s.sequence_id.0)
+                    && (band != DecodePriority::High || s.band == DecodePriority::High)
             })
             .collect();
         if active.is_empty() {
@@ -3222,6 +3224,24 @@ impl Scheduler {
             return None;
         }
         Some((seq_ids, inputs, group_idxs, advances))
+    }
+
+    /// The band the next section chunk rides at ([`Self::build_section_batch`]),
+    /// `None` with no section to ride: `High` while a dialogue's own section
+    /// waits — it rides apart from ingest rows, as in a creep group
+    /// (`form_wave_group`) — and otherwise the highest band waiting, since below
+    /// `High` the bands mix.
+    pub(super) fn section_batch_band(&self) -> Option<DecodePriority> {
+        let in_flight = self.wave_group_section_seqs();
+        self.active_section_ingests
+            .iter()
+            .filter(|s| {
+                s.error.is_none()
+                    && s.offset < s.tokens.len()
+                    && !in_flight.contains(&s.sequence_id.0)
+            })
+            .map(|s| s.band)
+            .max_by_key(|&b| rank(b))
     }
 
     /// Commit one section-ingest chunk after its forward (standalone or
@@ -4615,10 +4635,18 @@ impl Scheduler {
         self.wave_cobatched = has_glue || !seq_ids.is_empty();
 
         // The creep yields to the decodes that protect themselves from it
-        // (`throttle_ratio`). Without a creep
-        // the step co-batches glue and section chunks, which are background.
+        // (`throttle_ratio`). Without a creep the step co-batches glue and a
+        // section chunk, at the band of the sections it takes
+        // (`section_batch_band`).
+        //
+        // **A dialogue's own section is not background.** Counted as `Low`,
+        // a journal entry's chunk beside the cast's `High` decodes owed decode
+        // 64 times its share of the step, and while that debt ran no creep
+        // formed: on WhiteWorld (2026-10-26) four Makers' prompts sat at a
+        // fixed backlog for 40–60 s at a time while one decode ran alone, and
+        // prefilled at ~900 tok/s only in the gaps where nothing decoded.
         let work = if seq_ids.is_empty() {
-            DecodePriority::Low
+            self.section_batch_band().unwrap_or(DecodePriority::Low)
         } else {
             self.creep_priority(&members)
         };
@@ -7133,7 +7161,7 @@ mod priority_admission_tests {
     use super::super::tests::{boundary_state, make_test_scheduler};
     use super::super::*;
     use super::wave_chunk_tests::dialogue_prefill;
-    use super::HIGH_BESIDE_HIGH_RATIO;
+    use super::{throttle_ratio, HIGH_BESIDE_HIGH_RATIO};
     use crate::projection::{Conversation, DecodePriority};
     use crate::tenant_rank::TenantRank;
 
@@ -7488,6 +7516,47 @@ layers:
         sched.active_section_ingests.clear();
         assert!(sched.resume_creep());
         assert_eq!(sched.wave_prefill_members[0].seq_id(), ingest.0);
+    }
+
+    /// **A section chunk with no creep beside it rides at its own band.** A
+    /// schema's sections alone are `Low`; a dialogue's own waiting puts the
+    /// batch at `High`, and beside a `High` decode it then yields at `High`
+    /// beside `High` rather than at background's 64. A section already creeping
+    /// in a group is not counted.
+    #[test]
+    fn a_standalone_section_chunk_rides_at_its_own_band() {
+        let (mut sched, _tx) = make_test_scheduler();
+        let ingest = SequenceId(sched.session.create_sequence().expect("create"));
+        let journal = SequenceId(sched.session.create_sequence().expect("create"));
+        assert_eq!(sched.section_batch_band(), None, "nothing to ride");
+
+        sched
+            .active_section_ingests
+            .push(active_section(ingest, DecodePriority::Low, 512));
+        assert_eq!(sched.section_batch_band(), Some(DecodePriority::Low));
+
+        sched
+            .active_section_ingests
+            .push(active_section(journal, DecodePriority::High, 38));
+        assert_eq!(sched.section_batch_band(), Some(DecodePriority::High));
+        assert_eq!(
+            throttle_ratio(DecodePriority::High, [DecodePriority::High]),
+            HIGH_BESIDE_HIGH_RATIO
+        );
+        assert_eq!(
+            throttle_ratio(DecodePriority::Low, [DecodePriority::High]),
+            DecodePriority::High.ratio()
+        );
+
+        sched.wave_prefill_members = vec![WaveMember::Section {
+            seq_id: journal.0,
+            advance: 32,
+        }];
+        assert_eq!(
+            sched.section_batch_band(),
+            Some(DecodePriority::Low),
+            "the journal entry is already creeping in a group"
+        );
     }
 
     /// A section chunk runs at the band it was submitted at: a schema's alone
