@@ -7,9 +7,9 @@ tools: [bot_mission_give, bot_mission_read, bot_mission_step, bot_mission_cancel
 
 ## Before
 
-`bot_mission_read {bot}`: giving a mission with `start` (the default)
-replaces whatever it was carrying. If it is mid-mission, either queue yours
-(`start: false`) or wait.
+`bot_mission_read {bot}` first. `start` defaults to `true`, and a mission
+given with it replaces whatever the bot was carrying. If it is mid-mission,
+either queue yours (`start: false`) or wait.
 
 ## Write the brief
 
@@ -33,8 +33,9 @@ at the command table, the place in its world where bots take up missions.
 ## Follow it
 
 `bot_mission_read {bot}` again as it works: each step and whether it was
-achieved or thwarted. It works in its own time — check every few minutes, not
-every few seconds.
+achieved or thwarted. It answers at once with how things stand — it does not
+wait for a change — and the bot works in its own time, so pace the reads
+yourself: every few minutes, not every few seconds.
 
 ## Adjust
 

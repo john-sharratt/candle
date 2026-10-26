@@ -12,7 +12,9 @@ so it reads yours as it would anyone's and answers when it gets to it.
 - **It answers in its own time** — minutes, not seconds. Send, then read the
   thread later with `bot_message_read {bot}`; do not expect the reply in the
   answer to the send.
-- **The answer tells you who can reply**: a bot with no handset cannot answer.
+- **The answer says it was delivered** — "Sent to <bot> as <you>. N unread on
+  its handset." — and adds "It carries no handset, so it cannot answer" when
+  that is so: the message is delivered, but no reply will come.
 - **Be specific**: a question it can answer from where it is, or an
   instruction it can act on. For work with steps and a report, give a mission
   instead (`bot-mission`).

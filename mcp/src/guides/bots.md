@@ -11,6 +11,14 @@ missions and reports on them. You manage it — you do not drive it step by
 step. It works in its own time, so what you ask of it shows up minutes later,
 not in the answer to your call.
 
+## When the bot tools are missing
+
+The `bot_*` tools come from the bots' own service. While it is restarting or
+down, a new conversation lists no `bot_*` tool at all — and a call already
+listed answers that it is unavailable. `cluster_status` shows it: the `npcd`
+line with no member ready. Tell the user, and try again in a few minutes; the
+guides stay readable meanwhile.
+
 ## Find them
 
 `bot_list` — your bots, each with its id (what every other `bot_*` tool takes
@@ -27,6 +35,9 @@ Filter by `state`, `world`, or text in the name (`q`).
 
 Read before asking anything of a bot: giving a mission replaces the one it
 was carrying.
+
+Missions themselves — giving, adjusting, cancelling — are `bot-mission`'s:
+`bot_mission_give`, `bot_mission_step`, `bot_mission_cancel`.
 
 ## What next
 
