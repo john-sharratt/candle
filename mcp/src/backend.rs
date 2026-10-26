@@ -190,6 +190,30 @@ fn unavailable(name: &str, status: StatusCode, said: &str) -> String {
     )
 }
 
+/// What a backend answering `status` with `said` means for the call, in
+/// words that say whether to repeat it: a server error, a sign-in it did not
+/// take, and a route it did not have are the backend's state, not a refusal of
+/// what was asked — each passes while a restarting backend comes back.
+fn refusal(name: &str, status: StatusCode, said: &str) -> String {
+    let said = if said.is_empty() {
+        String::new()
+    } else {
+        format!(": {said}")
+    };
+    match status.as_u16() {
+        _ if status.is_server_error() => unavailable(name, status, said.trim_start_matches(": ")),
+        401 => format!(
+            "{name} did not accept your sign-in ({status}{said}) — while it restarts this passes \
+             in a minute or two; if it persists, sign in to the connector again"
+        ),
+        404 => format!(
+            "{name} has no MCP route right now ({status}{said}) — it is restarting; try the same \
+             call again in a minute or two"
+        ),
+        _ => format!("{name} refused ({status}){said}"),
+    }
+}
+
 /// Send `req` and read its answer — one JSON-RPC response, or an event stream
 /// of progress ending in one — telling each progress message to `step`.
 async fn answer(
@@ -217,22 +241,14 @@ async fn answer(
         return match serde_json::from_slice::<Value>(&bytes).map(|m| read(&m)) {
             Ok(Read::Result(r)) => Ok(r),
             Ok(Read::Error(e)) if status.is_success() => Err(format!("{name}: {e}")),
-            Ok(Read::Error(e)) if status.is_server_error() => Err(unavailable(name, status, &e)),
-            Ok(Read::Error(e)) => Err(format!("{name} refused ({status}): {e}")),
-            _ if status.as_u16() == 401 => Err(format!(
-                "{name} did not accept your sign-in; sign in to the connector again"
-            )),
+            Ok(Read::Error(e)) => Err(refusal(name, status, &e)),
             _ => {
                 let body: String = String::from_utf8_lossy(&bytes)
                     .trim()
                     .chars()
                     .take(300)
                     .collect();
-                Err(if status.is_server_error() {
-                    unavailable(name, status, &body)
-                } else {
-                    format!("{name} refused ({status}): {body}")
-                })
+                Err(refusal(name, status, &body))
             }
         };
     }
@@ -305,6 +321,36 @@ mod tests {
         assert_eq!(
             read(&json!({"error": "upstream_down"})),
             Read::Error("upstream_down".into())
+        );
+    }
+
+    /// **A sign-in not taken and a missing route are said as what they are**
+    /// — the backend's state while it restarts — and only another status is
+    /// a refusal.
+    #[test]
+    fn each_refusal_says_whether_to_repeat_the_call() {
+        assert_eq!(
+            refusal(
+                "bot",
+                StatusCode::UNAUTHORIZED,
+                "unauthorized: sign in to use Bots"
+            ),
+            "bot did not accept your sign-in (401 Unauthorized: unauthorized: sign in to use \
+             Bots) — while it restarts this passes in a minute or two; if it persists, sign in \
+             to the connector again"
+        );
+        assert_eq!(
+            refusal("bot", StatusCode::NOT_FOUND, ""),
+            "bot has no MCP route right now (404 Not Found) — it is restarting; try the same \
+             call again in a minute or two"
+        );
+        assert_eq!(
+            refusal("bot", StatusCode::FORBIDDEN, "forbidden: Admins only"),
+            "bot refused (403 Forbidden): forbidden: Admins only"
+        );
+        assert_eq!(
+            refusal("bot", StatusCode::BAD_GATEWAY, "upstream_unavailable"),
+            unavailable("bot", StatusCode::BAD_GATEWAY, "upstream_unavailable")
         );
     }
 

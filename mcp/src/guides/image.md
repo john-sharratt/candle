@@ -76,8 +76,10 @@ clothing. A prompt that leaves an age unclear may be declined.
 - **Seed:** every draw says the seed it used ("Drew a 1024x768 image, seed
   …"). Pass that seed back only to redraw the same picture with a small prompt
   change. **Shift:** leave it alone.
-- **Time:** a draw takes from about half a minute to two, most of it the
-  prompt check before drawing; progress arrives while it works.
+- **Time:** a draw takes from about half a minute to three, most of it the
+  prompt check and loading the image model. Some clients show no progress
+  while it works and give a call up after about five minutes; a call given up
+  that way may still be drawing, so wait two minutes before sending it again.
 - **One at a time.** The engine holds one image model at once: send the next
   draw after the last has answered, never several together.
 
@@ -99,9 +101,11 @@ do not rewrite it:
 
 - `no_room` — the engine had no room for the image model just then. Try again
   in a minute; a smaller size (768 on the long side) needs less room.
-- "is unavailable" (`upstream_unavailable`, `upstream_backoff`) or a call cut
-  off — the image service is restarting. Send the same call again in a minute
-  or two.
+- "is unavailable" (`upstream_unavailable`, `upstream_backoff`), a call cut
+  off, or — while the service comes back up — a `404` or a `401 … sign in`:
+  the image service is restarting. Send the same call again in a minute or
+  two; it can keep failing for some minutes after `cluster_status` first shows
+  it ready.
 - `failed: …` — a fault in the image engine itself. Try once more; if it
   fails the same way, stop — repeating it can take the service down — and
   tell the user, quoting the error and the size.
