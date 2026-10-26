@@ -35,7 +35,7 @@ enum Keep {
 }
 
 /// `a + w·b` per file, per probe.
-fn combined(a: &[Vec<f32>], b: &[Vec<f32>], w: f32) -> Vec<Vec<f32>> {
+pub fn combined(a: &[Vec<f32>], b: &[Vec<f32>], w: f32) -> Vec<Vec<f32>> {
     a.iter()
         .zip(b)
         .map(|(x, y)| x.iter().zip(y).map(|(p, q)| p + w * q).collect())
@@ -43,7 +43,7 @@ fn combined(a: &[Vec<f32>], b: &[Vec<f32>], w: f32) -> Vec<Vec<f32>> {
 }
 
 /// Whether `q` was calibrated with its thinking.
-fn thought(q: &Question) -> bool {
+pub fn thought(q: &Question) -> bool {
     !q.answer.is_empty()
 }
 
@@ -121,6 +121,49 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
                 &combined(&c, &q, WEIGHT),
             );
         }
+    }
+
+    // A live probe holds both halves: asked as one turn, and as its two halves
+    // asked apart with their scores summed.
+    let probes = |keep| -> Vec<(usize, &[WideQSig])> {
+        asked
+            .iter()
+            .map(|&fi| (fi, part(&files[fi].questions[0], keep)))
+            .collect()
+    };
+    let (whole, question, thinking) = (
+        probes(Keep::Whole),
+        probes(Keep::Question),
+        probes(Keep::Thinking),
+    );
+    let judge = |held| Judge {
+        gpu: &gpu,
+        held_out: held,
+        hubs: &[],
+        n,
+        questions: Questions::Without,
+        masked_question: &|_, _| false,
+    };
+    let (jw, jq, jt) = (judge(&whole), judge(&question), judge(&thinking));
+    let (cw, cq, ct) = (jw.scores(&[])?, jq.scores(&[])?, jt.scores(&[])?);
+    let (qw, qq, qt) = (
+        competition(&gpu, &whole, n, &masked, &[])?,
+        competition(&gpu, &question, n, &masked, &[])?,
+        competition(&gpu, &thinking, n, &masked, &[])?,
+    );
+    let (c_sum, q_sum) = (combined(&cq, &ct, 1.0), combined(&qq, &qt, 1.0));
+    header(&format!(
+        "live probes, question and thinking ({})",
+        whole.len()
+    ));
+    jw.print("one turn, content alone", &cw);
+    jw.print("halves summed, content alone", &c_sum);
+    for &w in &FUSION_WEIGHTS {
+        jw.print(&format!("  one turn, w {w}"), &combined(&cw, &qw, w));
+        jw.print(
+            &format!("  halves summed, w {w}"),
+            &combined(&c_sum, &q_sum, w),
+        );
     }
 
     // The competition's own generic chunks — thinking openers every question
@@ -221,9 +264,12 @@ const CUT_KEEP: f32 = 0.5;
 /// Weights of the calibration competition tried.
 const WEIGHTS: [f32; 3] = [0.25, 0.5, 1.0];
 
+/// Weights of the calibration competition tried on live probes.
+const FUSION_WEIGHTS: [f32; 5] = [0.1, 0.25, 0.35, 0.5, 0.75];
+
 /// `held` asked of the calibration competition alone — every file turn masked
 /// — with `masked` questions left out and `excluded` cut.
-fn competition(
+pub fn competition(
     gpu: &RemoteGallery,
     held: &[(usize, &[WideQSig])],
     n: usize,
