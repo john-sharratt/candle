@@ -69,16 +69,25 @@ pub fn read(message: &Value) -> Read {
     if let Some(result) = message.get("result") {
         return Read::Result(result.clone());
     }
-    if let Some(error) = message.get("error") {
-        return Read::Error(
+    match message.get("error") {
+        // A JSON-RPC error: its message.
+        Some(Value::Object(error)) => Read::Error(
             error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("the call failed")
                 .to_string(),
-        );
+        ),
+        // A route's own refusal, from before the MCP server — the gateway or
+        // the daemon's sign-in check: `{"error": "<kind>", "message": "…"}`.
+        Some(Value::String(kind)) => {
+            Read::Error(match message.get("message").and_then(Value::as_str) {
+                Some(said) => format!("{kind}: {said}"),
+                None => kind.clone(),
+            })
+        }
+        _ => Read::Other,
     }
-    Read::Other
 }
 
 /// The gateway, as the backends are reached through it.
@@ -197,7 +206,8 @@ async fn answer(
             .map_err(|e| format!("{name}'s answer was cut off: {e}"))?;
         return match serde_json::from_slice::<Value>(&bytes).map(|m| read(&m)) {
             Ok(Read::Result(r)) => Ok(r),
-            Ok(Read::Error(e)) => Err(format!("{name}: {e}")),
+            Ok(Read::Error(e)) if status.is_success() => Err(format!("{name}: {e}")),
+            Ok(Read::Error(e)) => Err(format!("{name} refused ({status}): {e}")),
             _ if status.as_u16() == 401 => Err(format!(
                 "{name} did not accept your sign-in; sign in to the connector again"
             )),
@@ -265,6 +275,21 @@ mod tests {
         assert_eq!(
             read(&json!({"jsonrpc": "2.0", "method": "notifications/other"})),
             Read::Other
+        );
+    }
+
+    /// **A route's own refusal keeps its words**: the body a sign-in check
+    /// answers before any MCP server is reached is said, not reduced to "the
+    /// call failed".
+    #[test]
+    fn a_routes_refusal_is_said_in_its_own_words() {
+        assert_eq!(
+            read(&json!({"error": "unauthorized", "message": "sign in to use Bots"})),
+            Read::Error("unauthorized: sign in to use Bots".into())
+        );
+        assert_eq!(
+            read(&json!({"error": "upstream_down"})),
+            Read::Error("upstream_down".into())
         );
     }
 
