@@ -22,6 +22,7 @@
 //! are calibrated without being read again, and a unit read again — a new
 //! version, a changed prompt — is calibrated again.
 
+pub mod permits;
 pub mod plan;
 pub mod questions;
 pub mod run;

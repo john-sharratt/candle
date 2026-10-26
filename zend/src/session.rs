@@ -9116,7 +9116,7 @@ mod projection_schema_tests {
         let calibrate = CalibrateSpec::of(layer("code_reading"))
             .unwrap()
             .expect("code_reading declares a calibration");
-        assert_eq!((calibrate.questions, calibrate.think), (24, 192));
+        assert_eq!((calibrate.questions, calibrate.think), (24, 64));
         // ... which compete among themselves, half a file's own vote.
         assert_eq!(
             layer("code_reading").groups[0]

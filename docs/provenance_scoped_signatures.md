@@ -209,7 +209,9 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   questions, the decode budget of each question's thinking (`think`), and the
   prompt that asks for them (`<<n>>`, `<<subject>>`, `<<file>>`, `<<repo>>`,
   `<<path>>`). Nothing names a layer; `code_reading` declares 24 questions
-  and 192 thinking tokens.
+  and 64 thinking tokens — one projection's worth: a turn's first
+  reprojection fires by the 64-token cadence, so the probe that decides what
+  is pulled in has seen at most that much of the model's thinking.
 - **Written by the unit.** Each unit is asked in a draft forked from its
   layer's base with the unit as its lineage — so it writes its questions with
   its whole content in front of it — without reasoning or tools. The draft is
