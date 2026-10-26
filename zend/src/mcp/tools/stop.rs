@@ -51,7 +51,9 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         return Answer::error(e);
     }
     let mut answer = answer_for(ctx, &[(thread, name)], wait_secs(ctx, args)).await;
-    if !answer.is_error && answer.text.contains(STILL_RUNNING) {
+    // One worker asked for: its answer opens with the running heading only
+    // while it still runs.
+    if !answer.is_error && answer.text.starts_with(STILL_RUNNING) {
         answer.text = format!("{PENDING}\n\n{}", answer.text);
     }
     answer

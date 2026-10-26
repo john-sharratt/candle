@@ -309,6 +309,7 @@ fn fresh(
         stopped: false,
         resumable: false,
         audit: None,
+        checked: false,
     }
 }
 
@@ -647,23 +648,32 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
         // to open it; the second answer is kept with its audit, whatever it
         // says. A continuation is Claude's to direct, with the audit in hand,
         // so it is not sent back.
-        let first_answer = worker.turn_ms == worker.started_ms;
-        if audit.unopened() && first.is_none() && first_answer {
-            let unopened = audit.miscopied.len() + audit.seen.len() + audit.never_seen.len();
-            let line = format!("its answer cites {unopened} it did not open; it is checking them");
+        if audit.unopened() && first.is_none() && !worker.checked {
+            let to_correct = audit.miscopied.len() + audit.seen.len() + audit.never_seen.len();
+            let line = format!(
+                "{to_correct} of its answer's citations are not by an address it opened; it is \
+                 checking them"
+            );
             if let Err(e) = note(&records, &owner, &worker, "Task sent back:", line) {
                 tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be entered: {e}");
             }
             message = format!("{}{ASKING}", audit.correction());
             first = Some((worker.final_text.clone(), audit, settled));
             worker.state = State::Running;
+            worker.checked = true;
             // Said on its record while the check runs, so a wait shows why a
-            // worker that answered is running again.
-            worker.audit = Some(format!(
-                "Checking its citations: sent back to open {unopened} it cited without opening."
-            ));
-            if let Err(e) = threads::put_worker(&records, &owner, &worker) {
-                tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be kept: {e}");
+            // worker that answered is running again. Only these fields: the
+            // beat owns the rest of the record while the turn runs.
+            let checking =
+                format!("Checking its citations: sent back to correct {to_correct} of them.");
+            if let Some(mut stored) =
+                threads::worker(&records, &owner, &worker.thread, &worker.name)
+            {
+                stored.audit = Some(checking);
+                stored.checked = true;
+                if let Err(e) = threads::put_worker(&records, &owner, &stored) {
+                    tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be kept: {e}");
+                }
             }
             continue;
         }
@@ -1207,6 +1217,7 @@ mod tests {
             stopped: false,
             resumable: false,
             audit: None,
+            checked: false,
         }
     }
 
