@@ -35,7 +35,7 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "node": {"type": "string", "description": "The agent's node id, to pin one."},
-                "repo": {"type": "string", "description": "The repository, as the workspace names it."},
+                "repo": {"type": "string", "description": "The repository's name — `candle`, `battle-cities` — as the repo_map layer lists it."},
                 "branch": {"type": "string", "description": "The branch to run on."},
                 "program": {"type": "string", "description": "The program, e.g. `cargo`."},
                 "args": {"type": "array", "items": {"type": "string"}, "description": "Its arguments."},
