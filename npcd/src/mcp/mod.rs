@@ -27,7 +27,7 @@
 //! | [`message_read`] | `bot_message_read` — the caller's thread with it |
 //! | [`channel_read`] | `bot_channel_read` — a world's channel |
 //! | [`channel_post`] | `bot_channel_post` — speak on a world's channel |
-//! | [`image`] | `image_generate` — draw a picture, answered as an image |
+//! | [`image`] | `image_generate` — draw a picture, answered as an image and a link to the file |
 //!
 //! [`args`] reads a tool's arguments, [`route`] reads a handler's answer, and
 //! [`view`] words a mission.
@@ -75,7 +75,8 @@ pub const INSTRUCTIONS: &str =
 a world and acting on its own. bot_list names them; the others take a bot's id from it. Give a \
 mission with bot_mission_give and follow it with bot_mission_read; talk to a bot with \
 bot_message_send and read its replies with bot_message_read. image_generate draws a picture \
-from a text prompt and returns it as an image.";
+from a text prompt and returns it as an image for you to look at, with a link to the file — \
+the user may not see the image, so send them the file from the link.";
 
 static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     name: "bots".into(),

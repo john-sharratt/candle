@@ -373,6 +373,11 @@ reports, world material.
   are stated as adults for the prompt check. 768 on a side fits beside a busy
   engine; 1024 when detail matters and there is room. One draw at a time.
   Look at the result and refine the prompt.
+- The image block reaches Claude, not the user — many clients show nothing
+  from a tool's result. The answer's link (signed, 7 days, opens without
+  signing in) is how the user gets it: Claude downloads it and sends the
+  file where it can send files, embeds it in a page it makes, or else gives
+  the link, with the prompt and seed.
 
 ---
 

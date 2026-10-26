@@ -6,7 +6,11 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use thiserror::Error;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Error)]
 pub enum KeyError {
@@ -62,6 +66,16 @@ impl GroupKey {
 
     pub(crate) fn bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// A key of its own for `purpose`: HMAC-SHA256 of the purpose's name under
+    /// this key. Every member holding the group key derives the same one, and
+    /// what it signs cannot be passed off as a handshake proof or as another
+    /// purpose's signature, so the group key itself never leaves this crate.
+    pub fn derive(&self, purpose: &str) -> [u8; 32] {
+        let mut m = HmacSha256::new_from_slice(&self.0).expect("HMAC takes a key of any length");
+        m.update(purpose.as_bytes());
+        m.finalize().into_bytes().into()
     }
 
     /// 32 bytes from the OS-seeded generator.
@@ -165,6 +179,28 @@ mod tests {
         }
         assert_eq!(GroupKey::load(&path).unwrap().bytes(), &[0xab; 32]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **A derived key is the purpose's HMAC under the group key**: the same on
+    /// every member, different per purpose, and never the group key itself.
+    #[test]
+    fn a_derived_key_is_the_purposes_hmac_under_the_group_key() {
+        let k = GroupKey::from_bytes([0xab; 32]);
+        let mut m = HmacSha256::new_from_slice(&[0xab; 32]).unwrap();
+        m.update(b"npcd image links");
+        let expected: [u8; 32] = m.finalize().into_bytes().into();
+        assert_eq!(k.derive("npcd image links"), expected);
+        assert_eq!(
+            GroupKey::from_bytes([0xab; 32]).derive("npcd image links"),
+            expected,
+            "another member holding the same key"
+        );
+        assert_ne!(k.derive("another purpose"), expected);
+        assert_ne!(k.derive("npcd image links"), [0xab; 32]);
+        assert_ne!(
+            GroupKey::from_bytes([0xac; 32]).derive("npcd image links"),
+            expected
+        );
     }
 
     /// A created key is 64 hex digits and a newline, loads back as itself,
