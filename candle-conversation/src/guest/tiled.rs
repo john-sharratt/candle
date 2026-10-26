@@ -49,6 +49,12 @@
 //! output**. A 2048×2048 decode has the same working set as a 512×512 one, and
 //! takes proportionally longer instead of failing.
 //!
+//! The tile itself is sized to the arena ([`fit_tile`]). Its peak is a resnet
+//! at full tile resolution, and that is mostly im2col: a 3×3 convolution over
+//! 128 channels lowers to a 1,152-wide column buffer per output pixel, 576 MiB
+//! for a 512×512 tile, beside the resnet's other intermediates. A tile the
+//! arena cannot hold is refused at the first overrun.
+//!
 //! # Seams, and why the overlap is in latent space
 //!
 //! A convolution reads its neighbours, so a tile decoded in isolation is wrong
@@ -70,12 +76,33 @@ use candle::{DType, Device, Result, Tensor};
 /// FLUX's, and it is the same 8 the guest divides by when it sizes the latent.
 pub const SCALE: usize = 8;
 
-/// The tile side, in latent cells — 64, so a tile decodes to 512×512.
+/// The largest tile side, in latent cells — 64, so a tile decodes to 512×512.
 ///
-/// Chosen because 512×512 is the size that has never failed on a 24 GB card with
-/// the engine resident: it is the drain the guest has served thousands of times,
-/// so a tile is a decode already known to fit rather than a new number to tune.
+/// The ceiling, not the choice: the tile a draw uses is [`fit_tile`]'s, sized
+/// to the guest's activation arena. A tile's stages carve from that arena and
+/// an overrun is an error, so a tile the arena cannot hold is a draw that fails
+/// rather than one that runs slower.
 pub const TILE: usize = 64;
+
+/// The smallest tile side, in latent cells — twice [`OVERLAP`], so a tile is
+/// never mostly overlap.
+pub const MIN_TILE: usize = 16;
+
+/// The largest tile side, in multiples of 8 latent cells between [`MIN_TILE`]
+/// and [`TILE`], whose decode fits `arena_bytes` at `bytes_per_pixel` of output.
+///
+/// [`MIN_TILE`] when even that does not fit: the draw is then refused by the
+/// arena at its first overrun, which names the stage, instead of here.
+pub fn fit_tile(arena_bytes: usize, bytes_per_pixel: usize) -> usize {
+    (MIN_TILE..=TILE)
+        .rev()
+        .step_by(8)
+        .find(|cells| {
+            let side = cells * SCALE;
+            side * side * bytes_per_pixel <= arena_bytes
+        })
+        .unwrap_or(MIN_TILE)
+}
 
 /// How far tiles overlap, in latent cells — 8, so 64 pixels of output.
 ///
@@ -104,21 +131,20 @@ impl Tile {
     }
 }
 
-/// Lay out one axis as overlapping tiles covering `cells`.
+/// Lay out one axis as overlapping tiles of `tile` cells covering `cells`.
 ///
 /// **Every cell is covered and the last tile ends exactly at the edge.** A grid
 /// that ran past the end would decode padding as if it were image; one that
 /// stopped short would leave a strip of the picture undecoded, and neither is
 /// visible in anything but the output.
 ///
-/// A latent smaller than one tile gives a single tile of the whole thing, which
-/// is the case that has to stay exactly as fast as it was: the overwhelming
-/// majority of draws are 512×512 and must not pay for machinery they do not use.
-pub fn tiles(cells: usize) -> Vec<Tile> {
+/// A latent no larger than one tile gives a single tile of the whole thing,
+/// which costs nothing beyond the decode itself.
+pub fn tiles(cells: usize, tile: usize) -> Vec<Tile> {
     if cells == 0 {
         return Vec::new();
     }
-    if cells <= TILE {
+    if cells <= tile {
         return vec![Tile {
             start: 0,
             len: cells,
@@ -126,20 +152,20 @@ pub fn tiles(cells: usize) -> Vec<Tile> {
     }
     // The distance between two tiles' starts. At least one, or a tile that is
     // all overlap would never advance and this would not terminate.
-    let stride = TILE.saturating_sub(OVERLAP).max(1);
+    let stride = tile.saturating_sub(OVERLAP).max(1);
     let mut out = Vec::new();
     let mut start = 0;
     loop {
         // The final tile is pulled back to the edge rather than extended past
-        // it, so it is always a full `TILE` of real latent.
-        if start + TILE >= cells {
+        // it, so it is always a full `tile` of real latent.
+        if start + tile >= cells {
             out.push(Tile {
-                start: cells - TILE,
-                len: TILE,
+                start: cells - tile,
+                len: tile,
             });
             break;
         }
-        out.push(Tile { start, len: TILE });
+        out.push(Tile { start, len: tile });
         start += stride;
     }
     out
@@ -167,22 +193,21 @@ fn ramp(n: usize, lead: usize, trail: usize, device: &Device) -> Result<Tensor> 
     Tensor::from_vec(w, n, device)
 }
 
-/// Decode `latent` a tile at a time and blend the result.
+/// Decode `latent` in tiles of `tile` latent cells and blend the result.
 ///
 /// `latent` is `[1, C, H, W]` in latent cells; the result is `[1, 3, H·SCALE,
 /// W·SCALE]`. `decode` is the autoencoder, called once per tile.
 ///
 /// **The single-tile case calls `decode` once and returns its output
 /// unchanged** — no accumulation buffers, no blend, no extra full-resolution
-/// tensor. That is the path a 512×512 draw takes, and it has to cost exactly
-/// what it did before tiling existed.
-pub fn decode_tiled<F>(latent: &Tensor, mut decode: F) -> Result<Tensor>
+/// tensor.
+pub fn decode_tiled<F>(latent: &Tensor, tile: usize, mut decode: F) -> Result<Tensor>
 where
     F: FnMut(&Tensor) -> Result<Tensor>,
 {
     let (_, _, h, w) = latent.dims4()?;
-    let rows = tiles(h);
-    let cols = tiles(w);
+    let rows = tiles(h, tile);
+    let cols = tiles(w, tile);
     if rows.len() == 1 && cols.len() == 1 {
         return decode(latent);
     }
@@ -250,7 +275,7 @@ where
 /// tile.
 ///
 /// **The single-tile case calls `encode` once and returns its output
-/// unchanged**, which is the path every 512×512 reference takes.
+/// unchanged.**
 ///
 /// # Blending latents is an approximation, and a sound one
 ///
@@ -266,7 +291,7 @@ where
 /// top of it, and the denoise is a contraction toward the model's own manifold
 /// — so a slightly-off latent is corrected by the very steps that follow it. A
 /// hard join would still show, which is why the fade is here at all.
-pub fn encode_tiled<F>(pixels: &Tensor, mut encode: F) -> Result<Tensor>
+pub fn encode_tiled<F>(pixels: &Tensor, tile: usize, mut encode: F) -> Result<Tensor>
 where
     F: FnMut(&Tensor) -> Result<Tensor>,
 {
@@ -277,8 +302,8 @@ where
         );
     }
     let (h, w) = (ph / SCALE, pw / SCALE);
-    let rows = tiles(h);
-    let cols = tiles(w);
+    let rows = tiles(h, tile);
+    let cols = tiles(w, tile);
     if rows.len() == 1 && cols.len() == 1 {
         return encode(pixels);
     }
@@ -342,7 +367,7 @@ mod tests {
     #[test]
     fn the_tiles_cover_every_cell() {
         for cells in [1usize, 8, 63, 64, 65, 100, 128, 129, 156, 256] {
-            let ts = tiles(cells);
+            let ts = tiles(cells, TILE);
             assert!(!ts.is_empty(), "{cells} cells produced no tiles");
             let mut covered = vec![0usize; cells];
             for t in &ts {
@@ -364,7 +389,7 @@ mod tests {
     fn a_small_latent_is_a_single_whole_tile() {
         for cells in [1usize, 16, 63, 64] {
             assert_eq!(
-                tiles(cells),
+                tiles(cells, TILE),
                 vec![Tile {
                     start: 0,
                     len: cells
@@ -373,10 +398,12 @@ mod tests {
             );
         }
         // 512×512 is 64 latent cells, the common case.
-        assert_eq!(tiles(512 / SCALE).len(), 1);
+        assert_eq!(tiles(512 / SCALE, TILE).len(), 1);
         // 1024 and the 3:2 buckets are not.
-        assert!(tiles(1024 / SCALE).len() > 1);
-        assert!(tiles(1248 / SCALE).len() > 1);
+        assert!(tiles(1024 / SCALE, TILE).len() > 1);
+        assert!(tiles(1248 / SCALE, TILE).len() > 1);
+        // Nor is 512×512 at the smallest tile.
+        assert_eq!(tiles(512 / SCALE, MIN_TILE).len(), 7);
     }
 
     /// The last tile ends exactly on the edge, so no tile decodes padding as if
@@ -384,7 +411,7 @@ mod tests {
     #[test]
     fn the_last_tile_lands_on_the_edge() {
         for cells in [65usize, 100, 128, 156, 256] {
-            let ts = tiles(cells);
+            let ts = tiles(cells, TILE);
             assert_eq!(
                 ts.last().unwrap().end(),
                 cells,
@@ -398,7 +425,7 @@ mod tests {
     /// nothing to fade and every join is a hard edge.
     #[test]
     fn neighbouring_tiles_overlap() {
-        let ts = tiles(200);
+        let ts = tiles(200, TILE);
         assert!(ts.len() >= 3);
         for pair in ts.windows(2) {
             let (a, b) = (pair[0], pair[1]);
@@ -413,7 +440,7 @@ mod tests {
     #[test]
     fn the_grid_is_bounded() {
         for cells in [65usize, 1000, 4096] {
-            let ts = tiles(cells);
+            let ts = tiles(cells, TILE);
             assert!(
                 ts.len() <= cells.div_ceil(TILE - OVERLAP) + 1,
                 "{cells} produced {} tiles, which is more than the stride allows",
@@ -476,7 +503,7 @@ mod tests {
         let d = Device::Cpu;
         let latent = Tensor::ones((1, 4, 8, 8), DType::F32, &d).unwrap();
         let mut calls = 0;
-        let out = decode_tiled(&latent, |t| {
+        let out = decode_tiled(&latent, TILE, |t| {
             calls += 1;
             // A recognisable "decode": 3 channels at SCALE×.
             let (_, _, h, w) = t.dims4().unwrap();
@@ -499,7 +526,7 @@ mod tests {
         // 96 cells a side: more than one tile, so the tiled path runs.
         let latent = Tensor::ones((1, 4, 96, 96), DType::F32, &d).unwrap();
         let mut calls = 0;
-        let out = decode_tiled(&latent, |t| {
+        let out = decode_tiled(&latent, TILE, |t| {
             calls += 1;
             let (_, _, h, w) = t.dims4().unwrap();
             Tensor::full(0.25f32, (1, 3, h * SCALE, w * SCALE), &d)
@@ -524,7 +551,7 @@ mod tests {
         let d = Device::Cpu;
         let px = Tensor::ones((1, 3, 512, 512), DType::F32, &d).unwrap();
         let mut calls = 0;
-        let out = encode_tiled(&px, |t| {
+        let out = encode_tiled(&px, TILE, |t| {
             calls += 1;
             let (_, _, h, w) = t.dims4().unwrap();
             Tensor::full(0.5f32, (1, 16, h / SCALE, w / SCALE), &d)
@@ -544,7 +571,7 @@ mod tests {
         // 1024×768 — more than one tile on both axes.
         let px = Tensor::ones((1, 3, 1024, 768), DType::F32, &d).unwrap();
         let mut calls = 0;
-        let out = encode_tiled(&px, |t| {
+        let out = encode_tiled(&px, TILE, |t| {
             calls += 1;
             let (_, _, h, w) = t.dims4().unwrap();
             assert_eq!(h % SCALE, 0, "a tile was cut off a latent-cell boundary");
@@ -569,7 +596,7 @@ mod tests {
     fn an_encode_off_the_cell_grid_is_refused() {
         let d = Device::Cpu;
         let px = Tensor::ones((1, 3, 513, 512), DType::F32, &d).unwrap();
-        assert!(encode_tiled(&px, |t| Ok(t.clone())).is_err());
+        assert!(encode_tiled(&px, TILE, |t| Ok(t.clone())).is_err());
     }
 
     /// The decoder is called once per tile in the grid, and each call gets a
@@ -579,19 +606,40 @@ mod tests {
     fn each_tile_is_decoded_once_at_the_grid_position() {
         let d = Device::Cpu;
         let latent = Tensor::ones((1, 4, 96, 130), DType::F32, &d).unwrap();
-        let mut seen = Vec::new();
-        decode_tiled(&latent, |t| {
-            let (_, _, h, w) = t.dims4().unwrap();
-            seen.push((h, w));
-            Tensor::zeros((1, 3, h * SCALE, w * SCALE), DType::F32, &d)
-        })
-        .unwrap();
-        assert_eq!(seen.len(), tiles(96).len() * tiles(130).len());
-        for (h, w) in &seen {
-            assert!(
-                *h <= TILE && *w <= TILE,
-                "a tile of {h}×{w} is larger than TILE"
-            );
+        for tile in [TILE, 32, MIN_TILE] {
+            let mut seen = Vec::new();
+            decode_tiled(&latent, tile, |t| {
+                let (_, _, h, w) = t.dims4().unwrap();
+                seen.push((h, w));
+                Tensor::zeros((1, 3, h * SCALE, w * SCALE), DType::F32, &d)
+            })
+            .unwrap();
+            assert_eq!(seen.len(), tiles(96, tile).len() * tiles(130, tile).len());
+            for (h, w) in &seen {
+                assert!(
+                    *h <= tile && *w <= tile,
+                    "a tile of {h}×{w} is larger than {tile}"
+                );
+            }
+        }
+    }
+
+    /// **The tile is the largest the arena holds.** Measured on the 3090: a
+    /// 512×512 tile's resnet asked for a 576 MiB column buffer with 992 MiB
+    /// already carved, in an arena of 1,363 — so 512 must not be chosen there,
+    /// and a smaller tile must be.
+    #[test]
+    fn the_tile_is_the_largest_the_arena_holds() {
+        let bpp = 16 << 10;
+        assert_eq!(fit_tile(1363 << 20, bpp), 32);
+        assert_eq!(fit_tile(1763 << 20, bpp), 40);
+        // A big arena takes the ceiling, and nothing past it.
+        assert_eq!(fit_tile(64 << 30, bpp), TILE);
+        // Nothing fits: the floor, and the arena refuses the overrun by name.
+        assert_eq!(fit_tile(0, bpp), MIN_TILE);
+        // Always a whole number of 8-cell steps.
+        for mib in [600usize, 900, 2_500, 3_300] {
+            assert_eq!(fit_tile(mib << 20, bpp) % 8, 0);
         }
     }
 }

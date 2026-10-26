@@ -358,6 +358,18 @@ reports, world material.
 - Read the report (pass or fail, and its account) and the answer; ask the bot
   what is unclear; record what came of it on the thread.
 
+### E8. `image`
+**Use when:** drawing a picture with `image_generate`.
+**Tools:** `image_generate`
+- The model is Z-Image-Turbo, fine-tuned on prompt-enhancer captions, so
+  Claude writes the enhancer's prompt itself (Tongyi's published rules: keep
+  every asked element, make an idea concrete, add composition, light,
+  material, colour and one style, put on-image text verbatim in double quotes,
+  objective language, no quality tags). No negative prompt or weighting; the
+  seed barely varies the picture, so variety comes from the prompt. People
+  are stated as adults for the prompt check. 1024 on the long side for
+  detail. Look at the result and refine the prompt.
+
 ---
 
 ## F. Combined workflows
