@@ -30,6 +30,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use candle_conversation::chain_health::chain_break;
 use candle_conversation::persistence::record::DistillMode;
@@ -311,10 +312,12 @@ fn calibrate_one(
     drafts: Option<&Permits>,
     unit: &Unit,
 ) -> anyhow::Result<()> {
+    let t_draft = Instant::now();
     let asked = {
         let _draft = drafts.map(Permits::acquire);
         draft(engine, spec, base, unit)?
     };
+    let draft_ms = t_draft.elapsed().as_millis() as u64;
     let found = questions(&asked, spec.questions);
     if found.is_empty() {
         let opening: String = asked.chars().take(160).collect();
@@ -323,7 +326,10 @@ fn calibrate_one(
             asked.len()
         );
     }
+    let t_think = Instant::now();
     let thought = thoughts(engine, frame, spec, &found)?;
+    let think_ms = t_think.elapsed().as_millis() as u64;
+    let t_seal = Instant::now();
     let mut conv = engine
         .lock()
         .unwrap()
@@ -385,6 +391,9 @@ fn calibrate_one(
         layer = %spec.layer,
         subject = %unit.subject,
         questions = found.len(),
+        draft_ms,
+        think_ms,
+        seal_ms = t_seal.elapsed().as_millis() as u64,
         "unit calibrated",
     );
     Ok(())
