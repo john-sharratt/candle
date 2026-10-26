@@ -5281,9 +5281,12 @@ impl Scheduler {
         // nothing at all until an unrelated event. The rate model never gets
         // consulted and the queue drains one turn at a time through the
         // deadlock guard, which is the opposite of filling a wave.
-        if !self.active_prefills.is_empty() {
-            self.settled_since_admit = true;
-        }
+        //
+        // **Only a prefill that leaves.** This runs after every decode step, so
+        // a flag raised whenever a prefill is in flight would run a whole
+        // admission pass a step for nothing that finished; the loop top re-reads
+        // prefills still advancing once a quantum (`Scheduler::run`).
+        let in_flight = self.active_prefills.len();
         // Turns whose prefill finished cleanly, with the first token the wave
         // that finished them sampled (`sample_first_rows`).
         let mut ready: Vec<(FinishedPrefill, FirstSampled)> = Vec::new();
@@ -5378,6 +5381,9 @@ impl Scheduler {
                 sampled,
             ));
             // swap_remove pulled the last element into i; don't increment.
+        }
+        if self.active_prefills.len() < in_flight {
+            self.settled_since_admit = true;
         }
         if !ready.is_empty() {
             let t_fin = std::time::Instant::now();
@@ -6752,6 +6758,34 @@ mod wave_chunk_tests {
             error: None,
             prefill_start: None,
         }
+    }
+
+    /// **Only a prefill that leaves opens the next admission.** Promotion runs
+    /// after every decode step; a prefill still advancing frees nothing, so it
+    /// must not price a whole admission pass a step. One that leaves — here on
+    /// an error — hands its slot back, and the pass is due.
+    #[test]
+    fn only_a_prefill_that_leaves_opens_the_next_admission() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(seq, (0..64u32).collect()));
+        scheduler.settled_since_admit = false;
+        scheduler.promote_finished_prefills_to_decodes();
+        assert_eq!(scheduler.active_prefills.len(), 1);
+        assert!(
+            !scheduler.settled_since_admit,
+            "a prefill still advancing settled nothing"
+        );
+
+        scheduler.active_prefills[0].error = Some(ConversationError::Channel("lost".into()));
+        scheduler.promote_finished_prefills_to_decodes();
+        assert!(scheduler.active_prefills.is_empty());
+        assert!(
+            scheduler.settled_since_admit,
+            "a prefill that left is an admission opportunity"
+        );
     }
 
     /// **A dialogue prefill enters the wave group in pass-sized chunks.** It

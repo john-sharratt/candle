@@ -436,6 +436,22 @@ impl Scheduler {
                     );
                 }
             }
+            // A prefill this step finished decodes from the next step, not the
+            // next quantum: promoted here, ahead of the drain below, so the
+            // reprojection its first token queued fires before its first decode
+            // step — the order the quantum's opening drain keeps. Left to the
+            // loop top, every finished prompt waited out the rest of the slice;
+            // a calibration's twenty-four 64-token thoughts reached the decode
+            // set a quantum at a time.
+            {
+                let _g = profile::span("loop:decode:promote_finished");
+                let t = Instant::now();
+                self.promote_finished_prefills_to_decodes();
+                HOUSE_PROMOTE_US.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             // Drain any continuous-re-projection swaps queued during the
             // batch.  Must run BEFORE cleanup_finished so a swap that
             // re-keys an active_decodes entry doesn't race with finalize.
@@ -534,6 +550,14 @@ impl Scheduler {
             if !cont {
                 return false;
             }
+        }
+        // **Admission reopens on whatever settled, not only on an arrival.** A
+        // turn finishing or a prefill leaving mid-quantum frees the ground a
+        // refused offer was waiting on; gated on the channel alone, the queue
+        // behind it waited out the slice — 88% of passes stopped on the rate
+        // while their turns were re-offered two seconds apart. The settled flag
+        // is what keeps this cheap: nothing changed, nothing is priced.
+        if self.settled_since_admit {
             let t_promote = Instant::now();
             let _g = profile::span("mid:promote");
             self.promote_new_prefills();
@@ -1144,6 +1168,12 @@ impl Scheduler {
                     t.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
+            }
+            // Prefills still advancing hand rows back to the forward as they go —
+            // the standing rows an offer is sized against fall with every sweep —
+            // so the pass re-reads them once a quantum though none has finished.
+            if !self.active_prefills.is_empty() {
+                self.settled_since_admit = true;
             }
 
             // Per-wave ingest backpressure + gentle demote. These are cheap (an
