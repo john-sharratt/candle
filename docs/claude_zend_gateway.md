@@ -358,8 +358,8 @@ substrate holds only the threads and workers still in work.
 
 The journal is the summary layer, and it already exists
 (`docs/zend_journal.md`): every claim in an entry cites the turn parts it came
-from, the server derives its kind from what it cites, and typed claims about
-files and branches are checked against the workspace before the entry is kept.
+from, and the server derives its kind from what it cites. A coding journal
+carries no typed facts: its claims rest on the turns they cite.
 The kinds are `Observed` / `Heard` / `Did` / `Inferred`
 (`journal-core/src/entry.rs:18-28`), rendered `Saw:` / `User said:` / `Did:` /
 `Concluded, not seen:` (`zend/src/journal/style.rs:158-161`): a user turn is
@@ -541,15 +541,17 @@ would leave the prompt and the address disagreeing; there is no rename.
   `#3`–`#9` into `#10`, reading `#5` reads `#10`'s turns and says `#5` was
   folded into it — through a later fold too — so a citation's evidence
   survives.
-- **Entries cite across journals.** A worker's claim may cite an ancestor's
-  entry — *Decided (per `T:review-layers#12`): …* — as a typed claim with
-  subject `entry:T:review-layers#12`, attribute `exists`, which the draft of a
-  conversation owned through `/mcp` is asked for (`LINEAGE_WRITE_QUESTION`,
-  `zend/src/journal/style.rs`). The check reads it against the journals above
-  the writer (`zend/src/journal/world.rs`): an entry that is not there, or not
-  an ancestor's, reads `false` and the claim is corrected to say so. That is a
-  provenance chain from a worker's action back to Claude's decision, and from
-  it to what the user said.
+- **Entries cite across journals.** A worker's claim may rest on an
+  ancestor's entry, named in the claim's `per`: *Decided … (per
+  `T:review-layers#12`)*. The draft of a conversation owned through `/mcp` is
+  asked for it (`LINEAGE_WRITE_QUESTION`, `zend/src/journal/style.rs`), and
+  `per` offers exactly the entries the journals above the writer hold, by
+  address (`JournalsAbove`, `zend/src/journal/world.rs`), the way `cite`
+  offers exactly the stretch's turns: an entry that is not there, or not an
+  ancestor's, cannot be written, and one that arrives by any other path is
+  dropped, leaving the claim on its turns. That is a provenance chain from a
+  worker's action back to
+  Claude's decision, and from it to what the user said.
 
 ### 5.3 The journal tools
 

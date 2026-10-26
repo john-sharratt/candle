@@ -87,6 +87,11 @@ pub mod projection;
 /// second table by another name. Snapshotting resets, so two reads bracket a
 /// window exactly.
 pub mod profile {
+    /// How the elastic VRAM boundary answered: the pool's growth answers and
+    /// the expert zone's outcomes, process-wide since boot — so a window's
+    /// share is the difference of two readings.
+    pub use candle_nn::kv_cache::spare_tally;
+    pub use candle_transformers::models::expert_lre::grow_tally;
     pub use candle_transformers::models::profile::{
         pipeline_snapshot_and_reset, set_gpu_span_period, ProfileSnapshot,
     };

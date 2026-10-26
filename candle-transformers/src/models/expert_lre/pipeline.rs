@@ -742,6 +742,7 @@ impl PipelineState {
             s.expert_misses += misses;
             s.worker_pinned += pinned;
             s.worker_cold += cold;
+            s.worker_cpu += cpu;
         }
         // ── Whether reading ahead pays (`read_ahead_gate`), judged on decode
         // invocations — the width the look-ahead runs at. The misses bucketize

@@ -106,7 +106,7 @@ use crate::journal::shelf::{Above, Drafted, Lazy, Notes, Shelf};
 use crate::journal::state::{SessionJournal, FOLD_SWEEP_EVERY};
 use crate::journal::style::style_for;
 use crate::journal::text::JournalText;
-use crate::journal::world::{Citable, ConversationFiles};
+use crate::journal::world::{Citable, JournalsAbove};
 use crate::journal::{carry, draft, origin, pressure};
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
@@ -3958,12 +3958,10 @@ fn run_inference_stream(
             .expect("seed_recurrent_from_lineage task panicked");
         }
         // What a draft of this conversation's journal is put through, so one can
-        // start without its lock: the asker its questions fork from, and the
-        // files its claims are checked against.
+        // start without its lock: the asker its questions fork from.
         if minted && state.journaling {
             let open = Open {
                 asker: cs.conv.unsealed_asker(),
-                files: Arc::clone(&cs.files),
             };
             state
                 .journals
@@ -5295,7 +5293,6 @@ fn citable_above(state: &InferenceState, conv_id: &str) -> Vec<Citable> {
         .into_iter()
         .map(|a| Citable {
             path: a.ancestor.path,
-            name: a.name,
             entries: a.entries,
         })
         .collect()
@@ -5561,7 +5558,7 @@ fn spawn_journal_draft(
 ) {
     tokio::spawn(async move {
         let mut desk = journal_desk(&state, &conv_id, timeline, open.asker, WRITE_TOKENS);
-        let world = ConversationFiles::of(open.files).citing(citable_above(&state, &conv_id));
+        let world = JournalsAbove(citable_above(&state, &conv_id));
         let record = draft::draft(&mut desk, &journal, &span, &world).await;
         tracing::info!(
             target: "zend::journal",

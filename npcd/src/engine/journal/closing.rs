@@ -29,6 +29,7 @@ pub fn closing_entry(mission: &Mission, at_ms: u64, covered_to: u64) -> Entry {
         perishable: false,
         typed: None,
         corrected: false,
+        per: None,
     };
     let ask = mission
         .mission_text()

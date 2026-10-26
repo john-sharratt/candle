@@ -39,7 +39,7 @@ use crate::repeats;
 use crate::section::JournalPrompt;
 use crate::span::Span;
 use crate::style::Style;
-use crate::tools::{self, Answer};
+use crate::tools::{self, Answer, Claims};
 use crate::transcript::Filed;
 use crate::verify::{verify, Note, Verified, World};
 
@@ -157,7 +157,13 @@ async fn draft<D: Desk, S: Holds>(
         let latest = journal.latest_step().cloned();
         (open, latest)
     };
-    let Some(specs) = tools::draft_specs(&span.citable_ids(), &open, latest.is_some()) else {
+    let entries = world.entries();
+    let claims = Claims {
+        facts: style.facts,
+        entries: &entries,
+    };
+    let Some(specs) = tools::draft_specs(&span.citable_ids(), &open, latest.is_some(), claims)
+    else {
         let why = "nothing in the stretch was something a claim could rest on".to_string();
         return settle(desk, state, span, style, why).await;
     };
@@ -167,6 +173,7 @@ async fn draft<D: Desk, S: Holds>(
         specs: &specs,
         open: &open,
         latest: latest.as_ref(),
+        above: !entries.is_empty(),
     };
     let outcome = write(desk, state, span, world, style, &asked).await;
     timing.write_ms = millis(started);
@@ -181,6 +188,8 @@ struct Asked<'a> {
     /// is no step (before the first, or after a fold), when there is nothing
     /// to weigh the stretch against and no skip.
     latest: Option<&'a Entry>,
+    /// Whether the call offers `per`: the writer has journals above it.
+    above: bool,
 }
 
 /// Ask for the entry until one passes the check, the writer skips, or the
@@ -200,6 +209,7 @@ async fn write<D: Desk, S: Holds>(
             span,
             style,
             asked.latest,
+            asked.above,
             refused
                 .as_ref()
                 .map(|(answer, reason)| (answer.as_str(), reason.as_str())),
@@ -312,6 +322,13 @@ mod tests {
     use crate::style::testing::PLAIN;
     use crate::verify::testing::Fake;
 
+    /// The claims [`PLAIN`] and an empty world offer: a fact slot, nothing to
+    /// rest on above.
+    const FACTS: Claims<'static> = Claims {
+        facts: true,
+        entries: &[],
+    };
+
     const WRITE: &str = r#"{"name": "journal_write", "arguments": {
         "claims": [{"text": "I told Pax hello.", "cite": "1"}],
         "summary": "Greeted Pax.",
@@ -419,13 +436,45 @@ mod tests {
         let mut desk = Script::new(&[WRITE]);
         run(&mut desk, &state, &span, &Fake::default(), &PLAIN).await;
         let first = &desk.write_asked[0];
-        assert_eq!(first, &ask::writing(&span, &PLAIN, None, None));
+        assert_eq!(first, &ask::writing(&span, &PLAIN, None, false, None));
         assert!(first.contains("#1 ") && first.contains("#2 "), "{first}");
         assert!(first.contains("(background)"), "{first}");
         assert_eq!(
             desk.specs[0],
-            vec![tools::write_spec(&[1, 2], &[]).unwrap()],
+            vec![tools::write_spec(&[1, 2], &[], FACTS).unwrap()],
             "an empty journal has nothing to weigh the stretch against, so no skip"
+        );
+    }
+
+    /// The call's claims take their shape from the style and the world: no
+    /// fact slot where the style offers none, and the world's entries above
+    /// to rest on.
+    #[tokio::test]
+    async fn the_call_offers_what_the_style_and_the_world_allow() {
+        let (state, span) = started(turns());
+        let mut desk = Script::new(&[WRITE]);
+        let world = Fake::default().above(&["T:review#4"]);
+        let no_facts = Style {
+            facts: false,
+            ..PLAIN
+        };
+        run(&mut desk, &state, &span, &world, &no_facts).await;
+        assert!(
+            desk.write_asked[0].ends_with(no_facts.per_question),
+            "a writer offered per is told what it is for"
+        );
+        let above = ["T:review#4".to_string()];
+        assert_eq!(
+            desk.specs[0],
+            vec![tools::write_spec(
+                &[1, 2],
+                &[],
+                Claims {
+                    facts: false,
+                    entries: &above
+                }
+            )
+            .unwrap()]
         );
     }
 
@@ -460,14 +509,14 @@ mod tests {
         assert_eq!(
             desk.specs[0],
             vec![
-                tools::write_spec(&[4], hold(&state).open()).unwrap(),
+                tools::write_spec(&[4], hold(&state).open(), FACTS).unwrap(),
                 tools::skip_spec()
             ]
         );
         let latest = hold(&state).entries().last().cloned().unwrap();
         assert_eq!(
             desk.write_asked[0],
-            ask::writing(&span, &PLAIN, Some(&latest), None)
+            ask::writing(&span, &PLAIN, Some(&latest), false, None)
         );
         assert!(
             desk.write_asked[0].contains("Latest: Entry 1 — Greeted Pax."),

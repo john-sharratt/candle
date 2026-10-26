@@ -134,12 +134,18 @@ pub const NPC: Style = Style {
     settled: "Settled:",
     corrected: " (the world reads",
     recheck: " (re-check)",
+    rests_on: " (per",
+    // A character's claims are about the world's state — energy, stockpiles,
+    // what a tower is doing — which the world reads, so a fact is checked.
+    facts: true,
     open_heading: "What you have left open:",
     nothing_open: "What you have left open: nothing.",
     end: "That is the whole of your journal.",
     clock,
     stretch,
     write_question: WRITE_QUESTION,
+    // A character has no journals above it, so `per` is never offered.
+    per_question: "",
     skip_question: SKIP_QUESTION,
     bucket: utc_bucket,
     period_name,
@@ -168,6 +174,7 @@ mod tests {
             perishable: false,
             typed: None,
             corrected: false,
+            per: None,
         }
     }
 
@@ -308,13 +315,13 @@ mod tests {
             text.contains("\n   14:23 (background) You: reflect — I feel uneasy"),
             "{text}"
         );
-        assert!(ask::writing(&span, &NPC, None, None).ends_with(WRITE_QUESTION));
+        assert!(ask::writing(&span, &NPC, None, false, None).ends_with(WRITE_QUESTION));
         let latest = Entry {
             summary: "Went to see Pax.".into(),
             ..entry(3)
         };
         assert!(
-            ask::writing(&span, &NPC, Some(&latest), None).ends_with(&format!(
+            ask::writing(&span, &NPC, Some(&latest), false, None).ends_with(&format!(
             "Your latest entry: Entry 3 — Went to see Pax.\n\n{SKIP_QUESTION}\n\n{WRITE_QUESTION}"
         ))
         );

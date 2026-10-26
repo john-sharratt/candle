@@ -79,6 +79,8 @@ pub struct Claim {
     pub typed: Option<Typed>,
     /// The world disagreed with the writer, and this is what the world said.
     pub corrected: bool,
+    /// The entry of another journal it rests on, by address: `T:review#4`.
+    pub per: Option<String>,
 }
 
 /// Something the writer has not finished with.
@@ -208,6 +210,9 @@ impl Claim {
     /// read the claim's fact differently, and whether it may have changed.
     fn line(&self, style: &Style) -> String {
         let mut s = self.text.trim().to_string();
+        if let Some(per) = &self.per {
+            s.push_str(&format!("{} {per})", style.rests_on));
+        }
         if let (true, Some(t)) = (self.corrected, &self.typed) {
             s.push_str(&format!(
                 "{} {} {} as {})",
@@ -233,6 +238,7 @@ pub(crate) mod testing {
             perishable: false,
             typed: None,
             corrected: false,
+            per: None,
         }
     }
 

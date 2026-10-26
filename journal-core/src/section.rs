@@ -162,6 +162,7 @@ mod tests {
                 perishable: true,
                 typed: None,
                 corrected: false,
+                per: None,
             }],
             ..entry(id)
         }
