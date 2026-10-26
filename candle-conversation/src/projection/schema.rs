@@ -1514,6 +1514,7 @@ mod belief_config_tests {
                 config,
                 tags: Vec::new(),
                 layer_weights: Vec::new(),
+                calibration_layer_weights: Vec::new(),
                 scan: ScanPolicy::default(),
             },
             budget: Budget::default(),

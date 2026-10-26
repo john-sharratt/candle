@@ -91,7 +91,7 @@ pub fn run(
 ) -> anyhow::Result<()> {
     let exp: Expectations = serde_yaml::from_str(&std::fs::read_to_string(expectations)?)?;
     let gpu = RemoteGallery::new(files, daemon);
-    let scorer = Scorer::new(&gpu, files, rule)?;
+    let scorer = Scorer::new(&gpu, files.len());
     let turns = by_layer
         .remove(&DIALOGUE)
         .and_then(|mut d| d.remove(&timeline))
@@ -184,8 +184,9 @@ pub fn run(
                     c.0 += 1;
                     c.1 += usize::from(top.contains(&p.as_str()));
                 }
-                // Today's, and the live rule with its questions.
-                if ri == 0 || ri + 1 == RULES.len() {
+                // code_reading's rule, and the fold-group rule it is weighed
+                // against.
+                if ri == 1 || ri == 3 {
                     tops.push(format!(
                         "    {}: {}",
                         rules[ri],
