@@ -643,19 +643,28 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
                 break settled;
             }
         };
-        // An answer citing what it never opened goes back once to open it;
-        // the second answer is kept with its audit, whatever it says.
-        if audit.unopened() && first.is_none() {
-            let line = format!(
-                "its answer cites {} it did not open; it is checking them",
-                audit.seen.len() + audit.never_seen.len()
-            );
+        // A task's first answer citing what it never opened goes back once
+        // to open it; the second answer is kept with its audit, whatever it
+        // says. A continuation is Claude's to direct, with the audit in hand,
+        // so it is not sent back.
+        let first_answer = worker.turn_ms == worker.started_ms;
+        if audit.unopened() && first.is_none() && first_answer {
+            let unopened = audit.miscopied.len() + audit.seen.len() + audit.never_seen.len();
+            let line = format!("its answer cites {unopened} it did not open; it is checking them");
             if let Err(e) = note(&records, &owner, &worker, "Task sent back:", line) {
                 tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be entered: {e}");
             }
             message = format!("{}{ASKING}", audit.correction());
             first = Some((worker.final_text.clone(), audit, settled));
             worker.state = State::Running;
+            // Said on its record while the check runs, so a wait shows why a
+            // worker that answered is running again.
+            worker.audit = Some(format!(
+                "Checking its citations: sent back to open {unopened} it cited without opening."
+            ));
+            if let Err(e) = threads::put_worker(&records, &owner, &worker) {
+                tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be kept: {e}");
+            }
             continue;
         }
         worker.audit = audit.cites().then(|| audit.render());

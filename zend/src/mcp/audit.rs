@@ -14,7 +14,7 @@
 //! failed returned no page. Deterministic and cheap. A task whose answer cites
 //! anything not opened is sent back once to open it ([`Audit::correction`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -35,8 +35,28 @@ pub type Turn<'a> = &'a str;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Audit {
     pub opened: Vec<String>,
+    /// Cited under an address that differs only in its separators from a page
+    /// the run opened — `2026-10-01/` for `2026/10/01/`: a slip in copying,
+    /// each with the address that was opened.
+    pub miscopied: Vec<(String, String)>,
     pub seen: Vec<String>,
     pub never_seen: Vec<String>,
+}
+
+/// The address two copyings of one page share however their separators slip:
+/// the host, and the path's letters and digits alone, in lower case.
+fn loose(url: &str) -> String {
+    let n = normal(url);
+    match n.split_once('/') {
+        Some((host, path)) => format!(
+            "{host}/{}",
+            path.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_lowercase()
+        ),
+        None => n,
+    }
 }
 
 /// A URL with the punctuation a sentence ends it with taken off, and a
@@ -118,6 +138,9 @@ impl Audit {
     /// The audit of `answer` against the user halves of a run's turns.
     pub fn of(answer: &str, turns: &[Turn<'_>]) -> Self {
         let mut opened = BTreeSet::new();
+        // Each opened page by its loose address, with the address it was
+        // reached at — what a miscopied citation should have said.
+        let mut opened_loosely: BTreeMap<String, String> = BTreeMap::new();
         let mut touched = BTreeSet::new();
         for body in turns.iter().flat_map(|user| response_bodies(user)) {
             match classify(body) {
@@ -127,6 +150,9 @@ impl Audit {
                 Returned::Page(urls) => {
                     for url in urls {
                         opened.insert(normal(&url));
+                        opened_loosely
+                            .entry(loose(&url))
+                            .or_insert_with(|| trimmed(&url).to_string());
                     }
                 }
                 Returned::Other => {}
@@ -140,6 +166,8 @@ impl Audit {
             let key = normal(&cited);
             if opened.contains(&key) {
                 audit.opened.push(cited);
+            } else if let Some(was) = opened_loosely.get(&loose(&cited)) {
+                audit.miscopied.push((cited, was.clone()));
             } else if touched.contains(&key) {
                 audit.seen.push(cited);
             } else {
@@ -151,12 +179,15 @@ impl Audit {
 
     /// Whether the answer cites anything.
     pub fn cites(&self) -> bool {
-        !(self.opened.is_empty() && self.seen.is_empty() && self.never_seen.is_empty())
+        !(self.opened.is_empty()
+            && self.miscopied.is_empty()
+            && self.seen.is_empty()
+            && self.never_seen.is_empty())
     }
 
-    /// Whether it cites anything it did not open.
+    /// Whether it cites anything not by an address it opened.
     pub fn unopened(&self) -> bool {
-        !(self.seen.is_empty() && self.never_seen.is_empty())
+        !(self.miscopied.is_empty() && self.seen.is_empty() && self.never_seen.is_empty())
     }
 
     /// The audit as a task's answer carries it.
@@ -164,11 +195,21 @@ impl Audit {
         let mut out = format!(
             "Citation audit: {} cited — {} opened, {} seen only in tool results, {} never seen \
              in the run.",
-            self.opened.len() + self.seen.len() + self.never_seen.len(),
-            self.opened.len(),
+            self.opened.len() + self.miscopied.len() + self.seen.len() + self.never_seen.len(),
+            self.opened.len() + self.miscopied.len(),
             self.seen.len(),
             self.never_seen.len()
         );
+        if !self.miscopied.is_empty() {
+            out.push_str(&format!(
+                "\nOpened, but cited under a miscopied address: {}",
+                self.miscopied
+                    .iter()
+                    .map(|(cited, was)| format!("{cited} (opened as {was})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if !self.seen.is_empty() {
             out.push_str(&format!(
                 "\nSeen only in tool results — a search hit, a link, an error — never opened: {}",
@@ -184,21 +225,41 @@ impl Audit {
         out
     }
 
-    /// The message that sends the worker back to open what it cited.
+    /// The message that sends the worker back to open what it cited, and to
+    /// cite what it opened by the address it opened it at.
     pub fn correction(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.miscopied.is_empty() {
+            parts.push(format!(
+                "Your answer cites pages you opened under addresses that differ from the ones \
+                 you opened them at: {}. Cite each by the exact address you opened — do not \
+                 fetch the miscopied one, which may not exist.",
+                self.miscopied
+                    .iter()
+                    .map(|(cited, was)| format!("{cited} → {was}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         let unopened: Vec<&str> = self
             .seen
             .iter()
             .chain(&self.never_seen)
             .map(String::as_str)
             .collect();
+        if !unopened.is_empty() {
+            parts.push(format!(
+                "Your answer cites these without having opened them: {}. Fetch each one with \
+                 web_fetch and check the claim it supports. Correct your answer where the page \
+                 says otherwise; remove a citation whose page does not exist; mark UNVERIFIED \
+                 anything you still cannot confirm.",
+                unopened.join(", ")
+            ));
+        }
         format!(
-            "Your answer cites these without having opened them: {}.\n\nFetch each one with \
-             web_fetch and check the claim it supports. Correct your answer where the page says \
-             otherwise; remove a citation whose page does not exist; mark UNVERIFIED anything you \
-             still cannot confirm. Answer again, whole, in the same shape as before, with a \
-             CHANGES section saying what you corrected and why.",
-            unopened.join(", ")
+            "{}\n\nAnswer again, whole, in the same shape as before, with a CHANGES section saying \
+             what you corrected and why.",
+            parts.join("\n\n")
         )
     }
 }
@@ -266,6 +327,7 @@ mod tests {
             ),
             Audit {
                 opened: vec!["https://x.com/data".into()],
+                miscopied: Vec::new(),
                 seen: vec!["https://x.com/paper".into()],
                 never_seen: vec!["https://made-up.example/report".into()],
             }
@@ -303,11 +365,50 @@ mod tests {
                     "https://redirect.example/x".into(),
                     "https://en.wikipedia.org/wiki/Mercury_(planet)".into(),
                 ],
+                miscopied: Vec::new(),
                 seen: vec!["https://llm-stats.com/models".into()],
                 never_seen: vec!["https://hf.co/moonshot".into()],
             },
             "a URL named in a prompt is not evidence"
         );
+    }
+
+    /// **A page opened but cited under a miscopied address is said as such**
+    /// — the address it was opened at given — and the correction asks for
+    /// that address, never to fetch the miscopied one.
+    #[test]
+    fn a_miscopied_citation_of_an_opened_page_is_named_with_its_real_address() {
+        let page = response(
+            r#"{"url":"https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/","final_url":"https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/","title":"Rust 1.99.0","content":"","truncated":false,"images":0}"#,
+        );
+        let a = Audit::of(
+            "See https://blog.rust-lang.org/2026-10-01/Rust-1.99.0/ and https://other.org/x.",
+            &[page.as_str()],
+        );
+        assert_eq!(
+            a,
+            Audit {
+                miscopied: vec![(
+                    "https://blog.rust-lang.org/2026-10-01/Rust-1.99.0/".into(),
+                    "https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/".into()
+                )],
+                never_seen: vec!["https://other.org/x".into()],
+                ..Audit::default()
+            }
+        );
+        assert_eq!(
+            a.render(),
+            "Citation audit: 2 cited — 1 opened, 0 seen only in tool results, 1 never seen in the \
+             run.\nOpened, but cited under a miscopied address: \
+             https://blog.rust-lang.org/2026-10-01/Rust-1.99.0/ (opened as \
+             https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/)\nNever seen in the run (inferred \
+             or invented): https://other.org/x"
+        );
+        assert!(a.correction().starts_with(
+            "Your answer cites pages you opened under addresses that differ from the ones you \
+             opened them at: https://blog.rust-lang.org/2026-10-01/Rust-1.99.0/ → \
+             https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/."
+        ));
     }
 
     /// **A fetch that failed opened nothing**, and the correction that names
@@ -340,6 +441,7 @@ mod tests {
     fn the_audit_says_what_was_not_opened_and_the_correction_names_it() {
         let a = Audit {
             opened: vec!["https://a.com".into()],
+            miscopied: Vec::new(),
             seen: vec!["https://b.com".into()],
             never_seen: vec!["https://c.com".into()],
         };

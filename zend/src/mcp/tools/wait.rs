@@ -57,7 +57,18 @@ fn new_entries(w: &Worker, seen: Option<u64>) -> String {
 pub fn result_of(w: &Worker, seen: Option<u64>) -> String {
     let entries = new_entries(w, seen);
     match w.state {
-        State::Running => format!("{} — {}{entries}", w.path(), w.doing(workers::now_ms())),
+        State::Running => {
+            let checking = w
+                .audit
+                .as_deref()
+                .map(|a| format!("\n  {a}"))
+                .unwrap_or_default();
+            format!(
+                "{} — {}{checking}{entries}",
+                w.path(),
+                w.doing(workers::now_ms())
+            )
+        }
         State::Question => format!(
             "{} — asks Claude (reply with `repo_task_reply`; it waits until then):\n{}{entries}",
             w.path(),
@@ -325,6 +336,22 @@ mod tests {
         let mut failed = worker("v", State::Error);
         failed.error = Some("boom".into());
         assert_eq!(result_of(&failed, None), "T:review/v — error: boom");
+    }
+
+    /// **A worker sent back to check its citations says so while it runs.**
+    #[test]
+    fn a_worker_checking_its_citations_says_so_while_it_runs() {
+        let mut checking = worker("v", State::Running);
+        checking.audit =
+            Some("Checking its citations: sent back to open 2 it cited without opening.".into());
+        assert_eq!(
+            result_of(&checking, None),
+            format!(
+                "T:review/v — {}\n  Checking its citations: sent back to open 2 it cited without \
+                 opening.",
+                checking.doing(workers::now_ms())
+            )
+        );
     }
 
     /// **A finished task closes with its audit, and says it can be
