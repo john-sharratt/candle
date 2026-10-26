@@ -1,12 +1,15 @@
-# Anchored document edits in npcd
+# Anchored document edits in npcd and zend
 
-How a character changes one part of a document without writing the rest of it
-again: every paragraph carries a short content anchor, `file_read` shows it, and
-`file_edit` names the paragraph by its anchor and says what to do there.
+How a character changes one part of a file without writing the rest of it
+again: every unit of the file (a paragraph of prose, a function or type of
+code) carries a short content anchor, `file_read` shows it, and `file_edit`
+names the unit by its anchor and says what to do there.
 
 Status: design. Replaces `file_edit`'s `old_str`/`new_str` form and the
 whole-piece mending sitting of `compose`; `file_write` and `compose` for a first
-draft are unchanged.
+draft are unchanged. `file_read` and `file_edit` live in `zend-tools`
+(`tools/file/`), so the change covers npcd's characters and zend's coding
+conversations alike.
 
 ## 1. Why
 
@@ -51,13 +54,51 @@ the second.
 
 ## 3. The unit
 
+A unit is what an author means by "that part": a paragraph of prose, a function
+of code. Units cover the file completely and in order, so every line belongs to
+exactly one.
+
 - **`.md` documents: the paragraph** — a run of non-blank lines between blank
-  lines. A heading, a list, a block quote or a scene break is its own unit.
-  Blank lines carry no anchor; the edit act restores the separating blank line
-  on insert and delete.
+  lines. A heading, a list, a block quote or a scene break is its own unit. A
+  fenced code block is one unit however many blank lines it holds, and YAML
+  front matter is one unit. Blank lines carry no anchor; the edit act restores
+  the separating blank line on insert and delete.
 - **`.yaml` documents: the line.** Character sheets, world files and
   `missions.yaml` are line-structured, and a paragraph of YAML is not a unit
   anybody edits.
+- **Code: the semantic scope**, carved by the per-language tree-sitter carver
+  zend used to chunk `code_reading` before that layer moved to real file reads
+  (removed in `46e247083`; restored by §9). Its rules carry over:
+  - **Tier 1, tree-sitter**: Rust, Python, TypeScript/TSX, JavaScript, Go, C,
+    C++ (CUDA carves as C++), Java, Ruby, PHP, Bash, HTML, CSS. Each language
+    maps node kinds to a unit: a function or method, a type definition (struct,
+    enum, trait, class, interface, type alias), a run of constants, or another
+    top-level item (`macro_rules!`, a module-level statement). Containers are
+    not units — an `impl`, `mod` or `class` is the path its members are named
+    under (`impl KvCache > fn seal_chunk`), so a large impl never becomes one
+    unit.
+  - **Tier 2, headers**: TOML and JSON split at top-level keys.
+  - **Tier 3, fixed windows** for a language with no carver, or a file its
+    parser rejects.
+  - **Gap fill**: lines no scope claims (`use` lines, module attributes, stray
+    statements) become units of their own, so coverage is total.
+  - **File header**: a leading doc or licence comment of two lines or more is
+    its own first unit.
+  - **Size cap**: a scope over `MAX_UNIT_LINES` (80) or `MAX_UNIT_CHARS` (4,000)
+    splits on its children's boundaries first (match arms, nested blocks,
+    labelled `[part N]`), and at line boundaries only when it has none. Lines
+    over 160 characters are broken at safe points outside string literals
+    before carving, as before.
+  - **No merge pass.** The old carver merged small scopes forward to at least 50
+    lines, which sized a prefill turn for ingest. An edit unit is the item
+    itself: a three-line helper is its own anchor.
+
+  Semantic units make collisions rare in code: a function or type is almost
+  always unique text, so the per-line duplicates that dominate source (`}`,
+  blank lines, `return Ok(());`) never get an anchor of their own and never
+  cascade seed bumps through the file. A 1,000-line source file is 30–60
+  units, not 1,000 lines, which bounds both the read cost and the grammar's
+  `at` enum (§6).
 
 ## 4. The anchor
 
@@ -90,7 +131,7 @@ anchor(p) = base64url( H( seed ‖ normalise(text) ) )[0..4]
 
 How often a seed is bumped, and how likely a stale anchor is to match new text:
 
-| anchor | space | collision, 60 paragraphs | collision, 300 lines | stale anchor matching new text |
+| anchor | space | collision, 60 paragraphs or code units | collision, 300 YAML lines | stale anchor matching new text |
 |---|---|---|---|---|
 | 3 chars | 262 K | 0.7% | 16% | 1 in 262 K |
 | **4 chars** | **16.7 M** | **0.01%** | **0.3%** | **1 in 16.7 M** |
@@ -106,8 +147,24 @@ b4_K| Then the order came down on the shared frequency…
 9fTa| You said fourteen.
 ```
 
+A code unit is labelled with its anchor and its scope path, then shown whole:
+
+```
+(units 1–41 of 41)
+Hk2a| file header
+//! Chunked KV backing.
+Zp0_| use
+use std::sync::Arc;
+r7Lm| impl KvCache > fn seal_chunk
+    pub fn seal_chunk(&mut self, gid: ChunkGid) -> Result<()> {
+        …
+    }
+```
+
 - Paging is by unit: at most 200 a read; `start_at` takes an anchor and the
   header says how many there are in all.
+- The label path is not hashed: the anchor is the unit's text alone, so moving a
+  function into another `impl` does not change its anchor, and renaming it does.
 - The engine records, per character and document, the anchors and their text as
   last shown to that character (§7). Nothing is persisted: it lives with the
   character's working set for the length of the mission.
@@ -134,6 +191,12 @@ b4_K| Then the order came down on the shared frequency…
 - One operation per call. Several calls from one read stay valid, because an
   edit changes only its own unit's anchor (and the anchor of any later unit
   whose seed was bumped by it — a copy of the same text).
+- **Code is carved again after every edit.** An edit can change where units
+  begin and end: an inserted function is its own unit, and replacing a unit with
+  two functions yields two. The reply (below) reports the units the edit's span
+  carves into, with their anchors. An edit that leaves the file unparseable
+  still applies — the file falls back to fixed windows until it parses again —
+  and the reply says so, so the author knows its next edit should mend it.
 
 ### The grammar
 
@@ -191,6 +254,8 @@ composed whole, as today.
 | one word in one sentence | ~800–1,300 decoded (`compose`), or the `old_str` copy plus context | ~15–25 (`at` + `old` + `text`) |
 | one paragraph rewritten | ~800–1,300 | ~60–110 (the paragraph) |
 | a reread of a 60-paragraph story | 60 line numbers | + ~240 prefill tokens for the anchors |
+| one line in a 40-line function | the `old_str` copy, widened until unique | ~15–25 (`at` + scoped `old` + `text`) |
+| a reread of a 1,000-line source file | 1,000 line numbers (~3,000 tokens) | 30–60 anchors and paths (~400–800 tokens) |
 
 Prefill is the cheap side (hundreds of tok/s on the same machine), so the read
 cost is negligible beside the decode it saves.
@@ -201,16 +266,25 @@ There is no backward compatibility, by the repository's standing rule: the
 anchored form **replaces** the line-numbered one, with no dual path and no flag
 to keep the old one alive.
 
-1. **`file_read` and `file_edit` change in place.** Line numbers and `old_str`
+1. **The carver is restored into `zend-tools`.** `zend/src/code_read/carve.rs`,
+   `types.rs` and `parsers/` come back from `46e247083^` as
+   `zend-tools/src/tools/file/units/`, beside the file tools that use them,
+   with their parser tests. The merge pass (`refine`'s forward merge) is not
+   restored, and the size caps become the edit-unit caps of §3. The tree-sitter
+   grammar dependencies move from `zend/Cargo.toml`, where nothing calls them
+   now, to `zend-tools/Cargo.toml`; the single `tree-sitter` 0.26 pin `yamlpatch`
+   needs stays workspace-wide. The Markdown paragraph rule and the YAML line
+   rule are new code in the same module.
+2. **`file_read` and `file_edit` change in place.** Line numbers and `old_str`
    anchors are removed from the reads and the act; every caller, prompt and
    example in the tool catalogue is moved to anchors in the same change.
-2. **zend's `code_reading` layer is wiped and re-ingested.** Its turns were read
+3. **zend's `code_reading` layer is wiped and re-ingested.** Its turns were read
    with line numbers and cite them, so they describe a read format that no
    longer exists. It is tombstoned whole on the first boot of the new build —
    `--wipe-layer code_reading` (`DaemonConfig::wiped_layers`), on every member,
    once — and the background ingest rebuilds it from the repositories with
    anchored reads. Every other layer is untouched.
-3. **npcd needs no migration of its own.** Anchors are computed from the text
+4. **npcd needs no migration of its own.** Anchors are computed from the text
    at read time and nothing about them is persisted (§5), so documents, drafts
    in operation stores and the record carry over unchanged. A mission open
    across the upgrade reads its document again before it edits, which the
@@ -224,9 +298,15 @@ Unit tests beside the code, asserting raw values:
   and line-ending normalisation; two identical paragraphs taking seeds 0 and 1;
   a constructed collision between different texts resolved by a seed bump, the
   anchor still four characters.
+- **Units**: the restored parser tests, asserting each language's expected
+  scope paths; coverage (every line in exactly one unit) for every language;
+  no merge — two adjacent three-line functions are two units; a 200-line
+  function splits on child boundaries within the caps; a fenced code block in
+  `.md` with blank lines inside is one unit; front matter is one unit.
 - **Edits**: each operation on a small document, the restored blank lines, the
   reply's new anchors; a scoped `old` that occurs twice in the unit is refused,
-  once is applied.
+  once is applied; inserting a function after a code unit returns it as its own
+  unit; an edit that breaks the parse applies and reports the fallback.
 - **Staleness**: an anchor read, then the unit changed by another hand → refused;
   a unit elsewhere changed → the edit still applies.
 - **Duplicates**: deleting the first of two identical paragraphs leaves the
