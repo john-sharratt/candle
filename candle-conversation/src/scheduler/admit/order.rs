@@ -37,12 +37,12 @@ pub(crate) enum Kind {
 /// of it is a directory whose next turn cannot be built. Nothing a person is
 /// waiting on sits behind it.
 ///
-/// The middle two bands are unexercised by the shipped configuration — only the
-/// dialogue layer sets a priority (`High`) and every other layer takes the
-/// `Low` default — so today this reduces to High decode, High prefill, section,
-/// Low prefill, Low decode. The table is written in full because it is the
-/// rule, not because the rule needs seven rows to express.
-pub(crate) const BANDS: [(DecodePriority, Kind); 7] = [
+/// **`Urgent` goes ahead of `High`, and is ordered the same way**: a person
+/// waiting on the turn itself — a live dialogue, the check an image draw waits
+/// on — goes before the work a person is waiting on only through it.
+pub(crate) const BANDS: [(DecodePriority, Kind); 9] = [
+    (DecodePriority::Urgent, Kind::Decode),
+    (DecodePriority::Urgent, Kind::Prefill),
     (DecodePriority::High, Kind::Decode),
     (DecodePriority::High, Kind::Prefill),
     (DecodePriority::Normal, Kind::Prefill),
@@ -98,8 +98,15 @@ mod tests {
     /// outranks finishing it.
     #[test]
     fn interactive_decode_leads_and_background_prefill_precedes_its_decode() {
-        assert_eq!(BANDS[0], (DecodePriority::High, Kind::Decode));
+        assert_eq!(BANDS[0], (DecodePriority::Urgent, Kind::Decode));
         let pos = |p, k| BANDS.iter().position(|b| *b == (p, k)).unwrap();
+        assert!(
+            pos(DecodePriority::Urgent, Kind::Decode) < pos(DecodePriority::Urgent, Kind::Prefill)
+        );
+        // Every Urgent band precedes every High band.
+        assert!(
+            pos(DecodePriority::Urgent, Kind::Prefill) < pos(DecodePriority::High, Kind::Decode)
+        );
         assert!(pos(DecodePriority::High, Kind::Decode) < pos(DecodePriority::High, Kind::Prefill));
         assert!(
             pos(DecodePriority::Normal, Kind::Prefill) < pos(DecodePriority::Normal, Kind::Decode)
