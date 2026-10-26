@@ -305,13 +305,6 @@ impl GalleryArena {
             sigs.first_width().unwrap_or(0),
             self.wpt
         );
-        // Keep the arena under its own ceiling before admitting anything new.
-        // This is where gallery growth is bounded: `alloc_and_upload` adds a
-        // slab whenever the page pool is empty, and nothing else ever shrinks
-        // the arena. Doing it here — under `res`, before `inner` is taken —
-        // respects the residency→inner lock order and skips pins, so an active
-        // scan's working set is never evicted out from under it.
-        self.evict_past_keep_locked(res);
         let lru = self.lru_clock.fetch_add(1, Ordering::Relaxed);
         // Addresses are resolved while `res` is still held: evicting or replacing
         // a run needs the residency lock, so its slots can't be freed in this
@@ -325,7 +318,23 @@ impl GalleryArena {
                 }
                 Ok((rt.run.addrs(), rt.run_id))
             }
-            _ => self.replace_locked(res, sid, sigs, fingerprint, pin, lru),
+            _ => {
+                // Keep the arena under its own ceiling before admitting
+                // anything new. This is where gallery growth is bounded:
+                // `alloc_and_upload` adds a slab whenever the page pool is
+                // empty, and nothing else ever shrinks the arena. Doing it here
+                // — under `res`, before `inner` is taken — respects the
+                // residency→inner lock order and skips pins, so an active
+                // scan's working set is never evicted out from under it.
+                //
+                // **Only on the way to an upload.** The pass walks every
+                // resident turn; run ahead of every ensure, a 27,217-turn
+                // `code_reading` index that uploaded nothing spent 20.6 s in it
+                // (BlackWorld, 2026-10-26), stalling each reprojection. A hit
+                // admits nothing, so it has nothing to make room for.
+                self.evict_past_keep_locked(res);
+                self.replace_locked(res, sid, sigs, fingerprint, pin, lru)
+            }
         }
     }
 
@@ -858,6 +867,31 @@ mod tests {
         assert_eq!(live1, 1);
         assert_eq!(live2, 2);
         assert_eq!(arena.resident_turns(), 1);
+    }
+
+    /// **A resident hit evicts nothing; an upload makes room first.** With a
+    /// keep time every turn is past, ensuring a resident turn leaves the other
+    /// in place, and only admitting a new one gives the idle turns up.
+    #[test]
+    fn only_an_upload_runs_the_keep_eviction() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let sigs = |t: u64| -> Vec<WideQSig> { (0..32).map(|k| sig(t * 1000 + k)).collect() };
+        arena.ensure_resident(sid(0), &sigs(0), 1).unwrap();
+        arena.ensure_resident(sid(1), &sigs(1), 2).unwrap();
+        arena.set_keep_within(Some(Duration::from_nanos(1)));
+        std::thread::sleep(Duration::from_millis(2));
+        arena.ensure_resident(sid(0), &sigs(0), 1).unwrap();
+        assert_eq!(arena.resident_turns(), 2, "a hit admits nothing");
+        std::thread::sleep(Duration::from_millis(2));
+        arena.ensure_resident(sid(2), &sigs(2), 3).unwrap();
+        let res = arena.residency.lock().unwrap();
+        assert_eq!(res.len(), 1, "the upload gave both idle turns up");
+        assert!(res.contains_key(&sid(2)));
     }
 
     /// Eviction frees LRU turns and skips the pinned working set.
