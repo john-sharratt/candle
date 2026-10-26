@@ -1,8 +1,8 @@
 //! One backend MCP server, called through the gateway as the caller
 //! (`docs/mcp_app.md` §1, §3).
 //!
-//! Every request goes to the gateway's entrance at `/v1/mcp`, names the
-//! backend's site in `Host`, and presents the caller's own access token, which
+//! Every request goes to the gateway's entrance at the backend's own path,
+//! names its site in `Host`, and presents the caller's own access token, which
 //! the gateway honours from this app's address and routes as it would the
 //! person's own request. It speaks the 2026-07-28 protocol, which keeps no
 //! session to open: each request names the caller's client, and the session
@@ -38,6 +38,8 @@ const IDLE: Duration = Duration::from_secs(4 * PROGRESS_EVERY.as_secs());
 pub struct Backend {
     pub name: String,
     pub host: String,
+    /// Its MCP server's path on that site.
+    pub path: String,
 }
 
 /// The session a request is made on behalf of.
@@ -135,7 +137,7 @@ impl Link {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req = self
             .client
-            .post(format!("{}/v1/mcp", self.base))
+            .post(format!("{}{}", self.base, backend.path))
             .header(header::HOST, &backend.host)
             .header(VERSION_HEADER, MODERN)
             .header(header::ACCEPT, "application/json, text/event-stream")
@@ -411,6 +413,7 @@ mod tests {
         let backend = Backend {
             name: "npcd".into(),
             host: "bot.tokera.com".into(),
+            path: "/v1/npc/mcp".into(),
         };
         let session = Session::new("o", Client::ClaudeCode, MODERN, 0);
         let on = OnBehalf {
@@ -428,7 +431,7 @@ mod tests {
             )
             .build()
             .unwrap();
-        assert_eq!(req.url().as_str(), "http://192.168.0.5/v1/mcp");
+        assert_eq!(req.url().as_str(), "http://192.168.0.5/v1/npc/mcp");
         assert_eq!(req.headers()[header::HOST], "bot.tokera.com");
         assert_eq!(req.headers()[header::AUTHORIZATION], "Bearer t0k");
         assert_eq!(req.headers()[VERSION_HEADER], MODERN);

@@ -114,7 +114,7 @@ tokio-stream = { version = "0.1" }
 # Identity, roles and the route guard's types — the HTTP front itself is the
 # host's.
 web = { path = "../web" }
-# The MCP server Battle Cities' tools are served on, at `/v1/mcp`
+# The MCP server Battle Cities' tools are served on, at `/v1/npc/mcp`
 # (`docs/mcp_app.md`): the protocol and its sessions, written once and shared
 # with zend and the aggregator in front of both.
 mcp-server = { path = "../mcp-server" }

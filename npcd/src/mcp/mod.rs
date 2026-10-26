@@ -1,4 +1,4 @@
-//! npcd's MCP server, at `/v1/mcp` (`docs/mcp_app.md` §4): the tools that
+//! npcd's MCP server, at `/v1/npc/mcp` (`docs/mcp_app.md` §4): the tools that
 //! manage the caller's characters as **bots** — list them, give and manage
 //! their missions, message them, read and speak on their world's channel. The
 //! model meets them as bots to be managed; a bot is an npcd character, named by

@@ -37,12 +37,14 @@ pub struct Card {
     pub icon: Option<String>,
 }
 
-/// One MCP server whose tools are served: the site its `/v1/mcp` is reached
-/// at through the gateway, named in `Host`.
+/// One MCP server whose tools are served: the site it is reached at through
+/// the gateway, named in `Host`, and its path there — each app's own, since
+/// one host may carry several apps whose routes must not meet.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BackendConfig {
     pub name: String,
     pub host: String,
+    pub path: String,
 }
 
 impl Config {
@@ -93,11 +95,13 @@ mod tests {
             [
                 BackendConfig {
                     name: "coding".into(),
-                    host: "code.tokera.com".into()
+                    host: "code.tokera.com".into(),
+                    path: "/v1/mcp".into()
                 },
                 BackendConfig {
                     name: "bot".into(),
-                    host: "bot.tokera.com".into()
+                    host: "bot.tokera.com".into(),
+                    path: "/v1/npc/mcp".into()
                 }
             ]
         );

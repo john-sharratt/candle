@@ -2,7 +2,9 @@
 
 The remote MCP endpoint Claude reaches at `https://code.tokera.com/mcp` is an
 **aggregator**. It holds no tools of its own. zend and npcd each serve their
-own tools as an ordinary MCP server at `/v1/mcp`. The aggregator lists all of
+own tools as an ordinary MCP server — zend at `/v1/mcp`, npcd at
+`/v1/npc/mcp`, apart because one motherd may host both tenants and their
+routes must not meet. The aggregator lists all of
 those tools as one server and passes each call to the backend that lists its
 tool, as the signed-in caller.
 
@@ -43,7 +45,8 @@ web gateway (BlackWorld)  ── token → identity (auth::mcp) ── X-Tokera-
    ▼                                                                      │
 aggregator (AlienWorld, :8095)   believes X-Tokera-* only from the gateway │
    │                                                                      │
-   │  POST http://<gateway>/v1/mcp   Host: code.tokera.com | bot.tokera.com
+   │  POST http://<gateway>/v1/mcp      Host: code.tokera.com
+   │  POST http://<gateway>/v1/npc/mcp  Host: bot.tokera.com
    │       Authorization: Bearer <the same token>                         │
    ▼                                                                      │
 web gateway  ── the token names the caller, from a trusted backend (§2) ──┘
@@ -137,7 +140,7 @@ sessions are records in its substrate (`zend/src/mcp/state.rs`,
 on the session under `attached`, which is what `"self"` names. The route is
 `Dispatch::Any`.
 
-### npcd (`/v1/mcp` on bot.tokera.com)
+### npcd (`/v1/npc/mcp` on bot.tokera.com)
 
 Each tool calls the handler of the route for the same act in-process, with the
 caller's headers. It reads the handler's answer back as that route's body type
@@ -197,7 +200,7 @@ carrying.
 | `gateway` | The gateway's LAN entrance every backend is reached through (`http://192.168.0.5`) |
 | `state` | The folder its sessions are kept in |
 | `server` | Its card: `name`, `title`, `description`, `instructions`, `icon` |
-| `backends` | The servers whose tools it serves, in list order: `{name, host}` each. The name is what a failed listing tells the client — `coding` (zend) and `bot` (npcd), never the app's own name |
+| `backends` | The servers whose tools it serves, in list order: `{name, host, path}` each — the path is the app's own MCP route on that site. The name is what a failed listing tells the client — `coding` (zend) and `bot` (npcd), never the app's own name |
 
 | Module | What |
 |---|---|

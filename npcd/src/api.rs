@@ -555,8 +555,10 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // names its own caller and refuses nobody with the challenge that
         // starts a sign-in. A tool call goes to the member holding the
         // character or world it acts on, as the route for the same act would.
+        // Under npcd's own prefix: zend serves `/v1/mcp`, and one host may
+        // carry both tenants, whose routes must not meet.
         .route(
-            "/v1/mcp",
+            "/v1/npc/mcp",
             Role::Unauthenticated,
             Dispatch::Owner(KeySource::Derived(Derived::McpSubject)),
             post(mcp_http::post::<Authored>)
@@ -3690,7 +3692,7 @@ mod tests {
                 ("/v1/npc", "user"),
                 // The MCP server: open, naming its own caller and sending
                 // nobody to sign in with the challenge.
-                ("/v1/mcp", "unauthenticated"),
+                ("/v1/npc/mcp", "unauthenticated"),
                 // The whole cast in and out as records, for backup/restore —
                 // `admin`, a full-estate read and a bulk write.
                 ("/v1/npcs/export", "admin"),

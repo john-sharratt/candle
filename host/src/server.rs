@@ -34,7 +34,8 @@ use crate::cluster::Cluster;
 use crate::tenant::TenantUi;
 
 /// The path prefixes the one router answers on every site: the API — each
-/// app's MCP server among it, at `/v1/mcp` (`docs/mcp_app.md`) — the sockets,
+/// app's MCP server among it, zend's at `/v1/mcp` and npcd's at `/v1/npc/mcp`
+/// (`docs/mcp_app.md`) — the sockets,
 /// and the shared front-end.
 const API_PREFIXES: [&str; 4] = ["/v1", "/ws", "/common", "/brand"];
 

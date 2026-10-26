@@ -1,6 +1,7 @@
 //! `mcp` — the MCP server Claude reaches at `code.tokera.com/mcp`
 //! (`docs/mcp_app.md`): an aggregator over the MCP servers zend and npcd each
-//! run at `/v1/mcp`, reached back through the gateway as the signed-in caller.
+//! run at its own path, reached back through the gateway as the signed-in
+//! caller.
 //!
 //! | Module | What |
 //! |---|---|
@@ -61,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
             .map(|b| Backend {
                 name: b.name.clone(),
                 host: b.host.clone(),
+                path: b.path.clone(),
             })
             .collect(),
         link: Link::new(&config.gateway)?,
