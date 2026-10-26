@@ -45,7 +45,8 @@
 
 use std::sync::Arc;
 
-use candle::quantized::Int8Mode;
+use candle::quantized::ggml_file::qtensor_from_ggml;
+use candle::quantized::{Int8Mode, QTensor};
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::RmsNorm;
 
@@ -206,43 +207,82 @@ impl Layer {
     }
 }
 
-/// The embedding table, on the host.
+/// The embedding table, on the host, at the file's own width.
 ///
-/// Held dequantised at [`DTYPE`]'s width rather than the file's, because the
-/// per-row cost of decoding Q8_0 on demand is paid on every prompt while this is
-/// paid once — and 778 MiB of host RAM is not the resource under pressure here.
-/// The card never sees it; [`Self::rows`] returns only the tokens asked for.
+/// **Quantised, and only the rows asked for are decoded.** A prompt reads a
+/// few dozen of the 151,936 rows, and the table is read afresh every drain
+/// because the guest holds nothing between them. Dequantising the whole of it
+/// to look those up was 1.5 GiB of conversion and three seconds of every image
+/// draw, on a host whose memory the engine already fills. The card never sees
+/// it; [`Self::rows`] returns only the tokens asked for.
 #[derive(Debug)]
 pub struct EmbedTable {
-    rows: Tensor,
+    rows: QTensor,
+    vocab: usize,
     hidden: usize,
+    /// Bytes one row occupies in the file's encoding.
+    row_bytes: usize,
 }
 
 impl EmbedTable {
-    /// Read `model.embed_tokens` out of a GGUF and dequantise it on the host.
+    /// Read `model.embed_tokens` out of a GGUF, as stored.
     pub fn from_gguf(path: &std::path::Path, cfg: &Config) -> Result<Self> {
         let mut file = std::fs::File::open(path)?;
         let content = candle::quantized::gguf_file::Content::read(&mut file)?;
         let q = content.tensor(&mut file, EMBED_TOKENS, &Device::Cpu)?;
-        let rows = q.dequantize(&Device::Cpu)?.to_dtype(DTYPE)?;
-        let (vocab, hidden) = rows.dims2()?;
-        if hidden != cfg.hidden_size {
+        let table = Self::quantized(q)?;
+        if table.hidden != cfg.hidden_size {
             candle::bail!(
-                "{EMBED_TOKENS} is {vocab}×{hidden} and the config says the model is \
-                 {}-wide — these are not the same checkpoint",
+                "{EMBED_TOKENS} is {}×{} and the config says the model is {}-wide — these \
+                 are not the same checkpoint",
+                table.vocab,
+                table.hidden,
                 cfg.hidden_size
             );
         }
-        Ok(Self { rows, hidden })
+        Ok(table)
+    }
+
+    /// A table over `rows`, a `[vocab, hidden]` quantised tensor on the host.
+    pub fn quantized(rows: QTensor) -> Result<Self> {
+        let (vocab, hidden) = rows.shape().dims2()?;
+        let dtype = rows.dtype();
+        if hidden % dtype.block_size() != 0 {
+            candle::bail!(
+                "{EMBED_TOKENS}: a {hidden}-wide row is not whole {dtype:?} blocks, so a row \
+                 cannot be read on its own"
+            );
+        }
+        let row_bytes = hidden / dtype.block_size() * dtype.type_size();
+        Ok(Self {
+            rows,
+            vocab,
+            hidden,
+            row_bytes,
+        })
     }
 
     /// The rows `ids` name, on `device`, as `[1, len, hidden]`.
     pub fn rows(&self, ids: &[u32], device: &Device) -> Result<Tensor> {
-        let idx = Tensor::new(ids, &Device::Cpu)?;
-        self.rows
-            .index_select(&idx, 0)?
-            .reshape((1, ids.len(), self.hidden))?
-            .to_device(device)
+        let data = self.rows.data()?;
+        let mut raw = Vec::with_capacity(ids.len() * self.row_bytes);
+        for &id in ids {
+            let id = id as usize;
+            if id >= self.vocab {
+                candle::bail!("token {id} is past the {}-row embedding table", self.vocab);
+            }
+            raw.extend_from_slice(&data[id * self.row_bytes..(id + 1) * self.row_bytes]);
+        }
+        qtensor_from_ggml(
+            self.rows.dtype(),
+            &raw,
+            vec![ids.len(), self.hidden],
+            &Device::Cpu,
+        )?
+        .dequantize(&Device::Cpu)?
+        .to_dtype(DTYPE)?
+        .reshape((1, ids.len(), self.hidden))?
+        .to_device(device)
     }
 }
 
@@ -325,6 +365,44 @@ impl TextEncoder {
 #[cfg(test)]
 mod tests {
     use candle::quantized::ko_quant::ko_tileable;
+    use candle::quantized::{GgmlDType, QTensor};
+    use candle::{Device, Tensor};
+
+    use super::{EmbedTable, DTYPE};
+
+    /// **A row read on its own decodes to the row of the whole table.** The
+    /// table is read per row so a draw never dequantises the vocabulary; that
+    /// is only sound if the bytes it slices are exactly that row's blocks, in
+    /// order, for every id — the first, the last, and one repeated.
+    #[test]
+    fn a_row_read_alone_is_the_row_of_the_whole_table() {
+        let (vocab, hidden) = (40usize, 64usize);
+        let values: Vec<f32> = (0..vocab * hidden)
+            .map(|i| ((i * 37) % 251) as f32 / 251.0 - 0.5)
+            .collect();
+        let full = Tensor::from_vec(values, (vocab, hidden), &Device::Cpu).unwrap();
+        let q = QTensor::quantize(&full, GgmlDType::Q8_0).unwrap();
+        let whole = q.dequantize(&Device::Cpu).unwrap().to_dtype(DTYPE).unwrap();
+        let table = EmbedTable::quantized(q).unwrap();
+        let ids = [0u32, 7, 39, 7];
+        let got = table.rows(&ids, &Device::Cpu).unwrap();
+        assert_eq!(got.dims(), &[1, ids.len(), hidden]);
+        for (i, &id) in ids.iter().enumerate() {
+            let want = whole.get(id as usize).unwrap().to_vec1::<f32>().unwrap();
+            let have = got
+                .get(0)
+                .unwrap()
+                .get(i)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(have, want, "row {id} decoded differently on its own");
+        }
+        assert!(
+            table.rows(&[40], &Device::Cpu).is_err(),
+            "a token past the table was read"
+        );
+    }
 
     /// The released encoder's geometry, from `text_encoder/config.json`.
     const HIDDEN: usize = 2560;
