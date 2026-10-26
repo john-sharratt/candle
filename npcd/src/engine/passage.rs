@@ -1,11 +1,11 @@
 //! An edit puts one passage right; it does not write the piece again.
 //!
 //! **A composed piece was undone by hand.** A Maker that sat down and composed
-//! its story whole then `file_edit`ed it with the entire document as `old_str`
-//! and its own new text as `new_str` — the piece rewritten in the middle of its
-//! running conversation, which is exactly the writing `compose` exists to
-//! replace, and the vault's light rings and air handlers went straight back in.
-//! So on a mission's prose document an edit that takes most of the piece is
+//! its story whole then `file_edit`ed the entire document with its own new text
+//! — the piece rewritten in the middle of its running conversation, which is
+//! exactly the writing `compose` exists to replace, and the vault's light rings
+//! and air handlers went straight back in. So on a mission's prose document an
+//! edit whose replaced paragraphs (or `old` words) take most of the piece is
 //! refused and pointed at `compose`.
 
 /// The share of a piece's words an edit may take before it is the piece and

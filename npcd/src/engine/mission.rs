@@ -918,8 +918,9 @@ fn doc_compass_unwritten(doc: &DocStep, at: &DeskVerbs, way: Option<&str>) -> St
         ) => {
             let mend = match edit {
                 Some(edit) => format!(
-                    " To put one passage right afterwards, `invoke` {edit} with the words to \
-                     replace as `old_str` and what replaces them as `new_str`."
+                    " To put one passage right afterwards, `invoke` {edit} with the paragraph's \
+                     anchor from your read as `at`, `do` replace, the words to change as `old` \
+                     and what they become as `text`."
                 ),
                 None => String::new(),
             };
