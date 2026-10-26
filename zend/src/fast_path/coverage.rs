@@ -6,8 +6,8 @@
 //! the model never gets. The chain's own record decides: each call turn's
 //! `file_read` pages, paired in order with the `<tool_response>` blocks of the
 //! turn after it, count when the response carries no `error`. The chain is
-//! complete when those pages cover `1 ..= ceil(lines / PAGE_LINES)` — pages
-//! count from 1, as `file_read`'s request does.
+//! complete when those pages cover `1 ..= pages`, the count its ingest
+//! recorded — pages count from 1, as `file_read`'s request does.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -15,7 +15,6 @@ use std::sync::Mutex;
 use candle_conversation::projection::TimelineId;
 use candle_conversation::{ConversationEngine, TurnText};
 use serde_json::Value;
-use zend_vfs::vfs::PAGE_LINES;
 
 use crate::tool_round::{plan, Step};
 
@@ -30,26 +29,26 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Whether the chain on `timeline` read every page of its `lines`-line file.
+    /// Whether the chain on `timeline` read every page of its `pages`-page
+    /// file.
     pub fn is_complete(
         &self,
         engine: &ConversationEngine,
         timeline: TimelineId,
-        lines: usize,
+        pages: u32,
     ) -> bool {
         if let Some(&known) = self.complete.lock().unwrap().get(&timeline) {
             return known;
         }
-        let complete = covers(&read_pages(&engine.turn_texts(timeline)), lines);
+        let complete = covers(&read_pages(&engine.turn_texts(timeline)), pages);
         self.complete.lock().unwrap().insert(timeline, complete);
         complete
     }
 }
 
-/// Whether `pages` (from 1) covers every page of a `lines`-line file.
-pub fn covers(pages: &BTreeSet<u32>, lines: usize) -> bool {
-    let needed = lines.div_ceil(PAGE_LINES as usize) as u32;
-    (1..=needed).all(|p| pages.contains(&p))
+/// Whether `read` (pages from 1) covers every page of a `pages`-page file.
+pub fn covers(read: &BTreeSet<u32>, pages: u32) -> bool {
+    (1..=pages).all(|p| read.contains(&p))
 }
 
 /// The `file_read` pages a chain served without an error. `turns` are the
@@ -152,7 +151,7 @@ mod tests {
         ];
         let pages = read_pages(&turns);
         assert_eq!(pages, BTreeSet::from([1, 2]));
-        assert!(covers(&pages, 350));
+        assert!(covers(&pages, 2));
     }
 
     /// A chain missing a page, or whose page came back an error, is not.
@@ -162,7 +161,7 @@ mod tests {
             ("Read a.rs".to_string(), call(1)),
             (response(PAGE), "It defines A.".to_string()),
         ];
-        assert!(!covers(&read_pages(&skipped), 350));
+        assert!(!covers(&read_pages(&skipped), 2));
 
         let failed = vec![
             ("Read a.rs".to_string(), call(1)),
@@ -173,14 +172,14 @@ mod tests {
             ),
         ];
         assert_eq!(read_pages(&failed), BTreeSet::from([1]));
-        assert!(!covers(&read_pages(&failed), 350));
+        assert!(!covers(&read_pages(&failed), 2));
     }
 
     /// **A chain read zero-based is not complete**: pages 0 and 1 of a two-page
     /// file are the first page and a past-the-end clamp, never the whole file.
     #[test]
     fn a_zero_based_chain_is_not_complete() {
-        assert!(!covers(&BTreeSet::from([0, 1]), 350));
+        assert!(!covers(&BTreeSet::from([0, 1]), 2));
     }
 
     /// A multi-call round's labels are stripped before the error test, and the
@@ -197,13 +196,13 @@ mod tests {
         assert_eq!(read_pages(&turns), BTreeSet::from([1]));
     }
 
-    /// Page counts are exact at the boundary: 200 lines is one page, 201 two,
-    /// and an empty file needs none.
+    /// Coverage is exact: a one-page file needs page 1, a two-page file both,
+    /// and a file with no pages none.
     #[test]
-    fn the_page_count_is_exact_at_the_boundary() {
+    fn the_page_count_is_exact() {
         let first = BTreeSet::from([1]);
-        assert!(covers(&first, 200));
-        assert!(!covers(&first, 201));
+        assert!(covers(&first, 1));
+        assert!(!covers(&first, 2));
         assert!(covers(&BTreeSet::new(), 0));
     }
 }

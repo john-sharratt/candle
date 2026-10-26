@@ -55,6 +55,9 @@ boa_engine = "0.21.1"
 # spawns or parses git), the file stores the file tools work through, the
 # replace engine behind file_edit, and the sandbox `run_command` runs jobs in.
 zend-vfs = { path = "../zend-vfs" }
+# A file as anchored units: what `file_read` shows and `file_edit` names
+# (docs/npcd_anchored_edits.md).
+doc-units = { path = "../doc-units" }
 # The journal tools read and search a conversation's journal text with the
 # logic npcd's characters share.
 journal-core = { path = "../journal-core" }

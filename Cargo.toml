@@ -141,7 +141,7 @@ serde_yaml = "0.9"
 #
 # From `zizmor`, which rewrites people's checked-in GitHub Actions workflows and
 # has the same requirement: the diff has to be reviewable. They need
-# `tree-sitter` 0.26, which is why `zend`'s grammars were moved up to match —
+# `tree-sitter` 0.26, which is why `doc-units`' grammars are pinned to match —
 # `tree-sitter` sets `links = "tree-sitter"`, so the workspace gets exactly one
 # version and that pin is a shared decision rather than any one crate's.
 #

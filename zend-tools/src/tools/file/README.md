@@ -18,8 +18,10 @@ which is what most unit tests use.
 | File | Tool | Description |
 |------|------|-------------|
 | `write.rs` | `write` | Create or overwrite a file; enforces 10 MiB cap |
-| `read.rs` | `file_read` | Return a file, or a line range of it, as a numbered, fenced excerpt; only `path` is required |
-| `edit.rs` | `file_edit` | Replaces `old_text` with `new_text`; the engine is `zend-vfs/src/replace/` |
+| `read.rs` | `file_read` | Return a page of a file — its parts under their anchors — in a fenced block; `repo`, `path` and `page` are required, `line` optional |
+| `edit.rs` | `file_edit` | One anchored edit — replace, insert, delete, move — by the anchors `file_read` shows; the engine is `doc-units` |
+| `grep.rs` | `file_grep` | Regex over file contents; each hit names its part's anchor and the page holding it |
+| `render.rs` | — | The page format, shared with the `code_reading` ingest |
 | `list.rs` | `file_list` | Paged, one-level union listing of a directory's project + session files |
 | `delete.rs` | `file_delete` | Drop a session file or whiteout a project one; returns `deleted` flag |
 | `present.rs` | `file_present` | Foreground presentation gesture |
@@ -49,37 +51,42 @@ example depends on.
 Project files above 4 MiB, or whose bytes are not valid UTF-8, list with their
 true size but fail to read with `unreadable`.
 
+## Parts and anchors
+
+A file is shown and edited in its parts (`docs/npcd_anchored_edits.md`): a
+function, a type or a block of imports for code (carved by tree-sitter), a
+paragraph for Markdown and text, a line for YAML. Each part carries a
+four-character anchor hashed from its own text, so a part another hand
+changed no longer has the anchor it was read under. `doc-units` is the engine.
+
 ## `file_read` paging
 
-`path` and `page` are both required — there is no whole-file read. `page`
-counts from 1 and every page is [`PAGE_LINES`](../../../../zend-vfs/src/vfs.rs)
-lines (currently 200); a page past the end clamps to the last one rather than
-failing, and page 0 is refused. The fence opens `page=P pages=N lines=L` and
-closes `end of <file> page P of N — next: page=P+1`, or `— the last page`, so
-the model reads straight off it whether and where to keep going.
+`repo`, `path` and `page` are required — there is no whole-file read. `page`
+counts from 1 and every page holds whole parts, up to
+[`PAGE_LINES`](render.rs) lines (200) of them; a page past the end clamps to
+the last one rather than failing, and page 0 is refused. `line` reads the page
+holding that line instead. The fence opens `page=P pages=N lines=L` and closes
+`end of <file> page P of N — next: page=P+1`, or `— the last page`, so the
+model reads straight off it whether and where to keep going.
 
-## `file_edit` replacements
+## `file_edit` operations
 
-`file_edit` takes `old_text` — the text to change, quoted from the file as it
-stands — and `new_text`, what takes its place. `zend-vfs/src/replace/` is the
-engine, and its module docs are the reference.
+`file_edit` names a part by its anchor (`at`) and says what to `do`:
 
-- `old_text` found exactly once → replaced (`"matched": "exact"`); an indented
-  `old_text` must start a line
-- found more than once (overlapping counted apart) → `ambiguous`, unless
-  `replace_all` is set
-- not found exactly, but found as whole lines with their indentation ignored →
-  replaced, the new text re-indented to the file's (`"matched": "indentation"`)
-- absent, with `new_text` standing in the file as whole lines that are not
-  only punctuation → **already applied**, nothing written
-- neither → `not_found`, saying where the first line of `old_text` is, if it is
-- empty `old_text`, or `new_text` the same → `invalid_arguments`
+- `replace` — the part with `text`; with `old`, just those words inside it,
+  which must occur in it once (`ambiguous` / `not_found` otherwise)
+- `insert_before` / `insert_after` — a new part `text` beside it, set apart
+  by a blank line where the file sets its parts apart
+- `delete` — the part, and the separator after it
+- `move` — the part, `before`/`after` the part `dest`, text unchanged
+- `to` — extends replace, delete and move over `at` through `to`
 
-Already-applied detection is what makes the tool idempotent: sending the same
-edit twice succeeds both times and the second call writes nothing. An
-occurrence of `old_text` inside an occurrence of `new_text` is the edit's own
-result and is not counted, which is why `retries = 3` → `retries = 30` cannot
-produce `retries = 300`.
+An anchor the file no longer has is `stale`, so a replace or delete re-sent
+after it landed is refused rather than applied twice — `retries = 3` →
+`retries = 30` cannot produce `retries = 300`. An insert leaves its anchor as
+it was, so it is the one edit a resumed turn may not re-issue (`replay`). The
+reply names what was done and shows the parts it wrote under their new
+anchors, between their neighbours.
 
 ## `file_present` vs Files panel
 
@@ -99,9 +106,10 @@ retained — only a write or a successful edit consumes budget.
 
 | Code | When |
 |------|------|
-| `not_found` | Path resolves in neither layer (`read`, `edit`, `delete`), or an `edit`'s `old_text` is not in the file |
+| `not_found` | Path resolves in neither layer (`read`, `edit`, `delete`), or an `edit`'s `old` is not in its part |
+| `stale` | An `edit`'s anchor names no part of the file as it stands — read it again |
 | `vfs_full` | Write would exceed 10 MiB cap |
-| `ambiguous` | An `edit`'s `old_text` occurs more than once and `replace_all` is not set |
+| `ambiguous` | An `edit`'s `old` occurs in its part more than once |
 | `no_files_found` | All requested paths missing (`present`) |
 | `unreadable` | Project file above the read limit or not UTF-8 text |
-| `invalid_arguments` | A required argument is missing — e.g. `file_read` without `path` — or an `edit` whose `old_text` is empty or the same as its `new_text` |
+| `invalid_arguments` | A required argument is missing — e.g. `file_read` without `path` — or an `edit` that names nothing to do: no `text`, a span run backwards, a move into itself |

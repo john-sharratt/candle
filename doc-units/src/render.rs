@@ -95,7 +95,8 @@ pub fn head(doc: &Doc, i: usize) -> String {
         Some(label) => label.clone(),
         None => bare(&doc.lines()[u.start]).trim().to_string(),
     };
-    let more = u.end - u.start > 1 || text.chars().count() > HEAD_CHARS;
+    // A label names its whole unit; a first line marks that more follows it.
+    let more = text.chars().count() > HEAD_CHARS || (u.label.is_none() && u.end - u.start > 1);
     let cut: String = text.chars().take(HEAD_CHARS).collect();
     match more {
         true => format!("{}| {}…\n", u.anchor, cut.trim_end()),
@@ -189,6 +190,11 @@ mod tests {
         assert_eq!(head(&doc, 0), format!("{}| Short.\n", a(0)));
         assert!(head(&doc, 1).ends_with("…\n"));
         assert_eq!(head(&doc, 2), format!("{}| Two…\n", a(2)));
+        let code = Doc::new("a.rs", "fn go() {\n    1\n}\n");
+        assert_eq!(
+            head(&code, 0),
+            format!("{}| fn go\n", code.units()[0].anchor)
+        );
     }
 
     #[test]
