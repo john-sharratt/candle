@@ -298,14 +298,20 @@ loses (`docs/results/provenance_gates_2026-10-26.md`).
   0.333 → 0.401 on question probes and 0.424 → 0.463 on thinking probes.
   Over every calibrated file as production learns it (1,637 files, most still
   calibrated with questions alone) it cuts 437 of ~36,000 chunks and is
-  neutral, MRR 0.251 → 0.250 (`provenance_gates calibration-cut`); measured
-  again once every unit carries its thinking.
+  neutral, MRR 0.251 → 0.250 (`provenance_gates calibration-cut`); over 999
+  files calibrated with thinking it is neutral too, k 3–5 within +0.004 MRR
+  (`provenance_gates thinking`).
 - **Where.** Learned ahead of each layer's calibration pass
-  (`GroupScanner::learn_chunk_exclusion`, the scan at ingest priority, the
-  attribution on the calling thread holding no lock), held in memory per group
+  (`GroupScanner::learn_chunk_exclusion`, the attribution on the calling
+  thread holding no lock), held in memory per group
   (`Substrate::chunk_exclusion`), and cut from the group's own windows where
   the live scan assembles them (`belief_files::cut_excluded`), calibration
-  windows and its own alike.
+  windows and its own alike. The questions are scanned 16 at a time, each
+  batch one background job the scheduler runs between waves: all of them in
+  one job held the engine ~40 s at a time and froze every live conversation
+  for minutes. A standing exclusion is kept, nothing scanned, until the
+  questions it was learned from move by a tenth; a restart, which holds none,
+  learns it on its first pass.
 - **Measured.** Held-out questions, content alone: MRR 0.172 → 0.186; stacked
   on the calibration competition at 15 questions a file: 0.220 → 0.228, R@10
   0.364 → 0.379.
@@ -387,3 +393,9 @@ replay of the conversation remains the end-to-end check after the gate passes.
 ## 7. Open
 
 - The expected injections, per projection (§3.4).
+- Gate 4 on the shipped weighting (content `[0, 1, 1]`, calibration
+  `[0, 0, 1]` at 0.25). The paper conversation measured on 2026-10-25
+  (`e7bca43c…`) now holds its dialogue turns' tokens but no signatures, so the
+  gate has no probe; it needs a fresh replay, run off the serving cluster.
+- The analysis layers carry `code_reading`'s weighting unmeasured; sweep them
+  (`provenance_gates layers`) once their units are read again and calibrated.

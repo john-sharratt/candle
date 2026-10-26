@@ -11,6 +11,53 @@ The probe set throughout: each calibrated file's question 0 (1,501–1,661
 questions), asked of every `code_reading` file. It is in no background and no
 gallery.
 
+## Headline
+
+What the day's calibration work bought `code_reading`'s file retrieval, each
+row measured on the live gallery against held-out calibration questions
+(R@1 / R@10 / MRR). Rows of one table share a gallery; the gallery grew
+between tables, so the two tables are compared row to row within themselves.
+
+**Bare-question probes** (the question's words alone; 15 questions a file):
+
+| scoring | R@1 | R@10 | MRR |
+|---|---|---|---|
+| calibration questions pooled with content (the scorer at the day's start) | — | — | 0.152 |
+| content alone | 0.125 | 0.264 | 0.172 |
+| calibration as a competition of its own, `+ 0.5 ×` | — | 0.365 | 0.221 |
+
+**Live-turn probes** (a held-out question and the ≤64 tokens of thinking it
+starts — the probe a live projection makes; 24 questions a file, 999 files):
+
+| scoring | R@1 | R@10 | MRR |
+|---|---|---|---|
+| content alone, every fold group | 0.270 | 0.457 | 0.337 |
+| `+ 0.5 ×` calibration competition, every fold group | 0.197 | 0.561 | 0.323 |
+| content groups 1–2 `+ 0.25 ×` calibration top group (**shipped**) | **0.310** | 0.554 | **0.397** |
+| the same through the working set's momentum, three turns on a file | **0.392** | **0.708** | **0.504** |
+
+Single-scan R@1 rises 0.270 → 0.310 over content alone while R@10 rises 0.457
+→ 0.554; over a short conversation, under the same momentum, R@1 nearly
+doubles against the competition weighed alike (0.213 → 0.392 at the same
+three turns, `momentum`). The findings that carry beyond this gallery:
+
+1. **A calibration question and a live probe share a distribution**, so in
+   one pool the questions take nearly every vote (96.5% of a background's
+   vote mass at 2% of the gallery); scored as a competition of their own and
+   added at a fraction, they lift recall instead of drowning content.
+2. **Probes find their own kind.** Question probes match stored questions,
+   thinking probes stored thinking; storing both and probing with the live
+   turn (both) is best, and summing two half-probes is worse than one whole.
+3. **Identity lives in different fold groups for content and for
+   calibration.** Fold group 0 (layers 0–45) carries none of a file's
+   identity; content sits in groups 1–2, calibration in the top group alone.
+4. **Momentum compounds the scoring gain rather than overlapping it**, at the
+   cost of slower topic switches (β 0.2: a new file leads in 70% of
+   dialogues after three turns).
+5. **Repairing signatures does not work; cutting chunks barely matters.**
+   Bit-level centring is a no-op; the anomalous-chunk cut moves MRR by
+   ±0.005 once calibration competes apart.
+
 ## Anomalous-chunk exclusion (`chunk-factor`)
 
 Each vote is credited to the 32-token gallery chunk it was won at
@@ -93,6 +140,26 @@ more segment of the same paged launch (and the same competition on the CPU
 path); `code_reading`'s `scopes` declares `calibration_weight: 0.5`. Gate 4,
 the paper conversation, waits for a replay.
 
+## The cut as production learns it (`calibration-cut`)
+
+The calibration competition's chunk cut learned as production learns it —
+over every calibrated file, from questions held out of both the learning and
+the gallery; 1,637 files asked, 443 of them calibrated with thinking at the
+time.
+
+| scoring | R@1 | R@10 | MRR |
+|---|---|---|---|
+| content alone | 0.155 | 0.301 | 0.205 |
+| `+ 0.5 ×` competition, no cut | 0.163 | 0.413 | 0.251 |
+| `+ 0.5 ×` competition, k 5 (3 chunks cut) | 0.163 | 0.412 | 0.251 |
+| `+ 0.5 ×` competition, k 4 (51 chunks cut) | 0.163 | 0.412 | 0.251 |
+
+The competition is worth +0.046 MRR and +0.112 R@10 here; the cut on top of it
+is neutral. Production learns the cut anyway (content k 5, calibration k 3):
+on the live gallery it cuts ~85 of 806 k content chunks and ~450 of 57 k
+calibration chunks — and was re-measured neutral on the thinking-calibrated
+set below (k 3–5: ≤ +0.004 MRR).
+
 ## Thinking and the live turn (`thinking`)
 
 Calibrated at 24 questions a file, each with up to 64 tokens of thinking; 979
@@ -112,6 +179,20 @@ its thinking (its questions alone give 0.004). Asking the two halves apart and
 summing their scores is worse than asking the turn whole at every weight. At
 `w = 0.5` the competition buys the turn ten points of R@10 and costs it eight
 of R@1.
+
+The calibration weight on the turn probe, every fold group alike (979 files):
+
+| w | one turn R@1 / R@10 / MRR | halves summed R@1 / R@10 / MRR |
+|---|---|---|
+| 0 (content) | 0.271 / 0.454 / 0.336 | 0.254 / 0.438 / 0.319 |
+| 0.1 | 0.263 / 0.496 / **0.353** | 0.250 / 0.484 / 0.338 |
+| 0.25 | 0.223 / 0.540 / 0.340 | 0.217 / 0.520 / 0.328 |
+| 0.35 | 0.201 / 0.551 / 0.327 | 0.199 / 0.533 / 0.320 |
+| 0.5 | 0.189 / **0.555** / 0.316 | 0.183 / 0.535 / 0.307 |
+| 0.75 | 0.170 / 0.541 / 0.298 | 0.163 / 0.529 / 0.288 |
+
+Weighed alike, the competition trades top hits for coverage at every weight —
+the trade the fold groups below remove.
 
 ## Fold groups (`layers`)
 
@@ -152,6 +233,29 @@ Momentum compounds the fold-group gain instead of overlapping it: R@1 0.186
 three turns on A, three on B leave B ahead of A in 70% of dialogues at β 0.2,
 87% at β 0.5, 50% at β 0 — and B's MRR reaches 0.475 by its sixth scan at
 β 0.2. Production's β 0.2 stands.
+
+## Calibrating as the ingest commits
+
+Each unit is calibrated by the ingest worker that read it, between its commit
+and its eviction to cold (`calibrate::calibrate_committed`), so the draft and
+its 24 questions fork onto the reading while it is still resident. Over the
+`code_reading` re-ingest on BlackWorld, 603 files were calibrated against 604
+committed — one a commit — at ~4–4.5 files a minute, each file's reading,
+24 questions and their thinking together; 2 drafts wrote no question and fell
+to the catch-up round. Decode is the bound, not the lift from cold the
+catch-up round paid.
+
+## Costs found in production
+
+- **The exclusion learner froze the engine.** Learning scanned all ~9,800
+  sampled questions in two scheduler jobs over the whole gallery, ~40 s
+  each; every live conversation stalled ~3.5 minutes after each restart and
+  ahead of each pass. It now scans 16 questions a job, between waves, and
+  relearns only when its questions move by a tenth.
+- **A per-probe harness gate starves production.** The `questions` gate
+  (≈3,300 probes, each two serial scans of the whole gallery) against the
+  live daemon held decode near 2 tokens/s for half an hour. Gates against a
+  serving daemon batch their probes.
 
 **What ships**: a group policy's `calibration_layer_weights` weighs the
 calibration competition's fold groups apart from the content's
