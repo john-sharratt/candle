@@ -8,8 +8,10 @@ use zend_vfs::vfs::Tree;
 
 use super::index::IngestIndex;
 use crate::branch_ingest::filter::IngestScope;
-use crate::branch_ingest::keys::file_key;
-use crate::branch_ingest::units::{folder_units, TreeFile};
+use crate::branch_ingest::keys::{
+    dir_key_at, file_key, unversioned, Listing, FIRST_VERSIONED, KEY_VERSION,
+};
+use crate::branch_ingest::units::{folder_units, FolderUnit, TreeFile};
 use crate::repo_scan::types::ModuleHint;
 
 /// One tree's units that have been ingested: files by path (repository
@@ -83,12 +85,31 @@ impl TreeScope {
             })
             .collect();
         for unit in folder_units(repo, tree, &read, hint_of) {
-            if let Some(tl) = index.get(&unit.key) {
+            if let Some(tl) = folder_reading(index, &unit) {
                 out.folders.insert(unit.dir, tl);
             }
         }
         out
     }
+}
+
+/// The reading of `unit`'s folder: under the current key version, or — while
+/// a key version change is re-read — under the newest earlier one that read
+/// it. A folder's digest covers its version, so an earlier reading is found by
+/// its own version's key, recomputed, never by the current one.
+fn folder_reading(index: &IngestIndex, unit: &FolderUnit) -> Option<TimelineId> {
+    let listing = Listing {
+        total: unit.total,
+        page: &unit.listed,
+    };
+    (FIRST_VERSIONED..=KEY_VERSION).rev().find_map(|version| {
+        index.get(&dir_key_at(
+            version,
+            &unit.dir,
+            &listing,
+            unit.module_hint.as_ref(),
+        ))
+    })
 }
 
 /// Whether a unit depending on `deps` (workspace-relative, each at its
@@ -106,7 +127,8 @@ fn built_against(
     let mut here = Vec::new();
     for (dep, key) in deps {
         if let Some(rel) = dep.strip_prefix(prefix) {
-            if keys.get(rel) != Some(key) {
+            // The file version, whatever key version read it.
+            if keys.get(rel).map(|k| unversioned(k)) != Some(unversioned(key)) {
                 return None;
             }
             here.push(rel.to_string());
@@ -140,5 +162,43 @@ mod tests {
             built_against(&[dep("other/x.rs", "x@9")], "r/", &keys),
             Some(vec![])
         );
+        // A dependency read under an earlier key version is the same file
+        // version.
+        let keys = HashMap::from([("src/d.rs", "v3:r/src/d.rs@1".to_string())]);
+        assert_eq!(
+            built_against(&[dep("r/src/d.rs", "v2:r/src/d.rs@1")], "r/", &keys),
+            Some(vec!["src/d.rs".to_string()])
+        );
+        assert_eq!(
+            built_against(&[dep("r/src/d.rs", "v2:r/src/d.rs@2")], "r/", &keys),
+            None
+        );
+    }
+
+    /// **A folder not yet re-read is found by its own version's key.**
+    #[test]
+    fn a_folder_reading_from_an_earlier_version_is_found() {
+        let unit = FolderUnit {
+            repo: "r".into(),
+            dir: "r/a/".into(),
+            total: 1,
+            listed: vec!["r/a/x.rs".into()],
+            module_hint: None,
+            key: String::new(),
+        };
+        let listing = Listing {
+            total: 1,
+            page: &unit.listed,
+        };
+        let tl = |n| TimelineId::from_raw(n).unwrap();
+        let old = dir_key_at(KEY_VERSION - 1, "r/a/", &listing, None);
+        let index = IngestIndex::of(HashMap::from([(old, tl(1))]), Vec::new(), 0);
+        assert_eq!(folder_reading(&index, &unit), Some(tl(1)));
+        let new = dir_key_at(KEY_VERSION, "r/a/", &listing, None);
+        let old = dir_key_at(KEY_VERSION - 1, "r/a/", &listing, None);
+        let index = IngestIndex::of(HashMap::from([(old, tl(1)), (new, tl(2))]), Vec::new(), 0);
+        assert_eq!(folder_reading(&index, &unit), Some(tl(2)), "the newest");
+        let none = IngestIndex::of(HashMap::new(), Vec::new(), 0);
+        assert_eq!(folder_reading(&none, &unit), None);
     }
 }

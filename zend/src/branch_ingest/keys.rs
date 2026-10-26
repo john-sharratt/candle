@@ -86,6 +86,11 @@ pub const COMMIT_KEY: &str = "commit";
 /// it — from one it should replace, and leaves it alone.
 pub const KEY_VERSION: u32 = 3;
 
+/// The first key version that writes its `v<N>:` prefix — the oldest a
+/// folder's earlier reading can be recomputed at ([`dir_key_at`]). A key from
+/// before it carries no version and is read as 1.
+pub const FIRST_VERSIONED: u32 = 2;
+
 /// The version a key was written under: its `v<N>:` prefix, and 1 for a key
 /// with none — the form every key had before versions.
 pub fn key_version(key: &str) -> u32 {
@@ -93,6 +98,17 @@ pub fn key_version(key: &str) -> u32 {
         .and_then(|rest| rest.split_once(':'))
         .and_then(|(n, _)| n.parse().ok())
         .unwrap_or(1)
+}
+
+/// `key` without its `v<N>:` prefix: what stays the same when only the
+/// version moves. A file's is its `path@blob`, so the readings of one file
+/// version under two key versions share it; a folder's digest covers its
+/// version, so a folder's never does — [`dir_key_at`] recomputes one instead.
+pub fn unversioned(key: &str) -> &str {
+    match key.strip_prefix('v').and_then(|r| r.split_once(':')) {
+        Some((n, rest)) if n.parse::<u32>().is_ok() => rest,
+        _ => key,
+    }
 }
 
 /// [`BRANCHES_KEY`]'s value for `names`.
@@ -143,8 +159,19 @@ pub struct Listing<'a> {
 /// saying the same thing: `candle/` stood ten times over seven distinct
 /// listings across its branches.
 pub fn dir_key(dir: &str, listing: &Listing<'_>, hint: Option<&ModuleHint>) -> String {
+    dir_key_at(KEY_VERSION, dir, listing, hint)
+}
+
+/// [`dir_key`] as key version `version` wrote it: what finds a folder's
+/// reading from before the current version while its replacement is read.
+pub fn dir_key_at(
+    version: u32,
+    dir: &str,
+    listing: &Listing<'_>,
+    hint: Option<&ModuleHint>,
+) -> String {
     let mut h = Sha256::new();
-    h.update(format!("v{KEY_VERSION}\n").as_bytes());
+    h.update(format!("v{version}\n").as_bytes());
     h.update(dir.as_bytes());
     h.update(b"\n");
     h.update(listing.total.to_string().as_bytes());
@@ -157,7 +184,7 @@ pub fn dir_key(dir: &str, listing: &Listing<'_>, hint: Option<&ModuleHint>) -> S
         h.update(b"\0hint\0");
         h.update(hint.render().as_bytes());
     }
-    let mut out = format!("v{KEY_VERSION}:");
+    let mut out = format!("v{version}:");
     for b in h.finalize() {
         let _ = write!(out, "{b:02x}");
     }
@@ -228,6 +255,21 @@ mod tests {
             dir_key("r/a/", &listing, Some(&hint)),
             "v3:0a2a1cadd262f54c1fade2189774367179f06703daea1db7671c110514af3395"
         );
+        // An earlier version's key is the one that version wrote.
+        assert_eq!(
+            dir_key_at(2, "r/a/", &listing, None),
+            "v2:717794e220eb93b6dd9585eca5034757489450c3b49532f42057f23df22e749c"
+        );
+    }
+
+    /// A file's readings under two key versions share their unversioned key;
+    /// a key with no version is its own.
+    #[test]
+    fn a_key_without_its_version_is_what_versions_share() {
+        assert_eq!(unversioned("v3:candle/a.rs@ce01"), "candle/a.rs@ce01");
+        assert_eq!(unversioned("v2:candle/a.rs@ce01"), "candle/a.rs@ce01");
+        assert_eq!(unversioned("candle/a.rs@ce01"), "candle/a.rs@ce01");
+        assert_eq!(unversioned("vx:not-a-version"), "vx:not-a-version");
     }
 
     /// Every key states the version it was written under, and a key from
