@@ -66,10 +66,12 @@ clothing. A prompt that leaves an age unclear may be declined.
 
 ## Size and settings
 
-- **Size:** 1024 on the long side gives the model its best detail; 512 (the
-  default) is quick but coarser. Both sides must be multiples of 16, at most
-  1024. Common shapes: 1024×1024 square, 1024×768 / 768×1024, 1024×576
-  landscape (16:9), 576×1024 portrait (9:16).
+- **Size:** 768 on a side is the reliable choice — it fits beside a busy
+  engine. 1024 gives the model its best detail but needs room the engine may
+  not have under load (`no_room`): ask for it when detail matters, and fall
+  back to 768 if it is refused. 512 (the default) is quick but coarser. Both sides must be multiples of 16, at most
+  1024. Common shapes: 768×768 square, 768×512 / 512×768, 768×432 landscape
+  (16:9), 432×768 portrait (9:16) — or the same at 1024 on the long side.
 - **Steps:** pass `steps: 12`. The model is trained for 8 — use 8 when speed
   matters most; 12 buys finish; more than that buys little and costs time,
   never variety.
@@ -137,4 +139,4 @@ Request: "a cosy bookshop for my game's town".
 > window, shallow depth of field on the counter. A painterly digital
 > illustration with visible brush texture and a muted amber and teal palette.
 
-At 1024×768.
+At 768×512.
