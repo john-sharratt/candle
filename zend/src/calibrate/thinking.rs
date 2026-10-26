@@ -15,8 +15,9 @@ const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
 /// The thinking `written` opened with: the text of its first reasoning block,
-/// to its close or, when the budget ran out first, to where it stopped.
-/// `None` when it did not think. Only the model's own tags bound it — a
+/// to its close or, when the budget ran out first, to where it stopped. A
+/// block the prompt opened carries no `<think>` of its own and starts the
+/// text. `None` when it did not think. Only the model's own tags bound it — a
 /// literal piece is content, never a tag.
 pub fn thinking_of(written: &TurnText) -> Option<String> {
     let text: String = written
@@ -25,7 +26,11 @@ pub fn thinking_of(written: &TurnText) -> Option<String> {
         .filter(|p| !p.literal)
         .map(|p| p.text.as_str())
         .collect();
-    let opened = &text[text.find(THINK_OPEN)? + THINK_OPEN.len()..];
+    let opened = match text.find(THINK_OPEN) {
+        Some(o) => &text[o + THINK_OPEN.len()..],
+        None if text.contains(THINK_CLOSE) => text.as_str(),
+        None => return None,
+    };
     let body = opened
         .find(THINK_CLOSE)
         .map_or(opened, |c| &opened[..c])
@@ -48,6 +53,13 @@ mod tests {
     #[test]
     fn a_closed_block_is_read_to_its_close() {
         let t = TurnText::markup("<think>\nIt needs the scan.\n</think>\n\nThe scan.");
+        assert_eq!(thinking_of(&t).as_deref(), Some("It needs the scan."));
+    }
+
+    /// A block the prompt opened starts the text and is read to its close.
+    #[test]
+    fn a_block_the_prompt_opened_is_read_from_the_start() {
+        let t = TurnText::markup("It needs the scan.\n</think>\n\nThe scan.");
         assert_eq!(thinking_of(&t).as_deref(), Some("It needs the scan."));
     }
 

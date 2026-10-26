@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_conversation::chain_health::chain_break;
 use candle_conversation::persistence::record::DistillMode;
@@ -36,6 +36,7 @@ use candle_conversation::projection::{
     DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId,
     NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
+use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
 
@@ -88,10 +89,13 @@ pub struct Layer<'a> {
 }
 
 /// Where calibrations are prefilled: the system prompt every conversation
-/// opens with, dialect-formatted, and the sequence config they run under.
+/// opens with, dialect-formatted, the sequence config they run under, and the
+/// steering a question's thinking decodes under — a live dialogue turn's at
+/// the default effort, so its reasoning block opens and closes as one does.
 pub struct Frame<'a> {
     pub system_prompt: &'a str,
     pub config: &'a SequenceConfig,
+    pub thinking: Arc<TriggerRegistry>,
 }
 
 /// Calibrate every unit of `layer` that is ready and not calibrated, and
@@ -365,6 +369,7 @@ fn thoughts(
             let options = TurnOptions {
                 max_tokens: Some(spec.think),
                 selection: thinking_selection(),
+                triggers: Arc::clone(&frame.thinking),
                 tags: vec![TAG.to_string()],
                 ..Default::default()
             };
@@ -380,10 +385,14 @@ fn thoughts(
                 .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
             conv.finish_turn(handle, &resp)
                 .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
-            out.push(
-                thinking_of(&resp.answer)
-                    .ok_or_else(|| anyhow::anyhow!("the model did not think about {q:?}"))?,
-            );
+            let thought = thinking_of(&resp.answer).ok_or_else(|| {
+                let opening: String = resp.text.chars().take(80).collect();
+                anyhow::anyhow!(
+                    "the model did not think about {q:?} (finish {:?}, it wrote {opening:?})",
+                    resp.stats.finish
+                )
+            })?;
+            out.push(thought);
         }
         Ok(out)
     });

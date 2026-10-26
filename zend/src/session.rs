@@ -3188,6 +3188,7 @@ impl InferenceState {
                 &CalibrateFrame {
                     system_prompt: &self.formatted_prompt,
                     config: &self.refresh_config,
+                    thinking: turn_triggers(self, ThinkMode::Balanced, ToolMode::None),
                 },
             );
         }
