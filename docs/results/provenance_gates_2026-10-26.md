@@ -92,3 +92,70 @@ with density.
 more segment of the same paged launch (and the same competition on the CPU
 path); `code_reading`'s `scopes` declares `calibration_weight: 0.5`. Gate 4,
 the paper conversation, waits for a replay.
+
+## Thinking and the live turn (`thinking`)
+
+Calibrated at 24 questions a file, each with up to 64 tokens of thinking; 979
+files carried thinking on all of questions `0..=8`. Question 0 held out, asked
+three ways: its words, its thinking, and both as one turn — the probe a live
+projection makes once the turn has thought.
+
+| probe | content alone | content + 0.5 × competition (question + thinking) |
+|---|---|---|
+| question | 0.143 / 0.294 / 0.191 | 0.132 / 0.377 / 0.214 |
+| thinking | 0.201 / 0.361 / 0.255 | 0.205 / 0.472 / 0.296 |
+| turn | 0.271 / 0.454 / 0.336 | 0.189 / 0.555 / 0.316 |
+
+R@1 / R@10 / MRR. A probe finds its own kind: question probes score on the
+competition's questions (its thinking alone gives 0.015), thinking probes on
+its thinking (its questions alone give 0.004). Asking the two halves apart and
+summing their scores is worse than asking the turn whole at every weight. At
+`w = 0.5` the competition buys the turn ten points of R@10 and costs it eight
+of R@1.
+
+## Fold groups (`layers`)
+
+Content and competition weighed by fold group apart, re-summed from one scan
+each; 999 files, turn probes.
+
+| content | competition | R@1 | R@10 | MRR |
+|---|---|---|---|---|
+| [1,1,1] | — | 0.270 | 0.457 | 0.337 |
+| [0,1,1] | — | 0.283 | 0.483 | 0.354 |
+| [1,0,0] | — | 0.000 | 0.003 | 0.003 |
+| [1,1,1] | 0.5 × [1,1,1] (production) | 0.197 | 0.561 | 0.323 |
+| [0,1,1] | 0.25 × [0,1,1] | 0.280 | 0.560 | 0.382 |
+| [0,1,1] | 0.25 × [0,0,1] | **0.310** | 0.554 | **0.397** |
+| [0,1,1] | 0.5 × [0,0,1] | 0.280 | **0.575** | 0.389 |
+
+Fold group 0 carries nothing of a file's identity and dilutes the rest; the
+calibration competition's identity sits in the top group alone. Question and
+thinking probes order the settings the same way (question 0.214 → 0.240,
+thinking 0.296 → 0.347 at their best).
+
+## Momentum (`momentum`)
+
+The working set's `m ← (1 − β)·m + fresh` over a dialogue asking three
+held-out questions of one file, each turn scanned at its opening (question)
+and once thought (the turn); 1,019 files. MRR after each scan, R@1 / R@10
+after the last.
+
+| scoring | β | q0 open | q0 thought | q1 thought | q2 thought | R@1 | R@10 |
+|---|---|---|---|---|---|---|---|
+| production | 1 (none) | 0.234 | 0.334 | 0.285 | 0.289 | 0.186 | 0.482 |
+| production | 0.2 | 0.234 | 0.329 | 0.363 | 0.375 | 0.213 | 0.692 |
+| [0,1,1] + 0.25 × [0,0,1] | 1 (none) | 0.252 | 0.405 | 0.336 | 0.335 | 0.258 | 0.473 |
+| [0,1,1] + 0.25 × [0,0,1] | 0.2 | 0.252 | 0.398 | 0.474 | **0.504** | **0.392** | **0.708** |
+
+Momentum compounds the fold-group gain instead of overlapping it: R@1 0.186
+→ 0.392 over three turns. Its cost is the switch to another file — after
+three turns on A, three on B leave B ahead of A in 70% of dialogues at β 0.2,
+87% at β 0.5, 50% at β 0 — and B's MRR reaches 0.475 by its sixth scan at
+β 0.2. Production's β 0.2 stands.
+
+**What ships**: the analysis layers (`dependency_analysis`, `code_review`,
+`security_review`) take `layer_weights: [0, 1, 1]` and `calibration_weight:
+0.25` — the best setting one weighting for both competitions can express —
+until their own units are measured. `code_reading` keeps `[1,1,1]` + 0.5
+until gate 4 replays it: weighing its top group alone lost the paper
+conversation a quarter of its tool calls (2026-10-25).

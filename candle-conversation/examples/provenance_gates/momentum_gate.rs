@@ -4,9 +4,10 @@
 //! A dialogue that stays on a file asks about it turn after turn, and each
 //! turn reprojects at its opening (the question) and again once it has
 //! thought (question and thinking). Each scan's fresh score — the file's
-//! content plus `WEIGHT ×` its calibration competition, as production scores
-//! it — feeds `m ← (1 − β)·m + fresh` (`working_set::WorkingSet::observe`),
-//! and the file is ranked by `m` after every scan.
+//! content plus a weight × its calibration competition, each summed over its
+//! fold groups by a [`Scoring`] — feeds `m ← (1 − β)·m + fresh`
+//! (`working_set::WorkingSet::observe`), and the file is ranked by `m` after
+//! every scan.
 //!
 //! Two sequences, over every file calibrated with thinking:
 //! - **staying**: file A's held-out questions `0..HELD`, each as two scans;
@@ -16,12 +17,13 @@
 
 use candle_conversation::provenance::WideQSig;
 
+use crate::attribution::{BATCH, KEEP};
 use crate::corpus::File;
-use crate::judge::Judge;
 use crate::ranking::rank_of;
 use crate::remote_gallery::{Daemon, Questions, RemoteGallery};
 use crate::stats::{mrr, recall};
-use crate::thinking_gate::{combined, competition, thought};
+use crate::sweep::{summed, TokenVotes};
+use crate::thinking_gate::thought;
 
 /// Questions per file asked in sequence, held out of the gallery.
 const HELD: usize = 3;
@@ -29,11 +31,32 @@ const HELD: usize = 3;
 /// Questions per file the calibration competition holds, after the held ones.
 const GALLERY: usize = 8;
 
-/// The calibration competition's weight, production's.
-const WEIGHT: f32 = 0.5;
-
 /// Leaks tried; production's is 0.2.
 const BETAS: [f32; 5] = [1.0, 0.5, 0.2, 0.1, 0.0];
+
+/// How a scan's votes become a file's fresh score.
+struct Scoring {
+    name: &'static str,
+    content: [f32; 3],
+    calibration: [f32; 3],
+    weight: f32,
+}
+
+/// Production's scoring, and the `layers` gate's best on live-turn probes.
+const SCORINGS: [Scoring; 2] = [
+    Scoring {
+        name: "production [1,1,1] + 0.5 x [1,1,1]",
+        content: [1.0, 1.0, 1.0],
+        calibration: [1.0, 1.0, 1.0],
+        weight: 0.5,
+    },
+    Scoring {
+        name: "layers [0,1,1] + 0.25 x [0,0,1]",
+        content: [0.0, 1.0, 1.0],
+        calibration: [0.0, 0.0, 1.0],
+        weight: 0.25,
+    },
+];
 
 /// One scan of a turn: its question alone, or question and thinking.
 #[derive(Clone, Copy)]
@@ -66,6 +89,19 @@ fn momentum(fresh: &[&[f32]], beta: f32) -> Vec<Vec<f32>> {
         .collect()
 }
 
+/// `content + w × calibration` per probe, each summed over its fold groups.
+fn fresh_of(content: &[TokenVotes], cal: &[TokenVotes], s: &Scoring, n: usize) -> Vec<Vec<f32>> {
+    content
+        .iter()
+        .zip(cal)
+        .map(|(c, q)| {
+            let c = summed(c, &s.content, KEEP, n);
+            let q = summed(q, &s.calibration, KEEP, n);
+            c.iter().zip(&q).map(|(a, b)| a + s.weight * b).collect()
+        })
+        .collect()
+}
+
 pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
     let gpu = RemoteGallery::new(files, daemon);
     let n = files.len();
@@ -86,35 +122,49 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
     );
     let masked = |fi: usize, qi: usize| !ready[fi] || !(HELD..HELD + GALLERY).contains(&qi);
 
-    // Every file's fresh scores at every scan: `fresh[s][a]` is asked file
-    // `a`'s probe at scan `s`, scored over all `n` files.
-    let mut fresh: Vec<Vec<Vec<f32>>> = Vec::with_capacity(SCANS.len());
+    // Every scan's votes, content and competition apart: `votes[s]` holds
+    // asked file `a`'s probe at scan `s` at index `a`.
+    let mut votes: Vec<(Vec<TokenVotes>, Vec<TokenVotes>)> = Vec::with_capacity(SCANS.len());
     for &(qi, scan) in &SCANS {
-        let held: Vec<(usize, &[WideQSig])> = asked
+        let held: Vec<&[WideQSig]> = asked
             .iter()
             .map(|&fi| {
                 let q = &files[fi].questions[qi];
-                let sigs = match scan {
+                match scan {
                     Scan::Opening => q.body_sigs(),
-                    Scan::Thought => &q.sigs,
-                };
-                (fi, sigs)
+                    Scan::Thought => q.sigs.as_slice(),
+                }
             })
             .collect();
-        let judge = Judge {
-            gpu: &gpu,
-            held_out: &held,
-            hubs: &[],
-            n,
-            questions: Questions::Without,
-            masked_question: &|_, _| false,
-        };
-        let content = judge.scores(&[])?;
-        let calibration = competition(&gpu, &held, n, &masked, &[])?;
-        fresh.push(combined(&content, &calibration, WEIGHT));
+        let (mut content, mut cal) = (Vec::new(), Vec::new());
+        for batch in held.chunks(BATCH) {
+            content.extend(gpu.votes_without(
+                batch,
+                &|_, _| false,
+                Questions::Without,
+                &|_, _| false,
+                &[],
+            )?);
+            cal.extend(gpu.votes_without(batch, &|_, _| true, Questions::With, &masked, &[])?);
+        }
+        votes.push((content, cal));
     }
 
-    println!("\nstaying on one file: MRR after each scan, R@1 / R@10 after the last");
+    for scoring in &SCORINGS {
+        let fresh: Vec<Vec<Vec<f32>>> = votes
+            .iter()
+            .map(|(c, q)| fresh_of(c, q, scoring, n))
+            .collect();
+        println!("\n== {}", scoring.name);
+        staying(&fresh, &asked);
+        switching(&fresh, &asked);
+    }
+    Ok(())
+}
+
+/// Staying on one file: MRR after each scan, R@1 / R@10 after the last.
+fn staying(fresh: &[Vec<Vec<f32>>], asked: &[usize]) {
+    println!("staying on one file: MRR after each scan, R@1 / R@10 after the last");
     print!("{:<8}", "beta");
     for (qi, scan) in SCANS {
         let s = match scan {
@@ -139,10 +189,12 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
         let last = &ranks[SCANS.len() - 1];
         println!(" {:>6.3} {:>6.3}", recall(last, 1), recall(last, 10));
     }
+}
 
-    // Switching: file A's scans, then file B's (the next file asked). Rank of
-    // B after each of its scans, and the share of dialogues where B leads A.
-    println!("\nswitching to another file: B's MRR after each of B's scans, and the share where B outranks A");
+/// Switching: file A's scans, then file B's (the next file asked). B's MRR
+/// after each of its scans, and the share of dialogues where B leads A.
+fn switching(fresh: &[Vec<Vec<f32>>], asked: &[usize]) {
+    println!("switching to another file: B's MRR after each of B's scans, and the share where B outranks A");
     print!("{:<8}", "beta");
     for i in 0..SCANS.len() {
         print!(" {:>9}", format!("B scan {}", i + 1));
@@ -174,7 +226,6 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
         }
         println!(" {:>12.3}", over as f32 / asked.len() as f32);
     }
-    Ok(())
 }
 
 #[cfg(test)]

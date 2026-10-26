@@ -1013,11 +1013,18 @@ layers:
         budget:
           priority: 100
         # A unit is taken whole: one case each, all in one competition (see
-        # code_reading's `scopes`); its calibration competes apart, at
-        # code_reading's weight.
+        # code_reading's `scopes`); its calibration competes apart. The fold
+        # groups and the calibration's weight are code_reading's best shared
+        # setting, carried over before this layer's own units are measured:
+        # fold group 0 is noise to a file's identity, and at 0.25 the
+        # calibration keeps the top hit. Over code_reading's live-turn probes
+        # (a held-out question and its thinking), R@1 / R@10 / MRR
+        # 0.197 / 0.561 / 0.323 at [1,1,1] + 0.5 -> 0.280 / 0.560 / 0.382
+        # (`provenance_gates layers`, docs/results/provenance_gates_2026-10-26.md).
         policy:
           cases: file
-          calibration_weight: 0.5
+          layer_weights: [0.0, 1.0, 1.0]
+          calibration_weight: 0.25
 
   # ── Code Review ────────────────────────────────────────────────────────────
   # Beside dependency_analysis, not above it: each unit continues the file's
@@ -1102,9 +1109,11 @@ layers:
         score_threshold: 0.0
         budget:
           priority: 100
+        # dependency_analysis's setting — see its note.
         policy:
           cases: file
-          calibration_weight: 0.5
+          layer_weights: [0.0, 1.0, 1.0]
+          calibration_weight: 0.25
 
   # ── Security Review ────────────────────────────────────────────────────────
   # Beside dependency_analysis and code_review (`after: code_reading`), so an
@@ -1203,9 +1212,11 @@ layers:
         score_threshold: 0.0
         budget:
           priority: 100
+        # dependency_analysis's setting — see its note.
         policy:
           cases: file
-          calibration_weight: 0.5
+          layer_weights: [0.0, 1.0, 1.0]
+          calibration_weight: 0.25
 
   # ── Dialogue ───────────────────────────────────────────────────────────────
   # The live developer ↔ assistant conversation.  Highest layer — sees
