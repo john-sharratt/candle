@@ -134,6 +134,7 @@ mod tests {
             name: "review".into(),
             created_ms: 0,
             archived: false,
+            attached_ms: 0,
         };
         let ws = [
             worker("a", State::Running),

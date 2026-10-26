@@ -136,9 +136,16 @@ it ends:
 - A worker is archived — distilled, no longer resumable — when its thread is
   archived (`thread_archive`), or when it has sat **24 hours** untouched. A
   thread whose newest activity is 24 hours old, with nothing running on it, is
-  archived the same way. The sweep runs hourly on every member
-  (`zend/src/mcp/archiving.rs`); archiving is idempotent, so two members
-  sweeping one thread do no harm. Only these workers and threads are swept: a
+  archived the same way. The sweep runs hourly on every member, and
+  only once the model is loaded (`zend/src/mcp/archiving.rs`). A worker is
+  claimed under the lock `task_reply` takes (which refuses a claimed worker),
+  distilled outside it, and only then written as archived — never when the
+  distil failed, so no record says archived of a conversation that was not.
+  `task_reply` on a worker whose thread was archived reopens the thread. Two members sweeping in the moment before
+  one's write replicates can both archive a thread: distilling twice is
+  harmless, and the journal gets the line twice. An attach counts as activity
+  (`Thread::attached_ms`, marked at most hourly), so a thread Claude reopens is
+  not swept back under it. Only these workers and threads are swept: a
   person's own zend conversations are never archived automatically.
 - A worker waiting on Claude (a question, stuck) that sits 24 hours is archived
   as an error saying so, its question kept, as `thread_archive` does.
@@ -156,13 +163,13 @@ cites, against what the worker actually did in its turns:
 
 | Mark | Meaning |
 |---|---|
-| opened | fetched with `web_fetch` (its `final_url`) |
+| opened | a `web_fetch` of it returned the page (the URL asked for, or its `final_url`) |
 | seen | appeared only in a tool's result — a search hit, a snippet — never fetched |
 | never seen | cited, but nothing in the run touched it — inferred or invented |
 
-zend already reads the tool calls a turn made (`tools::extract_tool_calls`) and
-their results are the coupled turns' user halves, so the audit is deterministic
-and cheap. It reads every normal turn of the worker's conversation and of each
+A turn's tool results are its user half's `<tool_response>` blocks
+(`fast_path::coverage::response_bodies`), so the audit is deterministic and
+cheap. It reads every normal turn of the worker's conversation and of each
 part it started (`ZendSession::conversation_detail`), and goes at the end of
 what `task_wait` / `task_start` answer for a `done` worker. An answer citing no
 URL carries no audit.
@@ -173,7 +180,17 @@ same run: "your answer cites X, Y, Z without having opened them — fetch each a
 correct your answer, remove what does not exist, mark UNVERIFIED what you still
 cannot confirm, with a CHANGES section." The thread's journal says it was sent
 back. The task answers after that round, with the audit of the corrected
-answer. Every task gets it; there is no opt-out.
+answer. Every task gets it; there is no opt-out. A check round that fails,
+is stopped, has its tools closed or asks a question leaves the task `done` with
+the answer it gave before, its audit saying what became of the round — a
+finished task never turns into a failed one for being checked.
+
+Only what tools returned counts: the `<tool_response>` blocks of the turns.
+A page is opened when a `web_fetch` returned it (a result with `final_url`; the
+URL asked for and the one reached both count) or an `http_request` answered it
+with a success status — a fetch that failed opened nothing. A URL named in a
+prompt, Claude's or the correction's, is not evidence, and neither is a part's
+`sub_run` answer: the part's own turns are audited with its worker's.
 
 ## 5. The research guide
 

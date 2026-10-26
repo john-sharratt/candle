@@ -173,9 +173,28 @@ pub fn refusal(e: &ProseError) -> Response {
         .into_response()
 }
 
-/// Decode `request` on the resident model and wait for the answer.
+/// Decode `request` on the resident model and wait for the answer, on the
+/// characters' band.
 pub async fn run(s: &Arc<Authored>, request: Request) -> Result<Answer, ProseError> {
     run_streamed(s, request, |_: &str| {}).await
+}
+
+/// The same on `band` — for a job something else is held up on until it
+/// answers.
+///
+/// **A gate in front of another job decodes above the characters.** The image
+/// route's content check is four one-token answers, and the draw is not queued
+/// until all four are in. At the characters' band, with five Makers decoding,
+/// each waited 40 to 70 seconds for its first token and the last had not started
+/// after eight minutes — the caller holding an open request the whole time for
+/// a picture that had never been queued. See
+/// [`crate::engine::prose::WORK_BAND`] for the same wait on the table's calls.
+pub async fn run_at(
+    s: &Arc<Authored>,
+    request: Request,
+    band: DecodePriority,
+) -> Result<Answer, ProseError> {
+    decode_on(s, request, band, &mut |_: &str| {}).await
 }
 
 /// The same, with each new fragment of text handed to `on_fragment` as it lands.
@@ -188,6 +207,18 @@ pub async fn run_streamed(
     s: &Arc<Authored>,
     request: Request,
     mut on_fragment: impl FnMut(&str) + Send + 'static,
+) -> Result<Answer, ProseError> {
+    // On the characters' band: a job asked for here is nothing an operation
+    // waits on.
+    decode_on(s, request, DecodePriority::Normal, &mut on_fragment).await
+}
+
+/// Decode `request` on `band`, handing each fragment to `on_fragment`.
+async fn decode_on(
+    s: &Arc<Authored>,
+    request: Request,
+    band: DecodePriority,
+    on_fragment: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Answer, ProseError> {
     request.check().map_err(ProseError::Refused)?;
     let Some(rt) = s.runtime.as_ref() else {
@@ -202,18 +233,9 @@ pub async fn run_streamed(
     // Awaited directly: the decode yields on the turn's event channel, so a
     // long generation parks a future rather than a thread — and a caller that
     // gives up drops the future, which stops the decode.
-    // On the characters' band: a job asked for here is nothing an operation
-    // waits on.
-    crate::engine::prose::decode(
-        &engine,
-        &cfg,
-        &request,
-        DecodePriority::Normal,
-        seed,
-        &mut on_fragment,
-    )
-    .await
-    .map_err(|e| ProseError::Failed(format!("{e:#}")))
+    crate::engine::prose::decode(&engine, &cfg, &request, band, seed, on_fragment)
+        .await
+        .map_err(|e| ProseError::Failed(format!("{e:#}")))
 }
 
 /// What a caller posts to `/v1/generate/prose`.

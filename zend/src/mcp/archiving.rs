@@ -11,15 +11,27 @@
 //! thread whose newest activity is that old with nothing running on it. It
 //! touches only these workers: a person's own zend conversations are never
 //! archived but by that person.
+//!
+//! A worker is archived in three steps: read again and claimed under the
+//! lock a reply takes ([`workers::holding`]) — a reply refuses a claimed
+//! worker — then distilled outside it, then, under it again, its record
+//! written as archived only if the distil succeeded and nothing changed the
+//! record meanwhile. A failed distil writes nothing, so no record ever says
+//! archived of a conversation that was not, and the next sweep tries again.
+//!
+//! Every member sweeps. Two members sweeping in the moment before one's
+//! write replicates to the other can each archive one thread: distilling
+//! twice is harmless, and the thread's journal gets the line twice.
 
-use std::sync::{Arc, Weak};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
 
 use super::records::Records;
 use super::threads::{self, Note, State, Thread, Worker};
-use super::workers::now_ms;
+use super::workers::{self, now_ms};
 use crate::session::ZendSession;
 
 /// How long a worker or a thread sits idle before the sweep archives it.
@@ -42,11 +54,26 @@ fn last_active(w: &Worker) -> u64 {
     w.ended_ms.unwrap_or(0).max(w.beat_ms).max(w.turn_ms)
 }
 
-/// Archive the worker `w`, which is not working, `why` it goes: a worker
-/// waiting on Claude ends as an error saying so, its question kept; a finished
-/// one keeps its answer. The record to keep.
-fn archive_worker(distil: Distil, mut w: Worker, why: &str, now: u64) -> Result<Worker, String> {
-    distil(&w.conv_id).map_err(|e| format!("{} could not be archived: {e}", w.path()))?;
+/// The newest thing that happened on the thread `t`: its birth, an attach —
+/// counted to the end of its mark's hour, since a later attach within it
+/// writes nothing — a journal line, or a worker's last activity.
+fn newest(records: &dyn Records, owner: &str, t: &Thread, workers: &[Worker]) -> u64 {
+    let attached = match t.attached_ms {
+        0 => 0,
+        at => at.saturating_add(threads::ATTACH_MARK_MS),
+    };
+    threads::notes(records, owner, &t.name)
+        .iter()
+        .map(|n| n.at_ms)
+        .chain(workers.iter().map(last_active))
+        .fold(t.created_ms.max(attached), u64::max)
+}
+
+/// The record of the worker `w`, which is not working, once archived `why`:
+/// a worker waiting on Claude ends as an error saying so, its question kept,
+/// ended when it last did anything — archiving is not activity; a finished
+/// one keeps its answer, and can no longer be continued.
+fn archived(mut w: Worker, why: &str) -> Worker {
     if w.state.live() {
         w.error = Some(format!(
             "archived {why} while {}",
@@ -57,70 +84,181 @@ fn archive_worker(distil: Distil, mut w: Worker, why: &str, now: u64) -> Result<
             }
         ));
         w.state = State::Error;
-        w.ended_ms = Some(now);
+        w.ended_ms = Some(last_active(&w));
     }
     w.resumable = false;
-    Ok(w)
+    w
 }
 
-/// Archive the thread `t` of `owner` and every worker on it still whole,
-/// entering `reason` on its journal; refused while any worker on it runs. The
-/// line entered.
+/// The conversations being archived on this member: claimed under the lock
+/// a reply takes, distilled outside it, released once their records say
+/// archived. A reply refuses a worker while it is here ([`being_archived`]).
+static ARCHIVING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+fn archiving() -> MutexGuard<'static, BTreeSet<String>> {
+    ARCHIVING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the conversation `conv_id` is being archived on this member.
+pub fn being_archived(conv_id: &str) -> bool {
+    archiving().contains(conv_id)
+}
+
+/// Distil each claimed worker — as its record read when claimed — outside
+/// the lock, since distilling takes the engine's; then, under the lock, keep
+/// the archived record of each that distilled, when nothing has changed its
+/// record since, and release every claim. Nothing is written for one that
+/// failed, so no record says archived of a conversation that was not. The
+/// paths that failed, each with why.
+fn distil_claimed(
+    records: &dyn Records,
+    distil: Distil,
+    owner: &str,
+    claimed: Vec<Worker>,
+    why: &str,
+) -> Vec<String> {
+    let outcomes: Vec<(Worker, Result<(), String>)> = claimed
+        .into_iter()
+        .map(|w| {
+            let distilled = distil(&w.conv_id);
+            (w, distilled)
+        })
+        .collect();
+    let _held = workers::holding();
+    let mut failed = Vec::new();
+    for (before, distilled) in outcomes {
+        archiving().remove(&before.conv_id);
+        if let Err(e) = distilled {
+            failed.push(format!("{} ({e})", before.path()));
+            continue;
+        }
+        let now = threads::worker(records, owner, &before.thread, &before.name);
+        if now.as_ref() != Some(&before) {
+            tracing::warn!(worker = %before.path(), "mcp: a worker changed while it was archived; its record is left as it is");
+            continue;
+        }
+        if let Err(e) = threads::put_worker(records, owner, &archived(before.clone(), why)) {
+            failed.push(format!(
+                "{} (its record could not be kept: {e})",
+                before.path()
+            ));
+        }
+    }
+    failed
+}
+
+/// Claim `w` for archiving, under the lock: false when it is claimed already.
+fn claim(w: &Worker) -> bool {
+    archiving().insert(w.conv_id.clone())
+}
+
+/// How archiving a thread came out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Archived {
+    /// Archived: the line entered on its journal, and any worker whose
+    /// conversation could not be distilled — left whole, to be archived again.
+    Done { line: String, failed: Vec<String> },
+    /// It was archived already; any worker on it still whole is archived now,
+    /// and those that could not be are named.
+    Already { failed: Vec<String> },
+    /// Something happened on it after the sweep's cutoff.
+    Active,
+}
+
+/// When a thread may be archived: always, or only when nothing on it
+/// happened at or after a cutoff — the sweep's idle test, made again on what
+/// the lock lets it read.
+#[derive(Debug, Clone, Copy)]
+pub enum When {
+    Now,
+    QuietSince(u64),
+}
+
+/// Archive the thread `name` of `owner` and every worker on it still whole,
+/// entering `reason` on its journal; refused while any worker on it runs.
 pub fn archive_thread(
     records: &dyn Records,
     distil: Distil,
     owner: &str,
-    t: Thread,
+    name: &str,
     reason: &str,
+    when: When,
     now: u64,
-) -> Result<String, String> {
-    let workers: Vec<Worker> = threads::workers(records, owner, &t.name)
-        .into_iter()
-        .map(|w| w.observed(now))
-        .collect();
-    let running: Vec<String> = workers
-        .iter()
-        .filter(|w| w.state.working())
-        .map(|w| w.path())
-        .collect();
-    if !running.is_empty() {
-        return Err(format!(
-            "workers on T:{} are still running: {}. Wait for them, then archive",
-            t.name,
-            running.join(", ")
-        ));
-    }
-    let mut closed = Vec::new();
-    for w in workers.into_iter().filter(unarchived) {
-        let waiting = w.state.live();
-        let w = archive_worker(distil, w, "with its thread", now)?;
-        threads::put_worker(records, owner, &w).map_err(|e| e.to_string())?;
-        if waiting {
-            closed.push(w.path());
+) -> Result<Archived, String> {
+    let (line, claimed) = {
+        // Held across the reads, the claims and the thread's record — not
+        // the distils — so no attach or reply lands between the thread's
+        // being read and its saying archived.
+        let _held = workers::holding();
+        let Some(t) = threads::thread(records, owner, name) else {
+            return Err(format!("there is no thread `T:{name}`"));
+        };
+        let workers: Vec<Worker> = threads::workers(records, owner, name)
+            .into_iter()
+            .map(|w| w.observed(now))
+            .collect();
+        let running: Vec<String> = workers
+            .iter()
+            .filter(|w| w.state.working())
+            .map(|w| w.path())
+            .collect();
+        if !running.is_empty() {
+            return Err(format!(
+                "workers on T:{name} are still running: {}. Wait for them, then archive",
+                running.join(", ")
+            ));
         }
-    }
-    let name = t.name.clone();
-    let archived = Thread {
-        archived: true,
-        ..t
+        if let When::QuietSince(cut) = when {
+            if t.archived || newest(records, owner, &t, &workers) >= cut {
+                return Ok(Archived::Active);
+            }
+        }
+        let whole: Vec<Worker> = workers.into_iter().filter(unarchived).collect();
+        let closed: Vec<String> = whole
+            .iter()
+            .filter(|w| w.state.live())
+            .map(Worker::path)
+            .collect();
+        let claimed: Vec<Worker> = whole.into_iter().filter(claim).collect();
+        let line = if t.archived {
+            None
+        } else {
+            let archived = Thread {
+                archived: true,
+                ..t
+            };
+            let line = if closed.is_empty() {
+                reason.to_string()
+            } else {
+                format!(
+                    "{reason}; archived with it, unanswered: {}",
+                    closed.join(", ")
+                )
+            };
+            let note = Note {
+                at_ms: now,
+                label: "Thread archived:".into(),
+                text: line.clone(),
+                worker: None,
+            };
+            let kept = threads::put_thread(records, owner, &archived)
+                .and_then(|()| threads::add_note(records, owner, name, &note));
+            if let Err(e) = kept {
+                let mut held = archiving();
+                for w in &claimed {
+                    held.remove(&w.conv_id);
+                }
+                return Err(e.to_string());
+            }
+            Some(line)
+        };
+        (line, claimed)
     };
-    threads::put_thread(records, owner, &archived).map_err(|e| e.to_string())?;
-    let text = if closed.is_empty() {
-        reason.to_string()
-    } else {
-        format!(
-            "{reason}; archived with it, unanswered: {}",
-            closed.join(", ")
-        )
-    };
-    let note = Note {
-        at_ms: now,
-        label: "Thread archived:".into(),
-        text: text.clone(),
-        worker: None,
-    };
-    threads::add_note(records, owner, &name, &note).map_err(|e| e.to_string())?;
-    Ok(text)
+    let failed = distil_claimed(records, distil, owner, claimed, "with its thread");
+    Ok(match line {
+        Some(line) => Archived::Done { line, failed },
+        None => Archived::Already { failed },
+    })
 }
 
 /// One pass of the sweep at `now`: every worker idle [`IDLE_MS`] archived,
@@ -134,36 +272,65 @@ pub fn sweep(records: &dyn Records, distil: Distil, now: u64) -> (usize, usize) 
             .into_iter()
             .map(|w| w.observed(now))
             .collect();
+        let mut stuck = false;
         for w in workers
             .iter()
             .filter(|w| unarchived(w) && idle(last_active(w)))
         {
-            match archive_worker(distil, w.clone(), "after a day idle", now) {
-                Ok(w) => match threads::put_worker(records, &owner, &w) {
-                    Ok(()) => workers_archived += 1,
-                    Err(e) => {
-                        tracing::warn!(worker = %w.path(), "mcp: an idle worker's record could not be kept: {e}")
-                    }
-                },
-                Err(e) => tracing::warn!("mcp: {e}"),
+            // Read again and claimed under the lock a reply takes, so a
+            // worker Claude continued a moment ago is never archived under
+            // its turn, and one Claude tries to continue now is refused.
+            let claimed = {
+                let _held = workers::holding();
+                let Some(w) = threads::worker(records, &owner, &t.name, &w.name)
+                    .map(|w| w.observed(now))
+                    .filter(|w| unarchived(w) && idle(last_active(w)))
+                    .filter(claim)
+                else {
+                    continue;
+                };
+                w
+            };
+            match distil_claimed(records, distil, &owner, vec![claimed], "after a day idle")
+                .as_slice()
+            {
+                [] => workers_archived += 1,
+                failed => {
+                    // Left whole; the next sweep tries again, and this one
+                    // leaves its thread for then.
+                    tracing::warn!(
+                        "mcp: an idle worker could not be archived: {}",
+                        failed.join("; ")
+                    );
+                    stuck = true;
+                }
             }
         }
-        if t.archived || workers.iter().any(|w| w.state.working()) {
+        if stuck || t.archived || workers.iter().any(|w| w.state.working()) {
             continue;
         }
-        let newest = threads::notes(records, &owner, &t.name)
-            .iter()
-            .map(|n| n.at_ms)
-            .chain(workers.iter().map(last_active))
-            .fold(t.created_ms, u64::max);
-        if !idle(newest) {
+        if !idle(newest(records, &owner, &t, &workers)) {
             continue;
         }
-        let name = t.name.clone();
-        match archive_thread(records, distil, &owner, t, "a day idle", now) {
-            Ok(_) => threads_archived += 1,
+        let cut = now.saturating_sub(IDLE_MS);
+        match archive_thread(
+            records,
+            distil,
+            &owner,
+            &t.name,
+            "a day idle",
+            When::QuietSince(cut),
+            now,
+        ) {
+            Ok(Archived::Done { failed, .. }) => {
+                threads_archived += 1;
+                if !failed.is_empty() {
+                    tracing::warn!(thread = %t.name, "mcp: workers of an idle thread could not be archived: {}", failed.join("; "));
+                }
+            }
+            Ok(Archived::Already { .. } | Archived::Active) => {}
             Err(e) => {
-                tracing::warn!(thread = %name, "mcp: an idle thread could not be archived: {e}")
+                tracing::warn!(thread = %t.name, "mcp: an idle thread could not be archived: {e}")
             }
         }
     }
@@ -171,11 +338,13 @@ pub fn sweep(records: &dyn Records, distil: Distil, now: u64) -> (usize, usize) 
 }
 
 /// What the session's own archive does, as the sweep and `thread_archive`
-/// call it: nothing to do before the model is loaded.
+/// call it: refused before the model is loaded, so no record says archived of
+/// a conversation that was not.
 pub fn distil_with(session: &ZendSession) -> impl Fn(&str) -> Result<(), String> + '_ {
     |conv_id| match session.archive_worker(conv_id) {
         Some(Err(e)) => Err(e.to_string()),
-        Some(Ok(())) | None => Ok(()),
+        Some(Ok(())) => Ok(()),
+        None => Err("the model is still loading".into()),
     }
 }
 
@@ -187,6 +356,9 @@ pub async fn sweeping(session: Weak<ZendSession>) {
         let Some(session) = session.upgrade() else {
             return;
         };
+        if !session.is_loaded() {
+            continue;
+        }
         // Archiving takes the engine's lock: off the runtime's threads.
         let swept = tokio::task::spawn_blocking(move || {
             let records = session.shared_substrate()?;
@@ -211,6 +383,7 @@ pub fn start_sweeping(session: &Arc<ZendSession>, runtime: &Handle) {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::mcp::records::MemRecords;
@@ -218,11 +391,20 @@ mod tests {
 
     const DAY: u64 = IDLE_MS;
 
+    /// Claims are per process, and the tests run at once: each worker's
+    /// conversation is its own, `c-<name>-<n>`.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    /// A conversation id without its test's number.
+    fn conv_name(conv_id: &str) -> &str {
+        conv_id.rsplit_once('-').map_or(conv_id, |(name, _)| name)
+    }
+
     fn worker(name: &str, state: State, at: u64) -> Worker {
         Worker {
             thread: "review".into(),
             name: name.into(),
-            conv_id: format!("c-{name}"),
+            conv_id: format!("c-{name}-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
             prompt: "p".into(),
             state,
             role: Role::User,
@@ -250,6 +432,7 @@ mod tests {
             name: "review".into(),
             created_ms: 0,
             archived: false,
+            attached_ms: 0,
         };
         threads::put_thread(records, "o", &t).unwrap();
         for w in workers {
@@ -283,7 +466,12 @@ mod tests {
             "a day exactly is not past it"
         );
         assert_eq!(sweep(&records, &distil, DAY + 1), (2, 1));
-        assert_eq!(*distilled.borrow(), ["c-asks", "c-done"]);
+        let names: Vec<String> = distilled
+            .borrow()
+            .iter()
+            .map(|c| conv_name(c).to_string())
+            .collect();
+        assert_eq!(names, ["c-asks", "c-done"]);
         let done = threads::worker(&records, "o", "review", "done").unwrap();
         assert!(!done.resumable && done.state == State::Done);
         let asks = threads::worker(&records, "o", "review", "asks").unwrap();
@@ -320,6 +508,108 @@ mod tests {
         assert!(!threads::thread(&records, "o", "review").unwrap().archived);
     }
 
+    /// **Attaching again is activity**: a swept thread Claude reopens is not
+    /// swept again while the attach is within the day.
+    #[test]
+    fn a_reopened_thread_is_not_swept_again() {
+        let records = MemRecords::default();
+        thread(&records, &[]);
+        let distil = |_: &str| -> Result<(), String> { Ok(()) };
+        assert_eq!(sweep(&records, &distil, DAY + 1), (0, 1));
+        // Its newest note — the archive's — is now a day old.
+        threads::attach(&records, "o", "review", 2 * DAY).unwrap();
+        assert_eq!(sweep(&records, &distil, 2 * DAY + 2), (0, 0));
+        assert!(!threads::thread(&records, "o", "review").unwrap().archived);
+        assert_eq!(
+            sweep(&records, &distil, 3 * DAY + 1),
+            (0, 0),
+            "an attach counts to the end of its mark's hour"
+        );
+        let after_mark = 3 * DAY + threads::ATTACH_MARK_MS + 1;
+        assert_eq!(sweep(&records, &distil, after_mark), (0, 1));
+    }
+
+    /// **A distil that fails writes nothing**: no record says archived of a
+    /// conversation that was not, its claim is released, its thread is left
+    /// for the next sweep, and that sweep archives both.
+    #[test]
+    fn a_failed_distil_leaves_the_worker_and_its_thread_as_they_were() {
+        let records = MemRecords::default();
+        let done = worker("done", State::Done, 0);
+        thread(&records, std::slice::from_ref(&done));
+        let refuse = |_: &str| -> Result<(), String> { Err("the model is still loading".into()) };
+        let now = DAY + 1;
+        assert_eq!(sweep(&records, &refuse, now), (0, 0));
+        assert_eq!(
+            threads::worker(&records, "o", "review", "done").unwrap(),
+            done
+        );
+        assert!(!being_archived(&done.conv_id));
+        assert!(!threads::thread(&records, "o", "review").unwrap().archived);
+        let ok = |_: &str| -> Result<(), String> { Ok(()) };
+        assert_eq!(sweep(&records, &ok, now + 1), (1, 1));
+        assert!(
+            !threads::worker(&records, "o", "review", "done")
+                .unwrap()
+                .resumable
+        );
+    }
+
+    /// **A worker being archived is refused to everyone else**: a second
+    /// claim fails until the first is released, and an archive that finds
+    /// the worker changed under it leaves the record alone.
+    #[test]
+    fn a_claimed_worker_is_claimed_once_and_a_changed_one_is_left() {
+        let records = MemRecords::default();
+        let done = worker("done", State::Done, 0);
+        thread(&records, std::slice::from_ref(&done));
+        assert!(claim(&done) && !claim(&done) && being_archived(&done.conv_id));
+        let mut continued = done.clone();
+        continued.state = State::Running;
+        threads::put_worker(&records, "o", &continued).unwrap();
+        let ok = |_: &str| -> Result<(), String> { Ok(()) };
+        assert!(distil_claimed(&records, &ok, "o", vec![done.clone()], "x").is_empty());
+        assert!(!being_archived(&done.conv_id));
+        assert_eq!(
+            threads::worker(&records, "o", "review", "done").unwrap(),
+            continued
+        );
+    }
+
+    /// **The sweep's idle test is made again under the lock**: a thread
+    /// with something after the cutoff is left open. Archiving one archived
+    /// already says so, and archives any worker left whole on it.
+    #[test]
+    fn a_thread_active_since_the_cutoff_or_already_archived_is_left() {
+        let records = MemRecords::default();
+        thread(&records, &[worker("done", State::Done, 50)]);
+        let ok = |_: &str| -> Result<(), String> { Ok(()) };
+        let refuse = |_: &str| -> Result<(), String> { Err("busy".into()) };
+        let quiet = When::QuietSince(50);
+        assert_eq!(
+            archive_thread(&records, &ok, "o", "review", "a day idle", quiet, 99),
+            Ok(Archived::Active)
+        );
+        assert!(matches!(
+            archive_thread(&records, &refuse, "o", "review", "done", When::Now, 99),
+            Ok(Archived::Done { failed, .. }) if failed.len() == 1
+        ));
+        assert!(
+            threads::worker(&records, "o", "review", "done")
+                .unwrap()
+                .resumable
+        );
+        assert_eq!(
+            archive_thread(&records, &ok, "o", "review", "done", When::Now, 99),
+            Ok(Archived::Already { failed: Vec::new() })
+        );
+        assert!(
+            !threads::worker(&records, "o", "review", "done")
+                .unwrap()
+                .resumable
+        );
+    }
+
     /// `thread_archive` is refused while a worker runs, and otherwise archives
     /// every worker still whole, naming the ones that waited on Claude.
     #[test]
@@ -333,10 +623,20 @@ mod tests {
             ],
         );
         let distil = |_: &str| -> Result<(), String> { Ok(()) };
-        let t = threads::thread(&records, "o", "review").unwrap();
         assert_eq!(
-            archive_thread(&records, &distil, "o", t, "the feature is done", 9).unwrap(),
-            "the feature is done; archived with it, unanswered: T:review/asks"
+            archive_thread(
+                &records,
+                &distil,
+                "o",
+                "review",
+                "the feature is done",
+                When::Now,
+                9
+            ),
+            Ok(Archived::Done {
+                line: "the feature is done; archived with it, unanswered: T:review/asks".into(),
+                failed: Vec::new()
+            })
         );
         assert!(
             !threads::worker(&records, "o", "review", "done")
@@ -346,8 +646,8 @@ mod tests {
 
         let records = MemRecords::default();
         thread(&records, &[worker("run", State::Running, 5)]);
-        let t = threads::thread(&records, "o", "review").unwrap();
-        let err = archive_thread(&records, &distil, "o", t, "done", 9).unwrap_err();
+        let err =
+            archive_thread(&records, &distil, "o", "review", "done", When::Now, 9).unwrap_err();
         assert!(
             err.starts_with("workers on T:review are still running: T:review/run"),
             "{err}"

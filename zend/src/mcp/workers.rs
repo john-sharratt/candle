@@ -30,7 +30,7 @@
 //! settling is its worker's business, not an entry on Claude's thread.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use candle_conversation::persistence::SharedSubstrate;
@@ -41,6 +41,7 @@ use tokio::sync::Notify;
 use web::auth::Role as AccessRole;
 
 use super::activity::{Activity, Doing};
+use super::archiving;
 use super::audit::{Audit, Turn};
 use super::caller::Caller;
 use super::names;
@@ -76,6 +77,16 @@ pub const QUESTION_MARK: &str = "QUESTION:";
 /// parallel) cannot both take one name, or both answer one question, and run
 /// two turns on one conversation.
 static BEGIN: Mutex<()> = Mutex::new(());
+
+/// Hold [`BEGIN`] — what archiving takes too, so no turn begins on a worker
+/// between its being read and its record saying archived
+/// (`super::archiving`). Held only across reads, claims and record writes,
+/// never a distil or a turn; every record written under it is whole on its
+/// own, so a lock poisoned by a panic is taken as it is rather than wedging
+/// every later task.
+pub fn holding() -> MutexGuard<'static, ()> {
+    BEGIN.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// What every task's prompt ends with: how to ask Claude instead of guessing.
 /// Asking ends the turn — the worker's last words are the question — so
@@ -212,8 +223,10 @@ pub fn start(
         return Err("the task's `prompt` is empty: state the task in full".into());
     }
     let now = now_ms();
+    // Attached under the lock archiving takes, so a sweep never archives the
+    // thread between the attach and the worker it begins.
+    let _held = holding();
     threads::attach(&records, &owner, thread, now).map_err(|e| e.to_string())?;
-    let _held = BEGIN.lock().unwrap();
     let taken = taken(&records, &owner, thread, now);
     let name = names::child_name(thread, "", wanted, &taken)?;
     let worker = fresh(
@@ -313,7 +326,7 @@ pub fn start_part(
         return Err("the part's `prompt` is empty: state its task in full".into());
     }
     let now = now_ms();
-    let _held = BEGIN.lock().unwrap();
+    let _held = holding();
     let taken = taken(&records, owner, &parent.thread, now);
     let name = names::child_name(&parent.thread, &parent.name, wanted, &taken)?;
     let part = fresh(
@@ -344,11 +357,18 @@ pub fn answer(
     if text.trim().is_empty() {
         return Err("the `answer` is empty".into());
     }
-    let _held = BEGIN.lock().unwrap();
+    let _held = holding();
     let Some(found) = threads::worker(&records, &owner, thread, name) else {
         return Err(format!("there is no worker `T:{thread}/{name}`"));
     };
     let mut worker = found.observed(now_ms());
+    if archiving::being_archived(&worker.conv_id) {
+        return Err(format!(
+            "`{}` is being archived, so it cannot be continued: start a new task, citing its \
+             entries",
+            worker.path()
+        ));
+    }
     let label = match worker.state {
         State::Question | State::Stuck => "Claude answered:",
         State::Done if worker.resumable => "Claude continued:",
@@ -373,6 +393,9 @@ pub fn answer(
         }
     };
     let now = now_ms();
+    // Continuing a worker is work on its thread: it reopens a thread archived
+    // while the worker was left whole.
+    threads::attach(&records, &owner, thread, now).map_err(|e| e.to_string())?;
     worker.state = State::Running;
     worker.role = caller.role;
     worker.beat_ms = now;
@@ -446,7 +469,7 @@ pub fn stop(
     let owner = caller.key();
     // Ordered against a turn beginning, which clears a stop meant for the
     // turn before it.
-    let _held = BEGIN.lock().unwrap();
+    let _held = holding();
     let Some(found) = threads::worker(&records, &owner, thread, name) else {
         return Err(format!("there is no worker `T:{thread}/{name}`"));
     };
@@ -561,7 +584,9 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
         live.clone(),
     ));
     let mut message = message;
-    let mut sent_back = false;
+    // The answer, audit and settling of a task sent back to open what it
+    // cited: what it ends with when the check round does not finish.
+    let mut first: Option<(String, Audit, (&'static str, String))> = None;
     let (label, outcome) = loop {
         let ended = turn(&session, &worker, message, &live).await;
         live.set_doing(Doing::Journaling);
@@ -599,13 +624,28 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
         }
         let settled = settle(&mut worker, ended);
         if worker.state != State::Done {
-            break settled;
+            // A check round that failed, was stopped or asked leaves the task
+            // done, with the answer it had: the round said nothing better.
+            let Some((answer, audit, (label, outcome))) = first.take() else {
+                break settled;
+            };
+            let round = keep_first_answer(&mut worker, answer, &audit);
+            break (label, format!("{outcome}; its citation check {round}"));
         }
-        let audit = audit_of(&session, &records, &owner, &worker);
+        let audit = match audit_of(&session, &records, &owner, &worker).await {
+            Ok(audit) => audit,
+            // Said, so an answer is never read as citing nothing because its
+            // audit could not run.
+            Err(e) => {
+                worker.audit = Some(format!(
+                    "Citation audit: could not be run ({e}); its citations are unchecked."
+                ));
+                break settled;
+            }
+        };
         // An answer citing what it never opened goes back once to open it;
         // the second answer is kept with its audit, whatever it says.
-        if audit.unopened() && !sent_back {
-            sent_back = true;
+        if audit.unopened() && first.is_none() {
             let line = format!(
                 "its answer cites {} it did not open; it is checking them",
                 audit.seen.len() + audit.never_seen.len()
@@ -613,8 +653,9 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
             if let Err(e) = note(&records, &owner, &worker, "Task sent back:", line) {
                 tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be entered: {e}");
             }
-            worker.state = State::Running;
             message = format!("{}{ASKING}", audit.correction());
+            first = Some((worker.final_text.clone(), audit, settled));
+            worker.state = State::Running;
             continue;
         }
         worker.audit = audit.cites().then(|| audit.render());
@@ -728,29 +769,73 @@ async fn beat(
 }
 
 /// The citation audit of `worker`'s final response, over every turn of its
-/// conversation and of each part it started (`super::audit`).
-fn audit_of(session: &ZendSession, records: &dyn Records, owner: &str, worker: &Worker) -> Audit {
+/// conversation and of each part it started (`super::audit`): decoding them
+/// reads the substrate, so it runs off the runtime's threads.
+async fn audit_of(
+    session: &Arc<ZendSession>,
+    records: &SharedSubstrate,
+    owner: &str,
+    worker: &Worker,
+) -> Result<Audit, String> {
     let below = format!("{}/", worker.name);
-    let convs: Vec<String> = threads::workers(records, owner, &worker.thread)
-        .into_iter()
-        .filter(|w| w.name.starts_with(&below))
-        .map(|w| w.conv_id)
-        .chain([worker.conv_id.clone()])
-        .collect();
-    let details: Vec<TimelineDetail> = convs
-        .iter()
-        .filter_map(|c| session.conversation_detail(c))
-        .collect();
-    let turns: Vec<Turn<'_>> = details
-        .iter()
-        .flat_map(|d| &d.turns)
-        .filter(|t| t.kind == "normal")
-        .map(|t| Turn {
-            user: &t.user,
-            assistant: &t.assistant,
-        })
-        .collect();
-    Audit::of(&worker.final_text, &turns)
+    let (records, owner, thread) = (records.clone(), owner.to_string(), worker.thread.clone());
+    let own = worker.conv_id.clone();
+    let session = Arc::clone(session);
+    let answer = worker.final_text.clone();
+    let audited = tokio::task::spawn_blocking(move || {
+        let convs: Vec<String> = threads::workers(&records, &owner, &thread)
+            .into_iter()
+            .filter(|w| w.name.starts_with(&below))
+            .map(|w| w.conv_id)
+            .chain([own])
+            .collect();
+        let details: Vec<TimelineDetail> = convs
+            .iter()
+            .filter_map(|c| session.conversation_detail(c))
+            .collect();
+        let turns: Vec<Turn<'_>> = details
+            .iter()
+            .flat_map(|d| &d.turns)
+            .filter(|t| t.kind == "normal")
+            .map(|t| t.user.as_str())
+            .collect();
+        Audit::of(&answer, &turns)
+    })
+    .await;
+    audited.map_err(|e| {
+        tracing::warn!(conv_id = %worker.conv_id, "mcp: the citation audit failed: {e}");
+        e.to_string()
+    })
+}
+
+/// Settle `worker` back on the `answer` it gave before it was sent to open
+/// what it cited, when the check round ended any way but done: done, with
+/// that answer, its `audit`, and what became of the round — which it answers,
+/// for the thread's line.
+fn keep_first_answer(worker: &mut Worker, answer: String, audit: &Audit) -> String {
+    let round = match worker.state {
+        State::Error => format!(
+            "failed: {}",
+            first_line(worker.error.as_deref().unwrap_or("the turn failed"), 200)
+        ),
+        State::Question => format!(
+            "ended asking: {}",
+            first_line(worker.question.as_deref().unwrap_or(""), 200)
+        ),
+        _ if worker.stopped => "was stopped by Claude".to_string(),
+        _ => "had its tools closed before it finished".to_string(),
+    };
+    worker.audit = Some(format!(
+        "{}\nIt was sent back to open these, and the check round {round}; the answer above is \
+         the one it gave before. Continue it with `task_reply` to finish the check.",
+        audit.render()
+    ));
+    worker.final_text = answer;
+    worker.state = State::Done;
+    worker.error = None;
+    worker.question = None;
+    worker.stopped = false;
+    round
 }
 
 /// Settle `worker` on how its turn `ended`: its new state, and the thread's
@@ -1114,6 +1199,35 @@ mod tests {
             resumable: false,
             audit: None,
         }
+    }
+
+    /// **A check round that does not finish leaves the task done** with the
+    /// answer it gave before, its audit saying what became of the round.
+    #[test]
+    fn a_check_round_that_fails_keeps_the_first_answer() {
+        let audit = Audit {
+            seen: vec!["https://b.com".into()],
+            ..Audit::default()
+        };
+        let mut w = worker();
+        w.state = State::Error;
+        w.error = Some("the engine went away".into());
+        w.final_text = String::new();
+        let round = keep_first_answer(&mut w, "First answer, citing https://b.com".into(), &audit);
+        assert_eq!(round, "failed: the engine went away");
+        assert_eq!(w.state, State::Done);
+        assert_eq!(w.final_text, "First answer, citing https://b.com");
+        assert_eq!(w.error, None);
+        assert_eq!(
+            w.audit.as_deref(),
+            Some(
+                "Citation audit: 1 cited — 0 opened, 1 seen only in tool results, 0 never seen \
+                 in the run.\nSeen only in tool results — a search hit, a link, an error — never \
+                 opened: https://b.com\nIt was sent back to open these, and the check round failed: the \
+                 engine went away; the answer above is the one it gave before. Continue it with \
+                 `task_reply` to finish the check."
+            )
+        );
     }
 
     /// **A record that does not read still takes its name**: it counts as

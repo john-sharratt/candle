@@ -158,6 +158,13 @@ itself.
 | `bot_message_read {bot}` | `GET /v1/npc/:nid/message` | The caller's thread with the bot |
 | `bot_channel_read {world}` | `GET /v1/world/:wid/channel` | The world's channel, as the caller has heard it |
 | `bot_channel_post {world, text}` | `POST /v1/world/:wid/channel` | Post on the world's channel (the Creator only) |
+| `image_generate {prompt, width?, height?, steps?, seed?, shift?}` | `POST /v1/image/generate` | Draw a picture on the image guest, through the route's compliance gate. Sides are capped at 1024. The PNG comes back as an MCP `image` content block after the text block |
+
+`image_generate` reads the route's NDJSON stream to its end and answers with
+the last line. A draw runs 10–60 s; the transport's progress notifications
+(`mcp_server::http::PROGRESS_EVERY`) keep the call alive meanwhile. The tool
+acts on no bot or world, so it names no subject and goes wherever the fallback
+sends it, like `bot_list`.
 
 **A call reaches the member holding what it acts on.** Character and world
 routes are dispatched to the member holding that character's or world's lease

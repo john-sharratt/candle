@@ -27,9 +27,13 @@
 //! | [`message_read`] | `bot_message_read` — the caller's thread with it |
 //! | [`channel_read`] | `bot_channel_read` — a world's channel |
 //! | [`channel_post`] | `bot_channel_post` — speak on a world's channel |
+//! | [`image`] | `image_generate` — draw a picture, answered as an image |
 //!
 //! [`args`] reads a tool's arguments, [`route`] reads a handler's answer, and
 //! [`view`] words a mission.
+//!
+//! `image_generate` acts on no bot or world, so like `bot_list` it names no
+//! subject and reaches any member.
 
 use std::future::Future;
 use std::net::IpAddr;
@@ -51,6 +55,7 @@ pub mod cancel;
 pub mod channel_post;
 pub mod channel_read;
 pub mod give;
+pub mod image;
 pub mod list;
 pub mod message_read;
 pub mod message_send;
@@ -62,14 +67,15 @@ pub mod view;
 /// What the server is, plainly: it manages bots.
 pub const DESCRIPTION: &str =
     "Bots: manage your bots — list them, give and manage their missions, \
-message them, and read and speak on their world's channel.";
+message them, and read and speak on their world's channel — and generate images.";
 
 /// How the tools go together.
 pub const INSTRUCTIONS: &str =
     "The bot_* tools manage your bots: autonomous agents, each living in \
 a world and acting on its own. bot_list names them; the others take a bot's id from it. Give a \
 mission with bot_mission_give and follow it with bot_mission_read; talk to a bot with \
-bot_message_send and read its replies with bot_message_read.";
+bot_message_send and read its replies with bot_message_read. image_generate draws a picture \
+from a text prompt and returns it as an image.";
 
 static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     name: "bots".into(),
@@ -80,12 +86,20 @@ static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     version: env!("CARGO_PKG_VERSION").into(),
 });
 
-/// A tool's answer: its text, and whether it is an error the model reads as
-/// one.
+/// A tool's answer: its text, whether it is an error the model reads as one,
+/// and a picture when the tool drew one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
     pub text: String,
     pub is_error: bool,
+    pub picture: Option<Picture>,
+}
+
+/// A picture an answer carries, base64, as an MCP image block takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picture {
+    pub data: String,
+    pub mime_type: String,
 }
 
 impl Answer {
@@ -93,6 +107,7 @@ impl Answer {
         Self {
             text: text.into(),
             is_error: false,
+            picture: None,
         }
     }
 
@@ -100,6 +115,15 @@ impl Answer {
         Self {
             text: text.into(),
             is_error: true,
+            picture: None,
+        }
+    }
+
+    /// `text` with the picture it describes.
+    pub fn picture(text: impl Into<String>, picture: Picture) -> Self {
+        Self {
+            picture: Some(picture),
+            ..Self::ok(text)
         }
     }
 
@@ -135,6 +159,7 @@ pub fn definitions() -> Value {
         message_read::Thread::definition(),
         channel_read::Read::definition(),
         channel_post::Post::definition(),
+        image::Generate::definition(),
     ])
 }
 
@@ -150,6 +175,7 @@ pub async fn call(s: &Arc<Authored>, headers: &HeaderMap, name: &str, args: &Val
         message_read::Thread::NAME => message_read::Thread::call(s, headers, args).await,
         channel_read::Read::NAME => channel_read::Read::call(s, headers, args).await,
         channel_post::Post::NAME => channel_post::Post::call(s, headers, args).await,
+        image::Generate::NAME => image::Generate::call(s, headers, args).await,
         other => Answer::error(format!("there is no tool `{other}`")),
     }
 }
@@ -161,6 +187,17 @@ pub fn said(lines: &[Said]) -> String {
         .map(|s| format!("{}: {}", s.from, s.text.trim()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The `tools/call` result `answer` is sent as: a text block, and after it the
+/// picture as an image block — the text is what every client reads, the image
+/// what one that shows pictures does.
+pub fn result_of(answer: &Answer) -> Value {
+    let mut result = protocol::text_result(&answer.text, answer.is_error);
+    if let (Some(p), Some(content)) = (&answer.picture, result["content"].as_array_mut()) {
+        content.push(json!({"type": "image", "data": p.data, "mimeType": p.mime_type}));
+    }
+    result
 }
 
 impl Server for Authored {
@@ -200,7 +237,7 @@ impl Server for Authored {
     }
 
     fn result(&self, answer: &Answer) -> Value {
-        protocol::text_result(&answer.text, answer.is_error)
+        result_of(answer)
     }
 
     async fn delivered(_this: &Arc<Self>, _call: &Call<Self>, _answer: &Answer) {}
@@ -213,7 +250,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_tool_has_a_bot_name_a_description_and_an_object_schema() {
+    fn every_tool_has_its_name_a_description_and_an_object_schema() {
         let defs = definitions();
         let names: Vec<&str> = defs
             .as_array()
@@ -236,7 +273,8 @@ mod tests {
                 "bot_message_send",
                 "bot_message_read",
                 "bot_channel_read",
-                "bot_channel_post"
+                "bot_channel_post",
+                "image_generate"
             ]
         );
     }
@@ -255,12 +293,38 @@ mod tests {
                 assert!(required.is_empty());
                 continue;
             }
+            // Acts on no bot or world: any member draws it.
+            if d["name"] == "image_generate" {
+                assert!(MCP_SUBJECTS.into_iter().all(|k| !props.contains_key(k)));
+                continue;
+            }
             let subject = MCP_SUBJECTS
                 .into_iter()
                 .find(|k| props.contains_key(*k))
                 .unwrap_or_else(|| panic!("{} names no subject", d["name"]));
             assert!(required.contains(&subject), "{}", d["name"]);
         }
+    }
+
+    #[test]
+    fn a_picture_follows_its_text_as_an_image_block() {
+        let plain = result_of(&Answer::ok("done"));
+        assert_eq!(plain["content"].as_array().unwrap().len(), 1);
+        let drawn = result_of(&Answer::picture(
+            "Drew it.",
+            Picture {
+                data: "iVBO".into(),
+                mime_type: "image/png".into(),
+            },
+        ));
+        assert_eq!(
+            drawn["content"],
+            json!([
+                {"type": "text", "text": "Drew it."},
+                {"type": "image", "data": "iVBO", "mimeType": "image/png"}
+            ])
+        );
+        assert_eq!(drawn["isError"], false);
     }
 
     #[test]

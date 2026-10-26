@@ -7,7 +7,7 @@ use super::{string, Answer, Ctx};
 use crate::mcp::names;
 use crate::mcp::state::ATTACHED;
 use crate::mcp::threads;
-use crate::mcp::workers::now_ms;
+use crate::mcp::workers::{self, now_ms};
 
 pub const NAME: &str = "thread_attach";
 
@@ -41,7 +41,13 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         return Answer::error("the model is still loading; try again shortly");
     };
     let owner = ctx.caller.key();
-    if let Err(e) = threads::attach(&records, &owner, thread, now_ms()) {
+    // Under the lock archiving takes, so a sweep reading the thread sees the
+    // attach or archives before it — never between.
+    let attached = {
+        let _held = workers::holding();
+        threads::attach(&records, &owner, thread, now_ms())
+    };
+    if let Err(e) = attached {
         return Answer::error(e.to_string());
     }
     if let Err(e) = ctx.store.hold(&ctx.mcp_id, ATTACHED, thread, now_ms()) {
