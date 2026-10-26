@@ -1,7 +1,7 @@
 //! A conversation's priority band, as the scheduler ranks it.
 //!
 //! A conversation's band is its target layer's `decode_priority`: the dialogue
-//! is `High`, the ingest layers `Low`. Bands share the device rather than take
+//! is `Urgent`, the ingest layers `Low`. Bands share the device rather than take
 //! turns with it (`docs/continuous_fair_waves.md` §3): every band's decode rows
 //! ride every forward, and a band's prefill creeps at the airtime ratio of the
 //! decodes that outrank it — and a `High` prefill, beside a `High` decode, is
@@ -23,6 +23,7 @@ pub(super) fn rank(p: DecodePriority) -> usize {
         DecodePriority::Low => 0,
         DecodePriority::Normal => 1,
         DecodePriority::High => 2,
+        DecodePriority::Urgent => 3,
     }
 }
 
@@ -41,20 +42,21 @@ pub(super) fn recorded_band(
 mod tests {
     use super::*;
     use crate::projection::{GroupId, LayerId};
-    use DecodePriority::{High, Low, Normal};
+    use DecodePriority::{High, Low, Normal, Urgent};
 
     #[test]
-    fn the_bands_rank_low_normal_high() {
+    fn the_bands_rank_low_normal_high_urgent() {
         assert!(rank(Low) < rank(Normal));
         assert!(rank(Normal) < rank(High));
+        assert!(rank(High) < rank(Urgent));
     }
 
     #[test]
     fn a_band_reads_back_by_its_name_and_nothing_else_does() {
-        for band in [Low, Normal, High] {
+        for band in [Low, Normal, High, Urgent] {
             assert_eq!(DecodePriority::parse(band.name()), Some(band));
         }
-        assert_eq!(DecodePriority::parse("urgent"), None);
+        assert_eq!(DecodePriority::parse("soon"), None);
         assert_eq!(DecodePriority::parse("High"), None);
     }
 

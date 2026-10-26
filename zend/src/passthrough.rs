@@ -385,7 +385,7 @@ pub fn open(
             &transcript.system,
             Reserved::Passthrough,
             base,
-            DecodePriority::High,
+            DecodePriority::Urgent,
         )
         .free_tool_calls_from_penalties()
     };

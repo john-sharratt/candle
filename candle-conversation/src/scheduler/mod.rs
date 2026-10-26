@@ -8006,7 +8006,7 @@ impl Scheduler {
         // each turn's seal and `Done`.
         let mut sealing: Vec<FinishedTurn> = Vec::with_capacity(finished_seq_ids.len());
         for seq_id in finished_seq_ids {
-            let high = self.decode_priority_or_high(seq_id) == DecodePriority::High;
+            let high = self.decode_priority_or_high(seq_id).is_live();
             if let Some(state) = self.active_decodes.remove(&seq_id) {
                 // The slot's ground is back, so an admission that did not fit
                 // before may fit now.

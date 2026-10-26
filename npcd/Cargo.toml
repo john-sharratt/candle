@@ -72,6 +72,9 @@ substrate-git = { path = "../substrate-git", features = ["member"] }
 # the provider chose. Not a security boundary — the subject inside the file is
 # authoritative — but it has to be total over every possible input.
 sha2       = "0.10"
+# Signing a link to a stored image (`image_links`), under a key derived from the
+# group key — the HMAC the cluster's handshake uses.
+hmac       = "0.12"
 # The OS entropy source behind an effector device token — a real secret, never
 # derived from the guessable `body_id` (see `effector::token`). The same crate,
 # and the same `OsRng`/`TryRngCore` path, that `web` mints its OAuth secrets

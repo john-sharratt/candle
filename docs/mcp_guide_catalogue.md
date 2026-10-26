@@ -327,10 +327,12 @@ corrupt conversation.
 **Use when:** having bots write or edit documents — research write-ups,
 reports, world material.
 **Tools:** `bot_mission_give`, `bot_mission_read`, `bot_message_send`,
-`bot_message_read`, plus `repo_task_start` to review the result
+`bot_message_read`
 - The brief names the document, its purpose, its sources and its shape; the
-  bot works the document in parts; its report says what it wrote; the result
-  is reviewed (by Claude or a zend worker) before it is relied on.
+  bot works the document in parts; its report says what it wrote; Claude
+  reviews the result before it is relied on. No tool reads a world's
+  documents and zend's workers have no bot tools, so the review goes through
+  the bot: its section-by-section report, and a quote asked for by message.
 
 ### E4. `bot-campaign`
 **Use when:** several bots work one goal together.
@@ -348,9 +350,10 @@ reports, world material.
 ### E6. `bot-watch`
 **Use when:** following what bots are doing over time.
 **Tools:** `bot_list`, `bot_mission_read`, `bot_channel_read`,
-`bot_message_read`
+`bot_message_read`, `journal_note`
 - States and moods across the roster; missions open and finished; what the
-  world's channel carried.
+  world's channel carried. A long watch is Claude's own snapshots repeated and
+  noted on a thread — a zend worker cannot call the bot tools.
 
 ### E7. `bot-debrief`
 **Use when:** a mission ended and its outcome matters.
@@ -370,6 +373,11 @@ reports, world material.
   are stated as adults for the prompt check. 768 on a side fits beside a busy
   engine; 1024 when detail matters and there is room. One draw at a time.
   Look at the result and refine the prompt.
+- The image block reaches Claude, not the user — many clients show nothing
+  from a tool's result. The answer's link (signed, 7 days, opens without
+  signing in) is how the user gets it: Claude downloads it and sends the
+  file where it can send files, embeds it in a page it makes, or else gives
+  the link, with the prompt and seed.
 
 ---
 
@@ -402,9 +410,10 @@ reports, world material.
 
 ### F5. `research-to-bots`
 **Use when:** research should become world material bots work with.
-**Tools:** as C1, E3
-- Research verified first (C1), then a bot mission to turn it into the
-  document, then a review of what the bot wrote.
+**Tools:** as E3, plus `bot_list`
+- Research verified first (Claude's own, by C1's method; on zend's workers
+  only when the user asks), then a bot mission to turn it into the document,
+  then a review of what the bot wrote.
 
 ---
 

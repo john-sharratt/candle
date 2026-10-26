@@ -48,6 +48,7 @@ use crate::drafts::{caller, records, Author};
 use crate::engine::runtime::Runtime;
 use crate::guest_routes;
 use crate::identity::require;
+use crate::image_links::{ImageLinks, Refused};
 use crate::images::{ImageError, Images};
 use crate::lifegen::job::Jobs;
 use crate::lifegen::narrate as lifegen_narrate;
@@ -101,6 +102,10 @@ pub struct Authored {
     /// are content-addressed and atomic — two uploads of the same image are the
     /// same file, and of different ones are different names.
     pub images: Images,
+    /// Signs and checks the links that open a stored image without signing in
+    /// ([`crate::image_links`]). This process's own key until the tenant,
+    /// joining a cluster, sets the one every member derives.
+    pub image_links: ImageLinks,
     /// `personality_id -> image_id` for the portraits personalities were
     /// authored with — see [`crate::personality_portrait`].
     ///
@@ -176,6 +181,7 @@ impl Authored {
             roles,
             libraries: SyncRwLock::new(Arc::new(libraries)),
             images,
+            image_links: ImageLinks::minted(),
             personality_portraits: SyncRwLock::new(personality_portraits),
             mind,
             authored_dir,
@@ -702,6 +708,15 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
         // live — a second registration is not an override, it is an
         // "overlapping method route" panic at startup.
         .route("/v1/image/:iid", Role::User, Dispatch::Best, get(get_image))
+        // The same bytes through a link that carries its own permission — a
+        // signature over the id and an expiry ([`crate::image_links`]). Open,
+        // because the link is the permission; the handler refuses any other.
+        .route(
+            "/v1/image/link/:iid",
+            Role::Unauthenticated,
+            Dispatch::Best,
+            get(get_linked_image),
+        )
         // An account and its profile are the caller's own, so `User` and then
         // the record is keyed by their subject — there is no id in these paths
         // to belong to somebody else. `/v1/me` itself is the host's, which
@@ -1694,21 +1709,54 @@ async fn put_portrait(
 ///
 /// `User`, like everything else about a character. Not `unauthenticated`: an id
 /// is a content hash and unguessable, but "unguessable" is not a permission,
-/// and these are pictures of somebody's characters.
+/// and these are pictures of somebody's characters. A link that carries its
+/// permission is [`get_linked_image`].
 async fn get_image(State(s): State<Arc<Authored>>, Path(id): Path<String>) -> Response {
-    match s.images.get(&id) {
+    // Content-addressed, so the bytes at an id never change and this can be
+    // cached hard. The one place in this daemon where that is true.
+    served(&s, &id, "public, max-age=31536000, immutable")
+}
+
+/// `GET /v1/image/link/:iid?exp=…&sig=…` — the image, to whoever holds a link
+/// this cluster signed, until it expires. A link missing either part, cut short
+/// in passing on, is refused as any other that is not one.
+async fn get_linked_image(
+    State(s): State<Arc<Authored>>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let exp = q.get("exp").and_then(|e| e.parse::<u64>().ok());
+    let sig = q.get("sig").map(String::as_str);
+    let checked = match (exp, sig) {
+        (Some(exp), Some(sig)) => s.image_links.check(&id, exp, sig, now_ms() / 1000),
+        _ => Err(Refused::Invalid),
+    };
+    match checked {
+        // Private: a shared cache would go on serving it past its expiry.
+        Ok(()) => served(&s, &id, "private, max-age=3600"),
+        Err(Refused::Expired) => err(
+            StatusCode::FORBIDDEN,
+            "link_expired",
+            "this image link has expired; ask for the picture again",
+        ),
+        Err(Refused::Invalid) => err(
+            StatusCode::FORBIDDEN,
+            "link_invalid",
+            "this is not a link to this image",
+        ),
+    }
+}
+
+/// Image `id` with its type, cached as `cache` says.
+fn served(s: &Authored, id: &str, cache: &'static str) -> Response {
+    match s.images.get(id) {
         Ok((bytes, mime)) => {
             let mut res = bytes.into_response();
             let h = res.headers_mut();
             if let Ok(v) = HeaderValue::from_str(mime) {
                 h.insert(header::CONTENT_TYPE, v);
             }
-            // Content-addressed, so the bytes at an id never change and this can
-            // be cached hard. The one place in this daemon where that is true.
-            h.insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
-            );
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
             res
         }
         Err(e) => image_err(e),
@@ -3727,6 +3775,10 @@ mod tests {
                 // character they just made.
                 ("/v1/npc/:nid/portrait/generate", "user"),
                 ("/v1/image/:iid", "user"),
+                // A signed link to the same bytes: open, because the signature
+                // over the id and an expiry is the permission, and the handler
+                // refuses anything else.
+                ("/v1/image/link/:iid", "unauthenticated"),
                 // The caller's own account. `/v1/me` itself is the host's. The
                 // read and the write are registered apart for their dispatch.
                 ("/v1/me/profile", "user"),
@@ -5158,6 +5210,38 @@ layers:
         .await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(got, png, "the bytes served are not the bytes uploaded");
+
+        // Not to a stranger by its id alone — unguessable is not a permission —
+        // but to anyone holding a link signed for it, until it expires.
+        let (s, _) = call_raw(
+            router(st.clone()),
+            get(&format!("/v1/image/{image_id}"), None),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let link = st.image_links.path(&image_id, now_ms() / 1000);
+        let (s, got) = call_raw(router(st.clone()), get(&link, None)).await;
+        assert_eq!(s, StatusCode::OK, "{link}");
+        assert_eq!(got, png, "the link served other bytes");
+        let last = if link.ends_with('0') { '1' } else { '0' };
+        let forged = format!("{}{last}", &link[..link.len() - 1]);
+        let (s, v) = call(router(st.clone()), get(&forged, None)).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("link_invalid"))
+        );
+        let (trimmed, _) = link.split_once('?').unwrap();
+        let (s, v) = call(router(st.clone()), get(trimmed, None)).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("link_invalid"))
+        );
+        let expired = st.image_links.path(&image_id, 0);
+        let (s, v) = call(router(st.clone()), get(&expired, None)).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("link_expired"))
+        );
 
         // A client cannot name an image id itself — that would let one point at
         // an upload it does not own, and every id in the store is valid.

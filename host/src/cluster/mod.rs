@@ -595,6 +595,13 @@ impl Join {
         &self.link
     }
 
+    /// A key for `purpose` that every member of the group derives alike
+    /// ([`GroupKey::derive`]): what a tenant signs something with that any
+    /// member must accept.
+    pub fn derive_key(&self, purpose: &str) -> [u8; 32] {
+        self.cluster.settings.key.derive(purpose)
+    }
+
     /// The agent in this process, with `--agent`: what the tenant's jobs go
     /// to while it is cut off from every cluster (§11.5).
     pub fn in_process_agent(&self) -> Option<Arc<Jobs>> {

@@ -6,6 +6,12 @@
 //! line. The picture comes back as an MCP image block beside a line of text,
 //! so the model sees what it drew rather than a base64 string it cannot read.
 //!
+//! **And a link to the file.** The image block reaches the model, not the
+//! person: a client may show no picture from a tool at all. So the draw is
+//! stored ([`crate::images`]) and the answer carries a link signed for a week
+//! ([`crate::image_links`]) that opens it without signing in — what the model
+//! fetches to hand the person the file.
+//!
 //! **JPEG unless PNG is asked for.** The answer is one message, and on a slow
 //! link to the client it is the whole of the wait: a 1024×768 PNG is 1.2 MB of
 //! base64, and through a gateway on a degraded Wi-Fi link it reached the client
@@ -26,12 +32,13 @@ use base64::Engine as _;
 use candle_conversation::guest::{ImageLora, DEFAULT_REFERENCE_HOLD};
 use image::codecs::jpeg::JpegEncoder;
 use image::ImageFormat;
+use mcp_server::origin;
 use serde_json::{json, Value};
 
 use super::args::string;
 use super::route::refused;
 use super::{Answer, Picture, Tool};
-use crate::api::Authored;
+use crate::api::{now_ms, Authored};
 use crate::guest_routes::{post_image, ImageBody};
 
 pub struct Generate;
@@ -69,11 +76,15 @@ impl Tool for Generate {
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Generate an image from a text prompt (Z-Image-Turbo) and return it — a \
-                JPEG, or a PNG when `format` asks for one. Describe the subject, style, lighting and composition in plain sentences; \
-                variety comes from the prompt, not the seed. A draw takes about half a minute \
-                to two, and progress arrives while it works. Prompts are checked first and a \
-                declined one is refused.",
+            "description": "Generate an image from a text prompt (Z-Image-Turbo). The answer is the \
+                picture for you to look at — a JPEG, or a PNG when `format` asks for one — and a \
+                link to the file that works for 7 days without signing in. The user may not see \
+                the picture in the tool result: to show it to them, download the link and send \
+                them the file, or give them the link. Describe the subject, style, lighting and \
+                composition in plain sentences; variety comes from the prompt, not the seed. A \
+                draw takes about half a minute to two, and progress arrives while it works. \
+                Prompts are checked first and a declined one is refused. Read the guide `image` \
+                first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -105,7 +116,40 @@ impl Tool for Generate {
         if !status.is_success() {
             return Answer::error(refused(status.as_u16(), &bytes));
         }
-        outcome(&bytes, format)
+        let drawn = match outcome(&bytes, format) {
+            Ok(d) => d,
+            Err(e) => return Answer::error(e),
+        };
+        let link = s.images.put(&drawn.file).map(|id| {
+            let path = s.image_links.path(&id, now_ms() / 1000);
+            format!("{}{path}", origin::of(headers))
+        });
+        Answer::picture(
+            said(&drawn.said, link.map_err(|e| e.to_string())),
+            Picture {
+                data: drawn.base64,
+                mime_type: drawn.mime.into(),
+            },
+        )
+    }
+}
+
+/// A finished draw: what it says of itself, and the file `format` asked for —
+/// its bytes to store and its base64 for the image block.
+#[derive(Debug)]
+struct Drawn {
+    said: String,
+    file: Vec<u8>,
+    base64: String,
+    mime: &'static str,
+}
+
+/// The answer's text: the draw's own line, then its link — or, when the file
+/// could not be stored, that there is none and why.
+fn said(drawn: &str, link: Result<String, String>) -> String {
+    match link {
+        Ok(url) => format!("{drawn} The file, for 7 days and without signing in: {url}"),
+        Err(e) => format!("{drawn} There is no link to the file: it could not be stored ({e})."),
     }
 }
 
@@ -118,17 +162,14 @@ fn format(args: &Value) -> Result<Format, String> {
     }
 }
 
-/// The route's PNG, base64, as the picture `format` asks for.
-fn picture(png_base64: &str, format: Format) -> Result<Picture, String> {
-    if format == Format::Png {
-        return Ok(Picture {
-            data: png_base64.to_string(),
-            mime_type: "image/png".into(),
-        });
-    }
+/// The route's PNG, base64, as the file `format` asks for, with its type.
+fn file(png_base64: &str, format: Format) -> Result<(Vec<u8>, &'static str), String> {
     let png = BASE64
         .decode(png_base64.as_bytes())
         .map_err(|e| format!("the picture is not base64: {e}"))?;
+    if format == Format::Png {
+        return Ok((png, "image/png"));
+    }
     let rgb = image::load_from_memory_with_format(&png, ImageFormat::Png)
         .map_err(|e| format!("the picture would not decode: {e}"))?
         .to_rgb8();
@@ -136,10 +177,7 @@ fn picture(png_base64: &str, format: Format) -> Result<Picture, String> {
     JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY)
         .encode_image(&rgb)
         .map_err(|e| format!("the picture would not encode: {e}"))?;
-    Ok(Picture {
-        data: BASE64.encode(&jpeg),
-        mime_type: "image/jpeg".into(),
-    })
+    Ok((jpeg, "image/jpeg"))
 }
 
 /// The route's body from the tool's arguments.
@@ -182,40 +220,50 @@ fn body(args: &Value) -> Result<ImageBody, String> {
     })
 }
 
-/// The answer the stream's last line carries, its picture as `format`.
-fn outcome(stream: &[u8], format: Format) -> Answer {
+/// The draw the stream's last line carries, its file as `format`, or what
+/// went wrong.
+fn outcome(stream: &[u8], format: Format) -> Result<Drawn, String> {
     let last = String::from_utf8_lossy(stream)
         .lines()
         .rev()
         .find_map(|l| serde_json::from_str::<Value>(l).ok());
     let Some(last) = last else {
-        return Answer::error("the draw ended without an answer");
+        return Err("the draw ended without an answer".into());
     };
     match last["event"].as_str() {
-        Some("done") => match last["png_base64"].as_str().map(|p| picture(p, format)) {
-            Some(Ok(picture)) => Answer::picture(
-                format!(
+        Some("done") => {
+            let png = last["png_base64"]
+                .as_str()
+                .ok_or("the draw finished without a picture")?;
+            let (file, mime) = file(png, format)?;
+            // A PNG is the route's own, already in base64.
+            let base64 = match format {
+                Format::Png => png.to_string(),
+                Format::Jpeg => BASE64.encode(&file),
+            };
+            Ok(Drawn {
+                said: format!(
                     "Drew a {}x{} image, seed {}.",
                     last["width"], last["height"], last["seed"]
                 ),
-                picture,
-            ),
-            Some(Err(e)) => Answer::error(e),
-            None => Answer::error("the draw finished without a picture"),
-        },
+                file,
+                base64,
+                mime,
+            })
+        }
         Some("error") => {
             let retry = if last["retry"] == true {
                 " (worth retrying)"
             } else {
                 ""
             };
-            Answer::error(format!(
+            Err(format!(
                 "{}: {}{retry}",
                 last["error"].as_str().unwrap_or("failed"),
                 last["detail"].as_str().unwrap_or("")
             ))
         }
-        _ => Answer::error(format!("the draw ended on `{last}`")),
+        _ => Err(format!("the draw ended on `{last}`")),
     }
 }
 
@@ -238,20 +286,41 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_draw_is_a_picture_and_an_error_line_is_an_error() {
+    fn a_finished_draw_is_a_file_and_an_error_line_is_an_error() {
         let done = b"{\"event\":\"loading\"}\n{\"event\":\"step\",\"done\":1,\"total\":9}\n\
             {\"event\":\"done\",\"width\":512,\"height\":512,\"png_base64\":\"iVBO\",\"seed\":7}\n";
-        let a = outcome(done, Format::Png);
-        assert!(!a.is_error);
-        assert_eq!(a.text, "Drew a 512x512 image, seed 7.");
-        assert_eq!(a.picture.unwrap().data, "iVBO");
+        let d = outcome(done, Format::Png).unwrap();
+        assert_eq!(d.said, "Drew a 512x512 image, seed 7.");
+        assert_eq!(
+            (d.file.as_slice(), d.base64.as_str(), d.mime),
+            (&[0x89, 0x50, 0x4E][..], "iVBO", "image/png")
+        );
 
         let failed =
             b"{\"event\":\"error\",\"error\":\"no_room\",\"detail\":\"full\",\"retry\":true}\n";
-        let a = outcome(failed, Format::Jpeg);
-        assert!(a.is_error);
-        assert_eq!(a.text, "no_room: full (worth retrying)");
-        assert!(outcome(b"", Format::Jpeg).is_error);
+        assert_eq!(
+            outcome(failed, Format::Jpeg).unwrap_err(),
+            "no_room: full (worth retrying)"
+        );
+        assert!(outcome(b"", Format::Jpeg).is_err());
+    }
+
+    /// **The answer names the link and how long it works**, or says there is
+    /// none and why.
+    #[test]
+    fn the_answer_carries_the_files_link_or_why_there_is_none() {
+        assert_eq!(
+            said(
+                "Drew a 512x512 image, seed 7.",
+                Ok("https://bot.tokera.com/v1/image/link/ab.jpg?exp=9&sig=cd".into())
+            ),
+            "Drew a 512x512 image, seed 7. The file, for 7 days and without signing in: \
+             https://bot.tokera.com/v1/image/link/ab.jpg?exp=9&sig=cd"
+        );
+        assert_eq!(
+            said("Drew it.", Err("no such image".into())),
+            "Drew it. There is no link to the file: it could not be stored (no such image)."
+        );
     }
 
     /// **A JPEG unless PNG is asked for**, and it is a real one: the route's
@@ -268,9 +337,10 @@ mod tests {
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
             .unwrap();
-        let p = picture(&BASE64.encode(&png), Format::Jpeg).unwrap();
-        assert_eq!(p.mime_type, "image/jpeg");
-        let jpeg = BASE64.decode(p.data.as_bytes()).unwrap();
+        let (same, mime) = file(&BASE64.encode(&png), Format::Png).unwrap();
+        assert_eq!((same, mime), (png.clone(), "image/png"));
+        let (jpeg, mime) = file(&BASE64.encode(&png), Format::Jpeg).unwrap();
+        assert_eq!(mime, "image/jpeg");
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "not a JPEG");
         let back = image::load_from_memory_with_format(&jpeg, ImageFormat::Jpeg).unwrap();
         assert_eq!((back.width(), back.height()), (32, 16));

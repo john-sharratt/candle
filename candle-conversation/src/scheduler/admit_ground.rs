@@ -127,13 +127,14 @@ pub(super) struct Composed {
     stage_seqs: Vec<usize>,
 }
 
-/// A priority's slot in the per-band cursors. Three bands, in the order
+/// A priority's slot in the per-band cursors. Four bands, in the order
 /// `admit::order::BANDS` offers them.
 fn band_index(prio: DecodePriority) -> usize {
     match prio {
-        DecodePriority::High => 0,
-        DecodePriority::Normal => 1,
-        DecodePriority::Low => 2,
+        DecodePriority::Urgent => 0,
+        DecodePriority::High => 1,
+        DecodePriority::Normal => 2,
+        DecodePriority::Low => 3,
     }
 }
 
@@ -204,10 +205,10 @@ pub(super) struct AdmitPass<'a> {
     /// to resume where *it* left off, not where the previous band did. Shared,
     /// the `Low` band would start from wherever `High` had walked to and skip
     /// every `Low` candidate ahead of it.
-    prefill_cursor: [usize; 3],
+    prefill_cursor: [usize; 4],
     /// Per band, the next pending submission to offer ([`Scheduler::pending_submits`]),
     /// scanned once the band's queued work is spent.
-    submit_cursor: [usize; 3],
+    submit_cursor: [usize; 4],
     /// Whether the offer [`Ground::peek`] last answered is a pending submission,
     /// which [`Ground::admit`] then materialises before it begins.
     offering_submit: bool,
@@ -267,8 +268,8 @@ impl<'a> AdmitPass<'a> {
             holes_spoken: 0,
             narrowable,
             narrow_spoken: 0,
-            prefill_cursor: [0; 3],
-            submit_cursor: [0; 3],
+            prefill_cursor: [0; 4],
+            submit_cursor: [0; 4],
             offering_submit: false,
             widened: false,
             closed: false,

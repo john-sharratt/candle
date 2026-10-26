@@ -641,6 +641,7 @@ enum YamlDecodePriority {
     Low,
     Normal,
     High,
+    Urgent,
 }
 
 impl From<YamlDecodePriority> for DecodePriority {
@@ -649,6 +650,7 @@ impl From<YamlDecodePriority> for DecodePriority {
             YamlDecodePriority::Low => DecodePriority::Low,
             YamlDecodePriority::Normal => DecodePriority::Normal,
             YamlDecodePriority::High => DecodePriority::High,
+            YamlDecodePriority::Urgent => DecodePriority::Urgent,
         }
     }
 }

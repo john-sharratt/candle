@@ -161,13 +161,23 @@ itself.
 | `bot_message_read {bot}` | `GET /v1/npc/:nid/message` | The caller's thread with the bot |
 | `bot_channel_read {world}` | `GET /v1/world/:wid/channel` | The world's channel, as the caller has heard it |
 | `bot_channel_post {world, text}` | `POST /v1/world/:wid/channel` | Post on the world's channel (the Creator only) |
-| `image_generate {prompt, width?, height?, steps?, seed?, shift?}` | `POST /v1/image/generate` | Draw a picture on the image guest, through the route's compliance gate. Sides are capped at 1024. The PNG comes back as an MCP `image` content block after the text block |
+| `image_generate {prompt, width?, height?, steps?, seed?, shift?, format?}` | `POST /v1/image/generate` | Draw a picture on the image guest, through the route's compliance gate. Sides are capped at 1024. The JPEG (or PNG with `format: png`) comes back as an MCP `image` content block after the text block, and the text carries a signed link to the stored file |
 
 `image_generate` reads the route's NDJSON stream to its end and answers with
 the last line. A draw runs 10–60 s; the transport's progress notifications
 (`mcp_server::http::PROGRESS_EVERY`) keep the call alive meanwhile. The tool
 acts on no bot or world, so it names no subject and goes wherever the fallback
 sends it, like `bot_list`.
+
+The image block reaches the model, not the person — a client may show nothing
+from a tool's result — so the draw is also stored in the image store
+(`npcd::images`, a substrate blob named by its SHA-256) and the text carries
+`<origin>/v1/image/link/<id>?exp=…&sig=…`. That route is open: the link is its
+own permission, an HMAC-SHA256 over the id and the expiry under a key every
+member derives from the group key (`GroupKey::derive("npcd image links")`),
+good for 7 days (`npcd::image_links`). The model downloads it and sends the
+user the file. `GET /v1/image/:iid`, by id alone, still needs a signed-in
+caller.
 
 **A call reaches the member holding what it acts on.** Character and world
 routes are dispatched to the member holding that character's or world's lease

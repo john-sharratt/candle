@@ -73,6 +73,8 @@ pub fn status(bot: &str, s: &MissionStatus) -> String {
             "\n\n{} more queued for it at the command table.",
             s.lodged
         ));
+    } else {
+        out.push_str("\n\nNothing more queued for it.");
     }
     out
 }
@@ -149,7 +151,7 @@ mod tests {
         assert_eq!(
             status("1z", &idle),
             format!(
-                "Bot 1z is not on a mission.\n\nLast finished:\n{}",
+                "Bot 1z is not on a mission.\n\nLast finished:\n{}\n\nNothing more queued for it.",
                 mission(&view(false))
             )
         );

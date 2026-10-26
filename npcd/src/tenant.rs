@@ -48,6 +48,7 @@ use crate::engine::guardian::{GuardianBuilder, GuardianConfig, RuntimeProbe};
 use crate::engine::identity::Authored as Identities;
 use crate::engine::runtime::{engine_asks, start as start_engine, Arrived, LoadPlan, Runtime};
 use crate::identity::log_identity;
+use crate::image_links::{self, ImageLinks};
 use crate::images::Images;
 use crate::mind::files::MindFiles;
 use crate::mind::{Mind, MindRepo};
@@ -464,7 +465,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         personalities.len(),
     );
 
-    let authored = Authored::new(
+    let mut authored = Authored::new(
         worlds,
         personalities,
         accounts,
@@ -475,6 +476,10 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         images,
         personality_portraits,
     );
+    // A link one member signs, another member may be asked to open.
+    if let Some(join) = &ctx.cluster {
+        authored.image_links = ImageLinks::new(join.derive_key(image_links::PURPOSE));
+    }
 
     // ── the engine ─────────────────────────────────────────────────────────
     //
