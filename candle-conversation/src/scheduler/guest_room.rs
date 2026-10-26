@@ -18,12 +18,14 @@
 //! message about a standing transient tier.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use candle::Device;
 
 use super::Scheduler;
 use crate::guest::drain::EngineRoom;
 use crate::guest::ground::{GroundError, GuestGround};
+use crate::guest::queue::Pending;
 use crate::guest::{drain_one, DrainReport, Guests};
 
 impl EngineRoom for Scheduler {
@@ -69,6 +71,45 @@ impl EngineRoom for Scheduler {
         //
         // Legal here for the same reason the claim was: between forwards.
         self.model.reclaim_spare_ground();
+    }
+
+    fn busy(&self) -> bool {
+        self.running_members() > 0 || !self.active_decodes.is_empty()
+    }
+
+    fn requeue(&mut self, jobs: Vec<Pending>, retry_in: Duration) {
+        self.guests.queue.requeue(jobs, retry_in);
+    }
+
+    /// The KV side's regions by state (`span` is the recurrent stores and the
+    /// gallery, not arenas), the work in flight that will give ground back,
+    /// and the idle slots that hold theirs. The weight side names its own
+    /// floor on the line before a refusal.
+    fn holders(&self) -> String {
+        let regions = match self.device.location() {
+            candle::DeviceLocation::Cuda { gpu_id } => candle_nn::kv_cache::region_stats(gpu_id),
+            _ => None,
+        };
+        let mib = |n: usize| (n * candle_nn::kv_cache::REGION_BYTES) >> 20;
+        let kv = regions.map_or_else(
+            || "kv=none".to_string(),
+            |r| {
+                format!(
+                    "kv_mib total={} live={} span={} free={} blocked={}",
+                    mib(r.total),
+                    mib(r.live),
+                    mib(r.span_tenant),
+                    mib(r.free),
+                    mib(r.blocked)
+                )
+            },
+        );
+        format!(
+            "{kv} | in flight: decodes={} prefills={} | idle {}",
+            self.active_decodes.len(),
+            self.running_members(),
+            self.idle_census(std::time::Instant::now()),
+        )
     }
 }
 
@@ -123,7 +164,13 @@ impl Scheduler {
             "stopping between waves to serve a guest — normal inference is blocked until it \
              finishes"
         );
-        Some(drain_one(self, model.as_mut(), jobs))
+        let report = drain_one(self, model.as_mut(), jobs);
+        // Drawn, refused or put back to wait, the ground has changed hands, and
+        // this is what reopens admission mid-quantum rather than at the next
+        // completion. A job left waiting keeps admission closed itself
+        // ([`GuestQueue::waiting_for_room`]).
+        self.settled_since_admit = true;
+        Some(report)
     }
 }
 

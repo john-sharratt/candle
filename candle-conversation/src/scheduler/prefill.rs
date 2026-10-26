@@ -2033,6 +2033,24 @@ impl Scheduler {
         if in_flight >= Self::MAX_PREFILL_WIDTH {
             return;
         }
+        // **A guest waiting for room closes admission**, the queue head's forced
+        // admission included. The ground it is short of is held by work in
+        // flight, and every prefill admitted now would take what that work gives
+        // back as it finishes: on WhiteWorld (2026-10-26) draws were refused
+        // 96–928 MiB short four times while the Makers kept starting turns.
+        // Deadlock-free because the wait is: a job waits only while something
+        // is running (`EngineRoom::busy`), and for at most `ROOM_PATIENCE`, and
+        // its drain sets `settled_since_admit` when it ends. One atomic load.
+        //
+        // **Every band, `Urgent` included.** Letting `Urgent` in unjudged while
+        // a guest waited put work past the rate model on a card that was, by
+        // construction, short of ground: on WhiteWorld (3907, 2026-10-26 22:05)
+        // four content-check prompts went in that way during a wait, a wave
+        // came out too wide for the partition and failed mid-sweep, and a
+        // decode tripped a device-side assert fifteen seconds later.
+        if self.guests.queue.waiting_for_room() {
+            return;
+        }
 
         // VRAM-pressure backpressure. Each admitted prefill pins its
         // conversation's KV in VRAM, so under pressure we shed hot KV to the
@@ -6792,6 +6810,65 @@ mod wave_chunk_tests {
         assert!(
             scheduler.settled_since_admit,
             "a prefill that left is an admission opportunity"
+        );
+    }
+
+    /// **A guest waiting for room closes admission, the forced head included.**
+    /// With nothing in flight and admission unsettled, the queue head is
+    /// normally forced in so the engine makes progress; while a guest waits,
+    /// that turn would take the ground the guest is waiting for. Once the wait
+    /// clears, the head is forced in as before.
+    #[test]
+    fn a_guest_waiting_for_room_closes_admission_and_the_forced_head() {
+        use crate::guest::work::{GuestRequest, MatteRequest};
+        use crate::guest::Guest;
+        use std::time::Duration;
+
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(seq, (0..64u32).collect()).work);
+        scheduler.settled_since_admit = false;
+
+        let queue = Arc::clone(&scheduler.guests.queue);
+        let _receipt = queue
+            .submit(GuestRequest::Matte(MatteRequest {
+                pixels: vec![0; 4 * 4 * 3],
+                width: 4,
+                height: 4,
+            }))
+            .unwrap();
+        queue.requeue(queue.take(Guest::Matte), Duration::from_secs(60));
+
+        scheduler.promote_new_prefills();
+        assert_eq!(
+            scheduler.prefill_queue.len(),
+            1,
+            "a turn was admitted while a guest waited for its ground"
+        );
+        assert!(scheduler.active_prefills.is_empty());
+
+        // An urgent turn is held too: unjudged, it is work past the rate model
+        // on a card already short of ground.
+        let live = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler.slot_bands.insert(live, DecodePriority::Urgent);
+        scheduler
+            .prefill_queue
+            .push_back(dialogue_prefill(live, (0..16u32).collect()).work);
+        scheduler.promote_new_prefills();
+        assert!(
+            scheduler.active_prefills.is_empty(),
+            "an urgent turn went in unjudged while a guest waited"
+        );
+        assert_eq!(scheduler.prefill_queue.len(), 2);
+
+        let _ = queue.take(Guest::Matte);
+        scheduler.promote_new_prefills();
+        assert_eq!(
+            scheduler.prefill_queue.len(),
+            1,
+            "with the wait cleared, the idle engine did not force its queue head"
         );
     }
 

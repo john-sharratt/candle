@@ -374,10 +374,11 @@ reports, world material.
   engine; 1024 when detail matters and there is room. One draw at a time.
   Look at the result and refine the prompt.
 - The image block reaches Claude, not the user — many clients show nothing
-  from a tool's result. The answer's link (signed, 7 days, opens without
+  from a tool's result. The answer's link (signed, 24 hours, opens without
   signing in) is how the user gets it: Claude downloads it and sends the
-  file where it can send files, embeds it in a page it makes, or else gives
-  the link, with the prompt and seed.
+  file where it can send files, puts the downloaded file in a page it makes,
+  or else gives the link and says to save it within the day — the picture is
+  deleted after 24 hours. With it, the prompt and seed, which draw it again.
 
 ---
 

@@ -27,9 +27,16 @@ METHOD:
 FINAL RESPONSE:
 DOCUMENT: path, branch and commit
 OUTLINE: its sections
+CITATIONS: each statement about the code, with the file:line behind it
 UNVERIFIED: statements you could not pin to the code
 COULD NOT DO: anything not done, and why
 ```
+
+**For a draft to review before anything is written** — a paragraph, a
+section — make it draft only: drop the path and branch from GOAL, add
+"read only — change nothing, push nothing; return the text in the answer",
+and replace DOCUMENT with DRAFT: the text itself. Ask for plain language:
+the statements a reader needs, not phrasing.
 
 ## Read the result
 

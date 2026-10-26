@@ -52,6 +52,11 @@ pub enum GuestEvent {
         total: u32,
         what: &'static str,
     },
+    /// The card had no room for the guest, and the job waits for work in
+    /// flight to finish and give its ground back
+    /// ([`super::drain::ROOM_PATIENCE`]). `short_mib` is what the last claim
+    /// fell short by; `waited_s` how long the job has waited so far.
+    WaitingForRoom { short_mib: u64, waited_s: u64 },
 }
 
 /// Where a job's progress goes while it runs, if anywhere.

@@ -192,6 +192,11 @@ impl SubstratePersistence {
         };
         self.index_remote(&entry);
         substrate.apply_walker_entry(&entry);
+        // A blob and its tombstone arrive in either order; whichever comes
+        // second finds the other, and the tombstone kills what it outranks.
+        if let Some(key) = blob::blob_of(&entry) {
+            blob::forget_if_retired(&mut self.blob_index, &mut self.accounting, substrate, key);
+        }
         if completes_turns(h.record_type) {
             turns.insert(StreamKey::of(StreamId(h.stream_id), &id));
         }

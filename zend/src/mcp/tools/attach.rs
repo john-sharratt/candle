@@ -46,17 +46,56 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
     // attach or archives before it — never between.
     let attached = {
         let _held = workers::holding();
-        threads::attach(&records, &owner, thread, now_ms())
+        let created = threads::thread(&records, &owner, thread).is_none();
+        threads::attach(&records, &owner, thread, now_ms()).map(|_| created)
     };
-    if let Err(e) = attached {
-        return Answer::error(e.to_string());
-    }
+    let created = match attached {
+        Ok(created) => created,
+        Err(e) => return Answer::error(e.to_string()),
+    };
     if let Err(e) = ctx.store.hold(&ctx.mcp_id, ATTACHED, thread, now_ms()) {
         return Answer::error(e.to_string());
     }
     let notes = threads::notes(&records, &owner, thread);
-    Answer::ok(format!(
-        "Attached to T:{thread}.\n\n{}",
-        threads::render_journal(&format!("T:{thread}"), &notes)
+    Answer::ok(answer(
+        thread,
+        created,
+        &threads::render_journal(&format!("T:{thread}"), &notes),
     ))
+}
+
+/// What an attach says: whether the thread was just created — so a mistyped
+/// name is seen at once rather than taken for an empty thread — and its
+/// journal.
+fn answer(thread: &str, created: bool, journal: &str) -> String {
+    let head = if created {
+        format!(
+            "Created T:{thread}, a new thread. If you meant one that exists, `thread_list` names \
+             them."
+        )
+    } else {
+        format!("Attached to T:{thread}.")
+    };
+    format!("{head}\n\n{journal}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A new thread says it is new**, so a slug typed wrong is not mistaken
+    /// for an existing thread with nothing in it.
+    #[test]
+    fn an_attach_says_whether_it_created_the_thread() {
+        assert_eq!(
+            answer(
+                "review",
+                true,
+                "Journal of T:review, written by Claude — no entries yet."
+            ),
+            "Created T:review, a new thread. If you meant one that exists, `thread_list` names \
+             them.\n\nJournal of T:review, written by Claude — no entries yet."
+        );
+        assert_eq!(answer("review", false, "J"), "Attached to T:review.\n\nJ");
+    }
 }

@@ -1,6 +1,6 @@
 ---
 name: image
-description: How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, and send the user the file from the link the answer carries.
+description: For any request to draw, paint or generate a picture, image or photo — the user's own image model, used rather than an SVG or widget you draw yourself. How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, and send the user the file from the link the answer carries.
 tools: [image_generate]
 ---
 # Generating an image
@@ -77,7 +77,8 @@ clothing. A prompt that leaves an age unclear may be declined.
   …"). Pass that seed back only to redraw the same picture with a small prompt
   change. **Shift:** leave it alone.
 - **Time:** a draw takes from about half a minute to three, most of it the
-  prompt check and loading the image model. Some clients show no progress
+  prompt check and loading the image model — up to three minutes more when
+  it has to wait for room on a busy card. Some clients show no progress
   while it works and give a call up after about five minutes; a call given up
   that way may still be drawing, so wait two minutes before sending it again.
 - **One at a time.** The engine holds one image model at once: send the next
@@ -102,13 +103,14 @@ request before showing it:
 When the draw fails for any other reason, the prompt was not the problem —
 do not rewrite it:
 
-- `no_room` — the engine had no room for the image model just then. On a
-  draw sent alongside another, that is the other draw: send it again once
-  the other has answered. On a draw sent alone, the engine was busy and came
-  up a few hundred MiB short; that room frees as its busy turns finish. Send
-  the same call again in a minute — it can take a few tries. A smaller size
-  (768 on the long side) needs about 500 MiB less, so it is the second
-  option when the same size keeps being refused.
+- `no_room` — the engine had no room for the image model. A draw that finds
+  the card busy does not fail at once: it waits up to three minutes, holding
+  back new work so the turns running finish and free their room, and draws
+  as soon as it fits. That wait is normal and needs nothing from you — it
+  only makes the draw slower. So `no_room` means the card stayed full for
+  those three minutes, or a draw sent alongside another lost to it. Send the
+  draw again in a few minutes, alone; when the same size keeps being refused,
+  a smaller one (768 on the long side) needs about 500 MiB less.
 - "is unavailable" (`upstream_unavailable`, `upstream_backoff`), a call cut
   off, or — while the service comes back up — a `404` or a `401 … sign in`:
   the image service is restarting. Send the same call again in a minute or
@@ -126,18 +128,22 @@ Two or three rounds is normal.
 
 ## Give it to the user
 
-The link opens the file for 7 days without signing in — the permission is
-in the link, so pass it on whole and do not trim its `?exp=…&sig=…`.
+The link opens the file for 24 hours without signing in — the permission is
+in the link, so pass it on whole and do not trim its `?exp=…&sig=…`. After
+that the link stops working and Zen deletes the picture, so what the user
+keeps is a file, not the link.
 
 1. When you can send the user a file (a tool that sends or attaches one),
    download the link into your workspace and send that file. It is the JPEG
    (or PNG) itself, so they see the picture you saw.
-2. When you can make a page or document, you can put the picture in it by
-   this link.
-3. Otherwise give them the link itself; it opens in their browser.
+2. When you can make a page or document, download the file and put it in
+   the page itself; a page that points at the link shows nothing after a day.
+3. Otherwise give them the link itself, and tell them to save the picture
+   within 24 hours.
 
 With it, give the prompt and seed that made it, so the next request can
-start from them. Say the link stops working after 7 days. An answer that says
+start from them — the same prompt and seed draw the same picture again
+after it is gone. An answer that says
 "There is no link to the file" means the picture could not be stored: say so,
 and offer to draw it again. A fresh link that answers `image_not_found` was
 read before the file reached every server: fetch it again in a minute.

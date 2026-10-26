@@ -6,7 +6,8 @@
 //! HMAC over both under a key every member holds, so whoever is handed it — a
 //! client's sandbox fetching a drawn picture to give it to its user — opens it
 //! at `GET /v1/image/link/:iid?exp=…&sig=…` without signing in, on any member,
-//! until it expires. Changing the id or the expiry breaks the signature.
+//! until it expires — when the drawn picture it opens is retired too
+//! (`crate::images`). Changing the id or the expiry breaks the signature.
 //!
 //! The key is derived from the cluster's group key
 //! (`host::cluster::Join::derive_key`). A daemon with no cluster is its own
@@ -22,11 +23,14 @@ use rand::rngs::OsRng;
 use rand::TryRngCore;
 use sha2::Sha256;
 
+use crate::images::DRAWN_KEPT;
+
 type HmacSha256 = Hmac<Sha256>;
 
-/// How long a link works: a week, long enough to be fetched, passed on and
-/// opened again by the person it was passed to.
-pub const LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How long a link works: as long as a drawn picture is kept
+/// ([`DRAWN_KEPT`]), a day — long enough to be fetched, passed on and opened
+/// by the person it was passed to.
+pub const LIFETIME: Duration = DRAWN_KEPT;
 
 /// What a link's key is derived for, from the group key.
 pub const PURPOSE: &str = "npcd image links";
@@ -116,14 +120,14 @@ mod tests {
         )
     }
 
-    /// **A link opens its own image for a week, on any member holding the key.**
+    /// **A link opens its own image for a day, on any member holding the key.**
     #[test]
-    fn a_link_opens_its_image_for_a_week_on_any_member() {
+    fn a_link_opens_its_image_for_a_day_on_any_member() {
         let links = ImageLinks::new([7; 32]);
         let path = links.path(ID, NOW);
-        assert!(path.starts_with(&format!("/v1/image/link/{ID}?exp=1800604800&sig=")));
+        assert!(path.starts_with(&format!("/v1/image/link/{ID}?exp=1800086400&sig=")));
         let (exp, sig) = parts(&path);
-        assert_eq!(exp, NOW + 7 * 24 * 60 * 60);
+        assert_eq!(exp, NOW + 24 * 60 * 60);
         assert_eq!(sig.len(), 64);
         let member = ImageLinks::new([7; 32]);
         assert_eq!(member.check(ID, exp, &sig, NOW), Ok(()));

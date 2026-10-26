@@ -36,7 +36,7 @@ rest. Never wait on one worker while others run unwatched.
 | stuck | Its loop closed: reply with what to do next (`repo_task_reply`) |
 | stopped | You stopped it: redirect it (`repo_task_reply`) or archive the thread |
 | failed | Read why; fix the cause or start the task again |
-| lost — "the task stopped being run: the member running it restarted or lost it" | Its turn is gone and it cannot be continued; what it found is in its journal entries, and anything it pushed is on its branch. Start the task again — the same name gets the next free one (`.2`) — pointing the new prompt at both |
+| lost — "the task stopped being run: the member running it restarted or lost it" | Its turn is gone and it cannot be continued; what it found is in its journal entries, and anything it pushed is on its branch. Start the task again — the same name gets the next free one (`.2`) — with what its entries found copied into the new prompt's CONTEXT (a worker cannot read another worker's journal) and its branch named |
 
 ## When a worker goes wrong
 
@@ -64,3 +64,9 @@ A call holds at most about four minutes — less on claude.ai — whatever
 any client gives up on the call. When no call is open — a new
 conversation, after compaction — `thread_list` shows what is running and what
 waits on you.
+
+**"MCP server connection lost"** (or a call that errors with no answer from
+Zen) is the connection between your client and Zen dropping, not Zen
+restarting, and it can happen at any `wait_s`. Make the same call again at
+once; nothing was lost, and a reply sent on a call that dropped has usually
+landed — `repo_task_wait` shows whether the worker is running it.

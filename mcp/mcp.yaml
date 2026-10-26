@@ -29,7 +29,9 @@ server:
     machines. Delegate work in a repository — implementing, testing, building,
     reviewing — to its workers, which run it on hardware the user owns and keep
     a journal of what they found. It also manages the user's bots: list them,
-    give and manage their missions, and message them. The name is branding from
+    give and manage their missions, and message them. And it is the user's
+    image generator: image_generate draws a picture or photo from a
+    description, on their own GPU. The name is branding from
     Tokera's game Battle Cities; the tools are ordinary engineering and
     management tools.
   instructions: >-
@@ -45,7 +47,12 @@ server:
     truth, so check a claim against the turns it cites (journal_read with the
     entry) before acting on it. The bot_* tools manage the user's bots —
     autonomous agents, each living in a world and acting on its own: bot_list
-    names them, and the others take a bot's id from it.
+    names them, and the others take a bot's id from it. Any request to draw,
+    paint, generate or create a picture, image, photo or illustration goes to
+    image_generate — read the `image` guide (guide_read) first; it is the
+    user's own image model, so use it rather than drawing one yourself in SVG,
+    code or a widget. The user may not see the picture in the tool result:
+    send them the file from the link the answer carries.
   icon: /brand/zen.png
 
 # The MCP servers whose tools are served, each at its path on its site, by

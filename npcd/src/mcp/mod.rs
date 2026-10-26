@@ -74,9 +74,10 @@ pub const INSTRUCTIONS: &str =
     "The bot_* tools manage your bots: autonomous agents, each living in \
 a world and acting on its own. bot_list names them; the others take a bot's id from it. Give a \
 mission with bot_mission_give and follow it with bot_mission_read; talk to a bot with \
-bot_message_send and read its replies with bot_message_read. image_generate draws a picture \
-from a text prompt and returns it as an image for you to look at, with a link to the file — \
-the user may not see the image, so send them the file from the link.";
+bot_message_send and read its replies with bot_message_read. Any request to draw or create a \
+picture, image or photo goes to image_generate — the user's own image model, rather than an SVG or \
+widget you draw yourself; read the `image` guide first. It returns the picture for you to look \
+at, with a link to the file — the user may not see the image, so send them the file from the link.";
 
 static IDENTITY: LazyLock<Identity> = LazyLock::new(|| Identity {
     name: "bots".into(),

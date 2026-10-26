@@ -34,6 +34,7 @@ use serde_json::Value;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio::task::{block_in_place, spawn_blocking, JoinHandle};
+use tokio::time::interval;
 use web::auth::Roles;
 
 use crate::accounts::Accounts;
@@ -503,6 +504,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
 
     install_sinks(&runtime, &authored, feelings);
     reload_on_move(&runtime, &authored);
+    retire_drawn_pictures(&authored);
     // Only for a mind still pending: the hook holds the authored state, which
     // holds the runtime, and the load takes it back out once it has run.
     if let Some(source) = repo.as_ref().filter(|_| mind_pending) {
@@ -722,6 +724,48 @@ async fn stop(runtime: Arc<Runtime>, npcs: Arc<RwLock<Npcs>>, guardian: Option<J
         Ok(Err(e)) => tracing::error!("npcd: {e:#}"),
         Err(e) => tracing::error!("npcd: engine shutdown panicked: {e}"),
     }
+}
+
+/// How often the pictures drawn for conversations are looked over for ones
+/// past their day (`crate::images`): an hour, so one is gone within an hour of
+/// its link expiring.
+const RETIRE_DRAWN_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// Retire, every [`RETIRE_DRAWN_EVERY`], the drawn pictures past their day
+/// that no portrait uses. Every member does it; a picture another member
+/// retired first has no note left to act on here. Holds the state weakly, so
+/// the task ends with it.
+fn retire_drawn_pictures(authored: &Arc<Authored>) {
+    let authored = Arc::downgrade(authored);
+    tokio::spawn(async move {
+        let mut every = interval(RETIRE_DRAWN_EVERY);
+        loop {
+            every.tick().await;
+            let Some(authored) = authored.upgrade() else {
+                return;
+            };
+            if authored.runtime.as_ref().is_some_and(|rt| rt.stopping()) {
+                return;
+            }
+            let mut named = authored.npcs.read().await.portrait_ids();
+            named.extend(
+                authored
+                    .personality_portraits
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .cloned(),
+            );
+            let images = authored.images.clone();
+            let now = api::now_ms();
+            match spawn_blocking(move || images.retire_drawn(now, &named)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => tracing::info!("images: {n} drawn pictures retired after their day"),
+                Ok(Err(e)) => tracing::warn!("images: drawn pictures could not be retired: {e}"),
+                Err(e) => tracing::error!("images: retiring drawn pictures panicked: {e}"),
+            }
+        }
+    });
 }
 
 /// npcd's route tables, each over the state it reads.

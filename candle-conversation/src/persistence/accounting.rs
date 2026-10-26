@@ -33,6 +33,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
+use super::blob::BlobKey;
 use super::identity::RecordIdentity;
 use super::record::{RecordHeader, RecordType, SectionTombstonePayload};
 use super::vfs::VfsEventId;
@@ -157,8 +158,10 @@ impl RecordAccounting {
                 (header.record_type, header.stream_id, header.chunk_index)
             }
             // A blob is keyed by its hash's first 128 bits, in the header: a
-            // second record of one hash is the same bytes again, and one of
-            // the two is dead whichever arrived first.
+            // second record of one hash is the same bytes again, and the lesser
+            // stamp is dead whichever arrived first — the one the blob index
+            // does not hold. A blob its tombstone outranks is retired whole
+            // (`retire_blob`).
             RecordType::Blob => (RecordType::Blob, header.stream_id, header.chunk_index),
             // `Snapshot` is header-keyed by a synthetic per-timeline stream
             // id: the newest snapshot supersedes the previous one here — this
@@ -256,6 +259,18 @@ impl RecordAccounting {
     /// is left alone, so retiring twice counts once.
     pub fn retire(&mut self, rt: RecordType, timeline: u64, id: VfsEventId) {
         if let Some(live) = self.live_sizes.remove(&(rt, timeline, id.seq, id.origin)) {
+            self.dead_bytes += live.size;
+        }
+    }
+
+    /// Count blob `key`'s live record as dead: its tombstone outranks it
+    /// (`super::blob::forget_if_retired`). A key not live is left alone, so
+    /// retiring twice counts once.
+    pub fn retire_blob(&mut self, key: BlobKey) {
+        if let Some(live) = self
+            .live_sizes
+            .remove(&(RecordType::Blob, key.hi, key.lo, 0))
+        {
             self.dead_bytes += live.size;
         }
     }

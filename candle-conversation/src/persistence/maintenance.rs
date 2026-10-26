@@ -1884,9 +1884,7 @@ impl SubstratePersistence {
     pub(super) fn blob_relocations(&self, targets: &[SegmentId]) -> Vec<(BlobKey, RecordLoc)> {
         self.blob_index
             .blobs()
-            .iter()
             .filter(|(_, loc)| targets.contains(&loc.segment))
-            .map(|(&key, &loc)| (key, loc))
             .collect()
     }
 
@@ -2257,9 +2255,10 @@ impl SubstratePersistence {
                 live.push(CountedRecord::at(RecordType::VfsTombstone, loc));
             }
         }
-        // Blobs — exactly what `blob_relocations` carries.
-        for loc in self.blob_index.blobs().values() {
-            live.push(CountedRecord::at(RecordType::Blob, loc));
+        // Blobs — exactly what `blob_relocations` carries: a retired one is
+        // not in the index, so its segment reads as that much dead.
+        for (_, loc) in self.blob_index.blobs() {
+            live.push(CountedRecord::at(RecordType::Blob, &loc));
         }
         (live, carried)
     }

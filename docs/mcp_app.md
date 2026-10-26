@@ -175,9 +175,17 @@ from a tool's result — so the draw is also stored in the image store
 `<origin>/v1/image/link/<id>?exp=…&sig=…`. That route is open: the link is its
 own permission, an HMAC-SHA256 over the id and the expiry under a key every
 member derives from the group key (`GroupKey::derive("npcd image links")`),
-good for 7 days (`npcd::image_links`). The model downloads it and sends the
+good for 24 hours (`npcd::image_links`). The model downloads it and sends the
 user the file. `GET /v1/image/:iid`, by id alone, still needs a signed-in
 caller.
+
+A drawn picture is kept as long as its link works. The draw is noted as the
+custom object `image/drawn/<id>` with the moment it was drawn; every member
+looks the notes over hourly, and one past 24 hours has its blob retired —
+unless a character's or personality's portrait names the same image — and
+its note ended (`npcd::images::drawn`). Retiring a blob is a tombstone
+(`docs/replicated_substrate.md` §10.3), so the bytes leave every member's log
+at its next compaction.
 
 **A call reaches the member holding what it acts on.** Character and world
 routes are dispatched to the member holding that character's or world's lease

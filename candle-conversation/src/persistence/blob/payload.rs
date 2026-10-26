@@ -14,7 +14,35 @@ pub struct BlobKey {
     pub lo: u64,
 }
 
+/// What every blob tombstone's key starts with.
+const TOMBSTONE_PREFIX: &str = "blob/";
+
 impl BlobKey {
+    /// The key of the custom object whose tombstone retires this blob:
+    /// `blob/` and the key's 32 hex digits.
+    pub fn tombstone_key(&self) -> String {
+        format!("{TOMBSTONE_PREFIX}{:016x}{:016x}", self.hi, self.lo)
+    }
+
+    /// The blob a custom object's `key` retires, when it is a blob
+    /// tombstone's key.
+    pub fn of_tombstone_key(key: &str) -> Option<BlobKey> {
+        let digits = key.strip_prefix(TOMBSTONE_PREFIX)?;
+        // Lowercase only: the one spelling `tombstone_key` writes, so no other
+        // custom object's key names the same blob.
+        if digits.len() != 32
+            || !digits
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        Some(BlobKey {
+            hi: u64::from_str_radix(&digits[..16], 16).ok()?,
+            lo: u64::from_str_radix(&digits[16..], 16).ok()?,
+        })
+    }
+
     /// The key of the blob whose SHA-256 is `sha256`.
     pub fn of(sha256: &[u8; 32]) -> BlobKey {
         let word = |at: usize| {

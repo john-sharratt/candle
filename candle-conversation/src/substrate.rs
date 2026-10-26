@@ -67,6 +67,7 @@ use std::sync::Arc;
 use crate::conversation::window_sealed_tokens;
 use crate::index_pages::{self, StoredPages};
 use crate::normalization::Phase;
+use crate::persistence::blob::{retired_blob, BlobKey};
 use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
 use crate::persistence::deleted::DeletedPayload;
 use crate::persistence::identity::{RecordIdentity, VersionStamp};
@@ -5156,6 +5157,25 @@ impl Substrate {
         self.custom_objects
             .get(&CustomObjectPayload::stream_id_for(key))
             .filter(|obj| !obj.ceased)
+    }
+
+    /// The identity of the tombstone standing on blob `key`, when its key's
+    /// winning record is one ([`BlobKey::tombstone_key`]): every record of the
+    /// blob it outranks is dead (`docs/replicated_substrate.md` §6.8).
+    pub fn blob_tombstone(&self, key: BlobKey) -> Option<RecordIdentity> {
+        let hash = CustomObjectPayload::stream_id_for(&key.tombstone_key());
+        self.custom_objects
+            .get(&hash)
+            .filter(|obj| obj.ceased)
+            .map(|_| self.custom_object_id(hash))
+    }
+
+    /// Every blob a tombstone stands on.
+    pub fn blob_tombstones(&self) -> Vec<BlobKey> {
+        self.custom_objects
+            .values()
+            .filter_map(retired_blob)
+            .collect()
     }
 
     /// Every live custom object whose key starts with `prefix`, with the

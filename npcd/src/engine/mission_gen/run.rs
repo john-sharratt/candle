@@ -28,7 +28,7 @@ use super::target::{self, Kind, Target};
 use crate::api::now_ms;
 use crate::engine::mind::Minds;
 use crate::engine::mission::{time_step_text, Mission, Todo};
-use crate::engine::prose::{self, decode_call, CallAsk, WORK_BAND};
+use crate::engine::prose::{self, decode_call, CallAsk, Frame, WORK_BAND};
 use crate::engine::runtime::Runtime;
 use crate::engine::work::what_happens;
 use crate::engine::workflow::{OnFailed, Where};
@@ -322,7 +322,17 @@ async fn contradict(
         seed: Some(1),
         choices: Some(vec!["yes".into(), "no".into()]),
     };
-    let answer = prose::decode(engine, base, &request, WORK_BAND, 1, &mut |_: &str| {}).await?;
+    // The judge's voice is fixed, so its frame is kept and read, not prefilled.
+    let answer = prose::decode(
+        engine,
+        base,
+        &request,
+        WORK_BAND,
+        Frame::Kept,
+        1,
+        &mut |_: &str| {},
+    )
+    .await?;
     Ok(answer.text.trim().eq_ignore_ascii_case("yes"))
 }
 
