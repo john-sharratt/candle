@@ -519,7 +519,7 @@ pub fn report_block(hosted: &Hosted, body: &str) -> Option<String> {
 /// Why the body's publish step may not be reported yet: its operation has not
 /// landed on the record (`published`). `None` when it has, or the step does
 /// not check it.
-fn unpublished(s: &Sim, body: &str) -> Option<String> {
+pub(crate) fn unpublished(s: &Sim, body: &str) -> Option<String> {
     let m = s.missions.active(body)?;
     let (id, _) = m.operation()?;
     let work = m.work.as_ref()?;
