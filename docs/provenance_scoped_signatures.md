@@ -208,8 +208,10 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
 - **Declared per layer.** A layer opts in with a `calibrate:` block — how many
   questions, the decode budget of each question's thinking (`think`), and the
   prompt that asks for them (`<<n>>`, `<<subject>>`, `<<file>>`, `<<repo>>`,
-  `<<path>>`). Nothing names a layer; `code_reading` declares 24 questions
-  and 64 thinking tokens — one projection's worth: a turn's first
+  `<<path>>`). Nothing names a layer; `code_reading` and the three analyses of
+  a file (`dependency_analysis`, `code_review`, `security_review`, each asked
+  about what its own analysis answers) declare 24 questions and 64 thinking
+  tokens — one projection's worth: a turn's first
   reprojection fires by the 64-token cadence, so the probe that decides what
   is pulled in has seen at most that much of the model's thinking.
 - **Written by the unit.** Each unit is asked in a draft forked from its

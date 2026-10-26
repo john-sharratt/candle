@@ -27,6 +27,8 @@
 //!   gallery that holds calibration questions.
 //! - **Competitions** (`competitions`): calibration questions scored in a
 //!   competition of their own, combined with the content's.
+//! - **Thinking** (`thinking`): question and thinking probes against the
+//!   calibration competition whole, cut to its questions, or to its thinking.
 //!
 //! The sweep, gate 4, the questions gate, the normalization probe and the
 //! chunk factor scan on a running daemon's gallery
@@ -57,6 +59,8 @@
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> competitions --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> thinking --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> scan-loop [passes] --daemon <url> --node <hex>
 
 mod anomaly;
@@ -79,6 +83,7 @@ mod rules;
 mod scan_loop;
 mod stats;
 mod sweep;
+mod thinking_gate;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -250,6 +255,9 @@ fn main() -> anyhow::Result<()> {
         "competitions" => {
             competitions::run(&files, daemon()?)?;
         }
+        "thinking" => {
+            thinking_gate::run(&files, daemon()?)?;
+        }
         "scan-loop" => {
             let passes = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(5);
             scan_loop::run(&files, passes, daemon()?)?;
@@ -257,7 +265,8 @@ fn main() -> anyhow::Result<()> {
         other => {
             anyhow::bail!(
                 "unknown command `{other}`: files, retrieval, sweep, paper, questions, \
-                 normalization, chunk-factor, density, question-cut, competitions or scan-loop"
+                 normalization, chunk-factor, density, question-cut, competitions, thinking or \
+                 scan-loop"
             )
         }
     }

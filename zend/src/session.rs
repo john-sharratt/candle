@@ -9126,6 +9126,19 @@ mod projection_schema_tests {
             0.5
         );
         assert!(calibrate.prompt.contains("<<path>>"));
+        // So is every analysis of a file, and its calibration weighs alike.
+        for name in ["dependency_analysis", "code_review", "security_review"] {
+            let spec = CalibrateSpec::of(layer(name))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} declares a calibration"));
+            assert_eq!((spec.questions, spec.think), (24, 64), "{name}");
+            assert!(spec.prompt.contains("<<path>>"), "{name}");
+            assert_eq!(
+                layer(name).groups[0].policy.scan.calibration_weight,
+                0.5,
+                "{name}"
+            );
+        }
 
         let ws = layer("dialogue")
             .working_set
