@@ -142,7 +142,6 @@ pub async fn get_guests(State(s): State<Arc<Authored>>) -> Response {
     };
     let (guests, backlog) = {
         let engine = minds.engine();
-        let engine = engine.lock().unwrap();
         (engine.configured_guests(), engine.guest_backlog())
     };
     Json(json!({ "ready": true, "guests": guests, "backlog": backlog })).into_response()
@@ -310,10 +309,10 @@ pub async fn post_image(
 /// behaviour below are stated once rather than re-derived per caller — and a
 /// caller that got either wrong would take the console down with it.
 ///
-/// The submission takes the engine lock only long enough to push. A guest
-/// receipt is a channel, not a borrow, so a caller waiting on a drain does not
-/// hold the lock every other route needs — getting that wrong would make one
-/// image request stop the whole daemon rather than only its inference.
+/// The submission only pushes. A guest receipt is a channel, not a borrow, so
+/// a caller waiting on a drain holds nothing any other route needs — getting
+/// that wrong would make one image request stop the whole daemon rather than
+/// only its inference.
 pub async fn run_guest(
     s: &Arc<Authored>,
     request: GuestRequest,
@@ -351,11 +350,7 @@ pub async fn run_guest_watched(
     let Some(minds) = minds else {
         return Err(GuestError::Abandoned);
     };
-    let receipt = {
-        let engine = minds.engine();
-        let engine = engine.lock().unwrap();
-        engine.submit_guest_watched(request, sink)?
-    };
+    let receipt = { minds.engine().submit_guest_watched(request, sink)? };
 
     // Awaited directly: the receipt's reply is a channel, so a drain that
     // takes a minute parks a future rather than a worker.
@@ -376,9 +371,7 @@ pub async fn configured(s: &Arc<Authored>) -> Vec<candle_conversation::guest::Gu
     let Some(minds) = minds else {
         return Vec::new();
     };
-    let engine = minds.engine();
-    let engine = engine.lock().unwrap();
-    engine.configured_guests()
+    minds.engine().configured_guests()
 }
 
 /// A reference that could not be used, as a status rather than a stream line.

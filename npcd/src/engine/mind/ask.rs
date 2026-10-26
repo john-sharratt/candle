@@ -100,11 +100,7 @@ impl Minds {
                 "this checkpoint has no tool-call grammar, so an answer cannot be forced"
             );
         }
-        let engine = self
-            .engine
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine lock poisoned"))?;
-        compile_calls(&engine, &self.base_config, specs, 1, None)
+        compile_calls(&self.engine, &self.base_config, specs, 1, None)
     }
 
     /// Ask `npc_id` a question and return what it answered.

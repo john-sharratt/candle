@@ -33,7 +33,7 @@
 //! governs the answer itself and the first token the model chooses is already one
 //! of the arms.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use candle_conversation::projection::{
@@ -59,7 +59,7 @@ use crate::prose::{Answer, Request, DEFAULT_SYSTEM};
 /// characters' [`DecodePriority::Normal`]; a judgement an operation waits on
 /// takes [`WORK_BAND`].
 pub async fn decode(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     base: &SequenceConfig,
     request: &Request,
     band: DecodePriority,
@@ -75,7 +75,7 @@ pub async fn decode(
     // the vocabulary cannot compile costs nothing to refuse.
     let (turn_grammar, prefill) = match request.choices.as_deref() {
         Some(arms) if !arms.is_empty() => {
-            let tree = choice_tree(&engine.lock().unwrap(), arms)?;
+            let tree = choice_tree(engine, arms)?;
             (
                 Some(Arc::new(tree)),
                 Some(base.dialect.no_think_block.to_string()),
@@ -154,7 +154,7 @@ pub const WORK_BAND: DecodePriority = DecodePriority::High;
 /// closes on its budget, and the call follows it as one grammar; what comes back
 /// is the call alone.
 pub async fn decode_call(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     base: &SequenceConfig,
     ask: &CallAsk<'_>,
 ) -> anyhow::Result<String> {
@@ -165,7 +165,7 @@ pub async fn decode_call(
 /// [`decode_call`]'s turn as written, its reasoning block with it — what a
 /// caller weighing how the call was arrived at reads.
 pub async fn decode_call_thought(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     base: &SequenceConfig,
     ask: &CallAsk<'_>,
 ) -> anyhow::Result<String> {
@@ -188,7 +188,7 @@ pub async fn decode_call_thought(
         }
     };
     let spec = spec.map_err(|e| anyhow::anyhow!("the answer grammar would not build: {e:#}"))?;
-    let tree = engine.lock().unwrap().compile_stencil(&spec)?;
+    let tree = engine.compile_stencil(&spec)?;
     // **The thinking is budgeted on top of the answer, not out of it.** Given
     // the answer's 2400 tokens for both, a generation that thought at length
     // came back as a call cut off before it closed — "that was not a call" — or
@@ -220,10 +220,10 @@ pub async fn decode_call_thought(
 
 /// The token ids a reasoning block is steered by, from this checkpoint.
 fn think_steer(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     base: &SequenceConfig,
 ) -> anyhow::Result<ThinkSteerEnvelope> {
-    let e = engine.lock().unwrap();
+    let e = engine;
     let tok = e.tokenizer();
     let (Some(think_open), Some(think_close)) =
         (tok.token_to_id("<think>"), tok.token_to_id("</think>"))
@@ -267,7 +267,7 @@ struct Held {
 /// One turn under `system`, in a conversation opened for it and then thrown
 /// away. Returns the text past any prefilled opening, and the tokens decoded.
 async fn framed(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     base: &SequenceConfig,
     system: &str,
     prompt: &str,
@@ -287,20 +287,33 @@ async fn framed(
         band,
     } = held;
 
-    let formatted = base.dialect.format_system_prompt(system);
-    // Taken outside the engine lock below, so that when it is let go — at the
-    // end of this function or on an early return — that lock is not held.
-    let frame = HeldFrame {
-        engine: Arc::clone(engine),
-        id: engine.lock().unwrap().transient_prompt_section(system)?,
-    };
-    let (mut sequence, timeline, decoder) = {
-        let e = engine.lock().unwrap();
-        let (builder, layer, group) = prose_projection(system, frame.id, band)?;
-        let seq = e.new_conversation_with_projection(&formatted, builder, layer, group, cfg)?;
-        let tl = seq.timeline_id();
-        e.mark_timeline_transient(tl);
-        (seq, tl, e.token_decoder())
+    // **The opening runs off the async task.** It waits on the scheduler for a
+    // slot, which answers between waves — a wave's length under load — and it
+    // waits synchronously. On the task it parked a runtime worker for that
+    // long, and stalled everything polled beside this future: the MCP stream's
+    // progress ticker shares its task, so an image call went a minute without
+    // a notification and its client gave it up.
+    //
+    // The frame is held to the end of this function, past the sequence's own
+    // drop below, so the slot reading it goes first.
+    let (_frame, mut sequence, timeline, decoder) = {
+        let engine = Arc::clone(engine);
+        let system = system.to_string();
+        let formatted = base.dialect.format_system_prompt(&system);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let frame = HeldFrame {
+                id: engine.transient_prompt_section(&system)?,
+                engine: Arc::clone(&engine),
+            };
+            let (builder, layer, group) = prose_projection(&system, frame.id, band)?;
+            let seq =
+                engine.new_conversation_with_projection(&formatted, builder, layer, group, cfg)?;
+            let tl = seq.timeline_id();
+            engine.mark_timeline_transient(tl);
+            Ok((frame, seq, tl, engine.token_decoder()))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("the prose opening did not finish: {e}"))??
     };
     // Retired whatever happens — a job that failed half-way leaves nothing
     // worth keeping, and a caller that drops this future mid-decode leaves
@@ -352,15 +365,13 @@ async fn framed(
 /// reading the frame — is dropped first. See
 /// [`ConversationEngine::transient_prompt_section`].
 struct HeldFrame {
-    engine: Arc<Mutex<ConversationEngine>>,
+    engine: Arc<ConversationEngine>,
     id: SectionId,
 }
 
 impl Drop for HeldFrame {
     fn drop(&mut self) {
-        if let Ok(e) = self.engine.lock() {
-            e.release_prompt_section(self.id);
-        }
+        self.engine.release_prompt_section(self.id);
     }
 }
 

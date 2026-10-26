@@ -3860,9 +3860,8 @@ impl Runtime {
         let Some(minds) = minds else {
             return Ok(());
         };
-        let engine = minds.engine();
-        let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-        engine
+        minds
+            .engine()
             .shutdown()
             .map_err(|e| anyhow::anyhow!("engine shutdown: {e}"))
     }
@@ -4252,12 +4251,12 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     // the daemon something: what the guests are, how the ingest is going,
     // whether the model is the one they expected.
     //
-    // Safe because nothing downstream holds the lock for longer than one call
-    // (see [`SharedEngine`]) — the ingest takes it to create a window's
-    // conversations and gives it straight back, so a guest submission never
-    // waits behind a layer. The routes that need the *cast* still report an
-    // empty one until the wake phase, which is true rather than a refusal.
-    let engine: SharedEngine = Arc::new(Mutex::new(engine));
+    // Safe because the engine is shared rather than held (see
+    // [`SharedEngine`]): the ingest creating a window's conversations does not
+    // stand in front of a guest submission. The routes that need the *cast*
+    // still report an empty one until the wake phase, which is true rather
+    // than a refusal.
+    let engine: SharedEngine = Arc::new(engine);
     let minds_over = |files: Option<&MindFiles>| {
         // Retention is read from the mind's own schema, so a deployment that
         // wants whole transcripts omits the block and nothing changes for it.
@@ -4289,7 +4288,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
     if let Some(join) = &plan.cluster {
         p.set_step(LoadStep::Connecting);
         let (node, model, writer, store) = {
-            let e = engine.lock().unwrap();
+            let e = &engine;
             let conv = e.conversation();
             let reloader = e.reloader();
             let store = ConversationStore::new(conv.clone(), e.kv_layers(), move || {
@@ -4402,7 +4401,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             mind_files = rt.mind_files();
             projection = schema::build(mind_files.as_deref(), "battle-cities");
             if let Some(p) = &projection {
-                let conv = engine.lock().unwrap().conversation();
+                let conv = engine.conversation();
                 for (layer, policy) in schema::corrupt_turn_policies(&p.builder) {
                     conv.set_layer_corrupt_turn_policy(layer, policy);
                 }
@@ -4551,7 +4550,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             // another member wrote — or this one, before its ledger was lost —
             // are already in the substrate at a recorded version, and writing
             // them again is how every document came to be held twice.
-            let seeded = mind_record::seed_ledger(&engine.lock().unwrap(), &rt.ledger);
+            let seeded = mind_record::seed_ledger(&engine, &rt.ledger);
             if seeded > 0 {
                 tracing::info!(
                     "mind: {seeded} document(s) already in the substrate, taken into the \
@@ -4567,13 +4566,12 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             // everything on disk is memory's to take.
             let out_of_record: Vec<PathBuf> = rt.ledger.missing(files);
             if !out_of_record.is_empty() {
-                let e = engine.lock().unwrap();
+                let e = &engine;
                 let retired: usize = out_of_record
                     .iter()
                     .filter_map(|p| mind_record::rel(dir, p))
-                    .map(|r| mind_record::retire(&e, &r))
+                    .map(|r| mind_record::retire(e, &r))
                     .sum();
-                drop(e);
                 for p in &out_of_record {
                     rt.ledger.forget(p);
                 }
@@ -4599,7 +4597,7 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                     .as_ref()
                     .and_then(|p| Some((p, shared_target(p, source)?)))
                 {
-                    engine.lock().unwrap().mark_layer_append_only(layer);
+                    engine.mark_layer_append_only(layer);
                     let moved = retire_misplaced(&engine, p.group, source, &rt.ledger);
                     if moved > 0 {
                         tracing::info!(
@@ -4714,14 +4712,14 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                 // A document held twice keeps one copy — the duplicates' tails
                 // then go with their timelines rather than being retired one
                 // by one below.
-                let copies = mind_record::retire_duplicate_documents(&engine.lock().unwrap());
+                let copies = mind_record::retire_duplicate_documents(&engine);
                 if copies > 0 {
                     tracing::info!(
                         copies,
                         "retired the extra copies of documents written more than once"
                     );
                 }
-                let retired = mind_record::retire_unresumed_snapshots(&engine.lock().unwrap());
+                let retired = mind_record::retire_unresumed_snapshots(&engine);
                 if retired > 0 {
                     tracing::info!(
                         retired,
@@ -4738,16 +4736,15 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             // the bearing it stands at draws on. See `bearings`.
             match bearings::Bearings::read(files) {
                 Ok(Some(b)) if !shared_groups.is_empty() => {
-                    let e = engine.lock().unwrap();
+                    let e = &engine;
                     let shelves: Vec<bearings::Shelf> = shared_groups
                         .iter()
-                        .map(|(name, group)| bearings::Shelf::read(&e, name, *group))
+                        .map(|(name, group)| bearings::Shelf::read(e, name, *group))
                         .collect();
                     let scopes = bearings::Scopes::new(b, shelves);
                     for group in scopes.groups() {
                         e.mark_group_scoped(group);
                     }
-                    drop(e);
                     if let Some(minds) = rt.minds.read().unwrap().as_ref() {
                         minds.set_scopes(scopes);
                     }
@@ -4989,7 +4986,7 @@ pub(crate) fn persist_signatures(
 /// this replaced. The sequences are dropped after sealing: the turns are in the
 /// substrate by then and the gather reaches them across conversations, so
 /// holding the sequence would only hold its K/V.
-/// **The engine, shared rather than borrowed, and locked per call.**
+/// **The engine, shared rather than borrowed, and never locked.**
 ///
 /// The ingest used to hold a `&ConversationEngine` for the whole of startup,
 /// and the shared handle was only published once every layer had been ingested
@@ -4997,10 +4994,12 @@ pub(crate) fn persist_signatures(
 /// load, every engine-backed route answered 503 — including the guest routes,
 /// which is exactly when somebody wants to look at the daemon.
 ///
-/// Taking the lock *per engine call* rather than for the phase is the whole of
-/// what makes that safe: a submission needs the lock only long enough to push a
-/// job onto a queue, so it is never waiting behind a layer.
-type SharedEngine = Arc<Mutex<ConversationEngine>>;
+/// No mutex around it, because the engine synchronises itself — every method
+/// takes `&self` — and a lock out here only serialised its callers. Opening a
+/// conversation waits on the scheduler for a slot, which answers between waves,
+/// so behind a lock every opening on the daemon queued a wave apart: a draw's
+/// four compliance questions took a minute to open and one step to answer.
+type SharedEngine = Arc<ConversationEngine>;
 
 /// Retire every live conversation in the substrate — `--wipe-conversations`.
 ///
@@ -5014,7 +5013,6 @@ type SharedEngine = Arc<Mutex<ConversationEngine>>;
 ///
 /// Returns how many it retired.
 fn wipe_conversations(engine: &SharedEngine) -> usize {
-    let engine = engine.lock().unwrap();
     let mut retired = 0;
     for timeline in engine.live_conversations() {
         match engine.tombstone_timeline(timeline) {
@@ -5064,7 +5062,7 @@ fn retire_misplaced(
     source: &ingest::LayerSource,
     ledger: &Ledger,
 ) -> usize {
-    let e = engine.lock().unwrap();
+    let e = &engine;
     let misplaced: Vec<TimelineId> = e
         .group_conversations(live)
         .into_iter()
@@ -5083,7 +5081,6 @@ fn retire_misplaced(
             }
         }
     }
-    drop(e);
     if retired > 0 {
         ledger.forget_under(&source.dir);
         ledger.flush();
@@ -5120,7 +5117,7 @@ async fn ingest_layer(
             // Its frame id comes from its text, so a layer's documents are
             // written under the layer's own prompt rather than under whichever
             // plain prompt sealed a shared id first.
-            let frame = engine.lock().unwrap().plain_prompt_section(&prompt)?;
+            let frame = engine.plain_prompt_section(&prompt)?;
             let b = Builder::for_plain_prompt(&prompt, frame);
             let l = &b.schema().layers[0];
             let (layer, group) = (l.id, l.groups[0].id);
@@ -5149,20 +5146,14 @@ async fn ingest_layer(
         // One round trip for the whole window. Creating them one at a time is
         // what starved zend's own batch to 2–4 wide before it was pipelined.
         //
-        // The lock is taken for this call and released before the window is
-        // submitted — see [`SharedEngine`]. Holding it across the window would
-        // put every other caller, guest submissions included, behind a layer.
-        let convs = engine
-            .lock()
-            .unwrap()
-            .new_conversations_with_projection_batch(
-                slice.len(),
-                &prompt,
-                builder,
-                layer_id,
-                group_id,
-                &cfg,
-            );
+        let convs = engine.new_conversations_with_projection_batch(
+            slice.len(),
+            &prompt,
+            builder,
+            layer_id,
+            group_id,
+            &cfg,
+        );
 
         // Submit every turn first, await none. This is the step that batches.
         let mut inflight = Vec::with_capacity(slice.len());
@@ -5184,7 +5175,7 @@ async fn ingest_layer(
                 Reconcile::Changed
             ) {
                 if let Some(r) = mind_record::rel(mind, &doc.path) {
-                    let gone = mind_record::retire(&engine.lock().unwrap(), &r);
+                    let gone = mind_record::retire(engine, &r);
                     tracing::info!("{addr}: changed — {gone} old conversation(s) retired");
                 }
             }
@@ -5240,12 +5231,7 @@ async fn ingest_layer(
                         p.add_prefill_tokens(r.stats.turn_prefill_tokens as u64);
                         persist_signatures(&mut conv, &r, &mut events, addr);
                         if let Some(rel) = mind_record::rel(mind, &doc.path) {
-                            mind_record::mark_version(
-                                &engine.lock().unwrap(),
-                                timeline,
-                                &rel,
-                                &doc.body,
-                            );
+                            mind_record::mark_version(engine, timeline, &rel, &doc.body);
                         }
                         // **The seal is what earns the ledger entry.** Recorded here, at the
                         // one point the document is provably a turn in the substrate, so a
@@ -5300,7 +5286,7 @@ async fn ingest_layer(
         // This drains completely between windows, so there is no later sweep and
         // a not-yet-warm timeline would simply not be reclaimed.
         if !sealed.is_empty() {
-            if let Err(e) = engine.lock().unwrap().demote_timelines_hot(&sealed, true) {
+            if let Err(e) = engine.demote_timelines_hot(&sealed, true) {
                 tracing::warn!("hot→warm demote failed: {e} — the arena will fill");
             }
         }
@@ -5387,7 +5373,7 @@ async fn run_life(
             // intention it formed, leave memory before it is lived again.
             Reconcile::Changed => {
                 if let Some(r) = &rel {
-                    let gone = mind_record::retire(&engine.lock().unwrap(), r);
+                    let gone = mind_record::retire(engine, r);
                     tracing::info!(
                         "life {who}: {} changed — {gone} conversation(s) retired",
                         ep.title
@@ -5414,7 +5400,7 @@ async fn run_life(
         // signature, which is the whole point of running the life against the
         // world rather than beside it.
         let mut conv = match proj {
-            Some(pr) => engine.lock().unwrap().new_conversation_with_projection(
+            Some(pr) => engine.new_conversation_with_projection(
                 &pr.prelude,
                 pr.builder.clone(),
                 pr.layer,
@@ -5422,8 +5408,6 @@ async fn run_life(
                 cfg.clone(),
             )?,
             None => engine
-                .lock()
-                .unwrap()
                 .new_conversation(&format!("An episode from the life of {who}."), cfg.clone())?,
         };
         let address = life::address(ep);
@@ -5459,17 +5443,13 @@ async fn run_life(
         // needs to reach an episode by *when* rather than only by what it said.
         let timeline = conv.timeline_id();
         if let Some(r) = &rel {
-            mind_record::mark_version(&engine.lock().unwrap(), timeline, r, &raw);
+            mind_record::mark_version(engine, timeline, r, &raw);
         }
         for (key, value) in [
             ("life.date", ep.date.as_str()),
             ("life.title", ep.title.as_str()),
         ] {
-            if let Err(e) = engine
-                .lock()
-                .unwrap()
-                .set_conversation_metadata(timeline, key, value)
-            {
+            if let Err(e) = engine.set_conversation_metadata(timeline, key, value) {
                 tracing::debug!("life {who}: metadata {key} not set — {e:?}");
             }
         }
@@ -5501,11 +5481,7 @@ async fn run_life(
         }
 
         // Give the arena back — the same reason the layer ingest does.
-        if let Err(e) = engine
-            .lock()
-            .unwrap()
-            .demote_timelines_hot(&[timeline], true)
-        {
+        if let Err(e) = engine.demote_timelines_hot(&[timeline], true) {
             tracing::debug!("life {who}: demote failed — {e}");
         }
         p.set_progress(i as u64 + 1, episodes.len() as u64);
@@ -5550,14 +5526,14 @@ async fn write_consequence(
     );
 
     let mut conv = match proj {
-        Some(pr) => engine.lock().unwrap().new_conversation_with_projection(
+        Some(pr) => engine.new_conversation_with_projection(
             &pr.prelude,
             pr.builder.clone(),
             pr.layer,
             pr.group,
             cfg.clone(),
         )?,
-        None => engine.lock().unwrap().new_conversation(
+        None => engine.new_conversation(
             &format!("What {who}'s life left them holding."),
             cfg.clone(),
         )?,
@@ -5584,11 +5560,11 @@ async fn write_consequence(
     // it contradicts.
     persist_signatures(&mut conv, &r, &mut events, &address);
     {
-        let e = engine.lock().unwrap();
+        let e = &engine;
         let _ = e.set_conversation_metadata(timeline, "from.date", &ep.date);
         let _ = e.set_conversation_metadata(timeline, "from.title", &ep.title);
         if let Some(r) = rel {
-            mind_record::mark(&e, timeline, r);
+            mind_record::mark(e, timeline, r);
         }
         let _ = e.demote_timelines_hot(&[timeline], true);
     }

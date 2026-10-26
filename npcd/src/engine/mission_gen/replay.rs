@@ -14,7 +14,7 @@
 //! `cargo test --release -p npcd --lib replay -- --ignored --nocapture`
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use candle::Device;
@@ -104,9 +104,7 @@ fn the_reading_replayed_on_the_real_model() {
     let device = Device::new_cuda(0).expect("a CUDA device");
     let mut builder = MODEL.builder().workspace_path(workspace.path());
     let conversation = builder.conversation_config();
-    let engine = Arc::new(Mutex::new(
-        builder.engine(&device).expect("the engine loads"),
-    ));
+    let engine = Arc::new(builder.engine(&device).expect("the engine loads"));
     // The daemon's own config: `Minds::new` resolves the reasoning block's
     // close tokens and budget. Taken from the builder alone, the block's
     // close never fired and the readings thought past their budget.
@@ -161,8 +159,6 @@ fn the_reading_replayed_on_the_real_model() {
 
     let tokens = |text: &str| -> usize {
         engine
-            .lock()
-            .unwrap()
             .tokenizer()
             .encode(text, false)
             .map(|e| e.get_ids().len())

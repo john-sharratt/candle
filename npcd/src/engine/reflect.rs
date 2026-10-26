@@ -55,7 +55,7 @@
 //! chosen to stand still, and blocking it costs nothing it had not already
 //! spent. The **dream** is the part that stays asynchronous; this is not.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use candle_conversation::stencil::{
     compile_think_tree, compile_tool_call_tree, Param as CallParam, ParamType, StencilTree,
@@ -364,7 +364,7 @@ fn rewritten(before: &str, after: &str) -> bool {
 ///   without a separate think stencil. A turn carries one grammar and this one
 ///   already spends it.
 fn call_tree(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     env: &ToolCallEnvelope,
     tool: &Tool,
 ) -> Option<Arc<StencilTree>> {
@@ -397,8 +397,7 @@ fn call_tree(
             return None;
         }
     };
-    let e = engine.lock().ok()?;
-    match e.compile_stencil(&tree) {
+    match engine.compile_stencil(&tree) {
         Ok(t) => Some(Arc::new(t)),
         Err(err) => {
             tracing::warn!(
@@ -516,11 +515,10 @@ fn json_argument(answer: &str, name: &str) -> Option<String> {
 /// `None` when the checkpoint's tokenizer has no single `<think>` token, in
 /// which case the turn free-decodes exactly as it did before.
 pub(crate) fn think_off(
-    engine: &Arc<Mutex<ConversationEngine>>,
+    engine: &Arc<ConversationEngine>,
     cfg: &SequenceConfig,
 ) -> Option<Arc<StencilTree>> {
-    let e = engine.lock().ok()?;
-    let tok = e.tokenizer();
+    let tok = engine.tokenizer();
     let steer = ThinkSteerEnvelope {
         think_open: tok.token_to_id("<think>")?,
         think_close: tok.token_to_id("</think>")?,
@@ -534,7 +532,7 @@ pub(crate) fn think_off(
     // Every dial yields a tree, `Off` included — suppression is structural, so
     // there is no `None` to propagate here.
     let spec = compile_think_tree(ThinkMode::Off, &steer);
-    match e.compile_stencil(&spec) {
+    match engine.compile_stencil(&spec) {
         Ok(t) => Some(Arc::new(t)),
         Err(e) => {
             tracing::warn!(
@@ -1024,7 +1022,7 @@ fn addresses_the_dreamer(brief: &str) -> bool {
 /// conversation's lifetime, and there is nothing to hold between two of them by
 /// design.
 pub struct Reflect<'t> {
-    engine: Arc<Mutex<ConversationEngine>>,
+    engine: Arc<ConversationEngine>,
     base_config: SequenceConfig,
     /// **Borrowed from the mind, never copied into here.** A default kept
     /// alongside is a second wording of the same prompt, and the two diverge —
@@ -1045,7 +1043,7 @@ pub struct Reflect<'t> {
 
 impl<'t> Reflect<'t> {
     pub fn new(
-        engine: Arc<Mutex<ConversationEngine>>,
+        engine: Arc<ConversationEngine>,
         base_config: SequenceConfig,
         turns: &'t ReflectionTurns,
     ) -> Self {
@@ -1119,7 +1117,7 @@ impl<'t> Reflect<'t> {
         };
 
         let (mut sequence, timeline) = {
-            let engine = self.engine.lock().unwrap();
+            let engine = &self.engine;
             let seq = match self.projected {
                 // Its own dreams, gathered deep — §4: a reflection is the same
                 // retrieval as an acting turn, run further. See `dreams`.

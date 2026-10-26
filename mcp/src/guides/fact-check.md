@@ -6,7 +6,9 @@ tools: [repo_task_start, repo_task_wait, journal_grep, timeline_read]
 # Fact-checking
 
 **Use when** claims need checking before they are relied on: a document, an
-article, a worker's answer, a vendor's announcement.
+article, a worker's answer, a vendor's announcement. Claims about the user's
+code go to a worker; claims checked against the web go to one only when the
+user asks — otherwise check them yourself, by the same method.
 
 ## Delegate
 
