@@ -179,6 +179,8 @@ r7Lm| impl KvCache > fn seal_chunk
 {"path": "…", "at": "9fTa", "do": "insert_after",  "text": "The tank sighed."}
 {"path": "…", "at": "Qm7x", "do": "insert_before", "text": "…"}
 {"path": "…", "at": "b4_K", "do": "delete"}
+{"path": "…", "at": "b4_K", "to": "9fTa", "do": "replace", "text": "…"}
+{"path": "…", "at": "Qm7x", "do": "move", "dest": "cX0e", "where": "after"}
 ```
 
 - **`replace`** without `old` replaces the whole unit with `text`. With `old`,
@@ -188,6 +190,12 @@ r7Lm| impl KvCache > fn seal_chunk
 - **`insert_before` / `insert_after`** add `text` as a new unit beside the
   anchored one.
 - **`delete`** removes the unit; `text` is not given.
+- **`to`** (optional, on `replace` without `old` and on `delete`) extends the
+  span from `at` through `to`, inclusive, in document order: three adjacent
+  paragraphs or helpers are one call. A `to` before `at` is refused.
+- **`move`** takes the unit at `at` (through `to`, when given) and puts it
+  `before` or `after` the unit at `dest`, without decoding its text again. A
+  `dest` inside the moved span is refused.
 - One operation per call. Several calls from one read stay valid, because an
   edit changes only its own unit's anchor (and the anchor of any later unit
   whose seed was bumped by it — a copy of the same text).
@@ -203,14 +211,21 @@ r7Lm| impl KvCache > fn seal_chunk
 The edit is decoded under the tool grammar like every act
 (`engine::tools`):
 
-- **`at`** is an enum of the anchors the character was last shown for that
+- **`path`** is an enum of the documents the character holds anchors for, and
+  each path **brings its own `at`** (the stencil's per-value `shapes`, as
+  `invoke`'s `url` brings its `body`): after a path, `at`, `to` and `dest` are
+  enums of that document's shown anchors only. Paths with equal anchor sets
+  share one sub-tree.
+- **`at`** is therefore an anchor the character was last shown for that
   document (§5). An anchor that does not exist cannot be emitted. Once the
   model has emitted enough of it to pick one out — usually its first token —
   the rest is forced.
-- **`do`** is an enum of the four operations; **`text`** is free prose; **`old`**
-  is bound to the substrings of the anchored unit where the stencil can express
-  that, and otherwise checked by the act (an `old` that does not occur once in
-  the unit is refused, as `file_edit` refuses today).
+- **`do`** is an enum of the five operations; **`text`** is free prose.
+- **`old`** is free text checked by the act: the stencil has no substring
+  constraint, so an `old` that does not occur once in the unit is refused, as
+  `file_edit` refuses today.
+- A document with no units (empty, or whitespace only) offers no anchors and so
+  no `file_edit`; its first text is written with `file_write`.
 
 ### Staleness
 
@@ -220,6 +235,10 @@ edit, the engine's tidy pass, a merge from the record — the anchor either no
 longer exists or names different text, and the act refuses: *"That paragraph
 has changed since you read it; read it again."* No edit is ever applied to text
 the character did not see.
+
+The shown anchors live in memory, so a restart forgets them; the first edit of a
+document after one is refused the same way — *read it again* — never as "no such
+paragraph".
 
 ### The reply
 
@@ -247,6 +266,17 @@ composed whole, as today.
 
 `compose` keeps writing first drafts and genuine rewrites whole.
 
+## 7a. Other places that cite lines
+
+- **`file_grep`** labels each hit with the anchor and scope path of the unit it
+  falls in, and records those anchors as shown, so a hit can be edited without
+  a read.
+- **Tool output that is not a read** — compiler errors, test failures, diffs,
+  blame — keeps its own line numbers. It describes the world, not the editing
+  surface; an author goes from it to a read, and edits from the read.
+- **zend's MCP endpoint** carries the same `file_read`/`file_edit` as every other
+  caller: one form, anchors. Its tool description teaches the convention.
+
 ## 8. Expected cost
 
 | change | today | anchored |
@@ -259,6 +289,11 @@ composed whole, as today.
 
 Prefill is the cheap side (hundreds of tok/s on the same machine), so the read
 cost is negligible beside the decode it saves.
+
+The anchor's forced remainder is decided without logits (`batched_sampler`'s
+single-allowed-token path), but whether it is fed in one step or one decode
+step per token is measured, not assumed (§10): at worst an anchor costs 2–4
+decode steps, not 1–2.
 
 ## 9. Migration
 
@@ -314,6 +349,15 @@ Unit tests beside the code, asserting raw values:
 - **Grammar**: the edit act's `at` enum is exactly the shown anchors; an empty
   set removes the act (`tools::stencil_params`' empty-set rule).
 
-Live measurement on WhiteWorld after landing: decoded tokens per `fix` and
-`review` step, edit refusals by cause, and operation turnaround through the
-pipeline, against the same figures for whole-piece mending.
+- **Ranges and moves**: `to` before `at` refused; a move into its own span
+  refused; a moved unit keeps its anchor.
+- **Grep**: a hit is labelled with its unit's anchor, and that anchor is then
+  editable without a read.
+
+Measurement, before and after landing:
+
+- **Baseline first**, from the build before the change: decoded tokens and
+  refusals per `fix` and `review` step on WhiteWorld, and zend's `file_edit`
+  refusal rate.
+- **After landing**, the same figures, edit refusals by cause, operation
+  turnaround through the pipeline, and decode steps per emitted anchor (§8).
