@@ -31,7 +31,7 @@
 //! superseding record: the id stays taken, because the acts it already
 //! committed still name it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use candle_conversation::models::identity::LegacySpec;
@@ -829,6 +829,15 @@ impl Npcs {
         npc.portrait_image_id = Some(image_id);
         npc.portrait_origin = Some(origin.to_string());
         self.bump(npc, owner, now_ms)
+    }
+
+    /// The image every character's portrait names — what a drawn picture's
+    /// retirement leaves alone.
+    pub fn portrait_ids(&self) -> HashSet<String> {
+        self.by_id
+            .values()
+            .filter_map(|n| n.portrait_image_id.clone())
+            .collect()
     }
 
     /// Every character whose portrait names an image `renames` has a new name

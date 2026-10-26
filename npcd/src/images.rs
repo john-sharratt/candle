@@ -31,11 +31,16 @@
 //! before it is stored, so what this serves back to browsers is images and
 //! nothing else — a stored `.html` served from this origin would run in it.
 
+mod drawn;
+
+pub use drawn::KEPT as DRAWN_KEPT;
+
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
 
 use candle_conversation::persistence::blob::{hex, parse_hex};
-use candle_conversation::persistence::SharedSubstrate;
+use candle_conversation::persistence::{PersistenceError, SharedSubstrate};
 
 /// Four megabytes. A generous portrait and nowhere near a way to fill a disk
 /// one upload at a time.
@@ -47,7 +52,7 @@ pub enum ImageError {
     NotAnImage,
     TooLarge(usize),
     NotFound,
-    Io(std::io::Error),
+    Io(io::Error),
 }
 
 impl std::fmt::Display for ImageError {
@@ -61,6 +66,13 @@ impl std::fmt::Display for ImageError {
             Self::NotFound => write!(f, "no such image"),
             Self::Io(e) => write!(f, "{e}"),
         }
+    }
+}
+
+/// The substrate failed to store or read one.
+impl From<PersistenceError> for ImageError {
+    fn from(e: PersistenceError) -> Self {
+        Self::Io(io::Error::other(format!("{e:?}")))
     }
 }
 
@@ -151,16 +163,22 @@ impl Images {
     ///
     /// The id is `<64 hex of the content hash>.<ext>` — content-addressed, so
     /// the same portrait uploaded twice is stored once, and idempotent, so a
-    /// retried upload is not a second blob.
+    /// retried upload is not a second blob. A picture drawn for a conversation
+    /// that is stored this way — a portrait made of it — is kept from then on
+    /// rather than retired after its day (`drawn`).
     pub fn put(&self, bytes: &[u8]) -> Result<String, ImageError> {
+        let id = self.store(bytes)?;
+        self.keep_drawn(&id)?;
+        Ok(id)
+    }
+
+    /// Store `bytes` as an image and give back its id.
+    fn store(&self, bytes: &[u8]) -> Result<String, ImageError> {
         if bytes.len() > MAX_BYTES {
             return Err(ImageError::TooLarge(bytes.len()));
         }
         let ext = sniff(bytes).ok_or(ImageError::NotAnImage)?;
-        let sha256 = self
-            .shared
-            .put_blob(bytes.to_vec())
-            .map_err(|e| ImageError::Io(std::io::Error::other(format!("{e:?}"))))?;
+        let sha256 = self.shared.put_blob(bytes.to_vec())?;
         Ok(format!("{}.{ext}", hex(&sha256)))
     }
 
@@ -170,11 +188,7 @@ impl Images {
     /// in a URL, and only a hash and a known format are ever looked up.
     pub fn get(&self, id: &str) -> Result<(Vec<u8>, &'static str), ImageError> {
         let (sha256, format) = valid_id(id).ok_or(ImageError::NotFound)?;
-        let bytes = self
-            .shared
-            .blob(&sha256)
-            .map_err(|e| ImageError::Io(std::io::Error::other(format!("{e:?}"))))?
-            .ok_or(ImageError::NotFound)?;
+        let bytes = self.shared.blob(&sha256)?.ok_or(ImageError::NotFound)?;
         Ok((bytes, format))
     }
 }

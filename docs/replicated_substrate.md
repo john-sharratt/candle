@@ -3546,6 +3546,21 @@ its own copy (§9.4). Nothing tracks that.
   is `<sha256-hex>.<ext>`, and `portrait_image_id` names it. A daemon's old `images/`
   folder is taken in once at startup, and every character's portrait pointing at an old
   id is pointed at the blob it became.
+
+  Of two records of one hash — the same bytes written again, or by another member — the
+  greater stamp is the live one, as for any key (§6.5); the blob index
+  (`persistence/blob/index.rs`) holds it, and the accounting counts the other dead.
+
+  **A blob is retired by a tombstone**: the custom object `blob/<32 hex>` — the key's
+  first 128 bits, as the header names the blob — marked ceased
+  (`SharedSubstrate::retire_blob`). It is a keyed tombstone like any other: it replicates,
+  wins by stamp, and expires by §6.8's two conditions. It kills every record of its blob
+  that it outranks, and only those, so the order a blob and its tombstone arrive in does
+  not matter (§6.9), and the same bytes written after it — a portrait uploaded from a
+  picture that was retired — are a newer record and live. A killed blob leaves the index
+  and is counted dead, so it reads as absent at once, and the next compaction, or
+  maintenance pass over its segment, does not carry it. npcd retires the pictures drawn
+  for a conversation 24 hours after they are drawn (`mcp_app.md` §4).
 - **Device tokens** stay local. They authenticate a device to the one machine it was
   issued on.
 
