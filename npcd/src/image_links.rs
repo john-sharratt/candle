@@ -32,11 +32,6 @@ use crate::images::Kept;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// How long a link works: as long as a drawn picture is kept
-/// ([`Kept::Drawn`]), a day — long enough to be fetched, passed on and opened
-/// by the person it was passed to.
-pub const LIFETIME: Duration = Kept::Drawn.lifetime();
-
 /// How long an upload link takes a picture: long enough for a client to
 /// fetch the file it was handed and send it, short enough that a link left in
 /// a transcript is no standing way in.
@@ -85,10 +80,11 @@ impl ImageLinks {
         Self { key }
     }
 
-    /// The path, from the origin, that opens image `id` for [`LIFETIME`] from
-    /// `now_s` (Unix seconds).
-    pub fn path(&self, id: &str, now_s: u64) -> String {
-        let exp = now_s + LIFETIME.as_secs();
+    /// The path, from the origin, that opens image `id` from `now_s` (Unix
+    /// seconds) for as long as a picture kept for `why` is kept — a draw's day,
+    /// an edit's hour — so a link never outlives what it opens.
+    pub fn path(&self, id: &str, now_s: u64, why: Kept) -> String {
+        let exp = now_s + why.lifetime().as_secs();
         let sig: [u8; 32] = self.mac(id, exp).finalize().into_bytes().into();
         format!("/v1/image/link/{id}?exp={exp}&sig={}", hex(&sig))
     }
@@ -170,7 +166,7 @@ mod tests {
     #[test]
     fn a_link_opens_its_image_for_a_day_on_any_member() {
         let links = ImageLinks::new([7; 32]);
-        let path = links.path(ID, NOW);
+        let path = links.path(ID, NOW, Kept::Drawn);
         assert!(path.starts_with(&format!("/v1/image/link/{ID}?exp=1800086400&sig=")));
         let (exp, sig) = parts(&path);
         assert_eq!(exp, NOW + 24 * 60 * 60);
@@ -179,6 +175,9 @@ mod tests {
         assert_eq!(member.check(ID, exp, &sig, NOW), Ok(()));
         assert_eq!(member.check(ID, exp, &sig, exp - 1), Ok(()));
         assert_eq!(member.check(ID, exp, &sig, exp), Err(Refused::Expired));
+        // An edit's link lasts its hour.
+        let (exp, _) = parts(&links.path(ID, NOW, Kept::Edited));
+        assert_eq!(exp, NOW + 60 * 60);
     }
 
     /// **Nothing in a link can be changed**: another image, a later expiry, an
@@ -186,7 +185,7 @@ mod tests {
     #[test]
     fn a_link_altered_in_any_part_is_refused() {
         let links = ImageLinks::new([7; 32]);
-        let (exp, sig) = parts(&links.path(ID, NOW));
+        let (exp, sig) = parts(&links.path(ID, NOW, Kept::Drawn));
         let other = ID.replace(".jpg", ".png");
         assert_eq!(links.check(&other, exp, &sig, NOW), Err(Refused::Invalid));
         assert_eq!(links.check(ID, exp + 1, &sig, NOW), Err(Refused::Invalid));
@@ -219,7 +218,7 @@ mod tests {
         assert_eq!(links.check_upload(exp, &sig, NOW), Ok(()));
         assert_eq!(links.check_upload(exp, &sig, exp), Err(Refused::Expired));
         assert_eq!(links.check(ID, exp, &sig, NOW), Err(Refused::Invalid));
-        let (exp, sig) = parts(&links.path(ID, NOW));
+        let (exp, sig) = parts(&links.path(ID, NOW, Kept::Drawn));
         assert_eq!(links.check_upload(exp, &sig, NOW), Err(Refused::Invalid));
         // Nor does an upload's signature open the "image" called `upload`.
         let (exp, sig) = parts(&links.upload_path(NOW));
@@ -229,7 +228,7 @@ mod tests {
     #[test]
     fn a_minted_key_is_the_processes_own() {
         let a = ImageLinks::minted();
-        let (exp, sig) = parts(&a.path(ID, NOW));
+        let (exp, sig) = parts(&a.path(ID, NOW, Kept::Drawn));
         assert_eq!(a.check(ID, exp, &sig, NOW), Ok(()));
         assert_eq!(
             ImageLinks::minted().check(ID, exp, &sig, NOW),

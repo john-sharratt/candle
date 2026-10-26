@@ -15,7 +15,7 @@
 //! id becomes a file name is a save, and that goes through
 //! `registry::id::check` first.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, RwLock as SyncRwLock};
 
@@ -266,6 +266,20 @@ impl Authored {
     pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Arc<Self> {
         self.runtime = Some(runtime);
         Arc::new(self)
+    }
+
+    /// Every image a portrait names — a character's or a personality's: what
+    /// no retirement of a kept picture may take.
+    pub async fn portrait_image_ids(&self) -> HashSet<String> {
+        let mut named = self.npcs.read().await.portrait_ids();
+        named.extend(
+            self.personality_portraits
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .cloned(),
+        );
+        named
     }
 
     /// What time it is in a character's world — the async route in.
@@ -5377,7 +5391,7 @@ layers:
         )
         .await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
-        let link = st.image_links.path(&image_id, now_ms() / 1000);
+        let link = st.image_links.path(&image_id, now_ms() / 1000, Kept::Drawn);
         let (s, got) = call_raw(router(st.clone()), get(&link, None)).await;
         assert_eq!(s, StatusCode::OK, "{link}");
         assert_eq!(got, png, "the link served other bytes");
@@ -5394,7 +5408,7 @@ layers:
             (s, v["error"].as_str()),
             (StatusCode::FORBIDDEN, Some("link_invalid"))
         );
-        let expired = st.image_links.path(&image_id, 0);
+        let expired = st.image_links.path(&image_id, 0, Kept::Drawn);
         let (s, v) = call(router(st.clone()), get(&expired, None)).await;
         assert_eq!(
             (s, v["error"].as_str()),

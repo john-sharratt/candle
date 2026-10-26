@@ -181,9 +181,13 @@ good for 24 hours (`npcd::image_links`). The model downloads it and sends the
 user the file. `GET /v1/image/:iid`, by id alone, still needs a signed-in
 caller.
 
-A drawn picture is kept as long as its link works, an uploaded one an hour.
-Each is noted as the custom object `image/drawn/<id>` or `image/uploaded/<id>`
-with the moment it arrived; every member looks the notes over every ten
+A drawn picture is kept as long as its link works, an uploaded one an hour,
+and an edit an hour or until two more edits follow it: an edit is always a
+new image, its note (`image/edited/<id>`) names the picture it came from, and
+making C from B, made from A, retires A at once — B stays, so editing from it
+undoes a step, and repeated edits do not pile up. Each is noted as the custom
+object `image/drawn/<id>`, `image/uploaded/<id>` or `image/edited/<id>` with
+the moment it arrived; every member looks the notes over every ten
 minutes, and a picture whose every note has run its time has its blob
 retired — unless a character's or personality's portrait names the same
 image — and its notes ended (`npcd::images::kept`). Retiring a blob is a

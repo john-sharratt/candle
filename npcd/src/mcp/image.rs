@@ -107,20 +107,30 @@ impl Tool for Generate {
 
     async fn call(s: &Arc<Authored>, headers: &HeaderMap, args: &Value) -> Answer {
         match body(args).and_then(|b| Ok((b, format(args)?))) {
-            Ok((body, format)) => draw(s, headers, body, format).await,
+            Ok((body, format)) => draw(s, headers, body, format, Made::Drawn).await,
             Err(e) => Answer::error(e),
         }
     }
 }
 
+/// What a draw makes: a new picture, or an edit of one.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Made<'a> {
+    /// `image_generate`: kept a day.
+    Drawn,
+    /// `image_edit` of `from`: kept an hour or until two edits on.
+    Edited { from: &'a str },
+}
+
 /// Run the draw `body` asks for and answer with its picture as `format`, and
-/// the link to it stored for a day — `image_generate`'s answer, and
+/// a link to it for as long as it is kept — `image_generate`'s answer, and
 /// `image_edit`'s.
 pub(super) async fn draw(
     s: &Arc<Authored>,
     headers: &HeaderMap,
     body: ImageBody,
     format: Format,
+    made: Made<'_>,
 ) -> Answer {
     let res = post_image(State(Arc::clone(s)), headers.clone(), Json(body)).await;
     let status = res.status();
@@ -136,9 +146,24 @@ pub(super) async fn draw(
         Err(e) => return Answer::error(e),
     };
     let now = now_ms();
-    let link = s.images.put_kept(&drawn.file, Kept::Drawn, now).map(|id| {
-        let path = s.image_links.path(&id, now / 1000);
-        format!("{}{path}", origin::of(headers))
+    let stored = match made {
+        Made::Drawn => s
+            .images
+            .put_kept(&drawn.file, Kept::Drawn, now)
+            .map(|id| (id, Kept::Drawn)),
+        Made::Edited { from } => match s.images.put_edited(&drawn.file, from, now) {
+            Ok((id, gone)) => {
+                if let Some(gone) = gone {
+                    retire_unless_portrait(s, &gone).await;
+                }
+                Ok((id, Kept::Edited))
+            }
+            Err(e) => Err(e),
+        },
+    };
+    let link = stored.map(|(id, why)| {
+        let path = s.image_links.path(&id, now / 1000, why);
+        (format!("{}{path}", origin::of(headers)), why)
     });
     Answer::picture(
         said(&drawn.said, link.map_err(|e| e.to_string())),
@@ -147,6 +172,18 @@ pub(super) async fn draw(
             mime_type: drawn.mime.into(),
         },
     )
+}
+
+/// Retire image `id`, two edits back, unless a portrait uses it. A failure is
+/// logged and left to the sweep, which retires it after its hour: the edit
+/// that asked has already succeeded.
+async fn retire_unless_portrait(s: &Authored, id: &str) {
+    if s.portrait_image_ids().await.contains(id) {
+        return;
+    }
+    if let Err(e) = s.images.retire(id) {
+        tracing::warn!("images: {id}, two edits back, could not be retired: {e}");
+    }
 }
 
 /// A finished draw: what it says of itself, and the file `format` asked for —
@@ -159,11 +196,17 @@ struct Drawn {
     mime: &'static str,
 }
 
-/// The answer's text: the draw's own line, then its link — or, when the file
-/// could not be stored, that there is none and why.
-fn said(drawn: &str, link: Result<String, String>) -> String {
+/// The answer's text: the draw's own line, then its link and how long the
+/// picture lives — or, when the file could not be stored, that there is none
+/// and why.
+fn said(drawn: &str, link: Result<(String, Kept), String>) -> String {
     match link {
-        Ok(url) => format!("{drawn} The file, for 24 hours and without signing in: {url}"),
+        Ok((url, Kept::Edited)) => format!(
+            "{drawn} A new image, kept for 1 hour or until two more edits follow it. The image \
+             it was edited from stays until this one is edited — edit from that to undo this \
+             step. The file, without signing in: {url}"
+        ),
+        Ok((url, _)) => format!("{drawn} The file, for 24 hours and without signing in: {url}"),
         Err(e) => format!("{drawn} There is no link to the file: it could not be stored ({e})."),
     }
 }
@@ -327,10 +370,19 @@ mod tests {
         assert_eq!(
             said(
                 "Drew a 512x512 image, seed 7.",
-                Ok("https://bot.tokera.com/v1/image/link/ab.jpg?exp=9&sig=cd".into())
+                Ok((
+                    "https://bot.tokera.com/v1/image/link/ab.jpg?exp=9&sig=cd".into(),
+                    Kept::Drawn
+                ))
             ),
             "Drew a 512x512 image, seed 7. The file, for 24 hours and without signing in: \
              https://bot.tokera.com/v1/image/link/ab.jpg?exp=9&sig=cd"
+        );
+        assert_eq!(
+            said("Drew it.", Ok(("U".into(), Kept::Edited))),
+            "Drew it. A new image, kept for 1 hour or until two more edits follow it. The image \
+             it was edited from stays until this one is edited — edit from that to undo this \
+             step. The file, without signing in: U"
         );
         assert_eq!(
             said("Drew it.", Err("no such image".into())),

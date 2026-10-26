@@ -5,8 +5,11 @@
 //! The picture is the draw's **reference**: the walk starts from it rather than
 //! from noise, and `hold` is how much of it survives. So the prompt describes
 //! the whole picture as it should end up, not only the change, and the answer
-//! is a new picture with its own link — which is itself something to edit, so
-//! a picture is refined a step at a time.
+//! is a new picture with its own id and link — which is itself something to
+//! edit, so a picture is refined a step at a time. The chain keeps two: an
+//! edit kept an hour, and the picture two edits back retired as the new one
+//! is made (`crate::images::Kept`), so the step before is always there to
+//! undo to and repeated edits do not pile up.
 //!
 //! **A picture is named, never sent.** `image` takes the link or id a draw, an
 //! edit or an upload (`image_upload`) answered with, and the bytes are read
@@ -32,7 +35,7 @@ use candle_conversation::guest::MAX_REFERENCE_HOLD;
 use serde_json::{json, Value};
 
 use super::args::string;
-use super::image::{body, draw, format, MAX_SIDE, STEPS};
+use super::image::{body, draw, format, Made, MAX_SIDE, STEPS};
 use super::{Answer, Tool};
 use crate::api::Authored;
 use crate::guest_routes::ImageBody;
@@ -61,9 +64,9 @@ impl Tool for Edit {
                 is the link or id image_generate, an earlier image_edit, or image_upload (for a \
                 picture of the user's own) answered with. The prompt describes the whole picture \
                 as it should end up, not only the change; `hold` is how much of the original \
-                survives. Answers like image_generate: the new picture for you to look at, and a \
-                link to its file for 24 hours, which can be edited again. Read the guide `image` \
-                first.",
+                survives. Every edit makes a new image with its own link, kept for 1 hour or \
+                until two more edits follow it; the image before stays until the new one is \
+                edited, so editing from it undoes a step. Read the guide `image` first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -88,8 +91,9 @@ impl Tool for Edit {
             Ok(b) => b,
             Err(e) => return Answer::error(e),
         };
+        let from = image_id(args["image"].as_str().unwrap_or_default());
         match edit_body(args, &source).and_then(|b| Ok((b, format(args)?))) {
-            Ok((body, format)) => draw(s, headers, body, format).await,
+            Ok((body, format)) => draw(s, headers, body, format, Made::Edited { from }).await,
             Err(e) => Answer::error(e),
         }
     }

@@ -1,6 +1,13 @@
 //! Pictures kept for a while, then retired: one drawn for a conversation
-//! (`image_generate`, `image_edit`) for a day, one uploaded to be edited
-//! (`PUT /v1/image/upload`) for an hour.
+//! (`image_generate`) for a day, one uploaded to be edited
+//! (`PUT /v1/image/upload`) for an hour, one an edit made (`image_edit`) for
+//! an hour or until it is two edits back.
+//!
+//! **An edit is a new picture, and the chain keeps two.** Each edit's note
+//! names the picture it was made from, so making C from B, itself made from A,
+//! retires A at once: repeated edits do not pile up, and B — one step back — is
+//! still there to edit from again, which is how an edit is undone. A picture
+//! retired that way is gone; the caller stores it again if it needs it.
 //!
 //! Such a picture is stored like any image, so a link can open it
 //! (`crate::image_links`), and noted as `image/<kind>/<id>` with the moment it
@@ -31,16 +38,19 @@ pub enum Kept {
     Drawn,
     /// Uploaded to be edited: long enough to edit, and no longer.
     Uploaded,
+    /// Made by an edit: an hour, or until it is two edits back
+    /// ([`Images::put_edited`]).
+    Edited,
 }
 
 impl Kept {
-    const ALL: [Kept; 2] = [Kept::Drawn, Kept::Uploaded];
+    const ALL: [Kept; 3] = [Kept::Drawn, Kept::Uploaded, Kept::Edited];
 
     /// How long a picture kept for this is kept.
     pub const fn lifetime(self) -> Duration {
         match self {
             Kept::Drawn => Duration::from_secs(24 * 60 * 60),
-            Kept::Uploaded => Duration::from_secs(60 * 60),
+            Kept::Uploaded | Kept::Edited => Duration::from_secs(60 * 60),
         }
     }
 
@@ -49,6 +59,7 @@ impl Kept {
         match self {
             Kept::Drawn => "image/drawn/",
             Kept::Uploaded => "image/uploaded/",
+            Kept::Edited => "image/edited/",
         }
     }
 
@@ -62,9 +73,13 @@ impl Kept {
         match self {
             Kept::Drawn => "drawn_ms",
             Kept::Uploaded => "uploaded_ms",
+            Kept::Edited => "edited_ms",
         }
     }
 }
+
+/// The field of an edit's note naming the picture it was made from.
+const FROM: &str = "from";
 
 impl Images {
     /// Store a picture kept for `why`, noting it arrived at `now_ms`, and give
@@ -78,8 +93,45 @@ impl Images {
         Ok(id)
     }
 
+    /// Store the picture an edit of `from` made, noting it was made at `now_ms`
+    /// and from what, and give back its id with the picture now two edits back
+    /// — `from`'s own source, when `from` was itself made by an edit — which
+    /// the caller retires ([`Self::retire`]) unless a portrait uses it. An edit
+    /// is a new picture every time; the one before it stays, to edit from again
+    /// and undo a step.
+    pub fn put_edited(
+        &self,
+        bytes: &[u8],
+        from: &str,
+        now_ms: u64,
+    ) -> Result<(String, Option<String>), ImageError> {
+        let id = self.store(bytes)?;
+        self.shared.put_custom_object(CustomObjectPayload::new(
+            Kept::Edited.note_key(&id),
+            json!({ Kept::Edited.at_field(): now_ms, FROM: from }),
+        ))?;
+        let back = self
+            .shared
+            .custom_object(&Kept::Edited.note_key(from))
+            .and_then(|note| note.blob[FROM].as_str().map(str::to_string))
+            .filter(|back| back != &id);
+        Ok((id, back))
+    }
+
+    /// Retire image `id` now, and end its notes.
+    pub fn retire(&self, id: &str) -> Result<(), ImageError> {
+        let (sha256, _) = valid_id(id).ok_or(ImageError::NotFound)?;
+        self.shared.retire_blob(&sha256)?;
+        self.end_notes(id)
+    }
+
     /// End image `id`'s notes, if it has any: it is kept from now on.
     pub(super) fn keep_for_good(&self, id: &str) -> Result<(), ImageError> {
+        self.end_notes(id)
+    }
+
+    /// End every note on image `id`.
+    fn end_notes(&self, id: &str) -> Result<(), ImageError> {
         for why in Kept::ALL {
             let key = why.note_key(id);
             if self.shared.custom_object(&key).is_some() {
@@ -199,6 +251,44 @@ mod tests {
         assert_eq!(images.get(&id).unwrap().0, jpeg(6));
         assert_eq!(images.retire_kept(NOW + 24 * HOUR_MS, &none).unwrap(), 1);
         assert!(matches!(images.get(&id), Err(ImageError::NotFound)));
+    }
+
+    /// **An edit's chain keeps two**: C made from B made from A names A as
+    /// gone, B stays to undo from, and editing B again names A again. The
+    /// first edit of a draw names nothing — the draw is one step back.
+    #[test]
+    fn an_edit_names_the_picture_two_steps_back() {
+        let dir = TempDir::new().unwrap();
+        let images = store(&dir);
+        let a = images.put_kept(&jpeg(1), Kept::Drawn, NOW).unwrap();
+        let (b, gone) = images.put_edited(&jpeg(2), &a, NOW).unwrap();
+        assert_eq!(gone, None, "a draw's first edit");
+        let (c, gone) = images.put_edited(&jpeg(3), &b, NOW).unwrap();
+        assert_eq!(gone.as_deref(), Some(a.as_str()));
+        images.retire(&a).unwrap();
+        assert!(matches!(images.get(&a), Err(ImageError::NotFound)));
+        assert_eq!(images.get(&b).unwrap().0, jpeg(2), "one step back stays");
+        assert_eq!(images.get(&c).unwrap().0, jpeg(3));
+
+        // Undo: edit from B again — a new picture, and A is already gone.
+        let (c2, gone) = images.put_edited(&jpeg(4), &b, NOW).unwrap();
+        assert_ne!(c2, c, "every edit is a new picture");
+        assert_eq!(gone.as_deref(), Some(a.as_str()));
+        assert_eq!(images.get(&c).unwrap().0, jpeg(3), "a sibling is untouched");
+    }
+
+    /// **An edit is kept an hour**, then retired by the sweep like an upload.
+    #[test]
+    fn an_edit_is_kept_an_hour() {
+        let dir = TempDir::new().unwrap();
+        let images = store(&dir);
+        let a = images.put_kept(&jpeg(1), Kept::Drawn, NOW).unwrap();
+        let (b, _) = images.put_edited(&jpeg(2), &a, NOW).unwrap();
+        let none = HashSet::new();
+        assert_eq!(images.retire_kept(NOW + 59 * MIN_MS, &none).unwrap(), 0);
+        assert_eq!(images.retire_kept(NOW + HOUR_MS, &none).unwrap(), 1);
+        assert!(matches!(images.get(&b), Err(ImageError::NotFound)));
+        assert_eq!(images.get(&a).unwrap().0, jpeg(1), "the draw keeps its day");
     }
 
     /// **A kept picture a portrait uses is kept**, its note ended all the
