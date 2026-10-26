@@ -232,11 +232,17 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   conversation names the unit (`Substrate::CALIBRATES_KEY`), is archived —
   the commit — and is distilled `ProvenanceOnly`: K/V dropped, signatures
   kept.
-- **Scored with the unit.** Wherever the unit is scored, each of its
-  calibration's questions is one more window voting for it
-  (`belief_files::assemble_file_scans`) — for the unit's head exchange, which
-  under file-scored cases is the unit. A calibration is never itself a
-  candidate, a working-set member, or a dialogue probe.
+- **Scored in a competition of their own.** A calibration's exemplars and a
+  live probe share a distribution: in one pool with the units' content they
+  took 96.5% of a background's vote mass at 2% of the gallery, and a question
+  found its unit less often than with no questions at all
+  (`docs/results/provenance_gates_2026-10-26.md`). So every calibrated unit is
+  a case of one more competition, scored on its calibration windows alone
+  with its own `z` and margin, in the same launch
+  (`belief_files::scan_file_scans`); the unit's vote there, weighed by its
+  group's `calibration_weight`, is added to its head exchange's score — under
+  file-scored cases, the unit's. `code_reading` weighs it 0.5. A calibration
+  is never itself a candidate, a working-set member, or a dialogue probe.
 - **Resumed like the tools' corpus.** Ahead of each ingest pass, a layer's
   ready units — finished without a chain break, every turn holding content
   here — without an archived calibration carrying their current marker

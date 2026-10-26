@@ -914,6 +914,12 @@ layers:
           # files, and weighting the top group a quarter of its tool calls'
           # (docs/results/provenance_gates_2026-10-25.md).
           cases: file
+          # Each file's calibration questions compete among themselves, not
+          # in the files' pool, where they took nearly every vote of a
+          # question probe; the file adds half its calibration vote. Held-out
+          # questions at 15 a file: MRR 0.152 pooled -> 0.221, R@10
+          # 0.261 -> 0.365 (docs/results/provenance_gates_2026-10-26.md).
+          calibration_weight: 0.5
 
   # ── Dependency Analysis ────────────────────────────────────────────────────
   - name: dependency_analysis

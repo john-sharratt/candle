@@ -6393,9 +6393,10 @@ layers:
 
     /// **A calibration's questions vote for the file they calibrate.** Two
     /// files whose content shares nothing with a question; a calibration of
-    /// the second holds that question. Assembled, the second file carries the
-    /// question as a window beyond its own, the first is untouched, and the
-    /// question probe ranks the second first.
+    /// the second holds that question, and one of the first its opposite.
+    /// Assembled, each file carries its calibration's question as a window
+    /// apart from its own, and the question probe ranks the second first
+    /// through the calibration competition, where the two questions compete.
     #[test]
     fn a_calibrations_questions_vote_for_their_file() {
         use super::super::belief_files::{assemble_file_scans, scan_file_scans};
@@ -6469,14 +6470,16 @@ layers:
             conv.persist_wide_q_sigs(turn_stream_id(tl.raw(), idx.0), &encode_wide_sigs(&sigs))
                 .expect("persist sigs");
         };
-        let (x, y, cal) = (
+        let (x, y, cal, cal_x) = (
             TimelineId::from_raw(51).unwrap(),
             TimelineId::from_raw(52).unwrap(),
             TimelineId::from_raw(53).unwrap(),
+            TimelineId::from_raw(54).unwrap(),
         );
         conv.register_timeline(x, files_layer, scopes);
         conv.register_timeline(y, files_layer, scopes);
         conv.register_timeline(cal, hidden, calibration);
+        conv.register_timeline(cal_x, hidden, calibration);
         write(
             x,
             vec![sig(0x0F0F_0F0F_0F0F_0F0F), sig(0x00FF_00FF_00FF_00FF)],
@@ -6489,14 +6492,19 @@ layers:
         write(cal, vec![sig(question)]);
         conv.set_conversation_metadata(cal, Substrate::CALIBRATES_KEY, &y.raw().to_string())
             .unwrap();
+        write(cal_x, vec![sig(!question)]);
+        conv.set_conversation_metadata(cal_x, Substrate::CALIBRATES_KEY, &x.raw().to_string())
+            .unwrap();
 
         let files = {
             let sub = conv.inner.read().unwrap();
             assemble_file_scans(&sub, vec![x, y]).0
         };
         assert_eq!(files.len(), 2);
-        assert_eq!(files[0].windows.len(), 1);
-        assert_eq!(files[1].windows, vec![(0, 0, 2, 0), (1, 0, 1, 0)]);
+        assert_eq!(files[0].windows, vec![(0, 0, 2, 0)]);
+        assert_eq!(files[0].cal_windows, vec![(1, 0, 1)]);
+        assert_eq!(files[1].windows, vec![(0, 0, 2, 0)]);
+        assert_eq!(files[1].cal_windows, vec![(1, 0, 1)]);
         assert_eq!(files[1].arc_sids[1], turn_stream_id(cal.raw(), 0));
 
         let group = builder
