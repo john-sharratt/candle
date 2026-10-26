@@ -8,8 +8,8 @@ use super::pack_source::{is_pack, resolve_local, resolve_spec, ResolvedModel};
 use super::{ModelArch, ModelSpec, RopePreset};
 use crate::cancel::CancelToken;
 use crate::config::{
-    pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SchedulerConfig,
-    SequenceConfig, REPROJECT_EVERY_N_TOKENS, REPROJECT_MAX_PROBE_TOKENS, REPROJECT_TRIGGER_TEXTS,
+    pick_max_hot_turns, DecodeHealthConfig, EngineConfig, SamplingConfig, SequenceConfig,
+    REPROJECT_EVERY_N_TOKENS, REPROJECT_MAX_PROBE_TOKENS, REPROJECT_TRIGGER_TEXTS,
 };
 use crate::engine::{ConversationEngine, EngineAttacher};
 use crate::engine_slot::CoreRequests;
@@ -18,6 +18,7 @@ use crate::guest::checkpoint::gguf_header;
 use crate::models::identity::{rope_key, ModelIdentity, WeightFiles};
 use crate::models::DialectType;
 use crate::persistence::{Admit, BoundSubstrate, OpenProgressHook, OpenStage, SharedSubstrate};
+use crate::prefill_width::prefill_pass_tokens;
 use crate::projection::{CorruptTurnPolicy, LayerId};
 use crate::tenant_rank::TenantRank;
 use crate::tree::ConversationTreeConfig;
@@ -198,11 +199,10 @@ pub struct ModelBuilder {
     /// conversation (ingest layers) or just the turn (dialogue) per layer. Empty
     /// by default ⇒ every layer defaults to `DropConversation`.
     layer_corrupt_turn: HashMap<LayerId, CorruptTurnPolicy>,
-    /// Override for [`SchedulerConfig::large_prefill_max_tokens`].
+    /// Override for `SchedulerConfig::large_prefill_max_tokens`.
     ///
-    /// `None` sizes it to the card at engine start
-    /// ([`SchedulerConfig::prefill_pass_tokens_for_vram`]: 2048 on a 16 GB card,
-    /// 4096 on the 24 GB class, 8192 on 64 GB and up). A workload that reliably
+    /// `None` sizes it to the card at engine start, by its VRAM and its measured
+    /// host→device link (`crate::prefill_width`). A workload that reliably
     /// has more than a turn or two waiting — a bulk ingest — may want it at the
     /// model ceiling instead; see [`ModelBuilder::prefill_pass_tokens`].
     prefill_pass_tokens: Option<usize>,
@@ -923,10 +923,27 @@ impl ModelBuilder {
         ret.layer_corrupt_turn = self.layer_corrupt_turn.clone();
         // **Sized to the card here, where every engine config is made**, so an
         // engine assembled from this config directly — the fragmentation probe,
-        // `ruler_stream` — gets the same pass as one from `build`. The 16 GB
-        // default on the 72 GB RTX PRO 5000 is a 2,048-token forward, which holds
-        // eight submitted turns to three per prefill wave where the card takes
-        // 8,192.
+        // `ruler_stream` — gets the same pass as one from `build`: by the card's
+        // VRAM and its host→device link (`prefill_width`).
+        //
+        // The link is measured here, the first thing to ask for it — before the
+        // load, with the card empty and the bus idle — and cached for the wave
+        // planner (`link_probe`). Later, the reading would be contended by the
+        // expert cache's staging and its landing buffer would compete with a
+        // full reservation.
+        let link = match device {
+            Device::Cuda(d) => match link_probe::host_to_device_bytes_per_s(d) {
+                Ok(bps) => {
+                    tracing::info!(link_gbps = bps / 1e9, "host→device link measured");
+                    bps
+                }
+                Err(e) => {
+                    tracing::warn!("host→device link probe failed: {e}");
+                    0.0
+                }
+            },
+            _ => 0.0,
+        };
         ret.scheduler.large_prefill_max_tokens = match self.prefill_pass_tokens {
             Some(n) => n,
             None => {
@@ -937,11 +954,12 @@ impl ModelBuilder {
                         .unwrap_or(0),
                     _ => 0,
                 };
-                let n = SchedulerConfig::prefill_pass_tokens_for_vram(total_vram);
+                let n = prefill_pass_tokens(total_vram, link);
                 tracing::info!(
                     total_vram_gib = total_vram / (1 << 30),
+                    link_gbps = link / 1e9,
                     prefill_pass_tokens = n,
-                    "prefill forward sized to the card"
+                    "prefill forward sized to the card and its link"
                 );
                 n
             }
@@ -1608,17 +1626,6 @@ impl ModelBuilder {
                 self.sampling.repeat_penalty,
             );
             tracing::info!("  Max response tokens: {}", self.max_response_tokens);
-        }
-
-        // The host→device link, measured now — the card empty and the bus idle
-        // — and cached for the wave planner (`link_probe`). Later, the reading
-        // would be contended by the expert cache's staging and its landing
-        // buffer would compete with a full reservation.
-        if let Device::Cuda(cuda) = device {
-            match link_probe::host_to_device_bytes_per_s(cuda) {
-                Ok(bps) => tracing::info!(link_gbps = bps / 1e9, "host→device link measured"),
-                Err(e) => tracing::warn!("host→device link probe failed: {e}"),
-            }
         }
 
         // Every driver allocation the load makes, by site: most are scratch the

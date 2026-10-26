@@ -1725,35 +1725,6 @@ impl Default for SchedulerConfig {
     }
 }
 
-/// Total VRAM at which a card takes 4096-token prefill forwards: the 24 GB
-/// class. A card reports a little under its nameplate (a 3090 reads ~23.7 GiB),
-/// so the bar sits below 24 GiB rather than on it.
-pub const PREFILL_4096_MIN_TOTAL_VRAM_BYTES: u64 = 22 * (1 << 30);
-
-/// Total VRAM at which a card takes 8192-token prefill forwards — the model's
-/// `MAX_PREFILL_TOKENS` ceiling: the 64 GB class and up (the 72 GB RTX PRO
-/// 5000 among them). Below 64 GiB for the same nameplate reason.
-pub const PREFILL_8192_MIN_TOTAL_VRAM_BYTES: u64 = 60 * (1 << 30);
-
-impl SchedulerConfig {
-    /// The per-forward prefill token target for a card with `total_vram_bytes`.
-    ///
-    /// The 2048 default is the 16 GB answer: a wider forward is faster alone
-    /// but its transient tier and in-flight KV narrow admission until the wide
-    /// forwards stop paying for what they starve (see [`Self::default`]). A
-    /// bigger card has the ground to carry the wider forward without that
-    /// trade — 4096 rows need ~3.5 GiB of transient tier, 8192 ~7 GiB.
-    pub fn prefill_pass_tokens_for_vram(total_vram_bytes: u64) -> usize {
-        if total_vram_bytes >= PREFILL_8192_MIN_TOTAL_VRAM_BYTES {
-            8192
-        } else if total_vram_bytes >= PREFILL_4096_MIN_TOTAL_VRAM_BYTES {
-            4096
-        } else {
-            SchedulerConfig::default().large_prefill_max_tokens
-        }
-    }
-}
-
 /// Pick a reasonable `max_hot_turns` ceiling from arena dimensions and
 /// expected turn length.
 ///
@@ -1934,34 +1905,6 @@ mod scheduler_config_tests {
         // model-side `MAX_PREFILL_TOKENS` ceiling (8192).
         assert_eq!(SchedulerConfig::default().large_prefill_max_tokens, 2048);
         assert!(SchedulerConfig::default().large_prefill_max_tokens <= 8192);
-    }
-
-    /// The prefill forward grows with the card: 2048 on 16 GB, 4096 on the
-    /// 24 GB class, 8192 on 64 GB and up — judged on what a card REPORTS, which
-    /// is a little under its nameplate.
-    #[test]
-    fn prefill_forward_is_sized_to_the_card() {
-        const GIB: u64 = 1 << 30;
-        let tokens = SchedulerConfig::prefill_pass_tokens_for_vram;
-        assert_eq!(tokens(0), 2048, "no device reading keeps the default");
-        assert_eq!(tokens(16 * GIB), 2048, "RTX 4090 Mobile");
-        assert_eq!(
-            tokens(23 * GIB + 700 * (1 << 20)),
-            4096,
-            "RTX 3090 reports ~23.7 GiB"
-        );
-        assert_eq!(
-            tokens(63 * GIB + 512 * (1 << 20)),
-            8192,
-            "a 64 GB card reports under 64 GiB"
-        );
-        assert_eq!(tokens(72 * GIB), 8192, "RTX PRO 5000");
-        for gib in [0, 16, 24, 64, 72, 96] {
-            assert!(
-                tokens(gib * GIB) <= 8192,
-                "never past the model's MAX_PREFILL_TOKENS"
-            );
-        }
     }
 }
 
