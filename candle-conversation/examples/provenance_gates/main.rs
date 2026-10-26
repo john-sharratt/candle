@@ -220,7 +220,7 @@ fn main() -> anyhow::Result<()> {
             norm_probe::run(&files, &args[2..], daemon()?)?;
         }
         "chunk-factor" => {
-            chunk_factor::run(&files, daemon()?)?;
+            chunk_factor::run(&files, &tokenizer, daemon()?)?;
         }
         "scan-loop" => {
             let passes = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(5);
