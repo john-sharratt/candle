@@ -38,6 +38,7 @@
 
 use candle::quantized::{Int8Mode, SumScale};
 use candle::{DType, IndexOp, Result, Tensor, D};
+use candle_nn::kv_cache::guest_chain;
 use candle_nn::{ops::silu, Module, RmsNorm};
 
 use super::attention::attend;
@@ -525,26 +526,28 @@ impl ZImageTransformer {
         // — measured, the sum of a 1024×1024 forward saturated seven gigabytes,
         // and once one carve fails nothing after it can inherit and the rest of
         // the draw falls back to the pool it was evicted from.
+        //
+        // A chain rather than a stage per block: a block's result is dead once
+        // the next has read it, so the loop carries two hidden states, not one
+        // per block ([`guest_chain`]).
         let (x_cos, x_sin) = g.rope.gather(&x_run.ids, dev)?;
-        let mut x = x_run.feats.unsqueeze(0)?;
-        for blk in self.noise_refiner.iter() {
-            x = candle_nn::kv_cache::guest_stage(&x, |x| {
-                blk.forward(x, &x_cos, &x_sin, Some(&adaln))
-            })?;
-        }
+        let x = guest_chain(&x_run.feats.unsqueeze(0)?, &self.noise_refiner, |x, blk| {
+            blk.forward(x, &x_cos, &x_sin, Some(&adaln))
+        })?;
 
         let (c_cos, c_sin) = g.rope.gather(&cap_run.ids, dev)?;
-        let mut c = cap_run.feats.unsqueeze(0)?;
-        for blk in self.context_refiner.iter() {
-            c = candle_nn::kv_cache::guest_stage(&c, |c| blk.forward(c, &c_cos, &c_sin, None))?;
-        }
+        let c = guest_chain(
+            &cap_run.feats.unsqueeze(0)?,
+            &self.context_refiner,
+            |c, blk| blk.forward(c, &c_cos, &c_sin, None),
+        )?;
 
-        let mut h = Tensor::cat(&[&x, &c], 1)?;
+        let h = Tensor::cat(&[&x, &c], 1)?;
         let cos = Tensor::cat(&[&x_cos, &c_cos], 0)?.contiguous()?;
         let sin = Tensor::cat(&[&x_sin, &c_sin], 0)?.contiguous()?;
-        for blk in self.layers.iter() {
-            h = candle_nn::kv_cache::guest_stage(&h, |h| blk.forward(h, &cos, &sin, Some(&adaln)))?;
-        }
+        let h = guest_chain(&h, &self.layers, |h, blk| {
+            blk.forward(h, &cos, &sin, Some(&adaln))
+        })?;
 
         let h = self.final_layer.forward(&h, &adaln)?;
         let h = h.i((0, ..ht * wt))?;

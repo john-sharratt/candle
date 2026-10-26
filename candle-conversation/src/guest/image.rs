@@ -274,25 +274,16 @@ fn activation_headroom(width: u32, height: u32) -> usize {
 
 /// What one draw's activations cost, per pixel of output.
 ///
-/// # What the arena's high-water says about this figure
+/// # Measured
 ///
-/// Measured across a mixed sweep, the activation arena's peak still comes back
-/// close under its capacity at the sizes where the claim is small — 1,888 MiB of
-/// 1,900, 3,904 of 3,948 — and fits with real slack where it is larger, 5,120 of
-/// 5,484. So the arena is still being asked for more than it has at the low end,
-/// and the overflow reaches the pool: a 1024×1024 drain reports around 84 GiB
-/// that carried no ticket.
-///
-/// That overflow no longer *fails*, which is the distinction worth keeping
-/// straight. A bump holds a generation's sum rather than its peak, and it was
-/// one unbounded generation spanning a whole VAE decode — not this number — that
-/// made the pool demand unbounded with it. The model's stages bound that now
-/// (`kv_cache::guest_stage`, per transformer block and per decoder resnet), so
-/// what still misses the arena is a bounded amount the pool can absorb.
-///
-/// Raising this would move more of that 84 GiB into ground, at the price of
-/// evicting more engine for every draw. It is a live trade, not a defect.
-const ACTIVATION_BYTES_PER_PIXEL: usize = 3 * 1024;
+/// A denoise step is one block's intermediates, the block chain's two carried
+/// hidden states (`kv_cache::guest_chain`) and the step's few tensors between
+/// them. On the 3090 a 512×512 step's block peaked at 331 MiB — 1.3 KiB a
+/// pixel — and the step at about 1.5 KiB. Two leaves the margin a 1024×1024
+/// draw needs without pricing it out of a card with an engine resident: at the
+/// old three, 1024² claimed 10.1 GB against the 9.7 the 3090 could free, and
+/// every such draw was refused before it started.
+const ACTIVATION_BYTES_PER_PIXEL: usize = 2 * 1024;
 
 impl GuestModel for ImageGuest {
     fn guest(&self) -> Guest {
@@ -422,10 +413,32 @@ impl GuestModel for ImageGuest {
                 "image guest: released the encoder's pool blocks"
             );
         }
-        ground
-            .lock()
-            .map_err(|_| "image guest: the ground lock was poisoned".to_string())?
-            .rewind();
+        // **The activation arena is placed first, on the widest run.** It must
+        // be one contiguous stretch, and the bump serves the widest run first:
+        // placed after the weights, it got whatever run they left — 1,347 MiB
+        // of a 1,536 MiB claim on the 3090, and a 1024-class draw then
+        // overran it. The weights are tensors of tens of megabytes and fit in
+        // the runs it leaves. Opened once they are in, below.
+        let wanted = jobs
+            .iter()
+            .filter_map(|j| match j {
+                GuestRequest::Image(r) => Some(activation_headroom(r.width, r.height)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let arena = {
+            let mut g = ground
+                .lock()
+                .map_err(|_| "image guest: the ground lock was poisoned".to_string())?;
+            g.rewind();
+            let len = wanted.min(g.largest_free_run().saturating_sub(ARENA_HEADROOM_BYTES));
+            if len >= MIN_ARENA_BYTES {
+                g.place(len, 256).ok().map(|at| (at, len))
+            } else {
+                None
+            }
+        };
 
         stage("placing the transformer");
         tracing::debug!(
@@ -458,9 +471,9 @@ impl GuestModel for ImageGuest {
         // not the size of any one tensor, is how a draw runs out of memory with
         // gigabytes of span standing idle.
         //
-        // It stands on whatever ground is left after the weights, which is the
-        // over-claim `footprint_bytes` already makes for activations. Two things
-        // have to hold for it to be correct, and both are elsewhere:
+        // It stands on the run placed for it above, which is the claim
+        // `footprint_bytes` makes for activations. Two things have to hold for
+        // it to be correct, and both are elsewhere:
         //
         // - **Routing is inheritance-only**, so a chain that starts owned stays
         //   owned however well the arena is sized. The weights carry a routing
@@ -469,28 +482,21 @@ impl GuestModel for ImageGuest {
         // - **A bump holds a generation's sum, not its peak.** Nothing here
         //   bounds that — the stages inside the model forwards do, per
         //   transformer block and per decoder resnet, and they nest.
-        {
-            let mut g = ground
-                .lock()
-                .map_err(|_| "image guest: the ground lock was poisoned".to_string())?;
-            let spare = g.largest_free_run().saturating_sub(ARENA_HEADROOM_BYTES);
-            if spare >= MIN_ARENA_BYTES {
-                if let Ok(at) = g.place(spare, 256) {
-                    candle_nn::kv_cache::open_guest_arena(
-                        &device
-                            .as_cuda_device()
-                            .map_err(|e| e.to_string())?
-                            .cuda_stream(),
-                        at.ptr,
-                        spare,
-                    );
-                    tracing::info!(
-                        target: "candle_conversation::guest",
-                        arena_mib = spare >> 20,
-                        "image guest: activations arena open"
-                    );
-                }
-            }
+        if let Some((at, len)) = arena {
+            candle_nn::kv_cache::open_guest_arena(
+                &device
+                    .as_cuda_device()
+                    .map_err(|e| e.to_string())?
+                    .cuda_stream(),
+                at.ptr,
+                len,
+            );
+            tracing::info!(
+                target: "candle_conversation::guest",
+                arena_mib = len >> 20,
+                wanted_mib = wanted >> 20,
+                "image guest: activations arena open"
+            );
         }
 
         self.loaded = Some(Loaded {
@@ -1117,7 +1123,7 @@ mod tests {
             CLAIMED_TILE,
             "the floor holds the tile it is sized for"
         );
-        assert_eq!(one_k, 3 << 30, "1024×1024 wants 3 GiB");
+        assert_eq!(one_k, 2 << 30, "1024×1024 wants 2 GiB");
         // Four times the pixels, four times the room — above the floor.
         assert_eq!(activation_headroom(2048, 1024), 2 * one_k);
     }
