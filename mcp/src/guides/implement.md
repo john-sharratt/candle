@@ -17,8 +17,8 @@ Note the spec's decisions on the thread first: every worker starts with them.
 `repo_task_start {thread, name: "implement-<what>", effort: "deep", prompt}`:
 
 ```
-GOAL: implement the specification below in <repository>, on a new branch
-`zen/<what>`.
+GOAL: implement the specification below in <repository>, on the branch
+`<the name the user gave, or zen/<what>>`.
 
 SPEC:
 <in full — what to change, where, the behaviour, the edge cases, what must not
@@ -27,7 +27,8 @@ change>
 CONSTRAINTS:
 - Follow the repository's conventions (its CLAUDE.md; the project journal
   holds the standing rules).
-- Push the branch; never push to the default branch.
+- Push the branch; never push to the default branch, and never force-push. If
+  the branch already exists on origin, build on it.
 - No stubs, no TODOs, no placeholder code: implement it fully or say what is
   missing.
 
@@ -36,7 +37,8 @@ METHOD:
 2. Write the tests alongside the code, at the level the behaviour lives,
    asserting exact expected values.
 3. Build and run the tests; read the outcome from the output, never assume it.
-4. Commit with clear messages; push.
+4. Commit and push as each piece works, not once at the end: a restart can
+   end your turn, and what is pushed survives it.
 5. If the spec is ambiguous or two designs trade off, ask (QUESTION block)
    rather than guess.
 
@@ -61,8 +63,14 @@ the spec, decide it, note the decision on the thread, then reply.
 
 ## Review before reporting success
 
-1. Check TESTS against the turns it cites (`journal_read` with the entry).
-2. Read the branch's diff yourself, or delegate a review (`review`).
+1. Check TESTS against the turns it cites (`journal_grep` the worker's
+   journal for the result line).
+2. Read the branch's diff yourself (with the repository at hand), or delegate
+   a review (`review`) — a build agent runs builds and tests, not `git`.
 3. Run the tests on an agent yourself if they matter (`test`).
+
+If the worker is lost to a restart, what it pushed is on the branch and what
+it found is in its journal entries; start the task again on the same branch,
+pointing it at both.
 
 Merging is the user's decision — ask.
