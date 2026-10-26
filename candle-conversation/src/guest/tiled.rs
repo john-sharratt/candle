@@ -71,6 +71,8 @@
 
 use candle::{DType, Device, Result, Tensor};
 
+use super::varground::into_arena;
+
 /// Pixels per latent cell, for this autoencoder.
 ///
 /// FLUX's, and it is the same 8 the guest divides by when it sizes the latent.
@@ -215,9 +217,17 @@ where
     let device = latent.device();
     let (out_h, out_w) = (h * SCALE, w * SCALE);
     // f32 accumulators: the weighted sum of bf16 tiles would round every
-    // contribution, and the overlap columns are sums of two of them.
-    let mut acc = Tensor::zeros((1, 3, out_h, out_w), DType::F32, device)?;
-    let mut wsum = Tensor::zeros((1, 1, out_h, out_w), DType::F32, device)?;
+    // contribution, and the overlap columns are sums of two of them. In the
+    // guest's arena when a drain holds one, so every blend step reading them
+    // carves there too.
+    let mut acc = into_arena(
+        &Tensor::zeros((1, 3, out_h, out_w), DType::F32, device)?,
+        device,
+    )?;
+    let mut wsum = into_arena(
+        &Tensor::zeros((1, 1, out_h, out_w), DType::F32, device)?,
+        device,
+    )?;
 
     for r in &rows {
         for c in &cols {
@@ -312,7 +322,7 @@ where
     // The channel count is the autoencoder's, so the accumulator cannot be
     // allocated until the first tile has come back and said what it is.
     let mut acc: Option<Tensor> = None;
-    let mut wsum = Tensor::zeros((1, 1, h, w), DType::F32, device)?;
+    let mut wsum = into_arena(&Tensor::zeros((1, 1, h, w), DType::F32, device)?, device)?;
 
     for r in &rows {
         for c in &cols {
@@ -338,7 +348,10 @@ where
             let contrib = z.broadcast_mul(&weight)?;
             let base = match acc.take() {
                 Some(a) => a,
-                None => Tensor::zeros((1, channels, h, w), DType::F32, device)?,
+                None => into_arena(
+                    &Tensor::zeros((1, channels, h, w), DType::F32, device)?,
+                    device,
+                )?,
             };
             let prev = base.narrow(2, y, r.len)?.narrow(3, x, c.len)?;
             acc = Some(base.slice_assign(
