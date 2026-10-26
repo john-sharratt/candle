@@ -65,7 +65,7 @@ const JPEG_QUALITY: u8 = 90;
 
 /// What the picture is sent back as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Format {
+pub(super) enum Format {
     Jpeg,
     Png,
 }
@@ -105,36 +105,47 @@ impl Tool for Generate {
     }
 
     async fn call(s: &Arc<Authored>, headers: &HeaderMap, args: &Value) -> Answer {
-        let (body, format) = match body(args).and_then(|b| Ok((b, format(args)?))) {
-            Ok(b) => b,
-            Err(e) => return Answer::error(e),
-        };
-        let res = post_image(State(Arc::clone(s)), headers.clone(), Json(body)).await;
-        let status = res.status();
-        let bytes = match to_bytes(res.into_body(), STREAM_LIMIT).await {
-            Ok(b) => b,
-            Err(e) => return Answer::error(format!("the draw could not be read: {e}")),
-        };
-        if !status.is_success() {
-            return Answer::error(refused(status.as_u16(), &bytes));
+        match body(args).and_then(|b| Ok((b, format(args)?))) {
+            Ok((body, format)) => draw(s, headers, body, format).await,
+            Err(e) => Answer::error(e),
         }
-        let drawn = match outcome(&bytes, format) {
-            Ok(d) => d,
-            Err(e) => return Answer::error(e),
-        };
-        let now = now_ms();
-        let link = s.images.put_drawn(&drawn.file, now).map(|id| {
-            let path = s.image_links.path(&id, now / 1000);
-            format!("{}{path}", origin::of(headers))
-        });
-        Answer::picture(
-            said(&drawn.said, link.map_err(|e| e.to_string())),
-            Picture {
-                data: drawn.base64,
-                mime_type: drawn.mime.into(),
-            },
-        )
     }
+}
+
+/// Run the draw `body` asks for and answer with its picture as `format`, and
+/// the link to it stored for a day — `image_generate`'s answer, and
+/// `image_edit`'s.
+pub(super) async fn draw(
+    s: &Arc<Authored>,
+    headers: &HeaderMap,
+    body: ImageBody,
+    format: Format,
+) -> Answer {
+    let res = post_image(State(Arc::clone(s)), headers.clone(), Json(body)).await;
+    let status = res.status();
+    let bytes = match to_bytes(res.into_body(), STREAM_LIMIT).await {
+        Ok(b) => b,
+        Err(e) => return Answer::error(format!("the draw could not be read: {e}")),
+    };
+    if !status.is_success() {
+        return Answer::error(refused(status.as_u16(), &bytes));
+    }
+    let drawn = match outcome(&bytes, format) {
+        Ok(d) => d,
+        Err(e) => return Answer::error(e),
+    };
+    let now = now_ms();
+    let link = s.images.put_drawn(&drawn.file, now).map(|id| {
+        let path = s.image_links.path(&id, now / 1000);
+        format!("{}{path}", origin::of(headers))
+    });
+    Answer::picture(
+        said(&drawn.said, link.map_err(|e| e.to_string())),
+        Picture {
+            data: drawn.base64,
+            mime_type: drawn.mime.into(),
+        },
+    )
 }
 
 /// A finished draw: what it says of itself, and the file `format` asked for —
@@ -157,7 +168,7 @@ fn said(drawn: &str, link: Result<String, String>) -> String {
 }
 
 /// The `format` argument.
-fn format(args: &Value) -> Result<Format, String> {
+pub(super) fn format(args: &Value) -> Result<Format, String> {
     match args.get("format").and_then(Value::as_str).map(str::trim) {
         None | Some("") | Some("jpeg") | Some("jpg") => Ok(Format::Jpeg),
         Some("png") => Ok(Format::Png),
@@ -184,7 +195,7 @@ fn file(png_base64: &str, format: Format) -> Result<(Vec<u8>, &'static str), Str
 }
 
 /// The route's body from the tool's arguments.
-fn body(args: &Value) -> Result<ImageBody, String> {
+pub(super) fn body(args: &Value) -> Result<ImageBody, String> {
     let prompt = string(args, "prompt")?.to_string();
     let side = |key: &str| -> Result<u32, String> {
         match args.get(key) {

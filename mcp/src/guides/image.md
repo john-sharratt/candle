@@ -1,7 +1,7 @@
 ---
 name: image
-description: For any request to draw, paint or generate a picture, image or photo — the user's own image model, used rather than an SVG or widget you draw yourself. How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, and send the user the file from the link the answer carries.
-tools: [image_generate]
+description: For any request to draw, paint or generate a picture, image or photo — the user's own image model, used rather than an SVG or widget you draw yourself. How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, refine it with image_edit (add or remove details, change the light or the style), and send the user the file from the link the answer carries.
+tools: [image_generate, image_edit]
 ---
 # Generating an image
 
@@ -92,8 +92,11 @@ picture itself. The picture is for you: many clients show the user nothing
 from a tool's result, so they have not seen it yet. Look at it against the
 request before showing it:
 
-- Something missing or wrong — name it more prominently and more concretely,
-  earlier in the prompt.
+- Mostly right, one thing off — a detail to add, remove or change, the light,
+  the colours: edit it (below) rather than drawing again, so what was right
+  stays.
+- Something missing or wrong in the whole — name it more prominently and
+  more concretely, earlier in the prompt, and draw again.
 - Text misspelled — shorten it, give it more room, describe its placement.
 - The same thing every time — change the description, not the seed.
 - `prompt_declined` — the prompt check refused it. If a person's age was
@@ -125,6 +128,33 @@ them the prompt to draw later; `cluster_status` says whether the bots'
 service is up at all.
 
 Two or three rounds is normal.
+
+## Edit and refine
+
+`image_edit` changes a picture by a prompt: it draws again starting from the
+picture instead of from noise, keeping as much of it as `hold` says. Use it
+after a draw to add or remove a detail, change the light or the palette, or
+push the finish, and when the user asks to change a photo of their own.
+
+- **The picture:** `image` takes the link (or id) a draw or an earlier edit
+  answered with — nothing to download or send. A picture of the user's own
+  goes as `image_base64`. It keeps its shape unless you give a size.
+- **The prompt is the whole picture as it should end up**, not the change
+  alone: take the prompt that made it and edit that — add "a brass lantern
+  hangs from the shelf", delete the sentence about the cat. The model has no
+  instructions, only a description: "remove the cat" alone gives it nothing
+  else to draw, and names the cat besides.
+- **`hold`** is how much of the original survives. Starting points: 0.5
+  (the default) to add or remove a detail; about 0.3 for a large change —
+  a new style, a different time of day; about 0.7 for a light touch — a
+  colour, a finish. Look at the result: the change did not happen — lower
+  it; the picture drifted from the original — raise it. Past about 0.45 the
+  subject itself (a face, an animal) no longer changes much.
+- **One change at a time**, each edit from the last one's link, so a step
+  that goes wrong is undone by editing from the one before.
+
+Each edit answers like a draw — the picture to look at and a link for 24
+hours — and its link is what the next edit takes.
 
 ## Give it to the user
 

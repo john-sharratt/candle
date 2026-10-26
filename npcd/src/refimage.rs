@@ -28,23 +28,31 @@
 //! survived and pick an output shape that suits their reference. That is why
 //! the sizes on offer include both 3:2 buckets.
 
+use std::io::Cursor;
+
 use candle_conversation::guest::ImageReference;
 use image::imageops::FilterType;
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, ImageReader, Rgb, RgbImage};
 
 /// The largest upload accepted, before decoding.
 ///
-/// The same limit portrait uploads take ([`crate::images::MAX_BYTES`]) doubled:
-/// a reference is a working file rather than a stored one, so it is routinely a
-/// camera JPEG or a screenshot that nobody has thought about compressing, and
-/// it is thrown away the moment the draw is queued.
-pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+/// A reference is a working file rather than a stored one, so it is routinely a
+/// camera original or a screenshot that nobody has thought about compressing —
+/// a 50-megapixel phone JPEG runs to 15 MB, a large PNG screenshot past 20 —
+/// and it is thrown away the moment the draw is queued.
+pub const MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// The largest decoded picture accepted, per side.
+pub const MAX_SIDE: u32 = 16384;
+
+/// The most pixels a decoded picture may hold: a 64-megapixel camera's.
 ///
 /// A compression bomb is a small file that decodes to an enormous surface, so
 /// the byte limit above does not bound the memory this costs — the pixel count
-/// does, and it is checked from the header before any pixels are produced.
-pub const MAX_SIDE: u32 = 8192;
+/// does (four bytes each while it is decoded), and it is checked from the
+/// header before any pixels are produced.
+pub const MAX_PIXELS: u64 = 64_000_000;
 
 /// The filter used to scale a reference.
 ///
@@ -72,32 +80,84 @@ pub fn conform(bytes: &[u8], width: u32, height: u32, hold: f32) -> Result<Image
     if width == 0 || height == 0 {
         return Err("a reference needs a draw with a non-zero size to fit to".into());
     }
-
-    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| format!("the reference could not be read: {e}"))?;
-    // **From the header, before any pixels exist.** A decompression bomb is a
-    // small file that decodes to an enormous surface, so this is the check that
-    // the byte limit above cannot make.
-    let (w, h) = reader
-        .into_dimensions()
-        .map_err(|e| format!("the reference is not a picture this build can read: {e}"))?;
-    if w > MAX_SIDE || h > MAX_SIDE {
-        return Err(format!(
-            "the reference is {w}×{h} and the limit is {MAX_SIDE} per side"
-        ));
-    }
-
-    let img = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| format!("the reference could not be read: {e}"))?
-        .decode()
-        .map_err(|e| format!("the reference is not a picture this build can read: {e}"))?;
-
-    let fitted = cover(&img.to_rgb8(), width, height);
+    let fitted = cover(&decode(bytes)?, width, height);
     Ok(ImageReference {
         pixels: fitted.into_raw(),
         hold,
+    })
+}
+
+/// The picture `bytes` hold the way a person sees it: whichever format it
+/// came in, turned as its camera recorded, and any transparency laid over
+/// white.
+///
+/// **Turned**, because a phone stores a portrait photo as a landscape sensor
+/// image with an EXIF note saying which way is up; read without the note, it
+/// arrives on its side and the draw redraws it on its side. **Over white**,
+/// because dropping the alpha channel leaves whatever colour the transparent
+/// pixels happened to hold — usually black — which the model reads as part of
+/// the picture.
+pub fn decode(bytes: &[u8]) -> Result<RgbImage, String> {
+    let mut decoder = decoder(bytes)?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("the picture could not be decoded: {e}"))?;
+    img.apply_orientation(orientation);
+    Ok(over_white(img))
+}
+
+/// The picture's width and height as [`decode`] will turn it, read from its
+/// header alone.
+pub fn dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+    let mut decoder = decoder(bytes)?;
+    let (w, h) = decoder.dimensions();
+    let turned = matches!(
+        decoder.orientation().unwrap_or(Orientation::NoTransforms),
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    Ok(if turned { (h, w) } else { (w, h) })
+}
+
+/// A decoder for `bytes`, its format recognised from the bytes themselves and
+/// its size checked **from the header, before any pixels exist** — a
+/// decompression bomb is a small file that decodes to an enormous surface, so
+/// this is the check the byte limit cannot make.
+fn decoder(bytes: &[u8]) -> Result<impl ImageDecoder + '_, String> {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("the picture could not be read: {e}"))?;
+    if reader.format().is_none() {
+        return Err(
+            "the picture is not in a format this can read: JPEG, PNG, WebP, GIF, BMP or TIFF"
+                .into(),
+        );
+    }
+    let decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("the picture could not be read: {e}"))?;
+    let (w, h) = decoder.dimensions();
+    if w > MAX_SIDE || h > MAX_SIDE || w as u64 * h as u64 > MAX_PIXELS {
+        return Err(format!(
+            "the picture is {w}×{h}; the limit is {MAX_SIDE} per side and {} megapixels",
+            MAX_PIXELS / 1_000_000
+        ));
+    }
+    Ok(decoder)
+}
+
+/// `img` as RGB, any transparency laid over white.
+fn over_white(img: DynamicImage) -> RgbImage {
+    if !img.color().has_alpha() {
+        return img.to_rgb8();
+    }
+    let rgba = img.to_rgba8();
+    RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        let blend = |c: u8| ((c as u32 * a as u32 + 255 * (255 - a as u32) + 127) / 255) as u8;
+        Rgb([blend(r), blend(g), blend(b)])
     })
 }
 
@@ -122,7 +182,7 @@ fn cover(src: &image::RgbImage, width: u32, height: u32) -> image::RgbImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ImageFormat, Rgb, RgbImage};
+    use image::ImageFormat;
 
     /// A PNG of `w`×`h`, with a distinguishable left half so a crop is visible.
     fn png(w: u32, h: u32) -> Vec<u8> {
@@ -225,6 +285,82 @@ mod tests {
             // short scale would have left behind.
             assert!(out.pixels().all(|p| *p == Rgb([9, 9, 9])), "{sw}×{sh}");
         }
+    }
+
+    /// `img` encoded as `format`.
+    fn encoded(img: DynamicImage, format: ImageFormat) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, format).unwrap();
+        out.into_inner()
+    }
+
+    /// **Every format a person is likely to hand over is read**, from its own
+    /// bytes, to the same picture.
+    #[test]
+    fn every_reasonable_format_is_read() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(6, 4, Rgb([40, 120, 200])));
+        for format in [
+            ImageFormat::Png,
+            ImageFormat::Jpeg,
+            ImageFormat::WebP,
+            ImageFormat::Gif,
+            ImageFormat::Bmp,
+            ImageFormat::Tiff,
+        ] {
+            let bytes = encoded(img.clone(), format);
+            assert_eq!(dimensions(&bytes), Ok((6, 4)), "{format:?}");
+            let back = decode(&bytes).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            assert_eq!(back.dimensions(), (6, 4), "{format:?}");
+            assert!(conform(&bytes, 32, 32, 0.5).is_ok(), "{format:?}");
+        }
+    }
+
+    /// **Transparency is laid over white**, exactly: opaque pixels keep their
+    /// colour, clear ones become white, half-clear ones meet halfway.
+    #[test]
+    fn transparency_is_laid_over_white() {
+        let mut rgba = image::RgbaImage::new(3, 1);
+        rgba.put_pixel(0, 0, image::Rgba([10, 20, 30, 255]));
+        rgba.put_pixel(1, 0, image::Rgba([10, 20, 30, 0]));
+        rgba.put_pixel(2, 0, image::Rgba([0, 0, 0, 128]));
+        let out = over_white(DynamicImage::ImageRgba8(rgba));
+        assert_eq!(out.get_pixel(0, 0), &Rgb([10, 20, 30]));
+        assert_eq!(out.get_pixel(1, 0), &Rgb([255, 255, 255]));
+        assert_eq!(out.get_pixel(2, 0), &Rgb([127, 127, 127]));
+    }
+
+    /// A JPEG of `w`×`h` carrying the EXIF orientation `orientation`, built by
+    /// hand: an APP1 segment spliced in after the start-of-image marker, holding
+    /// a little-endian TIFF header and one IFD entry, tag 0x0112.
+    fn jpeg_with_orientation(w: u32, h: u32, orientation: u8) -> Vec<u8> {
+        let jpeg = encoded(
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(w, h, Rgb([90, 90, 90]))),
+            ImageFormat::Jpeg,
+        );
+        let mut app1 = vec![0xFF, 0xE1, 0x00, 0x22];
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+        app1.extend_from_slice(&[0x01, 0x00]);
+        app1.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        app1.extend_from_slice(&[orientation, 0x00, 0x00, 0x00]);
+        app1.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(app1.len(), 2 + 0x22, "the segment's length field");
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&app1);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    /// **A phone's portrait photo comes out upright**: stored 8×4 with the
+    /// EXIF note "turn 90°", it is read as 4×8, header and pixels alike.
+    #[test]
+    fn a_photo_is_turned_the_way_its_camera_recorded() {
+        let turned = jpeg_with_orientation(8, 4, 6);
+        assert_eq!(dimensions(&turned), Ok((4, 8)));
+        assert_eq!(decode(&turned).unwrap().dimensions(), (4, 8));
+        let upright = jpeg_with_orientation(8, 4, 1);
+        assert_eq!(dimensions(&upright), Ok((8, 4)));
+        assert_eq!(decode(&upright).unwrap().dimensions(), (8, 4));
     }
 
     /// **The three refusals a caller can act on, each named.** A byte limit, a

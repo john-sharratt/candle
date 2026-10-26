@@ -114,6 +114,10 @@ hound = "3.5.1"
 image = { version = "0.25.2", default-features = false, features = [
     "jpeg",
     "png",
+    "webp",
+    "gif",
+    "bmp",
+    "tiff",
 ] }
 imageproc = { version = "0.24.0", default-features = false }
 intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"] }
