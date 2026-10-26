@@ -1,6 +1,6 @@
 ---
 name: image
-description: How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, and send the user the file from the link the answer carries.
+description: For any request to draw, paint or generate a picture, image or photo — the user's own image model, used rather than an SVG or widget you draw yourself. How to get a good picture from image_generate and give it to the user — write the prompt the way the model was trained to read it (a plain, concrete, detailed description), pick the size, look at what came back, change the prompt rather than the seed, and send the user the file from the link the answer carries.
 tools: [image_generate]
 ---
 # Generating an image

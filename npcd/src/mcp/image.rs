@@ -76,8 +76,10 @@ impl Tool for Generate {
     fn definition() -> Value {
         json!({
             "name": Self::NAME,
-            "description": "Generate an image from a text prompt (Z-Image-Turbo). The answer is the \
-                picture for you to look at — a JPEG, or a PNG when `format` asks for one — and a \
+            "description": "Draw, paint or generate a picture, image, photo or illustration — the \
+                user's own image model (Z-Image-Turbo, on their GPU). Use it for any request to \
+                draw or create an image, rather than drawing one yourself in SVG, code or a \
+                widget. The answer is the picture for you to look at — a JPEG, or a PNG when `format` asks for one — and a \
                 link to the file that works for 24 hours without signing in. The user may not see \
                 the picture in the tool result: to show it to them, download the link and send \
                 them the file, or give them the link. Describe the subject, style, lighting and \
