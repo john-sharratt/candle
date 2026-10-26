@@ -3206,6 +3206,8 @@ impl InferenceState {
                     questions = r.probes,
                     chunks = r.chunks,
                     cut = r.cut,
+                    calibration_chunks = r.calibration_chunks,
+                    calibration_cut = r.calibration_cut,
                     "learned the layer's anomalous-chunk exclusion",
                 ),
                 Err(e) => tracing::warn!(

@@ -13,7 +13,8 @@
 use candle_conversation::persistence::content_hash::turn_stream_id;
 use candle_conversation::provenance::WideQSig;
 
-use crate::attribution::{BATCH, KEEP};
+use crate::anomaly;
+use crate::attribution::{attributed, background_mass, Chunks, BATCH, KEEP};
 use crate::corpus::{File, Question};
 use crate::judge::{header, Judge};
 use crate::remote_gallery::{Daemon, Questions, RemoteGallery};
@@ -121,8 +122,104 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
             );
         }
     }
+
+    // The competition's own generic chunks — thinking openers every question
+    // shares — cut as content's are: their mass is what they win on other
+    // files' questions past the gallery's, asked of the competition alone.
+    let chunks = Chunks::of(files, false, &|fi, qi| !masked(fi, qi));
+    let background: Vec<(usize, &[WideQSig])> = asked
+        .iter()
+        .flat_map(|&fi| {
+            files[fi].questions[GALLERY + 1..]
+                .iter()
+                .filter(|q| thought(q))
+                .map(move |q| (fi, q.sigs.as_slice()))
+        })
+        .collect();
+    let bg = attributed(&gpu, &chunks, &background, false, Questions::With, &masked)?;
+    let mass = background_mass(&chunks, &background, &bg);
+    println!(
+        "\ncompetition chunks {}, background {} questions",
+        mass.len(),
+        background.len()
+    );
+    // What the most generic competition chunks are: their question and where
+    // in its turn they sit.
+    let mut by_mass: Vec<usize> = (0..mass.len()).collect();
+    by_mass.sort_by(|&a, &b| mass[b].total_cmp(&mass[a]));
+    let total: f32 = mass.iter().sum();
+    for &c in by_mass.iter().take(SHOWN) {
+        let (sid, start, end) = chunks.range_of[c];
+        let fi = chunks.file_of[c];
+        let Some((qi, q)) = files[fi]
+            .questions
+            .iter()
+            .enumerate()
+            .find(|(_, q)| turn_stream_id(q.timeline, q.turn).0 == sid)
+        else {
+            continue;
+        };
+        let part = if end <= q.body.end && start >= q.body.start {
+            "question"
+        } else if start >= q.answer.start && end <= q.answer.end {
+            "thinking"
+        } else {
+            "spans/framing"
+        };
+        println!(
+            "{:>10.0} ({:>4.1}%)  {} q{qi} [{start}..{end}] of {} (question {:?}, thinking {:?}) {part}",
+            mass[c],
+            100.0 * mass[c] / total.max(1e-6),
+            files[fi].path.as_deref().unwrap_or("<no path>"),
+            q.sigs.len(),
+            q.body,
+            q.answer
+        );
+    }
+    for (name, probe) in [("question", Keep::Question), ("thinking", Keep::Thinking)] {
+        let held: Vec<(usize, &[WideQSig])> = asked
+            .iter()
+            .map(|&fi| (fi, part(&files[fi].questions[0], probe)))
+            .collect();
+        let content = Judge {
+            gpu: &gpu,
+            held_out: &held,
+            hubs: &[],
+            n,
+            questions: Questions::Without,
+            masked_question: &|_, _| false,
+        };
+        let c = content.scores(&[])?;
+        header(&format!("{name} probes: weight and competition cut"));
+        for &k in &CUT_KS {
+            let cut: Vec<(u64, usize, usize)> = match k {
+                Some(k) => anomaly::excluded(&mass, &chunks.file_of, k, CUT_KEEP)
+                    .into_iter()
+                    .map(|c| chunks.range_of[c])
+                    .collect(),
+                None => Vec::new(),
+            };
+            let q = competition(&gpu, &held, n, &masked, &cut)?;
+            let label = k.map_or("no cut".to_string(), |k| format!("k {k} ({})", cut.len()));
+            for &w in &WEIGHTS {
+                content.print(&format!("  {label}, w {w}"), &combined(&c, &q, w));
+            }
+        }
+    }
     Ok(())
 }
+
+/// The most generic competition chunks shown.
+const SHOWN: usize = 25;
+
+/// Thresholds of the competition cut tried, `None` for none.
+const CUT_KS: [Option<f32>; 4] = [None, Some(5.0), Some(4.0), Some(3.0)];
+
+/// The share of each file's competition chunks a cut leaves it.
+const CUT_KEEP: f32 = 0.5;
+
+/// Weights of the calibration competition tried.
+const WEIGHTS: [f32; 3] = [0.25, 0.5, 1.0];
 
 /// `held` asked of the calibration competition alone — every file turn masked
 /// — with `masked` questions left out and `excluded` cut.

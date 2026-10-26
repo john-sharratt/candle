@@ -283,12 +283,20 @@ loses (`docs/results/provenance_gates_2026-10-26.md`).
   robust deviations (`1.4826 × MAD`) above the median of the chunks that won
   anything, each file keeping at least half its chunks — on the measured
   gallery, ~140 of ~800,000 chunks.
+- **Both competitions.** The calibration competition (§2.5) has generic
+  chunks of its own — the thinking every question opens with, the questions
+  near-identical files ask. The same questions are scanned against the
+  calibrations alone, every file's own turns masked, and its outliers are
+  cut at three robust deviations: its chunks are few per file and alike, so
+  its outliers sit nearer the median. Measured over the first files
+  calibrated with thinking: 17 of ~8,000 chunks cut, MRR 0.333 → 0.401 on
+  question probes and 0.424 → 0.463 on thinking probes.
 - **Where.** Learned ahead of each layer's calibration pass
   (`GroupScanner::learn_chunk_exclusion`, the scan at ingest priority, the
   attribution on the calling thread holding no lock), held in memory per group
   (`Substrate::chunk_exclusion`), and cut from the group's own windows where
-  the live scan assembles them (`belief_files::cut_excluded`). Calibration
-  windows are never cut: they compete apart (§2.5).
+  the live scan assembles them (`belief_files::cut_excluded`), calibration
+  windows and its own alike.
 - **Measured.** Held-out questions, content alone: MRR 0.172 → 0.186; stacked
   on the calibration competition at 15 questions a file: 0.220 → 0.228, R@10
   0.364 → 0.379.

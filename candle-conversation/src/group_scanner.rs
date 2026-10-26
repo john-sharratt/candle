@@ -45,8 +45,8 @@ impl GroupScanner {
         per_file: usize,
     ) -> candle::Result<ExclusionReport> {
         self.conversation
-            .learn_chunk_exclusion(group, per_file, |probes| {
-                match self.scan(group, false, HashSet::new(), HashMap::new(), probes) {
+            .learn_chunk_exclusion(group, per_file, |calibrations, masked, probes| {
+                match self.scan(group, calibrations, masked, HashMap::new(), probes) {
                     Ok(votes) => votes,
                     Err(refused) => Err(candle::Error::Msg(format!(
                         "the chunk-exclusion scan was refused: {refused:?}"

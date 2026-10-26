@@ -207,10 +207,10 @@ pub(crate) fn assemble_file_scans(
     (files, turns_walked)
 }
 
-/// `files` with every range `exclusion` names cut from their own windows — a
-/// window split around a cut, one wholly cut dropped — so a live scan never
-/// sees the chunks that win everything (`crate::provenance::chunk_exclusion`).
-/// Calibration windows are not cut: they compete apart.
+/// `files` with every range `exclusion` names cut from their windows, own and
+/// calibration — a window split around a cut, one wholly cut dropped — so a
+/// live scan never sees the chunks that win everything in either competition
+/// (`crate::provenance::chunk_exclusion`).
 pub(crate) fn cut_excluded(files: &mut [FileScan], exclusion: &ChunkExclusion) {
     if exclusion.is_empty() {
         return;
@@ -220,6 +220,12 @@ pub(crate) fn cut_excluded(files: &mut [FileScan], exclusion: &ChunkExclusion) {
         for (k, s, e, slot) in windows {
             for (a, b) in uncut(s, e, exclusion.of(f.arc_sids[k])) {
                 f.windows.push((k, a, b, slot));
+            }
+        }
+        let cal_windows = take(&mut f.cal_windows);
+        for (k, s, e) in cal_windows {
+            for (a, b) in uncut(s, e, exclusion.of(f.arc_sids[k])) {
+                f.cal_windows.push((k, a, b));
             }
         }
     }
@@ -714,16 +720,23 @@ layers:
     /// **A cut chunk leaves the scan; the rest of its window stays.** A
     /// 3-exchange file of 64-token turns loses chunk 1 of its first turn (the
     /// window splits around it) and both chunks of its second (the window
-    /// goes); its calibration window is untouched.
+    /// goes); of its two 40-token calibration questions, the first loses its
+    /// second chunk and the second is untouched.
     #[test]
-    fn excluded_chunks_are_cut_from_a_files_own_windows() {
-        let q = vec![(0..8).map(|t| sig(70_000 + t)).collect::<Vec<_>>()];
+    fn excluded_chunks_are_cut_from_a_files_windows() {
+        let q: Vec<Vec<WideQSig>> = (0..2)
+            .map(|i| (0..40).map(|t| sig(70_000 + i * 100 + t)).collect())
+            .collect();
         let mut files = vec![calibrated_file(1, 1, 3, 64, &q)];
-        let (t0, t1) = (files[0].arc_sids[0], files[0].arc_sids[1]);
-        let x = ChunkExclusion::of_chunks([(t0, 1, 64), (t1, 0, 64), (t1, 1, 64)]);
+        let (t0, t1, c0) = (
+            files[0].arc_sids[0],
+            files[0].arc_sids[1],
+            files[0].arc_sids[3],
+        );
+        let x = ChunkExclusion::of_chunks([(t0, 1, 64), (t1, 0, 64), (t1, 1, 64), (c0, 1, 40)]);
         cut_excluded(&mut files, &x);
         assert_eq!(files[0].windows, vec![(0, 0, 32, 0), (2, 0, 64, 2)]);
-        assert_eq!(files[0].cal_windows, vec![(3, 0, 8)]);
+        assert_eq!(files[0].cal_windows, vec![(3, 0, 32), (4, 0, 40)]);
         let before = files[0].windows.clone();
         cut_excluded(&mut files, &ChunkExclusion::default());
         assert_eq!(files[0].windows, before);

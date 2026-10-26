@@ -38,9 +38,14 @@ pub struct Chunks<'a> {
 }
 
 impl<'a> Chunks<'a> {
-    /// Every file's covered turns, and each question `question(file, index)`
-    /// keeps.
-    pub fn of(files: &'a [File], question: &dyn Fn(usize, usize) -> bool) -> Chunks<'a> {
+    /// Every file's covered turns when `content`, and each question
+    /// `question(file, index)` keeps — the gallery a scan saw, so a vote is
+    /// credited only where it could have been won.
+    pub fn of(
+        files: &'a [File],
+        content: bool,
+        question: &dyn Fn(usize, usize) -> bool,
+    ) -> Chunks<'a> {
         let mut chunks = Chunks {
             turns: Vec::with_capacity(files.len()),
             file_of: Vec::new(),
@@ -49,7 +54,12 @@ impl<'a> Chunks<'a> {
         };
         for (fi, f) in files.iter().enumerate() {
             let mut turns = Vec::new();
-            for (ti, t) in f.turns.iter().enumerate().filter(|(_, t)| t.covered()) {
+            let own = f
+                .turns
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| content && t.covered());
+            for (ti, t) in own {
                 let sid = turn_stream_id(f.timeline, ti as u32).0;
                 turns.push(chunks.add(fi, sid, &t.sigs, Some((fi, ti))));
             }
@@ -110,12 +120,13 @@ pub struct Won {
 }
 
 /// Every probe's kept votes, attributed to chunks, against the gallery
-/// `questions` and `masked_question` describe — which must hold exactly the
-/// questions `chunks` does.
+/// `content`, `questions` and `masked_question` describe — which must hold
+/// exactly what `chunks` does.
 pub fn attributed(
     gpu: &RemoteGallery,
     chunks: &Chunks,
     probes: &[(usize, &[WideQSig])],
+    content: bool,
     questions: Questions,
     masked_question: &dyn Fn(usize, usize) -> bool,
 ) -> anyhow::Result<Vec<Vec<Won>>> {
@@ -123,7 +134,7 @@ pub fn attributed(
     let mut out: Vec<Vec<Won>> = Vec::with_capacity(probes.len());
     for batch in probes.chunks(BATCH) {
         let sigs: Vec<&[WideQSig]> = batch.iter().map(|(_, s)| *s).collect();
-        let votes = gpu.votes(&sigs, &|_, _| false, questions, masked_question)?;
+        let votes = gpu.votes(&sigs, &|_, _| !content, questions, masked_question)?;
         let kept: Vec<Vec<Vote>> = votes
             .iter()
             .map(|per_token| {
