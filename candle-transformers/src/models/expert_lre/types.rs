@@ -194,6 +194,14 @@ pub struct PipelineStats {
     /// the read-ahead gate (`read_ahead_gate`), which reads ahead only while
     /// this repays it.
     pub ahead_link_us: f64,
+    /// Passes the read-ahead gate has decided at, and of them the ones it read
+    /// ahead through — the share of the run the look-ahead was paid for.
+    pub ahead_passes: usize,
+    pub ahead_passes_on: usize,
+    /// Times the gate changed its decision. Each change records the forward in
+    /// a different shape, so a gate that flips pass to pass costs more than
+    /// the look-ahead it saves.
+    pub ahead_switches: usize,
     /// Routed layers the pipeline thread has processed — one per MoE layer per
     /// forward.
     pub routed_messages: usize,

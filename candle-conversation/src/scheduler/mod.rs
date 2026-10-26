@@ -36,6 +36,7 @@ mod creep_slice;
 mod decode;
 mod detached;
 mod ephemeral_fork;
+mod expert_counters;
 pub mod exported_state;
 mod first_sample;
 mod graph_window;
@@ -84,6 +85,7 @@ mod whole_conversations;
 
 use band::recorded_band;
 use detached::Detached;
+use expert_counters::ExpertCounters;
 use graph_window::graph_window;
 use phase_split::cobatched_shares;
 use reproject_abandon::or_abandon;
@@ -2473,9 +2475,9 @@ struct WaveStats {
     /// only from a forward whose time decode's timer holds — the same wave step
     /// also runs from the prefill quantum.
     in_decode_quantum: bool,
-    /// The expert pipeline's `(hits, misses, DMA loads)` at the previous flush,
-    /// so each wave line reports this window's own — `None` on a dense model.
-    experts_prev: Option<(usize, usize, usize, usize, usize)>,
+    /// The expert pipeline's counters at the previous flush, so each wave line
+    /// reports this window's own — `None` on a dense model.
+    experts_prev: Option<ExpertCounters>,
     /// The device's wave-capture counters at the previous flush, so the wave
     /// line reports this window's own — `None` off CUDA.
     graphs_prev: Option<CaptureStats>,
@@ -2670,7 +2672,7 @@ impl WaveStats {
         backlog: u64,
         bands: VramBands,
         slots: (u32, u32, u32, u32),
-        experts: Option<(usize, usize, usize, usize, usize)>,
+        experts: Option<ExpertCounters>,
         graphs: Option<CaptureStats>,
         trades: Option<admit::rate::TradeWindow>,
         stores: (usize, usize),
@@ -2743,16 +2745,23 @@ impl WaveStats {
         // misses that were in no pinned slot and waited on the stager's pack
         // read — the slow kind, which a miss count alone cannot tell apart —
         // and `cpu` the share the host's expert pool computed, which crossed no
-        // link: the rest of the misses are what the link carried.
+        // link: the rest of the misses are what the link carried. `ahead` is
+        // what read-ahead copied in ahead of its row, the share of passes it
+        // read ahead through, and how often its gate changed its mind — the
+        // refill that brings a conceded zone back, and whether it ran.
         let experts_str = match (experts, self.experts_prev) {
-            (Some((h, m, d, c, p)), Some((h0, m0, d0, c0, p0))) if (h + m) > (h0 + m0) => {
-                let (hits, misses) = (h.saturating_sub(h0), m.saturating_sub(m0));
+            (Some(now), Some(then)) if now.hits + now.misses > then.hits + then.misses => {
+                let d = now.since(&then);
                 format!(
-                    " | experts hit={:.2}% miss={misses} cold={} cpu={} promoted={}",
-                    100.0 * hits as f64 / (hits + misses) as f64,
-                    c.saturating_sub(c0),
-                    p.saturating_sub(p0),
-                    d.saturating_sub(d0),
+                    " | experts hit={:.2}% miss={} cold={} cpu={} promoted={} ahead={} on={:.0}% flips={}",
+                    100.0 * d.hits as f64 / (d.hits + d.misses) as f64,
+                    d.misses,
+                    d.cold,
+                    d.cpu,
+                    d.promoted,
+                    d.ahead_claims,
+                    100.0 * d.ahead_passes_on as f64 / d.ahead_passes.max(1) as f64,
+                    d.ahead_switches,
                 )
             }
             _ => String::new(),
