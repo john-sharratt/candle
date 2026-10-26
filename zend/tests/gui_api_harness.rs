@@ -148,7 +148,7 @@ async fn serves_gui_shell_and_seam_scripts() {
         "zend-api.js",
         "zend-api.mock.js",
         "zend-api.live.js",
-        "favicon.svg",
+        "favicon.png",
         "common/base.css",
         "common/lib/dom.js",
         "common/lib/estate.css",

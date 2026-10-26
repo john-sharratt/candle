@@ -38,7 +38,7 @@
 
 export const SITES = [
   { id: 'tokera',       name: 'Tokera',        url: 'https://tokera.com/',       icon: '/brand/tokera.png' },
-  { id: 'zend',         name: 'Zend',          url: 'https://code.tokera.com/',  icon: '/brand/zend.svg' },
+  { id: 'zend',         name: 'Zen',           url: 'https://code.tokera.com/',  icon: '/brand/zen.png' },
   { id: 'npcd',         name: 'NPCs',          url: 'https://bot.tokera.com/',   icon: '/brand/npcd.svg' },
   { id: 'battlecities', name: 'Battle Cities', url: 'https://battlecities.net/', icon: '/brand/battlecities.png' },
 ];

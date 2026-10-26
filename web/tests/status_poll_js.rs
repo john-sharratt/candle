@@ -154,7 +154,7 @@ fn the_unreachable_reason_is_readable() {
     );
     assert_eq!(
         reason(json!("Error"), json!("GET /v1/status -> 503")),
-        json!("Zend is restarting — back in a moment."),
+        json!("Zen is restarting — back in a moment."),
         "every member still loading"
     );
     assert_eq!(

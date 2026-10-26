@@ -3,28 +3,28 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<title>Zend — a coding assistant that keeps the whole project in mind</title>
+<title>Zen — a coding assistant that keeps the whole project in mind</title>
 <!-- Metadata on an application shell. The console renders itself, so this will
      never rank on content; what it does is make the link render when somebody
-     shares it. The description is the one tokera.com uses for Zend, so the two
+     shares it. The description is the one tokera.com uses for Zen, so the two
      say the same thing about the same product. -->
 <meta name="description"
-  content="Most assistants forget between sessions and re-read the same files to re-derive the same conclusions. Zend keeps the codebase, the decisions and the reasons for them in a substrate that survives a restart.">
+  content="Most assistants forget between sessions and re-read the same files to re-derive the same conclusions. Zen keeps the codebase, the decisions and the reasons for them in a substrate that survives a restart.">
 <link rel="canonical" href="https://code.tokera.com/">
 <meta name="robots" content="index, follow, max-image-preview:large">
 <meta property="og:site_name" content="Tokera">
 <meta property="og:type" content="website">
-<meta property="og:title" content="Zend — a coding assistant that keeps the whole project in mind">
+<meta property="og:title" content="Zen — a coding assistant that keeps the whole project in mind">
 <meta property="og:description"
   content="Institutional memory for a codebase: why a module is shaped the way it is, months later. One shared KV prefix across every developer working from the same fork.">
 <meta property="og:url" content="https://code.tokera.com/">
 <meta property="og:locale" content="en">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:title" content="Zend — a coding assistant that keeps the whole project in mind">
+<meta name="twitter:title" content="Zen — a coding assistant that keeps the whole project in mind">
 <meta name="twitter:description"
   content="Keeps the codebase, the decisions and the reasons for them in a substrate that survives a restart.">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Zend",
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Zen",
 "url":"https://code.tokera.com/","applicationCategory":"DeveloperApplication",
 "operatingSystem":"Linux, Windows, macOS",
 "description":"A coding assistant with institutional memory — the codebase, the decisions and the reasons for them in a substrate that survives a restart.",
@@ -305,7 +305,7 @@
       <h1>A coding assistant that keeps the whole project in mind.</h1>
       <p>
         Most assistants forget between sessions and re-read the same files to
-        re-derive the same conclusions. Zend keeps the codebase, the decisions and
+        re-derive the same conclusions. Zen keeps the codebase, the decisions and
         the reasons for them in a substrate that survives a restart — so it can
         tell you months later why a module is shaped the way it is.
       </p>
@@ -2226,7 +2226,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const fileIcon = '<svg viewBox="0 0 24 24" fill="none" style="width:20px;height:20px;flex-shrink:0;color:#c9a25a;"><path d="M14 3v5h5M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     return h('div', { style: 'flex:1; min-height:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2.25rem; padding:0 2.5rem 3rem;' },
       h('div', { style: 'display:flex; flex-direction:column; align-items:center; gap:1.25rem;' },
-        h('div', { html: starLogo(52, '#26231f', 9) }),
+        h('div', { html: zenLogo(52) }),
         h('h1', { style: 'font-size:1.9rem; font-weight:600; letter-spacing:-0.4px; text-align:center; color:#ece8e4;' }, greeting)),
       h('div', { style: 'display:grid; grid-template-columns:1fr 1fr; gap:0.5rem; width:100%; max-width:500px;' },
         cards.map((card) => h('button', { onClick: () => send(card.prompt), style: 'display:flex; flex-direction:column; gap:0.3rem; background:#26231f; border:1px solid #252220; border-radius:10px; padding:0.9rem 1rem; cursor:pointer; text-align:left;' },
@@ -3868,9 +3868,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   }
   function closeBtnStyle() { return 'flex-shrink:0; width:28px; height:28px; display:flex; align-items:center; justify-content:center; font-size:15px; color:#7c736a; background:none; border:1px solid #38342f; border-radius:7px; cursor:pointer; padding:0;'; }
   function modalOvStyle(z) { return 'position:fixed; inset:0; z-index:' + z + '; background:rgba(0,0,0,0.62); backdrop-filter:blur(2px); display:flex; align-items:center; justify-content:center; padding:40px;'; }
-  function starLogo(sz, hole, rx) {
-    rx = rx || 7.5;
-    return '<svg width="' + sz + '" height="' + sz + '" viewBox="0 0 32 32" style="flex-shrink:0;display:block;"><rect width="32" height="32" rx="' + rx + '" fill="' + hole + '"/><path d="M16 2.5 C 16.4,9.8 22.2,15.6 29.5,16 C 22.2,16.4 16.4,22.2 16,29.5 C 15.6,22.2 9.8,16.4 2.5,16 C 9.8,15.6 15.6,9.8 16,2.5 Z" fill="#c98a3e"/><circle cx="16" cy="16" r="3.2" fill="' + hole + '" opacity="0.55"/></svg>';
+  // Zen's mark: the same image the page's icon is.
+  function zenLogo(sz) {
+    return '<img src="/favicon.png" alt="Zen" width="' + sz + '" height="' + sz + '" style="flex-shrink:0;display:block;">';
   }
   function flash(btn, on, off) { if (btn) { btn.textContent = on; setTimeout(() => { btn.textContent = off; }, 1400); } }
   // Robust clipboard copy. navigator.clipboard.writeText rejects ASYNC (a bare
@@ -3906,7 +3906,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // moment. The startup card below is for a daemon that says it is loading.
   function buildSplash() {
     return h('div', { class: 'z-splash', role: 'status', 'aria-live': 'polite' },
-      h('div', { class: 'z-splash-mark', html: starLogo(40, '#26231f', 8) }),
+      h('div', { class: 'z-splash-mark', html: zenLogo(40) }),
       h('div', {}, 'Getting ready…'));
   }
   // The boot poll has gone unanswered (`unanswered`): the gateway is down, or
@@ -3917,7 +3917,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function buildUnreachable() {
     const u = S.unreachable;
     const card = h('div', { class: 'z-load-card', role: 'alert' },
-      h('div', { class: 'z-load-eyebrow' }, 'Can’t reach Zend'),
+      h('div', { class: 'z-load-eyebrow' }, 'Can’t reach Zen'),
       h('div', { class: 'z-load-row' },
         spinner(),
         h('span', { class: 'z-load-cur', 'data-retry-msg': '' }, retryMessage(u))),
