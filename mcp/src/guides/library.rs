@@ -178,6 +178,60 @@ mod tests {
         );
     }
 
+    /// The boundary between the two forms sits exactly at `NAMES_ONLY_PAST`,
+    /// which is a deliberate choice about how long a tool's description gets:
+    /// listed by that many guides a tool still gets each one's one-liner, and
+    /// one more guide names them only.
+    #[test]
+    fn the_names_only_boundary_sits_exactly_past_names_only_past() {
+        assert_eq!(NAMES_ONLY_PAST, 4);
+
+        // `Library::new` keeps a tool's guides in name order, so the expected
+        // line lists them sorted whatever the constant is set to.
+        let named = |n: usize| -> Vec<String> {
+            let mut names: Vec<String> = (0..n).map(|i| format!("g{i}")).collect();
+            names.sort();
+            names
+        };
+
+        // At the boundary: descriptions, joined by "; ", the whole line.
+        let at = Library::new(
+            named(NAMES_ONLY_PAST)
+                .iter()
+                .map(|n| guide(n, &["t"]))
+                .collect(),
+        )
+        .unwrap();
+        let each: Vec<String> = named(NAMES_ONLY_PAST)
+            .iter()
+            .map(|n| format!("{n} — {n} work"))
+            .collect();
+        assert_eq!(
+            at.line_for("t").unwrap(),
+            format!(
+                "Guides: {}. Read one with guide_read before you start.",
+                each.join("; ")
+            )
+        );
+
+        // One past it: names only, joined by ", ", the whole line.
+        let over = Library::new(
+            named(NAMES_ONLY_PAST + 1)
+                .iter()
+                .map(|n| guide(n, &["t"]))
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            over.line_for("t").unwrap(),
+            format!(
+                "Guides: {} — read one with guide_read before you start; guide_list says \
+                 what each is for.",
+                named(NAMES_ONLY_PAST + 1).join(", ")
+            )
+        );
+    }
+
     #[test]
     fn a_listed_tool_has_its_guides_appended_and_the_others_are_untouched() {
         let l = Library::new(vec![guide("a", &["t"])]).unwrap();
