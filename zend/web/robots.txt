@@ -1,10 +1,9 @@
-# Zend — the console for the coding assistant.
+# Zen — the console for the coding assistant.
 #
 # One indexable address, the front door. Everything behind it is an instrument
 # panel over one developer's own daemon.
 User-agent: *
 Allow: /$
-Allow: /favicon.svg
 Allow: /favicon.png
 Allow: /favicon.ico
 Allow: /brand/

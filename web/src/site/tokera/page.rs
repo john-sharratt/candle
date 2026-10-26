@@ -179,9 +179,9 @@ pub const ESTATE: [(&str, &str, &str, &str); 4] = [
     ),
     (
         "zend",
-        "Zend",
+        "Zen",
         "https://code.tokera.com/",
-        "/brand/zend.svg",
+        "/brand/zen.png",
     ),
     ("npcd", "NPCs", "https://bot.tokera.com/", "/brand/npcd.svg"),
     (
@@ -789,8 +789,8 @@ mod tests {
                 content.join("battlecities").join("favicon-32x32.png"),
             ),
             (
-                "zend.svg",
-                root.join("..").join("zend").join("web").join("favicon.svg"),
+                "zen.png",
+                root.join("..").join("zend").join("web").join("favicon.png"),
             ),
         ] {
             let mine = content.join("common").join("brand").join(copy);

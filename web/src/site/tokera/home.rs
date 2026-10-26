@@ -109,7 +109,7 @@ const WORK: [Work; 6] = [
     },
     Work {
         kicker: "The assistant",
-        name: "Zend",
+        name: "Zen",
         tagline: "A coding assistant that keeps the whole project in mind",
         body: "Most assistants forget between sessions and re-read the same files to re-derive \
                the same conclusions. This one keeps the codebase, the decisions and the reasons \

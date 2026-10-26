@@ -71,7 +71,7 @@ export function unreachableReason(name, message) {
   const status = /-> (\d{3})$/.exec(msg);
   // The gateway's 503 while every member is still loading (`none_ready`,
   // web/src/cluster/route.rs): a restart, not a fault.
-  if (status && status[1] === '503') return 'Zend is restarting — back in a moment.';
+  if (status && status[1] === '503') return 'Zen is restarting — back in a moment.';
   if (status) return 'The gateway answered ' + status[1] + '.';
   return msg || 'The server did not answer.';
 }
