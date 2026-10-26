@@ -212,11 +212,10 @@ impl GalleryArena {
         let mut case_off = 0usize;
         let mut max_seg_cases = 1usize;
 
-        // Keep the arena under its own ceiling before the build admits anything
-        // — once, not per turn: the pass walks every resident turn, so run
-        // ahead of each of a large index's ensures it made the build quadratic
-        // in its turns. What the build uploads is held only by its own pins
-        // until the launch, so nothing it admits is given up under it.
+        // Give up the turns past their keep time before the build admits
+        // anything — once per build, not per turn: the pass is O(resident
+        // turns). What the build uploads is held by its own pins until the
+        // launch, so nothing it admits is given up under it.
         self.evict_past_keep();
         // Turns pinned so far — released on error so a failed build never leaks pins.
         let mut pinned_sids: Vec<StreamId> = Vec::new();
@@ -1593,6 +1592,37 @@ mod tests {
             Some(IndexMiss::Absent),
             "the stale index was dropped from the cache"
         );
+    }
+
+    /// **An index over a turn the gallery gave up is stale.** Built, then its
+    /// one turn dropped from residency: the cached index names a run that is
+    /// gone, so reuse refuses it as stale rather than handing out freed pages.
+    #[test]
+    fn an_index_over_an_evicted_turn_is_stale() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let a: Vec<WideQSig> = (0..20).map(|t| sig(0xB00 + t)).collect();
+        let seg = vec![PagedSegment {
+            windows: vec![PagedWindow {
+                sid: turn_stream_id(8, 0),
+                fingerprint: 1,
+                turn: (&a).into(),
+                start: 0,
+                end: 20,
+                case: 0,
+            }],
+            n_cases: 1,
+        }];
+        let probe = vec![sig(0xB00 + 5)];
+        let fp = fingerprint_segments(&seg);
+        arena.scan_weighted(&seg, &[probe.as_slice()], &[]).unwrap();
+        arena.drop_turn(turn_stream_id(8, 0));
+        assert_eq!(arena.resident_turns(), 0);
+        assert_eq!(arena.reuse_index(fp).err(), Some(IndexMiss::Stale));
     }
 
     /// **A compaction must be invisible to the scan.** Score the same segments
