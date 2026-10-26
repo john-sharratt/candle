@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use candle::Device;
 
-use super::prefill::VramPhase;
 use super::Scheduler;
 use crate::guest::drain::EngineRoom;
 use crate::guest::ground::{GroundError, GuestGround};
@@ -44,13 +43,13 @@ impl EngineRoom for Scheduler {
         }
     }
 
-    fn shed(&mut self, _bytes: usize) -> u64 {
-        let before = self.free_region_bytes();
-        // The same ladder ordinary KV pressure walks. `VramPhase::Load` is the
-        // right setpoint: a guest drain is a load — it is about to put a
-        // checkpoint on the card — not a decode step trying not to stall.
-        self.relieve_vram_pressure("guest", VramPhase::Load, super::prefill::ReliefNeed::Now);
-        self.free_region_bytes().saturating_sub(before)
+    /// The ladder ordinary KV pressure walks, driven to the guest's own target —
+    /// `bytes` more than is free now — rather than to the KV side's setpoint,
+    /// which on a quiet cache asks for nothing (see
+    /// [`Scheduler::relieve_toward`]).
+    fn shed(&mut self, bytes: usize) -> u64 {
+        let target = self.free_region_bytes() + bytes as u64;
+        self.relieve_toward(target)
     }
 
     fn free_bytes(&self) -> usize {

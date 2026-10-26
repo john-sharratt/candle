@@ -2630,6 +2630,56 @@ impl Scheduler {
             .is_some_and(|(free, setpoint)| free < setpoint)
     }
 
+    /// The relief ladder driven to `target` bytes of free KV ground rather than
+    /// to the pressure setpoint — what a guest drain sheds toward. Returns the
+    /// bytes freed.
+    ///
+    /// **A guest's need is not KV pressure.** [`Self::relieve_vram_pressure`]
+    /// answers the KV side's own shortfall and returns at once when there is
+    /// none, which on a quiet cache is always — so a drain that asked it for an
+    /// image's 9 GB freed nothing, every time, and took all of its ground from
+    /// the weight zone: experts to the floor for every draw, and a 1024² draw
+    /// refused 240 MiB short beside ground the KV side held for turns nobody
+    /// was attending. The rungs are the same, in the same order, and evict only
+    /// what they always may — a turn with a warm copy, outside every live
+    /// working set, which reloads from RAM when it is next reselected. The
+    /// weight side's concession stays the claim's, for what this cannot free.
+    pub(super) fn relieve_toward(&mut self, target: u64) -> u64 {
+        let free = |s: &Self| s.kv_regions().map_or(0, |r| r.free as u64 * region_bytes());
+        let before = free(self);
+        if before >= target {
+            return 0;
+        }
+        if let Device::Cuda(d) = self.session.device() {
+            end_wave_transient(&d.cuda_stream());
+        }
+        let _ = self.session.release_empty_arenas();
+        self.pack_until_settled(PackGoal::Ground);
+        let short = target.saturating_sub(free(self));
+        if short > 0 {
+            let evicted = self.evict_cold_tail(short);
+            if evicted.bytes < short {
+                let rest = short - evicted.bytes;
+                super::timed_wait(|| {
+                    self.persist_triggers
+                        .flush_at_least(rest, VRAM_OFFLOAD_FLUSH_TIMEOUT)
+                });
+                self.evict_cold_tail(rest);
+            }
+            let _ = self.session.release_empty_arenas();
+            self.pack_until_settled(PackGoal::Ground);
+        }
+        let freed = free(self).saturating_sub(before);
+        tracing::info!(
+            target: "candle_conversation::scheduler::timing",
+            target_mib = target >> 20,
+            before_mib = before >> 20,
+            freed_mib = freed >> 20,
+            "relief toward a guest's ground"
+        );
+        freed
+    }
+
     /// Bytes one relief pass should aim to free: enough to reach the setpoint
     /// plus [`RELIEF_OVERSHOOT_REGIONS`]. `None` when there is no pressure, so
     /// a relief call on a healthy cache costs one counter read.
