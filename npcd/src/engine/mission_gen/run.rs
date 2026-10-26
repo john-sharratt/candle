@@ -766,11 +766,19 @@ pub fn spawn(rt: Arc<Runtime>) {
                 // Steps of operations already open come first: an operation
                 // half done is worth more than a new one opened. The table's
                 // own steps are taken here; a Maker's is put on the table.
+                //
+                // **A Maker's step is offered before every reading, not only
+                // after the last.** Offering costs nothing; a reading takes
+                // minutes. Offered only once the table's steps were through, a
+                // publish and a canon check waited behind readings in a row —
+                // and lost the wait to a restart mid-reading — while every
+                // Maker free to take them drew routines.
                 if hosted.sim(|s| s.table_open && s.bench.has_root()) {
                     for (op, call) in hosted.sim(|s| s.missions.operations().awaiting_table()) {
                         if rt.stopping() {
                             return;
                         }
+                        offer_owed(&hosted, &mind);
                         if let Err(e) = table_step(&rt, &hosted, &config, op, &call).await {
                             tracing::warn!("operation: the table's step: {e:#}");
                             break;
