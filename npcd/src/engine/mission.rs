@@ -1000,6 +1000,40 @@ pub fn compass_report_line(
     line
 }
 
+/// The mission compass on a publish step whose work has not landed yet:
+/// `doc` is what is to land, `status` and `publish` the merge table's own
+/// addresses when the body stands at one, and `way` the way to the nearest
+/// when it does not.
+///
+/// **The landing, not the report.** Told on every turn that the work was done
+/// and to report it, a Maker carrying a publish stood at the order table
+/// calling `report_done` and `report_stuck` for half an hour, each refused
+/// with "it has not landed", while the merge table stood in the same room.
+pub fn publish_compass(
+    doc: &str,
+    status: Option<&str>,
+    publish: Option<&str>,
+    way: Option<&str>,
+) -> String {
+    match (status, publish, way) {
+        (Some(status), Some(publish), _) => format!(
+            "Your mission, next: land {doc} in the record. The merge table is here: `invoke` \
+             {status} to see what it changes and whether it merges cleanly, then `invoke` \
+             {publish} to land it. Report at the table once it has landed."
+        ),
+        (_, _, Some(way)) => format!(
+            "Your mission, next: land {doc} in the record, at the merge table in {way}. There, \
+             `merge_status` shows whether it merges cleanly and `merge_publish` lands it. \
+             Report at the table once it has landed."
+        ),
+        _ => format!(
+            "Your mission, next: land {doc} in the record, at the merge table: `merge_status` \
+             shows whether it merges cleanly and `merge_publish` lands it. Report at the table \
+             once it has landed."
+        ),
+    }
+}
+
 fn report_way(table: Option<&str>, at_table: bool, verdict: bool) -> String {
     let what = match verdict {
         true => {
@@ -1937,6 +1971,38 @@ mod tests {
             now.ends_with(" What you saw on it: in the plant room, the coolant valve: tight."),
             "{now}"
         );
+    }
+
+    /// **A publish not yet landed points at the merge table, by its own
+    /// addresses when it is here** — never "report it now", which the order
+    /// table refuses until the work has landed.
+    #[test]
+    fn a_publish_not_landed_points_at_the_merge_table() {
+        let doc = "layers/stories/the-opening.md";
+        let here = super::publish_compass(
+            doc,
+            Some("http://local/command/merge-table~1/merge_status"),
+            Some("http://local/command/merge-table~1/merge_publish"),
+            None,
+        );
+        assert_eq!(
+            here,
+            "Your mission, next: land layers/stories/the-opening.md in the record. The merge \
+             table is here: `invoke` http://local/command/merge-table~1/merge_status to see what \
+             it changes and whether it merges cleanly, then `invoke` \
+             http://local/command/merge-table~1/merge_publish to land it. Report at the table \
+             once it has landed."
+        );
+        let away = super::publish_compass(doc, None, None, Some("the command room: `move_to` it"));
+        assert_eq!(
+            away,
+            "Your mission, next: land layers/stories/the-opening.md in the record, at the merge \
+             table in the command room: `move_to` it. There, `merge_status` shows whether it \
+             merges cleanly and `merge_publish` lands it. Report at the table once it has landed."
+        );
+        let lost = super::publish_compass(doc, None, None, None);
+        assert!(!lost.contains("report it now"), "{lost}");
+        assert!(lost.contains("`merge_publish` lands it"), "{lost}");
     }
 
     /// **A document that does not stand is to be written again**: a done

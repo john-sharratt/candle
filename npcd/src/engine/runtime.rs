@@ -97,8 +97,8 @@ use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, doc_compass, progress_line, refused_compass, time_compass,
-    time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
+    compass_line, compass_report_line, doc_compass, progress_line, publish_compass,
+    refused_compass, time_compass, time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
 };
 use crate::engine::mission_acts;
 use crate::engine::mission_gen;
@@ -1453,6 +1453,7 @@ impl Runtime {
             edit: url_of("file_edit"),
             commit: url_of("bench_commit"),
         };
+        let (merge_status, merge_publish) = (url_of("merge_status"), url_of("merge_publish"));
         hosted.with_both(|w, s| {
             // Riding the lift, there is nothing to do but arrive: told the way
             // from the landing it is still standing on, a rider tried to call
@@ -1491,6 +1492,27 @@ impl Runtime {
                 .chain(route::reachable_from(w.map(), &here))
                 .collect();
             let place = |at: &Where| format!("{}/{}", at.area, at.node);
+            // A publish step is done when its work lands, which the report
+            // alone cannot do: the way is to the merge table, not the order
+            // table that would refuse it.
+            if next.reports && work::unpublished(s, &body).is_some() {
+                let doc = mission.work.as_ref()?.writes.clone();
+                let way = merge_publish
+                    .is_none()
+                    .then(|| {
+                        reach
+                            .iter()
+                            .find(|at| s.part_offers(&place(at), "merge_publish"))
+                            .and_then(&way_to)
+                    })
+                    .flatten();
+                return Some(publish_compass(
+                    &doc,
+                    merge_status.as_deref(),
+                    merge_publish.as_deref(),
+                    way.as_deref(),
+                ));
+            }
             if next.reports {
                 // The way back to the table, lift and all: told only the room, a
                 // character that had done its reading three floors down rode
