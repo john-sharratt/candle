@@ -154,7 +154,7 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             "/v1/substrate/zend/scan",
             Role::Admin,
             Dispatch::Best,
-            post(scan::scan),
+            post(scan::scan).body_limit(scan::BODY_LIMIT),
         )
         // Every member reaches every agent through its gateway, so any one
         // answers for them.

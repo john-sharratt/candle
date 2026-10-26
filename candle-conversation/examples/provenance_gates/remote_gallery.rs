@@ -7,14 +7,21 @@
 //! harness iterates on runs here. A second process uploading its own gallery
 //! beside a daemon that fills the card overcommits it, and the first kernel to
 //! touch an unbacked granule faults.
+//!
+//! **Every answer is kept** under [`CACHE_DIR`], keyed by the exact request —
+//! group, gallery, masks, cuts and probes — so an experiment run again under a
+//! new formula asks the daemon nothing. The daemon's gallery grows as it
+//! ingests; empty the folder to scan against what it holds now.
 
 use std::array::from_fn;
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use candle_conversation::persistence::content_hash::turn_stream_id;
+use candle_conversation::persistence::content_hash::{turn_stream_id, ContentHasher};
 use candle_conversation::provenance::window_score::Vote;
 use candle_conversation::provenance::{encode_wide_sigs, WideQSig, FOLD_GROUPS};
 use serde::Deserialize;
@@ -24,6 +31,9 @@ use crate::corpus::File;
 
 /// The `code_reading` group whose files the gates rank.
 const GROUP: &str = "scopes";
+
+/// Where the daemon's answers are kept, from the repository root.
+const CACHE_DIR: &str = "target/provenance-scan-cache";
 
 /// The admin identity a member's routes accept from the gateway.
 const ADMIN_HEADERS: [(&str, &str); 3] = [
@@ -141,23 +151,48 @@ impl<'a> RemoteGallery<'a> {
                 .map(|p| STANDARD.encode(encode_wide_sigs(p)))
                 .collect::<Vec<_>>(),
         });
+        let body = body.to_string();
+        let kept = cache_path(&body);
+        let answer = match fs::read_to_string(&kept) {
+            Ok(answer) => answer,
+            Err(_) => {
+                let answer = self.ask(&body)?;
+                fs::create_dir_all(CACHE_DIR).context("making the scan cache")?;
+                fs::write(&kept, &answer).context("keeping the daemon's scan")?;
+                answer
+            }
+        };
+        let view: ScanView = serde_json::from_str(&answer).context("reading the daemon's scan")?;
+        local_votes(&view, &self.index_of)
+    }
+
+    /// The daemon's answer to `body`, as it sent it.
+    fn ask(&self, body: &str) -> anyhow::Result<String> {
         let mut req = self
             .agent
             .post(&format!("{}/v1/substrate/zend/scan", self.daemon.url))
-            .set("x-tokera-node", &self.daemon.node);
+            .set("x-tokera-node", &self.daemon.node)
+            .set("content-type", "application/json");
         for (k, v) in ADMIN_HEADERS {
             req = req.set(k, v);
         }
-        let view: ScanView = match req.send_json(body) {
-            Ok(resp) => resp.into_json().context("reading the daemon's scan")?,
+        match req.send_string(body) {
+            Ok(resp) => resp.into_string().context("reading the daemon's scan"),
             Err(ureq::Error::Status(code, resp)) => anyhow::bail!(
                 "the daemon refused the scan: {code} {}",
                 resp.into_string().unwrap_or_default()
             ),
-            Err(e) => return Err(e).context("reaching the daemon"),
-        };
-        local_votes(&view, &self.index_of)
+            Err(e) => Err(e).context("reaching the daemon"),
+        }
     }
+}
+
+/// Where the answer to `body` is kept.
+fn cache_path(body: &str) -> PathBuf {
+    let mut h = ContentHasher::new();
+    h.update(body.as_bytes());
+    let key = h.finish();
+    PathBuf::from(CACHE_DIR).join(format!("{:016x}{:016x}.json", key.hi, key.lo))
 }
 
 /// `view`'s votes with each case named by this harness's file index.

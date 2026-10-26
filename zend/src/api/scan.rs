@@ -26,6 +26,11 @@ use candle_conversation::ScanRefused;
 
 use crate::session::ZendSession;
 
+/// The largest request the route reads: a batch of a few thousand probe
+/// tokens at 192 bytes each is megabytes of base64 on its own, and a gallery
+/// cut can name tens of thousands of ranges.
+pub const BODY_LIMIT: usize = 64 << 20;
+
 /// What to score, and against what.
 #[derive(Deserialize)]
 pub struct ScanReq {

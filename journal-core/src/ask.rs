@@ -34,6 +34,9 @@ pub fn stretch(span: &Span, style: &Style) -> String {
 /// shown the step it would be filed under compares against it rather than
 /// against the whole journal. The write follows for a stretch that is a step.
 ///
+/// When the call offers `per` — `above`, the writer has journals above it —
+/// the style's `per_question` follows the write.
+///
 /// After a refused attempt `refused` holds that attempt as it was written and why
 /// it was refused, because each question is put afresh and the writer would
 /// otherwise not know what to change.
@@ -41,6 +44,7 @@ pub fn writing(
     span: &Span,
     style: &Style,
     latest: Option<&Entry>,
+    above: bool,
     refused: Option<(&str, &str)>,
 ) -> String {
     let mut out = stretch(span, style);
@@ -56,6 +60,10 @@ pub fn writing(
     }
     out.push_str("\n\n");
     out.push_str(style.write_question);
+    if above {
+        out.push(' ');
+        out.push_str(style.per_question);
+    }
     if let Some((attempt, why)) = refused {
         out.push_str(&format!(
             "\n\nYou tried this:\n{}\n\nIt was refused: {why}\nWrite it again with that put right.",
@@ -95,7 +103,7 @@ mod tests {
 
     #[test]
     fn the_writing_question_is_the_stretch_then_the_call() {
-        let asked = writing(&span(), &PLAIN, None, None);
+        let asked = writing(&span(), &PLAIN, None, false, None);
         assert_eq!(
             asked,
             format!(
@@ -103,6 +111,14 @@ mod tests {
                 stretch(&span(), &PLAIN)
             )
         );
+    }
+
+    /// `per` is described only to a writer the call offers it to.
+    #[test]
+    fn per_is_asked_for_only_when_there_are_journals_above() {
+        assert!(writing(&span(), &PLAIN, None, true, None)
+            .ends_with("Write it up with journal_write. Name an entry above in per."));
+        assert!(!writing(&span(), &PLAIN, None, false, None).contains("per."));
     }
 
     /// With an entry to weigh the stretch against, the step test comes first
@@ -113,7 +129,7 @@ mod tests {
             summary: "Looked up IN_PROMPT. ".into(),
             ..entry(4)
         };
-        let asked = writing(&span(), &PLAIN, Some(&latest), None);
+        let asked = writing(&span(), &PLAIN, Some(&latest), false, None);
         assert_eq!(
             asked,
             format!(
@@ -130,6 +146,7 @@ mod tests {
             &span(),
             &PLAIN,
             None,
+            false,
             Some((" {\"name\": \"journal_write\"} ", "Claim 1 cites turn 3.")),
         );
         assert!(

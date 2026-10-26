@@ -15,10 +15,10 @@ use crate::mcp::threads::conv_names;
 const MS_PER_DAY: u64 = 86_400_000;
 const MS_PER_MINUTE: u64 = 60_000;
 
-/// The write question, with `$more` said after it.
-macro_rules! write_question {
-    ($more:literal) => {
-        concat!("Write it up with journal_write. An entry records what was \
+/// What the model is asked once the stretch is on the table.
+///
+/// The call is shown nowhere else, so the question says what each part of it is.
+pub const WRITE_QUESTION: &str = "Write it up with journal_write. An entry records what was \
 significant in this stretch, not a retelling of it: whoever reads your journal later sees the \
 entry, and goes to the turns themselves when they need the detail. For `claims`, write what \
 matters from here on — what was asked for, what was found (a cause, a result that settled a \
@@ -28,35 +28,21 @@ reads that showed nothing, the calls made again. One fact per claim, in one shor
 sentence — names, paths and numbers as they were — and `cite` the number of the turn it rests \
 on (`also_cite` for a second). A tool result you read is cited by its number; so is what you \
 were told, and so is a call you made. Something you worked out and did \
-not see in a result still cites the turn that led you to it. Only a claim that is itself one \
-fact about the workspace — that a file exists or not, which blob a file is at, which commit a \
-branch is on — takes `typed`, with `subject` `file:<repo>/<path>` and `attribute` `exists` or \
-`blob`, or `subject` `branch:<repo>` and `attribute` `head`, and the `value`; a claim about what \
-a file says, or what a result showed, takes none. `summary` is the task or step this stretch \
+not see in a result still cites the turn that led you to it. `summary` is the task or step this stretch \
 was, in one short sentence — what was being done and where it got to, not each read: it is the \
 line your journal shows, and the claims are kept behind it. `intend` is what you mean to do \
 next, as short lines, at most three. `open` is what is still unsettled — a failing test, a question \
 the user has not answered, a step not done: its `text`, and `relates` — `new` for something \
 you were not carrying, `restates N` to say an open item again, `resolves N` when it has been \
 settled. Put nothing in that did not happen: a conclusion you only worked out is written as \
-one, and a result that may have changed since is written as it was when you read it.", $more)
-    };
-}
+one, and a result that may have changed since is written as it was when you read it.";
 
-/// What the model is asked once the stretch is on the table.
-///
-/// The call is shown nowhere else, so the question says what each part of it is.
-pub const WRITE_QUESTION: &str = write_question!("");
-
-/// [`WRITE_QUESTION`] for a conversation with journals above it: a claim that
-/// rests on one of their entries names it, and the check confirms the entry is
-/// there and is an ancestor's (`docs/claude_zend_gateway.md` §5.2).
-pub const LINEAGE_WRITE_QUESTION: &str = write_question!(
-    " A claim that rests on an entry of a journal above you — a decision in your thread's \
-notes, a standing rule of the project, a finding of the worker that started you — says so in \
-its text, `per T:<thread>#<n>`, and takes `typed` with `subject` `entry:<journal>#<n>` (the \
-journal's path or name as your journals show it), `attribute` `exists` and `value` `true`."
-);
+/// Said after [`WRITE_QUESTION`] when the call offers `per` — the conversation
+/// has journals above it, whose entries `per` offers
+/// (`docs/claude_zend_gateway.md` §5.2).
+pub const PER_QUESTION: &str = "A claim that rests on an entry of a journal above you — a \
+decision in your thread's notes, a standing rule of the project, a finding of the worker that \
+started you — names that entry in `per`.";
 
 /// Offered after [`WRITE_QUESTION`] once the journal holds an entry.
 ///
@@ -182,6 +168,11 @@ pub const CODING: Style = Style {
     settled: "Settled:",
     corrected: " (the workspace reads",
     recheck: " (re-check)",
+    rests_on: " (per",
+    // A coding session's claims are about what files say and what results
+    // showed, which no check can read: a fact slot only gathered facts about
+    // something else. The cited turns are what a claim rests on.
+    facts: false,
     open_heading: "Still open:",
     nothing_open: "Still open: nothing.",
     end: "That is the whole of your journal. Anything else you know of this conversation comes \
@@ -189,6 +180,7 @@ from its turns or from what was retrieved for it, not from your journal.",
     clock,
     stretch,
     write_question: WRITE_QUESTION,
+    per_question: PER_QUESTION,
     skip_question: SKIP_QUESTION,
     bucket: utc_bucket,
     period_name,
@@ -200,7 +192,6 @@ from its turns or from what was retrieved for it, not from your journal.",
 /// task, an answer, a nudge — so what it heard is what Claude said.
 pub const DELEGATED: Style = Style {
     heard: "Claude said:",
-    write_question: LINEAGE_WRITE_QUESTION,
     ..CODING
 };
 
@@ -208,7 +199,6 @@ pub const DELEGATED: Style = Style {
 /// itself with `sub_run`: its user turns are that worker's.
 pub const PART: Style = Style {
     heard: "Its worker said:",
-    write_question: LINEAGE_WRITE_QUESTION,
     ..CODING
 };
 
@@ -240,6 +230,22 @@ mod tests {
             perishable,
             typed: None,
             corrected: false,
+            per: None,
+        }
+    }
+
+    /// **A coding session's questions never mention a typed fact**: the call
+    /// offers no slot for one. `per` is told of only by the question said
+    /// when the call offers it.
+    #[test]
+    fn no_question_offers_a_fact_and_only_the_per_question_tells_of_per() {
+        for style in [&CODING, &DELEGATED, &PART] {
+            assert!(!style.facts);
+            for asked in [style.write_question, style.per_question] {
+                assert!(!asked.contains("typed"), "{asked}");
+            }
+            assert!(!style.write_question.contains("`per`"));
+            assert!(style.per_question.contains("in `per`"));
         }
     }
 

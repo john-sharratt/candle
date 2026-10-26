@@ -109,11 +109,19 @@ impl Desk for EngineDesk<'_> {
 mod tests {
     use candle_conversation::stencil::{compile_tool_call_tree, ToolCallEnvelope};
     use journal_core::entry::Item;
-    use journal_core::tools::{draft_specs, write_spec, SKIP, WRITE};
+    use journal_core::tools::{draft_specs, write_spec, Claims, SKIP, WRITE};
 
     use super::*;
     use crate::engine::act::{self, Rejected};
+    use crate::engine::journal::style::NPC;
     use crate::engine::tools::CATALOG;
+
+    /// What a character's claims carry: a fact the world reads, and no
+    /// journal above to rest on.
+    const NPC_CLAIMS: Claims<'static> = Claims {
+        facts: NPC.facts,
+        entries: &[],
+    };
 
     fn item(id: u64, text: &str) -> Item {
         Item {
@@ -124,7 +132,7 @@ mod tests {
 
     /// The core's `{name, params}` form, as the engine reads it.
     fn spec(citable: &[u64], open: &[Item]) -> ToolSpec {
-        serde_json::from_value(write_spec(citable, open).unwrap()).unwrap()
+        serde_json::from_value(write_spec(citable, open, NPC_CLAIMS).unwrap()).unwrap()
     }
 
     #[test]
@@ -188,7 +196,7 @@ mod tests {
 
     #[test]
     fn the_engine_reads_the_skip_beside_the_write() {
-        let specs = tool_specs(&draft_specs(&[1, 2], &[], true).unwrap()).unwrap();
+        let specs = tool_specs(&draft_specs(&[1, 2], &[], true, NPC_CLAIMS).unwrap()).unwrap();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, [WRITE, SKIP]);
         let reason = &specs[1].params[0];
@@ -199,7 +207,7 @@ mod tests {
     fn the_drafting_grammar_compiles_under_both_call_shapes() {
         let citable: Vec<u64> = (1..=16).collect();
         let open: Vec<Item> = (1..=6).map(|i| item(i, "something")).collect();
-        let specs = tool_specs(&draft_specs(&citable, &open, true).unwrap()).unwrap();
+        let specs = tool_specs(&draft_specs(&citable, &open, true, NPC_CLAIMS).unwrap()).unwrap();
         for env in [ToolCallEnvelope::qwen3(), ToolCallEnvelope::qwen35()] {
             compile_tool_call_tree(&specs, &env).expect("the drafting grammar compiles");
         }
@@ -213,7 +221,7 @@ mod tests {
     fn the_drafting_grammar_stays_small_at_its_largest() {
         let citable: Vec<u64> = (1..=64).collect();
         let open: Vec<Item> = (1..=6).map(|i| item(i, "something")).collect();
-        let specs = tool_specs(&draft_specs(&citable, &open, true).unwrap()).unwrap();
+        let specs = tool_specs(&draft_specs(&citable, &open, true, NPC_CLAIMS).unwrap()).unwrap();
         let tree = compile_tool_call_tree(&specs, &ToolCallEnvelope::qwen3()).unwrap();
         let nodes = tree.nodes.len();
         assert!(

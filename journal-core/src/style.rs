@@ -45,6 +45,15 @@ pub struct Style {
     pub corrected: &'static str,
     /// Appended to a claim that may have stopped being true.
     pub recheck: &'static str,
+    /// Opens the entry of another journal a claim rests on: `" (per"` makes
+    /// `… (per T:review#4)`.
+    pub rests_on: &'static str,
+    /// Whether a claim may carry a typed fact the world is asked about. A
+    /// world whose state a claim can be read against — a game's — offers it;
+    /// one that cannot answer what its claims are about leaves it out of the
+    /// call, so the writer is never offered a slot to fill with something
+    /// else.
+    pub facts: bool,
     /// First line of the section the open items are carried in.
     pub open_heading: &'static str,
     /// That section when nothing is open — said, not left out, so a reader
@@ -60,6 +69,10 @@ pub struct Style {
     /// What the writer is asked once the stretch is on the table: the call, and
     /// what each part of it is.
     pub write_question: &'static str,
+    /// Follows `write_question` when the call offers `per` — the writer has
+    /// journals above it — saying what `per` is for. Never said otherwise, so
+    /// no writer is told of a slot it is not offered.
+    pub per_question: &'static str,
     /// Follows `write_question` when the journal already holds an entry: that
     /// `journal_skip`, with a reason, is the answer when the stretch adds
     /// nothing to it.
@@ -135,12 +148,15 @@ pub(crate) mod testing {
         settled: "Settled:",
         corrected: " (reads",
         recheck: " (re-check)",
+        rests_on: " (per",
+        facts: true,
         open_heading: "Open:",
         nothing_open: "Open: nothing.",
         end: "End.",
         clock,
         stretch,
         write_question: "Write it up with journal_write.",
+        per_question: "Name an entry above in per.",
         skip_question: "Or skip it with journal_skip.",
         bucket,
         period_name,
