@@ -65,7 +65,7 @@ use super::groundgguf::{ground_bytes, place_gguf};
 use super::model::GuestModel;
 use super::progress::{GuestEvent, GuestSink};
 use super::seed::resolve_seed;
-use super::tiled::{decode_tiled, encode_tiled};
+use super::tiled::{decode_tiled, encode_tiled, fit_tile, TILE};
 use super::varground::GroundVars;
 use super::work::{
     Guest, GuestImage, GuestOutcome, GuestRequest, ImageLora, ImageReference, ImageRequest,
@@ -260,8 +260,8 @@ fn staged(encode: usize, draw: usize) -> usize {
 /// by evicting.
 ///
 /// The area term describes the transformer, not the decoder. Since
-/// [`decode_tiled`] the decoder's working set is one 512×512 tile whatever the
-/// output is; what still scales with the image is the transformer's own
+/// [`decode_tiled`] the decoder's working set is one tile whatever the output
+/// is, and the tile is sized to the arena ([`autoencoder_tile`]); what still scales with the image is the transformer's own
 /// activations, and this is the rate for those.
 ///
 /// **Sized for the pool it leaves behind, not for the arena.** Two different
@@ -573,6 +573,30 @@ fn vae_bytes(dir: &std::path::Path) -> usize {
         .sum()
 }
 
+/// What one autoencoder tile costs the arena, per pixel of output.
+///
+/// **A margin over a measured lower bound, to be tightened from the high-water
+/// [`arena_reading`] logs.** Measured on the 3090: a 512×512 tile's
+/// full-resolution resnet asked for its second 576 MiB im2col buffer with 992
+/// MiB already carved — at least 6.2 KiB a pixel, and the stage had more to
+/// allocate after it. 16 KiB holds that with room for the rest.
+const AUTOENCODER_BYTES_PER_PIXEL: usize = 16 << 10;
+
+/// The autoencoder's tile side, sized to the arena this drain opened: the
+/// largest whose stages it holds ([`fit_tile`]). The full tile when no arena is
+/// open — a guest without one allocates from the pool, which has no cursor to
+/// overrun.
+fn autoencoder_tile(device: &Device) -> usize {
+    let capacity = device.as_cuda_device().ok().and_then(|cuda| {
+        candle_nn::kv_cache::guest_domain_stats(cuda.cuda_stream().context().ordinal())
+            .map(|(_, _, capacity)| capacity)
+    });
+    match capacity {
+        Some(capacity) => fit_tile(capacity, AUTOENCODER_BYTES_PER_PIXEL),
+        None => TILE,
+    }
+}
+
 /// Where the activation arena stands after `what`: its cursor, its high-water
 /// and its capacity.
 ///
@@ -719,7 +743,7 @@ impl Loaded {
         let px = ((px / 127.5)? - 1.0)?;
 
         let vae = &self.vae;
-        let z = encode_tiled(&px, |tile| {
+        let z = encode_tiled(&px, autoencoder_tile(&self.device), |tile| {
             // The mode, not a sample: the noise this latent will carry is
             // chosen by the hold a line below, and a second undeclared helping
             // from the encoder would sit on top of it.
@@ -925,25 +949,29 @@ impl Loaded {
         // out-of-memory this removes and why the guest's own ground cannot back
         // a decode.
         let vae = &self.vae;
-        let pixels = decode_tiled(&latent.unsqueeze(0)?, |tile| {
-            // One generation per tile, for the reason the denoise loop above
-            // takes one per step: a tile is a stage, and the cursor rewinding
-            // between them is what keeps the arena holding a tile's peak rather
-            // than every tile's sum. The decoded pixels are copied out before
-            // the rewind — three megabytes at a 512 tile, against the
-            // half-gigabyte runs the decode itself wants.
-            let gen = candle_nn::kv_cache::begin_guest(&stream).ok();
-            // Seeded at the tile, for the reason the denoise step is seeded at
-            // `x`: the decoder's half-gigabyte runs all descend from this one
-            // tensor, and it arrives owned.
-            let tile = super::varground::into_arena(&tile.to_dtype(VAE_DTYPE)?, &self.device)?;
-            let px = vae.decode(&tile)?;
-            let survivor = Tensor::zeros(px.shape(), px.dtype(), px.device())?;
-            survivor.slice_set(&px, 0, 0)?;
-            drop(px);
-            drop(gen);
-            Ok(survivor)
-        })?;
+        let pixels = decode_tiled(
+            &latent.unsqueeze(0)?,
+            autoencoder_tile(&self.device),
+            |tile| {
+                // One generation per tile, for the reason the denoise loop above
+                // takes one per step: a tile is a stage, and the cursor rewinding
+                // between them is what keeps the arena holding a tile's peak rather
+                // than every tile's sum. The decoded pixels are copied out before
+                // the rewind — three megabytes at a 512 tile, against the
+                // half-gigabyte runs the decode itself wants.
+                let gen = candle_nn::kv_cache::begin_guest(&stream).ok();
+                // Seeded at the tile, for the reason the denoise step is seeded at
+                // `x`: the decoder's half-gigabyte runs all descend from this one
+                // tensor, and it arrives owned.
+                let tile = super::varground::into_arena(&tile.to_dtype(VAE_DTYPE)?, &self.device)?;
+                let px = vae.decode(&tile)?;
+                let survivor = Tensor::zeros(px.shape(), px.dtype(), px.device())?;
+                survivor.slice_set(&px, 0, 0)?;
+                drop(px);
+                drop(gen);
+                Ok(survivor)
+            },
+        )?;
         tracing::debug!(
             target: "candle_conversation::guest",
             pixel_spread = %spread(&pixels),

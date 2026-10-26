@@ -3193,9 +3193,10 @@ impl InferenceState {
             };
             // The calibrations already written are the background the layer's
             // generic chunks are told apart by. Learned ahead of calibrating,
-            // which can take hours when every unit is asked again, so each pass
-            // — and a restart, which holds none — has an exclusion within
-            // minutes.
+            // which can take hours when every unit is asked again, so a
+            // restart, which holds none, has an exclusion within minutes; a
+            // later pass learns it again only once the questions have moved by
+            // a tenth.
             let scanner = self.engine.lock().unwrap().group_scanner();
             match scanner.learn_chunk_exclusion(group, EXCLUSION_QUESTIONS_PER_FILE) {
                 Ok(r) => tracing::info!(
@@ -3208,7 +3209,8 @@ impl InferenceState {
                     cut = r.cut,
                     calibration_chunks = r.calibration_chunks,
                     calibration_cut = r.calibration_cut,
-                    "learned the layer's anomalous-chunk exclusion",
+                    kept = r.kept,
+                    "the layer's anomalous-chunk exclusion",
                 ),
                 Err(e) => tracing::warn!(
                     target: "zend::calibrate",
