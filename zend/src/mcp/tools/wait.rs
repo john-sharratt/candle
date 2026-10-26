@@ -1,11 +1,9 @@
 //! `zend_wait {workers, wait_s?}`: wait on one or more workers, answering as
 //! soon as any of them stops running (`docs/claude_zend_gateway.md` §3.3).
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
-use super::{wait_secs, Answer, Ctx, LOADING};
+use super::{wait_secs, Answer, Ctx, Wait, LOADING};
 use crate::mcp::names::Path;
 use crate::mcp::reported::{self, Mark};
 use crate::mcp::threads::{State, Worker};
@@ -57,18 +55,17 @@ fn new_entries(w: &Worker, seen: Option<u64>) -> String {
 pub fn result_of(w: &Worker, seen: Option<u64>) -> String {
     let entries = new_entries(w, seen);
     match w.state {
-        State::Running => {
-            let activity = w.activity.clone().unwrap_or_default();
-            format!(
-                "{} — {}{entries}",
-                w.path(),
-                activity.sentence(workers::now_ms().saturating_sub(w.turn_ms))
-            )
-        }
+        State::Running => format!("{} — {}{entries}", w.path(), w.doing(workers::now_ms())),
         State::Question => format!(
             "{} — asks Claude (answer with `zend_answer`; it waits until then):\n{}{entries}",
             w.path(),
             w.question.as_deref().unwrap_or("")
+        ),
+        State::Stuck if w.stopped => format!(
+            "{} — stopped, as you asked; it is live. Redirect it with `zend_answer`, or end it \
+             with `zend_archive`. Its closing response:\n{}{entries}",
+            w.path(),
+            w.final_text
         ),
         State::Stuck => format!(
             "{} — stuck: the repeat guard or the round cap closed its tools. Say how to go on \
@@ -121,11 +118,19 @@ pub fn render(read: &[(String, Option<Worker>)], seen: &dyn Fn(&Worker) -> Optio
 
 /// Wait on `wanted` up to `wait`, telling each step on the call's progress,
 /// and answer with [`render`], carrying the entries it hands over as marks to
-/// keep once it is delivered, so the next answer gives only newer ones. What
+/// keep once it is delivered, so the next answer gives only newer ones. A wait
+/// its client's ceiling cut short says so while anything still runs. What
 /// `zend_wait`, `zend_task` and `zend_answer` answer.
-pub async fn answer_for(ctx: &Ctx, wanted: &[(String, String)], wait: Duration) -> Answer {
+pub async fn answer_for(ctx: &Ctx, wanted: &[(String, String)], wait: Wait) -> Answer {
     let owner = ctx.caller.key();
-    let read = match workers::wait(&ctx.session, &owner, wanted, wait, ctx.progress.as_ref()).await
+    let read = match workers::wait(
+        &ctx.session,
+        &owner,
+        wanted,
+        wait.duration(),
+        ctx.progress.as_ref(),
+    )
+    .await
     {
         Ok(read) => read,
         Err(e) => return Answer::error(e),
@@ -145,7 +150,15 @@ pub async fn answer_for(ctx: &Ctx, wanted: &[(String, String)], wait: Duration) 
             })
         })
         .collect();
-    Answer::ok(render(&read, &seen)).marking(marks)
+    let mut text = render(&read, &seen);
+    let still_running = read
+        .iter()
+        .any(|(_, w)| w.as_ref().is_some_and(|w| w.state.working()));
+    if let Some(note) = wait.note().filter(|_| still_running) {
+        text.push_str("\n\n");
+        text.push_str(&note);
+    }
+    Answer::ok(text).marking(marks)
 }
 
 pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
@@ -170,7 +183,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     if wanted.is_empty() {
         return Answer::error("`workers` is empty");
     }
-    answer_for(ctx, &wanted, Duration::from_secs(wait_secs(ctx, args))).await
+    answer_for(ctx, &wanted, wait_secs(ctx, args)).await
 }
 
 #[cfg(test)]
@@ -200,6 +213,7 @@ mod tests {
             question: None,
             activity: None,
             no_entry: None,
+            stopped: false,
         }
     }
 

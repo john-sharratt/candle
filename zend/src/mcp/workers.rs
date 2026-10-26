@@ -41,10 +41,11 @@ use super::caller::Caller;
 use super::names;
 use super::nudges;
 use super::records::Records;
+use super::stops;
 use super::threads::{self, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
-use crate::session::{NoDraft, StreamItem, ZendSession};
+use crate::session::{NoDraft, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
 use crate::types::{ChatMessage, Role};
 
 /// The effort a task thinks at: `deep`. Tokens are not the constraint.
@@ -286,6 +287,7 @@ fn fresh(
         question: None,
         activity: None,
         no_entry: None,
+        stopped: false,
     }
 }
 
@@ -406,6 +408,48 @@ pub fn nudge(
     Ok(worker)
 }
 
+/// Stop the running worker `name` of `thread` at its next tool round, for
+/// `reason` (`super::stops`).
+pub fn stop(
+    session: &ZendSession,
+    caller: &Caller,
+    thread: &str,
+    name: &str,
+    reason: &str,
+) -> Result<Worker, String> {
+    let records = session.shared_substrate().ok_or_else(loading)?;
+    let owner = caller.key();
+    // Ordered against a turn beginning, which clears a stop meant for the
+    // turn before it.
+    let _held = BEGIN.lock().unwrap();
+    let Some(found) = threads::worker(&records, &owner, thread, name) else {
+        return Err(format!("there is no worker `T:{thread}/{name}`"));
+    };
+    let worker = found.observed(now_ms());
+    if !worker.state.working() {
+        return Err(format!(
+            "`{}` is not running, so there is nothing to stop; {}",
+            worker.path(),
+            if worker.state.live() {
+                "it waits on an answer — redirect it with `zend_answer`"
+            } else {
+                "it has finished"
+            }
+        ));
+    }
+    stops::request(&records, &worker.conv_id, reason).map_err(|e| e.to_string())?;
+    let line = if reason.trim().is_empty() {
+        "at its next tool round".to_string()
+    } else {
+        format!(
+            "at its next tool round: {}",
+            first_line(reason, PROMPT_QUOTE)
+        )
+    };
+    note(&records, &owner, &worker, "Claude stopped:", line)?;
+    Ok(worker)
+}
+
 /// Enter a line about `worker` on its thread's journal.
 fn note(
     records: &dyn Records,
@@ -436,6 +480,9 @@ fn begin(
     worker: Worker,
     message: String,
 ) -> Result<Worker, String> {
+    // A stop sent as the last turn ended — after its settling looked — is
+    // not this turn's.
+    stops::take(records, &worker.conv_id);
     threads::put_worker(records, owner, &worker).map_err(|e| e.to_string())?;
     // Recorded before the turn makes the conversation's slot, which reads it.
     if let Some(Err(e)) = session.set_decode_band(&worker.conv_id, worker.priority.band()) {
@@ -455,9 +502,20 @@ fn begin(
 enum Ended {
     /// It ended on its own: its whole text.
     Replied(String),
-    /// The repeat guard or the round cap closed its tools: its whole text.
-    Closed(String),
+    /// Its tools were closed — by the repeat guard, the round cap, or Claude
+    /// stopping it (`by`, a [`StreamItem::Closing`] reason): its whole text.
+    Closed {
+        text: String,
+        by: &'static str,
+    },
     Failed(String),
+}
+
+impl Ended {
+    /// Whether Claude stopped the turn (`zend_stop`).
+    fn stopped(&self) -> bool {
+        matches!(self, Ended::Closed { by, .. } if *by == CLOSED_BY_CLAUDE)
+    }
 }
 
 /// The turn's life after [`begin`], and the worker's settling.
@@ -494,6 +552,14 @@ async fn run(session: Arc<ZendSession>, owner: String, mut worker: Worker, messa
         Ended::Failed(_) => None,
         _ => Some(finish_journal(&session, &worker.conv_id).await),
     };
+    // A stop that came after the turn's last tool round — while it answered
+    // or drafted — found it finishing.
+    if stops::take(&records, &worker.conv_id).is_some() {
+        let line = "not reached — the turn ended without another tool round".to_string();
+        if let Err(e) = note(&records, &owner, &worker, "Stop dropped:", line) {
+            tracing::warn!(conv_id = %worker.conv_id, "mcp: an unreached stop could not be entered: {e}");
+        }
+    }
     // A failed turn still carries what its cadence drafted while it ran.
     let view = session.journal(&worker.conv_id);
     worker.entries = entries_after(view.as_ref(), worker.entries_after);
@@ -613,6 +679,7 @@ fn settle(worker: &mut Worker, ended: Ended) -> (&'static str, String) {
         Some(e) => format!(" ({}#{})", w.path(), e.id),
         None => String::new(),
     };
+    worker.stopped = ended.stopped();
     match ended {
         Ended::Failed(error) => {
             let line = format!("error: {}", first_line(&error, 200));
@@ -620,7 +687,17 @@ fn settle(worker: &mut Worker, ended: Ended) -> (&'static str, String) {
             worker.state = State::Error;
             ("Task ended:", line)
         }
-        Ended::Closed(text) => {
+        Ended::Closed { text, .. } if worker.stopped => {
+            worker.final_text = final_reply(&text);
+            worker.state = State::Stuck;
+            let line = format!(
+                "stopped by Claude; it ended: {}{}",
+                first_line(&worker.final_text, 200),
+                cite(worker)
+            );
+            ("Task stopped:", line)
+        }
+        Ended::Closed { text, .. } => {
             worker.final_text = final_reply(&text);
             worker.state = State::Stuck;
             let line = format!(
@@ -666,10 +743,14 @@ fn settle_part(part: &mut Worker, ended: Ended) -> (&'static str, String) {
             part.state = State::Error;
             ("Part ended:", line)
         }
-        Ended::Closed(text) => {
+        Ended::Closed { text, by } => {
+            let why = if by == CLOSED_BY_CLAUDE {
+                "Claude stopped it"
+            } else {
+                "the same call repeated, or the round cap reached"
+            };
             part.final_text = format!(
-                "Its tools were closed before it finished — the same call repeated, or the \
-                 round cap reached — and it ended:\n{}",
+                "Its tools were closed before it finished — {why} — and it ended:\n{}",
                 final_reply(&text)
             );
             part.state = State::Done;
@@ -704,7 +785,7 @@ async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String, live
         .await;
     let mut text = String::new();
     let mut failed: Option<String> = None;
-    let mut closed = false;
+    let mut closed: Option<&'static str> = None;
     while let Some(item) = stream.next().await {
         if let Ok(item) = &item {
             live.observe(item);
@@ -714,7 +795,7 @@ async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String, live
             Ok(StreamItem::Error(e)) => {
                 failed.get_or_insert(e);
             }
-            Ok(StreamItem::Closing(_)) => closed = true,
+            Ok(StreamItem::Closing(by)) => closed = Some(by),
             Ok(_) => {}
             Err(e) => {
                 failed.get_or_insert(format!("{e:#}"));
@@ -723,8 +804,8 @@ async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String, live
     }
     match (failed, closed) {
         (Some(e), _) => Ended::Failed(e),
-        (None, true) => Ended::Closed(text),
-        (None, false) => Ended::Replied(text),
+        (None, Some(by)) => Ended::Closed { text, by },
+        (None, None) => Ended::Replied(text),
     }
 }
 
@@ -835,15 +916,12 @@ pub fn progress_lines(
             continue;
         }
         let path = w.path();
-        let activity = w.activity.clone().unwrap_or_default();
-        lines.push((
-            path.clone(),
-            activity.sentence(0),
-            format!(
-                "{path} — {}",
-                activity.sentence(now.saturating_sub(w.turn_ms))
-            ),
-        ));
+        // The step is the sentence with no time passed: what the turn did.
+        let step = w
+            .activity
+            .as_ref()
+            .map_or_else(|| Activity::default().sentence(0), |a| a.sentence(0));
+        lines.push((path.clone(), step, format!("{path} — {}", w.doing(now))));
         for e in &w.entries {
             let at = format!("{path}#{}", e.id);
             let line = format!("{at} — {}", summary_line(&e.text, 200));
@@ -914,6 +992,7 @@ pub async fn wait(
 mod tests {
     use super::*;
     use crate::mcp::records::MemRecords;
+    use crate::session::{CLOSED_BY_CAP, CLOSED_BY_REPEATS};
     use serde_json::json;
 
     fn view() -> Value {
@@ -949,6 +1028,7 @@ mod tests {
             question: None,
             activity: None,
             no_entry: None,
+            stopped: false,
         }
     }
 
@@ -1112,8 +1192,32 @@ mod tests {
         );
 
         let mut w = worker();
-        let (label, _) = settle(&mut w, Ended::Closed("I could not finish.".into()));
+        let (label, _) = settle(
+            &mut w,
+            Ended::Closed {
+                text: "I could not finish.".into(),
+                by: CLOSED_BY_REPEATS,
+            },
+        );
         assert_eq!((w.state, label), (State::Stuck, "Task stuck:"));
+        assert!(!w.stopped);
+
+        // **A stopped worker is live, and says Claude stopped it**: stuck,
+        // so `zend_answer` redirects it.
+        let mut w = worker();
+        let (label, line) = settle(
+            &mut w,
+            Ended::Closed {
+                text: "Found v2 only.".into(),
+                by: CLOSED_BY_CLAUDE,
+            },
+        );
+        assert_eq!((w.state, label), (State::Stuck, "Task stopped:"));
+        assert!(w.stopped && w.state.live());
+        assert_eq!(
+            line,
+            "stopped by Claude; it ended: Found v2 only. (T:review/verify#2)"
+        );
 
         let mut w = worker();
         let (label, line) = settle(&mut w, Ended::Failed("boom".into()));
@@ -1145,7 +1249,10 @@ mod tests {
         let mut p = part();
         settle_part(
             &mut p,
-            Ended::Closed("<think>x</think>I could not finish.".into()),
+            Ended::Closed {
+                text: "<think>x</think>I could not finish.".into(),
+                by: CLOSED_BY_CAP,
+            },
         );
         assert_eq!(p.state, State::Done);
         assert_eq!(

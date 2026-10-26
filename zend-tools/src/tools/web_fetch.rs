@@ -1,4 +1,7 @@
-//! `web_fetch` tool — fetch and clean a web page.
+//! `web_fetch` tool — fetch a web page and read it as text
+//! ([`html_text`]).
+
+mod html_text;
 
 use std::future;
 use std::net::{IpAddr, SocketAddr};
@@ -12,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use validator::Validate;
 
+use self::html_text::html_to_text;
 use crate::grants::Grants;
 use crate::net;
 use crate::{RegisteredTool, Replay, Tool, ToolContext, ToolError};
@@ -190,74 +194,6 @@ fn guard_redirect(grants: Grants, attempt: redirect::Attempt) -> redirect::Actio
         Ok(_) => attempt.follow(),
         Err(e) => attempt.error(e.to_string()),
     }
-}
-
-fn html_to_text(html: &str) -> (String, String) {
-    use scraper::{Html, Selector};
-
-    let document = Html::parse_document(html);
-
-    // Extract title
-    let title_sel = Selector::parse("title").unwrap();
-    let title = document
-        .select(&title_sel)
-        .next()
-        .map(|e| e.text().collect::<String>().trim().to_string())
-        .unwrap_or_default();
-
-    // Build text from body
-    let body_sel = Selector::parse("body").unwrap();
-    let body = document.select(&body_sel).next();
-
-    let mut text = String::new();
-    if let Some(body) = body {
-        for node in body.descendants() {
-            if let Some(elem) = node.value().as_element() {
-                match elem.name() {
-                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                        let level = elem
-                            .name()
-                            .chars()
-                            .nth(1)
-                            .unwrap_or('1')
-                            .to_digit(10)
-                            .unwrap_or(1) as usize;
-                        let hashes = "#".repeat(level);
-                        if let Some(t) = scraper::ElementRef::wrap(node) {
-                            let content: String = t.text().collect();
-                            text.push_str(&format!("\n{} {}\n", hashes, content.trim()));
-                        }
-                    }
-                    "p" => {
-                        if let Some(t) = scraper::ElementRef::wrap(node) {
-                            let content: String = t.text().collect();
-                            let trimmed = content.trim();
-                            if !trimmed.is_empty() {
-                                text.push('\n');
-                                text.push_str(trimmed);
-                                text.push('\n');
-                            }
-                        }
-                    }
-                    "script" | "style" | "nav" | "header" | "footer" => {}
-                    _ => {}
-                }
-            } else if let Some(txt) = node.value().as_text() {
-                let s = txt.trim();
-                if !s.is_empty() && s.len() > 2 {
-                    // avoid noise
-                }
-            }
-        }
-        // If text is sparse, fall back to simple text extraction
-        if text.trim().len() < 100 {
-            text = body.text().collect::<Vec<_>>().join(" ");
-            // Collapse whitespace
-            text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        }
-    }
-
-    (title, text)
 }
 
 pub struct WebFetchTool;

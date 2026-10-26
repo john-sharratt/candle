@@ -113,6 +113,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     let Some(job) = args.get("job").and_then(Value::as_u64) else {
         return Answer::error("`job` is the job's id, as `cluster_command` answered it");
     };
+    let wait = wait_secs(ctx, args);
     let reply = match ops::up(
         &ctx.session,
         &ctx.caller,
@@ -120,7 +121,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         &format!("/v1/cluster/command/job/{job}"),
         Some(&member),
         None,
-        Duration::from_secs(wait_secs(ctx, args).max(1)),
+        Duration::from_secs(wait.secs.max(1)),
     )
     .await
     {
@@ -128,10 +129,15 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Err(e) => return Answer::error(e),
     };
     match reply.status {
-        200 => Answer::ok(summarise(
-            &String::from_utf8_lossy(&reply.body),
-            reply.complete,
-        )),
+        200 => {
+            let mut text = summarise(&String::from_utf8_lossy(&reply.body), reply.complete);
+            // A job still running after a wait its client cut short says so.
+            if let Some(note) = wait.note().filter(|_| !reply.complete) {
+                text.push_str("\n\n");
+                text.push_str(&note);
+            }
+            Answer::ok(text)
+        }
         404 => Answer::error(format!(
             "job {job} is not on {member}: a job is read on the member that ran it, and one lost \
              to a restart is gone — check `cluster_status`, then run the command again"

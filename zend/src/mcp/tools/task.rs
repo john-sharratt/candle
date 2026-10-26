@@ -2,8 +2,6 @@
 //! new worker, and wait for it up to `wait_s` (`docs/claude_zend_gateway.md`
 //! §3.2, §3.3, §3.4).
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use super::wait::answer_for;
@@ -58,5 +56,5 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Err(e) => return Answer::error(e),
     };
     let wanted = [(worker.thread.clone(), worker.name.clone())];
-    answer_for(ctx, &wanted, Duration::from_secs(wait_secs(ctx, args))).await
+    answer_for(ctx, &wanted, wait_secs(ctx, args)).await
 }

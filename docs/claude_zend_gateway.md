@@ -138,6 +138,7 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 | `zend_wait {workers, wait_s?}` | Waits on one or more running workers, answering as soon as any of them leaves `running` (§3.3) | That worker's state, and for each still running what it has done so far, with any journal entries not yet given |
 | `zend_answer {worker, answer}` | Answers a worker's question or unsticks it (§6.2): the answer is the worker's next turn | As `zend_task` |
 | `zend_nudge {worker, message}` | Sends guidance to a running worker, taken at its next round head (§6.2) | `queued` |
+| `zend_stop {worker, reason?, wait_s?}` | Stops a running worker at its next tool round: no further call runs and it answers with what it has, then stays live for `zend_answer` to redirect (§6.2) | As `zend_wait`: `stopped` once it has |
 | `journal_read {journal, entry?, offset?, limit?}` | Without `entry`: the journal's entries, one line each, with open items. With an `entry` (or an entry address, `…#12`): pages the turns behind it | The journal as the prompt reads it, or `limit` lines from `offset` (200 by default, 400 at most) |
 | `journal_grep {journal, pattern, entry?, max_results?}` | Case-insensitive substring search of a journal's entries' turns; `journal` may be a subtree (`T:review-layers/*`) | Each hit's path, entry, turn and line; 20 hits by default, 50 at most |
 | `journal_note {journal, text}` | Records a note — a decision and its reason, what the user said — on a thread or project journal as one entry (§4) | The entry's address |
@@ -724,6 +725,19 @@ naming whose they are.
 A nudge never interrupts a decoding round. Today a second message on a busy
 conversation waits on its lock until the whole turn ends
 (`zend/src/session.rs:3848-3862`), which is too late to steer it.
+
+**Claude can stop a worker going the wrong way.** `zend_stop {worker,
+reason?}` queues a stop as a record under the worker's conversation
+(`zend/src/mcp/stops.rs`), read where a nudge is: at the worker's next tool
+round, never mid-decode. That round then closes the loop as the round cap does
+— its results carry the stop and Claude's reason, the next turn may not call
+tools, and the loop sends `StreamItem::Closing(CLOSED_BY_CLAUDE)` — so the
+worker answers with what it has found and what remains. It settles **stuck**
+with `stopped` set, unarchived: `zend_answer` redirects it ("use v2 and
+answer"), or `zend_archive` ends it. The call waits for the stop as
+`zend_wait` does. A stop the turn never reaches, because it ended without
+another round, is cleared at settling and entered on the thread as
+`Stop dropped:`.
 
 **Asking is cheap, and kept cheap.** A question costs Claude one tool result
 plus whatever it chooses to check. The skill's prompt tells the worker when to

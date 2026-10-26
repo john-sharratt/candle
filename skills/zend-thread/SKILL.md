@@ -30,20 +30,28 @@ what every later task knows.
    journal, not your conversation.
 5. **Wait on everything at once.** Start every independent task first, then
    `zend_wait {workers: [...]}` on all of them; it answers as soon as one
-   settles. Handle that one, then wait again on the rest.
+   settles, and otherwise every 45 s with what each worker has done — its
+   rounds, thinking, tool calls by name — and any journal entries it wrote
+   since you last heard. Tell the user one line of where things stand, then
+   wait again. Stop waiting early if the entries already answer you.
 6. **Answer what asks.** A worker that is blocked ends its turn with a
    `QUESTION:` block — options, what it tried, pointers. Check the pointers,
    decide, and `zend_answer`. A **stuck** worker (its loop was closed) is
    answered the same way: say how to go on.
-7. **Steer without waiting** with `zend_nudge` while a worker runs.
+7. **Steer without waiting** with `zend_nudge` while a worker runs. When its
+   progress shows it off course — the same fetch failing, a step repeated, a
+   path you no longer want — `zend_stop` it with a reason: it stops at its next
+   tool round and answers with what it has, then `zend_answer` redirects it.
 8. **Archive** the thread with `zend_archive` once the feature is done.
 
 ## Reading results
 
-A finished task answers with its **journal entries**: a line, then claims, each
-labelled with how it was known — `Saw:` (a tool result), `Did:`, `Claude said:`
-(from your own prompt), and `Concluded, not seen:`. An entry is evidence, not
-truth:
+A finished task answers with its **final response**, whole — the answer, in the
+shape you asked for — and the **journal entries** you have not already been
+given. An entry is a line, then claims, each labelled with how it was known —
+`Saw:` (a tool result), `Did:`, `Claude said:` (from your own prompt), and
+`Concluded, not seen:` — and a claim resting on a decision above it says
+`(per T:<thread>#<n>)`. Both are evidence, not truth:
 
 - Act on a claim — merge, deploy, report to the user — only after checking it
   against the turns it cites: `journal_read {journal: "<worker path>", entry}`

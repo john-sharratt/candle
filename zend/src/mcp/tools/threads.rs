@@ -13,8 +13,8 @@ pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "List your zend threads, newest first: each one's path, how many tasks it has had, \
-            any worker still running, and any waiting on you — a question to answer, or a stuck worker — \
-            with its path. Use it to find the thread of a feature you worked on before, and to see what is \
+            each worker still running with what it has done so far, and any waiting on you — a question to \
+            answer, or a stuck worker — with its path. Use it to find the thread of a feature you worked on before, and to see what is \
             waiting on you when no call was open to return it.",
         "inputSchema": {
             "type": "object",
@@ -26,8 +26,9 @@ pub fn definition() -> Value {
     })
 }
 
-/// One thread's line, and a line for each worker waiting on Claude.
-pub fn render_thread(t: &Thread, workers: &[Worker], last: Option<&str>) -> String {
+/// One thread's line, then a line for each worker running — what its turn
+/// has done, at `now` — and each waiting on Claude.
+pub fn render_thread(t: &Thread, workers: &[Worker], last: Option<&str>, now: u64) -> String {
     let running = workers.iter().filter(|w| w.state.working()).count();
     let mut out = format!(
         "T:{}{} — {} task{}",
@@ -44,11 +45,15 @@ pub fn render_thread(t: &Thread, workers: &[Worker], last: Option<&str>) -> Stri
     }
     for w in workers {
         match w.state {
+            State::Running => out.push_str(&format!("\n  {} — {}", w.path(), w.doing(now))),
             State::Question => out.push_str(&format!(
                 "\n  {} asks: {}",
                 w.path(),
                 first_line(w.question.as_deref().unwrap_or(""), 200)
             )),
+            State::Stuck if w.stopped => {
+                out.push_str(&format!("\n  {} is stopped, as you asked", w.path()))
+            }
             State::Stuck => out.push_str(&format!("\n  {} is stuck", w.path())),
             _ => {}
         }
@@ -81,7 +86,7 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
             let last = notes
                 .last()
                 .map(|n| first_line(&format!("{} {}", n.label, n.text), 160));
-            render_thread(&t, &workers, last.as_deref())
+            render_thread(&t, &workers, last.as_deref(), now)
         })
         .collect();
     if lines.is_empty() {
@@ -115,6 +120,7 @@ mod tests {
             question: Some("QUESTION: Inclusive?".into()),
             activity: None,
             no_entry: None,
+            stopped: false,
         }
     }
 
@@ -132,8 +138,10 @@ mod tests {
             worker("d", State::Done),
         ];
         assert_eq!(
-            render_thread(&t, &ws, Some("Task ended: done")),
+            render_thread(&t, &ws, Some("Task ended: done"), 250_000),
             "T:review — 4 tasks, 1 running; last: Task ended: done\n  \
+             T:review/a — running 4m10s, 0 rounds: 0 thinking tokens, no tool calls yet; now \
+             starting\n  \
              T:review/b asks: QUESTION: Inclusive?\n  T:review/c is stuck"
         );
         let archived = Thread {
@@ -141,7 +149,7 @@ mod tests {
             ..t
         };
         assert_eq!(
-            render_thread(&archived, &[], None),
+            render_thread(&archived, &[], None, 0),
             "T:review (archived) — 0 tasks"
         );
     }
