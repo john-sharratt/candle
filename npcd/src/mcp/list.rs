@@ -23,8 +23,10 @@ impl Tool for List {
             "name": Self::NAME,
             "description": "List your bots — autonomous agents, each living in a world and acting on \
                 its own: each one's id (what the other bot_* tools name it by), name, world, state and \
-                mood. Filter by `state` (active, idle, asleep, \
-                suspended), by `world`, or by text in its name with `q`.",
+                mood. The state (active, idle, asleep, suspended) is the standing its owner set; it \
+                does not change as the bot works — whether it is working is in bot_mission_read. \
+                Filter by `state`, by `world` (the world's id, as listed here), or by text in its \
+                name with `q`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

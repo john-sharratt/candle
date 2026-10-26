@@ -23,7 +23,10 @@ guides stay readable meanwhile.
 
 `bot_list` — your bots, each with its id (what every other `bot_*` tool takes
 as `bot`), name, world, state (active, idle, asleep, suspended) and mood.
-Filter by `state`, `world`, or text in the name (`q`).
+Filter by `state`, `world`, or text in the name (`q`). The state is the
+standing its owner set and does not change as the bot works: an "idle" bot
+may be deep in a mission. Whether it is working, and on what, is
+`bot_mission_read`'s.
 
 ## See what one is doing
 
@@ -31,7 +34,9 @@ Filter by `state`, `world`, or text in the name (`q`).
   how it went), the last one it finished (its answer and report), and how
   many more are queued.
 - `bot_message_read {bot}` — your message thread with it.
-- `bot_channel_read {world}` — what its world's group chat carried.
+- `bot_channel_read {world}` — what its world's group chat carried since you
+  joined it; nothing before that, so a quiet answer may only mean you joined
+  recently.
 
 An idle bot runs **routines** of its own — reading one station after another,
 a few minutes each — and a routine shows in `bot_mission_read` as the mission
