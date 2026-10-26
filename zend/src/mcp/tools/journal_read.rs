@@ -213,7 +213,7 @@ mod tests {
     fn a_notes_address_reads_that_note() {
         let notes = vec![
             Note {
-                label: "Claude asked:".into(),
+                label: "Claude started:".into(),
                 text: "verify the expiry".into(),
                 at_ms: 0,
                 worker: None,

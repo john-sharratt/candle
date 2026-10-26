@@ -38,13 +38,35 @@ UNVERIFIED: what you could not confirm, and what you could not read
 COULD NOT DO: anything asked that you did not do, and why
 ```
 
+The guide for the kind of work — `ask`, `implement`, `review`, `test`,
+`debug` and the rest — gives this template already filled in for it. Use that
+one; the rules below still apply to it.
+
 ## Rules every prompt carries
 
 These come from runs that went wrong. Include the ones that apply.
 
+For every task:
+
 - **Cite what you read.** A file, symbol or setting named in the answer cites
-  the file:line it was read at; a web claim cites the URL it came from. What
-  the worker "knows" from its context is not a reading — it is UNVERIFIED.
+  the file:line it was read at, with the line quoted; a web claim cites the URL
+  it came from. What the worker "knows" from its context is not a reading — it
+  is UNVERIFIED.
+- **Check yourself.** Before answering, read the draft against itself: two
+  claims that contradict, a figure stated two ways, a "none" beside a number
+  taken from that same thing. The final response is the answer only — no
+  corrections mid-sentence.
+- **Report the gaps.** What was not done, and why, is part of the answer —
+  never silently dropped.
+
+For work in a repository:
+
+- **Scope the first search.** Search the paths CONSTRAINTS name before the
+  whole repository: a repository-wide search for a common word returns
+  hundreds of hits, most of them docs and licences.
+
+For work on the web:
+
 - **Open what you cite.** A URL is cited only if it was fetched and read. A
   search snippet is not the page; a figure seen only in a snippet is
   UNVERIFIED.
@@ -54,11 +76,6 @@ These come from runs that went wrong. Include the ones that apply.
 - **Unread is not absent.** Not finding something in a page's text is not
   evidence it does not exist — the page may have shown it as an image (the
   fetch reports `images`). Say what could not be read.
-- **Check yourself.** Before answering, read the draft against itself: two
-  claims that contradict, a figure stated two ways, a "none" beside a number
-  taken from that same thing.
-- **Report the gaps.** What was not done, and why, is part of the answer —
-  never silently dropped.
 
 ## Effort and priority
 
@@ -75,4 +92,7 @@ These come from runs that went wrong. Include the ones that apply.
 
 Split broad work into independent tasks, each with its own prompt, name and
 final response. Start them all, then `repo_task_wait` on all of them together.
-Name each worker for what it does (`verify-expiry`), never a number.
+Name each worker for what it does (`verify-expiry`), never a number. A name
+already used on the thread gets the next free one (`verify-expiry.2`), so
+always wait on the path `repo_task_start` answers, not the name you asked
+for.

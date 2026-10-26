@@ -20,9 +20,11 @@ pub fn definition() -> Value {
             the journal entry it writes. Pass the thread you attached to. State the task in full in `prompt` — \
             what to do, what to verify before answering, and the shape of the final response (verdict, \
             findings, pointers such as file:line). Name the worker for what it does, as a kebab-case slug \
-            (`verify-expiry`), never a number. Answers `done` with the worker's final response and its \
-            journal entries, or `running` with its path and what it has done so far — then call `repo_task_wait` \
-            on it, or start more tasks first and wait on them all at once.",
+            (`verify-expiry`), never a number; a name already used on the thread gets the next free one \
+            (`verify-expiry.2`), so wait on the path this answers, not the name asked for. Answers `done` \
+            with the worker's final response and its journal entries, or `running` with its path and what it \
+            has done so far — then call `repo_task_wait` on it, or start more tasks first and wait on them \
+            all at once.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -242,7 +242,7 @@ pub fn start(
         &records,
         &owner,
         &worker,
-        "Claude asked:",
+        "Claude started:",
         first_line(prompt, PROMPT_QUOTE),
     )?;
     begin(

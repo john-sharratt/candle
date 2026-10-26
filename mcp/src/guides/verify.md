@@ -62,12 +62,29 @@ entries (`T:<thread>/<name>#<n>`) and says what to check.
 - `journal_grep {journal: "T:<thread>/<name>", pattern}` for a URL, a file, a
   figure — each hit names the turn it is in. `T:<thread>/*` searches every
   worker on the thread, parts included.
-- `journal_read {journal: "T:<thread>/<name>#<n>"}` shows an entry's claims and
-  the turns they cite.
+- `journal_read {journal: "T:<thread>/<name>"}` lists the worker's entries —
+  its claims. With an entry's address (`…#<n>`) it pages the raw turns behind
+  that entry, which run to hundreds of lines: find the turn with
+  `journal_grep` first, then page to it with `offset`.
 - `timeline_read {id, turn}` (Admins only) reads one turn whole: the tool
   results in its user half — the fetched page as the worker got it — and its
   thinking and tool calls in the assistant half. The timeline's metadata shows
   the effort the worker ran at.
+
+## A code answer
+
+An answer about a repository has no audit — its evidence is file:line, not
+URLs. Check it this way:
+
+- Every claim you will rely on cites a file:line with the line quoted; one
+  that does not is unverified. `ask`'s template demands this.
+- `journal_grep` the worker's journal for each cited file or symbol: the hit
+  shows the turn where it read it, and whether the quoted line is what the
+  file said.
+- Continue the worker with what is missing — "quote the line for each of
+  these", "you cited X without reading it; read it" — as in step 2.
+- If you have the repository yourself (Claude Code in it), open the cited
+  lines: the fastest check there is.
 
 ## 4. Say what was checked
 

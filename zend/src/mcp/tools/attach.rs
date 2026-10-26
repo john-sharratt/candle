@@ -20,7 +20,8 @@ pub fn definition() -> Value {
             feature, and again after your context is compacted. Name a thread for what it is about, as a \
             kebab-case slug (`review-layers`, `bc-wearables`); two unrelated pieces of work never share one. \
             Answers the thread's path and its journal. After attaching, `\"self\"` names this thread in the \
-            `journal_*` tools.",
+            `journal_*` tools — but it is the thread last attached by any of the user's conversations open \
+            at once, so name the thread (`T:<thread>`) when another may be open.",
         "inputSchema": {
             "type": "object",
             "properties": {

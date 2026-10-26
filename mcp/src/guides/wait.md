@@ -31,12 +31,25 @@ rest. Never wait on one worker while others run unwatched.
 | stuck | Its loop closed: reply with what to do next (`repo_task_reply`) |
 | stopped | You stopped it: redirect it (`repo_task_reply`) or archive the thread |
 | failed | Read why; fix the cause or start the task again |
+| lost — "the task stopped being run: the member running it restarted or lost it" | Its turn is gone; its conversation keeps what it did. Start the task again — the same name gets the next free one (`.2`) — and point the new prompt at the lost worker's journal entries, if it wrote any |
 
 ## When a worker goes wrong
 
 - Heading the wrong way, but still useful: `repo_task_nudge` (see `steer`).
 - Repeating a step, the same fetch failing: `repo_task_stop`, then `repo_task_reply`
   with a new direction.
+
+## When Zen restarts
+
+A call that answers "the model is still loading" or "is unavailable" means
+Zen is restarting: every call answers that way until it is back, usually
+within a few minutes. Wait a minute or two and call again; do not rewrite
+what you asked. Nothing on a thread is lost — only a turn that was running,
+which then reports as lost (above).
+
+A `repo_task_start` whose answer was cut off may still have started its
+worker. Before starting it again, `thread_list` (or `thread_attach` the
+thread): a worker it shows under the name is yours — wait on that path.
 
 ## Waits are cut off
 
