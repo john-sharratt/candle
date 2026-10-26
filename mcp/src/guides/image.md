@@ -66,11 +66,9 @@ clothing. A prompt that leaves an age unclear may be declined.
 
 ## Size and settings
 
-- **Size:** 768 on a side is the reliable choice — it fits beside a busy
-  engine. 1024 gives the model its best detail but needs room the engine may
-  not have under load (`no_room`): ask for it when detail matters, and fall
-  back to 768 if it is refused. 512 (the default) is quick but coarser. Both sides must be multiples of 16, at most
-  1024. Common shapes: 768×768 square, 768×512 / 512×768, 768×432 landscape
+- **Size:** 768 on a side is the everyday choice. 1024 gives the model its
+  best detail, so ask for it when detail matters. 512 (the default) is quick
+  but coarser. Both sides must be multiples of 16, at most 1024. Common shapes: 768×768 square, 768×512 / 512×768, 768×432 landscape
   (16:9), 432×768 portrait (9:16) — or the same at 1024 on the long side.
 - **Steps:** pass `steps: 12`. The model is trained for 8 — use 8 when speed
   matters most; 12 buys finish; more than that buys little and costs time,
@@ -104,8 +102,11 @@ do not rewrite it:
 
 - `no_room` — the engine had no room for the image model just then. On a
   draw sent alongside another, that is the other draw: send it again once
-  the other has answered. On a draw sent alone, the engine was busy: try
-  again in a minute; a smaller size (768 on the long side) needs less room.
+  the other has answered. On a draw sent alone, the engine was busy and came
+  up a few hundred MiB short; that room frees as its busy turns finish. Send
+  the same call again in a minute — it can take a few tries. A smaller size
+  (768 on the long side) needs about 500 MiB less, so it is the second
+  option when the same size keeps being refused.
 - "is unavailable" (`upstream_unavailable`, `upstream_backoff`), a call cut
   off, or — while the service comes back up — a `404` or a `401 … sign in`:
   the image service is restarting. Send the same call again in a minute or
