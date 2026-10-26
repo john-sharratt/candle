@@ -5,11 +5,13 @@ again: every unit of the file (a paragraph of prose, a function or type of
 code) carries a short content anchor, `file_read` shows it, and `file_edit`
 names the unit by its anchor and says what to do there.
 
-Status: design. Replaces `file_edit`'s `old_str`/`new_str` form and the
-whole-piece mending sitting of `compose`; `file_write` and `compose` for a first
-draft are unchanged. `file_read` and `file_edit` live in `zend-tools`
-(`tools/file/`), so the change covers npcd's characters and zend's coding
-conversations alike.
+Status: implemented (`doc-units`, `zend-tools/src/tools/file/`, zend's tool
+definitions, npcd's bench acts and `compose`). Replaces `file_edit`'s
+`old_str`/`new_str` form and the whole-piece mending sitting of `compose`;
+`file_write` and `compose` for a first draft are unchanged. It covers npcd's
+characters and zend's coding conversations alike: zend's file tools are
+`zend-tools`', npcd's are its own bench acts, and both carve, anchor and edit
+through `doc-units`.
 
 ## 1. Why
 
@@ -55,8 +57,12 @@ the second.
 ## 3. The unit
 
 A unit is what an author means by "that part": a paragraph of prose, a function
-of code. Units cover the file completely and in order, so every line belongs to
-exactly one.
+of code. Units partition the file's non-blank lines: in order, never
+overlapping, never starting or ending on a blank line, and together holding
+every line that has anything on it. Blank lines between units belong to none —
+they are the separators an edit keeps. The carving, the anchors, the rendering
+and the edits are one crate, `doc-units`, which `zend-tools`, `zend` and `npcd`
+all use.
 
 - **`.md` documents: the paragraph** — a run of non-blank lines between blank
   lines. A heading, a list, a block quote or a scene break is its own unit. A
@@ -73,32 +79,37 @@ exactly one.
     C++ (CUDA carves as C++), Java, Ruby, PHP, Bash, HTML, CSS. Each language
     maps node kinds to a unit: a function or method, a type definition (struct,
     enum, trait, class, interface, type alias), a run of constants, or another
-    top-level item (`macro_rules!`, a module-level statement). Containers are
-    not units — an `impl`, `mod` or `class` is the path its members are named
-    under (`impl KvCache > fn seal_chunk`), so a large impl never becomes one
-    unit.
-  - **Tier 2, headers**: TOML and JSON split at top-level keys.
-  - **Tier 3, fixed windows** for a language with no carver, or a file its
-    parser rejects.
-  - **Gap fill**: lines no scope claims (`use` lines, module attributes, stray
-    statements) become units of their own, so coverage is total.
+    top-level item (`macro_rules!`, a module-level statement). An item's
+    leading doc comments and attributes are part of it. Containers are not
+    units — an `impl` or `mod` is the path its members are named under
+    (`impl KvCache > fn seal_chunk`), so a large impl never becomes one unit.
+  - **The innermost item owns its lines.** Parsers emit nested items — a
+    method inside a class, a function inside a function — and an outer item
+    keeps only the lines none of its members claims: a class is its header and
+    fields, each method a unit of its own.
+  - **Tier 2, keys**: TOML and JSON split at top-level keys.
+  - **Unclaimed lines are paragraphs**: `use` lines, module attributes, stray
+    statements, a container's opening and closing lines, and the whole of a
+    file no parser fires on are split at blank lines into units of their own,
+    so coverage is total. A text file with no carver is paragraphs throughout.
   - **File header**: a leading doc or licence comment of two lines or more is
     its own first unit.
-  - **Size cap**: a scope over `MAX_UNIT_LINES` (80) or `MAX_UNIT_CHARS` (4,000)
-    splits on its children's boundaries first (match arms, nested blocks,
-    labelled `[part N]`), and at line boundaries only when it has none. Lines
-    over 160 characters are broken at safe points outside string literals
-    before carving, as before.
+  - **Size cap**: an item over `MAX_UNIT_LINES` (80) or `MAX_UNIT_CHARS`
+    (4,000) is split by its parser where one of its body's statements begins
+    (labelled `[part N]`), and anything still over a cap — a paragraph too —
+    at line boundaries. Long lines are left as they are: an edit unit is the
+    file's own text, never a re-wrapped copy of it.
   - **No merge pass.** The old carver merged small scopes forward to at least 50
     lines, which sized a prefill turn for ingest. An edit unit is the item
     itself: a three-line helper is its own anchor.
 
   Semantic units make collisions rare in code: a function or type is almost
-  always unique text, so the per-line duplicates that dominate source (`}`,
-  blank lines, `return Ok(());`) never get an anchor of their own and never
-  cascade seed bumps through the file. A 1,000-line source file is 30–60
-  units, not 1,000 lines, which bounds both the read cost and the grammar's
-  `at` enum (§6).
+  always unique text, so most of the per-line duplicates that dominate source
+  (`return Ok(());`, blank lines) never get an anchor of their own. A
+  container's bare closing brace is the exception — it is a unit, and two of
+  them take seeds 0 and 1 — which costs nothing, since a closing brace is not
+  what anybody edits. A 1,000-line source file is 30–60 units, not 1,000
+  lines.
 
 ## 4. The anchor
 
@@ -138,36 +149,46 @@ How often a seed is bumped, and how likely a stale anchor is to match new text:
 
 ## 5. Reading
 
-`file_read` labels each unit with its anchor:
+`file_read` labels each unit with its anchor. A unit named by its own first
+line — a paragraph, a YAML line — shows that line after its anchor and the rest
+beneath it (npcd's header shown):
 
 ```
-(paragraphs 1–14 of 14)
-Qm7x| The bay was warm when you walked in, the tank fluid already cycling…
+layers/life/bram/2834-11 The Body.md (14 paragraphs):
+Qm7x| The bay was warm when you walked in, the tank fluid already cycling,
+and the light was the light of a room nobody had left in years.
 b4_K| Then the order came down on the shared frequency…
 9fTa| You said fourteen.
 ```
 
-A code unit is labelled with its anchor and its scope path, then shown whole:
+A code unit shows its anchor and scope path, then its lines exactly as they
+are, indentation and all (zend's fence shown):
 
-```
-(units 1–41 of 41)
+````
+```rust file=candle/candle-nn/src/kv_cache/chunked/backing.rs page=1 pages=3 lines=620
 Hk2a| file header
 //! Chunked KV backing.
-Zp0_| use
-use std::sync::Arc;
+Zp0_| use std::sync::Arc;
+use std::collections::BTreeMap;
 r7Lm| impl KvCache > fn seal_chunk
     pub fn seal_chunk(&mut self, gid: ChunkGid) -> Result<()> {
         …
     }
 ```
+end of candle/candle-nn/src/kv_cache/chunked/backing.rs page 1 of 3 — next: page=2
+````
 
-- Paging is by unit: at most 200 a read; `start_at` takes an anchor and the
-  header says how many there are in all.
+- **Paging packs whole units**: a page holds whole units, up to 200 lines of
+  them (`doc_units::render::PAGE_LINES`), so no unit is ever cut across two
+  pages. `page` counts from 1; a page past the end reads the last. A page's
+  line range depends on the file, so zend's `file_read` also takes `line` — an
+  error's or a stack trace's — and returns the page holding it.
+- `file_grep` names each hit's unit and the page holding it (§7a).
 - The label path is not hashed: the anchor is the unit's text alone, so moving a
   function into another `impl` does not change its anchor, and renaming it does.
-- The engine records, per character and document, the anchors and their text as
-  last shown to that character (§7). Nothing is persisted: it lives with the
-  character's working set for the length of the mission.
+- **Nothing about a read is remembered.** Anchors are computed from the text
+  every time, so the staleness check (§6) needs no record of what was shown,
+  and a restart forgets nothing it depends on.
 
 ## 6. Editing
 
@@ -203,77 +224,100 @@ r7Lm| impl KvCache > fn seal_chunk
   begin and end: an inserted function is its own unit, and replacing a unit with
   two functions yields two. The reply (below) reports the units the edit's span
   carves into, with their anchors. An edit that leaves the file unparseable
-  still applies — the file falls back to fixed windows until it parses again —
-  and the reply says so, so the author knows its next edit should mend it.
+  still applies — tree-sitter recovers what it can and the rest is carved as
+  paragraphs — and the reply says so, so the author knows its next edit should
+  mend it.
+- **Separators are kept.** An insert is set apart by a blank line where the
+  file sets its units apart there (always, in prose); a delete takes the blank
+  line after it, so no double gap is left. Line endings and a missing final
+  newline are the file's own and stay so.
 
 ### The grammar
 
-The edit is decoded under the tool grammar like every act
-(`engine::tools`):
+The edit is decoded under the tool grammar like every act.
 
-- **`path`** is an enum of the documents the character holds anchors for, and
-  each path **brings its own `at`** (the stencil's per-value `shapes`, as
-  `invoke`'s `url` brings its `body`): after a path, `at`, `to` and `dest` are
-  enums of that document's shown anchors only. Paths with equal anchor sets
-  share one sub-tree.
-- **`at`** is therefore an anchor the character was last shown for that
-  document (§5). An anchor that does not exist cannot be emitted. Once the
-  model has emitted enough of it to pick one out — usually its first token —
-  the rest is forced.
-- **`do`** is an enum of the five operations; **`text`** is free prose.
+- **`do`** is an enum of the five operations and **`where`** of `before` and
+  `after`. In npcd's turn grammar each operation **brings the fields it takes**
+  (`engine::tools::BRINGS`, the stencil's per-value `shapes`): a replace or an
+  insert its `text`, a move its `dest` and `where`, a delete nothing. Left as
+  optional siblings of `do`, those fields doubled the decodes the act admits
+  once each, and with `file_edit` at every bench a crowded room went to
+  4 × 10⁷ decodes over a turn against the 2 × 10⁶ budget
+  (`estimated_paths`, `MAX_TURN_PATHS`); brought by their operation, they are
+  summed instead. zend's schema carries the same enums.
+- **`path` and `at` are free text in a character's turn grammar.** Binding `at`
+  to the anchors shown — each `path` bringing its document's anchors — puts an
+  enum of tens of anchors per document into every turn and multiplies the turn's
+  decodes past the same budget. An anchor the character mistypes or remembers
+  from an earlier version is refused instead (below), and its read is right
+  above it to copy four characters from. A mending sitting, whose grammar is its
+  own and covers one document, binds them (§7).
 - **`old`** is free text checked by the act: the stencil has no substring
-  constraint, so an `old` that does not occur once in the unit is refused, as
-  `file_edit` refuses today.
-- A document with no units (empty, or whitespace only) offers no anchors and so
-  no `file_edit`; its first text is written with `file_write`.
+  constraint, so an `old` that does not occur once in the unit is refused.
+- A document with no units (empty, or whitespace only) offers nothing to anchor
+  to; its first text is written with `file_write`.
 
 ### Staleness
 
-An edit is applied only if the anchored unit's text is what the character was
-last shown for that anchor (§5). If the document changed under it — another
-edit, the engine's tidy pass, a merge from the record — the anchor either no
-longer exists or names different text, and the act refuses: *"That paragraph
-has changed since you read it; read it again."* No edit is ever applied to text
-the character did not see.
+An anchor is its unit's text, hashed, so an edit is applied only to a unit
+whose text is what the anchor was taken from: if the document changed under it
+— another edit, the engine's tidy pass, a merge from the record — the anchor no
+longer names any unit, and the act refuses: *"Qm7x is not a part of it as it
+stands now — it has changed since you read it, or was never one of its anchors;
+read it again and edit by the anchors it shows."* No edit is ever applied to text
+the character did not see. (A different text matching a stale anchor by chance
+is 1 in 16.7 M.)
 
-The shown anchors live in memory, so a restart forgets them; the first edit of a
-document after one is refused the same way — *read it again* — never as "no such
-paragraph".
+Because the check is the document itself, nothing is remembered between a read
+and an edit: an edit after a restart is checked exactly as one before it.
+
+**Re-sending an edit is safe except an insert.** A replace or delete re-sent
+after it landed names an anchor the document no longer has and is refused; a
+move re-sent puts its unit where it already stands. An insert leaves its anchor
+as it was, so zend's resumed turns do not re-issue one (`Replay::Unsafe`).
 
 ### The reply
 
-Every edit answers with the units it touched and their new anchors, and the
-unit before and after each for context:
+Every edit answers with what was done, then the units it wrote, whole, under
+their new anchors, between the unit before and the unit after, each in one line:
 
 ```
-Changed 9fTa → R2kp.
+Changed 9fTa.
 b4_K| Then the order came down on the shared frequency…
 R2kp| You said fifteen.
 cX0e| The tower lord's reply came back flat…
 ```
 
-The engine adds those anchors to what the character has been shown, so its next
-edit can name them without reading the document again.
+A delete shows the units now either side of where it was. The next edit can
+name the new anchors without reading the document again.
 
 ## 7. Mending sittings
 
 The mend steps (`fix`, and `review` when it sends a document back) stop
-re-composing the piece. The mending sitting is put the faults and the piece as
-`file_read` shows it — anchors and all — and answers with a list of edits in the
-§6 form, under the same grammar, which the engine applies one by one through
-`file_edit`. A sitting that would rewrite most of the piece says so and is
-composed whole, as today.
+re-composing the piece. The mending sitting is put the faults and the piece
+under its paragraphs' anchors, and offered two calls: **`mend`**, whose `edits`
+(one to `compose::MOST_EDITS`, 12) each name a paragraph as `at` — bound in the
+sitting's grammar to the piece's own anchors, and `to` likewise — and say what
+to `do` (`replace`, `insert_before`, `insert_after`, `delete`, with `text` and
+`old` as in §6); and **`draft`**, the whole piece written again, for a sitting
+that has to change most of it. The engine makes the edits one by one
+(`compose::mended`) and writes the result into the working copy through
+`file_write`, as a draft is; an edit naming a paragraph an earlier one already
+changed finds its anchor gone and is refused, and the answer says which. A
+mend none of whose edits could be made is refused whole.
 
-`compose` keeps writing first drafts and genuine rewrites whole.
+`compose` keeps writing first drafts whole, and a draft short of its floor is
+carried on as before; only the first sitting may mend.
 
 ## 7a. Other places that cite lines
 
 - **`file_grep`** labels each hit with the anchor and scope path of the unit it
-  falls in, and records those anchors as shown, so a hit can be edited without
-  a read.
+  falls in (`part`) and the `file_read` page that holds it (`page`), so a hit
+  can be read whole, or edited, without counting pages.
 - **Tool output that is not a read** — compiler errors, test failures, diffs,
   blame — keeps its own line numbers. It describes the world, not the editing
-  surface; an author goes from it to a read, and edits from the read.
+  surface; an author goes from it to a read — `file_read`'s `line` opens the
+  page holding the line — and edits from the read.
 - **zend's MCP endpoint** carries the same `file_read`/`file_edit` as every other
   caller: one form, anchors. Its tool description teaches the convention.
 
@@ -290,10 +334,12 @@ composed whole, as today.
 Prefill is the cheap side (hundreds of tok/s on the same machine), so the read
 cost is negligible beside the decode it saves.
 
-The anchor's forced remainder is decided without logits (`batched_sampler`'s
-single-allowed-token path), but whether it is fed in one step or one decode
-step per token is measured, not assumed (§10): at worst an anchor costs 2–4
-decode steps, not 1–2.
+Where `at` is bound (a mending sitting), the anchor's forced remainder is
+decided without logits (`batched_sampler`'s single-allowed-token path), but
+whether it is fed in one step or one decode step per token is measured, not
+assumed (§10). Where it is free (a turn), an anchor is its 2–4 tokens decoded.
+Either way it is a handful of tokens against the hundreds a quoted `old_str`
+cost.
 
 ## 9. Migration
 
@@ -301,25 +347,32 @@ There is no backward compatibility, by the repository's standing rule: the
 anchored form **replaces** the line-numbered one, with no dual path and no flag
 to keep the old one alive.
 
-1. **The carver is restored into `zend-tools`.** `zend/src/code_read/carve.rs`,
-   `types.rs` and `parsers/` come back from `46e247083^` as
-   `zend-tools/src/tools/file/units/`, beside the file tools that use them,
-   with their parser tests. The merge pass (`refine`'s forward merge) is not
-   restored, and the size caps become the edit-unit caps of §3. The tree-sitter
-   grammar dependencies move from `zend/Cargo.toml`, where nothing calls them
-   now, to `zend-tools/Cargo.toml`; the single `tree-sitter` 0.26 pin `yamlpatch`
-   needs stays workspace-wide. The Markdown paragraph rule and the YAML line
-   rule are new code in the same module.
-2. **`file_read` and `file_edit` change in place.** Line numbers and `old_str`
-   anchors are removed from the reads and the act; every caller, prompt and
-   example in the tool catalogue is moved to anchors in the same change.
-3. **zend's `code_reading` layer is wiped and re-ingested.** Its turns were read
-   with line numbers and cite them, so they describe a read format that no
-   longer exists. It is tombstoned whole on the first boot of the new build —
-   `--wipe-layer code_reading` (`DaemonConfig::wiped_layers`), on every member,
-   once — and the background ingest rebuilds it from the repositories with
-   anchored reads. Every other layer is untouched.
-4. **npcd needs no migration of its own.** Anchors are computed from the text
+1. **The carver is restored as the `doc-units` crate.** `zend/src/code_read/`
+   `carve.rs`, `types.rs` and `parsers/` came back from `46e247083^` into
+   `doc-units/src/carve/`, with their parser tests — a crate of its own because
+   npcd, which does not depend on `zend-tools`, edits with it too. The merge
+   pass, the fixed-window and header carvers and the long-line rewrite are not
+   restored, and the size caps are the edit-unit caps of §3. The tree-sitter
+   grammar dependencies moved from `zend/Cargo.toml`, where nothing called them,
+   to `doc-units`; the single `tree-sitter` 0.26 pin `yamlpatch` needs stays
+   workspace-wide. `zend-vfs`'s `old_text` replace engine is gone.
+2. **`file_read` and `file_edit` change in place**, in `zend-tools`, zend's tool
+   definitions (`zend/src/prompts/tools/`) and npcd's bench acts. Line numbers
+   and `old_str`/`old_text` are removed from the reads and the act; every
+   caller, prompt and example is moved to anchors in the same change.
+3. **zend's `code_reading` units are re-read.** Their turns were read with line
+   numbers and cite them, so they describe a read format that no longer exists.
+   `KEY_VERSION` 3 (`zend/src/branch_ingest/keys.rs`) re-keys every unit, so the
+   next ingest pass reads each one again with anchored pages and tombstones the
+   old reading once the new one commits. A unit now records the pages it read
+   (`pages`, counted from the content) where it recorded a line count, which is
+   what the fast path checks a chain read in full. The re-key reaches every unit
+   keyed by `KEY_VERSION` — `repo_map`'s folders and the layers above
+   `code_reading` too — so the whole corpus is re-read.
+4. **The layer is also wiped at release**, so no line-numbered turn stands while
+   its replacement is read: the first boot of the new build on each member runs
+   with `--wipe-layer code_reading` (`DaemonConfig::wiped_layers`), once.
+5. **npcd needs no migration of its own.** Anchors are computed from the text
    at read time and nothing about them is persisted (§5), so documents, drafts
    in operation stores and the record carry over unchanged. A mission open
    across the upgrade reads its document again before it edits, which the
@@ -346,13 +399,16 @@ Unit tests beside the code, asserting raw values:
   a unit elsewhere changed → the edit still applies.
 - **Duplicates**: deleting the first of two identical paragraphs leaves the
   second's old anchor refused, never applied to the wrong copy.
-- **Grammar**: the edit act's `at` enum is exactly the shown anchors; an empty
-  set removes the act (`tools::stencil_params`' empty-set rule).
-
+- **Grammar**: each `do` value brings exactly the fields it takes; a crowded
+  room stays inside the turn's path budget; zend's catalog, `file_edit`
+  included, compiles against the real tokenizer; a mending sitting's `at` and
+  `to` are the piece's own anchors.
 - **Ranges and moves**: `to` before `at` refused; a move into its own span
   refused; a moved unit keeps its anchor.
-- **Grep**: a hit is labelled with its unit's anchor, and that anchor is then
-  editable without a read.
+- **Grep**: a hit names its unit's anchor and page, and that anchor then edits
+  the unit with no read in between.
+- **Mending**: a `mend` is read from its call and made edit by edit; an edit on
+  a paragraph an earlier one changed is refused.
 
 Measurement, before and after landing:
 
@@ -360,4 +416,6 @@ Measurement, before and after landing:
   refusals per `fix` and `review` step on WhiteWorld, and zend's `file_edit`
   refusal rate.
 - **After landing**, the same figures, edit refusals by cause, operation
-  turnaround through the pipeline, and decode steps per emitted anchor (§8).
+  turnaround through the pipeline, and decode steps per emitted anchor (§8). A
+  mending sitting logs `mended a piece by its anchors` with how many edits were
+  made and refused, beside `composed a draft`.

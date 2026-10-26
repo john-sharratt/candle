@@ -268,11 +268,11 @@ which is ordinary file editing. `zend-tools` already implements it —
 per-conversation overlay that records each change as a delta — an edit as only
 the lines it changed, a delete as a marker — over the workspace's file. Its own
 documentation states the alignment that matters here: `file_edit`
-replaces an `old_text` quoted from the file with a `new_text`, located by its
-content and never by line number, so text matching in several places is refused
-as ambiguous rather than guessed at, and an edit whose result is already in the
-file is counted as already applied — which forces the model to quote enough to
-identify a single edit site, and makes re-sending an edit safe.
+names the part it changes by a content anchor `file_read` shows — four
+characters hashed from that part's text, never a line number — so an anchor
+taken before somebody else changed the part is refused as stale rather than
+applied to the wrong text, and re-sending a replace or a delete that already
+landed is refused the same way (`docs/npcd_anchored_edits.md`).
 
 It is a workspace member with no candle dependency, so `npcd` can depend on it
 directly. Reusing it costs one dependency and buys names the model already has a

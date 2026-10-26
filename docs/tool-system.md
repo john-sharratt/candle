@@ -170,10 +170,10 @@ One assistant turn may make up to `MAX_TOOL_CALLS_PER_TURN` (6) calls — OpenAI
 
 ```
 <tool_call>
-{"name": "file_read", "arguments": {"path": "src/main.rs", "start_line": 1, "end_line": 200}}
+{"name": "file_read", "arguments": {"repo": "app", "path": "src/main.rs", "page": 1}}
 </tool_call>
 <tool_call>
-{"name": "file_read", "arguments": {"path": "Cargo.toml", "start_line": 1, "end_line": 200}}
+{"name": "file_read", "arguments": {"repo": "app", "path": "Cargo.toml", "page": 1}}
 </tool_call>
 ```
 
@@ -603,59 +603,9 @@ Create a new file or overwrite an existing one in the in-memory virtual filesyst
 
 ### `file_read`
 
-Read a range of lines from a file in the session VFS. Use for: looking at what was previously written, inspecting a file the user uploaded into the chat, retrieving content the model needs to reference for editing or summarising, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". **`path`, `start_line` and `end_line` are all required, and a call returns at most `MAX_READ_LINES` (200) lines — there is no whole-file read.** Returns the excerpt as numbered source in a fenced block, headed by the path and the line range it covers. Limited to files in the in-memory VFS — for remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
+Read one page of a file, in its parts under their anchors (`docs/npcd_anchored_edits.md`). Use for: reading a source file, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. Triggered by "show me the file", "read", "what's in", "open the file", "cat", "display the contents of". **`repo`, `path` and `page` are all required, and a call returns one page — whole parts, at most 200 lines of them; there is no whole-file read.** `line` (optional) reads the page holding that line instead, for an error's or a stack trace's line number. For remote filesystems use `remote_fs_session_get` to download first, then `file_read`.
 
-**Why the range is mandatory rather than merely encouraged.** An unbounded read is not a slower read; it is a different failure, and it is one that guidance does not prevent. With the range optional, a single live conversation made nine `file_read` calls and all nine asked for whole files — 9,534 lines, including one 2,499-line module that arrived as 144 KB of `<tool_response>`. Three such reads made the following turn a 53,288-token prefill, which the scheduler delivered in 8,192-token chunks while the KV pool ratcheted 6 GB against a card already at 99% occupancy: one turn, three minutes and fifty seconds, with the per-chunk cost rising as the prefill went on (12.3 s → 23.0 s for identical work at identical depth). An emphatic description had been in place for that entire conversation. The schema is what holds, because `required` drives the constrained-decode stencil: a call with no range is not discouraged, it is undecodable.
-
-**Parameters**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "path": {"type": "string"},
-    "start_line": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "First line of the range to return, 1-based. Required."
-    },
-    "end_line": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Last line of the range, 1-based and inclusive. Required. At most 200 lines come back per call."
-    }
-  },
-  "required": ["path", "start_line", "end_line"]
-}
-```
-
-**Returns**
-
-A rendered string, not a JSON object:
-
-````
-src/main.rs (lines 1-3):
-
-```rust
-1  fn main() {
-2      println!("hello");
-3  }
-```
-````
-
-`start_line` is clamped into `[1, total]` and `end_line` into `[start_line, total]`, so a range running past the end of the file ends at the file rather than failing, and a transposed pair collapses to a one-line read rather than costing a round trip. The span cap applies last, to whatever the clamps produced: `end` becomes at most `start_line + 199`.
-
-**A range wider than the cap is served, not refused.** Asking for lines 1-900 of a 900-line file returns lines 1-200, and because the excerpt now stops short of the end the header reads `(lines 1-200 of 900)` — which states both that it was cut and where to resume. Returning `invalid_arguments` would spend a whole turn conveying what the header already carries. When the excerpt does reach the end of the file the header is the plain `(lines a-b)`, which is how the model knows there is nothing further to fetch. An empty file reads as `(empty)`.
-
-The `required` list is declared `path, start_line, end_line`, and the constrained decoder emits required parameters in that order, so a call reads in the order it is written.
-
-**Errors.** Missing file returns `{"error": "not_found", "path": "..."}`. A call missing `path`, `start_line` or `end_line` returns `{"error": "invalid_arguments", ...}` naming the absent field. A path under a `secrets/` directory returns `{"error": "forbidden"}` — note that argument validation runs before the tool, so a malformed call to a protected path reports the malformation first; the guard is unaffected, since neither call reads anything.
-
----
-
-### `file_edit`
-
-Replace one piece of text in an existing VFS file with another. `old_text` is the text to change, copied from the file as it stands — whole lines, with enough of the lines around it to occur only once; `new_text` is what takes its place, empty to delete it. Use for: changing a value in a config, updating a function body, adding a method after an existing one, fixing a typo. Triggered by "change X to Y in the file", "update these lines", "fix the value of", "add this after". Returns path, how many occurrences were replaced, whether the edit was already applied, how the text was matched, and the new byte count. For full rewrites of a file use `write`.
+**Why the page is mandatory rather than merely encouraged.** An unbounded read is not a slower read; it is a different failure, and it is one that guidance does not prevent. With the range optional, a single live conversation made nine `file_read` calls and all nine asked for whole files — 9,534 lines, including one 2,499-line module that arrived as 144 KB of `<tool_response>`. Three such reads made the following turn a 53,288-token prefill, which the scheduler delivered in 8,192-token chunks while the KV pool ratcheted 6 GB against a card already at 99% occupancy: one turn, three minutes and fifty seconds, with the per-chunk cost rising as the prefill went on (12.3 s → 23.0 s for identical work at identical depth). An emphatic description had been in place for that entire conversation. The schema is what holds, because `required` drives the constrained-decode stencil: a call with no page is not discouraged, it is undecodable.
 
 **Parameters**
 
@@ -665,29 +615,75 @@ Replace one piece of text in an existing VFS file with another. `old_text` is th
   "properties": {
     "repo": {"type": "string"},
     "path": {"type": "string"},
-    "old_text": {"type": "string", "description": "The text to replace, copied from the file exactly as it stands — whole lines, with enough around it to occur once. Without the line numbers `file_read` shows."},
-    "new_text": {"type": "string", "description": "The text that takes its place. Empty to delete `old_text`."},
-    "replace_all": {"type": "boolean", "default": false}
+    "page": {"type": "integer", "minimum": 1, "description": "Page of the file, from 1; whole parts up to 200 lines. Required."},
+    "line": {"type": ["integer", "null"], "minimum": 1, "description": "A line number, to read the page holding it instead of `page`. Optional."}
   },
-  "required": ["repo", "path", "old_text", "new_text"]
+  "required": ["repo", "path", "page"]
+}
+```
+
+**Returns**
+
+A rendered string, not a JSON object — each part (a function, a type, a block of imports, a paragraph) under its four-character anchor, a code part with its scope path:
+
+````
+```rust file=app/src/main.rs page=1 pages=1 lines=5
+Zp0_| use std::env;
+r7Lm| fn main
+fn main() {
+    println!("hello");
+}
+```
+end of app/src/main.rs page 1 of 1 — the last page
+````
+
+The fence names the file, the page, how many pages there are and the file's length; the closing line names the next page, or says this is the last. A page past the end returns the last page; page 0 is refused. An empty file reads `lines=0` with no page.
+
+**Errors.** Missing file returns `{"error": "not_found", ...}`. A call missing `repo`, `path` or `page` returns `{"error": "invalid_arguments", ...}` naming the absent field. A path under a `secrets/` directory returns `{"error": "forbidden"}` — note that argument validation runs before the tool, so a malformed call to a protected path reports the malformation first; the guard is unaffected, since neither call reads anything.
+
+---
+
+### `file_edit`
+
+Change one part of an existing file by its anchor (`docs/npcd_anchored_edits.md` §6). `at` names the part as `file_read` shows it; `do` says what to do there: `replace` it with `text` (or, with `old`, just those words inside it), `insert_before` / `insert_after` it a new part `text`, `delete` it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete and move over a run of parts. Use for: changing a function body, adding a method after another, fixing a value in a config, removing dead code, reordering items. For a new file, or rewriting most of one, use `write`.
+
+**Parameters**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "repo": {"type": "string"},
+    "path": {"type": "string"},
+    "at": {"type": "string", "minLength": 4, "maxLength": 4},
+    "do": {"type": "string", "enum": ["replace", "insert_before", "insert_after", "delete", "move"]},
+    "text": {"type": ["string", "null"]},
+    "old": {"type": ["string", "null"]},
+    "to": {"type": ["string", "null"]},
+    "dest": {"type": ["string", "null"]},
+    "where": {"type": "string", "enum": ["before", "after"]}
+  },
+  "required": ["repo", "path", "at", "do"]
 }
 ```
 
 **Returns**
 
 ```json
-{"repo": "app", "path": "src/main.rs", "replacements": 1, "already_applied": false, "matched": "exact", "bytes": 1289}
+{"repo": "app", "path": "src/main.rs", "result": "Changed r7Lm.\nZp0_| use std::env;\nQx2c| fn main\nfn main() {\n    println!(\"hi\");\n}\n", "bytes": 64}
 ```
 
-**Why this shape.** It replaced a unified-diff `patch` argument. A live model could not drive the diff: it planned a correct hunk in its reasoning and then emitted the lines with no `@@` header, invented line numbers, and indented its context lines by what the line-numbered `file_read` view suggested rather than by what the file held — five failed calls before it gave up and rewrote the whole file with `write`. Quoting the old text and the new is the edit format models are trained on: nothing to count, no prefixes, no line numbers.
+`result` names what was done and shows the parts it wrote, whole, under their new anchors, between the parts either side of them in one line each — so the next edit needs no read. An edit that leaves a code file unparseable still applies, and `result` says so.
 
-**Implementation.** `zend-vfs/src/replace/`, applied to the file read through the overlay. `old_text` is looked for **exactly** first; one occurrence is replaced, several (overlapping ones counted apart) return `{"error": "ambiguous", ...}` unless `replace_all` is set. An `old_text` that opens with indentation must start a line — found partway into deeper indentation, it is the right line at the wrong depth. Failing that it is looked for **line by line with indentation ignored** — each line compared with its surrounding whitespace trimmed — the mistake a model actually makes; the replacement is re-indented by the difference between the file's indentation and the one `old_text` was written at, and the response says `"matched": "indentation"`. Nothing looser is tried. When `old_text` is absent and `new_text` stands in the file **as whole lines** that say something (not only punctuation), the edit is **already applied** and nothing is written — a bare substring of `new_text` is found by accident and never counts; an occurrence of `old_text` inside an occurrence of `new_text` is the edit's own result and is not counted, so `retries = 3` → `retries = 30` re-sent cannot compound into `retries = 300`. A deletion leaves nothing to recognise, so its missing `old_text` is `not_found`. `not_found` says where the first line of `old_text` is in the file, when it is, so the next call can quote the file as it stands. An LF edit lands in a CRLF file as CRLF; every line the edit does not replace keeps its own ending, and a missing final newline is kept.
+**Why this shape.** It replaced `old_text`/`new_text`, which replaced a unified-diff `patch`. A model could not drive the diff (invented line numbers, missing `@@` headers), and quoting the old text cost a decoded copy of it — often the whole function — refused on any slip or duplicate. An anchor is four characters copied off the read above; `old` names only the words being changed.
+
+**Implementation.** `doc-units`: the file is carved into parts (tree-sitter scopes for code, paragraphs for Markdown and text, lines for YAML), each anchored by four base64url characters of SHA-256 over a seed and its text. **An anchor the file no longer has is `stale`** — its part changed since it was read — so nothing is applied to text the caller never saw, and a replace or delete re-sent after it landed is refused rather than compounding `retries = 3` → `30` → `300`. An insert leaves its anchor as it was, so it is the one edit a resumed turn may not re-issue. An insert is set apart by a blank line where the file sets its parts apart; a delete takes the separator after it; line endings and a missing final newline are the file's own. `old` must occur once in its part (`ambiguous` / `not_found` otherwise).
 
 ---
 
 ### `file_list`
 
-Enumerate **one** directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Its files come back, and its immediate subdirectories come back as names to list in turn; nothing from inside them does. Use for: seeing what is in a specific directory, checking what the session has created, stepping down a path one level at a time. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path and byte size per entry, paged. **No line count** — for the reason `file_search` gives below: the walk has each entry's size from its directory metadata, but a line count means opening and decoding the file, and the listing then pages down to 50 entries and discards the rest. On this workspace that was ~2,900 files read to fill fifty rows. A file's length reaches the model through `file_read`'s header instead (`(lines 1-200 of 2499)`), which is exact and arrives when the number is actually needed. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
+Enumerate **one** directory you already know the name of — the project's working directory unioned with anything this session has written, which shadows the file of the same path on disk. Its files come back, and its immediate subdirectories come back as names to list in turn; nothing from inside them does. Use for: seeing what is in a specific directory, checking what the session has created, stepping down a path one level at a time. Triggered by "list files", "what files are in", "show me what's in", "ls", "what's been created so far". Returns path and byte size per entry, paged. **No line count** — for the reason `file_search` gives below: the walk has each entry's size from its directory metadata, but a line count means opening and decoding the file, and the listing then pages down to 50 entries and discards the rest. On this workspace that was ~2,900 files read to fill fifty rows. A file's length reaches the model through `file_read`'s fence instead (`page=1 pages=12 lines=2499`), which is exact and arrives when the number is actually needed. Ignored paths (`.gitignore` and friends) never appear, and neither does anything under a `secrets/` directory.
 
 **To *find* a file rather than enumerate one, use `file_search`; to find code by its contents, use `file_grep`.** Calling `file_list` on a guessed directory name is the slow way to answer either question — an empty result is indistinguishable from a wrong guess. For listing remote directories use `remote_fs_session_list_dir`.
 
