@@ -97,8 +97,8 @@ use crate::engine::loopguard::{salient, Took, NUDGE};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{
-    compass_line, compass_report_line, doc_compass, progress_line, time_compass, time_step, Aim,
-    DeskVerbs, DocStep, Mission, MissionPrompt,
+    compass_line, compass_report_line, doc_compass, progress_line, refused_compass, time_compass,
+    time_step, Aim, DeskVerbs, DocStep, Mission, MissionPrompt,
 };
 use crate::engine::mission_acts;
 use crate::engine::mission_gen;
@@ -1543,6 +1543,9 @@ impl Runtime {
                             .and_then(&way_to)
                     })
                     .flatten();
+                if let (DocStep::Write(p), Some(refusal)) = (&doc, &mission.gate_refusal) {
+                    return Some(refused_compass(p, refusal, &desk, way.as_deref()));
+                }
                 let written = written_up_to_floor(s, &body, mission, &doc);
                 return Some(doc_compass(&doc, &desk, way.as_deref(), written));
             }

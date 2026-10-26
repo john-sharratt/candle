@@ -808,6 +808,14 @@ impl Missions {
 
     /// Put the writing of the body's mission document back in front of it —
     /// see [`Mission::reopen_write`].
+    /// What the table said when it last refused the body's mission document,
+    /// or `None` once a report of it is taken — see `Mission::gate_refusal`.
+    pub fn set_gate_refusal(&mut self, body: &str, refusal: Option<String>) {
+        if let Some(m) = self.active.get_mut(body) {
+            m.gate_refusal = refusal;
+        }
+    }
+
     pub fn reopen_write(&mut self, body: &str) {
         if let Some(m) = self.active.get_mut(body) {
             if let Some(path) = m.work.as_ref().map(|w| w.writes.clone()) {

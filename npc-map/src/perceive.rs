@@ -233,8 +233,13 @@ fn around(world: &World, actor: &Actor) -> Option<String> {
             .next()
             .map(|(p, _)| p.count_name(free))
             .unwrap_or_else(|| plural("station", free as usize));
+        // A count names the kind, not the one: a part named "the merge table"
+        // read "One the merge table stand free". The article goes, and the
+        // verb agrees with the count.
+        let station = station.strip_prefix("the ").unwrap_or(&station);
         let clause = match free {
             0 => "Nothing here is free.".to_string(),
+            1 => format!("One {station} stands free."),
             n => format!("{} {station} stand free.", cap(&spell(n as usize))),
         };
         if !out.is_empty() {

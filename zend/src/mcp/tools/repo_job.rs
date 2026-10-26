@@ -27,7 +27,8 @@ pub fn definition() -> Value {
         "description": "Run a build or a test run on a build agent — a cluster machine that checks out a \
             repository and runs programs on it, never one serving traffic — against a branch as it stands on \
             origin. Give a program and its arguments, never a shell line; the agent runs only programs on \
-            its allow-list. Answers the job id and the agent it runs on; follow it with `repo_job_log`. A \
+            its allow-list — `cargo` — and a program no agent allows is refused as \"no ready agent holds \
+            repository … with <program>\". Answers the job id and the agent it runs on; follow it with `repo_job_log`. A \
             job lives in its agent's process: one lost to a restart is reported lost, and is run again. Name \
             `node` to pin an agent; otherwise the gateway picks one. With `stage`, the file the job builds is \
             staged for `service_trial` once the job succeeds. Admins only.",

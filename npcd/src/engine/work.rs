@@ -499,7 +499,13 @@ pub fn report_block(hosted: &Hosted, body: &str) -> Option<String> {
     }
     let vocabulary = hosted.read(leakage::vocabulary);
     let lore = hosted.sim(|s| s.bench.files()).map(|f| leakage::lore(&f));
-    let refusal = hosted.sim(|s| gate_refusal(s, body, &*shelf, &vocabulary, &lore))?;
+    // Kept on the mission until a report is taken, so the compass can say it
+    // on every turn between — see `mission::refused_compass`.
+    let Some(refusal) = hosted.sim(|s| gate_refusal(s, body, &*shelf, &vocabulary, &lore)) else {
+        hosted.with_sim(|s| s.missions.set_gate_refusal(body, None));
+        return None;
+    };
+    hosted.with_sim(|s| s.missions.set_gate_refusal(body, Some(refusal.clone())));
     // A document that does not stand is to be written again — said in the
     // mission's own steps, so the compass sends the Maker back to its desk
     // instead of on to a report that will be refused. One gone from the store
@@ -526,9 +532,16 @@ fn unpublished(s: &Sim, body: &str) -> Option<String> {
         .published
         .is_none()
         .then(|| {
+            // **Where the tools are, not only what they are called.** Told
+            // the names alone, four Makers stood beside the merge table and
+            // called `report_done` again and again, and asked each other how
+            // its tools were invoked: a station's acts are addresses, and
+            // `here` is where a room's addresses are read.
             format!(
                 "{} has not landed in the record yet. At the merge table, `merge_status` shows \
-             whether it merges cleanly, and `merge_publish` lands it; report once it has.",
+             whether it merges cleanly, and `merge_publish` lands it — `invoke` them at the \
+             table's own address, which `http://local/here` lists in its room. Report once \
+             it has.",
                 work.writes
             )
         })

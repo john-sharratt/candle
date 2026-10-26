@@ -216,6 +216,11 @@ pub struct Mission {
     /// none ([`Self::refuse_stuck_over_faults`]).
     #[serde(default)]
     pub faulted_draft: Option<u64>,
+    /// What the table found wrong with the mission's document the last time it
+    /// was reported, until a report of it is taken — what the compass says
+    /// beside the way to the desk ([`refused_compass`]).
+    #[serde(default)]
+    pub gate_refusal: Option<String>,
     /// The documents the mission is about, when it is work on the record.
     #[serde(default)]
     pub work: Option<Work>,
@@ -239,6 +244,7 @@ impl Mission {
             stuck_refused: 0,
             refused_since: false,
             faulted_draft: None,
+            gate_refusal: None,
             work: None,
             year: None,
         }
@@ -890,6 +896,25 @@ pub fn doc_compass(
         ),
         (doc, at, _) => doc_compass_unwritten(doc, at, way),
     }
+}
+
+/// The compass for a document the table refused at its last report:
+/// `refusal` is what it said, and `at` and `way` the desk as
+/// [`doc_compass`] takes them.
+///
+/// **Both ways out, and neither forbidden.** Told by the table "mend it with
+/// `file_edit`, or write it again whole with `compose`", and by the compass on
+/// every turn after "commit it … but do not write it again", three Makers whose
+/// edits had not cleared the brief's words out of their drafts had no way left
+/// they were allowed to take, and their operations failed stuck. The refusal
+/// stays in front of them until a report is taken, and so do both ways.
+pub fn refused_compass(p: &str, refusal: &str, at: &DeskVerbs, way: Option<&str>) -> String {
+    let desk = doc_compass_unwritten(&DocStep::Write(p.to_string()), at, way);
+    format!(
+        "When you last reported {p}, the table would not take it: {refusal}\nIf you have put \
+         that right since, commit it and report again. If not, mend those passages with \
+         `file_edit` — or write it whole again: {desk}"
+    )
 }
 
 fn doc_compass_unwritten(doc: &DocStep, at: &DeskVerbs, way: Option<&str>) -> String {
@@ -1726,6 +1751,18 @@ mod tests {
             "Your mission, next: read layers/eras/x.md. Documents are read at a desk: the nearest \
              is in band one, on the story level: `move_to` the lift."
         );
+        // A refused document: the refusal stands in front of the Maker, and
+        // both ways out of it are open — never "do not write it again".
+        let refused = super::refused_compass(
+            "layers/stories/y.md",
+            "it copies the brief's words: 'Out of scope.'",
+            &desk,
+            None,
+        );
+        assert!(refused.contains("it copies the brief's words"), "{refused}");
+        assert!(refused.contains("`file_edit`"), "{refused}");
+        assert!(refused.contains("http://local/desk/1/compose"), "{refused}");
+        assert!(!refused.contains("do not write it again"), "{refused}");
         // A terminal that reads but does not compose is not where a piece is
         // written: the way goes to a writing desk.
         let reads_only = DeskVerbs {

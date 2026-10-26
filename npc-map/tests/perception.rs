@@ -116,6 +116,22 @@ fn a_maker_alone_at_a_station_is_told_where_it_is_and_what_it_holds() {
     assert!(p.contains("Five character terminals stand free."), "{p}");
 }
 
+/// One left is said as one: no article out of the part's name, and a verb
+/// that agrees — "One the merge table stand free" is what the count said
+/// before.
+#[test]
+fn one_station_left_is_said_in_the_singular() {
+    let mut w = vault();
+    for i in 1..=5 {
+        let id = format!("m{i}");
+        w.enter(&id, format!("Maker-0{i}"), casting("band-one"))
+            .unwrap();
+        w.take(&id, Some(&format!("r-{i}"))).unwrap();
+    }
+    let p = flat(&w, "m1");
+    assert!(p.contains("One character terminal stands free."), "{p}");
+}
+
 #[test]
 fn a_percept_never_repeats_what_the_memory_already_says() {
     // Exits, capacity and which level a room is on do not change, so paying

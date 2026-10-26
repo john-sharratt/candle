@@ -31,7 +31,7 @@ rest. Never wait on one worker while others run unwatched.
 | stuck | Its loop closed: reply with what to do next (`repo_task_reply`) |
 | stopped | You stopped it: redirect it (`repo_task_reply`) or archive the thread |
 | failed | Read why; fix the cause or start the task again |
-| lost — "the task stopped being run: the member running it restarted or lost it" | Its turn is gone; its conversation keeps what it did. Start the task again — the same name gets the next free one (`.2`) — and point the new prompt at the lost worker's journal entries, if it wrote any |
+| lost — "the task stopped being run: the member running it restarted or lost it" | Its turn is gone and it cannot be continued; what it found is in its journal entries, and anything it pushed is on its branch. Start the task again — the same name gets the next free one (`.2`) — pointing the new prompt at both |
 
 ## When a worker goes wrong
 
