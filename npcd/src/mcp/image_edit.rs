@@ -13,14 +13,12 @@
 //! refinement costs the conversation one line instead of the picture's base64.
 //! `image_base64` is for a picture of the user's own.
 
-use std::io::Cursor;
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use candle_conversation::guest::MAX_REFERENCE_HOLD;
-use image::ImageReader;
 use serde_json::{json, Value};
 
 use super::image::{body, draw, format, MAX_SIDE, STEPS};
@@ -58,7 +56,7 @@ impl Tool for Edit {
                 "type": "object",
                 "properties": {
                     "image": {"type": "string", "description": "The picture to edit: the link or image id an image_generate or image_edit answer gave."},
-                    "image_base64": {"type": "string", "description": "Or a picture of the user's own, base64 — a JPEG or a PNG."},
+                    "image_base64": {"type": "string", "description": "Or a picture of the user's own, base64: JPEG, PNG, WebP, GIF, BMP or TIFF, any size up to 32 MB and 64 megapixels — Zen turns it the way its camera recorded and fits it."},
                     "prompt": {"type": "string", "description": "The whole picture as it should end up, with the change in it."},
                     "hold": {"type": "number", "minimum": 0.0, "maximum": MAX_REFERENCE_HOLD, "default": HOLD, "description": "How much of the original survives: about 0.3 for a large change, 0.5 to add or remove a detail, 0.7 for a light touch."},
                     "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "description": "Width in pixels, a multiple of 16; the original's shape when absent."},
@@ -136,11 +134,7 @@ fn edit_body(args: &Value, source: &[u8]) -> Result<ImageBody, String> {
     let given = |key: &str| args.get(key).filter(|v| !v.is_null()).is_some();
     let (given_w, given_h) = (given("width"), given("height"));
     if !(given_w && given_h) {
-        let (w, h) = ImageReader::new(Cursor::new(source))
-            .with_guessed_format()
-            .map_err(|e| format!("the picture could not be read: {e}"))?
-            .into_dimensions()
-            .map_err(|e| format!("the picture is not one this can read: {e}"))?;
+        let (w, h) = refimage::dimensions(source)?;
         (body.width, body.height) = shaped(
             (w, h),
             given_w.then_some(body.width),
@@ -188,6 +182,8 @@ fn snap(side: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     #[test]
