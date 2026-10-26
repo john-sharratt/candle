@@ -9118,9 +9118,9 @@ mod projection_schema_tests {
             assert!(l.budget.adaptive.is_none(), "{name}");
         }
 
-        // Whole files and analysis units are each one case of one competition.
-        // A file's reading votes in every fold group alike; an analysis unit
-        // leaves group 0 out (asserted with its calibration below).
+        // Whole files and analysis units are each one case of one competition,
+        // content weighed on fold groups 1-2 and the calibration competition
+        // on the top group alone, at a quarter of the content's weight.
         for name in [
             "code_reading",
             "dependency_analysis",
@@ -9129,9 +9129,13 @@ mod projection_schema_tests {
         ] {
             let g = &layer(name).groups[0];
             assert_eq!(g.policy.scan.cases, ScanCases::File, "{name}");
-            if name == "code_reading" {
-                assert!(g.policy.layer_weights.is_empty(), "{name}");
-            }
+            assert_eq!(g.policy.layer_weights, vec![0.0, 1.0, 1.0], "{name}");
+            assert_eq!(
+                g.policy.calibration_layer_weights,
+                vec![0.0, 0.0, 1.0],
+                "{name}"
+            );
+            assert_eq!(g.policy.scan.calibration_weight, 0.25, "{name}");
             // The cold-scope floor is code_reading's alone.
             let floor = if name == "code_reading" {
                 (2.0, 16.0)
@@ -9155,26 +9159,14 @@ mod projection_schema_tests {
             .unwrap()
             .expect("code_reading declares a calibration");
         assert_eq!((calibrate.questions, calibrate.think), (24, 64));
-        // ... which compete among themselves, half a file's own vote.
-        assert_eq!(
-            layer("code_reading").groups[0]
-                .policy
-                .scan
-                .calibration_weight,
-            0.5
-        );
         assert!(calibrate.prompt.contains("<<path>>"));
-        // So is every analysis of a file; each leaves fold group 0 out and
-        // weighs its calibration at a quarter.
+        // So is every analysis of a file.
         for name in ["dependency_analysis", "code_review", "security_review"] {
             let spec = CalibrateSpec::of(layer(name))
                 .unwrap()
                 .unwrap_or_else(|| panic!("{name} declares a calibration"));
             assert_eq!((spec.questions, spec.think), (24, 64), "{name}");
             assert!(spec.prompt.contains("<<path>>"), "{name}");
-            let policy = &layer(name).groups[0].policy;
-            assert_eq!(policy.scan.calibration_weight, 0.25, "{name}");
-            assert_eq!(policy.layer_weights, vec![0.0, 1.0, 1.0], "{name}");
         }
 
         let ws = layer("dialogue")
