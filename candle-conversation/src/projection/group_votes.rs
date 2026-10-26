@@ -10,7 +10,6 @@ use std::ops::Range;
 
 use super::belief_files::{assemble_file_scans, FileScan};
 use super::ids::{GroupId, TimelineId};
-use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::streams::StreamId;
 use crate::projection::Conversation;
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow, TokenVotes};
@@ -45,8 +44,9 @@ fn uncut(start: usize, end: usize, cut: &[Range<usize>]) -> Vec<(usize, usize)> 
 }
 
 /// One segment over `files`, file `i` case `i`: each file's own windows, its
-/// calibrations' questions too when `calibrations`, no window of a turn
-/// `masked` names, and none of the token ranges `excluded` names by turn.
+/// calibrations' questions too when `calibrations` — pooled in the file's
+/// case, for a caller measuring them there — no window of a turn `masked`
+/// names, and none of the token ranges `excluded` names by turn.
 fn group_segment<'a>(
     files: &'a [FileScan],
     calibrations: bool,
@@ -55,14 +55,11 @@ fn group_segment<'a>(
 ) -> PagedSegment<'a> {
     let mut windows = Vec::new();
     for (case, f) in files.iter().enumerate() {
-        let own: HashSet<StreamId> = f
-            .arc_turn
-            .iter()
-            .map(|t| turn_stream_id(f.timeline.raw(), t.0))
-            .collect();
-        for &(k, start, end, _) in &f.windows {
+        let own = f.windows.iter().map(|&(k, s, e, _)| (k, s, e));
+        let cal = f.cal_windows.iter().copied().filter(|_| calibrations);
+        for (k, start, end) in own.chain(cal) {
             let sid = f.arc_sids[k];
-            if masked.contains(&sid) || (!calibrations && !own.contains(&sid)) {
+            if masked.contains(&sid) {
                 continue;
             }
             let cut = excluded.get(&sid).map_or(&[][..], Vec::as_slice);
@@ -121,6 +118,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::persistence::content_hash::turn_stream_id;
     use crate::projection::ids::TurnIndex;
     use crate::provenance::{encode_wide_sigs, SigWindow};
 
@@ -138,11 +136,11 @@ mod tests {
         let tl = TimelineId::for_test(raw);
         let mut arcs_kept = vec![window(raw)];
         let mut arc_sids = vec![turn_stream_id(raw, 0)];
-        let mut windows = vec![(0, 0, 1, 0)];
+        let mut cal_windows = Vec::new();
         if let Some(cal) = question {
             arcs_kept.push(window(cal));
             arc_sids.push(turn_stream_id(cal, 0));
-            windows.push((1, 0, 1, 0));
+            cal_windows.push((1, 0, 1));
         }
         FileScan {
             timeline: tl,
@@ -151,7 +149,8 @@ mod tests {
             n_slots: 1,
             arcs_kept,
             arc_sids,
-            windows,
+            windows: vec![(0, 0, 1, 0)],
+            cal_windows,
             ex_tokens: vec![1],
         }
     }

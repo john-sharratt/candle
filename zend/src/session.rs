@@ -3188,6 +3188,7 @@ impl InferenceState {
                 &CalibrateFrame {
                     system_prompt: &self.formatted_prompt,
                     config: &self.refresh_config,
+                    thinking: turn_triggers(self, ThinkMode::Balanced, ToolMode::None),
                 },
             );
         }
@@ -9081,11 +9082,20 @@ mod projection_schema_tests {
             layer("repo_map").groups[0].policy.scan.cases,
             ScanCases::Exchange
         );
-        // Each file's reading is calibrated with the questions it answers.
+        // Each file's reading is calibrated with the questions it answers,
+        // each opening the thinking it starts.
         let calibrate = CalibrateSpec::of(layer("code_reading"))
             .unwrap()
             .expect("code_reading declares a calibration");
-        assert_eq!(calibrate.questions, 16);
+        assert_eq!((calibrate.questions, calibrate.think), (24, 192));
+        // ... which compete among themselves, half a file's own vote.
+        assert_eq!(
+            layer("code_reading").groups[0]
+                .policy
+                .scan
+                .calibration_weight,
+            0.5
+        );
         assert!(calibrate.prompt.contains("<<path>>"));
 
         let ws = layer("dialogue")

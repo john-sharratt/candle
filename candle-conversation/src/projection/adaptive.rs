@@ -46,6 +46,13 @@ pub struct ScanPolicy {
     pub level_prior_cap: f32,
     /// What a turn group's scan scores as one case.
     pub cases: ScanCases,
+    /// The weight of a file's vote in the calibration competition — every
+    /// calibrated file a case, scored on its calibrations alone — added to
+    /// its own score. Calibration exemplars and live probes share a
+    /// distribution: in one pool with the files' content they take nearly
+    /// every vote, so they compete among themselves (`docs/
+    /// provenance_scoped_signatures.md` §2.5).
+    pub calibration_weight: f32,
 }
 
 /// What a turn group's scan scores as one case
@@ -76,6 +83,7 @@ impl Default for ScanPolicy {
             level_prior_base: 0.0,
             level_prior_cap: 8.0,
             cases: ScanCases::Exchange,
+            calibration_weight: 1.0,
         }
     }
 }

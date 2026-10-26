@@ -206,35 +206,55 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
 (`docs/tool_selection_provenance_results.md` §26.3). A unit is given the same.
 
 - **Declared per layer.** A layer opts in with a `calibrate:` block — how many
-  questions, and the prompt that asks for them (`<<n>>`, `<<subject>>`,
-  `<<file>>`, `<<repo>>`, `<<path>>`). Nothing names a layer; `code_reading`
-  declares 16.
+  questions, the decode budget of each question's thinking (`think`), and the
+  prompt that asks for them (`<<n>>`, `<<subject>>`, `<<file>>`, `<<repo>>`,
+  `<<path>>`). Nothing names a layer; `code_reading` declares 24 questions
+  and 192 thinking tokens.
 - **Written by the unit.** Each unit is asked in a draft forked from its
   layer's base with the unit as its lineage — so it writes its questions with
   its whole content in front of it — without reasoning or tools. The draft is
   tombstoned once its answer is read; one question per line is kept.
+- **Thought about as a live turn is.** A live probe is the trailing window of
+  what the model decodes, and for most of a turn that is its own thinking,
+  which no question exemplar resembles. Each question is asked again alone —
+  a conversation of the hidden calibration layer, the system prompt every
+  conversation opens with, nothing projected, every dial at the dialogue's
+  default — and the thinking the model starts, up to `think` tokens, is kept.
+  All of a unit's questions are asked at once and decode in one wave.
 - **Calibrated as tools' questions are.** All of a unit's questions go in as
   one turn group in a conversation of the hidden calibration layer, under the
   system prompt every conversation opens with, prefilled lossless
-  (`kv_lossless`): each masked to itself, sealed one turn apiece with an empty
-  answer, tagged `calibration`. The
+  (`kv_lossless`): each masked to itself, sealed one turn apiece, its answer
+  its thinking as a closed reasoning block, tagged `calibration`. The answer
+  is assistant content, not a reasoning segment, so the seal keeps its
+  signatures: a turn's own reasoning is not retrievable, but an exemplar is
+  never retrieved — it votes for its unit. The
   conversation names the unit (`Substrate::CALIBRATES_KEY`), is archived —
   the commit — and is distilled `ProvenanceOnly`: K/V dropped, signatures
   kept.
-- **Scored with the unit.** Wherever the unit is scored, each of its
-  calibration's questions is one more window voting for it
-  (`belief_files::assemble_file_scans`) — for the unit's head exchange, which
-  under file-scored cases is the unit. A calibration is never itself a
-  candidate, a working-set member, or a dialogue probe.
+- **Scored in a competition of their own.** A calibration's exemplars and a
+  live probe share a distribution: in one pool with the units' content they
+  took 96.5% of a background's vote mass at 2% of the gallery, and a question
+  found its unit less often than with no questions at all
+  (`docs/results/provenance_gates_2026-10-26.md`). So every calibrated unit is
+  a case of one more competition, scored on its calibration windows alone
+  with its own `z` and margin, in the same launch
+  (`belief_files::scan_file_scans`); the unit's vote there, weighed by its
+  group's `calibration_weight`, is added to its head exchange's score — under
+  file-scored cases, the unit's. `code_reading` weighs it 0.5. A calibration
+  is never itself a candidate, a working-set member, or a dialogue probe.
 - **Resumed like the tools' corpus.** Ahead of each ingest pass, a layer's
   ready units — finished without a chain break, every turn holding content
   here — without an archived calibration carrying their current marker
   (layer, digest of what is asked, the unit's content key) are calibrated. A
   unit present but not ready keeps the calibration its marker names and waits:
   a member that holds another member's reading hollow must not retire a
-  calibration every member shares. Every other calibration of the layer — of
-  no present unit, never finished, or a second of the same marker — is
-  retired. Units read before the block existed are calibrated
+  calibration every member shares. A present unit's finished calibration
+  under an earlier marker — a changed prompt, count or budget — stands until
+  one carrying its current marker is archived, and the pass after retires it,
+  so the hours a layer takes to calibrate again never leave a unit with none.
+  Every other calibration of the layer — of no present unit, never finished,
+  or a second of the same marker — is retired. Units read before the block existed are calibrated
   without being read again, and a unit read again is calibrated again.
 
 ## 3. Gates

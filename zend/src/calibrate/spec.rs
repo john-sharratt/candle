@@ -1,11 +1,13 @@
 //! A layer's `calibrate:` block — how many questions each of its
-//! conversations is asked to write about itself, and the prompt that asks —
-//! read from the projection schema it is declared in.
+//! conversations is asked to write about itself, the prompt that asks, and
+//! how much of each question's thinking is kept — read from the projection
+//! schema it is declared in.
 //!
 //! ```yaml
 //! - name: code_reading
 //!   calibrate:
-//!     questions: 16
+//!     questions: 24
+//!     think: 192
 //!     prompt: |
 //!       Write <<n>> questions someone might ask whose answer needs `<<path>>` …
 //! ```
@@ -22,10 +24,15 @@ use sha2::{Digest, Sha256};
 /// prefill, and the calibration's K/V is held lossless until it seals.
 pub const MAX_QUESTIONS: usize = 64;
 
+/// The most thinking tokens kept per question: a live probe's trailing
+/// window is at most this long (`REPROJECT_MAX_PROBE_TOKENS`).
+pub const MAX_THINK: usize = 256;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
     questions: usize,
+    think: usize,
     prompt: String,
 }
 
@@ -36,6 +43,8 @@ pub struct CalibrateSpec {
     pub layer: String,
     /// How many questions each unit is asked to write.
     pub questions: usize,
+    /// The decode budget of each question's thinking ([`super::thinking`]).
+    pub think: usize,
     /// What it is asked, with `<<n>>`, `<<subject>>`, and for a file subject
     /// `<<file>>`, `<<repo>>` and `<<path>>` filled in.
     pub prompt: String,
@@ -56,12 +65,20 @@ impl CalibrateSpec {
                 raw.questions
             );
         }
+        if raw.think == 0 || raw.think > MAX_THINK {
+            anyhow::bail!(
+                "layer '{}': `calibrate.think` must be 1..={MAX_THINK}, not {}",
+                layer.name,
+                raw.think
+            );
+        }
         if raw.prompt.trim().is_empty() {
             anyhow::bail!("layer '{}': `calibrate.prompt` is empty", layer.name);
         }
         Ok(Some(Self {
             layer: layer.name.clone(),
             questions: raw.questions,
+            think: raw.think,
             prompt: raw.prompt,
         }))
     }
@@ -80,10 +97,12 @@ impl CalibrateSpec {
 
     /// The calibration marker of the unit committed under `content_key`: the
     /// layer, a digest of what it is asked, and the unit's own key — so a
-    /// changed prompt, question count or unit version calibrates again.
+    /// changed prompt, question count, thinking budget or unit version
+    /// calibrates again.
     pub fn marker(&self, content_key: &str) -> String {
         let mut h = Sha256::new();
         h.update(self.questions.to_le_bytes());
+        h.update(self.think.to_le_bytes());
         h.update([0u8]);
         h.update(self.prompt.as_bytes());
         let digest: String = h.finalize()[..8]
@@ -91,6 +110,12 @@ impl CalibrateSpec {
             .map(|b| format!("{b:02x}"))
             .collect();
         format!("{}|{digest}|{content_key}", self.layer)
+    }
+
+    /// The content key of the unit `marker` was written for — the part a
+    /// changed prompt, count or budget leaves alone.
+    pub fn unit_of(marker: &str) -> Option<&str> {
+        marker.splitn(3, '|').nth(2)
     }
 
     /// Whether `marker` is one of this layer's.
@@ -110,6 +135,7 @@ mod tests {
         CalibrateSpec {
             layer: "code_reading".into(),
             questions: 3,
+            think: 64,
             prompt: "<<n>> about `<<path>>` in <<repo>> (<<file>>, <<subject>>)".into(),
         }
     }
@@ -134,9 +160,19 @@ mod tests {
         let mut more = s.clone();
         more.questions = 4;
         assert_ne!(more.marker("k1"), m);
+        let mut longer = s.clone();
+        longer.think = 128;
+        assert_ne!(longer.marker("k1"), m);
         let mut reworded = s.clone();
         reworded.prompt.push('!');
         assert_ne!(reworded.marker("k1"), m);
+        assert_eq!(CalibrateSpec::unit_of(&m), Some("k1"));
+        assert_eq!(CalibrateSpec::unit_of(&longer.marker("k1")), Some("k1"));
+        assert_eq!(
+            CalibrateSpec::unit_of("code_reading|ab|key:a|b"),
+            Some("key:a|b")
+        );
+        assert_eq!(CalibrateSpec::unit_of("code_reading|ab"), None);
         assert!(s.owns(&m));
         assert!(!s.owns("code_reading_x|ab|k1"));
         assert!(!s.owns("repo_map|ab|k1"));
@@ -175,16 +211,29 @@ layers:
 
     #[test]
     fn a_block_is_read_and_a_bad_one_refused() {
-        let ok = layer("    calibrate:\n      questions: 16\n      prompt: \"ask <<n>>\"");
+        let block = |questions: usize, think: &str, prompt: &str| {
+            layer(&format!(
+                "    calibrate:\n      questions: {questions}\n{think}      prompt: \"{prompt}\""
+            ))
+        };
+        let ok = block(24, "      think: 192\n", "ask <<n>>");
         let s = CalibrateSpec::of(&ok).unwrap().expect("declared");
-        assert_eq!((s.layer.as_str(), s.questions), ("code_reading", 16));
+        assert_eq!(
+            (s.layer.as_str(), s.questions, s.think),
+            ("code_reading", 24, 192)
+        );
         assert!(CalibrateSpec::of(&layer("")).unwrap().is_none());
-        let zero = layer("    calibrate:\n      questions: 0\n      prompt: \"x\"");
-        assert!(CalibrateSpec::of(&zero).is_err());
-        let blank = layer("    calibrate:\n      questions: 4\n      prompt: \" \"");
-        assert!(CalibrateSpec::of(&blank).is_err());
-        let extra =
-            layer("    calibrate:\n      questions: 4\n      prompt: \"x\"\n      tools: []");
+        assert!(CalibrateSpec::of(&block(0, "      think: 8\n", "x")).is_err());
+        assert!(CalibrateSpec::of(&block(4, "      think: 0\n", "x")).is_err());
+        assert!(CalibrateSpec::of(&block(4, "      think: 257\n", "x")).is_err());
+        assert!(
+            CalibrateSpec::of(&block(4, "", "x")).is_err(),
+            "think is required"
+        );
+        assert!(CalibrateSpec::of(&block(4, "      think: 8\n", " ")).is_err());
+        let extra = layer(
+            "    calibrate:\n      questions: 4\n      think: 8\n      prompt: \"x\"\n      tools: []",
+        );
         assert!(CalibrateSpec::of(&extra).is_err());
     }
 }

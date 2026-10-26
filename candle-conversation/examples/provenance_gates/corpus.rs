@@ -84,6 +84,16 @@ pub struct Question {
     pub timeline: u64,
     pub turn: u32,
     pub sigs: Vec<WideQSig>,
+    /// The question's own words in `sigs`: its turn's user span, without the
+    /// chat framing every calibration turn shares.
+    pub body: Range<usize>,
+}
+
+impl Question {
+    /// The question's own words: what a live question probe holds.
+    pub fn body_sigs(&self) -> &[WideQSig] {
+        &self.sigs[self.body.clone()]
+    }
 }
 
 /// Every calibration's questions, keyed by the timeline it calibrates.
@@ -110,10 +120,18 @@ pub fn questions(sub: &Substrate) -> HashMap<u64, Vec<Question>> {
         if sigs.is_empty() {
             continue;
         }
+        let user = d.segments.iter().find_map(|s| match s {
+            TurnSegment::User { kv, .. } => Some(kv.range()),
+            _ => None,
+        });
+        let Some(body) = user.filter(|r| r.start < r.end && r.end <= sigs.len()) else {
+            continue;
+        };
         out.entry(unit).or_default().push(Question {
             timeline: d.timeline_id,
             turn: d.turn_index,
             sigs,
+            body,
         });
     }
     for qs in out.values_mut() {
