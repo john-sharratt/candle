@@ -215,6 +215,11 @@ impl GalleryArena {
         // Turns pinned so far — released on error so a failed build never leaks pins.
         let mut pinned_sids: Vec<StreamId> = Vec::new();
         let mut run_ids: Vec<u64> = Vec::new();
+        // What the build cost, and why: the turns it had to upload (a residency
+        // mutation across their ensure) against the turns already resident.
+        let t_build = Instant::now();
+        let mut ensure_time = Duration::ZERO;
+        let mut uploaded = 0usize;
         for seg in segments {
             // Emit each segment's windows in CASE order, so gallery case ids are
             // non-decreasing over the scan order. The scan math is order-independent
@@ -234,7 +239,12 @@ impl GalleryArena {
                     None => {
                         // Pin the turn atomically with residency so the governor
                         // can't free its pages before the launch reads them.
-                        let (addrs, run_id) = match self.scan_ensure(w.sid, w.turn, w.fingerprint) {
+                        let t_ensure = Instant::now();
+                        let gen = self.residency_gen();
+                        let ensured = self.scan_ensure(w.sid, w.turn, w.fingerprint);
+                        ensure_time += t_ensure.elapsed();
+                        uploaded += usize::from(self.residency_gen() != gen);
+                        let (addrs, run_id) = match ensured {
                             Ok(a) => a,
                             Err(e) => {
                                 for &s in &pinned_sids {
@@ -269,6 +279,8 @@ impl GalleryArena {
         }
 
         let n_tokens = pos_map.len();
+        let walked = t_build.elapsed();
+        let t_upload = Instant::now();
         let device = if n_tokens == 0 {
             None
         } else {
@@ -282,6 +294,17 @@ impl GalleryArena {
                 }
             }
         };
+        tracing::debug!(
+            target: "candle_conversation::provenance::gallery_arena",
+            segments = segments.len(),
+            turns = pinned_sids.len(),
+            uploaded,
+            tokens = n_tokens,
+            ensure_ms = ensure_time.as_millis() as u64,
+            walk_ms = walked.saturating_sub(ensure_time).as_millis() as u64,
+            index_upload_ms = t_upload.elapsed().as_millis() as u64,
+            "built a scan index"
+        );
         Ok(PagedIndex {
             device,
             n_tokens,
@@ -474,9 +497,25 @@ impl GalleryArena {
         let t_index = Instant::now();
         let gen_before = self.residency_gen();
         let fp = fingerprint_segments(segments);
+        let cached = self
+            .index_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&fp);
         let (idx, reused) = match self.reuse_index(fp) {
             Some(idx) => (idx, true),
             None => {
+                tracing::debug!(
+                    target: "candle_conversation::provenance::gallery_arena",
+                    fingerprint = fp,
+                    stale = cached,
+                    "scan index rebuilt: {}",
+                    if cached {
+                        "a turn it holds moved or was replaced"
+                    } else {
+                        "no index for this segment set"
+                    }
+                );
                 let built = Arc::new(self.build_index(segments)?);
                 // What a scan waits for when its working set is not all
                 // resident: the uploads of the turns it finds evicted and the
