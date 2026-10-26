@@ -31,7 +31,7 @@
 //! not fault — it would produce numbers.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use candle::Device;
 
@@ -48,6 +48,8 @@ pub struct DrainReport {
     pub jobs: usize,
     pub served: usize,
     pub failed: usize,
+    /// Jobs refused for room and put back to wait for it.
+    pub waiting: usize,
     /// Ground the guest actually stood in.
     pub ground_mib: u64,
     /// What the shedding ladder freed on the way to it.
@@ -97,7 +99,37 @@ pub trait EngineRoom {
 
     /// Let the weight side take back ground the shedding made it concede.
     fn reclaim(&mut self);
+
+    /// Whether work is in flight that gives ground back when it finishes — a
+    /// prefill, a section ingest or a decode. A refused job waits only while
+    /// this holds: with nothing running, nothing will free what it is short of.
+    fn busy(&self) -> bool;
+
+    /// Put jobs refused for room back on the queue, to be tried again after
+    /// `retry_in`. While they wait, the engine admits no new prefill.
+    fn requeue(&mut self, jobs: Vec<Pending>, retry_in: Duration);
+
+    /// Who holds the ground, for a refusal's log line: the KV side's regions
+    /// by state, the work in flight, and the idle slots. A "freed 0" says
+    /// nothing about where the room went; this does.
+    fn holders(&self) -> String;
 }
+
+/// How long a job refused for room waits for work in flight to give its ground
+/// back before it is answered [`GuestError::NoRoom`].
+///
+/// **A refusal on a busy card is usually a matter of minutes.** On WhiteWorld
+/// (2026-10-26) four draws were refused 96–928 MiB short with the weight side
+/// at its floor, while turns in flight held the rest; one drawn five minutes
+/// earlier fitted. Long enough for a Maker's turn to finish, short of the
+/// connector giving the call up.
+pub const ROOM_PATIENCE: Duration = Duration::from_secs(180);
+
+/// How often a job waiting for room is tried again. Each try walks the
+/// shedding ladder with normal inference blocked, so it is paced rather than
+/// run on every pass; admission is closed meanwhile, so the ground in between
+/// only grows.
+pub const ROOM_RETRY: Duration = Duration::from_secs(5);
 
 /// How many times the shedding ladder is walked before the drain gives up.
 ///
@@ -118,7 +150,7 @@ const MAX_SHED_PASSES: usize = 4;
 pub fn drain_one<R: EngineRoom>(
     room: &mut R,
     model: &mut dyn GuestModel,
-    jobs: Vec<Pending>,
+    mut jobs: Vec<Pending>,
 ) -> DrainReport {
     let started = Instant::now();
     let guest = model.guest();
@@ -161,19 +193,62 @@ pub fn drain_one<R: EngineRoom>(
         Ok(g) => Arc::new(Mutex::new(g)),
         Err(e) => {
             let err = ground_refusal(&e, want, freed);
+            // **Short of room on a busy card, a job waits rather than fails.**
+            // The ground it lacks is held by work in flight, which gives it
+            // back as it finishes; admission stays closed meanwhile so nothing
+            // new takes it first. With nothing running there is nothing to
+            // wait for, and the refusal stands at once.
+            let short = match &e {
+                GroundError::Short {
+                    wanted_bytes,
+                    got_bytes,
+                    ..
+                } => wanted_bytes.saturating_sub(*got_bytes),
+                _ => 0,
+            };
+            let waits = matches!(err, GuestError::NoRoom { .. }) && room.busy();
+            let now = Instant::now();
+            let mut patient: Vec<(Pending, Duration)> = Vec::new();
+            let mut expired: Vec<Pending> = Vec::new();
+            for mut job in jobs.drain(..) {
+                let waited = job.waited(now);
+                if waits && waited < ROOM_PATIENCE {
+                    patient.push((job, waited));
+                } else {
+                    expired.push(job);
+                }
+            }
             tracing::warn!(
                 target: "candle_conversation::guest",
                 %guest,
                 want_mib = want >> 20,
                 freed_mib = report.freed_mib,
+                short_mib = short >> 20,
+                waiting = patient.len(),
+                refused = expired.len(),
+                holders = %room.holders(),
                 "no room for the guest: {e}"
             );
-            for job in jobs {
+            for job in expired {
                 job.answer(Err(err.clone()));
             }
-            report.failed = report.jobs;
+            report.failed = report.jobs - patient.len();
+            report.waiting = patient.len();
             report.total_ms = started.elapsed().as_millis() as u64;
-            room.reclaim();
+            if patient.is_empty() {
+                room.reclaim();
+            } else {
+                // The weight side keeps what it conceded while the job waits:
+                // taking it back now would evict the same experts again on the
+                // next try.
+                for (job, waited) in &patient {
+                    job.emit(GuestEvent::WaitingForRoom {
+                        short_mib: short >> 20,
+                        waited_s: waited.as_secs(),
+                    });
+                }
+                room.requeue(patient.into_iter().map(|(j, _)| j).collect(), ROOM_RETRY);
+            }
             return report;
         }
     };
@@ -405,6 +480,10 @@ mod tests {
         /// the ladder has nothing left, which is the refusal case.
         sheds: Vec<u64>,
         log: Vec<&'static str>,
+        /// Whether work is in flight, so a refused job may wait for it.
+        busy: bool,
+        /// What the drain put back to wait, and the retry interval it gave.
+        requeued: Vec<(Pending, Duration)>,
     }
 
     impl EngineRoom for FakeRoom {
@@ -445,6 +524,17 @@ mod tests {
         }
         fn reclaim(&mut self) {
             self.log.push("reclaim");
+        }
+        fn busy(&self) -> bool {
+            self.busy
+        }
+        fn requeue(&mut self, jobs: Vec<Pending>, retry_in: Duration) {
+            self.log.push("requeue");
+            self.requeued
+                .extend(jobs.into_iter().map(|j| (j, retry_in)));
+        }
+        fn holders(&self) -> String {
+            format!("free={}", self.free)
         }
     }
 
@@ -582,6 +672,71 @@ mod tests {
             "a job that was refused for want of ground was told it was loading"
         );
         assert!(matches!(receipt.wait(), Err(GuestError::NoRoom { .. })));
+        assert!(room.requeued.is_empty(), "nothing was running to wait for");
+    }
+
+    /// **Short of room on a busy card, a job waits instead of failing.** It
+    /// is put back to be tried again, its caller hears how far short the claim
+    /// fell, and the weight side keeps what it conceded so the next try does
+    /// not evict the same experts again.
+    #[test]
+    fn a_refused_job_on_a_busy_card_waits_for_room() {
+        let mut room = FakeRoom {
+            free: 32 << 20,
+            busy: true,
+            ..Default::default()
+        };
+        let (mut model, loads, _, _) = guest_model(Guest::Image, 64 << 20);
+        let (_q, jobs, receipt, seen) = queued_watched(image_job());
+        let report = drain_one(&mut room, &mut model, jobs);
+
+        assert_eq!((report.waiting, report.failed), (1, 0));
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            0,
+            "a job short of room was loaded"
+        );
+        assert!(receipt.try_take().is_none(), "a waiting job was answered");
+        assert_eq!(room.requeued.len(), 1);
+        assert_eq!(room.requeued[0].1, ROOM_RETRY);
+        assert!(
+            !room.log.contains(&"reclaim"),
+            "the weight side took its concession back while the job still waits"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![GuestEvent::WaitingForRoom {
+                short_mib: 32,
+                waited_s: 0
+            }],
+            "the watcher was not told what the claim fell short by"
+        );
+    }
+
+    /// **The wait is bounded.** A job that has waited [`ROOM_PATIENCE`] is
+    /// answered `NoRoom` however busy the card still is, and the weight side
+    /// takes its concession back.
+    #[test]
+    fn a_job_that_has_waited_its_patience_is_refused() {
+        let mut room = FakeRoom {
+            free: 0,
+            busy: true,
+            ..Default::default()
+        };
+        let (mut model, _, _, _) = guest_model(Guest::Image, 64 << 20);
+        let (_q, mut jobs, receipts) = queued(vec![image_job(), image_job()]);
+        jobs[0].refused_ago(ROOM_PATIENCE + Duration::from_secs(1));
+        let report = drain_one(&mut room, &mut model, jobs);
+
+        assert_eq!((report.waiting, report.failed), (1, 1));
+        let mut receipts = receipts.into_iter();
+        assert!(matches!(
+            receipts.next().unwrap().wait(),
+            Err(GuestError::NoRoom { .. })
+        ));
+        assert!(receipts.next().unwrap().try_take().is_none());
+        assert_eq!(room.requeued.len(), 1, "only the newer job still waits");
+        assert!(!room.log.contains(&"reclaim"), "one job still waits on it");
     }
 
     /// An unwatched job costs an `Option` check per event and nothing else —

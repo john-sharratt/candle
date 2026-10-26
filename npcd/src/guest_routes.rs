@@ -263,6 +263,10 @@ pub async fn post_image(
                 GuestEvent::Step { done, total, what } => {
                     json!({ "event": "step", "done": done, "total": total, "what": what })
                 }
+                GuestEvent::WaitingForRoom {
+                    short_mib,
+                    waited_s,
+                } => json!({ "event": "waiting", "short_mib": short_mib, "waited_s": waited_s }),
             };
             // A send that fails means the reader hung up. The job runs on: the
             // drain has already evicted the engine's working set for it, and

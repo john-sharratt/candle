@@ -971,8 +971,14 @@ impl Scheduler {
                 // isn't mislabeled as Blocked in the GUI.
                 let t_idle = Instant::now();
                 // A queued warm-up is work too: wait only as long as it allows,
-                // then go round to score its next replayed turn.
-                let req = if let Some(wait) = self.norm_warm_wait() {
+                // then go round to score its next replayed turn. So is a guest
+                // job waiting for room — the drain at the top of the loop is
+                // what tries it again, and nothing arrives to wake it.
+                let wait = match (self.norm_warm_wait(), self.guests.queue.retry_wait()) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                let req = if let Some(wait) = wait {
                     match self.rx.recv_timeout(wait) {
                         Ok(req) => req,
                         Err(flume::RecvTimeoutError::Timeout) => {
