@@ -38,6 +38,9 @@ pub struct Response {
     pub title: String,
     pub content: String,
     pub truncated: bool,
+    /// How many pictures the page showed, each marked `[image…]` in
+    /// `content`: a table or chart drawn as one is not in the text.
+    pub images: usize,
 }
 
 #[derive(Debug, Error)]
@@ -207,7 +210,10 @@ impl Tool for WebFetchTool {
          the user mentioned. Triggered by \"read this page\", \"fetch the article at\", \"what \
          does this URL say\", \"open this link\", \"get me the content of\", \"summarise this \
          page\", or the user pasting a URL. Returns title, cleaned body text, final URL after \
-         redirects, and a truncated flag. Use web_search when the URL is not yet known. Use \
+         redirects, a truncated flag, and `images`: how many pictures the page showed, each \
+         marked `[image: …]` in the text where it stood. A table or chart published as a \
+         picture is not in the text — say what you could not read, never that it does not \
+         exist. Use web_search when the URL is not yet known. Use \
          http_session_* for authenticated API calls or operations needing cookies/auth state.";
 
     type Request = Request;
@@ -272,7 +278,8 @@ impl Tool for WebFetchTool {
         let html = resp
             .text()
             .map_err(|e| FetchError::FetchFailed(e.to_string()))?;
-        let (title, content) = html_to_text(&html);
+        let page = html_to_text(&html);
+        let (title, content, images) = (page.title, page.text, page.images);
 
         let max_chars = (req.max_tokens.unwrap_or(4000) * 4) as usize;
         let (content, truncated) = if content.len() > max_chars {
@@ -293,6 +300,7 @@ impl Tool for WebFetchTool {
             title,
             content,
             truncated,
+            images,
         })
     }
 }

@@ -76,6 +76,11 @@ number and its `summary` (`Entry::render`); asked for, everything below
 | `opened` | items left unresolved, each given an id by the server: a failing test, an unanswered question, a step not yet done | `MAX_OPEN` 6 live |
 | `resolved` | ids of earlier open items this entry settles | — |
 
+Each limit is held by the drafting grammar as well as the check: the list
+closes at its most (`max_items`, `journal_core::tools::write_spec`), so a
+writer with more to say keeps its entry rather than losing it to a
+`Too many claims` refusal.
+
 ### 3.1 Citations are parts
 
 A substrate turn holds both halves of one exchange — the user side and the
@@ -130,7 +135,7 @@ path is dropped and the claim stands on its turns (`Demoted`), never costing
 the entry. The `per` sentence of the write question is said only when the
 call offers `per` (`Style::per_question`), so a writer with no journals above
 is never told of a slot it does not have. The list costs the grammar nothing
-as it grows: `per` is one choice whose values are a table (1,169 nodes at 10
+as it grows: `per` is one choice whose values are a table (179 nodes at 10
 entries above or 1,600). The claim's line reads `… (per T:review#4)`.
 
 npcd keeps typed facts (`Style::facts` on): a character's claims are about the

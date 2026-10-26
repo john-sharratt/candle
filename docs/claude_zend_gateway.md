@@ -144,7 +144,7 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 | Tool | Does | Returns |
 |---|---|---|
 | `thread_attach {thread}` | Binds the MCP session to `thread`, creating it on first use (§4) | The thread's path and its journal's head lines |
-| `task_start {thread, name, prompt, priority?, wait_s?}` | Starts a worker named `name` under `thread` (§4, §5.2), runs the task on it, waits for its journal entry (§5), records the outcome on the thread, and archives the worker once it is `done` | One of the states of §3.3 |
+| `task_start {thread, name, prompt, priority?, effort?, wait_s?}` | Starts a worker named `name` under `thread` (§4, §5.2), runs the task on it, waits for its journal entry (§5), records the outcome on the thread, and archives the worker once it is `done` | One of the states of §3.3 |
 | `task_wait {workers, wait_s?}` | Waits on one or more running workers, answering as soon as any of them leaves `running` (§3.3) | That worker's state, and for each still running what it has done so far, with any journal entries not yet given |
 | `task_reply {worker, answer}` | Answers a worker's question or unsticks it (§6.2): the answer is the worker's next turn | As `task_start` |
 | `task_nudge {worker, message}` | Sends guidance to a running worker, taken at its next round head (§6.2) | `queued` |
@@ -261,8 +261,15 @@ stuck stays live, costing nothing while idle, until it is answered.
   guardrails of §11; anyone else's are served `restricted`, which grants no
   commands, network or push (`access.rs:63-80`). A skill that needs
   Comprehensive tells a non-admin it cannot run.
-- **`effort` high, `think` on**, no verbosity cap: tokens are not the
-  constraint.
+- **`effort` `deep` by default, `think` on**, no verbosity cap: tokens are not
+  the constraint. `task_start` takes `effort` — `balanced`, `deep` or
+  `exhaustive`, the effort dial's levels 2–4 (`threads::Effort`) — kept on the
+  worker's record and used for every turn it runs, its answers' and its
+  parts' included. `exhaustive` is for work that must weigh many results
+  against each other: a research run that read 50K tokens of search results
+  with under 3K tokens of thinking extracted the facts and missed that two of
+  its own findings contradicted each other. Effort is how hard a turn thinks;
+  priority, below, is only how soon it decodes.
 - **Decode priority `normal` by default.** Priority is a layer's, and a worker
   is a dialogue-layer conversation, so it would decode at the dialogue's `high`
   (`zend/src/prompts/projection.yaml`), level with a live user. A conversation

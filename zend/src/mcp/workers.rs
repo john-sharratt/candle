@@ -42,14 +42,12 @@ use super::names;
 use super::nudges;
 use super::records::Records;
 use super::stops;
-use super::threads::{self, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
+use super::threads::{self, Effort, Entry, Note, Priority, State, Worker, BEAT_EVERY_MS};
 use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
 use crate::session::{NoDraft, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
 use crate::types::{ChatMessage, Role};
 
-/// The effort a task thinks at: `deep`. Tokens are not the constraint.
-const TASK_EFFORT: u8 = 3;
 /// How long a task's draft may take before its earlier entries are taken.
 const DRAFT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// How often a draft's progress is read.
@@ -191,14 +189,15 @@ pub fn summary_line(entry: &str, max: usize) -> String {
 }
 
 /// Start `prompt` on a new worker named after `wanted` under `thread`,
-/// decoding at `priority`; the worker's record, `running`.
+/// decoding at `priority` and thinking at `effort`; the worker's record,
+/// `running`.
 pub fn start(
     session: &Arc<ZendSession>,
     caller: &Caller,
     thread: &str,
     wanted: &str,
     prompt: &str,
-    priority: Priority,
+    (priority, effort): (Priority, Effort),
 ) -> Result<Worker, String> {
     let records = session.shared_substrate().ok_or_else(loading)?;
     let owner = caller.key();
@@ -217,7 +216,7 @@ pub fn start(
         thread,
         name,
         prompt,
-        (caller.role, priority),
+        (caller.role, priority, effort),
         now,
     );
     note(
@@ -257,14 +256,14 @@ fn taken(records: &dyn Records, owner: &str, thread: &str, now: u64) -> Vec<(Str
 }
 
 /// A new worker's record, `running`, its turn beginning `now`, running as
-/// `role` at `priority`.
+/// `role` at `priority`, thinking at `effort`.
 fn fresh(
     session: &ZendSession,
     owner: &str,
     thread: &str,
     name: String,
     prompt: &str,
-    (role, priority): (AccessRole, Priority),
+    (role, priority, effort): (AccessRole, Priority, Effort),
     now: u64,
 ) -> Worker {
     let conv_id = threads::conv_id(owner, thread, &name);
@@ -277,6 +276,7 @@ fn fresh(
         state: State::Running,
         role,
         priority,
+        effort,
         started_ms: now,
         turn_ms: now,
         beat_ms: now,
@@ -314,7 +314,7 @@ pub fn start_part(
         &parent.thread,
         name,
         prompt,
-        (parent.role, parent.priority),
+        (parent.role, parent.priority, parent.effort),
         now,
     );
     let message = format!("{prompt}{}", part_close(&parent.path()));
@@ -768,7 +768,7 @@ fn settle_part(part: &mut Worker, ended: Ended) -> (&'static str, String) {
 /// what it does into `live`.
 async fn turn(session: &Arc<ZendSession>, worker: &Worker, message: String, live: &Live) -> Ended {
     let mode = access::effective_mode(worker.role, None);
-    let mut selection = dial_selection(Some(TASK_EFFORT), None, Some(true));
+    let mut selection = dial_selection(Some(worker.effort.level()), None, Some(true));
     apply_tools_dial(&mut selection, mode);
     let mut stream = session
         .submit(
@@ -1014,6 +1014,7 @@ mod tests {
             state: State::Running,
             role: AccessRole::Admin,
             priority: Priority::Normal,
+            effort: Effort::Deep,
             started_ms: 0,
             turn_ms: 0,
             beat_ms: 0,

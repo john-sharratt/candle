@@ -41,8 +41,9 @@ use serde_json::{json, Map, Value};
 
 use crate::cut::close_cut;
 use crate::entry::{Item, Typed};
+use crate::journal::MAX_OPEN;
 use crate::json_repair::escape_control_in_strings;
-use crate::verify::{Draft, DraftClaim, DraftOpen, Relates};
+use crate::verify::{Draft, DraftClaim, DraftOpen, Relates, MAX_CLAIMS, MAX_INTEND};
 
 /// The entry itself.
 pub const WRITE: &str = "journal_write";
@@ -67,12 +68,20 @@ fn choice(name: &str, required: bool, values: &[String]) -> Value {
     json!({ "name": name, "type": "string", "required": required, "enum": values })
 }
 
-fn list_of(name: &str, required: bool, min_items: usize, item: Value) -> Value {
+/// A list of `item`, between `min_items` and `max_items` long.
+///
+/// **The most is the grammar's to hold, not only the check's.** Held only by
+/// [`crate::verify`], a writer that went on past it — a worker whose research
+/// turned up fifteen findings — had its whole entry refused, every valid claim
+/// with it, and with one round to write in, kept nothing at all. Offered no
+/// element past the most, it closes the list and keeps the entry.
+fn list_of(name: &str, required: bool, min_items: usize, max_items: usize, item: Value) -> Value {
     json!({
         "name": name,
         "type": "array",
         "required": required,
         "min_items": min_items,
+        "max_items": max_items,
         "items": item,
     })
 }
@@ -156,10 +165,10 @@ pub fn write_spec(citable: &[u64], open: &[Item], claims: Claims<'_>) -> Option<
     Some(json!({
         "name": WRITE,
         "params": [
-            list_of("claims", true, claim_floor(citable.len()), claim),
+            list_of("claims", true, claim_floor(citable.len()), MAX_CLAIMS, claim),
             text("summary", true),
-            list_of("intend", false, 0, text("", true)),
-            list_of("open", false, 0, item),
+            list_of("intend", false, 0, MAX_INTEND, text("", true)),
+            list_of("open", false, 0, MAX_OPEN, item),
         ],
     }))
 }
@@ -600,6 +609,25 @@ mod tests {
             .filter_map(|p| p["min_items"].as_u64())
             .collect();
         assert_eq!(min, [1, 0, 0], "claims, intend, open");
+    }
+
+    /// **An entry cannot be written past what the check keeps**: the grammar
+    /// closes each list at the check's own most, so an entry is never refused
+    /// for holding too many.
+    #[test]
+    fn an_entry_cannot_be_written_past_what_the_check_keeps() {
+        let spec = write_spec(&[1, 2], &[], FACTS).unwrap();
+        let max: Vec<u64> = spec["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["max_items"].as_u64())
+            .collect();
+        assert_eq!(
+            max,
+            [MAX_CLAIMS as u64, MAX_INTEND as u64, MAX_OPEN as u64],
+            "claims, intend, open"
+        );
     }
 
     #[test]

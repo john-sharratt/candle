@@ -201,6 +201,7 @@ mod tests {
             state,
             role: Role::User,
             priority: Default::default(),
+            effort: Default::default(),
             started_ms: workers::now_ms(),
             turn_ms: workers::now_ms(),
             beat_ms: 0,

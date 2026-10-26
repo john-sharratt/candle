@@ -82,10 +82,14 @@ instructions and icon a client shows. The backends' own cards are never shown.
 
 **`tools/list`** asks every backend for its tools, in parallel and as the
 caller, and lists them in backend order. It also keeps a note of which backend
-lists which tool. A name an earlier backend already listed is left out. If a
-backend cannot be listed, the answer is an error rather than a shorter list. A
-client caches the list it gets, and a short one would leave it without that
-backend's tools for the whole conversation.
+lists which tool. A name an earlier backend already listed is left out. A
+backend that cannot be listed — restarting, still loading its model — costs
+only its own tools: claude.ai shows a refused list as no tools at all, and
+lists again for each conversation, so a short list lasts only until the
+backend is back. Only when no backend answers is the list refused.
+
+**Every listing and call is logged**: one line each, naming the backend, the
+tool and how long it took, at `WARN` with the reason when it failed.
 
 **`tools/call`** goes to the backend that listed the tool. If no backend has
 listed it yet, as after a restart, the tools are listed again first. The call

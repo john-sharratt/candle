@@ -9,6 +9,12 @@
 //! together. Chrome — scripts, styles, navigation, footers, buttons — is left
 //! out; a `<header>` or a `<form>` is kept, since an article's title is in
 //! its header and a whole page may sit in one form.
+//!
+//! **A picture is marked where it stood, and counted.** Its pixels are not
+//! text, so a table or chart published as an image never reaches the reader —
+//! and a reader told nothing of it reads "the page has no table" as "none was
+//! published". Each `<img>` is written as `[image: <alt>]` (or `[image]`) in
+//! its place, and [`Page::images`] says how many there were.
 
 use scraper::{ElementRef, Html, Selector};
 
@@ -41,8 +47,18 @@ const LINES: &[&str] = &[
     "div", "dt", "dd", "summary", "hr", "thead", "tbody", "tfoot",
 ];
 
-/// The page's title, and the text of its body.
-pub fn html_to_text(html: &str) -> (String, String) {
+/// A page as a reader takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    pub title: String,
+    /// The body's text, each picture marked where it stood.
+    pub text: String,
+    /// How many pictures the body showed: content the text does not hold.
+    pub images: usize,
+}
+
+/// The page's title, the text of its body, and how many pictures it showed.
+pub fn html_to_text(html: &str) -> Page {
     let document = Html::parse_document(html);
     let title = Selector::parse("title")
         .ok()
@@ -57,16 +73,22 @@ pub fn html_to_text(html: &str) -> (String, String) {
     {
         text.children(body);
     }
-    (title, text.finish())
+    let images = text.images;
+    Page {
+        title,
+        text: text.finish(),
+        images,
+    }
 }
 
-/// The text being written, whether a space is owed before the next word, and
-/// the cells of the table row being written so far.
+/// The text being written, whether a space is owed before the next word, the
+/// cells of the table row being written so far, and the pictures passed.
 #[derive(Default)]
 struct Text {
     out: String,
     space: bool,
     cells: usize,
+    images: usize,
 }
 
 impl Text {
@@ -77,6 +99,20 @@ impl Text {
         }
         match name {
             "br" => self.line(),
+            "img" => {
+                self.images += 1;
+                let alt = el
+                    .value()
+                    .attr("alt")
+                    .map(|a| a.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                if alt.is_empty() {
+                    self.word("[image]");
+                } else {
+                    self.word(&format!("[image: {alt}]"));
+                }
+                self.space = true;
+            }
             "math" => {
                 let tex = el
                     .value()
@@ -209,17 +245,34 @@ mod tests {
     use super::*;
 
     fn body(html: &str) -> String {
-        html_to_text(&format!("<html><body>{html}</body></html>")).1
+        html_to_text(&format!("<html><body>{html}</body></html>")).text
     }
 
     #[test]
     fn the_title_and_paragraphs_are_read_with_their_whitespace_collapsed() {
-        let (title, text) = html_to_text(
+        let page = html_to_text(
             "<html><head><title>  KV   cache </title></head>\
              <body><h1>QuaRot</h1><p>Rotates  the\n keys.</p><p>Online.</p></body></html>",
         );
-        assert_eq!(title, "KV cache");
-        assert_eq!(text, "# QuaRot\n\nRotates the keys.\n\nOnline.");
+        assert_eq!(page.title, "KV cache");
+        assert_eq!(page.text, "# QuaRot\n\nRotates the keys.\n\nOnline.");
+        assert_eq!(page.images, 0);
+    }
+
+    /// **A picture is marked where it stood, and counted**: a benchmark table
+    /// published as an image says so, rather than reading as no table.
+    #[test]
+    fn a_picture_is_marked_where_it_stood_and_counted() {
+        let page = html_to_text(
+            "<html><body><p>Results below.</p>\
+             <figure><img src=\"t.png\" alt=\"Benchmark  table\"><figcaption>Table 1</figcaption></figure>\
+             <p>A logo <img src=\"l.png\"> here.</p></body></html>",
+        );
+        assert_eq!(
+            page.text,
+            "Results below.\n\n[image: Benchmark table]\n\nTable 1\n\nA logo [image] here."
+        );
+        assert_eq!(page.images, 2);
     }
 
     /// **Lists and tables are text too**: a number in a table cell reaches

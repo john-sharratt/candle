@@ -47,7 +47,8 @@ impl World for JournalsAbove {
 mod tests {
     use candle_conversation::stencil::{compile_tool_call_tree, ToolCallEnvelope, ToolSpec};
     use journal_core::entry::Item;
-    use journal_core::tools::{draft_specs, Claims};
+    use journal_core::tools::{draft_specs, Claims, WRITE};
+    use journal_core::verify::MAX_CLAIMS;
 
     use super::*;
 
@@ -79,13 +80,33 @@ mod tests {
 
     /// **The grammar does not grow with the lineage's history**: `per` is one
     /// choice whose values are a table, so a thread of 1,600 entries above
-    /// compiles to the same nodes as one of 10 (measured: 1,041 nodes with no
-    /// `per`, 1,169 with one at any size).
+    /// compiles to the same nodes as one of 10 (measured: 155 nodes with no
+    /// `per`, 179 with one at any size — each list unrolled to its own most,
+    /// not the engine's bound of 64).
     #[test]
     fn the_grammar_stays_the_same_size_however_many_entries_are_above() {
         let few = nodes_with(10);
         assert_eq!(nodes_with(1_600), few);
-        assert!(few < 10_000, "{few} nodes");
+        assert_eq!((nodes_with(0), few), (155, 179), "measured node counts");
+    }
+
+    /// **The grammar zend compiles closes the claims at the check's most**: the
+    /// flat spec's `max_items` reaches the engine, so a writer cannot go past
+    /// what `journal_core::verify` keeps and lose its entry for it.
+    #[test]
+    fn the_claims_close_at_what_the_check_keeps() {
+        let claims = Claims {
+            facts: false,
+            entries: &[],
+        };
+        let specs: Vec<ToolSpec> = draft_specs(&[1, 2, 3], &[], true, claims)
+            .unwrap()
+            .into_iter()
+            .map(|s| serde_json::from_value(s).unwrap())
+            .collect();
+        let write = specs.iter().find(|s| s.name == WRITE).unwrap();
+        let listed = write.params.iter().find(|p| p.name == "claims").unwrap();
+        assert_eq!(listed.max_items, Some(MAX_CLAIMS));
     }
 
     /// **A claim may rest on exactly the entries above**, each by its

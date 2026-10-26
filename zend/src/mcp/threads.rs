@@ -84,6 +84,43 @@ impl Priority {
     }
 }
 
+/// How hard a task's turns think: `deep` unless the call asks otherwise.
+/// Separate from [`Priority`], which says only how soon its turns decode.
+/// A task that weighs many sources against each other — research that must
+/// reconcile what it fetched — is one to ask `exhaustive` for: thinking is
+/// where it notices that two of its findings disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Balanced,
+    #[default]
+    Deep,
+    Exhaustive,
+}
+
+impl Effort {
+    /// The effort a call names, `deep` when it names none.
+    pub fn of(name: Option<&str>) -> Result<Self, String> {
+        match name {
+            Some("balanced") => Ok(Self::Balanced),
+            None | Some("deep") => Ok(Self::Deep),
+            Some("exhaustive") => Ok(Self::Exhaustive),
+            Some(other) => Err(format!(
+                "`effort` is `balanced`, `deep` or `exhaustive`, not `{other}`"
+            )),
+        }
+    }
+
+    /// The effort dial's level (`crate::api::chat::EFFORT_OPTIONS`).
+    pub fn level(self) -> u8 {
+        match self {
+            Self::Balanced => 2,
+            Self::Deep => 3,
+            Self::Exhaustive => 4,
+        }
+    }
+}
+
 /// One of a task's journal entries, as the worker's journal kept it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -109,6 +146,9 @@ pub struct Worker {
     pub role: Role,
     /// How urgently its turns decode; a part decodes as its worker does.
     pub priority: Priority,
+    /// How hard its turns think; a part thinks as its worker does.
+    #[serde(default)]
+    pub effort: Effort,
     pub started_ms: u64,
     /// When its current turn began: a part this worker started in an earlier
     /// turn is never mistaken for the answer to a call in this one.
@@ -440,6 +480,7 @@ mod tests {
             state: State::Running,
             role: Role::User,
             priority: Priority::Normal,
+            effort: Effort::Deep,
             started_ms: 0,
             turn_ms: 0,
             beat_ms: 1_000,
@@ -490,6 +531,28 @@ mod tests {
             Priority::of(Some("low")).unwrap_err(),
             "`priority` is `normal` or `high`, not `low`"
         );
+    }
+
+    /// **A task thinks deep unless asked**, at the effort dial's own levels,
+    /// and its effort is no part of how soon it decodes.
+    #[test]
+    fn a_task_thinks_deep_unless_asked() {
+        assert_eq!(Effort::of(None).unwrap(), Effort::Deep);
+        assert_eq!(
+            ["balanced", "deep", "exhaustive"].map(|e| Effort::of(Some(e)).unwrap().level()),
+            [2, 3, 4]
+        );
+        assert_eq!(
+            Effort::of(Some("quick")).unwrap_err(),
+            "`effort` is `balanced`, `deep` or `exhaustive`, not `quick`"
+        );
+        let kept: Worker = serde_json::from_value(serde_json::json!({
+            "thread": "t", "name": "n", "conv_id": "c", "prompt": "p",
+            "state": "running", "role": "user", "priority": "normal",
+            "started_ms": 0, "turn_ms": 0
+        }))
+        .unwrap();
+        assert_eq!(kept.effort, Effort::Deep);
     }
 
     #[test]

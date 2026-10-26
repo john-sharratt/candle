@@ -2,10 +2,14 @@
 //! backend's tools in one list, and each call run by the backend that lists
 //! its tool — its progress relayed as it streams. The protocol, the sessions
 //! and the challenge are `mcp_server`'s; nothing here knows what any tool does.
+//!
+//! Every listing and every call is logged, one line each: which backend, how
+//! long it took, and — at `WARN` — why one failed.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use axum::http::HeaderMap;
 use futures::future::join_all;
@@ -51,6 +55,16 @@ pub fn merge(lists: Vec<(usize, Vec<Value>)>) -> (Vec<Value>, HashMap<String, us
     (tools, routes)
 }
 
+/// The first line of `text`, at most 200 characters: what a log line quotes.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect()
+}
+
 /// The routes learned from a listing in which the backends in `failed` did
 /// not answer: theirs are kept as they were, so one backend down does not
 /// lose the way to another's tools, nor its own once it is back.
@@ -83,24 +97,35 @@ impl App {
             id: &call.session_id,
             session: &call.session,
         };
-        let listed = join_all(
-            self.backends
-                .iter()
-                .map(|b| self.link.tools(b, &call.caller, &on)),
-        )
+        let listed = join_all(self.backends.iter().map(|b| async {
+            let started = Instant::now();
+            let got = self.link.tools(b, &call.caller, &on).await;
+            (got, started.elapsed())
+        }))
         .await;
         let mut lists = Vec::new();
         let mut failed = Vec::new();
         let mut why_failed = Vec::new();
-        for (i, got) in listed.into_iter().enumerate() {
+        for (i, (got, took)) in listed.into_iter().enumerate() {
+            let backend = &self.backends[i].name;
             match got {
-                Ok(tools) => lists.push((i, tools)),
+                Ok(tools) => {
+                    tracing::info!(
+                        backend,
+                        tools = tools.len(),
+                        ms = took.as_millis() as u64,
+                        "mcp: listed"
+                    );
+                    lists.push((i, tools));
+                }
                 Err(why) => {
+                    tracing::warn!(
+                        backend,
+                        ms = took.as_millis() as u64,
+                        "mcp: listing failed: {why}"
+                    );
                     failed.push(i);
-                    why_failed.push(format!(
-                        "{}'s tools could not be listed: {why}",
-                        self.backends[i].name
-                    ));
+                    why_failed.push(format!("{backend}'s tools could not be listed: {why}"));
                 }
             }
         }
@@ -142,15 +167,17 @@ impl Server for App {
         Ok(self.store.clone())
     }
 
-    /// A backend that cannot be listed is an error, not a shorter list: a
-    /// client caches the list it gets, and would go on without that backend's
-    /// tools for the whole conversation.
+    /// The tools of every backend that answered. A backend down — restarting,
+    /// still loading its model — costs only its own tools: claude.ai shows a
+    /// refused list as no tools at all, and lists again for each conversation,
+    /// so a short list lasts only until the backend is back. Only when no
+    /// backend answers is the list refused.
     async fn tools(this: &Arc<Self>, call: &Call<Self>) -> Result<Value, String> {
         let listed = this.list(call).await;
-        if listed.failed.is_empty() {
-            Ok(Value::Array(listed.tools))
-        } else {
+        if listed.tools.is_empty() && !listed.failed.is_empty() {
             Err(listed.failed.join("; "))
+        } else {
+            Ok(Value::Array(listed.tools))
         }
     }
 
@@ -175,9 +202,11 @@ impl Server for App {
             session: &call.session,
         };
         let step = |line: String| call.step(line);
+        let started = Instant::now();
+        let to = &this.backends[backend].name;
         // A client gone drops the backend's call with it, so the backend does
         // not take an answer nobody read as delivered.
-        tokio::select! {
+        let answer = tokio::select! {
             answer = this.link.call(
                 &this.backends[backend],
                 &call.caller,
@@ -186,8 +215,25 @@ impl Server for App {
                 args,
                 &step,
             ) => answer,
-            _ = call.abandoned() => text_result("the client stopped listening", true),
+            _ = call.abandoned() => {
+                tracing::info!(tool = name, backend = to, "mcp: the client left before the answer");
+                return text_result("the client stopped listening", true);
+            }
+        };
+        let ms = started.elapsed().as_millis() as u64;
+        if answer.get("isError").and_then(Value::as_bool) == Some(true) {
+            let text = answer["content"][0]["text"].as_str().unwrap_or("");
+            tracing::warn!(
+                tool = name,
+                backend = to,
+                ms,
+                "mcp: call answered an error: {}",
+                first_line(text)
+            );
+        } else {
+            tracing::info!(tool = name, backend = to, ms, "mcp: called");
         }
+        answer
     }
 
     fn result(&self, answer: &Value) -> Value {

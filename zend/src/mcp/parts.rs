@@ -188,6 +188,7 @@ mod tests {
             state,
             role: Role::Admin,
             priority: Default::default(),
+            effort: Default::default(),
             started_ms,
             turn_ms: started_ms,
             beat_ms: started_ms,
