@@ -257,6 +257,38 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   or a second of the same marker — is retired. Units read before the block existed are calibrated
   without being read again, and a unit read again is calibrated again.
 
+### 2.6 Anomalous-chunk exclusion
+
+Some gallery chunks win votes on every file's questions: the request template,
+the tool-call JSON and its closing tags, a pager's footer, file text worded
+like a question. Each vote one of them wins is a vote the right file does not
+get. They are cut from the live scan, so each such vote goes to the probe
+token's next-best agreement; down-weighting them only shrinks the vote and
+loses (`docs/results/provenance_gates_2026-10-26.md`).
+
+- **Learned from the questions, never from the gallery alone.** A layer's
+  calibration questions — `EXCLUSION_QUESTIONS_PER_FILE` (6) of each file —
+  are scanned raw against the group's content alone: no calibration in the
+  gallery, nothing cut, so the exclusion never learns from a gallery it already
+  shaped. Each kept vote for a file not the question's own is credited to the
+  32-token chunk holding the token that won it: the best agreement in the
+  vote's fold group among that file's own tokens. A chunk's mass is what it
+  wins on other files' questions. Verbatim shared runs, a gallery statistic,
+  lost at every threshold measured.
+- **Cut at the outliers.** A chunk is cut when its log mass is more than five
+  robust deviations (`1.4826 × MAD`) above the median of the chunks that won
+  anything, each file keeping at least half its chunks — on the measured
+  gallery, ~140 of ~800,000 chunks.
+- **Where.** Learned ahead of each layer's calibration pass
+  (`GroupScanner::learn_chunk_exclusion`, the scan at ingest priority, the
+  attribution on the calling thread holding no lock), held in memory per group
+  (`Substrate::chunk_exclusion`), and cut from the group's own windows where
+  the live scan assembles them (`belief_files::cut_excluded`). Calibration
+  windows are never cut: they compete apart (§2.5).
+- **Measured.** Held-out questions, content alone: MRR 0.172 → 0.186; stacked
+  on the calibration competition at 15 questions a file: 0.220 → 0.228, R@10
+  0.364 → 0.379.
+
 ## 3. Gates
 
 Each gate must hold before the next is run. All are `#[test]`s.
@@ -333,8 +365,4 @@ replay of the conversation remains the end-to-end check after the gate passes.
 
 ## 7. Open
 
-- Whether boilerplate — the request template, tool-call JSON, line-number
-  gutters — needs masking once windows are the probe's shape, or whether
-  window-shaped comparison and identity windows already remove its effect.
-  Measured at §3.3.
 - The expected injections, per projection (§3.4).

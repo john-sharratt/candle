@@ -202,6 +202,7 @@ pub mod adaptive;
 mod belief_files;
 mod belief_scan_split;
 mod builder;
+mod chunk_exclusion;
 mod error;
 pub(crate) mod event;
 mod group_votes;
@@ -251,6 +252,7 @@ pub use adaptive::{
     MemberBudgetAdaptive, ScanCases, ScanPolicy,
 };
 pub use builder::Builder;
+pub use chunk_exclusion::ExclusionReport;
 pub use error::ConstructionError;
 pub use event::{
     aggregate, decode_events, decode_points, encode_events, from_projection,

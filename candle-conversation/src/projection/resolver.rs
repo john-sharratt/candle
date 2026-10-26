@@ -15,7 +15,7 @@ pub use maintenance_op::MaintenanceOp;
 use maintenance_op::Pass;
 
 use super::adaptive::ScanCases;
-use super::belief_files::{assemble_file_scans, scan_file_scans};
+use super::belief_files::{assemble_file_scans, cut_excluded, scan_file_scans};
 use super::belief_scan_split::GROUP_SCAN_SPLIT;
 use super::held_index_pages::HeldIndexPages;
 use super::ids::{
@@ -2368,7 +2368,8 @@ impl Conversation {
             let select_us = t_select.elapsed().as_micros() as u64;
             let n_timelines = timelines.len();
             let t_assemble = Instant::now();
-            let (files, turns_walked) = assemble_file_scans(&sub, timelines);
+            let (mut files, turns_walked) = assemble_file_scans(&sub, timelines);
+            cut_excluded(&mut files, &sub.chunk_exclusion(group.id));
             // End of Phase A — release the substrate before the scan. Every
             // `FileScan` owns its data (`arcs_kept` holds `Arc`s), so nothing
             // below borrows the guard.

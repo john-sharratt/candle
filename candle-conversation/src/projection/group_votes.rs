@@ -12,6 +12,7 @@ use super::belief_files::{assemble_file_scans, FileScan};
 use super::ids::{GroupId, TimelineId};
 use crate::persistence::streams::StreamId;
 use crate::projection::Conversation;
+use crate::provenance::chunk_exclusion::uncut;
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow, TokenVotes};
 use crate::provenance::{GalleryArena, WideQSig};
 
@@ -20,27 +21,6 @@ use crate::provenance::{GalleryArena, WideQSig};
 pub struct GroupVotes {
     pub files: Vec<TimelineId>,
     pub votes: TokenVotes,
-}
-
-/// `[start, end)` less every range in `cut`: what is left, in order.
-fn uncut(start: usize, end: usize, cut: &[Range<usize>]) -> Vec<(usize, usize)> {
-    let mut cuts: Vec<&Range<usize>> = cut
-        .iter()
-        .filter(|r| r.start < end && r.end > start)
-        .collect();
-    cuts.sort_by_key(|r| r.start);
-    let mut left = Vec::new();
-    let mut at = start;
-    for r in cuts {
-        if r.start > at {
-            left.push((at, r.start));
-        }
-        at = at.max(r.end);
-    }
-    if at < end {
-        left.push((at, end));
-    }
-    left
 }
 
 /// One segment over `files`, file `i` case `i`: each file's own windows, its
@@ -201,19 +181,5 @@ mod tests {
             cases(&group_segment(&files, false, &none, &cut)),
             vec![(turn_stream_id(72, 0), 1)]
         );
-    }
-
-    /// **A cut leaves what lies outside it, in order**: overlapping and
-    /// out-of-order cuts, one past the end, one covering the start.
-    #[test]
-    fn a_window_less_its_cuts_keeps_what_lies_outside_them() {
-        assert_eq!(uncut(0, 100, &[]), vec![(0, 100)]);
-        assert_eq!(
-            uncut(0, 100, &[64..96, 32..40, 36..48]),
-            vec![(0, 32), (48, 64), (96, 100)]
-        );
-        assert_eq!(uncut(10, 50, &[0..20, 40..200]), vec![(20, 40)]);
-        assert_eq!(uncut(10, 50, &[0..60]), Vec::<(usize, usize)>::new());
-        assert_eq!(uncut(10, 50, &[60..70]), vec![(10, 50)]);
     }
 }
