@@ -1,5 +1,8 @@
 # MCP guide catalogue: the skills to write
 
+**Status: written** — every guide below is in `mcp/src/guides/<name>.md`; the
+library that serves them (`docs/mcp_guides.md` §2) is not built yet.
+
 The guides to build for the connector's guide library (`docs/mcp_guides.md`).
 Each entry is one guide: its name, when to use it (its `description`), the
 tools it lists (its `tools`, which get a "Guides" line), and the method in
@@ -234,6 +237,12 @@ something stalls.
 **Tools:** `cluster_logs`, `cluster_status`
 - Narrow by `since`, `level`, `tenant`; quote the lines relied on, with their
   member.
+
+### D2b. `watch`
+**Use when:** keeping an eye on a rollout, a member or the logs for a while.
+**Tools:** `task_start`, `task_wait`, `cluster_status`, `cluster_logs`
+- Delegated to a worker that polls and reports only exceptions and the end
+  state, so the watch costs one answer, not a poll loop.
 
 ### D3. `incident`
 **Use when:** something is broken now.

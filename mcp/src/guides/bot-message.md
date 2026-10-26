@@ -1,0 +1,20 @@
+---
+name: bot-message
+description: How to talk to a bot directly — a message on its handset, answered in its own time, read back from the thread.
+tools: [bot_message_send, bot_message_read]
+---
+# Messaging a bot
+
+`bot_message_send {bot, text}` sends it a message on its **handset**, the
+phone it carries in its world, as you. Bots message each other the same way,
+so it reads yours as it would anyone's and answers when it gets to it.
+
+- **It answers in its own time** — minutes, not seconds. Send, then read the
+  thread later with `bot_message_read {bot}`; do not expect the reply in the
+  answer to the send.
+- **The answer tells you who can reply**: a bot with no handset cannot answer.
+- **Be specific**: a question it can answer from where it is, or an
+  instruction it can act on. For work with steps and a report, give a mission
+  instead (`bot-mission`).
+- **Many bots at once**: post on the world's channel (`bot_channel_post`,
+  Creator role) rather than messaging each.

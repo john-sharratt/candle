@@ -1,0 +1,81 @@
+---
+name: research
+description: How to have workers answer a question from the web with every claim checked against the page it came from — gather, verify, check themselves, then you verify them.
+tools: [task_start, task_wait, task_reply, journal_grep, timeline_read]
+---
+# Research
+
+**Use when** the answer is on the web and takes many pages to establish. Not
+for questions about a codebase — that is `ask`.
+
+What went wrong before, and what this guards against: a worker searched ~40
+times and fetched 5 pages; it cited "primary sources" it never opened; its
+standout figures came from one aggregator; it reported "no benchmark table
+published" for a table that was an image; it contradicted itself; and it said
+a figure was "unresolved" when several sources agreed. The method below
+answers each of those.
+
+## Delegate
+
+Split a broad question into independent ones and start them together, each
+with `effort: "exhaustive"`:
+
+```
+GOAL: <the question, in full, and what the answer is for>
+
+CONTEXT: <what is already known; date window if any; earlier findings on this
+thread; what not to redo>
+
+CONSTRAINTS:
+- If you have no web access, say so in your first line and stop.
+- <date window>: report only what falls inside it, and check each date
+  against the primary source.
+
+METHOD — three phases:
+1. GATHER. Search widely for the candidates: what exists, what was released,
+   who says what.
+2. VERIFY, for each item you will report:
+   - Fetch its primary source and read it — the announcement, the
+     specification, the documentation, the model card, the source. A figure
+     you saw only in a search snippet is UNVERIFIED.
+   - Search for independent evidence: evaluations run by others, criticism,
+     reports that contradict the primary source. Report both directions —
+     where it does better than claimed as well as worse.
+   - Where sources disagree, settle on one figure by source quality — the
+     primary source, then independent measurement, then reporting — and say
+     why. Do not list both.
+   - A figure seen only on an aggregator or roundup is marked
+     "aggregator-only".
+   - A page that reports `images` may have shown its table or chart as a
+     picture: say "not readable in the page text", never "not published".
+3. CHECK YOURSELF before answering: read your draft against itself — two
+   claims that contradict, a figure stated two ways, a "none" beside a number
+   taken from that same thing. Resolve each.
+
+RULES:
+- Cite every claim with the URL you fetched it from. Cite only pages you
+  opened.
+- Keep vendor claims apart: "the vendor reports …" for what only the vendor
+  says.
+- Before answering, start a part named verify-sources with sub_run: it
+  re-opens each URL you rely on and checks the claim is there.
+
+FINAL RESPONSE, in this shape:
+ANSWER: the answer, in a few sentences
+DETAIL: each item, its facts with the URL each came from; independent
+evidence beside the vendor's; aggregator-only figures marked
+CONFLICTS: figures the sources disagreed on, the one you settled on, and why
+UNVERIFIED: what you could not confirm, and what you could not read
+SOURCES: every URL you opened
+COULD NOT DO: anything asked that you did not do, and why
+```
+
+## Verify the result (read `verify`)
+
+1. Read the citation audit: anything cited but not opened is suspect.
+2. Follow up with the same worker (`task_reply`) to open what it skipped and
+   correct itself.
+3. Spot-check the facts you will pass on: `timeline_read {turn}` shows the
+   query and the page the worker actually read.
+4. Tell the user what was checked, and keep "the worker reports" apart from
+   what you confirmed.
