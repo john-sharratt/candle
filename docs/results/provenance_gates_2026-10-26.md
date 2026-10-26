@@ -153,9 +153,17 @@ three turns on A, three on B leave B ahead of A in 70% of dialogues at β 0.2,
 87% at β 0.5, 50% at β 0 — and B's MRR reaches 0.475 by its sixth scan at
 β 0.2. Production's β 0.2 stands.
 
-**What ships**: the analysis layers (`dependency_analysis`, `code_review`,
-`security_review`) take `layer_weights: [0, 1, 1]` and `calibration_weight:
-0.25` — the best setting one weighting for both competitions can express —
-until their own units are measured. `code_reading` keeps `[1,1,1]` + 0.5
-until gate 4 replays it: weighing its top group alone lost the paper
-conversation a quarter of its tool calls (2026-10-25).
+**What ships**: a group policy's `calibration_layer_weights` weighs the
+calibration competition's fold groups apart from the content's
+(`layer_weights`), per segment in the one launch's tally. `code_reading`,
+`dependency_analysis`, `code_review` and `security_review` take
+`layer_weights: [0, 1, 1]`, `calibration_layer_weights: [0, 0, 1]` and
+`calibration_weight: 0.25` — the analysis layers carrying code_reading's
+measurement until their own units are measured.
+
+Gate 4 did not run: the paper conversation's dialogue turns (`e7bca43c…`)
+hold their tokens but no signatures, so it has no probe. Weighing the top
+group alone of *content* lost that conversation a quarter of its tool calls
+(2026-10-25); content here keeps groups 1 and 2, and only the calibration
+competition is the top group's. The replay is owed on a fresh paper
+conversation.

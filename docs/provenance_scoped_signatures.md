@@ -245,8 +245,12 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   with its own `z` and margin, in the same launch
   (`belief_files::scan_file_scans`); the unit's vote there, weighed by its
   group's `calibration_weight`, is added to its head exchange's score — under
-  file-scored cases, the unit's. `code_reading` weighs it 0.5. A calibration
-  is never itself a candidate, a working-set member, or a dialogue probe.
+  file-scored cases, the unit's. Each competition sums its fold groups by its
+  own weights: the content by `layer_weights`, the calibration by
+  `calibration_layer_weights`, applied per segment in the one launch's tally.
+  `code_reading` and the analysis layers weigh content `[0, 1, 1]`, the
+  calibration `[0, 0, 1]`, at `calibration_weight: 0.25`. A calibration is
+  never itself a candidate, a working-set member, or a dialogue probe.
 - **Resumed like the tools' corpus.** Ahead of each ingest pass, a layer's
   ready units — finished without a chain break, every turn holding content
   here — without an archived calibration carrying their current marker

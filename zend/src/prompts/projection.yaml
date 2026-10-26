@@ -912,17 +912,20 @@ layers:
           # competition: a file of several exchanges scored alone was scored
           # only against itself, and the large files read over several rounds
           # topped every question (docs/provenance_scoped_signatures.md §2.3).
-          # Every fold group votes alike: reading each file over its
-          # background peak lost the paper conversation more than half its
-          # files, and weighting the top group a quarter of its tool calls'
-          # (docs/results/provenance_gates_2026-10-25.md).
           cases: file
-          # Each file's calibration questions compete among themselves, not
-          # in the files' pool, where they took nearly every vote of a
-          # question probe; the file adds half its calibration vote. Held-out
-          # questions at 15 a file: MRR 0.152 pooled -> 0.221, R@10
-          # 0.261 -> 0.365 (docs/results/provenance_gates_2026-10-26.md).
-          calibration_weight: 0.5
+          # Each file's calibration questions and their thinking compete among
+          # themselves, not in the files' pool, where they took nearly every
+          # vote of a question probe; the file adds a quarter of its
+          # calibration vote. Content carries a file's identity in fold groups
+          # 1-2 (group 0 alone ranks nothing), the calibration in the top
+          # group alone. Over live-turn probes (a held-out question and its
+          # thinking, 999 files), R@1 / R@10 / MRR 0.197 / 0.561 / 0.323 at
+          # [1,1,1] + 0.5 x [1,1,1] -> 0.310 / 0.554 / 0.397; through the
+          # working set's momentum over three turns on a file, R@1 0.213 ->
+          # 0.392 (docs/results/provenance_gates_2026-10-26.md).
+          layer_weights: [0.0, 1.0, 1.0]
+          calibration_layer_weights: [0.0, 0.0, 1.0]
+          calibration_weight: 0.25
 
   # ── Dependency Analysis ────────────────────────────────────────────────────
   - name: dependency_analysis
@@ -1013,17 +1016,13 @@ layers:
         budget:
           priority: 100
         # A unit is taken whole: one case each, all in one competition (see
-        # code_reading's `scopes`); its calibration competes apart. The fold
-        # groups and the calibration's weight are code_reading's best shared
-        # setting, carried over before this layer's own units are measured:
-        # fold group 0 is noise to a file's identity, and at 0.25 the
-        # calibration keeps the top hit. Over code_reading's live-turn probes
-        # (a held-out question and its thinking), R@1 / R@10 / MRR
-        # 0.197 / 0.561 / 0.323 at [1,1,1] + 0.5 -> 0.280 / 0.560 / 0.382
-        # (`provenance_gates layers`, docs/results/provenance_gates_2026-10-26.md).
+        # code_reading's `scopes`); its calibration competes apart, weighed as
+        # code_reading's is — measured there, carried over before this
+        # layer's own units are.
         policy:
           cases: file
           layer_weights: [0.0, 1.0, 1.0]
+          calibration_layer_weights: [0.0, 0.0, 1.0]
           calibration_weight: 0.25
 
   # ── Code Review ────────────────────────────────────────────────────────────
@@ -1113,6 +1112,7 @@ layers:
         policy:
           cases: file
           layer_weights: [0.0, 1.0, 1.0]
+          calibration_layer_weights: [0.0, 0.0, 1.0]
           calibration_weight: 0.25
 
   # ── Security Review ────────────────────────────────────────────────────────
@@ -1216,6 +1216,7 @@ layers:
         policy:
           cases: file
           layer_weights: [0.0, 1.0, 1.0]
+          calibration_layer_weights: [0.0, 0.0, 1.0]
           calibration_weight: 0.25
 
   # ── Dialogue ───────────────────────────────────────────────────────────────
