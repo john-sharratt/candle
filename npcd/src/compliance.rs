@@ -156,8 +156,8 @@
 use std::sync::Arc;
 
 use crate::api::Authored;
-use crate::engine::prose::WORK_BAND;
 use crate::prose;
+use candle_conversation::projection::DecodePriority;
 
 /// The two answers the judge may give, as **single tokens**.
 ///
@@ -552,9 +552,11 @@ async fn ask(s: &Arc<Authored>, q: &Question, prompt: &str) -> Result<Answer, De
         choices: Some(CHOICES.iter().map(|s| s.to_string()).collect()),
     };
 
-    // Above the characters: the draw waits on this answer, and so does the
-    // person who asked for it (`prose::run_at`).
-    let answer = match prose::run_at(s, request, WORK_BAND).await {
+    // Above the characters and the Makers' table work: the draw waits on this
+    // answer, and so does the person who asked for it (`prose::run_at`). At
+    // the table's `High` on WW (2026-10-26, four Makers writing) the four
+    // questions took 10–19 s to answer one token each.
+    let answer = match prose::run_at(s, request, DecodePriority::Urgent).await {
         Ok(a) => a.text,
         Err(e) => return Err(Denial::Unavailable(e.to_string())),
     };

@@ -98,7 +98,7 @@ fn throttle_ratio(work: DecodePriority, decodes: impl IntoIterator<Item = Decode
         .filter_map(|d| {
             if rank(d) > rank(work) {
                 Some(d.ratio())
-            } else if d == DecodePriority::High && work == DecodePriority::High {
+            } else if d == work && work.is_live() {
                 Some(HIGH_BESIDE_HIGH_RATIO)
             } else {
                 None
@@ -582,7 +582,7 @@ impl Scheduler {
         // not the background work it goes ahead of. On WhiteWorld (b4ea6e33b,
         // 2026-10-19) a 68–92K-token backlog of file ingest read as every
         // placed turn's wait, and the card took 2 of 48 dialogue turns.
-        let high = |id: SequenceId| self.decode_priority_or_high(id) == DecodePriority::High;
+        let high = |id: SequenceId| self.decode_priority_or_high(id).is_live();
         let high_backlog = self
             .active_prefills
             .iter()
@@ -3012,7 +3012,7 @@ impl Scheduler {
     /// the split's per-prompt deadline (`turn_airtime`).
     pub(super) fn high_prompt_waits(&self) -> Vec<(usize, std::time::Duration)> {
         let now = Instant::now();
-        let high = |id: SequenceId| self.decode_priority_or_high(id) == DecodePriority::High;
+        let high = |id: SequenceId| self.decode_priority_or_high(id).is_live();
         self.active_prefills
             .iter()
             .filter(|p| p.error.is_none() && p.finished.is_none() && high(p.work.sequence_id))
@@ -3224,7 +3224,7 @@ impl Scheduler {
                 s.error.is_none()
                     && s.offset < s.tokens.len()
                     && !in_flight.contains(&s.sequence_id.0)
-                    && (band != DecodePriority::High || s.band == DecodePriority::High)
+                    && (!band.is_live() || s.band.is_live())
             })
             .collect();
         if active.is_empty() {
@@ -3598,21 +3598,28 @@ impl Scheduler {
         // next turn reads), and a group of ingest rows would hold it as long.
         // With no `High` prompt to ride beside, it runs in the standalone
         // section pass while this group stays empty.
+        //
+        // **An `Urgent` group carries `Urgent` prompts only**, for the same
+        // reason one band down: the check an image draw waits on, beside four
+        // Makers' table prompts, would wait for all of their rows.
         let lead = candidates
             .first()
             .map(|p| self.decode_priority_or_high(p.work.sequence_id));
         let high_section = include_sections
             && self.active_section_ingests.iter().any(|s| {
-                s.band == DecodePriority::High
+                s.band.is_live()
                     && s.error.is_none()
                     && s.offset < s.tokens.len()
                     && !paused.contains(&s.sequence_id.0)
             });
-        let high_only = lead == Some(DecodePriority::High) || high_section;
+        let floor = match lead.filter(|b| b.is_live()) {
+            Some(lead) => Some(lead),
+            None => high_section.then_some(DecodePriority::High),
+        };
+        let high_only = floor.is_some();
+        let below_floor = |b: DecodePriority| floor.is_some_and(|f| rank(b) < rank(f));
         if high_only {
-            candidates.retain(|p| {
-                self.decode_priority_or_high(p.work.sequence_id) == DecodePriority::High
-            });
+            candidates.retain(|p| !below_floor(self.decode_priority_or_high(p.work.sequence_id)));
         }
         for p in candidates {
             if p.error.is_some() || p.finished.is_some() || p.offset >= p.work.tokens.len() {
@@ -3701,7 +3708,7 @@ impl Scheduler {
                 if s.error.is_some()
                     || s.offset >= s.tokens.len()
                     || paused.contains(&s.sequence_id.0)
-                    || (high_only && s.band != DecodePriority::High)
+                    || below_floor(s.band)
                 {
                     continue;
                 }
@@ -3740,7 +3747,7 @@ impl Scheduler {
         let band = self.creep_priority(&members);
         // The decodes that set the ratio, by band — and how many count as
         // `High` only because their layer did not resolve.
-        let mut decodes_by_band = [0usize; 3];
+        let mut decodes_by_band = [0usize; 4];
         let mut unresolved = 0usize;
         for sid in self.foreground_decodes() {
             decodes_by_band[rank(self.decode_priority_or_high(sid))] += 1;
@@ -3753,6 +3760,7 @@ impl Scheduler {
             budget,
             members = members.len(),
             tokens = used,
+            urgent_decodes = decodes_by_band[3],
             high_decodes = decodes_by_band[2],
             normal_decodes = decodes_by_band[1],
             low_decodes = decodes_by_band[0],
@@ -4585,7 +4593,7 @@ impl Scheduler {
         let high_glue: usize = glue_seqs
             .iter()
             .zip(glue_inputs)
-            .filter(|(&id, _)| self.decode_priority_or_high(SequenceId(id)) == DecodePriority::High)
+            .filter(|(&id, _)| self.decode_priority_or_high(SequenceId(id)).is_live())
             .map(|(_, t)| t.dims().get(1).copied().unwrap_or(0))
             .sum();
         // A "full-sweep" wave carries decode and/or glue across all N layers; it
@@ -4718,7 +4726,7 @@ impl Scheduler {
         // prompt that has waited its own time at the front. The band's constant
         // stands until both sides are measured, and below `High` the bands decide
         // alone — background ingest yields to dialogue whatever the backlogs say.
-        let derived = (work == DecodePriority::High && band == HIGH_BESIDE_HIGH_RATIO)
+        let derived = (work.is_live() && band == HIGH_BESIDE_HIGH_RATIO)
             .then(|| {
                 super::turn_airtime::high_airtime_ratio(
                     self.segment_mean.tokens()?,
@@ -5080,8 +5088,7 @@ impl Scheduler {
                         let at = self.session.sequence_offset(*seq_id).unwrap_or(0);
                         pf_pairs += pairs_of(tok, at);
                         pf_kv += at;
-                        if self.decode_priority_or_high(SequenceId(*seq_id)) == DecodePriority::High
-                        {
+                        if self.decode_priority_or_high(SequenceId(*seq_id)).is_live() {
                             high_tok += tok;
                         }
                     }
@@ -5281,9 +5288,12 @@ impl Scheduler {
         // nothing at all until an unrelated event. The rate model never gets
         // consulted and the queue drains one turn at a time through the
         // deadlock guard, which is the opposite of filling a wave.
-        if !self.active_prefills.is_empty() {
-            self.settled_since_admit = true;
-        }
+        //
+        // **Only a prefill that leaves.** This runs after every decode step, so
+        // a flag raised whenever a prefill is in flight would run a whole
+        // admission pass a step for nothing that finished; the loop top re-reads
+        // prefills still advancing once a quantum (`Scheduler::run`).
+        let in_flight = self.active_prefills.len();
         // Turns whose prefill finished cleanly, with the first token the wave
         // that finished them sampled (`sample_first_rows`).
         let mut ready: Vec<(FinishedPrefill, FirstSampled)> = Vec::new();
@@ -5378,6 +5388,9 @@ impl Scheduler {
                 sampled,
             ));
             // swap_remove pulled the last element into i; don't increment.
+        }
+        if self.active_prefills.len() < in_flight {
+            self.settled_since_admit = true;
         }
         if !ready.is_empty() {
             let t_fin = std::time::Instant::now();
@@ -6754,6 +6767,34 @@ mod wave_chunk_tests {
         }
     }
 
+    /// **Only a prefill that leaves opens the next admission.** Promotion runs
+    /// after every decode step; a prefill still advancing frees nothing, so it
+    /// must not price a whole admission pass a step. One that leaves — here on
+    /// an error — hands its slot back, and the pass is due.
+    #[test]
+    fn only_a_prefill_that_leaves_opens_the_next_admission() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let seq = SequenceId(scheduler.session.create_sequence().expect("create"));
+        scheduler
+            .active_prefills
+            .push(dialogue_prefill(seq, (0..64u32).collect()));
+        scheduler.settled_since_admit = false;
+        scheduler.promote_finished_prefills_to_decodes();
+        assert_eq!(scheduler.active_prefills.len(), 1);
+        assert!(
+            !scheduler.settled_since_admit,
+            "a prefill still advancing settled nothing"
+        );
+
+        scheduler.active_prefills[0].error = Some(ConversationError::Channel("lost".into()));
+        scheduler.promote_finished_prefills_to_decodes();
+        assert!(scheduler.active_prefills.is_empty());
+        assert!(
+            scheduler.settled_since_admit,
+            "a prefill that left is an admission opportunity"
+        );
+    }
+
     /// **A dialogue prefill enters the wave group in pass-sized chunks.** It
     /// used to enter whole: a 15.2k-token Cline turn needed a 13.2 GiB transient
     /// tier on a 16 GB card, more than all the ground below the weight floor,
@@ -7154,6 +7195,18 @@ mod creep_throttle_tests {
         assert_eq!(throttle_ratio(Low, [Normal, High]), 64, "the highest ratio");
         assert_eq!(throttle_ratio(Normal, [High, Low]), 64);
         assert_eq!(throttle_ratio(Normal, [Normal, Low]), 1);
+    }
+
+    /// `Urgent` is paced as `High` is beside its own band, and outranks it:
+    /// a live dialogue's decode holds a Maker's table prompt back at the full
+    /// ratio, while a Maker's decode never holds an urgent prompt back.
+    #[test]
+    fn urgent_paces_as_high_and_outranks_it() {
+        use crate::projection::DecodePriority::Urgent;
+        assert_eq!(throttle_ratio(Urgent, [Urgent]), HIGH_BESIDE_HIGH_RATIO);
+        assert_eq!(throttle_ratio(High, [Urgent]), 64);
+        assert_eq!(throttle_ratio(Urgent, [High, Normal, Low]), 1);
+        assert_eq!(throttle_ratio(Low, [Urgent]), 64);
     }
 
     /// `ceil(n / R)` layers a wave, never zero.

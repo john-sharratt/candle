@@ -1484,17 +1484,6 @@ impl WaveRate {
         self.full
     }
 
-    /// Whether nothing has been admitted since the reset — the head of the
-    /// wave, which is carried whatever it costs.
-    ///
-    /// The model applies that waiver itself for the offers it judges; a caller
-    /// asking a second question about the same offer (see
-    /// [`Self::decode_would_carry`]) has to apply it too, or the head it is
-    /// about to be handed anyway is refused on the extra question.
-    pub fn carries_nothing(&self) -> bool {
-        !self.admitted_any
-    }
-
     /// Prefill rows admitted into the wave since the last reset.
     #[cfg(test)]
     pub fn tokens(&self) -> usize {
@@ -2055,8 +2044,9 @@ impl WaveRate {
     /// residency whenever it is admitted. What joining changes is the cohort —
     /// its prefill shares the forwards the others are already taking, and its
     /// decode steps beside theirs instead of a whole cohort later — and that
-    /// judgement is the decode model's, asked by the caller through
-    /// [`Self::decode_would_carry`] before this. What stays here is the line
+    /// judgement is the decode model's, asked through
+    /// [`Self::decode_would_carry`] by [`Self::try_join_trading`], which ends
+    /// here. What stays here is the line
     /// every admission respects: residency may not fall under the prefill
     /// floor. A refusal latches [`Self::is_full`], as any other does.
     pub fn try_join(&mut self, weights_after: u64) -> Admit {
@@ -2079,21 +2069,47 @@ impl WaveRate {
 
     /// [`Self::try_join`] beside running decodes: a join adds no row, so it has
     /// no prefill gain, but the K/V it claims dislodges residency every running
-    /// decode steps slower for. `decode_weight` is those decodes' claim, as in
-    /// [`Self::try_widen_trading`]; a join that would cost them anything is
-    /// refused as `Worse`, unlatched, and the turn waits for a pass that offers
-    /// it rows — where its waiting weight is traded against the same loss.
+    /// decode steps slower for.
+    ///
+    /// **A join that goes on to decode is judged with its decode in the wave.**
+    /// The question is [`Self::decode_would_carry`]'s: does the wave step more
+    /// decodes a second with this turn decoding in it, at the residency it
+    /// leaves, than without it at the residency it found — and by at least the
+    /// minimum gain. Where a dislodge is a large share of the zone — a streaming
+    /// card, or one already near its floor — the slower step outweighs the extra
+    /// row and the join is refused; where it is a sliver, the row pays and the
+    /// wave widens.
+    ///
+    /// **Admitted, its decode is charged.** The joins of one pass decode
+    /// together once their prompts are in, so each is priced against the wave
+    /// with the ones before it decoding: twenty-four turns of one burst are
+    /// twenty-four marginal decodes, not twenty-four first ones, and the burst
+    /// stops where the next row no longer pays.
+    ///
+    /// **Priced without its own decode, no join could ever pay.** The running
+    /// decodes' rate at lower residency is below their rate at the residency
+    /// found, so every join that claimed a byte was `Worse` — on BlackWorld
+    /// (2026-10-27, Flash-Next ingest) 582 of 663 passes stopped there, refusing
+    /// a calibration's twenty-four thinking turns for a 0.01% projected loss
+    /// (`before: 39.777, after: 39.772`) while 1–3 rows decoded.
+    ///
+    /// A join that never decodes — a section — has nothing to set against the
+    /// loss, and one that would cost the running decodes anything is refused as
+    /// `Worse`. `decode_weight` is those decodes' claim, as in
+    /// [`Self::try_widen_trading`].
     ///
     /// **A refusal the join undid.** On BlackWorld (dcba2cc3b, 2026-10-20)
     /// heavy-read's outranking tool results were refused on the trade and
     /// admitted at once as joins, judged on the prefill floor alone — `ok=1
     /// rate=1` on almost every pass for five minutes — and the expert zone fell
     /// to 21 GB against its 28.5 GB hold as before the trade was asked at all.
+    /// A decoding join is judged on the decodes' rate, not on the floor alone.
     pub fn try_join_trading(
         &mut self,
         weights_before: u64,
         weights_after: u64,
         decode_weight: f64,
+        decodes_after: bool,
     ) -> Admit {
         if self.full {
             return Admit::Refused(Refusal::Full);
@@ -2103,16 +2119,29 @@ impl WaveRate {
             && self.decode_learned()
             && weights_after < weights_before
         {
-            let now = self.decode_rate(self.decodes, self.routed_per_layer, weights_before);
-            let with = self.decode_rate(self.decodes, self.routed_per_layer, weights_after);
-            if now > 0.0 && decode_weight * (with - now) / now < -1e-12 {
-                return Admit::Refused(Refusal::Worse {
-                    before: now,
-                    after: with,
-                });
+            if decodes_after {
+                if let Err(refusal) = self.decode_would_carry(0, weights_before, weights_after) {
+                    return Admit::Refused(refusal);
+                }
+            } else {
+                let now = self.decode_rate(self.decodes, self.routed_per_layer, weights_before);
+                let with = self.decode_rate(self.decodes, self.routed_per_layer, weights_after);
+                if now > 0.0 && decode_weight * (with - now) / now < -1e-12 {
+                    return Admit::Refused(Refusal::Worse {
+                        before: now,
+                        after: with,
+                    });
+                }
             }
         }
-        self.try_join(weights_after)
+        let admitted = self.try_join(weights_after);
+        if decodes_after && matches!(admitted, Admit::Admitted { .. }) {
+            self.decodes += 1;
+            self.routed_per_layer = self
+                .routed_per_layer
+                .saturating_add(self.experts_per_decode(0));
+        }
+        admitted
     }
 
     /// Offer a prefill that **outranks work the engine is already running** — a
@@ -2176,11 +2205,10 @@ impl WaveRate {
     /// `resident` — asked **while judging that prefill**, so the turn is priced
     /// by both models at the one moment a refusal is still cheap.
     ///
-    /// **Pure, and it buys nothing.** The decode rides a later wave and takes
-    /// its ground a lease at a time; committing counters here would charge this
-    /// wave for a row it will not run. So nothing is mutated and nothing is
-    /// latched — this is a question, and [`Self::try_admit`] still makes the
-    /// decision.
+    /// **Pure, and it buys nothing.** Nothing is mutated and nothing is latched
+    /// — this is a question, and [`Self::try_join_trading`], which asks it of
+    /// every join that goes on to decode, makes the decision and charges the
+    /// decode it admits.
     ///
     /// Why the prefill model cannot answer it: a prefill's copy is paid per
     /// forward, so `rate()` amortises it across the chunk's rows and widening
@@ -3178,6 +3206,116 @@ mod tests {
         assert!(approx(priced, real, 0.05), "priced {priced} against {real}");
     }
 
+    /// A planner whose decode fit has learned a layer at `a` seconds plus `b`
+    /// per missed distinct expert, over one to thirty-two decodes and a spread
+    /// of residencies — as `a_decode_fit_extrapolates_by_distinct_experts_not_picks`
+    /// teaches it — reset to `resident` with `decodes` running.
+    fn planner_fitted(a: f64, b: f64, resident: u64, decodes: usize) -> WaveRate {
+        let total = ExpertGeometry::QWEN36_35B_A3B.total_bytes();
+        let mut p = planner(LINK_4090_MOBILE);
+        for round in 0..40 {
+            for d in (1..=32usize).step_by(3) {
+                let share = 0.1 + 0.1 * ((round + d) % 9) as f64;
+                let at = (total as f64 * share) as u64;
+                let m = p.distinct_routed(d * 8) * p.streamed_fraction(at);
+                p.observe_decode(d, 0, at, (a + b * m) * LAYERS);
+            }
+        }
+        assert!(p.decode_learned());
+        p.reset(resident, GIB, GIB, CAP, DECODE_CAP);
+        for _ in 0..decodes {
+            p.charge(decode(0), resident);
+        }
+        p
+    }
+
+    /// The 35B's experts at `share` of their whole.
+    fn share_of_experts(share: f64) -> u64 {
+        (ExpertGeometry::QWEN36_35B_A3B.total_bytes() as f64 * share) as u64
+    }
+
+    /// **A join that goes on to decode is priced with its decode in the wave.**
+    /// Nine tenths of the experts resident and three decodes running: the
+    /// store a fourth turn claims slows every step a little, and the fourth row
+    /// more than repays it — admitted, and counted in. The same claim from a
+    /// join that never decodes buys the running decodes nothing, and is
+    /// refused as `Worse`: what a decoding join was, before its own row was
+    /// priced.
+    #[test]
+    fn a_decoding_join_is_admitted_where_its_row_repays_the_dislodge() {
+        let resident = share_of_experts(0.9);
+        let store = 288 * MIB;
+        let mut p = planner_fitted(0.25e-3, 0.05e-3, resident, 3);
+        assert!(matches!(
+            p.try_join_trading(resident, resident - store, 3.0, true),
+            Admit::Admitted { .. }
+        ));
+        assert_eq!(p.decodes(), 4, "the admitted join's decode is charged");
+        assert_eq!(p.resident_now(), resident - store);
+
+        let mut p = planner_fitted(0.25e-3, 0.05e-3, resident, 3);
+        assert!(matches!(
+            p.try_join_trading(resident, resident - store, 3.0, false),
+            Admit::Refused(Refusal::Worse { .. })
+        ));
+        assert_eq!(p.decodes(), 3, "a refused join charges nothing");
+    }
+
+    /// **Where the dislodge is a large share of the zone, the row does not
+    /// repay it.** A fifth of the experts resident and eight decodes streaming
+    /// most of what they route to — a small card's working point — and a turn
+    /// whose claim is a twentieth of the model: every step slows by more than
+    /// a ninth row earns, and the join is refused.
+    #[test]
+    fn a_decoding_join_is_refused_where_the_dislodge_outweighs_its_row() {
+        let resident = share_of_experts(0.2);
+        let claim = share_of_experts(0.05);
+        let mut p = planner_fitted(0.25e-3, 0.05e-3, resident, 8);
+        assert!(matches!(
+            p.try_join_trading(resident, resident - claim, 8.0, true),
+            Admit::Refused(Refusal::Worse { .. } | Refusal::Saturated { .. })
+        ));
+        assert_eq!(p.decodes(), 8);
+    }
+
+    /// **A burst of joins is a run of marginal decodes, not of first ones.**
+    /// Each admitted join is charged, so the next is priced against the wave
+    /// with it decoding: the burst widens the wave while the next row pays and
+    /// stops at the rate, well above the floor — rather than every join
+    /// comparing one more decode against the same three until the floor.
+    #[test]
+    fn a_burst_of_decoding_joins_stops_where_the_next_row_stops_paying() {
+        let mut resident = share_of_experts(0.9);
+        let store = 288 * MIB;
+        let mut p = planner_fitted(0.25e-3, 0.05e-3, resident, 3);
+        let mut admitted = 0;
+        let refusal = loop {
+            match p.try_join_trading(resident, resident - store, p.decodes() as f64, true) {
+                Admit::Admitted { .. } => {
+                    admitted += 1;
+                    resident -= store;
+                }
+                Admit::Refused(r) => break r,
+            }
+        };
+        assert!(admitted >= 2, "a resident card widens the wave: {admitted}");
+        assert_eq!(p.decodes(), 3 + admitted);
+        assert!(
+            matches!(refusal, Refusal::Worse { .. } | Refusal::Saturated { .. }),
+            "stopped by the rate, not the floor: {refusal:?}"
+        );
+        assert!(resident > GIB, "stopped above the floor");
+        // What stopped it is the joins before it: the same claim, priced as a
+        // fourth decode beside the three that were running, still pays.
+        let fresh = planner_fitted(0.25e-3, 0.05e-3, resident, 3);
+        assert!(
+            fresh
+                .decode_would_carry(0, resident, resident - store)
+                .is_ok(),
+            "priced against the first three alone, the refused join would pass"
+        );
+    }
+
     /// **Searched from a hint, the same answer as from nothing.** Every
     /// threshold of a prefix that pays, every hint in and around the range,
     /// and none: the gallop finds what the bisection finds, and a hint on the
@@ -3465,9 +3603,9 @@ mod tests {
         );
     }
 
-    /// **The question commits nothing.** The decode rides a later wave and buys
-    /// its ground a lease at a time; charging this wave for a row it will not
-    /// run would price every offer behind it against a decode that is not there.
+    /// **The question commits nothing.** Asked and refused, or asked again, it
+    /// leaves the wave as it found it; what a join admits on its answer is
+    /// charged by the join (`a_burst_of_decoding_joins_stops_where_the_next_row_stops_paying`).
     #[test]
     fn asking_whether_a_decode_fits_changes_no_counter() {
         let mut p = planner_judging(20e-3);

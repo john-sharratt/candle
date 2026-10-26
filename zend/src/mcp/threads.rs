@@ -55,8 +55,12 @@ impl State {
     }
 }
 
-/// How urgently a task decodes (`docs/claude_zend_gateway.md` §3.4): `normal`,
-/// below a live user, unless someone waits on it interactively.
+/// How urgently a task decodes (`docs/claude_zend_gateway.md` §3.4).
+///
+/// **Either way at `Urgent`.** A task is a dialogue somebody started — over MCP,
+/// or zend's own sub-agent — and somebody is waiting on its answer; at `Normal`
+/// it sat below every npcd Maker's table work on a shared member. The call may
+/// still name a priority, so the argument is kept and read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
@@ -78,8 +82,7 @@ impl Priority {
     /// The band its conversation decodes at.
     pub fn band(self) -> DecodePriority {
         match self {
-            Self::Normal => DecodePriority::Normal,
-            Self::High => DecodePriority::High,
+            Self::Normal | Self::High => DecodePriority::Urgent,
         }
     }
 }
@@ -575,12 +578,12 @@ mod tests {
     }
 
     #[test]
-    fn a_task_decodes_normal_unless_asked_high() {
-        assert_eq!(Priority::of(None).unwrap().band(), DecodePriority::Normal);
+    fn a_task_decodes_urgent_whatever_it_asks() {
+        assert_eq!(Priority::of(None).unwrap().band(), DecodePriority::Urgent);
         assert_eq!(Priority::of(Some("normal")).unwrap(), Priority::Normal);
         assert_eq!(
             Priority::of(Some("high")).unwrap().band(),
-            DecodePriority::High
+            DecodePriority::Urgent
         );
         assert_eq!(
             Priority::of(Some("low")).unwrap_err(),

@@ -876,7 +876,7 @@ pub struct LayerSchema {
     /// denominators for candidates that can never be returned.
     pub gathered: bool,
     /// Continuous-fair-wave decode priority (`decode_priority:` in YAML).
-    /// Default [`DecodePriority::Low`]. The dialogue layer is `High`.
+    /// Default [`DecodePriority::Low`]. The dialogue layer is `Urgent`.
     pub decode_priority: DecodePriority,
     /// What to do when one of this layer's turns is unrecoverable on reload
     /// (`on_corrupt_turn:` in YAML). Default
@@ -940,8 +940,14 @@ pub enum DecodePriority {
     /// `R = 16`: prefill stretched ~16× while 16 decode tokens land.
     Normal,
     /// `R = 64`: prefill heavily throttled; decode latency maximally protected.
-    /// The dialogue layer.
+    /// Work somebody is waiting on that is not a live conversation — a Maker's
+    /// table call, a task delegated at `high`.
     High,
+    /// `R = 64`, and **above `High`**: a person is waiting on this turn right
+    /// now — zend's live dialogue, a passthrough client's turn, the content
+    /// check an image draw waits on. Paced like `High` in every other respect
+    /// ([`Self::is_live`]); it only outranks it.
+    Urgent,
 }
 
 impl DecodePriority {
@@ -956,6 +962,7 @@ impl DecodePriority {
             DecodePriority::Low => "low",
             DecodePriority::Normal => "normal",
             DecodePriority::High => "high",
+            DecodePriority::Urgent => "urgent",
         }
     }
 
@@ -965,8 +972,18 @@ impl DecodePriority {
             "low" => Some(DecodePriority::Low),
             "normal" => Some(DecodePriority::Normal),
             "high" => Some(DecodePriority::High),
+            "urgent" => Some(DecodePriority::Urgent),
             _ => None,
         }
+    }
+
+    /// Whether the band is one somebody waits on token by token — `High` or
+    /// `Urgent`. Everywhere the scheduler protects latency rather than
+    /// throughput (a group of live prompts only, the split by backlog, the
+    /// prompts a placed turn waits behind) the two are the same; only their
+    /// rank differs.
+    pub fn is_live(self) -> bool {
+        matches!(self, DecodePriority::High | DecodePriority::Urgent)
     }
 
     /// The decode-to-prefill airtime ratio `R`: how many decode tokens are
@@ -975,7 +992,7 @@ impl DecodePriority {
         match self {
             DecodePriority::Low => 1,
             DecodePriority::Normal => 16,
-            DecodePriority::High => 64,
+            DecodePriority::High | DecodePriority::Urgent => 64,
         }
     }
 }
