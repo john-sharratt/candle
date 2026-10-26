@@ -54,7 +54,8 @@ METHOD — three phases:
 
 RULES:
 - Cite every claim with the URL you fetched it from. Cite only pages you
-  opened.
+  opened: your answer is audited against what web_fetch returned you, and
+  anything cited that you did not open sends you back to open it.
 - Keep vendor claims apart: "the vendor reports …" for what only the vendor
   says.
 - Before answering, start a part named verify-sources with sub_run: it
@@ -72,10 +73,15 @@ COULD NOT DO: anything asked that you did not do, and why
 
 ## Verify the result (read `verify`)
 
-1. Read the citation audit: anything cited but not opened is suspect.
-2. Follow up with the same worker (`task_reply`) to open what it skipped and
-   correct itself.
-3. Spot-check the facts you will pass on: `timeline_read {turn}` shows the
-   query and the page the worker actually read.
+1. Read the citation audit at the end of the answer. The worker has already
+   been sent back once to open anything it cited unopened, so what is still
+   `seen` or `never seen` is unverified — say so, or fix it in step 2.
+2. Continue the same worker with `task_reply` — it keeps everything it read —
+   to open what remains, settle a conflict, or go deeper on one item. It can
+   be continued until its thread is archived or it sits a day untouched.
+3. Spot-check the facts you will pass on: the audit proves a page was opened,
+   not that it says what the answer claims. `journal_grep` finds the turn a
+   URL or figure is in; `timeline_read {id, turn}` shows the page as the
+   worker got it.
 4. Tell the user what was checked, and keep "the worker reports" apart from
    what you confirmed.

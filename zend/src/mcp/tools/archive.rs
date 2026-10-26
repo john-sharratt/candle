@@ -9,9 +9,8 @@
 use serde_json::{json, Value};
 
 use super::{string, Answer, Ctx};
-use crate::mcp::archiving::{self, distil_with};
+use crate::mcp::archiving::{self, distil_with, Archived, When};
 use crate::mcp::names;
-use crate::mcp::threads;
 use crate::mcp::workers::now_ms;
 
 pub const NAME: &str = "thread_archive";
@@ -44,19 +43,35 @@ pub fn call(ctx: &Ctx, args: &Value) -> Answer {
         return Answer::error("the model is still loading; try again shortly");
     };
     let owner = ctx.caller.key();
-    let Some(t) = threads::thread(&records, &owner, thread) else {
-        return Answer::error(format!("there is no thread `T:{thread}`"));
-    };
     let distil = distil_with(&ctx.session);
     match archiving::archive_thread(
         &records,
         &distil,
         &owner,
-        t,
+        thread,
         "the feature is done",
+        When::Now,
         now_ms(),
     ) {
-        Ok(text) => Answer::ok(format!("Archived T:{thread}: {text}.")),
+        Ok(Archived::Done { line, failed }) if failed.is_empty() => {
+            Answer::ok(format!("Archived T:{thread}: {line}."))
+        }
+        Ok(Archived::Done { line, failed }) => Answer::ok(format!(
+            "Archived T:{thread}: {line}. These workers' conversations could not be distilled and \
+             stay whole — call `thread_archive` again, or the sweep archives them after a day: {}.",
+            failed.join("; ")
+        )),
+        Ok(Archived::Already { failed }) if failed.is_empty() => Answer::ok(format!(
+            "T:{thread} is archived; every worker on it is too."
+        )),
+        Ok(Archived::Already { failed }) => Answer::ok(format!(
+            "T:{thread} is archived; these workers' conversations still could not be distilled \
+             and stay whole: {}.",
+            failed.join("; ")
+        )),
+        // Only the sweep asks for quiet; archiving now is never refused as
+        // active.
+        Ok(Archived::Active) => Answer::ok(format!("T:{thread} was left open.")),
         Err(e) => Answer::error(e),
     }
 }

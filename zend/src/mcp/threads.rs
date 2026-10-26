@@ -253,7 +253,15 @@ pub struct Thread {
     /// The feature is done (`thread_archive`); attaching to it again reopens it.
     #[serde(default)]
     pub archived: bool,
+    /// When Claude last attached to it, to the nearest [`ATTACH_MARK_MS`]:
+    /// activity, to the sweep that archives a thread left a day idle.
+    #[serde(default)]
+    pub attached_ms: u64,
 }
+
+/// How stale a thread's [`Thread::attached_ms`] may grow before an attach
+/// writes it again: the record replicates, so not every attach is kept.
+pub const ATTACH_MARK_MS: u64 = 60 * 60 * 1000;
 
 /// One entry of a thread's journal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,7 +322,7 @@ pub fn thread(records: &dyn Records, owner: &str, name: &str) -> Option<Thread> 
 }
 
 /// The thread `name`, created when it does not exist yet, and reopened when
-/// it was archived.
+/// it was archived; its attach marked, when the mark is stale.
 pub fn attach(
     records: &dyn Records,
     owner: &str,
@@ -322,15 +330,19 @@ pub fn attach(
     now_ms: u64,
 ) -> anyhow::Result<Thread> {
     let t = match thread(records, owner, name) {
-        Some(t) if !t.archived => return Ok(t),
+        Some(t) if !t.archived && now_ms.saturating_sub(t.attached_ms) < ATTACH_MARK_MS => {
+            return Ok(t)
+        }
         Some(t) => Thread {
             archived: false,
+            attached_ms: now_ms,
             ..t
         },
         None => Thread {
             name: name.to_string(),
             created_ms: now_ms,
             archived: false,
+            attached_ms: now_ms,
         },
     };
     put_thread(records, owner, &t)?;
@@ -452,8 +464,23 @@ mod tests {
         .unwrap();
         let back = attach(&r, "o", "review", 99).unwrap();
         assert!(!back.archived);
-        assert_eq!(back.created_ms, 10);
+        assert_eq!((back.created_ms, back.attached_ms), (10, 99));
         assert!(!thread(&r, "o", "review").unwrap().archived);
+    }
+
+    /// **An attach is activity**: marked when the mark is an hour stale, so
+    /// a thread Claude came back to is not swept as idle under it.
+    #[test]
+    fn an_attach_marks_the_thread_at_most_hourly() {
+        let r = MemRecords::default();
+        attach(&r, "o", "review", 10).unwrap();
+        attach(&r, "o", "review", 10 + ATTACH_MARK_MS - 1).unwrap();
+        assert_eq!(thread(&r, "o", "review").unwrap().attached_ms, 10);
+        attach(&r, "o", "review", 10 + ATTACH_MARK_MS).unwrap();
+        assert_eq!(
+            thread(&r, "o", "review").unwrap().attached_ms,
+            10 + ATTACH_MARK_MS
+        );
     }
 
     #[test]

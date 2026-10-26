@@ -79,7 +79,7 @@ pub fn read_pages(turns: &[(String, String)]) -> BTreeSet<u32> {
 
 /// Each `<tool_response>` block's body in `user`, in order, without the
 /// `[n/total name]` label a multi-call round puts on its first line.
-fn response_bodies(user: &str) -> Vec<&str> {
+pub fn response_bodies(user: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut rest = user;
     while let Some(open) = rest.find(OPEN) {
