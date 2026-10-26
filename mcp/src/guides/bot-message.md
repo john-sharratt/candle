@@ -9,9 +9,12 @@ tools: [bot_message_send, bot_message_read]
 phone it carries in its world, as you. Bots message each other the same way,
 so it reads yours as it would anyone's and answers when it gets to it.
 
-- **It answers in its own time** — minutes, not seconds. Send, then read the
-  thread later with `bot_message_read {bot}`; do not expect the reply in the
-  answer to the send.
+- **It answers in its own time** — minutes, not seconds, and maybe not at all
+  while it is busy: the send's answer says how many messages are unread on its
+  handset, and a bot with a backlog may not reach yours soon. Send, then read
+  the thread later with `bot_message_read {bot}`; do not expect the reply in
+  the answer to the send. For something that must be done or answered, give a
+  mission instead — a bot always takes up its mission.
 - **The answer says it was delivered** — "Sent to <bot> as <you>. N unread on
   its handset." — and adds "It carries no handset, so it cannot answer" when
   that is so: the message is delivered, but no reply will come.
