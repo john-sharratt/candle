@@ -29,6 +29,9 @@
 //!   competition of their own, combined with the content's.
 //! - **Thinking** (`thinking`): question and thinking probes against the
 //!   calibration competition whole, cut to its questions, or to its thinking.
+//! - **Calibration cut** (`calibration-cut`): the calibration competition's
+//!   cut as production learns it, over every calibrated file, judged on a
+//!   question held out of both the learning and the gallery.
 //!
 //! The sweep, gate 4, the questions gate, the normalization probe and the
 //! chunk factor scan on a running daemon's gallery
@@ -61,12 +64,15 @@
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> thinking --daemon <url> --node <hex>
 //!   cargo run -p candle-conversation --release --example provenance_gates -- \
+//!     <workspace dir> calibration-cut --daemon <url> --node <hex>
+//!   cargo run -p candle-conversation --release --example provenance_gates -- \
 //!     <workspace dir> scan-loop [passes] --daemon <url> --node <hex>
 
 mod anomaly;
 mod attribution;
 mod background;
 mod boilerplate;
+mod calibration_cut;
 mod chunk_factor;
 mod competitions;
 mod corpus;
@@ -258,6 +264,9 @@ fn main() -> anyhow::Result<()> {
         "thinking" => {
             thinking_gate::run(&files, daemon()?)?;
         }
+        "calibration-cut" => {
+            calibration_cut::run(&files, daemon()?)?;
+        }
         "scan-loop" => {
             let passes = args.get(2).map(|a| a.parse()).transpose()?.unwrap_or(5);
             scan_loop::run(&files, passes, daemon()?)?;
@@ -265,8 +274,8 @@ fn main() -> anyhow::Result<()> {
         other => {
             anyhow::bail!(
                 "unknown command `{other}`: files, retrieval, sweep, paper, questions, \
-                 normalization, chunk-factor, density, question-cut, competitions, thinking or \
-                 scan-loop"
+                 normalization, chunk-factor, density, question-cut, competitions, thinking, \
+                 calibration-cut or scan-loop"
             )
         }
     }

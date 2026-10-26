@@ -288,9 +288,14 @@ loses (`docs/results/provenance_gates_2026-10-26.md`).
   near-identical files ask. The same questions are scanned against the
   calibrations alone, every file's own turns masked, and its outliers are
   cut at three robust deviations: its chunks are few per file and alike, so
-  its outliers sit nearer the median. Measured over the first files
-  calibrated with thinking: 17 of ~8,000 chunks cut, MRR 0.333 → 0.401 on
-  question probes and 0.424 → 0.463 on thinking probes.
+  its outliers sit nearer the median. Over the first 285 files calibrated
+  with thinking — heavy with near-identical kernel files whose calibrations
+  win each other's votes — it cut 17 of ~8,000 chunks and lifted MRR
+  0.333 → 0.401 on question probes and 0.424 → 0.463 on thinking probes.
+  Over every calibrated file as production learns it (1,637 files, most still
+  calibrated with questions alone) it cuts 437 of ~36,000 chunks and is
+  neutral, MRR 0.251 → 0.250 (`provenance_gates calibration-cut`); measured
+  again once every unit carries its thinking.
 - **Where.** Learned ahead of each layer's calibration pass
   (`GroupScanner::learn_chunk_exclusion`, the scan at ingest priority, the
   attribution on the calling thread holding no lock), held in memory per group

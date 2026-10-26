@@ -50,12 +50,15 @@ pub(crate) fn ingest_link(
         binary,
     };
     let failures = Failures::new();
+    // A chain link is calibrated by the pass's catch-up round, not as it
+    // commits: it is read ahead of the pass, outside its workers.
     process_one_file(
         &link_ctx,
         base,
         &job,
         &finished_content_keys(ctx.engine),
         &failures,
+        None,
     )?;
     let report = failures.into_report(1);
     if let Some(failure) = report.failures.first() {

@@ -28,6 +28,7 @@ use super::keys::{
 use super::plan::{dep_version, Done, LiveFiles};
 use super::spec::LayerSpec;
 use crate::branch_ingest::keys::branches_value;
+use crate::calibrate::{calibrate_committed, CalibrateSpec};
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::{Failures, IngestReport};
 use crate::ingest_snapshots::{finished, Unit};
@@ -177,6 +178,7 @@ pub fn ingest_units(
     jobs: &[UnitJob],
     base: &Mutex<Sequence>,
     files: Option<&EdgeFiles<'_>>,
+    calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<IngestReport> {
     let total = jobs.len();
     tracing::info!(
@@ -204,7 +206,7 @@ pub fn ingest_units(
                 let Some(job) = jobs.get(idx) else {
                     return;
                 };
-                if let Err(e) = read_one(ctx, spec, job, base, files) {
+                if let Err(e) = read_one(ctx, spec, job, base, files, calibrate) {
                     if !crate::ingest_cancel::cancelled() {
                         let n = failures.record(&job.subject, format!("{e:#}"));
                         tracing::warn!(
@@ -262,6 +264,7 @@ fn read_one(
     job: &UnitJob,
     base: &Mutex<Sequence>,
     files: Option<&EdgeFiles<'_>>,
+    calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<()> {
     let hold = match ingest_lease::share(&job.key) {
         Share::Theirs => return Ok(()),
@@ -364,7 +367,7 @@ fn read_one(
     tags.insert(LAYER_KEY.to_string(), spec.layer.clone());
     tags.insert(SUBJECT_KEY.to_string(), job.subject.clone());
     tags.insert(AFTER_KEY.to_string(), job.after.clone());
-    tags.insert(CONTENT_KEY.to_string(), key);
+    tags.insert(CONTENT_KEY.to_string(), key.clone());
     tags.insert(SPEC_KEY.to_string(), spec_digest(spec));
     tags.insert(JOB_KEY.to_string(), job.key.clone());
     if spec.edges {
@@ -387,6 +390,19 @@ fn read_one(
         anyhow::bail!("the content key was not written: {err:#}");
     }
     ctx.retrieval.mark_stale();
+    // Calibrated while its reading is still resident; a failure leaves the
+    // unit to the catch-up round ahead of the next pass.
+    if let Some(cal) = calibrate {
+        let calibrated = calibrate_committed(ctx, cal, base, timeline, &job.subject, &key);
+        if let (Err(err), false) = (calibrated, crate::ingest_cancel::cancelled()) {
+            tracing::warn!(
+                target: "zend::layers",
+                layer = %spec.layer,
+                subject = %job.subject,
+                "the unit was not calibrated as it committed: {err:#}",
+            );
+        }
+    }
     let e = ctx.engine.lock().unwrap();
     finished(&e, timeline, Unit::Layer(&job.subject));
     e.evict_ingest_timeline(timeline);
