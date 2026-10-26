@@ -2042,19 +2042,13 @@ impl Scheduler {
         // is running (`EngineRoom::busy`), and for at most `ROOM_PATIENCE`, and
         // its drain sets `settled_since_admit` when it ends. One atomic load.
         //
-        // **Except `Urgent`.** A person waiting on the turn itself — a live
-        // dialogue's next reply — does not sit behind an image draw for minutes;
-        // it goes in unjudged, as the forced head does, and the guest waits on.
-        // Everything below it stays queued.
+        // **Every band, `Urgent` included.** Letting `Urgent` in unjudged while
+        // a guest waited put work past the rate model on a card that was, by
+        // construction, short of ground: on WhiteWorld (3907, 2026-10-26 22:05)
+        // four content-check prompts went in that way during a wait, a wave
+        // came out too wide for the partition and failed mid-sweep, and a
+        // decode tripped a device-side assert fifteen seconds later.
         if self.guests.queue.waiting_for_room() {
-            while self.running_members() < Self::MAX_PREFILL_WIDTH
-                && self.highest_queued_band() == Some(DecodePriority::Urgent)
-            {
-                let Some(work) = self.pop_highest_band_head() else {
-                    break;
-                };
-                self.begin_forced(work);
-            }
             return;
         }
 
@@ -2300,20 +2294,6 @@ impl Scheduler {
             );
             self.begin_section_forced(s);
         }
-    }
-
-    /// The highest band any queued prefill or pending submission is at, without
-    /// taking it — what [`Self::pop_highest_band_head`] would take from.
-    fn highest_queued_band(&self) -> Option<DecodePriority> {
-        self.prefill_queue
-            .iter()
-            .map(|w| self.decode_priority_or_high(w.sequence_id))
-            .chain(
-                self.pending_submits
-                    .iter()
-                    .map(|p| self.decode_priority_or_high(p.parent())),
-            )
-            .max_by_key(|&b| rank(b))
     }
 
     /// Remove and return the first queued prefill of the highest band queued,
@@ -6869,33 +6849,25 @@ mod wave_chunk_tests {
         );
         assert!(scheduler.active_prefills.is_empty());
 
-        // A person's own turn is not held behind the draw.
+        // An urgent turn is held too: unjudged, it is work past the rate model
+        // on a card already short of ground.
         let live = SequenceId(scheduler.session.create_sequence().expect("create"));
         scheduler.slot_bands.insert(live, DecodePriority::Urgent);
         scheduler
             .prefill_queue
             .push_back(dialogue_prefill(live, (0..16u32).collect()).work);
         scheduler.promote_new_prefills();
-        assert_eq!(
-            scheduler
-                .active_prefills
-                .iter()
-                .map(|p| p.work.sequence_id)
-                .collect::<Vec<_>>(),
-            vec![live],
-            "an urgent turn waited behind the guest, or a lower band came in with it"
+        assert!(
+            scheduler.active_prefills.is_empty(),
+            "an urgent turn went in unjudged while a guest waited"
         );
-        assert_eq!(
-            scheduler.prefill_queue.len(),
-            1,
-            "the high turn stays queued"
-        );
-        scheduler.active_prefills.clear();
+        assert_eq!(scheduler.prefill_queue.len(), 2);
 
         let _ = queue.take(Guest::Matte);
         scheduler.promote_new_prefills();
-        assert!(
-            scheduler.prefill_queue.is_empty(),
+        assert_eq!(
+            scheduler.prefill_queue.len(),
+            1,
             "with the wait cleared, the idle engine did not force its queue head"
         );
     }

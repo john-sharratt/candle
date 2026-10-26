@@ -353,7 +353,18 @@ pub(crate) fn opening_prompt(key: &str, lines: usize, pages: u32) -> String {
 /// and every 8k prefill's transient tier pushed the zone off its working set.
 /// Prefill fell from 1,725 to 1,154 tok/s, with the hit rate at 56% inside a
 /// 17-sequence prefill. Width is not the lever here; the expert zone is.
-pub const CODE_READ_PARALLELISM: usize = 8;
+///
+/// **16 since admission prices each joining turn against the zone.** Those
+/// widths were run while a turn that joined a spent forward was either judged
+/// on the floor alone or refused on any byte, so the pool's width reached the
+/// card unpriced or not at all. A joining turn is now admitted only while the
+/// wave steps more decodes a second with it than without it at the residency
+/// it leaves (`WaveRate::try_join_trading`), so the pool offers width and the
+/// zone decides how much of it runs. At 8 on Qwen3.8-Flash-Next (BlackWorld,
+/// 2026-10-27, build 3897) a file's chain — its reading's summary, its
+/// calibration draft — ran one row at a time: 3.7 rows per decode forward,
+/// 90 tok/s decode, 161 files an hour.
+pub const CODE_READ_PARALLELISM: usize = 16;
 
 /// Worker count for the parallel ingest — [`CODE_READ_PARALLELISM`].
 fn parallelism() -> usize {
