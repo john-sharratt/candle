@@ -65,7 +65,7 @@ use super::groundgguf::{ground_bytes, place_gguf};
 use super::model::GuestModel;
 use super::progress::{GuestEvent, GuestSink};
 use super::seed::resolve_seed;
-use super::tiled::{decode_tiled, encode_tiled, fit_tile, TILE};
+use super::tiled::{decode_tiled, encode_tiled, fit_tile, SCALE, TILE};
 use super::varground::GroundVars;
 use super::work::{
     Guest, GuestImage, GuestOutcome, GuestRequest, ImageLora, ImageReference, ImageRequest,
@@ -253,27 +253,23 @@ fn staged(encode: usize, draw: usize) -> usize {
     encode.max(draw)
 }
 
-/// Ground for the latents, the attention bands and the decode, at one size.
+/// Ground for the latents, the attention bands and the decode, at one size —
+/// the activation arena the claim leaves after the weights.
 ///
-/// A *headroom* figure rather than a claim: these tensors come from the CUDA
-/// pool, not from ground, so what it sizes is the room the drain leaves the pool
-/// by evicting.
+/// Two terms, the larger of which is the arena. The area term is the
+/// transformer's: what scales with the image is its activations, and this is
+/// the rate for those. The floor is the decoder's: since [`decode_tiled`] its
+/// working set is one tile whatever the output is, and the tile is sized to
+/// the arena ([`autoencoder_tile`]) — so the floor is what holds a
+/// [`CLAIMED_TILE`] tile, below which a draw decodes in many small ones.
 ///
-/// The area term describes the transformer, not the decoder. Since
-/// [`decode_tiled`] the decoder's working set is one tile whatever the output
-/// is, and the tile is sized to the arena ([`autoencoder_tile`]); what still scales with the image is the transformer's own
-/// activations, and this is the rate for those.
-///
-/// **Sized for the pool it leaves behind, not for the arena.** Two different
-/// consumers draw on the room this evicts, and only one of them is bounded: the
-/// arena takes what ground is spare and the model's stages bound what any one
-/// generation asks of it, while everything that fails to inherit a ticket still
-/// reaches the pool. Under-claiming starves the second, which is the
-/// out-of-memory this figure exists to prevent; over-claiming costs the engine
-/// eviction and nothing else. It is deliberately on the generous side.
+/// Over-claiming costs the engine eviction and nothing else; under-claiming
+/// is a draw refused at its first overrun, after the engine was evicted for it.
 fn activation_headroom(width: u32, height: u32) -> usize {
     let pixels = width as usize * height as usize;
-    (pixels * ACTIVATION_BYTES_PER_PIXEL).max(1 << 30)
+    let tile_side = CLAIMED_TILE * SCALE;
+    let decode = tile_side * tile_side * AUTOENCODER_BYTES_PER_PIXEL;
+    (pixels * ACTIVATION_BYTES_PER_PIXEL).max(decode)
 }
 
 /// What one draw's activations cost, per pixel of output.
@@ -371,13 +367,19 @@ impl GuestModel for ImageGuest {
         // has to *work* in is whatever the span left over. That number is
         // invisible everywhere else and is exactly what an out-of-memory here
         // means, so the load says it out loud.
+        //
+        // At info, with the time since the load began: the load is most of a
+        // draw's own cost, and which stage of it is the question a slow one
+        // always turns out to be.
+        let began = std::time::Instant::now();
         let stage = |what: &str| {
             let free = match device {
                 Device::Cuda(_) => device.mem_get_info().map(|(f, _)| f).unwrap_or(0),
                 _ => 0,
             };
-            tracing::debug!(
+            tracing::info!(
                 target: "candle_conversation::guest",
+                at_ms = began.elapsed().as_millis() as u64,
                 pool_free_mib = free / (1 << 20),
                 "image guest: {what}"
             );
@@ -444,6 +446,7 @@ impl GuestModel for ImageGuest {
                     .map_err(|e| format!("image guest: the decoder: {e}"))
             })?
         };
+        stage("loaded");
 
         // **The arena the guest's own activations carve from.**
         //
@@ -575,12 +578,21 @@ fn vae_bytes(dir: &std::path::Path) -> usize {
 
 /// What one autoencoder tile costs the arena, per pixel of output.
 ///
-/// **A margin over a measured lower bound, to be tightened from the high-water
-/// [`arena_reading`] logs.** Measured on the 3090: a 512×512 tile's
-/// full-resolution resnet asked for its second 576 MiB im2col buffer with 992
-/// MiB already carved — at least 6.2 KiB a pixel, and the stage had more to
-/// allocate after it. 16 KiB holds that with room for the rest.
-const AUTOENCODER_BYTES_PER_PIXEL: usize = 16 << 10;
+/// **Measured, with a margin for what the stages now carry.** On the 3090 a
+/// 256×256 tile's decode came to a high-water of 1,248 MiB — 19.5 KiB a pixel,
+/// most of it the full-resolution resnets' im2col buffers (576 MiB each at a
+/// 512 tile) — while every stage's result still went to the pool. Each stage
+/// now carries its result in the tile, on top of that. Tighten it from the
+/// high-water [`arena_reading`] logs.
+const AUTOENCODER_BYTES_PER_PIXEL: usize = 24 << 10;
+
+/// The smallest tile the activation claim is sized to hold, in latent cells —
+/// 32, a 256×256 tile.
+///
+/// The arena is what the claim leaves after the weights, so a claim that only
+/// priced the denoise left an arena the decode then had to fit itself to: on
+/// the 3090 that came to 192×192 tiles, sixteen of them for a 512×512 draw.
+const CLAIMED_TILE: usize = 32;
 
 /// The autoencoder's tile side, sized to the arena this drain opened: the
 /// largest whose stages it holds ([`fit_tile`]). The full tile when no arena is
@@ -740,14 +752,17 @@ impl Loaded {
         // The autoencoder's own range. It emits [-1, 1] at the far end and
         // takes [-1, 1] here; feeding it 0..255 encodes a picture that is
         // entirely out of distribution and reads as noise to the transformer.
-        let px = ((px / 127.5)? - 1.0)?;
+        let px = super::varground::into_arena(&((px / 127.5)? - 1.0)?, &self.device)?;
 
         let vae = &self.vae;
         let z = encode_tiled(&px, autoencoder_tile(&self.device), |tile| {
-            // The mode, not a sample: the noise this latent will carry is
-            // chosen by the hold a line below, and a second undeclared helping
-            // from the encoder would sit on top of it.
-            Ok(vae.encode(&tile.to_dtype(VAE_DTYPE)?)?.mode())
+            // A stage per tile, as the decode takes. The mode, not a sample:
+            // the noise this latent will carry is chosen by the hold a line
+            // below, and a second undeclared helping from the encoder would sit
+            // on top of it.
+            candle_nn::kv_cache::guest_stage(&tile.to_dtype(VAE_DTYPE)?, |t| {
+                Ok(vae.encode(t)?.mode())
+            })
         })?;
         // The inverse of the scaling the decode applies on the way out.
         let z = ((z.to_dtype(DType::F32)? - VAE_SHIFT)? * VAE_SCALE)?.squeeze(0)?;
@@ -837,6 +852,16 @@ impl Loaded {
         let seed = resolve_seed(request.seed);
         self.device.set_seed(seed)?;
 
+        // **One generation for the whole draw, so every stage inside it is
+        // enclosed.** A stage's result is carried in its enclosing generation
+        // (`kv_cache::guest_stage`) — a block's in the step, a step's and a
+        // tile's here — and the ops between stages carve where their operands
+        // live. Without it each step and each tile was outermost, and its
+        // result, and everything read from it, went to the pool. Dropped at the
+        // end of this function, after the PNG has been read off the card.
+        let stream = self.device.as_cuda_device()?.cuda_stream();
+        let _draw = candle_nn::kv_cache::begin_guest(&stream).ok();
+
         let cap = self
             .conditioning
             .get(&request.prompt)
@@ -846,10 +871,15 @@ impl Loaded {
                 )
             })?
             .to_device(&self.device)?;
+        // Seeded, so the caption's projection in every step carves here too.
+        let cap = super::varground::into_arena(&cap, &self.device)?;
 
         let (lh, lw) = (request.height as usize / 8, request.width as usize / 8);
         let channels = zi::Config::turbo().in_channels;
-        let noise = Tensor::randn(0f32, 1f32, (channels, lh, lw), &self.device)?;
+        let noise = super::varground::into_arena(
+            &Tensor::randn(0f32, 1f32, (channels, lh, lw), &self.device)?,
+            &self.device,
+        )?;
 
         // The caller may move the schedule's shift; absent one, the
         // deployment's. It is the only sampler dial this model has — there is
@@ -872,18 +902,18 @@ impl Loaded {
         let steps = sigmas.len().saturating_sub(1) as u32;
         let total = steps + 1;
         let mut step_no = 0usize;
-        let stream = self.device.as_cuda_device()?.cuda_stream();
         let latent = sampling::denoise(&latent, &sigmas, |x, t| {
-            // **The stage is a block, not a step**, and it is opened inside the
-            // transformer — see `z_image::quantized_model`'s block loops. A
-            // generation here would wrap all thirty-four of them, which is the
-            // sum that saturated seven gigabytes; one per block keeps the
-            // arena holding a block.
+            // **A step is a stage, and the blocks inside it are stages too** —
+            // see `z_image::quantized_model`'s block loops. The blocks bound
+            // the arena: each releases to its mark and carries its hidden state
+            // in the step. The step bounds the carry: what its blocks carried
+            // goes when it closes, and only the velocity is carried on, here.
             //
             // Turbo is guidance-distilled, so this is the whole step: one
             // forward, no negative prompt, no extrapolation between two halves
             // of a batch.
-            let out = self.transformer.forward(x, &cap, t)?;
+            let out =
+                candle_nn::kv_cache::guest_stage(x, |x| self.transformer.forward(x, &cap, t))?;
             step_no += 1;
             if step_no == 1 {
                 arena_reading(&self.device, "the first denoise step");
@@ -953,23 +983,11 @@ impl Loaded {
             &latent.unsqueeze(0)?,
             autoencoder_tile(&self.device),
             |tile| {
-                // One generation per tile, for the reason the denoise loop above
-                // takes one per step: a tile is a stage, and the cursor rewinding
-                // between them is what keeps the arena holding a tile's peak rather
-                // than every tile's sum. The decoded pixels are copied out before
-                // the rewind — three megabytes at a 512 tile, against the
-                // half-gigabyte runs the decode itself wants.
-                let gen = candle_nn::kv_cache::begin_guest(&stream).ok();
-                // Seeded at the tile, for the reason the denoise step is seeded at
-                // `x`: the decoder's half-gigabyte runs all descend from this one
-                // tensor, and it arrives owned.
-                let tile = super::varground::into_arena(&tile.to_dtype(VAE_DTYPE)?, &self.device)?;
-                let px = vae.decode(&tile)?;
-                let survivor = Tensor::zeros(px.shape(), px.dtype(), px.device())?;
-                survivor.slice_set(&px, 0, 0)?;
-                drop(px);
-                drop(gen);
-                Ok(survivor)
+                // A tile is a stage, for the reason a step is: the arena holds
+                // one tile's peak rather than every tile's sum, and the decoded
+                // pixels — under a megabyte at a 256 tile — are carried on in
+                // the draw.
+                candle_nn::kv_cache::guest_stage(&tile.to_dtype(VAE_DTYPE)?, |t| vae.decode(t))
             },
         )?;
         tracing::debug!(
@@ -1079,7 +1097,16 @@ mod tests {
     fn headroom_scales_with_the_image_and_has_a_floor() {
         let small = activation_headroom(256, 256);
         let one_k = activation_headroom(1024, 1024);
-        assert_eq!(small, 1 << 30, "a small image still gets the floor");
+        assert_eq!(
+            small,
+            1536 << 20,
+            "a small image still gets a 256² tile's decode"
+        );
+        assert_eq!(
+            fit_tile(small, AUTOENCODER_BYTES_PER_PIXEL),
+            CLAIMED_TILE,
+            "the floor holds the tile it is sized for"
+        );
         assert_eq!(one_k, 3 << 30, "1024×1024 wants 3 GiB");
         // Four times the pixels, four times the room — above the floor.
         assert_eq!(activation_headroom(2048, 1024), 2 * one_k);

@@ -31,6 +31,14 @@ pub struct Generate;
 /// past what a client accepts inline.
 pub const MAX_SIDE: u32 = 1024;
 
+/// The steps a draw takes when the caller names none.
+///
+/// Twelve rather than the route's twenty-four: a conversation asking for a
+/// picture wants it back, and twelve is half the denoise for a finish the eye
+/// does not tell apart at this size. Eight, the model's trained count, is the
+/// fast end.
+pub const STEPS: u32 = 12;
+
 /// The most of the route's stream read back: a 1024² PNG in base64 with room.
 const STREAM_LIMIT: usize = 16 << 20;
 
@@ -42,15 +50,16 @@ impl Tool for Generate {
             "name": Self::NAME,
             "description": "Generate an image from a text prompt (Z-Image-Turbo) and return it as a \
                 PNG. Describe the subject, style, lighting and composition in plain sentences; \
-                variety comes from the prompt, not the seed. A draw takes about 10-60 seconds. \
-                Prompts are checked first and a declined one is refused.",
+                variety comes from the prompt, not the seed. A draw takes about half a minute \
+                to two, and progress arrives while it works. Prompts are checked first and a \
+                declined one is refused.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "What to draw."},
                     "width": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": 512, "description": "Width in pixels, a multiple of 16."},
                     "height": {"type": "integer", "minimum": 16, "maximum": MAX_SIDE, "multipleOf": 16, "default": 512, "description": "Height in pixels, a multiple of 16."},
-                    "steps": {"type": "integer", "minimum": 1, "maximum": 100, "default": 24, "description": "Denoise steps: more buys finish, not variety; 8 is the model's trained count."},
+                    "steps": {"type": "integer", "minimum": 1, "maximum": 100, "default": STEPS, "description": "Denoise steps: 12 is the default and a good finish; 8 (the model's trained count) for speed. More buys finish, not variety."},
                     "seed": {"type": "integer", "minimum": 0, "description": "Seed, for repeating a draw; random when absent."},
                     "shift": {"type": "number", "minimum": 1.0, "maximum": 8.0, "description": "The schedule's shift; the deployment's own when absent."}
                 },
@@ -91,7 +100,7 @@ fn body(args: &Value) -> Result<ImageBody, String> {
         }
     };
     let steps = match args.get("steps") {
-        None | Some(Value::Null) => 24,
+        None | Some(Value::Null) => STEPS,
         Some(v) => v
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
@@ -166,7 +175,7 @@ mod tests {
         let b = body(&json!({"prompt": " a red fox "})).unwrap();
         assert_eq!(
             (b.prompt.as_str(), b.width, b.height, b.steps),
-            ("a red fox", 512, 512, 24)
+            ("a red fox", 512, 512, STEPS)
         );
         assert_eq!((b.seed, b.shift), (None, None));
         let b = body(&json!({"prompt": "x", "width": 768, "seed": 7, "shift": 3.0})).unwrap();

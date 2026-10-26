@@ -112,6 +112,13 @@ struct Inner {
     capacity: usize,
     /// Bytes handed out since the last reset.
     cursor: usize,
+    /// Bytes held at the **top** of the span, growing down toward `cursor`.
+    ///
+    /// A guest stage's result: it has to outlive the stage that made it, and
+    /// the stage's own range is released to its mark the moment it closes. So
+    /// it is carried at the other end, owned by the enclosing generation and
+    /// released with it ([`guest_stage`]). Always zero outside a guest arena.
+    carry: usize,
     /// Live [`Generation`] guards. The cursor cannot move while this is > 0.
     live: usize,
     /// Whether anything has been handed out since the last reset.
@@ -266,6 +273,7 @@ impl BumpArena {
                 base,
                 capacity,
                 cursor: 0,
+                carry: 0,
                 live: 0,
                 dirty: false,
                 peak: 0,
@@ -307,6 +315,7 @@ impl BumpArena {
                 base,
                 capacity,
                 cursor: 0,
+                carry: 0,
                 live: 0,
                 dirty: false,
                 peak: 0,
@@ -338,6 +347,7 @@ impl BumpArena {
             inner.peak = inner.cursor;
         }
         let entry_cursor = inner.cursor;
+        let entry_carry = inner.carry;
         inner.live += 1;
         drop(inner);
         Ok(Generation {
@@ -346,6 +356,7 @@ impl BumpArena {
             domain,
             arena,
             entry_cursor,
+            entry_carry,
             _turn: turn,
         })
     }
@@ -363,6 +374,7 @@ impl BumpArena {
                 base: 0,
                 capacity: 0,
                 cursor: 0,
+                carry: 0,
                 live: 0,
                 dirty: false,
                 peak: 0,
@@ -445,6 +457,7 @@ impl BumpArena {
         inner.base = base;
         inner.capacity = capacity;
         inner.cursor = 0;
+        inner.carry = 0;
         inner.dirty = false;
         inner.census.clear();
         // The epoch is what invalidates a `WaveTicket` minted before the move.
@@ -508,7 +521,7 @@ fn bump<'a>(
     let end = start
         .checked_add(len)
         .ok_or_else(|| candle::Error::Msg(format!("{name}: bump allocation overflowed usize")))?;
-    if end > inner.capacity {
+    if end > inner.capacity - inner.carry {
         // Itemise the generation that ran out, not just the carve that noticed.
         // A span exhausts because the plan is short, and "short by what" is the
         // only question worth asking here — the ordinary report fires when a
@@ -535,8 +548,8 @@ fn bump<'a>(
             label: wave_census::label(),
         });
     }
-    if end > inner.peak {
-        inner.peak = end;
+    if end + inner.carry > inner.peak {
+        inner.peak = end + inner.carry;
         // Only on a new high-water mark, so this is quiet in steady state
         // and self-terminating: a domain's watermark converges within the
         // first few waves. This is the measurement the transient span is
@@ -565,7 +578,7 @@ fn bump<'a>(
 fn bump_locked(inner: &mut Inner, name: &'static str, len: usize, align: usize) -> Option<u64> {
     let start = aligned_start(inner.base, inner.cursor, align);
     let end = start.checked_add(len)?;
-    if end > inner.capacity {
+    if end > inner.capacity - inner.carry {
         // The generation that ran out is the one worth itemising: what it had
         // carved, and the request that did not fit.
         if wave_census::enabled() {
@@ -589,11 +602,31 @@ fn bump_locked(inner: &mut Inner, name: &'static str, len: usize, align: usize) 
             label: wave_census::label(),
         });
     }
-    if end > inner.peak {
-        inner.peak = end;
+    if end + inner.carry > inner.peak {
+        inner.peak = end + inner.carry;
         log::debug!("{}: transient peak {} B of {} B", name, end, inner.capacity);
     }
     Some(inner.base + start as u64)
+}
+
+/// Carry `len` bytes at the top of the span, every byte of it above `above`.
+///
+/// `above` is the stage's high-water: its result still sits in the range the
+/// stage released, and a carry that reached down into it would be written by
+/// the copy it is the destination of. `None` when the two ends would meet.
+fn carry_locked(inner: &mut Inner, len: usize, align: usize, above: usize) -> Option<u64> {
+    let top = (inner.capacity - inner.carry).checked_sub(len)?;
+    let abs = (inner.base + top as u64) & !(align as u64 - 1);
+    let start = (abs.checked_sub(inner.base)?) as usize;
+    if start < above.max(inner.cursor) {
+        return None;
+    }
+    inner.carry = inner.capacity - start;
+    inner.dirty = true;
+    if inner.cursor + inner.carry > inner.peak {
+        inner.peak = inner.cursor + inner.carry;
+    }
+    Some(abs)
 }
 
 /// An open forward-wide span the launchers' scratch is carved from.
@@ -705,6 +738,9 @@ pub struct Generation {
     /// closes ([`guest_stage`]); anything still living in the released range
     /// when the mark unwinds would be handed to the next carve.
     entry_cursor: usize,
+    /// The carry as this generation opened, released back to the same way —
+    /// what a stage nested inside this one carried out belongs to this one.
+    entry_carry: usize,
     /// This thread's hold on a shared domain. The last field, so it is given
     /// back only after [`Drop::drop`] has fenced and rewound the cursor. Held
     /// for its drop alone.
@@ -797,10 +833,11 @@ impl Drop for Generation {
             // would put one in the innermost scope of the decoder — per resnet,
             // per block, per tile.
             if inner.live > 0 && self.arena == GUEST_ARENA {
-                if inner.cursor > inner.peak {
-                    inner.peak = inner.cursor;
+                if inner.cursor + inner.carry > inner.peak {
+                    inner.peak = inner.cursor + inner.carry;
                 }
                 inner.cursor = self.entry_cursor;
+                inner.carry = self.entry_carry;
                 // No tier reference to give back: a guest arena stands in the
                 // guest's own claimed ground, so this generation never took one.
                 return;
@@ -866,6 +903,7 @@ impl Drop for Generation {
         }
         inner.census.clear();
         inner.cursor = 0;
+        inner.carry = 0;
         inner.dirty = false;
         inner.epoch += 1;
         drop(inner);
@@ -1206,20 +1244,83 @@ where
     };
     let staged = stage_in(x, cuda, &generation)?;
     let out = f(&staged)?;
-    // Out before the rewind, and this is the copy that makes releasing the
-    // arena sound — nothing the stage allocated may outlive it.
-    //
-    // `empty` rather than `zeros`: `slice_set` below writes every element, so a
-    // memset here would be a second full-width pass over the exact bytes about
-    // to be stamped (principle 6). Neither constructor inherits a ticket, which
-    // is the other half of what this needs — the survivor must be an ordinary
-    // owned allocation, off the arena it is escaping.
-    let survivor = candle::Tensor::empty(out.shape(), out.dtype(), out.device())?;
-    survivor.slice_set(&out, 0, 0)?;
-    drop(out);
     drop(staged);
+    let inner = Arc::clone(&generation.inner);
+    let (high, enclosed) = {
+        let i = inner.lock().unwrap();
+        (i.cursor, i.live > 1)
+    };
+    if !enclosed {
+        // The outermost generation: its drop rewinds the whole arena and moves
+        // the epoch, so nothing carved here can outlive it. The result is
+        // copied out to the pool first.
+        //
+        // `empty` rather than `zeros`: `slice_set` below writes every element,
+        // so a memset here would be a second full-width pass over the exact
+        // bytes about to be stamped (principle 6).
+        let survivor = candle::Tensor::empty(out.shape(), out.dtype(), out.device())?;
+        survivor.slice_set(&out, 0, 0)?;
+        drop(out);
+        drop(generation);
+        return Ok(survivor);
+    }
+    // **Carried, in the enclosing generation.** The stage releases to its mark
+    // first — its result still sits in the released range, below `high`, and
+    // nothing is carved there before the copy below reads it — and the result
+    // is then carried at the top of the span, above `high`, where the
+    // enclosing generation owns it. So a stage's result never leaves the
+    // arena: it lives exactly as long as the stage around it, and the ops that
+    // read it carve where it does.
+    let ticket = WaveTicket {
+        domain: generation.domain,
+        arena: generation.arena,
+        epoch: generation.ticket().epoch,
+    };
     drop(generation);
+    let survivor = carry_out(&out, cuda, &inner, ticket, high)?;
+    drop(out);
     Ok(survivor)
+}
+
+/// Copy `out` into a carry at the top of `inner`'s span, above `high`.
+fn carry_out(
+    out: &candle::Tensor,
+    cuda: &candle::CudaDevice,
+    inner: &Mutex<Inner>,
+    ticket: WaveTicket,
+    high: usize,
+) -> Result<candle::Tensor> {
+    use candle::cuda_backend::wave_provenance::{exhausted, LeaseOrigin};
+
+    let bytes = out.elem_count() * out.dtype().size_in_bytes();
+    let ptr = {
+        let mut i = inner.lock().unwrap();
+        match carry_locked(&mut i, bytes, 256, high) {
+            Some(ptr) => ptr,
+            None => {
+                let span = SpanState {
+                    cursor: high + i.carry,
+                    capacity: i.capacity,
+                };
+                return Err(exhausted(ticket, bytes, span));
+            }
+        }
+    };
+    let dev = candle::Device::Cuda(cuda.clone());
+    // SAFETY: the range was carried for the generation `ticket` names, which
+    // is still open — the stage's caller holds it — and is released only when
+    // that generation closes, after this tensor and everything read from it.
+    let dst = unsafe {
+        candle::Tensor::from_leased_cuda_ptr(
+            ptr,
+            out.dtype(),
+            out.dims().to_vec(),
+            &dev,
+            LeaseOrigin::Wave(ticket),
+        )
+    }?;
+    dst.slice_set(out, 0, 0)?;
+    Ok(dst)
 }
 
 /// Copy `x` into the open guest generation, so ops reading it carve there.
@@ -2577,6 +2678,16 @@ mod tests {
         assert_eq!(c.0 % 256, 0, "alignment must be honoured");
     }
 
+    /// One guest-arena test at a time. The registry is per device and process
+    /// wide, so two tests opening an arena on the same card replace each
+    /// other's, and each reads the other's cursor.
+    #[cfg(feature = "cuda")]
+    fn guest_arena_test() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::Mutex;
+        static ONE: Mutex<()> = Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// **A nested generation is a mark/release scope; only the outermost
     /// rewinds.**
     ///
@@ -2598,6 +2709,7 @@ mod tests {
         use candle::Device;
         use std::sync::Arc;
 
+        let _one = guest_arena_test();
         let Ok(device) = Device::new_cuda(0) else {
             return;
         };
@@ -2654,6 +2766,76 @@ mod tests {
             0,
             "the outermost generation must rewind the arena"
         );
+    }
+
+    /// **A stage's result is carried in the generation around it, never the
+    /// pool, and the bottom cannot carve into it.**
+    ///
+    /// The result outlives its stage — the stage releases to its mark the
+    /// moment it closes — so it is carried at the top of the span, and the
+    /// enclosing generation owns it. The numbers must survive the release, a
+    /// stage nested in a stage must compose, and while a carry stands the
+    /// cursor must refuse the bytes it holds.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn a_stage_result_is_carried_in_its_enclosing_generation() {
+        use crate::kv_cache::{
+            begin_guest, close_guest_arena, guest_domain_stats, guest_stage, open_guest_arena,
+        };
+        use candle::cuda_backend::cudarc::driver::{CudaStream, DevicePtr};
+        use candle::{Device, Tensor};
+        use std::sync::Arc;
+
+        let _one = guest_arena_test();
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        let cuda = device.as_cuda_device().unwrap();
+        let stream = cuda.cuda_stream();
+        let ordinal = stream.context().ordinal();
+        let capacity = 1usize << 20;
+        let ground = unsafe { stream.alloc::<u8>(capacity).unwrap() };
+        let (base, _sync) = ground.device_ptr(&stream);
+        struct CloseOnDrop(Arc<CudaStream>);
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                close_guest_arena(&self.0);
+            }
+        }
+        open_guest_arena(&stream, base, capacity);
+        let _close = CloseOnDrop(stream.clone());
+
+        let outer = begin_guest(&stream).unwrap();
+        let x = Tensor::arange(0f32, 1024., &device).unwrap();
+        let y = guest_stage(&x, |x| x.affine(2., 1.)).unwrap();
+        assert_eq!(
+            guest_domain_stats(ordinal).unwrap().0,
+            0,
+            "the stage did not release to its mark"
+        );
+        let z = guest_stage(&y, |y| guest_stage(y, |t| t.affine(1., 1.))?.affine(1., 0.)).unwrap();
+        let want: Vec<f32> = (0..1024).map(|i| 2. * i as f32 + 2.).collect();
+        assert_eq!(
+            z.to_vec1::<f32>().unwrap(),
+            want,
+            "a carried result lost its numbers"
+        );
+        let y_want: Vec<f32> = (0..1024).map(|i| 2. * i as f32 + 1.).collect();
+        assert_eq!(
+            y.to_vec1::<f32>().unwrap(),
+            y_want,
+            "a later stage wrote over an earlier one's carried result"
+        );
+
+        // Two results of 4 KiB stand at the top; the bottom cannot reach them.
+        assert!(
+            outer.alloc(capacity - 4096, 256).is_err(),
+            "the cursor carved into a standing carry"
+        );
+        outer.alloc(capacity - 3 * 4096, 256).unwrap();
+
+        drop(outer);
+        assert_eq!(guest_domain_stats(ordinal).unwrap().0, 0);
     }
 
     /// Alignment rounds the cursor up, never down — a range must start at or
