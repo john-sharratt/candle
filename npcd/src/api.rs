@@ -29,6 +29,7 @@ use axum::{
 use cluster::dispatch::{Derived, Dispatch, KeySource, Merge, Mirror};
 use host::guard::{delete, get, post, put};
 use mcp_server::http as mcp_http;
+use mcp_server::origin;
 use mcp_server::SealedStore;
 // Only the test-only `router` builds one directly; the tenant goes through `api`.
 #[cfg(test)]
@@ -266,6 +267,23 @@ impl Authored {
     pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Arc<Self> {
         self.runtime = Some(runtime);
         Arc::new(self)
+    }
+
+    /// Let image `id`'s key go at once, at this member's own records as they
+    /// stand — the image's blob among them. An image is held by nobody; the
+    /// release is what tells the gateway which members hold it, so an edit
+    /// naming it is placed among them, never on one that would have to wait,
+    /// with this member the fallback (`docs/cooperative_admission.md` §2.2). A
+    /// daemon with no cluster has nobody to tell.
+    pub fn hand_over_image(&self, id: &str) {
+        let Some(member) = self.runtime.as_ref().and_then(|rt| rt.standing.member()) else {
+            return;
+        };
+        let Some(through) = member.replicator().map(|r| r.own_through()) else {
+            return;
+        };
+        member.hold(id.as_bytes());
+        member.let_go(id.as_bytes(), through);
     }
 
     /// Every image a portrait names — a character's or a personality's: what
@@ -1719,6 +1737,8 @@ async fn put_portrait(
         Ok(id) => id,
         Err(e) => return image_err(e),
     };
+    // A portrait can be edited too: placed among its holders like any picture.
+    s.hand_over_image(&id);
     // Recorded on the character, so the portrait survives a restart and the
     // console can find it again from the listing.
     //
@@ -1788,9 +1808,11 @@ const UPLOAD_BODY: usize = refimage::MAX_BYTES;
 /// `image_edit` takes.
 async fn put_upload(
     State(s): State<Arc<Authored>>,
+    headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
     body: Body,
 ) -> Response {
+    let public = origin::of(&headers);
     let exp = q.get("exp").and_then(|e| e.parse::<u64>().ok());
     let sig = q.get("sig").map(String::as_str);
     let checked = match (exp, sig) {
@@ -1830,20 +1852,29 @@ async fn put_upload(
         Store(ImageError),
     }
     // Decoding a camera original is a second of work: off the async workers.
+    // Handed over where it is stored, so a caller gone meanwhile leaves no
+    // stored picture unplaced.
     let kept = spawn_blocking(move || {
         let (jpeg, width, height) = refimage::normalised(&bytes).map_err(NotKept::Picture)?;
+        let now = now_ms();
         let id = s
             .images
-            .put_kept(&jpeg, Kept::Uploaded, now_ms())
+            .put_kept(&jpeg, Kept::Uploaded, now)
             .map_err(NotKept::Store)?;
-        Ok((id, width, height))
+        s.hand_over_image(&id);
+        let link = format!(
+            "{public}{}",
+            s.image_links.path(&id, now / 1000, Kept::Uploaded)
+        );
+        Ok((id, width, height, link))
     })
     .await;
     match kept {
-        Ok(Ok((id, width, height))) => Json(json!({
+        Ok(Ok((id, width, height, link))) => Json(json!({
             "image": id,
             "width": width,
             "height": height,
+            "link": link,
             "kept_s": Kept::Uploaded.lifetime().as_secs(),
         }))
         .into_response(),
@@ -3719,6 +3750,11 @@ mod tests {
             (Some(40), Some(20))
         );
         assert_eq!(v["kept_s"], 3600);
+        let opened = v["link"].as_str().unwrap();
+        let path = &opened[opened.find("/v1/image/link/").unwrap()..];
+        let (s, got) = call_raw(router(st.clone()), get(path, None)).await;
+        assert_eq!(s, StatusCode::OK, "its link opens it: {opened}");
+        assert_eq!(&got[..2], &[0xFF, 0xD8]);
         let (bytes, mime) = st.images.get(&id).unwrap();
         assert_eq!((&bytes[..2], mime), (&[0xFF, 0xD8][..], "image/jpeg"));
 

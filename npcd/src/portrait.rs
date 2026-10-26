@@ -316,6 +316,8 @@ pub async fn post_generate(
             )
         }
     };
+    // A portrait can be edited too: placed among its holders like any picture.
+    s.hand_over_image(&image_id);
 
     let mut npcs = s.npcs.write().await;
     match npcs.set_portrait(npc_id, &owner, image_id, "generated", crate::api::now_ms()) {

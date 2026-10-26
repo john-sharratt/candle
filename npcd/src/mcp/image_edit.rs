@@ -16,15 +16,17 @@
 //! from the image store — so a refinement costs the conversation one line, and
 //! a picture uploaded once is edited as often as wanted.
 //!
-//! **Every member holds every image, so whichever serves the edit has it.** An
-//! image is a blob in the substrate, which replicates, and the gateway orders
-//! a write's records ahead of its response: a call it routes afterwards, to
-//! any member, is served only once that member has applied them
-//! (`docs/replicated_substrate.md` §6.4). An image is immutable and named by
-//! its hash, so it is never stale — only present or not. Not present means it
-//! expired, or the member that stored it failed before its records left; it
-//! will not arrive by waiting, so the edit says so at once and the caller
-//! stores it again.
+//! **An edit is placed among the members that hold its picture.** The picture
+//! is its key (`image`, a subject the gateway routes by), and the member that
+//! stored it let the key go at once, at its own records then
+//! (`Authored::hand_over_image`): the gateway places the edit, as it places a
+//! conversation's next turn, on the best member that has applied them — never
+//! one that would wait — with the storing member the fallback
+//! (`docs/cooperative_admission.md` §2.2). A draw names no picture and goes to
+//! the best member anywhere. An image is immutable and named by its hash, so it
+//! is never stale — only present or not; not present means it expired, or the
+//! member that stored it failed before its records left, which no wait mends,
+//! so the edit says so at once and the caller stores it again.
 
 use std::sync::Arc;
 
@@ -32,6 +34,7 @@ use axum::http::HeaderMap;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use candle_conversation::guest::MAX_REFERENCE_HOLD;
+use cluster::dispatch::image_id;
 use serde_json::{json, Value};
 
 use super::args::string;
@@ -122,13 +125,6 @@ fn unavailable(id: &str) -> String {
          one hour) or the server holding it failed before it was shared. Store it again — \
          image_upload for the user's picture, or draw it again — then edit the new one"
     )
-}
-
-/// The image id in a link this server gave — `…/v1/image/link/<id>?exp=…&sig=…`
-/// or `…/v1/image/<id>` — or the id itself.
-fn image_id(link: &str) -> &str {
-    let path = link.split(['?', '#']).next().unwrap_or(link);
-    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// The draw's body: the tool's dials as `image_generate` reads them, the

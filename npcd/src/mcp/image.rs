@@ -146,13 +146,17 @@ pub(super) async fn draw(
         Err(e) => return Answer::error(e),
     };
     let now = now_ms();
+    // Handed over the moment it is stored, ahead of anything that awaits, so
+    // an edit of it is placed among its holders however this call ends.
     let stored = match made {
         Made::Drawn => s
             .images
             .put_kept(&drawn.file, Kept::Drawn, now)
+            .inspect(|id| s.hand_over_image(id))
             .map(|id| (id, Kept::Drawn)),
         Made::Edited { from } => match s.images.put_edited(&drawn.file, from, now) {
             Ok((id, gone)) => {
+                s.hand_over_image(&id);
                 if let Some(gone) = gone {
                     retire_unless_portrait(s, &gone).await;
                 }
