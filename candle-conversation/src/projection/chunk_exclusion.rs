@@ -100,8 +100,9 @@ impl Conversation {
     ///
     /// Each competition is learned against itself: the questions are scanned
     /// raw against the group's content alone, and again against its
-    /// calibrations alone — every file's own turns masked — with nothing cut,
-    /// so the exclusion never learns from a gallery it already shaped. `scan`
+    /// calibrations alone — every file's own turns and the asking questions
+    /// masked — with nothing cut, so the exclusion never learns from a
+    /// gallery it already shaped, nor from a question finding itself. `scan`
     /// is the scheduler's [`Self::scan_group_votes`] — `(calibrations,
     /// masked turns, probes)` — and answers in its own file order, which the
     /// cases are read back through. A group with no calibrated file learns an
@@ -120,7 +121,7 @@ impl Conversation {
                 .iter()
                 .find_map(|f| f.arcs_kept.first())
                 .map_or(0, SigWindow::width);
-            let mut probes: Vec<(usize, Vec<WideQSig>)> = Vec::new();
+            let mut probes: Vec<(usize, StreamId, Vec<WideQSig>)> = Vec::new();
             for (fi, f) in files.iter().enumerate() {
                 let questions = sub.calibrations_of(f.timeline).flat_map(|cal| {
                     (0..sub.turn_count(cal)).map(move |i| turn_stream_id(cal.raw(), i))
@@ -135,7 +136,7 @@ impl Conversation {
                         .filter(|t| t.words.len() == width)
                         .collect();
                     if !sigs.is_empty() {
-                        probes.push((fi, sigs));
+                        probes.push((fi, sid, sigs));
                     }
                 }
             }
@@ -150,16 +151,22 @@ impl Conversation {
         let exclusion = if probes.is_empty() {
             ChunkExclusion::default()
         } else {
-            let sigs: Vec<Vec<WideQSig>> = probes.iter().map(|(_, s)| s.clone()).collect();
-            let owned: Vec<(usize, &[WideQSig])> =
-                probes.iter().map(|(fi, s)| (*fi, s.as_slice())).collect();
-            let own_turns: HashSet<StreamId> = files
+            let sigs: Vec<Vec<WideQSig>> = probes.iter().map(|(_, _, s)| s.clone()).collect();
+            let owned: Vec<(usize, &[WideQSig])> = probes
+                .iter()
+                .map(|(fi, _, s)| (*fi, s.as_slice()))
+                .collect();
+            // The calibration scan's gallery: every calibration question but
+            // the asking ones — each would otherwise find itself, and its vote
+            // go to its own file — and none of the files' own turns.
+            let not_calibration: HashSet<StreamId> = files
                 .iter()
                 .flat_map(|f| {
                     f.arc_turn
                         .iter()
                         .map(|t| turn_stream_id(f.timeline.raw(), t.0))
                 })
+                .chain(probes.iter().map(|(_, sid, _)| *sid))
                 .collect();
             let content = scan(false, HashSet::new(), sigs.clone())?;
             let content = chunk_mass(
@@ -168,7 +175,7 @@ impl Conversation {
                 &in_file_order(&files, &content),
                 Competition::Content,
             );
-            let calibration = scan(true, own_turns, sigs)?;
+            let calibration = scan(true, not_calibration, sigs)?;
             let calibration = chunk_mass(
                 &files,
                 &owned,
