@@ -1,0 +1,197 @@
+# MCP guides: a skill library the connector serves
+
+**Status: designed, not built.** Written 2026-10-26 from the review of two Zen
+research runs and a design discussion that followed. It extends
+`docs/mcp_app.md` (the aggregator) and `docs/claude_zend_gateway.md` (zend's
+tools). Where this document and those disagree about guides, this one is
+authoritative; fix the others in the same change that builds it.
+
+## 1. Why
+
+A method — how to research, how to verify a worker's output, how to deploy —
+is what turns zend's tools into good work. Today that method lives in the
+repository's `skills/`, which reaches only a Claude Code session opened in
+this repository. Every other place Claude meets the connector goes without:
+
+| Channel | claude.ai | Claude Code | Reach |
+|---|---|---|---|
+| Repo `skills/` | no | only in this repo | one checkout |
+| Skills uploaded to claude.ai | yes, after a manual ZIP upload | yes, synced to `~/.claude/skills/synced/` (v2.1.273+) | every machine signed in, but hand-maintained and drifting from the tools |
+| Server `instructions` | **dropped** | delivered (truncated ~2 KB) | unreliable |
+| MCP prompts | requested (`prompts/list`) but **not shown** in the UI (anthropics/claude-ai-mcp#333, open) | slash commands `/mcp__<server>__<prompt>` | Claude Code only |
+| **Tool descriptions and tool results** | **delivered** | **delivered** | **every client** |
+
+The one channel every client delivers is the tools. So the method is served
+as tools.
+
+Evidence that the method must reach the worker, not just Claude: a research run
+delegated from claude.ai searched ~40 times and fetched 5 pages, cited
+"primary sources" it never opened, and took its standout figures from one
+aggregator page. The method in the repo skill would have prevented it; it never
+reached the conversation.
+
+## 2. The guide library
+
+### 2.1 What a guide is
+
+One Markdown file per guide, with YAML frontmatter, in the aggregator:
+`mcp/src/guides/<name>.md`. The format is SKILL.md's, plus `tools`, so a guide
+can also be zipped as a claude.ai skill if ever wanted.
+
+```markdown
+---
+name: research
+description: A question answered from the web, every claim checked against the page it came from.
+tools: [task_start, task_wait, task_reply, journal_grep, timeline_read]
+---
+# Research
+...the method...
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | What `guide_read` takes; equals the file's stem |
+| `description` | One line, "use when…": shown in the catalogue and on each listed tool |
+| `tools` | The tools this guide applies to — any backend's |
+| body | The method itself |
+
+### 2.2 Compiled in
+
+The folder is embedded with `include_dir!` (as zend embeds its prompts) and
+parsed once at startup into `Guide { name, description, tools, body }`
+(`mcp/src/guides/mod.rs`). A new `.md` dropped in the folder is picked up by the
+next build with no list to edit.
+
+- The guides ship in the same binary as the aggregator, so a guide and the
+  version it describes are released together.
+- Editing a guide is a commit, a rebuild of `mcp` and a restart — about a
+  minute on AlienWorld, touching neither zend nor npcd.
+- **Tests** parse every embedded guide: frontmatter present, `name` equals the
+  file stem, names unique, a non-empty `description` and `tools`, a body.
+  A broken guide fails `cargo test`, never a session.
+- Whether a guide's `tools` exist is known only at runtime (the backends' tools
+  arrive by `tools/list`): a guide naming a tool no backend lists is logged as a
+  warning when the list is merged.
+
+### 2.3 The tools
+
+The aggregator's own tools — the only ones it serves itself, named by the rule
+of `docs/mcp_app.md` (what it acts on, then what it does):
+
+- **`guide_list`** — the catalogue: every guide's `name` and `description`.
+  Its description says to call it once at the start of any conversation that
+  uses this connector, before starting work, and carries the catalogue itself
+  (generated), so Claude sees what is on offer even without the call.
+- **`guide_read {name}`** — one guide's body. An unknown name answers the
+  catalogue with the error.
+
+### 2.4 The "Guides" line
+
+When the aggregator merges the backends' `tools/list`, it appends one generated
+line to the description of every tool some guide lists:
+
+> **Guides:** `research` — a question answered from the web, every claim
+> checked; `verify` — checking a finished worker's output. Read one with
+> `guide_read` before you start.
+
+Only names and one-liners; the method arrives on demand. The backends know
+nothing of guides. A guide may span backends — a bot guide can list `bot_*`
+and `task_*` tools alike.
+
+### 2.5 What moves
+
+`skills/` becomes the first guides: `zend-thread` (as the base guide every
+other refers to), `zend-research`, `zend-implement`, `zend-review`,
+`zend-test`, `zend-deploy`, `zend-release`, `zend-rollback`, `zend-watch`,
+`cluster-care`, plus a new `bots` guide for npcd's tools. Each repo skill
+shrinks to a pointer — "call `guide_read {name: research}`" — kept only for
+Claude Code's automatic loading, or is removed.
+
+### 2.6 Later: `guide_edit`
+
+A tool for Claude to refine a guide when a run shows the method was wrong
+(the research review would have been a lasting edit, not a one-off prompt).
+With compiled guides this is a commit, not a tool; if guides ever move to
+records, `guide_edit` writes one, journalled with who and why, applied at once
+or held for the user's approval — the user's call.
+
+## 3. Continuing a finished worker
+
+`task_reply` today answers a worker that asked, is stuck, or was stopped; a
+finished worker is archived and a reply to it is refused. The worker's
+conversation persists, so it can be continued:
+
+- `task_reply` accepts a `done` worker too: the worker is un-archived, the
+  reply is its next turn with its whole context, and it answers as
+  `task_start` does. Its new journal entries are the reply's.
+- This is the verification path: the same worker that did the research is asked
+  to open what it skipped and correct itself, rather than a new worker starting
+  cold.
+- It is an MCP tool, so claude.ai and Claude Code get it alike. (Claude Code
+  can also continue its own subagents; claude.ai has none, so zend workers are
+  its only ones.)
+
+## 4. Citation audit
+
+Every finished task's answer carries an audit of the URLs its final response
+cites, against what the worker actually did in its turns:
+
+| Mark | Meaning |
+|---|---|
+| opened | fetched with `web_fetch` (its `final_url`) |
+| seen | appeared only in a `web_search` result: the snippet, not the page |
+| never seen | cited, but nothing in the run touched it — inferred or invented |
+
+zend already reads the tool calls a turn made (`tools::extract_tool_calls`) and
+their results are the coupled turns' user halves, so the audit is deterministic
+and cheap. It goes at the end of what `task_wait` / `task_start` answer for a
+`done` worker.
+
+**One automatic correction round.** When anything cited is `seen` or
+`never seen`, zend replies to the worker once by itself (§3): "you cited X, Y, Z
+without opening them — fetch them and correct your answer, or mark those claims
+unverified." The task answers after that round, with the audit of the
+corrected answer. Default for every task; a task may opt out.
+
+## 5. The research guide
+
+The first guide written against §3 and §4:
+
+1. **Gather** — search widely for the candidates.
+2. **Verify** each item reported: fetch its primary source; search for
+   independent evidence in both directions; settle conflicting figures by
+   source quality (primary, then independent measurement, then reporting) and
+   say why; a figure seen only on an aggregator is marked as such; text not
+   found in a fetched page is not proof it was not published — a page reporting
+   `images` may have shown it as a picture.
+3. **Check itself** — the draft against itself before answering.
+4. **Answer** in `ANSWER / DETAIL / CONFLICTS / UNVERIFIED / SOURCES`.
+5. **Claude's side**: start with `effort: exhaustive`; read the audit; if it is
+   not clean after the automatic round, `task_reply` the worker to fix what
+   remains; spot-check with `timeline_read {turn}` — the queries, fetched text
+   and the dials the worker ran at.
+
+## 6. Build order
+
+1. Guides: the loader, `guide_list`, `guide_read`, the "Guides" line, the
+   skills converted, tests, `docs/mcp_app.md` updated.
+2. Continue a finished worker (§3).
+3. Citation audit and the correction round (§4).
+4. The research and verify guides rewritten against 2 and 3 (§5).
+
+Releases: 1 is the aggregator alone (AlienWorld); 2 and 3 are zend (BlackWorld,
+rolling to the cluster).
+
+## 7. Decisions
+
+- **Tools, not prompts or instructions**, carry the method: they are the one
+  channel every client delivers (§1).
+- **The aggregator owns the guides**: one library over every backend's tools,
+  with the backends unaware of it.
+- **Compiled in, not read at runtime**: one version with the code that serves
+  it, checked by tests; a guide edit costs a rebuild of the aggregator only.
+- **`guide_list` / `guide_read`**, two tools rather than one with an optional
+  argument, by the naming rule.
+- **Verification by the same worker** (§3), not a fresh one.
+- **The audit is zend's, deterministic**; the correction round is one round,
+  never a loop.
