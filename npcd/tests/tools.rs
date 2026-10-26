@@ -366,7 +366,8 @@ fn a_refused_edit_at_a_desk_is_not_shown_to_the_room() {
     stand(&h, "m1", "vault-story", "first-room");
     let edit = act(
         "file_edit",
-        json!({"path": "layers/eras/no-such-era.md", "old_str": "a flood", "new_str": "a fire"}),
+        json!({"path": "layers/eras/no-such-era.md", "at": "Qm7x", "do": "replace",
+               "old": "a flood", "text": "a fire"}),
     );
     let why = refused(&perform(&h, "m1", &edit)).to_string();
     witnessed::show(&h, "m1", &edit, &why);

@@ -15,19 +15,36 @@ use zend_tools::Replay;
 
 use harness::REPO;
 
-/// An edit whose result is already in the file is reported rather than
-/// applied twice — an occurrence of the old text inside the new is the edit's
-/// own result — so the same edit re-sent leaves the same file rather than
-/// compounding (`3` → `30` → `300`).
+/// A replace or delete re-sent after it landed names an anchor its part no
+/// longer has and is refused, rather than compounding (`3` → `30` → `300`);
+/// a move re-sent puts its part where it already stands. An insert leaves its
+/// anchor as it was, so the same insert re-sent would land twice — it is the
+/// one edit a resumed turn may not re-issue.
 #[test]
-fn a_file_edit_may_be_re_issued() {
-    let args = serde_json::json!({
-        "repo": REPO,
-        "path": "src/main.rs",
-        "old_text": "old",
-        "new_text": "new",
-    });
-    assert_eq!(harness::replay("file_edit", args), Replay::Safe);
+fn a_file_edit_may_be_re_issued_unless_it_inserts() {
+    let edit = |action: &str| {
+        serde_json::json!({
+            "repo": REPO,
+            "path": "src/main.rs",
+            "at": "Qm7x",
+            "do": action,
+            "text": "new",
+        })
+    };
+    for safe in ["replace", "delete", "move"] {
+        assert_eq!(
+            harness::replay("file_edit", edit(safe)),
+            Replay::Safe,
+            "{safe}"
+        );
+    }
+    for unsafe_ in ["insert_before", "insert_after"] {
+        assert_eq!(
+            harness::replay("file_edit", edit(unsafe_)),
+            Replay::Unsafe,
+            "{unsafe_}"
+        );
+    }
 }
 
 /// Reads change nothing, so a resumed turn simply reads again.

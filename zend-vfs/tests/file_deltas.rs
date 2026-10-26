@@ -23,7 +23,7 @@
 use std::path::Path;
 
 use zend_vfs::file_delta::{self, Diverged, FileDelta, FileTimes, ReplayError, Splice, TimedDelta};
-use zend_vfs::{replace, VfsStore};
+use zend_vfs::VfsStore;
 
 // ── The generator ────────────────────────────────────────────────────────────
 
@@ -415,39 +415,12 @@ fn line_edit(rng: &mut Lcg, doc: &Doc, unique: &mut usize) -> Doc {
     out
 }
 
-/// The `old_text` / `new_text` a model would send `file_edit` for `old` →
-/// `new`: the lines that changed, with one unchanged line either side of them
-/// where there is one — which also gives a pure insertion something to quote.
-fn replacement(old: &Doc, new: &Doc) -> (String, String) {
-    let (a, b) = (&old.lines, &new.lines);
-    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
-    let suffix = a[prefix..]
-        .iter()
-        .rev()
-        .zip(b[prefix..].iter().rev())
-        .take_while(|(x, y)| x == y)
-        .count();
-    let from = prefix.saturating_sub(1);
-    let text = |lines: &[String]| {
-        Doc {
-            lines: lines.to_vec(),
-            eol: old.eol,
-            trailing_newline: true,
-        }
-        .text()
-    };
-    let a_to = (a.len() - suffix + 1).min(a.len());
-    let b_to = (b.len() - suffix + 1).min(b.len());
-    (text(&a[from..a_to]), text(&b[from..b_to]))
-}
-
 /// **Edits built, stored and applied — into the overlay and elsewhere.**
 ///
-/// For each case a workspace file is edited eight times. Each edit is the old
-/// and new text a model would quote, generated against the file as it stands,
-/// applied by `file_edit`'s replace engine, and recorded in an overlay store,
-/// which holds deltas and never touches its disk. After every step it holds
-/// the engine's result.
+/// For each case a workspace file is edited eight times. Each edit is a random
+/// line edit of the file as it stands, recorded in an overlay store, which
+/// holds deltas and never touches its disk. After every step it holds the
+/// edited text.
 ///
 /// Then the overlay's recorded chain is applied to a fresh overlay over a
 /// pristine copy of the workspace, reproducing the conversation's view there.
@@ -471,26 +444,14 @@ fn edits_are_built_stored_and_applied_to_the_overlay_and_elsewhere() {
             if next.text() == doc_text {
                 continue;
             }
-            let (old, new) = replacement(&doc, &next);
-            let patched = replace::apply(&doc_text, &old, &new, false).unwrap_or_else(|e| {
-                panic!("case {case} step {step}: {e}\nold: {old:?}\nnew: {new:?}")
-            });
-            assert_eq!(patched.replacements, 1, "case {case} step {step}");
-            assert_eq!(
-                patched.content,
-                next.text(),
-                "case {case} step {step}: the engine's result"
-            );
-
-            overlay
-                .edit("src/file.rs", patched.content.clone())
-                .unwrap();
+            let patched = next.text();
+            overlay.edit("src/file.rs", patched.clone()).unwrap();
             assert_eq!(
                 overlay.read("src/file.rs").unwrap().as_deref(),
-                Some(patched.content.as_str()),
+                Some(patched.as_str()),
                 "case {case} step {step}: overlay"
             );
-            doc_text = patched.content;
+            doc_text = patched;
             doc = next;
         }
 

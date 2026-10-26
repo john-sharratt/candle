@@ -39,10 +39,9 @@ use candle_conversation::working_set::WorkingSetConfig;
 use candle_conversation::ConversationEngine;
 use serde_json::{json, Value};
 use zend_tools::tools::file::render::file_anchor;
-use zend_vfs::vfs::PAGE_LINES;
 use zend_vfs::{Oid, RepoFiles, Workspace};
 
-use crate::branch_ingest::keys::{file_key, CONTENT_KEY, LINES_KEY};
+use crate::branch_ingest::keys::{file_key, CONTENT_KEY, PAGES_KEY};
 use crate::code_read::chain_finished;
 use crate::tool_round::Step;
 use crate::tools::{ToolCall, ToolResult};
@@ -73,8 +72,7 @@ const IN_CONTEXT: &str = "in_context";
 /// read, not this conversation. Told it had already read it, the model
 /// searched its own reads, found none, and called the reply false. `in_context`
 /// says what is true: the content is here, at this anchor.
-fn served_response(anchor: String, page: u32, lines: usize) -> Value {
-    let pages = page_count(lines);
+fn served_response(anchor: String, page: u32, pages: u32) -> Value {
     json!({
         "status": IN_CONTEXT,
         "anchor": format!("{anchor} page={page} pages={pages}"),
@@ -88,11 +86,6 @@ fn requested_page(call: &ToolCall) -> u64 {
         .get("page")
         .and_then(Value::as_u64)
         .unwrap_or(1)
-}
-
-/// How many pages a file of `lines` lines reads as.
-fn page_count(lines: usize) -> u32 {
-    (lines as u32).div_ceil(PAGE_LINES).max(1)
 }
 
 /// One call the fast path answered, for the caller to log and to mark on the
@@ -171,7 +164,7 @@ fn read_key(step: &Step, workspace: &Workspace) -> Option<(String, String, Strin
 }
 
 /// The finished, complete `code_reading` conversation that read `rel` in
-/// `repo` at the blob the conversation's base holds, with its line count —
+/// `repo` at the blob the conversation's base holds, with its page count —
 /// `None` when the conversation changed the file (its own copy is what its
 /// read must return), no conversation read that version, or none that did
 /// read every page.
@@ -181,7 +174,7 @@ pub fn file_conversation(
     coverage: &Coverage,
     repo: &str,
     rel: &str,
-) -> Option<(TimelineId, usize)> {
+) -> Option<(TimelineId, u32)> {
     let (blob, _) = committed(files, repo, rel)?;
     engine
         .find_conversations_by_metadata(CONTENT_KEY, &file_key(&format!("{repo}/{rel}"), &blob))
@@ -195,10 +188,10 @@ pub fn file_conversation(
         // reading of the same version may be whole.
         .filter(|&tl| engine.holds_whole(tl))
         .find_map(|tl| {
-            let lines = lines_of(engine, tl)?;
+            let pages = pages_of(engine, tl)?;
             coverage
-                .is_complete(engine, tl, lines)
-                .then_some((tl, lines))
+                .is_complete(engine, tl, pages)
+                .then_some((tl, pages))
         })
 }
 
@@ -222,6 +215,11 @@ impl Screen<'_> {
         let Step::Run(call) = step else {
             return None;
         };
+        // A read by `line` names its page only through the file's content —
+        // which page holds that line's part — so it runs for real.
+        if call.arguments.get("line").is_some_and(|l| !l.is_null()) {
+            return None;
+        }
         self.read_hit(key, &repo, &rel, requested_page(call))
     }
 
@@ -237,10 +235,10 @@ impl Screen<'_> {
             // working set refuses is not in the projection, so claiming it
             // would be a lie.
             file_conversation(&e, self.files, self.coverage, repo, rel)
-                .filter(|&(_, lines)| (1..=u64::from(page_count(lines))).contains(&page))
+                .filter(|&(_, pages)| (1..=u64::from(pages)).contains(&page))
                 .filter(|&(tl, _)| self.lock(&e, tl, &key))
         };
-        let Some((timeline, lines)) = locked else {
+        let Some((timeline, pages)) = locked else {
             tracing::debug!(
                 target: "zend::fast_path",
                 path = %key,
@@ -250,7 +248,7 @@ impl Screen<'_> {
             return None;
         };
         Some(Hit {
-            response: served_response(file_anchor(repo, rel), page as u32, lines),
+            response: served_response(file_anchor(repo, rel), page as u32, pages),
             served: Served {
                 tool: FILE_READ,
                 path: key,
@@ -344,15 +342,15 @@ fn committed(files: &RepoFiles, repo: &str, rel: &str) -> Option<(Oid, u64)> {
     files.repo(repo).ok()?.content_id(rel).ok()?
 }
 
-/// How many lines the file `timeline` read holds, as its ingest recorded it.
-/// `None` for a conversation that recorded none: an answer that cannot say
+/// How many pages the file `timeline` read reads as, as its ingest recorded
+/// it. `None` for a conversation that recorded none: an answer that cannot say
 /// how much the model already has is not given.
-fn lines_of(engine: &ConversationEngine, timeline: TimelineId) -> Option<usize> {
-    lines_in(&engine.conversation_metadata(timeline)?)
+fn pages_of(engine: &ConversationEngine, timeline: TimelineId) -> Option<u32> {
+    pages_in(&engine.conversation_metadata(timeline)?)
 }
 
-fn lines_in(meta: &BTreeMap<String, String>) -> Option<usize> {
-    meta.get(LINES_KEY)?.parse().ok()
+fn pages_in(meta: &BTreeMap<String, String>) -> Option<u32> {
+    meta.get(PAGES_KEY)?.parse().ok()
 }
 
 #[cfg(test)]
@@ -455,12 +453,12 @@ mod tests {
     /// very read the fast path just avoided.
     #[test]
     fn a_served_call_is_the_status_and_the_page_anchor() {
-        let reply = served_response(file_anchor("candle", "Cargo.toml"), 1, 42);
+        let reply = served_response(file_anchor("candle", "Cargo.toml"), 1, 1);
         assert_eq!(
             serde_json::to_string(&reply).unwrap(),
             r#"{"status":"in_context","anchor":"file=candle/Cargo.toml page=1 pages=1"}"#
         );
-        let later = served_response(file_anchor("candle", "a.rs"), 2, 450);
+        let later = served_response(file_anchor("candle", "a.rs"), 2, 3);
         assert_eq!(
             serde_json::to_string(&later).unwrap(),
             r#"{"status":"in_context","anchor":"file=candle/a.rs page=2 pages=3"}"#
@@ -468,24 +466,26 @@ mod tests {
     }
 
     /// The page anchor is exactly what that page's fence carries, so the model
-    /// can find it in context byte for byte.
+    /// can find it in context byte for byte — with the page count the ingest
+    /// records for the same text.
     #[test]
     fn the_page_anchor_occurs_in_the_pages_fence() {
-        let fence = zend_tools::tools::file::render::numbered_excerpt(
-            "candle", "a.rs", 2, 3, 201, 400, 450, "rust", "x",
+        use zend_tools::tools::file::render::{anchored_page, page_count};
+        let text: String = (0..300).map(|i| format!("fn f{i}() {{}}\n\n")).collect();
+        let pages = page_count("a.rs", &text);
+        assert!(pages >= 2, "{pages}");
+        let doc = doc_units::Doc::new("a.rs", &text);
+        let fence = anchored_page("candle", "a.rs", &doc, 2, "rust");
+        let reply = served_response(file_anchor("candle", "a.rs"), 2, pages);
+        assert!(
+            fence.contains(reply["anchor"].as_str().unwrap()),
+            "{fence:.120}"
         );
-        let reply = served_response(file_anchor("candle", "a.rs"), 2, 450);
-        assert!(fence.contains(reply["anchor"].as_str().unwrap()));
     }
 
-    /// A file's pages, as the tool counts them; a read asking no page asks for
-    /// the first.
+    /// A read asking no page asks for the first.
     #[test]
-    fn pages_count_from_the_line_total_and_a_bare_read_asks_page_one() {
-        assert_eq!(page_count(1399), 7);
-        assert_eq!(page_count(200), 1);
-        assert_eq!(page_count(201), 2);
-        assert_eq!(page_count(0), 1);
+    fn a_bare_read_asks_page_one() {
         let call = |args: Value| ToolCall {
             name: FILE_READ.to_string(),
             arguments: args,
@@ -589,16 +589,16 @@ mod tests {
         assert_eq!(committed(&files, "other", "a.rs"), None);
     }
 
-    /// **The line count is the one the ingest recorded**, and a conversation
+    /// **The page count is the one the ingest recorded**, and a conversation
     /// that recorded none — or something that is no count — answers nothing.
     #[test]
-    fn the_line_count_is_the_one_the_ingest_recorded() {
+    fn the_page_count_is_the_one_the_ingest_recorded() {
         let mut meta = BTreeMap::from([(CONTENT_KEY.to_string(), "k".to_string())]);
-        assert_eq!(lines_in(&meta), None);
-        meta.insert(LINES_KEY.to_string(), "42".to_string());
-        assert_eq!(lines_in(&meta), Some(42));
-        meta.insert(LINES_KEY.to_string(), "many".to_string());
-        assert_eq!(lines_in(&meta), None);
+        assert_eq!(pages_in(&meta), None);
+        meta.insert(PAGES_KEY.to_string(), "3".to_string());
+        assert_eq!(pages_in(&meta), Some(3));
+        meta.insert(PAGES_KEY.to_string(), "many".to_string());
+        assert_eq!(pages_in(&meta), None);
     }
 
     fn config() -> WorkingSetConfig {

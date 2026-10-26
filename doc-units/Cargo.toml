@@ -1,0 +1,31 @@
+[package]
+name = "doc-units"
+version = "0.1.0"
+edition = "2021"
+description = "A file as the units an author edits — paragraphs of prose, scopes of code — each named by a content anchor, and the edits that name them (docs/npcd_anchored_edits.md)."
+
+[lib]
+name = "doc_units"
+path = "src/lib.rs"
+
+[dependencies]
+base64 = { workspace = true }
+sha2   = "0.10"
+# The per-language syntax trees code is carved by. `tree-sitter` sets
+# `links = "tree-sitter"`, so exactly one version exists in the workspace —
+# the 0.26 `yamlpatch` needs (see the workspace manifest). The grammars moved
+# to `LANGUAGE`, a `LanguageFn` constant, in place of the old `language()`.
+tree-sitter             = "0.26"
+tree-sitter-rust        = "0.24"
+tree-sitter-python      = "0.25"
+tree-sitter-typescript  = "0.23"
+tree-sitter-javascript  = "0.25"
+tree-sitter-go          = "0.25"
+tree-sitter-c           = "0.24"
+tree-sitter-cpp         = "0.23"
+tree-sitter-java        = "0.23"
+tree-sitter-ruby        = "0.23"
+tree-sitter-php         = "0.24"
+tree-sitter-bash        = "0.25"
+tree-sitter-html        = "0.23"
+tree-sitter-css         = "0.25"

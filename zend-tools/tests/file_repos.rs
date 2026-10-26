@@ -59,6 +59,8 @@ fn groups<'a>(
         .collect()
 }
 
+/// The text of a rendered `file_read` page of a plain-text file: its parts
+/// with their `XXXX| ` anchors taken off.
 fn excerpt_source(resp: &serde_json::Value) -> String {
     let text = resp.as_str().expect("file_read returns a rendered string");
     let body = text
@@ -68,7 +70,10 @@ fn excerpt_source(resp: &serde_json::Value) -> String {
         .map(|(body, _)| body)
         .unwrap_or("");
     body.lines()
-        .map(|l| l.split_once("  ").map(|(_, t)| t).unwrap_or(l))
+        .map(|l| match l.split_once("| ") {
+            Some((a, rest)) if doc_units::anchor::is_anchor(a) => rest,
+            _ => l,
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

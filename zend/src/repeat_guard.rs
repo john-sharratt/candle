@@ -156,9 +156,8 @@ impl RepeatGuard {
     ///
     /// A mutating call its tool refused changed nothing, so it is screened
     /// like a read: a turn sent the same ambiguous `file_edit` nine rounds
-    /// running, each answered "occurs 9 times — include more of the lines, or
-    /// set `replace_all`", and the guard never fired because every one counted
-    /// as a mutation and cleared the counts.
+    /// running, each answered "occurs 9 times", and the guard never fired
+    /// because every one counted as a mutation and cleared the counts.
     ///
     /// A round is compared with the rounds before it, never with itself, so
     /// identical calls batched into one round all run — and all count.
@@ -441,8 +440,8 @@ mod tests {
             vec![result(
                 "file_edit",
                 json!({"repo": "candle", "path": "docs/a.md",
-                       "old_text": "W_warm_max", "new_text": "B_out"}),
-                json!({"error": "ambiguous", "detail": "`old_text` occurs 9 times"}),
+                       "at": "Qm7x", "do": "replace", "old": "W_warm_max", "text": "B_out"}),
+                json!({"error": "ambiguous", "detail": "`old` occurs 9 times in Qm7x"}),
             )]
         };
         passes(&mut guard, ambiguous, NOTICE_FROM - 1);

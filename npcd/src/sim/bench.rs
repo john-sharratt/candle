@@ -39,6 +39,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use doc_units::render::{around, pages, units, PAGE_LINES};
+use doc_units::{apply, Doc, Edit, Language};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -78,40 +80,6 @@ impl Change {
             (Some(_), None) => "gone",
             _ => "changed",
         }
-    }
-}
-
-/// The longest document a refused edit hands back whole, in words. A life
-/// event or a story fits; a longer document is read back in its own turn.
-const SHOWN_WHOLE: usize = 900;
-
-/// Why an edit found nothing to replace, and what is actually there.
-///
-/// "Read it back" alone was not followed: Makers went on quoting the text of
-/// their own refused edits, sure those had landed, and were refused turn after
-/// turn. The document as it stands is what the next edit has to quote, so a
-/// document short enough to show is shown.
-///
-/// Shown it, one Maker went on refused nine times: it was quoting an earlier
-/// version as what to replace and the document as it stands as the
-/// replacement — rewriting the piece through a tool for changing a passage of
-/// it. So the refusal names the act that does what it was after.
-fn not_there(key: &str, current: &str) -> String {
-    let refused = format!(
-        "That does not appear in {key} — what you are replacing has to be what is actually \
-         there, word for word."
-    );
-    let rewrite = "If you meant to replace the whole piece, write it whole again rather than \
-                   editing it.";
-    match current.split_whitespace().count() {
-        0 => format!("{refused} {key} is empty: write it whole first."),
-        n if n <= SHOWN_WHOLE => {
-            format!(
-                "{refused} {rewrite} It says, as it stands now:\n\n{}",
-                current.trim_end()
-            )
-        }
-        _ => format!("{refused} {rewrite} Otherwise read it back first."),
     }
 }
 
@@ -314,22 +282,21 @@ impl Benches {
         shelf.read(&key).ok_or_else(|| self.missing(&key, shelf))
     }
 
-    /// Read a document as a numbered excerpt, capped at [`MAX_READ_LINES`].
+    /// Read one page of a document, its parts under their anchors
+    /// (`docs/npcd_anchored_edits.md` §5).
     ///
     /// What the `file_read` act returns. [`Benches::read`] stays raw because an
-    /// edit matches against the document's own text, and matching against a
-    /// rendering with line numbers stuck to the front of every line would never
-    /// find anything.
+    /// edit is applied to the document's own text, never to its rendering.
     pub fn excerpt(
         &self,
         body: &str,
         raw: &str,
-        start_line: usize,
+        page: usize,
         shelf: &dyn Shelf,
     ) -> Result<String, String> {
         let key = self.doc(raw)?;
         let content = self.read(body, raw, shelf)?;
-        Ok(numbered_excerpt(&key, &content, start_line))
+        Ok(anchored_excerpt(&key, &content, page))
     }
 
     /// Write a document whole.
@@ -396,36 +363,31 @@ impl Benches {
         self.write(body, about, &key, &next, shelf)
     }
 
-    /// Replace one span of a document, where it appears exactly once.
+    /// Make one anchored edit to a document as this body has it
+    /// (`docs/npcd_anchored_edits.md` §6), and answer with what was done and
+    /// the parts it wrote under their new anchors, between the parts either
+    /// side of them.
     ///
-    /// The uniqueness rule is what makes an edit safe without reading the whole
-    /// document back: an ambiguous target is refused rather than applied to
-    /// whichever of three the scan happened to reach first.
+    /// **An anchor the document no longer has is refused** — its part changed
+    /// since it was read — so an edit is never applied to text the character
+    /// did not see; the refusal says to read it again.
     pub fn edit(
         &mut self,
         body: &str,
         about: &str,
         raw: &str,
-        old: &str,
-        new: &str,
+        edit: &Edit,
         shelf: &dyn Shelf,
     ) -> Result<String, String> {
-        if old.is_empty() {
-            return Err("Replacing nothing would put your text everywhere at once.".into());
-        }
         let key = self.doc(raw)?;
         let current = self.read(body, raw, shelf)?;
-        match current.matches(old).count() {
-            0 => Err(not_there(&key, &current)),
-            1 => {
-                let next = current.replacen(old, new, 1);
-                self.write(body, about, raw, &next, shelf)
-            }
-            n => Err(format!(
-                "That appears {n} times in {key}, so changing it would change the wrong one. Give \
-                 more of the text around it."
-            )),
-        }
+        let done = apply(&Doc::new(&key, &current), edit).map_err(|e| format!("In {key}, {e}."))?;
+        self.write(body, about, raw, &done.doc.text(), shelf)?;
+        Ok(format!(
+            "{key}: {}\n{}",
+            done.summary,
+            around(&done.doc, &done.touched, done.at_line)
+        ))
     }
 
     /// Read one field out of a YAML document.
@@ -791,53 +753,51 @@ fn editable_area(p: &MindPath) -> bool {
     }
 }
 
-/// The most lines one read returns.
+/// Header, fence and anchored parts — the shape a read returns.
 ///
-/// **A tool result lands in the conversation verbatim**, so an uncapped read is
-/// a context hazard: one long `.yaml` would fill a character's whole window and
-/// push out the turns that gave it a reason to be reading. The cap applies
-/// whether or not a start was named, so it cannot be walked around by asking
-/// for a wide range, and the header carries the continuation signal.
-pub const MAX_READ_LINES: usize = 200;
-
-/// Header, fence and `cat -n` body — the shape an editing tool returns.
+/// **A tool result lands in the conversation verbatim**, so a read is one
+/// page: whole parts up to [`PAGE_LINES`] lines. One long `.yaml` would
+/// otherwise fill a character's whole window and push out the turns that gave
+/// it a reason to be reading. A page past the end reads the last one rather
+/// than returning nothing, which a model reads as "the document is empty" and
+/// acts on; the header and a closing line carry the continuation signal.
 ///
-/// Numbered because the number is what makes the *next* act precise: an edit
-/// names text, and a character that can see which line it is on picks a target
-/// that appears once instead of one that appears three times.
-fn numbered_excerpt(path: &str, content: &str, start_line: usize) -> String {
-    // Split on '\n' rather than `lines()`: a trailing newline must not shift the
-    // numbering, and the phantom last element it leaves is dropped by count.
-    let all: Vec<&str> = content.split('\n').collect();
-    let total = match all.last() {
-        Some(&"") => all.len().saturating_sub(1),
-        _ => all.len(),
-    };
-    if total == 0 {
+/// Each part shows under its anchor, which is what makes the *next* act
+/// precise: an edit names the part by it, so the character never has to copy
+/// the words it is changing to say where they are.
+fn anchored_excerpt(path: &str, content: &str, page: usize) -> String {
+    let doc = Doc::new(path, content);
+    if doc.units().is_empty() {
         return format!("\n{path} (empty):\n\n```\n```\n");
     }
-
-    // A start past the end reads the last line rather than returning nothing,
-    // which a model reads as "the file is empty" and acts on.
-    let start = start_line.clamp(1, total);
-    let end = (start + MAX_READ_LINES - 1).min(total);
-    let width = end.to_string().len();
-    let mut numbered = String::with_capacity(content.len() + 8);
-    for (idx, line) in all[start - 1..end].iter().enumerate() {
-        let no = start + idx;
-        numbered.push_str(&format!("{no:width$}  {line}\n"));
-    }
-
-    let range = match end >= total {
-        true => format!("lines {start}-{end}"),
-        false => format!("lines {start}-{end} of {total}"),
+    let all = pages(&doc, PAGE_LINES);
+    let page = page.clamp(1, all.len());
+    let range = all[page - 1].clone();
+    let n = doc.units().len();
+    let parts = match doc.language() {
+        Language::Markdown | Language::PlainText => "paragraphs",
+        Language::Yaml => "lines",
+        _ => "parts",
     };
-    let tag = match path.rsplit_once('.') {
-        Some((_, "yaml")) => "yaml",
-        Some((_, "md")) => "markdown",
+    let header = match all.len() {
+        1 if n == 1 => format!("{path} (1 {})", parts.trim_end_matches('s')),
+        1 => format!("{path} ({n} {parts})"),
+        total => format!(
+            "{path} (page {page} of {total}: {parts} {}–{} of {n})",
+            range.start + 1,
+            range.end
+        ),
+    };
+    let more = match page < all.len() {
+        true => format!("There is more: the next read asks for page {}.\n", page + 1),
+        false => String::new(),
+    };
+    let tag = match doc.language() {
+        Language::Yaml => "yaml",
+        Language::Markdown => "markdown",
         _ => "",
     };
-    format!("\n{path} ({range}):\n\n```{tag}\n{numbered}```\n")
+    format!("\n{header}:\n\n```{tag}\n{}```\n{more}", units(&doc, range))
 }
 
 #[cfg(test)]

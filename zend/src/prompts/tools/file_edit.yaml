@@ -27,8 +27,10 @@ questions:
 - add a method right after the existing list function
 - insert an import below the others at the top
 - delete the stale commented-out block in utils
+- move that helper below the function that calls it
+- rewrite the body of that function
 category: Files
-description: 'Replace one piece of text in an existing file of the named repo with another. The file may be one this session created or one from the repository on disk — editing a project file copies it into the session first, so the version on disk is never modified. `old_text` is the text to change, copied from the file exactly as it stands — whole lines, with enough of the lines around it to occur only once, and without the line numbers `file_read` shows; `new_text` is what takes its place, empty to delete it. Text quoted at the wrong indentation is still found, and the new text is re-indented to the file''s. Text that occurs more than once is refused unless `replace_all` is set; an edit whose result is already in the file is reported as already applied, so re-sending it is safe. Use for: changing a value in a config, updating a function body, adding a method after an existing one, fixing a typo. Triggered by "change X to Y in the file", "update these lines", "fix the value of", "add this after". Returns the repo, the path, how many occurrences were replaced, whether it was already applied, how the text was matched, and the new byte count. For full rewrites use write.'
+description: 'Change one part of an existing file of the named repo by its anchor, leaving the rest exactly as it is. The file may be one this session created or one from the repository on disk — editing a project file copies it into the session first, so the version on disk is never modified. `file_read` shows every part of a file — a function, a type, a block of imports, a paragraph — under a four-character anchor, and for code its scope path (`r7Lm| impl Cache > fn seal`); name the part as `at` and say what to `do`: `replace` it with `text` (or, with `old`, replace just those words inside it), `insert_before` or `insert_after` it a new part `text`, `delete` it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete and move over a run of consecutive parts, `at` through `to`. Write `text` as the part is to stand, indentation included — never with anchors in it. Use for: changing a function body, adding a method after another, fixing a value in a config, removing dead code, reordering items. An anchor that no longer names a part — the file changed since it was read — is refused as stale; read it again and edit by the anchors it shows. Returns what was done and the parts it wrote under their new anchors, between the parts either side of them, so the next edit needs no read. Triggered by "change X to Y in the file", "update this function", "add this after", "remove that", "move this". For a new file, or rewriting most of one, use write.'
 high_risk: false
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
@@ -41,22 +43,51 @@ parameters:
       description: Path of the file to edit, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
       minLength: 1
       type: string
-    old_text:
-      description: The text to replace, copied from the file exactly as it stands — whole lines, with enough of the lines around it that it occurs only once. Without the line numbers `file_read` shows. Required.
-      minLength: 1
+    at:
+      description: The anchor of the part to change — the four characters before the `|` that `file_read` shows it under (e.g. `r7Lm`). Required.
+      maxLength: 4
+      minLength: 4
       type: string
-    new_text:
-      description: The text that takes its place. Empty to delete `old_text`. Required.
+    do:
+      description: What to do there — `replace` it, `insert_before` or `insert_after` it, `delete` it, or `move` it. Required.
+      enum:
+      - replace
+      - insert_before
+      - insert_after
+      - delete
+      - move
       type: string
-    replace_all:
-      default: false
-      description: Replace every occurrence of `old_text` instead of requiring exactly one. Optional; defaults to false.
-      type: boolean
+    text:
+      description: For replace, insert_before and insert_after — the new text, the whole part as it is to stand, its indentation included. Not given for delete or move.
+      type:
+      - string
+      - 'null'
+    old:
+      description: For replace only — words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`; without it the whole part is.
+      type:
+      - string
+      - 'null'
+    to:
+      description: For replace, delete and move — the anchor of the last part of a run of consecutive parts, so the edit covers `at` through `to`.
+      type:
+      - string
+      - 'null'
+    dest:
+      description: For move — the anchor of the part to move it beside.
+      type:
+      - string
+      - 'null'
+    where:
+      description: For move — `before` or `after` `dest`.
+      enum:
+      - before
+      - after
+      type: string
   required:
   - repo
   - path
-  - old_text
-  - new_text
+  - at
+  - do
   title: EditRequest
   type: object
 examples:
@@ -69,3 +100,4 @@ examples:
 - drop the leftover debug println in src/pipeline.rs<|im_end|>
 - add .env to .gitignore<|im_end|>
 - add a len() method after is_empty() in src/queue.rs<|im_end|>
+- move the parse helper in src/cli.rs below main<|im_end|>

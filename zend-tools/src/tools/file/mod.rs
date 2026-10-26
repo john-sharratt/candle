@@ -33,16 +33,17 @@
 //! Paths are normalised before use (see [`VfsStore`]), so
 //! `./src/../src/main.rs`, `/src/main.rs`, and `src/main.rs` are all one entry.
 //!
-//! # `file_edit` replacements
+//! # Anchored parts
 //!
-//! `file_edit` replaces `old_text` — quoted from the file as it stands — with
-//! `new_text`. Text found exactly is replaced; text quoted at the wrong
-//! indentation is found line by line and the replacement re-indented to the
-//! file's. Text that occurs more than once is `ambiguous` unless every
-//! occurrence is asked for; text that is nowhere is `not_found`. An edit whose
-//! result is already in the file counts as already applied, which is what makes
-//! sending it twice a no-op. The engine is [`zend_vfs::replace`], where the
-//! matching and each failure are documented.
+//! `file_read` shows a file in its parts — a function, a type, a block of
+//! imports, a paragraph — each under a four-character anchor hashed from its
+//! text, and `file_edit` names a part by that anchor and says what to do there:
+//! replace it (or words inside it), insert beside it, delete it, move it
+//! (`docs/npcd_anchored_edits.md`). An anchor that names no part of the file as
+//! it stands is `stale`: the part changed since it was read, so the edit is
+//! refused rather than applied to text the caller never saw — and re-sending
+//! an edit that already landed is refused the same way, never applied twice.
+//! The carving, the anchors and the edits are [`doc_units`].
 //!
 //! # `file_present`
 //!
@@ -60,12 +61,13 @@
 //!
 //! | Code | Cause |
 //! |------|-------|
-//! | `not_found` | Path resolves in neither layer (`file_read`, `file_edit`, `file_delete`), or a `file_edit` `old_text` is not in the file |
+//! | `not_found` | Path resolves in neither layer (`file_read`, `file_edit`, `file_delete`), or a `file_edit` `old` is not in its part |
+//! | `stale` | A `file_edit` anchor names no part of the file as it stands — read it again |
 //! | `vfs_full` | Write or copy-up would exceed the 10 MiB session cap |
-//! | `ambiguous` | A `file_edit` `old_text` occurs more than once and `replace_all` is not set |
+//! | `ambiguous` | A `file_edit` `old` occurs in its part more than once |
 //! | `no_files_found` | All requested paths are missing (`file_present`) |
 //! | `unreadable` | Workspace file is above the read limit or is not UTF-8 text |
-//! | `invalid_arguments` | A `file_edit` `old_text` is empty or the same as `new_text`, a `file_grep` pattern is not a valid regex, or a `file_read` path is a web address |
+//! | `invalid_arguments` | A `file_edit` that names no edit — no `text` to write, a span run backwards, a move into itself — a `file_grep` pattern that is not a valid regex, or a `file_read` path that is a web address |
 //! | `forbidden` | The path is under a `secrets/` directory — see [`zend_vfs::vfs`] |
 //! | `unknown_repo` | `repo` names no repository in the workspace; the message lists the ones it does |
 
@@ -74,7 +76,6 @@ use std::sync::Arc;
 use serde::Serialize;
 use thiserror::Error;
 
-use zend_vfs::replace::ReplaceError;
 use zend_vfs::{UnknownRepo, VfsError, VfsStore, ALL_REPOS};
 
 use crate::tools::code::UNKNOWN_REPO;
@@ -108,8 +109,8 @@ pub struct RepoPath {
 /// back.
 ///
 /// `file_read` is bounded too, but carries no `Paging`: its page is required and
-/// fixed at [`zend_vfs::vfs::PAGE_LINES`] lines, and the excerpt header is
-/// its own paging record — `(page P of N, lines a-b of total)` — in the
+/// holds whole parts up to [`render::PAGE_LINES`] lines, and the page's fence
+/// is its own paging record — `page=P pages=N lines=total` — in the
 /// `code_reading` ingest's format. The header serves the model directly, in the
 /// text it is already reading, where a structured field beside a rendered
 /// string would have to be correlated with it.
@@ -204,21 +205,25 @@ pub enum FileError {
     IsUrl(String),
     #[error("VFS storage limit exceeded")]
     VfsFull,
-    /// A `file_edit` `old_text` is nowhere in the file. It shares the
-    /// `not_found` code with a missing path because it is the same answer —
-    /// what the call named is not there — and the detail says which.
+    /// A `file_edit` `old` is nowhere in its part. It shares the `not_found`
+    /// code with a missing path because it is the same answer — what the call
+    /// named is not there — and the detail says which.
     #[error("{0}")]
     TextUnmatched(String),
-    /// A `file_edit` `old_text` occurs more than once.
+    /// A `file_edit` `old` occurs in its part more than once.
     #[error("{0}")]
     Ambiguous(String),
+    /// A `file_edit` anchor names no part of the file as it stands. Its own
+    /// code, not `not_found`: the way out is to read the file again, not to
+    /// look for it.
+    #[error("{0}")]
+    Stale(String),
     #[error("no files found")]
     NoFilesFound,
     #[error("{0}")]
     Unreadable(String),
-    /// A `file_edit` that changes nothing — an empty `old_text`, or a
-    /// `new_text` the same as it — or a `file_grep` pattern that is not a
-    /// valid regular expression.
+    /// A `file_edit` that names no edit that can be made, or a `file_grep`
+    /// pattern that is not a valid regular expression.
     #[error("{0}")]
     InvalidArguments(String),
     /// The path is under a `secrets/` directory. Named distinctly from
@@ -246,6 +251,7 @@ impl ToolError for FileError {
             }
             FileError::VfsFull => "vfs_full",
             FileError::Ambiguous(_) => "ambiguous",
+            FileError::Stale(_) => "stale",
             FileError::NoFilesFound => "no_files_found",
             FileError::Unreadable(_) => "unreadable",
             FileError::InvalidArguments(_) | FileError::IsUrl(_) => "invalid_arguments",
@@ -270,16 +276,6 @@ impl From<VfsError> for FileError {
             }
             VfsError::Unwritable(why) => FileError::Unwritable(why),
             VfsError::Diverged(why) => FileError::Diverged(why),
-        }
-    }
-}
-
-impl From<ReplaceError> for FileError {
-    fn from(e: ReplaceError) -> Self {
-        match e {
-            ReplaceError::Invalid(why) => FileError::InvalidArguments(why),
-            ReplaceError::Ambiguous(why) => FileError::Ambiguous(why),
-            ReplaceError::Unmatched(why) => FileError::TextUnmatched(why),
         }
     }
 }

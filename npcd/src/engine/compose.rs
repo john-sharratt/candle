@@ -19,12 +19,22 @@
 //! vault. What it writes goes into the Maker's working set exactly as a
 //! `file_write` would, through the same checks, and the Maker reads it back,
 //! mends it and commits it.
+//!
+//! **A piece that stands is mended, not written again**
+//! (`docs/npcd_anchored_edits.md` §7). Sent back to put a draft right, the
+//! sitting is shown the piece under its paragraphs' anchors and answers with
+//! `mend` — a list of edits naming the paragraphs it changes — which the engine
+//! makes one by one: the decode is the changes, not the 800 words around them.
+//! A sitting that has to change most of the piece answers with `draft`
+//! instead, and writes it whole.
 
 use candle_conversation::stencil::{Param, ThinkMode, ToolSpec};
-use serde_json::{json, Value};
+use doc_units::render::units;
+use doc_units::{apply, Doc};
+use serde_json::{json, Map, Value};
 
-use crate::engine::act;
 use crate::engine::mission_gen::gates::Voice;
+use crate::engine::{act, work};
 
 /// The call a composition answers with.
 pub const DRAFT: &str = "draft";
@@ -102,7 +112,13 @@ pub fn question(
     }
     let standing = standing.map(str::trim).filter(|t| !t.is_empty());
     if let Some(text) = standing {
-        q.push_str(&format!("\n# `{writes}` as it stands\n\n{text}\n"));
+        // Each paragraph under its anchor, as a read shows it: what a `mend`
+        // names (`docs/npcd_anchored_edits.md` §7).
+        let doc = Doc::new(writes, text);
+        q.push_str(&format!(
+            "\n# `{writes}` as it stands, each paragraph under its anchor\n\n{}",
+            units(&doc, 0..doc.units().len())
+        ));
     }
     let length = match min_words {
         0 => String::new(),
@@ -118,13 +134,27 @@ pub fn question(
     };
     let job = match standing {
         Some(_) => format!(
-            "Write `{writes}` whole again, as it is to stand in the record — keep everything in \
-             it that is right, and put right what your brief says is wrong with it."
+            "Mend `{writes}`: keep everything in it that is right, and put right what your brief \
+             says is wrong with it."
         ),
         None => format!(
             "Write `{writes}` whole — the piece your brief asks for, as it is to stand in the \
              record."
         ),
+    };
+    let answer = match standing {
+        Some(_) => format!(
+            "Answer with `{MEND}`, its `edits` the changes to make, each naming a paragraph by \
+             its anchor above as `at` and saying what to `do` there: `replace` it with `text` — \
+             or, with `old`, change just those words inside it — `insert_after` or \
+             `insert_before` it a new paragraph `text`, or `delete` it; `to` carries a replace \
+             or a delete on through the paragraphs to that anchor. Only if most of the piece has \
+             to change, answer instead with `{DRAFT}`, its `text` the whole piece written again \
+             and nothing but the piece."
+        ),
+        None => {
+            format!("Answer with `{DRAFT}`, its `text` the whole piece and nothing but the piece.")
+        }
     };
     // **The craft is said where the writing starts.** Put only in the voice,
     // above a brief whose "what happens" is itself a summary, it was not what
@@ -135,10 +165,119 @@ pub fn question(
         "\n# Write it now\n\n{job}{length}{told} Build it from your brief and from what you read above: \
          its people, its places, its time. The brief tells you what happens; you show it \
          happening — what is done and said, moment by moment, as somebody there would see and \
-         hear it — and never name a feeling or say what the moment means. Answer with \
-         `{DRAFT}`, its `text` the whole piece and nothing but the piece."
+         hear it — and never name a feeling or say what the moment means. {answer}"
     ));
     q
+}
+
+/// The call a mending sitting answers with: a list of anchored edits.
+pub const MEND: &str = "mend";
+
+/// The most edits one mending sitting makes. A mend that would change more is
+/// a piece written again, which is `draft`.
+pub const MOST_EDITS: usize = 12;
+
+/// The call a mending sitting may answer with besides `draft`: `mend`, whose
+/// `edits` each name a paragraph of the standing piece by one of `anchors` —
+/// bound in the grammar, so an anchor the piece does not have cannot be
+/// written — and say what to do there.
+pub fn mend_spec(anchors: &[String]) -> ToolSpec {
+    let params: Vec<Param> = serde_json::from_value(json!([{
+        "name": "edits",
+        "type": "array",
+        "required": true,
+        "min_items": 1,
+        "max_items": MOST_EDITS,
+        "items": {
+            "type": "object",
+            "properties": [
+                { "name": "at", "type": "string", "required": true, "enum": anchors },
+                {
+                    "name": "do",
+                    "type": "string",
+                    "required": true,
+                    "enum": ["replace", "insert_before", "insert_after", "delete"],
+                    "requires": [
+                        ["replace", ["text"]],
+                        ["insert_before", ["text"]],
+                        ["insert_after", ["text"]]
+                    ]
+                },
+                { "name": "text", "type": "string" },
+                { "name": "old", "type": "string" },
+                { "name": "to", "type": "string", "enum": anchors }
+            ]
+        }
+    }]))
+    .expect("a fixed parameter list");
+    ToolSpec {
+        name: MEND.to_string(),
+        params,
+    }
+}
+
+/// The edits a mending sitting's decode answered with — `None` when it holds
+/// no `mend` call, so the sitting wrote a `draft` or nothing.
+pub fn read_mend(raw: &str) -> Option<Vec<Map<String, Value>>> {
+    let (_, args) = act::raw_calls(raw)
+        .into_iter()
+        .find(|(name, _)| name == MEND)?;
+    let edits = args.get("edits")?.as_array()?;
+    Some(
+        edits
+            .iter()
+            .filter_map(|e| e.as_object().cloned())
+            .collect(),
+    )
+}
+
+/// A mending sitting's edits, made one by one on the standing piece.
+pub struct Mended {
+    /// The piece after every edit that could be made.
+    pub text: String,
+    /// How many were made.
+    pub made: usize,
+    /// Why each of the rest was not.
+    pub refused: Vec<String>,
+}
+
+/// Make `edits`, in order, on `doc`. An edit that names a paragraph an
+/// earlier edit already changed finds its anchor gone and is refused, never
+/// applied to the changed text.
+pub fn mended(doc: &Doc, edits: &[Map<String, Value>]) -> Mended {
+    let mut now = doc.clone();
+    let mut made = 0;
+    let mut refused = Vec::new();
+    for args in edits {
+        let edit = match work::edit_of(args) {
+            Ok(edit) => edit,
+            Err(why) => {
+                refused.push(why);
+                continue;
+            }
+        };
+        match apply(&now, &edit) {
+            Ok(done) => {
+                now = done.doc;
+                made += 1;
+            }
+            Err(e) => refused.push(e.to_string()),
+        }
+    }
+    Mended {
+        text: now.text(),
+        made,
+        refused,
+    }
+}
+
+/// The refusal for a mending sitting none of whose edits could be made.
+pub fn nothing_mended(writes: &str, refused: &[String]) -> String {
+    format!(
+        "You sat down to mend {writes} and none of your changes could be made: {}. Sit down to \
+         it again.",
+        refused.join("; ")
+    )
 }
 
 /// The same sitting, carried on: the piece came to `words`, short of
@@ -383,16 +522,71 @@ mod tests {
             !q.contains("Every other event"),
             "a story has no life's voice"
         );
+        // The piece is shown under its anchors, and mended by them.
+        let a = &Doc::new("layers/stories/the-count.md", "You count the fleet.").anchors()[0];
         assert!(
-            q.contains("\n# `layers/stories/the-count.md` as it stands\n\nYou count the fleet.\n"),
+            q.contains(&format!(
+                "\n# `layers/stories/the-count.md` as it stands, each paragraph under its \
+                 anchor\n\n{a}| You count the fleet.\n"
+            )),
             "{q}"
         );
         assert!(q.contains(
-            "Write `layers/stories/the-count.md` whole again, as it is to stand in the record — \
-             keep everything in it that is right"
+            "Mend `layers/stories/the-count.md`: keep everything in it that is right, and put \
+             right what your brief says is wrong with it."
         ));
+        assert!(
+            q.contains("Answer with `mend`, its `edits` the changes to make"),
+            "{q}"
+        );
+        assert!(q.contains("answer instead with `draft`"), "{q}");
         let blank = question("b", "x.md", 0, &[], Some("  "), None);
         assert!(!blank.contains("as it stands"), "{blank}");
+        assert!(!blank.contains("`mend`"), "{blank}");
+    }
+
+    /// **A mend is read from its call and made edit by edit**, and an edit
+    /// that names a paragraph an earlier one changed is refused rather than
+    /// applied to the changed text.
+    #[test]
+    fn a_mend_is_read_and_made_edit_by_edit() {
+        let piece = "The bay was warm.\n\nThe order came down.\n\nYou said fourteen.\n";
+        let doc = Doc::new("x.md", piece);
+        let [a, b, c] = [0, 1, 2].map(|i| doc.units()[i].anchor.clone());
+        let raw = format!(
+            "<tool_call>\n{{\"name\": \"mend\", \"arguments\": {{\"edits\": [\
+             {{\"at\": \"{c}\", \"do\": \"replace\", \"old\": \"fourteen\", \"text\": \"fifteen\"}}, \
+             {{\"at\": \"{b}\", \"do\": \"delete\"}}, \
+             {{\"at\": \"{c}\", \"do\": \"replace\", \"text\": \"Again.\"}}, \
+             {{\"at\": \"{a}\", \"do\": \"insert_before\", \"text\": \"Dawn.\"}}]}}}}\n</tool_call>"
+        );
+        let edits = read_mend(&raw).expect("a mend call");
+        assert_eq!(edits.len(), 4);
+        let m = mended(&doc, &edits);
+        assert_eq!(m.text, "Dawn.\n\nThe bay was warm.\n\nYou said fifteen.\n");
+        assert_eq!(m.made, 3);
+        assert_eq!(m.refused.len(), 1);
+        assert!(m.refused[0].contains("read it again"), "{:?}", m.refused);
+        assert_eq!(read_mend("<tool_call>\n{\"name\": \"draft\", \"arguments\": {\"text\": \"x\"}}\n</tool_call>"), None);
+    }
+
+    /// The mend's grammar binds `at` and `to` to the piece's own anchors.
+    #[test]
+    fn a_mends_anchors_are_the_pieces_own() {
+        let anchors = vec!["Qm7x".to_string(), "b4_K".to_string()];
+        let spec = mend_spec(&anchors);
+        assert_eq!(spec.name, MEND);
+        let items = spec.params[0].items.as_ref().unwrap();
+        let fields = items.properties.as_ref().unwrap();
+        let at = fields.iter().find(|f| f.name == "at").unwrap();
+        assert_eq!(at.enum_values.as_deref(), Some(&anchors[..]));
+        assert!(at.required);
+        let to = fields.iter().find(|f| f.name == "to").unwrap();
+        assert_eq!(to.enum_values.as_deref(), Some(&anchors[..]));
+        assert!(!to.required);
+        let act = fields.iter().find(|f| f.name == "do").unwrap();
+        assert_eq!(act.requires.len(), 3);
+        assert_eq!(spec.params[0].max_items, Some(MOST_EDITS));
     }
 
     #[test]

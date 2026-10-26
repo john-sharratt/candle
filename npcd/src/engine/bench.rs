@@ -232,9 +232,11 @@ pub const FILE_READ: Tool = Tool {
     plane: Plane::World,
     availability: Availability::AtPart,
     description: "Read a document, as it actually is on the page — including your own uncommitted \
-                  changes to it, which nobody else can see yet. Comes back numbered by line, at \
-                  most 200 lines at a time: a header reading `(lines 1-200 of 900)` means there \
-                  is more, and the next read asks for `start_line` 201.",
+                  changes to it, which nobody else can see yet. Comes back in its parts — each \
+                  paragraph, or each line of a `.yaml` — every one under a four-character anchor \
+                  (`Qm7x| The bay was warm…`), which is how `file_edit` names it. A page holds up \
+                  to 200 lines: a header reading `(page 1 of 3: …)` means there is more, and the \
+                  next read asks for `page` 2.",
     params: &[
         Param {
             name: "path",
@@ -248,11 +250,10 @@ pub const FILE_READ: Tool = Tool {
         // JSON nests without limit — the grammar then never finishes building.
         // See `tools::tests::every_parameter_is_a_type_the_grammar_can_bound`.
         Param {
-            name: "start_line",
+            name: "page",
             ty: "string",
             required: false,
-            description: "Which line to start at, counting from 1. Leave it out for the start of \
-                          the document.",
+            description: "Which page, counting from 1. Leave it out for the first.",
         },
     ],
     examples: &[Example {
@@ -302,17 +303,27 @@ pub const FILE_WRITE: Tool = Tool {
     }],
 };
 
+/// What a `file_edit` may do at its anchor — a closed set the grammar offers.
+pub const EDIT_ACTIONS: &[&str] = &["replace", "insert_before", "insert_after", "delete", "move"];
+
+/// Where a `file_edit` move puts its paragraph, beside `dest`.
+pub const MOVE_PLACES: &[&str] = &["before", "after"];
+
 pub const FILE_EDIT: Tool = Tool {
     name: "file_edit",
     at: BENCHES,
     category: "Bench",
     plane: Plane::World,
     availability: Availability::AtPart,
-    description: "Change one passage of a document, leaving the rest exactly as it is. What you \
-                  are replacing is copied from the document as it says now — not from an earlier \
-                  version of it — and has to appear exactly once; if it appears twice you will be \
-                  told how many, rather than have the wrong one changed. To rewrite the piece, or \
-                  most of it, write it whole again — `compose` it, when your mission writes it.",
+    description: "Change one part of a document, leaving the rest exactly as it is. `file_read` \
+                  shows every paragraph under a four-character anchor; name the one you mean as \
+                  `at` and say what to `do`: `replace` it with `text` — or, with `old`, change just \
+                  those words inside it — `insert_before` or `insert_after` it a new paragraph \
+                  `text`, `delete` it, or `move` it `before` or `after` the paragraph `dest`. `to` \
+                  carries a replace, delete or move on through a run of paragraphs, `at` through \
+                  `to`. An anchor read before the paragraph changed is refused: read it again. To \
+                  rewrite the piece, or most of it, write it whole again — `compose` it, when your \
+                  mission writes it.",
     params: &[
         Param {
             name: "path",
@@ -321,26 +332,57 @@ pub const FILE_EDIT: Tool = Tool {
             description: "Which document to change, as a path — `layers/eras/third.md`.",
         },
         Param {
-            name: "old_str",
+            name: "at",
             ty: "string",
             required: true,
-            description: "The passage to replace, copied exactly from the document as it says \
-                          now. Give enough of what surrounds it to pick out one place and not \
-                          three.",
+            description: "The anchor of the paragraph to change — the four characters before its \
+                          `|` in your last read of it.",
         },
         Param {
-            name: "new_str",
+            name: "do",
             ty: "string",
             required: true,
-            description: "What stands in that passage's place instead.",
+            description: "What to do there: replace, insert_before, insert_after, delete or move.",
+        },
+        Param {
+            name: "text",
+            ty: "string",
+            required: false,
+            description: "For replace and the inserts: the new paragraph, as it is to stand — or, \
+                          with `old`, what those words become.",
+        },
+        Param {
+            name: "old",
+            ty: "string",
+            required: false,
+            description: "For replace only: the words inside the paragraph to change, which must \
+                          appear in it once.",
+        },
+        Param {
+            name: "to",
+            ty: "string",
+            required: false,
+            description: "The anchor of the last paragraph of a run to replace, delete or move, \
+                          `at` through `to`.",
+        },
+        Param {
+            name: "dest",
+            ty: "string",
+            required: false,
+            description: "For move: the anchor of the paragraph to move it beside.",
+        },
+        Param {
+            name: "where",
+            ty: "string",
+            required: false,
+            description: "For move: before or after `dest`.",
         },
     ],
     examples: &[Example {
         situation: "One line in a long entry is wrong and everything around it is fine.",
-        call: r#"{"path":"eras/third.md","old_str":"burned in the spring","new_str":"burned in the autumn, the year the redoubt fell"}"#,
-        because: "The uniqueness rule is what makes an edit safe to make without reading the \
-                  whole thing back — so the target carries its neighbours, not just the words \
-                  being changed.",
+        call: r#"{"path":"eras/third.md","at":"b4_K","do":"replace","old":"burned in the spring","text":"burned in the autumn, the year the redoubt fell"}"#,
+        because: "The anchor says where; `old` names only the words being changed, so nothing \
+                  else in the paragraph has to be copied out.",
     }],
 };
 

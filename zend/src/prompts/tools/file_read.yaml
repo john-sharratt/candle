@@ -26,7 +26,7 @@ questions:
 - read back the notes file from this session
 category: Files
 mandatory: true
-description: 'Read a file, one 200-line page at a time. Resolves against this session''s edits first, then falls through to the repository on disk, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. The repo, the path within it, and the page are all required. Pages count from 1: page 1 is lines 1-200 — the top of the file, and a short file''s whole content — page 2 is lines 201-400, page 3 is 401-600, and so on; the page holding line N is (N - 1) / 200 + 1. Returns the page as numbered source in a fenced block whose opening fence names the file, the page, how many pages there are, and the file''s length — `rust file=candle/src/lib.rs page=2 pages=5 lines=940` — and which ends naming the next page to read, `end of candle/src/lib.rs page 2 of 5 — next: page=3`, or saying it was the last, `end of candle/src/lib.rs page 5 of 5 — the last page`. There is no need to find a file''s length before reading it: read page 1 and its fence reports it. To find the line worth reading, use file_grep rather than paging a large file looking for it. For remote filesystems use remote_fs_session_get to download first, then file_read. **This reads the file as it stands on disk right now, uncommitted edits included.** For the file as a COMMIT, BRANCH or TAG holds it — "show me this file as of that commit", "what did it look like on the release branch" — use git_show with `what: file`. **A repository''s `.git/` folder is refused outright**: for branches, tags, remotes or counts of them use git_refs, for history git_log, and for a file at a revision git_show — never `.git/packed-refs`, `.git/refs/…` or `.git/config`, which are a database rather than text and give wrong answers when read as files.'
+description: 'Read a file, one page at a time. Resolves against this session''s edits first, then falls through to the repository on disk, so real project files can be read directly. Use for: reading a source file from the project, looking at what was previously written, inspecting a file the user uploaded into the chat, checking the current state of a draft after edits. The repo, the path within it, and the page are all required; pages count from 1, and page 1 is the top of the file — a short file''s whole content. The file comes back in its parts — each function, type, block of imports or paragraph under a four-character anchor and, for code, its scope path (`r7Lm| impl Cache > fn seal`), then its lines exactly as they are — whole parts, up to 200 lines a page; `file_edit` names a part by its anchor. The page sits in a fenced block whose opening fence names the file, the page, how many pages there are, and the file''s length — `rust file=candle/src/lib.rs page=2 pages=5 lines=940` — and which ends naming the next page to read, `end of candle/src/lib.rs page 2 of 5 — next: page=3`, or saying it was the last, `end of candle/src/lib.rs page 5 of 5 — the last page`. There is no need to find a file''s length before reading it: read page 1 and its fence reports it. To read where an error, a stack trace or a line number points, pass that `line` and the page holding it comes back. To find the code worth reading, use file_grep, whose hits name the part and the page they are on, rather than paging a large file looking for it. For remote filesystems use remote_fs_session_get to download first, then file_read. **This reads the file as it stands on disk right now, uncommitted edits included.** For the file as a COMMIT, BRANCH or TAG holds it — "show me this file as of that commit", "what did it look like on the release branch" — use git_show with `what: file`. **A repository''s `.git/` folder is refused outright**: for branches, tags, remotes or counts of them use git_refs, for history git_log, and for a file at a revision git_show — never `.git/packed-refs`, `.git/refs/…` or `.git/config`, which are a database rather than text and give wrong answers when read as files.'
 parameters:
   $schema: http://json-schema.org/draft-07/schema#
   properties:
@@ -39,10 +39,17 @@ parameters:
       minLength: 1
       type: string
     page:
-      description: Page of the file to return, from 1, 200 lines a page. Required — pass 1 for the top of the file. Its fence names how many pages there are and the next one to read, or says it is the last. A page past the end returns the last one.
+      description: Page of the file to return, from 1; a page is whole parts of the file, up to 200 lines of them. Required — pass 1 for the top of the file. Its fence names how many pages there are and the next one to read, or says it is the last. A page past the end returns the last one.
       format: uint32
       minimum: 1.0
       type: integer
+    line:
+      description: A line number, from 1 — an error's, a stack trace's — to read the page holding it instead of `page`. Optional.
+      format: uint32
+      minimum: 1.0
+      type:
+      - integer
+      - 'null'
   required:
   - repo
   - path
@@ -64,7 +71,7 @@ examples:
   read the file src/main.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  A direct read of src/main.rs. No repository was named, so the workspace's app repository holds the generic src/main.rs entry point. No page location was named either, so I start at page 1,<|projection|> numbered so I can point at specific lines. If its fence names a next page I'll ask for it.
+  A direct read of src/main.rs. No repository was named, so the workspace's app repository holds the generic src/main.rs entry point. No page location was named either, so I start at page 1,<|projection|> each part under its anchor so I can point at — and edit — any of them. If its fence names a next page I'll ask for it.
   </think>
 
   <tool_call>
@@ -114,7 +121,7 @@ examples:
   show me the first 30 lines of src/lib.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Only the top of src/lib.rs is wanted, and no repository was named — the workspace's app repository is where this generic src/lib.rs belongs. Lines 1-30 sit inside page 1, which covers lines 1-200,<|projection|> so the call names repo, path and page 1, and I'll read the first 30 numbered lines out of what comes back.
+  Only the top of src/lib.rs is wanted, and no repository was named — the workspace's app repository is where this generic src/lib.rs belongs. The top of a file is page 1,<|projection|> so the call names repo, path and page 1, and the first thirty lines are the first parts of what comes back.
   </think>
 
   <tool_call>
@@ -124,41 +131,41 @@ examples:
   read lines 47 to 93 of src/auth/handler.rs<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The user named a range but no repository — the workspace's app repository holds this generic src/auth/handler.rs. Lines 47-93 both fall inside page 1 — the first 200 lines — so page 1 covers them; file_read pages, it doesn't take an arbitrary range.<|projection|> The numbered lines in the response let me point at exactly 47-93 when I answer.
+  The user named a range but no repository — the workspace's app repository holds this generic src/auth/handler.rs. file_read pages, it doesn't take an arbitrary range, so I pass `line` 47 and get the page holding where the range starts;<|projection|> its parts come back whole, so the code around 47-93 is there with it, and if the fence shows the range runs on, the next page has the rest.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/auth/handler.rs", "page": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/auth/handler.rs", "page": 1, "line": 47}}
   </tool_call><|projection|>
 - |-
   what does line 450 of zend/src/prompts/projection.yaml do<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The path names zend/src/prompts, which is this candle codebase's daemon crate, so the repo is candle. Line 450 is past the first 200-line page. Page 1 is lines 1-200, page 2 is lines 201-400, page 3 is lines 401-600 — 450 falls in page 3,<|projection|> so I ask for that page directly rather than paging through pages 1 and 2 first.
+  The path names zend/src/prompts, which is this candle codebase's daemon crate, so the repo is candle. Line 450 is well past the top of the file, and I don't know which page it is on — a page is whole parts, so its line range depends on the file —<|projection|> so I pass `line` 450 and get the page holding it directly, rather than paging through from page 1.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/prompts/projection.yaml", "page": 3}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/prompts/projection.yaml", "page": 1, "line": 450}}
   </tool_call><|projection|>
 - |-
   the error mentions line 240 of src/server.rs, let me see it<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  No repository was named, so the workspace's generic app repository holds this src/server.rs. The error points at line 240, which is inside page 2 (lines 201-400),<|projection|> so reading page 2 shows the failing line with plenty of context around it.
+  No repository was named, so the workspace's generic app repository holds this src/server.rs. The error points at line 240, so I pass it as `line`:<|projection|> the page holding it comes back, the failing line inside its whole function, with plenty of context around it.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "page": 2}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "page": 1, "line": 240}}
   </tool_call><|projection|>
 - |-
   what's around line 850 in that file<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  "That file" is still src/server.rs in the app repo from the read above. Line 850 is well past the first few pages: page 1 covers 1-200, page 2 covers 201-400, page 3 covers 401-600, page 4 covers 601-800, page 5 covers 801-1000 — 850 is in page 5.<|projection|>
+  "That file" is still src/server.rs in the app repo from the read above. Line 850 is well past the first few pages, and `line` takes me straight to the page holding it — no counting pages.<|projection|>
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "page": 5}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/server.rs", "page": 1, "line": 850}}
   </tool_call><|projection|>
 - |-
   show me the rest of that file<|im_end|>
@@ -184,7 +191,7 @@ examples:
   so what does that function actually do<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The search above put reconcile_wave_offsets at line 412 of candle-conversation/src/wave/stager.rs, in the candle repo. (412 - 1) / 200 + 1 is page 3, so that page catches the signature and the body<|projection|> — page 1 or 2 would miss it entirely. If the body runs past the page, the fence will name the next one and I can read on.
+  The search above put reconcile_wave_offsets at line 412 of candle-conversation/src/wave/stager.rs, in the candle repo, and the hit named its part's page: page 3. That page holds the function whole, signature and body<|projection|> — page 1 or 2 would miss it entirely.
   </think>
 
   <tool_call>
@@ -194,7 +201,7 @@ examples:
   that page cut off before the match arm, show me more<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  Page 3 of candle-conversation/src/wave/stager.rs in the candle repo covered lines 401-600 of 1,240 and the match it belongs to continues past line 600, so the arm is on the next page — its fence named page 4.<|projection|> Pages are fixed strides, not a range I can widen, so I read on rather than re-asking for a wider window.
+  Page 3 of candle-conversation/src/wave/stager.rs in the candle repo ended before the match arm, and its fence named page 4, so the arm's part is there.<|projection|> A page is whole parts and not a window I can widen, so I read on rather than re-asking for a wider one.
   </think>
 
   <tool_call>

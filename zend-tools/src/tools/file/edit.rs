@@ -1,12 +1,33 @@
-//! file_edit tool.
+//! file_edit tool — one anchored edit (`docs/npcd_anchored_edits.md` §6).
 
+use doc_units::render::around;
+use doc_units::{apply, Doc, Edit, EditError, Op, Place};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
-use zend_vfs::replace::apply;
 
 use super::FileError;
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
+
+/// Schema-only mirror of the operations `do` accepts, so the generated schema
+/// carries a real `"enum"` of them.
+#[derive(JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditAction {
+    Replace,
+    InsertBefore,
+    InsertAfter,
+    Delete,
+    Move,
+}
+
+/// Schema-only mirror of where a move puts its part.
+#[derive(JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MovePlace {
+    Before,
+    After,
+}
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct EditRequest {
@@ -16,27 +37,34 @@ pub struct EditRequest {
     /// Path of the file to edit, relative to the repository — a project file, or one this session created (e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
-    /// The text to replace, copied from the file exactly as it stands — whole lines, with enough of the lines around it that it occurs only once. Without the line numbers `file_read` shows. Required.
-    #[validate(length(min = 1))]
-    pub old_text: String,
-    /// The text that takes its place. Empty to delete `old_text`. Required.
-    pub new_text: String,
-    /// Replace every occurrence of `old_text` instead of requiring exactly one. Optional; defaults to false.
-    #[serde(default)]
-    pub replace_all: bool,
+    /// The anchor of the part to change: the four characters before the `|` that `file_read` shows it under (e.g. `r7Lm`). Required.
+    #[validate(length(min = 4, max = 4))]
+    pub at: String,
+    /// What to do there: `replace` it, `insert_before` or `insert_after` it, `delete` it, or `move` it. Required.
+    #[serde(rename = "do")]
+    #[schemars(with = "EditAction")]
+    pub action: String,
+    /// For replace, insert_before and insert_after: the new text — the whole part as it is to stand, its indentation included. Not given for delete or move.
+    pub text: Option<String>,
+    /// For replace only: words inside the part to change, which must occur in it exactly once. With `old`, only those words are replaced by `text`; without it the whole part is.
+    pub old: Option<String>,
+    /// For replace, delete and move: the anchor of the last part of a run of consecutive parts, so the edit covers `at` through `to`.
+    pub to: Option<String>,
+    /// For move: the anchor of the part to move it beside.
+    pub dest: Option<String>,
+    /// For move: `before` or `after` `dest`.
+    #[serde(rename = "where")]
+    #[schemars(with = "Option<MovePlace>")]
+    pub place: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct EditResponse {
     pub repo: String,
     pub path: String,
-    /// Occurrences replaced; zero when the edit was already in the file.
-    pub replacements: usize,
-    /// The edit's result was already in the file, so nothing was written.
-    pub already_applied: bool,
-    /// How `old_text` was found: `exact`, or `indentation` — as whole lines
-    /// with their indentation ignored, the new text re-indented to the file's.
-    pub matched: &'static str,
+    /// What was done, and the parts it wrote under their new anchors between
+    /// the parts either side of them, as `file_read` shows them.
+    pub result: String,
     /// Size of the file after the edit.
     pub bytes: usize,
 }
@@ -46,51 +74,128 @@ pub struct FileEdit;
 impl Tool for FileEdit {
     const NAME: &'static str = "file_edit";
     const DESCRIPTION: &'static str =
-        "Replace one piece of text in an existing file with another. `old_text` is the text to \
-         change, copied from the file exactly as it stands — whole lines, with enough of the lines \
-         around it to occur only once; `new_text` is what takes its place, empty to delete it. Use \
-         for: changing a value in a config, updating a function body, adding a method after an \
-         existing one, fixing a typo. Text quoted at the wrong indentation is still found, and \
-         the new text is re-indented to the file's. Text that occurs more than once is refused \
-         unless `replace_all` is set; an edit whose result is already in the file is reported as \
-         already applied, so re-sending it is safe. Triggered by \"change X to Y in the file\", \
-         \"update these lines\", \"fix the value of\", \"add this after\". Returns repo, path, \
-         how many occurrences were replaced, whether it was already applied, and the new byte \
-         count. For full rewrites use write.";
+        "Change one part of an existing file by its anchor, leaving the rest exactly as it is. \
+         `file_read` shows every part of a file — a function, a type, a block of imports, a \
+         paragraph — under a four-character anchor (`r7Lm| impl Cache > fn seal`); name the part \
+         as `at` and say what to `do`: `replace` it with `text` (or, with `old`, replace just \
+         those words inside it), `insert_before` / `insert_after` it a new part `text`, `delete` \
+         it, or `move` it `before`/`after` the part `dest`. `to` extends replace, delete and move \
+         over a run of consecutive parts, `at` through `to`. Write `text` as the part is to \
+         stand, indentation included — never with anchors in it. Use for: changing a function \
+         body, adding a method after another, fixing a value in a config, removing dead code, \
+         reordering items. An anchor that no longer names a part — the file changed since it was \
+         read — is refused; read it again. Returns what was done and the parts it wrote under \
+         their new anchors, between their neighbours, so the next edit needs no read. Triggered \
+         by \"change X to Y in the file\", \"update this function\", \"add this after\", \"remove \
+         that\". For a new file, or rewriting most of one, use write.";
 
     type Request = EditRequest;
     type Response = EditResponse;
     type Error = FileError;
 
-    /// An edit whose result is already in the file is reported rather than
-    /// applied twice, so re-sending the same edit leaves the same file.
-    fn replay(_req: &Self::Request) -> Replay {
-        Replay::Safe
+    /// A replace or delete re-sent after it landed names an anchor the file no
+    /// longer has and is refused, and a move re-sent puts its part where it
+    /// already stands — so those may be re-issued. **An insert may not**: it
+    /// leaves the part it is anchored beside as it was, so the same insert sent
+    /// again would land a second copy.
+    fn replay(req: &Self::Request) -> Replay {
+        match req.action.as_str() {
+            "insert_before" | "insert_after" => Replay::Unsafe,
+            _ => Replay::Safe,
+        }
     }
 
     fn run(ctx: &ToolContext, req: EditRequest) -> Result<EditResponse, FileError> {
         // Read through the overlay, so a file that lives only in the workspace is
-        // editable. Nothing is recorded unless the edit changed the file.
+        // editable. Nothing is recorded unless the edit is made.
         let store = ctx.files.repo(&req.repo)?;
         let content = store
             .read(&req.path)?
             .ok_or_else(|| FileError::NothingToEdit(req.path.clone()))?;
-
-        let replaced = apply(&content, &req.old_text, &req.new_text, req.replace_all)?;
-        let bytes = replaced.content.len();
+        let edit = edit_of(&req)?;
+        let doc = Doc::new(&req.path, &content);
+        let done = apply(&doc, &edit)?;
+        let text = done.doc.text();
+        let bytes = text.len();
         // Recorded as an edit — the changed lines only, not the file they
         // landed in.
-        if !replaced.already_applied {
-            store.edit(&req.path, replaced.content)?;
+        store.edit(&req.path, text)?;
+        let mut result = format!(
+            "{}\n{}",
+            done.summary,
+            around(&done.doc, &done.touched, done.at_line)
+        );
+        if done.broke {
+            result.push_str(&format!(
+                "{} no longer parses as {} — mend it with the next edit.\n",
+                req.path,
+                done.doc.language().name()
+            ));
         }
         Ok(EditResponse {
             repo: req.repo,
             path: req.path,
-            replacements: replaced.replacements,
-            already_applied: replaced.already_applied,
-            matched: replaced.matched.as_str(),
+            result,
             bytes,
         })
+    }
+}
+
+/// The request as the edit it names, or why it names none.
+fn edit_of(req: &EditRequest) -> Result<Edit, FileError> {
+    let invalid = |why: &str| FileError::InvalidArguments(why.to_string());
+    let text = || {
+        req.text
+            .clone()
+            .ok_or_else(|| invalid(&format!("`{}` needs `text`", req.action)))
+    };
+    let op = match req.action.as_str() {
+        "replace" => Op::Replace {
+            text: text()?,
+            old: req.old.clone(),
+            to: req.to.clone(),
+        },
+        "insert_before" => Op::Insert {
+            place: Place::Before,
+            text: text()?,
+        },
+        "insert_after" => Op::Insert {
+            place: Place::After,
+            text: text()?,
+        },
+        "delete" => Op::Delete { to: req.to.clone() },
+        "move" => Op::Move {
+            to: req.to.clone(),
+            dest: req
+                .dest
+                .clone()
+                .ok_or_else(|| invalid("`move` needs `dest`, the part to move it beside"))?,
+            place: match req.place.as_deref() {
+                Some("before") => Place::Before,
+                Some("after") => Place::After,
+                _ => return Err(invalid("`move` needs `where`: `before` or `after`")),
+            },
+        },
+        other => {
+            return Err(invalid(&format!(
+                "`do` is {other:?}; it is one of replace, insert_before, insert_after, delete, move"
+            )))
+        }
+    };
+    Ok(Edit {
+        at: req.at.clone(),
+        op,
+    })
+}
+
+impl From<EditError> for FileError {
+    fn from(e: EditError) -> Self {
+        match e {
+            EditError::Stale(_) => FileError::Stale(e.to_string()),
+            EditError::Invalid(why) => FileError::InvalidArguments(why),
+            EditError::Ambiguous(why) => FileError::Ambiguous(why),
+            EditError::Unmatched(why) => FileError::TextUnmatched(why),
+        }
     }
 }
 

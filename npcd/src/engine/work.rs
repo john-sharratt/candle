@@ -28,6 +28,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use doc_units::{Doc, Edit, Op, Place};
 use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
@@ -84,12 +85,14 @@ fn verbatim(args: &Map<String, Value>, key: &str) -> Option<String> {
 /// carries meaning for the model and none at all for the store, so the store is
 /// asked once here rather than in forty match arms.
 fn subject(args: &Map<String, Value>) -> Option<String> {
+    // `path` first: only the file acts take one, and it is always their
+    // subject — an edit's `to` is the anchor a span runs to, not an addressee.
     // `why` and `called` are here because two acts carry no subject of their
     // own — a commit acts on whatever you have open, and a new place is named
     // rather than found — and reaching the dispatch at all is what lets them
     // say so themselves rather than being turned away as subjectless.
     for key in [
-        "what", "of", "in", "to", "for", "from", "on", "about", "between", "under", "path", "why",
+        "path", "what", "of", "in", "to", "for", "from", "on", "about", "between", "under", "why",
         "called",
     ] {
         if let Some(v) = text(args, key) {
@@ -636,14 +639,15 @@ fn outside_the_mission(s: &Sim, body: &str, path: &str) -> Option<String> {
     })
 }
 
-/// Why an edit to the body's mission piece is refused: it takes most of the
-/// piece, which is writing it again by hand — see [`passage`]. `None` for any
-/// other document, a mission with no prose floor, or a passage.
+/// Why an edit to the body's mission piece is refused: what it replaces takes
+/// most of the piece, which is writing it again by hand — see [`passage`].
+/// `None` for any other document, a mission with no prose floor, an edit that
+/// replaces nothing, or a passage.
 fn rewritten_by_hand(
     s: &Sim,
     body: &str,
     what: &str,
-    old: &str,
+    edit: &Edit,
     shelf: &dyn Shelf,
 ) -> Option<String> {
     let work = s.missions.active(body)?.work.as_ref()?;
@@ -651,7 +655,72 @@ fn rewritten_by_hand(
         return None;
     }
     let current = s.bench.read(body, &work.writes, shelf).ok()?;
-    passage::rewrites_the_piece(&work.writes, &current, old)
+    let taken = match &edit.op {
+        Op::Replace { old: Some(old), .. } => old.clone(),
+        Op::Replace { old: None, to, .. } => {
+            let doc = Doc::new(&work.writes, &current);
+            let a = doc.find(&edit.at)?;
+            let b = to.as_deref().and_then(|t| doc.find(t)).unwrap_or(a);
+            (a..=b.max(a))
+                .map(|i| doc.unit_text(i))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }
+        _ => return None,
+    };
+    passage::rewrites_the_piece(&work.writes, &current, &taken)
+}
+
+/// A `file_edit` call's arguments — or one edit of a mending sitting's
+/// `mend` — as the anchored edit they name, or why they name none.
+pub(crate) fn edit_of(args: &Map<String, Value>) -> Result<Edit, String> {
+    let Some(at) = text(args, "at") else {
+        return Err(
+            "An edit names the paragraph it changes by its anchor, as your read of the document \
+             shows it. Say `at`."
+                .into(),
+        );
+    };
+    let action = text(args, "do").unwrap_or_default();
+    let words =
+        || verbatim(args, "text").ok_or_else(|| format!("To {action} you have to say the `text`."));
+    let to = text(args, "to");
+    let op = match action.as_str() {
+        "replace" => Op::Replace {
+            text: words()?,
+            old: verbatim(args, "old").filter(|o| !o.is_empty()),
+            to,
+        },
+        "insert_before" => Op::Insert {
+            place: Place::Before,
+            text: words()?,
+        },
+        "insert_after" => Op::Insert {
+            place: Place::After,
+            text: words()?,
+        },
+        "delete" => Op::Delete { to },
+        "move" => Op::Move {
+            to,
+            dest: text(args, "dest")
+                .ok_or("A move says which paragraph to put it beside, as `dest`.")?,
+            place: match text(args, "where").as_deref() {
+                Some("before") => Place::Before,
+                Some("after") => Place::After,
+                _ => return Err("A move says whether it goes `before` or `after` `dest`.".into()),
+            },
+        },
+        _ => {
+            return Err(
+                "An edit says what to `do`: replace, insert_before, insert_after, delete or move."
+                    .into(),
+            )
+        }
+    };
+    Ok(Edit {
+        at: at.trim().to_string(),
+        op,
+    })
 }
 
 /// Why the body's open mission document is not ready to commit — it is in the
@@ -1976,16 +2045,16 @@ fn bench(
         // has made changes, and what stands otherwise. That asymmetry is the
         // whole working set: it is what "your work is yours alone until you
         // offer it" means when somebody actually tries to look.
-        // `start_line` is a string because the grammar cannot bound an integer,
-        // so the act parses it. Anything unparseable reads as the start rather
-        // than refusing: a character that wrote "the top" meant line one, and
-        // turning that into a refusal spends its turn on arithmetic.
+        // `page` is a string because the grammar cannot bound an integer, so
+        // the act parses it. Anything unparseable reads as the first page
+        // rather than refusing: a character that wrote "the top" meant page
+        // one, and turning that into a refusal spends its turn on arithmetic.
         "file_read" => {
-            let from = text(args, "start_line")
+            let page = text(args, "page")
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(1);
             let shelf = hosted.shelf_of(body);
-            hosted.with_sim(|s| match s.bench.excerpt(body, what, from, &*shelf) {
+            hosted.with_sim(|s| match s.bench.excerpt(body, what, page, &*shelf) {
                 Ok(mut rendered) => {
                     // Reading a document a mission names is that step done.
                     if s.missions.read_doc(body, what) {
@@ -2019,22 +2088,17 @@ fn bench(
             })
         }
         "file_edit" => {
-            let (Some(old), Some(new)) = (verbatim(args, "old_str"), verbatim(args, "new_str"))
-            else {
-                return Outcome::Refused(
-                    "An edit is what you are replacing and what stands there instead. Say both."
-                        .into(),
-                );
+            let edit = match edit_of(args) {
+                Ok(edit) => edit,
+                Err(why) => return Outcome::Refused(why),
             };
             let shelf = hosted.shelf_of(body);
             hosted.with_sim(|s| {
-                if let Some(why) = rewritten_by_hand(s, body, what, &old, &*shelf) {
+                if let Some(why) = rewritten_by_hand(s, body, what, &edit, &*shelf) {
                     return Outcome::Refused(why);
                 }
-                match s.bench.edit(body, what, what, &old, &new, &*shelf) {
-                    Ok(p) => {
-                        Outcome::Did(format!("{p} is changed, and the rest of it is untouched."))
-                    }
+                match s.bench.edit(body, what, what, &edit, &*shelf) {
+                    Ok(reply) => Outcome::Did(reply),
                     Err(why) => Outcome::Refused(why),
                 }
             })
@@ -2778,19 +2842,27 @@ mod tests {
         );
     }
 
-    /// The same reason from the other side: an edit has to be able to match
-    /// leading whitespace, or it cannot touch a `.yaml` document at all — the
+    /// The anchor of paragraph `i` of `text`, as a read of `path` shows it.
+    fn anchor(path: &str, text: &str, i: usize) -> String {
+        Doc::new(path, text).units()[i].anchor.clone()
+    }
+
+    /// The same reason from the other side: an edit has to keep leading
+    /// whitespace, or it cannot touch a `.yaml` document at all — the
     /// indentation *is* the structure there.
     #[test]
-    fn an_edit_matches_the_indentation_it_was_given() {
+    fn an_edit_keeps_the_indentation_it_was_given() {
         let (h, root) = vault_with_documents("indent");
-        std::fs::write(root.join("layers/eras/third.md"), "a:\n  b: 1\n  c: 1\n").unwrap();
+        let text = "a:\n  b: 1\n  c: 1\n";
+        std::fs::write(root.join("layers/eras/third.md"), text).unwrap();
+        let at = anchor("layers/eras/third.md", text, 0);
         let out = perform(
             &h,
             "m1",
             &act(
                 "file_edit",
-                json!({"path":"layers/eras/third.md","old_str":"  b: 1","new_str":"  b: 2"}),
+                json!({"path":"layers/eras/third.md","at":at,"do":"replace",
+                       "old":"  b: 1","text":"  b: 2"}),
             ),
         );
         assert!(out.happened(), "{out:?}");
@@ -2814,32 +2886,39 @@ mod tests {
             "m1",
             &act("file_read", json!({"path":"layers/eras/long.md"})),
         );
+        // One 900-line paragraph is cut into parts of 80 lines, two to a page.
         let shown = first.line().unwrap();
-        assert!(shown.contains("(lines 1-200 of 900)"), "{shown}");
         assert!(
-            !shown.contains("line 201"),
+            shown.contains("(page 1 of 6: paragraphs 1–2 of 12)"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("line 161"),
             "the cap did not hold at the act"
         );
+        assert!(shown.contains("the next read asks for page 2"), "{shown}");
 
         let next = perform(
             &h,
             "m1",
             &act(
                 "file_read",
-                json!({"path":"layers/eras/long.md","start_line":"201"}),
+                json!({"path":"layers/eras/long.md","page":"2"}),
             ),
         );
         assert!(
-            next.line().unwrap().contains("(lines 201-400 of 900)"),
+            next.line()
+                .unwrap()
+                .contains("(page 2 of 6: paragraphs 3–4 of 12)"),
             "{next:?}"
         );
     }
 
-    /// `start_line` is a string because the grammar cannot bound an integer, so
-    /// the act parses it — and something unparseable means the start rather
+    /// `page` is a string because the grammar cannot bound an integer, so the
+    /// act parses it — and something unparseable means the first page rather
     /// than a refusal that spends the turn on arithmetic.
     #[test]
-    fn an_unparseable_start_line_reads_from_the_top() {
+    fn an_unparseable_page_reads_from_the_top() {
         let (h, _) = vault_with_documents("start-junk");
         for junk in ["the top", "", "-4", "one"] {
             let out = perform(
@@ -2847,7 +2926,7 @@ mod tests {
                 "m1",
                 &act(
                     "file_read",
-                    json!({"path":"layers/eras/third.md","start_line":junk}),
+                    json!({"path":"layers/eras/third.md","page":junk}),
                 ),
             );
             assert!(out.happened(), "{junk:?}: {out:?}");
@@ -2857,17 +2936,20 @@ mod tests {
 
     /// **Every file act takes its subject from `path`.** The subject is picked
     /// by scanning a list of argument names in order, and the new parameters
-    /// sit next to entries in that list — `start_line` beside `for`, `content`
-    /// beside `what`. If one of them ever wins, the act operates on the prose
-    /// instead of the document, reports success, and nobody finds out until the
-    /// record is wrong. That is exactly what `story_draft` did.
+    /// sit next to entries in that list — `page` beside `for`, `content` and
+    /// `text` beside `what`, `to` an addressee's word. If one of them ever
+    /// wins, the act operates on the prose instead of the document, reports
+    /// success, and nobody finds out until the record is wrong. That is exactly
+    /// what `story_draft` did.
     #[test]
     fn the_subject_of_every_file_act_is_its_path() {
         for args in [
             json!({"path":"layers/eras/third.md"}),
-            json!({"path":"layers/eras/third.md","start_line":"12"}),
+            json!({"path":"layers/eras/third.md","page":"2"}),
             json!({"path":"layers/eras/third.md","content":"what the document says"}),
-            json!({"path":"layers/eras/third.md","old_str":"a","new_str":"b"}),
+            json!({"path":"layers/eras/third.md","at":"Qm7x","do":"replace","old":"a","text":"b"}),
+            json!({"path":"layers/eras/third.md","at":"Qm7x","do":"move","to":"b4_K",
+                   "dest":"cX0e","where":"after"}),
         ] {
             let map = args.as_object().unwrap().clone();
             assert_eq!(
@@ -2881,15 +2963,23 @@ mod tests {
     #[test]
     fn an_edit_leaves_everything_it_did_not_name_alone() {
         let (h, _) = vault_with_documents("edit");
+        let path = "layers/eras/third.md";
+        let at = anchor(path, "the third era\nburned in the spring\n", 0);
         let out = perform(
             &h,
             "m1",
             &act(
                 "file_edit",
-                json!({"path":"layers/eras/third.md","old_str":"spring","new_str":"autumn"}),
+                json!({"path":path,"at":at,"do":"replace","old":"spring","text":"autumn"}),
             ),
         );
         assert!(out.happened(), "{out:?}");
+        // The answer shows the paragraph under its new anchor.
+        let now = anchor(path, "the third era\nburned in the autumn\n", 0);
+        assert_eq!(
+            out.line().unwrap(),
+            format!("{path}: Changed {at}.\n{now}| the third era\nburned in the autumn\n")
+        );
         perform(
             &h,
             "m1",
@@ -2907,32 +2997,63 @@ mod tests {
     #[test]
     fn an_ambiguous_edit_is_refused_rather_than_applied_to_the_wrong_one() {
         let (h, root) = vault_with_documents("ambiguous");
-        std::fs::write(root.join("layers/eras/third.md"), "a fire\nand a fire\n").unwrap();
+        let text = "a fire\nand a fire\n";
+        std::fs::write(root.join("layers/eras/third.md"), text).unwrap();
+        let at = anchor("layers/eras/third.md", text, 0);
         let out = perform(
             &h,
             "m1",
             &act(
                 "file_edit",
-                json!({"path":"layers/eras/third.md","old_str":"a fire","new_str":"a flood"}),
+                json!({"path":"layers/eras/third.md","at":at,"do":"replace",
+                       "old":"a fire","text":"a flood"}),
             ),
         );
         assert!(!out.happened());
-        assert!(out.line().unwrap().contains('2'), "{out:?}");
+        assert!(out.line().unwrap().contains("2 times"), "{out:?}");
     }
 
     #[test]
-    fn an_edit_missing_half_of_itself_says_which_half() {
+    fn an_edit_missing_what_it_needs_says_what() {
         let (h, _) = vault_with_documents("half");
-        let out = perform(
-            &h,
-            "m1",
-            &act(
-                "file_edit",
-                json!({"path":"layers/eras/third.md","old_str":"x"}),
+        let path = "layers/eras/third.md";
+        let at = anchor(path, "the third era\nburned in the spring\n", 0);
+        for (args, says) in [
+            (json!({"path":path,"at":at,"do":"replace"}), "`text`"),
+            (json!({"path":path,"do":"delete"}), "`at`"),
+            (
+                json!({"path":path,"at":at,"do":"rewrite"}),
+                "replace, insert_before",
             ),
-        );
+            (
+                json!({"path":path,"at":at,"do":"move","dest":at}),
+                "`before` or `after`",
+            ),
+        ] {
+            let out = perform(&h, "m1", &act("file_edit", args));
+            assert!(!out.happened());
+            assert!(out.line().unwrap().contains(says), "{says}: {out:?}");
+        }
+    }
+
+    /// **An anchor read before its paragraph changed is refused**, and told to
+    /// read again — never applied to text the character did not see.
+    #[test]
+    fn a_stale_anchor_is_refused_and_told_to_read_again() {
+        let (h, _) = vault_with_documents("stale");
+        let path = "layers/eras/third.md";
+        let at = anchor(path, "the third era\nburned in the spring\n", 0);
+        let replace = |text: &str| {
+            act(
+                "file_edit",
+                json!({"path":path,"at":at,"do":"replace","text":text}),
+            )
+        };
+        assert!(perform(&h, "m1", &replace("the third era\nburned in the autumn")).happened());
+        // The same anchor again names the paragraph as it was.
+        let out = perform(&h, "m1", &replace("the third era\nburned in winter"));
         assert!(!out.happened());
-        assert!(out.line().unwrap().contains("both"), "{out:?}");
+        assert!(out.line().unwrap().contains("read it again"), "{out:?}");
     }
 
     #[test]
