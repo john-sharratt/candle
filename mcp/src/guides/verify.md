@@ -54,8 +54,10 @@ corrected and why.
 ```
 
 Its new answer carries a new audit. Past the day, or once its thread is
-archived, the worker cannot be continued: start a new task that cites its
-entries (`T:<thread>/<name>#<n>`) and says what to check.
+archived, the worker cannot be continued: start a new task with the claims to
+check copied into its CONTEXT, and what to check. A worker reads its own
+journal, its thread's and the project's, but not another worker's, so an
+entry's address in the prompt gives it nothing to open.
 
 ## 3. Spot-check what you will act on
 
