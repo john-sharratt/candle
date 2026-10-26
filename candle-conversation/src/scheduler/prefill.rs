@@ -3022,7 +3022,7 @@ impl Scheduler {
 
     /// Whether a prefill or section that can advance, and that `held` does not
     /// claim, belongs to a band above `band`.
-    fn waiting_above(&self, band: DecodePriority, held: impl Fn(usize) -> bool) -> bool {
+    pub(super) fn waiting_above(&self, band: DecodePriority, held: impl Fn(usize) -> bool) -> bool {
         let above = |p: DecodePriority| rank(p) > rank(band);
         let prefills = self
             .active_prefills
@@ -3230,10 +3230,20 @@ impl Scheduler {
     /// `None` with no section to ride: `High` while a dialogue's own section
     /// waits — it rides apart from ingest rows, as in a creep group
     /// (`form_wave_group`) — and otherwise the highest band waiting, since below
-    /// `High` the bands mix.
+    /// `High` the bands mix. `None` too while a prompt of a higher band can
+    /// advance.
+    ///
+    /// **Background yields to a waiting prompt here as a creep does**
+    /// (`creep_outranked_by_a_waiting_prompt`). A chunk riding a step beside
+    /// decode owes decode its share times the ratio its band yields at — 64 for
+    /// a schema's `Low` ingest beside `High` decodes — and that debt holds every
+    /// creep, whatever its band, until it is paid: on WhiteWorld (2026-10-26)
+    /// one ingest chunk owed ~90 s, and four Makers' `High` prompts sat frozen at
+    /// an 8,275-row backlog behind it while their decodes ran.
     pub(super) fn section_batch_band(&self) -> Option<DecodePriority> {
         let in_flight = self.wave_group_section_seqs();
-        self.active_section_ingests
+        let band = self
+            .active_section_ingests
             .iter()
             .filter(|s| {
                 s.error.is_none()
@@ -3241,7 +3251,8 @@ impl Scheduler {
                     && !in_flight.contains(&s.sequence_id.0)
             })
             .map(|s| s.band)
-            .max_by_key(|&b| rank(b))
+            .max_by_key(|&b| rank(b))?;
+        (!self.waiting_above(band, |_| false)).then_some(band)
     }
 
     /// Commit one section-ingest chunk after its forward (standalone or
@@ -4650,6 +4661,7 @@ impl Scheduler {
         } else {
             self.creep_priority(&members)
         };
+        self.wave_step_band = work;
         let band = self.airtime_ratio_over(work);
         // **A `High` prompt beside `High` decodes splits the device by the work
         // each side holds** (`turn_airtime`): the smaller backlog first, and a
@@ -4694,6 +4706,7 @@ impl Scheduler {
                 creep_layer_budget(n, ratio.ceil() as u32).min(n - cursor.min(n)),
                 creep_rows,
                 self.creep_layer_row_cost,
+                self.creep_layer_cost,
                 self.decode_only_step
                     .map(|d| d.mul_f64(self.wave_step_slice)),
             )
@@ -4710,6 +4723,7 @@ impl Scheduler {
                 creep_layer_budget(n, ratio.ceil() as u32).min(n - cursor.min(n)),
                 creep_rows,
                 self.creep_layer_row_cost,
+                self.creep_layer_cost,
                 Some(DECODE_LESS_SLICE),
             )
         };
@@ -4722,6 +4736,7 @@ impl Scheduler {
         } else {
             0
         };
+        self.wave_step_creep_layers = if !seq_ids.is_empty() { swept } else { 0 };
         // And the query×key pairs those rows attend through the same layers —
         // the creep's cost at depth, which its rows alone do not say.
         self.wave_step_creep_layer_pairs = if !seq_ids.is_empty() {
@@ -7139,15 +7154,16 @@ mod creep_throttle_tests {
             creep_layer_budget(48, 1),
             8_190,
             Some(per_layer_row),
+            None,
             Some(DECODE_LESS_SLICE),
         );
         assert_eq!(layers, 4, "250 ms / (8,190 × 6.6 µs) = 4.6 → 4 layers");
         let step = per_layer_row.mul_f64((8_190 * layers) as f64);
         assert!(step <= DECODE_LESS_SLICE, "a step of {step:?}");
-        let small = time_bounded_layers(48, 19, Some(per_layer_row), Some(DECODE_LESS_SLICE));
+        let small = time_bounded_layers(48, 19, Some(per_layer_row), None, Some(DECODE_LESS_SLICE));
         assert_eq!(small, 48, "a 19-row prompt sweeps whole");
         assert_eq!(
-            time_bounded_layers(48, 8_190, None, Some(DECODE_LESS_SLICE)),
+            time_bounded_layers(48, 8_190, None, None, Some(DECODE_LESS_SLICE)),
             1,
             "unmeasured, one layer"
         );
@@ -7554,9 +7570,28 @@ layers:
         }];
         assert_eq!(
             sched.section_batch_band(),
-            Some(DecodePriority::Low),
-            "the journal entry is already creeping in a group"
+            None,
+            "the journal entry creeping in a group outranks the ingest: its \
+             debt would hold the group"
         );
+        sched.wave_prefill_members.clear();
+        sched
+            .active_section_ingests
+            .retain(|s| s.sequence_id != journal);
+        assert_eq!(sched.section_batch_band(), Some(DecodePriority::Low));
+
+        // A dialogue's prompt that can advance holds the ingest section back:
+        // it would owe decode 64 times its share, and the debt holds the
+        // prompt's creep too.
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let prompt = SequenceId(sched.session.create_sequence().expect("create"));
+        bind(&mut sched, &builder, prompt, "dialogue", 1);
+        sched
+            .active_prefills
+            .push(dialogue_prefill(prompt, vec![1; 8]));
+        assert_eq!(sched.section_batch_band(), None, "the prompt outranks it");
+        sched.active_prefills.clear();
+        assert_eq!(sched.section_batch_band(), Some(DecodePriority::Low));
     }
 
     /// A section chunk runs at the band it was submitted at: a schema's alone
