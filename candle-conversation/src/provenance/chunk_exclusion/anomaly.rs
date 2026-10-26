@@ -19,6 +19,14 @@
 /// (`docs/results/provenance_gates_2026-10-26.md`).
 pub const K: f32 = 5.0;
 
+/// The threshold in a calibration competition: its chunks are few per file
+/// and alike — questions and the thinking they start — so its outliers sit
+/// nearer the median. Measured on held-out questions over the files first
+/// calibrated with thinking: k = 3 cuts 17 of ~8,000 chunks and lifts MRR
+/// 0.333 → 0.401 on question probes and 0.424 → 0.463 on thinking probes;
+/// k = 4 and 5 cut none.
+pub const K_CALIBRATION: f32 = 3.0;
+
 /// The share of each file's chunks the cut leaves it.
 pub const KEEP: f32 = 0.5;
 

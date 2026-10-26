@@ -39,7 +39,7 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
     let n = files.len();
     let in_gallery = |qi: usize| (1..=GALLERY).contains(&qi);
     let masked = |_: usize, qi: usize| !in_gallery(qi);
-    let chunks = Chunks::of(files, &|_, qi| in_gallery(qi));
+    let chunks = Chunks::of(files, true, &|_, qi| in_gallery(qi));
     let mut background: Vec<(usize, &[WideQSig])> = Vec::new();
     let mut held_out: Vec<(usize, &[WideQSig])> = Vec::new();
     for (fi, f) in files.iter().enumerate() {
@@ -60,7 +60,7 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
         held_out.len()
     );
 
-    let bg = attributed(&gpu, &chunks, &background, Questions::With, &masked)?;
+    let bg = attributed(&gpu, &chunks, &background, true, Questions::With, &masked)?;
     let mass = background_mass(&chunks, &background, &bg);
     let won_by_questions: f32 = (0..mass.len())
         .filter(|&c| chunks.turn_of[c].is_none())

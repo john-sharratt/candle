@@ -963,6 +963,13 @@ layers:
 
         If it depends on no other file of the workspace, write the heading with
         nothing under it.
+    # As code_reading's: each unit's questions, each opening the thinking it
+    # starts, compete apart from the units' content.
+    calibrate:
+      questions: 24
+      think: 64
+      prompt: |
+        Write <<n>> different questions someone working in this workspace might ask whose answer needs the dependency analysis you just wrote of `<<path>>`. Vary what they ask: what it depends on, what depends on it, what breaks if one of those changes, which files have to change together, where a shared resource or convention ties it to others. Ask them as a person would, not as a summary. At most half may name the file. Write one question per line and nothing else.
     window: 8000
     score_threshold: 0.0
     budget:
@@ -1006,9 +1013,11 @@ layers:
         budget:
           priority: 100
         # A unit is taken whole: one case each, all in one competition (see
-        # code_reading's `scopes`).
+        # code_reading's `scopes`); its calibration competes apart, at
+        # code_reading's weight.
         policy:
           cases: file
+          calibration_weight: 0.5
 
   # ── Code Review ────────────────────────────────────────────────────────────
   # Beside dependency_analysis, not above it: each unit continues the file's
@@ -1049,6 +1058,11 @@ layers:
         End with a section exactly like this one:
 
         VERDICT: <one line — sound, sound with changes, or needs rework — and why>
+    calibrate:
+      questions: 24
+      think: 64
+      prompt: |
+        Write <<n>> different questions someone working in this workspace might ask whose answer needs the code review you just wrote of `<<path>>`. Vary what they ask: what is wrong or fragile in it, which edge cases it mishandles, how it reports and recovers from errors, where it races or wastes work, what to fix first and how, whether it keeps the workspace's conventions. Ask them as a person would, not as a summary. At most half may name the file. Write one question per line and nothing else.
     window: 8000
     score_threshold: 0.0
     budget:
@@ -1090,6 +1104,7 @@ layers:
           priority: 100
         policy:
           cases: file
+          calibration_weight: 0.5
 
   # ── Security Review ────────────────────────────────────────────────────────
   # Beside dependency_analysis and code_review (`after: code_reading`), so an
@@ -1142,6 +1157,11 @@ layers:
         End with a section exactly like this one:
 
         RISK: <one line — none found, low, medium, high or critical — and why>
+    calibrate:
+      questions: 24
+      think: 64
+      prompt: |
+        Write <<n>> different questions someone working in this workspace might ask whose answer needs the security review you just wrote of `<<path>>`. Vary what they ask: what untrusted input reaches it, what an attacker could do with it, how input is validated, where secrets, credentials or permissions are handled, which advisories apply to what it uses, how to mitigate what you found. Ask them as a person would, not as a summary. At most half may name the file. Write one question per line and nothing else.
     window: 8000
     score_threshold: 0.0
     budget:
@@ -1185,6 +1205,7 @@ layers:
           priority: 100
         policy:
           cases: file
+          calibration_weight: 0.5
 
   # ── Dialogue ───────────────────────────────────────────────────────────────
   # The live developer ↔ assistant conversation.  Highest layer — sees

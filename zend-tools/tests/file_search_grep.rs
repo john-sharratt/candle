@@ -2,10 +2,11 @@
 
 mod harness;
 
+use doc_units::render::{pages, PAGE_LINES};
+use doc_units::Doc;
 use serde_json::json;
 use tempfile::TempDir;
 use zend_tools::ToolContext;
-use zend_vfs::vfs::PAGE_LINES;
 
 use harness::REPO;
 
@@ -157,10 +158,11 @@ fn a_literal_is_found_with_its_line_number() {
     assert_eq!(r["repos"][0]["matches"][0]["text"], "    // TODO: cache");
 }
 
-/// The line number is what `(line - 1) / PAGE_LINES + 1` turns into the page
-/// `file_read` wants, so the pair composes without the model losing the hit.
+/// A hit names the part it is in under its anchor, and the `file_read` page
+/// that holds it — so the pair composes without the model losing the hit, and
+/// the part can be edited straight from the hit.
 #[test]
-fn the_line_number_feeds_a_file_read_page() {
+fn a_hit_names_its_part_and_page() {
     let dir = workspace();
     let c = ctx(&dir);
     let r = harness::expect_success(harness::invoke_with_ctx(
@@ -168,20 +170,61 @@ fn the_line_number_feeds_a_file_read_page() {
         json!({"repo": REPO, "page": 1, "pattern":"API_KEY"}),
         &c,
     ));
-    let path = r["repos"][0]["matches"][0]["path"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let line = r["repos"][0]["matches"][0]["line"].as_u64().unwrap();
-    assert_eq!(line, 3);
-    let page = (line - 1) / u64::from(PAGE_LINES) + 1;
+    let hit = &r["repos"][0]["matches"][0];
+    let path = hit["path"].as_str().unwrap().to_string();
+    assert_eq!(hit["line"], 3);
+    let text = "pub fn run() {\n    // TODO: cache\n    let API_KEY = 1;\n}\n";
+    let a = &Doc::new(&path, text).anchors()[0];
+    assert_eq!(hit["part"], format!("{a}| fn run"));
+    assert_eq!(hit["page"], 1);
 
-    let excerpt = harness::expect_success(harness::invoke_with_ctx(
+    let page = harness::expect_success(harness::invoke_with_ctx(
         "file_read",
-        json!({"repo": REPO, "path": path, "page": page}),
+        json!({"repo": REPO, "path": path, "page": hit["page"]}),
         &c,
     ));
-    assert!(excerpt.as_str().unwrap().contains("API_KEY"));
+    assert!(page.as_str().unwrap().contains(&format!("{a}| fn run\n")));
+
+    // The hit's anchor edits the part with no read in between.
+    harness::expect_success(harness::invoke_with_ctx(
+        "file_edit",
+        json!({"repo": REPO, "path": path, "at": a, "do": "replace",
+               "old": "API_KEY = 1", "text": "API_KEY = 2"}),
+        &c,
+    ));
+}
+
+/// Pages hold whole parts, so a hit deep in a long file names the page its
+/// part is on, not one derived from its line number.
+#[test]
+fn a_hit_in_a_long_file_names_the_page_its_part_is_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = harness::repo_root(dir.path());
+    std::fs::create_dir_all(&root).unwrap();
+    let text: String = (0..120)
+        .map(|i| format!("fn f{i}() {{\n    let _ = {i};\n}}\n\n"))
+        .collect();
+    std::fs::write(root.join("long.rs"), &text).unwrap();
+    let r = harness::expect_success(harness::invoke_with_ctx(
+        "file_grep",
+        json!({"repo": REPO, "page": 1, "pattern":"fn f99\\("}),
+        &harness::workspace_ctx(dir.path()),
+    ));
+    let hit = &r["repos"][0]["matches"][0];
+    let doc = Doc::new("long.rs", &text);
+    let i = doc
+        .units()
+        .iter()
+        .position(|u| u.label.as_deref() == Some("fn f99"))
+        .unwrap();
+    let page = pages(&doc, PAGE_LINES)
+        .iter()
+        .position(|p| p.contains(&i))
+        .unwrap()
+        + 1;
+    assert_eq!(hit["page"], page);
+    assert!(page > 1, "a page past the first: {page}");
+    assert_eq!(hit["part"], format!("{}| fn f99", doc.units()[i].anchor));
 }
 
 #[test]

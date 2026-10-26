@@ -40,15 +40,15 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::{TriggerRegistry, MAX_TOOL_CALLS_PER_TURN};
 use candle_conversation::{ConversationEngine, Sequence, TurnOptions, TurnText};
+use zend_tools::tools::file::render::{page_count, PAGE_LINES};
 use zend_tools::ToolContext;
-use zend_vfs::vfs::PAGE_LINES;
 use zend_vfs::{ObjectFormat, Oid};
 
 use self::lines::line_count;
 use crate::branch_ingest::filter::{language_of, MAX_FILE_BYTES};
 use crate::branch_ingest::keys::{
     branches_value, file_key, quant_tags, BLOB_KEY, BRANCHES_KEY, COMMIT_KEY, CONTENT_KEY,
-    LINES_KEY,
+    PAGES_KEY,
 };
 use crate::branch_ingest::plan::Committed;
 use crate::ingest_lease::{self, Share};
@@ -224,8 +224,8 @@ const FILE_READ_TOOL: &str = "file_read";
 const FILE_TURN_MAX_TOKENS: usize = 1536;
 
 /// Real `file_read` rounds a single file's conversation may run before being
-/// forced to answer on whatever it has already seen. The tool returns one
-/// [`PAGE_LINES`]-line page per call (`zend-vfs`), so a genuinely large
+/// forced to answer on whatever it has already seen. The tool returns one page
+/// of whole parts, at most [`PAGE_LINES`] lines, per call, so a genuinely large
 /// file may take several calls to read in full; this bounds the pathological
 /// case (or a model that keeps re-reading) rather than the ordinary one, which
 /// typically answers well before the cap.
@@ -250,7 +250,7 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 /// given, the arithmetic is settled before the model starts.
 ///
 /// **It asks for the calls in PARALLEL, and that is a round-count decision.**
-/// `file_read` serves one [`PAGE_LINES`]-line page per call, so a long file
+/// `file_read` serves one page of at most [`PAGE_LINES`] lines per call, so a long file
 /// needs several — and a round is one decode plus one tool dispatch, so reading
 /// a 2,000-line file one call per turn costs ten decodes where a single turn
 /// carrying ten calls costs one. The loop already supports it in full:
@@ -273,11 +273,13 @@ const MAX_FILE_READ_ROUNDS: usize = 24;
 /// the model correctly recalls its own earlier rounds without being told to.
 ///
 /// `key` is workspace-relative; the prompt names the repository and the path
-/// inside it separately, the two arguments the call it asks for takes.
-pub(crate) fn opening_prompt(key: &str, lines: usize) -> String {
+/// inside it separately, the two arguments the call it asks for takes. `pages`
+/// is how many pages `file_read` reads the file as ([`page_count`]) — whole
+/// parts make a page, so it is counted from the content, not the line total.
+pub(crate) fn opening_prompt(key: &str, lines: usize, pages: u32) -> String {
     let (repo, path) = split(key);
     // Pages count from 1, as `file_read`'s do: the last is `pages`.
-    let pages = lines.div_ceil(PAGE_LINES as usize).max(1);
+    let pages = (pages as usize).max(1);
     // A reply holds at most `MAX_TOOL_CALLS_PER_TURN` calls — the tool grammar
     // ends the turn after that many — so a longer file is asked for in replies
     // of that size rather than told to fit in one.
@@ -292,9 +294,10 @@ pub(crate) fn opening_prompt(key: &str, lines: usize) -> String {
     };
     format!(
         "Read the entire contents of `{path}` in the `{repo}` repository — and only \
-         this file — using {FILE_READ_TOOL}. The file is {lines} lines long and each \
-         call returns one {PAGE_LINES}-line page, so it takes exactly {pages} \
-         {FILE_READ_TOOL} call(s): {batching}, instead of one call per reply. \
+         this file — using {FILE_READ_TOOL}. The file is {lines} lines long and \
+         reads as {pages} page(s) — each call returns one page of its parts, at most \
+         {PAGE_LINES} lines — so it takes exactly {pages} {FILE_READ_TOOL} call(s): \
+         {batching}, instead of one call per reply. \
          Every call you make in a reply is run together and all of their results \
          come back to you at once. Once you've read the whole thing, summarize what \
          it contains: its purpose, its main structures or functions, and how it fits \
@@ -746,7 +749,7 @@ fn process_one_file(
         .repo(repo)
         .ok()
         .and_then(|store| store.read_bytes(inner).ok().flatten());
-    let lines = match bytes {
+    let (lines, pages) = match bytes {
         Some(bytes) if is_binary_sample(&bytes) => {
             tracing::debug!(
                 target: "zend::code_read::ingest",
@@ -756,7 +759,10 @@ fn process_one_file(
             job.binary.lock().unwrap().insert(job.key.to_string());
             return Ok(());
         }
-        Some(bytes) => line_count(&bytes),
+        Some(bytes) => (
+            line_count(&bytes),
+            page_count(inner, &String::from_utf8_lossy(&bytes)),
+        ),
         None => {
             failures.record(
                 &file.path,
@@ -873,6 +879,7 @@ fn process_one_file(
         &mut conv,
         &file.path,
         lines,
+        pages,
         &ctx.think_triggers,
         &unit_ctx,
     ) {
@@ -934,13 +941,14 @@ fn process_one_file(
 
     // Tag the conversation: the content key commits it — what the pass plans
     // against, the fast path finds and retrieval scopes by — `path` and `blob`
-    // are its parts, `lines` is what a fast-path answer reports, the rest is
-    // diagnostic. One record, so the line count lands with the key.
+    // are its parts, `pages` is what the fast path checks the chain read and
+    // what its answer reports, the rest is diagnostic. One record, so the page
+    // count lands with the key.
     let mut tags = BTreeMap::new();
     tags.insert("kind".to_string(), "code_read".to_string());
     tags.insert(PATH_KEY.to_string(), file.path.clone());
     tags.insert(BLOB_KEY.to_string(), file.blob.to_string());
-    tags.insert(LINES_KEY.to_string(), lines.to_string());
+    tags.insert(PAGES_KEY.to_string(), pages.to_string());
     tags.insert(CONTENT_KEY.to_string(), job.key.to_string());
     if let Some(bits) = crate::branch_ingest::keys::model_bits() {
         tags.insert(
@@ -1056,13 +1064,14 @@ fn run_file_conversation(
     conv: &mut Sequence,
     path: &str,
     lines: usize,
+    pages: u32,
     triggers: &Arc<TriggerRegistry>,
     tool_ctx: &Arc<ToolContext>,
 ) -> anyhow::Result<String> {
     let tags = vec!["code".to_string(), path.to_string()];
     let selection = file_selection();
 
-    let mut current_message: TurnText = TurnText::from(opening_prompt(path, lines));
+    let mut current_message: TurnText = TurnText::from(opening_prompt(path, lines, pages));
     let mut closing = false;
     for round in 0..=MAX_FILE_READ_ROUNDS {
         if crate::ingest_cancel::cancelled() {
@@ -1168,7 +1177,7 @@ mod tests {
         };
         assert_eq!(
             job.key(),
-            "v2:candle/src/lib.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+            "v3:candle/src/lib.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
     }
 
@@ -1188,7 +1197,7 @@ mod tests {
 
     #[test]
     fn opening_prompt_names_the_path_and_the_one_tool() {
-        let p = opening_prompt("candle/src/lib.rs", 120);
+        let p = opening_prompt("candle/src/lib.rs", 120, 1);
         assert!(
             p.starts_with("Read the entire contents of `src/lib.rs` in the `candle` repository")
         );
@@ -1204,35 +1213,34 @@ mod tests {
     /// budget cut it off mid-word, with no `file_read` call emitted, no coupling,
     /// no second turn and no summary. The arithmetic belongs in the prompt.
     ///
-    /// Pages are 200 lines and count from 1, so the boundaries are pinned as text.
+    /// Pages are counted from the content and count from 1, so the boundaries
+    /// are pinned as text.
     #[test]
     fn opening_prompt_states_the_length_and_the_call_count() {
         assert_eq!(
             PAGE_LINES, 200,
             "the expected text below is written for 200-line pages"
         );
-        // Exactly one page's worth: one call, not two.
-        let one = opening_prompt("candle/src/small.rs", 200);
+        let one = opening_prompt("candle/src/small.rs", 200, 1);
         assert!(
             one.contains(
-                "The file is 200 lines long and each call returns one 200-line page, \
-                 so it takes exactly 1 file_read call(s): issue all 1 in the SAME \
-                 reply, one per page from page 1 to page 1,"
+                "The file is 200 lines long and reads as 1 page(s) — each call returns one \
+                 page of its parts, at most 200 lines — so it takes exactly 1 file_read \
+                 call(s): issue all 1 in the SAME reply, one per page from page 1 to page 1,"
             ),
             "{one:?}",
         );
-        // One line over: two calls, pages 1 and 2.
-        let two = opening_prompt("candle/src/mid.rs", 201);
+        let two = opening_prompt("candle/src/mid.rs", 201, 2);
         assert!(
             two.contains(
-                "The file is 201 lines long and each call returns one 200-line page, \
-                 so it takes exactly 2 file_read call(s): issue all 2 in the SAME \
-                 reply, one per page from page 1 to page 2,"
+                "The file is 201 lines long and reads as 2 page(s) — each call returns one \
+                 page of its parts, at most 200 lines — so it takes exactly 2 file_read \
+                 call(s): issue all 2 in the SAME reply, one per page from page 1 to page 2,"
             ),
             "{two:?}",
         );
         // An empty file still asks for one call rather than zero.
-        let empty = opening_prompt("candle/src/empty.rs", 0);
+        let empty = opening_prompt("candle/src/empty.rs", 0, 0);
         assert!(
             empty.contains("exactly 1 file_read call(s)") && empty.contains("page 1 to page 1,"),
             "never zero calls: {empty:?}",
@@ -1245,7 +1253,7 @@ mod tests {
     /// reading the file, not merely permit it.
     #[test]
     fn opening_prompt_requires_reading_the_whole_file() {
-        let p = opening_prompt("candle/CHANGELOG.md", 40);
+        let p = opening_prompt("candle/CHANGELOG.md", 40, 1);
         assert!(
             p.contains("entire") || p.contains("whole"),
             "must ask for the whole file, not an unspecified amount: {p:?}",
@@ -1267,9 +1275,9 @@ mod tests {
     /// from the first page's header.
     #[test]
     fn opening_prompt_asks_for_parallel_reads_and_names_the_cap() {
-        let p = opening_prompt("candle/src/big.rs", 2000);
+        let p = opening_prompt("candle/src/big.rs", 2000, 10);
         assert!(
-            p.contains("one 200-line page, so it takes exactly 10 file_read call(s)"),
+            p.contains("at most 200 lines — so it takes exactly 10 file_read call(s)"),
             "must name the page size and the call count so every call can be issued \
              up front: {p:?}",
         );
@@ -1290,7 +1298,7 @@ mod tests {
     /// for whole.
     #[test]
     fn opening_prompt_batches_within_the_per_reply_cap() {
-        let long = opening_prompt("candle/src/big.rs", 2000);
+        let long = opening_prompt("candle/src/big.rs", 2000, 10);
         assert!(
             long.contains(&format!(
                 "issue them {MAX_TOOL_CALLS_PER_TURN} to a reply — the most one reply can hold"
@@ -1298,7 +1306,7 @@ mod tests {
             "{long:?}"
         );
         assert!(!long.contains("issue all 10"), "{long:?}");
-        let short = opening_prompt("candle/src/small.rs", 300);
+        let short = opening_prompt("candle/src/small.rs", 300, 2);
         assert!(
             short.contains("issue all 2 in the SAME reply, one per page from page 1 to page 2"),
             "{short:?}"

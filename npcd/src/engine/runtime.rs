@@ -65,6 +65,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::Request as HttpRequest;
 use axum::http::StatusCode;
 use axum::Router;
+use doc_units::Doc;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, json, to_string, to_vec, Value};
 use tower::ServiceExt;
@@ -2826,12 +2827,24 @@ impl Runtime {
             Err(e) => return refused(format!("You cannot settle to write: {e}")),
         };
         let (engine, base) = (minds.engine(), minds.base_config());
-        let calls = [compose::spec()];
+        // A piece that stands is mended by its paragraphs' anchors — `mend`
+        // beside `draft`, its anchors bound in the grammar — and one to be
+        // written anew is drafted (`docs/npcd_anchored_edits.md` §7).
+        let standing_doc = standing
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| Doc::new(&writes, s))
+            .filter(|d| !d.units().is_empty());
+        let mut calls = vec![compose::spec()];
+        if let Some(doc) = &standing_doc {
+            calls.push(compose::mend_spec(&doc.anchors()));
+        }
         // One sitting writes the whole piece: one that comes in short of its
         // floor is carried on from where it stopped — see `compose::fuller` —
         // and what comes next is put after it.
         let mut asked = question.clone();
         let mut text: Option<String> = None;
+        let mut mend: Option<compose::Mended> = None;
         for _ in 0..compose::SITTINGS {
             let ask = CallAsk {
                 system: &voice,
@@ -2850,6 +2863,17 @@ impl Runtime {
                 }
                 Err(_) => break,
             };
+            if let (Some(doc), Some(edits)) = (&standing_doc, compose::read_mend(&raw)) {
+                let made = compose::mended(doc, &edits);
+                if made.made == 0 {
+                    return refused(compose::nothing_mended(&writes, &made.refused));
+                }
+                text = Some(made.text.clone());
+                mend = Some(made);
+                break;
+            }
+            // Carrying a piece on is drafting it: only the first sitting may mend.
+            calls.truncate(1);
             let Some(written) = compose::read(&raw) else {
                 break;
             };
@@ -2900,6 +2924,40 @@ impl Runtime {
         let wrote = self.record_act(npc_id, &write);
         if !wrote.landed {
             return refused(wrote.answer);
+        }
+        if let Some(m) = mend {
+            tracing::info!(
+                npc_id,
+                %writes,
+                words,
+                made = m.made,
+                refused = m.refused.len(),
+                "mended a piece by its anchors",
+            );
+            let refusals = match m.refused.is_empty() {
+                true => String::new(),
+                false => format!(
+                    " {} of your changes could not be made: {}.",
+                    m.refused.len(),
+                    m.refused.join("; ")
+                ),
+            };
+            return Recorded {
+                feed: format!(
+                    "{} {LANDED} mended {writes}, {} changes, {words} words",
+                    act.summary(),
+                    m.made
+                ),
+                answer: format!(
+                    "You sat down with {writes} and mended it: {} changes, {words} words now, in \
+                     your working copy.{refusals} Read it back with `file_read`. If it stands, \
+                     `bench_commit` it; where one passage in it is still wrong, put that passage \
+                     right with `file_edit` — not the rest.",
+                    m.made
+                ),
+                landed: true,
+                departing: false,
+            };
         }
         tracing::info!(npc_id, %writes, words, "composed a draft");
         Recorded {

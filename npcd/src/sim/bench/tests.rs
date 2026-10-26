@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use doc_units::Op;
+
 use super::*;
 use crate::sim::shelf::{Published, NO_OPERATION};
 
@@ -272,115 +274,151 @@ fn removing_something_that_is_not_there_is_refused() {
     );
 }
 
-// ── the uniqueness rule ─────────────────────────────────────────────────
+// ── anchored edits ──────────────────────────────────────────────────────
+
+/// The anchor of paragraph `i` of a document as `body` has it.
+fn anchor_in(b: &Benches, body: &str, path: &str, i: usize, s: &dyn Shelf) -> String {
+    let text = b.read(body, path, s).unwrap();
+    Doc::new(path, &text).units()[i].anchor.clone()
+}
+
+/// `old` inside the anchored paragraph, replaced by `text`.
+fn change(at: String, old: &str, text: &str) -> Edit {
+    Edit {
+        at,
+        op: Op::Replace {
+            text: text.into(),
+            old: Some(old.into()),
+            to: None,
+        },
+    }
+}
 
 #[test]
-fn an_edit_replaces_the_one_place_its_target_appears() {
+fn an_edit_changes_the_paragraph_its_anchor_names() {
     let (mut b, _, s) = rooted("edit-one");
-    b.edit(
-        "m1",
-        "layers/eras",
-        "layers/eras/third.md",
-        "spring",
-        "autumn",
-        &s,
-    )
-    .unwrap();
+    let at = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
+    let reply = b
+        .edit(
+            "m1",
+            "layers/eras",
+            "layers/eras/third.md",
+            &change(at.clone(), "spring", "autumn"),
+            &s,
+        )
+        .unwrap();
     assert_eq!(
         b.read("m1", "layers/eras/third.md", &s).unwrap(),
         "the third era\nburned in the autumn\n"
     );
+    let now = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
+    assert_eq!(
+        reply,
+        format!(
+            "layers/eras/third.md: Changed {at}.\n{now}| the third era\nburned in the autumn\n"
+        )
+    );
 }
 
 /// An ambiguous edit is the one that silently does the wrong thing, so it
-/// is refused and says how many it found.
+/// is refused and says how many it found — and nothing lands.
 #[test]
-fn an_edit_whose_target_appears_twice_is_refused_and_counts_them() {
+fn words_that_appear_twice_in_the_paragraph_are_refused_and_counted() {
     let (mut b, root, s) = rooted("edit-two");
     std::fs::write(root.join("layers/eras/third.md"), "a fire\nand a fire\n").unwrap();
+    let at = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
     let err = b
         .edit(
             "m1",
             "layers/eras",
             "layers/eras/third.md",
-            "a fire",
-            "a flood",
+            &change(at, "a fire", "a flood"),
             &s,
         )
         .unwrap_err();
-    assert!(err.contains('2'), "{err}");
+    assert!(err.contains("2 times"), "{err}");
     assert!(
         b.opened("m1").is_none_or(|w| w.is_empty()),
         "a refused edit still landed"
     );
 }
 
+/// **Words not in the paragraph are refused, and the paragraph is shown** —
+/// the text the next edit can take its words from, as it stands in this
+/// working set.
 #[test]
-fn an_edit_whose_target_is_not_there_is_refused() {
+fn words_not_in_the_paragraph_are_refused_and_it_is_shown() {
     let (mut b, _, s) = rooted("edit-none");
+    let at = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
     let err = b
         .edit(
             "m1",
             "layers/eras",
             "layers/eras/third.md",
-            "a flood",
-            "a fire",
+            &change(at.clone(), "a flood", "a fire"),
             &s,
         )
         .unwrap_err();
-    assert!(err.contains("does not appear"), "{err}");
-    // **And it is shown what is there** — the text the next edit has to
-    // quote, including this working set's own earlier changes.
-    assert!(
-        err.ends_with(
-            "If you meant to replace the whole piece, write it whole again rather than \
-             editing it. It says, as it stands now:\n\nthe third era\nburned in the spring"
-        ),
-        "{err}"
+    assert_eq!(
+        err,
+        format!(
+            "In layers/eras/third.md, `old` does not occur in {at}, which reads:\nthe third \
+             era\nburned in the spring."
+        )
     );
 }
 
-/// A document too long to hand back whole is pointed at, not pasted.
+/// An anchor the document does not have is refused with the way on: read it
+/// again.
 #[test]
-fn a_long_document_is_not_pasted_into_a_refusal() {
-    let long = "word ".repeat(SHOWN_WHOLE + 1);
-    let err = not_there("layers/eras/third.md", &long);
-    assert!(err.ends_with("Otherwise read it back first."), "{err}");
+fn an_anchor_the_document_does_not_have_is_refused() {
+    let (mut b, _, s) = rooted("edit-stale");
+    let err = b
+        .edit(
+            "m1",
+            "layers/eras",
+            "layers/eras/third.md",
+            &change("zzzz".into(), "spring", "autumn"),
+            &s,
+        )
+        .unwrap_err();
     assert!(
-        err.contains("write it whole again rather than editing it"),
+        err.starts_with("In layers/eras/third.md, zzzz is not a part of it"),
         "{err}"
     );
-    assert!(not_there("layers/eras/third.md", "").ends_with("write it whole first."));
-}
-
-#[test]
-fn replacing_the_empty_string_is_refused() {
-    let (mut b, _, s) = rooted("edit-empty");
-    assert!(b
-        .edit("m1", "layers/eras", "layers/eras/third.md", "", "x", &s)
-        .is_err());
+    assert!(err.contains("read it again"), "{err}");
 }
 
 /// Edits compound in memory: the second reads the first's result, not the
-/// shelf's.
+/// shelf's — and the second has to name the paragraph as the first left it.
 #[test]
 fn a_second_edit_sees_the_first() {
     let (mut b, _, s) = rooted("edit-compound");
+    let at = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
     b.edit(
         "m1",
         "layers/eras",
         "layers/eras/third.md",
-        "third",
-        "thirteenth",
+        &change(at.clone(), "third", "thirteenth"),
         &s,
     )
     .unwrap();
+    assert!(b
+        .edit(
+            "m1",
+            "layers/eras",
+            "layers/eras/third.md",
+            &change(at, "spring", "autumn"),
+            &s,
+        )
+        .unwrap_err()
+        .contains("read it again"));
+    let now = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
     b.edit(
         "m1",
         "layers/eras",
         "layers/eras/third.md",
-        "spring",
-        "autumn",
+        &change(now, "spring", "autumn"),
         &s,
     )
     .unwrap();
@@ -787,45 +825,53 @@ fn long_document(root: &Path, lines: usize) {
 
 /// **An uncapped read is a context hazard.** A tool result lands in the
 /// conversation verbatim, so one long document would fill a character's
-/// whole window and push out the turns that gave it a reason to read.
+/// whole window and push out the turns that gave it a reason to read. A
+/// 900-line paragraph is cut into parts of 80 lines, two to a 200-line page.
 #[test]
-fn a_read_returns_at_most_the_capped_number_of_lines() {
+fn a_read_returns_at_most_one_page() {
     let (b, root, s) = rooted("cap");
     long_document(&root, 900);
     let out = b.excerpt("m1", "layers/eras/long.md", 1, &s).unwrap();
-    assert!(out.contains("(lines 1-200 of 900)"), "{out}");
-    assert!(out.contains("  line 1\n"), "{out}");
-    assert!(out.contains("line 200"), "{out}");
-    assert!(!out.contains("line 201"), "the cap did not hold");
+    assert!(
+        out.starts_with("\nlayers/eras/long.md (page 1 of 6: paragraphs 1–2 of 12):"),
+        "{out}"
+    );
+    assert!(out.contains("| line 1\n"), "{out}");
+    assert!(out.contains("line 160\n"), "{out}");
+    assert!(!out.contains("line 161"), "the cap did not hold");
+    assert!(
+        out.ends_with("There is more: the next read asks for page 2.\n"),
+        "{out}"
+    );
 }
 
-/// The header names the absolute range, so the next read asks for the next
-/// line directly rather than having to work it out.
+/// The header names the page and the paragraphs on it, so the next read asks
+/// for the next page directly rather than having to work it out.
 #[test]
-fn a_read_continues_from_the_line_it_is_given() {
+fn a_read_continues_from_the_page_it_is_given() {
     let (b, root, s) = rooted("cap-continue");
     long_document(&root, 900);
-    let out = b.excerpt("m1", "layers/eras/long.md", 201, &s).unwrap();
-    assert!(out.contains("(lines 201-400 of 900)"), "{out}");
-    assert!(out.contains("line 201"), "{out}");
-    assert!(!out.contains("  line 200\n"), "{out}");
+    let out = b.excerpt("m1", "layers/eras/long.md", 2, &s).unwrap();
+    assert!(out.contains("(page 2 of 6: paragraphs 3–4 of 12)"), "{out}");
+    assert!(out.contains("| line 161\n"), "{out}");
+    assert!(!out.contains("line 160\n"), "{out}");
 }
 
-/// The last page drops the `of n`, which is how a reader knows it has the
-/// end and not another 200 waiting.
+/// The last page says nothing of more, which is how a reader knows it has
+/// the end and not another page waiting.
 #[test]
 fn the_last_page_says_it_is_the_last() {
     let (b, root, s) = rooted("cap-last");
     long_document(&root, 250);
-    let out = b.excerpt("m1", "layers/eras/long.md", 201, &s).unwrap();
-    assert!(out.contains("(lines 201-250)"), "{out}");
-    assert!(!out.contains(" of 250"), "{out}");
+    let out = b.excerpt("m1", "layers/eras/long.md", 2, &s).unwrap();
+    assert!(out.contains("(page 2 of 2: paragraphs 3–4 of 4)"), "{out}");
+    assert!(!out.contains("There is more"), "{out}");
 }
 
-/// A start past the end reads the last line rather than coming back empty,
+/// A page past the end reads the last page rather than coming back empty,
 /// which a model reads as "the document is empty" and then acts on.
 #[test]
-fn a_start_past_the_end_reads_the_end() {
+fn a_page_past_the_end_reads_the_end() {
     let (b, root, s) = rooted("cap-past");
     long_document(&root, 10);
     let out = b.excerpt("m1", "layers/eras/long.md", 9_999, &s).unwrap();
@@ -833,12 +879,16 @@ fn a_start_past_the_end_reads_the_end() {
 }
 
 #[test]
-fn a_short_document_comes_back_whole_and_numbered() {
+fn a_short_document_comes_back_whole_and_anchored() {
     let (b, _, s) = rooted("excerpt");
     let out = b.excerpt("m1", "layers/eras/third.md", 1, &s).unwrap();
+    let a = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
     assert_eq!(
         out,
-        "\nlayers/eras/third.md (lines 1-2):\n\n```markdown\n1  the third era\n2  burned in the spring\n```\n"
+        format!(
+            "\nlayers/eras/third.md (1 paragraph):\n\n```markdown\n{a}| the third era\nburned \
+             in the spring\n```\n"
+        )
     );
 }
 
@@ -861,33 +911,37 @@ fn an_excerpt_shows_your_own_changes() {
     b.write("m1", "x", "layers/eras/third.md", "one\ntwo\nthree\n", &s)
         .unwrap();
     let mine = b.excerpt("m1", "layers/eras/third.md", 1, &s).unwrap();
-    assert!(mine.contains("3  three"), "{mine}");
+    assert!(mine.contains("| one\ntwo\nthree\n"), "{mine}");
     let theirs = b.excerpt("m2", "layers/eras/third.md", 1, &s).unwrap();
     assert!(theirs.contains("burned in the spring"), "{theirs}");
 }
 
-/// The numbering is right-aligned to the widest number in the range, which
-/// is what keeps the text column straight across a page boundary.
+/// A paragraph's lines stand as they are under its anchor — indentation and
+/// all — so what a read shows is the text an edit changes.
 #[test]
-fn line_numbers_are_aligned_to_the_widest_in_the_range() {
-    let (b, root, s) = rooted("align");
-    long_document(&root, 120);
+fn a_paragraph_shows_its_lines_as_they_are() {
+    let (b, root, s) = rooted("lines");
+    std::fs::write(
+        root.join("layers/eras/long.md"),
+        "first\n  indented\n\nsecond\n",
+    )
+    .unwrap();
     let out = b.excerpt("m1", "layers/eras/long.md", 1, &s).unwrap();
-    assert!(out.contains("\n  1  line 1\n"), "{out}");
-    assert!(out.contains("\n120  line 120\n"), "{out}");
+    assert!(out.contains("| first\n  indented\n"), "{out}");
+    assert!(out.contains("| second\n"), "{out}");
 }
 
-/// An edit matches the document, not its rendering — numbering the text and
-/// then searching it would never find anything.
+/// An edit is applied to the document, not its rendering — the anchors a
+/// read shows never land in the text.
 #[test]
-fn an_edit_matches_the_document_and_not_its_numbering() {
+fn an_edit_is_applied_to_the_document_and_not_its_rendering() {
     let (mut b, _, s) = rooted("raw");
+    let at = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
     b.edit(
         "m1",
         "x",
         "layers/eras/third.md",
-        "the third era",
-        "the fourth era",
+        &change(at, "the third era", "the fourth era"),
         &s,
     )
     .unwrap();
@@ -948,12 +1002,12 @@ fn nothing_uncommitted_leaks_between_bodies() {
     );
 
     // An edit compounds only on its own author's version.
+    let at = anchor_in(&b, "m1", "layers/eras/shared.md", 0, &s);
     b.edit(
         "m1",
         "x",
         "layers/eras/shared.md",
-        "m1's",
-        "m1 has edited its",
+        &change(at, "m1's", "m1 has edited its"),
         &s,
     )
     .unwrap();

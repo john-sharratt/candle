@@ -87,6 +87,9 @@ pub struct Question {
     /// The question's own words in `sigs`: its turn's user span, without the
     /// chat framing every calibration turn shares.
     pub body: Range<usize>,
+    /// The answer's span in `sigs` — the thinking the question starts, for a
+    /// calibration that kept it; empty for one sealed with an empty answer.
+    pub answer: Range<usize>,
 }
 
 impl Question {
@@ -127,11 +130,21 @@ pub fn questions(sub: &Substrate) -> HashMap<u64, Vec<Question>> {
         let Some(body) = user.filter(|r| r.start < r.end && r.end <= sigs.len()) else {
             continue;
         };
+        let answer = d
+            .segments
+            .iter()
+            .find_map(|s| match s {
+                TurnSegment::Assistant { kv, .. } => Some(kv.range()),
+                _ => None,
+            })
+            .filter(|r| r.end <= sigs.len())
+            .unwrap_or(0..0);
         out.entry(unit).or_default().push(Question {
             timeline: d.timeline_id,
             turn: d.turn_index,
             sigs,
             body,
+            answer,
         });
     }
     for qs in out.values_mut() {

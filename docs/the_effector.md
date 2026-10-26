@@ -1848,7 +1848,7 @@ handler already (`zend-tools`).
 |---|---|---|---|---|---|
 | `GET .../file/<id>/read` | GET | working (copy open) | `path` free req | World (session overlay) | `file_read` zend-tools, audit §5.3 |
 | `GET .../file/<id>/list` | GET | working | `path` free opt | World (overlay) | `file_list` zend-tools, audit §5.3 |
-| `POST .../file/<id>/edit` | POST | claimed (working) | `path` free req; `old_str` free req; `new_str` free req | World (overlay) | `file_edit` zend-tools (single-site `str_replace`), audit §5.3 |
+| `POST .../file/<id>/edit` | POST | claimed (working) | `path` free req; `at` free req; `do` enum req, each value bringing its fields (`text`; `dest`, `where` enum); `old`, `to` free opt | World (overlay) | `file_edit` by anchor (`docs/npcd_anchored_edits.md`), audit §5.3 |
 | `POST .../file/<id>/write` | POST | claimed (working) | `path` free req; `content` free req | World (overlay) | `file_write` zend-tools, audit §5.3 |
 | `POST .../file/<id>/delete` | POST | claimed (working) | `path` free req | World (overlay, whiteout) | `file_delete` zend-tools, audit §5.3 |
 

@@ -46,9 +46,9 @@ use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
 use super::spec::CalibrateSpec;
 use super::thinking::{exemplar, thinking_of};
-use crate::branch_ingest::keys::CONTENT_KEY;
+use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
 use crate::code_read::PATH_KEY;
-use crate::layers::keys::SUBJECT_KEY;
+use crate::layers::keys::{FILE_KEY, SUBJECT_KEY};
 use crate::layers::run::{answer_of, LAYER_PARALLELISM};
 
 /// The calibration marker a calibration carries ([`CalibrateSpec::marker`]).
@@ -208,8 +208,16 @@ pub fn calibrate_layer(
 }
 
 /// Every unit of `layer`: each conversation of its group committed under a
-/// content key and naming its subject — ready when its chain finished and
-/// every turn holds its content.
+/// content key and naming its subject — ready when its chain finished, every
+/// turn holds its content, and the reading it stands on is of the current
+/// [`KEY_VERSION`].
+///
+/// **A unit standing on an older reading waits.** Its draft forks from that
+/// reading, which the current rendering no longer projects: asked anyway, the
+/// draft saw no file and answered that none had been read, or called a tool,
+/// or wrote questions about nothing. Such a unit is read again under the
+/// current version by the pass a version change starts, and is calibrated
+/// then; its calibration stands until it is.
 fn units(engine: &ConversationEngine, layer: &Layer<'_>) -> Vec<Unit> {
     let conv = engine.conversation();
     let substrate = conv.read();
@@ -225,12 +233,17 @@ fn units_of(substrate: &Substrate, group: GroupId, spec: &CalibrateSpec) -> Vec<
             let meta = substrate.custom_of(tl)?;
             let key = meta.get(CONTENT_KEY)?;
             let subject = meta.get(SUBJECT_KEY).or_else(|| meta.get(PATH_KEY))?;
+            // A file's reading is keyed by its own content key; a unit built
+            // on one records the reading's under `FILE_KEY`.
+            let reading = meta.get(FILE_KEY).unwrap_or(key);
             Some(Unit {
                 timeline: tl,
                 subject: subject.clone(),
                 key: key.clone(),
                 marker: spec.marker(key),
-                ready: chain_break(substrate, tl).is_none() && substrate.holds_whole(tl),
+                ready: key_version(reading) == KEY_VERSION
+                    && chain_break(substrate, tl).is_none()
+                    && substrate.holds_whole(tl),
             })
         })
         .collect();
@@ -274,7 +287,11 @@ fn calibrate_one(
     };
     let found = questions(&asked, spec.questions);
     if found.is_empty() {
-        anyhow::bail!("the draft wrote no question ({} chars)", asked.len());
+        let opening: String = asked.chars().take(160).collect();
+        anyhow::bail!(
+            "the draft wrote no question ({} chars: {opening:?})",
+            asked.len()
+        );
     }
     let thought = thoughts(engine, frame, spec, &found)?;
     let mut conv = engine
@@ -510,54 +527,63 @@ mod tests {
             .unwrap();
         };
         let answered = |tl: TimelineId| said(tl, "It reads the file.");
-        let keyed = |tl: TimelineId, path: &str| {
-            conv.set_conversation_metadata(tl, CONTENT_KEY, &format!("key:{path}"))
+        let reading = |path: &str, version: u32| format!("v{version}:{path}@1");
+        let keyed = |tl: TimelineId, path: &str, key: &str| {
+            conv.set_conversation_metadata(tl, CONTENT_KEY, key)
                 .unwrap();
             conv.set_conversation_metadata(tl, PATH_KEY, path).unwrap();
         };
-        let [whole, gappy, cal, unkeyed, cut] =
-            [11u64, 12, 13, 14, 15].map(|raw| TimelineId::from_raw(raw).unwrap());
-        for tl in [whole, gappy, cal, unkeyed, cut] {
+        let [whole, gappy, cal, unkeyed, cut, old, built, built_old] =
+            [11u64, 12, 13, 14, 15, 16, 17, 18].map(|raw| TimelineId::from_raw(raw).unwrap());
+        for tl in [whole, gappy, cal, unkeyed, cut, old, built, built_old] {
             conv.register_timeline(tl, layer, group);
         }
+        let current = KEY_VERSION;
         answered(whole);
-        keyed(whole, "candle/a.rs");
+        keyed(whole, "candle/a.rs", &reading("candle/a.rs", current));
         conv.write().restore_gap_turn(gappy);
         answered(gappy);
-        keyed(gappy, "candle/b.rs");
+        keyed(gappy, "candle/b.rs", &reading("candle/b.rs", current));
         answered(cal);
-        keyed(cal, "candle/c.rs");
+        keyed(cal, "candle/c.rs", &reading("candle/c.rs", current));
         conv.set_conversation_metadata(cal, Substrate::CALIBRATES_KEY, &whole.raw().to_string())
             .unwrap();
         answered(unkeyed);
         said(cut, "<think>It reads the fi");
-        keyed(cut, "candle/d.rs");
+        keyed(cut, "candle/d.rs", &reading("candle/d.rs", current));
+        // Read under the version before: waits to be read again.
+        answered(old);
+        keyed(old, "candle/e.rs", &reading("candle/e.rs", current - 1));
+        // Units built on a reading, keyed apart, judged by the reading's key.
+        for (tl, version) in [(built, current), (built_old, current - 1)] {
+            answered(tl);
+            keyed(tl, "candle/f.rs", &format!("u1:review:{}", tl.raw()));
+            conv.set_conversation_metadata(tl, FILE_KEY, &reading("candle/f.rs", version))
+                .unwrap();
+        }
 
         let units = units_of(&conv.read(), group, &spec);
+        let unit = |timeline: TimelineId, subject: &str, key: String, ready: bool| Unit {
+            timeline,
+            subject: subject.into(),
+            marker: spec.marker(&key),
+            key,
+            ready,
+        };
         assert_eq!(
             units,
             vec![
-                Unit {
-                    timeline: whole,
-                    subject: "candle/a.rs".into(),
-                    key: "key:candle/a.rs".into(),
-                    marker: spec.marker("key:candle/a.rs"),
-                    ready: true,
-                },
-                Unit {
-                    timeline: gappy,
-                    subject: "candle/b.rs".into(),
-                    key: "key:candle/b.rs".into(),
-                    marker: spec.marker("key:candle/b.rs"),
-                    ready: false,
-                },
-                Unit {
-                    timeline: cut,
-                    subject: "candle/d.rs".into(),
-                    key: "key:candle/d.rs".into(),
-                    marker: spec.marker("key:candle/d.rs"),
-                    ready: false,
-                },
+                unit(whole, "candle/a.rs", reading("candle/a.rs", current), true),
+                unit(gappy, "candle/b.rs", reading("candle/b.rs", current), false),
+                unit(cut, "candle/d.rs", reading("candle/d.rs", current), false),
+                unit(
+                    old,
+                    "candle/e.rs",
+                    reading("candle/e.rs", current - 1),
+                    false
+                ),
+                unit(built, "candle/f.rs", "u1:review:17".into(), true),
+                unit(built_old, "candle/f.rs", "u1:review:18".into(), false),
             ]
         );
     }

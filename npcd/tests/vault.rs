@@ -964,21 +964,38 @@ async fn the_file_acts_reach_the_store_through_the_runtime() {
         )
         .feed;
     assert!(
-        read.contains("1  # the third era"),
-        "not the real numbered read: {read}"
+        read.contains("| # the third era\n"),
+        "not the real anchored read: {read}"
     );
+    // The anchor of the paragraph holding the words, off the read — as a
+    // model takes it.
+    let mut at = None;
+    for line in read.lines() {
+        if let Some((a, _)) = line.split_once("| ") {
+            if doc_units::anchor::is_anchor(a) {
+                at = Some(a.to_string());
+            }
+        }
+        if line.contains("in the spring") {
+            break;
+        }
+    }
+    let at = at.expect("an anchored paragraph holds the words");
 
-    rt.record_act(
+    let edited = rt.record_act(
         1,
         &act(
             "file_edit",
             json!({
                 "path": "layers/eras/third.md",
-                "old_str": "in the spring",
-                "new_str": "in the autumn"
+                "at": at,
+                "do": "replace",
+                "old": "in the spring",
+                "text": "in the autumn"
             }),
         ),
     );
+    assert!(edited.landed, "{}", edited.answer);
     rt.record_act(
         1,
         &act("bench_commit", json!({"why": "against its neighbours"})),

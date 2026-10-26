@@ -65,7 +65,7 @@ const SHOWN: usize = 25;
 
 pub fn run(files: &[File], tokenizer: &Tokenizer, daemon: &Daemon) -> anyhow::Result<()> {
     let gpu = RemoteGallery::new(files, daemon);
-    let chunks = Chunks::of(files, &|_, _| false);
+    let chunks = Chunks::of(files, true, &|_, _| false);
     let n = files.len();
     let (mut background, mut held_out): (Vec<(usize, &[WideQSig])>, Vec<(usize, &[WideQSig])>) =
         (Vec::new(), Vec::new());
@@ -87,9 +87,14 @@ pub fn run(files: &[File], tokenizer: &Tokenizer, daemon: &Daemon) -> anyhow::Re
     );
 
     // Each chunk's vote mass on questions not about its file.
-    let bg = attributed(&gpu, &chunks, &background, Questions::Without, &|_, _| {
-        false
-    })?;
+    let bg = attributed(
+        &gpu,
+        &chunks,
+        &background,
+        true,
+        Questions::Without,
+        &|_, _| false,
+    )?;
     let mass = background_mass(&chunks, &background, &bg);
     let nonzero: Vec<f32> = mass.iter().copied().filter(|&m| m > 0.0).collect();
     let w0 = nonzero.iter().sum::<f32>() / nonzero.len().max(1) as f32;
@@ -131,7 +136,14 @@ pub fn run(files: &[File], tokenizer: &Tokenizer, daemon: &Daemon) -> anyhow::Re
         );
     }
 
-    let judged = attributed(&gpu, &chunks, &held_out, Questions::Without, &|_, _| false)?;
+    let judged = attributed(
+        &gpu,
+        &chunks,
+        &held_out,
+        true,
+        Questions::Without,
+        &|_, _| false,
+    )?;
     let owners: Vec<usize> = held_out.iter().map(|(o, _)| *o).collect();
     // The hubs: the files that win the most held-out questions not theirs, raw.
     let raw_scores = scores(&judged, &mass, w0, Shape::None, n);

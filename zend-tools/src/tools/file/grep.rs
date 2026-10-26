@@ -1,11 +1,18 @@
 //! file_grep tool — regular-expression search over file contents.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use doc_units::render::head;
+use doc_units::Doc;
 use regex::RegexBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 use zend_vfs::vfs::GrepOutcome;
+use zend_vfs::VfsStore;
 
+use super::render::page_of;
 use super::{stores_for, FileError, Paging};
 use crate::{RegisteredTool, Replay, Tool, ToolContext};
 
@@ -54,9 +61,15 @@ pub struct GrepRequest {
 pub struct GrepMatch {
     /// Relative to the group's repository.
     pub path: String,
-    /// 1-based line number — `(line - 1) / PAGE_LINES + 1` is the page to pass
-    /// `file_read` to see the surrounding code.
+    /// 1-based line number.
     pub line: u32,
+    /// The part of the file the hit is in, as `file_read` shows it — its
+    /// anchor and its scope path or first line (`r7Lm| impl Cache > fn
+    /// seal`) — so the part can be edited by that anchor without a read.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub part: String,
+    /// The `file_read` page that holds that part.
+    pub page: u32,
     /// The matching line, trimmed of trailing whitespace and truncated if very
     /// long.
     pub text: String,
@@ -109,12 +122,14 @@ impl Tool for FileGrep {
          contain\", \"grep for\", \"which file has\", \"find the string\". Takes a \
          regex (`^pub fn `, `Error::\\w+`, `foo|bar`), an optional path prefix to \
          narrow the search, and optional ignore_case. Returns the matches grouped by \
-         repo — path, line number and the matching line — paged, with files_searched so an empty result is \
-         unambiguous. `page` is required and counts from 1 — pass 1 to start, and the response's \
-         `paging.next_page` for the next. THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it \
-         before guessing at directory names with file_list. Use file_search to find \
-         a file by its NAME; use file_read with the line number this returns to see \
-         the surrounding code.";
+         repo — path, line number, the matching line, and the part of the file it is in under \
+         its anchor (`r7Lm| impl Cache > fn seal`) with the file_read page that holds it — \
+         paged, with files_searched so an empty result is unambiguous. `page` is required and \
+         counts from 1 — pass 1 to start, and the response's `paging.next_page` for the next. \
+         THIS IS THE TOOL FOR FINDING CODE BY CONTENT — reach for it before guessing at \
+         directory names with file_list. Use file_search to find a file by its NAME; use \
+         file_read with a hit's page to see the part whole, and file_edit with its anchor to \
+         change it.";
 
     type Request = GrepRequest;
     type Response = GrepResponse;
@@ -162,6 +177,8 @@ impl Tool for FileGrep {
                     GrepMatch {
                         path: h.path,
                         line: h.line_no,
+                        part: String::new(),
+                        page: 1,
                         text: truncate(&h.line),
                         modified: h.modified,
                     },
@@ -170,7 +187,29 @@ impl Tool for FileGrep {
         }
 
         let paging = Paging::of(hits.len(), req.page, GREP_PAGE_HITS);
-        let page = hits.into_iter().skip(paging.skipped()).take(GREP_PAGE_HITS);
+        let mut page: Vec<(String, GrepMatch)> = hits
+            .into_iter()
+            .skip(paging.skipped())
+            .take(GREP_PAGE_HITS)
+            .collect();
+        // Only the hits shown are placed in their parts: a file is carved once
+        // however many of its hits the page holds.
+        let stores: HashMap<&str, &Arc<VfsStore>> =
+            stores.iter().map(|(r, s)| (r.as_str(), s)).collect();
+        let mut docs: HashMap<(String, String), Option<Doc>> = HashMap::new();
+        for (repo, hit) in &mut page {
+            let doc = docs
+                .entry((repo.clone(), hit.path.clone()))
+                .or_insert_with(|| {
+                    let text = stores.get(repo.as_str())?.read(&hit.path).ok()??;
+                    Some(Doc::new(&hit.path, &text))
+                });
+            let Some(doc) = doc else { continue };
+            if let Some(i) = doc.unit_at(hit.line as usize - 1) {
+                hit.part = head(doc, i).trim_end().to_string();
+                hit.page = page_of(doc, i);
+            }
+        }
 
         Ok(GrepResponse {
             repos: grouped(page),
@@ -219,6 +258,8 @@ mod tests {
         GrepMatch {
             path: path.into(),
             line,
+            part: String::new(),
+            page: 1,
             text: "x".into(),
             modified: false,
         }

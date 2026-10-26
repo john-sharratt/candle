@@ -15,7 +15,7 @@
 //! the questions, run once an ingest pass, never on the forward path.
 
 use std::array::from_fn;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter::repeat_n;
 
 use rayon::prelude::*;
@@ -26,7 +26,7 @@ use super::ids::{GroupId, TimelineId};
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::streams::StreamId;
 use crate::projection::Conversation;
-use crate::provenance::chunk_exclusion::anomaly::{outliers, K, KEEP};
+use crate::provenance::chunk_exclusion::anomaly::{outliers, K, KEEP, K_CALIBRATION};
 use crate::provenance::chunk_exclusion::{ChunkExclusion, CHUNK};
 use crate::provenance::gallery_arena::TokenVotes;
 use crate::provenance::scan::NEEDLE_KEEP_FRAC;
@@ -45,14 +45,38 @@ pub(crate) struct ChunkMass {
 }
 
 impl ChunkMass {
-    /// The exclusion the mass calls for: its outliers, each file keeping its
-    /// share.
-    pub fn exclusion(&self) -> ChunkExclusion {
-        ChunkExclusion::of_chunks(
-            outliers(&self.mass, &self.file_of, K, KEEP)
-                .into_iter()
-                .map(|c| self.chunks[c]),
-        )
+    /// The chunks the mass calls for cutting: its outliers at `k`, each file
+    /// keeping its share.
+    pub fn outliers(&self, k: f32) -> impl Iterator<Item = (StreamId, usize, usize)> + '_ {
+        outliers(&self.mass, &self.file_of, k, KEEP)
+            .into_iter()
+            .map(|c| self.chunks[c])
+    }
+}
+
+/// Which of a file's windows a scan saw: its own content, or its
+/// calibrations' — the two competitions a file-scored group is scored in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Competition {
+    Content,
+    Calibration,
+}
+
+impl Competition {
+    /// `f`'s windows in this competition, `(arc, start, end)`.
+    fn windows(self, f: &FileScan) -> Vec<(usize, usize, usize)> {
+        match self {
+            Competition::Content => f.windows.iter().map(|&(k, s, e, _)| (k, s, e)).collect(),
+            Competition::Calibration => f.cal_windows.clone(),
+        }
+    }
+
+    /// The robust deviations a chunk of this competition is cut at.
+    fn k(self) -> f32 {
+        match self {
+            Competition::Content => K,
+            Competition::Calibration => K_CALIBRATION,
+        }
     }
 }
 
@@ -62,25 +86,32 @@ pub struct ExclusionReport {
     /// Files of the group scanned, and those with calibration questions.
     pub files: usize,
     pub calibrated: usize,
-    /// Questions asked, chunks weighed, and chunks cut.
+    /// Questions asked, and per competition the chunks weighed and cut.
     pub probes: usize,
     pub chunks: usize,
     pub cut: usize,
+    pub calibration_chunks: usize,
+    pub calibration_cut: usize,
 }
 
 impl Conversation {
     /// Learn `group`'s anomalous-chunk exclusion from up to `per_file` of each
-    /// file's calibration questions and set it for every live scan. `scan`
-    /// scores probes raw against the group's content alone — the scheduler's
-    /// [`Self::scan_group_votes`], with no calibration in the gallery and
-    /// nothing masked or cut — and answers in its own file order, which the
+    /// file's calibration questions and set it for every live scan.
+    ///
+    /// Each competition is learned against itself: the questions are scanned
+    /// raw against the group's content alone, and again against its
+    /// calibrations alone — every file's own turns and the asking questions
+    /// masked — with nothing cut, so the exclusion never learns from a
+    /// gallery it already shaped, nor from a question finding itself. `scan`
+    /// is the scheduler's [`Self::scan_group_votes`] — `(calibrations,
+    /// masked turns, probes)` — and answers in its own file order, which the
     /// cases are read back through. A group with no calibrated file learns an
     /// empty exclusion.
     pub fn learn_chunk_exclusion(
         &self,
         group: GroupId,
         per_file: usize,
-        scan: impl FnOnce(Vec<Vec<WideQSig>>) -> candle::Result<GroupVotes>,
+        scan: impl Fn(bool, HashSet<StreamId>, Vec<Vec<WideQSig>>) -> candle::Result<GroupVotes>,
     ) -> candle::Result<ExclusionReport> {
         let (files, probes) = {
             let sub = self.inner.read().unwrap();
@@ -90,7 +121,7 @@ impl Conversation {
                 .iter()
                 .find_map(|f| f.arcs_kept.first())
                 .map_or(0, SigWindow::width);
-            let mut probes: Vec<(usize, Vec<WideQSig>)> = Vec::new();
+            let mut probes: Vec<(usize, StreamId, Vec<WideQSig>)> = Vec::new();
             for (fi, f) in files.iter().enumerate() {
                 let questions = sub.calibrations_of(f.timeline).flat_map(|cal| {
                     (0..sub.turn_count(cal)).map(move |i| turn_stream_id(cal.raw(), i))
@@ -105,7 +136,7 @@ impl Conversation {
                         .filter(|t| t.words.len() == width)
                         .collect();
                     if !sigs.is_empty() {
-                        probes.push((fi, sigs));
+                        probes.push((fi, sid, sigs));
                     }
                 }
             }
@@ -120,15 +151,47 @@ impl Conversation {
         let exclusion = if probes.is_empty() {
             ChunkExclusion::default()
         } else {
-            let scanned = scan(probes.iter().map(|(_, s)| s.clone()).collect())?;
-            let votes = in_file_order(&files, &scanned);
-            let owned: Vec<(usize, &[WideQSig])> =
-                probes.iter().map(|(fi, s)| (*fi, s.as_slice())).collect();
-            let mass = chunk_mass(&files, &owned, &votes);
-            report.chunks = mass.mass.len();
-            mass.exclusion()
+            let sigs: Vec<Vec<WideQSig>> = probes.iter().map(|(_, _, s)| s.clone()).collect();
+            let owned: Vec<(usize, &[WideQSig])> = probes
+                .iter()
+                .map(|(fi, _, s)| (*fi, s.as_slice()))
+                .collect();
+            // The calibration scan's gallery: every calibration question but
+            // the asking ones — each would otherwise find itself, and its vote
+            // go to its own file — and none of the files' own turns.
+            let not_calibration: HashSet<StreamId> = files
+                .iter()
+                .flat_map(|f| {
+                    f.arc_turn
+                        .iter()
+                        .map(|t| turn_stream_id(f.timeline.raw(), t.0))
+                })
+                .chain(probes.iter().map(|(_, sid, _)| *sid))
+                .collect();
+            let content = scan(false, HashSet::new(), sigs.clone())?;
+            let content = chunk_mass(
+                &files,
+                &owned,
+                &in_file_order(&files, &content),
+                Competition::Content,
+            );
+            let calibration = scan(true, not_calibration, sigs)?;
+            let calibration = chunk_mass(
+                &files,
+                &owned,
+                &in_file_order(&files, &calibration),
+                Competition::Calibration,
+            );
+            report.chunks = content.mass.len();
+            report.calibration_chunks = calibration.mass.len();
+            let cut: Vec<(StreamId, usize, usize)> =
+                content.outliers(Competition::Content.k()).collect();
+            let cal_cut: Vec<(StreamId, usize, usize)> =
+                calibration.outliers(Competition::Calibration.k()).collect();
+            report.cut = cut.len();
+            report.calibration_cut = cal_cut.len();
+            ChunkExclusion::of_chunks(cut.into_iter().chain(cal_cut))
         };
-        report.cut = exclusion.chunks();
         self.inner
             .write()
             .unwrap()
@@ -167,13 +230,14 @@ struct Cast<'a> {
     weight: f32,
 }
 
-/// The mass every chunk of `files` won on `probes` — each `(owner file,
-/// full-width tokens)` — from their raw votes `votes`, scanned with `files`'
-/// order as the cases.
+/// The mass every chunk of `files`' windows in `competition` won on `probes`
+/// — each `(owner file, full-width tokens)` — from their raw votes `votes`,
+/// scanned over that competition with `files`' order as the cases.
 pub(crate) fn chunk_mass(
     files: &[FileScan],
     probes: &[(usize, &[WideQSig])],
     votes: &TokenVotes,
+    competition: Competition,
 ) -> ChunkMass {
     // Kept votes for a file not the question's own, by the file they went to.
     let mut by_file: Vec<Vec<Cast>> = (0..files.len()).map(|_| Vec::new()).collect();
@@ -207,7 +271,7 @@ pub(crate) fn chunk_mass(
     let per_file: Vec<(Vec<(StreamId, usize, usize)>, Vec<f32>)> = files
         .par_iter()
         .zip(by_file.par_iter())
-        .map(|(f, casts)| file_mass(f, casts))
+        .map(|(f, casts)| file_mass(f, &competition.windows(f), casts))
         .collect();
     let mut out = ChunkMass::default();
     for (fi, (chunks, mass)) in per_file.into_iter().enumerate() {
@@ -218,12 +282,17 @@ pub(crate) fn chunk_mass(
     out
 }
 
-/// Every chunk of `f`'s own windows, and the mass `casts` credit each.
-fn file_mass(f: &FileScan, casts: &[Cast]) -> (Vec<(StreamId, usize, usize)>, Vec<f32>) {
+/// Every chunk of `windows` — `f`'s, `(arc, start, end)` — and the mass
+/// `casts` credit each.
+fn file_mass(
+    f: &FileScan,
+    windows: &[(usize, usize, usize)],
+    casts: &[Cast],
+) -> (Vec<(StreamId, usize, usize)>, Vec<f32>) {
     let decoded: Vec<Vec<WideQSig>> = f.arcs_kept.iter().map(|a| a.decode()).collect();
     let mut index: BTreeMap<(StreamId, usize), usize> = BTreeMap::new();
     let mut chunks = Vec::new();
-    for &(k, s, e, _) in &f.windows {
+    for &(k, s, e) in windows {
         let len = decoded[k].len();
         for c in s / CHUNK..e.div_ceil(CHUNK) {
             index.entry((f.arc_sids[k], c)).or_insert_with(|| {
@@ -234,7 +303,7 @@ fn file_mass(f: &FileScan, casts: &[Cast]) -> (Vec<(StreamId, usize, usize)>, Ve
     }
     let mut mass = vec![0f32; chunks.len()];
     for cast in casts {
-        if let Some((k, pos)) = best_token(f, &decoded, cast) {
+        if let Some((k, pos)) = best_token(windows, &decoded, cast) {
             if let Some(&c) = index.get(&(f.arc_sids[k], pos / CHUNK)) {
                 mass[c] += cast.weight;
             }
@@ -243,14 +312,18 @@ fn file_mass(f: &FileScan, casts: &[Cast]) -> (Vec<(StreamId, usize, usize)>, Ve
     (chunks, mass)
 }
 
-/// The arc and position of `f`'s own token agreeing best with `cast`'s probe
-/// token in its fold group.
-fn best_token(f: &FileScan, decoded: &[Vec<WideQSig>], cast: &Cast) -> Option<(usize, usize)> {
+/// The arc and position of the token of `windows` agreeing best with `cast`'s
+/// probe token in its fold group.
+fn best_token(
+    windows: &[(usize, usize, usize)],
+    decoded: &[Vec<WideQSig>],
+    cast: &Cast,
+) -> Option<(usize, usize)> {
     let gw = cast.token.words.len() / FOLD_GROUPS;
     let words = cast.group * gw..(cast.group + 1) * gw;
     let q = cast.token.words.get(words.clone())?;
     let mut best: Option<(u32, usize, usize)> = None;
-    for &(k, s, e, _) in &f.windows {
+    for &(k, s, e) in windows {
         for (i, tok) in decoded[k][s..e].iter().enumerate() {
             let Some(g) = tok.words.get(words.clone()) else {
                 continue;
@@ -319,7 +392,12 @@ mod tests {
             n_groups: FOLD_GROUPS,
             n_segments: 1,
         };
-        let m = chunk_mass(&files, &[(1, &probe[..]), (0, &probe[..])], &votes);
+        let m = chunk_mass(
+            &files,
+            &[(1, &probe[..]), (0, &probe[..])],
+            &votes,
+            Competition::Content,
+        );
         let (sa, sb) = (turn_stream_id(1, 0), turn_stream_id(2, 0));
         assert_eq!(m.chunks, vec![(sa, 0, 40), (sa, 1, 40), (sb, 0, 8)]);
         assert_eq!(m.file_of, vec![0, 0, 1]);

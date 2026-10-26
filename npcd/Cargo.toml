@@ -62,6 +62,9 @@ cluster    = { path = "../cluster" }
 # An operation's store over the mind repository, kept as file events, and its
 # publish pushed by an agent (`docs/replicated_substrate.md` §10.3, §11).
 zend-vfs     = { path = "../zend-vfs" }
+# A document as the anchored parts a read shows and an edit names
+# (`docs/npcd_anchored_edits.md`).
+doc-units    = { path = "../doc-units" }
 store-events = { path = "../store-events" }
 agent        = { path = "../agent" }
 substrate-git = { path = "../substrate-git", features = ["member"] }

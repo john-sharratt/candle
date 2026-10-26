@@ -40,11 +40,11 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | Tool | File | Notes |
 |------|------|-------|
 | `write` | `file/write.rs` | Create or overwrite; 10 MiB VFS cap |
-| `file_read` | `file/read.rs` | Numbered excerpt of the whole file, or of a line range; only `path` required |
-| `file_edit` | `file/edit.rs` | Replace `old_text` with `new_text`, located by content, indentation-tolerant |
+| `file_read` | `file/read.rs` | A page of the file's parts under their anchors; `repo`, `path`, `page` required, `line` optional |
+| `file_edit` | `file/edit.rs` | One anchored edit — replace, insert, delete, move — named by `at` |
 | `file_list` | `file/list.rs` | Path prefix filter; sorted |
 | `file_search` | `file/search.rs` | Find files by name/path; substring or `*` glob, whole project |
-| `file_grep` | `file/grep.rs` | Regex over file contents; path + line number per hit |
+| `file_grep` | `file/grep.rs` | Regex over file contents; path, line, part anchor and page per hit |
 | `file_delete` | `file/delete.rs` | Idempotent; returns `deleted` flag |
 | `file_present` | `file/present.rs` | Foreground presentation gesture |
 

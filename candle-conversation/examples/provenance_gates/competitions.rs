@@ -96,7 +96,7 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
 
     // Both: the content competition with its anomalous chunks cut
     // (`chunk_factor`), and the questions' competition beside it.
-    let chunks = Chunks::of(files, &|_, _| false);
+    let chunks = Chunks::of(files, true, &|_, _| false);
     let background: Vec<(usize, &[WideQSig])> = files
         .iter()
         .enumerate()
@@ -107,9 +107,14 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
                 .map(move |q| (fi, q.sigs.as_slice()))
         })
         .collect();
-    let bg = attributed(&gpu, &chunks, &background, Questions::Without, &|_, _| {
-        false
-    })?;
+    let bg = attributed(
+        &gpu,
+        &chunks,
+        &background,
+        true,
+        Questions::Without,
+        &|_, _| false,
+    )?;
     let mass = background_mass(&chunks, &background, &bg);
     let cut = anomaly::excluded(&mass, &chunks.file_of, CUT_K, CUT_KEEP);
     let ranges: Vec<(u64, usize, usize)> = cut.iter().map(|&c| chunks.range_of[c]).collect();

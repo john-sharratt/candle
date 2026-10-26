@@ -1631,6 +1631,8 @@ const FIXED: &[(&str, &str, &[&str])] = &[
     // depends on there being a fight, so it is live. See [`Choices::Postures`].
     ("engage", "priority", crate::sim::field::PRIORITIES),
     ("sleep", "until", crate::sim::ledger::WAKE_TIMES),
+    ("file_edit", "do", crate::engine::bench::EDIT_ACTIONS),
+    ("file_edit", "where", crate::engine::bench::MOVE_PLACES),
 ];
 
 /// The fixed set for a parameter, if it has one. See [`FIXED`].
@@ -2128,45 +2130,112 @@ pub(super) fn stencil_params(t: &Tool, within: &Within) -> Vec<StencilParam> {
         // this is for: aimed at nobody it is still a thing you can do, so the aim
         // drops and the act stays.
         .filter(|p| !(live_empty(t.name, p.name, within) && !p.required))
-        .map(|p| StencilParam {
-            name: p.name.to_string(),
-            ty: param_type(p.ty),
-            required: p.required,
-            // Free unless the world enumerates it. A closed set over an argument
-            // the character *means* would be the machinery writing its lines; a
-            // closed set over one that merely names something present is the
-            // machinery declining to let it name what is not.
-            enum_values: match live_choice(t.name, p.name) {
-                // **A vocabulary with nothing in it steers nothing.** The empty
-                // set here would be a branch with no arms, so it falls back to
-                // free text — see [`Choices::steers`] for why that is right for a
-                // vocabulary and wrong for everything else.
-                Some(c) => match live_set(c, within) {
-                    v if v.is_empty() => None,
-                    v => Some(v),
-                },
-                // Not world-enumerated. A fixed set is still a closed branch —
-                // the difference is only who computed it.
-                None => fixed_values(t.name, p.name)
-                    .map(|v| v.iter().map(|s| (*s).to_string()).collect()),
+        // A field some value brings ([`BRINGS`]) is written only after that
+        // value, never beside the choice as a sibling.
+        .filter(|p| !brought(t.name).contains(&p.name))
+        .map(|p| stencil_param(t, p, within))
+        .collect()
+}
+
+/// One parameter of `t` as the grammar's own, for a character standing *here*.
+fn stencil_param(t: &Tool, p: &Param, within: &Within) -> StencilParam {
+    StencilParam {
+        name: p.name.to_string(),
+        ty: param_type(p.ty),
+        required: p.required,
+        // Free unless the world enumerates it. A closed set over an argument
+        // the character *means* would be the machinery writing its lines; a
+        // closed set over one that merely names something present is the
+        // machinery declining to let it name what is not.
+        enum_values: match live_choice(t.name, p.name) {
+            // **A vocabulary with nothing in it steers nothing.** The empty
+            // set here would be a branch with no arms, so it falls back to
+            // free text — see [`Choices::steers`] for why that is right for a
+            // vocabulary and wrong for everything else.
+            Some(c) => match live_set(c, within) {
+                v if v.is_empty() => None,
+                v => Some(v),
             },
-            // An act's arguments are scalars; none is a container, and none may
-            // be null.
-            items: None,
-            min_items: 0,
-            max_items: None,
-            properties: None,
-            nullable: false,
-            minimum: minimum_of(t.name, p.name),
-            max_tokens: (p.ty == "string").then_some(ACT_VALUE_TOKENS),
-            requires: value_requirements(t.name, p.name),
-            // **What each address carries is decided by which address it is.**
-            // Only `invoke`'s `url` brings fields of its own: the typed body its
-            // endpoint accepts, in place of a free `body` beside it.
-            shapes: match live_choice(t.name, p.name) {
-                Some(Choices::InvokeUrl) => invoke_body::shapes(within),
-                _ => Vec::new(),
-            },
+            // Not world-enumerated. A fixed set is still a closed branch —
+            // the difference is only who computed it.
+            None => {
+                fixed_values(t.name, p.name).map(|v| v.iter().map(|s| (*s).to_string()).collect())
+            }
+        },
+        // An act's arguments are scalars; none is a container, and none may
+        // be null.
+        items: None,
+        min_items: 0,
+        max_items: None,
+        properties: None,
+        nullable: false,
+        minimum: minimum_of(t.name, p.name),
+        max_tokens: (p.ty == "string").then_some(ACT_VALUE_TOKENS),
+        requires: value_requirements(t.name, p.name),
+        // **What each value carries is decided by which value it is.**
+        // `invoke`'s `url` brings the typed body its endpoint accepts, in
+        // place of a free `body` beside it; a choice in [`BRINGS`] brings
+        // the fields that value takes.
+        shapes: match live_choice(t.name, p.name) {
+            Some(Choices::InvokeUrl) => invoke_body::shapes(within),
+            _ => value_shapes(t, p.name, within),
+        },
+    }
+}
+
+/// What each value of a choosing parameter brings with it, written after that
+/// value and nowhere else. `(tool, param) → [(value, fields)]`.
+///
+/// **A sibling is multiplied in; a brought field is added.** An edit's fields
+/// belong to its operation — a replace takes `text`, a move takes `dest` and
+/// `where`, a delete takes nothing — and left as optional siblings of `do` they
+/// were offered after every operation, each one doubling the decodes the act
+/// admits (`estimated_paths`): with `file_edit` at every bench a crowded room
+/// went to 4 × 10⁷ decodes over a turn. Brought by the value, each field is a
+/// path of that value's alone, and the operations sum instead of multiply.
+///
+/// A value with no entry takes nothing. Closed by
+/// [`tests::every_brought_field_is_a_real_optional_field`].
+const BRINGS: &[(&str, &str, &[Needs])] = &[(
+    "file_edit",
+    "do",
+    &[
+        ("replace", &["text"]),
+        ("insert_before", &["text"]),
+        ("insert_after", &["text"]),
+        ("move", &["dest", "where"]),
+    ],
+)];
+
+/// Every field some value of `tool`'s choices brings. See [`BRINGS`].
+fn brought(tool: &str) -> Vec<&'static str> {
+    BRINGS
+        .iter()
+        .filter(|(t, _, _)| *t == tool)
+        .flat_map(|(_, _, rules)| rules.iter())
+        .flat_map(|(_, fields)| fields.iter().copied())
+        .collect()
+}
+
+/// The fields each value of `t.param` brings, as the grammar's own. See
+/// [`BRINGS`].
+fn value_shapes(t: &Tool, param: &str, within: &Within) -> Vec<(String, Vec<StencilParam>)> {
+    BRINGS
+        .iter()
+        .filter(|(tool, p, _)| *tool == t.name && *p == param)
+        .flat_map(|(_, _, rules)| rules.iter())
+        .map(|(value, fields)| {
+            // Required, as the stencil writes every field a value brings: after
+            // the value it is part of the call, not a choice beside it.
+            let params = fields
+                .iter()
+                .filter_map(|f| t.params.iter().find(|p| p.name == *f))
+                .map(|p| StencilParam {
+                    required: true,
+                    ..stencil_param(t, p, within)
+                })
+                .collect();
+            ((*value).to_string(), params)
         })
         .collect()
 }
@@ -2962,6 +3031,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every [`BRINGS`] rule names a required choice with a closed set, and
+    /// fields that are the act's own optional parameters — so a brought field
+    /// is one the act declares and documents, written only after its value.
+    #[test]
+    fn every_brought_field_is_a_real_optional_field() {
+        for (tool, param, rules) in BRINGS {
+            let t = by_name(tool).unwrap_or_else(|| panic!("`{tool}` is not in the catalog"));
+            let chooser = t.params.iter().find(|p| p.name == *param).unwrap();
+            assert!(
+                chooser.required,
+                "`{tool}.{param}` decides, so it is required"
+            );
+            assert!(fixed_values(tool, param).is_some() || live_choice(tool, param).is_some());
+            for (_, fields) in *rules {
+                for field in *fields {
+                    let f = t
+                        .params
+                        .iter()
+                        .find(|p| p.name == *field)
+                        .unwrap_or_else(|| panic!("`{tool}` has no `{field}` parameter"));
+                    assert!(!f.required, "`{tool}.{field}` is already required outright");
+                }
+            }
+        }
+    }
+
+    /// **An edit writes what its operation takes, after the operation**: a
+    /// replace its text, a move where it goes, a delete nothing — and none of
+    /// those fields stands beside `do` as a sibling.
+    #[test]
+    fn each_edit_operation_brings_the_fields_it_takes() {
+        let params = stencil_params(by_name("file_edit").unwrap(), &Within::among(&[]));
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["path", "at", "do", "old", "to"]);
+        let act = params.iter().find(|p| p.name == "do").unwrap();
+        assert_eq!(
+            act.enum_values.as_deref().unwrap(),
+            crate::engine::bench::EDIT_ACTIONS
+        );
+        let brings = |value: &str| -> Vec<String> {
+            act.shapes
+                .iter()
+                .find(|(v, _)| v == value)
+                .map(|(_, f)| f.iter().map(|p| p.name.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(brings("replace"), ["text"]);
+        assert_eq!(brings("insert_after"), ["text"]);
+        assert_eq!(brings("move"), ["dest", "where"]);
+        assert!(brings("delete").is_empty());
+        let place = &act.shapes.iter().find(|(v, _)| v == "move").unwrap().1[1];
+        assert_eq!(
+            place.enum_values.as_deref().unwrap(),
+            crate::engine::bench::MOVE_PLACES
+        );
     }
 
     /// **A fold cannot be sent without somewhere to fold to.** The refusal
