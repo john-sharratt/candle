@@ -1,7 +1,7 @@
 ---
 name: fact-check
 description: How to have a worker check a set of claims — someone's, or another worker's — each confirmed, contradicted or unverified by the source that decides it.
-tools: [task_start, task_wait, journal_grep, timeline_read]
+tools: [repo_task_start, repo_task_wait, journal_grep, timeline_read]
 ---
 # Fact-checking
 

@@ -1,7 +1,7 @@
 //! Names and paths (`docs/claude_zend_gateway.md` §5.2).
 //!
 //! The call that creates a conversation names it: a thread by `thread_attach` or
-//! `task_start`, a worker by `task_start`, a part by the worker's `sub_run`. A
+//! `repo_task_start`, a worker by `repo_task_start`, a part by the worker's `sub_run`. A
 //! name is a kebab-case slug saying what the conversation is for. A path is
 //! the names down the lineage: `T:<thread>` for a thread,
 //! `T:<thread>/<worker>` for a worker under it, and a part continues its

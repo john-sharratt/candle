@@ -1,7 +1,7 @@
 ---
 name: upgrade
 description: How to upgrade a dependency or toolchain — research what changed first, then upgrade on a branch, build and test on an agent.
-tools: [task_start, task_wait, agent_job, agent_job_log]
+tools: [repo_task_start, repo_task_wait, repo_job_start, repo_job_log]
 ---
 # Upgrading a dependency
 
@@ -17,7 +17,7 @@ An `ask` task: every use in the repository of what changed, with file:line.
 
 ## 3. Upgrade
 
-`task_start {thread, name: "upgrade-<dep>", effort: "deep", prompt}`:
+`repo_task_start {thread, name: "upgrade-<dep>", effort: "deep", prompt}`:
 
 ```
 GOAL: upgrade <dependency> from <old> to <new> in <repository>, on branch

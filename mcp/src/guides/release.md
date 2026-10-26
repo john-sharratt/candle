@@ -1,7 +1,7 @@
 ---
 name: release
 description: How to take a commit on origin/main through a full release — tests, a trial on one machine, certification, then a rollout member by member — stopping at each decision for the user's approval.
-tools: [agent_job, agent_job_log, service_trial, service_status, cluster_command, cluster_job_status, gateway_command, cluster_status, cluster_logs, journal_note]
+tools: [repo_job_start, repo_job_log, service_trial, service_status, cluster_command, cluster_job_status, gateway_command, cluster_status, cluster_logs, journal_note]
 ---
 # Releasing a build
 

@@ -45,7 +45,7 @@ can also be zipped as a claude.ai skill if ever wanted.
 ---
 name: research
 description: A question answered from the web, every claim checked against the page it came from.
-tools: [task_start, task_wait, task_reply, journal_grep, timeline_read]
+tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline_read]
 ---
 # Research
 ...the method...
@@ -122,15 +122,15 @@ or held for the user's approval — the user's call.
 
 ## 3. Continuing a finished worker
 
-`task_reply` answers a worker that asked, is stuck, or was stopped — and one
+`repo_task_reply` answers a worker that asked, is stuck, or was stopped — and one
 that finished. Archiving a worker distils its conversation to text
 (`ZendSession::archive_worker`), which is one way: an archived conversation
 cannot be continued with its context. So a finished task is not archived when
 it ends:
 
-- A task that ends `done` is kept whole and marked `resumable`. `task_reply`
+- A task that ends `done` is kept whole and marked `resumable`. `repo_task_reply`
   accepts it: the reply is its next turn with its whole context, and it answers
-  as `task_start` does. Its new journal entries are the reply's. What a `done`
+  as `repo_task_start` does. Its new journal entries are the reply's. What a `done`
   worker answers says it can be continued.
 - A part, and a task that failed, are archived as they end, as before.
 - A worker is archived — distilled, no longer resumable — when its thread is
@@ -138,10 +138,10 @@ it ends:
   thread whose newest activity is 24 hours old, with nothing running on it, is
   archived the same way. The sweep runs hourly on every member, and
   only once the model is loaded (`zend/src/mcp/archiving.rs`). A worker is
-  claimed under the lock `task_reply` takes (which refuses a claimed worker),
+  claimed under the lock `repo_task_reply` takes (which refuses a claimed worker),
   distilled outside it, and only then written as archived — never when the
   distil failed, so no record says archived of a conversation that was not.
-  `task_reply` on a worker whose thread was archived reopens the thread. Two members sweeping in the moment before
+  `repo_task_reply` on a worker whose thread was archived reopens the thread. Two members sweeping in the moment before
   one's write replicates can both archive a thread: distilling twice is
   harmless, and the journal gets the line twice. An attach counts as activity
   (`Thread::attached_ms`, marked at most hourly), so a thread Claude reopens is
@@ -171,7 +171,7 @@ A turn's tool results are its user half's `<tool_response>` blocks
 (`fast_path::coverage::response_bodies`), so the audit is deterministic and
 cheap. It reads every normal turn of the worker's conversation and of each
 part it started (`ZendSession::conversation_detail`), and goes at the end of
-what `task_wait` / `task_start` answer for a `done` worker. An answer citing no
+what `repo_task_wait` / `repo_task_start` answer for a `done` worker. An answer citing no
 URL carries no audit.
 
 **One automatic correction round.** When anything cited is `seen` or
@@ -206,7 +206,7 @@ The first guide written against §3 and §4:
 3. **Check itself** — the draft against itself before answering.
 4. **Answer** in `ANSWER / DETAIL / CONFLICTS / UNVERIFIED / SOURCES`.
 5. **Claude's side**: start with `effort: exhaustive`; read the audit; if it is
-   not clean after the automatic round, `task_reply` the worker to fix what
+   not clean after the automatic round, `repo_task_reply` the worker to fix what
    remains; spot-check with `timeline_read {turn}` — the queries, fetched text
    and the dials the worker ran at.
 
@@ -240,6 +240,15 @@ rolling to the cluster).
   its thread archived, or a day idle.
 - **Only `/mcp` workers and threads archive themselves.** A person's own
   conversations are theirs to archive.
+- **Tool names route; descriptions instruct.** claude.ai lists a connector's
+  tools by name alone until one is loaded, and drops the server's
+  instructions, so a name is the only thing Claude sees when it decides
+  whether a request is Zen's. Work in the user's repositories is named
+  `repo_`: `repo_task_start` / `_wait` / `_reply` / `_nudge` / `_stop` (a
+  worker with a shell in the repository) and `repo_job_start` / `repo_job_log`
+  (a program run on a branch on one machine). Claude has no other way to reach
+  those, so the name is enough to send it here. Web research is Claude's own,
+  with its own tools; Zen's server instructions no longer ask for it.
 - **What Claude reads never says "zend".** The server is Zen; tool
   descriptions, errors, instructions and guides speak of workers, the model and
   hardware the user owns. The app's name appears only where it is a value Claude

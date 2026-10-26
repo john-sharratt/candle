@@ -1,7 +1,7 @@
 ---
 name: debug
 description: How to find a bug's root cause with a worker — reproduce, narrow by evidence, fix the cause with a test that failed before it.
-tools: [task_start, task_wait, task_reply, cluster_logs, agent_job, agent_job_log]
+tools: [repo_task_start, repo_task_wait, repo_task_reply, cluster_logs, repo_job_start, repo_job_log]
 ---
 # Debugging to the root cause
 
@@ -10,7 +10,7 @@ A workaround is not a fix; a restart is not a diagnosis.
 
 ## Prompt
 
-`task_start {thread, name: "debug-<symptom>", effort: "exhaustive", prompt}`:
+`repo_task_start {thread, name: "debug-<symptom>", effort: "exhaustive", prompt}`:
 
 ```
 GOAL: find the root cause of <symptom> in <repository>, and fix it.

@@ -1,13 +1,13 @@
 ---
 name: perf
 description: How to investigate a performance problem — measure before changing, compare like with like, one change per measurement, numbers with the machine they came from.
-tools: [task_start, task_wait, agent_job, agent_job_log, cluster_status]
+tools: [repo_task_start, repo_task_wait, repo_job_start, repo_job_log, cluster_status]
 ---
 # Performance work
 
 ## Prompt
 
-`task_start {thread, name: "perf-<what>", effort: "exhaustive", prompt}`:
+`repo_task_start {thread, name: "perf-<what>", effort: "exhaustive", prompt}`:
 
 ```
 GOAL: find why <operation> is slower than <expected>, and make it faster, in

@@ -2,7 +2,11 @@
 //!
 //! # What the pipeline is
 //!
-//! Three models in sequence, and only the largest two are ever both resident:
+//! Three models in sequence, in two stages over the same ground. The encoder
+//! stands first and conditions every prompt in the backlog; it is dropped, and
+//! the transformer and the autoencoder are placed over the bytes it held. So
+//! the claim is the larger stage, not the sum — on the 3090 beside a resident
+//! engine the sum (11.8 GB) does not fit and the larger stage (8.4 GB) does:
 //!
 //! | Piece | What it is |
 //! |---|---|
@@ -43,6 +47,7 @@
 //! GiB dequantised to look up a couple of dozen rows, so the lookup is a host
 //! index and a 300 KiB transfer ([`EmbedTable`]).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -207,9 +212,15 @@ const MIN_ARENA_BYTES: usize = 512 << 20;
 
 struct Loaded {
     device: Device,
-    tokenizer: tokenizers::Tokenizer,
-    table: EmbedTable,
-    encoder: TextEncoder,
+    /// Every backlog prompt's conditioning, by prompt, **on the host**.
+    ///
+    /// Made at load by the encoder, which is gone by the time a draw runs. On
+    /// the host rather than the card because the encoder's activations had no
+    /// arena to carve from and the transformer was then placed over the ground
+    /// the encoder stood in — a conditioning left on the card could share its
+    /// bytes with nothing, but one on the host cannot share them by construction.
+    /// A few hundred rows of 2,560 floats; the upload per draw is a megabyte.
+    conditioning: HashMap<String, Tensor>,
     transformer: zq::ZImageTransformer,
     vae: AutoEncoderKL,
     shift: f64,
@@ -224,17 +235,22 @@ impl ImageGuest {
         Self { spec, loaded: None }
     }
 
-    /// Ground the two GGUFs will take, at `mode`.
+    /// Ground the weights will take, at `mode`: the larger of the two stages.
     ///
     /// Read from the headers rather than the file lengths, because a KO twin is
     /// not the size of the bytes it was built from — see
     /// [`super::groundgguf::ground_bytes`]. A claim that is short fails at the
     /// last tensor, after the engine has already been evicted for it.
-    fn gguf_bytes(&self, mode: Int8Mode, transformer: &Path) -> usize {
+    fn weight_bytes(&self, mode: Int8Mode, transformer: &Path) -> usize {
         let t = ground_bytes(transformer, mode, &[]).unwrap_or(0);
         let e = ground_bytes(&self.spec.text_encoder, mode, &[EMBED_TOKENS]).unwrap_or(0);
-        t + e
+        staged(e, t + vae_bytes(&self.spec.vae))
     }
+}
+
+/// Ground for two stages that stand on the same bytes one after the other.
+fn staged(encode: usize, draw: usize) -> usize {
+    encode.max(draw)
 }
 
 /// Ground for the latents, the attention bands and the decode, at one size.
@@ -300,10 +316,9 @@ impl GuestModel for ImageGuest {
         // another and each releases its activations before the next starts, so
         // summing would evict the engine for a peak that never happens.
         //
-        // The weights *are* summed, because both models stay resident for the
-        // whole drain. Encoding per job and dropping the encoder between would
-        // save 4 GiB and cost a 4 GiB transfer per portrait — the wrong trade
-        // for a drain that exists to serve a backlog.
+        // The weights are the larger stage, not the sum: `load` conditions the
+        // whole backlog before the transformer is placed, so the encoder is
+        // loaded once per drain either way and never stands beside it.
         let mode = Int8Mode::auto(&Device::Cpu);
         // Sized against the checkpoint this backlog will actually load. When
         // the backlog names an unconfigured variant the standing checkpoint
@@ -313,7 +328,7 @@ impl GuestModel for ImageGuest {
             .spec
             .transformer_for(drain_lora(jobs))
             .unwrap_or(&self.spec.transformer);
-        self.gguf_bytes(mode, transformer) + vae_bytes(&self.spec.vae) + largest
+        self.weight_bytes(mode, transformer) + largest
     }
 
     fn load(
@@ -367,20 +382,47 @@ impl GuestModel for ImageGuest {
                 "image guest: {what}"
             );
         };
-        stage("reading the embedding table on the host");
-        let table = EmbedTable::from_gguf(&self.spec.text_encoder, &cfg)
-            .map_err(|e| format!("image guest: the embedding table: {e}"))?;
-        stage("placing the text encoder");
-        let vb = place_gguf(
-            &self.spec.text_encoder,
-            device,
-            ground,
-            mode,
-            &[EMBED_TOKENS],
-        )?;
-        stage("building the text encoder");
-        let encoder = TextEncoder::new(&cfg, ENCODER_SKIP_LAST, mode, vb)
-            .map_err(|e| format!("image guest: the text encoder: {e}"))?;
+        // **Stage one: the encoder, for the whole backlog.** Scoped so the
+        // encoder and every tensor it placed are dropped before the ground is
+        // rewound below — the scope is the guarantee, not a comment.
+        let conditioning = {
+            stage("reading the embedding table on the host");
+            let table = EmbedTable::from_gguf(&self.spec.text_encoder, &cfg)
+                .map_err(|e| format!("image guest: the embedding table: {e}"))?;
+            stage("placing the text encoder");
+            let vb = place_gguf(
+                &self.spec.text_encoder,
+                device,
+                ground,
+                mode,
+                &[EMBED_TOKENS],
+            )?;
+            stage("building the text encoder");
+            let encoder = TextEncoder::new(&cfg, ENCODER_SKIP_LAST, mode, vb)
+                .map_err(|e| format!("image guest: the text encoder: {e}"))?;
+            stage("conditioning the backlog");
+            condition(&tokenizer, &table, &encoder, device, jobs, lora)
+                .map_err(|e| format!("image guest: conditioning: {e}"))?
+        };
+
+        // **Stage two stands where stage one stood.** Every encoder kernel has
+        // to have finished reading its weights before the transformer's copies
+        // land on them; the host readback in `condition` waited for the last
+        // forward, and this barrier states it rather than relying on it.
+        device
+            .synchronize()
+            .map_err(|e| format!("image guest: the stage barrier: {e}"))?;
+        if let Some((before, after)) = candle::vram::trim_pool_after_load(device) {
+            tracing::debug!(
+                target: "candle_conversation::guest",
+                released_mib = before.saturating_sub(after) / (1 << 20),
+                "image guest: released the encoder's pool blocks"
+            );
+        }
+        ground
+            .lock()
+            .map_err(|_| "image guest: the ground lock was poisoned".to_string())?
+            .rewind();
 
         stage("placing the transformer");
         tracing::debug!(
@@ -449,9 +491,7 @@ impl GuestModel for ImageGuest {
 
         self.loaded = Some(Loaded {
             device: device.clone(),
-            tokenizer,
-            table,
-            encoder,
+            conditioning,
             transformer,
             vae,
             shift: self.spec.shift,
@@ -531,6 +571,74 @@ fn vae_bytes(dir: &std::path::Path) -> usize {
         .flatten()
         .filter_map(|p| std::fs::metadata(&p).ok().map(|m| m.len() as usize))
         .sum()
+}
+
+/// Where the activation arena stands after `what`: its cursor, its high-water
+/// and its capacity.
+///
+/// At info, because an overrun is an error and this is the number the claim
+/// has to be sized from — the high-water of the largest stage. A cursor above
+/// zero between stages is carves no stage owned.
+fn arena_reading(device: &Device, what: &str) {
+    let Ok(cuda) = device.as_cuda_device() else {
+        return;
+    };
+    if let Some((cursor, peak, capacity)) =
+        candle_nn::kv_cache::guest_domain_stats(cuda.cuda_stream().context().ordinal())
+    {
+        tracing::info!(
+            target: "candle_conversation::guest",
+            cursor_mib = cursor >> 20,
+            peak_mib = peak >> 20,
+            capacity_mib = capacity >> 20,
+            "image guest: activation arena after {what}"
+        );
+    }
+}
+
+/// Every distinct prompt among the backlog's `lora` jobs, conditioned, on the
+/// host.
+///
+/// A job for another checkpoint is refused at run and is not conditioned here,
+/// and a prompt asked twice is encoded once — the encoding depends on nothing
+/// else.
+fn condition(
+    tokenizer: &tokenizers::Tokenizer,
+    table: &EmbedTable,
+    encoder: &TextEncoder,
+    device: &Device,
+    jobs: &[GuestRequest],
+    lora: ImageLora,
+) -> candle::Result<HashMap<String, Tensor>> {
+    let mut out = HashMap::new();
+    for job in jobs {
+        let GuestRequest::Image(r) = job else {
+            continue;
+        };
+        if r.lora != lora || out.contains_key(&r.prompt) {
+            continue;
+        }
+        let ids = tokenizer
+            .encode(chat_wrap(&r.prompt), true)
+            .map_err(|e| candle::Error::Msg(format!("tokenizing: {e}")))?
+            .get_ids()
+            .to_vec();
+        let embeds = table.rows(&ids, device)?;
+        // No padding was added, so every position is a real token and the
+        // reference's attention-mask filter is the identity here.
+        let cap = encoder
+            .encode(&embeds)?
+            .contiguous()?
+            .to_device(&Device::Cpu)?;
+        tracing::debug!(
+            target: "candle_conversation::guest",
+            tokens = ids.len(),
+            caption_spread = %spread(&cap),
+            "image guest conditioned"
+        );
+        out.insert(r.prompt.clone(), cap);
+    }
+    Ok(out)
 }
 
 impl Loaded {
@@ -683,19 +791,7 @@ impl Loaded {
         // the number the activation claim has to cover for the arena to hold a
         // whole stage, and the only alternative to measuring it is the guessing
         // this replaced.
-        if let Ok(cuda) = self.device.as_cuda_device() {
-            if let Some((cursor, peak, capacity)) =
-                candle_nn::kv_cache::guest_domain_stats(cuda.cuda_stream().context().ordinal())
-            {
-                tracing::debug!(
-                    target: "candle_conversation::guest",
-                    cursor_mib = cursor >> 20,
-                    peak_mib = peak >> 20,
-                    capacity_mib = capacity >> 20,
-                    "image guest: activation arena high-water"
-                );
-            }
-        }
+        arena_reading(&self.device, "the draw");
         let report = candle::forbidden_alloc::take_report();
         if !report.is_clean() {
             tracing::warn!(
@@ -717,22 +813,15 @@ impl Loaded {
         let seed = resolve_seed(request.seed);
         self.device.set_seed(seed)?;
 
-        let ids = self
-            .tokenizer
-            .encode(chat_wrap(&request.prompt), true)
-            .map_err(|e| candle::Error::Msg(format!("image guest: tokenizing: {e}")))?
-            .get_ids()
-            .to_vec();
-        let embeds = self.table.rows(&ids, &self.device)?;
-        // No padding was added, so every position is a real token and the
-        // reference's attention-mask filter is the identity here.
-        let cap = self.encoder.encode(&embeds)?.contiguous()?;
-        tracing::debug!(
-            target: "candle_conversation::guest",
-            tokens = ids.len(),
-            caption_spread = %spread(&cap),
-            "image guest conditioned"
-        );
+        let cap = self
+            .conditioning
+            .get(&request.prompt)
+            .ok_or_else(|| {
+                candle::Error::Msg(
+                    "image guest: this prompt was not in the backlog the drain conditioned".into(),
+                )
+            })?
+            .to_device(&self.device)?;
 
         let (lh, lw) = (request.height as usize / 8, request.width as usize / 8);
         let channels = zi::Config::turbo().in_channels;
@@ -772,6 +861,9 @@ impl Loaded {
             // of a batch.
             let out = self.transformer.forward(x, &cap, t)?;
             step_no += 1;
+            if step_no == 1 {
+                arena_reading(&self.device, "the first denoise step");
+            }
             tracing::debug!(
                 target: "candle_conversation::guest",
                 step = step_no,
@@ -790,6 +882,10 @@ impl Loaded {
             });
             Ok(out)
         })?;
+        // Between the two passes, so a draw that overruns says which one did:
+        // a cursor standing high here is the denoise leaving carves behind its
+        // stages, not the decode needing more than the arena.
+        arena_reading(&self.device, "the denoise");
 
         // **Give the denoise's pool blocks back to the driver before the decode
         // asks for its own.**
@@ -941,6 +1037,16 @@ mod tests {
     /// attention and the decoder upsamples to full resolution. So the headroom
     /// must scale with the *image*, and must not fall below what a small one
     /// still needs.
+    /// **The two stages share ground, so the claim is the larger, not the sum.**
+    /// On the 3090 beside a resident engine the sum is 2 GB more than the span
+    /// can give, and the larger stage fits.
+    #[test]
+    fn the_weights_claim_the_larger_stage() {
+        let (encoder, transformer, vae) = (3_800usize << 20, 7_230usize << 20, 160usize << 20);
+        assert_eq!(staged(encoder, transformer + vae), transformer + vae);
+        assert_eq!(staged(9 << 30, 1 << 30), 9 << 30);
+    }
+
     #[test]
     fn headroom_scales_with_the_image_and_has_a_floor() {
         let small = activation_headroom(256, 256);

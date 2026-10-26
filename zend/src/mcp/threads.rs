@@ -33,10 +33,10 @@ static NOTE_SEQ: AtomicU64 = AtomicU64::new(0);
 pub enum State {
     Running,
     /// Its turn ended asking Claude a question; it waits, live, for
-    /// `task_reply`.
+    /// `repo_task_reply`.
     Question,
     /// The repeat guard or the round cap closed its tools; it waits, live, for
-    /// `task_reply` to say how to go on.
+    /// `repo_task_reply` to say how to go on.
     Stuck,
     Done,
     Error,
@@ -49,7 +49,7 @@ impl State {
         matches!(self, Self::Running | Self::Question | Self::Stuck)
     }
 
-    /// Whether zend is still working on it: what `task_wait` waits out.
+    /// Whether zend is still working on it: what `repo_task_wait` waits out.
     pub fn working(self) -> bool {
         matches!(self, Self::Running)
     }
@@ -182,11 +182,11 @@ pub struct Worker {
     /// Why its turn ended with no journal entry, as the draft recorded it;
     /// none when it kept one.
     pub no_entry: Option<String>,
-    /// Whether Claude stopped its last turn (`task_stop`): it is stuck, live,
-    /// for `task_reply` to redirect.
+    /// Whether Claude stopped its last turn (`repo_task_stop`): it is stuck, live,
+    /// for `repo_task_reply` to redirect.
     #[serde(default)]
     pub stopped: bool,
-    /// Whether a finished task's conversation is still whole, so `task_reply`
+    /// Whether a finished task's conversation is still whole, so `repo_task_reply`
     /// can continue it: true from when it ends `done` until it is archived —
     /// with its thread, or after a day idle (`super::archiving`).
     #[serde(default)]

@@ -1,5 +1,5 @@
 //! MCP sessions, kept as records so any member answers a client
-//! (`docs/claude_zend_gateway.md` §3), and the signal a waiting `task_wait`
+//! (`docs/claude_zend_gateway.md` §3), and the signal a waiting `repo_task_wait`
 //! wakes on.
 //!
 //! - **Sessions** are `mcp_server`'s ([`mcp_server::session`]): a handshake
@@ -11,7 +11,7 @@
 //!   `"self"` names. Which client opened it bounds how long a call may wait
 //!   (§3.3).
 //! - **A change signal**, bumped whenever a worker's state moves on this
-//!   member, which `task_wait` wakes on; it also re-reads every few seconds,
+//!   member, which `repo_task_wait` wakes on; it also re-reads every few seconds,
 //!   since a worker another member runs changes its record without bumping
 //!   this one.
 

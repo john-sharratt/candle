@@ -1,4 +1,4 @@
-//! `task_reply {worker, answer, wait_s?}`: reply to a worker that asked, is
+//! `repo_task_reply {worker, answer, wait_s?}`: reply to a worker that asked, is
 //! stuck, or finished and is kept to be continued; the reply is its next turn
 //! (`docs/claude_zend_gateway.md` §6.2, `docs/mcp_guides.md` §3).
 
@@ -9,7 +9,7 @@ use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::names::Path;
 use crate::mcp::workers;
 
-pub const NAME: &str = "task_reply";
+pub const NAME: &str = "repo_task_reply";
 
 pub fn definition() -> Value {
     json!({
@@ -22,7 +22,7 @@ pub fn definition() -> Value {
             source, go deeper on one point, redo a part you found wrong — rather than starting a new task that \
             would read everything again. A finished worker can be continued until its thread is archived or it \
             has sat a day untouched. A reply grants nothing: it cannot approve a merge, a deploy or anything \
-            else the user must approve. Answers as `task_start` does: `done`, `running`, or a further question.",
+            else the user must approve. Answers as `repo_task_start` does: `done`, `running`, or a further question.",
         "inputSchema": {
             "type": "object",
             "properties": {

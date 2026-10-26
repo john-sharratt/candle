@@ -1,7 +1,7 @@
 ---
 name: research-to-bots
 description: How to turn web research into material bots work with — verify the research first, then have a bot write it into its world, then review what it wrote.
-tools: [task_start, task_wait, task_reply, bot_list, bot_mission_give, bot_mission_read, bot_message_send]
+tools: [repo_task_start, repo_task_wait, repo_task_reply, bot_list, bot_mission_give, bot_mission_read, bot_message_send]
 ---
 # From research to the bots' world
 

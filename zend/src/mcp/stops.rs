@@ -1,11 +1,11 @@
-//! Claude stopping a running worker — `task_stop`
+//! Claude stopping a running worker — `repo_task_stop`
 //! (`docs/claude_zend_gateway.md` §6.2).
 //!
 //! Like a nudge, a stop never interrupts a decoding turn: it is read where the
 //! worker's next tool round ends, and that round then closes the loop as the
 //! round cap does — its results carry the stop, no further call runs, and the
 //! next turn answers with what the worker has. The worker settles stuck, live,
-//! so `task_reply` redirects it. A stop the turn never reaches, because it
+//! so `repo_task_reply` redirects it. A stop the turn never reaches, because it
 //! ended without another round, is cleared when the worker settles.
 //!
 //! **A stop is a record**, under the worker's conversation, so it reaches the

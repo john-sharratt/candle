@@ -18,7 +18,7 @@ tool, as the signed-in caller.
   act, called in-process.
 
 **Naming.** A tool's name says what it acts on and what it does to it —
-`task_start`, `service_status`, `bot_message_send` — never the process that
+`repo_task_start`, `service_status`, `bot_message_send` — never the process that
 serves it. Its description opens with what it does and glosses the system's
 own words where it uses them: a worker, a member, a build agent, keep.
 

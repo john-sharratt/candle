@@ -1,7 +1,7 @@
 ---
 name: refactor
 description: How to have a worker restructure code without changing what it does — tests green before and after, every call site moved, no behaviour hidden in the move.
-tools: [task_start, task_wait, agent_job, agent_job_log]
+tools: [repo_task_start, repo_task_wait, repo_job_start, repo_job_log]
 ---
 # Refactoring
 
@@ -10,7 +10,7 @@ an old path — and behaviour must not change.
 
 ## Prompt
 
-`task_start {thread, name: "refactor-<what>", effort: "deep", prompt}`:
+`repo_task_start {thread, name: "refactor-<what>", effort: "deep", prompt}`:
 
 ```
 GOAL: <the restructuring, in full> in <repository>, on branch

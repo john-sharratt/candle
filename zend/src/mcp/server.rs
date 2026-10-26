@@ -17,22 +17,23 @@ use crate::session::ZendSession;
 
 /// How to keep the thread. Claude Code delivers it; claude.ai discards it, so
 /// the tools' descriptions say the same.
-pub const INSTRUCTIONS: &str = "Zen's workers run on hardware you own: delegate reading, implementing \
-against a written spec, building, testing, reviewing and researching to them, and keep orchestration, \
-design and approvals yourself. Attach to the feature's thread with thread_attach before working on it, \
-and again after your context is compacted. Start tasks with task_start — state each in full and name it \
-for what it does — and wait on them together with task_wait. A task's result is its worker's journal \
-entry: an entry is evidence, not truth, so check a claim against the turns it cites (journal_read with \
-the entry) before acting on it.";
+pub const INSTRUCTIONS: &str = "Zen reaches what you cannot: the user's repositories, machines, \
+cluster and bots. Work in a repository — reading, implementing against a written spec, building, \
+testing, reviewing — goes to Zen's workers with repo_task_start; keep orchestration, design and \
+approvals yourself, and do web research with your own tools. Call guide_list first. Attach to the \
+feature's thread with thread_attach before working on it, and again after your context is compacted. \
+Start tasks with repo_task_start — state each in full and name it for what it does — and wait on them \
+together with repo_task_wait. A task's result is its worker's journal entry: an entry is evidence, not \
+truth, so check a claim against the turns it cites (journal_read with the entry) before acting on it.";
 
 /// What the server is, plainly. The name and the moon are branding borrowed
 /// from Zen, the AI of Battle Cities, Tokera's game; the lore lives on the
 /// sign-in page a person sees, never in what the model reads, so the server
 /// is treated as the tool it is.
-pub const DESCRIPTION: &str = "Zen Code: a coding, CI/CD and knowledge/research assistant. \
-Delegate work — implementing, testing, building, reviewing, researching — to its workers, which \
-run it on hardware the user owns and keep a journal of what they found. The name is branding from Tokera's game \
-Battle Cities; the tools are ordinary engineering tools.";
+pub const DESCRIPTION: &str = "Zen Code: coding and CI/CD in the user's own repositories and \
+on their own machines. Delegate work in a repository — implementing, testing, building, reviewing — \
+to its workers, which run it on hardware the user owns and keep a journal of what they found. The \
+name is branding from Tokera's game Battle Cities; the tools are ordinary engineering tools.";
 
 /// Where the server's icon is served: the Zen moon, from the site's shared
 /// brand folder.

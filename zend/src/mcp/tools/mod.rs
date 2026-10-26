@@ -7,8 +7,11 @@
 //! Admins only, with each decision gated on the user's approval
 //! ([`super::ops`]).
 //!
-//! A tool's name says what it acts on and what it does to it — `task_start`,
-//! `service_status` — never the process that serves it.
+//! A tool's name says what it acts on and what it does to it —
+//! `repo_task_start`, `service_status` — never the process that serves it.
+//! What it acts on is named so Claude can route by the name alone, before it
+//! has read a description: `repo_` is work in the user's repositories, which
+//! Claude has no other way to reach.
 //!
 //! **The descriptions carry the rules.** claude.ai discards a server's
 //! `instructions` (§13.3), so what Claude must do to keep its thread — attach
@@ -30,8 +33,6 @@ use super::reported::{self, Mark};
 use super::state::{ATTACHED, DEFAULT_WAIT_S};
 use crate::session::ZendSession;
 
-mod agent_job;
-mod agent_job_log;
 mod archive;
 mod attach;
 mod cluster_audit;
@@ -47,6 +48,8 @@ mod layer_read;
 mod layer_toggle;
 mod nudge;
 mod reply;
+mod repo_job;
+mod repo_job_log;
 mod service_control;
 mod service_status;
 mod service_trial;
@@ -147,8 +150,8 @@ pub fn definitions() -> Value {
         cluster_command::definition(),
         cluster_job_status::definition(),
         gateway_command::definition(),
-        agent_job::definition(),
-        agent_job_log::definition(),
+        repo_job::definition(),
+        repo_job_log::definition(),
         service_status::definition(),
         service_trial::definition(),
         service_control::definition(),
@@ -179,8 +182,8 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> Answer {
         cluster_command::NAME => cluster_command::call(ctx, args).await,
         cluster_job_status::NAME => cluster_job_status::call(ctx, args).await,
         gateway_command::NAME => gateway_command::call(ctx, args).await,
-        agent_job::NAME => agent_job::call(ctx, args).await,
-        agent_job_log::NAME => agent_job_log::call(ctx, args).await,
+        repo_job::NAME => repo_job::call(ctx, args).await,
+        repo_job_log::NAME => repo_job_log::call(ctx, args).await,
         service_status::NAME => service_status::call(ctx, args).await,
         service_trial::NAME => service_trial::call(ctx, args).await,
         service_control::NAME => service_control::call(ctx, args).await,
@@ -262,11 +265,11 @@ mod tests {
             names,
             [
                 "thread_attach",
-                "task_start",
-                "task_wait",
-                "task_reply",
-                "task_nudge",
-                "task_stop",
+                "repo_task_start",
+                "repo_task_wait",
+                "repo_task_reply",
+                "repo_task_nudge",
+                "repo_task_stop",
                 "journal_read",
                 "journal_grep",
                 "journal_note",
@@ -278,8 +281,8 @@ mod tests {
                 "cluster_command",
                 "cluster_job_status",
                 "gateway_command",
-                "agent_job",
-                "agent_job_log",
+                "repo_job_start",
+                "repo_job_log",
                 "service_status",
                 "service_trial",
                 "service_control",

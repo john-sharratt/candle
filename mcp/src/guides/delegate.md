@@ -1,7 +1,7 @@
 ---
 name: delegate
 description: How to write a task for a worker so it does the work properly — the prompt template every other guide builds on, and how to choose effort and priority.
-tools: [task_start, task_wait]
+tools: [repo_task_start, repo_task_wait]
 ---
 # Delegating a task
 
@@ -74,5 +74,5 @@ These come from runs that went wrong. Include the ones that apply.
 ## Splitting
 
 Split broad work into independent tasks, each with its own prompt, name and
-final response. Start them all, then `task_wait` on all of them together.
+final response. Start them all, then `repo_task_wait` on all of them together.
 Name each worker for what it does (`verify-expiry`), never a number.

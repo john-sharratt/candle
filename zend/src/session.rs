@@ -262,7 +262,7 @@ pub const CLOSED_BY_REPEATS: &str = "repeats";
 /// [`StreamItem::Closing`]'s reason when the round cap closed it.
 pub const CLOSED_BY_CAP: &str = "round_cap";
 /// [`StreamItem::Closing`]'s reason when Claude stopped the worker
-/// (`task_stop`, [`stops`]).
+/// (`repo_task_stop`, [`stops`]).
 pub const CLOSED_BY_CLAUDE: &str = "stopped";
 
 /// A dialogue conversation's recovered history, as `GET /v1/conversations/{id}`
@@ -6352,7 +6352,7 @@ pub struct ZendSession {
     /// its scan on the device — behind the next one.
     ingest_worker: Mutex<Option<crate::ingest_worker::IngestWorker>>,
     /// What `/mcp` holds in memory: its sessions, the tasks this process runs,
-    /// and the signal a waiting `task_wait` wakes on (`crate::mcp`).
+    /// and the signal a waiting `repo_task_wait` wakes on (`crate::mcp`).
     mcp: Arc<McpState>,
 }
 

@@ -1,7 +1,7 @@
 ---
 name: review
 description: How to have workers review a change — correctness, regressions, missing tests, convention breaks — with every finding verified against the code before it is reported.
-tools: [task_start, task_wait, journal_grep, timeline_read]
+tools: [repo_task_start, repo_task_wait, journal_grep, timeline_read]
 ---
 # Reviewing code
 
@@ -12,7 +12,7 @@ Split a large change by area; one task each, started together.
 
 ## Prompt
 
-`task_start {thread, name: "review-<area>", effort: "exhaustive", prompt}`:
+`repo_task_start {thread, name: "review-<area>", effort: "exhaustive", prompt}`:
 
 ```
 GOAL: review <branch | these files | this diff> of <repository>.
