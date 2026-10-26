@@ -1405,6 +1405,20 @@ pub trait ContentResolver {
     }
 }
 
+/// The hot KV the working-set pins hold — see
+/// [`Substrate::pinned_hot_by_timeline`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PinnedHot {
+    /// Residences pinned, hot or not.
+    pub pins: usize,
+    /// Hot bytes of every pinned residence, turns and sections.
+    pub pinned_bytes: u64,
+    /// Of them, the pinned turns' — what `by_timeline` divides.
+    pub turn_bytes: u64,
+    /// `(timeline, turns, bytes)`, largest first.
+    pub by_timeline: Vec<(TimelineId, usize, u64)>,
+}
+
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
 /// Per-session turn state that implements [`ContentResolver`].
@@ -2602,6 +2616,50 @@ impl Substrate {
             }
         }
         (dc, db, pc, pb)
+    }
+
+    /// The hot KV the working-set pins hold, by the timeline whose turns they
+    /// are, largest first and at most `top`: `(timeline, turns, bytes)`. With
+    /// the total over every timeline and the pins on sections, which no
+    /// timeline owns.
+    ///
+    /// What the pinned half of [`Self::warm_backlog_split`] is made of. That
+    /// half is the hot KV no drain may move while a live slot's working set
+    /// names it, so when it grows the question is whose working set — and a
+    /// count cannot say.
+    pub fn pinned_hot_by_timeline(&self, top: usize) -> PinnedHot {
+        let mut by_timeline: Vec<(TimelineId, usize, u64)> = Vec::new();
+        let mut turn_bytes = 0u64;
+        for (&timeline, entry) in &self.timelines {
+            let (mut turns, mut bytes) = (0usize, 0u64);
+            for t in entry.turns.values() {
+                let r = t.content.residence;
+                let slot = &self.residence[r.0];
+                if slot.hot.is_some() && self.working_set_pins.contains(&r) {
+                    turns += 1;
+                    bytes += slot.byte_size;
+                }
+            }
+            if turns > 0 {
+                turn_bytes += bytes;
+                by_timeline.push((timeline, turns, bytes));
+            }
+        }
+        by_timeline.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.raw().cmp(&b.0.raw())));
+        by_timeline.truncate(top);
+        let pinned_bytes: u64 = self
+            .working_set_pins
+            .iter()
+            .map(|r| &self.residence[r.0])
+            .filter(|slot| slot.hot.is_some())
+            .map(|slot| slot.byte_size)
+            .sum();
+        PinnedHot {
+            pins: self.working_set_pins.len(),
+            pinned_bytes,
+            turn_bytes,
+            by_timeline,
+        }
     }
 
     /// Snapshot indices of warm-resident slots that lack a cold (on-disk) record
@@ -10995,6 +11053,37 @@ mod tests {
             sub.residence[a.0].hot.is_none(),
             "A left the working set → eviction resumes"
         );
+    }
+
+    /// **The pinned hot KV is told by its owning timeline.** Two timelines'
+    /// turns pinned and one left out: each pinned timeline is reported with
+    /// its pinned turns' bytes, largest first, the unpinned one not at all,
+    /// and the cut at `top` keeps the largest.
+    #[test]
+    fn pinned_hot_kv_is_reported_by_its_timeline() {
+        let (layer, group, a, mut sub) = make_timeline();
+        let alloc = TimelineAllocator::new();
+        let b = alloc.next();
+        sub.register_timeline(b, layer, group);
+        let (a1, _) = install_hot_and_warm(&mut sub, a, 10);
+        let (a2, _) = install_hot_and_warm(&mut sub, a, 20);
+        install_hot_and_warm(&mut sub, a, 40);
+        let (b1, _) = install_hot_and_warm(&mut sub, b, 100);
+        sub.set_working_set_pins(
+            &[
+                TurnKey::new(a, a1),
+                TurnKey::new(a, a2),
+                TurnKey::new(b, b1),
+            ],
+            &[],
+        );
+
+        let pinned = sub.pinned_hot_by_timeline(8);
+        assert_eq!(pinned.pins, 3);
+        assert_eq!(pinned.pinned_bytes, 130);
+        assert_eq!(pinned.turn_bytes, 130);
+        assert_eq!(pinned.by_timeline, vec![(b, 1, 100), (a, 2, 30)]);
+        assert_eq!(sub.pinned_hot_by_timeline(1).by_timeline, vec![(b, 1, 100)]);
     }
 
     /// A sealed turn spanning REAL blocks, hot + warm installed — the shape a

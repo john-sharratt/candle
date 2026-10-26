@@ -55,6 +55,7 @@ pub mod phase_ring;
 mod phase_split;
 mod piece_identity;
 mod piece_splice;
+mod pinned_report;
 mod prefill;
 mod prefill_wait;
 pub(crate) mod profile;

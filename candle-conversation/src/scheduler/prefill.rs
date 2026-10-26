@@ -897,6 +897,7 @@ impl Scheduler {
             .is_none_or(|t| now.duration_since(t) >= RATES_LOG_EVERY)
         {
             self.rates_logged_at = Some(now);
+            self.log_pinned_working_sets();
             // And the model behind them, for the next start (`export_learned`).
             if let Some(r) = self.wave_rate.as_ref() {
                 super::phase_ring::keep_learned_model(&r.export_learned());
