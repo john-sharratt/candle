@@ -499,7 +499,13 @@ pub fn report_block(hosted: &Hosted, body: &str) -> Option<String> {
     }
     let vocabulary = hosted.read(leakage::vocabulary);
     let lore = hosted.sim(|s| s.bench.files()).map(|f| leakage::lore(&f));
-    let refusal = hosted.sim(|s| gate_refusal(s, body, &*shelf, &vocabulary, &lore))?;
+    // Kept on the mission until a report is taken, so the compass can say it
+    // on every turn between — see `mission::refused_compass`.
+    let Some(refusal) = hosted.sim(|s| gate_refusal(s, body, &*shelf, &vocabulary, &lore)) else {
+        hosted.with_sim(|s| s.missions.set_gate_refusal(body, None));
+        return None;
+    };
+    hosted.with_sim(|s| s.missions.set_gate_refusal(body, Some(refusal.clone())));
     // A document that does not stand is to be written again — said in the
     // mission's own steps, so the compass sends the Maker back to its desk
     // instead of on to a report that will be refused. One gone from the store
