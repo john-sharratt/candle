@@ -362,8 +362,9 @@ reports, world material.
   what is unclear; record what came of it on the thread.
 
 ### E8. `image`
-**Use when:** drawing a picture with `image_generate`.
-**Tools:** `image_generate`
+**Use when:** drawing a picture with `image_generate`, or changing one with
+`image_edit`.
+**Tools:** `image_generate`, `image_edit`
 - The model is Z-Image-Turbo, fine-tuned on prompt-enhancer captions, so
   Claude writes the enhancer's prompt itself (Tongyi's published rules: keep
   every asked element, make an idea concrete, add composition, light,
@@ -379,6 +380,10 @@ reports, world material.
   file where it can send files, puts the downloaded file in a page it makes,
   or else gives the link and says to save it within the day — the picture is
   deleted after 24 hours. With it, the prompt and seed, which draw it again.
+- A picture mostly right is refined with `image_edit` from its link, one
+  change at a time: the prompt is the whole picture as it should end up, and
+  `hold` (0.5 default; lower for a bigger change, higher for a lighter one)
+  is how much of the original survives.
 
 ---
 

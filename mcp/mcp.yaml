@@ -52,7 +52,9 @@ server:
     image_generate — read the `image` guide (guide_read) first; it is the
     user's own image model, so use it rather than drawing one yourself in SVG,
     code or a widget. The user may not see the picture in the tool result:
-    send them the file from the link the answer carries.
+    send them the file from the link the answer carries. To change a picture
+    — add or remove a detail, refine a draw, or edit a photo of the user's —
+    use image_edit, which takes the link a draw answered with.
   icon: /brand/zen.png
 
 # The MCP servers whose tools are served, each at its path on its site, by

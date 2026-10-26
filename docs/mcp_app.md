@@ -162,6 +162,7 @@ itself.
 | `bot_channel_read {world}` | `GET /v1/world/:wid/channel` | The world's channel, as the caller has heard it |
 | `bot_channel_post {world, text}` | `POST /v1/world/:wid/channel` | Post on the world's channel (the Creator only) |
 | `image_generate {prompt, width?, height?, steps?, seed?, shift?, format?}` | `POST /v1/image/generate` | Draw a picture on the image guest, through the route's compliance gate. Sides are capped at 1024. The JPEG (or PNG with `format: png`) comes back as an MCP `image` content block after the text block, and the text carries a signed link to the stored file |
+| `image_edit {image \| image_base64, prompt, hold?, width?, height?, steps?, seed?, shift?, format?}` | `POST /v1/image/generate` with `reference` | Redraw a picture by a prompt, starting from it: `image` names one this server stored (a link or id from a draw), read from the image store so no picture crosses the conversation; `image_base64` is the user's own. `hold` (default 0.5, at most 0.95) is how much survives. The size defaults to the picture's shape within 1024. Answered like `image_generate`, with its own link |
 
 `image_generate` reads the route's NDJSON stream to its end and answers with
 the last line. A draw runs 10–60 s; the transport's progress notifications
