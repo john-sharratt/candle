@@ -3122,6 +3122,7 @@ impl InferenceState {
                     scope: scope.clone(),
                     base: self.ingest_base(&il.name)?,
                     spec: il.spec.as_deref(),
+                    calibrate: il.calibrate.as_deref(),
                     sees: self
                         .layer_sees
                         .get(&il.name)
@@ -3158,11 +3159,10 @@ impl InferenceState {
     }
 
     /// Calibrate every branch layer that declares a `calibrate:` block
-    /// (`crate::calibrate`): each ready unit without a calibration of its
-    /// current version writes its questions, and they are prefilled as its
-    /// exemplars. Run ahead of each pass, so units already read are
-    /// calibrated without being read again; a unit the pass reads is
-    /// calibrated by the next.
+    /// (`crate::calibrate`), each layer's chunk exclusion learned first: each
+    /// ready unit without a calibration of its current version — one its
+    /// ingest did not calibrate as it committed it — writes its questions, and
+    /// they are prefilled as its exemplars. Run ahead of each pass.
     fn calibrate_layers(&self) {
         for (il, _) in &self.branch_layers {
             if crate::ingest_cancel::cancelled() {
@@ -3350,6 +3350,7 @@ impl InferenceState {
             progress,
             &files_layer.name,
             self.ingest_base(&files_layer.name)?,
+            files_layer.calibrate.as_deref(),
         )?;
         if ingested {
             // An upload is in every conversation's scope once it is committed.

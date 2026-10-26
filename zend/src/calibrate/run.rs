@@ -37,7 +37,7 @@ use candle_conversation::projection::{
     DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId,
     NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
-use candle_conversation::stencil::TriggerRegistry;
+use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
 
@@ -50,6 +50,8 @@ use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
 use crate::code_read::PATH_KEY;
 use crate::layers::keys::{FILE_KEY, SUBJECT_KEY};
 use crate::layers::run::{answer_of, LAYER_PARALLELISM};
+use crate::refresh_ctx::RefreshContext;
+use crate::types::ToolMode;
 
 /// The calibration marker a calibration carries ([`CalibrateSpec::marker`]).
 pub const MARKER_KEY: &str = "calibration";
@@ -107,8 +109,9 @@ pub struct Frame<'a> {
     pub thinking: Arc<TriggerRegistry>,
 }
 
-/// Calibrate every unit of `layer` that is ready and not calibrated, and
-/// retire every calibration of a unit no longer there.
+/// Calibrate every unit of `layer` that is ready and not calibrated — those
+/// its ingest did not calibrate as it committed them ([`calibrate_committed`])
+/// — and retire every calibration of a unit no longer there.
 pub fn calibrate_layer(
     engine: &Mutex<ConversationEngine>,
     layer: &Layer<'_>,
@@ -164,8 +167,7 @@ pub fn calibrate_layer(
     let drafts = Permits::new(LAYER_PARALLELISM);
     std::thread::scope(|s| {
         for _ in 0..CALIBRATE_PARALLELISM.min(todo.run.len()).max(1) {
-            // Only a shutdown stops it: a pass asked for meanwhile waits for
-            // the layer to finish, since this runs ahead of every pass.
+            // Only a shutdown stops it.
             s.spawn(|| loop {
                 if crate::ingest_cancel::cancelled() {
                     return;
@@ -173,7 +175,7 @@ pub fn calibrate_layer(
                 let Some(unit) = todo.run.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
                     return;
                 };
-                match calibrate_one(engine, layer, frame, &drafts, unit) {
+                match calibrate_one(engine, spec, layer.base, frame, Some(&drafts), unit) {
                     Ok(()) => {
                         sealed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -271,19 +273,47 @@ fn draft_selection() -> SelectionState {
     selection
 }
 
-/// Ask `unit` for its questions — holding one of `drafts` while it does — and
-/// calibrate them.
+/// Calibrate a unit the moment its conversation commits, from the ingest
+/// worker that read it: its reading is still resident then — the next step
+/// evicts it to cold — so the draft forked onto it projects the reading from
+/// the card, where a later pass lifts it back from disk first. Its reading
+/// is of the current key version by construction.
+pub fn calibrate_committed(
+    ctx: &RefreshContext<'_>,
+    spec: &CalibrateSpec,
+    base: &Mutex<Sequence>,
+    timeline: TimelineId,
+    subject: &str,
+    key: &str,
+) -> anyhow::Result<()> {
+    let frame = Frame {
+        system_prompt: ctx.formatted_prompt,
+        config: &ctx.config,
+        thinking: ctx.triggers_for(ThinkMode::Balanced, ToolMode::None),
+    };
+    let unit = Unit {
+        timeline,
+        subject: subject.to_string(),
+        key: key.to_string(),
+        marker: spec.marker(key),
+        ready: true,
+    };
+    calibrate_one(ctx.engine, spec, base, &frame, None, &unit)
+}
+
+/// Ask `unit` for its questions — holding one of `drafts`, when given, while
+/// it does — and calibrate them.
 fn calibrate_one(
     engine: &Mutex<ConversationEngine>,
-    layer: &Layer<'_>,
+    spec: &CalibrateSpec,
+    base: &Mutex<Sequence>,
     frame: &Frame<'_>,
-    drafts: &Permits,
+    drafts: Option<&Permits>,
     unit: &Unit,
 ) -> anyhow::Result<()> {
-    let spec = layer.spec;
     let asked = {
-        let _draft = drafts.acquire();
-        draft(engine, layer, unit)?
+        let _draft = drafts.map(Permits::acquire);
+        draft(engine, spec, base, unit)?
     };
     let found = questions(&asked, spec.questions);
     if found.is_empty() {
@@ -439,12 +469,11 @@ fn thoughts(
 /// whose lineage is the unit; the draft is tombstoned either way.
 fn draft(
     engine: &Mutex<ConversationEngine>,
-    layer: &Layer<'_>,
+    spec: &CalibrateSpec,
+    base: &Mutex<Sequence>,
     unit: &Unit,
 ) -> anyhow::Result<String> {
-    let spec = layer.spec;
-    let mut conv = layer
-        .base
+    let mut conv = base
         .lock()
         .unwrap()
         .fork()

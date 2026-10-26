@@ -29,5 +29,5 @@ pub mod run;
 pub mod spec;
 pub mod thinking;
 
-pub use run::{calibrate_layer, Frame, Layer, Report};
+pub use run::{calibrate_committed, calibrate_layer, Frame, Layer, Report};
 pub use spec::CalibrateSpec;

@@ -302,6 +302,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
             scope: scope.clone(),
             base: &repo_map_base,
             spec: None,
+            calibrate: None,
             sees: &[],
         },
         LayerPass {
@@ -310,6 +311,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
             scope: scope.clone(),
             base: &code_read_base,
             spec: None,
+            calibrate: None,
             sees: &[],
         },
     ];

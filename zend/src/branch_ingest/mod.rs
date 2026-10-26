@@ -28,6 +28,7 @@ use self::filter::IngestScope;
 use self::plan::{plan, Committed, Live};
 use self::tie::{backfill_commits, retie};
 use self::walk::{walk, Corpus, FileItem, RepoBranches, TreeCache};
+use crate::calibrate::CalibrateSpec;
 use crate::code_read::{self, is_upload_path, FileJob};
 use crate::ingest::IngestMode;
 use crate::layers::plan::Below;
@@ -66,6 +67,10 @@ pub struct LayerPass<'a> {
     pub base: &'a Mutex<Sequence>,
     /// How a [`IngestMode::Derived`] layer's units are read.
     pub spec: Option<&'a LayerSpec>,
+    /// How the layer's units are calibrated as they commit
+    /// (`crate::calibrate::calibrate_committed`), for a layer that declares a
+    /// `calibrate:` block.
+    pub calibrate: Option<&'a CalibrateSpec>,
     /// The scoped groups of the layers of units below a derived layer, by
     /// layer name — what its units may retrieve, on their branches.
     pub sees: &'a [(String, GroupId)],
@@ -140,6 +145,7 @@ impl BranchIngest {
                         let run = LayerRun {
                             spec,
                             base: layer.base,
+                            calibrate: layer.calibrate,
                             sees: layer.sees,
                         };
                         crate::layers::pass_layer(ctx, &run, &mut ground, Reach::Default)?
@@ -159,6 +165,7 @@ impl BranchIngest {
                 let run = LayerRun {
                     spec,
                     base: layer.base,
+                    calibrate: layer.calibrate,
                     sees: layer.sees,
                 };
                 changed |= crate::layers::pass_layer(ctx, &run, &mut ground, Reach::All)?;
@@ -244,6 +251,7 @@ impl BranchIngest {
                 let run = LayerRun {
                     spec,
                     base: upper.base,
+                    calibrate: upper.calibrate,
                     sees: upper.sees,
                 };
                 crate::layers::sweep_layer(ctx, &run, ground);
@@ -251,7 +259,15 @@ impl BranchIngest {
         }
         if !jobs.is_empty() {
             let keys: HashSet<String> = retain.iter().map(|k| k.to_string()).collect();
-            code_read::ingest_jobs(ctx, &jobs, &keys, progress, layer.base, &self.binary)?;
+            code_read::ingest_jobs(
+                ctx,
+                &jobs,
+                &keys,
+                progress,
+                layer.base,
+                &self.binary,
+                layer.calibrate,
+            )?;
         }
         ground_files(
             ctx, layer.name, &files, &retained, held_back, corpus, ground,

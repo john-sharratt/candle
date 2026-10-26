@@ -51,6 +51,7 @@ use crate::branch_ingest::keys::{
     PAGES_KEY,
 };
 use crate::branch_ingest::plan::Committed;
+use crate::calibrate::{calibrate_committed, CalibrateSpec};
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::Failures;
 use crate::ingest_snapshots::{finished, Unit};
@@ -372,13 +373,15 @@ fn parallelism() -> usize {
 /// Files whose extension isn't a recognised code language, and files over
 /// [`MAX_FILE_BYTES`], are skipped. Returns whether any file was read, and
 /// how many files' ingest tolerated-failed (e.g. out of KV VRAM), so the
-/// upload can surface a real failure.
+/// upload can surface a real failure. Each file is calibrated as it commits
+/// when the layer declares a `calibrate:` block (`calibrate`).
 pub fn ingest_files(
     ctx: &RefreshContext<'_>,
     rel_paths: &[String],
     progress: &Arc<LoadProgress>,
     layer_name: &str,
     base: &Mutex<Sequence>,
+    calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<(bool, usize)> {
     let uploads = ctx.tool_ctx.files.repo(UPLOADS_REPO)?;
     let mut jobs = Vec::new();
@@ -419,7 +422,15 @@ pub fn ingest_files(
     ctx.engine.lock().unwrap().mark_layer_append_only(layer);
 
     let live: HashSet<String> = jobs.iter().map(FileJob::key).collect();
-    let n_failed = ingest_jobs(ctx, &jobs, &live, progress, base, &Mutex::default())?;
+    let n_failed = ingest_jobs(
+        ctx,
+        &jobs,
+        &live,
+        progress,
+        base,
+        &Mutex::default(),
+        calibrate,
+    )?;
     Ok((true, n_failed))
 }
 
@@ -533,7 +544,9 @@ pub(crate) fn wipe_layer(engine: &Mutex<ConversationEngine>) {
 /// `live` is every file key the caller holds current: when a file commits,
 /// each other conversation of its path whose key is not in it is tombstoned.
 /// `binary` remembers the keys found to be binary, so a later pass does not
-/// read them again.
+/// read them again. With `calibrate`, each worker calibrates its file as soon
+/// as it commits, while the reading is still resident
+/// ([`calibrate_committed`]).
 ///
 /// The branch pass and the upload path ([`ingest_files`]) both funnel
 /// through here, so both drive the same `crate::ingest_backlog` counter and
@@ -545,6 +558,7 @@ pub fn ingest_jobs(
     progress: &Arc<LoadProgress>,
     base: &Mutex<Sequence>,
     binary: &Mutex<HashSet<String>>,
+    calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<usize> {
     let n_workers = parallelism();
     let total = jobs.len();
@@ -599,7 +613,9 @@ pub fn ingest_jobs(
                     live,
                     binary,
                 };
-                if let Err(e) = process_one_file(ctx, base, &job, &present_keys, &failures) {
+                if let Err(e) =
+                    process_one_file(ctx, base, &job, &present_keys, &failures, calibrate)
+                {
                     // An error escaping `process_one_file` is an unexpected one
                     // (its own failure mode records and returns Ok). Record it
                     // so it reaches the report instead of vanishing, and let the
@@ -691,7 +707,8 @@ fn file_tools(tools: &ToolContext, file: &FileJob) -> Option<ToolContext> {
 /// Ingest one file into a fresh per-file conversation: skip it when its key
 /// is already committed or it is binary; otherwise mint the conversation, run
 /// it as a real tool-using exchange ([`run_file_conversation`]), tag it with
-/// its content key + metadata, then drop it (freeing the GPU slot; the sealed
+/// its content key + metadata, calibrate it when `calibrate` names how — its
+/// reading still resident — then drop it (freeing the GPU slot; the sealed
 /// turns + tags persist in the substrate).
 fn process_one_file(
     ctx: &RefreshContext<'_>,
@@ -699,6 +716,7 @@ fn process_one_file(
     job: &Job<'_>,
     present_keys: &HashSet<String>,
     failures: &Failures,
+    calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<()> {
     let file = job.file;
     if present_keys.contains(job.key) {
@@ -1002,6 +1020,25 @@ fn process_one_file(
                     target: "zend::code_read::ingest",
                     file = %file.path,
                     "deferred tombstone of superseded generation failed: {err:#}",
+                );
+            }
+        }
+    }
+
+    // Calibrate it now, while its reading is still resident: the draft forked
+    // onto it projects the reading from the card, where a later pass would lift
+    // it back from cold first. A failure is calibrated again by the catch-up
+    // round ahead of the next pass.
+    if let Some(spec) = calibrate {
+        if let Err(e) =
+            calibrate_committed(ctx, spec, base, conv.timeline_id(), &file.path, job.key)
+        {
+            if !crate::ingest_cancel::cancelled() {
+                tracing::warn!(
+                    target: "zend::calibrate",
+                    layer = %spec.layer,
+                    subject = %file.path,
+                    "calibration failed (calibrated again next pass): {e:#}",
                 );
             }
         }
