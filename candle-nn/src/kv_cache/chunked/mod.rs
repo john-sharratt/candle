@@ -202,7 +202,7 @@ pub use alloc::class_promotion_count;
 #[cfg(feature = "cuda")]
 pub use bump_arena::{
     begin_forward, begin_guest, begin_wave, close_guest_arena, cover_wave_transient,
-    end_wave_transient, guest_domain_stats, guest_stage, open_guest_arena,
+    end_wave_transient, guest_chain, guest_domain_stats, guest_stage, open_guest_arena,
     persistence_domain_stats, plan_wave_transient, wave_domain_layout, wave_domain_stats,
     wave_is_live, BumpRange, Covering, ForwardOpen, Generation as WaveGeneration, GUEST_ARENA,
     KV_ARENA_MID_WAVE,
@@ -210,7 +210,7 @@ pub use bump_arena::{
 #[cfg(feature = "cuda")]
 pub use guard::{expect_kv_range, expect_kv_range_in};
 #[cfg(not(feature = "cuda"))]
-pub use guest_stage_cpu::guest_stage;
+pub use guest_stage_cpu::{guest_chain, guest_stage};
 #[cfg(feature = "cuda")]
 pub use region_pool::{
     claim_dense, claim_span_region, dense_bytes, empty_sweep_stats, ensure_reservation,

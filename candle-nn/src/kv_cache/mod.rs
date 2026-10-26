@@ -51,10 +51,6 @@ pub use chunked::fletcher_golden::{fletcher32_golden, GoldenRecord};
 pub use chunked::growth_policy::{
     kv_grow_step, FreeRegionTarget, GrowthPolicy, Occupancy, Refusal,
 };
-/// A guest's pipeline stage. Defined in both configurations — `f(x)` when there
-/// is no GPU backend, since no guest arena can exist without one — because the
-/// model code that marks its stages is built in both.
-pub use chunked::guest_stage;
 #[cfg(feature = "cuda")]
 pub use chunked::held_ground::{HeldClaim, HeldStats};
 #[cfg(feature = "cuda")]
@@ -108,6 +104,10 @@ pub use chunked::{
     region_stats, settle_held_ground, span_partition, span_partition_now, spare_tally, vram_bands,
     RegionStats, SpanPartition, VramBands, REGION_BYTES,
 };
+/// A guest's pipeline stage. Defined in both configurations — `f(x)` when there
+/// is no GPU backend, since no guest arena can exist without one — because the
+/// model code that marks its stages is built in both.
+pub use chunked::{guest_chain, guest_stage};
 /// The span's geometry, for the model loader that installs a weight side into it.
 #[cfg(feature = "cuda")]
 pub use chunked::{

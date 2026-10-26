@@ -552,9 +552,9 @@ fn turn_sampling(
 /// Calibration questions per file a layer's chunk exclusion is learned from:
 /// a background of ~3,300 questions over the workspace's ~1,650 files. The
 /// outliers it cuts sit orders of magnitude above the rest, so a sample finds
-/// them. The scans run between waves on the engine every restart pays for:
-/// six a file (~9,800 questions, ~1,230 scans of ~140 ms) held conversations
-/// to a stutter for three minutes after each.
+/// them. The scans run between waves, after the pass: six a file (~9,800
+/// questions, ~1,230 scans of ~140 ms) held conversations to a stutter for
+/// three minutes after each restart.
 const EXCLUSION_QUESTIONS_PER_FILE: usize = 2;
 
 /// The triggers a chat turn decodes under: any `<tool_call>` the model emits is
@@ -3161,10 +3161,10 @@ impl InferenceState {
     }
 
     /// Calibrate every branch layer that declares a `calibrate:` block
-    /// (`crate::calibrate`), each layer's chunk exclusion learned first: each
-    /// ready unit without a calibration of its current version — one its
-    /// ingest did not calibrate as it committed it — writes its questions, and
-    /// they are prefilled as its exemplars. Run ahead of each pass.
+    /// (`crate::calibrate`): each ready unit without a calibration of its
+    /// current version — one its ingest did not calibrate as it committed it —
+    /// writes its questions, and they are prefilled as its exemplars. Run ahead
+    /// of each pass.
     fn calibrate_layers(&self) {
         for (il, _) in &self.branch_layers {
             if crate::ingest_cancel::cancelled() {
@@ -3193,12 +3193,41 @@ impl InferenceState {
                     continue;
                 }
             };
-            // The calibrations already written are the background the layer's
-            // generic chunks are told apart by. Learned ahead of calibrating,
-            // which can take hours when every unit is asked again, so a
-            // restart, which holds none, has an exclusion within minutes; a
-            // later pass learns it again only once the questions have moved by
-            // a tenth.
+            calibrate_layer(
+                &self.engine,
+                &CalibrateLayer { spec, group, base },
+                &CalibrateFrame {
+                    system_prompt: &self.formatted_prompt,
+                    config: &self.refresh_config,
+                    thinking: turn_triggers(self, ThinkMode::Balanced, ToolMode::None),
+                },
+            );
+        }
+    }
+
+    /// Learn the chunk exclusion of every branch layer that declares a
+    /// `calibrate:` block: the calibrations written are the background its
+    /// generic chunks are told apart by. A standing exclusion is kept until its
+    /// questions move by a tenth.
+    ///
+    /// **After the pass, never ahead of it.** The learn is a few hundred scans,
+    /// each one background job the scheduler runs between waves; under live
+    /// conversations that is many minutes, and run ahead of the pass it held
+    /// the ingest back that long after every restart — on BlackWorld
+    /// (2026-10-26) restarts a quarter of an hour apart kept the ingest from
+    /// reading a file for hours. The cut measured neutral on retrieval, so a
+    /// pass read without one loses nothing.
+    fn learn_chunk_exclusions(&self) {
+        for (il, _) in &self.branch_layers {
+            if crate::ingest_cancel::cancelled() {
+                return;
+            }
+            if il.calibrate.is_none() {
+                continue;
+            }
+            let Some(group) = self.refresh_builder.id_for_group(&il.group) else {
+                continue;
+            };
             let scanner = self.engine.lock().unwrap().group_scanner();
             match scanner.learn_chunk_exclusion(group, EXCLUSION_QUESTIONS_PER_FILE) {
                 Ok(r) => tracing::info!(
@@ -3220,15 +3249,6 @@ impl InferenceState {
                     "learning the layer's chunk exclusion failed (its scans cut nothing): {e:#}",
                 ),
             }
-            calibrate_layer(
-                &self.engine,
-                &CalibrateLayer { spec, group, base },
-                &CalibrateFrame {
-                    system_prompt: &self.formatted_prompt,
-                    config: &self.refresh_config,
-                    thinking: turn_triggers(self, ThinkMode::Balanced, ToolMode::None),
-                },
-            );
         }
     }
 
@@ -3270,6 +3290,7 @@ impl InferenceState {
             any |= self
                 .branch_ingest
                 .pass(&ctx, &self.workspace, &passes, &progress)?;
+            self.learn_chunk_exclusions();
         }
         for il in &self.ingest_layers {
             // Cooperative shutdown: stop the background reconcile between layers so

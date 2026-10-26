@@ -301,7 +301,7 @@ loses (`docs/results/provenance_gates_2026-10-26.md`).
   neutral, MRR 0.251 → 0.250 (`provenance_gates calibration-cut`); over 999
   files calibrated with thinking it is neutral too, k 3–5 within +0.004 MRR
   (`provenance_gates thinking`).
-- **Where.** Learned ahead of each layer's calibration pass
+- **Where.** Learned after each ingest pass
   (`GroupScanner::learn_chunk_exclusion`, the attribution on the calling
   thread holding no lock), held in memory per group
   (`Substrate::chunk_exclusion`), and cut from the group's own windows where
@@ -311,7 +311,9 @@ loses (`docs/results/provenance_gates_2026-10-26.md`).
   one job held the engine ~40 s at a time and froze every live conversation
   for minutes. A standing exclusion is kept, nothing scanned, until the
   questions it was learned from move by a tenth; a restart, which holds none,
-  learns it on its first pass.
+  learns it once its first pass ends. Ahead of the pass, its few hundred jobs
+  under live conversations held the ingest back for many minutes after every
+  restart, and the cut measured neutral on retrieval.
 - **Measured.** Held-out questions, content alone: MRR 0.172 → 0.186; stacked
   on the calibration competition at 15 questions a file: 0.220 → 0.228, R@10
   0.364 → 0.379.
