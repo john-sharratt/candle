@@ -14,18 +14,24 @@ use crate::mcp::ops::{self, json_of};
 pub const NAME: &str = "cluster_logs";
 
 /// Lines answered when the call names no `limit`, and the most, as the
-/// members' search allows.
-const DEFAULT_LIMIT: u64 = 200;
+/// members' search allows. The default keeps a page inside what a client
+/// reads in one answer.
+const DEFAULT_LIMIT: u64 = 100;
 const MAX_LIMIT: u64 = 5000;
+
+/// The most of one line shown: a line that dumps a structure runs to
+/// kilobytes, and its head says what it is.
+const LINE_CHARS: usize = 400;
 
 pub fn definition() -> Value {
     json!({
         "name": NAME,
         "description": "Search the logs of the cluster's members — the machines running the motherd daemon — for \
-            what they say about a symptom: every member's matching lines, oldest first, each under its member. \
-            `grep` is a regular expression found anywhere in a line; narrow with `level`, `tenant` and \
-            `since`. A page, never a stream: call again with a later `since` to read on. Cite the lines you \
-            rely on.",
+            what they say about a symptom: every member's matching lines, oldest first, each under its member, \
+            each cut at 400 characters. `grep` is a regular expression found anywhere in a line; narrow with \
+            `level`, `tenant` and `since` (UTC). When more lines match than `limit`, the newest are kept and \
+            the answer says how many were left out: narrow the search to see the earlier ones. Cite the lines \
+            you rely on.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -33,7 +39,7 @@ pub fn definition() -> Value {
                 "level": {"type": "string", "enum": ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"], "description": "The least level kept."},
                 "tenant": {"type": "string", "enum": ["zend", "npcd"], "description": "Only lines one app wrote: `zend`, the coding service these tools run on, or `npcd`, the bots'."},
                 "since": {"type": "string", "description": "Only lines stamped at or after this: an RFC 3339 prefix such as `2026-10-16T00:20`."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "The most lines per member, the latest kept (200 by default)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "The most lines per member, the newest kept (100 by default)."},
                 "node": {"type": "string", "description": "One member's node id, as `cluster_status` lists it (Admins only)."}
             },
             "additionalProperties": false
@@ -86,13 +92,24 @@ pub fn render(envelope: &Value) -> String {
             .filter_map(Value::as_str)
             .collect();
         let matched = body.get("matched").and_then(Value::as_u64).unwrap_or(0);
+        let left_out = matched.saturating_sub(lines.len() as u64);
         out.push_str(&format!(
             "{host} {node}: {} of {matched} matching lines",
             lines.len()
         ));
+        if left_out > 0 {
+            out.push_str(&format!(
+                " — the newest; the {left_out} earlier are left out (narrow the search to see them)"
+            ));
+        }
         for line in lines {
             out.push('\n');
-            out.push_str(line);
+            if line.chars().count() > LINE_CHARS {
+                out.extend(line.chars().take(LINE_CHARS));
+                out.push('…');
+            } else {
+                out.push_str(line);
+            }
         }
     }
     if out.is_empty() {
@@ -146,19 +163,29 @@ mod tests {
             path_of(&json!({"grep": "a b|c", "level": "WARN", "limit": 9_999})),
             "/v1/logs?grep=a+b%7Cc&level=WARN&limit=5000"
         );
-        assert_eq!(path_of(&json!({})), "/v1/logs?limit=200");
+        assert_eq!(path_of(&json!({})), "/v1/logs?limit=100");
     }
 
+    /// **Each member's lines come under it**, a long line cut, and lines
+    /// left out by the limit counted and said to be the earlier ones.
     #[test]
     fn each_members_lines_come_under_it() {
+        let long = format!("2026 WARN {}", "z".repeat(500));
         let envelope = json!({"members": [
             {"host": "bw", "node": "01", "status": 200,
-             "body": {"lines": ["2026 WARN x", "2026 ERROR y"], "matched": 5}},
-            {"host": "ww", "node": "02", "status": 504}
+             "body": {"lines": ["2026 WARN x", long], "matched": 5}},
+            {"host": "ww", "node": "02", "status": 504},
+            {"host": "aw", "node": "03", "status": 200,
+             "body": {"lines": ["2026 ERROR y"], "matched": 1}}
         ]});
+        let cut: String = long.chars().take(LINE_CHARS).collect();
         assert_eq!(
             render(&envelope),
-            "bw 01: 2 of 5 matching lines\n2026 WARN x\n2026 ERROR y\n\nww 02: no answer (504)"
+            format!(
+                "bw 01: 2 of 5 matching lines — the newest; the 3 earlier are left out (narrow the \
+                 search to see them)\n2026 WARN x\n{cut}…\n\nww 02: no answer (504)\n\n\
+                 aw 03: 1 of 1 matching lines\n2026 ERROR y"
+            )
         );
         assert_eq!(render(&json!({"members": []})), "No member answered.");
     }

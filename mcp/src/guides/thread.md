@@ -1,6 +1,6 @@
 ---
 name: thread
-description: How to keep a thread — attach before working, note every decision, re-read after compaction. Read first, before any other guide.
+description: How to keep a thread for work that runs tasks or makes decisions — attach before working, note every decision, re-read after compaction. Read it before starting such work; a one-off read or a single job needs no thread.
 tools: [thread_attach, thread_list, thread_archive, journal_note, journal_read]
 ---
 # Keeping a thread
@@ -11,6 +11,10 @@ ended, and every decision you note. It is what you re-read when your context
 is compacted, and what every worker on it starts with in its prompt.
 
 ## Start
+
+A thread is for work that runs tasks or makes decisions. A one-off read — how
+the cluster stands, what the logs say — or a single test job needs none:
+answer it and stop.
 
 1. `guide_list` once per conversation, to see what methods exist.
 2. `thread_list` if the work may already have a thread.

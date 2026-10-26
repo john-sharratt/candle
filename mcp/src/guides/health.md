@@ -16,7 +16,9 @@ oldest build it still routes to.
    started, how each app on it stands — and, for an Admin, the gateway's
    view: each app's floor and ready members, upgrade candidates, members in or
    near fault.
-2. For a machine's services and its last trial: `service_status {host}`.
+2. For a machine's services and its last trial: `service_status {host}`,
+   with the host as `cluster_status`'s keep rows name it — those are the
+   machines.
 3. Summarise, in this order:
    - **Anything wrong first**: a member not ready, a tenant loading or in
      fault, a member that gave no answer, a local build serving cluster
@@ -32,6 +34,9 @@ oldest build it still routes to.
   not answer in 3 s: busy, not necessarily down.
 - `started N min ago` on one member means it restarted then: `cluster_audit`
   says who restarted it.
+- Report a build as its count and hash, `3825-bc8c1817` — the form the floor
+  and upgrades use — rather than the longer hex a member line may show.
+- Times are UTC; the user's clock may not be.
 - Non-Admins see only the members' own statuses.
 - If the connector itself is down, say so; the user can open `/gateway` in a
   browser.

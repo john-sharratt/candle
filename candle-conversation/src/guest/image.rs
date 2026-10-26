@@ -43,9 +43,9 @@
 //! path take 2.25 s a step against 0.33 s, so int8 is most of why this fits in a
 //! drain.
 //!
-//! The embedding table is the exception and does not reach the card at all: 1.55
-//! GiB dequantised to look up a couple of dozen rows, so the lookup is a host
-//! index and a 300 KiB transfer ([`EmbedTable`]).
+//! The embedding table is the exception and does not reach the card at all: it
+//! stays quantised on the host and only the couple of dozen rows a prompt names
+//! are decoded, a 300 KiB transfer ([`EmbedTable`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -381,6 +381,7 @@ impl GuestModel for ImageGuest {
                 target: "candle_conversation::guest",
                 at_ms = began.elapsed().as_millis() as u64,
                 pool_free_mib = free / (1 << 20),
+                no_ticket_mib = no_ticket_mib(),
                 "image guest: {what}"
             );
         };
@@ -627,9 +628,18 @@ fn arena_reading(device: &Device, what: &str) {
             cursor_mib = cursor >> 20,
             peak_mib = peak >> 20,
             capacity_mib = capacity >> 20,
+            no_ticket_mib = no_ticket_mib(),
             "image guest: activation arena after {what}"
         );
     }
+}
+
+/// Bytes the process has allocated from the pool for an operand that had no
+/// arena ticket, since it started, in MiB. Process-wide, so the difference
+/// between two readings is what happened between them — on any thread.
+fn no_ticket_mib() -> u64 {
+    use candle::cuda_backend::wave_provenance::{arena_declines, ArenaDecline};
+    arena_declines(ArenaDecline::NoTicket).1 >> 20
 }
 
 /// Every distinct prompt among the backlog's `lora` jobs, conditioned, on the

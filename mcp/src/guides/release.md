@@ -11,14 +11,17 @@ is the user's, asked at the step that needs it. Admins only.
 
 ## 1. Test
 
-`test` on `main` at the commit, for the crates the release changes. A failure
-stops the release.
+Follow the `test` guide on `main` at the commit, for the crates the release
+changes (the crates its changed paths are in). A failure stops the release.
 
 ## 2. Trial on one machine
 
-`deploy` on one machine — the candidate. It proves the build serves. A
+Follow the `deploy` guide on one machine — the candidate. It proves the build serves. A
 rollback stops the release. If the release changes what the gateway reads,
 the gateway (`web`) is trialled first.
+
+When the app has only one member (`cluster_status`), the trial takes it out
+of service while it runs: say so to the user before starting it.
 
 ## 3. Certification
 
@@ -34,8 +37,9 @@ mirroring traffic.
 
 ## 4. Rollout
 
-1. Ask for the plan, which changes nothing:
-   `cluster_command {name: "rollout", args: {app, build}}`.
+1. Ask for the plan, which changes nothing and needs no approval:
+   `cluster_command {name: "rollout", args: {app, build}}` — no `confirm`
+   anywhere.
 2. Show the user the plan — build, source, targets, how many at once — and
    ask.
 3. With approval: `cluster_command {name: "rollout", args: {app, build,
