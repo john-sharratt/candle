@@ -195,6 +195,10 @@ pub struct Worker {
     /// ended `done` citing anything.
     #[serde(default)]
     pub audit: Option<String>,
+    /// Whether it has been sent back once to correct its citations: once per
+    /// task, so neither a later answer nor a continuation is sent back again.
+    #[serde(default)]
+    pub checked: bool,
 }
 
 /// How often the member running a task says so on its record.
@@ -543,6 +547,7 @@ mod tests {
             stopped: false,
             resumable: false,
             audit: None,
+            checked: false,
         };
         assert_eq!(
             w.clone().observed(1_000 + BEAT_LOST_MS).state,

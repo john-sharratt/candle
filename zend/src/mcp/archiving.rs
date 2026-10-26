@@ -37,6 +37,13 @@ use crate::session::ZendSession;
 /// How long a worker or a thread sits idle before the sweep archives it.
 pub const IDLE_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// How long a lost worker's beat has been silent before the sweep archives
+/// it. "Lost" is read off a record that replicates: a member whose copy lags,
+/// or whose runtime stalls, sees a live worker's beat stop for a while, and
+/// archiving distils a conversation for good — so only a silence no lag or
+/// stall explains counts.
+pub const LOST_ARCHIVE_MS: u64 = 60 * 60 * 1000;
+
 /// How often the sweep runs.
 const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 
@@ -291,9 +298,11 @@ pub fn archive_thread(
 /// running on it. How many workers and threads it archived.
 pub fn sweep(records: &dyn Records, distil: Distil, now: u64) -> (usize, usize) {
     let idle = |at: u64| now.saturating_sub(at) > IDLE_MS;
-    // A lost worker is archived at once: nothing can continue it, and until
-    // then its record says it runs.
-    let due = |w: &Worker| unarchived(w) && (lost(w) || idle(last_active(w)));
+    // A lost worker is archived once its beat has been silent an hour:
+    // nothing can continue it, and until then its record says it runs.
+    let silent = |at: u64| now.saturating_sub(at) > LOST_ARCHIVE_MS;
+    let due =
+        |w: &Worker| unarchived(w) && ((lost(w) && silent(last_active(w))) || idle(last_active(w)));
     let (mut workers_archived, mut threads_archived) = (0, 0);
     for (owner, t) in threads::every_thread(records) {
         let workers: Vec<Worker> = threads::workers(records, &owner, &t.name)
@@ -455,6 +464,7 @@ mod tests {
             stopped: false,
             resumable: state == State::Done,
             audit: None,
+            checked: false,
         }
     }
 
@@ -607,17 +617,23 @@ mod tests {
         );
     }
 
-    /// **A lost worker is archived at the next sweep, and its end entered**:
-    /// its record said it ran, nothing could continue it, and nothing else
-    /// would ever say it ended.
+    /// **A lost worker is archived once its beat has been silent an hour,
+    /// and its end entered**: its record said it ran, nothing could continue
+    /// it, and nothing else would ever say it ended. A shorter silence — a
+    /// copy that lags, a stalled runtime — is left alone.
     #[test]
-    fn a_lost_worker_is_archived_at_once_with_its_end_on_the_thread() {
+    fn a_lost_worker_is_archived_after_an_hours_silence_with_its_end_on_the_thread() {
         let records = MemRecords::default();
         let mut gone = worker("gone", State::Running, 0);
         gone.beat_ms = 10;
         thread(&records, std::slice::from_ref(&gone));
         let distil = |_: &str| -> Result<(), String> { Ok(()) };
-        let now = 10 + threads::BEAT_LOST_MS + 1;
+        assert_eq!(
+            sweep(&records, &distil, 10 + threads::BEAT_LOST_MS + 1),
+            (0, 0),
+            "lost to a reader, but not yet silent long enough to archive"
+        );
+        let now = 10 + LOST_ARCHIVE_MS + 1;
         assert_eq!(sweep(&records, &distil, now), (1, 0));
         let after = threads::worker(&records, "o", "review", "gone").unwrap();
         assert_eq!(

@@ -203,6 +203,7 @@ mod tests {
             stopped: false,
             resumable: false,
             audit: None,
+            checked: false,
         }
     }
 

@@ -43,20 +43,20 @@ pub struct Audit {
     pub never_seen: Vec<String>,
 }
 
-/// The address two copyings of one page share however their separators slip:
-/// the host, and the path's letters and digits alone, in lower case.
+/// The address two copyings of one page share however their word separators
+/// slip: the path with every `-`, `_` and `/` read as one separator, in lower
+/// case — so `2026-10-01/` and `2026/10/01/` meet, while pages that differ in
+/// any other character, or in how their digits group, do not.
 fn loose(url: &str) -> String {
-    let n = normal(url);
-    match n.split_once('/') {
-        Some((host, path)) => format!(
-            "{host}/{}",
-            path.chars()
-                .filter(char::is_ascii_alphanumeric)
-                .collect::<String>()
-                .to_ascii_lowercase()
-        ),
-        None => n,
+    let lowered = normal(url).to_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    for c in lowered.chars() {
+        let c = if matches!(c, '-' | '_') { '/' } else { c };
+        if !(c == '/' && out.ends_with('/')) {
+            out.push(c);
+        }
     }
+    out
 }
 
 /// A URL with the punctuation a sentence ends it with taken off, and a
@@ -409,6 +409,14 @@ mod tests {
              opened them at: https://blog.rust-lang.org/2026-10-01/Rust-1.99.0/ → \
              https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/."
         ));
+        // Only word separators slip: other characters, and how digits group,
+        // tell pages apart.
+        assert_ne!(
+            loose("https://en.wikipedia.org/wiki/東京"),
+            loose("https://en.wikipedia.org/wiki/大阪")
+        );
+        assert_ne!(loose("https://x.com/a/1/23"), loose("https://x.com/a/12/3"));
+        assert_eq!(loose("https://x.com/a_b/c"), loose("https://x.com/a-b-c/"));
     }
 
     /// **A fetch that failed opened nothing**, and the correction that names

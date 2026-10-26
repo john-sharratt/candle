@@ -72,7 +72,10 @@ pub fn render(status: &Value, n: usize, now: u64) -> String {
         .take(n)
         .collect();
     if entries.is_empty() {
-        return "The coordination log holds no operation from the last day.".into();
+        return format!(
+            "No operation among the gateway log's newest {SCAN} entries — replication's own \
+             steps fill it; an older operation of the day is past what this reads."
+        );
     }
     entries
         .iter()
@@ -155,7 +158,8 @@ mod tests {
         );
         assert_eq!(
             render(&json!({"log": []}), 50, now),
-            "The coordination log holds no operation from the last day."
+            "No operation among the gateway log's newest 20000 entries — replication's own \
+             steps fill it; an older operation of the day is past what this reads."
         );
     }
 }

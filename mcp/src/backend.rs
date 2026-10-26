@@ -81,12 +81,15 @@ pub fn read(message: &Value) -> Read {
         ),
         // A route's own refusal, from before the MCP server — the gateway or
         // the daemon's sign-in check: `{"error": "<kind>", "message": "…"}`.
-        Some(Value::String(kind)) => {
-            Read::Error(match message.get("message").and_then(Value::as_str) {
+        Some(Value::String(kind)) => Read::Error(
+            match ["message", "detail"]
+                .iter()
+                .find_map(|k| message.get(*k).and_then(Value::as_str))
+            {
                 Some(said) => format!("{kind}: {said}"),
                 None => kind.clone(),
-            })
-        }
+            },
+        ),
         _ => Read::Other,
     }
 }
@@ -184,8 +187,13 @@ impl Link {
 /// What a backend answering a server error says: it is down or restarting —
 /// not a refusal of what was asked — so the same call is worth repeating.
 fn unavailable(name: &str, status: StatusCode, said: &str) -> String {
+    let said = if said.is_empty() {
+        String::new()
+    } else {
+        format!(": {said}")
+    };
     format!(
-        "{name} is unavailable ({status}: {said}) — it is restarting or down, not refusing \
+        "{name} is unavailable ({status}{said}) — it is restarting or down, not refusing \
          this call; try the same call again in a minute or two"
     )
 }
@@ -195,22 +203,29 @@ fn unavailable(name: &str, status: StatusCode, said: &str) -> String {
 /// take, and a route it did not have are the backend's state, not a refusal of
 /// what was asked — each passes while a restarting backend comes back.
 fn refusal(name: &str, status: StatusCode, said: &str) -> String {
-    let said = if said.is_empty() {
-        String::new()
-    } else {
-        format!(": {said}")
+    if status.is_server_error() {
+        return unavailable(name, status, said);
+    }
+    let with = |s: &str| {
+        if s.is_empty() {
+            String::new()
+        } else {
+            format!(": {s}")
+        }
     };
     match status.as_u16() {
-        _ if status.is_server_error() => unavailable(name, status, said.trim_start_matches(": ")),
         401 => format!(
-            "{name} did not accept your sign-in ({status}{said}) — while it restarts this passes \
-             in a minute or two; if it persists, sign in to the connector again"
+            "{name} did not accept your sign-in ({status}{}) — while it restarts this passes \
+             in a minute or two; if it persists, sign in to the connector again",
+            with(said)
         ),
-        404 => format!(
-            "{name} has no MCP route right now ({status}{said}) — it is restarting; try the same \
-             call again in a minute or two"
+        // A 404 with nothing said is a route not there yet — a restart; one
+        // that says why is the server's own answer, passed on as it is.
+        404 if said.is_empty() => format!(
+            "{name} has no MCP route right now ({status}) — it is restarting; try the same call \
+             again in a minute or two"
         ),
-        _ => format!("{name} refused ({status}){said}"),
+        _ => format!("{name} refused ({status}){}", with(said)),
     }
 }
 
@@ -322,6 +337,10 @@ mod tests {
             read(&json!({"error": "upstream_down"})),
             Read::Error("upstream_down".into())
         );
+        assert_eq!(
+            read(&json!({"error": "forbidden", "detail": "the gateway's status is an admin's"})),
+            Read::Error("forbidden: the gateway's status is an admin's".into())
+        );
     }
 
     /// **A sign-in not taken and a missing route are said as what they are**
@@ -347,6 +366,20 @@ mod tests {
         assert_eq!(
             refusal("bot", StatusCode::FORBIDDEN, "forbidden: Admins only"),
             "bot refused (403 Forbidden): forbidden: Admins only"
+        );
+        assert_eq!(
+            refusal(
+                "bot",
+                StatusCode::NOT_FOUND,
+                "`x` is not a method this server answers"
+            ),
+            "bot refused (404 Not Found): `x` is not a method this server answers",
+            "a 404 that says why is the server's answer, not a restart"
+        );
+        assert_eq!(
+            unavailable("bot", StatusCode::BAD_GATEWAY, ""),
+            "bot is unavailable (502 Bad Gateway) — it is restarting or down, not refusing this \
+             call; try the same call again in a minute or two"
         );
         assert_eq!(
             refusal("bot", StatusCode::BAD_GATEWAY, "upstream_unavailable"),
