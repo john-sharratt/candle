@@ -102,10 +102,11 @@ do not rewrite it:
 
 - `no_room` — the engine had no room for the image model just then. On a
   draw sent alongside another, that is the other draw: send it again once
-  the other has answered. On a draw sent alone, the engine was busy: the room
-  it lacks is the image model's own, several GiB, so a smaller picture does
-  not help. Send the same call again in a minute; it can take a few tries
-  before the engine frees the room.
+  the other has answered. On a draw sent alone, the engine was busy and came
+  up a few hundred MiB short; that room frees as its busy turns finish. Send
+  the same call again in a minute — it can take a few tries. A smaller size
+  (768 on the long side) needs about 500 MiB less, so it is the second
+  option when the same size keeps being refused.
 - "is unavailable" (`upstream_unavailable`, `upstream_backoff`), a call cut
   off, or — while the service comes back up — a `404` or a `401 … sign in`:
   the image service is restarting. Send the same call again in a minute or
