@@ -22,8 +22,11 @@ is compacted, and what every worker on it starts with in its prompt.
 
 ## While working
 
-- **Note each decision as you make it** — `journal_note {journal: "self",
-  text}` — with its reason, in a sentence or two. One note per decision.
+- **Note each decision as you make it** — `journal_note {journal:
+  "T:<thread>", text}` — with its reason, in a sentence or two. One note per
+  decision. Name the thread rather than writing `"self"`: `"self"` is the
+  thread last attached by *any* of the user's conversations open with Zen at
+  once, so with two open it can land on the other one's thread.
 - **Note what the user says** that later work must keep: a constraint, a
   preference, an approval and what it covered.
 - **A standing rule of a repository** (a convention, something the user says
@@ -31,14 +34,18 @@ is compacted, and what every worker on it starts with in its prompt.
   in every thread starts with.
 - Pass the thread to every `repo_task_start`.
 
-## After your context is compacted
+## After your context is compacted, or Zen restarted
 
 Re-attach (`thread_attach` with the same name), then
-`journal_read {journal: "self"}`, and carry on from the notes — not from what
-you think you remember. Running workers are still running: `repo_task_wait` on
-them.
+`journal_read {journal: "T:<thread>"}`, and carry on from the notes — not from
+what you think you remember. Running workers are still running:
+`repo_task_wait` on them. Do the same after a call answered that the model is
+still loading or the service was unavailable (see `wait`).
 
 ## When the work is done
 
 `thread_archive {thread}` once nothing on it is running. Its journal stays
-readable; attaching again reopens it.
+readable, and attaching again reopens it — but archiving ends every finished
+worker on it: none can be continued with `repo_task_reply` afterwards. Archive
+when there is nothing left to follow up; a thread left alone archives itself
+after a day with nothing new.

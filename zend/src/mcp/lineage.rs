@@ -47,7 +47,7 @@ pub fn sweep_names() -> Vec<String> {
 pub enum Whose {
     /// A project's standing rules, noted by Claude.
     Project,
-    /// The thread's notes: what Claude asked, decided and was told.
+    /// The thread's notes: what Claude started, decided and was told.
     Thread,
     /// A worker above the reader: what it did, drafted from its turns.
     Worker,
@@ -166,7 +166,7 @@ mod tests {
     fn the_journals_are_carried_outermost_first_then_the_readers_line() {
         let nearest_first = [
             ancestor("T:review/verify", Whose::Worker, &["#2 Read the plan."]),
-            ancestor("T:review", Whose::Thread, &["#1 Claude asked: verify"]),
+            ancestor("T:review", Whose::Thread, &["#1 Claude started: verify"]),
             ancestor(
                 "P:candle",
                 Whose::Project,
@@ -201,14 +201,14 @@ mod tests {
         let before = sections(
             "T:t/w",
             &[
-                ancestor("T:t", Whose::Thread, &["#1 Claude asked: w"]),
+                ancestor("T:t", Whose::Thread, &["#1 Claude started: w"]),
                 ancestor("P:candle", Whose::Project, &[]),
             ],
         );
         let after = sections(
             "T:t/w",
             &[
-                ancestor("T:t", Whose::Thread, &["#1 Claude asked: w"]),
+                ancestor("T:t", Whose::Thread, &["#1 Claude started: w"]),
                 ancestor("P:candle", Whose::Project, &["#1 never push main"]),
             ],
         );

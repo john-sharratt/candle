@@ -321,7 +321,7 @@ route appends a turn with no model reply — today every dialogue turn is
 decoded — and keeps the entry through the journal's own keep path
 (`journal.kept`, the section submit), so it seals, folds and replicates like
 any entry. Its claims are labelled by speaker: `Claude said:` for a note,
-`Claude asked:` for a task, `Task ended:` for an outcome (**new** labels;
+`Claude started:` for a task, `Task ended:` for an outcome (**new** labels;
 `zend/src/journal/style.rs:154-170` holds today's).
 
 Claude learns to keep the thread from the tools' own descriptions and the
@@ -1357,7 +1357,7 @@ Made in the change that builds each piece:
     archived, until its thread is tombstoned.
   - §4.2: in such a conversation a fold files the folded entries' turns under
     the fold.
-  - §3: the `Claude said:`, `Claude asked:` and `Task ended:` labels, and
+  - §3: the `Claude said:`, `Claude started:` and `Task ended:` labels, and
     entries kept from a note with no model reply.
   - §7: a journal is read by its own conversation and its descendants, and
     through the tools by its owner.

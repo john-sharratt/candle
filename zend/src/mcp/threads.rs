@@ -267,7 +267,7 @@ pub const ATTACH_MARK_MS: u64 = 60 * 60 * 1000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
     pub at_ms: u64,
-    /// `Claude asked:` or `Task ended:` — who the line is from, said in the
+    /// `Claude started:` or `Task ended:` — who the line is from, said in the
     /// line, since the thread holds no model turns to cite.
     pub label: String,
     pub text: String,
@@ -502,15 +502,15 @@ mod tests {
             text: text.into(),
             worker: Some("T:review/verify".into()),
         };
-        add_note(&r, "o", "review", &note(5, "Claude asked:", "verify")).unwrap();
+        add_note(&r, "o", "review", &note(5, "Claude started:", "verify")).unwrap();
         add_note(&r, "o", "review", &note(5, "Task ended:", "verify — ok")).unwrap();
-        add_note(&r, "o", "review", &note(9, "Claude asked:", "check")).unwrap();
+        add_note(&r, "o", "review", &note(9, "Claude started:", "check")).unwrap();
         let got = notes(&r, "o", "review");
         assert_eq!(got.len(), 3);
         assert_eq!(
             render_journal("T:review", &got),
             "Journal of T:review, written by Claude\n\
-             #1 Claude asked: verify\n#2 Task ended: verify — ok\n#3 Claude asked: check"
+             #1 Claude started: verify\n#2 Task ended: verify — ok\n#3 Claude started: check"
         );
         assert_eq!(
             render_journal("P:candle", &[]),

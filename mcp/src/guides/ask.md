@@ -42,6 +42,7 @@ COULD NOT DO: anything asked that you did not do, and why
 
 ## Read the result
 
-Check the pointers you will rely on: `journal_grep` the worker's journal for
-the file, `timeline_read {turn}` for the read. A claim without a file:line is
-not an answer.
+Check the pointers you will rely on, as `verify` says for a code answer:
+`journal_grep` the worker's journal for the file, and continue the worker with
+`repo_task_reply` for any claim without a quoted file:line. A claim without a
+file:line is not an answer.
