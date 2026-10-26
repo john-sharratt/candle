@@ -86,6 +86,7 @@ pub mod thread;
 pub mod tombstone_expiry;
 pub mod transfer;
 pub mod triggers;
+mod vanished_segment;
 pub mod vfs;
 pub mod walker;
 pub mod writer;
@@ -141,6 +142,7 @@ use stamped_locs::StampedLocs;
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use survival::RecordCensus;
 use tombstone_expiry::{TombstoneExpiry, DEFAULT_TOMBSTONE_RETENTION};
+use vanished_segment::retry_vanished;
 use vfs::{VfsEventId, VfsEventPayload, VfsIndex, VfsWrite};
 use walker::WalkEntry;
 use writer_lock::WriterLock;
@@ -1072,12 +1074,17 @@ impl SubstratePersistence {
         dir: &Path,
         substrate: &mut Substrate,
     ) -> Result<SubstratePersistence> {
-        Self::from_dir_with_sink(
-            &dir.join(SUBSTRATE_DIR),
-            &[],
-            true,
-            Purge::Nothing,
-            |entry| substrate.apply_walker_entry(entry),
+        // Beside a live writer a segment can be compacted away mid-open; the
+        // open starts over from an empty substrate (`vanished_segment`).
+        let dir = dir.join(SUBSTRATE_DIR);
+        let substrate = RefCell::new(substrate);
+        retry_vanished(
+            || {
+                Self::from_dir_with_sink(&dir, &[], true, Purge::Nothing, |entry| {
+                    substrate.borrow_mut().apply_walker_entry(entry)
+                })
+            },
+            || **substrate.borrow_mut() = Substrate::new(),
         )
     }
 

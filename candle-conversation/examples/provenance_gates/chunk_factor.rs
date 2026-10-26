@@ -25,6 +25,7 @@ use candle_conversation::persistence::content_hash::turn_stream_id;
 use candle_conversation::provenance::window_score::{gate, Vote};
 use candle_conversation::provenance::{WideQSig, FOLD_GROUPS};
 use rayon::prelude::*;
+use tokenizers::Tokenizer;
 
 use crate::corpus::{File, CHUNK};
 use crate::ranking::{rank_of, wins};
@@ -49,12 +50,15 @@ struct Chunks<'a> {
     file_of: Vec<usize>,
     /// Each chunk's turn, by stream id, and its `[start, end)` tokens there.
     range_of: Vec<(u64, usize, usize)>,
+    /// Each chunk's file and turn there.
+    turn_of: Vec<(usize, usize)>,
 }
 
 impl<'a> Chunks<'a> {
     fn of(files: &'a [File]) -> Chunks<'a> {
         let mut file_of = Vec::new();
         let mut range_of = Vec::new();
+        let mut turn_of = Vec::new();
         let turns = files
             .iter()
             .enumerate()
@@ -68,6 +72,7 @@ impl<'a> Chunks<'a> {
                         let n = t.sigs.len();
                         let sid = turn_stream_id(f.timeline, ti as u32).0;
                         file_of.extend(repeat_n(fi, n.div_ceil(CHUNK)));
+                        turn_of.extend(repeat_n((fi, ti), n.div_ceil(CHUNK)));
                         range_of.extend(
                             (0..n.div_ceil(CHUNK))
                                 .map(|c| (sid, c * CHUNK, ((c + 1) * CHUNK).min(n))),
@@ -81,6 +86,7 @@ impl<'a> Chunks<'a> {
             turns,
             file_of,
             range_of,
+            turn_of,
         }
     }
 
@@ -199,7 +205,10 @@ impl Shape {
     }
 }
 
-pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
+/// How many of the most generic chunks are printed, with their text.
+const SHOWN: usize = 25;
+
+pub fn run(files: &[File], tokenizer: &Tokenizer, daemon: &Daemon) -> anyhow::Result<()> {
     let gpu = RemoteGallery::new(files, daemon);
     let chunks = Chunks::of(files);
     let n = files.len();
@@ -252,6 +261,24 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
         at(1.0)
     );
 
+    // What the most generic chunks say: the ones a cut takes first.
+    let mut by_mass: Vec<usize> = (0..mass.len()).collect();
+    by_mass.sort_by(|&a, &b| mass[b].total_cmp(&mass[a]));
+    println!("\nthe most generic chunks");
+    for &c in by_mass.iter().take(SHOWN) {
+        let (fi, ti) = chunks.turn_of[c];
+        let (_, start, end) = chunks.range_of[c];
+        let text = tokenizer
+            .decode(&files[fi].turns[ti].tokens[start..end], false)
+            .unwrap_or_default()
+            .replace('\n', "⏎");
+        println!(
+            "{:>10.0}  {} turn {ti} [{start}..{end}]  {text}",
+            mass[c],
+            files[fi].path.as_deref().unwrap_or("<no path>")
+        );
+    }
+
     let judged = attributed(&gpu, &chunks, &held_out, n)?;
     let owners: Vec<usize> = held_out.iter().map(|(o, _)| *o).collect();
     // The hubs: the files that win the most held-out questions not theirs, raw.
@@ -288,8 +315,6 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
     // A factor of 0 for the most generic chunks, applied where the kernel
     // would apply one: the scan never sees them, so their votes go to the
     // next-best agreement instead of shrinking.
-    let mut by_mass: Vec<usize> = (0..mass.len()).collect();
-    by_mass.sort_by(|&a, &b| mass[b].total_cmp(&mass[a]));
     for &cut in &CUTS {
         let n_cut = (cut * mass.len() as f32) as usize;
         let excluded: Vec<(u64, usize, usize)> = by_mass[..n_cut]
@@ -317,7 +342,7 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
         let total: usize = w.iter().sum();
         println!(
             "{:<26} {:>6.3} {:>6.3} {:>6.3} {:>9.3} {:>7.1}% {:>10}",
-            format!("cut top {:.1}% ({n_cut})", cut * 100.0),
+            format!("cut top {:.2}% ({n_cut})", cut * 100.0),
             recall(&ranks, 1),
             recall(&ranks, 10),
             mrr(&ranks),
@@ -330,7 +355,7 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
 }
 
 /// The shares of chunks, most generic first, cut from the gallery.
-const CUTS: [f32; 5] = [0.0, 0.001, 0.005, 0.01, 0.05];
+const CUTS: [f32; 8] = [0.0, 0.0002, 0.0005, 0.001, 0.002, 0.003, 0.005, 0.01];
 
 /// Every probe's file scores: its kept votes, each weighed by its chunk's
 /// factor.
