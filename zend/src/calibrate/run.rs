@@ -312,12 +312,18 @@ fn calibrate_one(
     drafts: Option<&Permits>,
     unit: &Unit,
 ) -> anyhow::Result<()> {
-    let t_draft = Instant::now();
-    let asked = {
+    let t_wait = Instant::now();
+    let (asked, permit_wait_ms, draft_ms) = {
         let _draft = drafts.map(Permits::acquire);
-        draft(engine, spec, base, unit)?
+        let waited = t_wait.elapsed();
+        let t_draft = Instant::now();
+        let asked = draft(engine, spec, base, unit)?;
+        (
+            asked,
+            waited.as_millis() as u64,
+            t_draft.elapsed().as_millis() as u64,
+        )
     };
-    let draft_ms = t_draft.elapsed().as_millis() as u64;
     let found = questions(&asked, spec.questions);
     if found.is_empty() {
         let opening: String = asked.chars().take(160).collect();
@@ -329,7 +335,8 @@ fn calibrate_one(
     let t_think = Instant::now();
     let thought = thoughts(engine, frame, spec, &found)?;
     let think_ms = t_think.elapsed().as_millis() as u64;
-    let t_seal = Instant::now();
+    // The exemplars' prefill and seal, the calibration's archive and distill.
+    let t_exemplars = Instant::now();
     let mut conv = engine
         .lock()
         .unwrap()
@@ -391,9 +398,10 @@ fn calibrate_one(
         layer = %spec.layer,
         subject = %unit.subject,
         questions = found.len(),
+        permit_wait_ms,
         draft_ms,
         think_ms,
-        seal_ms = t_seal.elapsed().as_millis() as u64,
+        exemplars_ms = t_exemplars.elapsed().as_millis() as u64,
         "unit calibrated",
     );
     Ok(())

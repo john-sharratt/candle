@@ -67,8 +67,9 @@ pub(crate) const TRIAL_WAVES: u64 = 64;
 /// 64-wave trial had 7 hits, the rest 3 or fewer, and the trial banned 174 of
 /// 176 as rare while each recurred steadily. Measured by the samples it needs
 /// instead, a trial lasts until every candidate is judged or this cap — about
-/// twenty seconds of decode — and a topology hit fewer than [`MIN_HITS`] times
-/// by then is rare by any measure worth a graph.
+/// twenty seconds of a benchmark's decode, ~45 s of a serving daemon's mix —
+/// and a topology hit fewer than [`MIN_HITS`] times by then is rare by any
+/// measure worth a graph.
 ///
 /// **A longer cap does not buy a serving daemon more graphs.** On `.5`
 /// (2026-10-26), with conversations, ingest and their drafts sharing the
@@ -100,8 +101,8 @@ pub(crate) const MIN_GAIN: f64 = 0.95;
 /// back what the trials benched, so a topology that keeps recurring at a rate
 /// too low to judge was otherwise benched, reopened for and trialled again on
 /// every cycle: on `.5` (2026-10-17) one run logged 49 reopens, each a learn
-/// and a full trial with its eager halves. A topology benched `n`
-/// times counts as recurring only once met `REOPEN_SIGHTINGS << n` times
+/// and a full trial with its eager halves. A topology benched `n` times counts
+/// as recurring only once met `REOPEN_SIGHTINGS << n` times
 /// ([`Regime::sightings_needed`]), and only then does a reopen take it back.
 pub(crate) const REOPEN_SIGHTINGS: u32 = 3;
 

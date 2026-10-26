@@ -36,6 +36,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use std::result::Result as StdResult;
+
 use candle::{Device, Result};
 use candle_nn::kv_cache::{
     arena_held_bytes, arena_regions, claim_arena_slots, plan_slot_moves, ArenaSlot, SlotTenant,
@@ -126,6 +128,34 @@ impl ResidentTurn {
 
 /// Weight of the newest gap between scans in a turn's interval.
 const INTERVAL_WEIGHT: f64 = 0.5;
+
+/// Why a scan could not reuse a cached index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexMiss {
+    /// No index was cached for the segment set — never built, evicted from
+    /// the cache, or too large to cache.
+    Absent,
+    /// The cached index named a turn since evicted, moved or re-uploaded.
+    Stale,
+}
+
+impl IndexMiss {
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            IndexMiss::Absent => "no index cached for this segment set",
+            IndexMiss::Stale => "a turn it holds was evicted, moved or re-uploaded",
+        }
+    }
+}
+
+/// A turn made resident: its pages' device addresses (page order), the run id
+/// they belong to ([`ResidentTurn::run_id`]), and whether they were uploaded
+/// now rather than found resident.
+pub(super) struct Ensured {
+    pub addrs: Vec<u64>,
+    pub run_id: u64,
+    pub uploaded: bool,
+}
 
 /// Paged VRAM gallery arena. Clone-free; share via `Arc<GalleryArena>`.
 ///
@@ -290,6 +320,13 @@ impl GalleryArena {
     /// between here and the launch that reads its pages. The addresses are
     /// resolved while the residency lock is still held, so the gids cannot be
     /// recycled out from under them.
+    ///
+    /// **Makes no room.** The keep eviction walks every resident turn, so it is
+    /// the caller's to run once before what it admits: a single turn's
+    /// [`ensure_resident`](Self::ensure_resident) before its miss, a scan's
+    /// index build once before its every turn. Run ahead of each ensure, a
+    /// 27,217-turn `code_reading` index spent 20.6 s in it (BlackWorld,
+    /// 2026-10-26), stalling every reprojection.
     fn ensure_locked(
         &self,
         res: &mut HashMap<StreamId, ResidentTurn>,
@@ -297,7 +334,7 @@ impl GalleryArena {
         sigs: TurnSigs<'_>,
         fingerprint: u64,
         pin: bool,
-    ) -> Result<(Vec<u64>, u64)> {
+    ) -> Result<Ensured> {
         debug_assert!(
             sigs.first_width().unwrap_or(self.wpt) == self.wpt,
             "gallery sig width {} != arena wpt {} — folded-geometry mismatch (wrong \
@@ -316,25 +353,19 @@ impl GalleryArena {
                 if pin {
                     rt.pinned += 1;
                 }
-                Ok((rt.run.addrs(), rt.run_id))
+                Ok(Ensured {
+                    addrs: rt.run.addrs(),
+                    run_id: rt.run_id,
+                    uploaded: false,
+                })
             }
-            _ => {
-                // Keep the arena under its own ceiling before admitting
-                // anything new. This is where gallery growth is bounded:
-                // `alloc_and_upload` adds a slab whenever the page pool is
-                // empty, and nothing else ever shrinks the arena. Doing it here
-                // — under `res`, before `inner` is taken — respects the
-                // residency→inner lock order and skips pins, so an active
-                // scan's working set is never evicted out from under it.
-                //
-                // **Only on the way to an upload.** The pass walks every
-                // resident turn; run ahead of every ensure, a 27,217-turn
-                // `code_reading` index that uploaded nothing spent 20.6 s in it
-                // (BlackWorld, 2026-10-26), stalling each reprojection. A hit
-                // admits nothing, so it has nothing to make room for.
-                self.evict_past_keep_locked(res);
-                self.replace_locked(res, sid, sigs, fingerprint, pin, lru)
-            }
+            _ => self
+                .replace_locked(res, sid, sigs, fingerprint, pin, lru)
+                .map(|(addrs, run_id)| Ensured {
+                    addrs,
+                    run_id,
+                    uploaded: true,
+                }),
         }
     }
 
@@ -390,6 +421,11 @@ impl GalleryArena {
     /// turn — the delta a seal produces. `sigs` must be the turn's full window;
     /// a stored window is decoded only on the miss.
     /// Does NOT pin — used off the scan hot path (and by tests).
+    ///
+    /// A miss first keeps the arena under its own ceiling: this is where
+    /// gallery growth is bounded outside a scan, since `alloc_and_upload` adds
+    /// a slab whenever the page pool is empty and nothing else ever shrinks the
+    /// arena. A hit admits nothing, so it makes no room.
     pub fn ensure_resident<'a>(
         &self,
         sid: StreamId,
@@ -397,20 +433,24 @@ impl GalleryArena {
         fingerprint: u64,
     ) -> Result<Vec<u64>> {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
+        if res.get(&sid).is_none_or(|rt| rt.fingerprint != fingerprint) {
+            self.evict_past_keep_locked(&mut res);
+        }
         self.ensure_locked(&mut res, sid, sigs.into(), fingerprint, false)
-            .map(|(addrs, _)| addrs)
+            .map(|ensured| ensured.addrs)
     }
 
     /// Like [`ensure_resident`](Self::ensure_resident) but **pins** the turn for
-    /// the duration of a scan. Every pin must be balanced by an
-    /// [`unpin`](Self::unpin). Used by the paged scan's index builder, which
+    /// the duration of a scan, and makes no room: the index builder runs the
+    /// keep eviction once, before its first turn. Every pin must be balanced by
+    /// an [`unpin`](Self::unpin). Used by the paged scan's index builder, which
     /// records the run id to validate a later reuse of its index.
     pub(super) fn scan_ensure<'a>(
         &self,
         sid: StreamId,
         sigs: impl Into<TurnSigs<'a>>,
         fingerprint: u64,
-    ) -> Result<(Vec<u64>, u64)> {
+    ) -> Result<Ensured> {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
         self.ensure_locked(&mut res, sid, sigs.into(), fingerprint, true)
     }
@@ -449,10 +489,10 @@ impl GalleryArena {
     /// moved since the build, so every address the index holds for it is still
     /// its page. That is checked per referenced turn — O(turns), not
     /// O(tokens) — so another conversation's uploads leave this index valid.
-    fn reuse_index(&self, fingerprint: u64) -> Option<Arc<scan::PagedIndex>> {
+    fn reuse_index(&self, fingerprint: u64) -> StdResult<Arc<scan::PagedIndex>, IndexMiss> {
         let idx = {
             let mut cache = self.index_cache.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = cache.get_mut(&fingerprint)?;
+            let entry = cache.get_mut(&fingerprint).ok_or(IndexMiss::Absent)?;
             entry.used = self.lru_clock.fetch_add(1, Ordering::Relaxed);
             entry.idx.clone()
         };
@@ -475,7 +515,7 @@ impl GalleryArena {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&fingerprint);
-            return None;
+            return Err(IndexMiss::Stale);
         }
         let lru = self.lru_clock.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
@@ -486,7 +526,7 @@ impl GalleryArena {
                 rt.touch(now);
             }
         }
-        Some(idx)
+        Ok(idx)
     }
 
     /// Cache `idx` under `fingerprint` for reuse, evicting the least recently
