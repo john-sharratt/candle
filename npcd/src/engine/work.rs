@@ -807,11 +807,20 @@ fn short_by(writes: &str, n: usize, min: usize, happens: Option<String>) -> Stri
 /// Why a stuck report contradicts what the engine sees — every step of the
 /// body's mission but the report is done, and any document it writes is
 /// committed — or `None` when something is genuinely left.
-fn finished(s: &Sim, body: &str) -> Option<String> {
+pub(crate) fn finished(s: &Sim, body: &str) -> Option<String> {
     let m = s.missions.active(body)?;
     let left = m.next_step().is_some_and(|t| !t.reports);
     if left || !m.written_up() {
         return None;
+    }
+    // **What is left is the landing, when it has not landed.** Sent from the
+    // stuck desk to `report_done` and from `report_done` back to the stuck
+    // desk, a Maker on a publish step went between the two refusals and never
+    // to the merge table: the one way on is said instead.
+    if let Some(why) = unpublished(s, body) {
+        return Some(format!(
+            "Nothing here is stuck: every step of your mission is done but the landing. {why}"
+        ));
     }
     let made = match &m.work {
         Some(w) if !w.edit_optional => format!(" {} is written and committed.", w.writes),

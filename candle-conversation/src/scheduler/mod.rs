@@ -1325,6 +1325,10 @@ fn warn_unfoldable_capture(n_raw_heads: usize, fold: FoldParams) {
     });
 }
 
+/// How long a request may hold the wave thread before it is named in the log —
+/// a quarter of a typical two-second wave under load.
+const SLOW_REQUEST: Duration = Duration::from_millis(250);
+
 /// Chunks of the turn's head (the user query) that stay in every reprojection
 /// probe once the trailing `max_probe_tokens` window has slid past them. The
 /// query is the strongest intent signal in the belief-gallery domain, so long
@@ -4319,7 +4323,27 @@ impl Scheduler {
     }
 
     /// Handle a single request. Returns `false` if shutdown.
+    /// Handle one request, saying so when it held the wave thread long.
+    ///
+    /// **Named, because the phase ring cannot.** On WW under four Makers the
+    /// ring put 12% of the scheduler's time in `requests` — one window 3.4 s of
+    /// 4 — with no forward running meanwhile, and nothing said which request.
     fn handle_request(&mut self, req: SchedulerRequest) -> bool {
+        let name = req.span_name();
+        let began = Instant::now();
+        let keep_going = self.handle_request_now(req);
+        let took = began.elapsed();
+        if took >= SLOW_REQUEST {
+            tracing::info!(
+                request = name,
+                took_ms = took.as_millis() as u64,
+                "scheduler: a request held the wave thread"
+            );
+        }
+        keep_going
+    }
+
+    fn handle_request_now(&mut self, req: SchedulerRequest) -> bool {
         tracing::trace!(request = req.span_name(), slots = ?req.slots(), "scheduler request");
         // A detached substrate's handle: its own free releases the slot id it
         // reserved, and anything else it sends is dropped unanswered.

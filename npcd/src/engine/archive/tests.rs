@@ -145,6 +145,21 @@ fn refused(o: Outcome) -> String {
     }
 }
 
+/// **A stuck report on work that has not landed is sent to the landing**, not
+/// to `report_done`, which would refuse it and send the Maker back: the two
+/// desks pointed at each other and a Maker went between them for an hour.
+#[test]
+fn a_stuck_report_before_the_landing_names_the_landing() {
+    let (_dir, h, _id) = at_the_merge_table();
+    let why = h
+        .sim(|s| work::finished(s, "m1"))
+        .expect("a finished mission refuses a stuck report");
+    assert!(why.contains("done but the landing"), "{why}");
+    assert!(why.contains("has not landed in the record yet"), "{why}");
+    assert!(why.contains("`merge_publish`"), "{why}");
+    assert!(!why.contains("What is left is the report"), "{why}");
+}
+
 /// **The publish step's report waits on the record; `merge_publish` lands
 /// the work, records it on the operation, and brings the mind folder up.**
 #[test]
