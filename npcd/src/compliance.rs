@@ -156,6 +156,7 @@
 use std::sync::Arc;
 
 use crate::api::Authored;
+use crate::engine::prose::WORK_BAND;
 use crate::prose;
 
 /// The two answers the judge may give, as **single tokens**.
@@ -551,7 +552,9 @@ async fn ask(s: &Arc<Authored>, q: &Question, prompt: &str) -> Result<Answer, De
         choices: Some(CHOICES.iter().map(|s| s.to_string()).collect()),
     };
 
-    let answer = match prose::run(s, request).await {
+    // Above the characters: the draw waits on this answer, and so does the
+    // person who asked for it (`prose::run_at`).
+    let answer = match prose::run_at(s, request, WORK_BAND).await {
         Ok(a) => a.text,
         Err(e) => return Err(Denial::Unavailable(e.to_string())),
     };
