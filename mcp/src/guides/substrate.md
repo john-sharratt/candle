@@ -1,6 +1,6 @@
 ---
 name: substrate
-description: How to find out whether a bad answer comes from the stored analysis — switch a layer off and ask again, read what the layer holds, and delete a corrupt conversation only with approval.
+description: How to read what the stored analysis holds, find out whether a bad answer comes from it by switching a layer off and asking again, and delete a corrupt conversation only with approval.
 tools: [layer_read, layer_toggle, timeline_read, timeline_delete, repo_task_start, repo_task_wait]
 ---
 # Stored analysis
@@ -11,16 +11,23 @@ Analysis of the repositories is kept in **layers** (`repo_map`,
 Workers read from them. A wrong answer can come from a wrong timeline.
 Admins only.
 
-## Find the source
+## Read what a layer holds
+
+Reading changes nothing:
+
+1. `layer_read {name}` lists its timelines, each with its id, label,
+   repository, turns and tokens, a page at a time.
+2. `timeline_read {id}` for one timeline's turns, first line each;
+   `timeline_read {id, turn}` for one turn in full.
+
+## Find whether a layer causes a bad answer
 
 1. **Switch the suspect layer off** — `layer_toggle {name}` — and ask the same
-   question again (a fresh `repo_task_start`). Held in memory; a restart switches
-   it back on. If the answer is now right, the layer is the source.
-2. **Read what the layer holds**: `layer_read {name}` lists its timelines, each
-   with its id, label, repository, turns and tokens.
-3. **Read a suspect timeline**: `timeline_read {id}` for its turns' first
-   lines; `timeline_read {id, turn}` for one turn in full.
-4. Switch the layer back on: `layer_toggle {name}` again.
+   question again (a fresh `repo_task_start`). This changes what every worker
+   reads, so say so to the user first; it is held in memory and a restart
+   switches it back on. If the answer is now right, the layer is the source.
+2. Read the layer and the suspect timeline, as above.
+3. Switch the layer back on: `layer_toggle {name}` again.
 
 ## Repair
 

@@ -12,6 +12,9 @@ is compacted, and what every worker on it starts with in its prompt.
 
 ## Start
 
+A thread is for work that runs tasks or makes decisions. A one-off read — how
+the cluster stands, what the logs say — needs none: answer it and stop.
+
 1. `guide_list` once per conversation, to see what methods exist.
 2. `thread_list` if the work may already have a thread.
 3. `thread_attach {thread}` — a kebab-case slug for what the work is about
