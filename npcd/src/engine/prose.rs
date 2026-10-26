@@ -52,8 +52,25 @@ use crate::engine::reflect::{plain_prose, think_off};
 use crate::engine::throwaway::Throwaway;
 use crate::prose::{Answer, Request, DEFAULT_SYSTEM};
 
-/// Decode `request` with `seed` on `band`, handing each new fragment of text
-/// to `on_fragment` as it lands.
+/// How a job's system prompt is held on the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frame {
+    /// Sealed for the job and retired once it lets go — see
+    /// [`ConversationEngine::transient_prompt_section`]. For a voice that may
+    /// never be asked again: a caller whose every prompt differs leaves nothing
+    /// behind.
+    Transient,
+    /// Sealed once and kept in the substrate — see
+    /// [`ConversationEngine::plain_prompt_section`]. For a **fixed** voice asked
+    /// on every request: the next job reads the sealed frame instead of
+    /// prefilling it again. A gate in front of another job asks this way; its
+    /// questions never change, and the person behind it waits for every
+    /// prefill. One frame per distinct text, so only a fixed voice may take it.
+    Kept,
+}
+
+/// Decode `request` with `seed` on `band`, its system prompt held as `frame`,
+/// handing each new fragment of text to `on_fragment` as it lands.
 ///
 /// Awaits the decode; the routes in [`crate::prose`] call it directly, on the
 /// characters' [`DecodePriority::Normal`]; a judgement an operation waits on
@@ -63,6 +80,7 @@ pub async fn decode(
     base: &SequenceConfig,
     request: &Request,
     band: DecodePriority,
+    frame: Frame,
     seed: u64,
     on_fragment: &mut (dyn FnMut(&str) + Send),
 ) -> anyhow::Result<Answer> {
@@ -90,6 +108,7 @@ pub async fn decode(
         temperature: request.temperature,
         think: None,
         band,
+        frame,
     };
     let (text, tokens) = framed(
         engine,
@@ -204,6 +223,7 @@ pub async fn decode_call_thought(
         temperature: ask.temperature,
         think: (ask.think != ThinkMode::Off).then_some((ask.think, ask.max_tokens)),
         band: ask.band,
+        frame: Frame::Transient,
     };
     let (text, _) = framed(
         engine,
@@ -262,6 +282,8 @@ struct Held {
     think: Option<(ThinkMode, usize)>,
     /// The band the turn decodes at.
     band: DecodePriority,
+    /// How its system prompt is held.
+    frame: Frame,
 }
 
 /// One turn under `system`, in a conversation opened for it and then thrown
@@ -285,6 +307,7 @@ async fn framed(
         temperature,
         think,
         band,
+        frame,
     } = held;
 
     // **The opening runs off the async task.** It waits on the scheduler for a
@@ -294,18 +317,25 @@ async fn framed(
     // progress ticker shares its task, so an image call went a minute without
     // a notification and its client gave it up.
     //
-    // The frame is held to the end of this function, past the sequence's own
-    // drop below, so the slot reading it goes first.
+    // A transient frame is held to the end of this function, past the
+    // sequence's own drop below, so the slot reading it goes first. A kept one
+    // is never released.
     let (_frame, mut sequence, timeline, decoder) = {
         let engine = Arc::clone(engine);
         let system = system.to_string();
         let formatted = base.dialect.format_system_prompt(&system);
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let frame = HeldFrame {
-                id: engine.transient_prompt_section(&system)?,
-                engine: Arc::clone(&engine),
+            let (id, frame) = match frame {
+                Frame::Transient => {
+                    let held = HeldFrame {
+                        id: engine.transient_prompt_section(&system)?,
+                        engine: Arc::clone(&engine),
+                    };
+                    (held.id, Some(held))
+                }
+                Frame::Kept => (engine.plain_prompt_section(&system)?, None),
             };
-            let (builder, layer, group) = prose_projection(&system, frame.id, band)?;
+            let (builder, layer, group) = prose_projection(&system, id, band)?;
             let seq =
                 engine.new_conversation_with_projection(&formatted, builder, layer, group, cfg)?;
             let tl = seq.timeline_id();
@@ -450,9 +480,8 @@ const CLOSED: &str = "prose:closed";
 /// compared, so every job opened under one fixed frame id read whichever voice
 /// had sealed there first. The first job after a start is the create form's
 /// name, so every description after it was written under "reply with the name
-/// and nothing else" — and came back as a name. The frame is transient, retired
-/// once the job lets go of it — see
-/// [`ConversationEngine::transient_prompt_section`].
+/// and nothing else" — and came back as a name. The frame is transient or kept
+/// as the job asks — see [`Frame`].
 ///
 /// **Reserved, so a prose job never shares ids with the mind.** A plain-prompt
 /// schema's layer and group are otherwise fixed at 1, which is the mind's own

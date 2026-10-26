@@ -44,6 +44,13 @@ use candle_transformers::quantized_var_builder::VarBuilder;
 
 use super::checkpoint;
 use super::ground::GuestGround;
+use super::windowed::Windowed;
+
+/// The most of a checkpoint read off the disk at once: 16 direct reads of
+/// 4 MiB in flight four times over, and a host buffer the engine's RAM does not
+/// notice for the length of a load. A tensor larger than this is a window of its
+/// own.
+const WINDOW: u64 = 256 << 20;
 
 /// Alignment every placement takes.
 ///
@@ -60,10 +67,16 @@ const PLACE_ALIGN: usize = 256;
 /// as its file bytes; `Int8Mode::Off` places everything verbatim, which is what a
 /// card without the int8 MMA gets.
 ///
-/// **One barrier at the end, not one per tensor.** Every copy below is issued
-/// against the stream without waiting, exactly as `GroundVars::with` does, so the
-/// transfers pipeline; the sync before returning is what makes the whole set
-/// ordered before any read.
+/// **Read in file order, a window at a time** ([`Windowed`]): the tensors are
+/// sorted by where they sit, gathered into windows of up to [`WINDOW`], and
+/// each window comes off the disk unbuffered before its tensors are placed.
+///
+/// **One barrier per window, not one per tensor.** Every copy is issued against
+/// the stream without waiting, exactly as `GroundVars::with` does, so the
+/// transfers pipeline; the window is overwritten only after the stream has
+/// drained it, and the sync before returning orders the whole set before any
+/// read.
+///
 /// `skip` names tensors the model will never ask for, so they are not placed.
 /// Ground is the KV side's, taken for the length of a drain, and a tensor
 /// nothing reads is that much of the engine's working set evicted for nothing —
@@ -76,52 +89,74 @@ pub fn place_gguf(
     skip: &[&str],
 ) -> Result<VarBuilder, String> {
     let header = checkpoint::gguf_header(path).map_err(|e| format!("{path:?}: {e}"))?;
-    let payload = checkpoint::payload(path).map_err(|e| format!("{path:?}: {e}"))?;
+    let mut file = Windowed::open(path).map_err(|e| format!("{path:?}: {e}"))?;
     let Device::Cuda(cuda) = device else {
         return Err("guest weights: the reservation is a CUDA allocation".into());
     };
 
-    let mut placed: HashMap<String, Arc<QTensor>> =
-        HashMap::with_capacity(header.tensor_infos.len());
+    let mut wanted: Vec<(&String, Shape, GgmlDType, u64, u64)> = header
+        .tensor_infos
+        .iter()
+        .filter(|(name, _)| !skip.contains(&name.as_str()))
+        .map(|(name, info)| {
+            let shape = Shape::from(info.shape.dims().to_vec());
+            let dtype = info.ggml_dtype;
+            let start = header.tensor_data_offset + info.offset;
+            let len = shape.elem_count() / dtype.block_size() * dtype.type_size();
+            (name, shape, dtype, start, start + len as u64)
+        })
+        .collect();
+    wanted.sort_by_key(|&(_, _, _, start, _)| start);
+
+    let mut placed: HashMap<String, Arc<QTensor>> = HashMap::with_capacity(wanted.len());
     let mut twins = 0usize;
-    for (name, info) in header.tensor_infos.iter() {
-        if skip.contains(&name.as_str()) {
-            continue;
+    let mut at = 0usize;
+    while at < wanted.len() {
+        // A window holds every tensor that ends within `WINDOW` of the first's
+        // start, and always holds that first one, however large it is.
+        let from = wanted[at].3;
+        let mut until = at + 1;
+        while until < wanted.len() && wanted[until].4 - from <= WINDOW {
+            until += 1;
         }
-        let shape = Shape::from(info.shape.dims().to_vec());
-        let dtype = info.ggml_dtype;
-        let start = header.tensor_data_offset as usize + info.offset as usize;
-        let len = shape.elem_count() / dtype.block_size() * dtype.type_size();
-        let raw = payload.get(start..start + len).ok_or_else(|| {
-            format!("{name}: the header describes bytes past the end of {path:?}")
-        })?;
+        let to = wanted[at..until].iter().map(|t| t.4).max().unwrap_or(from);
+        let window = file
+            .read(from, to)
+            .map_err(|e| format!("{path:?}: reading bytes {from}..{to}: {e}"))?;
 
-        let twin = mode.is_int8()
-            && match shape.dims() {
-                [nrows, ncols] => ko_tileable(*nrows, *ncols),
-                _ => false,
-            };
-        // Named before it is placed, not after: a placement that faults takes
-        // the process with it, and the last line written is then the only
-        // evidence of which tensor did it.
-        tracing::trace!(
-            target: "candle_conversation::guest",
-            tensor = %name, shape = ?shape.dims(), ?dtype, twin,
-            "placing"
-        );
-        let qt = if twin {
-            twins += 1;
-            place_ko_twin(cuda, ground, raw, &shape, dtype, mode)
-        } else {
-            place_verbatim(cuda, ground, raw, &shape, dtype)
+        for (name, shape, dtype, start, end) in &wanted[at..until] {
+            let (shape, dtype) = (shape, *dtype);
+            let raw = &window[(start - from) as usize..(end - from) as usize];
+
+            let twin = mode.is_int8()
+                && match shape.dims() {
+                    [nrows, ncols] => ko_tileable(*nrows, *ncols),
+                    _ => false,
+                };
+            // Named before it is placed, not after: a placement that faults
+            // takes the process with it, and the last line written is then the
+            // only evidence of which tensor did it.
+            tracing::trace!(
+                target: "candle_conversation::guest",
+                tensor = %name, shape = ?shape.dims(), ?dtype, twin,
+                "placing"
+            );
+            let qt = if twin {
+                twins += 1;
+                place_ko_twin(cuda, ground, raw, shape, dtype, mode)
+            } else {
+                place_verbatim(cuda, ground, raw, shape, dtype)
+            }
+            .map_err(|e| format!("{name} {:?}: {e}", shape.dims()))?;
+            placed.insert((*name).clone(), Arc::new(qt));
         }
-        .map_err(|e| format!("{name} {:?}: {e}", shape.dims()))?;
-        placed.insert(name.clone(), Arc::new(qt));
+
+        // The window is read into again next; every copy out of it lands first.
+        device
+            .synchronize()
+            .map_err(|e| format!("guest weights: the load barrier: {e}"))?;
+        at = until;
     }
-
-    device
-        .synchronize()
-        .map_err(|e| format!("guest weights: the load barrier: {e}"))?;
     tracing::debug!(
         target: "candle_conversation::guest",
         tensors = placed.len(),

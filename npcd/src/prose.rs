@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::api::Authored;
+use crate::engine::prose::Frame;
 
 /// The most tokens one prose job may decode.
 ///
@@ -189,12 +190,16 @@ pub async fn run(s: &Arc<Authored>, request: Request) -> Result<Answer, ProseErr
 /// after eight minutes — the caller holding an open request the whole time for
 /// a picture that had never been queued. See
 /// [`crate::engine::prose::WORK_BAND`] for the same wait on the table's calls.
+///
+/// **A gate's voice is fixed, so its frame is kept** ([`Frame::Kept`]): the
+/// next draw reads the sealed system prompt instead of prefilling it again.
+/// Every job through here must ask under a fixed system prompt.
 pub async fn run_at(
     s: &Arc<Authored>,
     request: Request,
     band: DecodePriority,
 ) -> Result<Answer, ProseError> {
-    decode_on(s, request, band, &mut |_: &str| {}).await
+    decode_on(s, request, band, Frame::Kept, &mut |_: &str| {}).await
 }
 
 /// The same, with each new fragment of text handed to `on_fragment` as it lands.
@@ -210,14 +215,23 @@ pub async fn run_streamed(
 ) -> Result<Answer, ProseError> {
     // On the characters' band: a job asked for here is nothing an operation
     // waits on.
-    decode_on(s, request, DecodePriority::Normal, &mut on_fragment).await
+    decode_on(
+        s,
+        request,
+        DecodePriority::Normal,
+        Frame::Transient,
+        &mut on_fragment,
+    )
+    .await
 }
 
-/// Decode `request` on `band`, handing each fragment to `on_fragment`.
+/// Decode `request` on `band`, its system prompt held as `frame`, handing each
+/// fragment to `on_fragment`.
 async fn decode_on(
     s: &Arc<Authored>,
     request: Request,
     band: DecodePriority,
+    frame: Frame,
     on_fragment: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Answer, ProseError> {
     request.check().map_err(ProseError::Refused)?;
@@ -233,7 +247,7 @@ async fn decode_on(
     // Awaited directly: the decode yields on the turn's event channel, so a
     // long generation parks a future rather than a thread — and a caller that
     // gives up drops the future, which stops the decode.
-    crate::engine::prose::decode(&engine, &cfg, &request, band, seed, on_fragment)
+    crate::engine::prose::decode(&engine, &cfg, &request, band, frame, seed, on_fragment)
         .await
         .map_err(|e| ProseError::Failed(format!("{e:#}")))
 }
