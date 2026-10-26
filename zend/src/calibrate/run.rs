@@ -274,7 +274,11 @@ fn calibrate_one(
     };
     let found = questions(&asked, spec.questions);
     if found.is_empty() {
-        anyhow::bail!("the draft wrote no question ({} chars)", asked.len());
+        let opening: String = asked.chars().take(160).collect();
+        anyhow::bail!(
+            "the draft wrote no question ({} chars: {opening:?})",
+            asked.len()
+        );
     }
     let thought = thoughts(engine, frame, spec, &found)?;
     let mut conv = engine
