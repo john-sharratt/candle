@@ -1,11 +1,13 @@
 ---
 name: research
-description: How to have workers answer a question from the web with every claim checked against the page it came from — gather, verify, check themselves, then you verify them.
+description: When the user asks for web research to run on Zen's workers — how to have them answer with every claim checked against the page it came from; gather, verify, check themselves, then you verify them. Otherwise research with your own tools.
 tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline_read]
 ---
 # Research
 
-**Use when** the answer is on the web and takes many pages to establish. Not
+**Use when** the user asks for research to run on Zen — a long or exhaustive
+question, run while they are away, or one whose evidence should stay on a
+thread. Otherwise research with your own web tools, by the same method. Not
 for questions about a codebase — that is `ask`.
 
 What went wrong before, and what this guards against: a worker searched ~40

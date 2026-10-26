@@ -70,23 +70,35 @@ clothing. A prompt that leaves an age unclear may be declined.
   default) is quick but coarser. Both sides must be multiples of 16, at most
   1024. Common shapes: 1024×1024 square, 1024×768 / 768×1024, 1024×576
   landscape (16:9), 576×1024 portrait (9:16).
-- **Steps:** leave the default. The model is trained for eight; more buys a
-  little finish, not variety.
-- **Seed:** pass one only to redraw the same picture with a small prompt
+- **Steps:** pass `steps: 12`. The model is trained for 8 — use 8 when speed
+  matters most; 12 buys finish; more than that buys little and costs time,
+  never variety.
+- **Seed:** every draw says the seed it used ("Drew a 1024x768 image, seed
+  …"). Pass that seed back only to redraw the same picture with a small prompt
   change. **Shift:** leave it alone.
-- A draw takes about 10–60 seconds.
+- **Time:** a draw takes from about half a minute to two, most of it the
+  prompt check before drawing; progress arrives while it works.
 
 ## Look, then refine
 
-The picture comes back to you. Look at it against the request before showing
-it:
+The answer is a line of text — size and seed — and the picture itself, which
+you can see. Look at it against the request before showing it:
 
 - Something missing or wrong — name it more prominently and more concretely,
   earlier in the prompt.
 - Text misspelled — shorten it, give it more room, describe its placement.
 - The same thing every time — change the description, not the seed.
-- Refused — read why; if a person's age was unclear, state it; otherwise
-  rewrite what the checker objected to, or tell the user it cannot be drawn.
+- `prompt_declined` — the prompt check refused it. If a person's age was
+  unclear, state it; otherwise rewrite what it objected to, or tell the user
+  it cannot be drawn.
+
+When the draw fails for any other reason, the prompt was not the problem —
+do not rewrite it:
+
+- "is unavailable" (`upstream_unavailable`, `upstream_backoff`), `no_room` or
+  a call cut off — the image service is restarting or busy. Send the same
+  call again in a minute or two; after three tries over about ten minutes,
+  tell the user it is down and give them the prompt to draw later.
 
 Two or three rounds is normal. Show the user the result and the prompt that
 made it, so the next request can start from it.

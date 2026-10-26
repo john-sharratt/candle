@@ -5,6 +5,10 @@ tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline
 ---
 # Literature survey
 
+**Use when** the user asks for a survey to run on Zen — long, exhaustive, or
+to be kept on a thread. Otherwise survey with your own tools, by the same
+method.
+
 Read `research` first; papers add their own traps: an abstract overstates,
 numbers are measured under different conditions, and a table is often an
 image.

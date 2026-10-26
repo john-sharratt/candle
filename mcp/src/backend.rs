@@ -17,6 +17,7 @@ use futures::StreamExt;
 use mcp_server::http::{PROGRESS_EVERY, VERSION_HEADER};
 use mcp_server::protocol::{text_result, CLIENT_META, MODERN, SESSION_META};
 use mcp_server::Session;
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tokio::time::timeout;
 
@@ -180,6 +181,15 @@ impl Link {
     }
 }
 
+/// What a backend answering a server error says: it is down or restarting —
+/// not a refusal of what was asked — so the same call is worth repeating.
+fn unavailable(name: &str, status: StatusCode, said: &str) -> String {
+    format!(
+        "{name} is unavailable ({status}: {said}) — it is restarting or down, not refusing \
+         this call; try the same call again in a minute or two"
+    )
+}
+
 /// Send `req` and read its answer — one JSON-RPC response, or an event stream
 /// of progress ending in one — telling each progress message to `step`.
 async fn answer(
@@ -207,18 +217,23 @@ async fn answer(
         return match serde_json::from_slice::<Value>(&bytes).map(|m| read(&m)) {
             Ok(Read::Result(r)) => Ok(r),
             Ok(Read::Error(e)) if status.is_success() => Err(format!("{name}: {e}")),
+            Ok(Read::Error(e)) if status.is_server_error() => Err(unavailable(name, status, &e)),
             Ok(Read::Error(e)) => Err(format!("{name} refused ({status}): {e}")),
             _ if status.as_u16() == 401 => Err(format!(
                 "{name} did not accept your sign-in; sign in to the connector again"
             )),
-            _ => Err(format!(
-                "{name} refused ({status}): {}",
-                String::from_utf8_lossy(&bytes)
+            _ => {
+                let body: String = String::from_utf8_lossy(&bytes)
                     .trim()
                     .chars()
                     .take(300)
-                    .collect::<String>()
-            )),
+                    .collect();
+                Err(if status.is_server_error() {
+                    unavailable(name, status, &body)
+                } else {
+                    format!("{name} refused ({status}): {body}")
+                })
+            }
         };
     }
     let mut stream = res.bytes_stream();
@@ -290,6 +305,21 @@ mod tests {
         assert_eq!(
             read(&json!({"error": "upstream_down"})),
             Read::Error("upstream_down".into())
+        );
+    }
+
+    /// **A server error says the backend is down, not that it refused**, and
+    /// that the same call is worth repeating.
+    #[test]
+    fn a_server_error_is_said_as_unavailable() {
+        assert_eq!(
+            unavailable(
+                "bot",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_unavailable"
+            ),
+            "bot is unavailable (503 Service Unavailable: upstream_unavailable) — it is \
+             restarting or down, not refusing this call; try the same call again in a minute or two"
         );
     }
 

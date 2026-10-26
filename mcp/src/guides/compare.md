@@ -5,6 +5,11 @@ tools: [repo_task_start, repo_task_wait, repo_task_reply, journal_grep, timeline
 ---
 # Comparing options
 
+**Use when** the options bear on the user's code — libraries to adopt,
+approaches to a change, measured on their repository — or the user asks for
+the comparison to run on Zen. A comparison from the web alone you can do
+yourself, by the same method.
+
 Read `research` first: the gather → verify → check method applies to every
 cell of the comparison.
 
