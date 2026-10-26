@@ -23,6 +23,7 @@
 
 pub mod belief;
 pub mod boundaries;
+pub mod chunk_exclusion;
 pub mod fusion;
 pub mod gallery_arena;
 pub mod gather;

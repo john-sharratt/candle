@@ -223,6 +223,10 @@ struct YamlPolicy {
     /// Omitted ⇒ inherit.
     #[serde(default)]
     cases: Option<String>,
+    /// The weight of the calibration competition's vote against a file's
+    /// own. Omitted ⇒ inherit.
+    #[serde(default)]
+    calibration_weight: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -952,6 +956,9 @@ fn parse_policy(
             }
         };
     }
+    if let Some(w) = yp.calibration_weight {
+        scan.calibration_weight = w;
+    }
     validate_scan(name, &scan)?;
     Ok(SelectionPolicy {
         config,
@@ -977,6 +984,9 @@ fn validate_scan(name: &str, s: &ScanPolicy) -> Result<(), ConstructionError> {
     }
     if s.level_prior_cap < 1.0 {
         return Err(bad("level_prior.floor_cap must be >= 1"));
+    }
+    if s.calibration_weight.is_nan() || s.calibration_weight < 0.0 {
+        return Err(bad("calibration_weight must be >= 0"));
     }
     Ok(())
 }

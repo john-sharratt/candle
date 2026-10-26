@@ -15,7 +15,8 @@
 
 use candle_conversation::provenance::WideQSig;
 
-use crate::attribution::{BATCH, KEEP};
+use crate::anomaly;
+use crate::attribution::{attributed, background_mass, Chunks, BATCH, KEEP};
 use crate::corpus::File;
 use crate::judge::{header, Judge};
 use crate::remote_gallery::{Daemon, Questions, RemoteGallery};
@@ -92,8 +93,44 @@ pub fn run(files: &[File], daemon: &Daemon) -> anyhow::Result<()> {
             content.print(&format!("  normalized, + {w} x"), &combined(&cn, &qn, w));
         }
     }
+
+    // Both: the content competition with its anomalous chunks cut
+    // (`chunk_factor`), and the questions' competition beside it.
+    let chunks = Chunks::of(files, &|_, _| false);
+    let background: Vec<(usize, &[WideQSig])> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, f)| {
+            f.questions
+                .iter()
+                .skip(1)
+                .map(move |q| (fi, q.sigs.as_slice()))
+        })
+        .collect();
+    let bg = attributed(&gpu, &chunks, &background, Questions::Without, &|_, _| {
+        false
+    })?;
+    let mass = background_mass(&chunks, &background, &bg);
+    let cut = anomaly::excluded(&mass, &chunks.file_of, CUT_K, CUT_KEEP);
+    let ranges: Vec<(u64, usize, usize)> = cut.iter().map(|&c| chunks.range_of[c]).collect();
+    let c_cut = content.scores(&ranges)?;
+    let k = *DENSITIES.last().unwrap_or(&0);
+    let masked = move |_: usize, qi: usize| qi == 0 || qi > k;
+    let q = questions_alone(&gpu, &held, n, &masked)?;
+    content.print(&format!("content, {} chunks cut", cut.len()), &c_cut);
+    for &w in &WEIGHTS {
+        content.print(
+            &format!("  cut + {w} x questions 1..={k}"),
+            &combined(&c_cut, &q, w),
+        );
+    }
     Ok(())
 }
+
+/// The anomalous-chunk cut stacked on the competitions: robust deviations
+/// above the median log mass, and the share of each file's chunks it keeps.
+const CUT_K: f32 = 5.0;
+const CUT_KEEP: f32 = 0.5;
 
 /// `held` asked of every file's calibration questions alone — every turn of
 /// every file masked — those `masked` names left out too.

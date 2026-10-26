@@ -821,7 +821,10 @@ layers:
     # catalog gained 10.6 points Top-1 when its exemplars became questions.
     calibrate:
       questions: 24
-      think: 192
+      # One projection's worth: a turn's first reprojection fires by the
+      # 64-token cadence (`reproject_every_n_tokens`), so the probe that
+      # decides what is pulled in has seen at most this much thinking.
+      think: 64
       prompt: |
         Write <<n>> different questions someone working in this workspace might ask whose answer needs what you just read in `<<path>>`. Vary what they ask: what it is for, how it works, where something is done, why it is built the way it is, how to change or extend it, what it relates to. Ask them as a person would, not as a summary. At most half may name the file. Write one question per line and nothing else.
     # In tool rounds, like repo_map: a dialogue sees this layer as its working
@@ -914,6 +917,12 @@ layers:
           # files, and weighting the top group a quarter of its tool calls'
           # (docs/results/provenance_gates_2026-10-25.md).
           cases: file
+          # Each file's calibration questions compete among themselves, not
+          # in the files' pool, where they took nearly every vote of a
+          # question probe; the file adds half its calibration vote. Held-out
+          # questions at 15 a file: MRR 0.152 pooled -> 0.221, R@10
+          # 0.261 -> 0.365 (docs/results/provenance_gates_2026-10-26.md).
+          calibration_weight: 0.5
 
   # ── Dependency Analysis ────────────────────────────────────────────────────
   - name: dependency_analysis

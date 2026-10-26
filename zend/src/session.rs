@@ -549,6 +549,12 @@ fn turn_sampling(
     sampling
 }
 
+/// Calibration questions per file a layer's chunk exclusion is learned from:
+/// a background of ~10,000 questions over the workspace's ~1,600 files, a
+/// scan of about two minutes at ingest priority. The outliers it cuts sit
+/// orders of magnitude above the rest, so a sample finds them.
+const EXCLUSION_QUESTIONS_PER_FILE: usize = 6;
+
 /// The triggers a chat turn decodes under: any `<tool_call>` the model emits is
 /// forced to the exact JSON shape of a tool `tools_mode` offers (name ∈ that
 /// mode's catalog, required params in order, valid JSON), and atop that the `<think>` block is steered per the
@@ -3185,12 +3191,36 @@ impl InferenceState {
                     continue;
                 }
             };
+            // The calibrations already written are the background the layer's
+            // generic chunks are told apart by. Learned ahead of calibrating,
+            // which can take hours when every unit is asked again, so each pass
+            // — and a restart, which holds none — has an exclusion within
+            // minutes.
+            let scanner = self.engine.lock().unwrap().group_scanner();
+            match scanner.learn_chunk_exclusion(group, EXCLUSION_QUESTIONS_PER_FILE) {
+                Ok(r) => tracing::info!(
+                    target: "zend::calibrate",
+                    layer = %il.name,
+                    files = r.files,
+                    calibrated = r.calibrated,
+                    questions = r.probes,
+                    chunks = r.chunks,
+                    cut = r.cut,
+                    "learned the layer's anomalous-chunk exclusion",
+                ),
+                Err(e) => tracing::warn!(
+                    target: "zend::calibrate",
+                    layer = %il.name,
+                    "learning the layer's chunk exclusion failed (its scans cut nothing): {e:#}",
+                ),
+            }
             calibrate_layer(
                 &self.engine,
                 &CalibrateLayer { spec, group, base },
                 &CalibrateFrame {
                     system_prompt: &self.formatted_prompt,
                     config: &self.refresh_config,
+                    thinking: turn_triggers(self, ThinkMode::Balanced, ToolMode::None),
                 },
             );
         }
@@ -9108,7 +9138,15 @@ mod projection_schema_tests {
         let calibrate = CalibrateSpec::of(layer("code_reading"))
             .unwrap()
             .expect("code_reading declares a calibration");
-        assert_eq!((calibrate.questions, calibrate.think), (24, 192));
+        assert_eq!((calibrate.questions, calibrate.think), (24, 64));
+        // ... which compete among themselves, half a file's own vote.
+        assert_eq!(
+            layer("code_reading").groups[0]
+                .policy
+                .scan
+                .calibration_weight,
+            0.5
+        );
         assert!(calibrate.prompt.contains("<<path>>"));
 
         let ws = layer("dialogue")

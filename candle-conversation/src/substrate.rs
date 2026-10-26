@@ -87,6 +87,7 @@ use crate::projection::{
     ProjectionEvent, ProjectionTarget, SectionId, SystemItem, TimelineAllocator, TimelineId,
     TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
 };
+use crate::provenance::chunk_exclusion::ChunkExclusion;
 use crate::provenance::SigWindow;
 use crate::scheduler::profile;
 use crate::summary_tree::exchange::Couplings;
@@ -508,6 +509,13 @@ pub struct Substrate {
     /// self-local, as every append-only layer was before. Transient, set from
     /// the ingest setup each session ([`Self::set_ingest_sees`]).
     ingest_sees: HashMap<LayerId, HashSet<GroupId>>,
+
+    /// Per belief group, the gallery chunks cut from its live scans — those
+    /// that win votes on every file's questions
+    /// (`crate::provenance::chunk_exclusion`). Transient: learned from the
+    /// group's calibration questions once an ingest pass
+    /// ([`Self::set_chunk_exclusion`]), never redo-logged.
+    chunk_exclusion: HashMap<GroupId, Arc<ChunkExclusion>>,
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
@@ -1862,6 +1870,19 @@ impl Substrate {
         if let Some(tl) = self.timelines.get_mut(&timeline) {
             tl.summarize = summarize;
         }
+    }
+
+    /// Replace the chunks cut from `group`'s live belief scans.
+    pub fn set_chunk_exclusion(&mut self, group: GroupId, exclusion: ChunkExclusion) {
+        self.chunk_exclusion.insert(group, Arc::new(exclusion));
+    }
+
+    /// The chunks cut from `group`'s live belief scans; none until learned.
+    pub fn chunk_exclusion(&self, group: GroupId) -> Arc<ChunkExclusion> {
+        self.chunk_exclusion
+            .get(&group)
+            .map(Arc::clone)
+            .unwrap_or_default()
     }
 
     /// Mark `layer` as an append-only ingest layer (code_reading, repo_map) — a

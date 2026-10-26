@@ -11,6 +11,7 @@
 //! self-probes instead of once per probe.
 
 use std::cell::OnceCell;
+use std::mem::take;
 use std::ops::Range;
 
 use super::adaptive::ScanCases;
@@ -19,6 +20,7 @@ use super::resolver::subwindow_bounds;
 use super::schema::GroupSchema;
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::streams::StreamId;
+use crate::provenance::chunk_exclusion::{uncut, ChunkExclusion};
 use crate::provenance::gallery_arena::{PagedSegment, PagedWindow};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
@@ -41,10 +43,13 @@ pub(crate) struct FileScan {
     /// Stream id of each kept arc's turn — the arena residency key.
     pub arc_sids: Vec<StreamId>,
     /// `(arc index into arcs_kept, window start, window end, exchange slot)`:
-    /// the file's own windows first, then the questions its calibrations hold
-    /// ([`Substrate::CALIBRATES_KEY`]), each voting for the file's head
-    /// exchange — under file-scored cases, for the file.
+    /// the file's own windows.
     pub windows: Vec<(usize, usize, usize, usize)>,
+    /// `(arc index into arcs_kept, window start, window end)`: each question
+    /// its calibrations hold ([`Substrate::CALIBRATES_KEY`]), a window apiece.
+    /// They vote in the calibration competition, not among the file's own
+    /// windows ([`scan_file_scans`]).
+    pub cal_windows: Vec<(usize, usize, usize)>,
     /// Real signature tokens per exchange slot — the Concept A.4 size input.
     pub ex_tokens: Vec<usize>,
 }
@@ -169,8 +174,9 @@ pub(crate) fn assemble_file_scans(
         for &(_, s, e, slot) in &windows {
             ex_tokens[slot] += e - s;
         }
-        // Each calibration's questions, a window apiece, voting for the head
-        // exchange. Counted in no exchange's size: they are not its content.
+        // Each calibration's questions, a window apiece, for the calibration
+        // competition. Counted in no exchange's size: they are not its content.
+        let mut cal_windows: Vec<(usize, usize, usize)> = Vec::new();
         for cal in sub.calibrations_of(timeline) {
             for i in 0..sub.turn_count(cal) {
                 let sid = turn_stream_id(cal.raw(), i);
@@ -183,7 +189,7 @@ pub(crate) fn assemble_file_scans(
                 }
                 arcs_kept.push(window);
                 arc_sids.push(sid);
-                windows.push((arcs_kept.len() - 1, 0, len, 0));
+                cal_windows.push((arcs_kept.len() - 1, 0, len));
             }
         }
         files.push(FileScan {
@@ -194,10 +200,29 @@ pub(crate) fn assemble_file_scans(
             arcs_kept,
             arc_sids,
             windows,
+            cal_windows,
             ex_tokens,
         });
     }
     (files, turns_walked)
+}
+
+/// `files` with every range `exclusion` names cut from their own windows — a
+/// window split around a cut, one wholly cut dropped — so a live scan never
+/// sees the chunks that win everything (`crate::provenance::chunk_exclusion`).
+/// Calibration windows are not cut: they compete apart.
+pub(crate) fn cut_excluded(files: &mut [FileScan], exclusion: &ChunkExclusion) {
+    if exclusion.is_empty() {
+        return;
+    }
+    for f in files {
+        let windows = take(&mut f.windows);
+        for (k, s, e, slot) in windows {
+            for (a, b) in uncut(s, e, exclusion.of(f.arc_sids[k])) {
+                f.windows.push((k, a, b, slot));
+            }
+        }
+    }
 }
 
 /// The score competitions `files` form under `cases`, each as the indices of
@@ -320,6 +345,65 @@ fn scatter(
     out
 }
 
+/// The calibration competition: every file that holds a calibration window, a
+/// case each, in file order.
+fn calibrated(files: &[FileScan]) -> Vec<usize> {
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.cal_windows.is_empty())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The calibration competition's windows and the case each votes for:
+/// `cal[i]`'s calibration windows vote for case `i`. `decoded` is
+/// [`decode_files`] of `files`.
+fn calibration_windows<'a>(
+    files: &[FileScan],
+    decoded: &'a [Vec<Vec<WideQSig>>],
+    cal: &[usize],
+) -> (Vec<&'a [WideQSig]>, Vec<usize>) {
+    let mut wref = Vec::new();
+    let mut wslot = Vec::new();
+    for (case, &fi) in cal.iter().enumerate() {
+        for &(k, s, e) in &files[fi].cal_windows {
+            wref.push(&decoded[fi][k][s..e]);
+            wslot.push(case);
+        }
+    }
+    (wref, wslot)
+}
+
+/// Split `votes` — every file competition's cases laid end to end, then the
+/// calibration competition's, one case per file of `cal` — into one vector
+/// per file ([`scatter`]), each calibrated file's calibration vote weighed by
+/// `weight` and added to its head exchange; under [`ScanCases::File`], to the
+/// file's one score, which every exchange carries.
+fn with_calibration(
+    files: &[FileScan],
+    comps: &[Vec<usize>],
+    cal: &[usize],
+    votes: &[f32],
+    cases: ScanCases,
+    weight: f32,
+) -> Vec<Vec<f32>> {
+    let own: usize = files.iter().map(|f| n_cases_of(f, cases)).sum();
+    let mut out = scatter(files, comps, &votes[..own.min(votes.len())], cases);
+    for (i, &fi) in cal.iter().enumerate() {
+        let v = weight * votes.get(own + i).copied().unwrap_or(0.0);
+        match cases {
+            ScanCases::Exchange => {
+                if let Some(head) = out[fi].first_mut() {
+                    *head += v;
+                }
+            }
+            ScanCases::File => out[fi].iter_mut().for_each(|x| *x += v),
+        }
+    }
+    out
+}
+
 /// Score every probe against every file: `[probe][file]` of `(fused, mass
 /// base)` — the policy-fused per-exchange scores and the UNGATED additive sum
 /// Concept B reads. Every probe rides the same launch — one pass over the
@@ -331,6 +415,15 @@ fn scatter(
 /// per file, on a host without the arena or when the arena declines. Per-layer-
 /// group vote weights come from the group's `policy.layer_weights` (empty ⇒
 /// uniform).
+///
+/// **Calibrations compete among themselves.** A calibration's exemplars and a
+/// live probe share a distribution, so in one pool with the files' content
+/// they take nearly every vote, whatever the content says — measured, 96.5%
+/// of a background's vote mass at 2% of the gallery, and question recall
+/// below the content's alone. Every calibrated file is a case of one more
+/// competition, scored on its calibration windows alone with its own `z` and
+/// margin, in the same launch; its vote, weighed by the policy's
+/// `calibration_weight`, is added to the file's own score.
 pub(crate) fn scan_file_scans(
     files: &[FileScan],
     group: &GroupSchema,
@@ -339,7 +432,9 @@ pub(crate) fn scan_file_scans(
 ) -> Vec<Vec<(Vec<f32>, Vec<f32>)>> {
     let weights = &group.policy.layer_weights;
     let cases = group.policy.scan.cases;
+    let cal_weight = group.policy.scan.calibration_weight;
     let comps = competitions(files, cases);
+    let cal = calibrated(files);
     // The CPU scan of one probe — the path a host without the arena takes —
     // one competition at a time, its votes laid end to end in competition
     // order, as the arena lays them. The windows are decoded on the host path's
@@ -349,15 +444,14 @@ pub(crate) fn scan_file_scans(
         let decoded = decoded.get_or_init(|| decode_files(files));
         let mut fused_all: Vec<f32> = Vec::new();
         let mut base_all: Vec<f32> = Vec::new();
-        for comp in &comps {
-            let (wref, wslot, n_cases) = competition_windows(files, decoded, comp, cases);
+        let mut score = |wref: &[&[WideQSig]], wslot: &[usize], n_cases: usize| {
             let (fused, base) = match group.policy.scan.fusion {
                 FusionMode::Additive => {
-                    let v = score_slots_weighted(p, &wref, &wslot, n_cases, weights);
+                    let v = score_slots_weighted(p, wref, wslot, n_cases, weights);
                     (v.clone(), v)
                 }
                 mode => {
-                    let grouped = score_slots_grouped(p, &wref, &wslot, n_cases, weights);
+                    let grouped = score_slots_grouped(p, wref, wslot, n_cases, weights);
                     if grouped.is_empty() {
                         (vec![0.0; n_cases], vec![0.0; n_cases])
                     } else {
@@ -367,10 +461,19 @@ pub(crate) fn scan_file_scans(
             };
             fused_all.extend(resized(fused, n_cases));
             base_all.extend(resized(base, n_cases));
+        };
+        for comp in &comps {
+            let (wref, wslot, n_cases) = competition_windows(files, decoded, comp, cases);
+            score(&wref, &wslot, n_cases);
         }
-        scatter(files, &comps, &fused_all, cases)
+        if !cal.is_empty() {
+            let (wref, wslot) = calibration_windows(files, decoded, &cal);
+            score(&wref, &wslot, cal.len());
+        }
+        let split = |votes: &[f32]| with_calibration(files, &comps, &cal, votes, cases, cal_weight);
+        split(&fused_all)
             .into_iter()
-            .zip(scatter(files, &comps, &base_all, cases))
+            .zip(split(&base_all))
             .collect()
     };
     let gpu_scores: Option<Vec<Vec<(Vec<f32>, Vec<f32>)>>> = arena.and_then(|arena| {
@@ -380,7 +483,7 @@ pub(crate) fn scan_file_scans(
         // turns stay resident, and a resident turn is never decoded.
         // One segment per competition, each file's exchanges at its offset in
         // the competition's cases.
-        let segments: Vec<PagedSegment> = comps
+        let mut segments: Vec<PagedSegment> = comps
             .iter()
             .map(|comp| {
                 let mut windows = Vec::new();
@@ -400,15 +503,37 @@ pub(crate) fn scan_file_scans(
                 PagedSegment { windows, n_cases }
             })
             .collect();
+        // The calibration competition, last: each calibrated file a case.
+        if !cal.is_empty() {
+            let mut windows = Vec::new();
+            for (case, &fi) in cal.iter().enumerate() {
+                let f = &files[fi];
+                windows.extend(f.cal_windows.iter().map(|&(k, s, e)| PagedWindow {
+                    sid: f.arc_sids[k],
+                    fingerprint: f.arcs_kept[k].fingerprint(),
+                    turn: (&f.arcs_kept[k]).into(),
+                    start: s,
+                    end: e,
+                    case,
+                }));
+            }
+            segments.push(PagedSegment {
+                windows,
+                n_cases: cal.len(),
+            });
+        }
         // `[probe][file][slot]`.
         let arena_scan = |w: &[f32]| -> Option<Vec<Vec<Vec<f32>>>> {
             match arena.scan_weighted(&segments, probes, w) {
                 Ok(out) => {
                     // One per-GLOBAL-case vote vector per probe, in segment
-                    // (competition) order — split back per file.
+                    // (competition) order — split back per file, the
+                    // calibration competition's added on.
                     Some(
                         out.into_iter()
-                            .map(|votes| scatter(files, &comps, &votes, cases))
+                            .map(|votes| {
+                                with_calibration(files, &comps, &cal, &votes, cases, cal_weight)
+                            })
                             .collect(),
                     )
                 }
@@ -487,6 +612,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::projection::Builder;
     use crate::provenance::encode_wide_sigs;
 
     /// A deterministic pseudo-random folded signature: 3 groups × 4 heads ×
@@ -525,9 +651,151 @@ mod tests {
                 .map(|i| turn_stream_id(tl.raw(), i))
                 .collect(),
             windows: (0..exchanges).map(|e| (e, 0, tokens, e)).collect(),
+            cal_windows: Vec::new(),
             ex_tokens: vec![tokens; exchanges],
             arcs_kept: arcs,
         }
+    }
+
+    /// A group scored under `cases`, every other policy at its default.
+    fn schema_group(cases: ScanCases) -> GroupSchema {
+        let cases = match cases {
+            ScanCases::Exchange => "exchange",
+            ScanCases::File => "file",
+        };
+        let yaml = format!(
+            r#"
+system_prompt:
+  sections:
+    - id: frame
+      content: "frame"
+layers:
+  - name: files
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget:
+      priority: 40
+    groups:
+      - id: scopes
+        selection: {{ kind: top_k, k: 2 }}
+        policy: {{ cases: {cases} }}
+"#
+        );
+        Builder::from_yaml(&yaml).unwrap().schema().layers[0].groups[0].clone()
+    }
+
+    /// `file`, with a calibration of `questions` windows, one per question.
+    fn calibrated_file(
+        timeline: u64,
+        seed: u64,
+        exchanges: usize,
+        tokens: usize,
+        questions: &[Vec<WideQSig>],
+    ) -> FileScan {
+        let mut f = file(timeline, seed, exchanges, tokens);
+        for (i, q) in questions.iter().enumerate() {
+            f.arcs_kept
+                .push(SigWindow::new(Arc::from(encode_wide_sigs(q))).expect("a stored window"));
+            f.arc_sids.push(turn_stream_id(9_000 + timeline, i as u32));
+            f.cal_windows.push((f.arcs_kept.len() - 1, 0, q.len()));
+        }
+        f
+    }
+
+    /// **A cut chunk leaves the scan; the rest of its window stays.** A
+    /// 3-exchange file of 64-token turns loses chunk 1 of its first turn (the
+    /// window splits around it) and both chunks of its second (the window
+    /// goes); its calibration window is untouched.
+    #[test]
+    fn excluded_chunks_are_cut_from_a_files_own_windows() {
+        let q = vec![(0..8).map(|t| sig(70_000 + t)).collect::<Vec<_>>()];
+        let mut files = vec![calibrated_file(1, 1, 3, 64, &q)];
+        let (t0, t1) = (files[0].arc_sids[0], files[0].arc_sids[1]);
+        let x = ChunkExclusion::of_chunks([(t0, 1, 64), (t1, 0, 64), (t1, 1, 64)]);
+        cut_excluded(&mut files, &x);
+        assert_eq!(files[0].windows, vec![(0, 0, 32, 0), (2, 0, 64, 2)]);
+        assert_eq!(files[0].cal_windows, vec![(3, 0, 8)]);
+        let before = files[0].windows.clone();
+        cut_excluded(&mut files, &ChunkExclusion::default());
+        assert_eq!(files[0].windows, before);
+    }
+
+    /// **The calibration competition's votes land on their files.** Votes
+    /// laid out as the launch lays them — the file competitions' cases, then
+    /// one per calibrated file — come back with each calibrated file's
+    /// calibration vote, weighed, on its head exchange; by file, on its one
+    /// score.
+    #[test]
+    fn a_calibration_vote_is_weighed_onto_its_file() {
+        let q = vec![vec![sig(1)]];
+        let files = vec![
+            file(1, 1, 1, 4),
+            calibrated_file(2, 2, 3, 4, &q),
+            calibrated_file(3, 3, 1, 4, &q),
+        ];
+        assert_eq!(calibrated(&files), vec![1, 2]);
+        let ex = ScanCases::Exchange;
+        let comps = competitions(&files, ex);
+        // File 1's three exchanges, the pool's 0 and 2, then the calibration
+        // competition's 1 and 2.
+        let votes = [10.0, 11.0, 12.0, 20.0, 30.0, 4.0, 8.0];
+        assert_eq!(
+            with_calibration(&files, &comps, &[1, 2], &votes, ex, 0.5),
+            vec![vec![20.0], vec![12.0, 11.0, 12.0], vec![34.0]]
+        );
+        let by_file = ScanCases::File;
+        let comps = competitions(&files, by_file);
+        assert_eq!(
+            with_calibration(
+                &files,
+                &comps,
+                &[1, 2],
+                &[20.0, 10.0, 30.0, 4.0, 8.0],
+                by_file,
+                0.25
+            ),
+            vec![vec![20.0], vec![11.0, 11.0, 11.0], vec![32.0]]
+        );
+    }
+
+    /// **Questions compete among themselves.** Three files, each calibrated
+    /// with a question; a probe drawn from the second's question, in a pool
+    /// of content that matches none of them, ranks the second first through
+    /// the calibration competition alone — and with a weight of 0 it would
+    /// not be told apart.
+    #[test]
+    fn a_probe_like_a_calibration_question_finds_its_file() {
+        let questions: Vec<Vec<WideQSig>> = (0..3)
+            .map(|i| (0..12).map(|t| sig(50_000 + i * 100 + t)).collect())
+            .collect();
+        let files: Vec<FileScan> = (0..3)
+            .map(|i| calibrated_file(i + 1, i + 1, 1, 24, &questions[i as usize..i as usize + 1]))
+            .collect();
+        let probe: Vec<WideQSig> = questions[1][2..10].to_vec();
+        let mut group = schema_group(ScanCases::File);
+        let scores = |g: &GroupSchema| {
+            scan_file_scans(&files, g, &[probe.as_slice()], None)[0]
+                .iter()
+                .map(|(fused, _)| fused[0])
+                .collect::<Vec<f32>>()
+        };
+        let weighed = scores(&group);
+        assert!(
+            weighed[1] > weighed[0] && weighed[1] > weighed[2],
+            "{weighed:?}"
+        );
+        group.policy.scan.calibration_weight = 0.0;
+        let unweighed = scores(&group);
+        assert!(unweighed[1] < weighed[1], "{unweighed:?} vs {weighed:?}");
     }
 
     /// Files of one exchange compete together, a file of several on its own.

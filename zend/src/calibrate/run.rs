@@ -11,7 +11,8 @@
 //! hidden calibration layer, the system prompt every conversation opens with,
 //! nothing projected — with thinking on, and what the model reasons, up to the
 //! layer's `think` budget, is kept ([`super::thinking`]). Every question of a
-//! unit is asked at once, so they decode in one wave.
+//! unit is asked at once, so they decode in one wave, and more units think
+//! than draft at once: only the draft carries the unit's reading.
 //!
 //! The questions are calibrated the way a tool's are (`ToolDef::questions`):
 //! every one in ONE prefill, a turn group in a conversation of the hidden
@@ -28,7 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_conversation::chain_health::chain_break;
 use candle_conversation::persistence::record::DistillMode;
@@ -36,9 +37,11 @@ use candle_conversation::projection::{
     DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId,
     NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
+use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig, TurnOptions};
 
+use super::permits::Permits;
 use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
 use super::spec::CalibrateSpec;
@@ -62,6 +65,13 @@ pub const TAG: &str = "calibration";
 /// Decode budget for a draft's answer: room for the questions, which are
 /// asked for without reasoning.
 const DRAFT_MAX_TOKENS: usize = 2048;
+
+/// Units calibrated at once. A unit's draft forks from its whole reading, so
+/// drafts are held to the width the layer reads at (`LAYER_PARALLELISM`); its
+/// thinking and prefill carry only the system prompt — shared — and a
+/// question, so three times as many units are in flight, and one thinking
+/// does not hold a draft's place. The scheduler's waves pace the decode.
+const CALIBRATE_PARALLELISM: usize = 3 * LAYER_PARALLELISM;
 
 /// What one layer's pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -88,10 +98,13 @@ pub struct Layer<'a> {
 }
 
 /// Where calibrations are prefilled: the system prompt every conversation
-/// opens with, dialect-formatted, and the sequence config they run under.
+/// opens with, dialect-formatted, the sequence config they run under, and the
+/// steering a question's thinking decodes under — a live dialogue turn's at
+/// the default effort, so its reasoning block opens and closes as one does.
 pub struct Frame<'a> {
     pub system_prompt: &'a str,
     pub config: &'a SequenceConfig,
+    pub thinking: Arc<TriggerRegistry>,
 }
 
 /// Calibrate every unit of `layer` that is ready and not calibrated, and
@@ -148,8 +161,9 @@ pub fn calibrate_layer(
     let cursor = AtomicUsize::new(0);
     let sealed = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
+    let drafts = Permits::new(LAYER_PARALLELISM);
     std::thread::scope(|s| {
-        for _ in 0..LAYER_PARALLELISM.min(todo.run.len()).max(1) {
+        for _ in 0..CALIBRATE_PARALLELISM.min(todo.run.len()).max(1) {
             // Only a shutdown stops it: a pass asked for meanwhile waits for
             // the layer to finish, since this runs ahead of every pass.
             s.spawn(|| loop {
@@ -159,7 +173,7 @@ pub fn calibrate_layer(
                 let Some(unit) = todo.run.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
                     return;
                 };
-                match calibrate_one(engine, layer, frame, unit) {
+                match calibrate_one(engine, layer, frame, &drafts, unit) {
                     Ok(()) => {
                         sealed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -244,15 +258,20 @@ fn draft_selection() -> SelectionState {
     selection
 }
 
-/// Ask `unit` for its questions and calibrate them.
+/// Ask `unit` for its questions — holding one of `drafts` while it does — and
+/// calibrate them.
 fn calibrate_one(
     engine: &Mutex<ConversationEngine>,
     layer: &Layer<'_>,
     frame: &Frame<'_>,
+    drafts: &Permits,
     unit: &Unit,
 ) -> anyhow::Result<()> {
     let spec = layer.spec;
-    let asked = draft(engine, layer, unit)?;
+    let asked = {
+        let _draft = drafts.acquire();
+        draft(engine, layer, unit)?
+    };
     let found = questions(&asked, spec.questions);
     if found.is_empty() {
         anyhow::bail!("the draft wrote no question ({} chars)", asked.len());
@@ -365,6 +384,7 @@ fn thoughts(
             let options = TurnOptions {
                 max_tokens: Some(spec.think),
                 selection: thinking_selection(),
+                triggers: Arc::clone(&frame.thinking),
                 tags: vec![TAG.to_string()],
                 ..Default::default()
             };
@@ -380,10 +400,14 @@ fn thoughts(
                 .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
             conv.finish_turn(handle, &resp)
                 .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
-            out.push(
-                thinking_of(&resp.answer)
-                    .ok_or_else(|| anyhow::anyhow!("the model did not think about {q:?}"))?,
-            );
+            let thought = thinking_of(&resp.answer).ok_or_else(|| {
+                let opening: String = resp.text.chars().take(80).collect();
+                anyhow::anyhow!(
+                    "the model did not think about {q:?} (finish {:?}, it wrote {opening:?})",
+                    resp.stats.finish
+                )
+            })?;
+            out.push(thought);
         }
         Ok(out)
     });

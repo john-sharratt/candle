@@ -7,7 +7,7 @@
 //! - name: code_reading
 //!   calibrate:
 //!     questions: 24
-//!     think: 192
+//!     think: 64
 //!     prompt: |
 //!       Write <<n>> questions someone might ask whose answer needs `<<path>>` …
 //! ```
