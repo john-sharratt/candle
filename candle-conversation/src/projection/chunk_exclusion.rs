@@ -10,9 +10,11 @@
 //! kernel's measure. The mass a chunk gathers is what it wins on other files'
 //! questions; its outliers are cut.
 //!
-//! The attribution reads only the winning file's tokens, decoded once per
-//! file, files in parallel, outside every lock — host work over a sample of
-//! the questions, run once an ingest pass, never on the forward path.
+//! The questions are scanned a few at a time, each scan one background job
+//! the scheduler runs between waves, so learning never holds the engine. The
+//! attribution reads only the winning file's tokens, decoded once per file,
+//! files in parallel, outside every lock — host work over a sample of the
+//! questions, never on the forward path.
 
 use std::array::from_fn;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -92,6 +94,9 @@ pub struct ExclusionReport {
     pub cut: usize,
     pub calibration_chunks: usize,
     pub calibration_cut: usize,
+    /// Whether the standing exclusion was kept, its questions having moved by
+    /// less than a tenth — nothing scanned.
+    pub kept: bool,
 }
 
 impl Conversation {
@@ -106,15 +111,17 @@ impl Conversation {
     /// is the scheduler's [`Self::scan_group_votes`] — `(calibrations,
     /// masked turns, probes)` — and answers in its own file order, which the
     /// cases are read back through. A group with no calibrated file learns an
-    /// empty exclusion.
+    /// empty exclusion. The standing exclusion is kept, nothing scanned, while
+    /// the questions it was learned from have moved by less than a tenth.
     pub fn learn_chunk_exclusion(
         &self,
         group: GroupId,
         per_file: usize,
         scan: impl Fn(bool, HashSet<StreamId>, Vec<Vec<WideQSig>>) -> candle::Result<GroupVotes>,
     ) -> candle::Result<ExclusionReport> {
-        let (files, probes) = {
+        let (files, probes, standing) = {
             let sub = self.inner.read().unwrap();
+            let standing = sub.chunk_exclusion(group);
             let timelines: Vec<TimelineId> = sub.active_timelines_for_group(group).collect();
             let (files, _) = assemble_file_scans(&sub, timelines);
             let width = files
@@ -140,7 +147,7 @@ impl Conversation {
                     }
                 }
             }
-            (files, probes)
+            (files, probes, standing)
         };
         let mut report = ExclusionReport {
             files: files.len(),
@@ -148,6 +155,11 @@ impl Conversation {
             probes: probes.len(),
             ..Default::default()
         };
+        if standing.stands_for(probes.len()) {
+            report.kept = true;
+            report.cut = standing.chunks();
+            return Ok(report);
+        }
         let exclusion = if probes.is_empty() {
             ChunkExclusion::default()
         } else {
@@ -168,20 +180,12 @@ impl Conversation {
                 })
                 .chain(probes.iter().map(|(_, sid, _)| *sid))
                 .collect();
-            let content = scan(false, HashSet::new(), sigs.clone())?;
-            let content = chunk_mass(
-                &files,
-                &owned,
-                &in_file_order(&files, &content),
-                Competition::Content,
-            );
-            let calibration = scan(true, not_calibration, sigs)?;
-            let calibration = chunk_mass(
-                &files,
-                &owned,
-                &in_file_order(&files, &calibration),
-                Competition::Calibration,
-            );
+            let content = in_batches(&files, &sigs, |batch| scan(false, HashSet::new(), batch))?;
+            let content = chunk_mass(&files, &owned, &content, Competition::Content);
+            let calibration = in_batches(&files, &sigs, |batch| {
+                scan(true, not_calibration.clone(), batch)
+            })?;
+            let calibration = chunk_mass(&files, &owned, &calibration, Competition::Calibration);
             report.chunks = content.mass.len();
             report.calibration_chunks = calibration.mass.len();
             let cut: Vec<(StreamId, usize, usize)> =
@@ -190,7 +194,7 @@ impl Conversation {
                 calibration.outliers(Competition::Calibration.k()).collect();
             report.cut = cut.len();
             report.calibration_cut = cal_cut.len();
-            ChunkExclusion::of_chunks(cut.into_iter().chain(cal_cut))
+            ChunkExclusion::of_chunks(cut.into_iter().chain(cal_cut)).learned_from(probes.len())
         };
         self.inner
             .write()
@@ -198,6 +202,32 @@ impl Conversation {
             .set_chunk_exclusion(group, exclusion);
         Ok(report)
     }
+}
+
+/// Probes per scan. Each scan is one background job of the scheduler, run
+/// between its waves; the whole question sample in one scan held the engine
+/// for ~40 s at a time — every live conversation frozen while it ran — where
+/// a batch of this many takes a fraction of a second.
+const PROBES_PER_SCAN: usize = 16;
+
+/// `sigs` scanned [`PROBES_PER_SCAN`] at a time, their votes laid end to end
+/// in probe order, each batch's cases named by its file's index in `files` —
+/// so a file committed between two batches changes no case's meaning.
+fn in_batches(
+    files: &[FileScan],
+    sigs: &[Vec<WideQSig>],
+    scan: impl Fn(Vec<Vec<WideQSig>>) -> candle::Result<GroupVotes>,
+) -> candle::Result<TokenVotes> {
+    let mut out = TokenVotes::none(0, FOLD_GROUPS, 1);
+    for batch in sigs.chunks(PROBES_PER_SCAN) {
+        let votes = in_file_order(files, &scan(batch.to_vec())?);
+        out.case.extend(votes.case);
+        out.vote.extend(votes.vote);
+        out.per_probe.extend(votes.per_probe);
+        out.n_groups = votes.n_groups;
+        out.n_segments = votes.n_segments;
+    }
+    Ok(out)
 }
 
 /// `scanned`'s votes with each case named by its file's index in `files`; a
@@ -402,5 +432,41 @@ mod tests {
         assert_eq!(m.chunks, vec![(sa, 0, 40), (sa, 1, 40), (sb, 0, 8)]);
         assert_eq!(m.file_of, vec![0, 0, 1]);
         assert_eq!(m.mass, vec![0.0, 6.0, 0.0]);
+    }
+
+    /// **The questions are scanned a batch at a time, and the batches read
+    /// back as one scan.** 40 one-token probes go out as 16, 16 and 8; each
+    /// batch answers in its own file order — here the reverse of `files` —
+    /// and every case comes back named by its index in `files`.
+    #[test]
+    fn questions_are_scanned_in_batches_read_back_as_one() {
+        let files = vec![file(1, &[sig(0)]), file(2, &[sig(0)])];
+        let sigs: Vec<Vec<WideQSig>> = (0..40).map(|i| vec![sig(i)]).collect();
+        let sizes = std::cell::RefCell::new(Vec::new());
+        let votes = in_batches(&files, &sigs, |batch| {
+            sizes.borrow_mut().push(batch.len());
+            let n = batch.len() * FOLD_GROUPS;
+            Ok(GroupVotes {
+                files: vec![TimelineId::for_test(2), TimelineId::for_test(1)],
+                votes: TokenVotes {
+                    case: vec![0; n],
+                    vote: vec![batch.len() as f32; n],
+                    per_probe: vec![1; batch.len()],
+                    n_groups: FOLD_GROUPS,
+                    n_segments: 1,
+                },
+            })
+        })
+        .unwrap();
+        assert_eq!(sizes.into_inner(), vec![16, 16, 8]);
+        assert_eq!(votes.per_probe, vec![1; 40]);
+        assert_eq!(votes.case, vec![1; 40 * FOLD_GROUPS]);
+        let expected: Vec<f32> = [16.0, 16.0, 8.0]
+            .iter()
+            .zip([16, 16, 8])
+            .flat_map(|(&v, n)| repeat_n(v, n * FOLD_GROUPS))
+            .collect();
+        assert_eq!(votes.vote, expected);
+        assert_eq!((votes.n_groups, votes.n_segments), (FOLD_GROUPS, 1));
     }
 }
