@@ -66,17 +66,17 @@ pub(crate) const TRIAL_WAVES: u64 = 64;
 /// waves: on `.5` (2026-10-17), with timing working, the most-hit shape of a
 /// 64-wave trial had 7 hits, the rest 3 or fewer, and the trial banned 174 of
 /// 176 as rare while each recurred steadily. Measured by the samples it needs
-/// instead, a trial lasts until every candidate is judged or this cap, and a
-/// topology hit fewer than [`MIN_HITS`] times by then is rare by any measure
-/// worth a graph.
+/// instead, a trial lasts until every candidate is judged or this cap — about
+/// twenty seconds of decode — and a topology hit fewer than [`MIN_HITS`] times
+/// by then is rare by any measure worth a graph.
 ///
-/// **The cap is sized by a serving daemon's mix, not a benchmark's.** A
-/// benchmark's topologies recur every wave and its trial ends at
-/// [`TRIAL_WAVES`]; the cap only binds where conversations, ingest and their
-/// drafts share the waves. At 512 (~45 s of that mix on `.5`, 2026-10-26) a
-/// trial of 119 candidates proved 13 and benched 71 as rarely hit, and 5% of
-/// segments ran as graphs; at 4,096, 36–56% did.
-pub(crate) const TRIAL_MAX_WAVES: u64 = 4096;
+/// **A longer cap does not buy a serving daemon more graphs.** On `.5`
+/// (2026-10-26), with conversations, ingest and their drafts sharing the
+/// waves, 5% of segments ran as graphs under the lock at this cap and at
+/// 4,096 waves alike: the longer trial judged more candidates, but its
+/// candidates were graphed half the time only while it ran, and the lock
+/// after it held as few proven topologies.
+pub(crate) const TRIAL_MAX_WAVES: u64 = 512;
 
 /// Waves without an admission that end a learn — about a second of decode.
 pub(crate) const LEARN_IDLE_WAVES: u64 = 32;

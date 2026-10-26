@@ -113,10 +113,10 @@ executables per 2 s window on `.5` (2026-10-17) to admit shapes that were evicte
    learn ends at the first admission that does not fit, or after `LEARN_IDLE_WAVES` (32) waves
    with no admission.
 2. **Trial**, for at least `TRIAL_WAVES` (64) waves and until every candidate has
-   `MIN_SAMPLES` (4) timed runs in each mode, or `TRIAL_MAX_WAVES` (4,096 — minutes of a
-   serving daemon's mixed traffic: at 512, ~45 s on `.5`, a trial of 119 candidates proved
-   13 and benched 71 as rarely hit, and 5% of segments ran as graphs; at 4,096, 36–56%).
-   It judges every
+   `MIN_SAMPLES` (4) timed runs in each mode, or `TRIAL_MAX_WAVES` (512). A longer cap
+   does not buy a serving daemon more graphs: on `.5` (2026-10-26) 5% of segments ran as
+   graphs under the lock at 512 and at 4,096 alike — a long trial's candidates are graphed
+   half the time only while it runs. It judges every
    **topology** the library holds unproven when it begins. Each topology on trial alternates
    graphed and eager every time a segment predicts it, timed on the device from the segment's
    start to its end — host lateness included, which is what a graph removes. One whose
@@ -203,7 +203,7 @@ One stream removes the class: there is no other stream for a launch to land on.
 
 The constants are short on purpose: a decode wave is a token or so, so reaching the lock costs
 seconds of decode, not minutes — a trial whose shapes all recur every wave ends at its 64-wave
-minimum. Only the cap is long, and it binds only on a mixed serving load.
+minimum, and the cap is about twenty seconds.
 
 **A shape is only as stable as its launches' grids.** A kernel whose grid follows a per-token
 count makes every segment holding it a new shape. Launches inside a recorded wave size their
