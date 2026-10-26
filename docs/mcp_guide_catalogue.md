@@ -367,8 +367,9 @@ reports, world material.
   material, colour and one style, put on-image text verbatim in double quotes,
   objective language, no quality tags). No negative prompt or weighting; the
   seed barely varies the picture, so variety comes from the prompt. People
-  are stated as adults for the prompt check. 1024 on the long side for
-  detail. Look at the result and refine the prompt.
+  are stated as adults for the prompt check. 768 on a side fits beside a busy
+  engine; 1024 when detail matters and there is room. One draw at a time.
+  Look at the result and refine the prompt.
 
 ---
 

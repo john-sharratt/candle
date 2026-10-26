@@ -33,8 +33,11 @@ Filter by `state`, `world`, or text in the name (`q`).
 - `bot_message_read {bot}` — your message thread with it.
 - `bot_channel_read {world}` — what its world's group chat carried.
 
-Read before asking anything of a bot: giving a mission replaces the one it
-was carrying.
+An idle bot runs **routines** of its own — reading one station after another,
+a few minutes each — and a routine shows in `bot_mission_read` as the mission
+it carries, just like one you gave. Giving a mission with `start: true`
+(the default) replaces whatever it carries, routine or not; there is no need
+to wait for a routine to end.
 
 Missions themselves — giving, adjusting, cancelling — are `bot-mission`'s:
 `bot_mission_give`, `bot_mission_step`, `bot_mission_cancel`.

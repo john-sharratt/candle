@@ -8,8 +8,9 @@ tools: [bot_mission_give, bot_mission_read, bot_mission_step, bot_mission_cancel
 ## Before
 
 `bot_mission_read {bot}` first. `start` defaults to `true`, and a mission
-given with it replaces whatever the bot was carrying. If it is mid-mission,
-either queue yours (`start: false`) or wait.
+given with it replaces whatever the bot was carrying. If it is on a mission
+someone gave it, either queue yours (`start: false`) or wait; one of its own
+routines can simply be replaced (`bots`).
 
 ## Write the brief
 
@@ -28,14 +29,20 @@ instruction. Write them as you would a task prompt:
 
 `bot_mission_give {bot, brief, steps, start}` — `start: true` carries it now
 and rouses the bot to read it; `start: false` queues it for the bot to collect
-at the command table, the place in its world where bots take up missions.
+at the command table, the place in its world where bots take up missions. A
+last step, "go back to the table and report it", is added to the steps you
+give: do not write your own reporting step.
 
 ## Follow it
 
 `bot_mission_read {bot}` again as it works: each step and whether it was
 achieved or thwarted. It answers at once with how things stand — it does not
-wait for a change — and the bot works in its own time, so pace the reads
-yourself: every few minutes, not every few seconds.
+wait for a change — so pace the reads yourself. A short mission can be done
+in two or three minutes: read a minute after giving it if you may want to
+adjust it, then every few minutes.
+
+Judge the outcome by the report — pass or fail, and its account — not by the
+step list: steps the bot did are not always ticked.
 
 ## Adjust
 
